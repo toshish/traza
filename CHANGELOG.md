@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The tracing storage engine exposed as a Rust library.
 - The `traza-server` HTTP server for the documented ingestion and query endpoints.
 - The `bench` executable for measuring the existing datastore workloads.
-- Four integration tests covering the core storage behavior.
+- Four behavioral integration tests: buffer-flush persistence, crash recovery via reopen, randomized filter equivalence against an independent naive reference, and TTL compaction. (Persisted batch *ordering* is asserted only indirectly; a direct segment-order assertion arrives with the storage-correctness work.)
 - Crate documentation, dual MIT/Apache-2.0 licensing, and release automation.
 
 ### Known Limitations
