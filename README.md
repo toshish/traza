@@ -38,7 +38,7 @@ Measured by `cargo run --release --bin bench` against a 1,000,000-span corpus (1
 | Trace-by-id p95 | 0.296 ms | < 50 ms | PASS |
 | Attribute-filtered query p95 | 73.691 ms | < 300 ms | PASS |
 
-The ingest rate is timed over the full loop — client-side JSON serialization and loopback HTTP overhead included. Full percentiles and methodology live in [BENCHMARKS.md](BENCHMARKS.md). Results are machine-specific; run the benchmark yourself (see below) rather than treating these as guarantees.
+**What these figures measure:** the HTTP server's current persistence path — an append-only log with memory-resident indexes — not the segment-engine library documented below. Engine-backed serving is on the roadmap; these benchmarks will be regenerated against it when it lands, and the numbers may change since the engine does more per write. The ingest rate is timed over the full loop — client-side JSON serialization and loopback HTTP overhead included. Full percentiles and methodology live in [BENCHMARKS.md](BENCHMARKS.md). Results are machine-specific; run the benchmark yourself (see below) rather than treating these as guarantees.
 
 ## Quickstart
 
