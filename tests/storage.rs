@@ -6,7 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
-use traza::{Config, Span, SpanFilter, Store};
+use traza::{Config, Error, Span, SpanFilter, Store};
 
 static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
 
@@ -94,6 +94,17 @@ fn buffer_flush_persists_sorted_batches() {
 
     expected_ids.sort();
     assert_eq!(queried_ids(&store, &SpanFilter::default()), expected_ids);
+
+    // Inspect segment boundaries directly: a globally sorted query can hide an
+    // incorrectly ordered on-disk batch.
+    let persisted_segments = store
+        .persisted_segment_spans()
+        .expect("inspect persisted segments");
+    for segment in persisted_segments {
+        assert!(segment
+            .windows(2)
+            .all(|pair| pair[0].start_time_ns <= pair[1].start_time_ns));
+    }
 }
 
 #[test]
@@ -404,4 +415,194 @@ fn ttl_compaction_drops_expired_segments() {
         assert!(remaining.contains(span_id), "fresh span missing: {span_id}");
     }
     assert_eq!(remaining.len(), fresh_ids.len());
+}
+
+static CORRECTNESS_TEST_DIR_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn correctness_test_dir(label: &str) -> std::path::PathBuf {
+    let id = CORRECTNESS_TEST_DIR_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("traza-{label}-{}-{id}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&path);
+    std::fs::create_dir_all(&path).expect("create correctness test directory");
+    path
+}
+
+fn correctness_span(batch: u64, item: u64) -> Span {
+    Span {
+        trace_id: format!("trace-{batch}"),
+        span_id: format!("batch-{batch}-span-{item}"),
+        parent_span_id: None,
+        name: "correctness".to_string(),
+        start_time_ns: batch * 1_000 + item,
+        end_time_ns: batch * 1_000 + item + 10,
+        status: Default::default(),
+        service: "correctness-tests".to_string(),
+        attributes: serde_json::Map::new(),
+        events: Vec::new(),
+    }
+}
+
+#[test]
+fn lock_order_no_deadlock() {
+    let dir = correctness_test_dir("lock-order");
+    let store = std::sync::Arc::new(
+        Store::open(
+            &dir,
+            Config {
+                flush_spans: 10_000,
+                ttl_seconds: None,
+            },
+        )
+        .expect("open store"),
+    );
+    store
+        .ingest(correctness_span(0, 0))
+        .expect("seed writer buffer");
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let flush_store = std::sync::Arc::clone(&store);
+    let flush_done = done_tx.clone();
+    let flusher = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            flush_store.flush().expect("flush concurrently");
+        }
+        flush_done.send(()).expect("signal flusher completion");
+    });
+
+    let stats_store = std::sync::Arc::clone(&store);
+    let stats_done = done_tx.clone();
+    let statistician = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            stats_store.stats().expect("read stats concurrently");
+        }
+        stats_done.send(()).expect("signal statistician completion");
+    });
+    drop(done_tx);
+
+    for _ in 0..2 {
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("flush/stats deadlocked");
+    }
+    flusher.join().expect("flusher thread");
+    statistician.join().expect("statistician thread");
+    drop(store);
+    std::fs::remove_dir_all(dir).expect("remove test directory");
+}
+
+#[test]
+fn reads_never_miss_committed_spans() {
+    const BATCHES: u64 = 100;
+    const SPANS_PER_BATCH: u64 = 4;
+
+    let dir = correctness_test_dir("atomic-reads");
+    let store = std::sync::Arc::new(
+        Store::open(
+            &dir,
+            Config {
+                flush_spans: 10_000,
+                ttl_seconds: None,
+            },
+        )
+        .expect("open store"),
+    );
+    let watermark = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let writer_store = std::sync::Arc::clone(&store);
+    let writer_watermark = std::sync::Arc::clone(&watermark);
+    let writer = std::thread::spawn(move || {
+        for batch in 1..=BATCHES {
+            let spans = (0..SPANS_PER_BATCH)
+                .map(|item| correctness_span(batch, item))
+                .collect();
+            writer_store.ingest_batch(spans).expect("ingest batch");
+            writer_store.flush().expect("commit batch");
+            writer_watermark.store(batch, std::sync::atomic::Ordering::Release);
+        }
+    });
+
+    let reader_store = std::sync::Arc::clone(&store);
+    let reader_watermark = std::sync::Arc::clone(&watermark);
+    let reader = std::thread::spawn(move || loop {
+        let committed = reader_watermark.load(std::sync::atomic::Ordering::Acquire);
+        let spans = reader_store
+            .query(&SpanFilter::default())
+            .expect("query atomic snapshot");
+        // Exactly-once, not merely present: a non-atomic snapshot's failure
+        // mode is DUPLICATION (buffer copied, then flush moves the same spans
+        // into segments before they are read again).
+        let raw_count = spans.len();
+        let ids: std::collections::HashSet<_> =
+            spans.into_iter().map(|span| span.span_id).collect();
+        assert_eq!(
+            ids.len(),
+            raw_count,
+            "query returned duplicate spans: snapshot is not atomic"
+        );
+        for batch in 1..=committed {
+            for item in 0..SPANS_PER_BATCH {
+                assert!(
+                    ids.contains(&format!("batch-{batch}-span-{item}")),
+                    "query omitted committed batch {batch}, span {item}"
+                );
+            }
+        }
+        if committed == BATCHES {
+            break;
+        }
+        std::thread::yield_now();
+    });
+
+    writer.join().expect("writer thread");
+    reader.join().expect("reader thread");
+    drop(store);
+    std::fs::remove_dir_all(dir).expect("remove test directory");
+}
+
+#[test]
+fn stale_temp_does_not_wedge_flush() {
+    let dir = correctness_test_dir("stale-temp");
+    let orphan = dir.join(format!(".segment-0.json.{}.0.tmp", std::process::id()));
+    std::fs::write(&orphan, b"orphaned partial segment").expect("plant stale temp");
+
+    let store = Store::open(
+        &dir,
+        Config {
+            flush_spans: 2,
+            ttl_seconds: None,
+        },
+    )
+    .expect("recover store with stale temp");
+    assert!(!orphan.exists(), "open did not remove stale temp");
+    store
+        .ingest(correctness_span(1, 0))
+        .expect("ingest first span");
+    store
+        .ingest(correctness_span(1, 1))
+        .expect("ingest second span");
+    store
+        .ingest(correctness_span(1, 2))
+        .expect("ingest past threshold");
+    store.flush().expect("flush after stale-temp recovery");
+
+    drop(store);
+    std::fs::remove_dir_all(dir).expect("remove test directory");
+}
+
+#[test]
+fn second_open_is_rejected() {
+    let dir = correctness_test_dir("single-writer");
+    let config = Config {
+        flush_spans: 100,
+        ttl_seconds: None,
+    };
+    let first = Store::open(&dir, config.clone()).expect("open first store");
+    let second = Store::open(&dir, config.clone());
+    assert!(matches!(second, Err(Error::AlreadyOpen)));
+
+    drop(first);
+    let reopened = Store::open(&dir, config).expect("reopen after first store drops");
+    drop(reopened);
+    std::fs::remove_dir_all(dir).expect("remove test directory");
 }
