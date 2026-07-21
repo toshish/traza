@@ -1,0 +1,197 @@
+# Traza
+
+*Traza* (Spanish for "trace") is a lightweight, single-binary tracing datastore written in Rust.
+
+It accepts batches of spans over a plain JSON HTTP API, persists them to an append-only store on local disk, and answers trace lookups and filtered span queries in milliseconds — no external database, no runtime, and exactly two dependencies (`serde` and `serde_json`).
+
+```sh
+cargo build --release
+./target/release/traza-server --data-dir ./data --port 8080
+```
+
+## Why Traza
+
+Most tracing backends assume a fleet: a column store or search cluster to run, a queue in front of it, an operator to keep it healthy. That is the right trade for a large organization and the wrong one for a laptop, a CI job, a single-host service, or an edge box.
+
+Traza takes the other side of the trade:
+
+- **One process, one directory.** The server starts in milliseconds and stores everything under `--data-dir`.
+- **A small audit surface.** Two direct dependencies; networking, threading, file I/O, and HTTP parsing use the Rust standard library.
+- **Honest numbers.** Every figure in [BENCHMARKS.md](BENCHMARKS.md) is measured by a bundled end-to-end benchmark, never estimated.
+- **Crash-safe by construction.** Immutable segments, an atomically replaced manifest, and log replay on startup.
+
+## Features
+
+- Batched span ingestion over HTTP with bounded queues and backpressure.
+- Trace-by-ID lookup and indexed span search: service, operation name, exact attribute match, minimum duration, and time window, combined with logical AND.
+- An embeddable Rust library (`traza::Store`): an append-only segment storage engine with sorted-batch flush, atomic manifest publication, crash recovery, and TTL compaction.
+- A self-verifying benchmark binary that measures the real HTTP path and rewrites `BENCHMARKS.md` from its own run.
+- Dual-licensed under MIT or Apache-2.0.
+
+## Performance
+
+Measured by `cargo run --release --bin bench` against a 1,000,000-span corpus (100,000 traces, 20 services, 100 indexed attribute values) on macOS/aarch64 with 10 hardware threads:
+
+| Metric | Measured | Target | Result |
+|---|---:|---:|---|
+| Sustained batched HTTP ingest | 200,860 spans/s | >= 50,000 spans/s | PASS |
+| Trace-by-id p95 | 0.296 ms | < 50 ms | PASS |
+| Attribute-filtered query p95 | 73.691 ms | < 300 ms | PASS |
+
+The ingest rate is timed over the full loop — client-side JSON serialization and loopback HTTP overhead included. Full percentiles and methodology live in [BENCHMARKS.md](BENCHMARKS.md). Results are machine-specific; run the benchmark yourself (see below) rather than treating these as guarantees.
+
+## Quickstart
+
+Build and start the server:
+
+```sh
+cargo build --release
+./target/release/traza-server --data-dir ./data --port 8080
+```
+
+Ingest a batch of spans (the body is a JSON array, or `{"spans": [...]}`):
+
+```sh
+curl -X POST http://localhost:8080/v1/spans \
+  -H 'Content-Type: application/json' \
+  -d '[{
+        "trace_id": "trace-1",
+        "span_id": "span-1",
+        "name": "charge",
+        "service": "checkout",
+        "start_time_unix_nano": 1700000000000000000,
+        "end_time_unix_nano": 1700000000002500000,
+        "status": "ok",
+        "attributes": {"region": "us-east", "http.method": "POST"}
+      }]'
+# {"accepted":1}
+```
+
+Fetch a whole trace, spans sorted by start time:
+
+```sh
+curl http://localhost:8080/v1/traces/trace-1
+# {"trace_id":"trace-1","spans":[...]}
+```
+
+Search spans with indexed filters:
+
+```sh
+curl 'http://localhost:8080/v1/spans?service=checkout&attr.region=us-east&min_duration_ms=2&limit=50'
+```
+
+Check what the store is holding:
+
+```sh
+curl http://localhost:8080/v1/stats
+# {"span_count":1,"segment_count":1,"bytes_on_disk":231}
+```
+
+## HTTP API
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/v1/spans` | Ingest a JSON batch of spans; responds `{"accepted": N}` |
+| `GET` | `/v1/traces/{trace_id}` | All spans of one trace, sorted by start time; `404` if unknown |
+| `GET` | `/v1/spans?...` | Filtered span search |
+| `GET` | `/v1/stats` | Span count, segment count, bytes on disk |
+
+Search filters (all supplied predicates are ANDed; values must be URL-encoded):
+
+- `service` — exact service-name match.
+- `name` — exact operation-name match.
+- `attr.KEY` — exact attribute match for `KEY`; repeat for multiple attributes. Bare values match string attributes; JSON literals (`true`, `3`) match typed values.
+- `min_duration_ms` — minimum span duration in milliseconds.
+- `since` / `until` — inclusive start-timestamp bounds, Unix nanoseconds.
+- `limit` — maximum spans returned (default 100), applied after filtering, sorted by start time.
+
+Span timestamps are integer Unix nanoseconds. The server reads `start_time_unix_nano` (and the aliases `start_timestamp_ns`, `start_ns`, `start_time`) plus the matching `end_*` keys; any other fields you send are stored and returned verbatim. Invalid JSON gets `400`; requests are capped at 64 MiB; `503` means the ingest writer is unavailable and the batch should be retried with backoff.
+
+## Architecture
+
+Traza is two layers that share one goal: never lose a completed write, never serve a torn one.
+
+**Storage engine (the `traza` library).** Spans accumulate in an in-memory write buffer. At the flush threshold (default 10,000 spans) the batch is sorted by trace ID and start time and written as a new immutable segment file with an embedded index of trace IDs, services, operation names, and attribute values. A `MANIFEST.json` names the live segments and is replaced by write-temp, fsync, atomic rename — recovery always observes a complete old or complete new segment list, never a partial one. Opening a store loads only manifest-listed segments and ignores incomplete temporaries; after a crash (including `kill -9`), at most the unflushed buffer is lost and no completed flush can be. TTL compaction publishes a manifest without expired segments, then deletes their files, so readers see a coherent before or after.
+
+Queries narrow candidates through the per-segment indexes, then re-verify every predicate against the decoded spans — an index accelerates a filter, it never changes its semantics.
+
+**HTTP server (`traza-server`).** A deliberately small HTTP/1.1 implementation on `std::net`: a worker pool for connections and a single writer thread that appends incoming batches to an append-only log in the data directory and updates in-memory indexes. On restart the server replays the log to rebuild its state, ignoring a torn tail line from an interrupted write. Bounded connection and ingest queues throttle producers instead of growing without limit. The server currently persists through this log path; serving reads and writes directly through the segment engine is on the roadmap.
+
+Embedding the engine in your own process:
+
+```rust
+use traza::{Config, SpanFilter, Store};
+
+let store = Store::open("./data", Config::default())?;
+store.ingest(span)?;          // buffered; flushes automatically at the threshold
+store.flush()?;               // or force a durable segment now
+let slow_spans = store.query(&SpanFilter {
+    service: Some("checkout".into()),
+    min_duration_ns: Some(5_000_000),
+    ..SpanFilter::default()
+})?;
+```
+
+## Configuration
+
+`traza-server` command line:
+
+| Flag | Default | Description |
+|---|---|---|
+| `--data-dir DIR` | `./data` | Directory for the store's files; created if missing |
+| `--port PORT` | `8080` | TCP port; the server binds `0.0.0.0` |
+| `--workers N` | number of CPUs (min 4) | HTTP worker threads |
+| `--ttl-seconds N` | off | Prunes auxiliary `.log` files older than the window at startup; full TTL retention lives in the library engine and is not yet wired through the server |
+
+Library `Config`:
+
+| Field | Default | Description |
+|---|---|---|
+| `flush_spans` | `10_000` | Buffered spans that trigger a sorted segment flush |
+| `ttl_seconds` | `None` | Retention window for `compact_expired()`; segments whose newest span is older are dropped |
+
+## Running the benchmark
+
+```sh
+cargo run --release --bin bench
+```
+
+The benchmark builds the release server, starts it on a free loopback port with a fresh temporary data directory, ingests 1,000,000 spans over HTTP in 1,000-span batches, measures sustained ingest throughput and p50/p95/p99 query latencies, and rewrites `BENCHMARKS.md` with the measurements from that run. Never edit `BENCHMARKS.md` by hand — regenerate it.
+
+Run the test suite and all lint gates with:
+
+```sh
+./ci.sh
+```
+
+## Limitations
+
+Traza is a v0.1 project and says so plainly:
+
+- **Single-node.** One writer process per data directory; no replication, clustering, or failover yet.
+- **No authentication.** No auth, authorization, or TLS — run it on a trusted network or behind a reverse proxy that terminates TLS and enforces access.
+- **JSON-only.** No OTLP endpoint yet; ingestion is the JSON HTTP API described above.
+- **Durability boundary.** A process crash preserves every acknowledged batch; a power loss can lose the most recent writes, since the server does not fsync per request. The library engine's durability begins at segment flush.
+- **Memory-resident reads.** The server holds its working set and indexes in memory and replays its log at startup, so RAM and startup time grow with stored spans. The segment engine is the path to larger-than-RAM datasets.
+- **Minimal HTTP.** `Connection: close` per request, no keep-alive, no TLS, 64 MiB body cap.
+- **Exact-match filtering.** No full-text search, aggregations, or query language.
+- **Unstable formats.** Segment and log layouts may change between 0.x versions.
+
+All of these are on the roadmap, not swept under it.
+
+## Roadmap
+
+- **Query efficiency** — serve reads directly from the segment engine's on-disk indexes; larger-than-RAM datasets; streaming results.
+- **OTLP ingest** — accept OpenTelemetry OTLP alongside the JSON API.
+- **LLM-observability semantics** — first-class conventions for prompts, completions, token usage, and tool calls.
+- **Auth** — token authentication and per-token authorization.
+- **High availability** — replication and failover beyond a single node.
+- **Dashboard** — a bundled UI for browsing traces.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). The short version: stable Rust is the only dependency, `./ci.sh` is the merge bar, and new dependencies need a reason.
+
+## License
+
+Licensed under either of the [MIT license](LICENSE-MIT) or the [Apache License, Version 2.0](LICENSE-APACHE), at your option. Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you shall be dual-licensed as above, without any additional terms or conditions.
