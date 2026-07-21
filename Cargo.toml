@@ -1,0 +1,44 @@
+[workspace]
+members = ["."]
+resolver = "2"
+
+[package]
+name = "traza"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+description = "Traza: A lightweight embedded datastore and HTTP server for Rust tracing data"
+license = "MIT OR Apache-2.0"
+
+repository = "https://github.com/toshish/traza"
+homepage = "https://github.com/toshish/traza"
+keywords = ["tracing", "observability", "datastore", "debugging"]
+categories = ["database-implementations", "development-tools::debugging"]
+[lib]
+name = "traza"
+path = "src/lib.rs"
+
+[[bin]]
+name = "traza-server"
+path = "src/bin/traza-server.rs"
+
+[[bin]]
+name = "bench"
+path = "src/bin/bench.rs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[profile.bench]
+inherits = "release"
+
+[lints.clippy]
+unnecessary_filter_map = "allow"
+
+[lints.rust]
+missing_docs = "deny"
