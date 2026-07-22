@@ -591,6 +591,27 @@ fn stale_temp_does_not_wedge_flush() {
 }
 
 #[test]
+fn stale_lock_from_dead_process_is_recovered() {
+    // A SIGKILLed owner leaves its LOCK behind; the store must reclaim it
+    // once the recorded PID is verifiably gone, or one crash wedges the
+    // directory forever.
+    let dir = correctness_test_dir("stale-lock");
+    let dead_pid = {
+        let mut child = std::process::Command::new("/usr/bin/true")
+            .spawn()
+            .expect("spawns");
+        let pid = child.id();
+        child.wait().expect("waits");
+        pid
+    };
+    std::fs::write(dir.join("LOCK"), format!("{dead_pid}
+")).expect("stale lock writes");
+    let store = Store::open(&dir, Config::default())
+        .expect("stale lock from a dead process must be reclaimed");
+    drop(store);
+}
+
+#[test]
 fn second_open_is_rejected() {
     let dir = correctness_test_dir("single-writer");
     let config = Config {

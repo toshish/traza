@@ -176,9 +176,29 @@ struct DirectoryLock {
 
 impl DirectoryLock {
     fn acquire(path: PathBuf) -> Result<Self> {
+        match Self::try_create(&path) {
+            Ok(lock) => Ok(lock),
+            Err(Error::AlreadyOpen) => {
+                // The lock records its owner's PID. A crashed owner (killed
+                // server, OOM, power loss before unlink) must not wedge the
+                // store forever: if the recorded process is gone, the lock is
+                // stale and may be reclaimed. A live owner still rejects the
+                // open. Exactly one reclaim attempt — losing a race to another
+                // reclaiming process surfaces as AlreadyOpen, which is true.
+                if Self::owner_is_dead(&path) {
+                    let _ = fs::remove_file(&path);
+                    return Self::try_create(&path);
+                }
+                Err(Error::AlreadyOpen)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn try_create(path: &Path) -> Result<Self> {
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
-        let mut file = match options.open(&path) {
+        let mut file = match options.open(path) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 return Err(Error::AlreadyOpen);
@@ -187,15 +207,46 @@ impl DirectoryLock {
         };
 
         if let Err(error) = writeln!(file, "{}", std::process::id()) {
-            let _ = fs::remove_file(&path);
+            let _ = fs::remove_file(path);
             return Err(Error::Io(error));
         }
         if let Err(error) = file.sync_all() {
-            let _ = fs::remove_file(&path);
+            let _ = fs::remove_file(path);
             return Err(Error::Io(error));
         }
 
-        Ok(Self { path, _file: file })
+        Ok(Self {
+            path: path.to_path_buf(),
+            _file: file,
+        })
+    }
+
+    /// True only when the lock file names a PID that verifiably no longer
+    /// exists. Unreadable or malformed lock files are treated as live: false
+    /// negatives merely keep the conservative rejection, never corrupt data.
+    fn owner_is_dead(path: &Path) -> bool {
+        let Ok(contents) = fs::read_to_string(path) else {
+            return false;
+        };
+        let Ok(pid) = contents.trim().parse::<u32>() else {
+            return false;
+        };
+        if pid == std::process::id() {
+            return false;
+        }
+        // Signal 0 probes existence without delivering anything. EPERM means
+        // the process exists but belongs to someone else — still live.
+        match std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .output()
+        {
+            Ok(output) => !output.status.success() && {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                !stderr.contains("not permitted") && !stderr.contains("Operation not permitted")
+            },
+            Err(_) => false,
+        }
     }
 }
 
