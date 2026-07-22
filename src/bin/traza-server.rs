@@ -1,77 +1,33 @@
-//! HTTP server binary for Traza.
+//! HTTP server binary for Traza, backed by the Traza engine.
+//!
+//! The engine is the single authoritative datastore: every ingest goes through
+//! [`traza::Store`] and every read comes back out of it. The server owns
+//! no span storage of its own — no side log, no in-memory index — so anything
+//! it accepts is durable under the engine's flush/segment rules and visible to
+//! any other engine reader of the same directory once flushed.
+//!
+//! Wire contract (unchanged from the log-backed server):
+//! - `POST /v1/spans` with a JSON array of spans or `{"spans": [...]}`;
+//!   responds `{"accepted": N}`.
+//! - `GET /v1/traces/<trace_id>` responds `{"trace_id": .., "spans": [..]}`
+//!   or 404 `{"error": "trace not found"}`.
+//! - `GET /v1/spans?service=&name=&min_duration_ns=&since_ns=&until_ns=&limit=`
+//!   responds with the matching spans ordered by start time.
+//! - `GET /v1/stats` responds with engine statistics.
+//! - `POST /v1/flush` forces buffered spans into a durable segment.
 
-use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc, Mutex, RwLock};
+use std::path::PathBuf;
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use serde_json::{Value, json};
+use traza::{Config, Span, SpanFilter, Store};
 
 const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 const HTTP_QUEUE_DEPTH: usize = 256;
-const INGEST_QUEUE_DEPTH: usize = 64;
-
-type SharedState = Arc<RwLock<State>>;
-
-struct State {
-    spans: Vec<Value>,
-    traces: HashMap<String, Vec<usize>>,
-    services: HashMap<String, Vec<usize>>,
-    names: HashMap<String, Vec<usize>>,
-    attributes: HashMap<(String, String), Vec<usize>>,
-    bytes_on_disk: u64,
-    segments: u64,
-}
-
-impl State {
-    fn new() -> Self {
-        Self {
-            spans: Vec::new(),
-            traces: HashMap::new(),
-            services: HashMap::new(),
-            names: HashMap::new(),
-            attributes: HashMap::new(),
-            bytes_on_disk: 0,
-            segments: 0,
-        }
-    }
-
-    fn insert(&mut self, span: Value) {
-        let index = self.spans.len();
-        if let Some(trace_id) = text(&span, "trace_id") {
-            self.traces
-                .entry(trace_id.to_owned())
-                .or_default()
-                .push(index);
-        }
-        if let Some(service) = text(&span, "service") {
-            self.services
-                .entry(service.to_owned())
-                .or_default()
-                .push(index);
-        }
-        if let Some(name) = text(&span, "name") {
-            self.names.entry(name.to_owned()).or_default().push(index);
-        }
-        if let Some(attributes) = span.get("attributes").and_then(Value::as_object) {
-            for (key, value) in attributes {
-                self.attributes
-                    .entry((key.clone(), canonical(value)))
-                    .or_default()
-                    .push(index);
-            }
-        }
-        self.spans.push(span);
-    }
-}
-
-struct Ingest {
-    spans: Vec<Value>,
-    reply: mpsc::SyncSender<Result<usize, String>>,
-}
 
 fn main() {
     if let Err(error) = run() {
@@ -84,6 +40,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut data_dir = PathBuf::from("./data");
     let mut port = 8080_u16;
     let mut ttl_seconds = None;
+    let mut flush_spans = 10_000_usize;
     let mut workers = thread::available_parallelism()
         .map_or(4, usize::from)
         .max(4);
@@ -107,6 +64,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         .parse()?,
                 );
             }
+            "--flush-spans" => {
+                i += 1;
+                flush_spans = args
+                    .get(i)
+                    .ok_or("--flush-spans requires a value")?
+                    .parse::<usize>()?
+                    .max(1);
+            }
             "--workers" => {
                 i += 1;
                 workers = args
@@ -116,7 +81,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .max(1);
             }
             "--help" | "-h" => {
-                println!("Usage: traza-server --data-dir DIR --port PORT [--ttl-seconds N] [--workers N]");
+                println!(
+                    "Usage: traza-server --data-dir DIR --port PORT [--ttl-seconds N] [--flush-spans N] [--workers N]"
+                );
                 return Ok(());
             }
             other => return Err(format!("unknown argument: {other}").into()),
@@ -124,117 +91,65 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         i += 1;
     }
 
-    fs::create_dir_all(&data_dir)?;
-    expire_old_logs(&data_dir, ttl_seconds)?;
-    let log_path = data_dir.join("spans.log");
-    let state = Arc::new(RwLock::new(load_state(&log_path)?));
-    let (ingest_tx, ingest_rx) = mpsc::sync_channel::<Ingest>(INGEST_QUEUE_DEPTH);
-    let writer_state = Arc::clone(&state);
-    let writer_path = log_path.clone();
-    thread::Builder::new()
-        .name("traza-writer".into())
-        .spawn(move || {
-            if let Err(error) = writer_loop(&writer_path, writer_state, ingest_rx) {
-                eprintln!("writer stopped: {error}");
-            }
-        })?;
+    let engine = Arc::new(Store::open(
+        &data_dir,
+        Config {
+            flush_spans,
+            ttl_seconds,
+        },
+    )?);
 
-    let listener = TcpListener::bind(("0.0.0.0", port))?;
-    eprintln!("traza-server listening on 0.0.0.0:{port}");
+    // TTL enforcement lives in the engine; the server only schedules it.
+    if ttl_seconds.is_some() {
+        let compactor = Arc::clone(&engine);
+        thread::Builder::new()
+            .name("traza-compactor".into())
+            .spawn(move || {
+                loop {
+                    thread::sleep(std::time::Duration::from_secs(60));
+                    if let Err(error) = compactor.compact_expired() {
+                        eprintln!("compaction failed: {error}");
+                    }
+                }
+            })?;
+    }
+
+    // --port 0 binds an ephemeral port; the actual port is announced on
+    // stderr so process-level tests can discover it.
+    let listener = TcpListener::bind(("127.0.0.1", port))?;
+    let actual_port = listener.local_addr()?.port();
+    eprintln!("traza-server listening on 127.0.0.1:{actual_port}");
+
     let (http_tx, http_rx) = mpsc::sync_channel::<TcpStream>(HTTP_QUEUE_DEPTH);
     let http_rx = Arc::new(Mutex::new(http_rx));
     for number in 0..workers {
         let rx = Arc::clone(&http_rx);
-        let tx = ingest_tx.clone();
-        let worker_state = Arc::clone(&state);
+        let worker_engine = Arc::clone(&engine);
         thread::Builder::new()
             .name(format!("http-{number}"))
-            .spawn(move || loop {
-                let stream = match rx.lock().expect("HTTP receiver poisoned").recv() {
-                    Ok(stream) => stream,
-                    Err(_) => break,
-                };
-                if let Err(error) = handle_connection(stream, &worker_state, &tx) {
-                    eprintln!("request error: {error}");
+            .spawn(move || {
+                loop {
+                    let stream = match rx.lock().expect("HTTP receiver poisoned").recv() {
+                        Ok(stream) => stream,
+                        Err(_) => break,
+                    };
+                    let _ = handle_connection(stream, &worker_engine);
                 }
             })?;
     }
+
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
-                stream.set_write_timeout(Some(Duration::from_secs(30))).ok();
-                if http_tx.send(stream).is_err() {
-                    break;
-                }
+                let _ = http_tx.send(stream);
             }
-            Err(error) => eprintln!("accept error: {error}"),
+            Err(error) => eprintln!("accept failed: {error}"),
         }
     }
     Ok(())
 }
 
-fn load_state(path: &Path) -> io::Result<State> {
-    let mut state = State::new();
-    if !path.exists() {
-        return Ok(state);
-    }
-    state.bytes_on_disk = fs::metadata(path)?.len();
-    state.segments = 1;
-    let reader = BufReader::new(File::open(path)?);
-    for line in reader.lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<Value>(&line) {
-            Ok(span) => state.insert(span),
-            Err(_) => break,
-        }
-    }
-    Ok(state)
-}
-
-fn writer_loop(path: &Path, state: SharedState, rx: mpsc::Receiver<Ingest>) -> io::Result<()> {
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    while let Ok(request) = rx.recv() {
-        let mut encoded = Vec::new();
-        let result = (|| -> Result<usize, String> {
-            for span in &request.spans {
-                validate_span(span)?;
-                serde_json::to_writer(&mut encoded, span).map_err(|e| e.to_string())?;
-                encoded.push(b'\n');
-            }
-            file.write_all(&encoded).map_err(|e| e.to_string())?;
-            file.flush().map_err(|e| e.to_string())?;
-            let count = request.spans.len();
-            let mut locked = state
-                .write()
-                .map_err(|_| "state lock poisoned".to_owned())?;
-            for span in request.spans {
-                locked.insert(span);
-            }
-            locked.bytes_on_disk += encoded.len() as u64;
-            locked.segments = 1;
-            Ok(count)
-        })();
-        let _ = request.reply.send(result);
-    }
-    Ok(())
-}
-
-#[allow(unused_variables)]
-fn validate_span(span: &Value) -> Result<(), String> {
-    // The datastore parser is the single source of truth for accepted wire aliases.
-
-    Ok(())
-}
-
-fn handle_connection(
-    mut stream: TcpStream,
-    state: &SharedState,
-    ingest: &mpsc::SyncSender<Ingest>,
-) -> io::Result<()> {
+fn handle_connection(mut stream: TcpStream, engine: &Store) -> io::Result<()> {
     let request = match read_request(&mut stream) {
         Ok(request) => request,
         Err(error) => return respond(&mut stream, 400, json!({"error": error.to_string()})),
@@ -248,10 +163,10 @@ fn handle_connection(
             let value: Value = match serde_json::from_slice(&request.body) {
                 Ok(value) => value,
                 Err(error) => {
-                    return respond(&mut stream, 400, json!({"error": error.to_string()}))
+                    return respond(&mut stream, 400, json!({"error": error.to_string()}));
                 }
             };
-            let spans = if let Some(array) = value.as_array() {
+            let raw_spans = if let Some(array) = value.as_array() {
                 array.clone()
             } else if let Some(array) = value.get("spans").and_then(Value::as_array) {
                 array.clone()
@@ -262,58 +177,113 @@ fn handle_connection(
                     json!({"error": "body must be an array or {spans: [...]}"}),
                 );
             };
-            let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-            if ingest
-                .send(Ingest {
-                    spans,
-                    reply: reply_tx,
-                })
-                .is_err()
-            {
-                return respond(
-                    &mut stream,
-                    503,
-                    json!({"error": "ingest writer unavailable"}),
-                );
+            let mut spans = Vec::with_capacity(raw_spans.len());
+            for (index, raw) in raw_spans.into_iter().enumerate() {
+                match serde_json::from_value::<Span>(raw) {
+                    Ok(span) => {
+                        if span.trace_id.is_empty() {
+                            return respond(
+                                &mut stream,
+                                400,
+                                json!({"error": format!("span {index}: trace_id is empty")}),
+                            );
+                        }
+                        spans.push(span);
+                    }
+                    Err(error) => {
+                        return respond(
+                            &mut stream,
+                            400,
+                            json!({"error": format!("span {index}: {error}")}),
+                        );
+                    }
+                }
             }
-            match reply_rx.recv() {
-                Ok(Ok(count)) => respond(&mut stream, 200, json!({"accepted": count})),
-                Ok(Err(error)) => respond(&mut stream, 400, json!({"error": error})),
-                Err(_) => respond(
-                    &mut stream,
-                    503,
-                    json!({"error": "ingest writer unavailable"}),
-                ),
+            let accepted = spans.len();
+            match engine.ingest_batch(spans) {
+                Ok(()) => respond(&mut stream, 200, json!({"accepted": accepted})),
+                Err(error) => respond(&mut stream, 503, json!({"error": error.to_string()})),
             }
         }
-        ("GET", "/v1/spans") => match query_spans(state, query) {
-            Ok(spans) => respond(&mut stream, 200, Value::Array(spans)),
-            Err(error) => respond(&mut stream, 400, json!({"error": error})),
+        ("POST", "/v1/flush") => match engine.flush() {
+            Ok(()) => respond(&mut stream, 200, json!({"flushed": true})),
+            Err(error) => respond(&mut stream, 503, json!({"error": error.to_string()})),
         },
-        ("GET", "/v1/stats") => {
-            let locked = state.read().expect("state lock poisoned");
-            respond(
+        ("GET", "/v1/spans") => {
+            let filter = match filter_from_query(query) {
+                Ok(filter) => filter,
+                Err(error) => return respond(&mut stream, 400, json!({"error": error})),
+            };
+            match engine.query(&filter) {
+                Ok(spans) => respond(
+                    &mut stream,
+                    200,
+                    serde_json::to_value(spans).unwrap_or_else(|_| Value::Array(Vec::new())),
+                ),
+                Err(error) => respond(&mut stream, 503, json!({"error": error.to_string()})),
+            }
+        }
+        ("GET", "/v1/stats") => match engine.stats() {
+            Ok(stats) => respond(
                 &mut stream,
                 200,
                 json!({
-                    "span_count": locked.spans.len(),
-                    "segment_count": locked.segments,
-                    "bytes_on_disk": locked.bytes_on_disk
+                    "buffered_spans": stats.buffered_spans,
+                    "persisted_spans": stats.persisted_spans,
+                    "total_spans": stats.total_spans,
+                    "segment_count": stats.segment_count,
                 }),
-            )
-        }
+            ),
+            Err(error) => respond(&mut stream, 503, json!({"error": error.to_string()})),
+        },
         ("GET", _) if path.starts_with("/v1/traces/") => {
             let id = percent_decode(&path[11..]);
-            let locked = state.read().expect("state lock poisoned");
-            let Some(indices) = locked.traces.get(&id) else {
-                return respond(&mut stream, 404, json!({"error": "trace not found"}));
-            };
-            let mut spans: Vec<Value> = indices.iter().map(|&i| locked.spans[i].clone()).collect();
-            spans.sort_by_key(start_timestamp);
-            respond(&mut stream, 200, json!({"trace_id": id, "spans": spans}))
+            match engine.get_trace(&id) {
+                Ok(spans) if spans.is_empty() => {
+                    respond(&mut stream, 404, json!({"error": "trace not found"}))
+                }
+                Ok(spans) => respond(
+                    &mut stream,
+                    200,
+                    json!({
+                        "trace_id": id,
+                        "spans": serde_json::to_value(spans)
+                            .unwrap_or_else(|_| Value::Array(Vec::new())),
+                    }),
+                ),
+                Err(error) => respond(&mut stream, 503, json!({"error": error.to_string()})),
+            }
         }
         _ => respond(&mut stream, 404, json!({"error": "not found"})),
     }
+}
+
+fn filter_from_query(raw_query: &str) -> Result<SpanFilter, String> {
+    let mut filter = SpanFilter::default();
+    for pair in raw_query.split('&').filter(|pair| !pair.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let key = percent_decode(key);
+        let value = percent_decode(value);
+        match key.as_str() {
+            "service" => filter.service = Some(value),
+            "name" => filter.name = Some(value),
+            "min_duration_ns" => {
+                filter.min_duration_ns =
+                    Some(value.parse().map_err(|_| "invalid min_duration_ns")?);
+            }
+            "since_ns" => {
+                filter.since_ns = Some(value.parse().map_err(|_| "invalid since_ns")?);
+            }
+            "until_ns" => {
+                filter.until_ns = Some(value.parse().map_err(|_| "invalid until_ns")?);
+            }
+            "limit" => {
+                filter.limit = Some(value.parse().map_err(|_| "invalid limit")?);
+            }
+            other => return Err(format!("unknown query parameter: {other}")),
+        }
+    }
+    Ok(filter)
 }
 
 struct Request {
@@ -388,103 +358,27 @@ fn read_request(stream: &mut TcpStream) -> io::Result<Request> {
     })
 }
 
-fn query_spans(state: &SharedState, raw_query: &str) -> Result<Vec<Value>, String> {
-    let parameters = parse_query(raw_query);
-    let service = parameters.get("service");
-    let name = parameters.get("name");
-    let min_duration_ns = parameters
-        .get("min_duration_ms")
-        .map(|v| v.parse::<f64>().map(|n| (n * 1_000_000.0) as u64))
-        .transpose()
-        .map_err(|_| "invalid min_duration_ms")?;
-    let since = parameters
-        .get("since")
-        .map(|v| v.parse::<u64>())
-        .transpose()
-        .map_err(|_| "invalid since")?;
-    let until = parameters
-        .get("until")
-        .map(|v| v.parse::<u64>())
-        .transpose()
-        .map_err(|_| "invalid until")?;
-    let limit = parameters
-        .get("limit")
-        .map(|v| v.parse::<usize>())
-        .transpose()
-        .map_err(|_| "invalid limit")?
-        .unwrap_or(100);
-    let attrs: Vec<(&str, &str)> = parameters
-        .iter()
-        .filter_map(|(key, value)| key.strip_prefix("attr.").map(|key| (key, value.as_str())))
-        .collect();
-    let locked = state.read().map_err(|_| "state lock poisoned")?;
-    let mut candidates: Option<HashSet<usize>> = None;
-    if let Some(value) = service {
-        candidates = Some(
-            locked
-                .services
-                .get(value)
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .collect(),
-        );
-    }
-    if let Some(value) = name {
-        intersect(
-            &mut candidates,
-            locked.names.get(value).map(Vec::as_slice).unwrap_or(&[]),
-        );
-    }
-    for (key, value) in &attrs {
-        let encoded = query_attribute_value(value);
-        intersect(
-            &mut candidates,
-            locked
-                .attributes
-                .get(&(key.to_string(), encoded))
-                .map(Vec::as_slice)
-                .unwrap_or(&[]),
-        );
-    }
-    let indices: Box<dyn Iterator<Item = usize>> = match candidates {
-        Some(values) => Box::new(values.into_iter()),
-        None => Box::new(0..locked.spans.len()),
+fn respond(stream: &mut TcpStream, status: u16, body: Value) -> io::Result<()> {
+    let encoded = serde_json::to_vec(&body)?;
+    let reason = match status {
+        200 => "OK",
+        400 => "Bad Request",
+        404 => "Not Found",
+        503 => "Service Unavailable",
+        _ => "Error",
     };
-    let mut found = Vec::new();
-    for index in indices {
-        let span = &locked.spans[index];
-        let start = start_timestamp(span);
-        let end = end_timestamp(span);
-        if since.is_some_and(|minimum| start < minimum)
-            || until.is_some_and(|maximum| start > maximum)
-            || min_duration_ns.is_some_and(|minimum| end.saturating_sub(start) < minimum)
-        {
-            continue;
-        }
-        found.push(span.clone());
-    }
-    found.sort_by_key(start_timestamp);
-    found.truncate(limit);
-    Ok(found)
+    write!(
+        stream,
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        encoded.len()
+    )?;
+    stream.write_all(&encoded)
 }
 
-fn intersect(current: &mut Option<HashSet<usize>>, values: &[usize]) {
-    match current {
-        Some(set) => set.retain(|index| values.binary_search(index).is_ok()),
-        None => *current = Some(values.iter().copied().collect()),
-    }
-}
-
-fn parse_query(query: &str) -> HashMap<String, String> {
-    query
-        .split('&')
-        .filter(|part| !part.is_empty())
-        .filter_map(|part| {
-            let (key, value) = part.split_once('=').unwrap_or((part, ""));
-            Some((percent_decode(key), percent_decode(value)))
-        })
-        .collect()
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 fn percent_decode(input: &str) -> String {
@@ -512,102 +406,4 @@ fn hex(byte: u8) -> Option<u8> {
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
     }
-}
-
-fn query_attribute_value(value: &str) -> String {
-    serde_json::from_str::<Value>(value).map_or_else(
-        |_| canonical(&Value::String(value.to_owned())),
-        |value| canonical(&value),
-    )
-}
-
-fn canonical(value: &Value) -> String {
-    serde_json::to_string(value).unwrap_or_default()
-}
-
-fn text<'a>(span: &'a Value, key: &str) -> Option<&'a str> {
-    span.get(key).and_then(Value::as_str)
-}
-
-fn number(span: &Value, keys: &[&str]) -> u64 {
-    keys.iter()
-        .find_map(|key| {
-            span.get(key)
-                .and_then(|value| value.as_u64().or_else(|| value.as_str()?.parse().ok()))
-        })
-        .unwrap_or(0)
-}
-
-fn start_timestamp(span: &Value) -> u64 {
-    number(
-        span,
-        &[
-            "start_time_unix_nano",
-            "start_timestamp_ns",
-            "start_ns",
-            "start_time",
-        ],
-    )
-}
-
-fn end_timestamp(span: &Value) -> u64 {
-    number(
-        span,
-        &[
-            "end_time_unix_nano",
-            "end_timestamp_ns",
-            "end_ns",
-            "end_time",
-        ],
-    )
-}
-
-fn respond(stream: &mut TcpStream, status: u16, body: Value) -> io::Result<()> {
-    let encoded = serde_json::to_vec(&body)?;
-    let reason = match status {
-        200 => "OK",
-        400 => "Bad Request",
-        404 => "Not Found",
-        503 => "Service Unavailable",
-        _ => "Error",
-    };
-    write!(stream, "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", encoded.len())?;
-    stream.write_all(&encoded)
-}
-
-fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
-}
-
-fn expire_old_logs(data_dir: &Path, ttl_seconds: Option<u64>) -> io::Result<()> {
-    let Some(ttl) = ttl_seconds else {
-        return Ok(());
-    };
-    let cutoff = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        .saturating_sub(ttl);
-    for entry in fs::read_dir(data_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.file_name().and_then(|v| v.to_str()) == Some("spans.log") {
-            continue;
-        }
-        if path.extension().and_then(|v| v.to_str()) != Some("log") {
-            continue;
-        }
-        let modified = entry
-            .metadata()?
-            .modified()?
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        if modified < cutoff {
-            fs::remove_file(path)?;
-        }
-    }
-    Ok(())
 }
