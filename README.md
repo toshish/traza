@@ -38,7 +38,7 @@ Measured by `cargo run --release --bin bench` against a 1,000,000-span corpus (1
 | Trace-by-id p95 | 0.296 ms | < 50 ms | PASS |
 | Attribute-filtered query p95 | 73.691 ms | < 300 ms | PASS |
 
-**What these figures measure:** the HTTP server's current persistence path — an append-only log with memory-resident indexes — not the segment-engine library documented below. Engine-backed serving is on the roadmap; these benchmarks will be regenerated against it when it lands, and the numbers may change since the engine does more per write. The ingest rate is timed over the full loop — client-side JSON serialization and loopback HTTP overhead included. Full percentiles and methodology live in [BENCHMARKS.md](BENCHMARKS.md). Results are machine-specific; run the benchmark yourself (see below) rather than treating these as guarantees.
+**What these figures measure:** the HTTP server's RETIRED persistence path — an append-only log with memory-resident indexes that the server no longer uses. The server now serves reads and writes directly through the segment engine, and these benchmarks have not yet been regenerated against that path; expect different numbers, since the engine does more per write. The ingest rate is timed over the full loop — client-side JSON serialization and loopback HTTP overhead included. Full percentiles and methodology live in [BENCHMARKS.md](BENCHMARKS.md). Results are machine-specific; run the benchmark yourself (see below) rather than treating these as guarantees.
 
 ## Quickstart
 
@@ -115,7 +115,7 @@ Traza is two layers that share one goal: never lose a completed write, never ser
 
 Queries narrow candidates through the per-segment indexes, then re-verify every predicate against the decoded spans — an index accelerates a filter, it never changes its semantics.
 
-**HTTP server (`traza-server`).** A deliberately small HTTP/1.1 implementation on `std::net`: a worker pool for connections and a single writer thread that appends incoming batches to an append-only log in the data directory and updates in-memory indexes. On restart the server replays the log to rebuild its state, ignoring a torn tail line from an interrupted write. Bounded connection and ingest queues throttle producers instead of growing without limit. The server currently persists through this log path; serving reads and writes directly through the segment engine is on the roadmap.
+**HTTP server (`traza-server`).** A deliberately small HTTP/1.1 implementation on `std::net`: a worker pool for connections in front of the segment engine, which is the server's only datastore. Every ingest goes through the engine's write buffer and flush/segment machinery; every trace, query, and stats read comes out of the engine's combined buffered-plus-persisted snapshot. There is no server-side log, index, or replay — restart durability and crash recovery are the engine's, and `POST /v1/flush` forces buffered spans into a durable segment on demand. A bounded connection queue throttles producers instead of growing without limit. If a server process dies without cleanup, the next open reclaims the engine's directory lock once the recorded owner process is verifiably gone.
 
 Embedding the engine in your own process:
 
@@ -171,8 +171,8 @@ Traza is a v0.1 project and says so plainly:
 - **Single-node.** One writer process per data directory; no replication, clustering, or failover yet.
 - **No authentication.** No auth, authorization, or TLS — run it on a trusted network or behind a reverse proxy that terminates TLS and enforces access.
 - **JSON-only.** No OTLP endpoint yet; ingestion is the JSON HTTP API described above.
-- **Durability boundary.** A process crash preserves every acknowledged batch; a power loss can lose the most recent writes, since the server does not fsync per request. The library engine's durability begins at segment flush.
-- **Memory-resident reads.** The server holds its working set and indexes in memory and replays its log at startup, so RAM and startup time grow with stored spans. The segment engine is the path to larger-than-RAM datasets.
+- **Durability boundary.** Durability begins at segment flush: a crash loses at most the engine's unflushed write buffer (bounded by `--flush-spans`), never a completed flush. `POST /v1/flush` narrows the window on demand; per-request fsync is deliberately not offered yet.
+- **Memory-resident reads.** The engine keeps segment contents memory-resident after open, so RAM grows with stored spans. On-disk index serving for larger-than-RAM datasets is on the roadmap.
 - **Minimal HTTP.** `Connection: close` per request, no keep-alive, no TLS, 64 MiB body cap.
 - **Exact-match filtering.** No full-text search, aggregations, or query language.
 - **Unstable formats.** Segment and log layouts may change between 0.x versions.
