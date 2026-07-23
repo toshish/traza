@@ -75,6 +75,15 @@ Tool-call frequency for one tool:
 Cost and token totals are client-side sums over these result sets (the API
 returns the spans; aggregation endpoints are out of scope today).
 
+## Span links
+
+Agentic traces are not trees: parallel tool calls fan out and rejoin,
+retries reference earlier attempts, and one agent's span may cause work in
+another agent's trace. Spans carry a `links` array (`trace_id`, `span_id`,
+`attributes`) on both ingest surfaces; OTLP links map 1:1 with hex ids
+lowercased. A conventional `relation` link attribute (for example
+`retry-of`, `spawned`, `joins`) keeps link semantics queryable.
+
 ## OTLP mapping
 
 The same attributes flow through `POST /v1/traces`: OTLP `intValue`

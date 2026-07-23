@@ -49,6 +49,7 @@ fn span(trace_id: &str, span_id: String, start_time_ns: u64, duration_ns: u64) -
         service: "test-service".to_owned(),
         attributes: Map::new(),
         events: Vec::new(),
+        links: Vec::new(),
         extra: Map::new(),
     }
 }
@@ -298,6 +299,7 @@ fn randomized_filters_match_naive_reference() {
             service,
             attributes,
             events: Vec::new(),
+            links: Vec::new(),
             extra: serde_json::Map::new(),
         });
     }
@@ -441,6 +443,7 @@ fn correctness_span(batch: u64, item: u64) -> Span {
         service: "correctness-tests".to_string(),
         attributes: serde_json::Map::new(),
         events: Vec::new(),
+        links: Vec::new(),
         extra: serde_json::Map::new(),
     }
 }

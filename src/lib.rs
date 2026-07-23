@@ -11,6 +11,7 @@ pub mod auth;
 pub mod dashboard;
 pub mod expiration;
 pub mod otlp;
+pub mod otlp_pb;
 pub mod segment_v2;
 
 use serde::{Deserialize, Serialize};
@@ -44,6 +45,21 @@ pub struct Event {
     /// Event timestamp in nanoseconds since the Unix epoch.
     pub timestamp_ns: u64,
     /// Arbitrary event attributes.
+    pub attributes: Map<String, Value>,
+}
+
+/// A link from one span to another span, possibly in a different trace.
+/// Links model the non-tree relationships agentic traces are full of:
+/// fan-out to parallel tool calls, results rejoining a plan, retries
+/// referencing their earlier attempt.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct Link {
+    /// Trace id of the linked span.
+    pub trace_id: String,
+    /// Span id of the linked span.
+    pub span_id: String,
+    /// Arbitrary link attributes.
+    #[serde(default)]
     pub attributes: Map<String, Value>,
 }
 
@@ -92,6 +108,9 @@ pub struct Span {
     /// Events recorded during the span.
     #[serde(default)]
     pub events: Vec<Event>,
+    /// Links to other spans (see [`Link`]). Empty for tree-shaped traces.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<Link>,
     /// Any other fields supplied at ingest, stored and returned verbatim —
     /// the wire contract promises unknown fields survive the round trip.
     #[serde(flatten, default)]

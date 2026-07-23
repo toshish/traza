@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-07-23
+
+### Added
+
+- **OTLP/HTTP binary protobuf**: `POST /v1/traces` now accepts
+  `Content-Type: application/x-protobuf` — the encoding OTel SDKs use
+  with `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf` — via a
+  dependency-free, bounds-checked wire decoder that lowers protobuf
+  into the OTLP/JSON shape, so both encodings share one mapping.
+  Protobuf clients receive a protobuf-typed empty
+  ExportTraceServiceResponse. Malformed payloads (truncated varints,
+  lying lengths, 32-deep hostile nesting) are 400s, never panics;
+  unknown fields skip per the protobuf contract. gRPC is not served.
+- **Span links**: spans carry a first-class `links` array
+  (`trace_id`, `span_id`, `attributes`) on the native JSON surface and
+  the OTLP mapping (previously dropped) — the non-tree structure of
+  agentic traces: fan-out/fan-in, retries, cross-agent causality.
+- Conformance suite with an independent test-side protobuf encoder
+  (`tests/otlp_protobuf.rs`).
+
 ## [0.10.0] - 2026-07-23
 
 ### Added
