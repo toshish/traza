@@ -97,6 +97,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         i += 1;
     }
 
+    // Bearer auth from TRAZA_TOKENS; unset = open (development default). A
+    // set-but-invalid value refuses startup — running open when the operator
+    // tried to configure auth would be the worst failure mode.
+    let auth = Arc::new(
+        traza::auth::AuthConfig::from_env()
+            .map_err(|error| format!("auth configuration: {error}"))?,
+    );
     let engine = Arc::new(Store::open(
         &data_dir,
         Config {
@@ -129,6 +136,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     for number in 0..workers {
         let rx = Arc::clone(&http_rx);
         let worker_engine = Arc::clone(&engine);
+        let worker_auth = Arc::clone(&auth);
         thread::Builder::new()
             .name(format!("http-{number}"))
             .spawn(move || loop {
@@ -136,7 +144,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     Ok(stream) => stream,
                     Err(_) => break,
                 };
-                let _ = handle_connection(stream, &worker_engine);
+                let _ = handle_connection(stream, &worker_engine, &worker_auth);
             })?;
     }
 
@@ -151,11 +159,36 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn handle_connection(mut stream: TcpStream, engine: &Store) -> io::Result<()> {
+fn handle_connection(
+    mut stream: TcpStream,
+    engine: &Store,
+    auth: &Option<traza::auth::AuthConfig>,
+) -> io::Result<()> {
     let request = match read_request(&mut stream) {
         Ok(request) => request,
         Err(error) => return respond(&mut stream, 400, json!({"error": error.to_string()})),
     };
+    if let Some(config) = auth {
+        if let Err(failure) = config.authorize(request.authorization.as_deref(), &request.method) {
+            let challenge = failure
+                .www_authenticate()
+                .map(|value| format!("WWW-Authenticate: {value}\r\n"))
+                .unwrap_or_default();
+            let body = failure.body();
+            let reason = if failure.status() == 401 {
+                "Unauthorized"
+            } else {
+                "Forbidden"
+            };
+            write!(
+                stream,
+                "HTTP/1.1 {} {reason}\r\n{challenge}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                failure.status(),
+                body.len(),
+            )?;
+            return Ok(());
+        }
+    }
     let (path, query) = request
         .target
         .split_once('?')
@@ -331,6 +364,7 @@ fn filter_from_query(raw_query: &str) -> Result<SpanFilter, String> {
 struct Request {
     method: String,
     target: String,
+    authorization: Option<String>,
     body: Vec<u8>,
 }
 
@@ -370,7 +404,18 @@ fn read_request(stream: &mut TcpStream) -> io::Result<Request> {
             "invalid request line",
         ));
     }
-    let content_length = lines
+    let mut authorization = None;
+    let mut header_lines: Vec<&str> = Vec::new();
+    for line in lines {
+        if let Some((name, value)) = line.split_once(':') {
+            if name.eq_ignore_ascii_case("authorization") {
+                authorization = Some(value.trim().to_owned());
+            }
+        }
+        header_lines.push(line);
+    }
+    let content_length = header_lines
+        .iter()
         .filter_map(|line| line.split_once(':'))
         .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
         .map(|(_, value)| value.trim().parse::<usize>())
@@ -396,6 +441,7 @@ fn read_request(stream: &mut TcpStream) -> io::Result<Request> {
     Ok(Request {
         method,
         target,
+        authorization,
         body: bytes[header_end..header_end + content_length].to_vec(),
     })
 }

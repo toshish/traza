@@ -6,6 +6,7 @@
 //! Spans are buffered in memory and periodically persisted as sorted JSON-lines
 //! segment files. Reads combine the buffered and persisted data.
 
+pub mod auth;
 pub mod expiration;
 pub mod otlp;
 pub mod segment_v2;

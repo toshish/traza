@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-07-23
+
+### Added
+- **Roadmap leg 4 — bearer-token auth.** `TRAZA_TOKENS` (comma-separated
+  `scope:token`, scopes `ro`|`rw`) requires `Authorization: Bearer` on
+  every request: unknown tokens 401 with a `WWW-Authenticate: Bearer`
+  challenge, insufficient scope 403, token comparison constant-time (all
+  credentials checked even after a match). Unset means open — the
+  development default that keeps every existing test unchanged — while a
+  set-but-invalid value refuses startup rather than silently running
+  open. Zero new dependencies; process-level matrix tests cover open
+  mode, 401/403/200 across ingest, OTLP, and flush endpoints, and the
+  startup refusal.
+
 ## [0.7.0] - 2026-07-23
 
 ### Added

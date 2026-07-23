@@ -108,6 +108,22 @@ Search filters (all supplied predicates are ANDed; values must be URL-encoded):
 
 **Span identity is the (trace_id, span_id) pair, enforced as a primary key**: re-ingesting an existing pair replaces the stored span (last write wins), so client retries are idempotent and never create duplicate copies. Span timestamps are integer Unix nanoseconds. The server reads `start_time_unix_nano` (and the aliases `start_timestamp_ns`, `start_ns`, `start_time`) plus the matching `end_*` keys; any other fields you send are stored and returned verbatim. Invalid JSON gets `400`; requests are capped at 64 MiB; `503` means the ingest writer is unavailable and the batch should be retried with backoff.
 
+## Authentication
+
+Set `TRAZA_TOKENS` to require bearer tokens, with per-token read-only or
+read-write scope:
+
+```sh
+TRAZA_TOKENS="rw:e26002c9fcc75826c6b1deeb265f6d0e,ro:020675ab21ab5e972ab25af65fbd969a" traza-server --data-dir ./data
+```
+
+`ro` tokens may GET; `rw` tokens may GET and POST. Missing or unknown
+tokens receive 401 with a `WWW-Authenticate: Bearer` challenge; valid
+tokens without the needed scope receive 403. Token comparison is
+constant-time, and an invalid `TRAZA_TOKENS` value refuses startup rather
+than silently running open. Leaving the variable unset disables auth for
+local development.
+
 ## LLM observability
 
 Traza ships documented span conventions for generative-AI workloads —
@@ -177,7 +193,7 @@ Run the test suite and all lint gates with:
 Traza is a v0.1 project and says so plainly:
 
 - **Single-node.** One writer process per data directory; no replication, clustering, or failover yet.
-- **No authentication.** No auth, authorization, or TLS — run it on a trusted network or behind a reverse proxy that terminates TLS and enforces access.
+- **Bearer tokens, no TLS.** Set `TRAZA_TOKENS` (comma-separated `scope:token`, scopes `ro`|`rw`) to require `Authorization: Bearer` on every request — unknown tokens 401 with a Bearer challenge, insufficient scope 403, comparison constant-time. Unset means open (development). TLS stays reverse-proxy territory.
 - **OTLP is JSON-only.** `POST /v1/traces` accepts OTLP/HTTP JSON; protobuf and gRPC OTLP are not supported.
 - **Durability boundary.** Durability begins at segment flush: a crash loses at most the engine's unflushed write buffer (bounded by `--flush-spans`), never a completed flush. `POST /v1/flush` narrows the window on demand; per-request fsync is deliberately not offered yet.
 - **RAM is O(indexes).** Segments are file-backed: only the parsed indexes stay resident, and record payloads are read on demand — measured 0.71 GB peak server RSS over a 10M-span (2.4 GB on disk) corpus. Stores larger than RAM serve correctly; disk latency applies to cold reads.
