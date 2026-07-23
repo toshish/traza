@@ -25,11 +25,28 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use serde_json::{json, Value};
 use traza::{Config, Span, SpanFilter, Store};
 
 const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
+// Headers get a far tighter budget than bodies: without one, a 64 MiB
+// garbage "header" plus a 64 MiB declared body doubles the documented
+// per-request memory ceiling.
+const MAX_HEADER_BYTES: usize = 64 * 1024;
+// Per-read/write socket deadline. A connection that goes silent mid-request
+// (or never sends one) must release its worker thread instead of parking it
+// forever. TRAZA_SOCKET_TIMEOUT_MS overrides (primarily for tests).
+const SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn socket_timeout() -> Duration {
+    std::env::var("TRAZA_SOCKET_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(SOCKET_TIMEOUT)
+}
 const HTTP_QUEUE_DEPTH: usize = 256;
 
 fn main() {
@@ -166,24 +183,30 @@ fn handle_connection(
     engine: &Store,
     auth: &Option<traza::auth::AuthConfig>,
 ) -> io::Result<()> {
-    let request = match read_request(&mut stream) {
-        Ok(request) => request,
+    // A silent or dribbling peer must not park this worker thread forever.
+    let timeout = socket_timeout();
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    let head = match read_head(&mut stream) {
+        Ok(head) => head,
         Err(error) => return respond(&mut stream, 400, json!({"error": error.to_string()})),
     };
     // The dashboard SHELL is served before the auth gate: the page must load
     // in a browser without credentials, while every API call it makes below
     // remains fully gated (the page itself attaches the bearer token).
-    if request.method == "GET" {
-        let path = request
+    if head.method == "GET" {
+        let path = head
             .target
             .split_once('?')
-            .map_or(request.target.as_str(), |(path, _)| path);
+            .map_or(head.target.as_str(), |(path, _)| path);
         if let Some(page) = traza::dashboard::route(path) {
             return respond_page(&mut stream, &page);
         }
     }
+    // Auth verdicts need only the head: rejecting BEFORE the body read means
+    // an unauthenticated client cannot make this server buffer 64 MiB.
     if let Some(config) = auth {
-        if let Err(failure) = config.authorize(request.authorization.as_deref(), &request.method) {
+        if let Err(failure) = config.authorize(head.authorization.as_deref(), &head.method) {
             let challenge = failure
                 .www_authenticate()
                 .map(|value| format!("WWW-Authenticate: {value}\r\n"))
@@ -203,6 +226,10 @@ fn handle_connection(
             return Ok(());
         }
     }
+    let request = match read_body(&mut stream, head) {
+        Ok(request) => request,
+        Err(error) => return respond(&mut stream, 400, json!({"error": error.to_string()})),
+    };
     let (path, query) = request
         .target
         .split_once('?')
@@ -390,11 +417,23 @@ fn filter_from_query(raw_query: &str) -> Result<SpanFilter, String> {
 struct Request {
     method: String,
     target: String,
-    authorization: Option<String>,
     body: Vec<u8>,
 }
 
-fn read_request(stream: &mut TcpStream) -> io::Result<Request> {
+/// A parsed request head: everything except the body, which is read only
+/// AFTER the auth gate passes — an unauthenticated client must not be able
+/// to make the server buffer a 64 MiB body just by declaring one.
+struct RequestHead {
+    method: String,
+    target: String,
+    authorization: Option<String>,
+    content_length: usize,
+    /// Bytes read so far (headers plus any body prefix that arrived with them).
+    buffered: Vec<u8>,
+    header_end: usize,
+}
+
+fn read_head(stream: &mut TcpStream) -> io::Result<RequestHead> {
     let mut bytes = Vec::with_capacity(4096);
     let mut buffer = [0_u8; 8192];
     let header_end;
@@ -407,16 +446,25 @@ fn read_request(stream: &mut TcpStream) -> io::Result<Request> {
             ));
         }
         bytes.extend_from_slice(&buffer[..read]);
-        if bytes.len() > MAX_REQUEST_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "request too large",
-            ));
-        }
         if let Some(position) = find_bytes(&bytes, b"\r\n\r\n") {
             header_end = position + 4;
             break;
         }
+        if bytes.len() > MAX_HEADER_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "request headers too large",
+            ));
+        }
+    }
+    // The in-loop check only bounds growth while SEARCHING; a terminator
+    // arriving in the final chunk can still complete an oversized header,
+    // so the found header must be re-checked against the cap.
+    if header_end > MAX_HEADER_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "request headers too large",
+        ));
     }
     let headers = std::str::from_utf8(&bytes[..header_end])
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "headers are not UTF-8"))?;
@@ -454,7 +502,27 @@ fn read_request(stream: &mut TcpStream) -> io::Result<Request> {
             "request body too large",
         ));
     }
-    while bytes.len() < header_end + content_length {
+    Ok(RequestHead {
+        method,
+        target,
+        authorization,
+        content_length,
+        buffered: bytes,
+        header_end,
+    })
+}
+
+fn read_body(stream: &mut TcpStream, head: RequestHead) -> io::Result<Request> {
+    let RequestHead {
+        method,
+        target,
+        content_length,
+        mut buffered,
+        header_end,
+        ..
+    } = head;
+    let mut buffer = [0_u8; 8192];
+    while buffered.len() < header_end + content_length {
         let read = stream.read(&mut buffer)?;
         if read == 0 {
             return Err(io::Error::new(
@@ -462,13 +530,12 @@ fn read_request(stream: &mut TcpStream) -> io::Result<Request> {
                 "incomplete body",
             ));
         }
-        bytes.extend_from_slice(&buffer[..read]);
+        buffered.extend_from_slice(&buffer[..read]);
     }
     Ok(Request {
         method,
         target,
-        authorization,
-        body: bytes[header_end..header_end + content_length].to_vec(),
+        body: buffered[header_end..header_end + content_length].to_vec(),
     })
 }
 

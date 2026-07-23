@@ -160,6 +160,8 @@ pub enum Error {
     AlreadyOpen,
     /// An internal synchronization lock was poisoned.
     LockPoisoned(&'static str),
+    /// A span violated an ingest invariant (empty primary-key id).
+    InvalidSpan(&'static str),
 }
 
 impl fmt::Display for Error {
@@ -169,6 +171,7 @@ impl fmt::Display for Error {
             Self::Json(error) => write!(f, "storage JSON error: {error}"),
             Self::AlreadyOpen => write!(f, "store is already open by another writer"),
             Self::LockPoisoned(name) => write!(f, "storage lock poisoned: {name}"),
+            Self::InvalidSpan(reason) => write!(f, "invalid span: {reason}"),
         }
     }
 }
@@ -178,7 +181,7 @@ impl StdError for Error {
         match self {
             Self::Io(error) => Some(error),
             Self::Json(error) => Some(error),
-            Self::AlreadyOpen | Self::LockPoisoned(_) => None,
+            Self::AlreadyOpen | Self::LockPoisoned(_) | Self::InvalidSpan(_) => None,
         }
     }
 }
@@ -281,6 +284,20 @@ fn segment_v2_error(error: segment_v2::Error) -> Error {
 
 /// The in-memory write buffer, keyed by span identity.
 ///
+/// Both halves of the (trace_id, span_id) primary key must be non-empty at
+/// the engine boundary, not just at the HTTP surfaces: distinct spans sharing
+/// an empty id would silently collapse into one upserted key for any library
+/// consumer too.
+fn validate_span(span: &Span) -> Result<()> {
+    if span.trace_id.is_empty() {
+        return Err(Error::InvalidSpan("trace_id is empty"));
+    }
+    if span.span_id.is_empty() {
+        return Err(Error::InvalidSpan("span_id is empty"));
+    }
+    Ok(())
+}
+
 /// (trace_id, span_id) is the span's PRIMARY KEY: re-ingesting an existing
 /// key replaces the buffered version in place — retries are idempotent and
 /// never create a second acknowledged copy.
@@ -529,6 +546,7 @@ impl Store {
     /// Adds one span, automatically flushing when the configured threshold is
     /// reached.
     pub fn ingest(&self, span: Span) -> Result<()> {
+        validate_span(&span)?;
         let mut writer = self.lock_writer()?;
         writer.upsert(span);
         if self.should_flush(writer.len()) {
@@ -539,10 +557,14 @@ impl Store {
     }
 
     /// Adds a batch of spans, automatically flushing when the configured
-    /// threshold is reached.
+    /// threshold is reached. The batch is atomic with respect to validation:
+    /// if any span is invalid, nothing from the batch is stored.
     pub fn ingest_batch(&self, spans: Vec<Span>) -> Result<()> {
         if spans.is_empty() {
             return Ok(());
+        }
+        for span in &spans {
+            validate_span(span)?;
         }
 
         let mut writer = self.lock_writer()?;
