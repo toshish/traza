@@ -654,15 +654,24 @@ impl Store {
                 }
             };
 
+            // Head-timestamp cache: with file-backed segments every peek is a
+            // disk read, and re-peeking all sources per pop cost O(pops x
+            // sources) syscalls — measured 8 ms -> 125 ms at 10M. Each source
+            // is peeked once, then only re-peeked after ITS head is consumed.
+            let mut heads: Vec<Option<u64>> = Vec::with_capacity(sources.len());
+            for source in sources.iter() {
+                heads.push(peek(source)?);
+            }
+
             let mut result: Vec<Span> = Vec::with_capacity(limit.min(1024));
             let mut emitted: std::collections::HashSet<(String, String)> =
                 std::collections::HashSet::new();
             while result.len() < limit {
                 let mut best: Option<(usize, u64)> = None;
-                for (index, source) in sources.iter().enumerate() {
-                    if let Some(timestamp) = peek(source)? {
-                        if best.map_or(true, |(_, current)| timestamp < current) {
-                            best = Some((index, timestamp));
+                for (index, head) in heads.iter().enumerate() {
+                    if let Some(timestamp) = head {
+                        if best.map_or(true, |(_, current)| *timestamp < current) {
+                            best = Some((index, *timestamp));
                         }
                     }
                 }
@@ -683,6 +692,7 @@ impl Store {
                         span_matches(&span, filter).then_some(span)
                     }
                 };
+                heads[index] = peek(&sources[index])?;
                 let Some(span) = span else { continue };
                 let key = (span.trace_id.clone(), span.span_id.clone());
                 if emitted.contains(&key) {
@@ -863,6 +873,19 @@ impl Store {
         Ok(0)
     }
 
+    /// Bytes of segment payload encoding currently resident in memory.
+    ///
+    /// The larger-than-RAM rule: zero after open AND after flush — segments
+    /// are file-backed, holding only their parsed indexes; record payloads
+    /// are read on demand.
+    pub fn resident_payload_bytes(&self) -> Result<usize> {
+        let segments = self.lock_segments()?;
+        Ok(segments
+            .iter()
+            .map(|segment| segment.seg.resident_bytes())
+            .sum())
+    }
+
     fn lock_writer(&self) -> Result<MutexGuard<'_, WriteBuffer>> {
         self.writer
             .lock()
@@ -924,7 +947,11 @@ impl Store {
             fs::rename(&temp_path, &final_path)?;
             sync_directory(&self.directory)?;
             let bytes = fs::metadata(&final_path)?.len();
-            let seg = Box::new(segment_v2::Segment::from_bytes(encoded).map_err(segment_v2_error)?);
+            // Reopen FILE-BACKED: the encoded buffer is dropped and the
+            // segment serves reads from disk immediately — flushing never
+            // leaves a resident payload copy behind.
+            drop(encoded);
+            let seg = Box::new(segment_v2::Segment::open(&final_path).map_err(segment_v2_error)?);
             Ok(Segment {
                 path: final_path,
                 bytes,

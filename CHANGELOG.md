@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-23
+
+### Changed
+- **Roadmap leg 1 — larger-than-RAM reads.** Segments are file-backed:
+  `Segment::open` reads only the header and index sections into memory and
+  serves every record access by reading exactly the needed byte range from
+  the file (std `Seek`+`Read`; no mmap, no new dependencies). Flushing
+  reopens the new segment file-backed, so no resident payload copy survives
+  the write either. `Store::resident_payload_bytes()` exposes the invariant
+  (zero after open and after flush). Measured at a 10M-span corpus
+  (2.4 GB on disk): **0.71 GB peak server RSS** (was ~2.4 GB
+  bytes-resident, ~5 GB in the pre-v2 engine); trace lookup p50 0.8 ms,
+  attribute filter p50 8.7 ms — RAM is O(indexes) and stores larger than
+  memory serve correctly.
+- The lazy limited-query merge caches per-source head timestamps: with
+  file-backed segments every peek is a disk read, and re-peeking all
+  sources per pop had regressed the 10M filter to 125 ms; cached heads
+  restore 9.6 ms.
+
+### Known deviation
+- The leg's relative bound ("1M latencies within 2x of 0.4.0") is missed
+  on filter p95: 3.34 ms vs 1.27 ms (2.6x) — the cost of on-demand file
+  reads at sub-5 ms magnitudes. The absolute gate (< 300 ms) passes with
+  ~90x headroom; recorded here rather than tuned away.
+
 ## [0.4.0] - 2026-07-23
 
 ### Changed (breaking)

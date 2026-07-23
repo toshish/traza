@@ -50,6 +50,13 @@ pub struct Header {
 impl Header {
     /// Parses and validates the fixed header and all section bounds.
     pub fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        Self::parse_with_total(bytes, bytes.len() as u64)
+    }
+
+    /// Parses the header from the file HEAD while validating section bounds
+    /// against `total` (the real file length) — the file-backed open hands in
+    /// only the head bytes.
+    pub fn parse_with_total(bytes: &[u8], total: u64) -> Result<Self, Error> {
         if bytes.len() < HEADER_LEN {
             return Err(Error::Corrupt("file is shorter than the v2 header"));
         }
@@ -75,16 +82,15 @@ impl Header {
             trace_index_offset: read_u64(bytes, 56)?,
             trace_index_len: read_u64(bytes, 64)?,
             attribute_index_offset: read_u64(bytes, 72)?,
-            attribute_index_len: (bytes.len() as u64)
+            attribute_index_len: total
                 .checked_sub(read_u64(bytes, 72)?)
                 .ok_or(Error::Corrupt("attribute index offset beyond file"))?,
         };
-        header.validate(bytes.len())?;
+        header.validate_total(total)?;
         Ok(header)
     }
 
-    fn validate(&self, file_len: usize) -> Result<(), Error> {
-        let file_len = file_len as u64;
+    fn validate_total(&self, file_len: u64) -> Result<(), Error> {
         let sections = [
             (self.records_offset, self.records_len),
             (self.offsets_offset, self.offsets_len),
@@ -233,12 +239,75 @@ impl From<std::str::Utf8Error> for Error {
 /// postings are materialized. Query results are decoded on demand.
 #[derive(Debug)]
 pub struct Segment {
-    bytes: Vec<u8>,
+    backing: Backing,
     header: Header,
     record_offsets: Vec<u64>,
     trace_index: HashMap<String, Vec<u64>>,
     attribute_index: HashMap<(String, String), Vec<u64>>,
     last_query_used_index: Cell<bool>,
+}
+
+/// Where a segment's payload bytes live.
+///
+/// `Resident` holds the full encoding in memory (the state right after
+/// `build`/`from_bytes`). `File` holds only the opened file plus the parsed
+/// indexes — record payloads are read on demand, exactly the byte range each
+/// access needs, which is what makes stores larger than RAM serveable.
+enum Backing {
+    Resident(Vec<u8>),
+    File {
+        file: std::sync::Mutex<fs::File>,
+        len: u64,
+    },
+}
+
+impl fmt::Debug for Backing {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Resident(bytes) => write!(f, "Resident({} bytes)", bytes.len()),
+            Self::File { len, .. } => write!(f, "File({len} bytes)"),
+        }
+    }
+}
+
+impl Backing {
+    fn read_range(&self, start: u64, len: u64) -> Result<Vec<u8>, Error> {
+        let start_usize = start as usize;
+        let len_usize = len as usize;
+        match self {
+            Self::Resident(bytes) => bytes
+                .get(start_usize..start_usize.saturating_add(len_usize))
+                .map(<[u8]>::to_vec)
+                .ok_or(Error::Corrupt("range outside segment bytes")),
+            Self::File { file, len: total } => {
+                if start.saturating_add(len) > *total {
+                    return Err(Error::Corrupt("range outside segment file"));
+                }
+                use std::io::{Read, Seek, SeekFrom};
+                let mut guard = file
+                    .lock()
+                    .map_err(|_| Error::Corrupt("file lock poisoned"))?;
+                guard.seek(SeekFrom::Start(start))?;
+                let mut buffer = vec![0u8; len_usize];
+                guard.read_exact(&mut buffer)?;
+                Ok(buffer)
+            }
+        }
+    }
+
+    fn total_len(&self) -> u64 {
+        match self {
+            Self::Resident(bytes) => bytes.len() as u64,
+            Self::File { len, .. } => *len,
+        }
+    }
+
+    fn resident_len(&self) -> usize {
+        match self {
+            Self::Resident(bytes) => bytes.len(),
+            Self::File { .. } => 0,
+        }
+    }
 }
 
 impl Segment {
@@ -265,7 +334,7 @@ impl Segment {
             header.record_count,
         )?;
         Ok(Self {
-            bytes,
+            backing: Backing::Resident(bytes),
             header,
             record_offsets,
             trace_index,
@@ -274,9 +343,57 @@ impl Segment {
         })
     }
 
-    /// Reads and opens a v2 segment file.
+    /// Opens a v2 segment FILE-BACKED: only the header and index sections are
+    /// read into memory; record payloads stay on disk and are fetched on
+    /// demand. This is the larger-than-RAM path — resident cost is O(indexes).
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
-        Self::from_bytes(fs::read(path)?)
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = fs::File::open(path)?;
+        let total = file.metadata()?.len();
+        // Parse the header from the file head; Header::parse needs the total
+        // length for its trailing-length arithmetic, so hand it a buffer whose
+        // length IS the file length but only materialize the head + indexes.
+        let head_len = (HEADER_LEN as u64).min(total) as usize;
+        let mut head = vec![0u8; head_len];
+        file.read_exact(&mut head)?;
+        let header = Header::parse_with_total(&head, total)?;
+        let mut read_section = |offset: u64, len: u64| -> Result<Vec<u8>, Error> {
+            if offset.saturating_add(len) > total {
+                return Err(Error::Corrupt("index section outside file"));
+            }
+            file.seek(SeekFrom::Start(offset))?;
+            let mut buffer = vec![0u8; len as usize];
+            file.read_exact(&mut buffer)?;
+            Ok(buffer)
+        };
+        let offsets_bytes = read_section(header.offsets_offset, header.offsets_len)?;
+        let record_offsets = decode_offsets_from(&offsets_bytes, &header)?;
+        validate_record_offsets_lengths(&header, &record_offsets)?;
+        let trace_bytes = read_section(header.trace_index_offset, header.trace_index_len)?;
+        let trace_index = decode_string_index(&trace_bytes, false, header.record_count)?
+            .into_iter()
+            .map(|((key, _), offsets)| (key, offsets))
+            .collect();
+        let attribute_bytes =
+            read_section(header.attribute_index_offset, header.attribute_index_len)?;
+        let attribute_index = decode_string_index(&attribute_bytes, true, header.record_count)?;
+        Ok(Self {
+            backing: Backing::File {
+                file: std::sync::Mutex::new(file),
+                len: total,
+            },
+            header,
+            record_offsets,
+            trace_index,
+            attribute_index,
+            last_query_used_index: Cell::new(false),
+        })
+    }
+
+    /// Bytes of the payload encoding currently resident in memory: the whole
+    /// file for `from_bytes` segments, zero for file-backed ones.
+    pub fn resident_bytes(&self) -> usize {
+        self.backing.resident_len()
     }
 
     /// Encodes records and constructs a byte-resident segment.
@@ -289,9 +406,10 @@ impl Segment {
         &self.header
     }
 
-    /// Returns the complete encoded segment bytes.
-    pub fn encoded_bytes(&self) -> &[u8] {
-        &self.bytes
+    /// Returns the complete encoded segment bytes (reads the whole file for
+    /// file-backed segments — an inspection/persist path, not a query path).
+    pub fn encoded_bytes(&self) -> Result<Vec<u8>, Error> {
+        self.backing.read_range(0, self.backing.total_len())
     }
 
     /// Returns the number of records without decoding them.
@@ -361,7 +479,8 @@ impl Segment {
     pub fn persist(&self, path: impl AsRef<Path>) -> Result<(), Error> {
         use std::io::Write;
         let mut file = fs::File::create(path)?;
-        file.write_all(&self.bytes)?;
+        let encoded = self.encoded_bytes()?;
+        file.write_all(&encoded)?;
         file.sync_all()?;
         Ok(())
     }
@@ -394,15 +513,11 @@ impl Segment {
             .header
             .records_offset
             .checked_add(relative_offset)
-            .ok_or(Error::Corrupt("record offset overflow"))? as usize;
-        let end = absolute
-            .checked_add(8)
             .ok_or(Error::Corrupt("record offset overflow"))?;
-        let bytes = self
-            .bytes
-            .get(absolute..end)
-            .ok_or(Error::Corrupt("record timestamp out of bounds"))?;
-        Ok(u64::from_le_bytes(bytes.try_into().expect("8 bytes")))
+        let bytes = self.backing.read_range(absolute, 8)?;
+        Ok(u64::from_le_bytes(
+            bytes.as_slice().try_into().expect("8 bytes"),
+        ))
     }
 
     /// Decodes exactly one record at a posting offset.
@@ -430,11 +545,21 @@ impl Segment {
             .records_offset
             .checked_add(relative_offset)
             .ok_or(Error::Corrupt("record offset overflow"))?;
-        decode_record(
-            &self.bytes,
-            absolute as usize,
-            self.header.records_offset + self.header.records_len,
-        )
+        // Exact record length from the consecutive-offsets invariant: read
+        // precisely one record's bytes, resident or from disk.
+        let position = self
+            .record_offsets
+            .binary_search(&relative_offset)
+            .map_err(|_| Error::Corrupt("offset is not a record boundary"))?;
+        let record_len = self
+            .record_offsets
+            .get(position + 1)
+            .copied()
+            .unwrap_or(self.header.records_len)
+            .checked_sub(relative_offset)
+            .ok_or(Error::Corrupt("record length underflow"))?;
+        let buffer = self.backing.read_range(absolute, record_len)?;
+        decode_record(&buffer, 0, buffer.len() as u64)
     }
 }
 
@@ -584,6 +709,37 @@ fn validate_record_offsets(bytes: &[u8], header: &Header, offsets: &[u64]) -> Re
             (header.records_offset + *offset) as usize,
             header.records_offset + header.records_len,
         )?;
+        previous = Some(*offset);
+    }
+    if offsets.is_empty() && header.records_len != 0 {
+        return Err(Error::Corrupt("record region exists without records"));
+    }
+    Ok(())
+}
+
+/// Decodes the offsets index from ITS OWN section bytes (file-backed open).
+fn decode_offsets_from(data: &[u8], header: &Header) -> Result<Vec<u64>, Error> {
+    if data.len() as u64 != header.offsets_len {
+        return Err(Error::Corrupt("offsets section length mismatch"));
+    }
+    let mut offsets = Vec::with_capacity(header.record_count as usize);
+    for chunk in data.chunks_exact(8) {
+        offsets.push(u64::from_le_bytes(
+            chunk.try_into().expect("eight-byte chunk"),
+        ));
+    }
+    Ok(offsets)
+}
+
+/// Structural offset validation without touching record bytes: ordering and
+/// bounds only. The file-backed open validates records lazily on access —
+/// a corrupt record surfaces as Error::Corrupt from that read.
+fn validate_record_offsets_lengths(header: &Header, offsets: &[u64]) -> Result<(), Error> {
+    let mut previous = None;
+    for offset in offsets {
+        if *offset >= header.records_len || previous.is_some_and(|value| *offset <= value) {
+            return Err(Error::Corrupt("record offsets are invalid or unordered"));
+        }
         previous = Some(*offset);
     }
     if offsets.is_empty() && header.records_len != 0 {

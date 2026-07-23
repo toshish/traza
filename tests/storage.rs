@@ -1013,3 +1013,37 @@ fn nul_prefixed_attribute_cannot_poison_the_service_index() {
         .expect("hostile attr query");
     assert_eq!(by_attr.len(), 1, "the attribute itself remains queryable");
 }
+
+#[test]
+fn file_backed_segments_hold_no_resident_payload() {
+    // Leg 1, larger-than-RAM: segments hold parsed indexes only — payload
+    // bytes are read on demand from the file. Zero resident payload after
+    // flush AND after reopen, with reads still exact.
+    let dir = correctness_test_dir("file-backed-residency");
+    let store = Store::open(&dir, Config::default()).expect("opens");
+    for i in 0..200 {
+        store
+            .ingest(span("t-fb", format!("s{i}"), 1_000 + i, 10))
+            .expect("ingest");
+    }
+    store.flush().expect("flush");
+    assert_eq!(
+        store.resident_payload_bytes().expect("resident"),
+        0,
+        "flushing must not leave a resident payload copy"
+    );
+    drop(store);
+
+    let store = Store::open(&dir, Config::default()).expect("reopens");
+    assert_eq!(store.resident_payload_bytes().expect("resident"), 0);
+    assert_eq!(store.resident_persisted_span_structs().expect("structs"), 0);
+    assert_eq!(store.get_trace("t-fb").expect("trace").len(), 200);
+    let filtered = store
+        .query(&SpanFilter {
+            service: Some("test-service".into()),
+            limit: Some(50),
+            ..SpanFilter::default()
+        })
+        .expect("limited filter");
+    assert_eq!(filtered.len(), 50, "index-served reads work file-backed");
+}
