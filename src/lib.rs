@@ -14,7 +14,7 @@ use serde_json::{Map, Value};
 use std::error::Error as StdError;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -259,69 +259,6 @@ impl Segment {
     fn trace_spans(&self, trace_id: &str) -> Result<Vec<Span>> {
         let records = self.seg.query_trace(trace_id).map_err(segment_v2_error)?;
         records.iter().map(record_to_span).collect()
-    }
-
-    /// Index-accelerated filter: the most selective available index narrows
-    /// candidates, then every predicate is re-verified on the parsed span —
-    /// an index accelerates a filter, it never changes its semantics.
-    fn filter_spans(&self, filter: &SpanFilter) -> Result<Vec<Span>> {
-        {
-            {
-                let seg = &self.seg;
-                let candidates = if let Some(service) = &filter.service {
-                    Some(
-                        seg.query_attribute(IDX_SERVICE, service)
-                            .map_err(segment_v2_error)?,
-                    )
-                } else if let Some(name) = &filter.name {
-                    Some(
-                        seg.query_attribute(IDX_NAME, name)
-                            .map_err(segment_v2_error)?,
-                    )
-                } else if let Some((key, value)) = filter
-                    .attributes
-                    .iter()
-                    .find(|(key, _)| !key.starts_with('\u{0}'))
-                {
-                    Some(
-                        seg.query_attribute(key, &canonical_value(value))
-                            .map_err(segment_v2_error)?,
-                    )
-                } else if filter.since_ns.is_some() || filter.until_ns.is_some() {
-                    Some(
-                        seg.query_time_range(
-                            filter.since_ns.unwrap_or(0),
-                            filter.until_ns.unwrap_or(u64::MAX),
-                        )
-                        .map_err(segment_v2_error)?,
-                    )
-                } else {
-                    None
-                };
-                let mut result = Vec::new();
-                match candidates {
-                    Some(records) => {
-                        for record in &records {
-                            let span = record_to_span(record)?;
-                            if span_matches(&span, filter) {
-                                result.push(span);
-                            }
-                        }
-                    }
-                    None => {
-                        for ordinal in 0..seg.len() {
-                            if let Some(record) = seg.record(ordinal).map_err(segment_v2_error)? {
-                                let span = record_to_span(&record)?;
-                                if span_matches(&span, filter) {
-                                    result.push(span);
-                                }
-                            }
-                        }
-                    }
-                }
-                Ok(result)
-            }
-        }
     }
 }
 
