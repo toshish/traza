@@ -730,7 +730,7 @@ fn recovery_heals_crash_duplicated_segments() {
         .expect("one segment file exists");
     // A real crash duplicate is the compaction's REWRITTEN segment: a valid
     // next-numbered segment name the loader will pick up.
-    let duplicate = segment_path.with_file_name("segment-00000000000000000099.jsonl");
+    let duplicate = segment_path.with_file_name("segment-00000000000000000099.seg");
     std::fs::copy(&segment_path, &duplicate).expect("simulate crash duplicate");
 
     let store = Store::open(&dir, Config::default()).expect("reopens");
@@ -775,4 +775,69 @@ fn empty_stale_sentinel_does_not_wedge_reclaim() {
         first.is_ok() || second.is_ok(),
         "an aged empty sentinel must not wedge recovery"
     );
+}
+
+#[test]
+fn v2_open_holds_no_resident_span_structs() {
+    // The v2 memory rule: after reopen, persisted data lives as bytes plus
+    // indexes — zero materialized Span structs — and reads still work.
+    let dir = correctness_test_dir("v2-residency");
+    let store = Store::open(&dir, Config::default()).expect("opens");
+    for i in 0..50 {
+        store
+            .ingest(span("t-res", format!("s{i}"), 1_000 + i, 10))
+            .expect("ingest");
+    }
+    store.flush().expect("flush");
+    drop(store);
+
+    let store = Store::open(&dir, Config::default()).expect("reopens");
+    assert_eq!(
+        store
+            .resident_persisted_span_structs()
+            .expect("resident count"),
+        0,
+        "v2 segments must not materialize spans at open"
+    );
+    assert_eq!(store.get_trace("t-res").expect("trace").len(), 50);
+    let filtered = store
+        .query(&SpanFilter {
+            service: Some("test-service".into()),
+            ..SpanFilter::default()
+        })
+        .expect("query");
+    assert_eq!(
+        filtered.len(),
+        50,
+        "index-served query must return all spans"
+    );
+}
+
+#[test]
+fn v1_jsonl_segments_load_and_serve() {
+    // Format compatibility: a pre-v2 JSONL segment file loads, serves reads
+    // beside v2 segments, and participates in duplicate healing.
+    let dir = correctness_test_dir("v1-compat");
+    let legacy = span("t-legacy", "l1".to_owned(), 500, 10);
+    let line = serde_json::to_string(&legacy).expect("encodes");
+    std::fs::write(
+        dir.join("segment-00000000000000000000.jsonl"),
+        format!("{line}\n"),
+    )
+    .expect("writes v1 segment");
+
+    let store = Store::open(&dir, Config::default()).expect("opens mixed store");
+    assert_eq!(store.get_trace("t-legacy").expect("trace").len(), 1);
+    store
+        .ingest(span("t-new", "n1".to_owned(), 900, 10))
+        .expect("ingest");
+    store.flush().expect("flush v2 beside v1");
+    drop(store);
+
+    let store = Store::open(&dir, Config::default()).expect("reopens mixed");
+    assert_eq!(store.get_trace("t-legacy").expect("legacy trace").len(), 1);
+    assert_eq!(store.get_trace("t-new").expect("new trace").len(), 1);
+    let stats = store.stats().expect("stats");
+    assert_eq!(stats.persisted_spans, 2);
+    assert_eq!(stats.segment_count, 2);
 }

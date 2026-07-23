@@ -7,6 +7,7 @@
 //! segment files. Reads combine the buffered and persisted data.
 
 pub mod expiration;
+pub mod segment_v2;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -22,6 +23,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const LOCK_FILE_NAME: &str = "LOCK";
 const SEGMENT_PREFIX: &str = "segment-";
 const SEGMENT_SUFFIX: &str = ".jsonl";
+/// Suffix for format-v2 segment files (indexed, byte-resident).
+const SEGMENT_V2_SUFFIX: &str = ".seg";
+/// Reserved attribute-index keys for span fields; the NUL prefix cannot
+/// collide with practical user attribute names, and even a collision only
+/// over-selects candidates that re-verification drops.
+const IDX_SERVICE: &str = "\u{0}service";
+const IDX_NAME: &str = "\u{0}name";
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// An event attached to a span.
@@ -186,8 +194,153 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug)]
 struct Segment {
     path: PathBuf,
-    spans: Vec<Span>,
     bytes: u64,
+    data: SegmentData,
+}
+
+/// v1 segments stay fully parsed in memory (legacy); v2 segments hold raw
+/// bytes plus their embedded indexes and parse spans on demand — the memory
+/// rule of the v2 format: resident cost is bytes + indexes, never Span
+/// structs.
+#[derive(Debug)]
+enum SegmentData {
+    V1 { spans: Vec<Span> },
+    V2 { seg: Box<segment_v2::Segment> },
+}
+
+fn canonical_value(value: &Value) -> String {
+    serde_json::to_string(value).unwrap_or_default()
+}
+
+fn span_to_record(span: &Span) -> Result<segment_v2::RecordInput> {
+    let mut attributes = std::collections::BTreeMap::new();
+    attributes.insert(IDX_SERVICE.to_owned(), span.service.clone());
+    attributes.insert(IDX_NAME.to_owned(), span.name.clone());
+    for (key, value) in &span.attributes {
+        attributes.insert(key.clone(), canonical_value(value));
+    }
+    Ok(segment_v2::RecordInput::new(
+        span.start_time_ns,
+        span.trace_id.clone(),
+        attributes,
+        serde_json::to_vec(span)?,
+    ))
+}
+
+fn record_to_span(record: &segment_v2::Record) -> Result<Span> {
+    Ok(serde_json::from_slice(record.payload())?)
+}
+
+impl Segment {
+    fn span_count(&self) -> usize {
+        match &self.data {
+            SegmentData::V1 { spans } => spans.len(),
+            SegmentData::V2 { seg } => seg.len(),
+        }
+    }
+
+    /// Full parse — the rewrite/heal/inspection path, never the query path.
+    fn spans_parsed(&self) -> Result<Vec<Span>> {
+        match &self.data {
+            SegmentData::V1 { spans } => Ok(spans.clone()),
+            SegmentData::V2 { seg } => {
+                let mut spans = Vec::with_capacity(seg.len());
+                for ordinal in 0..seg.len() {
+                    if let Some(record) = seg.record(ordinal).map_err(segment_v2_error)? {
+                        spans.push(record_to_span(&record)?);
+                    }
+                }
+                Ok(spans)
+            }
+        }
+    }
+
+    fn trace_spans(&self, trace_id: &str) -> Result<Vec<Span>> {
+        match &self.data {
+            SegmentData::V1 { spans } => Ok(spans
+                .iter()
+                .filter(|span| span.trace_id == trace_id)
+                .cloned()
+                .collect()),
+            SegmentData::V2 { seg } => {
+                let records = seg.query_trace(trace_id).map_err(segment_v2_error)?;
+                records.iter().map(record_to_span).collect()
+            }
+        }
+    }
+
+    /// Index-accelerated filter: the most selective available index narrows
+    /// candidates, then every predicate is re-verified on the parsed span —
+    /// an index accelerates a filter, it never changes its semantics.
+    fn filter_spans(&self, filter: &SpanFilter) -> Result<Vec<Span>> {
+        match &self.data {
+            SegmentData::V1 { spans } => Ok(spans
+                .iter()
+                .filter(|span| span_matches(span, filter))
+                .cloned()
+                .collect()),
+            SegmentData::V2 { seg } => {
+                let candidates = if let Some(service) = &filter.service {
+                    Some(
+                        seg.query_attribute(IDX_SERVICE, service)
+                            .map_err(segment_v2_error)?,
+                    )
+                } else if let Some(name) = &filter.name {
+                    Some(
+                        seg.query_attribute(IDX_NAME, name)
+                            .map_err(segment_v2_error)?,
+                    )
+                } else if let Some((key, value)) = filter.attributes.first() {
+                    Some(
+                        seg.query_attribute(key, &canonical_value(value))
+                            .map_err(segment_v2_error)?,
+                    )
+                } else if filter.since_ns.is_some() || filter.until_ns.is_some() {
+                    Some(
+                        seg.query_time_range(
+                            filter.since_ns.unwrap_or(0),
+                            filter.until_ns.unwrap_or(u64::MAX),
+                        )
+                        .map_err(segment_v2_error)?,
+                    )
+                } else {
+                    None
+                };
+                let mut result = Vec::new();
+                match candidates {
+                    Some(records) => {
+                        for record in &records {
+                            let span = record_to_span(record)?;
+                            if span_matches(&span, filter) {
+                                result.push(span);
+                            }
+                        }
+                    }
+                    None => {
+                        for ordinal in 0..seg.len() {
+                            if let Some(record) = seg.record(ordinal).map_err(segment_v2_error)? {
+                                let span = record_to_span(&record)?;
+                                if span_matches(&span, filter) {
+                                    result.push(span);
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(result)
+            }
+        }
+    }
+}
+
+fn segment_v2_error(error: segment_v2::Error) -> Error {
+    match error {
+        segment_v2::Error::Io(inner) => Error::Io(inner),
+        other => Error::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            other.to_string(),
+        )),
+    }
 }
 
 #[derive(Debug)]
@@ -369,16 +522,34 @@ impl Store {
             // review, with a reproducing crash simulation).
             let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
             let mut healed: Vec<Segment> = Vec::with_capacity(segments.len());
-            for mut segment in segments {
-                segment.spans.retain(|span| {
-                    serde_json::to_string(span)
-                        .map(|canonical| seen.insert(canonical))
-                        .unwrap_or(true)
-                });
-                if segment.spans.is_empty() {
+            for segment in segments {
+                let spans = segment.spans_parsed()?;
+                let kept: Vec<Span> = spans
+                    .into_iter()
+                    .filter(|span| {
+                        serde_json::to_string(span)
+                            .map(|canonical| seen.insert(canonical))
+                            .unwrap_or(true)
+                    })
+                    .collect();
+                if kept.is_empty() {
                     fs::remove_file(&segment.path)?;
-                } else {
+                } else if kept.len() == segment.span_count() {
                     healed.push(segment);
+                } else {
+                    // Partial duplicates: v1 heals in memory (file untouched,
+                    // as before); an immutable v2 file is rewritten in place
+                    // under the same id via temp + fsync + rename.
+                    match segment.data {
+                        SegmentData::V1 { .. } => healed.push(Segment {
+                            path: segment.path,
+                            bytes: segment.bytes,
+                            data: SegmentData::V1 { spans: kept },
+                        }),
+                        SegmentData::V2 { .. } => {
+                            healed.push(rewrite_v2_in_place(&segment.path, &kept)?);
+                        }
+                    }
                 }
             }
             let segments = healed;
@@ -457,11 +628,7 @@ impl Store {
             }
         }
         for segment in segments.iter() {
-            for span in &segment.spans {
-                if span.trace_id == trace_id {
-                    result.push(span.clone());
-                }
-            }
+            result.extend(segment.trace_spans(trace_id)?);
         }
 
         sort_spans(&mut result);
@@ -483,11 +650,7 @@ impl Store {
             }
         }
         for segment in segments.iter() {
-            for span in &segment.spans {
-                if span_matches(span, filter) {
-                    result.push(span.clone());
-                }
-            }
+            result.extend(segment.filter_spans(filter)?);
         }
 
         sort_spans(&mut result);
@@ -501,7 +664,7 @@ impl Store {
     pub fn stats(&self) -> Result<Stats> {
         let writer = self.lock_writer()?;
         let segments = self.lock_segments()?;
-        let persisted_spans = segments.iter().map(|segment| segment.spans.len()).sum();
+        let persisted_spans = segments.iter().map(Segment::span_count).sum();
         let disk_bytes = segments.iter().map(|segment| segment.bytes).sum();
         let buffered_spans = writer.len();
 
@@ -554,19 +717,31 @@ impl Store {
         let mut replacement: Vec<Segment> = Vec::with_capacity(segments.len());
         let mut removed_from_segments = 0usize;
         for segment in segments.iter() {
-            let kept: Vec<Span> = segment
-                .spans
-                .iter()
+            let all = segment.spans_parsed()?;
+            let total = all.len();
+            let kept: Vec<Span> = all
+                .into_iter()
                 .filter(|span| span.end_time_ns >= cutoff_ns)
-                .cloned()
                 .collect();
-            removed_from_segments += segment.spans.len() - kept.len();
+            removed_from_segments += total - kept.len();
 
-            if kept.len() == segment.spans.len() {
-                replacement.push(Segment {
-                    path: segment.path.clone(),
-                    spans: kept,
-                    bytes: segment.bytes,
+            if kept.len() == total {
+                replacement.push(match &segment.data {
+                    SegmentData::V1 { .. } => Segment {
+                        path: segment.path.clone(),
+                        bytes: segment.bytes,
+                        data: SegmentData::V1 { spans: kept },
+                    },
+                    SegmentData::V2 { .. } => Segment {
+                        path: segment.path.clone(),
+                        bytes: segment.bytes,
+                        data: SegmentData::V2 {
+                            seg: Box::new(
+                                segment_v2::Segment::open(&segment.path)
+                                    .map_err(segment_v2_error)?,
+                            ),
+                        },
+                    },
                 });
                 continue;
             }
@@ -597,10 +772,24 @@ impl Store {
     pub fn persisted_segment_spans(&self) -> Result<Vec<Vec<Span>>> {
         let _writer = self.lock_writer()?;
         let segments = self.lock_segments()?;
+        segments.iter().map(Segment::spans_parsed).collect()
+    }
+
+    /// Number of fully materialized `Span` structs held for PERSISTED data.
+    ///
+    /// The v2 memory rule: this is zero after an open of a v2-only store —
+    /// segments hold bytes plus indexes, and spans parse on demand. Legacy v1
+    /// segments (still memory-resident) and the write buffer are the only
+    /// contributors.
+    pub fn resident_persisted_span_structs(&self) -> Result<usize> {
+        let segments = self.lock_segments()?;
         Ok(segments
             .iter()
-            .map(|segment| segment.spans.clone())
-            .collect())
+            .map(|segment| match &segment.data {
+                SegmentData::V1 { spans } => spans.len(),
+                SegmentData::V2 { .. } => 0,
+            })
+            .sum())
     }
 
     fn lock_writer(&self) -> Result<MutexGuard<'_, Vec<Span>>> {
@@ -635,35 +824,31 @@ impl Store {
     }
 
     fn write_segment(&self, id: u64, spans: &[Span]) -> Result<Segment> {
-        let file_name = format!("{SEGMENT_PREFIX}{id:020}{SEGMENT_SUFFIX}");
+        let file_name = format!("{SEGMENT_PREFIX}{id:020}{SEGMENT_V2_SUFFIX}");
         let final_path = self.directory.join(&file_name);
         let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let temp_name = format!(".{file_name}.{}.{}.tmp", std::process::id(), counter);
         let temp_path = self.directory.join(temp_name);
 
         let write_result = (|| {
+            let records = spans
+                .iter()
+                .map(span_to_record)
+                .collect::<Result<Vec<_>>>()?;
+            let encoded = segment_v2::encode(&records).map_err(segment_v2_error)?;
             let mut options = OpenOptions::new();
             options.write(true).create_new(true);
-            let file = options.open(&temp_path)?;
-            // Buffer the serialization: serde emits one write per JSON token,
-            // and token-sized write() syscalls against a raw File made flush
-            // cost ~140us PER SPAN — the entire measured ingest bottleneck
-            // (5,450 spans/s end to end). One syscall per 256 KiB instead.
-            let mut writer = io::BufWriter::with_capacity(256 * 1024, file);
-            for span in spans {
-                serde_json::to_writer(&mut writer, span)?;
-                writer.write_all(b"\n")?;
-            }
-            writer.flush()?;
-            let file = writer.into_inner().map_err(|error| error.into_error())?;
+            let mut file = options.open(&temp_path)?;
+            file.write_all(&encoded)?;
             file.sync_all()?;
             fs::rename(&temp_path, &final_path)?;
             sync_directory(&self.directory)?;
             let bytes = fs::metadata(&final_path)?.len();
+            let seg = Box::new(segment_v2::Segment::from_bytes(encoded).map_err(segment_v2_error)?);
             Ok(Segment {
                 path: final_path,
-                spans: spans.to_vec(),
                 bytes,
+                data: SegmentData::V2 { seg },
             })
         })();
 
@@ -672,6 +857,47 @@ impl Store {
         }
         write_result
     }
+}
+
+/// Rewrites a v2 segment file in place (same id) via temp + fsync + rename.
+fn rewrite_v2_in_place(path: &Path, spans: &[Span]) -> Result<Segment> {
+    let records = spans
+        .iter()
+        .map(span_to_record)
+        .collect::<Result<Vec<_>>>()?;
+    let encoded = segment_v2::encode(&records).map_err(segment_v2_error)?;
+    let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let temp_path = path.with_file_name(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        counter
+    ));
+    let write_result = (|| {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        let mut file = options.open(&temp_path)?;
+        file.write_all(&encoded)?;
+        file.sync_all()?;
+        fs::rename(&temp_path, path)?;
+        if let Some(parent) = path.parent() {
+            sync_directory(parent)?;
+        }
+        let bytes = fs::metadata(path)?.len();
+        let seg = Box::new(segment_v2::Segment::from_bytes(encoded).map_err(segment_v2_error)?);
+        Ok(Segment {
+            path: path.to_path_buf(),
+            bytes,
+            data: SegmentData::V2 { seg },
+        })
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    write_result
 }
 
 fn sort_spans(spans: &mut [Span]) {
@@ -732,18 +958,34 @@ fn load_segments(directory: &Path) -> Result<Vec<Segment>> {
 
     let mut segments = Vec::with_capacity(paths.len());
     for path in paths {
-        let file = File::open(&path)?;
-        let reader = BufReader::new(file);
-        let mut spans = Vec::new();
-        for line in reader.lines() {
-            let line = line?;
-            if !line.trim().is_empty() {
-                spans.push(serde_json::from_str(&line)?);
+        let bytes_meta = fs::metadata(&path)?.len();
+        let is_v2 = path
+            .extension()
+            .is_some_and(|ext| ext.to_string_lossy() == SEGMENT_V2_SUFFIX.trim_start_matches('.'));
+        if is_v2 {
+            let seg = Box::new(segment_v2::Segment::open(&path).map_err(segment_v2_error)?);
+            segments.push(Segment {
+                path,
+                bytes: bytes_meta,
+                data: SegmentData::V2 { seg },
+            });
+        } else {
+            let file = File::open(&path)?;
+            let reader = BufReader::new(file);
+            let mut spans = Vec::new();
+            for line in reader.lines() {
+                let line = line?;
+                if !line.trim().is_empty() {
+                    spans.push(serde_json::from_str(&line)?);
+                }
             }
+            sort_spans(&mut spans);
+            segments.push(Segment {
+                path,
+                bytes: bytes_meta,
+                data: SegmentData::V1 { spans },
+            });
         }
-        sort_spans(&mut spans);
-        let bytes = fs::metadata(&path)?.len();
-        segments.push(Segment { path, spans, bytes });
     }
     Ok(segments)
 }
@@ -766,7 +1008,10 @@ fn remove_orphan_temps(directory: &Path) -> Result<()> {
 fn is_segment_file(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name.starts_with(SEGMENT_PREFIX) && name.ends_with(SEGMENT_SUFFIX))
+        .is_some_and(|name| {
+            name.starts_with(SEGMENT_PREFIX)
+                && (name.ends_with(SEGMENT_SUFFIX) || name.ends_with(SEGMENT_V2_SUFFIX))
+        })
 }
 
 fn segment_number(path: &Path) -> Option<u64> {

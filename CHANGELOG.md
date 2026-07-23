@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-23
+
+### Changed
+- **Segment format v2**: new segments are indexed binary files (`.seg`) —
+  JSON span payloads with an embedded record-offset index, trace index, and
+  attribute index, written with the same temp + fsync + atomic-rename
+  discipline. v1 JSONL segments remain fully readable beside v2 and heal
+  through the same duplicate-recovery path; TTL rewrites produce v2.
+- **Byte-resident reads**: opening a store no longer materializes spans.
+  v2 segments hold raw bytes plus their indexes; spans parse on demand,
+  only for records a query returns. `Store::resident_persisted_span_structs`
+  exposes the invariant (zero after a v2-only open).
+- **Index-served queries**: `get_trace` binary-searches the trace index;
+  filters narrow through service/name/attribute indexes or time range and
+  re-verify every predicate on the parsed span. Measured on the bundled
+  benchmark: trace lookup p50 0.185 ms at 1M spans (was 14.2 ms) and
+  0.536 ms at 10M (was 145.6 ms); attribute filter p50 18 ms at 1M
+  (was 66.5 ms) and 209 ms at 10M (was 4,395 ms).
+
+### Known limits
+- The 10M advisory filter target (<100 ms) is not yet met: candidate
+  payload parsing dominates large result groups. Posting-list
+  intersection and parse-avoidance are the next optimization.
+- Segment bytes are read into memory at open (no mmap yet); resident cost
+  is file bytes + indexes rather than parsed structs.
+
 ## [0.2.3] - 2026-07-22
 
 ### Fixed
