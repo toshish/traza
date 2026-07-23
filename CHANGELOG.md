@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-07-23
+
+### Fixed
+
+- **Payload TTL deleted live data** (found in review, reproduced): the
+  content-addressed store dedupes identical payloads to one file
+  WITHOUT refreshing its mtime, while the TTL sweep deleted by mtime
+  alone — a fresh span re-referencing old content kept its span but
+  lost its payload. The sweep now protects every payload referenced by
+  a live span (buffer + all segments, collected via the cached
+  rollups) and deletes only unreferenced-and-old files.
+- **LLM/session rollups double-counted replaced spans** (found in
+  review, reproduced): cached per-segment rollups summed every
+  physical copy of a re-ingested (trace_id, span_id), contradicting
+  the primary key's last-write-wins semantics — the aggregate said
+  2 calls / 30 tokens / $0.30 where the visible truth was
+  1 call / 20 tokens / $0.20. Rollups now walk segments newest-first
+  carrying the seen-key set (FNV-1a prefilter; buffer always wins);
+  a segment containing any possibly-superseded key is re-scanned
+  exactly, dropping stale versions. Collisions can only cost an
+  unnecessary re-scan, never a wrong count.
+
 ## [0.12.0] - 2026-07-23
 
 ### Added

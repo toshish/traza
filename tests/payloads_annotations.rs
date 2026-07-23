@@ -315,3 +315,125 @@ fn server_round_trips_payloads_annotations_and_export() {
         .as_str()
         .is_some());
 }
+
+#[test]
+fn reingested_payload_survives_ttl_compaction() {
+    // Found in review: content addressing dedupes identical payloads to one
+    // file WITHOUT refreshing its mtime, while the sweep deleted by mtime
+    // alone — a fresh span re-referencing old content kept the span but
+    // lost its payload. The sweep must honor live references.
+    let dir = test_dir("ttl-live");
+    let store = Store::open(
+        &dir,
+        Config {
+            ttl_seconds: Some(1),
+            payload_threshold: Some(64),
+            ..Config::default()
+        },
+    )
+    .expect("opens");
+
+    let shared = "S".repeat(5_000); // referenced by old AND new span
+    let doomed = "D".repeat(5_000); // referenced by the old span only
+    let mut old_shared = span_with_content("t-old", "s1", &shared);
+    old_shared.start_time_ns = 1_000;
+    old_shared.end_time_ns = 2_000;
+    let mut old_doomed = span_with_content("t-old", "s2", &doomed);
+    old_doomed.start_time_ns = 1_000;
+    old_doomed.end_time_ns = 2_000;
+    store.ingest(old_shared).expect("ingests");
+    store.ingest(old_doomed).expect("ingests");
+    store.flush().expect("seals the doomed segment");
+
+    // Let the TTL pass, then a FRESH span re-references the shared content
+    // (dedup hit: same file, stale mtime).
+    std::thread::sleep(Duration::from_millis(1_200));
+    let now_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let mut fresh = span_with_content("t-new", "s1", &shared);
+    fresh.start_time_ns = now_ns;
+    fresh.end_time_ns = now_ns + 1_000;
+    store.ingest(fresh).expect("ingests");
+    store.flush().expect("seals the fresh segment");
+
+    store.compact_expired().expect("compacts");
+
+    // The fresh span survived AND kept its payload bytes.
+    let spans = store.get_trace("t-new").expect("queries");
+    assert_eq!(spans.len(), 1, "fresh span survives the TTL");
+    let reference = spans[0].events[0].attributes["content"]["$payload"]
+        .as_str()
+        .expect("ref")
+        .to_owned();
+    let bytes = store
+        .payload(&reference)
+        .expect("loads")
+        .expect("payload referenced by a live span must survive the sweep");
+    assert_eq!(bytes.len(), 5_000);
+
+    // The truly orphaned payload is gone with its span.
+    let doomed_hash = traza::payload::sha256_hex(doomed.as_bytes());
+    assert!(
+        store
+            .payload(&format!("sha256/{doomed_hash}"))
+            .expect("loads")
+            .is_none(),
+        "unreferenced expired payload must be swept"
+    );
+}
+
+#[test]
+fn replaced_spans_count_once_in_rollups() {
+    // Found in review: cached rollups summed every PHYSICAL segment copy of
+    // a re-ingested span — 2 calls / 30 tokens / $0.30 where the visible
+    // truth (primary key, last write wins) was 1 call / 20 tokens / $0.20.
+    use traza::analytics::LlmGroupBy;
+    let dir = test_dir("replace-count");
+    let store = Store::open(&dir, Config::default()).expect("opens");
+
+    let make = |tokens: u64, cost: f64| -> traza::Span {
+        serde_json::from_value(json!({
+            "trace_id": "t1", "span_id": "s1", "name": "llm.completion",
+            "service": "agent", "start_time_ns": 1_000, "end_time_ns": 2_000,
+            "attributes": {"session.id": "sess", "llm.model": "m",
+                            "llm.prompt_tokens": tokens, "llm.completion_tokens": 0,
+                            "llm.cost_usd": cost}
+        }))
+        .expect("span")
+    };
+
+    // Version 1 sealed into a segment; version 2 sealed into a LATER segment.
+    store.ingest(make(10, 0.10)).expect("ingests v1");
+    store.flush().expect("seals v1");
+    store.ingest(make(20, 0.20)).expect("ingests v2");
+    store.flush().expect("seals v2");
+
+    for _ in 0..2 {
+        // Twice: the second pass exercises the cached-rollup path.
+        let sessions = store.sessions(None, None, 10).expect("lists");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].llm_calls, 1, "one logical span: {sessions:?}");
+        assert_eq!(sessions[0].span_count, 1);
+        assert_eq!(sessions[0].total_tokens, 20, "last write wins");
+        assert!((sessions[0].cost_usd - 0.20).abs() < 1e-9);
+
+        let rows = store
+            .llm_aggregate(LlmGroupBy::Model, None, None)
+            .expect("aggregates");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].llm_calls, 1, "{rows:?}");
+        assert_eq!(rows[0].total_tokens, 20);
+    }
+
+    // A third version still in the BUFFER also wins over both segments.
+    store.ingest(make(50, 0.50)).expect("ingests v3 buffered");
+    let sessions = store.sessions(None, None, 10).expect("lists");
+    assert_eq!(sessions[0].total_tokens, 50, "buffer supersedes segments");
+    assert_eq!(sessions[0].llm_calls, 1);
+    let by_day = store
+        .llm_aggregate(LlmGroupBy::Day, None, None)
+        .expect("aggregates");
+    assert_eq!(by_day[0].llm_calls, 1, "{by_day:?}");
+}

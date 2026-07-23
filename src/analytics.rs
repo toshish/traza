@@ -231,6 +231,13 @@ pub(crate) struct SegmentRollup {
     by_day: BTreeMap<String, Counters>,
     by_session_key: HashMap<String, Counters>,
     sessions: HashMap<String, SessionCounters>,
+    /// FNV-1a hashes of every (trace_id, span_id) in the rollup: the
+    /// supersede prefilter. A key replaced in a NEWER source makes this
+    /// rollup unusable as-is (its counters include the stale version).
+    key_hashes: HashSet<u64>,
+    /// `$payload` references held by any span in the rollup — the live set
+    /// that protects payload files from the TTL sweep.
+    pub(crate) payload_refs: HashSet<String>,
 }
 
 impl SegmentRollup {
@@ -251,6 +258,9 @@ impl SegmentRollup {
     fn absorb(&mut self, span: &Span) {
         self.min_start_ns = self.min_start_ns.min(span.start_time_ns);
         self.max_start_ns = self.max_start_ns.max(span.start_time_ns);
+        self.key_hashes
+            .insert(key_hash(&span.trace_id, &span.span_id));
+        collect_payload_refs(span, &mut self.payload_refs);
         if let Some(model) = attr_str(&span.attributes, ATTR_MODEL) {
             self.by_model.entry(model).or_default().absorb(span);
         }
@@ -273,6 +283,40 @@ impl SegmentRollup {
 }
 
 // ------------------------------------------------------------ span helpers
+
+/// FNV-1a over the primary key. Used only as a PREFILTER: a hash collision
+/// can force an unnecessary exact re-scan, never a wrong count.
+fn key_hash(trace_id: &str, span_id: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in trace_id
+        .as_bytes()
+        .iter()
+        .chain([0_u8].iter())
+        .chain(span_id.as_bytes())
+    {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// Collects `$payload` references from span and event attributes.
+fn collect_payload_refs(span: &Span, refs: &mut HashSet<String>) {
+    let mut scan = |attributes: &Map<String, Value>| {
+        for value in attributes.values() {
+            if let Some(reference) = value
+                .get(crate::payload::PAYLOAD_KEY)
+                .and_then(Value::as_str)
+            {
+                refs.insert(reference.to_owned());
+            }
+        }
+    };
+    scan(&span.attributes);
+    for event in &span.events {
+        scan(&event.attributes);
+    }
+}
 
 fn attr_str(attributes: &Map<String, Value>, key: &str) -> Option<String> {
     match attributes.get(key)? {
@@ -471,9 +515,15 @@ impl Store {
         Ok(rows)
     }
 
-    /// Folds every in-window span group into `visit`: cached rollups for
-    /// fully-covered segments, exact single-segment rollups for partially
-    /// covered ones, and a live rollup of the write buffer.
+    /// Folds every in-window span group into `visit`, honoring the
+    /// (trace_id, span_id) primary key: a span re-ingested later exists only
+    /// in its NEWEST version, so segments are walked newest-first carrying
+    /// the set of keys already seen (buffer first — it always wins). A
+    /// cached rollup is used verbatim only when the window covers it AND no
+    /// key in it was seen in a newer source (FNV prefilter; a collision just
+    /// forces an exact re-scan). Found live: a replaced span kept both
+    /// versions in the aggregates — 2 calls, 30 tokens, $0.30 where the
+    /// truth was 1 call, 20 tokens, $0.20.
     fn fold_analytics(
         &self,
         since_ns: Option<u64>,
@@ -488,37 +538,66 @@ impl Store {
             .filter(|span| in_window(span.start_time_ns, since_ns, until_ns))
             .cloned()
             .collect();
+        // ALL buffer keys supersede segment copies, in-window or not.
+        let buffer_keys: HashSet<(String, String)> = writer.index.keys().cloned().collect();
         drop(writer);
         if !buffered.is_empty() {
             visit(&SegmentRollup::build(&buffered));
         }
+        let mut seen_hashes: HashSet<u64> = buffer_keys
+            .iter()
+            .map(|(trace_id, span_id)| key_hash(trace_id, span_id))
+            .collect();
 
         let segments = self.lock_segments()?;
         let mut live_paths: HashSet<PathBuf> = HashSet::new();
-        for segment in segments.iter() {
+        // Newest first: paths are zero-padded, so path order is flush order.
+        for (position, segment) in segments.iter().enumerate().rev() {
             live_paths.insert(segment.path.clone());
             let rollup = self.segment_rollup(segment)?;
-            let fully_inside = in_window(rollup.min_start_ns, since_ns, until_ns)
-                && in_window(rollup.max_start_ns, since_ns, until_ns);
-            if fully_inside {
-                visit(&rollup);
-                continue;
-            }
             let overlaps = since_ns.map_or(true, |bound| rollup.max_start_ns >= bound)
                 && until_ns.map_or(true, |bound| rollup.min_start_ns <= bound);
             if !overlaps {
+                seen_hashes.extend(rollup.key_hashes.iter().copied());
                 continue;
             }
-            // Boundary segment: exact per-query rollup of just the in-window
-            // spans (decode cost confined to window edges).
-            let spans: Vec<Span> = segment
-                .spans_parsed()?
-                .into_iter()
-                .filter(|span| in_window(span.start_time_ns, since_ns, until_ns))
-                .collect();
-            if !spans.is_empty() {
-                visit(&SegmentRollup::build(&spans));
+            let fully_inside = in_window(rollup.min_start_ns, since_ns, until_ns)
+                && in_window(rollup.max_start_ns, since_ns, until_ns);
+            let possibly_superseded = rollup
+                .key_hashes
+                .iter()
+                .any(|hash| seen_hashes.contains(hash));
+            if fully_inside && !possibly_superseded {
+                visit(&rollup);
+                seen_hashes.extend(rollup.key_hashes.iter().copied());
+                continue;
             }
+            // Exact path: decode this segment, dropping out-of-window spans
+            // and spans whose key exists in the buffer or a newer segment.
+            let mut survivors: Vec<Span> = Vec::new();
+            for span in segment.spans_parsed()? {
+                if !in_window(span.start_time_ns, since_ns, until_ns) {
+                    continue;
+                }
+                let key = (span.trace_id.clone(), span.span_id.clone());
+                if buffer_keys.contains(&key) {
+                    continue;
+                }
+                let mut superseded = false;
+                for newer in segments.iter().skip(position + 1) {
+                    if newer.contains_key(&span.trace_id, &span.span_id)? {
+                        superseded = true;
+                        break;
+                    }
+                }
+                if !superseded {
+                    survivors.push(span);
+                }
+            }
+            if !survivors.is_empty() {
+                visit(&SegmentRollup::build(&survivors));
+            }
+            seen_hashes.extend(rollup.key_hashes.iter().copied());
         }
         // Superseded segments drop out of the cache with their paths.
         self.rollups
@@ -526,6 +605,24 @@ impl Store {
             .map_err(|_| crate::Error::LockPoisoned("rollups"))?
             .retain(|path, _| live_paths.contains(path));
         Ok(())
+    }
+
+    /// Every `$payload` reference held by a live span (buffer + all
+    /// segments): the protection set for the TTL payload sweep. Superseded
+    /// span versions may contribute references; that over-protection only
+    /// delays deletion, never loses data.
+    pub(crate) fn live_payload_refs(&self) -> Result<HashSet<String>> {
+        let mut refs = HashSet::new();
+        let writer = self.lock_writer()?;
+        for span in &writer.spans {
+            collect_payload_refs(span, &mut refs);
+        }
+        drop(writer);
+        let segments = self.lock_segments()?;
+        for segment in segments.iter() {
+            refs.extend(self.segment_rollup(segment)?.payload_refs.iter().cloned());
+        }
+        Ok(refs)
     }
 
     /// The segment's cached rollup, building it on first use.
