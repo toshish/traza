@@ -108,6 +108,13 @@ Search filters (all supplied predicates are ANDed; values must be URL-encoded):
 
 **Span identity is the (trace_id, span_id) pair, enforced as a primary key**: re-ingesting an existing pair replaces the stored span (last write wins), so client retries are idempotent and never create duplicate copies. Span timestamps are integer Unix nanoseconds. The server reads `start_time_unix_nano` (and the aliases `start_timestamp_ns`, `start_ns`, `start_time`) plus the matching `end_*` keys; any other fields you send are stored and returned verbatim. Invalid JSON gets `400`; requests are capped at 64 MiB; `503` means the ingest writer is unavailable and the batch should be retried with backoff.
 
+## LLM observability
+
+Traza ships documented span conventions for generative-AI workloads —
+model, token, cost, and tool-call attributes plus prompt/completion
+payloads as events — all served by the standard filter API with no extra
+configuration. See [docs/llm-semantics.md](docs/llm-semantics.md).
+
 ## Architecture
 
 Traza is two layers that share one goal: never lose a completed write, never serve a torn one.

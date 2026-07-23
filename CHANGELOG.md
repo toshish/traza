@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-07-23
+
+### Added
+- **Roadmap leg 3 — LLM-observability semantics.** Documented gen-AI span
+  conventions ([docs/llm-semantics.md](docs/llm-semantics.md)): `llm.*`
+  span names, model/token/temperature/stop-reason/tool/cost attributes
+  (index-served like any attribute), prompt and completion payloads as
+  span events so large text never enters the filter index, and four
+  concrete query recipes over the existing API. Process-level tests prove
+  every recipe through both `/v1/spans` and OTLP ingest. Purely additive:
+  one doc, one test target, one README section.
+
 ## [0.6.0] - 2026-07-23
 
 ### Added
