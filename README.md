@@ -22,8 +22,11 @@ Traza takes the other side of the trade:
 
 ## Features
 
-- Batched span ingestion over HTTP with bounded queues and backpressure.
+- Batched span ingestion over HTTP (native JSON or OTLP/HTTP JSON) with bounded queues and backpressure.
 - Trace-by-ID lookup and filtered span search: service, operation name, exact attribute match, minimum duration, and time window, combined with logical AND.
+- A bundled dependency-free dashboard: recent spans, trace waterfall, span detail, and filters, served by the binary itself.
+- Optional bearer-token auth with per-token read-only/read-write scopes.
+- LLM-observability conventions for prompts, completions, token usage, and tool calls.
 - An embeddable Rust library (`traza::Store`): an append-only segment storage engine with sorted-batch flush, crash recovery, and TTL compaction.
 - A self-verifying benchmark binary that measures the real HTTP path and rewrites `BENCHMARKS.md` from its own run.
 - Dual-licensed under MIT or Apache-2.0.
@@ -124,6 +127,27 @@ constant-time, and an invalid `TRAZA_TOKENS` value refuses startup rather
 than silently running open. Leaving the variable unset disables auth for
 local development.
 
+## Dashboard
+
+The server bundles a dependency-free trace browser — one self-contained
+HTML page embedded in the binary, served at `GET /` and `GET /dashboard`.
+Open `http://127.0.0.1:9411/` in a browser to get:
+
+- **Recent spans** with a filter bar (service, name, attribute key/value,
+  minimum duration, limit) mapped 1:1 onto the `/v1/spans` query params.
+- **Trace waterfall**: click a span to lay out its whole trace on a time
+  axis (error spans highlighted), backed by `/v1/traces/{id}`.
+- **Span detail**: attributes, events, parent, duration, and any extra
+  fields stored at ingest.
+
+The page consumes only the JSON API above — no dashboard-specific
+endpoints exist. With authentication enabled the shell itself stays open
+(it carries no data), while every API call it makes is gated: the page
+prompts for a bearer token on the first `401` and keeps it in
+`sessionStorage` only. The page references no external resources, so it
+works offline and adds no supply-chain surface; light and dark color
+schemes follow the browser preference.
+
 ## LLM observability
 
 Traza ships documented span conventions for generative-AI workloads —
@@ -208,10 +232,7 @@ All of these are on the roadmap, not swept under it.
 
 - **Streaming results** — chunked HTTP responses for very large result sets.
 - **Filter throughput at scale** — posting-list intersection and parse-avoidance for large unlimited result sets (limited queries already decode only what they return).
-- **LLM-observability semantics** — first-class conventions for prompts, completions, token usage, and tool calls.
-- **Auth** — token authentication and per-token authorization.
 - **High availability** — replication and failover beyond a single node.
-- **Dashboard** — a bundled UI for browsing traces.
 
 ## Contributing
 

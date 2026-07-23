@@ -7,6 +7,7 @@
 //! segment files. Reads combine the buffered and persisted data.
 
 pub mod auth;
+pub mod dashboard;
 pub mod expiration;
 pub mod otlp;
 pub mod segment_v2;

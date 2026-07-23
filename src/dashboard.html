@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Traza</title>
+<style>
+  :root {
+    --bg: #f6f4ef; --panel: #ffffff; --ink: #1f2430; --muted: #6b7280;
+    --line: #e2ddd2; --accent: #0f766e; --accent-ink: #ffffff;
+    --bar: #14b8a6; --bar-error: #dc2626; --chip: #eef2f1;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #12151c; --panel: #1a1f29; --ink: #e5e7eb; --muted: #9ca3af;
+      --line: #2b3240; --accent: #2dd4bf; --accent-ink: #04211d;
+      --bar: #0d9488; --bar-error: #f87171; --chip: #232a37;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { display: flex; align-items: center; gap: 12px; padding: 10px 16px;
+           border-bottom: 1px solid var(--line); background: var(--panel); }
+  header h1 { font-size: 16px; margin: 0; letter-spacing: 0.04em; }
+  header .tag { color: var(--muted); font-size: 12px; }
+  #status { margin-left: auto; font-size: 12px; color: var(--muted); }
+  #token-btn { border: 1px solid var(--line); background: var(--chip); color: var(--ink);
+               border-radius: 6px; padding: 4px 10px; font-size: 12px; cursor: pointer; }
+  main { display: grid; grid-template-columns: minmax(340px, 44%) 1fr; gap: 12px;
+         padding: 12px 16px; max-width: 1400px; margin: 0 auto; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  section { background: var(--panel); border: 1px solid var(--line);
+            border-radius: 10px; padding: 12px; min-width: 0; }
+  h2 { font-size: 13px; margin: 0 0 8px; color: var(--muted);
+       text-transform: uppercase; letter-spacing: 0.06em; }
+  form#filters { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin-bottom: 10px; }
+  form#filters input { width: 100%; padding: 5px 7px; border: 1px solid var(--line);
+                       border-radius: 6px; background: var(--bg); color: var(--ink); font-size: 12px; }
+  form#filters button { grid-column: span 3; padding: 6px; border: 0; border-radius: 6px;
+                        background: var(--accent); color: var(--accent-ink); font-weight: 600; cursor: pointer; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th { text-align: left; color: var(--muted); font-weight: 600; padding: 4px 6px;
+       border-bottom: 1px solid var(--line); }
+  td { padding: 4px 6px; border-bottom: 1px solid var(--line);
+       white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 180px; }
+  tr.span-row { cursor: pointer; }
+  tr.span-row:hover { background: var(--chip); }
+  tr.selected { background: var(--chip); }
+  .status-error { color: var(--bar-error); font-weight: 600; }
+  .mono { font-family: var(--mono); font-size: 11px; }
+  #waterfall { margin-top: 4px; }
+  .wf-row { display: grid; grid-template-columns: minmax(140px, 34%) 1fr; gap: 8px;
+            align-items: center; padding: 3px 0; cursor: pointer; border-radius: 4px; }
+  .wf-row:hover { background: var(--chip); }
+  .wf-row.selected { background: var(--chip); }
+  .wf-label { font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .wf-label .svc { color: var(--muted); }
+  .wf-track { position: relative; height: 16px; background: var(--bg); border-radius: 4px; }
+  .wf-bar { position: absolute; top: 2px; bottom: 2px; border-radius: 3px;
+            background: var(--bar); min-width: 2px; }
+  .wf-bar.error { background: var(--bar-error); }
+  .wf-ms { font-size: 10px; color: var(--muted); position: absolute; right: 4px; top: 1px; }
+  #detail dl { display: grid; grid-template-columns: max-content 1fr; gap: 3px 10px;
+               margin: 0; font-size: 12px; }
+  #detail dt { color: var(--muted); }
+  #detail dd { margin: 0; font-family: var(--mono); font-size: 11px; word-break: break-all; }
+  #detail .event { border-left: 2px solid var(--line); padding-left: 8px; margin: 6px 0; }
+  .empty { color: var(--muted); font-size: 12px; padding: 10px 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>TRAZA</h1>
+  <span class="tag">trace browser</span>
+  <span id="status">connecting…</span>
+  <button id="token-btn" type="button">Set token</button>
+</header>
+<main>
+  <section>
+    <h2>Recent spans</h2>
+    <form id="filters">
+      <input id="f-service" placeholder="service">
+      <input id="f-name" placeholder="name">
+      <input id="f-limit" placeholder="limit (100)" inputmode="numeric">
+      <input id="f-attr-key" placeholder="attr key">
+      <input id="f-attr-value" placeholder="attr value">
+      <input id="f-min-ms" placeholder="min duration ms" inputmode="numeric">
+      <button type="submit">Search</button>
+    </form>
+    <table>
+      <thead><tr><th>service</th><th>name</th><th>trace</th><th>ms</th><th>status</th></tr></thead>
+      <tbody id="span-rows"></tbody>
+    </table>
+    <div id="span-empty" class="empty" hidden>No spans match.</div>
+  </section>
+  <section>
+    <h2 id="trace-title">Trace waterfall</h2>
+    <div id="waterfall" class="empty">Select a span to load its trace.</div>
+    <div id="detail" hidden>
+      <h2 id="detail-title">Span detail</h2>
+      <div id="detail-body"></div>
+    </div>
+  </section>
+</main>
+<script>
+"use strict";
+/* Data layer: the existing JSON API only — /v1/spans, /v1/traces/{id}.
+   Bearer token: kept in sessionStorage only, prompted on the first 401. */
+const statusEl = document.getElementById("status");
+
+function token() { return sessionStorage.getItem("traza_token") || ""; }
+
+function askForToken() {
+  const value = window.prompt("Bearer token (ro or rw scope):", "");
+  if (value !== null) sessionStorage.setItem("traza_token", value.trim());
+  return token();
+}
+
+async function api(path) {
+  const headers = {};
+  if (token()) headers["Authorization"] = "Bearer " + token();
+  let response = await fetch(path, { headers });
+  if (response.status === 401) {
+    if (askForToken()) {
+      response = await fetch(path, { headers: { Authorization: "Bearer " + token() } });
+    }
+  }
+  if (!response.ok) throw new Error("HTTP " + response.status + " for " + path);
+  return response.json();
+}
+
+function ms(span) { return (span.end_time_ns - span.start_time_ns) / 1e6; }
+function fmtMs(value) {
+  if (value >= 1000) return (value / 1000).toFixed(2) + " s";
+  if (value >= 1) return value.toFixed(2) + " ms";
+  return (value * 1000).toFixed(0) + " µs";
+}
+function esc(text) {
+  return String(text).replace(/[&<>"]/g, c =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+
+/* ---- recent spans ---- */
+async function searchSpans(event) {
+  if (event) event.preventDefault();
+  const params = new URLSearchParams();
+  const service = document.getElementById("f-service").value.trim();
+  const name = document.getElementById("f-name").value.trim();
+  const limit = document.getElementById("f-limit").value.trim();
+  const attrKey = document.getElementById("f-attr-key").value.trim();
+  const attrValue = document.getElementById("f-attr-value").value.trim();
+  const minMs = document.getElementById("f-min-ms").value.trim();
+  if (service) params.set("service", service);
+  if (name) params.set("name", name);
+  if (attrKey) params.set("attr." + attrKey, attrValue);
+  if (minMs) params.set("min_duration_ms", minMs);
+  params.set("limit", limit || "100");
+  let spans;
+  try {
+    spans = await api("/v1/spans?" + params.toString());
+    statusEl.textContent = spans.length + " spans";
+  } catch (error) {
+    statusEl.textContent = String(error.message || error);
+    return;
+  }
+  spans.sort((a, b) => b.start_time_ns - a.start_time_ns);
+  const rows = document.getElementById("span-rows");
+  rows.replaceChildren();
+  document.getElementById("span-empty").hidden = spans.length > 0;
+  for (const span of spans) {
+    const tr = document.createElement("tr");
+    tr.className = "span-row";
+    const bad = span.status && span.status !== "ok";
+    tr.innerHTML =
+      "<td>" + esc(span.service) + "</td>" +
+      "<td>" + esc(span.name) + "</td>" +
+      '<td class="mono">' + esc(span.trace_id) + "</td>" +
+      "<td>" + fmtMs(ms(span)) + "</td>" +
+      '<td class="' + (bad ? "status-error" : "") + '">' + esc(span.status || "") + "</td>";
+    tr.addEventListener("click", () => {
+      for (const row of rows.children) row.classList.remove("selected");
+      tr.classList.add("selected");
+      loadTrace(span.trace_id, span.span_id);
+    });
+    rows.appendChild(tr);
+  }
+}
+
+/* ---- waterfall + detail ---- */
+async function loadTrace(traceId, focusSpanId) {
+  const holder = document.getElementById("waterfall");
+  document.getElementById("trace-title").textContent = "Trace " + traceId;
+  let payload;
+  try {
+    payload = await api("/v1/traces/" + encodeURIComponent(traceId));
+  } catch (error) {
+    holder.className = "empty";
+    holder.textContent = String(error.message || error);
+    return;
+  }
+  const spans = payload.spans || [];
+  spans.sort((a, b) => a.start_time_ns - b.start_time_ns);
+  const t0 = Math.min(...spans.map(s => s.start_time_ns));
+  const t1 = Math.max(...spans.map(s => s.end_time_ns));
+  const range = Math.max(t1 - t0, 1);
+  holder.className = "";
+  holder.replaceChildren();
+  for (const span of spans) {
+    const row = document.createElement("div");
+    row.className = "wf-row" + (span.span_id === focusSpanId ? " selected" : "");
+    const left = ((span.start_time_ns - t0) / range) * 100;
+    const width = Math.max(((span.end_time_ns - span.start_time_ns) / range) * 100, 0.4);
+    const bad = span.status && span.status !== "ok";
+    row.innerHTML =
+      '<div class="wf-label">' + esc(span.name) +
+      ' <span class="svc">· ' + esc(span.service) + "</span></div>" +
+      '<div class="wf-track"><div class="wf-bar' + (bad ? " error" : "") +
+      '" style="left:' + left.toFixed(2) + "%;width:" + width.toFixed(2) + '%"></div>' +
+      '<span class="wf-ms">' + fmtMs(ms(span)) + "</span></div>";
+    row.addEventListener("click", () => showDetail(span));
+    holder.appendChild(row);
+    if (span.span_id === focusSpanId) showDetail(span);
+  }
+}
+
+function showDetail(span) {
+  const detail = document.getElementById("detail");
+  detail.hidden = false;
+  const body = document.getElementById("detail-body");
+  let html = "<dl>";
+  html += "<dt>span_id</dt><dd>" + esc(span.span_id) + "</dd>";
+  if (span.parent_span_id) html += "<dt>parent</dt><dd>" + esc(span.parent_span_id) + "</dd>";
+  html += "<dt>status</dt><dd>" + esc(span.status || "(unset)") + "</dd>";
+  html += "<dt>start</dt><dd>" + new Date(span.start_time_ns / 1e6).toISOString() + "</dd>";
+  html += "<dt>duration</dt><dd>" + fmtMs(ms(span)) + "</dd>";
+  for (const [key, value] of Object.entries(span.attributes || {})) {
+    html += "<dt>" + esc(key) + "</dt><dd>" + esc(JSON.stringify(value)) + "</dd>";
+  }
+  for (const [key, value] of Object.entries(span.extra || {})) {
+    html += "<dt>" + esc(key) + "</dt><dd>" + esc(JSON.stringify(value)) + "</dd>";
+  }
+  html += "</dl>";
+  for (const event of span.events || []) {
+    html += '<div class="event"><span class="mono">' + esc(event.name || "event") + "</span>";
+    if (event.attributes && Object.keys(event.attributes).length) {
+      html += ' <span class="mono">' + esc(JSON.stringify(event.attributes)) + "</span>";
+    }
+    html += "</div>";
+  }
+  body.innerHTML = html;
+}
+
+document.getElementById("filters").addEventListener("submit", searchSpans);
+document.getElementById("token-btn").addEventListener("click", () => {
+  askForToken();
+  searchSpans();
+});
+searchSpans();
+</script>
+</body>
+</html>

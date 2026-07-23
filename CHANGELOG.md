@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-07-23
+
+### Added
+
+- Bundled dashboard: a dependency-free trace browser embedded in the
+  server binary (`src/dashboard.html` via `include_str!`), served at
+  `GET /` and `GET /dashboard`. Recent-spans view with a filter bar
+  mapped 1:1 onto the `/v1/spans` query params, a trace waterfall backed
+  by `/v1/traces/{id}` with error spans highlighted, and a span detail
+  pane (attributes, events, parent, extra fields). Light and dark color
+  schemes follow the browser preference.
+- The dashboard consumes only the existing JSON API — no new endpoints.
+  With `TRAZA_TOKENS` set the shell stays open (it carries no data)
+  while every API call remains gated; the page prompts for a bearer
+  token on the first `401` and stores it in `sessionStorage` only.
+- `traza::dashboard`: the embedded asset and route helper
+  (`route(path) -> Option<DashboardResponse>`), consulted by the server
+  before the auth gate for `GET` requests.
+- `tests/dashboard.rs`: process-level acceptance — the real server
+  serves the embedded page at `/`, `/dashboard`, and `/dashboard/`
+  (unknown deeper assets 404); a grep oracle proves the page references
+  no external URLs (self-contained, no supply-chain surface); with auth
+  enabled the shell loads open while `/v1/*` still returns 401/403/200
+  by scope.
+
+### Changed
+
+- README: Features and Roadmap now reflect shipped OTLP ingest, auth,
+  LLM-observability semantics, and the dashboard; remaining roadmap is
+  streaming results, filter throughput at scale, and high availability.
+
 ## [0.8.0] - 2026-07-23
 
 ### Added
