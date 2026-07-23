@@ -18,13 +18,13 @@ Traza takes the other side of the trade:
 - **One process, one directory.** The server starts in milliseconds and stores everything under `--data-dir`.
 - **A small audit surface.** Two direct dependencies; networking, threading, file I/O, and HTTP parsing use the Rust standard library.
 - **Honest numbers.** Every figure in [BENCHMARKS.md](BENCHMARKS.md) is measured by a bundled end-to-end benchmark, never estimated.
-- **Crash-safe by construction.** Immutable segments, an atomically replaced manifest, and log replay on startup.
+- **Crash-safe by construction.** Immutable segments written by write-temp, fsync, atomic rename; recovery loads only complete segments and heals crash artifacts.
 
 ## Features
 
 - Batched span ingestion over HTTP with bounded queues and backpressure.
-- Trace-by-ID lookup and indexed span search: service, operation name, exact attribute match, minimum duration, and time window, combined with logical AND.
-- An embeddable Rust library (`traza::Store`): an append-only segment storage engine with sorted-batch flush, atomic manifest publication, crash recovery, and TTL compaction.
+- Trace-by-ID lookup and filtered span search: service, operation name, exact attribute match, minimum duration, and time window, combined with logical AND.
+- An embeddable Rust library (`traza::Store`): an append-only segment storage engine with sorted-batch flush, crash recovery, and TTL compaction.
 - A self-verifying benchmark binary that measures the real HTTP path and rewrites `BENCHMARKS.md` from its own run.
 - Dual-licensed under MIT or Apache-2.0.
 
@@ -34,11 +34,11 @@ Measured by `cargo run --release --bin bench` against a 1,000,000-span corpus (1
 
 | Metric | Measured | Target | Result |
 |---|---:|---:|---|
-| Sustained batched HTTP ingest | 200,860 spans/s | >= 50,000 spans/s | PASS |
-| Trace-by-id p95 | 0.296 ms | < 50 ms | PASS |
-| Attribute-filtered query p95 | 73.691 ms | < 300 ms | PASS |
+| Sustained batched HTTP ingest | 5,450 spans/s | >= 50,000 spans/s | MISS |
+| Trace-by-id p95 | 16.1 ms | < 50 ms | PASS |
+| Attribute-filtered query p95 | 72.4 ms | < 300 ms | PASS |
 
-**What these figures measure:** the HTTP server's RETIRED persistence path — an append-only log with memory-resident indexes that the server no longer uses. The server now serves reads and writes directly through the segment engine, and these benchmarks have not yet been regenerated against that path; expect different numbers, since the engine does more per write. The ingest rate is timed over the full loop — client-side JSON serialization and loopback HTTP overhead included. Full percentiles and methodology live in [BENCHMARKS.md](BENCHMARKS.md). Results are machine-specific; run the benchmark yourself (see below) rather than treating these as guarantees.
+**What these figures measure:** the CURRENT engine-backed path — every ingest goes through the engine's write buffer, sorting, and segment machinery, and every query linearly scans memory-resident segments. The ingest target is honestly MISSED today: the engine does far more per write than the retired log did, and closing that gap (batched lock scope, on-disk indexes, streaming reads) is the top of the roadmap, with these same measured gates as the bar. The ingest rate is timed over the full loop — client-side JSON serialization and loopback HTTP overhead included. Full percentiles and methodology live in [BENCHMARKS.md](BENCHMARKS.md). Results are machine-specific; run the benchmark yourself (see below) rather than treating these as guarantees.
 
 ## Quickstart
 
@@ -111,7 +111,7 @@ Span timestamps are integer Unix nanoseconds. The server reads `start_time_unix_
 
 Traza is two layers that share one goal: never lose a completed write, never serve a torn one.
 
-**Storage engine (the `traza` library).** Spans accumulate in an in-memory write buffer. At the flush threshold (default 10,000 spans) the batch is sorted and written as a new immutable JSON-lines segment file via write-temp, fsync, atomic rename — a segment is either completely present or not present at all. Opening a store loads every complete segment and removes crash-orphaned temporaries; after a crash (including `kill -9`), at most the unflushed buffer is lost and no completed flush can be. Segment contents stay memory-resident after open, and queries scan them linearly, re-verifying every predicate against the decoded spans. There is no manifest and no per-segment index yet — on-disk indexes and manifest-atomic segment lists are roadmap work, and until then TTL compaction is atomic per segment file but not across the whole set: a crash mid-compaction can leave an old segment beside its rewritten replacement until the next successful compaction.
+**Storage engine (the `traza` library).** Spans accumulate in an in-memory write buffer. At the flush threshold (default 10,000 spans) the batch is sorted and written as a new immutable JSON-lines segment file via write-temp, fsync, atomic rename — a segment is either completely present or not present at all. Opening a store loads every complete segment and removes crash-orphaned temporaries; after a crash (including `kill -9`), at most the unflushed buffer is lost and no completed flush can be. Segment contents stay memory-resident after open, and queries scan them linearly, re-verifying every predicate against the decoded spans. There is no manifest and no per-segment index yet — on-disk indexes and manifest-atomic segment lists are roadmap work. TTL compaction is atomic per segment file but not across the whole set: a crash mid-compaction can leave an old segment beside its rewritten replacement, and recovery heals exactly that case on the next open by dropping exact-duplicate spans and deleting fully-duplicate segment files.
 
 **HTTP server (`traza-server`).** A deliberately small HTTP/1.1 implementation on `std::net`: a worker pool for connections in front of the segment engine, which is the server's only datastore. Every ingest goes through the engine's write buffer and flush/segment machinery; every trace, query, and stats read comes out of the engine's combined buffered-plus-persisted snapshot. There is no server-side log, index, or replay — restart durability and crash recovery are the engine's, and `POST /v1/flush` forces buffered spans into a durable segment on demand. A bounded connection queue throttles producers instead of growing without limit. If a server process dies without cleanup, the next open reclaims the engine's directory lock once the recorded owner process is verifiably gone.
 
@@ -139,14 +139,16 @@ let slow_spans = store.query(&SpanFilter {
 | `--data-dir DIR` | `./data` | Directory for the store's files; created if missing |
 | `--port PORT` | `8080` | TCP port; the server binds `0.0.0.0` |
 | `--workers N` | number of CPUs (min 4) | HTTP worker threads |
-| `--ttl-seconds N` | off | Prunes auxiliary `.log` files older than the window at startup; full TTL retention lives in the library engine and is not yet wired through the server |
+| `--ttl-seconds N` | off | Engine TTL retention window; a background thread compacts expired spans every minute. `0` disables |
+| `--host ADDR` | `0.0.0.0` | Bind address |
+| `--flush-spans N` | `10000` | Engine flush threshold |
 
 Library `Config`:
 
 | Field | Default | Description |
 |---|---|---|
 | `flush_spans` | `10_000` | Buffered spans that trigger a sorted segment flush |
-| `ttl_seconds` | `None` | Retention window for `compact_expired()`; segments whose newest span is older are dropped |
+| `ttl_seconds` | `None` | Retention window for `compact_expired()`; `None` and `Some(0)` both disable expiration |
 
 ## Running the benchmark
 
@@ -173,7 +175,7 @@ Traza is a v0.1 project and says so plainly:
 - **Memory-resident reads.** The engine keeps segment contents memory-resident after open, so RAM grows with stored spans. On-disk index serving for larger-than-RAM datasets is on the roadmap.
 - **Minimal HTTP.** `Connection: close` per request, no keep-alive, no TLS, 64 MiB body cap.
 - **Exact-match filtering.** No full-text search, aggregations, or query language.
-- **Compaction crash-atomicity.** TTL compaction is atomic per segment file, not across the set: a crash mid-compaction can duplicate a segment's surviving spans until the next successful compaction. A manifest closes this and is on the roadmap.
+- **Compaction crash-atomicity.** TTL compaction is atomic per segment file, not across the set: a crash mid-compaction can briefly duplicate a segment's surviving spans on disk. Recovery deduplicates on the next open; a manifest that closes the window entirely is on the roadmap.
 - **Unstable formats.** Segment and log layouts may change between 0.x versions.
 
 All of these are on the roadmap, not swept under it.

@@ -114,7 +114,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             flush_spans: 10_000,
-            ttl_seconds: Some(7 * 24 * 60 * 60),
+            ttl_seconds: None,
         }
     }
 }
@@ -272,7 +272,20 @@ impl DirectoryLock {
                 true
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                if Self::owner_is_dead(&sentinel) {
+                // A reclaimer that died between creating the sentinel and
+                // recording its PID leaves an empty file that the PID check
+                // treats as live forever. Age is the fallback: reclamation
+                // takes milliseconds, so an unreadable sentinel older than
+                // ten seconds is a corpse.
+                let unreadable_and_old = fs::read_to_string(&sentinel)
+                    .map(|contents| contents.trim().parse::<u32>().is_err())
+                    .unwrap_or(false)
+                    && fs::metadata(&sentinel)
+                        .and_then(|meta| meta.modified())
+                        .ok()
+                        .and_then(|modified| modified.elapsed().ok())
+                        .is_some_and(|age| age.as_secs() >= 10);
+                if Self::owner_is_dead(&sentinel) || unreadable_and_old {
                     let _ = fs::remove_file(&sentinel);
                 }
                 // Either way this attempt yields; the next open retries.
@@ -347,6 +360,28 @@ impl Store {
             remove_orphan_temps(&directory)?;
             let mut segments = load_segments(&directory)?;
             segments.sort_by(|left, right| left.path.cmp(&right.path));
+            // A crash between writing a compacted segment and deleting its
+            // original leaves the surviving spans in BOTH files. Recovery
+            // heals it here: exact duplicates (identical on every field) are
+            // dropped in path order, and a segment whose spans are all
+            // duplicates is deleted outright. Later compactions cannot be
+            // relied on for this — they only touch expired spans (found in
+            // review, with a reproducing crash simulation).
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut healed: Vec<Segment> = Vec::with_capacity(segments.len());
+            for mut segment in segments {
+                segment.spans.retain(|span| {
+                    serde_json::to_string(span)
+                        .map(|canonical| seen.insert(canonical))
+                        .unwrap_or(true)
+                });
+                if segment.spans.is_empty() {
+                    fs::remove_file(&segment.path)?;
+                } else {
+                    healed.push(segment);
+                }
+            }
+            let segments = healed;
             let next_segment = segments
                 .iter()
                 .filter_map(|segment| segment_number(&segment.path))
@@ -485,6 +520,10 @@ impl Store {
         let Some(ttl_seconds) = self.config.ttl_seconds else {
             return Ok(0);
         };
+        // Zero is documented as "disabled", not "expire everything now".
+        if ttl_seconds == 0 {
+            return Ok(0);
+        }
 
         let now_ns = SystemTime::now()
             .duration_since(UNIX_EPOCH)

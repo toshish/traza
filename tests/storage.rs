@@ -677,3 +677,102 @@ fn stale_lock_reclaim_has_exactly_one_winner() {
         "exactly one racer may reclaim a stale lock"
     );
 }
+
+#[test]
+fn ttl_zero_disables_expiration() {
+    // Documented: zero disables TTL. Review finding: Some(0) computed a
+    // cutoff of "now" and expired every existing span.
+    let dir = correctness_test_dir("ttl-zero");
+    let store = Store::open(
+        &dir,
+        Config {
+            ttl_seconds: Some(0),
+            ..Config::default()
+        },
+    )
+    .expect("opens");
+    store
+        .ingest(span("t-zero", "s1".to_owned(), 1_000, 10))
+        .expect("ingest");
+    store.flush().expect("flush");
+    let removed = store.compact_expired().expect("compact");
+    assert_eq!(removed, 0, "ttl 0 must be a no-op");
+    assert_eq!(
+        store.get_trace("t-zero").expect("read").len(),
+        1,
+        "spans must survive a ttl-0 compaction"
+    );
+}
+
+#[test]
+fn recovery_heals_crash_duplicated_segments() {
+    // Simulate a crash between writing the compacted replacement segment and
+    // deleting its original: both files exist, holding the same surviving
+    // span. Reopen must return ONE copy and heal the extra file.
+    let dir = correctness_test_dir("dup-heal");
+    let store = Store::open(&dir, Config::default()).expect("opens");
+    store
+        .ingest(span("t-dup", "s1".to_owned(), 1_000, 10))
+        .expect("ingest");
+    store.flush().expect("flush");
+    drop(store);
+
+    let segment_path = std::fs::read_dir(&dir)
+        .expect("dir")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.extension().is_some_and(|ext| ext == "jsonl")
+                || path
+                    .file_name()
+                    .is_some_and(|n| n.to_string_lossy().contains("segment"))
+        })
+        .expect("one segment file exists");
+    // A real crash duplicate is the compaction's REWRITTEN segment: a valid
+    // next-numbered segment name the loader will pick up.
+    let duplicate = segment_path.with_file_name("segment-00000000000000000099.jsonl");
+    std::fs::copy(&segment_path, &duplicate).expect("simulate crash duplicate");
+
+    let store = Store::open(&dir, Config::default()).expect("reopens");
+    let spans = store.get_trace("t-dup").expect("read");
+    assert_eq!(spans.len(), 1, "recovery must return one copy, not two");
+    drop(store);
+    assert!(
+        !duplicate.exists(),
+        "the fully-duplicate segment file must be healed away"
+    );
+}
+
+#[test]
+fn empty_stale_sentinel_does_not_wedge_reclaim() {
+    // A reclaimer that died before writing its PID leaves an empty sentinel.
+    // Backdated past the age threshold, it must not block recovery forever.
+    let dir = correctness_test_dir("sentinel-wedge");
+    let dead_pid = {
+        let mut child = std::process::Command::new("/usr/bin/true")
+            .spawn()
+            .expect("spawns");
+        let pid = child.id();
+        child.wait().expect("waits");
+        pid
+    };
+    std::fs::write(dir.join("LOCK"), format!("{dead_pid}\n")).expect("stale lock");
+    let sentinel = dir.join("LOCK.reclaim");
+    std::fs::write(&sentinel, "").expect("empty sentinel");
+    // Backdate the sentinel beyond the 10s age threshold.
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&sentinel)
+        .expect("open sentinel");
+    file.set_modified(old).expect("backdate");
+    drop(file);
+
+    // First open clears the corpse sentinel; a retry wins the reclaim.
+    let first = Store::open(&dir, Config::default());
+    let second = Store::open(&dir, Config::default());
+    assert!(
+        first.is_ok() || second.is_ok(),
+        "an aged empty sentinel must not wedge recovery"
+    );
+}

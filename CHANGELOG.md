@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-07-22
+
+### Fixed
+- `ttl_seconds: Some(0)` disables expiration as documented instead of
+  expiring every existing span; the library `Config` TTL default is `None`
+  as documented, no longer a silent seven days.
+- Recovery heals crash-duplicated segments: exact-duplicate spans are
+  dropped at open and fully-duplicate segment files deleted, closing the
+  window where a crash mid-compaction returned two copies of surviving
+  spans on reopen.
+- An empty reclamation sentinel left by a reclaimer that died before
+  recording its PID no longer wedges lock recovery: unreadable sentinels
+  older than ten seconds are treated as corpses.
+- The README introduction and features no longer claim a manifest,
+  per-segment indexes, or log replay; the configuration tables match the
+  code (server `--ttl-seconds` drives engine compaction; `--host` and
+  `--flush-spans` documented).
+
+### Changed
+- BENCHMARKS.md regenerated against the engine-backed server. The ingest
+  gate is honestly reported as MISSED (5,450 spans/s against the 50,000
+  target); read gates pass. Closing the write-path gap is the top of the
+  roadmap.
+
 ## [0.2.1] - 2026-07-22
 
 ### Fixed
