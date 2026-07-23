@@ -10,7 +10,7 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const SPAN_COUNT: usize = 1_000_000;
+const DEFAULT_SPAN_COUNT: usize = 1_000_000;
 const BATCH_SIZE: usize = 1_000;
 const TRACE_SAMPLES: usize = 200;
 const FILTER_SAMPLES: usize = 100;
@@ -26,6 +26,16 @@ impl Drop for ServerGuard {
         let _ = self.child.wait();
         let _ = fs::remove_dir_all(&self.data_dir);
     }
+}
+
+fn span_count() -> usize {
+    // TRAZA_BENCH_SPANS overrides the corpus size for scaling experiments.
+    // BENCHMARKS.md is only rewritten for the canonical default corpus, so
+    // experimental runs cannot silently change the published numbers.
+    std::env::var("TRAZA_BENCH_SPANS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_SPAN_COUNT)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -56,6 +66,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut server = ServerGuard { child, data_dir };
     wait_for_server(port, &mut server.child)?;
 
+    #[allow(non_snake_case)]
+    let SPAN_COUNT = span_count();
     println!("Loading {SPAN_COUNT} spans in batches of {BATCH_SIZE}...");
     let ingest_started = Instant::now();
     let mut body = Vec::with_capacity(512 * BATCH_SIZE);
@@ -214,7 +226,11 @@ The ingest threshold is {}. The trace p95 threshold is {}. The filtered-query p9
         pass(filter_p95 < Duration::from_millis(300)),
     );
     report.push_str("\n## Verification Notes\n\n- Corpus declaration: `1000000` spans (1,000,000 spans).\n- Every reported result is measured by this benchmark run, never estimated.\n- Unsuccessful lookups are reported as misses.\n");
-    fs::write("BENCHMARKS.md", report)?;
+    if SPAN_COUNT == DEFAULT_SPAN_COUNT {
+        fs::write("BENCHMARKS.md", report)?;
+    } else {
+        println!("(experimental corpus — BENCHMARKS.md not rewritten)");
+    }
 
     println!(
         "Ingest: {ingest_rate:.0} spans/s ({:.2}s)",
@@ -232,7 +248,9 @@ The ingest threshold is {}. The trace p95 threshold is {}. The filtered-query p9
         ms(filter_p95),
         ms(filter_p99)
     );
-    println!("Wrote BENCHMARKS.md");
+    if SPAN_COUNT == DEFAULT_SPAN_COUNT {
+        println!("Wrote BENCHMARKS.md");
+    }
     Ok(())
 }
 
