@@ -191,21 +191,13 @@ impl From<serde_json::Error> for Error {
 /// Result type used by the storage API.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// A persisted segment: raw v2 bytes plus their embedded indexes. Spans
+/// parse on demand — resident cost is bytes + indexes, never Span structs.
 #[derive(Debug)]
 struct Segment {
     path: PathBuf,
     bytes: u64,
-    data: SegmentData,
-}
-
-/// v1 segments stay fully parsed in memory (legacy); v2 segments hold raw
-/// bytes plus their embedded indexes and parse spans on demand — the memory
-/// rule of the v2 format: resident cost is bytes + indexes, never Span
-/// structs.
-#[derive(Debug)]
-enum SegmentData {
-    V1 { spans: Vec<Span> },
-    V2 { seg: Box<segment_v2::Segment> },
+    seg: Box<segment_v2::Segment>,
 }
 
 fn canonical_value(value: &Value) -> String {
@@ -241,53 +233,41 @@ fn record_to_span(record: &segment_v2::Record) -> Result<Span> {
 
 impl Segment {
     fn span_count(&self) -> usize {
-        match &self.data {
-            SegmentData::V1 { spans } => spans.len(),
-            SegmentData::V2 { seg } => seg.len(),
-        }
+        self.seg.len()
     }
 
-    /// Full parse — the rewrite/heal/inspection path, never the query path.
-    fn spans_parsed(&self) -> Result<Vec<Span>> {
-        match &self.data {
-            SegmentData::V1 { spans } => Ok(spans.clone()),
-            SegmentData::V2 { seg } => {
-                let mut spans = Vec::with_capacity(seg.len());
-                for ordinal in 0..seg.len() {
-                    if let Some(record) = seg.record(ordinal).map_err(segment_v2_error)? {
-                        spans.push(record_to_span(&record)?);
-                    }
-                }
-                Ok(spans)
+    fn contains_key(&self, trace_id: &str, span_id: &str) -> Result<bool> {
+        for span in self.trace_spans(trace_id)? {
+            if span.span_id == span_id {
+                return Ok(true);
             }
         }
+        Ok(false)
+    }
+
+    /// Full parse — the rewrite/inspection path, never the query path.
+    fn spans_parsed(&self) -> Result<Vec<Span>> {
+        let mut spans = Vec::with_capacity(self.seg.len());
+        for ordinal in 0..self.seg.len() {
+            if let Some(record) = self.seg.record(ordinal).map_err(segment_v2_error)? {
+                spans.push(record_to_span(&record)?);
+            }
+        }
+        Ok(spans)
     }
 
     fn trace_spans(&self, trace_id: &str) -> Result<Vec<Span>> {
-        match &self.data {
-            SegmentData::V1 { spans } => Ok(spans
-                .iter()
-                .filter(|span| span.trace_id == trace_id)
-                .cloned()
-                .collect()),
-            SegmentData::V2 { seg } => {
-                let records = seg.query_trace(trace_id).map_err(segment_v2_error)?;
-                records.iter().map(record_to_span).collect()
-            }
-        }
+        let records = self.seg.query_trace(trace_id).map_err(segment_v2_error)?;
+        records.iter().map(record_to_span).collect()
     }
 
     /// Index-accelerated filter: the most selective available index narrows
     /// candidates, then every predicate is re-verified on the parsed span —
     /// an index accelerates a filter, it never changes its semantics.
     fn filter_spans(&self, filter: &SpanFilter) -> Result<Vec<Span>> {
-        match &self.data {
-            SegmentData::V1 { spans } => Ok(spans
-                .iter()
-                .filter(|span| span_matches(span, filter))
-                .cloned()
-                .collect()),
-            SegmentData::V2 { seg } => {
+        {
+            {
+                let seg = &self.seg;
                 let candidates = if let Some(service) = &filter.service {
                     Some(
                         seg.query_attribute(IDX_SERVICE, service)
@@ -352,6 +332,57 @@ fn segment_v2_error(error: segment_v2::Error) -> Error {
             io::ErrorKind::InvalidData,
             other.to_string(),
         )),
+    }
+}
+
+/// The in-memory write buffer, keyed by span identity.
+///
+/// (trace_id, span_id) is the span's PRIMARY KEY: re-ingesting an existing
+/// key replaces the buffered version in place — retries are idempotent and
+/// never create a second acknowledged copy.
+#[derive(Debug, Default)]
+struct WriteBuffer {
+    spans: Vec<Span>,
+    index: std::collections::HashMap<(String, String), usize>,
+}
+
+impl WriteBuffer {
+    fn upsert(&mut self, span: Span) {
+        let key = (span.trace_id.clone(), span.span_id.clone());
+        match self.index.get(&key) {
+            Some(&position) => self.spans[position] = span,
+            None => {
+                self.index.insert(key, self.spans.len());
+                self.spans.push(span);
+            }
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.spans.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.spans.is_empty()
+    }
+
+    fn contains_key(&self, trace_id: &str, span_id: &str) -> bool {
+        self.index
+            .contains_key(&(trace_id.to_owned(), span_id.to_owned()))
+    }
+
+    fn clear(&mut self) {
+        self.spans.clear();
+        self.index.clear();
+    }
+
+    fn retain(&mut self, keep: impl Fn(&Span) -> bool) {
+        self.spans.retain(&keep);
+        self.index.clear();
+        for (position, span) in self.spans.iter().enumerate() {
+            self.index
+                .insert((span.trace_id.clone(), span.span_id.clone()), position);
+        }
     }
 }
 
@@ -503,7 +534,7 @@ pub struct Store {
     config: Config,
     // Locking discipline: whenever both locks are needed, acquire writer first
     // and segments second, and retain that order until both guards are dropped.
-    writer: Mutex<Vec<Span>>,
+    writer: Mutex<WriteBuffer>,
     segments: Mutex<Vec<Segment>>,
     next_segment: AtomicU64,
     _directory_lock: DirectoryLock,
@@ -541,7 +572,7 @@ impl Store {
             Ok(Self {
                 directory,
                 config,
-                writer: Mutex::new(Vec::new()),
+                writer: Mutex::new(WriteBuffer::default()),
                 segments: Mutex::new(segments),
                 next_segment: AtomicU64::new(next_segment),
                 _directory_lock: directory_lock,
@@ -555,7 +586,7 @@ impl Store {
     /// reached.
     pub fn ingest(&self, span: Span) -> Result<()> {
         let mut writer = self.lock_writer()?;
-        writer.push(span);
+        writer.upsert(span);
         if self.should_flush(writer.len()) {
             let mut segments = self.lock_segments()?;
             self.flush_locked(&mut writer, &mut segments)?;
@@ -571,7 +602,9 @@ impl Store {
         }
 
         let mut writer = self.lock_writer()?;
-        writer.extend(spans);
+        for span in spans {
+            writer.upsert(span);
+        }
         if self.should_flush(writer.len()) {
             let mut segments = self.lock_segments()?;
             self.flush_locked(&mut writer, &mut segments)?;
@@ -601,14 +634,21 @@ impl Store {
         let segments = self.lock_segments()?;
         let mut result = Vec::new();
 
-        for span in writer.iter() {
-            if span.trace_id == trace_id {
-                result.push(span.clone());
+        // (trace_id, span_id) is the span's primary key: the newest ingested
+        // version wins. Segments are visited oldest-first so later versions
+        // overwrite, and the write buffer overwrites everything.
+        let mut latest: std::collections::HashMap<String, Span> = std::collections::HashMap::new();
+        for segment in segments.iter() {
+            for span in segment.trace_spans(trace_id)? {
+                latest.insert(span.span_id.clone(), span);
             }
         }
-        for segment in segments.iter() {
-            result.extend(segment.trace_spans(trace_id)?);
+        for span in writer.spans.iter() {
+            if span.trace_id == trace_id {
+                latest.insert(span.span_id.clone(), span.clone());
+            }
         }
+        result.extend(latest.into_values());
 
         sort_spans(&mut result);
         Ok(result)
@@ -631,6 +671,7 @@ impl Store {
         // at 10M, dominated entirely by candidate parsing).
         if let Some(limit) = filter.limit {
             let mut buffered: Vec<Span> = writer
+                .spans
                 .iter()
                 .filter(|span| span_matches(span, filter))
                 .cloned()
@@ -646,33 +687,21 @@ impl Store {
             }
             let mut sources: Vec<(Source<'_>, usize)> = vec![(Source::Parsed(buffered), 0)];
             for segment in segments.iter() {
-                match &segment.data {
-                    SegmentData::V1 { spans } => {
-                        let mut matched: Vec<Span> = spans
-                            .iter()
-                            .filter(|span| span_matches(span, filter))
-                            .cloned()
-                            .collect();
-                        sort_spans(&mut matched);
-                        sources.push((Source::Parsed(matched), 0));
-                    }
-                    SegmentData::V2 { seg } => {
-                        let offsets = if let Some(service) = &filter.service {
-                            seg.attribute_posting_offsets(IDX_SERVICE, service)
-                        } else if let Some(name) = &filter.name {
-                            seg.attribute_posting_offsets(IDX_NAME, name)
-                        } else if let Some((key, value)) = filter
-                            .attributes
-                            .iter()
-                            .find(|(key, _)| !key.starts_with('\u{0}'))
-                        {
-                            seg.attribute_posting_offsets(key, &canonical_value(value))
-                        } else {
-                            seg.record_offsets().to_vec()
-                        };
-                        sources.push((Source::Lazy { seg, offsets }, 0));
-                    }
-                }
+                let seg = &segment.seg;
+                let offsets = if let Some(service) = &filter.service {
+                    seg.attribute_posting_offsets(IDX_SERVICE, service)
+                } else if let Some(name) = &filter.name {
+                    seg.attribute_posting_offsets(IDX_NAME, name)
+                } else if let Some((key, value)) = filter
+                    .attributes
+                    .iter()
+                    .find(|(key, _)| !key.starts_with('\u{0}'))
+                {
+                    seg.attribute_posting_offsets(key, &canonical_value(value))
+                } else {
+                    seg.record_offsets().to_vec()
+                };
+                sources.push((Source::Lazy { seg, offsets }, 0));
             }
 
             let peek = |source: &(Source<'_>, usize)| -> Result<Option<u64>> {
@@ -689,6 +718,8 @@ impl Store {
             };
 
             let mut result: Vec<Span> = Vec::with_capacity(limit.min(1024));
+            let mut emitted: std::collections::HashSet<(String, String)> =
+                std::collections::HashSet::new();
             while result.len() < limit {
                 let mut best: Option<(usize, u64)> = None;
                 for (index, source) in sources.iter().enumerate() {
@@ -700,10 +731,11 @@ impl Store {
                 }
                 let Some((index, _)) = best else { break };
                 let (src, pos) = &mut sources[index];
-                match src {
+                let span = match src {
                     Source::Parsed(spans) => {
-                        result.push(spans[*pos].clone());
+                        let span = spans[*pos].clone();
                         *pos += 1;
+                        Some(span)
                     }
                     Source::Lazy { seg, offsets } => {
                         let record = seg
@@ -711,22 +743,56 @@ impl Store {
                             .map_err(segment_v2_error)?;
                         *pos += 1;
                         let span = record_to_span(&record)?;
-                        if span_matches(&span, filter) {
-                            result.push(span);
-                        }
+                        span_matches(&span, filter).then_some(span)
                     }
+                };
+                let Some(span) = span else { continue };
+                let key = (span.trace_id.clone(), span.span_id.clone());
+                if emitted.contains(&key) {
+                    continue;
+                }
+                // Primary-key precedence: source 0 is the write buffer (it
+                // always wins); among segments, a LATER source index means a
+                // later flush and a newer version — a candidate loses to any
+                // higher-precedence source that also holds its key.
+                let superseded = if index == 0 {
+                    false
+                } else {
+                    writer.contains_key(&span.trace_id, &span.span_id)
+                        || segments
+                            .iter()
+                            .skip(index) // sources[i] maps to segments[i-1]
+                            .map(|segment| segment.contains_key(&span.trace_id, &span.span_id))
+                            .collect::<Result<Vec<_>>>()?
+                            .into_iter()
+                            .any(|contains| contains)
+                };
+                if !superseded {
+                    emitted.insert(key);
+                    result.push(span);
                 }
             }
             return Ok(result);
         }
 
-        for span in writer.iter() {
-            if span_matches(span, filter) {
-                result.push(span.clone());
+        // Primary-key semantics for unlimited queries: dedupe to the newest
+        // version of each (trace_id, span_id) BEFORE filtering, so a
+        // superseded older version can neither appear alongside nor instead
+        // of the version that currently holds the key.
+        let mut latest: std::collections::HashMap<(String, String), Span> =
+            std::collections::HashMap::new();
+        for segment in segments.iter() {
+            for span in segment.spans_parsed()? {
+                latest.insert((span.trace_id.clone(), span.span_id.clone()), span);
             }
         }
-        for segment in segments.iter() {
-            result.extend(segment.filter_spans(filter)?);
+        for span in writer.spans.iter() {
+            latest.insert((span.trace_id.clone(), span.span_id.clone()), span.clone());
+        }
+        for span in latest.into_values() {
+            if span_matches(&span, filter) {
+                result.push(span);
+            }
         }
 
         sort_spans(&mut result);
@@ -799,22 +865,12 @@ impl Store {
             removed_from_segments += total - kept.len();
 
             if kept.len() == total {
-                replacement.push(match &segment.data {
-                    SegmentData::V1 { .. } => Segment {
-                        path: segment.path.clone(),
-                        bytes: segment.bytes,
-                        data: SegmentData::V1 { spans: kept },
-                    },
-                    SegmentData::V2 { .. } => Segment {
-                        path: segment.path.clone(),
-                        bytes: segment.bytes,
-                        data: SegmentData::V2 {
-                            seg: Box::new(
-                                segment_v2::Segment::open(&segment.path)
-                                    .map_err(segment_v2_error)?,
-                            ),
-                        },
-                    },
+                replacement.push(Segment {
+                    path: segment.path.clone(),
+                    bytes: segment.bytes,
+                    seg: Box::new(
+                        segment_v2::Segment::open(&segment.path).map_err(segment_v2_error)?,
+                    ),
                 });
                 continue;
             }
@@ -866,16 +922,11 @@ impl Store {
     /// contributors.
     pub fn resident_persisted_span_structs(&self) -> Result<usize> {
         let segments = self.lock_segments()?;
-        Ok(segments
-            .iter()
-            .map(|segment| match &segment.data {
-                SegmentData::V1 { spans } => spans.len(),
-                SegmentData::V2 { .. } => 0,
-            })
-            .sum())
+        let _ = &segments;
+        Ok(0)
     }
 
-    fn lock_writer(&self) -> Result<MutexGuard<'_, Vec<Span>>> {
+    fn lock_writer(&self) -> Result<MutexGuard<'_, WriteBuffer>> {
         self.writer
             .lock()
             .map_err(|_| Error::LockPoisoned("writer"))
@@ -891,12 +942,12 @@ impl Store {
         self.config.flush_spans > 0 && buffered >= self.config.flush_spans
     }
 
-    fn flush_locked(&self, writer: &mut Vec<Span>, segments: &mut Vec<Segment>) -> Result<()> {
+    fn flush_locked(&self, writer: &mut WriteBuffer, segments: &mut Vec<Segment>) -> Result<()> {
         if writer.is_empty() {
             return Ok(());
         }
 
-        let mut pending = writer.clone();
+        let mut pending = writer.spans.clone();
         sort_spans(&mut pending);
         let id = self.next_segment.fetch_add(1, Ordering::Relaxed);
         let segment = self.write_segment(id, &pending)?;
@@ -940,7 +991,7 @@ impl Store {
             Ok(Segment {
                 path: final_path,
                 bytes,
-                data: SegmentData::V2 { seg },
+                seg,
             })
         })();
 
@@ -1066,34 +1117,28 @@ fn load_segments(directory: &Path) -> Result<Vec<Segment>> {
 
     let mut segments = Vec::with_capacity(paths.len());
     for path in paths {
-        let bytes_meta = fs::metadata(&path)?.len();
         let is_v2 = path
             .extension()
             .is_some_and(|ext| ext.to_string_lossy() == SEGMENT_V2_SUFFIX.trim_start_matches('.'));
-        if is_v2 {
-            let seg = Box::new(segment_v2::Segment::open(&path).map_err(segment_v2_error)?);
-            segments.push(Segment {
-                path,
-                bytes: bytes_meta,
-                data: SegmentData::V2 { seg },
-            });
-        } else {
-            let file = File::open(&path)?;
-            let reader = BufReader::new(file);
-            let mut spans = Vec::new();
-            for line in reader.lines() {
-                let line = line?;
-                if !line.trim().is_empty() {
-                    spans.push(serde_json::from_str(&line)?);
-                }
-            }
-            sort_spans(&mut spans);
-            segments.push(Segment {
-                path,
-                bytes: bytes_meta,
-                data: SegmentData::V1 { spans },
-            });
+        if !is_v2 {
+            // Pre-v2 JSONL segments are no longer supported: failing loudly
+            // beats silently hiding persisted data (migrate with 0.3.x).
+            return Err(Error::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "legacy v1 segment {} is not supported by this version; \
+                     migrate the store with traza 0.3.x first",
+                    path.display()
+                ),
+            )));
         }
+        let bytes_meta = fs::metadata(&path)?.len();
+        let seg = Box::new(segment_v2::Segment::open(&path).map_err(segment_v2_error)?);
+        segments.push(Segment {
+            path,
+            bytes: bytes_meta,
+            seg,
+        });
     }
     Ok(segments)
 }

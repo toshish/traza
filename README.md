@@ -34,9 +34,9 @@ Measured by `cargo run --release --bin bench` against a 1,000,000-span corpus (1
 
 | Metric | Measured | Target | Result |
 |---|---:|---:|---|
-| Sustained batched HTTP ingest | 114,924 spans/s | >= 50,000 spans/s | PASS |
-| Trace-by-id p95 | 0.333 ms | < 50 ms | PASS |
-| Attribute-filtered query p95 | 0.695 ms | < 300 ms | PASS |
+| Sustained batched HTTP ingest | 115,723 spans/s | >= 50,000 spans/s | PASS |
+| Trace-by-id p95 | 0.379 ms | < 50 ms | PASS |
+| Attribute-filtered query p95 | 1.274 ms | < 300 ms | PASS |
 
 **What these figures measure:** the engine-backed path with format-v2 indexed segments — ingest passes through the write buffer and segment encoder, trace lookups binary-search each segment's embedded trace index, and filters merge undecoded index postings across segments in start-time order, decoding and re-verifying only the records a limited query actually returns. At a 10M-span corpus (10x the canonical run), measured trace lookup is p50 0.45 ms and the attribute filter p50 2.9 ms — both effectively scale-independent for limited queries. The ingest rate is timed over the full loop — client-side JSON serialization and loopback HTTP overhead included. Full percentiles and methodology live in [BENCHMARKS.md](BENCHMARKS.md). Results are machine-specific; run the benchmark yourself (see below) rather than treating these as guarantees.
 
@@ -105,7 +105,7 @@ Search filters (all supplied predicates are ANDed; values must be URL-encoded):
 - `since` / `until` — inclusive start-timestamp bounds, Unix nanoseconds.
 - `limit` — maximum spans returned (default 100), applied after filtering, sorted by start time.
 
-Span timestamps are integer Unix nanoseconds. The server reads `start_time_unix_nano` (and the aliases `start_timestamp_ns`, `start_ns`, `start_time`) plus the matching `end_*` keys; any other fields you send are stored and returned verbatim. Invalid JSON gets `400`; requests are capped at 64 MiB; `503` means the ingest writer is unavailable and the batch should be retried with backoff.
+**Span identity is the (trace_id, span_id) pair, enforced as a primary key**: re-ingesting an existing pair replaces the stored span (last write wins), so client retries are idempotent and never create duplicate copies. Span timestamps are integer Unix nanoseconds. The server reads `start_time_unix_nano` (and the aliases `start_timestamp_ns`, `start_ns`, `start_time`) plus the matching `end_*` keys; any other fields you send are stored and returned verbatim. Invalid JSON gets `400`; requests are capped at 64 MiB; `503` means the ingest writer is unavailable and the batch should be retried with backoff.
 
 ## Architecture
 

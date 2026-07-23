@@ -789,29 +789,46 @@ fn supersede_journal_without_replacement_keeps_original() {
 }
 
 #[test]
-fn acknowledged_duplicate_cardinality_survives_restart() {
-    // At-least-once ingest semantics: a client retry that re-sends an
-    // identical span after an ack produces two acknowledged copies, and BOTH
-    // must survive restart. Content-based healing used to silently drop one
-    // (found in review).
-    let dir = correctness_test_dir("ack-dup-cardinality");
+fn span_identity_is_a_primary_key() {
+    // (trace_id, span_id) is enforced unique: re-ingesting the key replaces
+    // the span (retries are idempotent), in the buffer, across flushes, and
+    // across restart. Last write wins.
+    let dir = correctness_test_dir("primary-key");
     let store = Store::open(&dir, Config::default()).expect("opens");
-    let identical = span("t-ack", "same-span".to_owned(), 1_000, 10);
-    store.ingest(identical.clone()).expect("first ingest");
-    store.flush().expect("first flush");
-    store.ingest(identical.clone()).expect("retry ingest");
-    store
-        .flush()
-        .expect("second flush — an identical whole segment");
+
+    // Buffer-level replace.
+    let mut first = span("t-pk", "same-span".to_owned(), 1_000, 10);
+    first.status = "first".to_owned();
+    store.ingest(first).expect("first ingest");
+    let mut second = span("t-pk", "same-span".to_owned(), 1_000, 10);
+    second.status = "second".to_owned();
+    store.ingest(second).expect("retry ingest replaces");
+    assert_eq!(store.get_trace("t-pk").expect("trace").len(), 1);
+    store.flush().expect("flush");
+
+    // Cross-segment replace: same key re-ingested after a flush.
+    let mut third = span("t-pk", "same-span".to_owned(), 1_000, 10);
+    third.status = "third".to_owned();
+    store.ingest(third).expect("post-flush re-ingest");
+    store.flush().expect("second flush");
     drop(store);
 
     let store = Store::open(&dir, Config::default()).expect("reopens");
+    let spans = store.get_trace("t-pk").expect("trace");
     assert_eq!(
-        store.get_trace("t-ack").expect("trace").len(),
-        2,
-        "both acknowledged copies must survive restart"
+        spans.len(),
+        1,
+        "one span per key, across segments and restart"
     );
-    assert_eq!(store.stats().expect("stats").persisted_spans, 2);
+    assert_eq!(spans[0].status, "third", "last write wins");
+    let filtered = store
+        .query(&SpanFilter {
+            service: Some("test-service".into()),
+            ..SpanFilter::default()
+        })
+        .expect("query");
+    assert_eq!(filtered.len(), 1, "queries also see exactly one version");
+    assert_eq!(filtered[0].status, "third");
 }
 
 #[test]
@@ -885,32 +902,22 @@ fn v2_open_holds_no_resident_span_structs() {
 }
 
 #[test]
-fn v1_jsonl_segments_load_and_serve() {
-    // Format compatibility: a pre-v2 JSONL segment file loads, serves reads
-    // beside v2 segments, and participates in duplicate healing.
-    let dir = correctness_test_dir("v1-compat");
-    let legacy = span("t-legacy", "l1".to_owned(), 500, 10);
-    let line = serde_json::to_string(&legacy).expect("encodes");
+fn legacy_v1_segment_fails_loudly() {
+    // v1 JSONL segments are no longer supported: opening a directory that
+    // contains one must fail with a clear error, never silently hide data.
+    let dir = correctness_test_dir("v1-refused");
     std::fs::write(
         dir.join("segment-00000000000000000000.jsonl"),
-        format!("{line}\n"),
+        "{\"not\":\"supported\"}\n",
     )
-    .expect("writes v1 segment");
-
-    let store = Store::open(&dir, Config::default()).expect("opens mixed store");
-    assert_eq!(store.get_trace("t-legacy").expect("trace").len(), 1);
-    store
-        .ingest(span("t-new", "n1".to_owned(), 900, 10))
-        .expect("ingest");
-    store.flush().expect("flush v2 beside v1");
-    drop(store);
-
-    let store = Store::open(&dir, Config::default()).expect("reopens mixed");
-    assert_eq!(store.get_trace("t-legacy").expect("legacy trace").len(), 1);
-    assert_eq!(store.get_trace("t-new").expect("new trace").len(), 1);
-    let stats = store.stats().expect("stats");
-    assert_eq!(stats.persisted_spans, 2);
-    assert_eq!(stats.segment_count, 2);
+    .expect("writes legacy file");
+    let result = Store::open(&dir, Config::default());
+    assert!(result.is_err(), "legacy segments must be refused loudly");
+    let message = format!("{}", result.err().expect("error"));
+    assert!(
+        message.contains("migrate"),
+        "error must say how to migrate: {message}"
+    );
 }
 
 #[test]

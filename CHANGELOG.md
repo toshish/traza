@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-23
+
+### Changed (breaking)
+- **Span identity is a primary key.** (trace_id, span_id) is enforced
+  unique: re-ingesting an existing pair replaces the stored span — in the
+  write buffer, across flushes, and across restart. Last write wins on
+  every read path (trace, filtered, and limited lazy queries), so client
+  retries are idempotent and never produce duplicate copies. This reverses
+  0.3.1's at-least-once visible-duplicate semantics.
+- **v1 JSONL segments are no longer read.** The engine is v2-only; opening
+  a directory containing a legacy `.jsonl` segment fails loudly with a
+  migration pointer (read with 0.3.x first). The dual-format code path is
+  removed.
+
 ## [0.3.1] - 2026-07-23
 
 ### Fixed
