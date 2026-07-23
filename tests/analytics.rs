@@ -292,6 +292,7 @@ fn rollup_cache_survives_compaction_supersede() {
         Config {
             flush_spans: 10_000,
             ttl_seconds: Some(1),
+            payload_threshold: None,
         },
     )
     .expect("opens");

@@ -75,6 +75,16 @@ Tool-call frequency for one tool:
 Cost and token totals are client-side sums over these result sets (the API
 returns the spans; aggregation endpoints are out of scope today).
 
+## Payloads and annotations
+
+Prompt/completion text longer than the server's payload threshold is
+offloaded at ingest: the event attribute keeps a
+`{"$payload": "sha256/…", "bytes": N, "preview": "…"}` reference and
+`GET /v1/payloads/{ref}` serves the bytes. Content addressing stores a
+repeated system prompt once. Post-hoc judgment — eval scores, human
+feedback — attaches via `POST /v1/annotations` without mutating spans, and
+`GET /v1/export` turns any span filter into an NDJSON dataset.
+
 ## Span links
 
 Agentic traces are not trees: parallel tool calls fan out and rejoin,

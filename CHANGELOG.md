@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-07-23
+
+### Added
+
+- **Payload offloading**: string attribute values above a threshold
+  (server default 256 KiB, `--payload-threshold-bytes`, `0` disables)
+  are extracted at ingest to a content-addressed store
+  (`payloads/<aa>/<sha256>.bin`, temp+rename writes) and replaced by
+  `{"$payload": "sha256/…", "bytes": N, "preview": "…"}`. Identical
+  payloads are stored once; `GET /v1/payloads/{ref}` serves the bytes
+  (hex-validated — traversal-shaped refs are 404). SHA-256 is
+  implemented in-crate (FIPS 180-4) and verified against the NIST
+  vectors.
+- **Annotations**: post-hoc scores/feedback/eval verdicts attach to
+  spans (or whole traces) without mutating them — an append-only,
+  fsync'd `annotations.jsonl` with an in-memory index, tolerant of a
+  torn tail. `POST /v1/annotations`, `GET /v1/annotations`, and the
+  trace view carries a trace's annotations alongside its spans.
+- **Dataset export**: `GET /v1/export` streams any span filter as
+  NDJSON (unbounded by default, unlike interactive search) — the
+  traces-to-eval-dataset path.
+- TTL compaction now also drops annotations older than the window and
+  sweeps payload files by mtime (an orphan payload outlives its span
+  by at most one TTL).
+
 ## [0.11.0] - 2026-07-23
 
 ### Added
