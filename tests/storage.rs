@@ -49,6 +49,7 @@ fn span(trace_id: &str, span_id: String, start_time_ns: u64, duration_ns: u64) -
         service: "test-service".to_owned(),
         attributes: Map::new(),
         events: Vec::new(),
+        extra: Map::new(),
     }
 }
 
@@ -297,6 +298,7 @@ fn randomized_filters_match_naive_reference() {
             service,
             attributes,
             events: Vec::new(),
+            extra: serde_json::Map::new(),
         });
     }
 
@@ -439,6 +441,7 @@ fn correctness_span(batch: u64, item: u64) -> Span {
         service: "correctness-tests".to_string(),
         attributes: serde_json::Map::new(),
         events: Vec::new(),
+        extra: serde_json::Map::new(),
     }
 }
 
@@ -604,8 +607,14 @@ fn stale_lock_from_dead_process_is_recovered() {
         child.wait().expect("waits");
         pid
     };
-    std::fs::write(dir.join("LOCK"), format!("{dead_pid}
-")).expect("stale lock writes");
+    std::fs::write(
+        dir.join("LOCK"),
+        format!(
+            "{dead_pid}
+"
+        ),
+    )
+    .expect("stale lock writes");
     let store = Store::open(&dir, Config::default())
         .expect("stale lock from a dead process must be reclaimed");
     drop(store);
@@ -626,4 +635,45 @@ fn second_open_is_rejected() {
     let reopened = Store::open(&dir, config).expect("reopen after first store drops");
     drop(reopened);
     std::fs::remove_dir_all(dir).expect("remove test directory");
+}
+
+#[test]
+fn stale_lock_reclaim_has_exactly_one_winner() {
+    // Review finding: remove-then-create reclamation let a slow reclaimer
+    // delete the fast reclaimer's fresh lock. Racing openers on a stale lock
+    // must produce exactly one owner; the rest see AlreadyOpen.
+    let dir = correctness_test_dir("reclaim-race");
+    let dead_pid = {
+        let mut child = std::process::Command::new("/usr/bin/true")
+            .spawn()
+            .expect("spawns");
+        let pid = child.id();
+        child.wait().expect("waits");
+        pid
+    };
+    std::fs::write(dir.join("LOCK"), format!("{dead_pid}\n")).expect("stale lock writes");
+
+    let winners = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let dir = dir.clone();
+        let winners = std::sync::Arc::clone(&winners);
+        handles.push(std::thread::spawn(move || {
+            if let Ok(store) = Store::open(&dir, Config::default()) {
+                winners.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // Hold the store long enough that late reclaimers race a LIVE
+                // lock, not a released one.
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                drop(store);
+            }
+        }));
+    }
+    for handle in handles {
+        handle.join().expect("thread joins");
+    }
+    assert_eq!(
+        winners.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "exactly one racer may reclaim a stale lock"
+    );
 }

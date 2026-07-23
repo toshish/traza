@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use traza::{Config, Store};
 
 struct Server {
@@ -27,6 +27,8 @@ impl Server {
         let mut child = Command::new(env!("CARGO_BIN_EXE_traza-server"))
             .arg("--data-dir")
             .arg(data_dir)
+            .arg("--host")
+            .arg("127.0.0.1")
             .arg("--port")
             .arg("0")
             .arg("--flush-spans")
@@ -190,13 +192,17 @@ fn server_read_query_round_trip_uses_engine() {
     );
     assert_eq!(status, 200);
 
-    let (status, body) =
-        server.request("GET", &format!("/v1/spans?service={service_a}"), None);
+    let (status, body) = server.request("GET", &format!("/v1/spans?service={service_a}"), None);
     assert_eq!(status, 200, "query failed: {body}");
     let spans = body.as_array().expect("query returns an array");
     assert_eq!(spans.len(), 2, "service filter must isolate svc-a: {body}");
-    assert!(spans.iter().all(|span| span["service"] == service_a.as_str()));
-    assert_eq!(spans[0]["span_id"], "a1", "spans must come back start-ordered");
+    assert!(spans
+        .iter()
+        .all(|span| span["service"] == service_a.as_str()));
+    assert_eq!(
+        spans[0]["span_id"], "a1",
+        "spans must come back start-ordered"
+    );
 
     let (status, body) = server.request(
         "GET",
@@ -223,7 +229,13 @@ fn server_reopen_preserves_spans() {
     let (status, _) = server.request(
         "POST",
         "/v1/spans",
-        Some(&json!([span_json(&trace_id, "r1", "billing", "persist-me", 100)])),
+        Some(&json!([span_json(
+            &trace_id,
+            "r1",
+            "billing",
+            "persist-me",
+            100
+        )])),
     );
     assert_eq!(status, 200);
     let (status, _) = server.request("POST", "/v1/flush", None);
@@ -282,7 +294,13 @@ fn server_invalid_write_preserves_error_contract() {
     let (status, _) = server.request(
         "POST",
         "/v1/spans",
-        Some(&json!([span_json("trace-still-alive", "s1", "svc", "op", 1)])),
+        Some(&json!([span_json(
+            "trace-still-alive",
+            "s1",
+            "svc",
+            "op",
+            1
+        )])),
     );
     assert_eq!(status, 200);
     let (status, _) = server.request("GET", "/v1/traces/trace-still-alive", None);
@@ -302,5 +320,115 @@ fn server_missing_trace_preserves_error_contract() {
     let (status, body) = server.request("GET", "/v1/nonsense", None);
     assert_eq!(status, 404);
     assert_eq!(body["error"], "not found");
+    server.kill();
+}
+
+#[test]
+fn server_accepts_the_documented_wire_contract() {
+    // The README quickstart verbatim: OTel-style timestamp names, no events,
+    // no parent — plus an undocumented extra field that must survive the
+    // round trip ("any other fields you send are stored and returned
+    // verbatim"). Review finding: typed deserialization had silently
+    // narrowed all of this.
+    let dir = test_dir("wire");
+    let server = Server::spawn(&dir);
+
+    let (status, body) = server.request(
+        "POST",
+        "/v1/spans",
+        Some(&json!([{
+            "trace_id": "trace-1",
+            "span_id": "span-1",
+            "name": "charge",
+            "service": "checkout",
+            "start_time_unix_nano": 1_700_000_000_000_000_000u64,
+            "end_time_unix_nano": 1_700_000_000_002_500_000u64,
+            "status": "ok",
+            "attributes": {"region": "us-east", "http.method": "POST"},
+            "vendor.custom": "kept-verbatim"
+        }])),
+    );
+    assert_eq!(status, 200, "quickstart-shaped ingest must succeed: {body}");
+    assert_eq!(body["accepted"], 1);
+
+    // The bench aliases too.
+    let (status, body) = server.request(
+        "POST",
+        "/v1/spans",
+        Some(&json!([{
+            "trace_id": "trace-1",
+            "span_id": "span-2",
+            "name": "operation",
+            "service": "checkout",
+            "start_ns": 1_700_000_000_003_000_000u64,
+            "end_ns": 1_700_000_000_003_500_000u64
+        }])),
+    );
+    assert_eq!(status, 200, "bench-alias ingest must succeed: {body}");
+
+    let (status, body) = server.request("GET", "/v1/traces/trace-1", None);
+    assert_eq!(status, 200);
+    let spans = body["spans"].as_array().expect("spans");
+    assert_eq!(spans.len(), 2);
+    assert_eq!(spans[0]["start_time_ns"], 1_700_000_000_000_000_000u64);
+    assert_eq!(
+        spans[0]["vendor.custom"], "kept-verbatim",
+        "unknown fields must survive the round trip: {body}"
+    );
+    server.kill();
+}
+
+#[test]
+fn server_supports_the_documented_filters() {
+    let dir = test_dir("filters");
+    let server = Server::spawn(&dir);
+    let (status, _) = server.request(
+        "POST",
+        "/v1/spans",
+        Some(&json!([
+            {
+                "trace_id": "t1", "span_id": "fast", "name": "op", "service": "svc",
+                "start_time_ns": 1_000_000u64, "end_time_ns": 2_000_000u64,
+                "attributes": {"region": "us-east", "retries": 3}
+            },
+            {
+                "trace_id": "t1", "span_id": "slow", "name": "op", "service": "svc",
+                "start_time_ns": 5_000_000u64, "end_time_ns": 55_000_000u64,
+                "attributes": {"region": "eu-west"}
+            }
+        ])),
+    );
+    assert_eq!(status, 200);
+
+    // attr.KEY: bare string value.
+    let (status, body) = server.request("GET", "/v1/spans?attr.region=us-east", None);
+    assert_eq!(status, 200, "attr filter must be accepted: {body}");
+    let spans = body.as_array().expect("array");
+    assert_eq!(spans.len(), 1, "{body}");
+    assert_eq!(spans[0]["span_id"], "fast");
+
+    // attr.KEY: JSON literal matches a typed value.
+    let (status, body) = server.request("GET", "/v1/spans?attr.retries=3", None);
+    assert_eq!(status, 200);
+    assert_eq!(body.as_array().map(Vec::len), Some(1));
+
+    // min_duration_ms in milliseconds.
+    let (status, body) = server.request("GET", "/v1/spans?min_duration_ms=10", None);
+    assert_eq!(status, 200, "min_duration_ms must be accepted: {body}");
+    let spans = body.as_array().expect("array");
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0]["span_id"], "slow");
+
+    // since/until in Unix nanoseconds.
+    let (status, body) = server.request("GET", "/v1/spans?since=4000000&until=6000000", None);
+    assert_eq!(status, 200, "since/until must be accepted: {body}");
+    assert_eq!(body.as_array().map(Vec::len), Some(1));
+
+    // Documented stats keys.
+    let (status, body) = server.request("GET", "/v1/stats", None);
+    assert_eq!(status, 200);
+    for key in ["span_count", "segment_count", "bytes_on_disk"] {
+        assert!(body.get(key).is_some(), "stats must expose {key}: {body}");
+    }
     server.kill();
 }

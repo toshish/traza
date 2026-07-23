@@ -43,21 +43,43 @@ pub struct Span {
     /// Identifier unique to this span within its trace.
     pub span_id: String,
     /// Identifier of the parent span, if this is not a root span.
+    #[serde(default)]
     pub parent_span_id: Option<String>,
     /// Operation name.
     pub name: String,
-    /// Start timestamp in nanoseconds since the Unix epoch.
+    /// Start timestamp in nanoseconds since the Unix epoch. Deserialization
+    /// accepts the documented wire aliases.
+    #[serde(
+        alias = "start_time_unix_nano",
+        alias = "start_timestamp_ns",
+        alias = "start_ns",
+        alias = "start_time"
+    )]
     pub start_time_ns: u64,
-    /// End timestamp in nanoseconds since the Unix epoch.
+    /// End timestamp in nanoseconds since the Unix epoch. Deserialization
+    /// accepts the documented wire aliases.
+    #[serde(
+        alias = "end_time_unix_nano",
+        alias = "end_timestamp_ns",
+        alias = "end_ns",
+        alias = "end_time"
+    )]
     pub end_time_ns: u64,
     /// Application-defined completion status.
+    #[serde(default)]
     pub status: String,
     /// Service that emitted the span.
     pub service: String,
     /// Arbitrary span attributes.
+    #[serde(default)]
     pub attributes: Map<String, Value>,
     /// Events recorded during the span.
+    #[serde(default)]
     pub events: Vec<Event>,
+    /// Any other fields supplied at ingest, stored and returned verbatim —
+    /// the wire contract promises unknown fields survive the round trip.
+    #[serde(flatten, default)]
+    pub extra: Map<String, Value>,
 }
 
 /// Conditions used to select spans.
@@ -183,11 +205,22 @@ impl DirectoryLock {
                 // server, OOM, power loss before unlink) must not wedge the
                 // store forever: if the recorded process is gone, the lock is
                 // stale and may be reclaimed. A live owner still rejects the
-                // open. Exactly one reclaim attempt — losing a race to another
-                // reclaiming process surfaces as AlreadyOpen, which is true.
-                if Self::owner_is_dead(&path) {
-                    let _ = fs::remove_file(&path);
-                    return Self::try_create(&path);
+                // open. Reclamation must have exactly ONE winner and no
+                // check-then-act window: a bare remove (or rename) lets a
+                // slow reclaimer that validated the STALE file destroy the
+                // fast reclaimer's FRESH lock (found in review, then again by
+                // the race test). A reclamation sentinel closes it: exactly
+                // one reclaimer create_new-wins the sentinel, re-verifies
+                // staleness while holding it, and only then swaps the lock.
+                if Self::owner_is_dead(&path) && Self::reclaim_sentinel(&path) {
+                    let result = if Self::owner_is_dead(&path) {
+                        let _ = fs::remove_file(&path);
+                        Self::try_create(&path)
+                    } else {
+                        Err(Error::AlreadyOpen)
+                    };
+                    let _ = fs::remove_file(Self::sentinel_path(&path));
+                    return result;
                 }
                 Err(Error::AlreadyOpen)
             }
@@ -221,6 +254,34 @@ impl DirectoryLock {
         })
     }
 
+    fn sentinel_path(path: &Path) -> PathBuf {
+        path.with_extension("reclaim")
+    }
+
+    /// Wins the exclusive right to reclaim, or returns false. A sentinel left
+    /// by a reclaimer that itself died is reclaimed by the same dead-owner
+    /// rule, one level deep.
+    fn reclaim_sentinel(path: &Path) -> bool {
+        let sentinel = Self::sentinel_path(path);
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        match options.open(&sentinel) {
+            Ok(mut file) => {
+                let _ = writeln!(file, "{}", std::process::id());
+                let _ = file.sync_all();
+                true
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                if Self::owner_is_dead(&sentinel) {
+                    let _ = fs::remove_file(&sentinel);
+                }
+                // Either way this attempt yields; the next open retries.
+                false
+            }
+            Err(_) => false,
+        }
+    }
+
     /// True only when the lock file names a PID that verifiably no longer
     /// exists. Unreadable or malformed lock files are treated as live: false
     /// negatives merely keep the conservative rejection, never corrupt data.
@@ -241,10 +302,12 @@ impl DirectoryLock {
             .arg(pid.to_string())
             .output()
         {
-            Ok(output) => !output.status.success() && {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                !stderr.contains("not permitted") && !stderr.contains("Operation not permitted")
-            },
+            Ok(output) => {
+                !output.status.success() && {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    !stderr.contains("not permitted") && !stderr.contains("Operation not permitted")
+                }
+            }
             Err(_) => false,
         }
     }
@@ -440,31 +503,49 @@ impl Store {
         writer.retain(|span| span.end_time_ns >= cutoff_ns);
         let mut removed = before_buffer - writer.len();
 
-        let old_segments = std::mem::take(&mut *segments);
-        let mut replacement = Vec::with_capacity(old_segments.len());
+        // The in-memory segment set is only replaced after every file
+        // operation has succeeded: an early error must leave the running
+        // store serving its previous (superset) view, never an empty one
+        // (found in review: mem::take + a fallible loop could wipe the
+        // in-memory set on the first I/O failure). Compaction is still not
+        // crash-ATOMIC across segments — there is no manifest yet — so a
+        // crash mid-compaction can leave both an old and its rewritten
+        // segment on disk until the next successful compaction; that bound
+        // is documented in the README limitations.
+        let mut replacement: Vec<Segment> = Vec::with_capacity(segments.len());
+        let mut removed_from_segments = 0usize;
+        for segment in segments.iter() {
+            let kept: Vec<Span> = segment
+                .spans
+                .iter()
+                .filter(|span| span.end_time_ns >= cutoff_ns)
+                .cloned()
+                .collect();
+            removed_from_segments += segment.spans.len() - kept.len();
 
-        for mut segment in old_segments {
-            let old_len = segment.spans.len();
-            segment.spans.retain(|span| span.end_time_ns >= cutoff_ns);
-            removed += old_len - segment.spans.len();
-
-            if segment.spans.len() == old_len {
-                replacement.push(segment);
+            if kept.len() == segment.spans.len() {
+                replacement.push(Segment {
+                    path: segment.path.clone(),
+                    spans: kept,
+                    bytes: segment.bytes,
+                });
                 continue;
             }
 
-            if segment.spans.is_empty() {
+            if kept.is_empty() {
                 fs::remove_file(&segment.path)?;
                 continue;
             }
 
-            sort_spans(&mut segment.spans);
+            let mut kept = kept;
+            sort_spans(&mut kept);
             let id = self.next_segment.fetch_add(1, Ordering::Relaxed);
-            let new_segment = self.write_segment(id, &segment.spans)?;
+            let new_segment = self.write_segment(id, &kept)?;
             fs::remove_file(&segment.path)?;
             replacement.push(new_segment);
         }
 
+        removed += removed_from_segments;
         replacement.sort_by(|left, right| left.path.cmp(&right.path));
         *segments = replacement;
         Ok(removed)

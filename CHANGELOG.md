@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-07-22
+
+### Fixed
+- The documented ingest contract works again: timestamp aliases
+  (`start_time_unix_nano`, `start_timestamp_ns`, `start_ns`, `start_time`
+  and the matching `end_*` keys) are accepted, `parent_span_id`, `status`,
+  `attributes`, and `events` are optional, and unknown span fields are
+  stored and returned verbatim instead of silently discarded. This also
+  un-breaks the bundled benchmark, which emits `start_ns`/`end_ns`.
+- The documented search filters work again: `attr.KEY`, `min_duration_ms`,
+  `since`/`until`, and the default `limit` of 100.
+- `/v1/stats` exposes the documented `span_count`, `segment_count`, and
+  `bytes_on_disk` keys alongside the engine's finer-grained fields.
+- The server binds `0.0.0.0` again by default; `--host` overrides.
+- TTL expiration no longer empties the in-memory segment set when a file
+  operation fails mid-compaction; the store keeps serving its previous view
+  and surfaces the error.
+- Stale-lock reclamation is single-winner: a reclamation sentinel closes the
+  window in which a slow reclaimer could delete a fresh lock and defeat the
+  single-writer guarantee.
+- The README architecture section describes the engine as built (JSON-lines
+  segments, memory-resident, linear scans, no manifest or per-segment index
+  yet) instead of the roadmap design, and names the compaction
+  crash-atomicity bound in Limitations.
+
 ## [0.2.0] - 2026-07-22
 
 ### Changed

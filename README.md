@@ -74,7 +74,7 @@ curl http://localhost:8080/v1/traces/trace-1
 # {"trace_id":"trace-1","spans":[...]}
 ```
 
-Search spans with indexed filters:
+Search spans with filters:
 
 ```sh
 curl 'http://localhost:8080/v1/spans?service=checkout&attr.region=us-east&min_duration_ms=2&limit=50'
@@ -111,9 +111,7 @@ Span timestamps are integer Unix nanoseconds. The server reads `start_time_unix_
 
 Traza is two layers that share one goal: never lose a completed write, never serve a torn one.
 
-**Storage engine (the `traza` library).** Spans accumulate in an in-memory write buffer. At the flush threshold (default 10,000 spans) the batch is sorted by trace ID and start time and written as a new immutable segment file with an embedded index of trace IDs, services, operation names, and attribute values. A `MANIFEST.json` names the live segments and is replaced by write-temp, fsync, atomic rename — recovery always observes a complete old or complete new segment list, never a partial one. Opening a store loads only manifest-listed segments and ignores incomplete temporaries; after a crash (including `kill -9`), at most the unflushed buffer is lost and no completed flush can be. TTL compaction publishes a manifest without expired segments, then deletes their files, so readers see a coherent before or after.
-
-Queries narrow candidates through the per-segment indexes, then re-verify every predicate against the decoded spans — an index accelerates a filter, it never changes its semantics.
+**Storage engine (the `traza` library).** Spans accumulate in an in-memory write buffer. At the flush threshold (default 10,000 spans) the batch is sorted and written as a new immutable JSON-lines segment file via write-temp, fsync, atomic rename — a segment is either completely present or not present at all. Opening a store loads every complete segment and removes crash-orphaned temporaries; after a crash (including `kill -9`), at most the unflushed buffer is lost and no completed flush can be. Segment contents stay memory-resident after open, and queries scan them linearly, re-verifying every predicate against the decoded spans. There is no manifest and no per-segment index yet — on-disk indexes and manifest-atomic segment lists are roadmap work, and until then TTL compaction is atomic per segment file but not across the whole set: a crash mid-compaction can leave an old segment beside its rewritten replacement until the next successful compaction.
 
 **HTTP server (`traza-server`).** A deliberately small HTTP/1.1 implementation on `std::net`: a worker pool for connections in front of the segment engine, which is the server's only datastore. Every ingest goes through the engine's write buffer and flush/segment machinery; every trace, query, and stats read comes out of the engine's combined buffered-plus-persisted snapshot. There is no server-side log, index, or replay — restart durability and crash recovery are the engine's, and `POST /v1/flush` forces buffered spans into a durable segment on demand. A bounded connection queue throttles producers instead of growing without limit. If a server process dies without cleanup, the next open reclaims the engine's directory lock once the recorded owner process is verifiably gone.
 
@@ -175,6 +173,7 @@ Traza is a v0.1 project and says so plainly:
 - **Memory-resident reads.** The engine keeps segment contents memory-resident after open, so RAM grows with stored spans. On-disk index serving for larger-than-RAM datasets is on the roadmap.
 - **Minimal HTTP.** `Connection: close` per request, no keep-alive, no TLS, 64 MiB body cap.
 - **Exact-match filtering.** No full-text search, aggregations, or query language.
+- **Compaction crash-atomicity.** TTL compaction is atomic per segment file, not across the set: a crash mid-compaction can duplicate a segment's surviving spans until the next successful compaction. A manifest closes this and is on the roadmap.
 - **Unstable formats.** Segment and log layouts may change between 0.x versions.
 
 All of these are on the roadmap, not swept under it.

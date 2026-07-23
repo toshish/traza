@@ -23,7 +23,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use traza::{Config, Span, SpanFilter, Store};
 
 const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
@@ -38,6 +38,7 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut data_dir = PathBuf::from("./data");
+    let mut host = String::from("0.0.0.0");
     let mut port = 8080_u16;
     let mut ttl_seconds = None;
     let mut flush_spans = 10_000_usize;
@@ -51,6 +52,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "--data-dir" => {
                 i += 1;
                 data_dir = PathBuf::from(args.get(i).ok_or("--data-dir requires a value")?);
+            }
+            "--host" => {
+                i += 1;
+                host = args.get(i).ok_or("--host requires a value")?.clone();
             }
             "--port" => {
                 i += 1;
@@ -82,7 +87,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--help" | "-h" => {
                 println!(
-                    "Usage: traza-server --data-dir DIR --port PORT [--ttl-seconds N] [--flush-spans N] [--workers N]"
+                    "Usage: traza-server --data-dir DIR --port PORT [--host ADDR] [--ttl-seconds N] [--flush-spans N] [--workers N]"
                 );
                 return Ok(());
             }
@@ -104,21 +109,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let compactor = Arc::clone(&engine);
         thread::Builder::new()
             .name("traza-compactor".into())
-            .spawn(move || {
-                loop {
-                    thread::sleep(std::time::Duration::from_secs(60));
-                    if let Err(error) = compactor.compact_expired() {
-                        eprintln!("compaction failed: {error}");
-                    }
+            .spawn(move || loop {
+                thread::sleep(std::time::Duration::from_secs(60));
+                if let Err(error) = compactor.compact_expired() {
+                    eprintln!("compaction failed: {error}");
                 }
             })?;
     }
 
     // --port 0 binds an ephemeral port; the actual port is announced on
     // stderr so process-level tests can discover it.
-    let listener = TcpListener::bind(("127.0.0.1", port))?;
+    let listener = TcpListener::bind((host.as_str(), port))?;
     let actual_port = listener.local_addr()?.port();
-    eprintln!("traza-server listening on 127.0.0.1:{actual_port}");
+    eprintln!("traza-server listening on {host}:{actual_port}");
 
     let (http_tx, http_rx) = mpsc::sync_channel::<TcpStream>(HTTP_QUEUE_DEPTH);
     let http_rx = Arc::new(Mutex::new(http_rx));
@@ -127,14 +130,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let worker_engine = Arc::clone(&engine);
         thread::Builder::new()
             .name(format!("http-{number}"))
-            .spawn(move || {
-                loop {
-                    let stream = match rx.lock().expect("HTTP receiver poisoned").recv() {
-                        Ok(stream) => stream,
-                        Err(_) => break,
-                    };
-                    let _ = handle_connection(stream, &worker_engine);
-                }
+            .spawn(move || loop {
+                let stream = match rx.lock().expect("HTTP receiver poisoned").recv() {
+                    Ok(stream) => stream,
+                    Err(_) => break,
+                };
+                let _ = handle_connection(stream, &worker_engine);
             })?;
     }
 
@@ -228,10 +229,14 @@ fn handle_connection(mut stream: TcpStream, engine: &Store) -> io::Result<()> {
                 &mut stream,
                 200,
                 json!({
+                    // Documented keys first — span count, segment count,
+                    // bytes on disk — then the engine's finer-grained view.
+                    "span_count": stats.total_spans,
+                    "segment_count": stats.segment_count,
+                    "bytes_on_disk": stats.disk_bytes,
                     "buffered_spans": stats.buffered_spans,
                     "persisted_spans": stats.persisted_spans,
                     "total_spans": stats.total_spans,
-                    "segment_count": stats.segment_count,
                 }),
             ),
             Err(error) => respond(&mut stream, 503, json!({"error": error.to_string()})),
@@ -259,23 +264,39 @@ fn handle_connection(mut stream: TcpStream, engine: &Store) -> io::Result<()> {
 }
 
 fn filter_from_query(raw_query: &str) -> Result<SpanFilter, String> {
-    let mut filter = SpanFilter::default();
+    // The README's contract: default limit 100, applied after filtering.
+    let mut filter = SpanFilter {
+        limit: Some(100),
+        ..SpanFilter::default()
+    };
     for pair in raw_query.split('&').filter(|pair| !pair.is_empty()) {
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
         let key = percent_decode(key);
         let value = percent_decode(value);
+        if let Some(attribute) = key.strip_prefix("attr.") {
+            // Bare values match string attributes; JSON literals match typed
+            // values — the documented attr.KEY semantics.
+            let parsed = serde_json::from_str::<Value>(&value)
+                .unwrap_or_else(|_| Value::String(value.clone()));
+            filter.attributes.push((attribute.to_owned(), parsed));
+            continue;
+        }
         match key.as_str() {
             "service" => filter.service = Some(value),
             "name" => filter.name = Some(value),
+            "min_duration_ms" => {
+                let ms: u64 = value.parse().map_err(|_| "invalid min_duration_ms")?;
+                filter.min_duration_ns = Some(ms.saturating_mul(1_000_000));
+            }
             "min_duration_ns" => {
                 filter.min_duration_ns =
                     Some(value.parse().map_err(|_| "invalid min_duration_ns")?);
             }
-            "since_ns" => {
-                filter.since_ns = Some(value.parse().map_err(|_| "invalid since_ns")?);
+            "since" | "since_ns" => {
+                filter.since_ns = Some(value.parse().map_err(|_| "invalid since")?);
             }
-            "until_ns" => {
-                filter.until_ns = Some(value.parse().map_err(|_| "invalid until_ns")?);
+            "until" | "until_ns" => {
+                filter.until_ns = Some(value.parse().map_err(|_| "invalid until")?);
             }
             "limit" => {
                 filter.limit = Some(value.parse().map_err(|_| "invalid limit")?);
