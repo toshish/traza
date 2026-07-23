@@ -230,11 +230,23 @@ fn handle_connection(
             for (index, raw) in raw_spans.into_iter().enumerate() {
                 match serde_json::from_value::<Span>(raw) {
                     Ok(span) => {
+                        // Both halves of the (trace_id, span_id) primary key
+                        // must be non-empty: an empty span_id would make every
+                        // such span in a trace one colliding key, silently
+                        // upserted over each other while the response counts
+                        // them all as accepted.
                         if span.trace_id.is_empty() {
                             return respond(
                                 &mut stream,
                                 400,
                                 json!({"error": format!("span {index}: trace_id is empty")}),
+                            );
+                        }
+                        if span.span_id.is_empty() {
+                            return respond(
+                                &mut stream,
+                                400,
+                                json!({"error": format!("span {index}: span_id is empty")}),
                             );
                         }
                         spans.push(span);
