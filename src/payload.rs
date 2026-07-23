@@ -197,9 +197,17 @@ fn offload_map(
     Ok(())
 }
 
-/// Deletes payload files whose modification time is older than the cutoff;
-/// the TTL compactor's sweep. Returns the number of files removed.
-pub(crate) fn sweep_expired(directory: &Path, cutoff: std::time::SystemTime) -> Result<usize> {
+/// Deletes payload files that are BOTH older than the cutoff and no longer
+/// referenced by any live span. Age alone is not grounds for deletion:
+/// content addressing means a fresh span can re-reference an old file
+/// (identical content dedupes to one path without refreshing its mtime),
+/// and deleting by mtime alone destroyed exactly that live data (found in
+/// review, reproduced). Returns the number of files removed.
+pub(crate) fn sweep_expired(
+    directory: &Path,
+    cutoff: std::time::SystemTime,
+    live: &std::collections::HashSet<String>,
+) -> Result<usize> {
     let root = directory.join(PAYLOAD_DIR);
     if !root.exists() {
         return Ok(0);
@@ -214,7 +222,13 @@ pub(crate) fn sweep_expired(directory: &Path, cutoff: std::time::SystemTime) -> 
             let entry = entry?;
             let metadata = entry.metadata()?;
             let modified = metadata.modified().unwrap_or(cutoff);
-            if modified < cutoff {
+            let reference = entry
+                .path()
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(|hash| format!("sha256/{hash}"))
+                .unwrap_or_default();
+            if modified < cutoff && !live.contains(&reference) {
                 fs::remove_file(entry.path())?;
                 removed += 1;
             }

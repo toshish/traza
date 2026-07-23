@@ -880,7 +880,10 @@ impl Store {
         // lingers at most one TTL past its span).
         self.annotations.drop_older_than(cutoff_ns)?;
         let cutoff_time = UNIX_EPOCH + std::time::Duration::from_nanos(cutoff_ns);
-        payload::sweep_expired(&self.directory, cutoff_time)?;
+        // Live references computed AFTER span expiry, so payloads referenced
+        // only by just-expired spans become sweepable.
+        let live_refs = self.live_payload_refs()?;
+        payload::sweep_expired(&self.directory, cutoff_time, &live_refs)?;
         Ok(removed)
     }
 
