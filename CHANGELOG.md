@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `docs/ha-design.md`: the high-availability design document — four
+  compared architectures with a quorum-replicated logical-log
+  recommendation (segment shipping retained for catch-up), grounded in
+  the real engine mechanisms (`WriteBuffer` acknowledgment boundary,
+  `segment_v2` snapshot transfer, replicated supersede-journal
+  transitions, `(trace_id, span_id)` idempotency, `DirectoryLock`
+  scope). Design only; no HA behavior is implemented.
+
 ## [0.9.0] - 2026-07-23
 
 ### Added

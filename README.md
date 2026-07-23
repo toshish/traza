@@ -232,7 +232,10 @@ All of these are on the roadmap, not swept under it.
 
 - **Streaming results** — chunked HTTP responses for very large result sets.
 - **Filter throughput at scale** — posting-list intersection and parse-avoidance for large unlimited result sets (limited queries already decode only what they return).
-- **High availability** — replication and failover beyond a single node.
+- **High availability** — replication and failover beyond a single node; the
+  decision-ready design is in [docs/ha-design.md](docs/ha-design.md)
+  (quorum-replicated logical log recommended, with segment shipping for
+  catch-up), implementation not yet scheduled.
 
 ## Contributing
 
