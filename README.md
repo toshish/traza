@@ -92,6 +92,7 @@ curl http://localhost:8080/v1/stats
 | Method | Path | Purpose |
 |---|---|---|
 | `POST` | `/v1/spans` | Ingest a JSON batch of spans; responds `{"accepted": N}` |
+| `POST` | `/v1/traces` | OTLP/HTTP JSON: an OpenTelemetry ExportTraceServiceRequest, mapped onto the span model (`service.name` -> service, typed attributes flattened, string-encoded nanos accepted) |
 | `GET` | `/v1/traces/{trace_id}` | All spans of one trace, sorted by start time; `404` if unknown |
 | `GET` | `/v1/spans?...` | Filtered span search |
 | `GET` | `/v1/stats` | Span count, segment count, bytes on disk |
@@ -170,7 +171,7 @@ Traza is a v0.1 project and says so plainly:
 
 - **Single-node.** One writer process per data directory; no replication, clustering, or failover yet.
 - **No authentication.** No auth, authorization, or TLS — run it on a trusted network or behind a reverse proxy that terminates TLS and enforces access.
-- **JSON-only.** No OTLP endpoint yet; ingestion is the JSON HTTP API described above.
+- **OTLP is JSON-only.** `POST /v1/traces` accepts OTLP/HTTP JSON; protobuf and gRPC OTLP are not supported.
 - **Durability boundary.** Durability begins at segment flush: a crash loses at most the engine's unflushed write buffer (bounded by `--flush-spans`), never a completed flush. `POST /v1/flush` narrows the window on demand; per-request fsync is deliberately not offered yet.
 - **RAM is O(indexes).** Segments are file-backed: only the parsed indexes stay resident, and record payloads are read on demand — measured 0.71 GB peak server RSS over a 10M-span (2.4 GB on disk) corpus. Stores larger than RAM serve correctly; disk latency applies to cold reads.
 - **Minimal HTTP.** `Connection: close` per request, no keep-alive, no TLS, 64 MiB body cap.
@@ -184,7 +185,6 @@ All of these are on the roadmap, not swept under it.
 
 - **Streaming results** — chunked HTTP responses for very large result sets.
 - **Filter throughput at scale** — posting-list intersection and parse-avoidance for large unlimited result sets (limited queries already decode only what they return).
-- **OTLP ingest** — accept OpenTelemetry OTLP alongside the JSON API.
 - **LLM-observability semantics** — first-class conventions for prompts, completions, token usage, and tool calls.
 - **Auth** — token authentication and per-token authorization.
 - **High availability** — replication and failover beyond a single node.

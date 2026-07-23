@@ -7,6 +7,7 @@
 //! segment files. Reads combine the buffered and persisted data.
 
 pub mod expiration;
+pub mod otlp;
 pub mod segment_v2;
 
 use serde::{Deserialize, Serialize};

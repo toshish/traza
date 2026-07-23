@@ -15,6 +15,7 @@
 //!   responds with the matching spans ordered by start time.
 //! - `GET /v1/stats` responds with engine statistics.
 //! - `POST /v1/flush` forces buffered spans into a durable segment.
+//! - `POST /v1/traces` accepts an OTLP/HTTP JSON ExportTraceServiceRequest.
 
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -203,6 +204,26 @@ fn handle_connection(mut stream: TcpStream, engine: &Store) -> io::Result<()> {
             let accepted = spans.len();
             match engine.ingest_batch(spans) {
                 Ok(()) => respond(&mut stream, 200, json!({"accepted": accepted})),
+                Err(error) => respond(&mut stream, 503, json!({"error": error.to_string()})),
+            }
+        }
+        ("POST", "/v1/traces") => {
+            // OTLP/HTTP JSON: an ExportTraceServiceRequest mapped onto the
+            // span model (docs: leg-2 spec / README).
+            let value: Value = match serde_json::from_slice(&request.body) {
+                Ok(value) => value,
+                Err(error) => {
+                    return respond(&mut stream, 400, json!({"error": error.to_string()}));
+                }
+            };
+            let spans = match traza::otlp::spans_from_request(&value) {
+                Ok(spans) => spans,
+                Err(error) => {
+                    return respond(&mut stream, 400, json!({"error": error.to_string()}));
+                }
+            };
+            match engine.ingest_batch(spans) {
+                Ok(()) => respond(&mut stream, 200, json!({"partialSuccess": {}})),
                 Err(error) => respond(&mut stream, 503, json!({"error": error.to_string()})),
             }
         }

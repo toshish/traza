@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-23
+
+### Added
+- **Roadmap leg 2 — OTLP/HTTP JSON ingest.** `POST /v1/traces` accepts an
+  OpenTelemetry ExportTraceServiceRequest in OTLP/HTTP JSON and maps it
+  onto the span model: hex ids lowercased, `*TimeUnixNano` accepted as
+  string or number, typed `AnyValue` attributes (string/int/double/bool/
+  array/kvlist) flattened to plain JSON, resource `service.name` becoming
+  the span's service (`unknown_service` fallback), scope attributes
+  merging beneath span attributes, events mapped, and OTLP status codes
+  becoming `ok`/`error`/empty. Structurally invalid requests 400 with a
+  diagnostic; the existing `/v1/spans` contract is untouched. No new
+  dependencies. Conformance-tested end to end against the real binary,
+  including index-served queries over OTLP-ingested spans.
+
 ## [0.5.0] - 2026-07-23
 
 ### Changed
