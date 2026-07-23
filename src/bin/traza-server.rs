@@ -300,12 +300,23 @@ fn handle_connection(
             }
         }
         ("POST", "/v1/traces") => {
-            // OTLP/HTTP JSON: an ExportTraceServiceRequest mapped onto the
-            // span model (docs: leg-2 spec / README).
-            let value: Value = match serde_json::from_slice(&request.body) {
-                Ok(value) => value,
-                Err(error) => {
-                    return respond(&mut stream, 400, json!({"error": error.to_string()}));
+            // OTLP/HTTP: an ExportTraceServiceRequest, binary protobuf or
+            // JSON by Content-Type. The protobuf decoder lowers to the JSON
+            // shape, so both encodings share one mapping (docs: README).
+            let is_protobuf = request.content_type.starts_with("application/x-protobuf");
+            let value: Value = if is_protobuf {
+                match traza::otlp_pb::traces_request_to_json(&request.body) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return respond(&mut stream, 400, json!({"error": error.to_string()}));
+                    }
+                }
+            } else {
+                match serde_json::from_slice(&request.body) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return respond(&mut stream, 400, json!({"error": error.to_string()}));
+                    }
                 }
             };
             let spans = match traza::otlp::spans_from_request(&value) {
@@ -315,6 +326,14 @@ fn handle_connection(
                 }
             };
             match engine.ingest_batch(spans) {
+                Ok(()) if is_protobuf => {
+                    // An empty ExportTraceServiceResponse is zero protobuf
+                    // bytes; protobuf clients expect the matching media type.
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/x-protobuf\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                }
                 Ok(()) => respond(&mut stream, 200, json!({"partialSuccess": {}})),
                 Err(error) => respond(&mut stream, 503, json!({"error": error.to_string()})),
             }
@@ -521,6 +540,7 @@ fn filter_from_query(raw_query: &str) -> Result<SpanFilter, String> {
 struct Request {
     method: String,
     target: String,
+    content_type: String,
     body: Vec<u8>,
 }
 
@@ -531,6 +551,7 @@ struct RequestHead {
     method: String,
     target: String,
     authorization: Option<String>,
+    content_type: String,
     content_length: usize,
     /// Bytes read so far (headers plus any body prefix that arrived with them).
     buffered: Vec<u8>,
@@ -583,11 +604,15 @@ fn read_head(stream: &mut TcpStream) -> io::Result<RequestHead> {
         ));
     }
     let mut authorization = None;
+    let mut content_type = String::new();
     let mut header_lines: Vec<&str> = Vec::new();
     for line in lines {
         if let Some((name, value)) = line.split_once(':') {
             if name.eq_ignore_ascii_case("authorization") {
                 authorization = Some(value.trim().to_owned());
+            }
+            if name.eq_ignore_ascii_case("content-type") {
+                content_type = value.trim().to_ascii_lowercase();
             }
         }
         header_lines.push(line);
@@ -610,6 +635,7 @@ fn read_head(stream: &mut TcpStream) -> io::Result<RequestHead> {
         method,
         target,
         authorization,
+        content_type,
         content_length,
         buffered: bytes,
         header_end,
@@ -620,6 +646,7 @@ fn read_body(stream: &mut TcpStream, head: RequestHead) -> io::Result<Request> {
     let RequestHead {
         method,
         target,
+        content_type,
         content_length,
         mut buffered,
         header_end,
@@ -639,6 +666,7 @@ fn read_body(stream: &mut TcpStream, head: RequestHead) -> io::Result<Request> {
     Ok(Request {
         method,
         target,
+        content_type,
         body: buffered[header_end..header_end + content_length].to_vec(),
     })
 }

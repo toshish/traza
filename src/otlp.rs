@@ -7,7 +7,7 @@
 //! to plain JSON, the resource attribute `service.name` becoming the span's
 //! service, and scope attributes merging beneath span attributes.
 
-use crate::{Event, Span};
+use crate::{Event, Link, Span};
 use serde_json::{Map, Value};
 
 /// A structural problem in an OTLP request body.
@@ -109,6 +109,28 @@ fn map_span(
         })
         .transpose()?
         .unwrap_or_default();
+    // Links carry the non-tree structure (fan-out/fan-in, retries); a link
+    // with an empty id pair is meaningless and dropped rather than fatal.
+    let links = otlp
+        .get("links")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|entry| {
+                    Ok(Link {
+                        trace_id: hex_id(entry.get("traceId"), "link traceId")?,
+                        span_id: hex_id(entry.get("spanId"), "link spanId")?,
+                        attributes: attribute_map(entry.get("attributes")),
+                    })
+                })
+                .collect::<Result<Vec<_>, OtlpError>>()
+        })
+        .transpose()?
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|link: &Link| !link.trace_id.is_empty() && !link.span_id.is_empty())
+        .collect();
     Ok(Span {
         trace_id,
         span_id,
@@ -124,6 +146,7 @@ fn map_span(
         service: service.to_owned(),
         attributes,
         events,
+        links,
         extra: Map::new(),
     })
 }

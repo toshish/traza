@@ -95,7 +95,7 @@ curl http://localhost:8080/v1/stats
 | Method | Path | Purpose |
 |---|---|---|
 | `POST` | `/v1/spans` | Ingest a JSON batch of spans; responds `{"accepted": N}` |
-| `POST` | `/v1/traces` | OTLP/HTTP JSON: an OpenTelemetry ExportTraceServiceRequest, mapped onto the span model (`service.name` -> service, typed attributes flattened, string-encoded nanos accepted) |
+| `POST` | `/v1/traces` | OTLP/HTTP: an OpenTelemetry ExportTraceServiceRequest as binary protobuf (`Content-Type: application/x-protobuf`) or JSON, mapped onto the span model (`service.name` -> service, typed attributes flattened, span links preserved). Point an SDK at it with `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf` and `OTEL_EXPORTER_OTLP_ENDPOINT=http://host:port` (gRPC is not served; compression must be off) |
 | `GET` | `/v1/traces/{trace_id}` | All spans of one trace, sorted by start time; `404` if unknown |
 | `GET` | `/v1/spans?...` | Filtered span search |
 | `GET` | `/v1/stats` | Span count, segment count, bytes on disk |
