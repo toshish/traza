@@ -6,16 +6,16 @@ These values were measured by `cargo run --release --bin bench`; they are not es
 
 | Metric | Measured | Target | Result |
 |---|---:|---:|---|
-| Sustained batched HTTP ingest | 5450 spans/s | >= 50,000 spans/s | MISS |
-| Trace-by-id p95 | 16.146 ms | < 50 ms | PASS |
-| Attribute-filtered query p95 | 72.361 ms | < 300 ms | PASS |
+| Sustained batched HTTP ingest | 138180 spans/s | >= 50,000 spans/s | PASS |
+| Trace-by-id p95 | 17.280 ms | < 50 ms | PASS |
+| Attribute-filtered query p95 | 71.120 ms | < 300 ms | PASS |
 
 Additional percentiles:
 
 | Query | p50 | p95 | p99 | samples |
 |---|---:|---:|---:|---:|
-| Trace by ID | 13.859 ms | 16.146 ms | 19.990 ms | 200 |
-| Attribute filter | 68.103 ms | 72.361 ms | 76.230 ms | 100 |
+| Trace by ID | 14.212 ms | 17.280 ms | 26.443 ms | 200 |
+| Attribute filter | 66.530 ms | 71.120 ms | 71.765 ms | 100 |
 
 ## Methodology
 
@@ -24,11 +24,11 @@ Additional percentiles:
 - Trace sampling: 200 deterministic trace IDs spread through the corpus; each response is parsed and checked for 10 spans.
 - Filter sampling: 100 deterministic `attr.benchmark.group` queries with `limit=100`; each response body is parsed as JSON.
 - Percentiles: nearest-rank selection over complete request wall-clock durations measured with `std::time::Instant`; no warm-up samples are discarded.
-- Build: Cargo release profile. Timestamp: Unix 1784789012.
+- Build: Cargo release profile. Timestamp: Unix 1784789449.
 - Machine context: macos/aarch64, 10 available hardware threads.
 - Final server stats: `{"buffered_spans":0,"bytes_on_disk":337068707,"persisted_spans":1000000,"segment_count":100,"span_count":1000000,"total_spans":1000000}`.
 
-The ingest threshold is MISS. The trace p95 threshold is PASS. The filtered-query p95 threshold is PASS. Any miss remains visible in the table rather than being substituted or estimated.
+The ingest threshold is PASS. The trace p95 threshold is PASS. The filtered-query p95 threshold is PASS. Any miss remains visible in the table rather than being substituted or estimated.
 
 ## Verification Notes
 

@@ -34,11 +34,11 @@ Measured by `cargo run --release --bin bench` against a 1,000,000-span corpus (1
 
 | Metric | Measured | Target | Result |
 |---|---:|---:|---|
-| Sustained batched HTTP ingest | 5,450 spans/s | >= 50,000 spans/s | MISS |
-| Trace-by-id p95 | 16.1 ms | < 50 ms | PASS |
-| Attribute-filtered query p95 | 72.4 ms | < 300 ms | PASS |
+| Sustained batched HTTP ingest | 138,180 spans/s | >= 50,000 spans/s | PASS |
+| Trace-by-id p95 | 17.3 ms | < 50 ms | PASS |
+| Attribute-filtered query p95 | 71.1 ms | < 300 ms | PASS |
 
-**What these figures measure:** the CURRENT engine-backed path — every ingest goes through the engine's write buffer, sorting, and segment machinery, and every query linearly scans memory-resident segments. The ingest target is honestly MISSED today: the engine does far more per write than the retired log did, and closing that gap (batched lock scope, on-disk indexes, streaming reads) is the top of the roadmap, with these same measured gates as the bar. The ingest rate is timed over the full loop — client-side JSON serialization and loopback HTTP overhead included. Full percentiles and methodology live in [BENCHMARKS.md](BENCHMARKS.md). Results are machine-specific; run the benchmark yourself (see below) rather than treating these as guarantees.
+**What these figures measure:** the CURRENT engine-backed path — every ingest goes through the engine's write buffer, sorting, and segment machinery, and every query linearly scans memory-resident segments. Query latencies are linear in stored spans until on-disk indexes land (top of the roadmap), with these same measured gates as the bar. The ingest rate is timed over the full loop — client-side JSON serialization and loopback HTTP overhead included. Full percentiles and methodology live in [BENCHMARKS.md](BENCHMARKS.md). Results are machine-specific; run the benchmark yourself (see below) rather than treating these as guarantees.
 
 ## Quickstart
 

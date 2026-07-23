@@ -644,11 +644,18 @@ impl Store {
         let write_result = (|| {
             let mut options = OpenOptions::new();
             options.write(true).create_new(true);
-            let mut file = options.open(&temp_path)?;
+            let file = options.open(&temp_path)?;
+            // Buffer the serialization: serde emits one write per JSON token,
+            // and token-sized write() syscalls against a raw File made flush
+            // cost ~140us PER SPAN — the entire measured ingest bottleneck
+            // (5,450 spans/s end to end). One syscall per 256 KiB instead.
+            let mut writer = io::BufWriter::with_capacity(256 * 1024, file);
             for span in spans {
-                serde_json::to_writer(&mut file, span)?;
-                file.write_all(b"\n")?;
+                serde_json::to_writer(&mut writer, span)?;
+                writer.write_all(b"\n")?;
             }
+            writer.flush()?;
+            let file = writer.into_inner().map_err(|error| error.into_error())?;
             file.sync_all()?;
             fs::rename(&temp_path, &final_path)?;
             sync_directory(&self.directory)?;

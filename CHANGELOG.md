@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-07-22
+
+### Fixed
+- Segment writes are buffered. `serde_json::to_writer` against a raw `File`
+  issued one write() syscall per JSON token, making flush cost ~140 us per
+  span and capping measured end-to-end ingest at 5,450 spans/s. A 256 KiB
+  `BufWriter` restores flush to ~1.5 us per span; the regenerated benchmark
+  measures 138,180 spans/s and the ingest gate passes again.
+
 ## [0.2.2] - 2026-07-22
 
 ### Fixed
