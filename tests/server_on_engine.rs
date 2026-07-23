@@ -83,7 +83,16 @@ impl Server {
 
     /// SIGKILL — deliberately ungraceful, so restart tests also prove the
     /// engine's stale-lock recovery instead of relying on clean shutdown.
-    fn kill(mut self) {
+    fn kill(self) {
+        drop(self);
+    }
+}
+
+// A panicking test must never leak its server child: cargo waits on the
+// child's inherited pipes, hanging the whole test binary long after the
+// failure it should be reporting.
+impl Drop for Server {
+    fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }

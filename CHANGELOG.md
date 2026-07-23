@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-07-23
+
+### Security / Hardening
+
+- The engine itself now rejects spans with an empty `trace_id` or
+  `span_id` (`Error::InvalidSpan`) — the primary-key invariant no
+  longer depends on each HTTP surface validating correctly, and a
+  batch with any invalid span stores nothing.
+- Socket read/write deadline (30s, `TRAZA_SOCKET_TIMEOUT_MS` to
+  override): a peer that connects and goes silent — or declares a
+  body it never sends — is released instead of parking a worker
+  thread forever.
+- Request headers are capped at 64 KiB (bodies keep the 64 MiB cap).
+  Previously a request could spend the full body budget on headers,
+  doubling the per-request memory ceiling.
+- With auth enabled, requests are refused from the head alone:
+  an unauthenticated client can no longer make the server buffer a
+  declared 64 MiB body before hearing 401.
+
+### Added
+
+- `tests/ingest_hardening.rs`: adversarial wire probes — lying
+  content-length, oversized headers, silent peers, pre-auth body
+  refusal, malformed OTLP shapes, query-parameter extremes, inverted
+  timestamps, hostile ids (NUL-prefixed / unicode) round-tripping
+  through flush and reopen, and the documented last-write-wins
+  semantics for duplicate keys within one batch.
+- Test harnesses kill their spawned server on every exit path
+  (`Drop`), so a failing test reports instead of hanging `cargo test`
+  on the leaked child's pipes.
+
 ## [0.9.1] - 2026-07-23
 
 ### Fixed
