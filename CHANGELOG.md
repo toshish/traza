@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-07-23
+
+### Fixed
+
+- `POST /v1/spans` now rejects spans with an empty `span_id` (400,
+  naming the span index), matching the existing empty-`trace_id`
+  rejection. Both halves of the `(trace_id, span_id)` primary key must
+  be non-empty: previously two distinct spans with empty `span_id`
+  were both counted in `{"accepted": N}` while the upsert silently
+  collapsed them into one stored span. The OTLP endpoint already
+  rejected empty ids; the native endpoint now agrees. Rejection is
+  atomic — nothing from a rejected batch is stored.
+
 ### Added
 
 - `docs/ha-design.md`: the high-availability design document — four

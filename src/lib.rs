@@ -49,9 +49,13 @@ pub struct Event {
 /// A single tracing span.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Span {
-    /// Identifier shared by every span in a trace.
+    /// Identifier shared by every span in a trace. Must be non-empty: it is
+    /// half of the (trace_id, span_id) primary key, and both HTTP ingest
+    /// surfaces reject spans with an empty id.
     pub trace_id: String,
-    /// Identifier unique to this span within its trace.
+    /// Identifier unique to this span within its trace. Must be non-empty
+    /// (the other half of the primary key): distinct spans sharing an empty
+    /// span_id would collide into one upserted key.
     pub span_id: String,
     /// Identifier of the parent span, if this is not a root span.
     #[serde(default)]

@@ -289,6 +289,29 @@ fn server_invalid_write_preserves_error_contract() {
         "diagnostic must identify the empty trace id: {body}"
     );
 
+    // An empty span id is rejected the same way: (trace_id, span_id) is the
+    // primary key, so two distinct spans with empty span_id are one colliding
+    // key — accepting them upserted the second over the first while the
+    // response counted both (found live: accepted:2, one span stored).
+    let (status, body) = server.request(
+        "POST",
+        "/v1/spans",
+        Some(&json!([
+            span_json("t-empty-sid", "", "svc", "first", 1),
+            span_json("t-empty-sid", "", "svc", "second", 2),
+        ])),
+    );
+    assert_eq!(status, 400);
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("span 0: span_id is empty")),
+        "diagnostic must identify the empty span id: {body}"
+    );
+    // The rejection is atomic: nothing from the batch was stored.
+    let (status, _) = server.request("GET", "/v1/traces/t-empty-sid", None);
+    assert_eq!(status, 404);
+
     // The rejections must not have corrupted the server: a valid write and
     // read still succeed afterwards.
     let (status, _) = server.request(
