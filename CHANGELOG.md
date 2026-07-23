@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.2] - 2026-07-23
+
+### Fixed
+
+- **Payload TTL race** (found in review): compaction snapshotted live
+  references, released the locks, then swept — an ingest committing a
+  new reference to an old deduped file inside that window authorized
+  its deletion. The store is single-process (DirectoryLock), so an
+  in-memory touch registry now records every payload write/dedup
+  BEFORE filesystem work; the sweep spares anything touched within a
+  10-minute immunity window in addition to the live-reference set.
+- **Concurrent identical-payload ingest** (found in review, reproduced
+  as 9 successes + one ENOENT): all writers shared one `<hash>.tmp`
+  path, truncating each other's temp and racing the rename. Temps are
+  now writer-unique; every rename is valid, and identical content
+  makes the last rename byte-identical anyway.
+- **Export truly streams** (found in review): `GET /v1/export`
+  materialized the complete query result plus a complete NDJSON
+  buffer, defeating the larger-than-RAM design. It now streams
+  close-delimited (no Content-Length) in bounded pages keyed by the
+  query's total sort order, holding no engine lock across socket
+  writes; equal-timestamp runs wider than a page grow the page until
+  the cursor can cross them.
+
 ## [0.12.1] - 2026-07-23
 
 ### Fixed
