@@ -38,6 +38,8 @@
   form#filters { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin-bottom: 10px; }
   form#filters input { width: 100%; padding: 5px 7px; border: 1px solid var(--line);
                        border-radius: 6px; background: var(--bg); color: var(--ink); font-size: 12px; }
+  .inline-btn { float: right; font-size: 12px; padding: 3px 10px; border: 1px solid var(--line);
+    border-radius: 6px; background: transparent; color: inherit; cursor: pointer; }
   form#filters button { grid-column: span 3; padding: 6px; border: 0; border-radius: 6px;
                         background: var(--accent); color: var(--accent-ink); font-weight: 600; cursor: pointer; }
   table { width: 100%; border-collapse: collapse; font-size: 12px; }
@@ -78,6 +80,14 @@
   <button id="token-btn" type="button">Set token</button>
 </header>
 <main>
+  <section>
+    <h2>Sessions <button id="sessions-refresh" type="button" class="inline-btn">Refresh</button></h2>
+    <table>
+      <thead><tr><th>session</th><th>traces</th><th>spans</th><th>LLM calls</th><th>tokens</th><th>cost&nbsp;USD</th><th>errors</th></tr></thead>
+      <tbody id="session-rows"></tbody>
+    </table>
+    <div id="session-empty" class="empty" hidden>No sessions (spans carrying a session.id attribute appear here).</div>
+  </section>
   <section>
     <h2>Recent spans</h2>
     <form id="filters">
@@ -252,11 +262,48 @@ function showDetail(span) {
   body.innerHTML = html;
 }
 
+/* ---- sessions ---- */
+async function loadSessions() {
+  let payload;
+  try {
+    payload = await api("/v1/sessions?limit=50");
+  } catch (error) {
+    statusEl.textContent = String(error.message || error);
+    return;
+  }
+  const sessions = payload.sessions || [];
+  const rows = document.getElementById("session-rows");
+  rows.replaceChildren();
+  document.getElementById("session-empty").hidden = sessions.length > 0;
+  for (const s of sessions) {
+    const tr = document.createElement("tr");
+    tr.className = "span-row";
+    tr.innerHTML =
+      '<td class="mono">' + esc(s.session_id) + "</td>" +
+      "<td>" + s.trace_count + "</td>" +
+      "<td>" + s.span_count + "</td>" +
+      "<td>" + s.llm_calls + "</td>" +
+      "<td>" + s.total_tokens + "</td>" +
+      "<td>" + s.cost_usd.toFixed(4) + "</td>" +
+      '<td class="' + (s.error_count ? "status-error" : "") + '">' + s.error_count + "</td>";
+    tr.addEventListener("click", () => {
+      // Reuse the span search: filter the table to this session's spans.
+      document.getElementById("f-attr-key").value = "session.id";
+      document.getElementById("f-attr-value").value = s.session_id;
+      searchSpans();
+    });
+    rows.appendChild(tr);
+  }
+}
+
 document.getElementById("filters").addEventListener("submit", searchSpans);
 document.getElementById("token-btn").addEventListener("click", () => {
   askForToken();
+  loadSessions();
   searchSpans();
 });
+document.getElementById("sessions-refresh").addEventListener("click", loadSessions);
+loadSessions();
 searchSpans();
 </script>
 </body>
