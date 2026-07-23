@@ -705,42 +705,113 @@ fn ttl_zero_disables_expiration() {
 }
 
 #[test]
-fn recovery_heals_crash_duplicated_segments() {
-    // Simulate a crash between writing the compacted replacement segment and
-    // deleting its original: both files exist, holding the same surviving
-    // span. Reopen must return ONE copy and heal the extra file.
-    let dir = correctness_test_dir("dup-heal");
+fn supersede_journal_finishes_interrupted_rewrite() {
+    // Crash between the rewritten segment's rename and the original's delete:
+    // the journal marker lets recovery finish the delete — no content
+    // guessing involved.
+    let dir = correctness_test_dir("supersede-finish");
     let store = Store::open(&dir, Config::default()).expect("opens");
     store
-        .ingest(span("t-dup", "s1".to_owned(), 1_000, 10))
+        .ingest(span("t-sup", "s1".to_owned(), 1_000, 10))
         .expect("ingest");
     store.flush().expect("flush");
     drop(store);
 
-    let segment_path = std::fs::read_dir(&dir)
+    let original = std::fs::read_dir(&dir)
         .expect("dir")
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())
         .find(|path| {
-            path.extension().is_some_and(|ext| ext == "jsonl")
-                || path
-                    .file_name()
-                    .is_some_and(|n| n.to_string_lossy().contains("segment"))
+            path.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with("segment-"))
         })
-        .expect("one segment file exists");
-    // A real crash duplicate is the compaction's REWRITTEN segment: a valid
-    // next-numbered segment name the loader will pick up.
-    let duplicate = segment_path.with_file_name("segment-00000000000000000099.seg");
-    std::fs::copy(&segment_path, &duplicate).expect("simulate crash duplicate");
+        .expect("segment exists");
+    let old_name = original.file_name().unwrap().to_string_lossy().into_owned();
+    let new_name = "segment-00000000000000000099.seg";
+    let replacement = original.with_file_name(new_name);
+    std::fs::copy(&original, &replacement).expect("replacement in place");
+    std::fs::write(
+        dir.join(format!(".supersede.{old_name}.{new_name}.journal")),
+        format!("{old_name} -> {new_name}\n"),
+    )
+    .expect("marker");
+
+    let store = Store::open(&dir, Config::default()).expect("recovers");
+    assert!(
+        !original.exists(),
+        "journal recovery must delete the superseded original"
+    );
+    assert_eq!(
+        store.get_trace("t-sup").expect("trace").len(),
+        1,
+        "exactly one copy served after recovery"
+    );
+}
+
+#[test]
+fn supersede_journal_without_replacement_keeps_original() {
+    // Crash before the replacement materialized: the original stays
+    // authoritative and the stale marker is cleared.
+    let dir = correctness_test_dir("supersede-abort");
+    let store = Store::open(&dir, Config::default()).expect("opens");
+    store
+        .ingest(span("t-abort", "s1".to_owned(), 1_000, 10))
+        .expect("ingest");
+    store.flush().expect("flush");
+    drop(store);
+
+    let original = std::fs::read_dir(&dir)
+        .expect("dir")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with("segment-"))
+        })
+        .expect("segment exists");
+    let old_name = original.file_name().unwrap().to_string_lossy().into_owned();
+    let marker = dir.join(format!(
+        ".supersede.{old_name}.segment-00000000000000000099.seg.journal"
+    ));
+    std::fs::write(
+        &marker,
+        format!("{old_name} -> segment-00000000000000000099.seg\n"),
+    )
+    .expect("marker");
+
+    let store = Store::open(&dir, Config::default()).expect("recovers");
+    assert!(
+        original.exists(),
+        "original must survive an aborted rewrite"
+    );
+    assert!(!marker.exists(), "stale marker must be cleared");
+    assert_eq!(store.get_trace("t-abort").expect("trace").len(), 1);
+}
+
+#[test]
+fn acknowledged_duplicate_cardinality_survives_restart() {
+    // At-least-once ingest semantics: a client retry that re-sends an
+    // identical span after an ack produces two acknowledged copies, and BOTH
+    // must survive restart. Content-based healing used to silently drop one
+    // (found in review).
+    let dir = correctness_test_dir("ack-dup-cardinality");
+    let store = Store::open(&dir, Config::default()).expect("opens");
+    let identical = span("t-ack", "same-span".to_owned(), 1_000, 10);
+    store.ingest(identical.clone()).expect("first ingest");
+    store.flush().expect("first flush");
+    store.ingest(identical.clone()).expect("retry ingest");
+    store
+        .flush()
+        .expect("second flush — an identical whole segment");
+    drop(store);
 
     let store = Store::open(&dir, Config::default()).expect("reopens");
-    let spans = store.get_trace("t-dup").expect("read");
-    assert_eq!(spans.len(), 1, "recovery must return one copy, not two");
-    drop(store);
-    assert!(
-        !duplicate.exists(),
-        "the fully-duplicate segment file must be healed away"
+    assert_eq!(
+        store.get_trace("t-ack").expect("trace").len(),
+        2,
+        "both acknowledged copies must survive restart"
     );
+    assert_eq!(store.stats().expect("stats").persisted_spans, 2);
 }
 
 #[test]
@@ -840,4 +911,98 @@ fn v1_jsonl_segments_load_and_serve() {
     let stats = store.stats().expect("stats");
     assert_eq!(stats.persisted_spans, 2);
     assert_eq!(stats.segment_count, 2);
+}
+
+#[test]
+fn flush_after_reopen_does_not_overwrite_segments() {
+    // Found in review, reproduced across restart: next-id computation only
+    // recognized .jsonl names, so a reopened v2-only store restarted
+    // numbering at zero and the next flush renamed over segment 0 —
+    // destroying persisted spans.
+    let dir = correctness_test_dir("reopen-no-overwrite");
+    let store = Store::open(&dir, Config::default()).expect("opens");
+    store
+        .ingest(span("t-first", "s1".to_owned(), 1_000, 10))
+        .expect("ingest");
+    store.flush().expect("flush");
+    drop(store);
+
+    let store = Store::open(&dir, Config::default()).expect("reopens");
+    store
+        .ingest(span("t-second", "s2".to_owned(), 2_000, 10))
+        .expect("ingest after reopen");
+    store.flush().expect("flush after reopen");
+    drop(store);
+
+    let store = Store::open(&dir, Config::default()).expect("reopens again");
+    assert_eq!(
+        store.get_trace("t-first").expect("first").len(),
+        1,
+        "pre-restart span survives"
+    );
+    assert_eq!(store.get_trace("t-second").expect("second").len(), 1);
+    assert_eq!(store.stats().expect("stats").segment_count, 2);
+}
+
+#[test]
+fn corrupt_v2_header_is_an_error_not_a_panic() {
+    let dir = correctness_test_dir("corrupt-header");
+    // A file with the right magic but a nonsense attribute-index offset used
+    // to panic through unsigned subtraction (found in review).
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"TRAZAV2\0");
+    bytes.extend_from_slice(&2u16.to_le_bytes());
+    bytes.extend_from_slice(&80u16.to_le_bytes());
+    bytes.extend_from_slice(&[0u8; 4]);
+    bytes.extend_from_slice(&1u64.to_le_bytes());
+    bytes.extend_from_slice(&80u64.to_le_bytes());
+    bytes.extend_from_slice(&8u64.to_le_bytes());
+    bytes.extend_from_slice(&88u64.to_le_bytes());
+    bytes.extend_from_slice(&8u64.to_le_bytes());
+    bytes.extend_from_slice(&96u64.to_le_bytes());
+    bytes.extend_from_slice(&8u64.to_le_bytes());
+    bytes.extend_from_slice(&u64::MAX.to_le_bytes()); // absurd attr offset
+    bytes.resize(200, 0);
+    std::fs::write(dir.join("segment-00000000000000000000.seg"), &bytes).expect("writes");
+    let result = Store::open(&dir, Config::default());
+    assert!(result.is_err(), "corrupt header must surface as an error");
+}
+
+#[test]
+fn nul_prefixed_attribute_cannot_poison_the_service_index() {
+    let dir = correctness_test_dir("index-poison");
+    let store = Store::open(&dir, Config::default()).expect("opens");
+    let mut poisoned = span("t-poison", "s1".to_owned(), 1_000, 10);
+    poisoned.attributes.insert(
+        "\u{0}service".to_owned(),
+        serde_json::Value::String("evil".to_owned()),
+    );
+    store.ingest(poisoned).expect("ingest");
+    store.flush().expect("flush");
+    drop(store);
+
+    let store = Store::open(&dir, Config::default()).expect("reopens");
+    let by_service = store
+        .query(&SpanFilter {
+            service: Some("test-service".into()),
+            ..SpanFilter::default()
+        })
+        .expect("service query");
+    assert_eq!(
+        by_service.len(),
+        1,
+        "real service query must not be poisoned"
+    );
+    // The hostile attribute is still stored verbatim and queryable via the
+    // (index-declining) scan path.
+    let by_attr = store
+        .query(&SpanFilter {
+            attributes: vec![(
+                "\u{0}service".to_owned(),
+                serde_json::Value::String("evil".to_owned()),
+            )],
+            ..SpanFilter::default()
+        })
+        .expect("hostile attr query");
+    assert_eq!(by_attr.len(), 1, "the attribute itself remains queryable");
 }

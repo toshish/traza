@@ -34,11 +34,11 @@ Measured by `cargo run --release --bin bench` against a 1,000,000-span corpus (1
 
 | Metric | Measured | Target | Result |
 |---|---:|---:|---|
-| Sustained batched HTTP ingest | 116,559 spans/s | >= 50,000 spans/s | PASS |
-| Trace-by-id p95 | 0.370 ms | < 50 ms | PASS |
-| Attribute-filtered query p95 | 19.6 ms | < 300 ms | PASS |
+| Sustained batched HTTP ingest | 114,924 spans/s | >= 50,000 spans/s | PASS |
+| Trace-by-id p95 | 0.333 ms | < 50 ms | PASS |
+| Attribute-filtered query p95 | 0.695 ms | < 300 ms | PASS |
 
-**What these figures measure:** the engine-backed path with format-v2 indexed segments — ingest passes through the write buffer and segment encoder, trace lookups binary-search each segment's embedded trace index, and filters narrow through the attribute indexes before re-verifying every predicate on parsed spans. At a 10M-span corpus (10x the canonical run), measured trace lookup stays at p50 0.5 ms while the attribute filter is p50 ~209 ms — index-served lookup is effectively scale-independent; large filter groups still pay per-candidate parsing, which is the next optimization. The ingest rate is timed over the full loop — client-side JSON serialization and loopback HTTP overhead included. Full percentiles and methodology live in [BENCHMARKS.md](BENCHMARKS.md). Results are machine-specific; run the benchmark yourself (see below) rather than treating these as guarantees.
+**What these figures measure:** the engine-backed path with format-v2 indexed segments — ingest passes through the write buffer and segment encoder, trace lookups binary-search each segment's embedded trace index, and filters merge undecoded index postings across segments in start-time order, decoding and re-verifying only the records a limited query actually returns. At a 10M-span corpus (10x the canonical run), measured trace lookup is p50 0.45 ms and the attribute filter p50 2.9 ms — both effectively scale-independent for limited queries. The ingest rate is timed over the full loop — client-side JSON serialization and loopback HTTP overhead included. Full percentiles and methodology live in [BENCHMARKS.md](BENCHMARKS.md). Results are machine-specific; run the benchmark yourself (see below) rather than treating these as guarantees.
 
 ## Quickstart
 
@@ -172,17 +172,18 @@ Traza is a v0.1 project and says so plainly:
 - **No authentication.** No auth, authorization, or TLS — run it on a trusted network or behind a reverse proxy that terminates TLS and enforces access.
 - **JSON-only.** No OTLP endpoint yet; ingestion is the JSON HTTP API described above.
 - **Durability boundary.** Durability begins at segment flush: a crash loses at most the engine's unflushed write buffer (bounded by `--flush-spans`), never a completed flush. `POST /v1/flush` narrows the window on demand; per-request fsync is deliberately not offered yet.
-- **Memory-resident reads.** The engine keeps segment contents memory-resident after open, so RAM grows with stored spans. On-disk index serving for larger-than-RAM datasets is on the roadmap.
+- **Bytes in RAM, not structs.** v2 segments are held as raw bytes plus their indexes (no materialized span structs), so RAM grows with stored bytes — roughly half the former cost. mmap-backed segments for genuinely larger-than-RAM datasets are on the roadmap.
 - **Minimal HTTP.** `Connection: close` per request, no keep-alive, no TLS, 64 MiB body cap.
 - **Exact-match filtering.** No full-text search, aggregations, or query language.
-- **Compaction crash-atomicity.** TTL compaction is atomic per segment file, not across the set: a crash mid-compaction can briefly duplicate a segment's surviving spans on disk. Recovery deduplicates on the next open; a manifest that closes the window entirely is on the roadmap.
+- **Compaction crash windows.** Every compaction rewrite is journaled with a supersede marker before it begins; recovery finishes an interrupted rewrite in whichever direction the crash left it, never guessing from content — legitimately re-ingested identical spans always keep their acknowledged cardinality.
 - **Unstable formats.** Segment and log layouts may change between 0.x versions.
 
 All of these are on the roadmap, not swept under it.
 
 ## Roadmap
 
-- **Query efficiency** — serve reads directly from the segment engine's on-disk indexes; larger-than-RAM datasets; streaming results.
+- **Larger-than-RAM datasets** — mmap-backed segment bytes and streaming results; today's embedded per-segment indexes already serve lookups without materializing spans.
+- **Filter throughput at scale** — posting-list intersection and parse-avoidance for large unlimited result sets (limited queries already decode only what they return).
 - **OTLP ingest** — accept OpenTelemetry OTLP alongside the JSON API.
 - **LLM-observability semantics** — first-class conventions for prompts, completions, token usage, and tool calls.
 - **Auth** — token authentication and per-token authorization.

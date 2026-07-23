@@ -214,11 +214,19 @@ fn canonical_value(value: &Value) -> String {
 
 fn span_to_record(span: &Span) -> Result<segment_v2::RecordInput> {
     let mut attributes = std::collections::BTreeMap::new();
+    // User attributes first, and NUL-prefixed user keys are never indexed:
+    // a user attribute literally named "\u{0}service" could otherwise
+    // overwrite the reserved service posting and turn real service queries
+    // into false negatives (found in review). The span itself still stores
+    // such attributes verbatim in the payload; only the INDEX ignores them,
+    // and the filter path declines index use for them symmetrically.
+    for (key, value) in &span.attributes {
+        if !key.starts_with('\u{0}') {
+            attributes.insert(key.clone(), canonical_value(value));
+        }
+    }
     attributes.insert(IDX_SERVICE.to_owned(), span.service.clone());
     attributes.insert(IDX_NAME.to_owned(), span.name.clone());
-    for (key, value) in &span.attributes {
-        attributes.insert(key.clone(), canonical_value(value));
-    }
     Ok(segment_v2::RecordInput::new(
         span.start_time_ns,
         span.trace_id.clone(),
@@ -290,7 +298,11 @@ impl Segment {
                         seg.query_attribute(IDX_NAME, name)
                             .map_err(segment_v2_error)?,
                     )
-                } else if let Some((key, value)) = filter.attributes.first() {
+                } else if let Some((key, value)) = filter
+                    .attributes
+                    .iter()
+                    .find(|(key, _)| !key.starts_with('\u{0}'))
+                {
                     Some(
                         seg.query_attribute(key, &canonical_value(value))
                             .map_err(segment_v2_error)?,
@@ -511,48 +523,15 @@ impl Store {
 
         let opened = (|| {
             remove_orphan_temps(&directory)?;
+            // Interrupted compaction rewrites are finished from their
+            // supersede markers BEFORE loading: recovery follows the journal,
+            // never content — content-based duplicate healing silently
+            // destroyed legitimately re-ingested identical spans (found in
+            // review: acknowledged duplicate cardinality must survive
+            // restart).
+            recover_supersede_markers(&directory)?;
             let mut segments = load_segments(&directory)?;
             segments.sort_by(|left, right| left.path.cmp(&right.path));
-            // A crash between writing a compacted segment and deleting its
-            // original leaves the surviving spans in BOTH files. Recovery
-            // heals it here: exact duplicates (identical on every field) are
-            // dropped in path order, and a segment whose spans are all
-            // duplicates is deleted outright. Later compactions cannot be
-            // relied on for this — they only touch expired spans (found in
-            // review, with a reproducing crash simulation).
-            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-            let mut healed: Vec<Segment> = Vec::with_capacity(segments.len());
-            for segment in segments {
-                let spans = segment.spans_parsed()?;
-                let kept: Vec<Span> = spans
-                    .into_iter()
-                    .filter(|span| {
-                        serde_json::to_string(span)
-                            .map(|canonical| seen.insert(canonical))
-                            .unwrap_or(true)
-                    })
-                    .collect();
-                if kept.is_empty() {
-                    fs::remove_file(&segment.path)?;
-                } else if kept.len() == segment.span_count() {
-                    healed.push(segment);
-                } else {
-                    // Partial duplicates: v1 heals in memory (file untouched,
-                    // as before); an immutable v2 file is rewritten in place
-                    // under the same id via temp + fsync + rename.
-                    match segment.data {
-                        SegmentData::V1 { .. } => healed.push(Segment {
-                            path: segment.path,
-                            bytes: segment.bytes,
-                            data: SegmentData::V1 { spans: kept },
-                        }),
-                        SegmentData::V2 { .. } => {
-                            healed.push(rewrite_v2_in_place(&segment.path, &kept)?);
-                        }
-                    }
-                }
-            }
-            let segments = healed;
             let next_segment = segments
                 .iter()
                 .filter_map(|segment| segment_number(&segment.path))
@@ -644,6 +623,103 @@ impl Store {
         let segments = self.lock_segments()?;
         let mut result = Vec::new();
 
+        // Limited queries take the lazy path: per-source candidates stay
+        // UNDECODED (v2 posting/record offsets), a k-way merge pops them in
+        // start-time order, and only popped candidates are parsed and
+        // re-verified — a limit-100 query over 10M spans decodes ~100
+        // records instead of ~100,000 (measured: attribute filter p50 209 ms
+        // at 10M, dominated entirely by candidate parsing).
+        if let Some(limit) = filter.limit {
+            let mut buffered: Vec<Span> = writer
+                .iter()
+                .filter(|span| span_matches(span, filter))
+                .cloned()
+                .collect();
+            sort_spans(&mut buffered);
+
+            enum Source<'a> {
+                Parsed(Vec<Span>),
+                Lazy {
+                    seg: &'a segment_v2::Segment,
+                    offsets: Vec<u64>,
+                },
+            }
+            let mut sources: Vec<(Source<'_>, usize)> = vec![(Source::Parsed(buffered), 0)];
+            for segment in segments.iter() {
+                match &segment.data {
+                    SegmentData::V1 { spans } => {
+                        let mut matched: Vec<Span> = spans
+                            .iter()
+                            .filter(|span| span_matches(span, filter))
+                            .cloned()
+                            .collect();
+                        sort_spans(&mut matched);
+                        sources.push((Source::Parsed(matched), 0));
+                    }
+                    SegmentData::V2 { seg } => {
+                        let offsets = if let Some(service) = &filter.service {
+                            seg.attribute_posting_offsets(IDX_SERVICE, service)
+                        } else if let Some(name) = &filter.name {
+                            seg.attribute_posting_offsets(IDX_NAME, name)
+                        } else if let Some((key, value)) = filter
+                            .attributes
+                            .iter()
+                            .find(|(key, _)| !key.starts_with('\u{0}'))
+                        {
+                            seg.attribute_posting_offsets(key, &canonical_value(value))
+                        } else {
+                            seg.record_offsets().to_vec()
+                        };
+                        sources.push((Source::Lazy { seg, offsets }, 0));
+                    }
+                }
+            }
+
+            let peek = |source: &(Source<'_>, usize)| -> Result<Option<u64>> {
+                let (src, pos) = source;
+                match src {
+                    Source::Parsed(spans) => Ok(spans.get(*pos).map(|span| span.start_time_ns)),
+                    Source::Lazy { seg, offsets } => match offsets.get(*pos) {
+                        None => Ok(None),
+                        Some(offset) => {
+                            Ok(Some(seg.timestamp_at(*offset).map_err(segment_v2_error)?))
+                        }
+                    },
+                }
+            };
+
+            let mut result: Vec<Span> = Vec::with_capacity(limit.min(1024));
+            while result.len() < limit {
+                let mut best: Option<(usize, u64)> = None;
+                for (index, source) in sources.iter().enumerate() {
+                    if let Some(timestamp) = peek(source)? {
+                        if best.map_or(true, |(_, current)| timestamp < current) {
+                            best = Some((index, timestamp));
+                        }
+                    }
+                }
+                let Some((index, _)) = best else { break };
+                let (src, pos) = &mut sources[index];
+                match src {
+                    Source::Parsed(spans) => {
+                        result.push(spans[*pos].clone());
+                        *pos += 1;
+                    }
+                    Source::Lazy { seg, offsets } => {
+                        let record = seg
+                            .record_at_offset(offsets[*pos])
+                            .map_err(segment_v2_error)?;
+                        *pos += 1;
+                        let span = record_to_span(&record)?;
+                        if span_matches(&span, filter) {
+                            result.push(span);
+                        }
+                    }
+                }
+            }
+            return Ok(result);
+        }
+
         for span in writer.iter() {
             if span_matches(span, filter) {
                 result.push(span.clone());
@@ -654,9 +730,6 @@ impl Store {
         }
 
         sort_spans(&mut result);
-        if let Some(limit) = filter.limit {
-            result.truncate(limit);
-        }
         Ok(result)
     }
 
@@ -754,8 +827,18 @@ impl Store {
             let mut kept = kept;
             sort_spans(&mut kept);
             let id = self.next_segment.fetch_add(1, Ordering::Relaxed);
+            let old_name = segment
+                .path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let new_name = format!("{SEGMENT_PREFIX}{id:020}{SEGMENT_V2_SUFFIX}");
+            // Journal first: whichever side of the rewrite a crash lands on,
+            // recovery finishes it without content guessing.
+            let marker = write_supersede_marker(&self.directory, &old_name, &new_name)?;
             let new_segment = self.write_segment(id, &kept)?;
             fs::remove_file(&segment.path)?;
+            let _ = fs::remove_file(marker);
             replacement.push(new_segment);
         }
 
@@ -831,6 +914,15 @@ impl Store {
         let temp_path = self.directory.join(temp_name);
 
         let write_result = (|| {
+            if final_path.exists() {
+                return Err(Error::Io(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "segment id collision: {} already exists",
+                        final_path.display()
+                    ),
+                )));
+            }
             let records = spans
                 .iter()
                 .map(span_to_record)
@@ -859,45 +951,61 @@ impl Store {
     }
 }
 
-/// Rewrites a v2 segment file in place (same id) via temp + fsync + rename.
-fn rewrite_v2_in_place(path: &Path, spans: &[Span]) -> Result<Segment> {
-    let records = spans
-        .iter()
-        .map(span_to_record)
-        .collect::<Result<Vec<_>>>()?;
-    let encoded = segment_v2::encode(&records).map_err(segment_v2_error)?;
-    let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let file_name = path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let temp_path = path.with_file_name(format!(
-        ".{file_name}.{}.{}.tmp",
-        std::process::id(),
-        counter
-    ));
-    let write_result = (|| {
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        let mut file = options.open(&temp_path)?;
-        file.write_all(&encoded)?;
-        file.sync_all()?;
-        fs::rename(&temp_path, path)?;
-        if let Some(parent) = path.parent() {
-            sync_directory(parent)?;
+/// Compaction supersede journal: a marker recording that a rewritten segment
+/// replaces an original. Written BEFORE the replacement, deleted after the
+/// original is removed, so recovery can finish an interrupted rewrite in
+/// either direction without ever guessing from content — content-based
+/// duplicate healing silently destroyed legitimately re-ingested identical
+/// spans (found in review: acknowledged duplicate cardinality must survive
+/// restart).
+fn supersede_marker_path(directory: &Path, old_name: &str, new_name: &str) -> PathBuf {
+    directory.join(format!(".supersede.{old_name}.{new_name}.journal"))
+}
+
+fn write_supersede_marker(directory: &Path, old_name: &str, new_name: &str) -> Result<PathBuf> {
+    let path = supersede_marker_path(directory, old_name, new_name);
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    let mut file = options.open(&path)?;
+    writeln!(file, "{old_name} -> {new_name}")?;
+    file.sync_all()?;
+    sync_directory(directory)?;
+    Ok(path)
+}
+
+/// Finishes interrupted compaction rewrites recorded in supersede markers.
+///
+/// If the replacement exists and is complete, the original is deleted (the
+/// crash hit between replacement rename and original delete). If the
+/// replacement never materialized, nothing is deleted — the original remains
+/// authoritative. The marker is removed either way.
+fn recover_supersede_markers(directory: &Path) -> Result<()> {
+    let mut markers = Vec::new();
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
         }
-        let bytes = fs::metadata(path)?.len();
-        let seg = Box::new(segment_v2::Segment::from_bytes(encoded).map_err(segment_v2_error)?);
-        Ok(Segment {
-            path: path.to_path_buf(),
-            bytes,
-            data: SegmentData::V2 { seg },
-        })
-    })();
-    if write_result.is_err() {
-        let _ = fs::remove_file(&temp_path);
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with(".supersede.") && name.ends_with(".journal") {
+            markers.push(entry.path());
+        }
     }
-    write_result
+    for marker in markers {
+        let parsed = fs::read_to_string(&marker).unwrap_or_default();
+        if let Some((old_name, new_name)) = parsed.trim().split_once(" -> ") {
+            let old_path = directory.join(old_name);
+            let new_path = directory.join(new_name);
+            let replacement_ready = new_path.exists()
+                && (!new_name.ends_with(SEGMENT_V2_SUFFIX)
+                    || segment_v2::Segment::open(&new_path).is_ok());
+            if replacement_ready && old_path.exists() {
+                fs::remove_file(&old_path)?;
+            }
+        }
+        fs::remove_file(&marker)?;
+    }
+    Ok(())
 }
 
 fn sort_spans(spans: &mut [Span]) {
@@ -1016,9 +1124,14 @@ fn is_segment_file(path: &Path) -> bool {
 
 fn segment_number(path: &Path) -> Option<u64> {
     let name = path.file_name()?.to_str()?;
-    let number = name
-        .strip_prefix(SEGMENT_PREFIX)?
-        .strip_suffix(SEGMENT_SUFFIX)?;
+    // Both formats count: recognizing only .jsonl made a reopened v2-only
+    // store restart numbering at zero, and the next flush RENAMED OVER
+    // segment-…0000.seg — persisted spans destroyed (found in review,
+    // reproduced across restart).
+    let stem = name.strip_prefix(SEGMENT_PREFIX)?;
+    let number = stem
+        .strip_suffix(SEGMENT_SUFFIX)
+        .or_else(|| stem.strip_suffix(SEGMENT_V2_SUFFIX))?;
     number.parse().ok()
 }
 

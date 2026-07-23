@@ -6,16 +6,16 @@ These values were measured by `cargo run --release --bin bench`; they are not es
 
 | Metric | Measured | Target | Result |
 |---|---:|---:|---|
-| Sustained batched HTTP ingest | 116559 spans/s | >= 50,000 spans/s | PASS |
-| Trace-by-id p95 | 0.370 ms | < 50 ms | PASS |
-| Attribute-filtered query p95 | 19.584 ms | < 300 ms | PASS |
+| Sustained batched HTTP ingest | 114924 spans/s | >= 50,000 spans/s | PASS |
+| Trace-by-id p95 | 0.333 ms | < 50 ms | PASS |
+| Attribute-filtered query p95 | 0.695 ms | < 300 ms | PASS |
 
 Additional percentiles:
 
 | Query | p50 | p95 | p99 | samples |
 |---|---:|---:|---:|---:|
-| Trace by ID | 0.185 ms | 0.370 ms | 1.631 ms | 200 |
-| Attribute filter | 17.994 ms | 19.584 ms | 22.993 ms | 100 |
+| Trace by ID | 0.159 ms | 0.333 ms | 0.373 ms | 200 |
+| Attribute filter | 0.534 ms | 0.695 ms | 0.740 ms | 100 |
 
 ## Methodology
 
@@ -24,7 +24,7 @@ Additional percentiles:
 - Trace sampling: 200 deterministic trace IDs spread through the corpus; each response is parsed and checked for 10 spans.
 - Filter sampling: 100 deterministic `attr.benchmark.group` queries with `limit=100`; each response body is parsed as JSON.
 - Percentiles: nearest-rank selection over complete request wall-clock durations measured with `std::time::Instant`; no warm-up samples are discarded.
-- Build: Cargo release profile. Timestamp: Unix 1784794217.
+- Build: Cargo release profile. Timestamp: Unix 1784795212.
 - Machine context: macos/aarch64, 10 available hardware threads.
 - Final server stats: `{"buffered_spans":0,"bytes_on_disk":583182107,"persisted_spans":1000000,"segment_count":100,"span_count":1000000,"total_spans":1000000}`.
 

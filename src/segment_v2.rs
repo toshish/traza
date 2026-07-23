@@ -75,7 +75,9 @@ impl Header {
             trace_index_offset: read_u64(bytes, 56)?,
             trace_index_len: read_u64(bytes, 64)?,
             attribute_index_offset: read_u64(bytes, 72)?,
-            attribute_index_len: bytes.len() as u64 - read_u64(bytes, 72)?,
+            attribute_index_len: (bytes.len() as u64)
+                .checked_sub(read_u64(bytes, 72)?)
+                .ok_or(Error::Corrupt("attribute index offset beyond file"))?,
         };
         header.validate(bytes.len())?;
         Ok(header)
@@ -362,6 +364,50 @@ impl Segment {
         file.write_all(&self.bytes)?;
         file.sync_all()?;
         Ok(())
+    }
+
+    /// All record offsets in record (timestamp) order — the lazy full-scan
+    /// candidate list when no index applies.
+    pub fn record_offsets(&self) -> &[u64] {
+        &self.record_offsets
+    }
+
+    /// Raw posting offsets for one attribute key/value pair, in record
+    /// (timestamp) order — no records are decoded. The lazy query path pairs
+    /// this with [`Self::timestamp_at`] and [`Self::record_at_offset`] so a
+    /// limited query decodes only the records it returns.
+    pub fn attribute_posting_offsets(&self, key: &str, value: &str) -> Vec<u64> {
+        self.last_query_used_index.set(true);
+        self.attribute_index
+            .get(&(key.to_owned(), value.to_owned()))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Timestamp of the record at a posting offset without decoding it: the
+    /// timestamp is the record's first fixed field.
+    pub fn timestamp_at(&self, relative_offset: u64) -> Result<u64, Error> {
+        if relative_offset >= self.header.records_len {
+            return Err(Error::Corrupt("record offset is outside record region"));
+        }
+        let absolute = self
+            .header
+            .records_offset
+            .checked_add(relative_offset)
+            .ok_or(Error::Corrupt("record offset overflow"))? as usize;
+        let end = absolute
+            .checked_add(8)
+            .ok_or(Error::Corrupt("record offset overflow"))?;
+        let bytes = self
+            .bytes
+            .get(absolute..end)
+            .ok_or(Error::Corrupt("record timestamp out of bounds"))?;
+        Ok(u64::from_le_bytes(bytes.try_into().expect("8 bytes")))
+    }
+
+    /// Decodes exactly one record at a posting offset.
+    pub fn record_at_offset(&self, relative_offset: u64) -> Result<Record, Error> {
+        self.decode_at(relative_offset)
     }
 
     fn decode_postings(&self, postings: Option<&Vec<u64>>) -> Result<Vec<Record>, Error> {

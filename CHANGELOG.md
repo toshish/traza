@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-07-23
+
+### Fixed
+- **Data loss across restart**: next-segment numbering only recognized
+  `.jsonl` names, so a reopened v2-only store restarted at id zero and the
+  next flush renamed over an existing segment, destroying persisted spans.
+  Both suffixes count now, and `write_segment` refuses to replace an
+  existing file outright.
+- **Acknowledged duplicate cardinality survives restart**: content-based
+  duplicate healing is gone. Compaction rewrites are journaled with a
+  supersede marker written before the rewrite begins; recovery finishes an
+  interrupted rewrite from the journal in either direction and never
+  deduplicates by content, so legitimately re-ingested identical spans keep
+  both acknowledged copies.
+- A corrupt v2 header with an out-of-range attribute-index offset returns
+  `Error::Corrupt` instead of panicking through unsigned subtraction.
+- User attributes named with a NUL prefix (for example `"\u{0}service"`)
+  can no longer overwrite the reserved service/name index keys and poison
+  those queries; such attributes are stored verbatim but excluded from the
+  index, and filters on them decline index use symmetrically.
+
+### Changed
+- **Limited queries are lazy end to end**: per-segment index postings stay
+  undecoded and a k-way merge pops candidates in start-time order, decoding
+  and re-verifying only what the limit returns. Measured: attribute filter
+  p50 18 ms -> 0.53 ms at 1M spans and 209 ms -> 2.9 ms at 10M — the 10M
+  advisory target (<100 ms) is closed with 35x headroom.
+- README limitations and roadmap reflect the v2 engine (byte residency,
+  journaled compaction, remaining mmap/streaming work).
+
 ## [0.3.0] - 2026-07-23
 
 ### Changed
