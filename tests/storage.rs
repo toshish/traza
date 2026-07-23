@@ -73,6 +73,7 @@ fn buffer_flush_persists_sorted_batches() {
         Config {
             flush_spans: 8,
             ttl_seconds: None,
+            payload_threshold: None,
         },
     )
     .expect("open store");
@@ -121,6 +122,7 @@ fn crash_recovery_preserves_flushed_spans() {
             Config {
                 flush_spans: 32,
                 ttl_seconds: None,
+                payload_threshold: None,
             },
         )
         .expect("open initial store");
@@ -157,6 +159,7 @@ fn crash_recovery_preserves_flushed_spans() {
         Config {
             flush_spans: 32,
             ttl_seconds: None,
+            payload_threshold: None,
         },
     )
     .expect("reopen store after dropping unflushed data");
@@ -270,6 +273,7 @@ fn randomized_filters_match_naive_reference() {
         Config {
             flush_spans: 4_096,
             ttl_seconds: None,
+            payload_threshold: None,
         },
     )
     .expect("open store");
@@ -355,6 +359,7 @@ fn ttl_compaction_drops_expired_segments() {
         Config {
             flush_spans: 4,
             ttl_seconds: Some(1),
+            payload_threshold: None,
         },
     )
     .expect("open store");
@@ -457,6 +462,7 @@ fn lock_order_no_deadlock() {
             Config {
                 flush_spans: 10_000,
                 ttl_seconds: None,
+                payload_threshold: None,
             },
         )
         .expect("open store"),
@@ -510,6 +516,7 @@ fn reads_never_miss_committed_spans() {
             Config {
                 flush_spans: 10_000,
                 ttl_seconds: None,
+                payload_threshold: None,
             },
         )
         .expect("open store"),
@@ -577,6 +584,7 @@ fn stale_temp_does_not_wedge_flush() {
         Config {
             flush_spans: 2,
             ttl_seconds: None,
+            payload_threshold: None,
         },
     )
     .expect("recover store with stale temp");
@@ -629,6 +637,7 @@ fn second_open_is_rejected() {
     let config = Config {
         flush_spans: 100,
         ttl_seconds: None,
+        payload_threshold: None,
     };
     let first = Store::open(&dir, config.clone()).expect("open first store");
     let second = Store::open(&dir, config.clone());
@@ -690,6 +699,7 @@ fn ttl_zero_disables_expiration() {
         &dir,
         Config {
             ttl_seconds: Some(0),
+            payload_threshold: None,
             ..Config::default()
         },
     )

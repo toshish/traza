@@ -7,11 +7,13 @@
 //! segment files. Reads combine the buffered and persisted data.
 
 pub mod analytics;
+pub mod annotations;
 pub mod auth;
 pub mod dashboard;
 pub mod expiration;
 pub mod otlp;
 pub mod otlp_pb;
+pub mod payload;
 pub mod segment_v2;
 
 use serde::{Deserialize, Serialize};
@@ -143,6 +145,10 @@ pub struct Config {
     pub flush_spans: usize,
     /// Retention period in seconds; zero disables TTL expiration.
     pub ttl_seconds: Option<u64>,
+    /// String attribute values longer than this many bytes are offloaded to
+    /// the content-addressed payload store and replaced by a reference
+    /// object (see [`payload`]). `None` disables offloading.
+    pub payload_threshold: Option<usize>,
 }
 
 impl Default for Config {
@@ -150,6 +156,7 @@ impl Default for Config {
         Self {
             flush_spans: 10_000,
             ttl_seconds: None,
+            payload_threshold: None,
         }
     }
 }
@@ -520,6 +527,7 @@ pub struct Store {
     writer: Mutex<WriteBuffer>,
     segments: Mutex<Vec<Segment>>,
     rollups: Mutex<std::collections::HashMap<PathBuf, std::sync::Arc<analytics::SegmentRollup>>>,
+    annotations: annotations::AnnotationLog,
     next_segment: AtomicU64,
     _directory_lock: DirectoryLock,
 }
@@ -554,6 +562,7 @@ impl Store {
                 .map_or(0, |number| number.saturating_add(1));
 
             Ok(Self {
+                annotations: annotations::AnnotationLog::open(&directory)?,
                 directory,
                 config,
                 writer: Mutex::new(WriteBuffer::default()),
@@ -569,8 +578,11 @@ impl Store {
 
     /// Adds one span, automatically flushing when the configured threshold is
     /// reached.
-    pub fn ingest(&self, span: Span) -> Result<()> {
+    pub fn ingest(&self, mut span: Span) -> Result<()> {
         validate_span(&span)?;
+        if let Some(threshold) = self.config.payload_threshold {
+            payload::offload_span(&self.directory, &mut span, threshold)?;
+        }
         let mut writer = self.lock_writer()?;
         writer.upsert(span);
         if self.should_flush(writer.len()) {
@@ -589,6 +601,12 @@ impl Store {
         }
         for span in &spans {
             validate_span(span)?;
+        }
+        let mut spans = spans;
+        if let Some(threshold) = self.config.payload_threshold {
+            for span in &mut spans {
+                payload::offload_span(&self.directory, span, threshold)?;
+            }
         }
 
         let mut writer = self.lock_writer()?;
@@ -818,6 +836,28 @@ impl Store {
 
     /// Removes spans older than the configured TTL and returns the number
     /// removed. A zero TTL disables expiration.
+    /// Records one annotation durably (see [`annotations::Annotation`]).
+    pub fn annotate(&self, annotation: annotations::Annotation) -> Result<()> {
+        self.annotations.append(annotation)
+    }
+
+    /// Annotations for a trace, optionally narrowed to one span or name.
+    pub fn annotations(
+        &self,
+        trace_id: &str,
+        span_id: Option<&str>,
+        name: Option<&str>,
+    ) -> Result<Vec<annotations::Annotation>> {
+        self.annotations.query(trace_id, span_id, name)
+    }
+
+    /// Reads an offloaded payload by its `sha256/<hex>` reference.
+    pub fn payload(&self, reference: &str) -> Result<Option<Vec<u8>>> {
+        payload::load_payload(&self.directory, reference)
+    }
+
+    /// Expires spans, annotations, and payload files older than the
+    /// configured TTL (no-op when TTL is unset or zero).
     pub fn compact_expired(&self) -> Result<usize> {
         let Some(ttl_seconds) = self.config.ttl_seconds else {
             return Ok(0);
@@ -833,7 +873,15 @@ impl Store {
             .as_nanos()
             .min(u128::from(u64::MAX)) as u64;
         let ttl_ns = ttl_seconds.saturating_mul(1_000_000_000);
-        self.expire_before(now_ns.saturating_sub(ttl_ns))
+        let cutoff_ns = now_ns.saturating_sub(ttl_ns);
+        let removed = self.expire_before(cutoff_ns)?;
+        // Same retention window for the satellite stores: annotations by
+        // their own timestamps, payload files by mtime (an orphan payload
+        // lingers at most one TTL past its span).
+        self.annotations.drop_older_than(cutoff_ns)?;
+        let cutoff_time = UNIX_EPOCH + std::time::Duration::from_nanos(cutoff_ns);
+        payload::sweep_expired(&self.directory, cutoff_time)?;
+        Ok(removed)
     }
 
     /// Removes spans ending before `cutoff_ns` and returns the number removed.

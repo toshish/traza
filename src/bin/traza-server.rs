@@ -68,6 +68,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut port = 8080_u16;
     let mut ttl_seconds = None;
     let mut flush_spans = 10_000_usize;
+    let mut payload_threshold_bytes = 256 * 1024_usize;
     let mut workers = thread::available_parallelism()
         .map_or(4, usize::from)
         .max(4);
@@ -95,6 +96,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         .parse()?,
                 );
             }
+            "--payload-threshold-bytes" => {
+                i += 1;
+                payload_threshold_bytes = args
+                    .get(i)
+                    .ok_or("--payload-threshold-bytes requires a value")?
+                    .parse::<usize>()?;
+            }
             "--flush-spans" => {
                 i += 1;
                 flush_spans = args
@@ -113,7 +121,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--help" | "-h" => {
                 println!(
-                    "Usage: traza-server --data-dir DIR --port PORT [--host ADDR] [--ttl-seconds N] [--flush-spans N] [--workers N]"
+                    "Usage: traza-server --data-dir DIR --port PORT [--host ADDR] [--ttl-seconds N] [--flush-spans N] [--workers N] [--payload-threshold-bytes N (0 disables)]"
                 );
                 return Ok(());
             }
@@ -134,6 +142,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Config {
             flush_spans,
             ttl_seconds,
+            // 0 disables offloading.
+            payload_threshold: (payload_threshold_bytes > 0).then_some(payload_threshold_bytes),
         },
     )?);
 
@@ -379,15 +389,20 @@ fn handle_connection(
                 Ok(spans) if spans.is_empty() => {
                     respond(&mut stream, 404, json!({"error": "trace not found"}))
                 }
-                Ok(spans) => respond(
-                    &mut stream,
-                    200,
-                    json!({
-                        "trace_id": id,
-                        "spans": serde_json::to_value(spans)
-                            .unwrap_or_else(|_| Value::Array(Vec::new())),
-                    }),
-                ),
+                Ok(spans) => {
+                    let annotations = engine.annotations(&id, None, None).unwrap_or_default();
+                    respond(
+                        &mut stream,
+                        200,
+                        json!({
+                            "trace_id": id,
+                            "spans": serde_json::to_value(spans)
+                                .unwrap_or_else(|_| Value::Array(Vec::new())),
+                            "annotations": serde_json::to_value(annotations)
+                                .unwrap_or_else(|_| Value::Array(Vec::new())),
+                        }),
+                    )
+                }
                 Err(error) => respond(&mut stream, 503, json!({"error": error.to_string()})),
             }
         }
@@ -422,6 +437,107 @@ fn handle_connection(
                     200,
                     serde_json::to_value(detail).unwrap_or_else(|_| json!({})),
                 ),
+                Err(error) => respond(&mut stream, 503, json!({"error": error.to_string()})),
+            }
+        }
+        ("POST", "/v1/annotations") => {
+            let annotation: traza::annotations::Annotation =
+                match serde_json::from_slice(&request.body) {
+                    Ok(annotation) => annotation,
+                    Err(error) => {
+                        return respond(&mut stream, 400, json!({"error": error.to_string()}));
+                    }
+                };
+            let mut annotation = annotation;
+            if annotation.timestamp_ns == 0 {
+                annotation.timestamp_ns = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+                    .min(u128::from(u64::MAX)) as u64;
+            }
+            match engine.annotate(annotation) {
+                Ok(()) => respond(&mut stream, 200, json!({"recorded": true})),
+                Err(traza::Error::InvalidSpan(reason)) => {
+                    respond(&mut stream, 400, json!({"error": reason}))
+                }
+                Err(error) => respond(&mut stream, 503, json!({"error": error.to_string()})),
+            }
+        }
+        ("GET", "/v1/annotations") => {
+            let mut trace_id = None;
+            let mut span_id = None;
+            let mut name = None;
+            for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+                let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+                match percent_decode(key).as_str() {
+                    "trace_id" => trace_id = Some(percent_decode(value)),
+                    "span_id" => span_id = Some(percent_decode(value)),
+                    "name" => name = Some(percent_decode(value)),
+                    other => {
+                        return respond(
+                            &mut stream,
+                            400,
+                            json!({"error": format!("unknown query parameter: {other}")}),
+                        )
+                    }
+                }
+            }
+            let Some(trace_id) = trace_id else {
+                return respond(&mut stream, 400, json!({"error": "trace_id is required"}));
+            };
+            match engine.annotations(&trace_id, span_id.as_deref(), name.as_deref()) {
+                Ok(annotations) => respond(
+                    &mut stream,
+                    200,
+                    json!({"annotations": serde_json::to_value(annotations)
+                        .unwrap_or_else(|_| Value::Array(Vec::new()))}),
+                ),
+                Err(error) => respond(&mut stream, 503, json!({"error": error.to_string()})),
+            }
+        }
+        ("GET", _) if path.starts_with("/v1/payloads/") => {
+            let reference = percent_decode(&path[13..]);
+            match engine.payload(&reference) {
+                Ok(Some(bytes)) => {
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        bytes.len()
+                    )?;
+                    stream.write_all(&bytes)
+                }
+                Ok(None) => respond(&mut stream, 404, json!({"error": "payload not found"})),
+                Err(error) => respond(&mut stream, 503, json!({"error": error.to_string()})),
+            }
+        }
+        ("GET", "/v1/export") => {
+            let filter = match filter_from_query(query) {
+                Ok(mut filter) => {
+                    // Exports default to unbounded, unlike interactive search.
+                    if !query.split('&').any(|pair| pair.starts_with("limit")) {
+                        filter.limit = None;
+                    }
+                    filter
+                }
+                Err(error) => return respond(&mut stream, 400, json!({"error": error})),
+            };
+            match engine.query(&filter) {
+                Ok(spans) => {
+                    let mut body = Vec::new();
+                    for span in &spans {
+                        if let Ok(line) = serde_json::to_vec(span) {
+                            body.extend_from_slice(&line);
+                            body.push(b'\n');
+                        }
+                    }
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )?;
+                    stream.write_all(&body)
+                }
                 Err(error) => respond(&mut stream, 503, json!({"error": error.to_string()})),
             }
         }

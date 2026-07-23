@@ -102,6 +102,12 @@ curl http://localhost:8080/v1/stats
 | `GET` | `/v1/sessions?since=&until=&limit=` | Sessions (spans carrying `session.id`), most recent activity first, with span/trace counts, token sums, cost, and errors |
 | `GET` | `/v1/sessions/{id}` | One session's rollup plus its per-trace breakdown; `404` if unknown |
 | `GET` | `/v1/stats/llm?group_by=model\|service\|session\|day&since=&until=` | Token/cost aggregation rows, sorted by cost |
+| `POST` | `/v1/annotations` | Attach a score/feedback record to a span (or whole trace): `{trace_id, span_id?, name, value, source?, comment?}`; the trace view returns them alongside spans |
+| `GET` | `/v1/annotations?trace_id=&span_id=&name=` | Query annotations |
+| `GET` | `/v1/payloads/sha256/{hex}` | Raw bytes of an offloaded payload |
+| `GET` | `/v1/export?...` | Span search as NDJSON (same filters as `/v1/spans`, unbounded by default) — dataset export for evals/fine-tuning |
+
+String attribute values above `--payload-threshold-bytes` (default 256 KiB, `0` disables) are offloaded to a content-addressed store under the data directory and replaced by `{"$payload": "sha256/…", "bytes": N, "preview": "…"}` — identical payloads (repeated system prompts) are stored once, and segment decodes never drag multi-megabyte text along. Payload files and annotations honor the same TTL as spans.
 
 Search filters (all supplied predicates are ANDed; values must be URL-encoded):
 
