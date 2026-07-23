@@ -17,18 +17,35 @@
 //! TTL). SHA-256 is implemented here (FIPS 180-4), dependency-free, and
 //! verified against the standard test vectors in the module tests.
 
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value};
 
-use crate::{Result, Span};
+use crate::{Error, Result, Span};
 
 /// Key marking a payload reference object.
 pub const PAYLOAD_KEY: &str = "$payload";
 /// Characters of original text kept inline as a preview.
 const PREVIEW_CHARS: usize = 256;
+/// How long a freshly touched payload is immune from the TTL sweep. The
+/// compactor snapshots live references, releases the locks, then deletes;
+/// an ingest can commit a NEW reference to an OLD file (content-address
+/// dedup does not refresh mtime) inside that window. The store is
+/// single-process (DirectoryLock), so an in-memory touch registry is
+/// complete knowledge: anything touched within this window cannot be swept.
+const TOUCH_IMMUNITY: Duration = Duration::from_secs(600);
+
+/// The in-process registry of recently written or deduplicated payload
+/// references, keyed by `sha256/<hex>`.
+pub(crate) type TouchRegistry = Mutex<HashMap<String, Instant>>;
+
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 // ----------------------------------------------------------------- sha-256
 
@@ -131,16 +148,33 @@ pub(crate) fn payload_path(directory: &Path, hash: &str) -> PathBuf {
 
 /// Writes `content` to the content-addressed store (idempotent — an existing
 /// file with the same hash is left alone) and returns the reference object.
-pub(crate) fn store_payload(directory: &Path, content: &str) -> Result<Value> {
+/// The touch is registered BEFORE any filesystem work, so a concurrent sweep
+/// can never observe the file without its immunity.
+pub(crate) fn store_payload(
+    directory: &Path,
+    content: &str,
+    registry: &TouchRegistry,
+) -> Result<Value> {
     let hash = sha256_hex(content.as_bytes());
+    registry
+        .lock()
+        .map_err(|_| Error::LockPoisoned("payload registry"))?
+        .insert(format!("sha256/{hash}"), Instant::now());
     let path = payload_path(directory, &hash);
     if !path.exists() {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        // Write via temp + rename so a crash never leaves a partial file
-        // under the final content address.
-        let temp = path.with_extension("tmp");
+        // Write via a WRITER-UNIQUE temp + rename: a shared `<hash>.tmp`
+        // let ten concurrent identical ingests truncate each other's temp
+        // and race the rename (found in review: 9 successes, one ENOENT).
+        // Unique temps make every rename valid; identical content means
+        // whichever rename lands last is byte-identical anyway.
+        let temp = path.with_extension(format!(
+            "{}.{}.tmp",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
         {
             let mut file = fs::File::create(&temp)?;
             file.write_all(content.as_bytes())?;
@@ -174,10 +208,15 @@ pub(crate) fn load_payload(directory: &Path, reference: &str) -> Result<Option<V
 
 /// Replaces every string attribute value longer than `threshold` bytes
 /// (span attributes and event attributes) with a payload reference.
-pub(crate) fn offload_span(directory: &Path, span: &mut Span, threshold: usize) -> Result<()> {
-    offload_map(directory, &mut span.attributes, threshold)?;
+pub(crate) fn offload_span(
+    directory: &Path,
+    span: &mut Span,
+    threshold: usize,
+    registry: &TouchRegistry,
+) -> Result<()> {
+    offload_map(directory, &mut span.attributes, threshold, registry)?;
     for event in &mut span.events {
-        offload_map(directory, &mut event.attributes, threshold)?;
+        offload_map(directory, &mut event.attributes, threshold, registry)?;
     }
     Ok(())
 }
@@ -186,11 +225,12 @@ fn offload_map(
     directory: &Path,
     attributes: &mut Map<String, Value>,
     threshold: usize,
+    registry: &TouchRegistry,
 ) -> Result<()> {
     for value in attributes.values_mut() {
         if let Value::String(text) = value {
             if text.len() > threshold {
-                *value = store_payload(directory, text)?;
+                *value = store_payload(directory, text, registry)?;
             }
         }
     }
@@ -206,8 +246,19 @@ fn offload_map(
 pub(crate) fn sweep_expired(
     directory: &Path,
     cutoff: std::time::SystemTime,
-    live: &std::collections::HashSet<String>,
+    live: &HashSet<String>,
+    registry: &TouchRegistry,
 ) -> Result<usize> {
+    // Prune stale registry entries, then snapshot the immune set. A ref
+    // touched within the immunity window survives even if the live-ref
+    // snapshot (taken earlier, locks since released) missed it.
+    let immune: HashSet<String> = {
+        let mut touched = registry
+            .lock()
+            .map_err(|_| Error::LockPoisoned("payload registry"))?;
+        touched.retain(|_, at| at.elapsed() < TOUCH_IMMUNITY);
+        touched.keys().cloned().collect()
+    };
     let root = directory.join(PAYLOAD_DIR);
     if !root.exists() {
         return Ok(0);
@@ -228,7 +279,7 @@ pub(crate) fn sweep_expired(
                 .and_then(|stem| stem.to_str())
                 .map(|hash| format!("sha256/{hash}"))
                 .unwrap_or_default();
-            if modified < cutoff && !live.contains(&reference) {
+            if modified < cutoff && !live.contains(&reference) && !immune.contains(&reference) {
                 fs::remove_file(entry.path())?;
                 removed += 1;
             }
@@ -239,7 +290,42 @@ pub(crate) fn sweep_expired(
 
 #[cfg(test)]
 mod tests {
-    use super::sha256_hex;
+    use super::{sha256_hex, store_payload, sweep_expired, TouchRegistry};
+    use std::collections::HashSet;
+    use std::time::{Duration, Instant, SystemTime};
+
+    #[test]
+    fn recently_touched_payloads_are_immune_from_the_sweep() {
+        // The compactor snapshots live refs, RELEASES the locks, then
+        // sweeps: a ref committed inside that window must survive even
+        // though the stale snapshot does not contain it.
+        let dir = std::env::temp_dir().join(format!(
+            "traza-touch-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let registry = TouchRegistry::default();
+        let reference = store_payload(&dir, "fresh-touch", &registry).expect("stores");
+        let reference = reference["$payload"].as_str().expect("ref").to_owned();
+
+        // Sweep with an EMPTY live set and a future cutoff (the file's
+        // mtime is in the past relative to it): only the touch protects it.
+        let cutoff = SystemTime::now() + Duration::from_secs(3_600);
+        let removed = sweep_expired(&dir, cutoff, &HashSet::new(), &registry).expect("sweeps");
+        assert_eq!(removed, 0, "a freshly touched payload must survive");
+
+        // Age the touch beyond the immunity window: now it is sweepable.
+        registry
+            .lock()
+            .expect("registry")
+            .insert(reference, Instant::now() - Duration::from_secs(700));
+        let removed = sweep_expired(&dir, cutoff, &HashSet::new(), &registry).expect("sweeps");
+        assert_eq!(removed, 1, "an old, unreferenced, untouched payload sweeps");
+    }
 
     #[test]
     fn sha256_matches_the_standard_vectors() {

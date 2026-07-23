@@ -527,6 +527,7 @@ pub struct Store {
     writer: Mutex<WriteBuffer>,
     segments: Mutex<Vec<Segment>>,
     rollups: Mutex<std::collections::HashMap<PathBuf, std::sync::Arc<analytics::SegmentRollup>>>,
+    recent_payloads: payload::TouchRegistry,
     annotations: annotations::AnnotationLog,
     next_segment: AtomicU64,
     _directory_lock: DirectoryLock,
@@ -568,6 +569,7 @@ impl Store {
                 writer: Mutex::new(WriteBuffer::default()),
                 segments: Mutex::new(segments),
                 rollups: Mutex::new(std::collections::HashMap::new()),
+                recent_payloads: payload::TouchRegistry::default(),
                 next_segment: AtomicU64::new(next_segment),
                 _directory_lock: directory_lock,
             })
@@ -581,7 +583,7 @@ impl Store {
     pub fn ingest(&self, mut span: Span) -> Result<()> {
         validate_span(&span)?;
         if let Some(threshold) = self.config.payload_threshold {
-            payload::offload_span(&self.directory, &mut span, threshold)?;
+            payload::offload_span(&self.directory, &mut span, threshold, &self.recent_payloads)?;
         }
         let mut writer = self.lock_writer()?;
         writer.upsert(span);
@@ -605,7 +607,7 @@ impl Store {
         let mut spans = spans;
         if let Some(threshold) = self.config.payload_threshold {
             for span in &mut spans {
-                payload::offload_span(&self.directory, span, threshold)?;
+                payload::offload_span(&self.directory, span, threshold, &self.recent_payloads)?;
             }
         }
 
@@ -883,7 +885,12 @@ impl Store {
         // Live references computed AFTER span expiry, so payloads referenced
         // only by just-expired spans become sweepable.
         let live_refs = self.live_payload_refs()?;
-        payload::sweep_expired(&self.directory, cutoff_time, &live_refs)?;
+        payload::sweep_expired(
+            &self.directory,
+            cutoff_time,
+            &live_refs,
+            &self.recent_payloads,
+        )?;
         Ok(removed)
     }
 

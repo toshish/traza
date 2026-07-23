@@ -512,34 +512,17 @@ fn handle_connection(
             }
         }
         ("GET", "/v1/export") => {
-            let filter = match filter_from_query(query) {
+            let (filter, user_limit) = match filter_from_query(query) {
                 Ok(mut filter) => {
                     // Exports default to unbounded, unlike interactive search.
-                    if !query.split('&').any(|pair| pair.starts_with("limit")) {
-                        filter.limit = None;
-                    }
-                    filter
+                    let explicit = query.split('&').any(|pair| pair.starts_with("limit"));
+                    let user_limit = if explicit { filter.limit } else { None };
+                    filter.limit = None;
+                    (filter, user_limit)
                 }
                 Err(error) => return respond(&mut stream, 400, json!({"error": error})),
             };
-            match engine.query(&filter) {
-                Ok(spans) => {
-                    let mut body = Vec::new();
-                    for span in &spans {
-                        if let Ok(line) = serde_json::to_vec(span) {
-                            body.extend_from_slice(&line);
-                            body.push(b'\n');
-                        }
-                    }
-                    write!(
-                        stream,
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        body.len()
-                    )?;
-                    stream.write_all(&body)
-                }
-                Err(error) => respond(&mut stream, 503, json!({"error": error.to_string()})),
-            }
+            stream_export(&mut stream, engine, filter, user_limit)
         }
         ("GET", "/v1/stats/llm") => {
             let (since, until, limit, group_by) = match analytics_query(query) {
@@ -575,6 +558,80 @@ fn handle_connection(
             }
         }
         _ => respond(&mut stream, 404, json!({"error": "not found"})),
+    }
+}
+
+/// Streams an export as NDJSON in bounded pages so an unbounded export
+/// never materializes the corpus (the review found the old implementation
+/// building the complete result AND a complete body buffer — defeating the
+/// larger-than-RAM design). Pages are keyed by the query sort order
+/// (start, end, trace, span — a total order), so each page is a normal
+/// bounded engine query and no engine lock is held across socket writes.
+/// The body is close-delimited (no Content-Length).
+fn stream_export(
+    stream: &mut TcpStream,
+    engine: &Store,
+    filter: SpanFilter,
+    user_limit: Option<usize>,
+) -> io::Result<()> {
+    const EXPORT_PAGE: usize = 4_096;
+
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n"
+    )?;
+    let mut cursor: Option<(u64, u64, String, String)> = None;
+    let mut emitted = 0_usize;
+    let mut page_size = EXPORT_PAGE;
+    loop {
+        let mut page_filter = filter.clone();
+        if let Some((start, _, _, _)) = &cursor {
+            // Inclusive re-fetch from the cursor's timestamp: spans sharing
+            // it are skipped below by full-key comparison.
+            page_filter.since_ns = Some((*start).max(page_filter.since_ns.unwrap_or(0)));
+        }
+        page_filter.limit = Some(page_size);
+        let page = match engine.query(&page_filter) {
+            Ok(page) => page,
+            // Headers are already on the wire; a mid-stream failure can only
+            // be signaled by closing early.
+            Err(_) => return Ok(()),
+        };
+        let fetched = page.len();
+        let mut progressed = false;
+        for span in page {
+            let key = (
+                span.start_time_ns,
+                span.end_time_ns,
+                span.trace_id.clone(),
+                span.span_id.clone(),
+            );
+            if cursor.as_ref().is_some_and(|last| key <= *last) {
+                continue;
+            }
+            let line = match serde_json::to_vec(&span) {
+                Ok(line) => line,
+                Err(_) => continue,
+            };
+            stream.write_all(&line)?;
+            stream.write_all(b"\n")?;
+            cursor = Some(key);
+            progressed = true;
+            emitted += 1;
+            if user_limit.is_some_and(|limit| emitted >= limit) {
+                return Ok(());
+            }
+        }
+        if fetched < page_size {
+            return Ok(()); // the corpus is exhausted
+        }
+        if progressed {
+            page_size = EXPORT_PAGE;
+        } else {
+            // An equal-timestamp run wider than the page: grow until the run
+            // fits, so the cursor can cross it.
+            page_size = page_size.saturating_mul(2);
+        }
     }
 }
 

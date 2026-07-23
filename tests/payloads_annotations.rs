@@ -358,6 +358,19 @@ fn reingested_payload_survives_ttl_compaction() {
     store.ingest(fresh).expect("ingests");
     store.flush().expect("seals the fresh segment");
 
+    // Reopen before compacting: the in-memory touch registry starts empty,
+    // so survival must come from the LIVE-REFERENCE protection alone (and
+    // the orphan is not shielded by its recent touch).
+    drop(store);
+    let store = Store::open(
+        &dir,
+        Config {
+            ttl_seconds: Some(1),
+            payload_threshold: Some(64),
+            ..Config::default()
+        },
+    )
+    .expect("reopens");
     store.compact_expired().expect("compacts");
 
     // The fresh span survived AND kept its payload bytes.
@@ -436,4 +449,136 @@ fn replaced_spans_count_once_in_rollups() {
         .llm_aggregate(LlmGroupBy::Day, None, None)
         .expect("aggregates");
     assert_eq!(by_day[0].llm_calls, 1, "{by_day:?}");
+}
+
+#[test]
+fn concurrent_identical_payload_ingest_all_succeed() {
+    // Found in review: a shared `<hash>.tmp` path let ten simultaneous
+    // identical-payload ingests truncate each other's temp file and race
+    // the rename — nine successes, one ENOENT. Unique temps fix it.
+    use std::sync::Arc;
+    let dir = test_dir("concurrent");
+    let store = Arc::new(
+        Store::open(
+            &dir,
+            Config {
+                payload_threshold: Some(1_024),
+                ..Config::default()
+            },
+        )
+        .expect("opens"),
+    );
+    let content = Arc::new("C".repeat(1_000_000));
+    let mut handles = Vec::new();
+    for worker in 0..10 {
+        let store = Arc::clone(&store);
+        let content = Arc::clone(&content);
+        handles.push(std::thread::spawn(move || {
+            let span = span_with_content(&format!("t{worker}"), "s1", &content);
+            store.ingest(span)
+        }));
+    }
+    for handle in handles {
+        handle
+            .join()
+            .expect("no panic")
+            .expect("every concurrent identical ingest must succeed");
+    }
+    // One deduped file; the bytes are intact.
+    let files = walk(&dir.join("payloads"));
+    let payload_files: Vec<_> = files
+        .iter()
+        .filter(|path| path.extension().is_some_and(|ext| ext == "bin"))
+        .collect();
+    assert_eq!(payload_files.len(), 1, "{files:?}");
+    let spans = store.get_trace("t0").expect("queries");
+    let reference = spans[0].events[0].attributes["content"]["$payload"]
+        .as_str()
+        .expect("ref")
+        .to_owned();
+    let bytes = store.payload(&reference).expect("loads").expect("exists");
+    assert_eq!(bytes.len(), 1_000_000);
+    // And no leftover temp litter.
+    assert!(
+        files
+            .iter()
+            .all(|path| !path.to_string_lossy().ends_with(".tmp")),
+        "temps must be renamed or cleaned: {files:?}"
+    );
+}
+
+#[test]
+fn export_streams_without_content_length_and_paginates_exactly() {
+    // Found in review: export materialized the full result plus a full
+    // NDJSON buffer, defeating larger-than-RAM. It now streams
+    // close-delimited pages; an equal-timestamp run WIDER than one page
+    // exercises the cursor's stall guard.
+    let dir = test_dir("export-stream");
+    let server = Server::spawn(&dir);
+
+    // 6,000 spans sharing one timestamp (page size is 4,096), plus one
+    // replaced span that must appear exactly once with its final name.
+    let mut batch = Vec::new();
+    for index in 0..6_000 {
+        batch.push(json!({
+            "trace_id": format!("t{}", index / 10), "span_id": format!("s{index}"),
+            "name": "op", "service": "bulk",
+            "start_time_ns": 42_000u64, "end_time_ns": 43_000u64,
+        }));
+    }
+    let (status, _) = server.json("POST", "/v1/spans", Some(&json!(batch)));
+    assert_eq!(status, 200);
+    for name in ["first", "final"] {
+        let (status, _) = server.json(
+            "POST",
+            "/v1/spans",
+            Some(&json!([{
+                "trace_id": "t-replaced", "span_id": "s1", "name": name,
+                "service": "bulk", "start_time_ns": 41_000u64, "end_time_ns": 41_500u64,
+            }])),
+        );
+        assert_eq!(status, 200);
+    }
+
+    let (status, bytes) = server.raw("GET", "/v1/export?service=bulk", None);
+    assert_eq!(status, 200);
+    let text = String::from_utf8(bytes).expect("utf8");
+    let lines: Vec<&str> = text.lines().filter(|line| !line.is_empty()).collect();
+    assert_eq!(lines.len(), 6_001, "every span exactly once across pages");
+    let replaced: Vec<Value> = lines
+        .iter()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|span| span["trace_id"] == "t-replaced")
+        .collect();
+    assert_eq!(replaced.len(), 1, "replaced span appears once");
+    assert_eq!(replaced[0]["name"], "final", "last write wins in export");
+
+    // Close-delimited: no Content-Length on the export response.
+    {
+        use std::io::{Read, Write};
+        let mut stream =
+            std::net::TcpStream::connect(("127.0.0.1", server.port)).expect("connects");
+        write!(
+            stream,
+            "GET /v1/export?service=bulk&limit=5 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+        )
+        .expect("writes");
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).expect("reads");
+        let text = String::from_utf8_lossy(&response);
+        let head = text
+            .split("\r\n\r\n")
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        assert!(
+            !head.contains("content-length"),
+            "export must be close-delimited: {head}"
+        );
+        let body_lines = text
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body.lines().filter(|line| !line.is_empty()).count())
+            .unwrap_or(0);
+        assert_eq!(body_lines, 5, "user limit caps the stream");
+    }
 }
