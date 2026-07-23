@@ -6,6 +6,7 @@
 //! Spans are buffered in memory and periodically persisted as sorted JSON-lines
 //! segment files. Reads combine the buffered and persisted data.
 
+pub mod analytics;
 pub mod auth;
 pub mod dashboard;
 pub mod expiration;
@@ -495,8 +496,11 @@ pub struct Store {
     config: Config,
     // Locking discipline: whenever both locks are needed, acquire writer first
     // and segments second, and retain that order until both guards are dropped.
+    // The rollup cache is leaf-level: acquired briefly and never while taking
+    // another lock.
     writer: Mutex<WriteBuffer>,
     segments: Mutex<Vec<Segment>>,
+    rollups: Mutex<std::collections::HashMap<PathBuf, std::sync::Arc<analytics::SegmentRollup>>>,
     next_segment: AtomicU64,
     _directory_lock: DirectoryLock,
 }
@@ -535,6 +539,7 @@ impl Store {
                 config,
                 writer: Mutex::new(WriteBuffer::default()),
                 segments: Mutex::new(segments),
+                rollups: Mutex::new(std::collections::HashMap::new()),
                 next_segment: AtomicU64::new(next_segment),
                 _directory_lock: directory_lock,
             })

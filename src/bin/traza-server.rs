@@ -14,6 +14,12 @@
 //! - `GET /v1/spans?service=&name=&min_duration_ns=&since_ns=&until_ns=&limit=`
 //!   responds with the matching spans ordered by start time.
 //! - `GET /v1/stats` responds with engine statistics.
+//! - `GET /v1/sessions?since=&until=&limit=` lists sessions (spans carrying
+//!   the `session.id` attribute), most recent activity first.
+//! - `GET /v1/sessions/<id>` responds with the session rollup and its
+//!   per-trace breakdown, or 404.
+//! - `GET /v1/stats/llm?group_by=model|service|session|day&since=&until=`
+//!   responds with token/cost aggregation rows.
 //! - `POST /v1/flush` forces buffered spans into a durable segment.
 //! - `POST /v1/traces` accepts an OTLP/HTTP JSON ExportTraceServiceRequest.
 //! - `GET /` and `GET /dashboard` serve the bundled dashboard page (always
@@ -366,8 +372,106 @@ fn handle_connection(
                 Err(error) => respond(&mut stream, 503, json!({"error": error.to_string()})),
             }
         }
+        ("GET", "/v1/sessions") => {
+            let (since, until, limit, group_by) = match analytics_query(query) {
+                Ok(parsed) => parsed,
+                Err(error) => return respond(&mut stream, 400, json!({"error": error})),
+            };
+            if group_by.is_some() {
+                return respond(
+                    &mut stream,
+                    400,
+                    json!({"error": "group_by is not a /v1/sessions parameter"}),
+                );
+            }
+            match engine.sessions(since, until, limit.unwrap_or(100)) {
+                Ok(sessions) => respond(
+                    &mut stream,
+                    200,
+                    json!({"sessions": serde_json::to_value(sessions)
+                        .unwrap_or_else(|_| Value::Array(Vec::new()))}),
+                ),
+                Err(error) => respond(&mut stream, 503, json!({"error": error.to_string()})),
+            }
+        }
+        ("GET", _) if path.starts_with("/v1/sessions/") => {
+            let id = percent_decode(&path[13..]);
+            match engine.session(&id) {
+                Ok(None) => respond(&mut stream, 404, json!({"error": "session not found"})),
+                Ok(Some(detail)) => respond(
+                    &mut stream,
+                    200,
+                    serde_json::to_value(detail).unwrap_or_else(|_| json!({})),
+                ),
+                Err(error) => respond(&mut stream, 503, json!({"error": error.to_string()})),
+            }
+        }
+        ("GET", "/v1/stats/llm") => {
+            let (since, until, limit, group_by) = match analytics_query(query) {
+                Ok(parsed) => parsed,
+                Err(error) => return respond(&mut stream, 400, json!({"error": error})),
+            };
+            let group_by = match group_by {
+                None => traza::analytics::LlmGroupBy::Model,
+                Some(name) => match traza::analytics::LlmGroupBy::parse(&name) {
+                    Some(group) => group,
+                    None => {
+                        return respond(
+                            &mut stream,
+                            400,
+                            json!({"error": "group_by must be model|service|session|day"}),
+                        )
+                    }
+                },
+            };
+            match engine.llm_aggregate(group_by, since, until) {
+                Ok(mut rows) => {
+                    if let Some(limit) = limit {
+                        rows.truncate(limit);
+                    }
+                    respond(
+                        &mut stream,
+                        200,
+                        json!({"rows": serde_json::to_value(rows)
+                            .unwrap_or_else(|_| Value::Array(Vec::new()))}),
+                    )
+                }
+                Err(error) => respond(&mut stream, 503, json!({"error": error.to_string()})),
+            }
+        }
         _ => respond(&mut stream, 404, json!({"error": "not found"})),
     }
+}
+
+/// Query parser for the analytics endpoints: `since`/`until` (ns), `limit`,
+/// `group_by`. Unknown parameters are rejected like everywhere else.
+#[allow(clippy::type_complexity)]
+fn analytics_query(
+    raw_query: &str,
+) -> Result<(Option<u64>, Option<u64>, Option<usize>, Option<String>), String> {
+    let mut since = None;
+    let mut until = None;
+    let mut limit = None;
+    let mut group_by = None;
+    for pair in raw_query.split('&').filter(|pair| !pair.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let key = percent_decode(key);
+        let value = percent_decode(value);
+        match key.as_str() {
+            "since" | "since_ns" => {
+                since = Some(value.parse().map_err(|_| "invalid since")?);
+            }
+            "until" | "until_ns" => {
+                until = Some(value.parse().map_err(|_| "invalid until")?);
+            }
+            "limit" => {
+                limit = Some(value.parse().map_err(|_| "invalid limit")?);
+            }
+            "group_by" => group_by = Some(value),
+            other => return Err(format!("unknown query parameter: {other}")),
+        }
+    }
+    Ok((since, until, limit, group_by))
 }
 
 fn filter_from_query(raw_query: &str) -> Result<SpanFilter, String> {

@@ -99,6 +99,9 @@ curl http://localhost:8080/v1/stats
 | `GET` | `/v1/traces/{trace_id}` | All spans of one trace, sorted by start time; `404` if unknown |
 | `GET` | `/v1/spans?...` | Filtered span search |
 | `GET` | `/v1/stats` | Span count, segment count, bytes on disk |
+| `GET` | `/v1/sessions?since=&until=&limit=` | Sessions (spans carrying `session.id`), most recent activity first, with span/trace counts, token sums, cost, and errors |
+| `GET` | `/v1/sessions/{id}` | One session's rollup plus its per-trace breakdown; `404` if unknown |
+| `GET` | `/v1/stats/llm?group_by=model\|service\|session\|day&since=&until=` | Token/cost aggregation rows, sorted by cost |
 
 Search filters (all supplied predicates are ANDed; values must be URL-encoded):
 

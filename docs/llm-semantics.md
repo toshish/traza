@@ -26,9 +26,23 @@ One span per model interaction, named by operation:
 | `llm.stop_reason` | string | `stop`, `length`, `tool_use`, … |
 | `llm.tool_name` | string | Tool invoked (`llm.tool_call` spans) |
 | `llm.cost_usd` | double | Metered cost, if known (optional) |
+| `session.id` | string | Groups spans (across traces) into one agent session or conversation |
 
 Attributes are indexed like any other, so exact-match filters on them are
 index-served.
+
+## Sessions and aggregation
+
+An agent session usually spans many traces. Any span carrying a `session.id`
+attribute joins that session; `GET /v1/sessions` lists sessions with span and
+distinct-trace counts, token sums, cost, and error counts, and
+`GET /v1/sessions/{id}` adds the per-trace breakdown. `GET /v1/stats/llm`
+aggregates token/cost figures grouped by `model`, `service`, `session`, or
+UTC `day`. Numeric token/cost attributes may be supplied as numbers or
+numeric strings; an explicit `llm.total_tokens` wins over the
+prompt+completion sum. Aggregates are exact: sealed segments contribute
+cached rollups (segments are immutable, so a rollup is computed once), and
+window edges fall back to decoding just the boundary segments.
 
 ## Prompt and completion payloads
 

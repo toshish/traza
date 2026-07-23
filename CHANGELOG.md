@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-07-23
+
+### Added
+
+- **Sessions**: any span carrying a `session.id` attribute joins a
+  session — the unit of agentic/LLM work spanning many traces.
+  `GET /v1/sessions` lists sessions (span/trace counts, token sums,
+  cost, errors, activity window), `GET /v1/sessions/{id}` adds the
+  per-trace breakdown. The dashboard grew a Sessions panel; clicking a
+  session filters the span table to it.
+- **LLM aggregation**: `GET /v1/stats/llm?group_by=model|service|session|day`
+  returns exact token/cost/error/latency rollups over an optional
+  `since`/`until` window. Numeric attributes are accepted as numbers or
+  numeric strings; explicit `llm.total_tokens` wins over the
+  prompt+completion sum.
+- Aggregation cost model: sealed segments are immutable, so per-segment
+  rollups are computed once and cached; query windows that split a
+  segment decode just that segment for exact edge membership. Rollups
+  for superseded (compacted) segments drop out automatically.
+- `session.id` added to the LLM semantic conventions
+  (docs/llm-semantics.md) with a sessions/aggregation section.
+
 ## [0.9.2] - 2026-07-23
 
 ### Security / Hardening
