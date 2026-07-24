@@ -1,85 +1,113 @@
 # LLM observability semantics
 
 Conventions for tracing generative-AI workloads with Traza. They are plain
-span attributes and events — no server or engine support is required, and
-every recipe below runs against the standard filter API today.
+span attributes and events — no server or engine support beyond recognizing
+the keys, and every recipe below runs against the standard filter API today.
 
-## Span names
+Traza follows the [OpenLLMetry](https://github.com/traceloop/openllmetry)
+standard — Traceloop's OpenTelemetry-based conventions for LLM and agent
+tracing (the `opentelemetry-semantic-conventions-ai` package), built on the
+OpenTelemetry GenAI semantic conventions. Point any OpenLLMetry- or OTel-GenAI-
+instrumented app at Traza over OTLP and its sessions, token counts, cost, and
+provider/model rollups populate with **no attribute renaming**. Traza's earlier
+native `llm.*` / `session.id` shorthand is still accepted as an alias, so
+existing instrumentation keeps working unchanged.
 
-One span per model interaction, named by operation:
+The single source of truth for the key precedence is
+[`src/semconv.rs`](../src/semconv.rs); the dashboard mirrors it in
+`ui/src/lib/spans.js`.
 
-| Name | Use |
+## Recognized attributes
+
+Each fact is resolved from the first key present, in this order:
+
+| Fact | Keys (first present wins) |
 |---|---|
-| `llm.completion` | A chat/completion call |
-| `llm.tool_call` | The model invoking a tool/function |
-| `llm.embedding` | An embedding request |
+| Provider | `gen_ai.system` |
+| Model | `gen_ai.response.model` → `gen_ai.request.model` → `llm.model` |
+| Prompt tokens | `gen_ai.usage.prompt_tokens` → `gen_ai.usage.input_tokens` → `llm.prompt_tokens` |
+| Completion tokens | `gen_ai.usage.completion_tokens` → `gen_ai.usage.output_tokens` → `llm.completion_tokens` |
+| Total tokens | `llm.usage.total_tokens` → `gen_ai.usage.total_tokens` → `llm.total_tokens` → (prompt + completion) |
+| Cost (USD) | `gen_ai.usage.cost` → `llm.cost_usd` |
+| Session id | `session.id` → `gen_ai.conversation.id` → `traceloop.association.properties.session_id` → `traceloop.association.properties.chat_id` |
 
-## Attributes
-
-| Attribute | Type | Meaning |
-|---|---|---|
-| `llm.model` | string | Model identifier (for example `gpt-5.6-sol`) |
-| `llm.prompt_tokens` | int | Tokens in the prompt |
-| `llm.completion_tokens` | int | Tokens generated |
-| `llm.total_tokens` | int | Prompt + completion |
-| `llm.temperature` | double | Sampling temperature |
-| `llm.stop_reason` | string | `stop`, `length`, `tool_use`, … |
-| `llm.tool_name` | string | Tool invoked (`llm.tool_call` spans) |
-| `llm.cost_usd` | double | Metered cost, if known (optional) |
-| `session.id` | string | Groups spans (across traces) into one agent session or conversation |
+A span counts as an **LLM call** when it carries any of: a model, a provider
+(`gen_ai.system`), a token count, `llm.request.type`, or
+`traceloop.span.kind == "llm"`. Numeric token/cost values may be supplied as
+numbers or numeric strings (some OTLP exporters stringify counters); an
+explicit total wins over the prompt+completion sum.
 
 Attributes are indexed like any other, so exact-match filters on them are
 index-served.
 
+## Span names and kinds
+
+OpenLLMetry names spans by operation and provider — `openai.chat`,
+`anthropic.chat`, `{workflow}.workflow`, `{task}.task`, `{tool}.tool` — not by
+a fixed `llm.completion` name. To select LLM spans portably, filter on the
+Traceloop span kind rather than the name:
+
+    GET /v1/spans?attr.traceloop.span.kind=llm
+
+Traceloop's workflow model is carried by `traceloop.span.kind`
+(`workflow`/`task`/`agent`/`tool`/`llm`), `traceloop.workflow.name`, and
+`traceloop.entity.name` / `traceloop.entity.path`. Traza stores and indexes
+these verbatim, so they are all filterable.
+
 ## Sessions and aggregation
 
-An agent session usually spans many traces. Any span carrying a `session.id`
-attribute joins that session; `GET /v1/sessions` lists sessions with span and
-distinct-trace counts, token sums, cost, and error counts, and
-`GET /v1/sessions/{id}` adds the per-trace breakdown. `GET /v1/stats/llm`
-aggregates token/cost figures grouped by `model`, `service`, `session`, or
-UTC `day`. Numeric token/cost attributes may be supplied as numbers or
-numeric strings; an explicit `llm.total_tokens` wins over the
-prompt+completion sum. Aggregates are exact: sealed segments contribute
-cached rollups (segments are immutable, so a rollup is computed once), and
-window edges fall back to decoding just the boundary segments.
+An agent session usually spans many traces. Any span carrying a recognized
+session key (above) joins that session. `GET /v1/sessions` lists sessions with
+span and distinct-trace counts, token sums, cost, error counts, and the
+`session_attribute` that grouped each one; `GET /v1/sessions/{id}` adds the
+per-trace breakdown and resolves the id under any recognized key.
+
+`GET /v1/stats/llm?group_by=model|provider|service|session|day` aggregates
+token/cost figures. `provider` groups by `gen_ai.system`; `model` by the
+resolved model. Aggregates are exact: sealed segments contribute cached
+rollups (segments are immutable, so a rollup is computed once), and window
+edges fall back to decoding just the boundary segments.
 
 ## Prompt and completion payloads
 
-Large text payloads ride EVENTS, not attributes, so they never enter the
-attribute index and cannot bloat filter postings:
+Chat content rides two shapes, both recognized:
 
-- event `llm.prompt`, attribute `content`: the prompt text;
-- event `llm.completion`, attribute `content`: the generated text.
+- **OpenLLMetry indexed attributes** — `gen_ai.prompt.{i}.role` /
+  `gen_ai.prompt.{i}.content` and `gen_ai.completion.{i}.role` /
+  `gen_ai.completion.{i}.content`;
+- **Native events** — event `llm.prompt` with attribute `content`, event
+  `llm.completion` with attribute `content`.
 
-Events round-trip verbatim through both `/v1/spans` and OTLP ingest.
+Both round-trip verbatim through `/v1/spans` and OTLP ingest, and the
+dashboard renders them as a Messages panel. Large content is offloaded at
+ingest (below), so it never bloats the attribute index.
 
 ## Query recipes
 
-All spans for one model (index-served):
+All spans for one model (index-served attribute filter):
 
-    GET /v1/spans?attr.llm.model=gpt-5.6-sol&limit=100
+    GET /v1/spans?attr.gen_ai.request.model=gpt-4o&limit=100
 
-Completions for one service (service + name are both indexed):
+Chat spans for one service:
 
-    GET /v1/spans?service=agent-web&name=llm.completion
+    GET /v1/spans?service=agent&attr.traceloop.span.kind=llm
 
-Slowest completions (duration filter over completion spans):
+Slowest LLM calls (duration filter over LLM-kind spans):
 
-    GET /v1/spans?name=llm.completion&min_duration_ms=2000
+    GET /v1/spans?attr.traceloop.span.kind=llm&min_duration_ms=2000
 
-Tool-call frequency for one tool:
+Tool-call frequency for one tool (Traceloop tool spans):
 
-    GET /v1/spans?name=llm.tool_call&attr.llm.tool_name=web_search
+    GET /v1/spans?attr.traceloop.span.kind=tool&attr.traceloop.entity.name=web_search
 
 `GET /v1/stats/llm` provides server-side cost and token totals grouped by
-model, service, session, or UTC day. Integer counters saturate at `u64::MAX`
-rather than wrapping, and non-finite cost strings are ignored.
+model, provider, service, session, or UTC day. Integer counters saturate at
+`u64::MAX` rather than wrapping, and non-finite cost strings are ignored.
 
 ## Payloads and annotations
 
 Prompt/completion text longer than the server's payload threshold is
-offloaded at ingest: the event attribute keeps a
+offloaded at ingest: the attribute (or event attribute) keeps a
 `{"$payload": "sha256/…", "bytes": N, "preview": "…"}` reference and
 `GET /v1/payloads/{ref}` serves the bytes. Content addressing stores a
 repeated system prompt once. Post-hoc judgment — eval scores, human
@@ -100,6 +128,8 @@ lowercased. A conventional `relation` link attribute (for example
 ## OTLP mapping
 
 The same attributes flow through `POST /v1/traces`: OTLP `intValue`
-attributes become numbers, `doubleValue` stays a double, and events map to
-span events — so OpenTelemetry gen-AI instrumentation lands queryable
-without translation.
+attributes become numbers, `doubleValue` stays a double, string values stay
+strings, and events map to span events — so OpenLLMetry / OTel GenAI
+instrumentation lands queryable without translation. `service.name` on the
+OTLP resource becomes the span's service. gRPC is not served; use the
+`http/protobuf` exporter setting every OTel SDK supports.

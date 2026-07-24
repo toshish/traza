@@ -38,8 +38,8 @@ export function SessionsView({ openSession }) {
     <LoadingBar active={loading} style={{ marginBottom: 8 }} />
     {error ? <ErrorState what={error.what} next={error.next} /> : null}
     {sessions && !sessions.length ? <EmptyState
-      message={<span>No sessions yet. A session is any set of spans sharing a <code>session.id</code> attribute; send one to group agent work:</span>}
-      command={'"attributes": {"session.id": "chat-4711", "llm.model": "…"}'} /> : null}
+      message={<span>No sessions yet. A session is any set of spans sharing a recognized session key — <code>session.id</code>, <code>gen_ai.conversation.id</code>, or a <code>traceloop.association.properties.*</code> key:</span>}
+      command={'"attributes": {"gen_ai.conversation.id": "chat-4711", "gen_ai.request.model": "…"}'} /> : null}
     {sessions && sessions.length ? <>
       <div style={{ display: 'grid', gap: 8 }}>
         {sessions.map((s) => <SessionCard key={s.session_id}
@@ -78,7 +78,7 @@ export function SessionDetailView({ sessionId, openTrace, filterSpans }) {
   return <Section title={'Session ' + sessionId}
     action={<div style={{ display: 'flex', gap: 6 }}>
       <CopyButton text={sessionId} label="copy id" />
-      <Button variant="ghost" size="sm" onClick={() => filterSpans(sessionId)}>Search its spans</Button>
+      <Button variant="ghost" size="sm" onClick={() => filterSpans(sessionId, detail && detail.session_attribute)}>Search its spans</Button>
       <Button variant="ghost" size="sm" onClick={fetchDetail}>Refresh</Button>
     </div>}>
     <LoadingBar active={loading} style={{ marginBottom: 8 }} />
@@ -94,7 +94,7 @@ export function SessionDetailView({ sessionId, openTrace, filterSpans }) {
         <StatTile label="errors" value={fmtNum(detail.error_count)} />
       </div>
       <div style={{ fontSize: 'var(--text-12)', color: 'var(--ink-faint)', fontFamily: 'var(--font-mono)', marginBottom: 8 }}>
-        {fmtWindow(detail.first_start_ns, detail.last_end_ns)} · prompt {fmtNum(detail.prompt_tokens)} · completion {fmtNum(detail.completion_tokens)}
+        {fmtWindow(detail.first_start_ns, detail.last_end_ns)} · prompt {fmtNum(detail.prompt_tokens)} · completion {fmtNum(detail.completion_tokens)}{detail.session_attribute && detail.session_attribute !== 'session.id' ? ' · via ' + detail.session_attribute : ''}
       </div>
       <div style={{ overflowX: 'auto' }}>
         <DataTable density="dense" onRowClick={(r) => openTrace(r.trace_id)} columns={[

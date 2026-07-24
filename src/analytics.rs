@@ -1,9 +1,11 @@
 //! Session grouping and LLM cost/token aggregation.
 //!
 //! Sessions and aggregates are DERIVED views over ordinary spans — no new
-//! record type, no format change. A span joins a session by carrying the
-//! `session.id` attribute; token/cost figures come from the documented
-//! `llm.*` attributes (docs/llm-semantics.md).
+//! record type, no format change. What a span contributes (whether it is an
+//! LLM call, its model, provider, session, token counts, and cost) is decided
+//! by [`crate::semconv`], which recognizes both the OpenLLMetry / OTel GenAI
+//! conventions (`gen_ai.*`, `llm.usage.*`, `traceloop.*`) and Traza's native
+//! `llm.*` / `session.id` shorthand (docs/llm-semantics.md).
 //!
 //! Cost model: segments are immutable, so a per-segment rollup is computed at
 //! most once per process and cached by path (superseded segments simply fall
@@ -19,22 +21,23 @@ use std::sync::Arc;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
+use crate::semconv::{self, LlmFacts};
 use crate::{Result, Span, Store};
 
-/// Attribute carrying the session identifier (see docs/llm-semantics.md).
+/// The native attribute carrying a session identifier. It heads the recognized
+/// session-key precedence (see [`crate::semconv`]); other keys such as
+/// `gen_ai.conversation.id` also group spans into a session.
 pub const SESSION_ATTRIBUTE: &str = "session.id";
-
-const ATTR_MODEL: &str = "llm.model";
-const ATTR_PROMPT_TOKENS: &str = "llm.prompt_tokens";
-const ATTR_COMPLETION_TOKENS: &str = "llm.completion_tokens";
-const ATTR_TOTAL_TOKENS: &str = "llm.total_tokens";
-const ATTR_COST: &str = "llm.cost_usd";
 
 /// One session's aggregate view.
 #[derive(Clone, Debug, Serialize)]
 pub struct SessionSummary {
-    /// The `session.id` attribute value shared by the session's spans.
+    /// The session identifier shared by the session's spans.
     pub session_id: String,
+    /// The attribute key that grouped this session (`session.id`,
+    /// `gen_ai.conversation.id`, a `traceloop.association.properties.*` key,
+    /// …). Drill-downs filter spans on this key.
+    pub session_attribute: String,
     /// Earliest span start in the session.
     pub first_start_ns: u64,
     /// Latest span end in the session.
@@ -91,11 +94,14 @@ pub struct SessionDetail {
 /// Aggregation dimension for [`Store::llm_aggregate`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LlmGroupBy {
-    /// Group by the `llm.model` attribute.
+    /// Group by the recognized model (`gen_ai.response.model` →
+    /// `gen_ai.request.model` → native `llm.model`).
     Model,
+    /// Group by the provider/system (`gen_ai.system`).
+    Provider,
     /// Group by the emitting service.
     Service,
-    /// Group by the `session.id` attribute.
+    /// Group by the recognized session identifier.
     Session,
     /// Group by UTC calendar day of the span start.
     Day,
@@ -106,6 +112,7 @@ impl LlmGroupBy {
     pub fn parse(name: &str) -> Option<Self> {
         match name {
             "model" => Some(Self::Model),
+            "provider" => Some(Self::Provider),
             "service" => Some(Self::Service),
             "session" => Some(Self::Session),
             "day" => Some(Self::Day),
@@ -152,33 +159,28 @@ struct Counters {
 }
 
 impl Counters {
-    fn absorb(&mut self, span: &Span) {
+    /// Folds one span's normalized [`LlmFacts`] in. Facts are computed once
+    /// per span in [`SegmentRollup::absorb`] and shared across every group the
+    /// span joins, so the semconv scan runs once, not once per group.
+    fn absorb(&mut self, span: &Span, facts: &LlmFacts) {
         self.spans = self.spans.saturating_add(1);
         if span.status == "error" {
             self.errors = self.errors.saturating_add(1);
         }
-        let prompt = attr_u64(&span.attributes, ATTR_PROMPT_TOKENS);
-        let completion = attr_u64(&span.attributes, ATTR_COMPLETION_TOKENS);
-        let explicit_total = attr_u64(&span.attributes, ATTR_TOTAL_TOKENS);
-        let cost = attr_f64(&span.attributes, ATTR_COST);
-        let is_llm = span.attributes.contains_key(ATTR_MODEL)
-            || prompt.is_some()
-            || completion.is_some()
-            || explicit_total.is_some();
-        if is_llm {
+        if facts.is_llm {
             self.llm_calls = self.llm_calls.saturating_add(1);
             self.llm_duration_ns = self
                 .llm_duration_ns
                 .saturating_add(span.end_time_ns.saturating_sub(span.start_time_ns));
         }
-        self.prompt_tokens = self.prompt_tokens.saturating_add(prompt.unwrap_or(0));
+        self.prompt_tokens = self
+            .prompt_tokens
+            .saturating_add(facts.prompt_tokens.unwrap_or(0));
         self.completion_tokens = self
             .completion_tokens
-            .saturating_add(completion.unwrap_or(0));
-        let total = explicit_total
-            .unwrap_or_else(|| prompt.unwrap_or(0).saturating_add(completion.unwrap_or(0)));
-        self.total_tokens = self.total_tokens.saturating_add(total);
-        self.cost_usd = finite_saturating_add(self.cost_usd, cost.unwrap_or(0.0));
+            .saturating_add(facts.completion_tokens.unwrap_or(0));
+        self.total_tokens = self.total_tokens.saturating_add(facts.total());
+        self.cost_usd = finite_saturating_add(self.cost_usd, facts.cost_usd.unwrap_or(0.0));
     }
 
     fn merge(&mut self, other: &Counters) {
@@ -212,10 +214,13 @@ struct SessionCounters {
     first_start_ns: u64,
     last_end_ns: u64,
     traces: HashSet<String>,
+    /// The recognized session key that grouped this session; the
+    /// highest-precedence key seen wins when spans differ (see [`prefer_key`]).
+    session_key: Option<&'static str>,
 }
 
 impl SessionCounters {
-    fn absorb(&mut self, span: &Span) {
+    fn absorb(&mut self, span: &Span, facts: &LlmFacts) {
         if self.counters.spans == 0 || span.start_time_ns < self.first_start_ns {
             self.first_start_ns = span.start_time_ns;
         }
@@ -223,7 +228,8 @@ impl SessionCounters {
             self.last_end_ns = span.end_time_ns;
         }
         self.traces.insert(span.trace_id.clone());
-        self.counters.absorb(span);
+        self.session_key = prefer_key(self.session_key, facts.session_key);
+        self.counters.absorb(span, facts);
     }
 
     fn merge(&mut self, other: &SessionCounters) {
@@ -234,7 +240,29 @@ impl SessionCounters {
             self.last_end_ns = other.last_end_ns;
         }
         self.traces.extend(other.traces.iter().cloned());
+        self.session_key = prefer_key(self.session_key, other.session_key);
         self.counters.merge(&other.counters);
+    }
+
+    /// The session key to report, defaulting to the native `session.id`.
+    fn attribute(&self) -> String {
+        self.session_key.unwrap_or(SESSION_ATTRIBUTE).to_owned()
+    }
+}
+
+/// Keeps the higher-precedence session key (earlier in the recognized order).
+fn prefer_key(
+    current: Option<&'static str>,
+    candidate: Option<&'static str>,
+) -> Option<&'static str> {
+    let rank = |key: Option<&str>| {
+        key.and_then(|k| semconv::SESSION_KEYS.iter().position(|c| *c == k))
+            .unwrap_or(usize::MAX)
+    };
+    match (current, candidate) {
+        (None, other) | (other, None) => other,
+        (Some(_), Some(_)) if rank(candidate) < rank(current) => candidate,
+        (current, _) => current,
     }
 }
 
@@ -245,6 +273,7 @@ pub(crate) struct SegmentRollup {
     min_start_ns: u64,
     max_start_ns: u64,
     by_model: HashMap<String, Counters>,
+    by_provider: HashMap<String, Counters>,
     by_service: HashMap<String, Counters>,
     by_day: BTreeMap<String, Counters>,
     by_session_key: HashMap<String, Counters>,
@@ -279,23 +308,37 @@ impl SegmentRollup {
         self.key_hashes
             .insert(key_hash(&span.trace_id, &span.span_id));
         collect_payload_refs(span, &mut self.payload_refs);
-        if let Some(model) = attr_str(&span.attributes, ATTR_MODEL) {
-            self.by_model.entry(model).or_default().absorb(span);
+        // One semconv scan, shared across every group this span joins.
+        let facts = semconv::facts(&span.attributes);
+        if let Some(model) = &facts.model {
+            self.by_model
+                .entry(model.clone())
+                .or_default()
+                .absorb(span, &facts);
+        }
+        if let Some(provider) = &facts.provider {
+            self.by_provider
+                .entry(provider.clone())
+                .or_default()
+                .absorb(span, &facts);
         }
         self.by_service
             .entry(span.service.clone())
             .or_default()
-            .absorb(span);
+            .absorb(span, &facts);
         self.by_day
             .entry(day_bucket(span.start_time_ns))
             .or_default()
-            .absorb(span);
-        if let Some(session) = attr_str(&span.attributes, SESSION_ATTRIBUTE) {
+            .absorb(span, &facts);
+        if let Some(session) = &facts.session {
             self.by_session_key
                 .entry(session.clone())
                 .or_default()
-                .absorb(span);
-            self.sessions.entry(session).or_default().absorb(span);
+                .absorb(span, &facts);
+            self.sessions
+                .entry(session.clone())
+                .or_default()
+                .absorb(span, &facts);
         }
     }
 }
@@ -334,35 +377,6 @@ fn collect_payload_refs(span: &Span, refs: &mut HashSet<String>) {
     for event in &span.events {
         scan(&event.attributes);
     }
-}
-
-fn attr_str(attributes: &Map<String, Value>, key: &str) -> Option<String> {
-    match attributes.get(key)? {
-        Value::String(text) if !text.is_empty() => Some(text.clone()),
-        Value::Number(number) => Some(number.to_string()),
-        _ => None,
-    }
-}
-
-/// Numeric attribute, tolerant of numeric strings (native-JSON producers and
-/// some OTLP exporters stringify counters).
-fn attr_u64(attributes: &Map<String, Value>, key: &str) -> Option<u64> {
-    match attributes.get(key)? {
-        Value::Number(number) => number
-            .as_u64()
-            .or_else(|| number.as_f64().map(|value| value.max(0.0) as u64)),
-        Value::String(text) => text.trim().parse().ok(),
-        _ => None,
-    }
-}
-
-fn attr_f64(attributes: &Map<String, Value>, key: &str) -> Option<f64> {
-    let value = match attributes.get(key)? {
-        Value::Number(number) => number.as_f64(),
-        Value::String(text) => text.trim().parse().ok(),
-        _ => None,
-    };
-    value.filter(|number| number.is_finite())
 }
 
 /// UTC calendar day (YYYY-MM-DD) of a nanosecond timestamp, dependency-free
@@ -406,6 +420,7 @@ impl Store {
             .into_iter()
             .map(|(session_id, entry)| SessionSummary {
                 session_id,
+                session_attribute: entry.attribute(),
                 first_start_ns: entry.first_start_ns,
                 last_end_ns: entry.last_end_ns,
                 trace_count: entry.traces.len(),
@@ -430,24 +445,38 @@ impl Store {
     /// One session with its per-trace breakdown, or `None` when no span
     /// carries the id.
     pub fn session(&self, session_id: &str) -> Result<Option<SessionDetail>> {
-        let spans = self.query(&crate::SpanFilter {
-            attributes: vec![(
-                SESSION_ATTRIBUTE.to_owned(),
-                Value::String(session_id.into()),
-            )],
-            limit: None,
-            ..crate::SpanFilter::default()
-        })?;
+        // A session id may arrive under any recognized key; each candidate key
+        // is an index-served point query. The union is then re-checked against
+        // the semconv precedence so a span whose RESOLVED session differs
+        // (for example it carries both a native `session.id` and a matching
+        // `gen_ai.conversation.id`) lands in exactly one session.
+        let mut spans: Vec<Span> = Vec::new();
+        let mut seen: HashSet<(String, String)> = HashSet::new();
+        for key in semconv::SESSION_KEYS {
+            for span in self.query(&crate::SpanFilter {
+                attributes: vec![(key.to_owned(), Value::String(session_id.into()))],
+                limit: None,
+                ..crate::SpanFilter::default()
+            })? {
+                if !seen.insert((span.trace_id.clone(), span.span_id.clone())) {
+                    continue;
+                }
+                if semconv::facts(&span.attributes).session.as_deref() == Some(session_id) {
+                    spans.push(span);
+                }
+            }
+        }
         if spans.is_empty() {
             return Ok(None);
         }
         let mut session = SessionCounters::default();
         let mut traces: BTreeMap<String, (Vec<&Span>, Counters)> = BTreeMap::new();
         for span in &spans {
-            session.absorb(span);
+            let facts = semconv::facts(&span.attributes);
+            session.absorb(span, &facts);
             let entry = traces.entry(span.trace_id.clone()).or_default();
             entry.0.push(span);
-            entry.1.absorb(span);
+            entry.1.absorb(span, &facts);
         }
         let mut trace_rows: Vec<SessionTrace> = traces
             .into_iter()
@@ -476,6 +505,7 @@ impl Store {
         Ok(Some(SessionDetail {
             summary: SessionSummary {
                 session_id: session_id.to_owned(),
+                session_attribute: session.attribute(),
                 first_start_ns: session.first_start_ns,
                 last_end_ns: session.last_end_ns,
                 trace_count: session.traces.len(),
@@ -503,6 +533,7 @@ impl Store {
         self.fold_analytics(since_ns, until_ns, |rollup| {
             let groups: Box<dyn Iterator<Item = (&String, &Counters)>> = match group_by {
                 LlmGroupBy::Model => Box::new(rollup.by_model.iter()),
+                LlmGroupBy::Provider => Box::new(rollup.by_provider.iter()),
                 LlmGroupBy::Service => Box::new(rollup.by_service.iter()),
                 LlmGroupBy::Session => Box::new(rollup.by_session_key.iter()),
                 LlmGroupBy::Day => Box::new(rollup.by_day.iter()),
