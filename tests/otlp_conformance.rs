@@ -1,4 +1,4 @@
-//! OTLP/HTTP JSON conformance: the leg-2 fixture drives the real server
+//! OTLP/HTTP JSON conformance: a representative fixture drives the real server
 //! binary end to end and reads mapped spans back through the existing API.
 
 use std::io::{BufRead, BufReader, Read, Write};
@@ -99,7 +99,7 @@ fn test_dir(label: &str) -> PathBuf {
     dir
 }
 
-/// The leg-2 spec fixture: two resources, two scopes, typed attributes,
+/// Conformance fixture: two resources, two scopes, typed attributes,
 /// string-encoded nanos, events, and a STATUS_CODE_ERROR span.
 fn fixture() -> Value {
     json!({
