@@ -16,6 +16,13 @@ use std::path::PathBuf;
 use traza::seed::{corpus, SeedOptions};
 use traza::{Config, Store};
 
+/// Scale units generated per chunk. Bounds peak memory to roughly one chunk's
+/// worth of spans regardless of the requested total.
+const CHUNK_SCALE: usize = 25;
+/// How far each chunk's time window advances (one day), so a large seed spans
+/// a realistic range instead of piling onto one instant.
+const CHUNK_WINDOW_NS: u64 = 86_400_000_000_000;
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("seed: {error}");
@@ -85,54 +92,95 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         i += 1;
     }
 
-    let generated = corpus(&options);
-    eprintln!(
-        "seed: generated {} spans, {} annotations (scale {})",
-        generated.spans.len(),
-        generated.annotations.len(),
-        options.scale
-    );
+    // Generate in bounded chunks rather than materializing the whole corpus:
+    // one scale unit is ~100 spans but carries oversized prompt bodies, so a
+    // single large corpus costs gigabytes of RSS before a byte is written.
+    // Each chunk gets its own id namespace and time window, so chunks never
+    // collide on the primary key.
+    let total_scale = options.scale.max(1);
+    let chunk_scale = CHUNK_SCALE.min(total_scale);
+    let mut written = 0_usize;
+    let mut annotated = 0_usize;
 
-    match (data_dir, url) {
-        (Some(directory), None) => {
-            let store = Store::open(
-                &directory,
-                Config {
-                    flush_spans: 10_000,
-                    ttl_seconds: None,
-                    payload_threshold: (payload_threshold > 0).then_some(payload_threshold),
-                },
-            )?;
-            store.ingest_batch(generated.spans)?;
-            for annotation in generated.annotations {
-                store.annotate(annotation)?;
-            }
-            store.flush()?;
-            let stats = store.stats()?;
-            eprintln!(
-                "seed: wrote {} records into {} ({} segments, {} bytes)",
-                stats.total_records,
-                directory.display(),
-                stats.segment_count,
-                stats.disk_bytes
-            );
-        }
-        (None, Some(endpoint)) => {
-            let (host, port, _) = split_url(&endpoint)?;
-            let mut sent = 0;
-            for chunk in generated.spans.chunks(batch) {
-                let body = serde_json::to_vec(chunk)?;
-                post(&host, port, "/v1/spans", &body)?;
-                sent += chunk.len();
-            }
-            for annotation in &generated.annotations {
-                let body = serde_json::to_vec(annotation)?;
-                post(&host, port, "/v1/annotations", &body)?;
-            }
-            eprintln!("seed: posted {sent} spans to {endpoint}");
-        }
+    let store = match &data_dir {
+        Some(directory) => Some(Store::open(
+            directory,
+            Config {
+                flush_spans: 10_000,
+                ttl_seconds: None,
+                payload_threshold: (payload_threshold > 0).then_some(payload_threshold),
+            },
+        )?),
+        None => None,
+    };
+    let endpoint = match (&store, &url) {
         (Some(_), Some(_)) => return Err("pass either --data-dir or --url, not both".into()),
         (None, None) => return Err("pass --data-dir DIR or --url http://host:port".into()),
+        (None, Some(endpoint)) => Some(split_url(endpoint)?),
+        (Some(_), None) => None,
+    };
+
+    let mut done = 0_usize;
+    let mut chunk_index = 0_u32;
+    while done < total_scale {
+        let this_scale = chunk_scale.min(total_scale - done);
+        let chunk = corpus(&SeedOptions {
+            scale: this_scale,
+            // Walk the window forward so chunks do not stack on one instant.
+            start_time_ns: options.start_time_ns + u64::from(chunk_index) * CHUNK_WINDOW_NS,
+            seed: options.seed.wrapping_add(u64::from(chunk_index)),
+            namespace: if total_scale > chunk_scale {
+                format!("b{chunk_index}")
+            } else {
+                String::new()
+            },
+            big_payload_bytes: options.big_payload_bytes,
+        });
+        written += chunk.spans.len();
+        annotated += chunk.annotations.len();
+
+        match (&store, &endpoint) {
+            (Some(store), _) => {
+                store.ingest_batch(chunk.spans)?;
+                for annotation in chunk.annotations {
+                    store.annotate(annotation)?;
+                }
+            }
+            (None, Some((host, port, _))) => {
+                for slice in chunk.spans.chunks(batch) {
+                    post(host, *port, "/v1/spans", &serde_json::to_vec(slice)?)?;
+                }
+                for annotation in &chunk.annotations {
+                    post(
+                        host,
+                        *port,
+                        "/v1/annotations",
+                        &serde_json::to_vec(annotation)?,
+                    )?;
+                }
+            }
+            (None, None) => unreachable!("a destination was validated above"),
+        }
+        done += this_scale;
+        chunk_index += 1;
+        eprintln!("seed: {written} spans ({done}/{total_scale} scale units)");
+    }
+
+    if let Some(store) = &store {
+        store.flush()?;
+        let stats = store.stats()?;
+        eprintln!(
+            "seed: wrote {} records into {} ({} segments, {} bytes, {annotated} annotations)",
+            stats.total_records,
+            data_dir.expect("a data directory").display(),
+            stats.segment_count,
+            stats.disk_bytes,
+        );
+    } else {
+        eprintln!(
+            "seed: posted {written} spans and {annotated} annotations to {}",
+            url.expect("an endpoint")
+        );
     }
     Ok(())
 }

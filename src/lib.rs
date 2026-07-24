@@ -869,25 +869,61 @@ impl Store {
             return Ok(result);
         }
 
-        // Primary-key semantics for unlimited queries: dedupe to the newest
-        // version of each (trace_id, span_id) BEFORE filtering, so a
-        // superseded older version can neither appear alongside nor instead
-        // of the version that currently holds the key.
-        let mut latest: std::collections::HashMap<(String, String), Span> =
-            std::collections::HashMap::new();
-        for segment in segments.iter() {
-            for span in segment.spans_parsed()? {
-                latest.insert((span.trace_id.clone(), span.span_id.clone()), span);
+        // Unlimited queries narrow candidates through the SAME index the
+        // limited path uses. Decoding every record to answer a selective
+        // filter made a session lookup on a 50k-span store take 1.3 s, and the
+        // cost grew with the store rather than with the answer.
+        //
+        // Primary-key semantics are preserved without materializing the
+        // corpus: a candidate is emitted only if no higher-precedence source
+        // (the write buffer, or a newer segment) also holds its key, which is
+        // an index lookup rather than a decode. Filtering a candidate before
+        // that check is safe — a superseded older version is dropped either
+        // way, and the version that currently holds the key is never
+        // superseded by definition.
+        for (position, segment) in segments.iter().enumerate() {
+            let seg = &segment.seg;
+            let offsets = if let Some(service) = &filter.service {
+                seg.attribute_posting_offsets_ref(IDX_SERVICE, service)
+            } else if let Some(name) = &filter.name {
+                seg.attribute_posting_offsets_ref(IDX_NAME, name)
+            } else if let Some((key, value)) = filter
+                .attributes
+                .iter()
+                .find(|(key, _)| !key.starts_with('\u{0}'))
+            {
+                seg.attribute_posting_offsets_ref(key, &canonical_value(value))
+            } else {
+                seg.record_offsets()
+            };
+            for offset in offsets {
+                let record = seg.record_at_offset(*offset).map_err(segment_v2_error)?;
+                let span = record_to_span(&record)?;
+                if !span_matches(&span, filter)
+                    || cursor.is_some_and(|bound| !span_after_cursor(&span, bound))
+                {
+                    continue;
+                }
+                if writer.contains_key(&span.trace_id, &span.span_id) {
+                    continue; // the buffer holds a newer version
+                }
+                let mut superseded = false;
+                for newer in segments.iter().skip(position + 1) {
+                    if newer.contains_key(&span.trace_id, &span.span_id)? {
+                        superseded = true;
+                        break;
+                    }
+                }
+                if !superseded {
+                    result.push(span);
+                }
             }
         }
         for span in writer.spans.iter() {
-            latest.insert((span.trace_id.clone(), span.span_id.clone()), span.clone());
-        }
-        for span in latest.into_values() {
-            if span_matches(&span, filter)
-                && cursor.map_or(true, |position| span_after_cursor(&span, position))
+            if span_matches(span, filter)
+                && cursor.map_or(true, |bound| span_after_cursor(span, bound))
             {
-                result.push(span);
+                result.push(span.clone());
             }
         }
 
