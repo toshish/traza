@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Limited queries now merge source heads by the engine's complete
+  `(start_time, end_time, trace_id, span_id)` order. Equal-timestamp spans
+  persisted in different segments can no longer appear in source order and
+  fall behind an export cursor; the cross-segment `z-trace`/`a-trace`
+  reproduction now exports both rows exactly once.
+- Payload sweeping now holds the touch-registry exclusion through each final
+  eligibility check and file deletion. A concurrent ingest therefore either
+  registers before the sweep and protects the payload, or waits for deletion
+  and recreates the content-addressed file before committing its span.
+
 ## [0.12.2] - 2026-07-23
 
 ### Fixed

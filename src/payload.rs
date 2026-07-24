@@ -249,16 +249,17 @@ pub(crate) fn sweep_expired(
     live: &HashSet<String>,
     registry: &TouchRegistry,
 ) -> Result<usize> {
-    // Prune stale registry entries, then snapshot the immune set. A ref
-    // touched within the immunity window survives even if the live-ref
-    // snapshot (taken earlier, locks since released) missed it.
-    let immune: HashSet<String> = {
-        let mut touched = registry
-            .lock()
-            .map_err(|_| Error::LockPoisoned("payload registry"))?;
-        touched.retain(|_, at| at.elapsed() < TOUCH_IMMUNITY);
-        touched.keys().cloned().collect()
-    };
+    // Keep the registry locked through the final eligibility check AND file
+    // deletion. Snapshotting it here merely moved the race: an ingest could
+    // touch and commit an old deduplicated payload after that snapshot but
+    // before the directory walk reached its file. With this exclusion, an
+    // ingest that touched first is protected; one that arrives during the
+    // sweep waits, sees any deletion, and recreates the content-addressed
+    // file before committing its span.
+    let mut touched = registry
+        .lock()
+        .map_err(|_| Error::LockPoisoned("payload registry"))?;
+    touched.retain(|_, at| at.elapsed() < TOUCH_IMMUNITY);
     let root = directory.join(PAYLOAD_DIR);
     if !root.exists() {
         return Ok(0);
@@ -279,7 +280,8 @@ pub(crate) fn sweep_expired(
                 .and_then(|stem| stem.to_str())
                 .map(|hash| format!("sha256/{hash}"))
                 .unwrap_or_default();
-            if modified < cutoff && !live.contains(&reference) && !immune.contains(&reference) {
+            if modified < cutoff && !live.contains(&reference) && !touched.contains_key(&reference)
+            {
                 fs::remove_file(entry.path())?;
                 removed += 1;
             }
