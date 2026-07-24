@@ -58,7 +58,7 @@ export function SessionsView({ openSession }) {
 }
 
 /** One session: aggregate tiles plus the per-trace breakdown. */
-export function SessionDetailView({ sessionId, openTrace, filterSpans }) {
+export function SessionDetailView({ sessionId, openTrace, openConversation, onBack, filterSpans }) {
   const [detail, setDetail] = React.useState(null);
   const [error, setError] = React.useState(null);
   const [loading, setLoading] = React.useState(true);
@@ -78,7 +78,9 @@ export function SessionDetailView({ sessionId, openTrace, filterSpans }) {
   return <Section title={'Session ' + sessionId}
     action={<div style={{ display: 'flex', gap: 6 }}>
       <CopyButton text={sessionId} label="copy id" />
+      {openConversation ? <Button variant="primary" size="sm" onClick={openConversation}>Conversation</Button> : null}
       <Button variant="ghost" size="sm" onClick={() => filterSpans(sessionId)}>Search its spans</Button>
+      {onBack ? <Button variant="ghost" size="sm" onClick={onBack}>Back</Button> : null}
       <Button variant="ghost" size="sm" onClick={fetchDetail}>Refresh</Button>
     </div>}>
     <LoadingBar active={loading} style={{ marginBottom: 8 }} />

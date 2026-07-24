@@ -156,6 +156,74 @@ const TOOLS: &[(&str, &str)] = &[
     ),
 ];
 
+/// A 16x16 PNG, small enough to inline as a data URI. Generated media in the
+/// corpus is REAL so the dashboard renders it rather than showing a
+/// placeholder — a renderer that has never been handed actual bytes is a
+/// renderer nobody has tested.
+const DEMO_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAABQElEQVR42hXMIWpYMQAA0B5xJxkMCoXCoFAoFAINJYXAvoiIiIiIiIiIiJjorbb3xbPv4fvnj39/OWwWk0GnUSlcZBKRwMP3LwGHzWIy6DQqhYtMIhJ+3cGjgMNmMRl0GpXCRSYRCY938CTgsFlMBp1GpXCRSUTC0x08CzhsFpNBp1EpXGQSkfB8B78FHDaLyaDTqBQuMolI+H0HLwIOm8Vk0GlUCheZRCS83MGrgMNmMRl0GpXCRSYRCa938CbgsFlMBp1GpXCRSUTC2x28CzhsFpNBp1EpXGQSkfB+B0HAYbOYDDqNSuEik4iEcAcfAg6bxWTQaVQKF5lEJHzcwaeAw2YxGXQalcJFJhEJn3fwJeCwWUwGnUalcJFJRMLXHWQBh81iMug0KoWLTCIS8h38EXDYLCaDTqNSuMgkIoH/+gF9n9zbzB8AAAAASUVORK5CYII=";
+
+/// A 0.25 s 440 Hz tone as a base64 WAV, synthesized rather than pasted so the
+/// source stays readable.
+fn demo_wav_b64() -> String {
+    let sample_rate = 8000_u32;
+    let samples: Vec<u8> = (0..(sample_rate / 4))
+        .map(|i| {
+            let t = f64::from(i) / f64::from(sample_rate);
+            (128.0 + 100.0 * (2.0 * std::f64::consts::PI * 440.0 * t).sin()) as u8
+        })
+        .collect();
+    let mut wav = Vec::new();
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + samples.len() as u32).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16_u32.to_le_bytes());
+    wav.extend_from_slice(&1_u16.to_le_bytes()); // PCM
+    wav.extend_from_slice(&1_u16.to_le_bytes()); // mono
+    wav.extend_from_slice(&sample_rate.to_le_bytes());
+    wav.extend_from_slice(&sample_rate.to_le_bytes()); // byte rate
+    wav.extend_from_slice(&1_u16.to_le_bytes()); // block align
+    wav.extend_from_slice(&8_u16.to_le_bytes()); // bits per sample
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&(samples.len() as u32).to_le_bytes());
+    wav.extend_from_slice(&samples);
+    base64_encode(&wav)
+}
+
+/// Standard base64. The crate carries no encoder and this is the only caller.
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    // (len + 2) / 3 rather than div_ceil: the crate's MSRV is 1.70.
+    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    for group in bytes.chunks(3) {
+        let b0 = u32::from(group[0]);
+        let b1 = group.get(1).copied().map_or(0, u32::from);
+        let b2 = group.get(2).copied().map_or(0, u32::from);
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[(triple >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(triple >> 12) as usize & 63] as char);
+        out.push(if group.len() > 1 {
+            ALPHABET[(triple >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if group.len() > 2 {
+            ALPHABET[triple as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// A markdown answer, the most common assistant output shape.
+const MARKDOWN_ANSWER: &str = "## Q4 summary\n\nRevenue rose **12%** quarter over quarter, driven by:\n\n1. Enterprise renewals (up 18%)\n2. A pricing change in *EMEA*\n3. Lower churn — see `retention.sql`\n\n> Margin was flat; support costs absorbed the gain.\n\n| Region | Revenue | Change |\n|---|---|---|\n| NA | $4.2M | +9% |\n| EMEA | $2.8M | +21% |\n| APAC | $1.1M | +4% |\n\nNext step: confirm the EMEA numbers with finance.";
+
+/// A fenced code answer.
+const CODE_ANSWER: &str = "Here is the query you asked for:\n\n```sql\nselect\n  date_trunc('month', created_at) as month,\n  count(*) as orders,\n  sum(total_cents) / 100.0 as revenue\nfrom orders\nwhere created_at >= now() - interval '12 months'\ngroup by 1\norder by 1;\n```\n\nRun it against the replica — it scans the whole orders table.";
+
+/// A structured-output (JSON) answer.
+const JSON_ANSWER: &str = "{\n  \"sentiment\": \"negative\",\n  \"confidence\": 0.87,\n  \"topics\": [\"billing\", \"refund\", \"support wait time\"],\n  \"entities\": [\n    {\"type\": \"order_id\", \"value\": \"A-441902\"},\n    {\"type\": \"amount\", \"value\": 129.99, \"currency\": \"USD\"}\n  ],\n  \"escalate\": true\n}";
+
 /// How the corpus is generated.
 #[derive(Clone, Debug)]
 pub struct SeedOptions {
@@ -248,6 +316,26 @@ pub fn corpus(options: &SeedOptions) -> Corpus {
     }
     for index in 0..(3 * scale) {
         gen.plain_service_traffic(index);
+    }
+    // Framework- and provider-shaped traces: the same conventions arriving in
+    // the different arrangements real SDKs produce.
+    for index in 0..(2 * scale) {
+        gen.openai_session(index);
+    }
+    for index in 0..(2 * scale) {
+        gen.anthropic_session(index);
+    }
+    for index in 0..scale {
+        gen.langgraph_session(index);
+    }
+    for index in 0..scale {
+        gen.crewai_session(index);
+    }
+    for index in 0..scale {
+        gen.generated_media_session(index);
+    }
+    for index in 0..scale {
+        gen.content_formats_session(index);
     }
     gen.out
 }
@@ -1107,6 +1195,530 @@ impl Gen {
         self.push(span);
 
         let _ = index;
+    }
+
+    /// OpenAI-shaped: response id and system fingerprint, OpenAI tool-call
+    /// arguments as a JSON *string* (as the API returns them), and a
+    /// structured-output turn whose answer is JSON.
+    fn openai_session(&mut self, index: usize) {
+        let vendor = &VENDORS[0];
+        let session = format!("openai-{:04}", index);
+        let trace = self.id("trace-openai");
+        let root = self.id("span");
+        let start = self.advance_rand(20, 200, SEC);
+
+        let prompt_tokens = self.rng.range(400, 2000);
+        let completion_tokens = self.rng.range(60, 400);
+        let mut attributes =
+            self.usage_attributes(vendor, Dialect::Current, prompt_tokens, completion_tokens);
+        attributes.insert("gen_ai.conversation.id".into(), json!(session));
+        attributes.insert(
+            "gen_ai.response.id".into(),
+            json!(format!("chatcmpl-{:012x}", self.rng.next_u64())),
+        );
+        attributes.insert(
+            "gen_ai.openai.response.system_fingerprint".into(),
+            json!("fp_44709d6fcb"),
+        );
+        attributes.insert("gen_ai.output.type".into(), json!("json"));
+        attributes.insert("gen_ai.response.finish_reason".into(), json!("tool_calls"));
+        attributes.insert(
+            "gen_ai.input.messages".into(),
+            messages_json(json!([
+                {"role": "system", "parts": [{"type": "text", "content": "Classify the ticket and return JSON matching the schema."}]},
+                {"role": "user", "parts": [{"type": "text", "content": "Order A-441902 still hasn't shipped and I've been on hold for 40 minutes. I want a refund."}]}
+            ])),
+        );
+        attributes.insert(
+            "gen_ai.output.messages".into(),
+            messages_json(json!([
+                {"role": "assistant", "parts": [{
+                    "type": "tool_call",
+                    "id": "call_9sLk2",
+                    "name": "lookup_order",
+                    // OpenAI returns arguments as a JSON string, not an object.
+                    "arguments": "{\"order_id\":\"A-441902\"}"
+                }], "finish_reason": "tool_calls"}
+            ])),
+        );
+        let span = make_span(
+            &trace,
+            &root,
+            None,
+            "openai.chat",
+            vendor.service,
+            start,
+            self.rng.range(300, 1800) * MS,
+            "ok",
+            attributes,
+        );
+        self.push(span);
+
+        // The structured-output answer.
+        let answer = self.id("span");
+        let prompt_tokens = self.rng.range(600, 2400);
+        let completion_tokens = self.rng.range(80, 300);
+        let mut attributes =
+            self.usage_attributes(vendor, Dialect::Current, prompt_tokens, completion_tokens);
+        attributes.insert("gen_ai.conversation.id".into(), json!(session));
+        attributes.insert("gen_ai.output.type".into(), json!("json"));
+        attributes.insert("gen_ai.response.finish_reason".into(), json!("stop"));
+        attributes.insert(
+            "gen_ai.input.messages".into(),
+            messages_json(json!([
+                {"role": "tool", "parts": [{"type": "tool_call_response", "id": "call_9sLk2", "result": "{\"status\":\"delayed\",\"eta\":\"2026-01-09\"}"}]}
+            ])),
+        );
+        attributes.insert(
+            "gen_ai.output.messages".into(),
+            messages_json(json!([
+                {"role": "assistant", "parts": [{"type": "text", "content": JSON_ANSWER}], "finish_reason": "stop"}
+            ])),
+        );
+        let span = make_span(
+            &trace,
+            &answer,
+            Some(&root),
+            "openai.chat",
+            vendor.service,
+            start + 2 * SEC,
+            self.rng.range(300, 1500) * MS,
+            "ok",
+            attributes,
+        );
+        self.push(span);
+    }
+
+    /// Anthropic-shaped: prompt-cache token counters and a markdown answer.
+    fn anthropic_session(&mut self, index: usize) {
+        let vendor = &VENDORS[2];
+        let session = format!("anthropic-{:04}", index);
+        let trace = self.id("trace-anthropic");
+        let span_id = self.id("span");
+        let start = self.advance_rand(20, 200, SEC);
+
+        let prompt_tokens = self.rng.range(2000, 9000);
+        let completion_tokens = self.rng.range(200, 1200);
+        let mut attributes =
+            self.usage_attributes(vendor, Dialect::Current, prompt_tokens, completion_tokens);
+        attributes.insert("gen_ai.conversation.id".into(), json!(session));
+        // Anthropic's cache counters, which OpenLLMetry records verbatim.
+        attributes.insert(
+            "gen_ai.usage.cache_creation_input_tokens".into(),
+            json!(self.rng.range(0, 3000)),
+        );
+        attributes.insert(
+            "gen_ai.usage.cache_read_input_tokens".into(),
+            json!(self.rng.range(0, 12000)),
+        );
+        attributes.insert("gen_ai.response.stop_reason".into(), json!("end_turn"));
+        attributes.insert("gen_ai.response.finish_reason".into(), json!("end_turn"));
+        attributes.insert(
+            "gen_ai.input.messages".into(),
+            messages_json(json!([
+                {"role": "user", "parts": [{"type": "text", "content": "Summarize the Q4 report for the board, with a table by region."}]}
+            ])),
+        );
+        attributes.insert(
+            "gen_ai.output.messages".into(),
+            messages_json(json!([
+                {"role": "assistant", "parts": [{"type": "text", "content": MARKDOWN_ANSWER}], "finish_reason": "end_turn"}
+            ])),
+        );
+        let span = make_span(
+            &trace,
+            &span_id,
+            None,
+            "anthropic.chat",
+            vendor.service,
+            start,
+            self.rng.range(800, 6000) * MS,
+            "ok",
+            attributes,
+        );
+        self.push(span);
+    }
+
+    /// A LangGraph run: a graph root carrying its node/edge topology, then one
+    /// span per node, some of which are LLM calls and some plain state work.
+    fn langgraph_session(&mut self, index: usize) {
+        let vendor = &VENDORS[4];
+        let session = format!("graph-{:04}", index);
+        let trace = self.id("trace-langgraph");
+        let root = self.id("span");
+        let start = self.advance_rand(30, 300, SEC);
+        let nodes = ["retrieve", "grade_documents", "generate", "reflect"];
+
+        let mut attributes = Map::new();
+        attributes.insert("traceloop.span.kind".into(), json!("workflow"));
+        attributes.insert("traceloop.workflow.name".into(), json!("LangGraph"));
+        attributes.insert("traceloop.entity.name".into(), json!("self_rag_graph"));
+        attributes.insert("gen_ai.conversation.id".into(), json!(session));
+        attributes.insert("gen_ai.workflow.nodes".into(), json!(nodes));
+        attributes.insert(
+            "gen_ai.workflow.edges".into(),
+            json!([
+                ["retrieve", "grade_documents"],
+                ["grade_documents", "generate"],
+                ["generate", "reflect"],
+                ["reflect", "generate"]
+            ]),
+        );
+        attributes.insert("framework".into(), json!("langgraph"));
+        let span = make_span(
+            &trace,
+            &root,
+            None,
+            "self_rag_graph.workflow",
+            vendor.service,
+            start,
+            self.rng.range(3, 25) * SEC,
+            "ok",
+            attributes,
+        );
+        self.push(span);
+
+        let mut previous = root.clone();
+        for (step, node) in nodes.iter().enumerate() {
+            let node_span = self.id("span");
+            let is_llm = matches!(*node, "generate" | "reflect" | "grade_documents");
+            let mut attributes = if is_llm {
+                let prompt_tokens = self.rng.range(500, 4000);
+                let completion_tokens = self.rng.range(60, 600);
+                self.usage_attributes(vendor, Dialect::Current, prompt_tokens, completion_tokens)
+            } else {
+                Map::new()
+            };
+            attributes.insert(
+                "traceloop.span.kind".into(),
+                json!(if is_llm { "llm" } else { "task" }),
+            );
+            attributes.insert("traceloop.entity.name".into(), json!(*node));
+            attributes.insert("gen_ai.task.name".into(), json!(*node));
+            attributes.insert("gen_ai.task.id".into(), json!(format!("{node}-{step}")));
+            attributes.insert("gen_ai.task.parent.id".into(), json!("self_rag_graph"));
+            attributes.insert("gen_ai.conversation.id".into(), json!(session));
+            attributes.insert("framework".into(), json!("langgraph"));
+            attributes.insert(
+                "traceloop.entity.input".into(),
+                json!(format!(
+                    "{{\"question\":\"What changed in Q4?\",\"step\":{step}}}"
+                )),
+            );
+            if is_llm {
+                attributes.insert(
+                    "gen_ai.output.messages".into(),
+                    messages_json(json!([
+                        {"role": "assistant", "parts": [{"type": "text", "content": format!("Node `{node}` decided: continue.")}], "finish_reason": "stop"}
+                    ])),
+                );
+            }
+            let span = make_span(
+                &trace,
+                &node_span,
+                Some(&previous),
+                &format!("{node}.langgraph"),
+                vendor.service,
+                start + (step as u64 + 1) * SEC,
+                self.rng.range(200, 4000) * MS,
+                "ok",
+                attributes,
+            );
+            self.push(span);
+            previous = node_span;
+        }
+    }
+
+    /// A CrewAI run: a crew root, agents with roles, and their delegated tasks.
+    fn crewai_session(&mut self, index: usize) {
+        let vendor = &VENDORS[1];
+        let session = format!("crew-{:04}", index);
+        let trace = self.id("trace-crewai");
+        let root = self.id("span");
+        let start = self.advance_rand(30, 300, SEC);
+        let agents: &[(&str, &str)] = &[
+            ("researcher", "Find primary sources on the topic"),
+            ("analyst", "Turn sources into a numbers-first brief"),
+            ("writer", "Write the final memo in plain language"),
+        ];
+
+        let mut attributes = Map::new();
+        attributes.insert("traceloop.span.kind".into(), json!("workflow"));
+        attributes.insert("traceloop.workflow.name".into(), json!("Crew"));
+        attributes.insert(
+            "traceloop.entity.name".into(),
+            json!("market_research_crew"),
+        );
+        attributes.insert("gen_ai.conversation.id".into(), json!(session));
+        attributes.insert("framework".into(), json!("crewai"));
+        attributes.insert("crewai.crew.process".into(), json!("sequential"));
+        attributes.insert(
+            "crewai.crew.agents".into(),
+            json!(["researcher", "analyst", "writer"]),
+        );
+        let span = make_span(
+            &trace,
+            &root,
+            None,
+            "market_research_crew.workflow",
+            vendor.service,
+            start,
+            self.rng.range(10, 60) * SEC,
+            "ok",
+            attributes,
+        );
+        self.push(span);
+
+        for (step, (role, goal)) in agents.iter().enumerate() {
+            let agent_span = self.id("span");
+            let mut attributes = Map::new();
+            attributes.insert("traceloop.span.kind".into(), json!("agent"));
+            attributes.insert("traceloop.entity.name".into(), json!(*role));
+            attributes.insert("gen_ai.agent.name".into(), json!(*role));
+            attributes.insert("gen_ai.agent.description".into(), json!(*goal));
+            attributes.insert("gen_ai.conversation.id".into(), json!(session));
+            attributes.insert("framework".into(), json!("crewai"));
+            let agent_start = start + (step as u64 * 4 + 1) * SEC;
+            let span = make_span(
+                &trace,
+                &agent_span,
+                Some(&root),
+                &format!("{role}.agent"),
+                vendor.service,
+                agent_start,
+                self.rng.range(2, 12) * SEC,
+                "ok",
+                attributes,
+            );
+            self.push(span);
+
+            // Each agent runs one task, which makes one LLM call.
+            let task_span = self.id("span");
+            let prompt_tokens = self.rng.range(300, 2500);
+            let completion_tokens = self.rng.range(80, 700);
+            let mut attributes =
+                self.usage_attributes(vendor, Dialect::Current, prompt_tokens, completion_tokens);
+            attributes.insert("traceloop.span.kind".into(), json!("llm"));
+            attributes.insert("gen_ai.conversation.id".into(), json!(session));
+            attributes.insert("framework".into(), json!("crewai"));
+            attributes.insert("gen_ai.agent.name".into(), json!(*role));
+            attributes.insert(
+                "gen_ai.input.messages".into(),
+                messages_json(json!([
+                    {"role": "system", "parts": [{"type": "text", "content": format!("You are the {role}. {goal}.")}]},
+                    {"role": "user", "parts": [{"type": "text", "content": "Produce your section of the market brief."}]}
+                ])),
+            );
+            attributes.insert(
+                "gen_ai.output.messages".into(),
+                messages_json(json!([
+                    {"role": "assistant", "parts": [{"type": "text", "content": if step == 2 { MARKDOWN_ANSWER } else { "Section drafted; handing off." }}], "finish_reason": "stop"}
+                ])),
+            );
+            let span = make_span(
+                &trace,
+                &task_span,
+                Some(&agent_span),
+                &format!("{role}_task.task"),
+                vendor.service,
+                agent_start + 200 * MS,
+                self.rng.range(500, 8000) * MS,
+                "ok",
+                attributes,
+            );
+            self.push(span);
+        }
+    }
+
+    /// Turns whose OUTPUT is media: an image the model generated, speech it
+    /// synthesized, and a rendered video. Inline data URIs, so a dashboard can
+    /// actually display them.
+    fn generated_media_session(&mut self, index: usize) {
+        let session = format!("studio-{:04}", index);
+        let png = format!("data:image/png;base64,{DEMO_PNG_B64}");
+        let wav = format!("data:audio/wav;base64,{}", demo_wav_b64());
+
+        // 1) Image generation.
+        let vendor = &VENDORS[0];
+        let trace = self.id("trace-imagegen");
+        let span_id = self.id("span");
+        let start = self.advance_rand(20, 180, SEC);
+        let mut attributes = Map::new();
+        attributes.insert("gen_ai.provider.name".into(), json!("openai"));
+        attributes.insert("gen_ai.operation.name".into(), json!("image.generation"));
+        attributes.insert("gen_ai.request.model".into(), json!("gpt-image-1"));
+        attributes.insert(
+            "gen_ai.usage.input_tokens".into(),
+            json!(self.rng.range(20, 120)),
+        );
+        attributes.insert("gen_ai.output.type".into(), json!("image"));
+        attributes.insert("gen_ai.conversation.id".into(), json!(session));
+        attributes.insert("llm.cost_usd".into(), json!(0.04));
+        attributes.insert(
+            "gen_ai.input.messages".into(),
+            messages_json(json!([
+                {"role": "user", "parts": [{"type": "text", "content": "A 16x16 terracotta gradient tile, flat design."}]}
+            ])),
+        );
+        attributes.insert(
+            "gen_ai.output.messages".into(),
+            messages_json(json!([
+                {"role": "assistant", "parts": [
+                    {"type": "text", "content": "Here is the tile you asked for."},
+                    {"type": "image", "mime_type": "image/png", "filename": "tile.png",
+                     "size_bytes": 372, "data": png}
+                ], "finish_reason": "stop"}
+            ])),
+        );
+        let span = make_span(
+            &trace,
+            &span_id,
+            None,
+            "openai.images.generate",
+            vendor.service,
+            start,
+            self.rng.range(2, 20) * SEC,
+            "ok",
+            attributes,
+        );
+        self.push(span);
+
+        // 2) Text to speech.
+        let trace = self.id("trace-tts");
+        let span_id = self.id("span");
+        let start = self.advance_rand(10, 90, SEC);
+        let mut attributes = Map::new();
+        attributes.insert("gen_ai.provider.name".into(), json!("openai"));
+        attributes.insert("gen_ai.operation.name".into(), json!("audio.speech"));
+        attributes.insert("gen_ai.request.model".into(), json!("gpt-4o-mini-tts"));
+        attributes.insert("gen_ai.output.type".into(), json!("speech"));
+        attributes.insert(
+            "gen_ai.usage.input_tokens".into(),
+            json!(self.rng.range(10, 80)),
+        );
+        attributes.insert("gen_ai.conversation.id".into(), json!(session));
+        attributes.insert("llm.cost_usd".into(), json!(0.015));
+        attributes.insert(
+            "gen_ai.input.messages".into(),
+            messages_json(json!([
+                {"role": "user", "parts": [{"type": "text", "content": "Read the summary aloud."}]}
+            ])),
+        );
+        attributes.insert(
+            "gen_ai.output.messages".into(),
+            messages_json(json!([
+                {"role": "assistant", "parts": [
+                    {"type": "audio", "mime_type": "audio/wav", "filename": "summary.wav",
+                     "size_bytes": 2044, "data": wav}
+                ], "finish_reason": "stop"}
+            ])),
+        );
+        let span = make_span(
+            &trace,
+            &span_id,
+            None,
+            "openai.audio.speech",
+            vendor.service,
+            start,
+            self.rng.range(1, 8) * SEC,
+            "ok",
+            attributes,
+        );
+        self.push(span);
+
+        // 3) Video generation — too large to inline, referenced by URL with a
+        //    poster image, the shape a real pipeline produces.
+        let trace = self.id("trace-videogen");
+        let span_id = self.id("span");
+        let start = self.advance_rand(30, 200, SEC);
+        let mut attributes = Map::new();
+        attributes.insert("gen_ai.provider.name".into(), json!("gcp.vertex_ai"));
+        attributes.insert("gen_ai.operation.name".into(), json!("video.generation"));
+        attributes.insert("gen_ai.request.model".into(), json!("veo-3"));
+        attributes.insert("gen_ai.output.type".into(), json!("video"));
+        attributes.insert("gen_ai.conversation.id".into(), json!(session));
+        attributes.insert("llm.cost_usd".into(), json!(1.20));
+        attributes.insert(
+            "gen_ai.input.messages".into(),
+            messages_json(json!([
+                {"role": "user", "parts": [{"type": "text", "content": "A 6 second clip of rain on a window, slow pan."}]}
+            ])),
+        );
+        attributes.insert(
+            "gen_ai.output.messages".into(),
+            messages_json(json!([
+                {"role": "assistant", "parts": [
+                    {"type": "video", "mime_type": "video/mp4", "filename": "rain.mp4",
+                     "size_bytes": 8_412_233, "uri": "https://storage.example.com/traza-demo/rain.mp4"},
+                    {"type": "image", "mime_type": "image/png", "filename": "poster.png",
+                     "size_bytes": 372, "data": format!("data:image/png;base64,{DEMO_PNG_B64}")}
+                ], "finish_reason": "stop"}
+            ])),
+        );
+        let span = make_span(
+            &trace,
+            &span_id,
+            None,
+            "vertex_ai.video.generate",
+            "studio-agent",
+            start,
+            self.rng.range(20, 120) * SEC,
+            "ok",
+            attributes,
+        );
+        self.push(span);
+    }
+
+    /// One session whose answers cover every text shape the renderer must
+    /// handle: markdown, fenced code, JSON, and plain prose.
+    fn content_formats_session(&mut self, index: usize) {
+        let vendor = &VENDORS[2];
+        let session = format!("formats-{:04}", index);
+        let answers: &[(&str, &str)] = &[
+            ("markdown", MARKDOWN_ANSWER),
+            ("code", CODE_ANSWER),
+            ("json", JSON_ANSWER),
+            (
+                "plain",
+                "No table needed — revenue is up 12% and margin is flat. I'd confirm EMEA with finance before the board sees it.",
+            ),
+        ];
+        for (kind, answer) in answers {
+            let trace = self.id("trace-format");
+            let span_id = self.id("span");
+            let start = self.advance_rand(10, 120, SEC);
+            let prompt_tokens = self.rng.range(200, 1500);
+            let completion_tokens = self.rng.range(80, 900);
+            let mut attributes =
+                self.usage_attributes(vendor, Dialect::Current, prompt_tokens, completion_tokens);
+            attributes.insert("gen_ai.conversation.id".into(), json!(session));
+            attributes.insert("gen_ai.response.finish_reason".into(), json!("stop"));
+            attributes.insert("response.format".into(), json!(*kind));
+            attributes.insert(
+                "gen_ai.input.messages".into(),
+                messages_json(json!([
+                    {"role": "user", "parts": [{"type": "text", "content": format!("Answer as {kind}.")}]}
+                ])),
+            );
+            attributes.insert(
+                "gen_ai.output.messages".into(),
+                messages_json(json!([
+                    {"role": "assistant", "parts": [{"type": "text", "content": *answer}], "finish_reason": "stop"}
+                ])),
+            );
+            let span = make_span(
+                &trace,
+                &span_id,
+                None,
+                "anthropic.chat",
+                vendor.service,
+                start,
+                self.rng.range(400, 6000) * MS,
+                "ok",
+                attributes,
+            );
+            self.push(span);
+        }
     }
 }
 
