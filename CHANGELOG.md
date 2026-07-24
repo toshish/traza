@@ -10,20 +10,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Traza now follows the [OpenLLMetry](https://github.com/traceloop/openllmetry)
-  standard (Traceloop's OpenTelemetry GenAI conventions). Sessions, token/cost
-  analytics, and the dashboard recognize `gen_ai.*`, `llm.usage.*`, and
-  `traceloop.*` attributes natively, so an OpenLLMetry-instrumented app
-  populates every derived view over OTLP with no attribute renaming. A new
-  `src/semconv.rs` normalization layer resolves model, provider, tokens, cost,
-  and session identity from either the OpenLLMetry keys or Traza's native
-  `llm.*` / `session.id` shorthand (native behavior is unchanged).
-- `GET /v1/stats/llm?group_by=provider` rolls token/cost figures up by
-  `gen_ai.system`.
-- Sessions are grouped by any recognized session key (`session.id`,
-  `gen_ai.conversation.id`, or a `traceloop.association.properties.*` key), and
-  each session reports the `session_attribute` that grouped it. The dashboard's
-  span detail renders provider/model/token chips and a Messages panel from the
-  OpenLLMetry `gen_ai.prompt.*` / `gen_ai.completion.*` attributes.
+  standard (Traceloop's OpenTelemetry GenAI conventions). Sessions, token
+  analytics, and the dashboard recognize the current OTel GenAI attributes —
+  `gen_ai.provider.name`, `gen_ai.operation.name`, `gen_ai.usage.input_tokens` /
+  `output_tokens`, `gen_ai.request/response.model`, `gen_ai.conversation.id`,
+  and `traceloop.*` — so an OpenLLMetry-instrumented app populates every
+  derived view over OTLP with no attribute renaming. The OTel-deprecated names
+  (`gen_ai.system`, `gen_ai.usage.prompt_tokens` / `completion_tokens`) and
+  Traza's native `llm.*` / `session.id` shorthand are accepted as aliases;
+  native behavior is unchanged. A new `src/semconv.rs` normalization layer is
+  the single source of truth for the key precedence.
+- `GET /v1/stats/llm?group_by=provider` rolls tokens up by the resolved
+  provider.
+- `GET /v1/spans?session=<id>` filters spans to a session, unioning every
+  recognized session key so a session whose spans mix conventions (some
+  `session.id`, some `gen_ai.conversation.id`) is returned whole. Sessions are
+  grouped by any recognized key, and each reports the `session_attribute` that
+  grouped it.
+- The dashboard's span detail renders provider/model/token chips and a Messages
+  panel from the current JSON `gen_ai.input.messages` / `gen_ai.output.messages`
+  as well as the legacy indexed `gen_ai.prompt.*` / `gen_ai.completion.*`
+  attributes and native `llm.prompt` / `llm.completion` events.
+
+### Notes
+
+- Cost analytics remain a Traza extension (`llm.cost_usd`), not part of
+  OpenLLMetry — OpenTelemetry GenAI defines no cost attribute. Cost populates
+  only when the ingest pipeline supplies it.
 
 ### Changed
 

@@ -19,23 +19,30 @@ The single source of truth for the key precedence is
 
 ## Recognized attributes
 
-Each fact is resolved from the first key present, in this order:
+Each fact is resolved from the first key present, in this order. Current OTel
+GenAI names come first; the names OTel has since deprecated are kept as
+aliases, and Traza's native `llm.*` shorthand last:
 
 | Fact | Keys (first present wins) |
 |---|---|
-| Provider | `gen_ai.system` |
+| Provider | `gen_ai.provider.name` → `gen_ai.system` *(deprecated)* |
 | Model | `gen_ai.response.model` → `gen_ai.request.model` → `llm.model` |
-| Prompt tokens | `gen_ai.usage.prompt_tokens` → `gen_ai.usage.input_tokens` → `llm.prompt_tokens` |
-| Completion tokens | `gen_ai.usage.completion_tokens` → `gen_ai.usage.output_tokens` → `llm.completion_tokens` |
+| Prompt tokens | `gen_ai.usage.input_tokens` → `gen_ai.usage.prompt_tokens` *(deprecated)* → `llm.prompt_tokens` |
+| Completion tokens | `gen_ai.usage.output_tokens` → `gen_ai.usage.completion_tokens` *(deprecated)* → `llm.completion_tokens` |
 | Total tokens | `llm.usage.total_tokens` → `gen_ai.usage.total_tokens` → `llm.total_tokens` → (prompt + completion) |
-| Cost (USD) | `gen_ai.usage.cost` → `llm.cost_usd` |
 | Session id | `session.id` → `gen_ai.conversation.id` → `traceloop.association.properties.session_id` → `traceloop.association.properties.chat_id` |
 
-A span counts as an **LLM call** when it carries any of: a model, a provider
-(`gen_ai.system`), a token count, `llm.request.type`, or
-`traceloop.span.kind == "llm"`. Numeric token/cost values may be supplied as
-numbers or numeric strings (some OTLP exporters stringify counters); an
-explicit total wins over the prompt+completion sum.
+A span counts as an **LLM call** when it carries any of: a model, a provider,
+a token count, `gen_ai.operation.name`, `llm.request.type`, or
+`traceloop.span.kind == "llm"`. Numeric token values may be supplied as numbers
+or numeric strings (some OTLP exporters stringify counters); an explicit total
+wins over the prompt+completion sum.
+
+**Cost is a Traza extension, not an OpenLLMetry attribute.** OpenTelemetry
+GenAI defines no cost attribute — providers meter cost out of band. Traza
+reads cost from `llm.cost_usd` (and accepts `gen_ai.usage.cost` as a courtesy
+for pipelines that compute it), so cost analytics populate only when your
+ingest supplies one of those; it is not part of OpenLLMetry conformance.
 
 Attributes are indexed like any other, so exact-match filters on them are
 index-served.
@@ -62,25 +69,37 @@ span and distinct-trace counts, token sums, cost, error counts, and the
 `session_attribute` that grouped each one; `GET /v1/sessions/{id}` adds the
 per-trace breakdown and resolves the id under any recognized key.
 
+To list a session's spans, use the dedicated session filter — it **unions**
+every recognized key, so a session that spans conventions (some spans
+`session.id`, others `gen_ai.conversation.id`) returns whole, which a
+single-key `attr.session.id` filter cannot do:
+
+    GET /v1/spans?session=chat-4711&limit=100
+
 `GET /v1/stats/llm?group_by=model|provider|service|session|day` aggregates
-token/cost figures. `provider` groups by `gen_ai.system`; `model` by the
-resolved model. Aggregates are exact: sealed segments contribute cached
-rollups (segments are immutable, so a rollup is computed once), and window
-edges fall back to decoding just the boundary segments.
+token/cost figures. `provider` groups by the resolved provider
+(`gen_ai.provider.name`, else `gen_ai.system`); `model` by the resolved model.
+Aggregates are exact: sealed segments contribute cached rollups (segments are
+immutable, so a rollup is computed once), and window edges fall back to
+decoding just the boundary segments.
 
 ## Prompt and completion payloads
 
-Chat content rides two shapes, both recognized:
+Chat content rides three shapes, all recognized by the dashboard's Messages
+panel:
 
-- **OpenLLMetry indexed attributes** — `gen_ai.prompt.{i}.role` /
+- **Current OTel GenAI messages** (OpenLLMetry default) — JSON-encoded
+  `gen_ai.input.messages` and `gen_ai.output.messages`, each an array of
+  `{"role": …, "parts": [{"type": "text", "content": …}, …]}` objects
+  (tool-call parts are rendered compactly);
+- **Legacy indexed attributes** — `gen_ai.prompt.{i}.role` /
   `gen_ai.prompt.{i}.content` and `gen_ai.completion.{i}.role` /
   `gen_ai.completion.{i}.content`;
 - **Native events** — event `llm.prompt` with attribute `content`, event
   `llm.completion` with attribute `content`.
 
-Both round-trip verbatim through `/v1/spans` and OTLP ingest, and the
-dashboard renders them as a Messages panel. Large content is offloaded at
-ingest (below), so it never bloats the attribute index.
+All round-trip verbatim through `/v1/spans` and OTLP ingest. Large content is
+offloaded at ingest (below), so it never bloats the attribute index.
 
 ## Query recipes
 

@@ -119,8 +119,15 @@ fn openllmetry_spans_populate_sessions_and_rollups() {
     let dir = test_dir("recognize");
     let server = Server::spawn(&dir);
 
-    // Three OpenLLMetry-shaped spans over the JSON surface. No native llm.*
-    // keys, no session.id: everything is gen_ai.* / traceloop.*.
+    // Span A uses the CURRENT OTel GenAI names captured from OpenLLMetry:
+    // gen_ai.provider.name, gen_ai.operation.name, input/output tokens, and
+    // JSON gen_ai.input.messages / gen_ai.output.messages (role + parts).
+    let input_messages =
+        r#"[{"role":"user","parts":[{"type":"text","content":"What is Traza?"}]}]"#;
+    let output_messages = r#"[{"role":"assistant","parts":[{"type":"text","content":"A trace datastore."}],"finish_reason":"stop"}]"#;
+    // Span B uses the OTel-DEPRECATED names still emitted by older
+    // instrumentation: gen_ai.system + prompt/completion tokens + indexed
+    // gen_ai.prompt.N / gen_ai.completion.N messages.
     let (status, body) = server.request(
         "POST",
         "/v1/spans",
@@ -129,18 +136,16 @@ fn openllmetry_spans_populate_sessions_and_rollups() {
                 "trace_id": "ta", "span_id": "a1", "name": "openai.chat", "service": "agent",
                 "start_time_ns": 1_000_000_000u64, "end_time_ns": 1_002_000_000u64, "status": "ok",
                 "attributes": {
-                    "gen_ai.system": "openai",
+                    "gen_ai.provider.name": "openai",
+                    "gen_ai.operation.name": "chat",
                     "gen_ai.request.model": "gpt-4o",
-                    "gen_ai.usage.prompt_tokens": 120,
-                    "gen_ai.usage.completion_tokens": 80,
+                    "gen_ai.usage.input_tokens": 120,
+                    "gen_ai.usage.output_tokens": 80,
                     "llm.usage.total_tokens": 200,
-                    "gen_ai.usage.cost": 0.01,
                     "gen_ai.conversation.id": "chat-1",
                     "traceloop.span.kind": "llm",
-                    "gen_ai.prompt.0.role": "user",
-                    "gen_ai.prompt.0.content": "Hi",
-                    "gen_ai.completion.0.role": "assistant",
-                    "gen_ai.completion.0.content": "Hello"
+                    "gen_ai.input.messages": input_messages,
+                    "gen_ai.output.messages": output_messages
                 }
             },
             {
@@ -149,19 +154,23 @@ fn openllmetry_spans_populate_sessions_and_rollups() {
                 "attributes": {
                     "gen_ai.system": "anthropic",
                     "gen_ai.request.model": "claude-sonnet",
-                    "gen_ai.usage.input_tokens": 10,
-                    "gen_ai.usage.output_tokens": 5,
-                    "gen_ai.conversation.id": "chat-1"
+                    "gen_ai.usage.prompt_tokens": 10,
+                    "gen_ai.usage.completion_tokens": 5,
+                    "gen_ai.conversation.id": "chat-1",
+                    "gen_ai.prompt.0.role": "user",
+                    "gen_ai.prompt.0.content": "Hi",
+                    "gen_ai.completion.0.role": "assistant",
+                    "gen_ai.completion.0.content": "Hello"
                 }
             },
             {
                 "trace_id": "tc", "span_id": "c1", "name": "openai.chat", "service": "worker",
                 "start_time_ns": 3_000_000_000u64, "end_time_ns": 3_001_000_000u64, "status": "ok",
                 "attributes": {
-                    "gen_ai.system": "openai",
+                    "gen_ai.provider.name": "openai",
                     "gen_ai.request.model": "gpt-4o",
-                    "gen_ai.usage.prompt_tokens": 30,
-                    "gen_ai.usage.completion_tokens": 20,
+                    "gen_ai.usage.input_tokens": 30,
+                    "gen_ai.usage.output_tokens": 20,
                     "traceloop.association.properties.chat_id": "chat-2"
                 }
             }
@@ -184,10 +193,10 @@ fn openllmetry_spans_populate_sessions_and_rollups() {
                 "startTimeUnixNano": "4000000000",
                 "endTimeUnixNano": "4001000000",
                 "attributes": [
-                    {"key": "gen_ai.system", "value": {"stringValue": "openai"}},
+                    {"key": "gen_ai.provider.name", "value": {"stringValue": "openai"}},
                     {"key": "gen_ai.request.model", "value": {"stringValue": "gpt-4o"}},
-                    {"key": "gen_ai.usage.prompt_tokens", "value": {"intValue": "40"}},
-                    {"key": "gen_ai.usage.completion_tokens", "value": {"intValue": "10"}},
+                    {"key": "gen_ai.usage.input_tokens", "value": {"intValue": "40"}},
+                    {"key": "gen_ai.usage.output_tokens", "value": {"intValue": "10"}},
                     {"key": "gen_ai.conversation.id", "value": {"stringValue": "chat-1"}}
                 ]
             }]}]
@@ -195,7 +204,9 @@ fn openllmetry_spans_populate_sessions_and_rollups() {
     );
     assert_eq!(status, 200, "OTLP ingest: {body}");
 
-    // Grouped by provider (gen_ai.system) — a dimension that did not exist.
+    // Grouped by provider — a dimension that did not exist. openai comes from
+    // gen_ai.provider.name (A, C, D); anthropic from the deprecated
+    // gen_ai.system alias (B).
     let (status, body) = server.request("GET", "/v1/stats/llm?group_by=provider", None);
     assert_eq!(status, 200);
     let openai = row_by(&body["rows"], "key", "openai");
@@ -205,7 +216,7 @@ fn openllmetry_spans_populate_sessions_and_rollups() {
     assert_eq!(anthropic["llm_calls"], 1);
     assert_eq!(
         anthropic["total_tokens"], 15,
-        "input+output fallback: 10 + 5"
+        "input+output fallback via deprecated names: 10 + 5"
     );
 
     // Grouped by model — resolved from gen_ai.request.model.
@@ -214,10 +225,14 @@ fn openllmetry_spans_populate_sessions_and_rollups() {
     let gpt = row_by(&body["rows"], "key", "gpt-4o");
     assert_eq!(gpt["llm_calls"], 3);
     assert_eq!(gpt["total_tokens"], 300);
-    assert!(
-        (gpt["cost_usd"].as_f64().expect("cost") - 0.01).abs() < 1e-9,
-        "gen_ai.usage.cost is summed: {body}"
-    );
+
+    // Span A round-trips the current-shape JSON messages verbatim (the UI
+    // parses them; the store keeps them intact).
+    let (status, body) = server.request("GET", "/v1/traces/ta", None);
+    assert_eq!(status, 200);
+    let a_attrs = &body["spans"][0]["attributes"];
+    assert_eq!(a_attrs["gen_ai.input.messages"], json!(input_messages));
+    assert_eq!(a_attrs["gen_ai.output.messages"], json!(output_messages));
 
     // Sessions grouped via gen_ai.conversation.id and a traceloop association
     // property — with the attribute that grouped each reported back.
@@ -255,6 +270,71 @@ fn openllmetry_spans_populate_sessions_and_rollups() {
         "only span A: {body}"
     );
     assert_eq!(body[0]["span_id"], "a1");
+
+    server.kill();
+}
+
+#[test]
+fn session_filter_unions_mixed_convention_keys() {
+    // A single session whose spans use DIFFERENT session keys — one native
+    // `session.id`, one OpenLLMetry `gen_ai.conversation.id`. This is the
+    // migration case the reviewer flagged: a single-key attr filter drops
+    // half the session; the dedicated `session=` filter must return it whole.
+    let dir = test_dir("mixed");
+    let server = Server::spawn(&dir);
+    let (status, _) = server.request(
+        "POST",
+        "/v1/spans",
+        Some(&json!([
+            {
+                "trace_id": "m1", "span_id": "s1", "name": "openai.chat", "service": "agent",
+                "start_time_ns": 1_000_000_000u64, "end_time_ns": 1_001_000_000u64, "status": "ok",
+                "attributes": {"session.id": "mix", "gen_ai.request.model": "gpt-4o",
+                               "gen_ai.usage.input_tokens": 5, "gen_ai.usage.output_tokens": 5}
+            },
+            {
+                "trace_id": "m2", "span_id": "s2", "name": "openai.chat", "service": "agent",
+                "start_time_ns": 2_000_000_000u64, "end_time_ns": 2_001_000_000u64, "status": "ok",
+                "attributes": {"gen_ai.conversation.id": "mix", "gen_ai.request.model": "gpt-4o",
+                               "gen_ai.usage.input_tokens": 7, "gen_ai.usage.output_tokens": 3}
+            }
+        ])),
+    );
+    assert_eq!(status, 200);
+
+    // The session rollup sees both spans...
+    let (status, body) = server.request("GET", "/v1/sessions/mix", None);
+    assert_eq!(status, 200);
+    assert_eq!(body["span_count"], 2, "both conventions join one session");
+    assert_eq!(body["total_tokens"], 20);
+
+    // ...and so does the dedicated session filter (the union).
+    let (status, body) = server.request("GET", "/v1/spans?session=mix", None);
+    assert_eq!(status, 200);
+    assert_eq!(
+        body.as_array().map(Vec::len),
+        Some(2),
+        "session filter unions both keys: {body}"
+    );
+
+    // A single-key attr filter, by contrast, only sees its own dialect — the
+    // exact drop the dedicated filter fixes.
+    let (status, body) = server.request("GET", "/v1/spans?attr.session.id=mix", None);
+    assert_eq!(status, 200);
+    assert_eq!(
+        body.as_array().map(Vec::len),
+        Some(1),
+        "single key sees half"
+    );
+
+    // The session filter composes with the other predicates (AND).
+    let (status, body) = server.request("GET", "/v1/spans?session=mix&name=nope", None);
+    assert_eq!(status, 200);
+    assert_eq!(
+        body.as_array().map(Vec::len),
+        Some(0),
+        "name predicate still applies"
+    );
 
     server.kill();
 }

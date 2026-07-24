@@ -21,15 +21,19 @@
 use serde_json::{Map, Value};
 
 // -- OpenTelemetry GenAI / OpenLLMetry (Traceloop) -------------------------
-const GEN_AI_SYSTEM: &str = "gen_ai.system";
+// Current OTel GenAI names first; the deprecated names OTel replaced are kept
+// as aliases (`gen_ai.system` → `gen_ai.provider.name`,
+// `gen_ai.usage.{prompt,completion}_tokens` → `.{input,output}_tokens`).
+const GEN_AI_PROVIDER_NAME: &str = "gen_ai.provider.name";
+const GEN_AI_SYSTEM: &str = "gen_ai.system"; // deprecated alias for provider
+const GEN_AI_OPERATION_NAME: &str = "gen_ai.operation.name";
 const GEN_AI_REQUEST_MODEL: &str = "gen_ai.request.model";
 const GEN_AI_RESPONSE_MODEL: &str = "gen_ai.response.model";
-const GEN_AI_USAGE_PROMPT_TOKENS: &str = "gen_ai.usage.prompt_tokens";
 const GEN_AI_USAGE_INPUT_TOKENS: &str = "gen_ai.usage.input_tokens";
-const GEN_AI_USAGE_COMPLETION_TOKENS: &str = "gen_ai.usage.completion_tokens";
+const GEN_AI_USAGE_PROMPT_TOKENS: &str = "gen_ai.usage.prompt_tokens"; // deprecated
 const GEN_AI_USAGE_OUTPUT_TOKENS: &str = "gen_ai.usage.output_tokens";
+const GEN_AI_USAGE_COMPLETION_TOKENS: &str = "gen_ai.usage.completion_tokens"; // deprecated
 const GEN_AI_USAGE_TOTAL_TOKENS: &str = "gen_ai.usage.total_tokens";
-const GEN_AI_USAGE_COST: &str = "gen_ai.usage.cost";
 const GEN_AI_CONVERSATION_ID: &str = "gen_ai.conversation.id";
 const LLM_USAGE_TOTAL_TOKENS: &str = "llm.usage.total_tokens";
 const LLM_REQUEST_TYPE: &str = "llm.request.type";
@@ -37,12 +41,18 @@ const TRACELOOP_SPAN_KIND: &str = "traceloop.span.kind";
 const TRACELOOP_SESSION_ID: &str = "traceloop.association.properties.session_id";
 const TRACELOOP_CHAT_ID: &str = "traceloop.association.properties.chat_id";
 
+// Cost is NOT an OpenTelemetry GenAI attribute; `llm.cost_usd` is a Traza
+// extension, populated when a pipeline meters cost. `gen_ai.usage.cost` is
+// accepted as a courtesy for tools that emit it, but it is not part of the
+// OpenLLMetry standard (see docs/llm-semantics.md).
+const LLM_COST_USD: &str = "llm.cost_usd";
+const GEN_AI_USAGE_COST: &str = "gen_ai.usage.cost";
+
 // -- Native Traza shorthand ------------------------------------------------
 const LLM_MODEL: &str = "llm.model";
 const LLM_PROMPT_TOKENS: &str = "llm.prompt_tokens";
 const LLM_COMPLETION_TOKENS: &str = "llm.completion_tokens";
 const LLM_TOTAL_TOKENS: &str = "llm.total_tokens";
-const LLM_COST_USD: &str = "llm.cost_usd";
 const SESSION_ID: &str = "session.id";
 
 /// Attribute keys that identify a session, in resolution priority order:
@@ -64,7 +74,8 @@ pub struct LlmFacts {
     pub is_llm: bool,
     /// Model identifier (response model preferred over request model).
     pub model: Option<String>,
-    /// Provider/system (`gen_ai.system`, for example `openai`, `anthropic`).
+    /// Provider (`gen_ai.provider.name`, else the deprecated `gen_ai.system`;
+    /// for example `openai`, `anthropic`, `aws.bedrock`).
     pub provider: Option<String>,
     /// Session identifier, if any recognized session key is present.
     pub session: Option<String>,
@@ -98,20 +109,20 @@ pub fn facts(attributes: &Map<String, Value>) -> LlmFacts {
         attributes,
         &[GEN_AI_RESPONSE_MODEL, GEN_AI_REQUEST_MODEL, LLM_MODEL],
     );
-    let provider = attr_str(attributes, GEN_AI_SYSTEM);
+    let provider = first_str(attributes, &[GEN_AI_PROVIDER_NAME, GEN_AI_SYSTEM]);
     let prompt_tokens = first_u64(
         attributes,
         &[
-            GEN_AI_USAGE_PROMPT_TOKENS,
             GEN_AI_USAGE_INPUT_TOKENS,
+            GEN_AI_USAGE_PROMPT_TOKENS,
             LLM_PROMPT_TOKENS,
         ],
     );
     let completion_tokens = first_u64(
         attributes,
         &[
-            GEN_AI_USAGE_COMPLETION_TOKENS,
             GEN_AI_USAGE_OUTPUT_TOKENS,
+            GEN_AI_USAGE_COMPLETION_TOKENS,
             LLM_COMPLETION_TOKENS,
         ],
     );
@@ -123,7 +134,7 @@ pub fn facts(attributes: &Map<String, Value>) -> LlmFacts {
             LLM_TOTAL_TOKENS,
         ],
     );
-    let cost_usd = first_f64(attributes, &[GEN_AI_USAGE_COST, LLM_COST_USD]);
+    let cost_usd = first_f64(attributes, &[LLM_COST_USD, GEN_AI_USAGE_COST]);
     let (session, session_key) = SESSION_KEYS
         .iter()
         .find_map(|key| attr_str(attributes, key).map(|value| (value, *key)))
@@ -133,6 +144,7 @@ pub fn facts(attributes: &Map<String, Value>) -> LlmFacts {
         || prompt_tokens.is_some()
         || completion_tokens.is_some()
         || total_tokens.is_some()
+        || attributes.contains_key(GEN_AI_OPERATION_NAME)
         || attributes.contains_key(LLM_REQUEST_TYPE)
         || attr_str(attributes, TRACELOOP_SPAN_KIND).as_deref() == Some("llm");
     LlmFacts {
@@ -221,12 +233,15 @@ mod tests {
     }
 
     #[test]
-    fn openllmetry_gen_ai_conventions_are_recognized() {
+    fn current_gen_ai_conventions_are_recognized() {
+        // Current OTel GenAI names: gen_ai.provider.name, input/output tokens,
+        // gen_ai.operation.name.
         let f = facts(&attrs(json!({
-            "gen_ai.system": "openai",
+            "gen_ai.provider.name": "openai",
+            "gen_ai.operation.name": "chat",
             "gen_ai.request.model": "gpt-4o",
-            "gen_ai.usage.prompt_tokens": 120,
-            "gen_ai.usage.completion_tokens": 80,
+            "gen_ai.usage.input_tokens": 120,
+            "gen_ai.usage.output_tokens": 80,
             "llm.usage.total_tokens": 200,
             "gen_ai.conversation.id": "chat-1",
         })));
@@ -242,20 +257,46 @@ mod tests {
     }
 
     #[test]
-    fn response_model_and_input_output_aliases_win_when_present() {
+    fn deprecated_gen_ai_names_are_accepted_as_aliases() {
+        // gen_ai.system and prompt/completion tokens are OTel-deprecated but
+        // still emitted by older instrumentation.
         let f = facts(&attrs(json!({
+            "gen_ai.system": "anthropic",
+            "gen_ai.request.model": "claude-sonnet",
+            "gen_ai.usage.prompt_tokens": 40,
+            "gen_ai.usage.completion_tokens": 25,
+        })));
+        assert!(f.is_llm);
+        assert_eq!(f.provider.as_deref(), Some("anthropic"));
+        assert_eq!(f.prompt_tokens, Some(40));
+        assert_eq!(f.completion_tokens, Some(25));
+        assert_eq!(f.total(), 65);
+    }
+
+    #[test]
+    fn current_names_win_over_deprecated_when_both_present() {
+        let f = facts(&attrs(json!({
+            "gen_ai.provider.name": "openai",
+            "gen_ai.system": "legacy",
             "gen_ai.request.model": "req-model",
             "gen_ai.response.model": "resp-model",
             "gen_ai.usage.input_tokens": 7,
+            "gen_ai.usage.prompt_tokens": 999,
             "gen_ai.usage.output_tokens": 3,
+            "gen_ai.usage.completion_tokens": 999,
         })));
+        assert_eq!(
+            f.provider.as_deref(),
+            Some("openai"),
+            "provider.name preferred"
+        );
         assert_eq!(
             f.model.as_deref(),
             Some("resp-model"),
             "response model preferred"
         );
-        assert_eq!(f.prompt_tokens, Some(7));
-        assert_eq!(f.completion_tokens, Some(3));
+        assert_eq!(f.prompt_tokens, Some(7), "input_tokens preferred");
+        assert_eq!(f.completion_tokens, Some(3), "output_tokens preferred");
         assert_eq!(f.total(), 10);
     }
 
@@ -263,9 +304,9 @@ mod tests {
     fn numeric_strings_coerce() {
         let f = facts(&attrs(json!({
             "gen_ai.request.model": "m",
-            "gen_ai.usage.prompt_tokens": "120",
-            "gen_ai.usage.completion_tokens": "30",
-            "gen_ai.usage.cost": "0.25",
+            "gen_ai.usage.input_tokens": "120",
+            "gen_ai.usage.output_tokens": "30",
+            "llm.cost_usd": "0.25",
         })));
         assert_eq!(f.prompt_tokens, Some(120));
         assert_eq!(f.completion_tokens, Some(30));
@@ -292,7 +333,16 @@ mod tests {
     }
 
     #[test]
-    fn provider_or_span_kind_alone_marks_an_llm_span() {
+    fn provider_operation_or_span_kind_alone_marks_an_llm_span() {
+        // The reviewer's runtime case: only gen_ai.provider.name +
+        // gen_ai.operation.name present must still classify as an LLM span.
+        assert!(
+            facts(&attrs(
+                json!({ "gen_ai.provider.name": "openai", "gen_ai.operation.name": "chat" })
+            ))
+            .is_llm
+        );
+        assert!(facts(&attrs(json!({ "gen_ai.operation.name": "embeddings" }))).is_llm);
         assert!(facts(&attrs(json!({ "gen_ai.system": "anthropic" }))).is_llm);
         assert!(facts(&attrs(json!({ "traceloop.span.kind": "llm" }))).is_llm);
         assert!(facts(&attrs(json!({ "llm.request.type": "chat" }))).is_llm);
