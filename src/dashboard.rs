@@ -1,14 +1,16 @@
-//! The bundled dashboard: a dependency-free trace browser embedded in the
-//! server binary.
+//! The bundled dashboard: a trace browser embedded in the server binary.
 //!
-//! The single self-contained HTML page (inline CSS + vanilla JS, no external
-//! resources) is compiled in via `include_str!` and served at `GET /` and
-//! `GET /dashboard`. It consumes only the existing JSON API (`/v1/spans`,
-//! `/v1/traces/{id}`, `/v1/stats`) — no dashboard-specific endpoints exist.
-//! When auth is enabled the SHELL stays open (this module is consulted before
-//! the auth gate) while every API call the page makes remains gated; the page
-//! prompts for a bearer token on the first 401 and keeps it in
-//! `sessionStorage` only.
+//! The page is a React app built to the Traza design system; its source
+//! lives in `ui/` and `npm run build` (Vite, single-file output) regenerates
+//! the checked-in `src/dashboard.html` — never edit that file by hand. The
+//! result is still one self-contained HTML document compiled in via
+//! `include_str!` and served at `GET /` and `GET /dashboard`, so building
+//! the server needs no Node toolchain. It consumes only the public JSON API
+//! (spans, traces, sessions, LLM analytics, annotations, payloads, export,
+//! flush, stats) — no dashboard-specific endpoints exist. When auth is
+//! enabled the SHELL stays open (this module is consulted before the auth
+//! gate) while every API call the page makes remains gated; the page prompts
+//! for a bearer token on the first 401 and keeps it in `sessionStorage` only.
 
 /// The dashboard HTML document embedded in the server binary.
 pub const DASHBOARD_HTML: &str = include_str!("dashboard.html");

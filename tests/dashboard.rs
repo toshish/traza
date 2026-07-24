@@ -137,14 +137,38 @@ fn dashboard_route_serves_embedded_asset() {
 fn dashboard_references_no_external_urls() {
     // The page must be self-contained: same-origin API paths only. A grep
     // over the embedded asset is the spec's oracle for this criterion.
-    for needle in [
-        "http://",
-        "https://",
-        "src=\"//",
-        "href=\"//",
-        "@import",
-        "srcset",
-    ] {
+    //
+    // The bundled React runtime carries a handful of URL-shaped string
+    // constants that are never fetched: the W3C XML namespace identifiers
+    // (`document.createElementNS` requires those exact strings) and the
+    // prefix React prints in minified-error console messages. Those exact
+    // strings are exempt; every other absolute URL fails the test.
+    const RUNTIME_IDENTIFIERS: &[&str] = &[
+        "http://www.w3.org/2000/svg",
+        "http://www.w3.org/1999/xlink",
+        "http://www.w3.org/1998/Math/MathML",
+        "http://www.w3.org/XML/1998/namespace",
+        "https://react.dev/errors/",
+    ];
+    for scheme in ["http://", "https://"] {
+        let mut searched = 0;
+        while let Some(found) = DASHBOARD_HTML[searched..].find(scheme) {
+            let at = searched + found;
+            let rest = &DASHBOARD_HTML[at..];
+            assert!(
+                RUNTIME_IDENTIFIERS
+                    .iter()
+                    .any(|identifier| rest.starts_with(identifier)),
+                "dashboard page references an external resource: {}",
+                &rest[..rest.len().min(60)]
+            );
+            searched = at + scheme.len();
+        }
+    }
+    // `srcset` itself appears as a DOM property name inside the React
+    // runtime; external srcset URLs are already caught by the scheme scan
+    // above, so only the protocol-relative form needs its own needle.
+    for needle in ["src=\"//", "href=\"//", "@import", "srcset=\"//"] {
         assert!(
             !DASHBOARD_HTML.contains(needle),
             "dashboard page references an external resource ({needle})"

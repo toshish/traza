@@ -1,0 +1,80 @@
+/* Traza design system — tokens and base, imported from the Traza Design
+   System project (claude.ai/design, "Traza Design System").
+   The brand fonts are vendored and inlined (see fonts.css): no network
+   loads, the embedded dashboard stays fully self-contained, and the spec
+   test that greps for external URLs holds. */
+@import './fonts.css';
+
+/* ------------------------------------------------ color tokens
+   light = "paper", dark = inverted notebook. The single accent
+   (terracotta) is reserved for MEASURED things: span bars, figures,
+   costs, scores, PASS. Everything unmeasured stays ink. */
+:root {
+  --bg: #FAF7F2; --bg-raised: #FFFFFF; --bg-sunken: #F2EDE4;
+  --ink: #1F1B17; --ink-muted: #6E675E; --ink-faint: #A39B8F;
+  --hairline: #E4DDD1; --grid: #EFE9DE;
+  --accent: #C65D3B; --accent-hover: #A84B2D; --accent-tint: #F5E3DA;
+  --ok: #3D7A50; --warn: #B07C2E; --error: #9E2B25;
+  --ok-tint: #E3EDE6; --warn-tint: #F3EADA; --error-tint: #F2E0DE;
+  --surface-page: var(--bg); --surface-card: var(--bg-raised); --surface-well: var(--bg-sunken);
+  --text-body: var(--ink); --text-secondary: var(--ink-muted); --text-tertiary: var(--ink-faint);
+  --text-measured: var(--accent);
+  --border-default: var(--hairline); --border-grid: var(--grid);
+  --span-bar: var(--accent); --span-bar-error: var(--error);
+  --series-compare: rgba(31, 27, 23, 0.4);
+}
+[data-theme="dark"] {
+  --bg: #191512; --bg-raised: #211D19; --bg-sunken: #131009;
+  --ink: #EDE7DD; --ink-muted: #9C9489; --ink-faint: #6B645A;
+  --hairline: #2E2924; --grid: #262119;
+  --accent: #E07A52; --accent-hover: #E98F6B; --accent-tint: #3A251C;
+  --ok: #6CAF84; --warn: #CFA35C; --error: #C25A4C;
+  --ok-tint: #22301F; --warn-tint: #332A18; --error-tint: #33201C;
+  --series-compare: rgba(237, 231, 221, 0.4);
+}
+
+/* ------------------------------------------------ typography tokens */
+:root {
+  --font-mono: 'JetBrains Mono', 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+  --font-sans: 'Inter', 'IBM Plex Sans', system-ui, -apple-system, sans-serif;
+  --text-12: 12px; --lh-12: 16px;
+  --text-13: 13px; --lh-13: 18px;
+  --text-14: 14px; --lh-14: 20px; /* body */
+  --text-16: 16px; --lh-16: 24px;
+  --text-20: 20px; --lh-20: 28px;
+  --text-24: 24px; --lh-24: 32px;
+  --text-32: 32px; --lh-32: 40px;
+  --weight-regular: 400; --weight-medium: 500; --weight-semibold: 600;
+  --tracking-caps: 0.06em; /* uppercase micro-labels only */
+}
+
+/* ------------------------------------------------ space, shape, motion */
+:root {
+  --space-1: 4px; --space-2: 8px; --space-3: 12px; --space-4: 16px;
+  --space-6: 24px; --space-8: 32px; --space-12: 48px; --space-16: 64px;
+  --radius-control: 3px; --radius-card: 6px; --radius-bar: 1.5px;
+  --border-hairline: 1px solid var(--hairline);
+  --focus-ring: 2px solid var(--accent); --focus-offset: 1px;
+  --row-comfortable: 40px; --row-dense: 28px;
+  --dur-fast: 120ms;
+  --dur-base: 160ms;
+  --ease-out: cubic-bezier(0, 0, 0.2, 1);
+}
+
+/* ------------------------------------------------ base */
+* { box-sizing: border-box; }
+html { height: 100%; }
+body {
+  margin: 0; min-height: 100%;
+  background: var(--bg); color: var(--ink);
+  font-family: var(--font-sans); font-size: var(--text-14); line-height: var(--lh-14);
+  -webkit-font-smoothing: antialiased;
+}
+code, kbd, pre, samp { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+a { color: var(--ink); text-decoration: underline; text-decoration-color: var(--ink-faint); text-underline-offset: 2px; }
+a:hover { color: var(--accent-hover); text-decoration-color: var(--accent-hover); }
+:focus-visible { outline: var(--focus-ring); outline-offset: var(--focus-offset); }
+::selection { background: var(--accent-tint); color: var(--ink); }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+}
