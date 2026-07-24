@@ -8,7 +8,7 @@ version = "0.13.0"
 edition = "2021"
 rust-version = "1.70"
 description = "Single-binary trace datastore with first-class LLM/agent observability: OTLP ingest, sessions, token/cost analytics, and a built-in dashboard"
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 
 repository = "https://github.com/toshish/traza"
 homepage = "https://github.com/toshish/traza"
