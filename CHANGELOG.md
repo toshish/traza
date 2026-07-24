@@ -7,15 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The dashboard is no longer compiled into `traza-server`. The server now
+  serves the UI's build output from disk: `--ui-dir` (default `./ui/dist`,
+  produced by `cd ui && npm run build`) backs `GET /` and `GET /dashboard`.
+  Building the server still needs no Node toolchain, a rebuilt UI is picked up
+  without restarting, and a missing build is not fatal — the API runs and the
+  UI routes 404 with build instructions. The shell stays served before the auth
+  gate (it is static build output carrying no data) while every `/v1` call it
+  makes remains gated. Path traversal out of the UI directory is refused.
+
 ### Removed
 
-- The dashboard is no longer embedded in `traza-server`; the server is now a
-  pure JSON API and no longer serves `GET /` or `GET /dashboard` (both now
-  404). The trace browser lives on as a standalone React app in [`ui/`](ui/) —
-  run it with `npm run dev` or deploy the static `npm run build` bundle,
-  pointed at the server's API. Removed `src/dashboard.html`, `src/dashboard.rs`,
-  `ui/scripts/embed.mjs`, and `tests/dashboard.rs`; `ui` builds no longer
-  regenerate an embedded HTML file.
+- The checked-in generated `src/dashboard.html` and the `ui/scripts/embed.mjs`
+  script that produced it, along with `src/dashboard.rs`. UI builds no longer
+  regenerate an embedded HTML file, so `ui/` changes no longer produce a
+  368 KB diff in the Rust crate.
 
 ### Added
 

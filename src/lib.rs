@@ -15,6 +15,7 @@ pub mod otlp_pb;
 pub mod payload;
 pub mod segment_v2;
 pub mod semconv;
+pub mod ui;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
