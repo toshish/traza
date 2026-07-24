@@ -117,90 +117,136 @@ export function sessionIdOf(span) {
   return null;
 }
 
-// A single message's rendered text is capped: sub-threshold prompts can still
-// be hundreds of KB, and pasting that into the DOM freezes the panel. The full
-// value is always available under Attributes / Offloaded payloads.
-const MAX_MESSAGE_CHARS = 4000;
-// Longer tool arguments/results are summarized rather than dumped.
-const MAX_PART_JSON = 400;
+// Very long text is clipped for display; the full value stays in Attributes
+// and, when offloaded, behind the payload fetch.
+const MAX_TEXT_CHARS = 20000;
 
 function clip(text, limit) {
-  return text.length > limit ? text.slice(0, limit) + ' … (' + text.length + ' chars)' : text;
+  return text.length > limit ? text.slice(0, limit) + '\n… (' + text.length + ' chars total)' : text;
 }
 
-function bytesLabel(bytes) {
+/** Human byte label. */
+export function bytesLabel(bytes) {
   if (typeof bytes !== 'number' || !Number.isFinite(bytes)) return null;
   if (bytes >= 1 << 20) return (bytes / (1 << 20)).toFixed(1) + ' MiB';
   if (bytes >= 1 << 10) return (bytes / (1 << 10)).toFixed(1) + ' KiB';
   return bytes + ' B';
 }
 
-// Renders one message part. Media parts (image/audio/video/document) are
-// described, never inlined: a base64 `data:` blob is megabytes of noise that
-// tells the reader nothing the descriptor does not.
-function describePart(part) {
-  if (part == null || typeof part !== 'object') return String(part ?? '');
-  if (isPayloadRef(part.content)) {
-    return '[offloaded ' + (bytesLabel(part.content.bytes) || '') + '] ' + (part.content.preview || '');
+const MEDIA_KINDS = ['image', 'audio', 'video', 'document', 'file'];
+
+/** Media kind for a part type or MIME type, else null. */
+function mediaKindOf(type, mime) {
+  if (typeof type === 'string') {
+    const t = type.toLowerCase();
+    if (t === 'file') return 'document';
+    if (MEDIA_KINDS.includes(t)) return t;
+    if (t === 'image_url' || t === 'input_image') return 'image';
+    if (t === 'input_audio') return 'audio';
   }
-  if (part.type === 'text' && typeof part.content === 'string') return part.content;
-  if (part.type === 'tool_call') {
-    return '[tool_call ' + (part.name || '') + ' ' + clip(JSON.stringify(part.arguments ?? {}), MAX_PART_JSON) + ']';
+  if (typeof mime === 'string') {
+    if (mime.startsWith('image/')) return 'image';
+    if (mime.startsWith('audio/')) return 'audio';
+    if (mime.startsWith('video/')) return 'video';
+    if (mime === 'application/pdf' || mime.startsWith('text/')) return 'document';
   }
-  if (part.type === 'tool_call_response') {
-    return '[tool_result ' + clip(JSON.stringify(part.result ?? part.response ?? ''), MAX_PART_JSON) + ']';
-  }
-  // Media and unknown part types: a compact descriptor.
-  const bits = [part.type || 'part'];
-  if (part.mime_type) bits.push(part.mime_type);
-  if (part.filename) bits.push(part.filename);
-  const size = bytesLabel(part.size_bytes);
-  if (size) bits.push(size);
-  if (typeof part.uri === 'string') bits.push(part.uri);
-  else if (typeof part.data === 'string') bits.push('inline ' + part.data.length + ' chars');
-  else if (!part.type) return clip(JSON.stringify(part), MAX_PART_JSON);
-  return '[' + bits.join(' · ') + ']';
+  return null;
 }
 
-// Flattens one OTel GenAI message ({role, parts:[{type,content|...}]} or the
-// older {role, content}) to { role, content } where content is a string (or a
-// payload reference passed through untouched).
-function flattenGenAiMessage(message, direction) {
-  if (message == null || typeof message !== 'object') {
-    return { direction, role: undefined, content: message };
+/** A browser can only render data: and http(s): sources; s3://, gs:// and
+    friends are real locators but not fetchable here, so they are shown as
+    references rather than broken media. */
+function renderableSrc(value) {
+  if (typeof value !== 'string') return null;
+  return /^(data:|https?:)/i.test(value) ? value : null;
+}
+
+// One part of a message, normalized into a shape the renderer can switch on.
+function normalizePart(part) {
+  if (part == null) return { kind: 'text', text: '' };
+  if (typeof part !== 'object') return { kind: 'text', text: String(part) };
+  if (isPayloadRef(part)) {
+    return { kind: 'payload', ref: part.$payload, bytes: part.bytes, preview: part.preview || '' };
   }
-  const role = message.role;
-  if (isPayloadRef(message.content)) return { direction, role, content: message.content };
-  if (typeof message.content === 'string') {
-    return { direction, role, content: clip(message.content, MAX_MESSAGE_CHARS) };
+  if (isPayloadRef(part.content)) {
+    return { kind: 'payload', ref: part.content.$payload, bytes: part.content.bytes, preview: part.content.preview || '' };
   }
-  const parts = Array.isArray(message.parts) ? message.parts : null;
-  if (!parts) return { direction, role, content: clip(JSON.stringify(message), MAX_MESSAGE_CHARS) };
-  const text = parts.map(describePart).join('\n');
-  return { direction, role, content: clip(text, MAX_MESSAGE_CHARS) };
+  const type = typeof part.type === 'string' ? part.type.toLowerCase() : undefined;
+  if (type === 'tool_call') {
+    return { kind: 'tool_call', id: part.id, name: part.name || '', args: part.arguments ?? part.args ?? {} };
+  }
+  if (type === 'tool_call_response' || type === 'tool_result') {
+    return { kind: 'tool_result', id: part.id, result: part.result ?? part.response ?? part.content ?? '' };
+  }
+  const mime = part.mime_type || part.mimeType || part.media_type;
+  const media = mediaKindOf(type, mime);
+  if (media) {
+    const raw = part.data ?? part.uri ?? part.url ?? part.image_url;
+    const locator = typeof raw === 'object' && raw !== null ? raw.url : raw;
+    return {
+      kind: 'media',
+      mediaType: media,
+      mime: mime || undefined,
+      filename: part.filename || part.name || undefined,
+      sizeBytes: typeof part.size_bytes === 'number' ? part.size_bytes : undefined,
+      src: renderableSrc(locator),
+      uri: typeof locator === 'string' ? locator : undefined,
+    };
+  }
+  if (typeof part.content === 'string') return { kind: 'text', text: clip(part.content, MAX_TEXT_CHARS) };
+  if (typeof part.text === 'string') return { kind: 'text', text: clip(part.text, MAX_TEXT_CHARS) };
+  return { kind: 'text', text: clip(JSON.stringify(part, null, 2), MAX_TEXT_CHARS) };
+}
+
+// One message -> { role, parts: [...] }. Accepts the OTel GenAI shape
+// ({role, parts:[...]}), the older {role, content} shape, and a bare string.
+function normalizeMessage(message, direction) {
+  if (message == null) return { direction, role: undefined, parts: [] };
+  if (typeof message === 'string') {
+    return { direction, role: undefined, parts: [{ kind: 'text', text: clip(message, MAX_TEXT_CHARS) }] };
+  }
+  if (isPayloadRef(message)) return { direction, role: undefined, parts: [normalizePart(message)] };
+  const role = typeof message.role === 'string' ? message.role : undefined;
+  const finishReason = message.finish_reason || message.finishReason;
+  if (Array.isArray(message.parts)) {
+    return { direction, role, finishReason, parts: message.parts.map(normalizePart) };
+  }
+  if (Array.isArray(message.content)) {
+    return { direction, role, finishReason, parts: message.content.map(normalizePart) };
+  }
+  if (message.content != null) {
+    return { direction, role, finishReason, parts: [normalizePart({ content: message.content })] };
+  }
+  return { direction, role, finishReason, parts: [normalizePart(message)] };
 }
 
 // Parses a gen_ai.{input,output}.messages attribute, which OpenLLMetry emits
 // JSON-encoded (a string) but native ingest may carry as an array. A whole
 // attribute past the offload threshold arrives as a {$payload} reference —
-// surface it (preview + byte count) instead of silently rendering nothing.
+// surface it instead of silently rendering nothing.
 function parseMessagesAttr(value, direction) {
   if (value == null) return [];
-  if (isPayloadRef(value)) return [{ direction, role: undefined, content: value }];
-  let arr = value;
-  if (typeof value === 'string') {
-    try { arr = JSON.parse(value); } catch (e) { return [{ direction, role: undefined, content: clip(value, MAX_MESSAGE_CHARS) }]; }
+  if (isPayloadRef(value)) {
+    return [{ direction, role: undefined, parts: [normalizePart(value)] }];
   }
-  if (!Array.isArray(arr)) return [];
-  return arr.map((m) => flattenGenAiMessage(m, direction));
+  let parsed = value;
+  if (typeof value === 'string') {
+    try { parsed = JSON.parse(value); } catch (e) {
+      return [{ direction, role: undefined, parts: [{ kind: 'text', text: clip(value, MAX_TEXT_CHARS) }] }];
+    }
+  }
+  const list = Array.isArray(parsed) ? parsed : [parsed];
+  return list.map((m) => normalizeMessage(m, direction));
 }
 
-/** Chat turns recovered from an LLM span, in order. Recognizes, newest OTel
-    convention first: JSON gen_ai.input.messages / gen_ai.output.messages
-    ({role, parts:[{type,content}]}); then legacy indexed attributes
-    gen_ai.prompt.{i}.{role,content} / gen_ai.completion.{i}.{role,content};
-    then Traza's native llm.prompt / llm.completion events. Content may be an
-    offloaded-payload reference (see isPayloadRef). */
+/** Chat turns recovered from an LLM span, in order, as structured messages:
+    { direction: 'prompt'|'completion', role, finishReason, parts: [...] }.
+    Part kinds are 'text', 'media', 'tool_call', 'tool_result', 'payload'.
+
+    Recognizes, newest OTel convention first: JSON gen_ai.input.messages /
+    gen_ai.output.messages ({role, parts:[{type,content}]}); then the legacy
+    indexed gen_ai.prompt.{i}.{role,content} / gen_ai.completion.{i}.*; then
+    Traza's native llm.prompt / llm.completion events. */
 export function llmMessages(span) {
   const attrs = span.attributes || {};
   if (attrs['gen_ai.input.messages'] != null || attrs['gen_ai.output.messages'] != null) {
@@ -225,14 +271,28 @@ export function llmMessages(span) {
     }
     return [...byIndex.entries()]
       .sort((a, b) => Number(a[0]) - Number(b[0]))
-      .map(([, m]) => ({ direction: kind, role: m.role, content: m.content }));
+      .map(([, m]) => ({ direction: kind, role: m.role, parts: [normalizePart({ content: m.content })] }));
   };
   const events = (span.events || [])
     .filter((e) => e.name === 'llm.prompt' || e.name === 'llm.completion')
     .map((e) => ({
       direction: e.name === 'llm.prompt' ? 'prompt' : 'completion',
       role: (e.attributes || {}).role,
-      content: (e.attributes || {}).content,
+      parts: [normalizePart({ content: (e.attributes || {}).content })],
     }));
   return [...collectIndexed('prompt'), ...collectIndexed('completion'), ...events];
+}
+
+/** Plain-text rendering of a message, for copy-to-clipboard. */
+export function messageText(message) {
+  return (message.parts || []).map((part) => {
+    switch (part.kind) {
+      case 'text': return part.text;
+      case 'tool_call': return part.name + '(' + (typeof part.args === 'string' ? part.args : JSON.stringify(part.args)) + ')';
+      case 'tool_result': return typeof part.result === 'string' ? part.result : JSON.stringify(part.result);
+      case 'media': return '[' + part.mediaType + (part.filename ? ' ' + part.filename : '') + (part.uri ? ' ' + part.uri : '') + ']';
+      case 'payload': return part.preview;
+      default: return '';
+    }
+  }).filter(Boolean).join('\n');
 }

@@ -1,7 +1,7 @@
 import React from 'react';
 import { api } from '../lib/api.js';
 import { fmtDurationNs, fmtTimeNs, fmtNum, fmtCost } from '../lib/format.js';
-import { waterfallOrder, collectPayloadRefs, llmUsage, sessionIdOf, llmMessages, isPayloadRef } from '../lib/spans.js';
+import { waterfallOrder, collectPayloadRefs, llmUsage, sessionIdOf, llmMessages } from '../lib/spans.js';
 import { Section } from '../components/Section.jsx';
 import { Button } from '../components/primitives/Button.jsx';
 import { Input } from '../components/primitives/Input.jsx';
@@ -15,6 +15,7 @@ import { CopyButton } from '../components/data/CopyButton.jsx';
 import { TraceWaterfall } from '../components/trace/TraceWaterfall.jsx';
 import { ScoreChip } from '../components/trace/ScoreChip.jsx';
 import { AnnotationTimeline } from '../components/trace/AnnotationTimeline.jsx';
+import { MessageList } from '../components/trace/MessageList.jsx';
 import { ErrorState } from '../components/feedback/ErrorState.jsx';
 import { LoadingBar } from '../components/feedback/LoadingBar.jsx';
 
@@ -77,24 +78,11 @@ function AnnotateModal({ open, traceId, spanId, onClose, onRecorded, pushToast }
 
 function LlmMessages({ span }) {
   const messages = llmMessages(span);
+  const loadPayload = React.useCallback((ref) => api.payload(ref), []);
   if (!messages.length) return null;
   return <div style={{ marginTop: 12 }}>
     <div style={{ fontSize: 'var(--text-12)', fontWeight: 500, color: 'var(--ink-muted)', textTransform: 'uppercase', letterSpacing: 'var(--tracking-caps)', marginBottom: 6 }}>Messages</div>
-    <div style={{ display: 'grid', gap: 6 }}>
-      {messages.map((m, i) => {
-        const offloaded = isPayloadRef(m.content);
-        const text = offloaded ? (m.content.preview || '')
-          : (typeof m.content === 'string' ? m.content : JSON.stringify(m.content));
-        return <div key={i} style={{ border: '1px solid var(--hairline)', borderRadius: 'var(--radius-control)', padding: '6px 8px', background: m.direction === 'completion' ? 'var(--bg-raised)' : 'var(--bg-sunken)', minWidth: 0 }}>
-          <div style={{ fontSize: 'var(--text-12)', lineHeight: 'var(--lh-12)', color: 'var(--ink-muted)', marginBottom: 2 }}>
-            {m.direction}{m.role ? ' · ' + m.role : ''}{offloaded ? ' · offloaded ' + fmtNum(m.content.bytes) + ' B' : ''}
-          </div>
-          <div style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-12)', lineHeight: 'var(--lh-12)', whiteSpace: 'pre-wrap', wordBreak: 'break-word', color: 'var(--ink)' }}>
-            {text}{offloaded ? ' …' : ''}
-          </div>
-        </div>;
-      })}
-    </div>
+    <MessageList messages={messages} onLoadPayload={loadPayload} />
   </div>;
 }
 
@@ -192,7 +180,7 @@ function SpanDetail({ span, annotations, onAnnotate, openSession, pushToast }) {
 }
 
 /** One trace: waterfall, span detail, annotation timeline. */
-export function TraceView({ traceId, selectedSpanId, selectSpan, openSession, pushToast }) {
+export function TraceView({ traceId, selectedSpanId, selectSpan, openSession, openConversation, onBack, pushToast }) {
   const [data, setData] = React.useState(null);
   const [error, setError] = React.useState(null);
   const [loading, setLoading] = React.useState(true);
@@ -219,6 +207,8 @@ export function TraceView({ traceId, selectedSpanId, selectSpan, openSession, pu
   return <Section title={'Trace ' + traceId}
     action={<div style={{ display: 'flex', gap: 6 }}>
       <CopyButton text={traceId} label="copy id" />
+      {openConversation ? <Button variant="ghost" size="sm" onClick={openConversation}>Conversation</Button> : null}
+      {onBack ? <Button variant="ghost" size="sm" onClick={onBack}>Back</Button> : null}
       <Button variant="ghost" size="sm" onClick={fetchTrace}>Refresh</Button>
     </div>}>
     <LoadingBar active={loading} style={{ marginBottom: 8 }} />

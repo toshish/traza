@@ -369,6 +369,126 @@ fn multimodal_messages_keep_their_media_descriptors() {
 }
 
 #[test]
+fn generated_output_media_is_carried_on_the_completion_side() {
+    // Regression: the corpus only ever had media on the INPUT side, so a
+    // renderer could "handle media" while never displaying a model-produced
+    // image, audio clip, or video.
+    let (store, _) = store_with_corpus("outmedia", &SeedOptions::default());
+    let stored = all_spans(&store);
+
+    let mut output_kinds: HashSet<String> = HashSet::new();
+    let mut inline_renderable = 0;
+    for span in &stored {
+        let Some(text) = span
+            .attributes
+            .get("gen_ai.output.messages")
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        let Ok(parsed) = serde_json::from_str::<Value>(text) else {
+            continue;
+        };
+        for message in parsed.as_array().into_iter().flatten() {
+            for part in message["parts"].as_array().into_iter().flatten() {
+                let kind = part["type"].as_str().unwrap_or_default();
+                if ["image", "audio", "video"].contains(&kind) {
+                    output_kinds.insert(kind.to_owned());
+                    // A browser can only render data:/http(s) sources.
+                    let locator = part["data"].as_str().or_else(|| part["uri"].as_str());
+                    if locator.is_some_and(|l| l.starts_with("data:") || l.starts_with("http")) {
+                        inline_renderable += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(
+        output_kinds.len(),
+        3,
+        "the model should produce image, audio and video output: {output_kinds:?}"
+    );
+    assert!(
+        inline_renderable >= 3,
+        "generated media must carry a locator a browser can actually load"
+    );
+}
+
+#[test]
+fn framework_shaped_traces_are_represented() {
+    // OpenAI, Anthropic, LangGraph and CrewAI arrange the same conventions
+    // differently; the corpus must contain each so the UI is exercised against
+    // real arrangements rather than one idealized shape.
+    let (store, _) = store_with_corpus("frameworks", &SeedOptions::default());
+    let stored = all_spans(&store);
+
+    let frameworks: HashSet<&str> = stored
+        .iter()
+        .filter_map(|span| span.attributes.get("framework").and_then(Value::as_str))
+        .collect();
+    assert!(
+        frameworks.contains("langgraph") && frameworks.contains("crewai"),
+        "graph and crew frameworks should be present: {frameworks:?}"
+    );
+
+    // LangGraph records its topology; CrewAI records agent roles.
+    assert!(
+        stored
+            .iter()
+            .any(|span| span.attributes.contains_key("gen_ai.workflow.nodes")),
+        "a LangGraph run should carry its node topology"
+    );
+    assert!(
+        stored
+            .iter()
+            .any(|span| span.attributes.contains_key("gen_ai.agent.name")),
+        "a CrewAI run should name its agents"
+    );
+
+    // OpenAI returns tool-call arguments as a JSON STRING, not an object — the
+    // shape a naive renderer double-encodes.
+    let openai_string_args = stored.iter().any(|span| {
+        span.attributes
+            .get("gen_ai.output.messages")
+            .and_then(Value::as_str)
+            .is_some_and(|text| text.contains("\\\"order_id\\\""))
+    });
+    assert!(
+        openai_string_args,
+        "an OpenAI-shaped tool call should carry stringified arguments"
+    );
+
+    // Anthropic's prompt-cache counters ride along.
+    assert!(
+        stored.iter().any(|span| span
+            .attributes
+            .contains_key("gen_ai.usage.cache_read_input_tokens")),
+        "an Anthropic-shaped span should carry cache token counters"
+    );
+}
+
+#[test]
+fn answers_cover_every_text_shape_the_renderer_switches_on() {
+    let (store, _) = store_with_corpus("formats", &SeedOptions::default());
+    let stored = all_spans(&store);
+    let mut shapes: HashSet<String> = HashSet::new();
+    for span in &stored {
+        if let Some(kind) = span
+            .attributes
+            .get("response.format")
+            .and_then(Value::as_str)
+        {
+            shapes.insert(kind.to_owned());
+        }
+    }
+    assert_eq!(
+        shapes.len(),
+        4,
+        "markdown, code, json and plain answers should all appear: {shapes:?}"
+    );
+}
+
+#[test]
 fn tool_calling_traces_keep_their_shape() {
     let (store, _) = store_with_corpus("tools", &SeedOptions::default());
     let stored = all_spans(&store);
