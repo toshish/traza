@@ -43,4 +43,4 @@ Never edit `BENCHMARKS.md` by hand. If your change affects performance, regenera
 
 ## License
 
-Traza is dual-licensed under MIT and Apache-2.0. Unless you explicitly state otherwise, any contribution you intentionally submit for inclusion is dual-licensed the same way, without additional terms.
+Traza is licensed under Apache-2.0. Unless you explicitly state otherwise, any contribution you intentionally submit for inclusion is licensed the same way, without additional terms.

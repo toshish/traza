@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- License is now Apache-2.0 only (previously dual MIT OR Apache-2.0).
+  `LICENSE-MIT` is removed and `LICENSE-APACHE` renamed to `LICENSE`.
+
 ## [0.13.0] - 2026-07-23
 
 Wire-contract release: `/v1/stats` renames its counters to record
