@@ -119,8 +119,9 @@ the choice. 1.0 is a promise, not a birthday.*
 - **Prometheus `/metrics`.** The datastore must be observable itself:
   ingest rate, queue depth, flush latency, segment counts, query latency
   histograms, payload store size, compaction progress.
-- **Backup/restore.** Consistent snapshot of a live store (segments are
-  immutable — snapshot = hardlink/copy manifest + sealed buffer flush);
+- **Backup/restore.** Consistent snapshot of a live store: sealed segment
+  state plus annotations, payload bytes, and a checksummed manifest. This
+  generation/checkpoint mechanism becomes the HA snapshot substrate;
   documented restore drill; `traza-server --verify` integrity check.
 - **Ingest-time controls.** Head sampling (per-service rate), field-level
   PII redaction hooks (drop/hash named attributes before storage), and
@@ -142,15 +143,21 @@ the choice. 1.0 is a promise, not a birthday.*
 
 ## Phase 2 — High availability (v1.x → v2.0)
 
-*Goal: node failure is an operational non-event. The design is done
-([ha-design.md](ha-design.md)); this phase executes it.*
+*Goal: node failure is an operational non-event. The Raft direction is chosen;
+the [HA design](ha-design.md) now defines the v0.13 state inventory and the
+phase-zero engine, dependency, and protocol gates that must close before
+networked HA is exposed.*
 
-- **Quorum-replicated logical log** for ingest (leader-ordered, per the
-  design: the leader's write buffer is the acknowledgment boundary), with
-  automatic leader election and client-transparent failover.
-- **Segment shipping** for replica catch-up and re-seeding; replicas serve
-  reads (read-your-writes on the leader, bounded staleness elsewhere —
-  documented, queryable consistency mode).
+- **Quorum-replicated logical log** for every query-visible mutation. The log,
+  not the leader's volatile write buffer, is the recovery authority; success
+  requires quorum durability and leader visibility.
+- **Validated full-state snapshots** for replica catch-up and re-seeding,
+  covering segments, annotations, payload bytes, retention state, and retry
+  outcomes rather than shipping segment files alone.
+- **Explicit read consistency:** linearizable logical reads on the leader;
+  follower reads are opt-in stale reads labeled with their applied index.
+  Bounded staleness is claimed only after a configured lag bound is enforced
+  and tested.
 - **Replicated retention:** expiration decisions ride the log, so replicas
   never disagree about what exists.
 - **Rolling upgrades** across a replica set with version-skew tolerance of

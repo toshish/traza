@@ -1,617 +1,583 @@
-# Traza High-Availability Design
-
-## Document status
-
-This is a design proposal, not shipped behavior. It describes a proposed
-high-availability architecture for Traza and the evidence an implementation
-would need to provide. It does not assert that HA behavior, HA tests,
-operational readiness, or production deployment support currently exists.
-Requirement identifiers in this document are traceability labels for review.
-
-## Purpose and scope
-
-Leg 6 adds a design for making a Traza deployment tolerate loss of its active server
-without accepting split-brain writes, corrupting persisted data, silently losing
-acknowledged writes, or changing the established client-facing behavior unnecessarily.
-The design covers leader election, replicated durable state, failure detection,
-failover, fencing, recovery, observability, security, compatibility, and reproducible
-acceptance evidence.
-
-The proposal preserves the carried-forward storage engine as the authority for record
-encoding, query semantics, segment validation, retention, and startup recovery. HA is a
-coordination and replication layer around that engine, not a second independent storage
-format. A replica may serve as leader only after it has obtained an exclusive term and
-has recovered all state committed in that term's predecessor history.
-
-In scope:
-
-- a single writable leader and one or more followers;
-- quorum-based election and commitment;
-- replication of ordered logical storage mutations and required metadata;
-- deterministic replay through the existing engine persistence boundary;
-- failover with explicit fencing and bounded detection behavior;
-- follower catch-up, snapshot installation, and replacement-node recovery;
-- compatibility with authentication, OTLP ingestion, dashboard access, expiration,
-  and segment format validation already represented in the v0.9.0 tree;
-- operator-visible health, role, term, lag, and recovery state;
-- tests and fault-injection oracles that distinguish real behavior from stubs.
-
-Out of scope for this design artifact:
-
-- implementing or shipping the proposed protocol;
-- multi-leader or conflict-free replicated writes;
-- cross-cluster federation;
-- automatic geographic placement policy;
-- changing closed earlier-leg formats or acceptance contracts;
-- claiming a particular deployment is ready for production use;
-- tagging, publishing, or independently closing Leg 6.
-
-## Terminology
-
-**Node** is one Traza server process with a stable node identity and private durable
-state. **Cluster** is the configured voting membership sharing one cluster identity.
-**Leader** is the sole node permitted to propose client-visible mutations in a term.
-**Follower** receives and durably records replicated entries. **Candidate** requests
-votes during election. **Term** is a monotonically increasing election epoch persisted
-before a vote or leadership action. **Log index** is the monotonically increasing
-position of a replicated mutation. **Commit index** is the highest index known durable
-on a quorum and therefore eligible for application. **Applied index** is the highest
-committed entry reflected in the local Traza engine. **Quorum** means a strict majority
-of the current voter configuration. **Fencing** is rejection of work from an obsolete
-term or non-leader. **Snapshot** is a point-in-time transferable image with cluster,
-term, membership, format, and last-included-index metadata.
-
-An **acknowledged write** is one for which the public request returned success after the
-corresponding entry became committed and locally applied. Receiving, buffering, or only
-locally persisting a request is not an acknowledgment boundary. A **linearizable read**
-is evaluated on the leader only after a quorum-confirmed leadership barrier and after
-application through the barrier's commit index. A **stale read** is an explicitly opted
-in follower read and cannot be represented as linearizable.
-
-## Current Traza mechanisms
-
-The sanctioned v0.9.0 tree is a single-node system. This section records integration
-points visible in that carried-forward tree and must not be read as evidence that those
-mechanisms already provide distributed coordination.
-
-The library entry point in `src/lib.rs` exposes the storage engine and its request-facing
-operations. The existing engine remains the application state machine. Its startup,
-write, query, flush, and shutdown boundaries need to be wrapped rather than duplicated.
-The successor implementation must inspect the concrete types and lock ordering before
-introducing asynchronous replication callbacks; this design does not invent an existing
-replication hook.
-
-`src/segment_v2.rs` and `docs/segment-format-v2.md` define the carried-forward segment
-representation and validation behavior. Replication does not rewrite segment bytes into
-a new closed-leg format. Snapshot transfer must preserve or reconstruct valid v2
-segments and must run the same validation used by ordinary startup. Corrupt snapshots
-or replicated segment material fail closed.
-
-`src/expiration.rs` performs retention or expiration work that mutates stored state.
-Under HA, time-based mutation cannot run independently on every node. The leader alone
-must decide an expiration mutation and append it to the replicated log; followers replay
-that decision. This prevents clock skew from producing divergent data sets.
-
-`src/otlp.rs` maps OTLP ingestion into engine writes. OTLP requests follow the same
-leader, commit, idempotency, and response rules as any other write. A follower must not
-silently accept and apply an OTLP write locally. It returns a documented not-leader
-response or redirects only where the protocol and authentication policy permit it.
-
-`src/auth.rs` supplies the existing authentication and authorization boundary.
-Cluster-internal identity is additional to, and not a bypass around, client auth.
-Replication, voting, snapshot, and administrative membership endpoints require mutual
-node authentication and explicit authorization.
-
-`src/dashboard.rs` and `src/dashboard.html` provide the existing dashboard surface. A
-future HA status view may expose role and health, but it must not leak secrets, peer
-credentials, bearer tokens, raw replication payloads, or sensitive error detail. The
-existing dashboard behavior remains compatible when HA is disabled.
-
-`src/bin/traza-server.rs` owns process startup and network lifecycle. It is the natural
-composition point for cluster configuration, transport startup, readiness state,
-graceful leadership transfer, and coordinated engine shutdown. `src/bin/bench.rs` is not
-an acceptance oracle for correctness; throughput measurements cannot substitute for
-fault tests.
-
-The integration suites in `tests/auth.rs`, `tests/dashboard.rs`,
-`tests/llm_semantics.rs`, `tests/otlp_conformance.rs`,
-`tests/segment_format_v2_acceptance.rs`, `tests/server_on_engine.rs`, and
-`tests/storage.rs` define carried-forward regression behavior. HA work must add focused
-fault and cluster tests while continuing to pass the complete existing suite.
-
-## HA architecture
-
-### Components and responsibilities
-
-Each node contains five proposed layers:
-
-1. The client front end authenticates requests and classifies each operation as a read,
-   write, administration operation, or local diagnostic.
-2. The consensus module persists term, vote, membership, replicated log, and commit
-   progress and implements leader election and quorum commitment.
-3. The HA state-machine adapter converts an accepted mutation into a deterministic log
-   command, applies committed commands to the existing engine in index order, and
-   records deduplication results where retries require them.
-4. The snapshot manager creates, validates, transfers, installs, and retires snapshots
-   without exposing a partially installed engine state.
-5. The health and operations layer reports role, term, leader identity, commit/applied
-   indices, peer reachability, replication lag, snapshot progress, and readiness.
-
-The protocol should use a well-specified consensus algorithm with Raft-equivalent safety
-properties rather than an ad hoc heartbeat lock. The implementation may use a reviewed
-library if its persistence and membership semantics satisfy this design. Choosing a
-library does not waive protocol-level tests.
-
-### Stable identity and bootstrap
-
-Every node has an operator-provisioned stable node ID, cluster ID, peer address, client
-address, and data directory. Node IDs cannot be inferred only from ephemeral addresses.
-A node persists the cluster ID and refuses to join or restore data from another cluster.
-Reusing a removed node's data directory or identity fails with a diagnostic unless an
-explicit, validated recovery procedure authorizes it.
-
-A new cluster is bootstrapped once with an explicit initial voter set. Starting several
-empty nodes with independent bootstrap flags must not create several clusters that later
-merge. Joining is performed through a committed membership operation. Discovery may
-find peers, but discovery does not establish voting membership or trust.
-
-### Request routing
-
-Only the leader accepts writes. A follower responds with a machine-readable not-leader
-result containing a leader hint only when known and safe to disclose. Automatic proxying
-is optional and, if selected, must preserve authentication context, request identity,
-timeout, body limits, and end-to-end error semantics. Redirect loops are prevented by a
-hop marker or by clients connecting directly to the advertised leader.
-
-Default reads are linearizable and therefore pass through the leader's read barrier.
-Follower reads are disabled unless the caller explicitly requests stale semantics. An
-explicit stale response includes enough metadata, such as applied index and observed
-term, for diagnostics. Administrative state changes are replicated writes. Node-local
-health and metrics may remain local.
-
-## Replication model
-
-### Replicated command log
-
-The leader converts each mutating operation into a deterministic, versioned command.
-Each entry contains cluster protocol version, term, index, command kind, canonical
-payload, request/deduplication key when applicable, and integrity metadata. Entries must
-not depend on follower wall clocks, random generation, unordered map iteration, or local
-file names. Values that would otherwise be nondeterministic are selected by the leader
-and included in the command.
-
-An entry is appended durably on the leader before replication. Followers validate term,
-predecessor index and term, command version, length, and checksum before durable append.
-A follower acknowledges append only after the bytes and required metadata cross the
-specified persistence boundary. The leader advances commit index only when the entry is
-stored on a quorum and the consensus algorithm permits commitment. It then applies
-entries in strict index order and responds success only after the requested command is
-applied locally.
-
-The exact fsync policy is part of correctness, not a tuning detail. A mode that reports
-success before quorum durability must be named unsafe, must not be the default, and
-cannot satisfy the acknowledged-write oracle.
-
-### Application and idempotency
-
-The state-machine adapter is the sole path from committed log entries to engine
-mutation. Concurrent client requests may be proposed concurrently, but application is
-serialized by log index or otherwise proven observationally equivalent. The adapter
-persists the applied index atomically with, or recoverably relative to, the engine
-mutation. On restart it can determine whether to replay an entry without duplicating
-its effect.
-
-Client retries across leader changes require a stable request ID for operations whose
-repetition changes results. The replicated deduplication table maps client/request ID to
-the committed outcome and has a bounded, documented retention policy. A retry with the
-same identity and different canonical payload is rejected. If the existing public API
-cannot carry such an identity, exactly-once effects are an unsupported requirement until
-the API is extended; the system must document at-least-once retry behavior rather than
-claim stronger semantics.
-
-### Snapshots and catch-up
-
-Log compaction requires a snapshot created at a committed applied index. Snapshot
-metadata includes cluster ID, format and protocol versions, last included index and
-term, membership configuration, content manifest, lengths, and cryptographic checksums.
-Creation uses an engine-consistent view; copying live files without the engine's
-consistency guarantee is invalid.
-
-Transfer is chunked, authenticated, checksummed, resumable or safely restartable, and
-written to a temporary location. Installation validates all metadata and segment
-content before an atomic directory or engine-state swap. A crash at any transfer or
-installation point leaves either the old valid state or the new complete valid state,
-never a mixed state. After installation, replay begins at the next index. Obsolete logs
-and snapshots are deleted only after the new state is durable and active.
-
-## Failure detection and failover
-
-Leaders send periodic heartbeats. Followers start an election after a randomized timeout
-without valid leader contact. Timeout defaults and allowed ranges must be documented and
-validated against expected network latency and storage stalls. A health endpoint is not
-the election oracle; consensus messages and persisted terms govern authority.
-
-Before voting, a node persists the new term and its vote. It grants at most one vote per
-term and only to a candidate whose log is at least as up to date. A candidate becomes
-leader only after a quorum elects it. On receiving a higher term, every role immediately
-steps down and persists that term before further protocol action.
-
-A newly elected leader appends or confirms a current-term barrier before serving
-linearizable reads or acknowledging new writes. Uncommitted suffixes from an obsolete
-leader may be overwritten according to consensus rules and must never have been exposed
-as successful writes. Committed entries are retained by every future leader.
-
-Network partitions preserve safety: only the majority side can elect and commit. A
-minority-side former leader cannot acknowledge writes and fails readiness after losing
-quorum. Lease optimizations may be added only with a documented clock model and tests;
-term and quorum fencing remain authoritative.
-
-Graceful shutdown first stops accepting writes, optionally transfers leadership to an
-eligible caught-up voter, waits only for a bounded interval, flushes protocol and engine
-state, and exits. Abrupt process termination, machine loss, packet loss, duplication,
-reordering, and delayed disk completion are all required fault cases.
-
-Readiness differs from liveness. A process is live when its local event loop can answer.
-It is ready for writes only when it is the quorum-confirmed leader and its state machine
-is operational. A follower may be ready for replication while not ready as a write
-target. Unknown leader, snapshot installation, incompatible format, corrupt state, and
-quorum loss produce explicit non-ready reasons.
-
-## Consistency and correctness
-
-The safety invariants are:
-
-- at most one quorum-authorized leader can commit entries for a term;
-- committed log entries have one command at each index and appear in every future
-  leader's history;
-- commands apply exactly in committed index order;
-- no node serves a successful write before quorum durability and leader application;
-- no default read observes state older than a completed acknowledged write when the read
-  begins after that write;
-- an obsolete term cannot mutate externally visible state;
-- expiration and other background mutation are leader-proposed replicated commands;
-- recovery never treats partial, corrupt, foreign-cluster, or incompatible data as valid;
-- membership changes preserve an intersecting quorum during transition.
-
-Memory ordering and Rust concurrency safety alone do not establish these invariants.
-Protocol state transitions, durable-write ordering, engine locking, and response ordering
-must be tested together. Locks must not be held across unbounded network awaits. Applying
-an entry must not call back into proposal code and deadlock. Shutdown and snapshot swaps
-must coordinate with active readers and the engine lifecycle.
-
-Linearizability is the proposed default client contract. It is verified with concurrent
-histories containing successful, failed, timed-out, and retried operations while leaders
-are killed and links partitioned. The checker must reason about ambiguous timeout results
-rather than deleting them from history. A model-based or established linearizability
-checker is preferred over assertions about final row count alone.
-
-Membership changes use joint consensus or an equivalent protocol that maintains quorum
-intersection. Adding a voter first catches it up as a non-voter; it does not vote until
-sufficiently current. Removing a leader causes transfer or step-down. A two-node cluster
-cannot remain available after either node fails and must not be advertised as satisfying
-one-failure availability. Three voters are the minimum recommended topology.
-
-
-### Partial write handling
-
-Partial write handling is a correctness boundary, not an implementation detail. A leader must never count a replica acknowledgement until that replica has durably persisted and validated the complete framed replication record. `WriteBuffer` output is transferred as length-delimited records carrying the term, log position, payload length, and checksum; short socket writes are retried from the remaining byte offset, while disconnects leave the record unacknowledged. A follower writes incoming bytes to a staging file, loops until the complete frame is present, verifies its declared length and checksum, calls the required durability primitive, and only then atomically advances its persisted match position and returns an acknowledgement. Bytes from a truncated frame are never exposed through the primary-key index, query path, segment manifest, or quorum accounting.
-
-On restart, recovery scans only complete validated frames. A torn header, short payload, checksum mismatch, or partially persisted `SegmentWriter` output is truncated back to the last validated record boundary before replication resumes. The supersede journal follows the same rule: its intent and completion records are independently framed and checksummed, so a partial journal write cannot make an old primary-key value disappear without a durable replacement. If truncation cannot be performed safely, the replica enters a quarantined/catch-up state and requests a snapshot or retransmission rather than serving reads or voting with ambiguous state. Leaders treat any partial write, timeout, or lost acknowledgement as not committed; retry uses the same term and log position so followers can reject conflicts and recognize an already durable duplicate without applying it twice. This preserves the invariant that acknowledged quorum positions correspond only to complete durable records and that recovery never invents a committed prefix from torn bytes.
-
-## Operations and recovery
-
-### Configuration and observability
-
-Configuration distinguishes cluster ID, node ID, advertised client and peer addresses,
-initial bootstrap, join target, voter role, election and heartbeat timings, snapshot
-thresholds, storage paths, TLS identities, and compatibility policy. Invalid combinations
-fail startup. Environment, file, and command-line precedence must be deterministic and
-secret values must be redacted from diagnostics.
-
-Metrics include current role and term, known leader, commit and applied indices, per-peer
-match index and lag, election count, quorum status, proposal latency, replication
-latency, apply latency, snapshot bytes and duration, rejected stale-term messages,
-not-leader responses, deduplication hits, and corruption failures. Labels must avoid
-unbounded request or tenant cardinality. Structured logs include node, cluster, term,
-index, and peer context but no authentication secrets or sensitive payloads.
-
-Operators need documented procedures for initial bootstrap, adding and removing nodes,
-planned maintenance, leadership transfer, replacing a failed node, restoring from backup,
-rotating certificates, upgrading, downgrading where supported, and disaster recovery.
-Every dangerous operation states preconditions and expected quorum impact.
-
-### Backup and disaster recovery
-
-A backup is derived from a validated snapshot at a committed index plus sufficient
-metadata to restore cluster identity deliberately. Restoring one node from old data into
-a live cluster as if current is forbidden. A restored cluster receives an explicit new
-cluster identity unless the disaster-recovery procedure proves the old cluster cannot
-return. This avoids two independently writable incarnations.
-
-Loss of quorum is not automatically repaired by promoting arbitrary surviving data.
-Operator-forced recovery is a distinct, destructive procedure that identifies the last
-known committed state, records possible acknowledged-data risk, rotates cluster identity
-or fencing credentials, and requires confirmation. It must not be presented as ordinary
-failover.
-
-Disk-full, permission, checksum, incompatible-version, and fsync failures force the node
-out of write readiness. The implementation does not continue with memory-only consensus
-state. Recovery diagnostics identify the failed path and operation without deleting the
-only good copy.
-
-### Required fault exercises
-
-Focused integration tests run real server processes or production protocol components
-with isolated durable directories. They must not replace persistence or elections with a
-test-only success flag. Required scenarios include leader process kill, follower kill,
-majority/minority partition, message delay and reorder, restart after append and before
-apply, restart after apply and before response, disk-full or injected durable-write
-failure at the production persistence boundary, snapshot interruption, corrupt snapshot,
-rolling version skew, and expiration across failover.
-
-Each scenario records client history, node logs, terms, commit/applied indices, and final
-engine contents. Tests use bounded eventual assertions with diagnostic output instead of
-unexplained sleeps. Repeated randomized tests supplement, but do not replace,
-deterministic regression cases.
-
-## Security considerations
-
-Peer transport requires mutual authentication, confidentiality, hostname or node-ID
-verification, and a trust policy separate from public client credentials. A valid client
-token cannot invoke voting, append, snapshot, join, remove, transfer, or recovery RPCs.
-Node certificates bind the authenticated identity to configured membership. Removed
-nodes lose authorization even if an old transport credential remains temporarily valid.
-
-All peer messages are length-limited and version-checked before allocation or decoding.
-Snapshot paths are generated internally; peer-controlled names cannot escape temporary
-storage. Checksums detect corruption but do not replace authenticated transport.
-Replay-sensitive administrative requests include term, cluster identity, and request
-identity. Rate and concurrency limits prevent a peer from exhausting memory, disk,
-threads, or snapshot slots.
-
-Existing client authentication remains in force on whichever node receives a request.
-If proxying is implemented, it forwards a signed, narrowly scoped identity assertion or
-re-authenticates through a defined mechanism; it never forwards reusable secrets in
-logs or query strings. Leader hints disclose only configured public addresses.
-
-Operational endpoints reveal minimal data by default. Detailed peer topology and lag
-require administrative authorization. Metrics and logs redact tokens, key material,
-request bodies, and replicated values. Backup and snapshot files receive permissions
-and encryption controls equivalent to the primary data directory.
+# Traza high-availability design
+
+## Status and baseline
+
+This is a pre-implementation architecture, not shipped behavior. It is grounded in the
+v0.13.0 engine and public API (`ac69f44`) and supersedes the earlier v0.9-oriented
+proposal. It defines the safety contract and the engine work required before HA may be
+exposed. It does not claim that replication, failover, cluster security, or operational
+readiness exists today.
+
+The protocol direction is decided:
+
+- one Raft leader accepts mutations;
+- a successful mutation is durable in a voting quorum and visible on the leader;
+- the Raft log is the recovery authority for committed logical state;
+- every node materializes that state through its own Traza engine directory;
+- follower reads are stale and opt-in; logical reads are linearizable by default;
+- physical segment creation and compaction remain local implementation details;
+- three voters are the minimum supported production topology.
+
+The design is not implementation-ready until the phase-zero gates in
+[Implementation sequence](#implementation-sequence) close the engine checkpoint,
+command-application, consensus-library, TLS, and dependency decisions.
+
+## Goals and non-goals
+
+HA must preserve these properties:
+
+1. No acknowledged mutation is lost after any single voter fails.
+2. A minority partition never acknowledges a mutation.
+3. Every promoted leader contains the committed logical history.
+4. A default logical read observes one state at one committed index.
+5. Restart, replay, and snapshot installation cannot duplicate non-idempotent effects.
+6. Spans, annotations, payload bytes, retention state, and retry outcomes fail over
+   together.
+7. Standalone mode retains the v0.13 API and storage behavior.
+
+This design does not provide multi-leader writes, Byzantine-fault tolerance,
+cross-cluster federation, geographic placement, sharding, or automatic recovery after
+the permanent loss of a voting majority. Those require separate designs.
+
+## Current v0.13 state and HA authority
+
+Traza does not have one monolithic data file. HA must cover every query-visible state
+surface, not only `.seg` files.
+
+| State or operation | Current v0.13 persistence | HA authority and command |
+|---|---|---|
+| Span batch from `/v1/spans` or OTLP | Primary-key upsert into `WriteBuffer`, then immutable v2 segments | Replicated `SpanBatch*` transaction; `(trace_id, span_id)` remains the logical key |
+| Large span/event text | Content-addressed files under `payloads/`, referenced from spans | Replicated `PayloadChunk` and `PayloadSeal` before a referencing span batch commits |
+| Annotation append | Fsynced `annotations.jsonl` plus an in-memory trace index | Replicated `AnnotationAppend` carrying the leader-resolved timestamp |
+| TTL expiration | `Store::compact_expired` rewrites spans and annotations and sweeps payload files | Replicated staged `RetentionPlan*` transaction; filesystem mtime is not an HA decision source |
+| Explicit flush | `POST /v1/flush` seals the local write buffer | Replicated `FlushBarrier`; leader response waits for local seal through the barrier |
+| Request deduplication | No general request-ID table | Replicated bounded outcome table keyed by authenticated principal and `Idempotency-Key` |
+| Segment indexes and analytics rollups | Derived from immutable segments | Rebuilt locally; never independent consensus authority |
+| Segment supersede journal | Local crash recovery for physical replacement | Local only; it must not consume a Raft index or decide logical visibility |
+| `/v1/stats` physical counters | Local buffer, segment count, and bytes | Node-local diagnostic state, explicitly not a linearizable cluster total |
+| Term, vote, membership, log and snapshot metadata | Not present | Consensus storage under the node-private `raft/` directory |
+
+`src/lib.rs` is the application-state-machine boundary. `src/segment_v2.rs` remains
+the segment encoder and validator. `src/annotations.rs` and `src/payload.rs` are part of
+the state machine, not optional sidecars. `src/expiration.rs` is currently only a module
+placeholder; retention behavior lives in `Store::compact_expired` and
+`Store::expire_before`. The scheduler in `src/bin/traza-server.rs` must run only on the
+leader in HA mode.
+
+The complete existing regression suite remains mandatory, including auth, dashboard,
+ingest hardening, LLM analytics, OTLP JSON and protobuf, payload/annotation/export,
+segment-format, server-on-engine, and storage tests. A benchmark is not a correctness
+oracle.
+
+## Node layout and ownership
+
+Each replica has a distinct data directory and acquires its own local `DirectoryLock`.
+That lock prevents two local `Store` owners; it does not establish cluster leadership.
+The proposed layout separates consensus state from replaceable engine generations:
+
+```text
+data/
+  LOCK
+  raft/
+    hard-state
+    log/
+    snapshots/
+  generations/
+    <generation-id>/
+      engine/
+        segment-*.seg
+        annotations.jsonl
+        payloads/
+      state-manifest.json
+  incoming/
+  CURRENT
+```
+
+`CURRENT` names one complete generation. Consensus metadata is never inside a directory
+that snapshot installation swaps. A generation remains immutable after replacement,
+except for deletion once no reader or export pins it.
+
+Every node has a stable operator-provisioned node ID, cluster ID, peer address, client
+address, and data directory. Node identity is not inferred from an ephemeral address.
+A node persists its cluster ID and rejects log, snapshot, or membership traffic for any
+other cluster. Reusing a removed identity or directory requires an explicit recovery
+procedure.
+
+## Consensus protocol and implementation boundary
+
+Traza uses Raft semantics, not an ad hoc heartbeat lease:
+
+- persisted term and one vote per term;
+- log matching and leader completeness;
+- commitment by a voting majority, including the current-term commit restriction;
+- pre-vote and quorum checking to reduce disruptive elections;
+- ReadIndex-style quorum confirmation for linearizable reads;
+- learners for catch-up and joint consensus for voter changes;
+- no clock-based leader lease in the first implementation.
+
+The consensus implementation must be a reviewed library rather than new handwritten
+Raft. The current integration candidate is
+[OpenRaft 0.9.x](https://docs.rs/openraft/latest/openraft/) because it exposes separate
+log, state-machine, snapshot, network, membership, and linearizable-read interfaces.
+Its pre-1.0 API is explicitly unstable, so this document does not approve a crate
+version. Phase zero must pin and evaluate one patch release, record its MSRV and
+transitive dependencies, exercise its storage contract under fault injection, and
+either approve it in an ADR or reject it before production code depends on it.
+
+The consensus task uses an async runtime isolated behind `src/ha/`. The synchronous
+`Store` is reached through one bounded apply worker. Engine locks are never held across
+network or consensus awaits, and state-machine application never calls back into
+proposal code.
+
+Peer transport uses TLS 1.3 mutual authentication through a reviewed TLS library such
+as [rustls](https://docs.rs/rustls/latest/rustls/). Certificates bind cluster ID and
+node ID to current membership. A removed node is rejected even while an old certificate
+remains cryptographically valid.
+Plaintext peer transport is permitted only on loopback in tests. The exact consensus,
+runtime, TLS, and async-adapter dependencies require a written dependency and MSRV ADR;
+standalone builds must remain available without enabling HA.
+
+## Replicated command protocol
+
+### Envelope
+
+Every application entry is interpreted with:
+
+- command schema version;
+- Raft log ID (term and index) supplied by the consensus layer, not embedded in
+  the canonical command digest;
+- command kind;
+- cluster ID;
+- canonical payload length and digest;
+- optional idempotency identity and canonical request digest;
+- deterministic command data.
+
+Entries never depend on follower clocks, random generation, hash-map iteration order,
+local paths, or local segment numbers. The leader resolves timestamps and generated
+identifiers before proposing the command.
+
+Application entries are bounded to 2 MiB. Client requests may remain as large as the
+standalone 64 MiB limit, so large logical operations use staged commands:
+
+- `PayloadChunk { hash, offset, total_length, bytes }`
+- `PayloadSeal { hash, total_length }`
+- `SpanBatchBegin { batch_id, count, digest }`
+- `SpanBatchChunk { batch_id, offset, canonical_spans }`
+- `SpanBatchCommit { batch_id }`
+- `SpanBatchAbort { batch_id }`
+- `AnnotationAppend { annotation, resolved_timestamp_ns }`
+- `RetentionPlanBegin { plan_id, cutoff_ns, digest }`
+- `RetentionPlanChunk { plan_id, expired_payload_hashes }`
+- `RetentionPlanCommit { plan_id }`
+- `FlushBarrier`
+
+Payload chunks are content-addressed, idempotent by hash and offset, and invisible until
+`PayloadSeal` verifies length and content digest. A `SpanBatchCommit` is proposed only
+after all referenced payloads are sealed. Batch chunks remain invisible in staging
+until commit, preserving the existing all-or-nothing validation behavior. A crashed or
+abandoned preparation is removed only by a replicated abort or a later committed
+garbage-collection plan; local age is never sufficient.
+
+Multi-entry transactions are contiguous in the application log. The proposal adapter
+does not interleave another logical mutation between a transaction's begin and terminal
+commit or abort entry. A new leader reconstructs committed staging state and either
+finishes a fully validated transaction or appends an abort; it never infers commit from
+the presence of chunks.
+
+The leader builds a retention plan from one applied prefix. The plan contains its cutoff
+and the exact payload hashes that become unreachable after spans and annotations expire;
+prepared but not yet committed payloads are excluded. `RetentionPlanCommit` atomically
+makes the staged plan visible. Every replica therefore removes the same logical spans,
+annotations, and payloads. HA retention never uses local payload mtime as an authority.
+Physical deletion can be deferred, but a node must not serve content deleted by a
+committed plan.
+
+### Request identity
+
+`(trace_id, span_id)` is a record key, not a request ID. A later request may
+legitimately replace that key with a different span.
+
+HA accepts an optional `Idempotency-Key` header on mutating public requests. The
+replicated deduplication key is `(authenticated principal, route, idempotency key)`.
+The table stores the canonical request digest and committed response:
+
+- the same key and digest returns the stored outcome;
+- the same key with a different digest returns `409 idempotency_conflict`;
+- entries have a documented bounded retention period and are included in snapshots.
+
+Without an idempotency key, retry behavior remains at least once. Span upserts converge
+through last-write-wins semantics, but retrying an annotation after an ambiguous timeout
+may append another annotation. Traza does not claim exactly-once effects in that case.
+
+### Commit and response sequence
+
+A mutation follows this sequence:
+
+1. The leader authenticates, parses, validates, canonicalizes, and stages any bounded
+   chunks.
+2. It appends application entries to its durable Raft log.
+3. Followers validate cluster, version, prefix, sizes, and checksums and acknowledge
+   only after the consensus library's required durable-write boundary.
+4. Raft commits the entry on a voting majority.
+5. The leader's single apply worker applies committed commands in index order.
+6. The leader returns success only after the relevant commit is query-visible locally.
+
+The `WriteBuffer` is a local materialized view, not the HA acknowledgment or recovery
+boundary. A success is recoverable because the command is committed in the Raft log.
+The leader does not need to create one segment per request.
+
+### Applied-index recovery contract
+
+Traza tracks three positions:
+
+- `commit_index`: committed by Raft;
+- `visible_applied_index`: reflected in this process's query-visible state;
+- `durable_applied_index`: recoverably materialized in the active engine generation.
+
+The apply worker may advance the visible index after putting a span into the write
+buffer, but it advances the durable index only after every effect through that index is
+durable. On restart it replays `(durable_applied_index, commit_index]`.
+
+Every application command is idempotent by Raft log ID:
+
+- staged span batches and payload chunks use log/batch IDs;
+- annotation records persist their originating log ID and reject replay duplicates;
+- retention persists the plan ID, cutoff, and deletion digest and is safe to repeat;
+- payload sealing verifies the same digest;
+- flush barriers record the highest sealed log index.
+
+An engine checkpoint atomically publishes the segment and satellite-store state through
+an index, then updates the generation manifest's durable applied index. A crash before
+manifest publication replays commands; a crash after publication starts after them.
+Raft log compaction never removes entries newer than the last durably installed
+snapshot.
+
+This requires new, narrow engine APIs before networked HA work begins:
+
+```text
+apply_committed(log_id, command)
+begin_snapshot(applied_index) -> SnapshotView
+install_generation(validated_generation)
+durable_applied_index()
+```
+
+The exact Rust signatures are implementation details; their crash and locking semantics
+are not.
+
+## Logical retention versus physical compaction
+
+Consensus decides logical visibility. A committed `RetentionPlan` is the only
+distributed expiration decision. It is applied in log order and can be replayed.
+
+Segment creation, merging, and supersede-journal recovery remain local. Two replicas may
+have different segment counts or file names while representing the same logical spans.
+The supersede journal never appears in the Raft command log and never advances a Raft
+applied index. A local compaction failure makes that node unhealthy if it cannot continue
+to represent the committed prefix; it does not change cluster history.
+
+This choice has an API consequence: `/v1/stats` is a node-local diagnostic because its
+physical record, buffer, segment, and byte counts can differ across replicas and after
+failover. In HA mode its response adds node ID, role, term, and applied index. It is not
+advertised as a linearizable cluster total. Logical analytics such as `/v1/stats/llm`
+remain governed by the read contract below.
+
+## Request routing and consistency
+
+The first implementation does not proxy or redirect client requests through followers.
+A follower receiving a mutation returns retryable `503` JSON with
+`error: "not_leader"` and a configured public leader hint when known. No auth failure is
+redirected. Unknown leader, no quorum, recovery, and incompatible-version states also
+return explicit retryable errors.
+
+| Surface | Default contract in HA mode | Optional follower behavior |
+|---|---|---|
+| Mutating routes | Leader only; quorum commit plus leader visibility before success | Rejected with `not_leader` |
+| `/v1/spans`, `/v1/traces/*`, sessions, LLM analytics, annotations | Linearizable leader read at one applied index | `consistency=stale`, labeled with term and applied index |
+| `/v1/export` | Leader ReadIndex followed by a pinned `SnapshotView`; all pages come from that view | Disabled initially |
+| `/v1/payloads/*` | Leader read pinned against deletion for the operation | Stale only when explicitly requested |
+| `/v1/stats` | Local physical diagnostic, labeled with node and applied index | Always local |
+| Dashboard shell, liveness, metrics | Local and non-authoritative | Always local |
+
+A ReadIndex barrier proves leadership but does not itself create an engine snapshot.
+After the barrier, the node waits until `visible_applied_index` reaches the returned
+commit index. Point reads acquire a state-machine read gate that cannot interleave with
+multi-store application. Export pins an immutable `SnapshotView` at that index rather
+than re-querying a changing store page by page. Its existing completion/count trailers
+remain mandatory, and the response additionally reports the snapshot applied index.
+
+Follower responses requested with `consistency=stale` include
+`X-Traza-Consistency: stale`, `X-Traza-Term`, and `X-Traza-Applied-Index`. They never
+claim read-your-writes or bounded staleness unless a separately tested maximum-lag
+contract is configured.
+
+## Election, membership, and fencing
+
+Followers start an election after a randomized timeout without valid leader contact.
+Terms and votes are persisted before the corresponding protocol response. A candidate
+must have an up-to-date log and a voting majority. A higher term immediately fences an
+older leader.
+
+A newly elected leader commits a current-term no-op and replays through its commit index
+before accepting mutations or linearizable reads. A minority-side former leader cannot
+commit and fails write readiness after quorum checking detects loss of contact. Lease
+reads are out of scope until a clock model and fault tests justify them.
+
+Membership changes use learners and joint consensus:
+
+1. add and authenticate a node as a non-voting learner;
+2. catch it up and validate its state;
+3. enter joint old/new voter configuration;
+4. commit the new configuration;
+5. remove obsolete authorization.
+
+A two-voter deployment cannot survive either voter failing and is rejected by the
+production configuration validator. Three voters are the minimum production topology.
+Five voters are supported when two-failure tolerance justifies the latency and cost.
+
+## Snapshots and catch-up
+
+### Snapshot contents
+
+A snapshot is built at one committed and durably applied index. Its manifest contains:
+
+- cluster ID, command schema, engine format, last included log ID, and membership;
+- every visible v2 segment plus length and cryptographic digest;
+- annotation records and their originating log IDs;
+- every sealed payload referenced by live spans plus length and digest;
+- the replicated idempotency outcome table;
+- greatest applied retention cutoff and flush barrier;
+- active-generation metadata and a manifest digest.
+
+The in-memory primary-key map and analytics caches are derived and are rebuilt after
+installation. Embedded segment indexes are validated by the normal segment opener but
+are not independent authority.
+
+### Consistent creation
+
+`begin_snapshot(index)` waits until the durable applied index reaches `index`, seals any
+required buffer state, and returns a generation-pinned view. It does not copy a live
+mutable annotation log or payload tree without coordination. Snapshot work may release
+the apply gate after the generation is pinned; immutable files may then be hard-linked
+or copied into the snapshot staging directory.
+
+### Transfer and installation
+
+Transfer is authenticated, length-bounded, chunked, checksummed, and resumable or safely
+restartable. A receiving node remains a learner or recovering voter and does not serve
+reads while installing.
+
+Installation proceeds as follows:
+
+1. download into a unique `incoming/` directory;
+2. verify cluster ID, versions, manifest, every file length and digest, and every segment;
+3. fsync files and the incoming directory;
+4. rename the completed directory into a new `generations/<id>`;
+5. write and fsync a temporary `CURRENT`, atomically replace `CURRENT`, and fsync `data/`;
+6. open a new `Store` against the selected generation and rebuild derived indexes;
+7. publish the new store handle, then resume log replay at the next index;
+8. retire the old generation only after all readers and exports release it.
+
+A crash exposes either the old complete generation or the new complete generation.
+Consensus metadata is never swapped with the engine generation. Unsupported atomic
+rename or directory-sync behavior disqualifies a platform until an equivalent tested
+protocol exists.
+
+Log truncation is permitted only at or below a snapshot index after the snapshot is
+durable under the configured recovery policy. A slow follower cannot retain unbounded
+leader disk: per-peer byte windows, snapshot concurrency limits, log-size alerts, and an
+operator-visible eviction policy are required.
+
+## Failure and recovery behavior
+
+The system distinguishes liveness from readiness. A process can be live while it is not
+eligible for client traffic. Write readiness requires current leadership, recent quorum
+confirmation, compatible versions, and a working apply path. Read readiness additionally
+requires recovery through the advertised applied index.
+
+Consensus-log framing and persistence belong to the selected Raft storage adapter, not
+to `WriteBuffer` or segment output. A follower acknowledges a log append only after a
+complete validated entry and required hard state are durable in the ordering required by
+the consensus library. Torn log records are recovered by that adapter to the last valid
+boundary. Partially written segment, annotation, payload, or generation files are
+recovered by their state-machine idempotency and generation protocol and never count as
+Raft commitment.
+
+Disk-full, permission, checksum, incompatible-version, and fsync failures remove a node
+from readiness. The node does not continue with memory-only consensus state. If safe
+local recovery is impossible, it quarantines the generation and requests a snapshot
+rather than guessing.
+
+Loss of quorum is not ordinary failover. Forced recovery is an explicit destructive
+procedure that:
+
+- names the chosen last-known state and possible acknowledged-data risk;
+- proves or requires operator confirmation that the old cluster cannot return;
+- issues a new cluster identity and peer credentials;
+- preserves the old data for audit;
+- never appears as an automatic promotion.
+
+## Security
+
+Client bearer-token authorization remains in force on every node. Peer credentials are
+separate and cannot be used as client credentials. Voting, append, snapshot, membership,
+leadership-transfer, and recovery RPCs require the exact peer authorization.
+
+Peer messages are authenticated before expensive allocation, then checked for cluster,
+node, version, term, size, and digest. Snapshot paths are generated locally. Rate,
+connection, in-flight byte, log, staging, and snapshot limits prevent one peer from
+exhausting a node.
+
+Logs and metrics include node, cluster, role, term, index, peer, and operation kind but
+never bearer tokens, private keys, request bodies, payload bytes, or replicated command
+content. Detailed topology and lag require administrative authorization.
+
+Certificate rotation uses an overlap window committed in membership/configuration state:
+install new trust, rotate node credentials, confirm every voter, then remove old trust.
+Removing a node revokes membership authorization immediately even if certificate expiry
+is later.
 
 ## Compatibility and migration
 
-HA is opt-in. With no cluster configuration, a v0.9.0-compatible standalone deployment
-continues to use the established engine, APIs, authentication, OTLP behavior, dashboard,
-expiration behavior, and segment validation. HA configuration must not silently reinterpret
-an existing standalone directory as a multi-node cluster.
+HA is opt-in. With no cluster configuration, v0.13 standalone behavior, file layout,
+authentication, OTLP mapping, dashboard, export trailers, TTL scheduling, and public
+responses remain unchanged.
 
-Migration begins by taking and validating a backup, stopping the standalone writer,
-initializing one cluster leader from the existing engine state at a defined snapshot
-index, recording cluster metadata, then joining empty followers through snapshot transfer.
-The old standalone process remains fenced and must not restart against the migrated data
-directory. Rollback is allowed only before new cluster writes or through an explicit
-export procedure that accounts for all committed data.
+HA introduces these explicit API extensions:
 
-Protocol and command entries carry versions. During rolling upgrades, a leader proposes
-only features understood by the active voting configuration. Incompatible nodes remain
-non-voting or fail join clearly. The supported version matrix and order of upgrades must
-be documented and tested. On-disk consensus metadata has its own version independent of
-segment v2.
+- optional `Idempotency-Key` on mutations;
+- retryable structured `not_leader`, `no_quorum`, and `recovering` errors;
+- `consistency=stale` and applied-index response metadata;
+- node/role/applied-index metadata on the already local `/v1/stats`;
+- snapshot applied index on export responses.
 
-Public success and error semantics remain stable where possible. New not-leader,
-no-quorum, recovering, and incompatible-version outcomes need documented HTTP or RPC
-mapping and retry guidance. Existing auth failures must not become redirects. Existing
-OTLP conformance and server-on-engine tests remain regression gates.
+`POST /v1/flush` remains meaningful: a committed `FlushBarrier` forces the leader's
+materialized state through that index into a durable local segment before success.
+Quorum durability already comes from Raft; the endpoint does not claim that every
+follower has compacted or produced an identical segment layout.
 
-No migration may rewrite closed-leg documents or weaken their tests. If an HA command
-cannot represent an existing engine operation deterministically, that operation is a gap
-to resolve in successor work, not grounds for silently changing prior semantics.
+Standalone-to-cluster migration requires:
 
-<!-- leg6-grounded-architecture-comparison -->
-## Non-goals
+1. a verified standalone backup;
+2. stopping and fencing the standalone writer;
+3. importing its complete engine state as generation zero at snapshot index zero;
+4. creating one cluster identity and initial voter configuration;
+5. joining empty learners through snapshot transfer;
+6. permitting cluster writes only after the initial voter set is healthy.
 
-This proposal deliberately does not redesign the closed Legs 1 through 5, change the segment-v2 on-disk contract, replace OTLP or dashboard APIs, or reinterpret authentication and LLM-semantic behavior. It does not promise multi-region active-active writes, Byzantine-fault tolerance, transparent operation through arbitrary network partitions, zero-data-loss asynchronous replication, or automatic disaster recovery without an operator-provided quorum and durable storage. It also does not treat a shared filesystem, process supervision alone, or `DirectoryLock` alone as a distributed consensus mechanism. Existing single-node operation remains a supported compatibility mode. This document proposes future work; none of the HA behavior described here is asserted to exist in the carried-forward tree.
+Rollback is allowed before the first cluster mutation. After that point, rollback
+requires a versioned export/import procedure accounting for every committed state
+surface.
 
-## Grounded Current-State Persistence Boundaries
+Command and consensus metadata versions are separate from segment format versions.
+During rolling upgrades, a leader emits only command versions understood by every
+voter. Unsupported nodes remain learners or reject join. The supported version and MSRV
+matrix is release evidence, not prose-only intent.
 
-The sanctioned v0.9.0 engine has several concrete mechanisms that constrain an HA design:
+## Operations and observability
 
-- `WriteBuffer` is the in-process mutable ingestion boundary. Data accepted only into a leader's `WriteBuffer` cannot be considered replicated or failover-safe. A future leader must acknowledge a write only after the replicated log policy is met, then apply the committed entry to its local `WriteBuffer` and normal storage path.
-- `segment_v2` is the durable segment format and remains the local immutable-data representation. Replication should carry logical committed operations and verified immutable segment artifacts rather than allowing multiple processes to append concurrently to the same segment file.
-- The supersede journal records replacement/supersession intent around segment transitions. Its ordering and recovery semantics must be represented in the replicated state machine so failover cannot expose both an obsolete segment and its replacement, lose a completed supersession, or finish an uncommitted one.
-- The `(trace_id, span_id)` trace/span primary key defines idempotent identity for span writes. Retries across an uncertain failover boundary must converge on the same logical record rather than create a second span; conflicting payload policy must be deterministic and replicated.
-- `DirectoryLock` fences concurrent local owners of a data directory. It protects one node's files but neither establishes cluster leadership nor fences a stale leader from remote clients. Each replica therefore owns a distinct directory and acquires its own `DirectoryLock`; distributed fencing is supplied separately by quorum term and commit rules.
+Configuration distinguishes cluster ID, node ID, advertised client and peer addresses,
+bootstrap versus join, voter role, heartbeat and election timings, log and snapshot
+limits, TLS identity, engine generation root, and compatibility policy. Invalid or
+ambiguous bootstrap combinations fail startup.
 
-These are current mechanisms and invariants used as integration constraints, not evidence that replication is already implemented.
+Required metrics include:
 
-## Architecture Options Comparison
+- role, term, leader and membership;
+- commit, visible-applied, and durable-applied indices;
+- per-peer match index, byte lag, and last contact;
+- elections, quorum status, and leadership changes;
+- proposal, quorum, apply, and checkpoint latency;
+- log and staging bytes;
+- snapshot build, transfer, install, and failure counts;
+- deduplication hits and conflicts;
+- stale-term, not-leader, corruption, fsync, and quarantine events.
 
-### Architecture Option 1: Shared Storage With Active-Passive Processes
+Operators need tested runbooks for bootstrap, add/remove/replace, maintenance, leadership
+transfer, backup, restore, certificate rotation, rolling upgrade, downgrade where
+supported, and forced quorum-loss recovery. Every destructive operation states
+preconditions, quorum impact, rollback boundary, and audit artifacts.
 
-Two server processes could point at one shared data directory while an external manager chooses the active process. This has a small conceptual diff, but it is rejected as the primary design. `DirectoryLock` permits only a local directory owner and does not reliably fence hosts across all network filesystems. Cache coherence, partial segment writes, supersede journal transitions, and lock behavior after partitions would depend on filesystem semantics outside Traza's control. It also leaves acknowledged `WriteBuffer` contents vulnerable when the active process dies.
+The product objective is RPO 0 for quorum-acknowledged mutations after one voter failure
+and RTO under 10 seconds for leader failover on the reference deployment. Election
+timeouts remain configurable; no environment is promised that bound until its latency
+and storage assumptions pass the fault suite.
 
-### Architecture Option 2: Primary-Backup File Shipping
+## Acceptance evidence
 
-A primary could retain the existing write path and periodically ship closed `segment_v2` files plus supersede journal material to one or more backups. This is useful later for snapshots and catch-up, and it preserves immutable artifacts efficiently. By itself it cannot provide the required correctness boundary for recently acknowledged writes: an open `WriteBuffer` and partially completed supersession are not necessarily represented by a shipped segment. Promotion also needs an external authority and a durable ordering point to prevent split brain. This option is therefore retained only as a bulk-transfer optimization beneath a replicated protocol.
+| ID | Requirement | Required executable evidence |
+|---|---|---|
+| HA-001 | One write leader | Three real processes expose exactly one write-ready leader per term; follower mutations never succeed |
+| HA-002 | Acknowledged-state survival | Commit spans, annotations, and payloads; kill the leader at every response boundary; the successor returns every acknowledged value |
+| HA-003 | Split-brain prevention | Partition the old leader into a minority; zero minority successes; heal and prove one converged committed history |
+| HA-004 | Complete state replication | Exercise every command in the state inventory and compare logical results, payload bytes, annotations, and retry outcomes after failover |
+| HA-005 | Applied-index crash safety | Kill before effect, after effect, before durable-index publication, and after publication; restart without omission or duplication |
+| HA-006 | Request identity | Lost response plus same key returns the original result; same key/different digest fails; no-key annotation retry remains documented at-least-once |
+| HA-007 | Linearizable reads | History checker covers successful, failed, timed-out, and retried reads/writes during partitions and leader kills |
+| HA-008 | Export snapshot | Mutate concurrently with a multi-page export; output exactly matches its advertised applied-index snapshot and completion trailer |
+| HA-009 | Physical-layout independence | Replicas compact at different times yet return identical logical results; `/v1/stats` remains correctly node-local |
+| HA-010 | Snapshot completeness | Catch up after log truncation and verify spans, annotations, payloads, dedupe outcomes, retention, and all manifest digests |
+| HA-011 | Atomic installation | Kill at every installation step; restart selects exactly the old or new complete generation |
+| HA-012 | Membership safety | Add learners, promote, remove, and replace while writing; model-check quorum intersection and reject removed credentials |
+| HA-013 | Security | Reject missing, client, wrong-cluster, wrong-node, expired, and removed-node peer credentials without secret leakage |
+| HA-014 | Resource bounds | Slow peer and oversized request tests prove bounded memory, staging, log, and snapshot concurrency |
+| HA-015 | Version skew | Supported rolling upgrade under traffic succeeds; unsupported command or metadata versions fail closed |
+| HA-016 | Standalone compatibility | Complete current `./ci.sh` passes unchanged with HA disabled |
+| HA-017 | Recovery objectives | Repeated fault runs report RPO and RTO distributions; no retry is hidden and no fixed sleep substitutes for an eventual assertion |
 
-### Architecture Option 3: Quorum Replicated Logical Log
+The harness uses production protocol, persistence, request-routing, and snapshot paths.
+It records client history, node logs, terms, commit/applied indices, process exits, and
+final state. Mocked consensus or test-only success flags are not sufficient evidence.
+Flaky retries are reported with every attempt.
 
-A fixed-membership Raft-style state machine assigns each mutation a monotonically ordered `(term, index)` and commits it after durable acknowledgement by a voting majority. Each replica has a private `DirectoryLock`-protected data directory and independently applies committed operations through the existing engine boundaries. The log covers span upserts keyed by `(trace_id, span_id)`, retention/expiration decisions that affect visible state, and supersede journal state transitions. Closed `segment_v2` files can be transferred as checksummed snapshots or immutable artifacts, but their installation is authorized by a committed manifest entry.
+## Implementation sequence
 
-This option gives Traza an internal leader election, an explicit acknowledgement oracle, stale-leader rejection, deterministic recovery, and a single ordering source. Its costs are a larger implementation surface, quorum latency, membership operations, and the need to specify deterministic application around existing background work.
+### Phase zero: close architecture gates
 
-### Architecture Option 4: External Consensus Service
+- inventory and encode every v0.13 mutation;
+- implement idempotent log-ID-aware annotation, payload, retention, and batch staging;
+- implement engine checkpoint, generation install, and pinned read/export views;
+- spike and approve the consensus library, runtime, TLS, dependency set, and MSRV;
+- model command application, membership, and snapshot invariants;
+- publish exact HTTP consistency and retry contracts.
 
-Traza could lease leadership and publish metadata through an external service such as etcd while file shipping carries data. This can provide strong fencing if every mutation validates a revision or lease, but introduces a mandatory operational dependency and still requires a durable data replication protocol. A metadata lease alone cannot recover acknowledged `WriteBuffer` entries. It remains a possible deployment adapter, not the recommended correctness core.
+No networked HA mode is exposed in phase zero.
 
-## Recommended HA Architecture
+### Phase one: durable single-node state machine
 
-The recommended future direction is Architecture Option 3: one voting leader and quorum-replicated logical log, with file/snapshot transfer from Option 2 for efficient catch-up. Each node consists of a transport/authentication boundary, consensus module, durable log and metadata store, deterministic apply worker, and the existing Traza engine operating in a node-private directory. Readers default to the leader or use an explicit linearizable read barrier; followers may serve explicitly labeled stale reads only if the governing specification permits that mode.
+Run the selected consensus storage and apply adapter as one voter. Prove term, vote, log,
+visible/durable applied indices, restart replay, large-batch staging, and snapshots under
+fault injection. This phase claims recoverability, not availability.
 
-The consensus term is the distributed fencing token. A node may accept mutations only while it is leader in the current term and can contact a quorum. The mutation response includes stable operation identity and is successful only after the entry is durably committed. Loss of quorum makes the old leader reject new writes even if it still holds its local `DirectoryLock`. A promoted follower first completes election, establishes a current-term committed entry/read barrier, replays committed unapplied entries, and only then advertises write readiness.
+### Phase two: three-node replication
 
-## Replication Protocol
+Add authenticated transport, election, quorum replication, leader-only mutations,
+ReadIndex, fencing, readiness, and real three-process partition tests. No membership
+changes or follower reads are exposed yet.
 
-The proposed replication protocol uses authenticated, versioned peer messages and persistent consensus metadata. Every request carries cluster ID, sender node ID, protocol version, term, and message identity. Vote requests include the candidate's last log term/index; append requests include the preceding term/index, an ordered entry batch, leader commit index, and current fencing term. Receivers reject the wrong cluster, unsupported protocol, stale term, inconsistent prefix, invalid authentication, or malformed size/checksum before mutating durable state.
+### Phase three: snapshots and operations
 
-A client mutation follows this exact sequence:
+Add learner catch-up, generation installation, log compaction, joint-consensus
+membership, leadership transfer, backup/restore, metrics, and operator runbooks.
 
-1. The leader authenticates and validates the request, derives an idempotency identity from the operation and, for spans, the `(trace_id, span_id)` primary key, and appends a typed log entry to its durable local log.
-2. The leader sends the entry to voting followers. Each follower verifies the prefix and durably flushes the entry before acknowledging it; merely buffering it in memory is not an acknowledgement.
-3. After a voting majority, including the leader, has durably stored the entry, the leader advances the commit index according to the consensus term rule. Only this committed point permits a successful client response.
-4. Every replica applies committed entries in index order. Span mutations enter the local `WriteBuffer` and existing persistence path deterministically. Supersession operations drive the supersede journal in the same committed order. Apply progress is stored so restart can safely repeat an entry.
-5. Duplicate requests return the prior committed result or deterministically reapply an idempotent operation. A timeout before the client observes a response is an unknown outcome, so retry with the same identity is required.
+### Phase four: compatibility and qualification
 
-Followers that are behind stream missing log entries. If retained log history is insufficient, the leader creates a snapshot at a committed index, including a manifest of visible `segment_v2` artifacts, primary-key/index state required for deterministic reads, supersede journal state, and integrity hashes. The follower downloads into a temporary location, verifies cluster ID, format version, index/term, lengths, and hashes, atomically installs it while holding its local `DirectoryLock`, and resumes log replay after the snapshot index. Interrupted or corrupt transfers remain non-visible and are retried; they never replace the last valid local state.
+Add supported rolling upgrades, migration, explicit stale reads, extended chaos and soak
+tests, linearizability analysis, security review, RPO/RTO measurement, and independent
+release review.
 
-Flow control bounds outstanding bytes and entries per follower so a slow replica cannot exhaust the leader. A quorum may continue while one follower catches up, but the leader must step down or reject writes when it cannot maintain a majority. Log truncation is allowed only after the snapshot is durable on enough nodes to preserve the configured recovery guarantee. Membership changes use joint consensus rather than independent configuration edits; removing enough voters to erase quorum durability is rejected.
+## Remaining decisions
 
-Protocol compatibility is negotiated before replication. Unknown required entry types stop application and prevent promotion; they are not silently skipped. Rolling upgrades require an overlap version in which all voters understand the emitted entry set. Encryption and mutual peer authentication bind a node identity to cluster membership, and authorization separates peer replication, membership administration, snapshot transfer, and client access.
+These are explicit blockers, not details silently delegated to implementation:
 
-## Consistency Consequences of the Recommendation
+1. Approve or reject the evaluated OpenRaft patch and storage adapter.
+2. Approve the async runtime and TLS provider, including platform and MSRV support.
+3. Fix the deduplication retention default and authenticated-principal namespace.
+4. Fix entry, staging, snapshot, log, and peer-flow-control limits from measured data.
+5. Define the supported rolling-version matrix.
+6. Define certificate provisioning and rotation UX.
+7. Define the supported filesystem/platform crash-consistency matrix.
+8. Review forced quorum-loss recovery independently.
 
-Successful writes are linearizable at the committed log index, while local application may trail commitment only behind an internal readiness barrier. A leader must not report a committed write as query-visible until its own apply index reaches that commit, and a promoted node must not serve until replay reaches the required index. Linearizable reads use a current-term quorum confirmation/read index and wait for local apply. Any follower-read mode must expose its applied index and be documented as potentially stale.
-
-The `(trace_id, span_id)` primary key and stable request identity provide retry idempotence, but they do not by themselves settle conflicting payloads. The state-machine entry must encode a deterministic conflict rule matching the sanctioned single-node behavior or explicitly reject a mismatch. Time-based expiration cannot depend independently on each node's wall clock; the leader must replicate the expiration decision or a deterministic logical cutoff. Segment creation, compaction, and supersede journal completion may differ physically by node only where observable query state remains identical and snapshot manifests remain verifiable.
-
-The design chooses consistency over write availability during a partition: only a side with a voting majority can elect a leader and commit. Minority nodes reject writes and must not self-promote. This is the necessary split-brain boundary; DNS, load balancers, process managers, and `DirectoryLock` are routing or local-safety aids rather than substitutes for it.
-
-## Requirements traceability
-
-The following matrix maps the mechanically identifiable normative requirements from
-this design. Status is **proposed** unless a gap is stated. “Proposed” means this
-design supplies an architecture and oracle; it does not mean runtime behavior exists.
-Independent review must compare every entry with the source specification and correct
-any interpretation mismatch.
-
-| ID | Requirement interpretation | Proposed mechanism | Exact acceptance evidence / oracle | Status or gap |
-|---|---|---|---|---|
-| TRACE-001 | Define an HA deployment with one active writer and replicas. | Quorum-elected single leader; followers reject writes. | Start at least three real nodes; assert one write-ready leader and no successful follower write in each observed term. | Proposed. |
-| TRACE-002 | Preserve acknowledged writes through failover. | Acknowledge only after quorum durability and leader apply. | Write uniquely identified records, wait for success, kill leader without graceful shutdown, elect a successor, and query every acknowledged record; repeat across durability crash points. | Proposed; persistence boundary needs implementation review. |
-| TRACE-003 | Prevent split brain during partitions. | Majority quorum, persisted votes and terms, stale-term fencing. | Partition old leader into a minority; concurrent writes on both sides must show zero minority successes while majority commits; heal and verify one converged history. | Proposed. |
-| TRACE-004 | Detect failure and perform bounded automatic failover. | Randomized election timeout, heartbeat, readiness transition. | Kill leader and measure from last valid heartbeat to new leader readiness under the configured bound; collect election timeline and repeat without fixed sleeps. | Proposed; exact bound follows governing specification/configuration. |
-| TRACE-005 | Maintain a consistent ordered replicated history. | Term/index log matching, quorum commit, ordered state-machine apply. | Inject duplication, loss, reorder, and delay; compare committed index/term hashes and final engine results across caught-up nodes. | Proposed. |
-| TRACE-006 | Fence obsolete leaders and stale requests. | Higher-term step-down, leader barrier, term checks on all mutation paths. | Pause old leader, elect and commit on majority, resume old leader, then prove all old-term proposals and background mutations are rejected. | Proposed. |
-| TRACE-007 | Provide correct read semantics across failover. | Leader read barrier; stale follower reads only by explicit opt-in. | Run a linearizability checker over concurrent reads/writes and leader failures; separately verify follower reads are rejected by default and labeled when opted in. | Proposed. |
-| TRACE-008 | Replicate all state-changing operations, including maintenance work. | Deterministic versioned commands; leader-proposed expiration. | Exercise normal ingestion, OTLP, expiration, and administrative mutations; fail over after each and compare query-visible state and applied indices. | Proposed; full mutation inventory requires source-level review. |
-| TRACE-009 | Recover cleanly after process or machine restart. | Durable term/vote/log/applied metadata and idempotent replay. | Terminate at each append/commit/apply/response crash point, restart from the same production data directory, and verify no lost committed or duplicate mutation. | Proposed. |
-| TRACE-010 | Catch up lagging or replacement replicas. | Incremental log replication followed by validated snapshot installation when compacted. | Isolate follower through log compaction, reconnect, observe snapshot plus tail replay, then compare engine state and commit/applied indices. | Proposed. |
-| TRACE-011 | Detect corruption and avoid partial snapshot activation. | Manifest checksums, segment validation, temporary transfer, atomic installation. | Corrupt each metadata and payload class and kill during transfer/install; restart must retain old valid state or activate complete new state and must never become ready on corrupt state. | Proposed. |
-| TRACE-012 | Support safe membership changes. | Catch-up as non-voter and joint-consensus voter transitions. | Add and remove nodes while writing and during induced failure; model-check quorum intersection and verify removed nodes cannot vote or commit. | Proposed; consensus implementation choice remains open. |
-| TRACE-013 | Expose actionable health and HA observability. | Separate liveness/readiness plus bounded-cardinality role, term, lag, quorum, and snapshot metrics. | Query each node in leader, follower, candidate, partitioned, recovering, corrupt, and incompatible states; assert exact readiness and metric transitions. | Proposed; metric names need specification. |
-| TRACE-014 | Secure cluster-internal communication and administration. | Mutual TLS/node identity, membership authorization, limits, redaction. | Attempt every peer/admin RPC with no credential, client credential, wrong-node credential, removed-node credential, and valid credential; inspect logs and metrics for secret leakage. | Proposed; credential provisioning/rotation remains open. |
-| TRACE-015 | Retain standalone and existing API compatibility. | HA opt-in wrapper around existing engine and request surfaces. | Run the full v0.9.0 workspace test suite with HA disabled; run existing auth, OTLP, dashboard, storage, segment, semantics, and server tests unchanged. | Proposed; no earlier-leg behavior may be weakened. |
-| TRACE-016 | Define safe migration and version interoperability. | Explicit stopped-writer import, protocol versions, rolling feature gate. | Migrate a populated standalone fixture, verify all data, perform supported rolling upgrades under traffic, reject incompatible joins, and exercise documented rollback boundary. | Proposed; supported version matrix is an open decision. |
-| TRACE-017 | Make retry and duplicate behavior explicit. | Replicated request-ID deduplication and payload conflict check. | Drop the response after apply, retry through a new leader with same ID, and assert one effect and same result; same ID/different payload must fail. | Gap if public mutation APIs cannot carry stable request identity. |
-| TRACE-018 | Provide operator recovery without unsafe automatic promotion. | Validated backups, replacement flow, explicit forced quorum-loss recovery. | Restore into an isolated new cluster identity, prove old-cluster messages are rejected, and require confirmation for forced recovery while reporting potential data loss. | Proposed; UX and authorization require review. |
-| TRACE-019 | Supply focused real-behavior HA tests with no shortcuts. | Multi-process/component fault harness using production persistence and protocol paths. | Execute deterministic kill, partition, reorder, disk, snapshot, restart, expiration, security, and compatibility scenarios and retain histories and diagnostics. | Proposed; harness does not yet exist. |
-| TRACE-020 | Preserve full-workspace quality and provide reproducible review evidence. | Existing regressions plus focused HA suite and recorded Git identity. | From a clean sanctioned descendant run formatting/checks required by the repository, `cargo build --workspace`, and `cargo test --workspace`; record exact commands, complete exit status, `git rev-parse HEAD`, `git rev-parse HEAD^{tree}`, and scoped diff. | Proposed; evidence can be claimed only after successor implementation and independent run. |
-
-### Evidence record format
-
-A successor implementation report should provide, for every requirement, the exact
-command, environment assumptions, exit code, relevant parsed result, and artifact path.
-It should include the sanctioned seed commit, implementation commit, tree ID, clean or
-fully enumerated worktree status, compiler version, and operating system. A timeout is a
-failed or absent result, not evidence of success. Flaky retries must be reported with all
-attempts. Unsupported requirements remain explicit gaps.
-
-The minimum final command set is expected to include repository-prescribed formatting or
-lint commands where present, `cargo build --workspace`, `cargo test --workspace`, focused
-HA integration invocations, and the specification's exact commands. The source
-specification controls if it names a stricter command. Unit tests that mock away quorum,
-durable storage, transport failure, or production request routing cannot be the sole
-oracle for distributed requirements.
-
-## Implementation phases
-
-Phase one introduces durable protocol metadata and a deterministic state-machine adapter
-behind an opt-in configuration, with no claim of availability. It establishes crash-safe
-term, vote, log, commit, and apply behavior plus restart fault tests.
-
-Phase two adds authenticated peer transport, election, replication, leader request
-routing, fencing, and linearizable read barriers. It adds three-node partition and
-leader-kill tests before exposing the mode outside development.
-
-Phase three adds snapshots, compaction, lagging-replica recovery, membership changes,
-and operational APIs. Snapshot corruption and crash-atomicity tests gate this phase.
-
-Phase four integrates all mutating surfaces, including OTLP and expiration, adds
-migration and rolling-upgrade behavior, and executes the complete carried-forward
-regression suite.
-
-Phase five performs extended fault injection, linearizability analysis, soak testing,
-security review, and operator runbook exercises. Completion of phases is evidence for
-review, not self-approval; independent closure remains a separate gate.
-
-## Risks and open questions
-
-1. **Engine transaction boundary:** The existing engine may not expose an atomic way to
-   couple applied index with every mutation. The implementation must design recoverable
-   replay or add a narrowly scoped metadata transaction without changing stored record
-   semantics.
-2. **Mutation inventory:** Every path that changes durable or query-visible state must be
-   classified. An omitted background task can cause replica divergence.
-3. **Request identity:** Existing APIs may lack stable idempotency keys. Exactly-once
-   retry effects remain unsupported until an authenticated, bounded identity contract is
-   available.
-4. **Consensus dependency:** Building versus adopting a consensus implementation affects
-   audit scope, transport integration, storage ownership, licensing, and failure tests.
-5. **Snapshot consistency:** The engine's safe point-in-time capture mechanism must be
-   confirmed. Raw file copying is not assumed safe.
-6. **Timing guarantees:** Election bounds depend on scheduler, network, and durable-write
-   latency. The specification's bound must be reconciled with deployment guidance and
-   tested under load.
-7. **Two-node expectations:** A two-voter deployment cannot provide write availability
-   after one failure. Documentation and configuration validation must prevent misleading
-   expectations.
-8. **Membership recovery:** Forced reconfiguration after quorum loss can discard data or
-   create split brain. Its interface, authorization, and cluster-identity rotation need
-   independent safety review.
-9. **Rolling compatibility:** Command and metadata version negotiation needs a concrete
-   supported matrix before rolling upgrades can be represented as supported.
-10. **Proxy semantics:** Forwarding writes through followers may complicate authentication,
-    cancellation, body limits, tracing, and timeout ambiguity. Returning not-leader may
-    be safer for the first implementation.
-11. **Retention determinism:** Expiration based on leader-selected timestamps must remain
-    compatible with existing retention semantics and avoid mass expiration after a long
-    outage.
-12. **Resource exhaustion:** Slow peers and snapshots can retain logs and consume disk.
-    Backpressure, quotas, and safe eviction policy require concrete limits.
-13. **Observability privacy:** Topology and replication metadata are operationally useful
-    but may be sensitive. Access control for dashboard and metrics needs deployment-level
-    definition.
-14. **Platform durability:** Filesystem rename and sync semantics vary. Supported platforms
-    need explicit crash-consistency tests rather than assumptions.
-15. **Formal assurance:** Fault tests provide evidence but cannot enumerate every protocol
-    interleaving. A protocol model or model-checking effort should validate election,
-    commitment, membership, and snapshot invariants.
-
-These are design gaps and decisions for independent review and successor engineering.
-They are not represented as already satisfied.
-
-## Review boundary
-
-Automated structural checks can establish that this artifact exists, names the governing
-specification, contains required sections, and has a contiguous requirement matrix. They
-cannot establish semantic fidelity, protocol safety, feasibility against concrete source
-locks and persistence boundaries, or runtime availability. Human reviewers must check
-the requirement mappings against this document's own sections, inspect the current
-implementation, and reject references to nonexistent behavior.
-
-This proposal intentionally leaves implementation, executable HA evidence, operational
-qualification, and milestone closure to later gates. No tag or publication action is
-part of this document.
-
-### TRACE-020 mechanism grounding
-
-TRACE-020 requires the proposed HA work to remain grounded in the actual v0.9.0 write and persistence mechanisms rather than introducing an abstract replication layer disconnected from Traza. The following boundaries are current-state observations plus proposed integration rules; they are not claims that HA behavior exists today.
-
-- **WriteBuffer:** In the carried-forward engine, accepted records are accumulated through the existing `WriteBuffer` path before durable segment publication. The proposed leader must assign a monotonically increasing log position and term to a batch before that batch can become externally acknowledged. Followers must apply the same ordered batch through an equivalent buffer-to-segment transition, while treating retries for an already applied `(term, position)` as idempotent. A crash before quorum acknowledgement leaves the batch uncommitted and therefore ineligible for recovery as acknowledged data; a crash after quorum acknowledgement requires the new leader to retain or reconstruct that committed prefix before serving writes.
-- **SegmentWriter:** `SegmentWriter` is the concrete segment-encoding and publication boundary, not a substitute consensus log. Replication must carry canonical logical records and their ordering metadata, then use `SegmentWriter` locally so each replica preserves the sanctioned segment format and validation rules. A partially written or unfinalized segment must never advance the replica's durable applied position. On restart, the replica validates published segments, discards or quarantines incomplete output according to the existing recovery rules, and resumes from the last durably recorded applied position; checksum, framing, or publication failure makes that replica unavailable for quorum progress until repaired or caught up.
-- **primary-key index:** The in-memory primary-key index is derived acceleration state over the durable segment history. It must be updated only in the same ordered apply step that makes a committed record visible, and it must never be replicated as independent authority. Startup, snapshot installation, or catch-up rebuilds the primary-key index from the validated committed segment set before the replica may answer reads at the advertised applied position. If index reconstruction fails, if an index points beyond the durable committed prefix, or if duplicate application would change the winning record, the node must fail closed, rebuild, and remain outside read and leadership eligibility until the invariant is restored.
-- **supersede journal:** The existing supersede journal records the old-to-new segment transition used by segment replacement. Under the proposed HA protocol, compaction and supersession are deterministic local maintenance over an already committed logical prefix; journal files themselves are not consensus decisions and must not cause a log position to be acknowledged. Recovery must finish or roll back an interrupted journaled transition using the existing atomicity rules before exposing segments or rebuilding indexes. Replicas may compact at different times, but both the pre-supersede and post-supersede layouts must represent the same committed records. Missing operands, conflicting journal state, or validation failure fences the replica from reads and leadership rather than guessing which physical layout is authoritative.
-
-Together these rules define one authority boundary: consensus metadata decides which logical record prefix is committed; `WriteBuffer` stages ordered application; `SegmentWriter` creates validated durable segments; the supersede journal makes physical replacement recoverable; and the primary-key index is rebuilt derived state. Promotion is permitted only after all four relevant recovery checks establish that the candidate exposes exactly its durable committed prefix. The implementation and failure-injection tests needed to establish these properties remain successor work and are an explicit gap in this design-only artifact.
-
+The architecture becomes implementation-ready only when phase-zero decisions are
+recorded and their executable oracles exist. Completion of implementation phases is
+evidence for review, not self-approval.
