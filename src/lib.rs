@@ -673,13 +673,16 @@ impl Store {
         let segments = self.lock_segments()?;
         let mut result = Vec::new();
 
-        // Limited queries take the lazy path: per-source candidates stay
-        // UNDECODED (v2 posting/record offsets), a k-way merge pops them in
-        // start-time order, and only popped candidates are parsed and
-        // re-verified — a limit-100 query over 10M spans decodes ~100
-        // records instead of ~100,000 (measured: attribute filter p50 209 ms
-        // at 10M, dominated entirely by candidate parsing).
+        // Limited queries take the lazy path: per-source candidates stay as
+        // v2 posting/record offsets and a k-way merge decodes one head per
+        // source. Heads are compared with the SAME total order used by
+        // unlimited queries (start, end, trace, span). Comparing only the
+        // timestamp made equal-time ties depend on segment/source order;
+        // cursor consumers such as export then skipped valid rows.
         if let Some(limit) = filter.limit {
+            if limit == 0 {
+                return Ok(Vec::new());
+            }
             let mut buffered: Vec<Span> = writer
                 .spans
                 .iter()
@@ -714,59 +717,55 @@ impl Store {
                 sources.push((Source::Lazy { seg, offsets }, 0));
             }
 
-            let peek = |source: &(Source<'_>, usize)| -> Result<Option<u64>> {
+            let advance = |source: &mut (Source<'_>, usize)| -> Result<Option<Span>> {
                 let (src, pos) = source;
                 match src {
-                    Source::Parsed(spans) => Ok(spans.get(*pos).map(|span| span.start_time_ns)),
-                    Source::Lazy { seg, offsets } => match offsets.get(*pos) {
-                        None => Ok(None),
-                        Some(offset) => {
-                            Ok(Some(seg.timestamp_at(*offset).map_err(segment_v2_error)?))
+                    Source::Parsed(spans) => {
+                        let span = spans.get(*pos).cloned();
+                        if span.is_some() {
+                            *pos += 1;
                         }
-                    },
+                        Ok(span)
+                    }
+                    Source::Lazy { seg, offsets } => {
+                        let Some(offset) = offsets.get(*pos).copied() else {
+                            return Ok(None);
+                        };
+                        *pos += 1;
+                        let record = seg.record_at_offset(offset).map_err(segment_v2_error)?;
+                        record_to_span(&record).map(Some)
+                    }
                 }
             };
 
-            // Head-timestamp cache: with file-backed segments every peek is a
-            // disk read, and re-peeking all sources per pop cost O(pops x
-            // sources) syscalls — measured 8 ms -> 125 ms at 10M. Each source
-            // is peeked once, then only re-peeked after ITS head is consumed.
-            let mut heads: Vec<Option<u64>> = Vec::with_capacity(sources.len());
-            for source in sources.iter() {
-                heads.push(peek(source)?);
+            // Decode and cache one head per source. Only the selected source
+            // advances, so each record is read at most once.
+            let mut heads: Vec<Option<Span>> = Vec::with_capacity(sources.len());
+            for source in sources.iter_mut() {
+                heads.push(advance(source)?);
             }
 
             let mut result: Vec<Span> = Vec::with_capacity(limit.min(1024));
             let mut emitted: std::collections::HashSet<(String, String)> =
                 std::collections::HashSet::new();
             while result.len() < limit {
-                let mut best: Option<(usize, u64)> = None;
+                let mut best: Option<usize> = None;
                 for (index, head) in heads.iter().enumerate() {
-                    if let Some(timestamp) = head {
-                        if best.map_or(true, |(_, current)| *timestamp < current) {
-                            best = Some((index, *timestamp));
+                    if let Some(head) = head {
+                        if best.map_or(true, |current| {
+                            compare_spans(head, heads[current].as_ref().expect("best head exists"))
+                                .is_lt()
+                        }) {
+                            best = Some(index);
                         }
                     }
                 }
-                let Some((index, _)) = best else { break };
-                let (src, pos) = &mut sources[index];
-                let span = match src {
-                    Source::Parsed(spans) => {
-                        let span = spans[*pos].clone();
-                        *pos += 1;
-                        Some(span)
-                    }
-                    Source::Lazy { seg, offsets } => {
-                        let record = seg
-                            .record_at_offset(offsets[*pos])
-                            .map_err(segment_v2_error)?;
-                        *pos += 1;
-                        let span = record_to_span(&record)?;
-                        span_matches(&span, filter).then_some(span)
-                    }
-                };
-                heads[index] = peek(&sources[index])?;
-                let Some(span) = span else { continue };
+                let Some(index) = best else { break };
+                let span = heads[index].take().expect("selected head exists");
+                heads[index] = advance(&mut sources[index])?;
+                if index != 0 && !span_matches(&span, filter) {
+                    continue;
+                }
                 let key = (span.trace_id.clone(), span.span_id.clone());
                 if emitted.contains(&key) {
                     continue;
@@ -1134,14 +1133,16 @@ fn recover_supersede_markers(directory: &Path) -> Result<()> {
     Ok(())
 }
 
+fn compare_spans(left: &Span, right: &Span) -> std::cmp::Ordering {
+    left.start_time_ns
+        .cmp(&right.start_time_ns)
+        .then_with(|| left.end_time_ns.cmp(&right.end_time_ns))
+        .then_with(|| left.trace_id.cmp(&right.trace_id))
+        .then_with(|| left.span_id.cmp(&right.span_id))
+}
+
 fn sort_spans(spans: &mut [Span]) {
-    spans.sort_by(|left, right| {
-        left.start_time_ns
-            .cmp(&right.start_time_ns)
-            .then_with(|| left.end_time_ns.cmp(&right.end_time_ns))
-            .then_with(|| left.trace_id.cmp(&right.trace_id))
-            .then_with(|| left.span_id.cmp(&right.span_id))
-    });
+    spans.sort_by(compare_spans);
 }
 
 fn span_matches(span: &Span, filter: &SpanFilter) -> bool {

@@ -582,3 +582,50 @@ fn export_streams_without_content_length_and_paginates_exactly() {
         assert_eq!(body_lines, 5, "user limit caps the stream");
     }
 }
+
+#[test]
+fn export_keeps_equal_timestamp_rows_from_different_segments() {
+    // Limited queries used to break equal-start ties by source order while
+    // the export cursor assumed the engine's full (start, end, trace, span)
+    // order. Persisting z before a made the first row advance the cursor past
+    // a, so a was silently omitted from the stream.
+    let dir = test_dir("export-cross-segment-tie");
+    let server = Server::spawn(&dir);
+
+    for (trace_id, name) in [("z-trace", "z"), ("a-trace", "a")] {
+        let (status, _) = server.json(
+            "POST",
+            "/v1/spans",
+            Some(&json!([{
+                "trace_id": trace_id,
+                "span_id": "s",
+                "name": name,
+                "service": "tie",
+                "start_time_ns": 42_000u64,
+                "end_time_ns": 43_000u64
+            }])),
+        );
+        assert_eq!(status, 200);
+        let (status, _) = server.json("POST", "/v1/flush", None);
+        assert_eq!(status, 200);
+    }
+
+    let (status, bytes) = server.raw("GET", "/v1/export?service=tie", None);
+    assert_eq!(status, 200);
+    let trace_ids: Vec<String> = String::from_utf8(bytes)
+        .expect("utf8")
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            serde_json::from_str::<Value>(line).expect("span JSON")["trace_id"]
+                .as_str()
+                .expect("trace id")
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(
+        trace_ids,
+        vec!["a-trace", "z-trace"],
+        "every cross-segment tie must be exported once in total order"
+    );
+}
