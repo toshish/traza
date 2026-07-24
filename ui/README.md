@@ -1,25 +1,26 @@
 # Traza dashboard (ui/)
 
-The bundled trace browser: a React + Vite app built to the Traza design
+The trace browser: a standalone React + Vite app built to the Traza design
 system (tokens and components imported from the "Traza Design System"
-project on claude.ai/design). The build compiles to **one self-contained
-HTML file** that is checked in as `../src/dashboard.html` and embedded in
-`traza-server` via `include_str!` — building the server itself needs no
-Node toolchain, and the one-binary rule holds.
+project on claude.ai/design). It is a single-page app that talks to a
+`traza-server` JSON API; it is **not** bundled into the server binary — run
+or deploy it separately.
 
 ## Working on it
 
 ```sh
 npm ci
 npm run dev     # dev server on :5173, /v1 proxied to localhost:8080
-npm run build   # vite build + scripts/embed.mjs -> ../src/dashboard.html
+npm run build   # vite build -> dist/ (a self-contained static SPA)
 ```
 
-Run a real server beside `npm run dev` for live data:
+Run a server beside `npm run dev` for live data:
 `cargo run --release --bin traza-server -- --data-dir ./data --port 8080`.
 
-After `npm run build`, rebuild the server and the new page ships at `/`.
-Never edit `src/dashboard.html` by hand — it is generated.
+`npm run build` emits `dist/` — a self-contained static bundle you can host
+anywhere (any static file server, a CDN, or behind the same reverse proxy as
+the API). Point it at your server's origin; the client attaches the bearer
+token and calls `/v1/*`.
 
 ## Shape
 
@@ -30,8 +31,8 @@ Never edit `src/dashboard.html` by hand — it is generated.
 - `src/views/` — Spans, Trace, Sessions, Analytics, Store.
 - `src/lib/` — API client (bearer token in sessionStorage, 401 → token
   prompt), formatting, span-tree helpers.
-- Routing is hash-based (`#/spans`, `#/traces/<id>`, …) because the server
-  deliberately serves only `/` and `/dashboard`.
+- Routing is hash-based (`#/spans`, `#/traces/<id>`, …), so the app works from
+  any static host without server-side route rewrites.
 
 Design rules that reviewers hold the line on: one accent (terracotta),
 reserved for measured values; mono + `tabular-nums` for every figure; flat

@@ -2,19 +2,19 @@
 
 **A trace datastore with first-class LLM and agent observability — one binary from laptop to cluster.**
 
-Traza (Spanish for "trace") ingests OpenTelemetry or plain-JSON spans over HTTP, stores them durably, and answers trace lookups, filtered searches, and token/cost analytics in milliseconds — with a built-in trace browser and no infrastructure to stand up. Two dependencies (`serde`, `serde_json`), no external database, and one deployment story at every size: today a single node that starts in milliseconds; the designed trajectory is replicated, highly available clusters of the same binary.
+Traza (Spanish for "trace") ingests OpenTelemetry or plain-JSON spans over HTTP, stores them durably, and answers trace lookups, filtered searches, and token/cost analytics in milliseconds — with no infrastructure to stand up. Two dependencies (`serde`, `serde_json`), no external database, and one deployment story at every size: today a single node that starts in milliseconds; the designed trajectory is replicated, highly available clusters of the same binary. A standalone React trace browser ([`ui/`](ui/)) talks to the same HTTP API.
 
 ```sh
 cargo build --release
 ./target/release/traza-server --data-dir ./data --port 8080
-# open http://localhost:8080 — the dashboard is built in
+# JSON API on :8080; for the trace browser, run the ui/ app (see below)
 ```
 
 ## Why Traza
 
 Most tracing backends make you assemble a fleet before the first span: a column store or search cluster, a queue in front, an operator keeping it healthy. Traza's bet is that a trace datastore should scale like a database, not like a pipeline — **one binary whose deployment grows with you** instead of a different architecture at every size:
 
-- **Start on one machine in seconds.** A single process stores everything under `--data-dir`, serves its own dashboard, and needs nothing else — right-sized for a laptop, a CI job, a single-host service, an edge box, or the AI agent you're debugging *right now*.
+- **Start on one machine in seconds.** A single process stores everything under `--data-dir` and needs nothing else — right-sized for a laptop, a CI job, a single-host service, an edge box, or the AI agent you're debugging *right now*.
 - **Scale by adding nodes, not systems.** The engine's foundations — immutable segments, idempotent primary-key ingest, journaled compaction — were chosen to replicate. The [HA design](docs/ha-design.md) (quorum-replicated logical log, validated full-state snapshots for catch-up) is the committed trajectory: clustered, highly available deployments running this same binary. Today's scope is single-node; see [Status](#status-and-roadmap).
 - **Built for LLM and agent workloads.** Sessions, token and cost analytics, prompt/completion capture with large-payload offloading, post-hoc evals and feedback, and one-command dataset export — first-class, not bolted on.
 - **OpenTelemetry-compatible, OpenLLMetry-native.** Point any OTel SDK at it with two environment variables. Traza follows the [OpenLLMetry](https://github.com/traceloop/openllmetry) standard (`gen_ai.*` / `traceloop.*`), so instrumented apps get sessions and token/cost analytics with no attribute renaming.
@@ -49,7 +49,7 @@ curl 'http://localhost:8080/v1/spans?service=checkout&attr.region=us-east&min_du
 curl http://localhost:8080/v1/stats
 ```
 
-Or skip curl entirely: the dashboard at `http://localhost:8080/` shows recent spans, a filter bar, per-trace waterfalls, and span detail.
+Or skip curl entirely: the [`ui/`](ui/) trace browser (a standalone React app — `cd ui && npm ci && npm run dev`, pointed at your server) shows recent spans, a filter bar, per-trace waterfalls, span detail, sessions, and LLM analytics.
 
 **Span identity is a primary key.** `(trace_id, span_id)` uniquely names a span; re-ingesting it replaces the stored version (last write wins). Client retries are idempotent and never create duplicates.
 
@@ -169,7 +169,7 @@ TRAZA_TOKENS="rw:$(openssl rand -hex 16),ro:$(openssl rand -hex 16)" \
   traza-server --data-dir ./data
 ```
 
-Missing or unknown tokens get 401 with a `WWW-Authenticate: Bearer` challenge; insufficient scope gets 403. Comparison is constant-time; an invalid `TRAZA_TOKENS` refuses startup rather than silently running open. Without tokens, Traza permits loopback binds only; a non-loopback `--host` requires `TRAZA_TOKENS` or the explicit `--allow-unauthenticated-non-loopback` escape hatch. The dashboard shell itself stays open (it carries no data) and prompts for a token on the first 401, holding it in `sessionStorage` only. TLS is reverse-proxy territory.
+Missing or unknown tokens get 401 with a `WWW-Authenticate: Bearer` challenge; insufficient scope gets 403. Comparison is constant-time; an invalid `TRAZA_TOKENS` refuses startup rather than silently running open. Without tokens, Traza permits loopback binds only; a non-loopback `--host` requires `TRAZA_TOKENS` or the explicit `--allow-unauthenticated-non-loopback` escape hatch. The [`ui/`](ui/) trace browser prompts for a token on the first 401 and holds it in `sessionStorage` only. TLS is reverse-proxy territory.
 
 **Retention.** `--ttl-seconds N` keeps a rolling window: a background pass compacts expired spans every minute, and annotations and payload files age out on the same window. Off by default — nothing is deleted unless you ask.
 
@@ -230,7 +230,7 @@ Deeper reading: [segment format](docs/segment-format-v2.md) · [LLM conventions]
 
 ## Status and roadmap
 
-Traza is pre-1.0 and honest about it: on-disk formats may change between 0.x versions, and single-node is the current scope. Shipped and load-bearing today: durable segment storage with crash recovery, OTLP protobuf/JSON ingest, sessions and cost analytics, payload offloading, annotations, streaming export, bearer auth, and the bundled dashboard.
+Traza is pre-1.0 and honest about it: on-disk formats may change between 0.x versions, and single-node is the current scope. Shipped and load-bearing today: durable segment storage with crash recovery, OTLP protobuf/JSON ingest, sessions and cost analytics, payload offloading, annotations, streaming export, bearer auth, and the standalone [`ui/`](ui/) trace browser.
 
 The destination is bigger than one node. The full product roadmap — durable v1 foundations (a write-ahead log and the identity model that must precede any format freeze), then replicated HA clusters and agent-native debugging depth, then columnar analytics at billion-span scale, then the enterprise control plane — lives in [docs/roadmap.md](docs/roadmap.md), with the HA architecture detailed in [docs/ha-design.md](docs/ha-design.md). Same binary, same API, at every phase.
 

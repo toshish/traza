@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- The dashboard is no longer embedded in `traza-server`; the server is now a
+  pure JSON API and no longer serves `GET /` or `GET /dashboard` (both now
+  404). The trace browser lives on as a standalone React app in [`ui/`](ui/) —
+  run it with `npm run dev` or deploy the static `npm run build` bundle,
+  pointed at the server's API. Removed `src/dashboard.html`, `src/dashboard.rs`,
+  `ui/scripts/embed.mjs`, and `tests/dashboard.rs`; `ui` builds no longer
+  regenerate an embedded HTML file.
+
 ### Added
 
 - Traza now follows the [OpenLLMetry](https://github.com/traceloop/openllmetry)

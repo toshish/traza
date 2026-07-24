@@ -2,11 +2,11 @@
   "name": "traza-ui",
   "private": true,
   "version": "0.13.0",
-  "description": "The bundled Traza dashboard: a React trace browser built to the Traza design system, compiled to one self-contained HTML file embedded in traza-server.",
+  "description": "The Traza dashboard: a standalone React trace browser built to the Traza design system, talking to a traza-server JSON API.",
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vite build && node scripts/embed.mjs",
+    "build": "vite build",
     "preview": "vite preview"
   },
   "dependencies": {

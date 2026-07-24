@@ -64,7 +64,7 @@ placeholder; retention behavior lives in `Store::compact_expired` and
 `Store::expire_before`. The scheduler in `src/bin/traza-server.rs` must run only on the
 leader in HA mode.
 
-The complete existing regression suite remains mandatory, including auth, dashboard,
+The complete existing regression suite remains mandatory, including auth,
 ingest hardening, LLM analytics, OTLP JSON and protobuf, payload/annotation/export,
 segment-format, server-on-engine, and storage tests. A benchmark is not a correctness
 oracle.
@@ -439,7 +439,7 @@ is later.
 ## Compatibility and migration
 
 HA is opt-in. With no cluster configuration, v0.13 standalone behavior, file layout,
-authentication, OTLP mapping, dashboard, export trailers, TTL scheduling, and public
+authentication, OTLP mapping, export trailers, TTL scheduling, and public
 responses remain unchanged.
 
 HA introduces these explicit API extensions:
