@@ -94,9 +94,31 @@ export const api = {
     const response = await request('/v1/payloads/' + encodeURIComponent(ref), { raw: true });
     return response.text();
   },
-  exportBlob: async (filters) => {
+  // Streams an export with a hard client-side byte cap, counting rows as
+  // they arrive. Browsers cannot read HTTP trailers, so the server's
+  // X-Traza-Export-Complete signal is NOT observable here — callers must
+  // not claim verified completeness for this path; curl can verify it.
+  exportStream: async (filters, { maxBytes = 256 * 1024 * 1024 } = {}) => {
     const response = await request('/v1/export' + query(filters), { raw: true });
-    return response.blob();
+    const reader = response.body.getReader();
+    const chunks = [];
+    let bytes = 0;
+    let rows = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > maxBytes) {
+        reader.cancel();
+        throw new ApiError(0,
+          'The export passed the in-browser cap of ' + Math.round(maxBytes / (1 << 20)) + ' MiB.',
+          'Use the curl command — it streams to disk and can verify the completion trailer.');
+      }
+      let at = -1;
+      while ((at = value.indexOf(10, at + 1)) !== -1) rows += 1;
+      chunks.push(value);
+    }
+    return { blob: new Blob(chunks, { type: 'application/x-ndjson' }), rows, bytes };
   },
   exportPath: (filters) => '/v1/export' + query(filters),
 };

@@ -50,16 +50,25 @@ export function StoreView({ pushToast }) {
     return filters;
   };
 
+  // In-browser downloads are buffered, so they require a bounded limit;
+  // unbounded exports belong in curl. Browsers cannot read the
+  // X-Traza-Export-Complete trailer, so the toast reports what was
+  // measured client-side and points at curl for verified completeness.
+  const bounded = /^[1-9]\d*$/.test(form.limit.trim());
+
   const download = async () => {
     setExporting(true);
     try {
-      const blob = await api.exportBlob(exportFilters());
+      const { blob, rows, bytes } = await api.exportStream(exportFilters());
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url; a.download = 'dataset.ndjson';
       a.click();
       URL.revokeObjectURL(url);
-      pushToast({ status: 'ok', title: 'Export downloaded', detail: 'dataset.ndjson — ' + fmtBytes(blob.size) });
+      pushToast({
+        status: 'ok', title: 'Export downloaded',
+        detail: fmtNum(rows) + ' rows · ' + fmtBytes(bytes) + '. For canonical datasets, verify the completion trailer via curl.',
+      });
     } catch (e) {
       pushToast({ status: 'error', title: e.what || 'Export failed', detail: e.next });
     } finally {
@@ -96,8 +105,10 @@ export function StoreView({ pushToast }) {
     </Section>
     <Section title="Dataset export" style={{ marginTop: 12 }}>
       <div style={{ fontSize: 'var(--text-13)', color: 'var(--ink-muted)', marginBottom: 8 }}>
-        Streams matching spans as NDJSON with bounded memory — an export larger than RAM is fine.
-        Filters are optional; empty exports everything.
+        Streams matching spans as NDJSON. In-browser downloads are buffered in memory, so
+        they require a limit and cap at 256 MiB; for unbounded exports — and whenever
+        completeness matters — use the curl command, which streams to disk and can verify
+        the <code>X-Traza-Export-Complete</code> trailer (browsers cannot read trailers).
       </div>
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 6, marginBottom: 8 }}>
         <Input size="sm" placeholder="service" value={form.service} onChange={set('service')} />
@@ -105,10 +116,13 @@ export function StoreView({ pushToast }) {
         <Input size="sm" mono placeholder="min duration ms" value={form.minMs} onChange={set('minMs')} />
         <Input size="sm" mono placeholder="attr key" value={form.attrKey} onChange={set('attrKey')} />
         <Input size="sm" mono placeholder="attr value" value={form.attrValue} onChange={set('attrValue')} />
-        <Input size="sm" mono placeholder="limit (default: all)" value={form.limit} onChange={set('limit')} />
+        <Input size="sm" mono placeholder="limit (required here; curl exports all)" value={form.limit} onChange={set('limit')} />
       </div>
-      <div style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
-        <Button variant="primary" onClick={download} disabled={exporting}>{exporting ? 'Exporting…' : 'Run export'}</Button>
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 8 }}>
+        <Button variant="primary" onClick={download} disabled={exporting || !bounded}>{exporting ? 'Exporting…' : 'Run export'}</Button>
+        {!bounded ? <span style={{ fontSize: 'var(--text-12)', color: 'var(--ink-muted)' }}>
+          set a limit to download here, or run the curl command for an unbounded export
+        </span> : null}
       </div>
       <CodeBlock code={curl} />
     </Section>
