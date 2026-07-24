@@ -10,6 +10,7 @@ pub mod analytics;
 pub mod annotations;
 pub mod auth;
 pub mod expiration;
+mod media;
 pub mod otlp;
 pub mod otlp_pb;
 pub mod payload;

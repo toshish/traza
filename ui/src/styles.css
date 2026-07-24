@@ -22,6 +22,11 @@
   --border-default: var(--hairline); --border-grid: var(--grid);
   --span-bar: var(--accent); --span-bar-error: var(--error);
   --series-compare: rgba(31, 27, 23, 0.4);
+  /* Syntax colours are deliberately NOT the accent: terracotta is reserved
+     for measured values, and code is not a measurement. Low-saturation hues
+     that sit on paper without shouting. */
+  --syn-keyword: #7A4A78; --syn-string: #3F6E4A; --syn-number: #9A6B1F;
+  --syn-comment: #A39B8F; --syn-property: #3A5F8A; --syn-punct: #6E675E;
 }
 [data-theme="dark"] {
   --bg: #191512; --bg-raised: #211D19; --bg-sunken: #131009;
@@ -31,6 +36,8 @@
   --ok: #6CAF84; --warn: #CFA35C; --error: #C25A4C;
   --ok-tint: #22301F; --warn-tint: #332A18; --error-tint: #33201C;
   --series-compare: rgba(237, 231, 221, 0.4);
+  --syn-keyword: #C79BC4; --syn-string: #8FBF9B; --syn-number: #D9AE6A;
+  --syn-comment: #6B645A; --syn-property: #89B4DE; --syn-punct: #9C9489;
 }
 
 /* ------------------------------------------------ typography tokens */

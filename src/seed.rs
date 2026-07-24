@@ -156,63 +156,27 @@ const TOOLS: &[(&str, &str)] = &[
     ),
 ];
 
-/// A 16x16 PNG, small enough to inline as a data URI. Generated media in the
-/// corpus is REAL so the dashboard renders it rather than showing a
-/// placeholder — a renderer that has never been handed actual bytes is a
-/// renderer nobody has tested.
-const DEMO_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAABQElEQVR42hXMIWpYMQAA0B5xJxkMCoXCoFAoFAINJYXAvoiIiIiIiIiIiJjorbb3xbPv4fvnj39/OWwWk0GnUSlcZBKRwMP3LwGHzWIy6DQqhYtMIhJ+3cGjgMNmMRl0GpXCRSYRCY938CTgsFlMBp1GpXCRSUTC0x08CzhsFpNBp1EpXGQSkfB8B78FHDaLyaDTqBQuMolI+H0HLwIOm8Vk0GlUCheZRCS83MGrgMNmMRl0GpXCRSYRCa938CbgsFlMBp1GpXCRSUTC2x28CzhsFpNBp1EpXGQSkfB+B0HAYbOYDDqNSuEik4iEcAcfAg6bxWTQaVQKF5lEJHzcwaeAw2YxGXQalcJFJhEJn3fwJeCwWUwGnUalcJFJRMLXHWQBh81iMug0KoWLTCIS8h38EXDYLCaDTqNSuMgkIoH/+gF9n9zbzB8AAAAASUVORK5CYII=";
-
-/// A 0.25 s 440 Hz tone as a base64 WAV, synthesized rather than pasted so the
-/// source stays readable.
-fn demo_wav_b64() -> String {
-    let sample_rate = 8000_u32;
-    let samples: Vec<u8> = (0..(sample_rate / 4))
-        .map(|i| {
-            let t = f64::from(i) / f64::from(sample_rate);
-            (128.0 + 100.0 * (2.0 * std::f64::consts::PI * 440.0 * t).sin()) as u8
-        })
-        .collect();
-    let mut wav = Vec::new();
-    wav.extend_from_slice(b"RIFF");
-    wav.extend_from_slice(&(36 + samples.len() as u32).to_le_bytes());
-    wav.extend_from_slice(b"WAVEfmt ");
-    wav.extend_from_slice(&16_u32.to_le_bytes());
-    wav.extend_from_slice(&1_u16.to_le_bytes()); // PCM
-    wav.extend_from_slice(&1_u16.to_le_bytes()); // mono
-    wav.extend_from_slice(&sample_rate.to_le_bytes());
-    wav.extend_from_slice(&sample_rate.to_le_bytes()); // byte rate
-    wav.extend_from_slice(&1_u16.to_le_bytes()); // block align
-    wav.extend_from_slice(&8_u16.to_le_bytes()); // bits per sample
-    wav.extend_from_slice(b"data");
-    wav.extend_from_slice(&(samples.len() as u32).to_le_bytes());
-    wav.extend_from_slice(&samples);
-    base64_encode(&wav)
+/// Demo media is synthesized (see [`crate::media`]) rather than pasted as a
+/// token blob: the renderer is only exercised by bytes that actually decode
+/// into something a reader can see and hear.
+fn demo_image_png() -> String {
+    crate::media::data_uri("image/png", &crate::media::png_chart(480, 260))
 }
 
-/// Standard base64. The crate carries no encoder and this is the only caller.
-fn base64_encode(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    // (len + 2) / 3 rather than div_ceil: the crate's MSRV is 1.70.
-    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
-    for group in bytes.chunks(3) {
-        let b0 = u32::from(group[0]);
-        let b1 = group.get(1).copied().map_or(0, u32::from);
-        let b2 = group.get(2).copied().map_or(0, u32::from);
-        let triple = (b0 << 16) | (b1 << 8) | b2;
-        out.push(ALPHABET[(triple >> 18) as usize & 63] as char);
-        out.push(ALPHABET[(triple >> 12) as usize & 63] as char);
-        out.push(if group.len() > 1 {
-            ALPHABET[(triple >> 6) as usize & 63] as char
-        } else {
-            '='
-        });
-        out.push(if group.len() > 2 {
-            ALPHABET[triple as usize & 63] as char
-        } else {
-            '='
-        });
-    }
-    out
+fn demo_image_svg() -> String {
+    crate::media::data_uri("image/svg+xml", crate::media::svg_chart().as_bytes())
+}
+
+/// Kept deliberately small: the encoder emits uncompressed LZW, so pixels
+/// cost ~9 bits each, and an animation past the payload threshold would be
+/// offloaded to the payload store and never render inline — which defeats
+/// the point of seeding a moving picture at all.
+fn demo_animation_gif() -> String {
+    crate::media::data_uri("image/gif", &crate::media::gif_animation(160, 90, 6))
+}
+
+fn demo_audio_wav() -> String {
+    crate::media::data_uri("audio/wav", &crate::media::wav_arpeggio(3.0))
 }
 
 /// A markdown answer, the most common assistant output shape.
@@ -1535,8 +1499,10 @@ impl Gen {
     /// actually display them.
     fn generated_media_session(&mut self, index: usize) {
         let session = format!("studio-{:04}", index);
-        let png = format!("data:image/png;base64,{DEMO_PNG_B64}");
-        let wav = format!("data:audio/wav;base64,{}", demo_wav_b64());
+        let png = demo_image_png();
+        let svg = demo_image_svg();
+        let gif = demo_animation_gif();
+        let wav = demo_audio_wav();
 
         // 1) Image generation.
         let vendor = &VENDORS[0];
@@ -1557,16 +1523,18 @@ impl Gen {
         attributes.insert(
             "gen_ai.input.messages".into(),
             messages_json(json!([
-                {"role": "user", "parts": [{"type": "text", "content": "A 16x16 terracotta gradient tile, flat design."}]}
+                {"role": "user", "parts": [{"type": "text", "content": "Chart revenue by month as bars, paper background."}]}
             ])),
         );
         attributes.insert(
             "gen_ai.output.messages".into(),
             messages_json(json!([
                 {"role": "assistant", "parts": [
-                    {"type": "text", "content": "Here is the tile you asked for."},
-                    {"type": "image", "mime_type": "image/png", "filename": "tile.png",
-                     "size_bytes": 372, "data": png}
+                    {"type": "text", "content": "Here is the revenue chart, as a raster image and as vector art."},
+                    {"type": "image", "mime_type": "image/png", "filename": "revenue.png",
+                     "size_bytes": png.len(), "data": png},
+                    {"type": "image", "mime_type": "image/svg+xml", "filename": "revenue.svg",
+                     "size_bytes": svg.len(), "data": svg}
                 ], "finish_reason": "stop"}
             ])),
         );
@@ -1608,8 +1576,9 @@ impl Gen {
             "gen_ai.output.messages".into(),
             messages_json(json!([
                 {"role": "assistant", "parts": [
+                    {"type": "text", "content": "Here is the audio summary."},
                     {"type": "audio", "mime_type": "audio/wav", "filename": "summary.wav",
-                     "size_bytes": 2044, "data": wav}
+                     "size_bytes": wav.len(), "data": wav}
                 ], "finish_reason": "stop"}
             ])),
         );
@@ -1641,17 +1610,18 @@ impl Gen {
         attributes.insert(
             "gen_ai.input.messages".into(),
             messages_json(json!([
-                {"role": "user", "parts": [{"type": "text", "content": "A 6 second clip of rain on a window, slow pan."}]}
+                {"role": "user", "parts": [{"type": "text", "content": "Animate the revenue bars growing, 6 frames."}]}
             ])),
         );
         attributes.insert(
             "gen_ai.output.messages".into(),
             messages_json(json!([
                 {"role": "assistant", "parts": [
-                    {"type": "video", "mime_type": "video/mp4", "filename": "rain.mp4",
-                     "size_bytes": 8_412_233, "uri": "https://storage.example.com/traza-demo/rain.mp4"},
-                    {"type": "image", "mime_type": "image/png", "filename": "poster.png",
-                     "size_bytes": 372, "data": format!("data:image/png;base64,{DEMO_PNG_B64}")}
+                    {"type": "text", "content": "Rendered 6 frames; the looping preview is below, the full render is in object storage."},
+                    {"type": "image", "mime_type": "image/gif", "filename": "preview.gif",
+                     "size_bytes": gif.len(), "data": gif},
+                    {"type": "video", "mime_type": "video/mp4", "filename": "render.mp4",
+                     "size_bytes": 8_412_233, "uri": "s3://traza-demo/renders/render.mp4"}
                 ], "finish_reason": "stop"}
             ])),
         );
