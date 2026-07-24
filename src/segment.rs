@@ -1,4 +1,7 @@
-//! Segment format v2 file-backed storage and persisted indexes.
+//! Segment file-backed storage and persisted indexes.
+//!
+//! The on-disk format is version 2 (see `MAGIC`/`VERSION`); version 1 (JSONL)
+//! is no longer read.
 //!
 //! An opened file-backed segment owns only its file handle and decoded index
 //! maps. In-memory segments built for encoding may own their bytes. Records are
@@ -571,7 +574,7 @@ impl Segment {
     }
 }
 
-/// Encodes records into a complete segment-format-v2 byte stream.
+/// Encodes records into a complete segment byte stream.
 pub fn encode(records: &[RecordInput]) -> Result<Vec<u8>, Error> {
     let mut record_region = Vec::new();
     let mut offsets = Vec::with_capacity(records.len());

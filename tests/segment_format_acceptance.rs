@@ -1,4 +1,4 @@
-//! Focused segment-format-v2 acceptance target.
+//! Focused segment-format acceptance target.
 //!
 //! Each test emits one JSON evidence record so verification can distinguish the
 //! five required behavioral categories without relying on test names alone.
@@ -12,7 +12,7 @@ static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 fn temp_dir(label: &str) -> PathBuf {
     let sequence = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!(
-        "traza-segment-v2-{label}-{}-{sequence}",
+        "traza-segment-{label}-{}-{sequence}",
         std::process::id()
     ));
     let _ = fs::remove_dir_all(&path);
@@ -26,7 +26,7 @@ fn cleanup(path: &Path) {
 
 fn evidence(category: &str, checks: &[&str]) {
     println!(
-        "{{\"target\":\"segment_format_v2_acceptance\",\"category\":\"{}\",\"status\":\"passed\",\"checks\":[{}]}}",
+        "{{\"target\":\"segment_format_acceptance\",\"category\":\"{}\",\"status\":\"passed\",\"checks\":[{}]}}",
         category,
         checks
             .iter()

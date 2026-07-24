@@ -15,7 +15,7 @@ pub mod otlp;
 pub mod otlp_pb;
 pub mod payload;
 pub mod seed;
-pub mod segment_v2;
+pub mod segment;
 pub mod semconv;
 pub mod ui;
 mod wal;
@@ -33,9 +33,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const LOCK_FILE_NAME: &str = "LOCK";
 const SEGMENT_PREFIX: &str = "segment-";
-const SEGMENT_SUFFIX: &str = ".jsonl";
-/// Suffix for format-v2 indexed segment files.
-const SEGMENT_V2_SUFFIX: &str = ".seg";
+/// Suffix of the unsupported legacy (v1 JSONL) segment files, recognized
+/// only so they can be rejected with a migration pointer.
+const LEGACY_SEGMENT_SUFFIX: &str = ".jsonl";
+/// Suffix for the current indexed segment files.
+const SEGMENT_SUFFIX: &str = ".seg";
 /// Reserved attribute-index keys for span fields; the NUL prefix cannot
 /// collide with practical user attribute names, and even a collision only
 /// over-selects candidates that re-verification drops.
@@ -325,14 +327,14 @@ pub type Result<T> = std::result::Result<T, Error>;
 struct Segment {
     path: PathBuf,
     bytes: u64,
-    seg: Box<segment_v2::Segment>,
+    seg: Box<segment::Segment>,
 }
 
 fn canonical_value(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_default()
 }
 
-fn span_to_record(span: &Span) -> Result<segment_v2::RecordInput> {
+fn span_to_record(span: &Span) -> Result<segment::RecordInput> {
     let mut attributes = std::collections::BTreeMap::new();
     // User attributes first, and NUL-prefixed user keys are never indexed:
     // a user attribute literally named "\u{0}service" could otherwise
@@ -347,7 +349,7 @@ fn span_to_record(span: &Span) -> Result<segment_v2::RecordInput> {
     }
     attributes.insert(IDX_SERVICE.to_owned(), span.service.clone());
     attributes.insert(IDX_NAME.to_owned(), span.name.clone());
-    Ok(segment_v2::RecordInput::new(
+    Ok(segment::RecordInput::new(
         span.start_time_ns,
         span.trace_id.clone(),
         attributes,
@@ -355,7 +357,7 @@ fn span_to_record(span: &Span) -> Result<segment_v2::RecordInput> {
     ))
 }
 
-fn record_to_span(record: &segment_v2::Record) -> Result<Span> {
+fn record_to_span(record: &segment::Record) -> Result<Span> {
     Ok(serde_json::from_slice(record.payload())?)
 }
 
@@ -377,7 +379,7 @@ impl Segment {
     fn spans_parsed(&self) -> Result<Vec<Span>> {
         let mut spans = Vec::with_capacity(self.seg.len());
         for ordinal in 0..self.seg.len() {
-            if let Some(record) = self.seg.record(ordinal).map_err(segment_v2_error)? {
+            if let Some(record) = self.seg.record(ordinal).map_err(segment_error)? {
                 spans.push(record_to_span(&record)?);
             }
         }
@@ -385,14 +387,14 @@ impl Segment {
     }
 
     fn trace_spans(&self, trace_id: &str) -> Result<Vec<Span>> {
-        let records = self.seg.query_trace(trace_id).map_err(segment_v2_error)?;
+        let records = self.seg.query_trace(trace_id).map_err(segment_error)?;
         records.iter().map(record_to_span).collect()
     }
 }
 
-fn segment_v2_error(error: segment_v2::Error) -> Error {
+fn segment_error(error: segment::Error) -> Error {
     match error {
-        segment_v2::Error::Io(inner) => Error::Io(inner),
+        segment::Error::Io(inner) => Error::Io(inner),
         other => Error::Io(io::Error::new(
             io::ErrorKind::InvalidData,
             other.to_string(),
@@ -871,7 +873,7 @@ impl Store {
             offsets.sort_unstable();
             offsets.dedup();
             for offset in offsets {
-                let record = seg.record_at_offset(offset).map_err(segment_v2_error)?;
+                let record = seg.record_at_offset(offset).map_err(segment_error)?;
                 let span = record_to_span(&record)?;
                 // An index accelerates a filter, it never changes it.
                 if !matches(&span) {
@@ -939,7 +941,7 @@ impl Store {
             enum Source<'a> {
                 Parsed(Vec<Span>),
                 Lazy {
-                    seg: &'a segment_v2::Segment,
+                    seg: &'a segment::Segment,
                     offsets: &'a [u64],
                 },
             }
@@ -981,7 +983,7 @@ impl Store {
                             return Ok(None);
                         };
                         *pos += 1;
-                        let record = seg.record_at_offset(offset).map_err(segment_v2_error)?;
+                        let record = seg.record_at_offset(offset).map_err(segment_error)?;
                         record_to_span(&record).map(Some)
                     }
                 }
@@ -1074,7 +1076,7 @@ impl Store {
                 seg.record_offsets()
             };
             for offset in offsets {
-                let record = seg.record_at_offset(*offset).map_err(segment_v2_error)?;
+                let record = seg.record_at_offset(*offset).map_err(segment_error)?;
                 let span = record_to_span(&record)?;
                 if !span_matches(&span, filter)
                     || cursor.is_some_and(|bound| !span_after_cursor(&span, bound))
@@ -1221,9 +1223,7 @@ impl Store {
                 replacement.push(Segment {
                     path: segment.path.clone(),
                     bytes: segment.bytes,
-                    seg: Box::new(
-                        segment_v2::Segment::open(&segment.path).map_err(segment_v2_error)?,
-                    ),
+                    seg: Box::new(segment::Segment::open(&segment.path).map_err(segment_error)?),
                 });
                 continue;
             }
@@ -1241,7 +1241,7 @@ impl Store {
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            let new_name = format!("{SEGMENT_PREFIX}{id:020}{SEGMENT_V2_SUFFIX}");
+            let new_name = format!("{SEGMENT_PREFIX}{id:020}{SEGMENT_SUFFIX}");
             // Journal first: whichever side of the rewrite a crash lands on,
             // recovery finishes it without content guessing.
             let marker = write_supersede_marker(&self.directory, &old_name, &new_name)?;
@@ -1333,7 +1333,7 @@ impl Store {
     }
 
     fn write_segment(&self, id: u64, spans: &[Span]) -> Result<Segment> {
-        let file_name = format!("{SEGMENT_PREFIX}{id:020}{SEGMENT_V2_SUFFIX}");
+        let file_name = format!("{SEGMENT_PREFIX}{id:020}{SEGMENT_SUFFIX}");
         let final_path = self.directory.join(&file_name);
         let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let temp_name = format!(".{file_name}.{}.{}.tmp", std::process::id(), counter);
@@ -1353,7 +1353,7 @@ impl Store {
                 .iter()
                 .map(span_to_record)
                 .collect::<Result<Vec<_>>>()?;
-            let encoded = segment_v2::encode(&records).map_err(segment_v2_error)?;
+            let encoded = segment::encode(&records).map_err(segment_error)?;
             let mut options = OpenOptions::new();
             options.write(true).create_new(true);
             let mut file = options.open(&temp_path)?;
@@ -1366,7 +1366,7 @@ impl Store {
             // segment serves reads from disk immediately — flushing never
             // leaves a resident payload copy behind.
             drop(encoded);
-            let seg = Box::new(segment_v2::Segment::open(&final_path).map_err(segment_v2_error)?);
+            let seg = Box::new(segment::Segment::open(&final_path).map_err(segment_error)?);
             Ok(Segment {
                 path: final_path,
                 bytes,
@@ -1427,8 +1427,8 @@ fn recover_supersede_markers(directory: &Path) -> Result<()> {
             let old_path = directory.join(old_name);
             let new_path = directory.join(new_name);
             let replacement_ready = new_path.exists()
-                && (!new_name.ends_with(SEGMENT_V2_SUFFIX)
-                    || segment_v2::Segment::open(&new_path).is_ok());
+                && (!new_name.ends_with(SEGMENT_SUFFIX)
+                    || segment::Segment::open(&new_path).is_ok());
             if replacement_ready && old_path.exists() {
                 fs::remove_file(&old_path)?;
             }
@@ -1459,7 +1459,7 @@ fn span_after_cursor(span: &Span, cursor: &SpanCursor) -> bool {
 }
 
 fn first_offset_after(
-    segment: &segment_v2::Segment,
+    segment: &segment::Segment,
     offsets: &[u64],
     cursor: &SpanCursor,
 ) -> Result<usize> {
@@ -1469,7 +1469,7 @@ fn first_offset_after(
         let middle = low + (high - low) / 2;
         let record = segment
             .record_at_offset(offsets[middle])
-            .map_err(segment_v2_error)?;
+            .map_err(segment_error)?;
         let span = record_to_span(&record)?;
         if span_after_cursor(&span, cursor) {
             high = middle;
@@ -1534,7 +1534,7 @@ fn load_segments(directory: &Path) -> Result<Vec<Segment>> {
     for path in paths {
         let is_v2 = path
             .extension()
-            .is_some_and(|ext| ext.to_string_lossy() == SEGMENT_V2_SUFFIX.trim_start_matches('.'));
+            .is_some_and(|ext| ext.to_string_lossy() == SEGMENT_SUFFIX.trim_start_matches('.'));
         if !is_v2 {
             // Pre-v2 JSONL segments are no longer supported: failing loudly
             // beats silently hiding persisted data (migrate with 0.3.x).
@@ -1548,7 +1548,7 @@ fn load_segments(directory: &Path) -> Result<Vec<Segment>> {
             )));
         }
         let bytes_meta = fs::metadata(&path)?.len();
-        let seg = Box::new(segment_v2::Segment::open(&path).map_err(segment_v2_error)?);
+        let seg = Box::new(segment::Segment::open(&path).map_err(segment_error)?);
         segments.push(Segment {
             path,
             bytes: bytes_meta,
@@ -1578,7 +1578,7 @@ fn is_segment_file(path: &Path) -> bool {
         .and_then(|name| name.to_str())
         .is_some_and(|name| {
             name.starts_with(SEGMENT_PREFIX)
-                && (name.ends_with(SEGMENT_SUFFIX) || name.ends_with(SEGMENT_V2_SUFFIX))
+                && (name.ends_with(LEGACY_SEGMENT_SUFFIX) || name.ends_with(SEGMENT_SUFFIX))
         })
 }
 
@@ -1590,8 +1590,8 @@ fn segment_number(path: &Path) -> Option<u64> {
     // reproduced across restart).
     let stem = name.strip_prefix(SEGMENT_PREFIX)?;
     let number = stem
-        .strip_suffix(SEGMENT_SUFFIX)
-        .or_else(|| stem.strip_suffix(SEGMENT_V2_SUFFIX))?;
+        .strip_suffix(LEGACY_SEGMENT_SUFFIX)
+        .or_else(|| stem.strip_suffix(SEGMENT_SUFFIX))?;
     number.parse().ok()
 }
 

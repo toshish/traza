@@ -57,7 +57,7 @@ surface, not only `.seg` files.
 | `/v1/stats` physical counters | Local buffer, segment count, and bytes | Node-local diagnostic state, explicitly not a linearizable cluster total |
 | Term, vote, membership, log and snapshot metadata | Not present | Consensus storage under the node-private `raft/` directory |
 
-`src/lib.rs` is the application-state-machine boundary. `src/segment_v2.rs` remains
+`src/lib.rs` is the application-state-machine boundary. `src/segment.rs` remains
 the segment encoder and validator. `src/annotations.rs` and `src/payload.rs` are part of
 the state machine, not optional sidecars. `src/expiration.rs` is currently only a module
 placeholder; retention behavior lives in `Store::compact_expired` and
