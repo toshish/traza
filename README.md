@@ -1,8 +1,8 @@
 # Traza
 
-**A single-binary trace datastore with first-class LLM and agent observability.**
+**A trace datastore with first-class LLM and agent observability — one binary from laptop to cluster.**
 
-Traza (Spanish for "trace") ingests OpenTelemetry or plain-JSON spans over HTTP, stores them durably in one local directory, and answers trace lookups, filtered searches, and token/cost analytics in milliseconds — with a built-in trace browser and zero infrastructure. One process, two dependencies (`serde`, `serde_json`), no database to run.
+Traza (Spanish for "trace") ingests OpenTelemetry or plain-JSON spans over HTTP, stores them durably, and answers trace lookups, filtered searches, and token/cost analytics in milliseconds — with a built-in trace browser and no infrastructure to stand up. Two dependencies (`serde`, `serde_json`), no external database, and one deployment story at every size: today a single node that starts in milliseconds; the designed trajectory is replicated, highly available clusters of the same binary.
 
 ```sh
 cargo build --release
@@ -10,13 +10,12 @@ cargo build --release
 # open http://localhost:8080 — the dashboard is built in
 ```
 
-## Who it's for
+## Why Traza
 
-Most tracing backends assume a fleet: a column store or search cluster, a queue in front, an operator keeping it healthy. That's the right trade for a large organization and the wrong one for a laptop, a CI job, a single-host service, an edge box — or an AI agent you're debugging *right now*.
+Most tracing backends make you assemble a fleet before the first span: a column store or search cluster, a queue in front, an operator keeping it healthy. Traza's bet is that a trace datastore should scale like a database, not like a pipeline — **one binary whose deployment grows with you** instead of a different architecture at every size:
 
-Traza takes the other side of the trade:
-
-- **Drop-in tracing for one machine.** Starts in milliseconds, stores everything under `--data-dir`, serves its own dashboard. Delete the directory and it's gone.
+- **Start on one machine in seconds.** A single process stores everything under `--data-dir`, serves its own dashboard, and needs nothing else — right-sized for a laptop, a CI job, a single-host service, an edge box, or the AI agent you're debugging *right now*.
+- **Scale by adding nodes, not systems.** The engine's foundations — immutable segments, idempotent primary-key ingest, journaled compaction — were chosen to replicate. The [HA design](docs/ha-design.md) (quorum-replicated logical log, segment shipping for catch-up) is the committed trajectory: clustered, highly available deployments running this same binary. Today's scope is single-node; see [Status](#status-and-roadmap).
 - **Built for LLM and agent workloads.** Sessions, token and cost analytics, prompt/completion capture with large-payload offloading, post-hoc evals and feedback, and one-command dataset export — first-class, not bolted on.
 - **OpenTelemetry-compatible.** Point any OTel SDK at it with two environment variables.
 - **Small enough to trust.** Two direct dependencies; HTTP, threading, and file I/O are the Rust standard library. `#![forbid(unsafe_code)]`. Every performance number in [BENCHMARKS.md](BENCHMARKS.md) is measured by a bundled benchmark, never estimated.
@@ -159,7 +158,7 @@ Missing or unknown tokens get 401 with a `WWW-Authenticate: Bearer` challenge; i
 
 **Resources.** Memory is O(indexes), not O(data): segments are file-backed, only their parsed indexes stay resident, and span payloads are read on demand — measured 0.71 GB peak RSS serving a 10M-span (2.4 GB on disk) corpus. Stores larger than RAM serve correctly; disk latency applies to cold reads.
 
-**Scope.** One writer process per data directory (a stale lock from a dead process is reclaimed automatically). Single-node today — see the [roadmap](#status-and-roadmap).
+**Scope.** One writer process per data directory (a stale lock from a dead process is reclaimed automatically). Single-node today; clustered HA is the designed next arc — see the [roadmap](#status-and-roadmap).
 
 ### Server flags
 
@@ -213,9 +212,9 @@ Deeper reading: [segment format](docs/segment-format-v2.md) · [LLM conventions]
 
 Traza is pre-1.0 and honest about it: on-disk formats may change between 0.x versions, and single-node is the current scope. Shipped and load-bearing today: durable segment storage with crash recovery, OTLP protobuf/JSON ingest, sessions and cost analytics, payload offloading, annotations, streaming export, bearer auth, and the bundled dashboard.
 
-Next up:
+The destination is bigger than one node. Traza is being built toward large-scale, highly available, clustered deployments — same binary, same API, replication instead of a separate architecture. In order:
 
-- **High availability** — replication and failover beyond one node. The decision-ready design is in [docs/ha-design.md](docs/ha-design.md) (quorum-replicated logical log, segment shipping for catch-up).
+- **High availability** — quorum-replicated ingest and failover across nodes. The decision-ready design is in [docs/ha-design.md](docs/ha-design.md) (replicated logical log, segment shipping for catch-up); implementation is the next major arc.
 - **Filter throughput at scale** — posting-list intersection for large *unlimited* result sets (limited queries already decode only what they return).
 
 Deliberately out of scope: TLS termination (front it with a reverse proxy), gRPC (use `http/protobuf`), and a query DSL (filters stay URL parameters).
