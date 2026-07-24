@@ -191,11 +191,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // routes explain how to produce it.
     let ui = Arc::new(traza::ui::UiRoot::new(&ui_dir));
     if ui.is_available() {
-        eprintln!("traza-server serving dashboard from {}", ui_dir.display());
+        eprintln!(
+            "traza-server serving dashboard from {}",
+            ui.directory().display()
+        );
     } else {
         eprintln!(
             "traza-server: no dashboard at {} (build it with: cd ui && npm ci && npm run build)",
-            ui_dir.display()
+            ui.directory().display()
         );
     }
 
