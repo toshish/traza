@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-07-23
+
+Wire-contract release: `/v1/stats` renames its counters to record
+terminology and `/v1/export` switches to chunked framing with
+completion trailers — clients parsing either surface must update.
+
 ### Fixed
 
 - Export pagination now uses the engine's exclusive full-key
