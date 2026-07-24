@@ -96,6 +96,9 @@ the choice. 1.0 is a promise, not a birthday.*
 - **HTTP/1.1 keep-alive + gzip** (request and response). Exporters batch
   aggressively; per-request TCP handshakes are the current bottleneck's
   ceiling. (gRPC remains out; `http/protobuf` covers OTel SDKs.)
+- **Streaming interactive searches.** Exports already stream with
+  integrity trailers; `/v1/spans` still materializes one bounded JSON
+  response. Interactive queries adopt the same chunked cursor machinery.
 - **OTel GenAI dialect normalization.** Ingest-time mapping of `gen_ai.*`
   (agent spans, tool calls, content events) onto Traza's native
   conventions, tracked against the evolving spec; dual-dialect queries so

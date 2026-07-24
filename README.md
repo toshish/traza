@@ -222,13 +222,9 @@ Deeper reading: [segment format](docs/segment-format-v2.md) · [LLM conventions]
 
 Traza is pre-1.0 and honest about it: on-disk formats may change between 0.x versions, and single-node is the current scope. Shipped and load-bearing today: durable segment storage with crash recovery, OTLP protobuf/JSON ingest, sessions and cost analytics, payload offloading, annotations, streaming export, bearer auth, and the bundled dashboard.
 
-The destination is bigger than one node. Traza is being built toward large-scale, highly available, clustered deployments — same binary, same API, replication instead of a separate architecture. In order:
+The destination is bigger than one node. The full product roadmap — from production-ready single node (1.0) through replicated HA clusters, columnar analytics at billion-span scale, agent-native debugging depth, and enterprise operation — lives in [docs/roadmap.md](docs/roadmap.md), with the HA architecture detailed in [docs/ha-design.md](docs/ha-design.md). Same binary, same API, at every phase.
 
-- **High availability** — quorum-replicated ingest and failover across nodes. The decision-ready design is in [docs/ha-design.md](docs/ha-design.md) (replicated logical log, segment shipping for catch-up); implementation is the next major arc.
-- **Filter throughput at scale** — posting-list intersection for large *unlimited* result sets (limited queries already decode only what they return).
-- **Streaming interactive searches** — exports are chunked today; `/v1/spans` still returns one bounded JSON response.
-
-Deliberately out of scope: TLS termination (front it with a reverse proxy), gRPC (use `http/protobuf`), and a query DSL (filters stay URL parameters).
+Deliberately out of scope: a metrics/logs suite, embedded eval models, general SQL, and framework SDKs — the [roadmap](docs/roadmap.md#explicit-non-goals) explains why.
 
 ## Contributing
 
