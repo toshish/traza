@@ -1,16 +1,12 @@
-# Traza Leg 6 High-Availability Design
+# Traza High-Availability Design
 
 ## Document status
 
-This document is the sole design artifact for Leg 6. Its governing specification is
-`docs/leg-6-ha.md` from the sanctioned `v0.9.0` workspace. It describes a proposed
-high-availability architecture and the evidence that a successor implementation would
-need to provide. It does not assert that HA behavior, HA tests, operational readiness,
-or production deployment support currently exists.
-
-The normative source remains `docs/leg-6-ha.md`. If this document conflicts with that
-specification, the specification wins. Requirement identifiers in this document are
-traceability labels for review; they do not replace the source text.
+This is a design proposal, not shipped behavior. It describes a proposed
+high-availability architecture for Traza and the evidence an implementation
+would need to provide. It does not assert that HA behavior, HA tests,
+operational readiness, or production deployment support currently exists.
+Requirement identifiers in this document are traceability labels for review.
 
 ## Purpose and scope
 
@@ -484,7 +480,7 @@ The design chooses consistency over write availability during a partition: only 
 ## Requirements traceability
 
 The following matrix maps the mechanically identifiable normative requirements from
-`docs/leg-6-ha.md`. Status is **proposed** unless a gap is stated. “Proposed” means this
+this design. Status is **proposed** unless a gap is stated. “Proposed” means this
 design supplies an architecture and oracle; it does not mean runtime behavior exists.
 Independent review must compare every entry with the source specification and correct
 any interpretation mismatch.
@@ -600,9 +596,9 @@ They are not represented as already satisfied.
 Automated structural checks can establish that this artifact exists, names the governing
 specification, contains required sections, and has a contiguous requirement matrix. They
 cannot establish semantic fidelity, protocol safety, feasibility against concrete source
-locks and persistence boundaries, or runtime availability. Human reviewers must compare
-all twenty mappings with `docs/leg-6-ha.md`, inspect the sanctioned v0.9.0 implementation,
-and reject references to nonexistent behavior.
+locks and persistence boundaries, or runtime availability. Human reviewers must check
+the requirement mappings against this document's own sections, inspect the current
+implementation, and reject references to nonexistent behavior.
 
 This proposal intentionally leaves implementation, executable HA evidence, operational
 qualification, and milestone closure to later gates. No tag or publication action is

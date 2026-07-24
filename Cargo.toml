@@ -7,12 +7,12 @@ name = "traza"
 version = "0.12.2"
 edition = "2021"
 rust-version = "1.70"
-description = "Traza: A lightweight embedded datastore and HTTP server for Rust tracing data"
+description = "Single-binary trace datastore with first-class LLM/agent observability: OTLP ingest, sessions, token/cost analytics, and a built-in dashboard"
 license = "MIT OR Apache-2.0"
 
 repository = "https://github.com/toshish/traza"
 homepage = "https://github.com/toshish/traza"
-keywords = ["tracing", "observability", "datastore", "debugging"]
+keywords = ["tracing", "observability", "opentelemetry", "llm", "agents"]
 categories = ["database-implementations", "development-tools::debugging"]
 [lib]
 name = "traza"

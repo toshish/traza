@@ -1,58 +1,30 @@
 # Traza
 
-*Traza* (Spanish for "trace") is a lightweight, single-binary tracing datastore written in Rust.
+**A single-binary trace datastore with first-class LLM and agent observability.**
 
-It accepts batches of spans over a plain JSON HTTP API, persists them to an append-only store on local disk, and answers trace lookups and filtered span queries in milliseconds — no external database, no runtime, and exactly two dependencies (`serde` and `serde_json`).
+Traza (Spanish for "trace") ingests OpenTelemetry or plain-JSON spans over HTTP, stores them durably in one local directory, and answers trace lookups, filtered searches, and token/cost analytics in milliseconds — with a built-in trace browser and zero infrastructure. One process, two dependencies (`serde`, `serde_json`), no database to run.
 
 ```sh
 cargo build --release
 ./target/release/traza-server --data-dir ./data --port 8080
+# open http://localhost:8080 — the dashboard is built in
 ```
 
-## Why Traza
+## Who it's for
 
-Most tracing backends assume a fleet: a column store or search cluster to run, a queue in front of it, an operator to keep it healthy. That is the right trade for a large organization and the wrong one for a laptop, a CI job, a single-host service, or an edge box.
+Most tracing backends assume a fleet: a column store or search cluster, a queue in front, an operator keeping it healthy. That's the right trade for a large organization and the wrong one for a laptop, a CI job, a single-host service, an edge box — or an AI agent you're debugging *right now*.
 
 Traza takes the other side of the trade:
 
-- **One process, one directory.** The server starts in milliseconds and stores everything under `--data-dir`.
-- **A small audit surface.** Two direct dependencies; networking, threading, file I/O, and HTTP parsing use the Rust standard library.
-- **Honest numbers.** Every figure in [BENCHMARKS.md](BENCHMARKS.md) is measured by a bundled end-to-end benchmark, never estimated.
+- **Drop-in tracing for one machine.** Starts in milliseconds, stores everything under `--data-dir`, serves its own dashboard. Delete the directory and it's gone.
+- **Built for LLM and agent workloads.** Sessions, token and cost analytics, prompt/completion capture with large-payload offloading, post-hoc evals and feedback, and one-command dataset export — first-class, not bolted on.
+- **OpenTelemetry-compatible.** Point any OTel SDK at it with two environment variables.
+- **Small enough to trust.** Two direct dependencies; HTTP, threading, and file I/O are the Rust standard library. `#![forbid(unsafe_code)]`. Every performance number in [BENCHMARKS.md](BENCHMARKS.md) is measured by a bundled benchmark, never estimated.
 - **Crash-safe by construction.** Immutable segments written by write-temp, fsync, atomic rename; recovery loads only complete segments and heals crash artifacts.
-
-## Features
-
-- Batched span ingestion over HTTP (native JSON or OTLP/HTTP JSON) with bounded queues and backpressure.
-- Trace-by-ID lookup and filtered span search: service, operation name, exact attribute match, minimum duration, and time window, combined with logical AND.
-- A bundled dependency-free dashboard: recent spans, trace waterfall, span detail, and filters, served by the binary itself.
-- Optional bearer-token auth with per-token read-only/read-write scopes.
-- LLM-observability conventions for prompts, completions, token usage, and tool calls.
-- An embeddable Rust library (`traza::Store`): an append-only segment storage engine with sorted-batch flush, crash recovery, and TTL compaction.
-- A self-verifying benchmark binary that measures the real HTTP path and rewrites `BENCHMARKS.md` from its own run.
-- Dual-licensed under MIT or Apache-2.0.
-
-## Performance
-
-Measured by `cargo run --release --bin bench` against a 1,000,000-span corpus (100,000 traces, 20 services, 100 indexed attribute values) on macOS/aarch64 with 10 hardware threads:
-
-| Metric | Measured | Target | Result |
-|---|---:|---:|---|
-| Sustained batched HTTP ingest | 116,618 spans/s | >= 50,000 spans/s | PASS |
-| Trace-by-id p95 | 0.642 ms | < 50 ms | PASS |
-| Attribute-filtered query p95 | 3.344 ms | < 300 ms | PASS |
-
-**What these figures measure:** the engine-backed path with format-v2 indexed segments — ingest passes through the write buffer and segment encoder, trace lookups binary-search each segment's embedded trace index, and filters merge undecoded index postings across segments in start-time order, decoding and re-verifying only the records a limited query actually returns. At a 10M-span corpus (10x the canonical run), measured trace lookup is p50 0.45 ms and the attribute filter p50 2.9 ms — both effectively scale-independent for limited queries. The ingest rate is timed over the full loop — client-side JSON serialization and loopback HTTP overhead included. Full percentiles and methodology live in [BENCHMARKS.md](BENCHMARKS.md). Results are machine-specific; run the benchmark yourself (see below) rather than treating these as guarantees.
 
 ## Quickstart
 
-Build and start the server:
-
-```sh
-cargo build --release
-./target/release/traza-server --data-dir ./data --port 8080
-```
-
-Ingest a batch of spans (the body is a JSON array, or `{"spans": [...]}`):
+Ingest a batch of spans (a JSON array, or `{"spans": [...]}`):
 
 ```sh
 curl -X POST http://localhost:8080/v1/spans \
@@ -70,109 +42,149 @@ curl -X POST http://localhost:8080/v1/spans \
 # {"accepted":1}
 ```
 
-Fetch a whole trace, spans sorted by start time:
+Fetch a trace, search spans, check the store:
 
 ```sh
 curl http://localhost:8080/v1/traces/trace-1
-# {"trace_id":"trace-1","spans":[...]}
-```
-
-Search spans with filters:
-
-```sh
 curl 'http://localhost:8080/v1/spans?service=checkout&attr.region=us-east&min_duration_ms=2&limit=50'
+curl http://localhost:8080/v1/stats
 ```
 
-Check what the store is holding:
+Or skip curl entirely: the dashboard at `http://localhost:8080/` shows recent spans, a filter bar, per-trace waterfalls, and span detail.
+
+**Span identity is a primary key.** `(trace_id, span_id)` uniquely names a span; re-ingesting it replaces the stored version (last write wins). Client retries are idempotent and never create duplicates.
+
+## LLM and agent observability
+
+Traza treats generative-AI telemetry as a native workload, not an attribute soup. The [conventions](docs/llm-semantics.md) are plain span attributes — no SDK required:
+
+```jsonc
+{
+  "name": "llm.completion",
+  "service": "support-agent",
+  "attributes": {
+    "session.id": "chat-4711",          // groups traces into a session
+    "llm.model": "gpt-5.6",
+    "llm.prompt_tokens": 412,
+    "llm.completion_tokens": 88,
+    "llm.cost_usd": 0.0042,
+    "llm.stop_reason": "end_turn"
+  },
+  "events": [{ "name": "llm.prompt", "attributes": { "content": "..." } }]
+}
+```
+
+**Sessions** — the unit of agent work that spans many traces:
 
 ```sh
-curl http://localhost:8080/v1/stats
-# {"span_count":1,"segment_count":1,"bytes_on_disk":231}
+curl 'http://localhost:8080/v1/sessions?limit=20'
+# per session: span/trace counts, token totals, cost, errors, activity window
+curl 'http://localhost:8080/v1/sessions/chat-4711'
+# adds the per-trace breakdown
 ```
+
+**Cost and token analytics** — exact rollups, grouped how you ask:
+
+```sh
+curl 'http://localhost:8080/v1/stats/llm?group_by=model'     # or service | session | day
+# rows of {key, llm_calls, prompt/completion/total tokens, cost_usd, errors, latency}
+```
+
+**Prompt and completion payloads** stay queryable without bloating the store: string values above `--payload-threshold-bytes` (default 256 KiB) are offloaded to a content-addressed store and replaced inline by `{"$payload": "sha256/…", "bytes": N, "preview": "…"}`. Identical payloads — repeated system prompts — are stored once. `GET /v1/payloads/{ref}` returns the bytes.
+
+**Evals and feedback** attach to spans after the fact, without mutating them:
+
+```sh
+curl -X POST http://localhost:8080/v1/annotations \
+  -d '{"trace_id": "trace-1", "span_id": "span-1", "name": "groundedness",
+       "value": 0.9, "source": "eval:nightly"}'
+```
+
+**Dataset export** turns any search into training/eval data:
+
+```sh
+curl 'http://localhost:8080/v1/export?service=support-agent&attr.llm.model=gpt-5.6' > dataset.ndjson
+```
+
+Exports stream with bounded memory — an export larger than RAM is fine.
+
+## OpenTelemetry
+
+Point any OTel SDK at Traza:
+
+```sh
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:8080
+export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf   # or http/json
+export OTEL_EXPORTER_OTLP_COMPRESSION=none
+```
+
+`POST /v1/traces` accepts OTLP/HTTP as binary protobuf or JSON: `service.name` becomes the span's service, typed attributes are flattened, events and span links are preserved. gRPC is not served — use the `http/protobuf` exporter setting, which every OTel SDK supports.
 
 ## HTTP API
 
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/v1/spans` | Ingest a JSON batch of spans; responds `{"accepted": N}` |
-| `POST` | `/v1/traces` | OTLP/HTTP: an OpenTelemetry ExportTraceServiceRequest as binary protobuf (`Content-Type: application/x-protobuf`) or JSON, mapped onto the span model (`service.name` -> service, typed attributes flattened, span links preserved). Point an SDK at it with `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf` and `OTEL_EXPORTER_OTLP_ENDPOINT=http://host:port` (gRPC is not served; compression must be off) |
-| `GET` | `/v1/traces/{trace_id}` | All spans of one trace, sorted by start time; `404` if unknown |
-| `GET` | `/v1/spans?...` | Filtered span search |
-| `GET` | `/v1/stats` | Span count, segment count, bytes on disk |
-| `GET` | `/v1/sessions?since=&until=&limit=` | Sessions (spans carrying `session.id`), most recent activity first, with span/trace counts, token sums, cost, and errors |
-| `GET` | `/v1/sessions/{id}` | One session's rollup plus its per-trace breakdown; `404` if unknown |
-| `GET` | `/v1/stats/llm?group_by=model\|service\|session\|day&since=&until=` | Token/cost aggregation rows, sorted by cost |
-| `POST` | `/v1/annotations` | Attach a score/feedback record to a span (or whole trace): `{trace_id, span_id?, name, value, source?, comment?}`; the trace view returns them alongside spans |
+| `POST` | `/v1/spans` | Ingest a JSON span batch; responds `{"accepted": N}` |
+| `POST` | `/v1/traces` | OTLP/HTTP ingest (protobuf or JSON) |
+| `GET` | `/v1/traces/{trace_id}` | One trace's spans (sorted) plus its annotations |
+| `GET` | `/v1/spans?…` | Filtered span search |
+| `GET` | `/v1/sessions?since=&until=&limit=` | Sessions, most recent first |
+| `GET` | `/v1/sessions/{id}` | One session's rollup + per-trace breakdown |
+| `GET` | `/v1/stats/llm?group_by=model\|service\|session\|day` | Token/cost aggregation |
+| `POST` | `/v1/annotations` | Attach a score/feedback record to a span or trace |
 | `GET` | `/v1/annotations?trace_id=&span_id=&name=` | Query annotations |
 | `GET` | `/v1/payloads/sha256/{hex}` | Raw bytes of an offloaded payload |
-| `GET` | `/v1/export?...` | Span search as NDJSON (same filters as `/v1/spans`, unbounded by default) — dataset export for evals/fine-tuning |
+| `GET` | `/v1/export?…` | Streaming NDJSON export (same filters as `/v1/spans`) |
+| `GET` | `/v1/stats` | Span count, segment count, bytes on disk |
+| `POST` | `/v1/flush` | Force buffered spans into a durable segment |
 
-String attribute values above `--payload-threshold-bytes` (default 256 KiB, `0` disables) are offloaded to a content-addressed store under the data directory and replaced by `{"$payload": "sha256/…", "bytes": N, "preview": "…"}` — identical payloads (repeated system prompts) are stored once, and segment decodes never drag multi-megabyte text along. Payload files and annotations honor the same TTL as spans.
+Search filters (ANDed; URL-encoded): `service` and `name` (exact match), `attr.KEY` (exact attribute match — bare values match strings, JSON literals match typed values; repeatable), `min_duration_ms`, `since`/`until` (Unix nanoseconds, inclusive), `limit` (default 100 on `/v1/spans`; exports are unbounded by default).
 
-Search filters (all supplied predicates are ANDed; values must be URL-encoded):
+Timestamps are integer Unix nanoseconds; `start_time_unix_nano` and the aliases `start_timestamp_ns`, `start_ns`, `start_time` are accepted (same for `end_*`). Unknown fields on a span are stored and returned verbatim. Invalid JSON is `400`; bodies are capped at 64 MiB; `503` means retry with backoff.
 
-- `service` — exact service-name match.
-- `name` — exact operation-name match.
-- `attr.KEY` — exact attribute match for `KEY`; repeat for multiple attributes. Bare values match string attributes; JSON literals (`true`, `3`) match typed values.
-- `min_duration_ms` — minimum span duration in milliseconds.
-- `since` / `until` — inclusive start-timestamp bounds, Unix nanoseconds.
-- `limit` — maximum spans returned (default 100), applied after filtering, sorted by start time.
+## Operating Traza
 
-**Span identity is the (trace_id, span_id) pair, enforced as a primary key**: re-ingesting an existing pair replaces the stored span (last write wins), so client retries are idempotent and never create duplicate copies. Span timestamps are integer Unix nanoseconds. The server reads `start_time_unix_nano` (and the aliases `start_timestamp_ns`, `start_ns`, `start_time`) plus the matching `end_*` keys; any other fields you send are stored and returned verbatim. Invalid JSON gets `400`; requests are capped at 64 MiB; `503` means the ingest writer is unavailable and the batch should be retried with backoff.
-
-## Authentication
-
-Set `TRAZA_TOKENS` to require bearer tokens, with per-token read-only or
-read-write scope:
+**Authentication.** Set `TRAZA_TOKENS` to require bearer tokens, with per-token scope — `ro` tokens may GET, `rw` tokens may GET and POST:
 
 ```sh
-TRAZA_TOKENS="rw:e26002c9fcc75826c6b1deeb265f6d0e,ro:020675ab21ab5e972ab25af65fbd969a" traza-server --data-dir ./data
+TRAZA_TOKENS="rw:$(openssl rand -hex 16),ro:$(openssl rand -hex 16)" \
+  traza-server --data-dir ./data
 ```
 
-`ro` tokens may GET; `rw` tokens may GET and POST. Missing or unknown
-tokens receive 401 with a `WWW-Authenticate: Bearer` challenge; valid
-tokens without the needed scope receive 403. Token comparison is
-constant-time, and an invalid `TRAZA_TOKENS` value refuses startup rather
-than silently running open. Leaving the variable unset disables auth for
-local development.
+Missing or unknown tokens get 401 with a `WWW-Authenticate: Bearer` challenge; insufficient scope gets 403. Comparison is constant-time; an invalid `TRAZA_TOKENS` refuses startup rather than silently running open. Unset means open, for local development. The dashboard shell itself stays open (it carries no data) and prompts for a token on the first 401, holding it in `sessionStorage` only. TLS is reverse-proxy territory.
 
-## Dashboard
+**Retention.** `--ttl-seconds N` keeps a rolling window: a background pass compacts expired spans every minute, and annotations and payload files age out on the same window. Off by default — nothing is deleted unless you ask.
 
-The server bundles a dependency-free trace browser — one self-contained
-HTML page embedded in the binary, served at `GET /` and `GET /dashboard`.
-Open `http://127.0.0.1:9411/` in a browser to get:
+**Durability.** Durability begins at segment flush: a crash loses at most the unflushed write buffer (bounded by `--flush-spans`, default 10,000), never a completed flush. `POST /v1/flush` narrows the window on demand. Every compaction rewrite is journaled before it begins; recovery finishes an interrupted rewrite in whichever direction the crash left it.
 
-- **Recent spans** with a filter bar (service, name, attribute key/value,
-  minimum duration, limit) mapped 1:1 onto the `/v1/spans` query params.
-- **Trace waterfall**: click a span to lay out its whole trace on a time
-  axis (error spans highlighted), backed by `/v1/traces/{id}`.
-- **Span detail**: attributes, events, parent, duration, and any extra
-  fields stored at ingest.
+**Resources.** Memory is O(indexes), not O(data): segments are file-backed, only their parsed indexes stay resident, and span payloads are read on demand — measured 0.71 GB peak RSS serving a 10M-span (2.4 GB on disk) corpus. Stores larger than RAM serve correctly; disk latency applies to cold reads.
 
-The page consumes only the JSON API above — no dashboard-specific
-endpoints exist. With authentication enabled the shell itself stays open
-(it carries no data), while every API call it makes is gated: the page
-prompts for a bearer token on the first `401` and keeps it in
-`sessionStorage` only. The page references no external resources, so it
-works offline and adds no supply-chain surface; light and dark color
-schemes follow the browser preference.
+**Scope.** One writer process per data directory (a stale lock from a dead process is reclaimed automatically). Single-node today — see the [roadmap](#status-and-roadmap).
 
-## LLM observability
+### Server flags
 
-Traza ships documented span conventions for generative-AI workloads —
-model, token, cost, and tool-call attributes plus prompt/completion
-payloads as events — all served by the standard filter API with no extra
-configuration. See [docs/llm-semantics.md](docs/llm-semantics.md).
+| Flag | Default | Description |
+|---|---|---|
+| `--data-dir DIR` | `./data` | Directory for all state; created if missing |
+| `--host ADDR` / `--port PORT` | `0.0.0.0` / `8080` | Bind address and port |
+| `--workers N` | CPUs (min 4) | HTTP worker threads |
+| `--ttl-seconds N` | off | Rolling retention window |
+| `--flush-spans N` | `10000` | Buffered spans that trigger a durable flush |
+| `--payload-threshold-bytes N` | `262144` | Offload threshold for large string values; `0` disables |
 
-## Architecture
+## Performance
 
-Traza is two layers that share one goal: never lose a completed write, never serve a torn one.
+Measured on macOS/aarch64 (10 hardware threads) by the bundled end-to-end benchmark over a 1,000,000-span corpus ingested through the real HTTP path:
 
-**Storage engine (the `traza` library).** Spans accumulate in an in-memory write buffer. At the flush threshold (default 10,000 spans) the batch is sorted and written as an immutable format-v2 segment file — JSON span payloads with an embedded record-offset index, trace index, and attribute index — via write-temp, fsync, atomic rename: a segment is either completely present or not present at all. Opening a store loads segment BYTES and parses only the indexes; spans materialize on demand for the records a query returns. `get_trace` binary-searches each segment's trace index; filters narrow candidates through the service/name/attribute indexes or a time range, then re-verify every predicate against the parsed span — an index accelerates a filter, it never changes its semantics. Pre-v2 JSON-lines segments remain readable beside v2 files (they stay memory-resident until a TTL rewrite upgrades them). There is no cross-segment manifest yet: TTL compaction is atomic per segment file, and recovery heals a crash-duplicated segment on the next open by dropping exact-duplicate spans and deleting fully-duplicate files.
+- **Sustained ingest:** 116,618 spans/s (batched HTTP, client serialization and loopback included)
+- **Trace lookup:** p95 0.64 ms
+- **Attribute-filtered search:** p95 3.3 ms
 
-**HTTP server (`traza-server`).** A deliberately small HTTP/1.1 implementation on `std::net`: a worker pool for connections in front of the segment engine, which is the server's only datastore. Every ingest goes through the engine's write buffer and flush/segment machinery; every trace, query, and stats read comes out of the engine's combined buffered-plus-persisted snapshot. There is no server-side log, index, or replay — restart durability and crash recovery are the engine's, and `POST /v1/flush` forces buffered spans into a durable segment on demand. A bounded connection queue throttles producers instead of growing without limit. If a server process dies without cleanup, the next open reclaims the engine's directory lock once the recorded owner process is verifiably gone.
+Limited queries decode only the records they return, so lookup and search latency are effectively scale-independent: at 10M spans, trace lookup is p50 0.45 ms and the attribute filter p50 2.9 ms. Full percentiles and methodology are in [BENCHMARKS.md](BENCHMARKS.md), which is rewritten by the benchmark itself (`cargo run --release --bin bench`) — run it on your hardware rather than trusting ours.
 
-Embedding the engine in your own process:
+## Using Traza as a library
+
+The engine embeds in your own process — same durability, no server:
 
 ```rust
 use traza::{Config, SpanFilter, Store};
@@ -180,71 +192,33 @@ use traza::{Config, SpanFilter, Store};
 let store = Store::open("./data", Config::default())?;
 store.ingest(span)?;          // buffered; flushes automatically at the threshold
 store.flush()?;               // or force a durable segment now
-let slow_spans = store.query(&SpanFilter {
+let slow = store.query(&SpanFilter {
     service: Some("checkout".into()),
     min_duration_ns: Some(5_000_000),
     ..SpanFilter::default()
 })?;
 ```
 
-## Configuration
+## Design
 
-`traza-server` command line:
+Two layers with one contract: never lose a completed write, never serve a torn one.
 
-| Flag | Default | Description |
-|---|---|---|
-| `--data-dir DIR` | `./data` | Directory for the store's files; created if missing |
-| `--port PORT` | `8080` | TCP port; the server binds `0.0.0.0` |
-| `--workers N` | number of CPUs (min 4) | HTTP worker threads |
-| `--ttl-seconds N` | off | Engine TTL retention window; a background thread compacts expired spans every minute. `0` disables |
-| `--host ADDR` | `0.0.0.0` | Bind address |
-| `--flush-spans N` | `10000` | Engine flush threshold |
+The **storage engine** buffers spans in memory and flushes sorted, immutable segment files — JSON payloads with embedded record-offset, trace, and attribute indexes — via write-temp, fsync, atomic rename. Opening a store parses only the indexes; spans materialize on demand. Filters narrow candidates through the indexes, then re-verify every predicate against the parsed span: an index accelerates a filter, it never changes its semantics.
 
-Library `Config`:
+The **HTTP server** is a deliberately small HTTP/1.1 implementation on `std::net` — a bounded worker pool in front of the engine, which is its only datastore. There is no server-side log or side index; restart durability is the engine's.
 
-| Field | Default | Description |
-|---|---|---|
-| `flush_spans` | `10_000` | Buffered spans that trigger a sorted segment flush |
-| `ttl_seconds` | `None` | Retention window for `compact_expired()`; `None` and `Some(0)` both disable expiration |
+Deeper reading: [segment format](docs/segment-format-v2.md) · [LLM conventions](docs/llm-semantics.md) · [HA design](docs/ha-design.md).
 
-## Running the benchmark
+## Status and roadmap
 
-```sh
-cargo run --release --bin bench
-```
+Traza is pre-1.0 and honest about it: on-disk formats may change between 0.x versions, and single-node is the current scope. Shipped and load-bearing today: durable segment storage with crash recovery, OTLP protobuf/JSON ingest, sessions and cost analytics, payload offloading, annotations, streaming export, bearer auth, and the bundled dashboard.
 
-The benchmark builds the release server, starts it on a free loopback port with a fresh temporary data directory, ingests 1,000,000 spans over HTTP in 1,000-span batches, measures sustained ingest throughput and p50/p95/p99 query latencies, and rewrites `BENCHMARKS.md` with the measurements from that run. Never edit `BENCHMARKS.md` by hand — regenerate it.
+Next up:
 
-Run the test suite and all lint gates with:
+- **High availability** — replication and failover beyond one node. The decision-ready design is in [docs/ha-design.md](docs/ha-design.md) (quorum-replicated logical log, segment shipping for catch-up).
+- **Filter throughput at scale** — posting-list intersection for large *unlimited* result sets (limited queries already decode only what they return).
 
-```sh
-./ci.sh
-```
-
-## Limitations
-
-Traza is a v0.1 project and says so plainly:
-
-- **Single-node.** One writer process per data directory; no replication, clustering, or failover yet.
-- **Bearer tokens, no TLS.** Set `TRAZA_TOKENS` (comma-separated `scope:token`, scopes `ro`|`rw`) to require `Authorization: Bearer` on every request — unknown tokens 401 with a Bearer challenge, insufficient scope 403, comparison constant-time. Unset means open (development). TLS stays reverse-proxy territory.
-- **OTLP is JSON-only.** `POST /v1/traces` accepts OTLP/HTTP JSON; protobuf and gRPC OTLP are not supported.
-- **Durability boundary.** Durability begins at segment flush: a crash loses at most the engine's unflushed write buffer (bounded by `--flush-spans`), never a completed flush. `POST /v1/flush` narrows the window on demand; per-request fsync is deliberately not offered yet.
-- **RAM is O(indexes).** Segments are file-backed: only the parsed indexes stay resident, and record payloads are read on demand — measured 0.71 GB peak server RSS over a 10M-span (2.4 GB on disk) corpus. Stores larger than RAM serve correctly; disk latency applies to cold reads.
-- **Minimal HTTP.** `Connection: close` per request, no keep-alive, no TLS, 64 MiB body cap.
-- **Exact-match filtering.** No full-text search, aggregations, or query language.
-- **Compaction crash windows.** Every compaction rewrite is journaled with a supersede marker before it begins; recovery finishes an interrupted rewrite in whichever direction the crash left it, never guessing from content — legitimately re-ingested identical spans always keep their acknowledged cardinality.
-- **Unstable formats.** Segment and log layouts may change between 0.x versions.
-
-All of these are on the roadmap, not swept under it.
-
-## Roadmap
-
-- **Streaming results** — chunked HTTP responses for very large result sets.
-- **Filter throughput at scale** — posting-list intersection and parse-avoidance for large unlimited result sets (limited queries already decode only what they return).
-- **High availability** — replication and failover beyond a single node; the
-  decision-ready design is in [docs/ha-design.md](docs/ha-design.md)
-  (quorum-replicated logical log recommended, with segment shipping for
-  catch-up), implementation not yet scheduled.
+Deliberately out of scope: TLS termination (front it with a reverse proxy), gRPC (use `http/protobuf`), and a query DSL (filters stay URL parameters).
 
 ## Contributing
 
