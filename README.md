@@ -148,7 +148,7 @@ OpenLLMetry and OTel GenAI instrumentation lands queryable without translation: 
 
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/v1/spans` | Ingest a JSON span batch; responds `{"accepted": N}` |
+| `POST` | `/v1/spans` | Ingest a JSON span batch; responds `{"accepted": N, "durability": MODE}` |
 | `POST` | `/v1/traces` | OTLP/HTTP ingest (protobuf or JSON) |
 | `GET` | `/v1/traces/{trace_id}` | One trace's spans (sorted) plus its annotations |
 | `GET` | `/v1/spans?…` | Filtered span search |
@@ -184,7 +184,19 @@ Missing or unknown tokens get 401 with a `WWW-Authenticate: Bearer` challenge; i
 
 **Retention.** `--ttl-seconds N` keeps a rolling window: a background pass compacts expired spans every minute, and annotations and payload files age out on the same window. Off by default — nothing is deleted unless you ask.
 
-**Durability.** Durability begins at segment flush: a crash loses at most the unflushed write buffer (bounded by `--flush-spans`, default 10,000), never a completed flush. `POST /v1/flush` narrows the window on demand. Every compaction rewrite is journaled before it begins; recovery finishes an interrupted rewrite in whichever direction the crash left it.
+**Durability.** An acknowledged write means what `--durability` says it means, and the mode is reported in every ingest response and in `/v1/stats` so a client never has to guess:
+
+| Mode | A `200` means | Cost |
+|---|---|---|
+| `buffered` | accepted in memory; a crash loses anything not yet flushed | fastest, **lossy by design** |
+| `wal` (default) | fsynced to the write-ahead log and recovered on restart | one group-committed fsync per batch |
+| `flushed` | present in a sealed segment | a segment write per call |
+
+The log is appended and fsynced *before* ingest returns, and replayed into the write buffer on open; once a flush seals those spans into a segment the log is reclaimed. The fsync happens outside the writer lock, so concurrent batches coalesce into one sync — measured 13.7k spans/s at concurrency 1 rising to 48.1k at concurrency 16 on the reference laptop, where a per-batch fsync would stay flat. `buffered` reaches 247k spans/s and `flushed` 6.0k, which is the trade-off the mode names.
+
+Recovery is ordered: log records replay in append order, so a re-ingested span recovers as its newest version, exactly as last-write-wins had it before the crash. A torn or corrupt trailing record is discarded — it was never acknowledged, because the acknowledgement follows the fsync. Annotations and payload writes already fsync on their own path. Every compaction rewrite is journaled before it begins; recovery finishes an interrupted rewrite in whichever direction the crash left it.
+
+One caveat worth stating plainly: `wal` and `flushed` issue `fsync`, which on **macOS does not flush the drive's own write cache** (that needs `F_FULLFSYNC`, which the Rust standard library does not expose and which this crate will not reach for while it has two dependencies and forbids unsafe code). On Linux, `fsync` carries the usual guarantee. A macOS laptop losing power can therefore still lose an acknowledged write; a kill -9, a panic, or an OS crash cannot, and that is what the durability suite proves.
 
 **Resources.** Memory is O(indexes), not O(data): segments are file-backed, only their parsed indexes stay resident, and span payloads are read on demand — measured 0.71 GB peak RSS serving a 10M-span (2.4 GB on disk) corpus. Stores larger than RAM serve correctly; disk latency applies to cold reads.
 
@@ -200,6 +212,7 @@ Missing or unknown tokens get 401 with a `WWW-Authenticate: Bearer` challenge; i
 | `--ttl-seconds N` | off | Rolling retention window |
 | `--flush-spans N` | `10000` | Buffered spans that trigger a durable flush |
 | `--payload-threshold-bytes N` | `262144` | Offload threshold for large string values; `0` disables |
+| `--durability MODE` | `wal` | `buffered`, `wal`, or `flushed` — what an acknowledged write guarantees (see [Durability](#operating-traza)) |
 | `--ui-dir DIR` | see below | Built dashboard to serve at `/`; served from disk, so a rebuilt UI needs no server restart. Unset ⇒ `$TRAZA_UI_DIR`, `<binary dir>/ui`, `<binary dir>/../share/traza/ui`, `./ui/dist`, first one containing `index.html`. None found ⇒ the API runs and `/` 404s with build instructions |
 | `--allow-unauthenticated-non-loopback` | off | Explicitly allow an unsafe non-loopback bind without tokens |
 

@@ -8,7 +8,8 @@
 //!
 //! Wire contract (unchanged from the log-backed server):
 //! - `POST /v1/spans` with a JSON array of spans or `{"spans": [...]}`;
-//!   responds `{"accepted": N}`.
+//!   responds `{"accepted": N, "durability": "buffered|wal|flushed"}`,
+//!   naming what the acknowledgement guarantees.
 //! - `GET /v1/traces/<trace_id>` responds `{"trace_id": .., "spans": [..]}`
 //!   or 404 `{"error": "trace not found"}`.
 //! - `GET /v1/spans?service=&name=&min_duration_ns=&since_ns=&until_ns=&limit=`
@@ -43,7 +44,7 @@ use std::thread;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use traza::{Config, Span, SpanCursor, SpanFilter, Store};
+use traza::{Config, Durability, Span, SpanCursor, SpanFilter, Store};
 
 const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 // Headers get a far tighter budget than bodies: without one, a 64 MiB
@@ -83,6 +84,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .max(4);
     let mut allow_unauthenticated_non_loopback = false;
     let mut ui_dir: Option<PathBuf> = None;
+    let mut durability = Durability::default();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < args.len() {
@@ -130,6 +132,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .parse::<usize>()?
                     .max(1);
             }
+            "--durability" => {
+                i += 1;
+                let name = args.get(i).ok_or("--durability requires a value")?;
+                durability =
+                    Durability::parse(name).ok_or("--durability must be buffered|wal|flushed")?;
+            }
             "--ui-dir" => {
                 i += 1;
                 ui_dir = Some(PathBuf::from(
@@ -141,7 +149,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--help" | "-h" => {
                 println!(
-                    "Usage: traza-server --data-dir DIR --port PORT [--host ADDR] [--ttl-seconds N] [--flush-spans N] [--workers N] [--payload-threshold-bytes N (0 disables)] [--ui-dir DIR (built dashboard; default: TRAZA_UI_DIR, beside the binary, then ./ui/dist)] [--allow-unauthenticated-non-loopback]"
+                    "Usage: traza-server --data-dir DIR --port PORT [--host ADDR] [--ttl-seconds N] [--flush-spans N] [--workers N] [--payload-threshold-bytes N (0 disables)] [--durability buffered|wal|flushed (default wal)] [--ui-dir DIR (built dashboard; default: TRAZA_UI_DIR, beside the binary, then ./ui/dist)] [--allow-unauthenticated-non-loopback]"
                 );
                 return Ok(());
             }
@@ -169,6 +177,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             ttl_seconds,
             // 0 disables offloading.
             payload_threshold: (payload_threshold_bytes > 0).then_some(payload_threshold_bytes),
+            durability,
         },
     )?);
 
@@ -190,6 +199,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind((host.as_str(), port))?;
     let actual_port = listener.local_addr()?.port();
     eprintln!("traza-server listening on {host}:{actual_port}");
+    // The acknowledgement contract is announced, not implied.
+    match durability {
+        Durability::Buffered => eprintln!(
+            "traza-server: durability=buffered — acknowledged writes are IN MEMORY ONLY and \
+             a crash loses anything not yet flushed. Use --durability wal in production."
+        ),
+        Durability::Wal => eprintln!(
+            "traza-server: durability=wal — acknowledged writes are fsynced to the \
+             write-ahead log and recovered on restart"
+        ),
+        Durability::Flushed => eprintln!(
+            "traza-server: durability=flushed — acknowledged writes are sealed into a segment"
+        ),
+    }
 
     // The dashboard is served from disk (ui/ `npm run build` output), never
     // compiled in. A missing build is not fatal: the API runs, and the UI
@@ -384,7 +407,12 @@ fn handle_connection(
             }
             let accepted = spans.len();
             match engine.ingest_batch(spans) {
-                Ok(()) => respond(&mut stream, 200, json!({"accepted": accepted})),
+                Ok(()) => respond(
+                    &mut stream,
+                    200,
+                    // The client should never have to guess what a 200 promises.
+                    json!({"accepted": accepted, "durability": engine.durability().as_str()}),
+                ),
                 Err(error) => respond(&mut stream, 503, json!({"error": error.to_string()})),
             }
         }
@@ -459,6 +487,8 @@ fn handle_connection(
                     "buffered_records": stats.buffered_records,
                     "persisted_records": stats.persisted_records,
                     "total_records": stats.total_records,
+                    "durability": stats.durability.as_str(),
+                    "wal_bytes": stats.wal_bytes,
                 }),
             ),
             Err(error) => respond(&mut stream, 503, json!({"error": error.to_string()})),

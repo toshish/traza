@@ -78,13 +78,14 @@ impl Server {
         let mut response = Vec::new();
         if let Err(error) = stream.read_to_end(&mut response) {
             // Auth is intentionally decided from headers before the body is
-            // buffered. Some TCP stacks report the close as ECONNRESET when
-            // the server rejects a request with unread body bytes, even after
-            // delivering the complete HTTP response.
+            // buffered, so the server can close with body bytes still unread.
+            // The invariant that matters is that a COMPLETE response arrived;
+            // how the peer tears the socket down afterwards is OS noise, and
+            // pinning it to ECONNRESET made this test flaky under load.
             assert!(
-                error.kind() == std::io::ErrorKind::ConnectionReset
-                    && complete_http_response(&response),
-                "reads: {error}"
+                complete_http_response(&response),
+                "incomplete response after {:?}: {error}",
+                error.kind()
             );
         }
         let text = String::from_utf8_lossy(&response).into_owned();

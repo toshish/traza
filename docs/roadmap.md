@@ -35,7 +35,7 @@ attribute convention bolted onto a request tracer. The product wins when:
   Features can be added; identity cannot be retrofitted.
 - **Small enough to audit.** Dependencies are budgeted, not vibes-based.
 
-## Where Traza stands (baseline, v0.14)
+## Where Traza stands (baseline, v0.15)
 
 Shipped and load-bearing: durable segment engine (immutable indexed
 segments, crash recovery, journaled TTL compaction, larger-than-RAM
@@ -106,10 +106,13 @@ Weave, Opik, AgentOps, Laminar):
 the choice — and nothing in v1.0 blocks what comes after. 1.0 is a promise,
 not a birthday.*
 
-### 1.1 Durability and the acknowledgement contract
+### 1.1 Durability and the acknowledgement contract — **delivered in 0.15**
 
-The current ack-before-durability behavior is the single largest gap
-between Traza and a production database.
+Ack-before-durability was the single largest gap between Traza and a
+production database. It is closed: the write-ahead log, the three explicit
+modes, ordered recovery, and log reclamation all ship, with `wal` the
+default and a SIGKILL suite holding each mode to its own claim. What remains
+of this section is the reporting half — `/metrics` lands with §1.4.
 
 - **Write-ahead log with group commit.** Ingest appends a batched WAL
   record and fsyncs before acknowledging; segment flush stays asynchronous
