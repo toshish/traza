@@ -222,7 +222,7 @@ Deeper reading: [segment format](docs/segment-format-v2.md) · [LLM conventions]
 
 Traza is pre-1.0 and honest about it: on-disk formats may change between 0.x versions, and single-node is the current scope. Shipped and load-bearing today: durable segment storage with crash recovery, OTLP protobuf/JSON ingest, sessions and cost analytics, payload offloading, annotations, streaming export, bearer auth, and the bundled dashboard.
 
-The destination is bigger than one node. The full product roadmap — from production-ready single node (1.0) through replicated HA clusters, columnar analytics at billion-span scale, agent-native debugging depth, and enterprise operation — lives in [docs/roadmap.md](docs/roadmap.md), with the HA architecture detailed in [docs/ha-design.md](docs/ha-design.md). Same binary, same API, at every phase.
+The destination is bigger than one node. The full product roadmap — durable v1 foundations (a write-ahead log and the identity model that must precede any format freeze), then replicated HA clusters and agent-native debugging depth, then columnar analytics at billion-span scale, then the enterprise control plane — lives in [docs/roadmap.md](docs/roadmap.md), with the HA architecture detailed in [docs/ha-design.md](docs/ha-design.md). Same binary, same API, at every phase.
 
 Deliberately out of scope: a metrics/logs suite, embedded eval models, general SQL, and framework SDKs — the [roadmap](docs/roadmap.md#explicit-non-goals) explains why.
 

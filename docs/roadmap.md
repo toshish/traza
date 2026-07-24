@@ -21,8 +21,8 @@ attribute convention bolted onto a request tracer. The product wins when:
 
 ### Product principles (these outrank any feature)
 
-- **One binary.** Every capability ships in `traza-server`. No sidecar
-  constellation, no mandatory external database, queue, or coordinator.
+- **One binary.** Every capability ships in `traza-server`. No mandatory
+  external control-plane database, coordinator, or lock service.
 - **Own the data model, speak the standards.** Native conventions stay
   simple and stable; OpenTelemetry (including GenAI conventions) is a
   supported dialect at the boundary, normalized on ingest — never a
@@ -30,8 +30,10 @@ attribute convention bolted onto a request tracer. The product wins when:
 - **Honest numbers, honest status.** Benchmarks are measured by shipped
   code; capabilities are documented only once they exist; formats are
   versioned and migrations are automatic.
-- **Small enough to audit.** Dependencies require a reason. The standard
-  library is the default answer.
+- **Identity before features.** Anything that must appear in a key, a
+  record header, or an addressing scheme ships *before* the format freeze.
+  Features can be added; identity cannot be retrofitted.
+- **Small enough to audit.** Dependencies are budgeted, not vibes-based.
 
 ## Where Traza stands (baseline, v0.13)
 
@@ -43,223 +45,315 @@ append-only annotations, streaming NDJSON export with integrity trailers,
 bearer auth with scopes, safe bind defaults, bundled dashboard, measured
 benchmarks (116k spans/s ingest; sub-ms trace lookup at 10M spans).
 
-Not yet: replication/HA, query language, columnar analytics at billion-span
-scale, multi-tenancy, RBAC/SSO, PII controls, sampling, targeted deletion,
-metrics endpoint, keep-alive HTTP, packaged releases.
+**Known gap that shapes Phase 1:** `POST /v1/spans` acknowledges after the
+write buffer accepts the batch, and durability begins at segment flush. A
+crash can therefore lose acknowledged writes (bounded by `--flush-spans`).
+This is documented in the README and is *not* a production durability
+contract. Closing it is the first item below.
+
+Also not yet: replication/HA, query language, columnar analytics at
+billion-span scale, tenancy, RBAC/SSO, targeted deletion, encryption at
+rest, tail sampling, content search, an eval entity model, packaged
+releases.
 
 ## What production users expect in 2026 (research summary)
 
 From surveying the current state of the art — general trace backends
-(Grafana Tempo's object-storage Parquet architecture, ClickHouse-based
-stacks, VictoriaTraces, Jaeger v2) and LLM/agent platforms (Langfuse,
-LangSmith, Braintrust, Arize Phoenix, W&B Weave, Opik, AgentOps, Laminar):
+(Grafana Tempo, ClickHouse-based stacks, VictoriaTraces, Jaeger v2) and
+LLM/agent platforms (Langfuse, LangSmith, Braintrust, Arize Phoenix, W&B
+Weave, Opik, AgentOps, Laminar):
 
-- **The market validated the thesis, twice.** Langfuse — the leading
-  open-source LLM observability platform — was acquired by ClickHouse
-  (Jan 2026) precisely because LLM observability at scale is a *database*
-  problem. Braintrust reached the same conclusion from the other side and
-  built **Brainstore**, a purpose-built AI-log database: a single Rust
-  binary whose segments carry a row store, an inverted (full-text) index,
-  and a column store, with an object-storage WAL and a tiered
-  WAL→processing→indexed read merge. Traza's angle is the same class of
-  engine with a harder constraint Brainstore doesn't attempt: no external
-  metadata database, no lock service — Brainstore needs Postgres and
-  Redis beside it; Traza is one binary, full stop.
-- **Eval-first is the workflow bar, not a feature.** Braintrust's core
-  loop — datasets of examples, task runs, scorers grading outputs,
-  experiments diffing score distributions across versions, failing
-  production traces promoted into permanent regression datasets — is what
-  serious AI teams now call observability. A trace store that cannot
-  represent experiments, dataset versions, and scores as queryable records
-  is the substrate for that loop at best, not a product.
-- **Columnar + object storage is the scale architecture.** Tempo writes
-  Parquet to S3; ClickHouse stacks query wide events in LSM columnar
-  storage. Full-fidelity row storage wins for lookup; columnar projections
-  win for analytics; tiering to object storage wins for cost.
+- **The market supports the thesis.** ClickHouse
+  [acquired Langfuse](https://clickhouse.com/blog/clickhouse-acquires-langfuse-open-source-llm-observability)
+  (Jan 2026), pairing the leading open-source LLM observability platform
+  with a columnar database vendor. Braintrust built
+  [Brainstore](https://www.braintrust.dev/blog/brainstore-architecture), a
+  purpose-built AI-log database: a single Rust binary whose segments carry
+  a row store, an inverted index, and a column store, with an
+  object-storage WAL and a tiered read merge — but requiring Postgres for
+  metadata and Redis for locks. Both data points say LLM observability at
+  scale is a database problem. Traza's differentiation is being that
+  database with no external control plane.
+- **Eval-first is the workflow bar, not a feature.** The Braintrust loop —
+  datasets of examples, task runs, scorers, experiments diffing score
+  distributions, failing production traces promoted into regression
+  datasets — is what serious AI teams now mean by observability. A trace
+  store that cannot represent experiments, dataset versions, and scores as
+  queryable records is substrate for someone else's product. *This roadmap
+  therefore treats a minimal eval model as a 1.0 requirement, not a later
+  phase.*
+- **Columnar + object storage is a proven scale architecture.** Tempo
+  writes [Parquet blocks to object storage](https://grafana.com/docs/tempo/latest/reference-tempo-architecture/block-format/);
+  ClickHouse stacks query wide events in LSM columnar storage. Row storage
+  wins lookup, columnar projections win analytics, object tiering wins cost.
 - **Agent models are outgrowing "a list of LLM calls."** The 2026
   differentiators are session/goal-level outcomes, multi-agent step graphs,
-  time-travel replay of a session, loop/runaway detection, and evals wired
-  to production traces (LLM-as-judge, human annotation queues,
-  auto-generated datasets from failures).
+  time-travel replay, loop/runaway detection, and evals wired to production
+  traces.
 - **OTel GenAI conventions are coming but unstable.** `gen_ai.*` semantics
-  (agent spans, MCP tool calls, content events) are still in Development
-  status; attribute names may change. The durable strategy is dual-dialect:
+  remain in [Development status](https://opentelemetry.io/docs/specs/semconv/configuration/version-selection/);
+  attribute names may still change. The durable strategy is dual-dialect:
   accept and normalize both OTel GenAI and native conventions.
-- **Enterprise table stakes are unchanged but non-negotiable:**
-  multi-tenancy, RBAC scoped by team/service, SSO (OIDC/SAML), audit logs,
-  PII redaction at ingest, retention tiers, sampling/cost controls, data
-  export **and deletion** on demand, SOC2/GDPR-supporting controls.
-
-The roadmap below sequences Traza from today's single node to that
-destination without breaking the product principles.
+- **Enterprise table stakes are unchanged:** tenancy, RBAC, SSO, audit
+  logs, PII controls, retention tiers, sampling, export **and deletion** on
+  demand. Their *administration* can ship late; their *identity* cannot.
 
 ---
 
-## Phase 1 — Production-ready single node (→ v1.0)
+## Phase 1 — Durable, complete v1 foundations (→ v1.0)
 
 *Goal: a team can run one Traza node in production, on purpose, and defend
-the choice. 1.0 is a promise, not a birthday.*
+the choice — and nothing in v1.0 blocks what comes after. 1.0 is a promise,
+not a birthday.*
 
-**Functional**
+### 1.1 Durability and the acknowledgement contract
 
-- **Wire and format stability contract.** Frozen v1 HTTP API surface;
-  on-disk format versioning with automatic forward migration; documented
-  deprecation policy. Post-1.0: no breaking change without a major version
-  and a migration path.
-- **HTTP/1.1 keep-alive + gzip** (request and response). Exporters batch
-  aggressively; per-request TCP handshakes are the current bottleneck's
-  ceiling. (gRPC remains out; `http/protobuf` covers OTel SDKs.)
-- **Streaming interactive searches.** Exports already stream with
-  integrity trailers; `/v1/spans` still materializes one bounded JSON
-  response. Interactive queries adopt the same chunked cursor machinery.
+The current ack-before-durability behavior is the single largest gap
+between Traza and a production database.
+
+- **Write-ahead log with group commit.** Ingest appends a batched WAL
+  record and fsyncs before acknowledging; segment flush stays asynchronous
+  and unchanged. Group commit amortizes fsync across concurrent batches so
+  durability does not cost the throughput target (per-request synchronous
+  segment flush would, and is not the design).
+- **Explicit durability modes**, selected per deployment and reported in
+  responses and `/metrics`:
+  - `buffered` — today's behavior; acknowledged means accepted in memory.
+    Remains available for laptop/CI use, and is *documented as lossy*.
+  - `wal` (default for production) — acknowledged means fsynced to the WAL
+    and recoverable.
+  - `flushed` — acknowledged means present in a sealed segment.
+- **Recovery** replays the WAL into the write buffer on open; WAL segments
+  are reclaimed once the spans they carry are sealed. Payload writes and
+  annotation appends join the same ordering discipline.
+- **The acknowledgement contract is documented per endpoint**, and the API
+  never implies more durability than the configured mode provides.
+
+This work is also the foundation Phase 2 needs: the HA design's replicated
+log and applied-index recovery contract assume a durable local state
+machine underneath them.
+
+### 1.2 Identity and schema foundations (freeze-critical)
+
+Everything here changes keys, record headers, or addressing. It must exist
+in v1 — as reserved, versioned representation even where administration
+ships later — or the format freeze is not credible.
+
+- **Tenant identity in the primary key.** Span identity becomes
+  `(tenant, trace_id, span_id)`. Without tenant scoping, two tenants
+  generating the same trace ID silently upsert over each other — a
+  cross-tenant data-loss bug, not a namespacing inconvenience. Single-tenant
+  deployments use a default tenant and see no behavioral change. Tenant
+  scoping extends to sessions, annotations, payload references, retention
+  policy, and quota accounting.
+- **Tombstone identity for deletion.** Erasure requires a replicated,
+  ordered deletion record that names its subject (tenant, trace, span,
+  session, or payload reference) and supersedes prior versions under the
+  same last-write-wins discipline as span upserts. Compaction honors
+  tombstones; queries never return tombstoned content even before the
+  rewrite runs.
+  - **Deletion must be reference-aware.** Content-addressed payload dedup
+    means one blob may back many spans — potentially across tenants.
+    Deleting one tenant's data must not delete a payload another tenant
+    still references; the live-reference discipline the TTL sweep already
+    uses is the model, extended to per-tenant reference counting.
+- **Key-version metadata on encrypted-at-rest artifacts.** Segment,
+  payload, WAL, and annotation headers reserve a key-version field so
+  encryption and key rotation (Phase 4) do not require a format break.
+- **Eval entity model** — a real addressing scheme, not a storage trick:
+  - `Dataset` — stable dataset ID, name, tenant.
+  - `DatasetVersion` — immutable, content-addressed manifest listing
+    example IDs and digests; records its **parent version** for lineage,
+    plus provenance (the query or import that produced it).
+  - `Example` — **stable example ID** stable across versions, with input,
+    optional expected output, split label (train/dev/test), and provenance
+    back to the source trace/span it was promoted from.
+  - `Experiment` — stable ID linking one dataset version to a set of task
+    runs (traces), with configuration metadata.
+  - `Score` — addresses the `(experiment, example, span)` tuple. Today's
+    `Annotation` addresses only `(trace_id, span_id)` and cannot express
+    this, so v1 generalizes annotation addressing to a typed subject
+    (trace/span/session/experiment-example) with the existing fields
+    preserved.
+  - **Deletion and lineage semantics are defined up front:** deleting
+    source traces must not corrupt dataset versions that referenced them
+    (examples carry their own copies), and deleting a dataset version is
+    itself a tombstone with defined effects on dependent experiments.
+- **Tail sampling.** Head sampling alone cannot express the rule this
+  product exists to serve — "keep every trace whose eval failed" is a
+  post-hoc decision. Tail sampling needs a buffered decision window and a
+  retention-decision record, both of which touch storage semantics; the
+  mechanism ships in v1 even if policies expand later.
+
+### 1.3 Product-thesis minimum
+
+By the roadmap's own definition, a trace store without these is substrate,
+not a product. A v1.0 that passed every other gate while failing this test
+would be a planning failure.
+
+- **Minimal eval workflow, end to end:** promote failing production traces
+  into a dataset version, run an experiment (task execution stays external),
+  record scores, and query score distributions and experiment-over-experiment
+  diffs as ordinary rollups.
+- **Minimal content search:** substring/token matching over span names,
+  string attributes, event content, and payload previews, executed through
+  the existing index-then-verify path. This validates the debugging
+  primitive ("find the session where the model said X") without waiting
+  for the full per-segment inverted index in Phase 3.
+
+### 1.4 Operability and release engineering
+
+- **HTTP/1.1 keep-alive + gzip.** Per-request TCP handshakes cap the ingest
+  path. (gRPC stays out; `http/protobuf` covers OTel SDKs.)
+- **Streaming interactive searches.** `/v1/spans` adopts the chunked cursor
+  machinery the export path already proves.
 - **OTel GenAI dialect normalization.** Ingest-time mapping of `gen_ai.*`
-  (agent spans, tool calls, content events) onto Traza's native
-  conventions, tracked against the evolving spec; dual-dialect queries so
-  either vocabulary finds the data. MCP tool-call attributes included.
-- **Prometheus `/metrics`.** The datastore must be observable itself:
-  ingest rate, queue depth, flush latency, segment counts, query latency
-  histograms, payload store size, compaction progress.
-- **Backup/restore.** Consistent snapshot of a live store: sealed segment
-  state plus annotations, payload bytes, and a checksummed manifest. This
-  generation/checkpoint mechanism becomes the HA snapshot substrate;
-  documented restore drill; `traza-server --verify` integrity check.
-- **Ingest-time controls.** Head sampling (per-service rate), field-level
-  PII redaction hooks (drop/hash named attributes before storage), and
-  per-service retention overrides on top of the global TTL.
+  (agent spans, tool calls, content events, MCP attributes) onto native
+  conventions; dual-dialect queries so either vocabulary finds the data.
+- **Prometheus `/metrics`.** Ingest rate, WAL fsync latency, queue depth,
+  flush latency, segment counts, query latency histograms, payload store
+  size, compaction progress, durability mode.
+- **Backup/restore.** Consistent snapshot of a live store: sealed segments,
+  WAL position, annotations, payload bytes, eval records, and a checksummed
+  manifest; documented restore drill; `traza-server --verify`. This
+  generation/checkpoint mechanism becomes the HA snapshot substrate.
+- **Ingest-time controls.** Head sampling, field-level PII redaction
+  (drop/hash named attributes before storage), per-service retention
+  overrides.
 - **Release engineering.** GitHub Actions CI (the current `ci.sh` gate),
-  prebuilt binaries + container image, crates.io publication, versioned
+  prebuilt binaries and container image, crates.io publication, versioned
   docs site.
+- **Wire and format stability contract.** Frozen v1 HTTP surface; on-disk
+  format versioning with automatic forward migration; documented deprecation
+  policy. Post-1.0: no breaking change without a major version and a
+  migration path.
 
-**Non-functional acceptance for 1.0**
+### 1.5 Acceptance gates for 1.0
 
-- 250k spans/s sustained ingest on reference hardware (keep-alive +
-  protobuf path), measured by the bundled benchmark.
-- p99 < 10 ms trace lookup and < 50 ms filtered search at a 100M-span
-  store; RSS remains O(indexes).
-- Crash-safety property test in CI (kill -9 loops against a writing store,
-  zero acknowledged-write loss, zero torn reads).
-- Zero-warning security posture: no unsafe code, fuzzed wire surfaces
-  (HTTP framing, protobuf decoder, segment parser) in CI.
+Gates are only credible if reproducible, so the **reference environment is
+specified, not implied**: named CPU model and core count, RAM, storage class
+(local NVMe, with model and queue depth), filesystem, OS/kernel, durability
+mode, payload size distribution, attribute cardinality, client concurrency,
+query selectivity, and hot/cold cache state. The benchmark records all of it
+alongside results.
 
-## Phase 2 — High availability (v1.x → v2.0)
+- **Durability:** kill -9 property tests in CI prove zero loss of writes
+  acknowledged under `wal` and `flushed` modes, and zero torn reads, across
+  ingest, annotation, payload, and compaction paths. `buffered` mode is
+  tested to lose *only* unacknowledged-as-durable data.
+- **Throughput:** 250k spans/s sustained on the reference environment in
+  `wal` mode (keep-alive + protobuf), measured by the bundled benchmark.
+- **Query latency:** p99 < 10 ms trace lookup and < 50 ms filtered search at
+  a 100M-span store; RSS remains O(indexes).
+- **Regression policy:** each gate runs ≥5 times; the reported statistic is
+  the median with an interquartile range; a release blocks when the median
+  regresses >10% *and* the change exceeds run-to-run noise for that metric.
+  Single-run comparisons never gate a release.
+- **Security posture:** no unsafe code; fuzzed wire surfaces (HTTP framing,
+  protobuf decoder, segment parser, WAL reader) in CI; documented threat
+  model.
+- **Product-thesis gate:** the §1.3 workflow runs end to end in CI against
+  the built binary.
 
-*Goal: node failure is an operational non-event. The Raft direction is chosen;
-the [HA design](ha-design.md) now defines the v0.13 state inventory and the
-phase-zero engine, dependency, and protocol gates that must close before
-networked HA is exposed.*
+## Phase 2 — High availability and agent-native depth (v1.x → v2.0)
 
-- **Quorum-replicated logical log** for every query-visible mutation. The log,
-  not the leader's volatile write buffer, is the recovery authority; success
-  requires quorum durability and leader visibility.
-- **Validated full-state snapshots** for replica catch-up and re-seeding,
-  covering segments, annotations, payload bytes, retention state, and retry
-  outcomes rather than shipping segment files alone.
+*Two tracks in parallel: one makes node failure a non-event, the other makes
+Traza the best place to understand agent behavior.*
+
+### 2a. High availability
+
+The Raft direction is chosen; the [HA design](ha-design.md) defines the
+v0.13 state inventory and the phase-zero engine, dependency, and protocol
+gates that must close before networked HA is exposed.
+
+- **Quorum-replicated logical log** for every query-visible mutation. The
+  log — not the leader's volatile write buffer — is the recovery authority;
+  success requires quorum durability plus leader visibility.
+- **Validated full-state snapshots** covering segments, annotations, payload
+  bytes, eval records, retention state, tombstones, and retry outcomes.
 - **Explicit read consistency:** linearizable logical reads on the leader;
-  follower reads are opt-in stale reads labeled with their applied index.
-  Bounded staleness is claimed only after a configured lag bound is enforced
-  and tested.
-- **Replicated retention:** expiration decisions ride the log, so replicas
-  never disagree about what exists.
-- **Rolling upgrades** across a replica set with version-skew tolerance of
-  one minor version.
-- **Cluster operations:** join/leave/replace a node with one command;
-  cluster status in `/metrics` and the dashboard.
+  follower reads are opt-in, labeled with their applied index. Bounded
+  staleness is claimed only after a lag bound is enforced and tested.
+- **Replicated retention and deletion:** expiration and tombstones ride the
+  log, so replicas never disagree about what exists.
+- **Rolling upgrades** with one-minor-version skew tolerance; cluster
+  join/leave/replace in one command; cluster status in `/metrics`.
 
-**Non-functional acceptance:** automated fault-injection suite (leader
-kill, network partition, disk-full, slow follower) with defined recovery
-objectives — RPO 0 for quorum-acknowledged writes, RTO < 10 s for leader
-failover — measured in CI, not asserted.
+**Acceptance:** the HA design's HA-001…HA-017 evidence table, executed
+against real processes — RPO 0 for quorum-acknowledged mutations after one
+voter failure, RTO < 10 s for leader failover, measured across repeated
+fault runs rather than asserted.
+
+### 2b. Agent-native depth
+
+- **Session outcomes and goals.** First-class terminal status
+  (`session.outcome`, goal text, resolution attributes) with outcome-rate
+  rollups.
+- **Step-graph queries.** Link-aware queries (children-of, caused-by,
+  retry-chains) over the span links already stored, plus a dashboard graph
+  view for multi-agent sessions.
+- **Replay bundles.** One-command export of a session — spans, payloads,
+  annotations, link graph — as a self-contained bundle for time-travel
+  debugging and regression corpora; one-command re-import.
+- **Online eval hooks.** A registration surface invoking an external judge
+  (webhook or command) on matching new traces, writing verdicts back as
+  scores. Traza orchestrates; it never embeds a model.
+- **Annotation queues.** Filtered human-review workflows ("unreviewed failed
+  sessions"), reviewer attribution, progress tracking.
+- **Anomaly surfacing.** Loop/runaway detection (repeated near-identical
+  spans, token-burn spikes) and cost-budget alerts from the rollup layer.
+- **Semantic similarity search (opt-in).** Externally computed embeddings
+  are indexed in a **side index keyed by `(tenant, trace_id, span_id)`,
+  stored as its own append-only index family** — *not* inside span segments,
+  because an immutable segment cannot absorb an embedding that arrives after
+  it was sealed. The side index supports append, supersession, and
+  tombstone-driven removal on the same discipline as spans. Traza never
+  computes embeddings.
 
 ## Phase 3 — Scale-out and analytics (v2.x)
 
 *Goal: billion-span stores with interactive analytics and bounded cost —
 the same binary.*
 
-- **Columnar segment projections (format v3).** Alongside the row-oriented
-  record store, segments carry columnar projections of hot fields
-  (service, name, duration, session, model, tokens, cost) so aggregation
-  scans read columns, not records. Parquet-inspired, but embedded in the
-  self-contained segment — no external file zoo.
-- **Full-text search over trace content.** A per-segment inverted index
-  over span names, string attributes, event content, and payload previews
-  — "find the session where the model said X" is a debugging primitive,
-  not a luxury (Brainstore ships an inverted index per segment for exactly
-  this reason). Same self-contained segment, same index-accelerates-but-
-  never-changes-semantics rule; offloaded payload bodies are indexed at
-  offload time so search never re-reads the blob store.
-- **Aggregation pushdown.** Rollup queries (`/v1/stats/llm`, sessions)
-  execute against projections with late materialization; target:
-  interactive (<1 s) group-bys over 1B spans.
-- **Query language.** A small, stable filter/aggregation DSL for the API
-  and dashboard (shaped so a TraceQL-compatibility layer is possible
-  later). URL parameters remain the simple path; the DSL is for the
-  queries URLs can't express (grouping, span-relationship predicates).
-- **Object-storage tier.** Sealed segments age out to S3-compatible
-  storage on policy; queries transparently span local and remote tiers
-  with a local index cache. This is the cost story at fleet scale — and it
-  doubles as the HA catch-up and backup substrate.
-- **Horizontal partitioning** (after replication, not instead of it):
-  shard by trace-id hash across replica groups; scatter-gather with the
-  same total-order cursor semantics the export path already uses.
+- **Columnar segment projections (format v3).** Alongside the row store,
+  segments carry columnar projections of hot fields (service, name,
+  duration, session, model, tokens, cost) so aggregation scans read columns,
+  not records — embedded in the self-contained segment.
+- **Full per-segment inverted index**, generalizing §1.3's minimal content
+  search: span names, string attributes, event content, and payload text
+  indexed at offload time so search never re-reads the blob store.
+- **Aggregation pushdown.** Rollups execute against projections with late
+  materialization; target interactive (<1 s) group-bys over 1B spans.
+- **Query language.** A small, stable filter/aggregation DSL for the queries
+  URL parameters can't express (grouping, span-relationship predicates),
+  shaped so a TraceQL-compatibility layer stays possible.
+- **Object-storage tier.** Sealed segments age out to S3-compatible storage
+  on policy; queries transparently span local and remote tiers with a local
+  index cache. This is an optional data-plane tier the operator already
+  runs — it is not a control-plane dependency, and Traza runs fully without
+  it.
+- **Horizontal partitioning** (after replication, not instead of it): shard
+  by `(tenant, trace_id)` hash across replica groups; scatter-gather using
+  the same total-order cursor semantics the export path proves.
 
-## Phase 4 — Agent-native depth (parallel track from v1.x)
+## Phase 4 — Enterprise control plane (v2.x+)
 
-*Goal: the best place to understand — not just store — agent behavior.
-These build on the session/annotation/payload foundations already shipped.*
+*Goal: pass procurement without becoming a different product. The identity
+these features need was reserved in v1; this phase adds administration.*
 
-- **Session outcomes and goals.** First-class terminal status for a
-  session (`session.outcome`, goal text, resolution attributes) with
-  outcome-rate rollups; sessions stop being just activity windows.
-- **Step-graph queries.** Span links already model fan-out/fan-in and
-  retries; add link-aware queries (children-of, caused-by, retry-chains)
-  and a dashboard graph view for multi-agent sessions.
-- **Replay bundles.** One-command export of a session — spans, payloads,
-  annotations, link graph — as a self-contained bundle for time-travel
-  debugging and regression corpora; one-command re-import.
-- **Online eval hooks.** A registration surface that invokes an external
-  judge (webhook or command) on matching new traces and writes the verdict
-  back as annotations — Traza orchestrates the loop but never embeds a
-  model.
-- **Annotation queues.** Human review workflows: filtered work queues
-  ("unreviewed failed sessions"), reviewer attribution, progress tracking —
-  on the existing annotation record.
-- **Anomaly surfacing.** Loop/runaway detection (repeated near-identical
-  spans, token-burn spikes) and cost-budget alerts computed from the
-  rollup layer, exposed as queryable events and dashboard badges.
-- **Experiments, datasets, and scores as records.** The eval-first loop
-  needs a data model, and Traza already owns the primitives: dataset
-  versions are content-addressed snapshots of an export (immutable,
-  named, diffable — the payload CAS already does the storage); an
-  experiment is a record linking a dataset version to a set of task runs
-  (traces); scores are annotations attached to (experiment, example,
-  span). Score-distribution queries and experiment-vs-experiment diffs
-  become ordinary rollups. Traza runs no tasks and no scorers — CI or the
-  online-eval hook does — but the results live and query here.
-- **Semantic similarity search (opt-in).** Store externally computed
-  embeddings on spans and index them per segment for approximate
-  nearest-neighbor lookup — "find failures like this one" across sessions.
-  Embeddings arrive at ingest or by annotation; Traza never computes them
-  (the no-embedded-models principle holds).
-
-## Phase 5 — Enterprise operation (v2.x+)
-
-*Goal: pass procurement without becoming a different product.*
-
-- **Multi-tenancy.** Isolated tenants in one deployment: per-tenant
-  keyspace, quotas (ingest rate, storage), retention, and tokens. Tenant =
-  namespace, not a separate process.
-- **AuthN/AuthZ.** OIDC/SAML SSO for the dashboard and API tokens minted
-  against identities; RBAC with scopes by tenant/service/action (read,
-  write, annotate, export, admin).
+- **Tenancy administration.** Per-tenant quotas (ingest rate, storage),
+  retention policy, token issuance, and usage accounting on the v1 tenant
+  keyspace.
+- **AuthN/AuthZ.** OIDC/SAML SSO for the dashboard; API tokens minted
+  against identities; RBAC scoped by tenant/service/action (read, write,
+  annotate, export, admin).
 - **Audit log.** Append-only, queryable record of administrative and
   data-access actions.
-- **Targeted deletion (GDPR/erasure).** Tombstone records + prioritized
-  compaction rewrite deliver verifiable deletion from immutable segments,
-  payloads, and annotations — the design must respect the primary-key and
-  supersede semantics that every satellite layer already honors.
-- **Encryption at rest** (segment + payload files) with key rotation;
-  TLS remains the reverse-proxy's job until keep-alive lands, then native
-  TLS is reconsidered on evidence.
+- **Erasure workflows.** Operator-facing deletion requests, verification
+  reports, and prioritized compaction driving the v1 tombstone mechanism to
+  physical removal within a stated SLA.
+- **Encryption at rest** for segments, payloads, WAL, and annotations, with
+  rotation over the v1 key-version metadata.
 - **Compliance packaging.** SOC2-supporting controls documentation, data
   residency guidance, BYOC deployment guides (container, Helm, systemd).
 
@@ -269,44 +363,49 @@ These build on the session/annotation/payload foundations already shipped.*
 
 | Dimension | Commitment |
 |---|---|
-| **Deployment shape** | One binary, every phase. A feature that requires a second mandatory process is out of scope by definition. |
+| **Deployment shape** | One binary, every phase. No mandatory external control-plane database, coordinator, or lock service — ever. Optional data-plane tiers (object storage) are operator-owned and never required. |
 | **Compatibility** | SemVer on the wire API and on-disk formats from 1.0; automatic forward migration; one-minor-version cluster skew tolerance from 2.0. |
-| **Durability** | Acknowledged means recoverable: quorum-acknowledged from Phase 2. Crash-safety verified by fault-injection CI, every release. |
-| **Performance** | Every release re-runs the bundled benchmark on reference hardware; regressions >10% block the release. Published numbers are always measured. |
-| **Security** | `#![forbid(unsafe_code)]`; fuzzed ingest surfaces; constant-time credential comparison; secure-by-default binds; documented threat model by 1.0. |
+| **Durability** | Acknowledgement means what the configured durability mode says and no more: `wal` (fsynced, default in production) or `flushed` from 1.0; quorum-durable from 2.0. Verified by kill -9 fault injection every release. |
+| **Performance** | Published numbers are measured on the specified reference environment, ≥5 runs, median with IQR. A release blocks on a >10% median regression that also exceeds that metric's run-to-run noise. |
+| **Security** | `#![forbid(unsafe_code)]`; fuzzed ingest surfaces; constant-time credential comparison; secure-by-default binds; documented threat model by 1.0. **Public API TLS** stays reverse-proxy territory until keep-alive lands, then is reconsidered on evidence; **cluster peer transport requires mutual TLS 1.3 from the first HA release** — these are separate contracts. |
+| **Dependencies** | An audited budget, not a slogan: every dependency (direct *and* transitive) is inventoried per release with license, MSRV, and justification. Additions require a written ADR. The HA phase will add a consensus library, async runtime, and TLS provider; that increase is planned, bounded, and must keep standalone builds dependency-minimal via feature flags. |
 | **Observability of Traza itself** | `/metrics`, structured logs, and a health endpoint by 1.0; cluster introspection by 2.0. |
-| **Dependencies** | Each new dependency needs a written justification in the PR; the count stays countable on one hand. |
 | **Documentation** | Every shipped surface documented in the same release; quickstart verified in CI against the built binary. |
 
 ## Explicit non-goals
 
-- **Not a general observability suite.** Traces and their analytics —
-  no metrics TSDB, no general log storage. (Full-text search over *trace
-  content* is in scope — Phase 3; indexing your application's log firehose
-  is not.) Correlate by trace-id with whatever owns those.
-- **No external coupling, ever.** No metadata database, no lock service,
-  no coordinator beside the binary — the constraint that distinguishes
-  Traza from otherwise-similar engines that lean on Postgres and Redis.
+- **Not a general observability suite.** Traces and their analytics — no
+  metrics TSDB, no general log storage. (Full-text search over *trace
+  content* is in scope; indexing an application log firehose is not.)
+- **No mandatory external control plane.** No metadata database, no lock
+  service, no coordinator required beside the binary — the constraint that
+  distinguishes Traza from otherwise-similar engines that lean on Postgres
+  and Redis. Optional data-plane tiers the operator already owns are a
+  different thing and are explicitly allowed.
 - **Not an eval model host.** Traza orchestrates eval loops and stores
   verdicts; it never runs or embeds judge models.
-- **Not a SQL engine.** The DSL stays small and purpose-built; teams who
-  need SQL can export or read segments directly (format documented).
-- **Not a framework SDK.** Instrumentation belongs to OTel and native
-  HTTP; Traza competes on the datastore, not on client libraries.
+- **Not a SQL engine.** The DSL stays small and purpose-built.
+- **Not a framework SDK.** Instrumentation belongs to OTel and native HTTP.
 
 ## Sequencing at a glance
 
 ```
-v0.14+   Phase 1 items land incrementally (keep-alive, gzip, metrics,
-         GenAI dialect, sampling/redaction, backup, release engineering)
-v1.0     Stability contract + Phase 1 acceptance gates met
-v1.x     Phase 2 (HA) + Phase 4 (agent depth) in parallel
+v0.14+   1.1 durability (WAL + ack contract) — first, everything rests on it
+         1.2 identity foundations (tenant key, tombstones, key versions,
+             eval entity model, tail sampling) — before any format freeze
+         1.3 product-thesis minimum (eval workflow + content search)
+         1.4 operability (keep-alive, metrics, backup, packaging)
+v1.0     Stability contract + §1.5 gates met on the specified reference
+         environment
+v1.x     Phase 2 in parallel: HA (2a) and agent-native depth (2b)
 v2.0     Replicated clusters GA; rolling upgrades
-v2.x     Phase 3 (columnar, object tier, partitioning) + Phase 5
-         (enterprise) as demand dictates
+v2.x     Phase 3 (columnar, inverted index, object tier, sharding), then
+         Phase 4 (enterprise control plane) as demand dictates
 ```
 
-The ordering principle: durability and honesty first (done), production
-single-node credibility second, availability third, scale and enterprise
-surface last — because each layer is only worth building on a trustworthy
-version of the previous one.
+The ordering principle: **durability, then identity, then the product
+thesis, then availability, then scale.** Durability first because every
+later guarantee inherits it. Identity second because keys and addressing
+cannot be retrofitted after a format freeze. The product thesis third
+because a datastore that stores agent traces without closing the eval loop
+is, by this document's own definition, someone else's substrate.
