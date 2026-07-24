@@ -18,6 +18,7 @@ pub mod seed;
 pub mod segment_v2;
 pub mod semconv;
 pub mod ui;
+mod wal;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -175,6 +176,48 @@ impl From<&Span> for SpanCursor {
     }
 }
 
+/// What an acknowledged write guarantees.
+///
+/// The mode is the store's contract with its clients, so it is chosen per
+/// deployment and reported rather than inferred. Ordering of strength:
+/// `Buffered` < `Wal` < `Flushed`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Durability {
+    /// Acknowledged means accepted in memory. A crash loses everything not
+    /// yet sealed into a segment. Fast, and **lossy by design** — appropriate
+    /// for laptops, CI, and benchmarks, not for production.
+    Buffered,
+    /// Acknowledged means fsynced to the write-ahead log and recoverable on
+    /// restart. The production default: durability without paying a segment
+    /// write per request, because group commit amortizes the fsync.
+    #[default]
+    Wal,
+    /// Acknowledged means present in a sealed segment. The strongest and
+    /// slowest mode — every ingest call seals a segment.
+    Flushed,
+}
+
+impl Durability {
+    /// Parses the wire/CLI name.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "buffered" => Some(Self::Buffered),
+            "wal" => Some(Self::Wal),
+            "flushed" => Some(Self::Flushed),
+            _ => None,
+        }
+    }
+
+    /// The wire/CLI name, as reported to clients.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Buffered => "buffered",
+            Self::Wal => "wal",
+            Self::Flushed => "flushed",
+        }
+    }
+}
+
 /// Storage configuration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
@@ -186,6 +229,10 @@ pub struct Config {
     /// the content-addressed payload store and replaced by a reference
     /// object (see [`payload`]). `None` disables offloading.
     pub payload_threshold: Option<usize>,
+    /// What an acknowledged ingest guarantees. Defaults to [`Durability::Wal`]:
+    /// a store that silently loses acknowledged writes is the wrong default,
+    /// even though it is the faster one.
+    pub durability: Durability,
 }
 
 impl Default for Config {
@@ -194,6 +241,7 @@ impl Default for Config {
             flush_spans: 10_000,
             ttl_seconds: None,
             payload_threshold: None,
+            durability: Durability::Wal,
         }
     }
 }
@@ -212,6 +260,11 @@ pub struct Stats {
     pub segment_count: usize,
     /// Total size of persisted segment files in bytes.
     pub disk_bytes: u64,
+    /// What an acknowledged write currently guarantees.
+    pub durability: Durability,
+    /// Bytes the write-ahead log holds, i.e. the work a restart would replay.
+    /// Zero in [`Durability::Buffered`], and immediately after a flush.
+    pub wal_bytes: u64,
 }
 
 /// Errors returned by storage operations.
@@ -568,6 +621,9 @@ pub struct Store {
     recent_payloads: payload::TouchRegistry,
     annotations: annotations::AnnotationLog,
     next_segment: AtomicU64,
+    /// Present unless durability is [`Durability::Buffered`]. Guards the gap
+    /// between acknowledging a write and sealing it into a segment.
+    wal: Option<wal::Wal>,
     _directory_lock: DirectoryLock,
 }
 
@@ -594,6 +650,22 @@ impl Store {
             recover_supersede_markers(&directory)?;
             let mut segments = load_segments(&directory)?;
             segments.sort_by(|left, right| left.path.cmp(&right.path));
+
+            // Replay BEFORE accepting new writes. Records are append-ordered
+            // and upserted in that order, so the newest version of a
+            // re-ingested key wins exactly as it did before the crash.
+            let mut buffer = WriteBuffer::default();
+            let wal = if config.durability == Durability::Buffered {
+                // A buffered store makes no durability promise, so it neither
+                // writes nor reads a log. An existing log is left untouched:
+                // restarting in wal mode must still recover it.
+                None
+            } else {
+                for span in wal::Wal::replay(&directory)? {
+                    buffer.upsert(span);
+                }
+                Some(wal::Wal::open(&directory)?)
+            };
             let next_segment = segments
                 .iter()
                 .filter_map(|segment| segment_number(&segment.path))
@@ -604,11 +676,12 @@ impl Store {
                 annotations: annotations::AnnotationLog::open(&directory)?,
                 directory,
                 config,
-                writer: Mutex::new(WriteBuffer::default()),
+                writer: Mutex::new(buffer),
                 segments: Mutex::new(segments),
                 rollups: Mutex::new(std::collections::HashMap::new()),
                 recent_payloads: payload::TouchRegistry::default(),
                 next_segment: AtomicU64::new(next_segment),
+                wal,
                 _directory_lock: directory_lock,
             })
         })();
@@ -623,13 +696,7 @@ impl Store {
         if let Some(threshold) = self.config.payload_threshold {
             payload::offload_span(&self.directory, &mut span, threshold, &self.recent_payloads)?;
         }
-        let mut writer = self.lock_writer()?;
-        writer.upsert(span);
-        if self.should_flush(writer.len()) {
-            let mut segments = self.lock_segments()?;
-            self.flush_locked(&mut writer, &mut segments)?;
-        }
-        Ok(())
+        self.admit(vec![span])
     }
 
     /// Adds a batch of spans, automatically flushing when the configured
@@ -649,15 +716,49 @@ impl Store {
             }
         }
 
-        let mut writer = self.lock_writer()?;
-        for span in spans {
-            writer.upsert(span);
+        self.admit(spans)
+    }
+
+    /// The acknowledgement path shared by both ingest surfaces.
+    ///
+    /// Ordering is the whole contract:
+    /// 1. append the batch to the log and upsert it into the buffer, both
+    ///    under the writer lock, so a concurrent flush cannot seal a buffer
+    ///    that disagrees with the log;
+    /// 2. release the lock;
+    /// 3. fsync, and only then return.
+    ///
+    /// The fsync deliberately happens OUTSIDE the lock: that is what lets
+    /// concurrent batches accumulate into one sync instead of serializing an
+    /// fsync per request. A crash before step 3 loses the batch, which is
+    /// correct — nothing was acknowledged yet.
+    fn admit(&self, spans: Vec<Span>) -> Result<()> {
+        let mut pending_commit = None;
+        {
+            let mut writer = self.lock_writer()?;
+            if let Some(log) = &self.wal {
+                pending_commit = Some(log.append(&spans)?);
+            }
+            for span in spans {
+                writer.upsert(span);
+            }
+            if self.should_flush(writer.len()) {
+                let mut segments = self.lock_segments()?;
+                // A sealed segment supersedes the log, so this also discards
+                // it and satisfies any commit still waiting on it.
+                self.flush_locked(&mut writer, &mut segments)?;
+                pending_commit = None;
+            }
         }
-        if self.should_flush(writer.len()) {
-            let mut segments = self.lock_segments()?;
-            self.flush_locked(&mut writer, &mut segments)?;
+        if let (Some(log), Some(lsn)) = (&self.wal, pending_commit) {
+            log.commit(lsn)?;
         }
         Ok(())
+    }
+
+    /// What an acknowledged ingest currently guarantees.
+    pub fn durability(&self) -> Durability {
+        self.config.durability
     }
 
     /// Returns the current number of spans buffered in memory.
@@ -1025,6 +1126,8 @@ impl Store {
             total_records: buffered_records.saturating_add(persisted_records),
             segment_count: segments.len(),
             disk_bytes,
+            durability: self.config.durability,
+            wal_bytes: self.wal.as_ref().map_or(0, wal::Wal::size_bytes),
         })
     }
 
@@ -1200,6 +1303,10 @@ impl Store {
     }
 
     fn should_flush(&self, buffered: usize) -> bool {
+        // `flushed` acknowledges only sealed spans, so every call seals.
+        if self.config.durability == Durability::Flushed {
+            return buffered > 0;
+        }
         self.config.flush_spans > 0 && buffered >= self.config.flush_spans
     }
 
@@ -1215,6 +1322,13 @@ impl Store {
         writer.clear();
         segments.push(segment);
         segments.sort_by(|left, right| left.path.cmp(&right.path));
+        // The segment is fsynced and renamed, so every log record it covers is
+        // superseded. Reclaim AFTER the segment lands: a crash in between
+        // simply replays records the segment already holds, which upsert
+        // resolves to the same state.
+        if let Some(log) = &self.wal {
+            log.reset()?;
+        }
         Ok(())
     }
 

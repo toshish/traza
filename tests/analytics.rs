@@ -61,8 +61,15 @@ fn plain_span(trace_id: &str, span_id: &str, service: &str, start_ns: u64, statu
 #[test]
 fn sessions_aggregate_across_buffer_segments_and_reopen() {
     let dir = test_dir("sessions");
+    // Pinned to `buffered`: this test documents the LOSSY contract, where an
+    // unflushed span is volatile. The recoverable default is covered below
+    // and, end to end through SIGKILL, in tests/durability.rs.
+    let buffered = Config {
+        durability: traza::Durability::Buffered,
+        ..Config::default()
+    };
     {
-        let store = Store::open(&dir, Config::default()).expect("opens");
+        let store = Store::open(&dir, buffered.clone()).expect("opens");
         // Session A: two traces, one persisted and one buffered.
         store
             .ingest(llm_span(
@@ -107,7 +114,7 @@ fn sessions_aggregate_across_buffer_segments_and_reopen() {
     // A cold reopen rebuilds rollups from what was DURABLE: only the sealed
     // segment's two sess-a spans survive (buffered spans are volatile until
     // flush, by design).
-    let store = Store::open(&dir, Config::default()).expect("reopens");
+    let store = Store::open(&dir, buffered).expect("reopens");
     let sessions = store.sessions(None, None, 10).expect("lists after reopen");
     assert_eq!(
         sessions.len(),
@@ -117,6 +124,42 @@ fn sessions_aggregate_across_buffer_segments_and_reopen() {
     assert_eq!(sessions[0].session_id, "sess-a");
     assert_eq!(sessions[0].span_count, 2);
     assert_eq!(sessions[0].total_tokens, 450);
+}
+
+#[test]
+fn the_default_mode_recovers_unflushed_sessions_across_reopen() {
+    // The same shape as the test above, under the DEFAULT durability: what was
+    // volatile in `buffered` is recovered from the log, so a session is whole
+    // after a restart even though it was never flushed.
+    let dir = test_dir("sessions-wal");
+    {
+        let store = Store::open(&dir, Config::default()).expect("opens");
+        store
+            .ingest(llm_span(
+                "t1", "s1", "sess-a", "m-fast", 1_000, 100, 50, 0.01,
+            ))
+            .expect("ingests");
+        store
+            .ingest(llm_span(
+                "t1", "s2", "sess-a", "m-smart", 2_000, 200, 100, 0.20,
+            ))
+            .expect("ingests");
+        store.flush().expect("seals the first segment");
+        // Acknowledged but never flushed: only the log protects these.
+        store
+            .ingest(llm_span(
+                "t2", "s1", "sess-a", "m-fast", 3_000, 10, 5, 0.001,
+            ))
+            .expect("ingests");
+    }
+    let store = Store::open(&dir, Config::default()).expect("reopens");
+    let sessions = store.sessions(None, None, 10).expect("lists after reopen");
+    assert_eq!(sessions.len(), 1, "{sessions:?}");
+    let recovered = &sessions[0];
+    assert_eq!(recovered.session_id, "sess-a");
+    assert_eq!(recovered.span_count, 3, "the unflushed span is recovered");
+    assert_eq!(recovered.trace_count, 2);
+    assert_eq!(recovered.total_tokens, 465, "its tokens count again");
 }
 
 #[test]
@@ -321,6 +364,7 @@ fn rollup_cache_survives_compaction_supersede() {
             flush_spans: 10_000,
             ttl_seconds: Some(1),
             payload_threshold: None,
+            durability: traza::Durability::Buffered,
         },
     )
     .expect("opens");
