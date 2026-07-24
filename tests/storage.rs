@@ -6,7 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
-use traza::{Config, Error, Span, SpanFilter, Store};
+use traza::{Config, Error, Span, SpanCursor, SpanFilter, Store};
 
 static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
 
@@ -842,6 +842,70 @@ fn span_identity_is_a_primary_key() {
         .expect("query");
     assert_eq!(filtered.len(), 1, "queries also see exactly one version");
     assert_eq!(filtered[0].status, "third");
+}
+
+#[test]
+fn full_key_cursor_pages_equal_timestamps_with_a_constant_limit() {
+    let dir = correctness_test_dir("full-key-cursor");
+    let store = Store::open(&dir, Config::default()).expect("opens");
+    for index in 0..5_000 {
+        store
+            .ingest(span(
+                &format!("trace-{index:05}"),
+                "span".to_owned(),
+                42_000,
+                1_000,
+            ))
+            .expect("ingests");
+        if index == 2_499 {
+            store.flush().expect("flushes first half");
+        }
+    }
+    store.flush().expect("flushes second half");
+
+    let filter = SpanFilter {
+        service: Some("test-service".into()),
+        limit: Some(257),
+        ..SpanFilter::default()
+    };
+    let mut cursor: Option<SpanCursor> = None;
+    let mut ids = Vec::new();
+    loop {
+        let page = store
+            .query_after(&filter, cursor.as_ref())
+            .expect("queries page");
+        assert!(page.len() <= 257, "page bound is invariant");
+        if page.is_empty() {
+            break;
+        }
+        ids.extend(page.iter().map(|item| item.trace_id.clone()));
+        cursor = page.last().map(SpanCursor::from);
+    }
+    assert_eq!(ids.len(), 5_000);
+    assert!(
+        ids.windows(2).all(|pair| pair[0] < pair[1]),
+        "cursor preserves the complete total order"
+    );
+}
+
+#[test]
+fn stats_name_physical_records_explicitly() {
+    let dir = correctness_test_dir("physical-stats");
+    let store = Store::open(&dir, Config::default()).expect("opens");
+    store
+        .ingest(span("trace", "span".into(), 1_000, 10))
+        .expect("v1");
+    store.flush().expect("flushes v1");
+    store
+        .ingest(span("trace", "span".into(), 2_000, 10))
+        .expect("v2");
+    store.flush().expect("flushes v2");
+
+    assert_eq!(store.query(&SpanFilter::default()).unwrap().len(), 1);
+    let stats = store.stats().expect("stats");
+    assert_eq!(stats.persisted_records, 2);
+    assert_eq!(stats.total_records, 2);
+    assert_eq!(stats.buffered_records, 0);
 }
 
 #[test]

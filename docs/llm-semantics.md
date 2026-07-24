@@ -72,8 +72,9 @@ Tool-call frequency for one tool:
 
     GET /v1/spans?name=llm.tool_call&attr.llm.tool_name=web_search
 
-Cost and token totals are client-side sums over these result sets (the API
-returns the spans; aggregation endpoints are out of scope today).
+`GET /v1/stats/llm` provides server-side cost and token totals grouped by
+model, service, session, or UTC day. Integer counters saturate at `u64::MAX`
+rather than wrapping, and non-finite cost strings are ignored.
 
 ## Payloads and annotations
 
@@ -83,7 +84,9 @@ offloaded at ingest: the event attribute keeps a
 `GET /v1/payloads/{ref}` serves the bytes. Content addressing stores a
 repeated system prompt once. Post-hoc judgment — eval scores, human
 feedback — attaches via `POST /v1/annotations` without mutating spans, and
-`GET /v1/export` turns any span filter into an NDJSON dataset.
+`GET /v1/export` turns any span filter into a chunked NDJSON dataset. Export
+clients must verify the terminal `X-Traza-Export-Complete: true` trailer and
+may cross-check `X-Traza-Export-Count`.
 
 ## Span links
 

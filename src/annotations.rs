@@ -9,8 +9,8 @@
 //! entries older than the retention window.
 
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -66,14 +66,19 @@ impl AnnotationLog {
         let path = directory.join(LOG_NAME);
         let mut inner = Inner::default();
         if path.exists() {
-            let reader = BufReader::new(File::open(&path)?);
-            for line in reader.lines() {
-                let line = line?;
-                if line.trim().is_empty() {
+            let contents = fs::read(&path)?;
+            let terminated = contents.ends_with(b"\n");
+            let mut lines = contents.split_inclusive(|byte| *byte == b'\n').peekable();
+            let mut valid_len = 0_u64;
+            let mut truncated_torn_tail = false;
+            while let Some(line) = lines.next() {
+                if line.iter().all(|byte| byte.is_ascii_whitespace()) {
+                    valid_len = valid_len.saturating_add(line.len() as u64);
                     continue;
                 }
-                match serde_json::from_str::<Annotation>(&line) {
+                match serde_json::from_slice::<Annotation>(line) {
                     Ok(annotation) => {
+                        valid_len = valid_len.saturating_add(line.len() as u64);
                         inner.count += 1;
                         inner
                             .by_trace
@@ -81,8 +86,30 @@ impl AnnotationLog {
                             .or_default()
                             .push(annotation);
                     }
-                    Err(_) => break, // torn tail: everything before it stands
+                    // A crash can leave only the final append unterminated.
+                    // A malformed newline-terminated record, or any malformed
+                    // record before a later one, is real corruption: failing
+                    // loudly prevents a valid suffix from disappearing.
+                    Err(_) if lines.peek().is_none() && !terminated => {
+                        // Heal the torn append before accepting new writes;
+                        // otherwise the next valid JSON object would be
+                        // concatenated onto this partial line.
+                        let file = OpenOptions::new().write(true).open(&path)?;
+                        file.set_len(valid_len)?;
+                        file.sync_all()?;
+                        truncated_torn_tail = true;
+                        break;
+                    }
+                    Err(error) => return Err(error.into()),
                 }
+            }
+            if !contents.is_empty() && !terminated && !truncated_torn_tail {
+                // A complete JSON object whose newline was the only torn byte
+                // is valid. Restore the delimiter so the next append cannot
+                // concatenate another object onto it.
+                let mut file = OpenOptions::new().append(true).open(&path)?;
+                file.write_all(b"\n")?;
+                file.sync_all()?;
             }
         }
         Ok(Self {
@@ -105,12 +132,18 @@ impl AnnotationLog {
             .map_err(|_| Error::LockPoisoned("annotations"))?;
         let mut line = serde_json::to_string(&annotation)?;
         line.push('\n');
+        let created = !self.path.exists();
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.path)?;
         file.write_all(line.as_bytes())?;
         file.sync_all()?;
+        if created {
+            if let Some(directory) = self.path.parent() {
+                crate::sync_directory(directory)?;
+            }
+        }
         inner.count += 1;
         inner
             .by_trace
@@ -177,6 +210,9 @@ impl AnnotationLog {
             file.sync_all()?;
         }
         std::fs::rename(&temp, &self.path)?;
+        if let Some(directory) = self.path.parent() {
+            crate::sync_directory(directory)?;
+        }
         inner.by_trace.clear();
         inner.count = kept.len();
         for annotation in kept {

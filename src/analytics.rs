@@ -153,9 +153,9 @@ struct Counters {
 
 impl Counters {
     fn absorb(&mut self, span: &Span) {
-        self.spans += 1;
+        self.spans = self.spans.saturating_add(1);
         if span.status == "error" {
-            self.errors += 1;
+            self.errors = self.errors.saturating_add(1);
         }
         let prompt = attr_u64(&span.attributes, ATTR_PROMPT_TOKENS);
         let completion = attr_u64(&span.attributes, ATTR_COMPLETION_TOKENS);
@@ -166,25 +166,43 @@ impl Counters {
             || completion.is_some()
             || explicit_total.is_some();
         if is_llm {
-            self.llm_calls += 1;
-            self.llm_duration_ns += span.end_time_ns.saturating_sub(span.start_time_ns);
+            self.llm_calls = self.llm_calls.saturating_add(1);
+            self.llm_duration_ns = self
+                .llm_duration_ns
+                .saturating_add(span.end_time_ns.saturating_sub(span.start_time_ns));
         }
-        self.prompt_tokens += prompt.unwrap_or(0);
-        self.completion_tokens += completion.unwrap_or(0);
-        self.total_tokens +=
-            explicit_total.unwrap_or(prompt.unwrap_or(0) + completion.unwrap_or(0));
-        self.cost_usd += cost.unwrap_or(0.0);
+        self.prompt_tokens = self.prompt_tokens.saturating_add(prompt.unwrap_or(0));
+        self.completion_tokens = self
+            .completion_tokens
+            .saturating_add(completion.unwrap_or(0));
+        let total = explicit_total
+            .unwrap_or_else(|| prompt.unwrap_or(0).saturating_add(completion.unwrap_or(0)));
+        self.total_tokens = self.total_tokens.saturating_add(total);
+        self.cost_usd = finite_saturating_add(self.cost_usd, cost.unwrap_or(0.0));
     }
 
     fn merge(&mut self, other: &Counters) {
-        self.spans += other.spans;
-        self.llm_calls += other.llm_calls;
-        self.prompt_tokens += other.prompt_tokens;
-        self.completion_tokens += other.completion_tokens;
-        self.total_tokens += other.total_tokens;
-        self.cost_usd += other.cost_usd;
-        self.errors += other.errors;
-        self.llm_duration_ns += other.llm_duration_ns;
+        self.spans = self.spans.saturating_add(other.spans);
+        self.llm_calls = self.llm_calls.saturating_add(other.llm_calls);
+        self.prompt_tokens = self.prompt_tokens.saturating_add(other.prompt_tokens);
+        self.completion_tokens = self
+            .completion_tokens
+            .saturating_add(other.completion_tokens);
+        self.total_tokens = self.total_tokens.saturating_add(other.total_tokens);
+        self.cost_usd = finite_saturating_add(self.cost_usd, other.cost_usd);
+        self.errors = self.errors.saturating_add(other.errors);
+        self.llm_duration_ns = self.llm_duration_ns.saturating_add(other.llm_duration_ns);
+    }
+}
+
+fn finite_saturating_add(left: f64, right: f64) -> f64 {
+    let total = left + right;
+    if total.is_finite() {
+        total
+    } else if total.is_sign_negative() {
+        f64::MIN
+    } else {
+        f64::MAX
     }
 }
 
@@ -339,11 +357,12 @@ fn attr_u64(attributes: &Map<String, Value>, key: &str) -> Option<u64> {
 }
 
 fn attr_f64(attributes: &Map<String, Value>, key: &str) -> Option<f64> {
-    match attributes.get(key)? {
+    let value = match attributes.get(key)? {
         Value::Number(number) => number.as_f64(),
         Value::String(text) => text.trim().parse().ok(),
         _ => None,
-    }
+    };
+    value.filter(|number| number.is_finite())
 }
 
 /// UTC calendar day (YYYY-MM-DD) of a nanosecond timestamp, dependency-free

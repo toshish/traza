@@ -9,15 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Limited queries now merge source heads by the engine's complete
-  `(start_time, end_time, trace_id, span_id)` order. Equal-timestamp spans
-  persisted in different segments can no longer appear in source order and
-  fall behind an export cursor; the cross-segment `z-trace`/`a-trace`
-  reproduction now exports both rows exactly once.
-- Payload sweeping now holds the touch-registry exclusion through each final
-  eligibility check and file deletion. A concurrent ingest therefore either
-  registers before the sweep and protects the payload, or waits for deletion
-  and recreates the content-addressed file before committing its span.
+- Export pagination now uses the engine's exclusive full-key
+  `(start_time, end_time, trace_id, span_id)` cursor with a fixed 4,096-row
+  page. Equal-timestamp runs no longer trigger exponential prefix re-fetches
+  or corpus-sized pages, and bounded queries borrow resident posting lists
+  instead of cloning them per page.
+- Export responses use HTTP chunked framing with explicit
+  `X-Traza-Export-Complete` and `X-Traza-Export-Count` trailers. A storage or
+  serialization failure after `200 OK` can no longer masquerade as a complete
+  dataset.
+- Annotation replay now tolerates only an unterminated final append. A
+  malformed newline-terminated middle record fails startup instead of
+  silently hiding every valid annotation after it; a torn tail is truncated
+  before new appends, a missing final delimiter is restored, and annotation
+  creation/rewrite renames also fsync the parent directory.
+- LLM/session integer counters saturate instead of panicking in debug builds
+  or wrapping in release builds. Non-finite cost strings are ignored and
+  floating sums remain finite.
+- Payload sweeping holds the touch-registry lock only across each final
+  eligibility check and deletion. The ingest race remains excluded without a
+  large directory walk stalling every oversized-payload write.
+
+### Changed
+
+- `/v1/stats` and `Store::stats` now name their cheap physical storage counts
+  as `record_count` / `*_records`. Immutable historical versions remain
+  physical records until compaction even though last-write-wins queries expose
+  one logical span.
+- The server now binds `127.0.0.1` by default. Unauthenticated non-loopback
+  binds are refused unless the operator configures `TRAZA_TOKENS` or passes
+  `--allow-unauthenticated-non-loopback` explicitly.
+- Current documentation now matches the v2-only file-backed engine,
+  OTLP/HTTP protobuf support, v0.12 crate line, export integrity contract, and
+  safe bind defaults.
 
 ## [0.12.2] - 2026-07-23
 

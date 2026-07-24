@@ -106,6 +106,10 @@ curl 'http://localhost:8080/v1/export?service=support-agent&attr.llm.model=gpt-5
 ```
 
 Exports stream with bounded memory — an export larger than RAM is fine.
+Successful streams end with `X-Traza-Export-Complete: true` and
+`X-Traza-Export-Count` HTTP trailers. Programmatic clients must verify the
+completion trailer; a `false` value means the stream failed after its `200`
+response began.
 
 ## OpenTelemetry
 
@@ -133,13 +137,18 @@ export OTEL_EXPORTER_OTLP_COMPRESSION=none
 | `POST` | `/v1/annotations` | Attach a score/feedback record to a span or trace |
 | `GET` | `/v1/annotations?trace_id=&span_id=&name=` | Query annotations |
 | `GET` | `/v1/payloads/sha256/{hex}` | Raw bytes of an offloaded payload |
-| `GET` | `/v1/export?…` | Streaming NDJSON export (same filters as `/v1/spans`) |
-| `GET` | `/v1/stats` | Span count, segment count, bytes on disk |
+| `GET` | `/v1/export?…` | Chunked NDJSON export with completion/count trailers |
+| `GET` | `/v1/stats` | Physical record count, segment count, bytes on disk |
 | `POST` | `/v1/flush` | Force buffered spans into a durable segment |
 
 Search filters (ANDed; URL-encoded): `service` and `name` (exact match), `attr.KEY` (exact attribute match — bare values match strings, JSON literals match typed values; repeatable), `min_duration_ms`, `since`/`until` (Unix nanoseconds, inclusive), `limit` (default 100 on `/v1/spans`; exports are unbounded by default).
 
 Timestamps are integer Unix nanoseconds; `start_time_unix_nano` and the aliases `start_timestamp_ns`, `start_ns`, `start_time` are accepted (same for `end_*`). Unknown fields on a span are stored and returned verbatim. Invalid JSON is `400`; bodies are capped at 64 MiB; `503` means retry with backoff.
+
+`/v1/stats` counts physical records, including immutable historical versions
+that last-write-wins reads hide until compaction. Its response includes
+`record_count`, `buffered_records`, `persisted_records`, `segment_count`, and
+`bytes_on_disk`.
 
 ## Operating Traza
 
@@ -150,7 +159,7 @@ TRAZA_TOKENS="rw:$(openssl rand -hex 16),ro:$(openssl rand -hex 16)" \
   traza-server --data-dir ./data
 ```
 
-Missing or unknown tokens get 401 with a `WWW-Authenticate: Bearer` challenge; insufficient scope gets 403. Comparison is constant-time; an invalid `TRAZA_TOKENS` refuses startup rather than silently running open. Unset means open, for local development. The dashboard shell itself stays open (it carries no data) and prompts for a token on the first 401, holding it in `sessionStorage` only. TLS is reverse-proxy territory.
+Missing or unknown tokens get 401 with a `WWW-Authenticate: Bearer` challenge; insufficient scope gets 403. Comparison is constant-time; an invalid `TRAZA_TOKENS` refuses startup rather than silently running open. Without tokens, Traza permits loopback binds only; a non-loopback `--host` requires `TRAZA_TOKENS` or the explicit `--allow-unauthenticated-non-loopback` escape hatch. The dashboard shell itself stays open (it carries no data) and prompts for a token on the first 401, holding it in `sessionStorage` only. TLS is reverse-proxy territory.
 
 **Retention.** `--ttl-seconds N` keeps a rolling window: a background pass compacts expired spans every minute, and annotations and payload files age out on the same window. Off by default — nothing is deleted unless you ask.
 
@@ -165,11 +174,12 @@ Missing or unknown tokens get 401 with a `WWW-Authenticate: Bearer` challenge; i
 | Flag | Default | Description |
 |---|---|---|
 | `--data-dir DIR` | `./data` | Directory for all state; created if missing |
-| `--host ADDR` / `--port PORT` | `0.0.0.0` / `8080` | Bind address and port |
+| `--host ADDR` / `--port PORT` | `127.0.0.1` / `8080` | Bind address and port |
 | `--workers N` | CPUs (min 4) | HTTP worker threads |
 | `--ttl-seconds N` | off | Rolling retention window |
 | `--flush-spans N` | `10000` | Buffered spans that trigger a durable flush |
 | `--payload-threshold-bytes N` | `262144` | Offload threshold for large string values; `0` disables |
+| `--allow-unauthenticated-non-loopback` | off | Explicitly allow an unsafe non-loopback bind without tokens |
 
 ## Performance
 
@@ -202,7 +212,7 @@ let slow = store.query(&SpanFilter {
 
 Two layers with one contract: never lose a completed write, never serve a torn one.
 
-The **storage engine** buffers spans in memory and flushes sorted, immutable segment files — JSON payloads with embedded record-offset, trace, and attribute indexes — via write-temp, fsync, atomic rename. Opening a store parses only the indexes; spans materialize on demand. Filters narrow candidates through the indexes, then re-verify every predicate against the parsed span: an index accelerates a filter, it never changes its semantics.
+The **storage engine** buffers spans in memory and flushes sorted, immutable v2 segment files — JSON payloads with embedded record-offset, trace, and attribute indexes — via write-temp, fsync, atomic rename. Opening a store parses only the indexes; spans materialize on demand. Legacy v1 JSONL segments fail startup with a migration pointer rather than being silently misread. Filters narrow candidates through the indexes, then re-verify every predicate against the parsed span: an index accelerates a filter, it never changes its semantics.
 
 The **HTTP server** is a deliberately small HTTP/1.1 implementation on `std::net` — a bounded worker pool in front of the engine, which is its only datastore. There is no server-side log or side index; restart durability is the engine's.
 
@@ -216,6 +226,7 @@ The destination is bigger than one node. Traza is being built toward large-scale
 
 - **High availability** — quorum-replicated ingest and failover across nodes. The decision-ready design is in [docs/ha-design.md](docs/ha-design.md) (replicated logical log, segment shipping for catch-up); implementation is the next major arc.
 - **Filter throughput at scale** — posting-list intersection for large *unlimited* result sets (limited queries already decode only what they return).
+- **Streaming interactive searches** — exports are chunked today; `/v1/spans` still returns one bounded JSON response.
 
 Deliberately out of scope: TLS termination (front it with a reverse proxy), gRPC (use `http/protobuf`), and a query DSL (filters stay URL parameters).
 

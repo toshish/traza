@@ -129,10 +129,10 @@ impl AuthConfig {
     /// scopes are `ro` and `rw`; tokens must be nonempty and unique. Parsing
     /// errors deliberately identify only the configuration defect, never the
     /// offending value.
-    /// Reads `TRAZA_TOKENS`; `Ok(None)` when unset — auth disabled (the
-    /// open development default). A SET but invalid value is a hard error:
-    /// silently running open when the operator tried to configure auth
-    /// would be the worst failure mode.
+    /// Reads `TRAZA_TOKENS`; `Ok(None)` when unset. The server permits that
+    /// mode on loopback by default and separately guards non-loopback binds.
+    /// A SET but invalid value is a hard error: silently running open when the
+    /// operator tried to configure auth would be the worst failure mode.
     pub fn from_env() -> Result<Option<Self>, ConfigError> {
         match env::var(AUTH_ENV) {
             Err(_) => Ok(None),
@@ -140,7 +140,7 @@ impl AuthConfig {
         }
     }
 
-    /// Parses a TRAZA_TOKENS value (`token:scope`, comma-separated).
+    /// Parses a TRAZA_TOKENS value (`scope:token`, comma-separated).
     pub fn parse(raw: &str) -> Result<Self, ConfigError> {
         if raw.is_empty() {
             return Err(ConfigError::new("TRAZA_TOKENS must not be empty"));

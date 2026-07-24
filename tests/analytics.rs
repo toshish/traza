@@ -284,6 +284,34 @@ fn numeric_strings_and_explicit_totals_are_honored() {
 }
 
 #[test]
+fn aggregate_overflow_saturates_and_non_finite_cost_is_ignored() {
+    let dir = test_dir("overflow");
+    let store = Store::open(&dir, Config::default()).expect("opens");
+    for index in 0..2 {
+        let mut span = llm_span(
+            &format!("trace-{index}"),
+            "span",
+            "session",
+            "model",
+            index,
+            0,
+            0,
+            0.0,
+        );
+        span.attributes
+            .insert("llm.total_tokens".into(), json!(u64::MAX));
+        span.attributes.insert("llm.cost_usd".into(), json!("NaN"));
+        store.ingest(span).expect("ingests");
+    }
+
+    let rows = store
+        .llm_aggregate(LlmGroupBy::Model, None, None)
+        .expect("aggregates without panic");
+    assert_eq!(rows[0].total_tokens, u64::MAX, "counter saturates");
+    assert_eq!(rows[0].cost_usd, 0.0, "non-finite cost is ignored");
+}
+
+#[test]
 fn rollup_cache_survives_compaction_supersede() {
     // Expiring a segment must not leave its rollup haunting the answers.
     let dir = test_dir("supersede");

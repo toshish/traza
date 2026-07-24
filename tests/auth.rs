@@ -1,5 +1,5 @@
-//! Bearer-auth matrix, process-level: open by default; with TRAZA_TOKENS,
-//! 401/403/200 behavior across ingest, OTLP, and flush endpoints.
+//! Bearer-auth matrix, process-level: loopback is open by default; with
+//! TRAZA_TOKENS, 401/403/200 behavior across ingest, OTLP, and flush endpoints.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -76,7 +76,17 @@ impl Server {
             stream.write_all(&bytes).expect("body");
         }
         let mut response = Vec::new();
-        stream.read_to_end(&mut response).expect("reads");
+        if let Err(error) = stream.read_to_end(&mut response) {
+            // Auth is intentionally decided from headers before the body is
+            // buffered. Some TCP stacks report the close as ECONNRESET when
+            // the server rejects a request with unread body bytes, even after
+            // delivering the complete HTTP response.
+            assert!(
+                error.kind() == std::io::ErrorKind::ConnectionReset
+                    && complete_http_response(&response),
+                "reads: {error}"
+            );
+        }
         let text = String::from_utf8_lossy(&response).into_owned();
         let status = text
             .split_whitespace()
@@ -95,6 +105,24 @@ impl Server {
     fn kill(self) {
         drop(self);
     }
+}
+
+fn complete_http_response(response: &[u8]) -> bool {
+    let Some(header_end) = response.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
+        return false;
+    };
+    let Ok(head) = std::str::from_utf8(&response[..header_end]) else {
+        return false;
+    };
+    let Some(content_length) = head.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse::<usize>().ok())
+            .flatten()
+    }) else {
+        return false;
+    };
+    response.len() >= header_end + 4 + content_length
 }
 
 // A panicking test must never leak its server child: cargo waits on the
@@ -200,5 +228,30 @@ fn invalid_token_config_refuses_startup() {
     assert!(
         stderr.contains("auth"),
         "startup error names auth: {stderr}"
+    );
+}
+
+#[test]
+fn unauthenticated_non_loopback_bind_requires_explicit_opt_in() {
+    let dir = test_dir("unsafe-bind");
+    let output = Command::new(env!("CARGO_BIN_EXE_traza-server"))
+        .arg("--data-dir")
+        .arg(&dir)
+        .arg("--host")
+        .arg("0.0.0.0")
+        .arg("--port")
+        .arg("0")
+        .env_remove("TRAZA_TOKENS")
+        .output()
+        .expect("runs");
+    assert!(!output.status.success(), "unsafe default must be refused");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("refusing unauthenticated non-loopback bind"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("--allow-unauthenticated-non-loopback"),
+        "error names the deliberate override: {stderr}"
     );
 }

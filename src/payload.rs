@@ -249,17 +249,12 @@ pub(crate) fn sweep_expired(
     live: &HashSet<String>,
     registry: &TouchRegistry,
 ) -> Result<usize> {
-    // Keep the registry locked through the final eligibility check AND file
-    // deletion. Snapshotting it here merely moved the race: an ingest could
-    // touch and commit an old deduplicated payload after that snapshot but
-    // before the directory walk reached its file. With this exclusion, an
-    // ingest that touched first is protected; one that arrives during the
-    // sweep waits, sees any deletion, and recreates the content-addressed
-    // file before committing its span.
-    let mut touched = registry
+    // Prune stale immunity entries briefly, then traverse without the
+    // registry lock: a large payload directory must not stall every ingest.
+    registry
         .lock()
-        .map_err(|_| Error::LockPoisoned("payload registry"))?;
-    touched.retain(|_, at| at.elapsed() < TOUCH_IMMUNITY);
+        .map_err(|_| Error::LockPoisoned("payload registry"))?
+        .retain(|_, at| at.elapsed() < TOUCH_IMMUNITY);
     let root = directory.join(PAYLOAD_DIR);
     if !root.exists() {
         return Ok(0);
@@ -280,10 +275,19 @@ pub(crate) fn sweep_expired(
                 .and_then(|stem| stem.to_str())
                 .map(|hash| format!("sha256/{hash}"))
                 .unwrap_or_default();
-            if modified < cutoff && !live.contains(&reference) && !touched.contains_key(&reference)
-            {
-                fs::remove_file(entry.path())?;
-                removed += 1;
+            if modified < cutoff && !live.contains(&reference) {
+                // Serialize only the final touch check and deletion with
+                // store_payload's pre-filesystem registration. If ingest
+                // touches first, this skips the file; if deletion wins,
+                // ingest observes the missing path and recreates it before
+                // committing its span.
+                let touched = registry
+                    .lock()
+                    .map_err(|_| Error::LockPoisoned("payload registry"))?;
+                if !touched.contains_key(&reference) {
+                    fs::remove_file(entry.path())?;
+                    removed += 1;
+                }
             }
         }
     }
