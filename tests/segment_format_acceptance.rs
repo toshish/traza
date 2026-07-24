@@ -102,7 +102,15 @@ fn independently_encoded_fixture() -> Vec<u8> {
 fn format_conformance() {
     let bytes = independently_encoded_fixture();
 
-    assert_eq!(&bytes[0..8], b"TRAZASEG", "v2 magic");
+    assert_eq!(&bytes[0..8], b"TRAZASEG", "magic");
+    // Pin the fixture's magic to the REAL constant, so the two can never
+    // silently disagree again — they once did (the code wrote TRAZAV2 while
+    // this fixture and the docs said TRAZASEG).
+    assert_eq!(
+        traza::segment::MAGIC,
+        *b"TRAZASEG",
+        "the real magic must match the documented format"
+    );
     assert_eq!(get_u16(&bytes, 8), 2, "format version");
     assert_eq!(get_u32(&bytes, 12), 80, "fixed header length");
     assert_eq!(get_u64(&bytes, 16), 1, "record count");
