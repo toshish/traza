@@ -117,35 +117,79 @@ export function sessionIdOf(span) {
   return null;
 }
 
+// A single message's rendered text is capped: sub-threshold prompts can still
+// be hundreds of KB, and pasting that into the DOM freezes the panel. The full
+// value is always available under Attributes / Offloaded payloads.
+const MAX_MESSAGE_CHARS = 4000;
+// Longer tool arguments/results are summarized rather than dumped.
+const MAX_PART_JSON = 400;
+
+function clip(text, limit) {
+  return text.length > limit ? text.slice(0, limit) + ' … (' + text.length + ' chars)' : text;
+}
+
+function bytesLabel(bytes) {
+  if (typeof bytes !== 'number' || !Number.isFinite(bytes)) return null;
+  if (bytes >= 1 << 20) return (bytes / (1 << 20)).toFixed(1) + ' MiB';
+  if (bytes >= 1 << 10) return (bytes / (1 << 10)).toFixed(1) + ' KiB';
+  return bytes + ' B';
+}
+
+// Renders one message part. Media parts (image/audio/video/document) are
+// described, never inlined: a base64 `data:` blob is megabytes of noise that
+// tells the reader nothing the descriptor does not.
+function describePart(part) {
+  if (part == null || typeof part !== 'object') return String(part ?? '');
+  if (isPayloadRef(part.content)) {
+    return '[offloaded ' + (bytesLabel(part.content.bytes) || '') + '] ' + (part.content.preview || '');
+  }
+  if (part.type === 'text' && typeof part.content === 'string') return part.content;
+  if (part.type === 'tool_call') {
+    return '[tool_call ' + (part.name || '') + ' ' + clip(JSON.stringify(part.arguments ?? {}), MAX_PART_JSON) + ']';
+  }
+  if (part.type === 'tool_call_response') {
+    return '[tool_result ' + clip(JSON.stringify(part.result ?? part.response ?? ''), MAX_PART_JSON) + ']';
+  }
+  // Media and unknown part types: a compact descriptor.
+  const bits = [part.type || 'part'];
+  if (part.mime_type) bits.push(part.mime_type);
+  if (part.filename) bits.push(part.filename);
+  const size = bytesLabel(part.size_bytes);
+  if (size) bits.push(size);
+  if (typeof part.uri === 'string') bits.push(part.uri);
+  else if (typeof part.data === 'string') bits.push('inline ' + part.data.length + ' chars');
+  else if (!part.type) return clip(JSON.stringify(part), MAX_PART_JSON);
+  return '[' + bits.join(' · ') + ']';
+}
+
 // Flattens one OTel GenAI message ({role, parts:[{type,content|...}]} or the
 // older {role, content}) to { role, content } where content is a string (or a
-// payload reference passed through untouched). Non-text parts (tool_call,
-// tool_call_response) are rendered compactly so nothing is silently dropped.
+// payload reference passed through untouched).
 function flattenGenAiMessage(message, direction) {
   if (message == null || typeof message !== 'object') {
     return { direction, role: undefined, content: message };
   }
   const role = message.role;
   if (isPayloadRef(message.content)) return { direction, role, content: message.content };
-  if (typeof message.content === 'string') return { direction, role, content: message.content };
+  if (typeof message.content === 'string') {
+    return { direction, role, content: clip(message.content, MAX_MESSAGE_CHARS) };
+  }
   const parts = Array.isArray(message.parts) ? message.parts : null;
-  if (!parts) return { direction, role, content: JSON.stringify(message) };
-  const text = parts.map((p) => {
-    if (p == null || typeof p !== 'object') return String(p ?? '');
-    if (p.type === 'text' && typeof p.content === 'string') return p.content;
-    if (p.type === 'tool_call') return '[tool_call ' + (p.name || '') + ' ' + JSON.stringify(p.arguments ?? {}) + ']';
-    if (p.type === 'tool_call_response') return '[tool_result ' + JSON.stringify(p.result ?? p.response ?? '') + ']';
-    return JSON.stringify(p);
-  }).join('\n');
-  return { direction, role, content: text };
+  if (!parts) return { direction, role, content: clip(JSON.stringify(message), MAX_MESSAGE_CHARS) };
+  const text = parts.map(describePart).join('\n');
+  return { direction, role, content: clip(text, MAX_MESSAGE_CHARS) };
 }
 
 // Parses a gen_ai.{input,output}.messages attribute, which OpenLLMetry emits
-// JSON-encoded (a string) but native ingest may carry as an array.
+// JSON-encoded (a string) but native ingest may carry as an array. A whole
+// attribute past the offload threshold arrives as a {$payload} reference —
+// surface it (preview + byte count) instead of silently rendering nothing.
 function parseMessagesAttr(value, direction) {
+  if (value == null) return [];
+  if (isPayloadRef(value)) return [{ direction, role: undefined, content: value }];
   let arr = value;
   if (typeof value === 'string') {
-    try { arr = JSON.parse(value); } catch (e) { return [{ direction, role: undefined, content: value }]; }
+    try { arr = JSON.parse(value); } catch (e) { return [{ direction, role: undefined, content: clip(value, MAX_MESSAGE_CHARS) }]; }
   }
   if (!Array.isArray(arr)) return [];
   return arr.map((m) => flattenGenAiMessage(m, direction));

@@ -13,6 +13,7 @@ pub mod expiration;
 pub mod otlp;
 pub mod otlp_pb;
 pub mod payload;
+pub mod seed;
 pub mod segment_v2;
 pub mod semconv;
 pub mod ui;
