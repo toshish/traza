@@ -5,59 +5,10 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.0] - 2026-07-24
 
-### Fixed
-- Session resolution now resolves every recognized key under ONE snapshot of
-  the write buffer and segment list. Querying each key separately let a span
-  re-ingested between the queries be seen first in its superseded version,
-  which then locked the newer version out — breaking last-write-wins during
-  ordinary concurrent ingest.
-- A numeric session id (`"gen_ai.conversation.id": 4711`) can now be opened,
-  not just listed. Normalization stringifies numeric attributes, but the
-  lookup matched only JSON strings, so such a session appeared in
-  `/v1/sessions` while `/v1/sessions/4711` returned 404 and
-  `/v1/spans?session=4711` returned nothing.
-- The server finds a packaged dashboard: with no `--ui-dir` it searches
-  `$TRAZA_UI_DIR`, `<binary dir>/ui`, `<binary dir>/../share/traza/ui`, then
-  `./ui/dist`, and lists every path it tried when none has a build. A
-  CWD-relative default alone meant an installed binary served nothing unless
-  it was launched from a checkout.
-- The conversation view pages through long sessions and says when it is
-  showing a prefix. Spans come back oldest-first, so a fixed cap silently
-  dropped the newest turns while presenting the result as complete.
-- `ui/src/views/ConversationView.jsx` no longer contains a literal NUL byte,
-  which made git treat the file as binary and hid it from diff and blame.
-
-### Changed
-- `ci.sh` is the merge bar for the whole tree: it now builds and tests the
-  dashboard (`npm ci`, `npm test`, `npm run build`, Node per `ui/.nvmrc`) and
-  rejects source files containing a NUL byte. Rust tooling cannot police the
-  UI, and a broken Vite build must not merge green. `TRAZA_SKIP_UI=1` runs the
-  Rust half alone.
-- The dashboard has unit tests (`ui/`, vitest): message parsing, content-type
-  detection, the markdown subset, and the syntax tokenizer — including that
-  highlighting round-trips to the exact source and never linkifies a
-  `javascript:` URL.
-
-## [Unreleased]
-
-### Changed
-
-- The dashboard is no longer compiled into `traza-server`. The server now
-  serves the UI's build output from disk: `--ui-dir` (default `./ui/dist`,
-  produced by `cd ui && npm run build`) backs `GET /` and `GET /dashboard`.
-  Building the server still needs no Node toolchain, a rebuilt UI is picked up
-  without restarting, and a missing build is not fatal — the API runs and the
-  UI routes 404 with build instructions. The shell stays served before the auth
-  gate (it is static build output carrying no data) while every `/v1` call it
-  makes remains gated. Path traversal out of the UI directory is refused.
-
-### Removed
-
-- The checked-in generated `src/dashboard.html` and the `ui/scripts/embed.mjs`
-  script that produced it, along with `src/dashboard.rs`. UI builds no longer
-  regenerate an embedded HTML file, so `ui/` changes no longer produce a
-  368 KB diff in the Rust crate.
+OpenLLMetry-native tracing, a standalone dashboard served from its build
+output, and a trace browser that renders what agents actually produce.
 
 ### Added
 
@@ -84,16 +35,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as well as the legacy indexed `gen_ai.prompt.*` / `gen_ai.completion.*`
   attributes and native `llm.prompt` / `llm.completion` events.
 
+### Changed
+
+- The dashboard is no longer compiled into `traza-server`. The server now
+  serves the UI's build output from disk: `--ui-dir` (default `./ui/dist`,
+  produced by `cd ui && npm run build`) backs `GET /` and `GET /dashboard`.
+  Building the server still needs no Node toolchain, a rebuilt UI is picked up
+  without restarting, and a missing build is not fatal — the API runs and the
+  UI routes 404 with build instructions. The shell stays served before the auth
+  gate (it is static build output carrying no data) while every `/v1` call it
+  makes remains gated. Path traversal out of the UI directory is refused.
+
+
+- License is now Apache-2.0 only (previously dual MIT OR Apache-2.0).
+  `LICENSE-MIT` is removed and `LICENSE-APACHE` renamed to `LICENSE`.
+
+- `ci.sh` is the merge bar for the whole tree: it now builds and tests the
+  dashboard (`npm ci`, `npm test`, `npm run build`, Node per `ui/.nvmrc`) and
+  rejects source files containing a NUL byte. Rust tooling cannot police the
+  UI, and a broken Vite build must not merge green. `TRAZA_SKIP_UI=1` runs the
+  Rust half alone.
+- The dashboard has unit tests (`ui/`, vitest): message parsing, content-type
+  detection, the markdown subset, and the syntax tokenizer — including that
+  highlighting round-trips to the exact source and never linkifies a
+  `javascript:` URL.
+
+### Fixed
+
+- Session resolution now resolves every recognized key under ONE snapshot of
+  the write buffer and segment list. Querying each key separately let a span
+  re-ingested between the queries be seen first in its superseded version,
+  which then locked the newer version out — breaking last-write-wins during
+  ordinary concurrent ingest.
+- A numeric session id (`"gen_ai.conversation.id": 4711`) can now be opened,
+  not just listed. Normalization stringifies numeric attributes, but the
+  lookup matched only JSON strings, so such a session appeared in
+  `/v1/sessions` while `/v1/sessions/4711` returned 404 and
+  `/v1/spans?session=4711` returned nothing.
+- The server finds a packaged dashboard: with no `--ui-dir` it searches
+  `$TRAZA_UI_DIR`, `<binary dir>/ui`, `<binary dir>/../share/traza/ui`, then
+  `./ui/dist`, and lists every path it tried when none has a build. A
+  CWD-relative default alone meant an installed binary served nothing unless
+  it was launched from a checkout.
+- The conversation view pages through long sessions and says when it is
+  showing a prefix. Spans come back oldest-first, so a fixed cap silently
+  dropped the newest turns while presenting the result as complete.
+- `ui/src/views/ConversationView.jsx` no longer contains a literal NUL byte,
+  which made git treat the file as binary and hid it from diff and blame.
+
+### Removed
+
+- The checked-in generated `src/dashboard.html` and the `ui/scripts/embed.mjs`
+  script that produced it, along with `src/dashboard.rs`. UI builds no longer
+  regenerate an embedded HTML file, so `ui/` changes no longer produce a
+  368 KB diff in the Rust crate.
+
 ### Notes
 
 - Cost analytics remain a Traza extension (`llm.cost_usd`), not part of
   OpenLLMetry — OpenTelemetry GenAI defines no cost attribute. Cost populates
   only when the ingest pipeline supplies it.
-
-### Changed
-
-- License is now Apache-2.0 only (previously dual MIT OR Apache-2.0).
-  `LICENSE-MIT` is removed and `LICENSE-APACHE` renamed to `LICENSE`.
 
 ## [0.13.0] - 2026-07-23
 
