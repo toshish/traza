@@ -106,6 +106,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Some(directory) => Some(Store::open(
             directory,
             Config {
+                // Seeding is a bulk load into a fresh store; the log would be
+                // pure overhead for data that is flushed at the end anyway.
+                durability: traza::Durability::Buffered,
                 flush_spans: 10_000,
                 ttl_seconds: None,
                 payload_threshold: (payload_threshold > 0).then_some(payload_threshold),

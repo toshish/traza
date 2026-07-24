@@ -5,6 +5,53 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.0] - 2026-07-24
+
+Durability: an acknowledged write now means what the deployment says it means.
+
+### Added
+
+- **Write-ahead log with group commit.** Ingest appends a batch to `wal.log`
+  and fsyncs it BEFORE acknowledging; the log is replayed into the write
+  buffer on open and reclaimed once a flush seals those spans into a segment.
+  The fsync runs outside the writer lock, so concurrent batches coalesce into
+  one sync instead of serializing an fsync per request — measured 13.7k
+  spans/s at concurrency 1 rising to 48.1k at 16, where per-batch fsync would
+  stay flat.
+- **Explicit durability modes**, selected with `--durability` and reported in
+  every ingest response and in `/v1/stats`, so a client never has to infer
+  what a `200` promised:
+  - `buffered` — accepted in memory; lossy by design, and no longer the
+    default.
+  - `wal` (**new default**) — fsynced to the log and recovered on restart.
+  - `flushed` — present in a sealed segment.
+- `/v1/stats` reports `durability` and `wal_bytes` (the work a restart would
+  replay).
+- `tests/durability.rs` holds each mode to its own claim under **SIGKILL**:
+  `wal` and `flushed` lose nothing acknowledged, `buffered` is verified to be
+  lossy rather than accidentally durable, recovery preserves last-write-wins
+  for a re-ingested span, the log is reclaimed after a flush without losing
+  data, and 800 spans acknowledged across 8 concurrent writers all survive.
+
+### Changed
+
+- `Config::default()` is now `Durability::Wal`. A store that silently loses
+  acknowledged writes is the wrong default even though it is the faster one.
+  `Config` gains a `durability` field, so code constructing it as a struct
+  literal must add one (or spread `..Config::default()`).
+- The benchmark measures the default (`wal`) and labels the mode, rather than
+  reporting a `buffered` number no production deployment could rely on.
+- `tests/auth.rs` no longer pins socket teardown to `ECONNRESET`; the
+  invariant is that a complete HTTP response arrived, and pinning the errno
+  made the test flaky under parallel load.
+
+### Notes
+
+- `fsync` on macOS does not flush the drive's write cache (`F_FULLFSYNC`
+  would, and std does not expose it), so a macOS power cut can still lose an
+  acknowledged write. Process death cannot, on any platform. Documented in
+  the README and `src/wal.rs` rather than left implied.
+
 ## [0.14.0] - 2026-07-24
 
 OpenLLMetry-native tracing, a standalone dashboard served from its build
