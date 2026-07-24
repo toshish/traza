@@ -1,25 +1,27 @@
 # Traza dashboard (ui/)
 
-The bundled trace browser: a React + Vite app built to the Traza design
-system (tokens and components imported from the "Traza Design System"
-project on claude.ai/design). The build compiles to **one self-contained
-HTML file** that is checked in as `../src/dashboard.html` and embedded in
-`traza-server` via `include_str!` — building the server itself needs no
-Node toolchain, and the one-binary rule holds.
+The trace browser: a React + Vite app built to the Traza design system
+(tokens and components imported from the "Traza Design System" project on
+claude.ai/design). It is a single-page app that talks to a `traza-server`
+JSON API.
+
+`npm run build` emits `dist/` — one self-contained `index.html` — and
+`traza-server` **serves that directory** (`--ui-dir`, default `./ui/dist`).
+Nothing is compiled into the binary: building the server needs no Node
+toolchain, and rebuilding the UI is picked up without restarting the server.
+`dist/` is git-ignored; build it where you deploy, or host it anywhere else
+that can reach the API.
 
 ## Working on it
 
 ```sh
 npm ci
 npm run dev     # dev server on :5173, /v1 proxied to localhost:8080
-npm run build   # vite build + scripts/embed.mjs -> ../src/dashboard.html
+npm run build   # vite build -> dist/ (served by traza-server)
 ```
 
-Run a real server beside `npm run dev` for live data:
+Run a server beside `npm run dev` for live data:
 `cargo run --release --bin traza-server -- --data-dir ./data --port 8080`.
-
-After `npm run build`, rebuild the server and the new page ships at `/`.
-Never edit `src/dashboard.html` by hand — it is generated.
 
 ## Shape
 
@@ -30,8 +32,8 @@ Never edit `src/dashboard.html` by hand — it is generated.
 - `src/views/` — Spans, Trace, Sessions, Analytics, Store.
 - `src/lib/` — API client (bearer token in sessionStorage, 401 → token
   prompt), formatting, span-tree helpers.
-- Routing is hash-based (`#/spans`, `#/traces/<id>`, …) because the server
-  deliberately serves only `/` and `/dashboard`.
+- Routing is hash-based (`#/spans`, `#/traces/<id>`, …), so the app works from
+  any static host without server-side route rewrites.
 
 Design rules that reviewers hold the line on: one accent (terracotta),
 reserved for measured values; mono + `tabular-nums` for every figure; flat

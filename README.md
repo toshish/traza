@@ -2,22 +2,33 @@
 
 **A trace datastore with first-class LLM and agent observability — one binary from laptop to cluster.**
 
-Traza (Spanish for "trace") ingests OpenTelemetry or plain-JSON spans over HTTP, stores them durably, and answers trace lookups, filtered searches, and token/cost analytics in milliseconds — with a built-in trace browser and no infrastructure to stand up. Two dependencies (`serde`, `serde_json`), no external database, and one deployment story at every size: today a single node that starts in milliseconds; the designed trajectory is replicated, highly available clusters of the same binary.
+Traza (Spanish for "trace") ingests OpenTelemetry or plain-JSON spans over HTTP, stores them durably, and answers trace lookups, filtered searches, and token/cost analytics in milliseconds — with a trace browser and no infrastructure to stand up. Two dependencies (`serde`, `serde_json`), no external database, and one deployment story at every size: today a single node that starts in milliseconds; the designed trajectory is replicated, highly available clusters of the same binary. The trace browser is a React app ([`ui/`](ui/)) that the server serves straight from its build output — nothing is compiled into the binary, so building the server still needs no Node toolchain.
 
 ```sh
 cargo build --release
+(cd ui && npm ci && npm run build)          # builds the dashboard into ui/dist
 ./target/release/traza-server --data-dir ./data --port 8080
-# open http://localhost:8080 — the dashboard is built in
+# open http://localhost:8080 — the server serves ui/dist
 ```
+
+**The dashboard is a build artifact, not part of the binary.** `traza-server`
+compiles with no Node toolchain and embeds no HTML; it serves whatever built
+dashboard it finds on disk. So a `cargo install`ed or otherwise packaged
+binary ships the **API only** — until you give it a build. It looks in, in
+order: `--ui-dir`, `$TRAZA_UI_DIR`, `<directory of the binary>/ui`,
+`<binary>/../share/traza/ui`, then `./ui/dist`. Packagers should drop the
+build beside the executable as `ui/`; from a checkout, `npm run build` puts it
+at `./ui/dist`. Without any of them the API runs exactly the same, `/` returns
+a 404 saying how to build it, and startup logs every path it searched.
 
 ## Why Traza
 
 Most tracing backends make you assemble a fleet before the first span: a column store or search cluster, a queue in front, an operator keeping it healthy. Traza's bet is that a trace datastore should scale like a database, not like a pipeline — **one binary whose deployment grows with you** instead of a different architecture at every size:
 
-- **Start on one machine in seconds.** A single process stores everything under `--data-dir`, serves its own dashboard, and needs nothing else — right-sized for a laptop, a CI job, a single-host service, an edge box, or the AI agent you're debugging *right now*.
+- **Start on one machine in seconds.** A single process stores everything under `--data-dir` and needs nothing else — right-sized for a laptop, a CI job, a single-host service, an edge box, or the AI agent you're debugging *right now*.
 - **Scale by adding nodes, not systems.** The engine's foundations — immutable segments, idempotent primary-key ingest, journaled compaction — were chosen to replicate. The [HA design](docs/ha-design.md) (quorum-replicated logical log, validated full-state snapshots for catch-up) is the committed trajectory: clustered, highly available deployments running this same binary. Today's scope is single-node; see [Status](#status-and-roadmap).
 - **Built for LLM and agent workloads.** Sessions, token and cost analytics, prompt/completion capture with large-payload offloading, post-hoc evals and feedback, and one-command dataset export — first-class, not bolted on.
-- **OpenTelemetry-compatible.** Point any OTel SDK at it with two environment variables.
+- **OpenTelemetry-compatible, OpenLLMetry-native.** Point any OTel SDK at it with two environment variables. Traza follows the [OpenLLMetry](https://github.com/traceloop/openllmetry) standard (`gen_ai.*` / `traceloop.*`), so instrumented apps get sessions and token/cost analytics with no attribute renaming.
 - **Small enough to trust.** Two direct dependencies; HTTP, threading, and file I/O are the Rust standard library. `#![forbid(unsafe_code)]`. Every performance number in [BENCHMARKS.md](BENCHMARKS.md) is measured by a bundled benchmark, never estimated.
 - **Crash-safe by construction.** Immutable segments written by write-temp, fsync, atomic rename; recovery loads only complete segments and heals crash artifacts.
 
@@ -49,27 +60,35 @@ curl 'http://localhost:8080/v1/spans?service=checkout&attr.region=us-east&min_du
 curl http://localhost:8080/v1/stats
 ```
 
-Or skip curl entirely: the dashboard at `http://localhost:8080/` shows recent spans, a filter bar, per-trace waterfalls, and span detail.
+Or skip curl entirely: the trace browser at `http://localhost:8080/` shows recent spans, a filter bar, per-trace waterfalls, span detail, sessions, and LLM analytics. It is a React app in [`ui/`](ui/); `npm run build` emits `ui/dist`, which the server serves (see [`--ui-dir`](#server-flags)). For UI development, `npm run dev` runs Vite on :5173 with `/v1` proxied to the server.
 
 **Span identity is a primary key.** `(trace_id, span_id)` uniquely names a span; re-ingesting it replaces the stored version (last write wins). Client retries are idempotent and never create duplicates.
 
 ## LLM and agent observability
 
-Traza treats generative-AI telemetry as a native workload, not an attribute soup. The [conventions](docs/llm-semantics.md) are plain span attributes — no SDK required:
+Traza treats generative-AI telemetry as a native workload, not an attribute
+soup. It follows the [OpenLLMetry](https://github.com/traceloop/openllmetry)
+standard — Traceloop's OpenTelemetry GenAI conventions — so an app instrumented
+with OpenLLMetry populates sessions and cost/token analytics with no attribute
+renaming. Traza's own shorthand (`llm.*`, `session.id`) is accepted as an
+alias. The [conventions](docs/llm-semantics.md) are plain span attributes — no
+SDK required:
 
 ```jsonc
 {
-  "name": "llm.completion",
+  "name": "openai.chat",
   "service": "support-agent",
   "attributes": {
-    "session.id": "chat-4711",          // groups traces into a session
-    "llm.model": "gpt-5.6",
-    "llm.prompt_tokens": 412,
-    "llm.completion_tokens": 88,
-    "llm.cost_usd": 0.0042,
-    "llm.stop_reason": "end_turn"
-  },
-  "events": [{ "name": "llm.prompt", "attributes": { "content": "..." } }]
+    "gen_ai.conversation.id": "chat-4711",   // groups traces into a session
+    "gen_ai.provider.name": "openai",         // provider
+    "gen_ai.operation.name": "chat",
+    "gen_ai.request.model": "gpt-4o",
+    "gen_ai.usage.input_tokens": 412,
+    "gen_ai.usage.output_tokens": 88,
+    "gen_ai.response.finish_reason": "stop",
+    // messages: JSON gen_ai.input.messages / gen_ai.output.messages
+    "gen_ai.input.messages": "[{\"role\":\"user\",\"parts\":[{\"type\":\"text\",\"content\":\"...\"}]}]"
+  }
 }
 ```
 
@@ -85,7 +104,7 @@ curl 'http://localhost:8080/v1/sessions/chat-4711'
 **Cost and token analytics** — exact rollups, grouped how you ask:
 
 ```sh
-curl 'http://localhost:8080/v1/stats/llm?group_by=model'     # or service | session | day
+curl 'http://localhost:8080/v1/stats/llm?group_by=model'     # or provider | service | session | day
 # rows of {key, llm_calls, prompt/completion/total tokens, cost_usd, errors, latency}
 ```
 
@@ -123,6 +142,8 @@ export OTEL_EXPORTER_OTLP_COMPRESSION=none
 
 `POST /v1/traces` accepts OTLP/HTTP as binary protobuf or JSON: `service.name` becomes the span's service, typed attributes are flattened, events and span links are preserved. gRPC is not served — use the `http/protobuf` exporter setting, which every OTel SDK supports.
 
+OpenLLMetry and OTel GenAI instrumentation lands queryable without translation: `gen_ai.*`, `llm.usage.*`, and `traceloop.*` attributes drive sessions, provider/model rollups, and token/cost analytics directly (see [LLM conventions](docs/llm-semantics.md)).
+
 ## HTTP API
 
 | Method | Path | Purpose |
@@ -133,7 +154,7 @@ export OTEL_EXPORTER_OTLP_COMPRESSION=none
 | `GET` | `/v1/spans?…` | Filtered span search |
 | `GET` | `/v1/sessions?since=&until=&limit=` | Sessions, most recent first |
 | `GET` | `/v1/sessions/{id}` | One session's rollup + per-trace breakdown |
-| `GET` | `/v1/stats/llm?group_by=model\|service\|session\|day` | Token/cost aggregation |
+| `GET` | `/v1/stats/llm?group_by=model\|provider\|service\|session\|day` | Token/cost aggregation |
 | `POST` | `/v1/annotations` | Attach a score/feedback record to a span or trace |
 | `GET` | `/v1/annotations?trace_id=&span_id=&name=` | Query annotations |
 | `GET` | `/v1/payloads/sha256/{hex}` | Raw bytes of an offloaded payload |
@@ -141,7 +162,7 @@ export OTEL_EXPORTER_OTLP_COMPRESSION=none
 | `GET` | `/v1/stats` | Physical record count, segment count, bytes on disk |
 | `POST` | `/v1/flush` | Force buffered spans into a durable segment |
 
-Search filters (ANDed; URL-encoded): `service` and `name` (exact match), `attr.KEY` (exact attribute match — bare values match strings, JSON literals match typed values; repeatable), `min_duration_ms`, `since`/`until` (Unix nanoseconds, inclusive), `limit` (default 100 on `/v1/spans`; exports are unbounded by default).
+Search filters (ANDed; URL-encoded): `service` and `name` (exact match), `attr.KEY` (exact attribute match — bare values match strings, JSON literals match typed values; repeatable), `session` (all spans of a session, unioning every recognized session key), `min_duration_ms`, `since`/`until` (Unix nanoseconds, inclusive), `limit` (default 100 on `/v1/spans`; exports are unbounded by default).
 
 Timestamps are integer Unix nanoseconds; `start_time_unix_nano` and the aliases `start_timestamp_ns`, `start_ns`, `start_time` are accepted (same for `end_*`). Unknown fields on a span are stored and returned verbatim. Invalid JSON is `400`; bodies are capped at 64 MiB; `503` means retry with backoff.
 
@@ -159,7 +180,7 @@ TRAZA_TOKENS="rw:$(openssl rand -hex 16),ro:$(openssl rand -hex 16)" \
   traza-server --data-dir ./data
 ```
 
-Missing or unknown tokens get 401 with a `WWW-Authenticate: Bearer` challenge; insufficient scope gets 403. Comparison is constant-time; an invalid `TRAZA_TOKENS` refuses startup rather than silently running open. Without tokens, Traza permits loopback binds only; a non-loopback `--host` requires `TRAZA_TOKENS` or the explicit `--allow-unauthenticated-non-loopback` escape hatch. The dashboard shell itself stays open (it carries no data) and prompts for a token on the first 401, holding it in `sessionStorage` only. TLS is reverse-proxy territory.
+Missing or unknown tokens get 401 with a `WWW-Authenticate: Bearer` challenge; insufficient scope gets 403. Comparison is constant-time; an invalid `TRAZA_TOKENS` refuses startup rather than silently running open. Without tokens, Traza permits loopback binds only; a non-loopback `--host` requires `TRAZA_TOKENS` or the explicit `--allow-unauthenticated-non-loopback` escape hatch. The dashboard SHELL itself stays open (it is static build output and carries no data) while every `/v1` call it makes remains gated; the page prompts for a token on the first 401 and holds it in `sessionStorage` only. TLS is reverse-proxy territory.
 
 **Retention.** `--ttl-seconds N` keeps a rolling window: a background pass compacts expired spans every minute, and annotations and payload files age out on the same window. Off by default — nothing is deleted unless you ask.
 
@@ -179,6 +200,7 @@ Missing or unknown tokens get 401 with a `WWW-Authenticate: Bearer` challenge; i
 | `--ttl-seconds N` | off | Rolling retention window |
 | `--flush-spans N` | `10000` | Buffered spans that trigger a durable flush |
 | `--payload-threshold-bytes N` | `262144` | Offload threshold for large string values; `0` disables |
+| `--ui-dir DIR` | see below | Built dashboard to serve at `/`; served from disk, so a rebuilt UI needs no server restart. Unset ⇒ `$TRAZA_UI_DIR`, `<binary dir>/ui`, `<binary dir>/../share/traza/ui`, `./ui/dist`, first one containing `index.html`. None found ⇒ the API runs and `/` 404s with build instructions |
 | `--allow-unauthenticated-non-loopback` | off | Explicitly allow an unsafe non-loopback bind without tokens |
 
 ## Performance
@@ -214,13 +236,13 @@ Two layers with one contract: never lose a completed write, never serve a torn o
 
 The **storage engine** buffers spans in memory and flushes sorted, immutable v2 segment files — JSON payloads with embedded record-offset, trace, and attribute indexes — via write-temp, fsync, atomic rename. Opening a store parses only the indexes; spans materialize on demand. Legacy v1 JSONL segments fail startup with a migration pointer rather than being silently misread. Filters narrow candidates through the indexes, then re-verify every predicate against the parsed span: an index accelerates a filter, it never changes its semantics.
 
-The **HTTP server** is a deliberately small HTTP/1.1 implementation on `std::net` — a bounded worker pool in front of the engine, which is its only datastore. There is no server-side log or side index; restart durability is the engine's.
+The **HTTP server** is a deliberately small HTTP/1.1 implementation on `std::net` — a bounded worker pool in front of the engine, which is its only datastore. There is no server-side log or side index; restart durability is the engine's. It also serves the dashboard's build directory as static files, resolved against the canonicalized root so no request can read outside it.
 
 Deeper reading: [segment format](docs/segment-format-v2.md) · [LLM conventions](docs/llm-semantics.md) · [HA design](docs/ha-design.md).
 
 ## Status and roadmap
 
-Traza is pre-1.0 and honest about it: on-disk formats may change between 0.x versions, and single-node is the current scope. Shipped and load-bearing today: durable segment storage with crash recovery, OTLP protobuf/JSON ingest, sessions and cost analytics, payload offloading, annotations, streaming export, bearer auth, and the bundled dashboard.
+Traza is pre-1.0 and honest about it: on-disk formats may change between 0.x versions, and single-node is the current scope. Shipped and load-bearing today: durable segment storage with crash recovery, OTLP protobuf/JSON ingest, sessions and cost analytics, payload offloading, annotations, streaming export, bearer auth, and the [`ui/`](ui/) trace browser served from its build output.
 
 The destination is bigger than one node. The full product roadmap — durable v1 foundations (a write-ahead log and the identity model that must precede any format freeze), then replicated HA clusters and agent-native debugging depth, then columnar analytics at billion-span scale, then the enterprise control plane — lives in [docs/roadmap.md](docs/roadmap.md), with the HA architecture detailed in [docs/ha-design.md](docs/ha-design.md). Same binary, same API, at every phase.
 

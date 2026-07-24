@@ -2,9 +2,9 @@ import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import { viteSingleFile } from 'vite-plugin-singlefile';
 
-// The dashboard ships inside the traza-server binary as ONE self-contained
-// HTML document (`include_str!`). The singlefile plugin inlines every JS/CSS
-// asset so the server never has to route static files.
+// The dashboard is a standalone SPA. The singlefile plugin inlines every
+// JS/CSS asset into one self-contained dist/index.html, so it can be hosted
+// from any static file server with no asset routing.
 export default defineConfig({
   plugins: [react(), viteSingleFile()],
   server: {

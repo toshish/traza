@@ -45,7 +45,9 @@ export function SpansView({ openTrace, sessionFilter, clearSessionFilter }) {
       limit: effectiveLimit,
     };
     if (filters.attrKey) params['attr.' + filters.attrKey] = filters.attrValue;
-    if (sessionFilter) params['attr.session.id'] = sessionFilter;
+    // The dedicated session filter unions every recognized session key, so a
+    // mixed-convention session returns whole (see /v1/spans?session=).
+    if (sessionFilter) params.session = sessionFilter;
     try {
       setSpans(await api.spans(params));
     } catch (e) {
@@ -66,7 +68,7 @@ export function SpansView({ openTrace, sessionFilter, clearSessionFilter }) {
     applied.name && { field: 'name', value: applied.name },
     applied.attrKey && { field: 'attr.' + applied.attrKey, value: applied.attrValue },
     applied.minMs && { field: 'duration', op: '≥', value: applied.minMs + ' ms' },
-    sessionFilter && { field: 'session.id', value: sessionFilter, session: true },
+    sessionFilter && { field: 'session', value: sessionFilter, session: true },
   ].filter(Boolean);
 
   return <Section title="Spans" action={<Button variant="ghost" size="sm" onClick={() => fetchSpans(applied, limit)}>Refresh</Button>}>

@@ -339,6 +339,7 @@ fn randomized_filters_match_naive_reference() {
             min_duration_ns: (query_index % 2 == 0).then(|| 1 + rng.below(20_000)),
             since_ns,
             until_ns,
+            session: None,
             limit: (query_index % 5 == 0).then(|| 1 + rng.below(75) as usize),
         };
 

@@ -1,0 +1,130 @@
+import React from 'react';
+import { api } from '../lib/api.js';
+import { fmtTimeNs, fmtDurationNs, fmtNum, fmtCost } from '../lib/format.js';
+import { llmMessages, llmUsage } from '../lib/spans.js';
+import { Section } from '../components/Section.jsx';
+import { Button } from '../components/primitives/Button.jsx';
+import { Tag } from '../components/primitives/Tag.jsx';
+import { MessageList } from '../components/trace/MessageList.jsx';
+import { EmptyState } from '../components/feedback/EmptyState.jsx';
+import { ErrorState } from '../components/feedback/ErrorState.jsx';
+import { LoadingBar } from '../components/feedback/LoadingBar.jsx';
+
+/* The conversation behind a session: every LLM span's messages, in time order,
+   flattened into the sequence a human actually wants to read. A waterfall
+   answers "what ran"; this answers "what was said".
+
+   Deduplication matters: consecutive turns re-send the whole history, so
+   replaying every span's prompt verbatim shows the same user message a dozen
+   times. Each turn contributes only what is new since the previous turn. */
+
+function turnsFromSpans(spans) {
+  const ordered = [...spans].sort((a, b) => a.start_time_ns - b.start_time_ns);
+  const turns = [];
+  const seen = new Set();
+  for (const span of ordered) {
+    const messages = llmMessages(span);
+    if (!messages.length) continue;
+    const fresh = [];
+    for (const message of messages) {
+      // Identity of a message = role + its rendered parts. A prompt already
+      // shown by an earlier turn is history, not a new thing said.
+      // Structured, so no delimiter can collide with content -- and no
+      // literal control byte ends up in this source file.
+      const key = JSON.stringify([message.role || '', message.parts]);
+      if (message.direction === 'prompt' && seen.has(key)) continue;
+      seen.add(key);
+      fresh.push(message);
+    }
+    if (fresh.length) turns.push({ span, messages: fresh, usage: llmUsage(span) });
+  }
+  return turns;
+}
+
+function TurnHeader({ span, usage, onOpenTrace }) {
+  return <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', margin: '2px 0 6px' }}>
+    <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-12)', color: 'var(--ink-faint)' }}>
+      {fmtTimeNs(span.start_time_ns)}
+    </span>
+    <span style={{ fontSize: 'var(--text-12)', color: 'var(--ink-muted)' }}>{span.name}</span>
+    {usage && usage.model ? <Tag mono>{usage.model}</Tag> : null}
+    {usage && usage.totalTokens != null ? <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-12)', color: 'var(--ink-faint)' }}>{fmtNum(usage.totalTokens)} tok</span> : null}
+    {usage && usage.costUsd ? <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-12)', color: 'var(--ink-faint)' }}>${fmtCost(usage.costUsd)}</span> : null}
+    <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-12)', color: 'var(--ink-faint)' }}>
+      {fmtDurationNs(span.end_time_ns - span.start_time_ns)}
+    </span>
+    {span.status === 'error' ? <Tag status="error">error</Tag> : null}
+    <Button variant="ghost" size="sm" style={{ marginLeft: 'auto' }} onClick={() => onOpenTrace(span.trace_id, span.span_id)}>
+      Open trace
+    </Button>
+  </div>;
+}
+
+// Spans come back oldest-first, so a fixed cap silently drops the NEWEST
+// turns — exactly what a reader opens a conversation to see. Fetch a page at
+// a time, detect that the page filled, and say so rather than presenting a
+// truncated conversation as complete.
+const PAGE_SPANS = 500;
+
+/** Conversation for a session id (across its traces) or a single trace. */
+export function ConversationView({ sessionId, traceId, onOpenTrace, onBack, backLabel }) {
+  const [spans, setSpans] = React.useState(null);
+  const [error, setError] = React.useState(null);
+  const [loading, setLoading] = React.useState(true);
+  const [limit, setLimit] = React.useState(PAGE_SPANS);
+  const [truncated, setTruncated] = React.useState(false);
+
+  const fetchSpans = React.useCallback(async (effectiveLimit) => {
+    setLoading(true); setError(null);
+    try {
+      if (sessionId) {
+        const page = await api.spans({ session: sessionId, limit: effectiveLimit });
+        setSpans(page);
+        // A full page means the store may hold more after it.
+        setTruncated(page.length >= effectiveLimit);
+      } else {
+        const trace = await api.trace(traceId);
+        setSpans(trace.spans || []);
+        setTruncated(false);
+      }
+    } catch (e) {
+      setError(e); setSpans(null);
+    } finally {
+      setLoading(false);
+    }
+  }, [sessionId, traceId]);
+  React.useEffect(() => { fetchSpans(limit); }, [fetchSpans]);
+
+  const turns = React.useMemo(() => (spans ? turnsFromSpans(spans) : []), [spans]);
+  const loadPayload = React.useCallback((ref) => api.payload(ref), []);
+  const title = sessionId ? 'Conversation · ' + sessionId : 'Conversation · trace ' + traceId;
+
+  return <Section title={title} action={<div style={{ display: 'flex', gap: 6 }}>
+    {onBack ? <Button variant="ghost" size="sm" onClick={onBack}>{backLabel || 'Back'}</Button> : null}
+    <Button variant="ghost" size="sm" onClick={() => fetchSpans(limit)}>Refresh</Button>
+  </div>}>
+    <LoadingBar active={loading} style={{ marginBottom: 8 }} />
+    {error ? <ErrorState what={error.what} next={error.next} /> : null}
+    {spans && !turns.length && !error ? <EmptyState
+      message="No chat turns here. A conversation is built from spans carrying gen_ai.input.messages / gen_ai.output.messages (or the legacy prompt/completion attributes)." /> : null}
+    {turns.length ? <>
+      <div style={{ fontSize: 'var(--text-12)', color: 'var(--ink-faint)', marginBottom: 8 }}>
+        {turns.length} turn{turns.length === 1 ? '' : 's'} · newest last
+        {truncated ? ' · showing the oldest ' + spans.length + ' spans of a longer session' : ''}
+      </div>
+      {truncated ? <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10, padding: '6px 10px', border: '1px solid var(--hairline)', borderRadius: 'var(--radius-card)', background: 'var(--bg-sunken)', fontSize: 'var(--text-12)', color: 'var(--ink-muted)' }}>
+        <span>This session has more spans than are shown; later turns are not on screen.</span>
+        <Button variant="ghost" size="sm" style={{ marginLeft: 'auto' }} disabled={loading}
+          onClick={() => { const next = limit + PAGE_SPANS; setLimit(next); fetchSpans(next); }}>
+          Load more
+        </Button>
+      </div> : null}
+      <div style={{ display: 'grid', gap: 14, minWidth: 0 }}>
+        {turns.map((turn, i) => <div key={i} style={{ minWidth: 0 }}>
+          <TurnHeader span={turn.span} usage={turn.usage} onOpenTrace={onOpenTrace} />
+          <MessageList messages={turn.messages} onLoadPayload={loadPayload} />
+        </div>)}
+      </div>
+    </> : null}
+  </Section>;
+}

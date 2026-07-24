@@ -11,6 +11,7 @@ import { SpansView } from './views/SpansView.jsx';
 import { TraceView } from './views/TraceView.jsx';
 import { SessionsView, SessionDetailView } from './views/SessionsView.jsx';
 import { AnalyticsView } from './views/AnalyticsView.jsx';
+import { ConversationView } from './views/ConversationView.jsx';
 import { StoreView } from './views/StoreView.jsx';
 
 // ------------------------------------------------------------------ routing
@@ -36,11 +37,33 @@ function useHashRoute() {
   return route;
 }
 
-function navigate(parts, params) {
+function hashFor(parts, params) {
   let hash = '#/' + parts.map(encodeURIComponent).join('/');
   const query = params ? new URLSearchParams(params).toString() : '';
   if (query) hash += '?' + query;
-  window.location.hash = hash;
+  return hash;
+}
+
+/** Push a history entry (a real navigation) or replace the current one.
+    Selecting a span inside a trace REPLACES: it is a change of focus, not a
+    new place, and pushing it made Back step through every span you clicked
+    instead of leaving the trace. */
+function navigate(parts, params, { replace = false } = {}) {
+  const hash = hashFor(parts, params);
+  if (replace) {
+    const url = window.location.pathname + window.location.search + hash;
+    window.history.replaceState(null, '', url);
+    window.dispatchEvent(new HashChangeEvent('hashchange'));
+  } else {
+    window.location.hash = hash;
+  }
+}
+
+/** Browser history if there is somewhere to go back to, else a sensible
+    parent route, so Back is never a dead button. */
+function goBack(fallbackParts) {
+  if (window.history.length > 1) window.history.back();
+  else navigate(fallbackParts || ['spans']);
 }
 
 // ------------------------------------------------------------------ header
@@ -75,6 +98,28 @@ function Header({ recordCount, onSetToken }) {
     <ThemeToggle />
     <Button size="sm" onClick={onSetToken}>Set token</Button>
   </header>;
+}
+
+/* Where you are, and the way out. Hash routing gives the browser Back for
+   free, but a dashboard opened straight into a deep link has nothing behind
+   it — so Back falls through to the parent route and the trail is clickable. */
+function Breadcrumbs({ crumbs, onBack, onGo }) {
+  return <nav style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 10, fontFamily: 'var(--font-sans)', fontSize: 'var(--text-12)' }}>
+    <button onClick={onBack} title="Back"
+      style={{ display: 'inline-flex', alignItems: 'center', gap: 4, border: '1px solid var(--hairline)', borderRadius: 'var(--radius-control)', background: 'var(--bg-raised)', color: 'var(--ink-muted)', cursor: 'pointer', font: 'inherit', padding: '2px 8px' }}>
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M15 18l-6-6 6-6" /></svg>
+      Back
+    </button>
+    {crumbs.map((crumb, i) => <span key={i} style={{ display: 'inline-flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+      {i > 0 ? <span style={{ color: 'var(--ink-faint)' }}>/</span> : null}
+      {crumb.to
+        ? <button onClick={() => onGo(crumb.to)}
+            style={{ border: 'none', background: 'transparent', color: 'var(--accent)', cursor: 'pointer', font: 'inherit', padding: 0 }}>
+            {crumb.label}
+          </button>
+        : <span style={{ color: 'var(--ink-muted)', fontFamily: 'var(--font-mono)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 320 }}>{crumb.label}</span>}
+    </span>)}
+  </nav>;
 }
 
 // ------------------------------------------------------------------ app
@@ -138,16 +183,32 @@ export function App() {
   const activeTab = head === 'traces' ? 'spans' : (TABS.some((t) => t.id === head) ? head : 'spans');
   const sessionFilter = route.params.get('session') || '';
 
+  const third = route.parts[2];
+
   let view;
-  if (head === 'traces' && second) {
+  if (head === 'traces' && second && third === 'conversation') {
+    view = <ConversationView key={'conv:' + second + ':' + authVersion} traceId={second}
+      onOpenTrace={(traceId, spanId) => navigate(['traces', traceId], spanId ? { span: spanId } : undefined)}
+      onBack={() => goBack(['traces', second])} backLabel="Back to trace" />;
+  } else if (head === 'traces' && second) {
     view = <TraceView key={second + ':' + authVersion} traceId={second}
       selectedSpanId={route.params.get('span') || ''}
-      selectSpan={(spanId) => navigate(['traces', second], spanId ? { span: spanId } : undefined)}
+      // Focus, not navigation: replace so Back leaves the trace rather than
+      // stepping back through every span that was clicked.
+      selectSpan={(spanId) => navigate(['traces', second], spanId ? { span: spanId } : undefined, { replace: true })}
       openSession={(id) => navigate(['sessions', id])}
+      openConversation={() => navigate(['traces', second, 'conversation'])}
+      onBack={() => goBack(['spans'])}
       pushToast={pushToast} />;
+  } else if (head === 'sessions' && second && third === 'conversation') {
+    view = <ConversationView key={'conv:' + second + ':' + authVersion} sessionId={second}
+      onOpenTrace={(traceId, spanId) => navigate(['traces', traceId], spanId ? { span: spanId } : undefined)}
+      onBack={() => goBack(['sessions', second])} backLabel="Back to session" />;
   } else if (head === 'sessions' && second) {
     view = <SessionDetailView key={second + ':' + authVersion} sessionId={second}
       openTrace={(traceId) => navigate(['traces', traceId])}
+      openConversation={() => navigate(['sessions', second, 'conversation'])}
+      onBack={() => goBack(['sessions'])}
       filterSpans={(id) => navigate(['spans'], { session: id })} />;
   } else if (head === 'sessions') {
     view = <SessionsView key={'sessions:' + authVersion} openSession={(id) => navigate(['sessions', id])} />;
@@ -162,10 +223,27 @@ export function App() {
       openTrace={(traceId, spanId) => navigate(['traces', traceId], spanId ? { span: spanId } : undefined)} />;
   }
 
+  // Where the current route sits, so every depth has a way out.
+  const crumbs = [];
+  if (head === 'traces' && second) {
+    crumbs.push({ label: 'Spans', to: ['spans'] });
+    crumbs.push(third === 'conversation'
+      ? { label: 'Trace ' + second, to: ['traces', second] }
+      : { label: 'Trace ' + second });
+    if (third === 'conversation') crumbs.push({ label: 'Conversation' });
+  } else if (head === 'sessions' && second) {
+    crumbs.push({ label: 'Sessions', to: ['sessions'] });
+    crumbs.push(third === 'conversation'
+      ? { label: second, to: ['sessions', second] }
+      : { label: second });
+    if (third === 'conversation') crumbs.push({ label: 'Conversation' });
+  }
+
   return <div style={{ minHeight: '100vh', background: 'var(--bg)' }}>
     <Header recordCount={recordCount} onSetToken={() => setTokenModal(true)} />
     <main style={{ maxWidth: 1400, margin: '0 auto', padding: '12px 16px' }}>
       <Tabs tabs={TABS} active={activeTab} onChange={(id) => navigate([id])} style={{ marginBottom: 12 }} />
+      {crumbs.length ? <Breadcrumbs crumbs={crumbs} onBack={() => goBack(['spans'])} onGo={navigate} /> : null}
       {view}
     </main>
     <Modal open={tokenModal} title="Set token" onClose={() => setTokenModal(false)} footer={<>
