@@ -26,7 +26,7 @@ Additional percentiles:
 - Percentiles: nearest-rank selection over complete request wall-clock durations measured with `std::time::Instant`; no warm-up samples are discarded.
 - Build: Cargo release profile. Timestamp: Unix 1784800070.
 - Machine context: macos/aarch64, 10 available hardware threads.
-- Final server stats: `{"buffered_spans":0,"bytes_on_disk":583182107,"persisted_spans":1000000,"segment_count":100,"span_count":1000000,"total_spans":1000000}`.
+- Final server stats: `{"buffered_records":0,"bytes_on_disk":583182107,"persisted_records":1000000,"record_count":1000000,"segment_count":100,"total_records":1000000}`.
 
 The ingest threshold is PASS. The trace p95 threshold is PASS. The filtered-query p95 threshold is PASS. Any miss remains visible in the table rather than being substituted or estimated.
 

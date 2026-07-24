@@ -1,8 +1,9 @@
-//! Segment format v2 byte-resident storage and persisted indexes.
+//! Segment format v2 file-backed storage and persisted indexes.
 //!
-//! An opened segment owns its encoded bytes and small decoded index maps. Records
-//! are decoded only when a query selects their offsets; no decoded record vector is
-//! retained by [`Segment`].
+//! An opened file-backed segment owns only its file handle and decoded index
+//! maps. In-memory segments built for encoding may own their bytes. Records are
+//! decoded only when a query selects their offsets; no decoded record vector
+//! is retained by [`Segment`].
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
@@ -233,10 +234,10 @@ impl From<std::str::Utf8Error> for Error {
     }
 }
 
-/// An opened byte-resident v2 segment.
+/// An opened v2 segment backed by either a file or encoded memory.
 ///
-/// The encoded file is retained in `bytes`; only offsets and persisted index
-/// postings are materialized. Query results are decoded on demand.
+/// File-backed segments retain only offsets and persisted index postings.
+/// Query results are decoded from their exact byte ranges on demand.
 #[derive(Debug)]
 pub struct Segment {
     backing: Backing,
@@ -496,11 +497,18 @@ impl Segment {
     /// this with [`Self::timestamp_at`] and [`Self::record_at_offset`] so a
     /// limited query decodes only the records it returns.
     pub fn attribute_posting_offsets(&self, key: &str, value: &str) -> Vec<u64> {
+        self.attribute_posting_offsets_ref(key, value).to_vec()
+    }
+
+    /// Borrowed posting offsets for one attribute key/value pair.
+    ///
+    /// This avoids cloning a potentially corpus-sized posting list for each
+    /// bounded query page.
+    pub fn attribute_posting_offsets_ref(&self, key: &str, value: &str) -> &[u64] {
         self.last_query_used_index.set(true);
         self.attribute_index
             .get(&(key.to_owned(), value.to_owned()))
-            .cloned()
-            .unwrap_or_default()
+            .map_or(&[], Vec::as_slice)
     }
 
     /// Timestamp of the record at a posting offset without decoding it: the

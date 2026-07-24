@@ -459,7 +459,7 @@ fn server_supports_the_documented_filters() {
     // Documented stats keys.
     let (status, body) = server.request("GET", "/v1/stats", None);
     assert_eq!(status, 200);
-    for key in ["span_count", "segment_count", "bytes_on_disk"] {
+    for key in ["record_count", "segment_count", "bytes_on_disk"] {
         assert!(body.get(key).is_some(), "stats must expose {key}: {body}");
     }
     server.kill();

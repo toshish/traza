@@ -3,8 +3,8 @@
 
 //! A small durable storage engine for tracing spans.
 //!
-//! Spans are buffered in memory and periodically persisted as sorted JSON-lines
-//! segment files. Reads combine the buffered and persisted data.
+//! Spans are buffered in memory and periodically persisted as sorted,
+//! file-backed indexed segments. Reads combine the buffered and persisted data.
 
 pub mod analytics;
 pub mod annotations;
@@ -30,7 +30,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const LOCK_FILE_NAME: &str = "LOCK";
 const SEGMENT_PREFIX: &str = "segment-";
 const SEGMENT_SUFFIX: &str = ".jsonl";
-/// Suffix for format-v2 segment files (indexed, byte-resident).
+/// Suffix for format-v2 indexed segment files.
 const SEGMENT_V2_SUFFIX: &str = ".seg";
 /// Reserved attribute-index keys for span fields; the NUL prefix cannot
 /// collide with practical user attribute names, and even a collision only
@@ -138,6 +138,34 @@ pub struct SpanFilter {
     pub limit: Option<usize>,
 }
 
+/// Exclusive position in Traza's stable span order.
+///
+/// Passing a cursor to [`Store::query_after`] returns only spans ordered after
+/// `(start_time_ns, end_time_ns, trace_id, span_id)`. This is the bounded
+/// pagination primitive used by dataset export.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpanCursor {
+    /// Span start timestamp.
+    pub start_time_ns: u64,
+    /// Span end timestamp.
+    pub end_time_ns: u64,
+    /// Trace identifier.
+    pub trace_id: String,
+    /// Span identifier.
+    pub span_id: String,
+}
+
+impl From<&Span> for SpanCursor {
+    fn from(span: &Span) -> Self {
+        Self {
+            start_time_ns: span.start_time_ns,
+            end_time_ns: span.end_time_ns,
+            trace_id: span.trace_id.clone(),
+            span_id: span.span_id.clone(),
+        }
+    }
+}
+
 /// Storage configuration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
@@ -164,12 +192,13 @@ impl Default for Config {
 /// A point-in-time summary of store usage.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Stats {
-    /// Number of spans currently buffered in memory.
-    pub buffered_spans: usize,
-    /// Number of spans in persisted segments.
-    pub persisted_spans: usize,
-    /// Total number of buffered and persisted spans.
-    pub total_spans: usize,
+    /// Number of primary-key-unique records currently buffered in memory.
+    pub buffered_records: usize,
+    /// Number of physical records in persisted segments, including historical
+    /// versions superseded by last-write-wins reads.
+    pub persisted_records: usize,
+    /// Total physical buffered and persisted records.
+    pub total_records: usize,
     /// Number of persisted segment files.
     pub segment_count: usize,
     /// Total size of persisted segment files in bytes.
@@ -228,8 +257,8 @@ impl From<serde_json::Error> for Error {
 /// Result type used by the storage API.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// A persisted segment: raw v2 bytes plus their embedded indexes. Spans
-/// parse on demand — resident cost is bytes + indexes, never Span structs.
+/// A persisted file-backed segment plus its embedded indexes. Span payloads
+/// parse on demand and do not remain resident.
 #[derive(Debug)]
 struct Segment {
     path: PathBuf,
@@ -269,7 +298,7 @@ fn record_to_span(record: &segment_v2::Record) -> Result<Span> {
 }
 
 impl Segment {
-    fn span_count(&self) -> usize {
+    fn record_count(&self) -> usize {
         self.seg.len()
     }
 
@@ -664,11 +693,24 @@ impl Store {
         Ok(result)
     }
 
-    /// Returns spans matching `filter`, ordered by start time.
+    /// Returns spans matching `filter`, ordered by Traza's stable span order.
     ///
     /// Buffered and persisted spans are inspected under one atomic combined
     /// snapshot to prevent concurrent flushes from hiding committed data.
     pub fn query(&self, filter: &SpanFilter) -> Result<Vec<Span>> {
+        self.query_after(filter, None)
+    }
+
+    /// Returns spans matching `filter` strictly after `cursor`.
+    ///
+    /// The cursor is compared using the same total order as [`Self::query`],
+    /// allowing callers to paginate with a constant result bound even when
+    /// many spans share one timestamp.
+    pub fn query_after(
+        &self,
+        filter: &SpanFilter,
+        cursor: Option<&SpanCursor>,
+    ) -> Result<Vec<Span>> {
         let writer = self.lock_writer()?;
         let segments = self.lock_segments()?;
         let mut result = Vec::new();
@@ -686,7 +728,10 @@ impl Store {
             let mut buffered: Vec<Span> = writer
                 .spans
                 .iter()
-                .filter(|span| span_matches(span, filter))
+                .filter(|span| {
+                    span_matches(span, filter)
+                        && cursor.map_or(true, |position| span_after_cursor(span, position))
+                })
                 .cloned()
                 .collect();
             sort_spans(&mut buffered);
@@ -695,26 +740,30 @@ impl Store {
                 Parsed(Vec<Span>),
                 Lazy {
                     seg: &'a segment_v2::Segment,
-                    offsets: Vec<u64>,
+                    offsets: &'a [u64],
                 },
             }
             let mut sources: Vec<(Source<'_>, usize)> = vec![(Source::Parsed(buffered), 0)];
             for segment in segments.iter() {
                 let seg = &segment.seg;
                 let offsets = if let Some(service) = &filter.service {
-                    seg.attribute_posting_offsets(IDX_SERVICE, service)
+                    seg.attribute_posting_offsets_ref(IDX_SERVICE, service)
                 } else if let Some(name) = &filter.name {
-                    seg.attribute_posting_offsets(IDX_NAME, name)
+                    seg.attribute_posting_offsets_ref(IDX_NAME, name)
                 } else if let Some((key, value)) = filter
                     .attributes
                     .iter()
                     .find(|(key, _)| !key.starts_with('\u{0}'))
                 {
-                    seg.attribute_posting_offsets(key, &canonical_value(value))
+                    seg.attribute_posting_offsets_ref(key, &canonical_value(value))
                 } else {
-                    seg.record_offsets().to_vec()
+                    seg.record_offsets()
                 };
-                sources.push((Source::Lazy { seg, offsets }, 0));
+                let position = match cursor {
+                    Some(cursor) => first_offset_after(seg, offsets, cursor)?,
+                    None => 0,
+                };
+                sources.push((Source::Lazy { seg, offsets }, position));
             }
 
             let advance = |source: &mut (Source<'_>, usize)| -> Result<Option<Span>> {
@@ -763,7 +812,10 @@ impl Store {
                 let Some(index) = best else { break };
                 let span = heads[index].take().expect("selected head exists");
                 heads[index] = advance(&mut sources[index])?;
-                if index != 0 && !span_matches(&span, filter) {
+                if index != 0
+                    && (!span_matches(&span, filter)
+                        || cursor.is_some_and(|position| !span_after_cursor(&span, position)))
+                {
                     continue;
                 }
                 let key = (span.trace_id.clone(), span.span_id.clone());
@@ -809,7 +861,9 @@ impl Store {
             latest.insert((span.trace_id.clone(), span.span_id.clone()), span.clone());
         }
         for span in latest.into_values() {
-            if span_matches(&span, filter) {
+            if span_matches(&span, filter)
+                && cursor.map_or(true, |position| span_after_cursor(&span, position))
+            {
                 result.push(span);
             }
         }
@@ -818,18 +872,22 @@ impl Store {
         Ok(result)
     }
 
-    /// Returns current buffer, segment, span, and disk usage statistics.
+    /// Returns current buffer, segment, physical-record, and disk statistics.
+    ///
+    /// Persisted counts are physical records rather than logical
+    /// last-write-wins cardinality. Naming that distinction explicitly keeps
+    /// this operation O(number of segments) instead of decoding the corpus.
     pub fn stats(&self) -> Result<Stats> {
         let writer = self.lock_writer()?;
         let segments = self.lock_segments()?;
-        let persisted_spans = segments.iter().map(Segment::span_count).sum();
+        let persisted_records = segments.iter().map(Segment::record_count).sum();
         let disk_bytes = segments.iter().map(|segment| segment.bytes).sum();
-        let buffered_spans = writer.len();
+        let buffered_records = writer.len();
 
         Ok(Stats {
-            buffered_spans,
-            persisted_spans,
-            total_spans: buffered_spans + persisted_spans,
+            buffered_records,
+            persisted_records,
+            total_records: buffered_records.saturating_add(persisted_records),
             segment_count: segments.len(),
             disk_bytes,
         })
@@ -973,10 +1031,8 @@ impl Store {
 
     /// Number of fully materialized `Span` structs held for PERSISTED data.
     ///
-    /// The v2 memory rule: this is zero after an open of a v2-only store —
-    /// segments hold bytes plus indexes, and spans parse on demand. Legacy v1
-    /// segments (still memory-resident) and the write buffer are the only
-    /// contributors.
+    /// The v2 memory rule: this is zero after open and flush. Segments hold
+    /// file handles plus indexes, and spans parse on demand.
     pub fn resident_persisted_span_structs(&self) -> Result<usize> {
         let segments = self.lock_segments()?;
         let _ = &segments;
@@ -1139,6 +1195,40 @@ fn compare_spans(left: &Span, right: &Span) -> std::cmp::Ordering {
         .then_with(|| left.end_time_ns.cmp(&right.end_time_ns))
         .then_with(|| left.trace_id.cmp(&right.trace_id))
         .then_with(|| left.span_id.cmp(&right.span_id))
+}
+
+fn compare_span_cursor(span: &Span, cursor: &SpanCursor) -> std::cmp::Ordering {
+    span.start_time_ns
+        .cmp(&cursor.start_time_ns)
+        .then_with(|| span.end_time_ns.cmp(&cursor.end_time_ns))
+        .then_with(|| span.trace_id.cmp(&cursor.trace_id))
+        .then_with(|| span.span_id.cmp(&cursor.span_id))
+}
+
+fn span_after_cursor(span: &Span, cursor: &SpanCursor) -> bool {
+    compare_span_cursor(span, cursor).is_gt()
+}
+
+fn first_offset_after(
+    segment: &segment_v2::Segment,
+    offsets: &[u64],
+    cursor: &SpanCursor,
+) -> Result<usize> {
+    let mut low = 0;
+    let mut high = offsets.len();
+    while low < high {
+        let middle = low + (high - low) / 2;
+        let record = segment
+            .record_at_offset(offsets[middle])
+            .map_err(segment_v2_error)?;
+        let span = record_to_span(&record)?;
+        if span_after_cursor(&span, cursor) {
+            high = middle;
+        } else {
+            low = middle + 1;
+        }
+    }
+    Ok(low)
 }
 
 fn sort_spans(spans: &mut [Span]) {

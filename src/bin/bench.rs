@@ -128,7 +128,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ingest_elapsed = ingest_started.elapsed();
     let ingest_rate = SPAN_COUNT as f64 / ingest_elapsed.as_secs_f64();
 
-    wait_for_span_count(port, SPAN_COUNT as u64)?;
+    wait_for_record_count(port, SPAN_COUNT as u64)?;
 
     println!("Measuring trace lookup latency...");
     let mut trace_latencies = Vec::with_capacity(TRACE_SAMPLES);
@@ -293,13 +293,16 @@ fn wait_for_server(port: u16, child: &mut Child) -> Result<(), Box<dyn std::erro
     }
 }
 
-fn wait_for_span_count(port: u16, expected: u64) -> Result<(), Box<dyn std::error::Error>> {
+fn wait_for_record_count(port: u16, expected: u64) -> Result<(), Box<dyn std::error::Error>> {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let (status, body) = request(port, "GET", "/v1/stats", None)?;
         if status == 200 {
             let value: Value = serde_json::from_slice(&body)?;
-            let count = value.get("span_count").and_then(Value::as_u64).unwrap_or(0);
+            let count = value
+                .get("record_count")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
             if count >= expected {
                 return Ok(());
             }

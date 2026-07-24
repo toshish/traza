@@ -21,12 +21,13 @@
 //! - `GET /v1/stats/llm?group_by=model|service|session|day&since=&until=`
 //!   responds with token/cost aggregation rows.
 //! - `POST /v1/flush` forces buffered spans into a durable segment.
-//! - `POST /v1/traces` accepts an OTLP/HTTP JSON ExportTraceServiceRequest.
+//! - `POST /v1/traces` accepts OTLP/HTTP JSON or binary protobuf.
+//! - `GET /v1/export` streams chunked NDJSON with completion/count trailers.
 //! - `GET /` and `GET /dashboard` serve the bundled dashboard page (always
 //!   open — the shell carries no data; its API calls are auth-gated as above).
 
 use std::io::{self, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{IpAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -34,7 +35,7 @@ use std::thread;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use traza::{Config, Span, SpanFilter, Store};
+use traza::{Config, Span, SpanCursor, SpanFilter, Store};
 
 const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 // Headers get a far tighter budget than bodies: without one, a 64 MiB
@@ -64,7 +65,7 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut data_dir = PathBuf::from("./data");
-    let mut host = String::from("0.0.0.0");
+    let mut host = String::from("127.0.0.1");
     let mut port = 8080_u16;
     let mut ttl_seconds = None;
     let mut flush_spans = 10_000_usize;
@@ -72,6 +73,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut workers = thread::available_parallelism()
         .map_or(4, usize::from)
         .max(4);
+    let mut allow_unauthenticated_non_loopback = false;
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < args.len() {
@@ -119,9 +121,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .parse::<usize>()?
                     .max(1);
             }
+            "--allow-unauthenticated-non-loopback" => {
+                allow_unauthenticated_non_loopback = true;
+            }
             "--help" | "-h" => {
                 println!(
-                    "Usage: traza-server --data-dir DIR --port PORT [--host ADDR] [--ttl-seconds N] [--flush-spans N] [--workers N] [--payload-threshold-bytes N (0 disables)]"
+                    "Usage: traza-server --data-dir DIR --port PORT [--host ADDR] [--ttl-seconds N] [--flush-spans N] [--workers N] [--payload-threshold-bytes N (0 disables)] [--allow-unauthenticated-non-loopback]"
                 );
                 return Ok(());
             }
@@ -130,13 +135,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         i += 1;
     }
 
-    // Bearer auth from TRAZA_TOKENS; unset = open (development default). A
-    // set-but-invalid value refuses startup — running open when the operator
+    // Bearer auth from TRAZA_TOKENS; unset is allowed on loopback by default.
+    // A set-but-invalid value refuses startup — running open when the operator
     // tried to configure auth would be the worst failure mode.
-    let auth = Arc::new(
-        traza::auth::AuthConfig::from_env()
-            .map_err(|error| format!("auth configuration: {error}"))?,
-    );
+    let auth_config = traza::auth::AuthConfig::from_env()
+        .map_err(|error| format!("auth configuration: {error}"))?;
+    if auth_config.is_none() && !is_loopback_bind(&host) && !allow_unauthenticated_non_loopback {
+        return Err(format!(
+            "refusing unauthenticated non-loopback bind {host}; configure TRAZA_TOKENS or pass --allow-unauthenticated-non-loopback explicitly"
+        )
+        .into());
+    }
+    let auth = Arc::new(auth_config);
     let engine = Arc::new(Store::open(
         &data_dir,
         Config {
@@ -192,6 +202,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+fn is_loopback_bind(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 fn handle_connection(
@@ -371,14 +388,15 @@ fn handle_connection(
                 &mut stream,
                 200,
                 json!({
-                    // Documented keys first — span count, segment count,
-                    // bytes on disk — then the engine's finer-grained view.
-                    "span_count": stats.total_spans,
+                    // These are physical storage records. Historical versions
+                    // superseded by last-write-wins reads remain on disk until
+                    // compaction, so calling them spans was misleading.
+                    "record_count": stats.total_records,
                     "segment_count": stats.segment_count,
                     "bytes_on_disk": stats.disk_bytes,
-                    "buffered_spans": stats.buffered_spans,
-                    "persisted_spans": stats.persisted_spans,
-                    "total_spans": stats.total_spans,
+                    "buffered_records": stats.buffered_records,
+                    "persisted_records": stats.persisted_records,
+                    "total_records": stats.total_records,
                 }),
             ),
             Err(error) => respond(&mut stream, 503, json!({"error": error.to_string()})),
@@ -561,13 +579,13 @@ fn handle_connection(
     }
 }
 
-/// Streams an export as NDJSON in bounded pages so an unbounded export
-/// never materializes the corpus (the review found the old implementation
-/// building the complete result AND a complete body buffer — defeating the
-/// larger-than-RAM design). Pages are keyed by the query sort order
-/// (start, end, trace, span — a total order), so each page is a normal
-/// bounded engine query and no engine lock is held across socket writes.
-/// The body is close-delimited (no Content-Length).
+/// Streams an export as chunked NDJSON in constant-size pages.
+///
+/// The engine cursor carries the complete `(start, end, trace, span)` order,
+/// so timestamp collisions never force a larger page or a prefix re-fetch.
+/// Completion and emitted row count are explicit HTTP trailers: a storage
+/// failure after `200 OK` is therefore distinguishable from a complete
+/// dataset without adding control objects to the NDJSON body.
 fn stream_export(
     stream: &mut TcpStream,
     engine: &Store,
@@ -578,61 +596,58 @@ fn stream_export(
 
     write!(
         stream,
-        "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n"
+        "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nTransfer-Encoding: chunked\r\nTrailer: X-Traza-Export-Complete, X-Traza-Export-Count\r\nConnection: close\r\n\r\n"
     )?;
-    let mut cursor: Option<(u64, u64, String, String)> = None;
+    let mut cursor: Option<SpanCursor> = None;
     let mut emitted = 0_usize;
-    let mut page_size = EXPORT_PAGE;
     loop {
-        let mut page_filter = filter.clone();
-        if let Some((start, _, _, _)) = &cursor {
-            // Inclusive re-fetch from the cursor's timestamp: spans sharing
-            // it are skipped below by full-key comparison.
-            page_filter.since_ns = Some((*start).max(page_filter.since_ns.unwrap_or(0)));
+        let remaining = user_limit.map_or(EXPORT_PAGE, |limit| limit.saturating_sub(emitted));
+        if remaining == 0 {
+            return finish_export(stream, true, emitted);
         }
+        let page_size = remaining.min(EXPORT_PAGE);
+        let mut page_filter = filter.clone();
         page_filter.limit = Some(page_size);
-        let page = match engine.query(&page_filter) {
+        let page = match engine.query_after(&page_filter, cursor.as_ref()) {
             Ok(page) => page,
-            // Headers are already on the wire; a mid-stream failure can only
-            // be signaled by closing early.
-            Err(_) => return Ok(()),
+            Err(error) => {
+                eprintln!("export failed after {emitted} rows: {error}");
+                return finish_export(stream, false, emitted);
+            }
         };
         let fetched = page.len();
-        let mut progressed = false;
         for span in page {
-            let key = (
-                span.start_time_ns,
-                span.end_time_ns,
-                span.trace_id.clone(),
-                span.span_id.clone(),
-            );
-            if cursor.as_ref().is_some_and(|last| key <= *last) {
-                continue;
-            }
-            let line = match serde_json::to_vec(&span) {
+            let mut line = match serde_json::to_vec(&span) {
                 Ok(line) => line,
-                Err(_) => continue,
+                Err(error) => {
+                    eprintln!("export serialization failed after {emitted} rows: {error}");
+                    return finish_export(stream, false, emitted);
+                }
             };
-            stream.write_all(&line)?;
-            stream.write_all(b"\n")?;
-            cursor = Some(key);
-            progressed = true;
+            line.push(b'\n');
+            write_chunk(stream, &line)?;
+            cursor = Some(SpanCursor::from(&span));
             emitted += 1;
-            if user_limit.is_some_and(|limit| emitted >= limit) {
-                return Ok(());
-            }
         }
-        if fetched < page_size {
-            return Ok(()); // the corpus is exhausted
-        }
-        if progressed {
-            page_size = EXPORT_PAGE;
-        } else {
-            // An equal-timestamp run wider than the page: grow until the run
-            // fits, so the cursor can cross it.
-            page_size = page_size.saturating_mul(2);
+        if fetched < page_size || user_limit.is_some_and(|limit| emitted >= limit) {
+            return finish_export(stream, true, emitted);
         }
     }
+}
+
+fn write_chunk(stream: &mut TcpStream, bytes: &[u8]) -> io::Result<()> {
+    write!(stream, "{:X}\r\n", bytes.len())?;
+    stream.write_all(bytes)?;
+    stream.write_all(b"\r\n")
+}
+
+fn finish_export(stream: &mut TcpStream, complete: bool, emitted: usize) -> io::Result<()> {
+    write!(
+        stream,
+        "0\r\nX-Traza-Export-Complete: {}\r\nX-Traza-Export-Count: {emitted}\r\n\r\n",
+        if complete { "true" } else { "false" }
+    )?;
+    stream.flush()
 }
 
 /// Query parser for the analytics endpoints: `since`/`until` (ns), `limit`,

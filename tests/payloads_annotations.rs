@@ -98,6 +98,37 @@ fn walk(root: &Path) -> Vec<PathBuf> {
     files
 }
 
+fn decode_chunked(bytes: &[u8]) -> (Vec<u8>, String) {
+    let mut rest = bytes;
+    let mut decoded = Vec::new();
+    loop {
+        let line_end = rest
+            .windows(2)
+            .position(|window| window == b"\r\n")
+            .expect("chunk size line");
+        let size = usize::from_str_radix(
+            std::str::from_utf8(&rest[..line_end])
+                .expect("chunk size utf8")
+                .split(';')
+                .next()
+                .unwrap_or_default(),
+            16,
+        )
+        .expect("chunk size");
+        rest = &rest[line_end + 2..];
+        if size == 0 {
+            return (
+                decoded,
+                String::from_utf8(rest.to_vec()).expect("trailers utf8"),
+            );
+        }
+        assert!(rest.len() >= size + 2, "complete chunk");
+        decoded.extend_from_slice(&rest[..size]);
+        assert_eq!(&rest[size..size + 2], b"\r\n");
+        rest = &rest[size + 2..];
+    }
+}
+
 #[test]
 fn annotations_append_query_and_survive_reopen() {
     let dir = test_dir("annotations");
@@ -153,6 +184,67 @@ fn annotations_append_query_and_survive_reopen() {
     let store = Store::open(&dir, Config::default()).expect("reopens");
     let all = store.annotations("t1", None, None).expect("queries");
     assert_eq!(all.len(), 2, "annotations survive reopen");
+}
+
+#[test]
+fn annotation_replay_rejects_corrupt_middle_records_but_tolerates_a_torn_tail() {
+    let valid = Annotation {
+        trace_id: "trace".into(),
+        span_id: "span".into(),
+        name: "quality".into(),
+        value: json!(1),
+        source: String::new(),
+        comment: String::new(),
+        timestamp_ns: 1,
+    };
+    let encoded = serde_json::to_string(&valid).expect("encodes");
+
+    let corrupt = test_dir("annotation-corrupt-middle");
+    std::fs::write(
+        corrupt.join("annotations.jsonl"),
+        format!("{encoded}\nnot-json\n{encoded}\n"),
+    )
+    .expect("writes corrupt log");
+    assert!(
+        Store::open(&corrupt, Config::default()).is_err(),
+        "newline-terminated middle corruption must fail loudly"
+    );
+
+    let torn = test_dir("annotation-torn-tail");
+    std::fs::write(
+        torn.join("annotations.jsonl"),
+        format!("{encoded}\n{{\"trace_id\":\"incomplete"),
+    )
+    .expect("writes torn log");
+    let store = Store::open(&torn, Config::default()).expect("ignores torn final append");
+    assert_eq!(store.annotations("trace", None, None).unwrap().len(), 1);
+    let mut second = valid.clone();
+    second.span_id = "second".into();
+    store.annotate(second).expect("appends after recovery");
+    drop(store);
+    let store = Store::open(&torn, Config::default()).expect("reopens healed log");
+    assert_eq!(
+        store.annotations("trace", None, None).unwrap().len(),
+        2,
+        "torn bytes were truncated before the next append"
+    );
+
+    let missing_newline = test_dir("annotation-missing-newline");
+    std::fs::write(missing_newline.join("annotations.jsonl"), &encoded)
+        .expect("writes complete unterminated record");
+    let store = Store::open(&missing_newline, Config::default()).expect("accepts complete record");
+    let mut second = valid.clone();
+    second.span_id = "second".into();
+    store
+        .annotate(second)
+        .expect("appends after delimiter repair");
+    drop(store);
+    let store = Store::open(&missing_newline, Config::default()).expect("reopens repaired log");
+    assert_eq!(
+        store.annotations("trace", None, None).unwrap().len(),
+        2,
+        "missing newline was restored before the next append"
+    );
 }
 
 // ---------------------------------------------------------------- server
@@ -223,7 +315,14 @@ impl Server {
             .and_then(|head| head.split_whitespace().nth(1))
             .and_then(|code| code.parse().ok())
             .expect("status");
-        (status, response[split + 4..].to_vec())
+        let head = String::from_utf8_lossy(&response[..split]).to_ascii_lowercase();
+        let body = &response[split + 4..];
+        let decoded = if head.contains("transfer-encoding: chunked") {
+            decode_chunked(body).0
+        } else {
+            body.to_vec()
+        };
+        (status, decoded)
     }
 
     fn json(&self, method: &str, target: &str, body: Option<&Value>) -> (u16, Value) {
@@ -508,11 +607,10 @@ fn concurrent_identical_payload_ingest_all_succeed() {
 }
 
 #[test]
-fn export_streams_without_content_length_and_paginates_exactly() {
+fn export_streams_with_completion_trailers_and_paginates_exactly() {
     // Found in review: export materialized the full result plus a full
-    // NDJSON buffer, defeating larger-than-RAM. It now streams
-    // close-delimited pages; an equal-timestamp run WIDER than one page
-    // exercises the cursor's stall guard.
+    // NDJSON buffer, defeating larger-than-RAM. A complete full-key cursor now
+    // holds pages constant even for a timestamp run wider than one page.
     let dir = test_dir("export-stream");
     let server = Server::spawn(&dir);
 
@@ -553,7 +651,7 @@ fn export_streams_without_content_length_and_paginates_exactly() {
     assert_eq!(replaced.len(), 1, "replaced span appears once");
     assert_eq!(replaced[0]["name"], "final", "last write wins in export");
 
-    // Close-delimited: no Content-Length on the export response.
+    // Chunked framing preserves NDJSON while trailers prove completion.
     {
         use std::io::{Read, Write};
         let mut stream =
@@ -573,14 +671,89 @@ fn export_streams_without_content_length_and_paginates_exactly() {
             .to_ascii_lowercase();
         assert!(
             !head.contains("content-length"),
-            "export must be close-delimited: {head}"
+            "chunked export must not declare content length: {head}"
         );
-        let body_lines = text
-            .split_once("\r\n\r\n")
-            .map(|(_, body)| body.lines().filter(|line| !line.is_empty()).count())
-            .unwrap_or(0);
+        assert!(head.contains("transfer-encoding: chunked"), "{head}");
+        assert!(
+            head.contains("trailer: x-traza-export-complete, x-traza-export-count"),
+            "{head}"
+        );
+        let body = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|split| &response[split + 4..])
+            .expect("body");
+        let (decoded, trailers) = decode_chunked(body);
+        let body_lines = String::from_utf8(decoded)
+            .expect("body utf8")
+            .lines()
+            .filter(|line| !line.is_empty())
+            .count();
         assert_eq!(body_lines, 5, "user limit caps the stream");
+        assert!(
+            trailers
+                .to_ascii_lowercase()
+                .contains("x-traza-export-complete: true"),
+            "{trailers}"
+        );
+        assert!(
+            trailers
+                .to_ascii_lowercase()
+                .contains("x-traza-export-count: 5"),
+            "{trailers}"
+        );
     }
+}
+
+#[test]
+fn export_storage_failure_is_explicit_in_trailers() {
+    let dir = test_dir("export-failure");
+    let server = Server::spawn(&dir);
+    let (status, _) = server.json(
+        "POST",
+        "/v1/spans",
+        Some(&json!([{
+            "trace_id": "trace", "span_id": "span", "name": "op",
+            "service": "broken", "start_time_ns": 1u64, "end_time_ns": 2u64
+        }])),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(server.json("POST", "/v1/flush", None).0, 200);
+    let segment = walk(&dir)
+        .into_iter()
+        .find(|path| path.extension().is_some_and(|ext| ext == "seg"))
+        .expect("segment");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(segment)
+        .expect("opens segment")
+        .set_len(0)
+        .expect("truncates segment");
+
+    let mut stream = TcpStream::connect(("127.0.0.1", server.port)).expect("connects");
+    write!(
+        stream,
+        "GET /v1/export?service=broken HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+    )
+    .expect("writes");
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).expect("reads");
+    let split = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("header");
+    assert!(
+        String::from_utf8_lossy(&response[..split]).starts_with("HTTP/1.1 200"),
+        "headers precede the storage failure"
+    );
+    let (decoded, trailers) = decode_chunked(&response[split + 4..]);
+    assert!(decoded.is_empty());
+    let trailers = trailers.to_ascii_lowercase();
+    assert!(
+        trailers.contains("x-traza-export-complete: false"),
+        "{trailers}"
+    );
+    assert!(trailers.contains("x-traza-export-count: 0"), "{trailers}");
 }
 
 #[test]
