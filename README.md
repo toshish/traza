@@ -17,7 +17,7 @@ Most tracing backends make you assemble a fleet before the first span: a column 
 - **Start on one machine in seconds.** A single process stores everything under `--data-dir`, serves its own dashboard, and needs nothing else — right-sized for a laptop, a CI job, a single-host service, an edge box, or the AI agent you're debugging *right now*.
 - **Scale by adding nodes, not systems.** The engine's foundations — immutable segments, idempotent primary-key ingest, journaled compaction — were chosen to replicate. The [HA design](docs/ha-design.md) (quorum-replicated logical log, validated full-state snapshots for catch-up) is the committed trajectory: clustered, highly available deployments running this same binary. Today's scope is single-node; see [Status](#status-and-roadmap).
 - **Built for LLM and agent workloads.** Sessions, token and cost analytics, prompt/completion capture with large-payload offloading, post-hoc evals and feedback, and one-command dataset export — first-class, not bolted on.
-- **OpenTelemetry-compatible.** Point any OTel SDK at it with two environment variables.
+- **OpenTelemetry-compatible, OpenLLMetry-native.** Point any OTel SDK at it with two environment variables. Traza follows the [OpenLLMetry](https://github.com/traceloop/openllmetry) standard (`gen_ai.*` / `traceloop.*`), so instrumented apps get sessions and token/cost analytics with no attribute renaming.
 - **Small enough to trust.** Two direct dependencies; HTTP, threading, and file I/O are the Rust standard library. `#![forbid(unsafe_code)]`. Every performance number in [BENCHMARKS.md](BENCHMARKS.md) is measured by a bundled benchmark, never estimated.
 - **Crash-safe by construction.** Immutable segments written by write-temp, fsync, atomic rename; recovery loads only complete segments and heals crash artifacts.
 
@@ -55,21 +55,29 @@ Or skip curl entirely: the dashboard at `http://localhost:8080/` shows recent sp
 
 ## LLM and agent observability
 
-Traza treats generative-AI telemetry as a native workload, not an attribute soup. The [conventions](docs/llm-semantics.md) are plain span attributes — no SDK required:
+Traza treats generative-AI telemetry as a native workload, not an attribute
+soup. It follows the [OpenLLMetry](https://github.com/traceloop/openllmetry)
+standard — Traceloop's OpenTelemetry GenAI conventions — so an app instrumented
+with OpenLLMetry populates sessions and cost/token analytics with no attribute
+renaming. Traza's own shorthand (`llm.*`, `session.id`) is accepted as an
+alias. The [conventions](docs/llm-semantics.md) are plain span attributes — no
+SDK required:
 
 ```jsonc
 {
-  "name": "llm.completion",
+  "name": "openai.chat",
   "service": "support-agent",
   "attributes": {
-    "session.id": "chat-4711",          // groups traces into a session
-    "llm.model": "gpt-5.6",
-    "llm.prompt_tokens": 412,
-    "llm.completion_tokens": 88,
-    "llm.cost_usd": 0.0042,
-    "llm.stop_reason": "end_turn"
-  },
-  "events": [{ "name": "llm.prompt", "attributes": { "content": "..." } }]
+    "gen_ai.conversation.id": "chat-4711",   // groups traces into a session
+    "gen_ai.system": "openai",               // provider
+    "gen_ai.request.model": "gpt-4o",
+    "gen_ai.usage.prompt_tokens": 412,
+    "gen_ai.usage.completion_tokens": 88,
+    "gen_ai.usage.cost": 0.0042,
+    "gen_ai.response.finish_reason": "stop",
+    "gen_ai.prompt.0.role": "user",
+    "gen_ai.prompt.0.content": "..."
+  }
 }
 ```
 
@@ -85,7 +93,7 @@ curl 'http://localhost:8080/v1/sessions/chat-4711'
 **Cost and token analytics** — exact rollups, grouped how you ask:
 
 ```sh
-curl 'http://localhost:8080/v1/stats/llm?group_by=model'     # or service | session | day
+curl 'http://localhost:8080/v1/stats/llm?group_by=model'     # or provider | service | session | day
 # rows of {key, llm_calls, prompt/completion/total tokens, cost_usd, errors, latency}
 ```
 
@@ -123,6 +131,8 @@ export OTEL_EXPORTER_OTLP_COMPRESSION=none
 
 `POST /v1/traces` accepts OTLP/HTTP as binary protobuf or JSON: `service.name` becomes the span's service, typed attributes are flattened, events and span links are preserved. gRPC is not served — use the `http/protobuf` exporter setting, which every OTel SDK supports.
 
+OpenLLMetry and OTel GenAI instrumentation lands queryable without translation: `gen_ai.*`, `llm.usage.*`, and `traceloop.*` attributes drive sessions, provider/model rollups, and token/cost analytics directly (see [LLM conventions](docs/llm-semantics.md)).
+
 ## HTTP API
 
 | Method | Path | Purpose |
@@ -133,7 +143,7 @@ export OTEL_EXPORTER_OTLP_COMPRESSION=none
 | `GET` | `/v1/spans?…` | Filtered span search |
 | `GET` | `/v1/sessions?since=&until=&limit=` | Sessions, most recent first |
 | `GET` | `/v1/sessions/{id}` | One session's rollup + per-trace breakdown |
-| `GET` | `/v1/stats/llm?group_by=model\|service\|session\|day` | Token/cost aggregation |
+| `GET` | `/v1/stats/llm?group_by=model\|provider\|service\|session\|day` | Token/cost aggregation |
 | `POST` | `/v1/annotations` | Attach a score/feedback record to a span or trace |
 | `GET` | `/v1/annotations?trace_id=&span_id=&name=` | Query annotations |
 | `GET` | `/v1/payloads/sha256/{hex}` | Raw bytes of an offloaded payload |

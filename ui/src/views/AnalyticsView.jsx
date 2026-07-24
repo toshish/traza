@@ -61,14 +61,14 @@ export function AnalyticsView() {
     <div style={{ display: 'flex', gap: 12, alignItems: 'center', marginBottom: 12, flexWrap: 'wrap' }}>
       <span style={{ fontSize: 'var(--text-12)', color: 'var(--ink-muted)' }}>group by</span>
       <Select size="sm" value={groupBy} onChange={setGroupBy}
-        options={[{ value: 'model', label: 'model' }, { value: 'service', label: 'service' }, { value: 'session', label: 'session' }, { value: 'day', label: 'day' }]} />
+        options={[{ value: 'model', label: 'model' }, { value: 'provider', label: 'provider' }, { value: 'service', label: 'service' }, { value: 'session', label: 'session' }, { value: 'day', label: 'day' }]} />
       <Tabs tabs={RANGES.map((r) => ({ id: r.id, label: r.label }))} active={range} onChange={setRange} style={{ borderBottom: 'none' }} />
     </div>
     <LoadingBar active={loading} style={{ marginBottom: 8 }} />
     {error ? <ErrorState what={error.what} next={error.next} /> : null}
     {rows && !rows.length ? <EmptyState
-      message={<span>No LLM calls in this window. Traza recognizes spans carrying <code>llm.*</code> usage attributes:</span>}
-      command={'"attributes": {"llm.model": "…", "llm.prompt_tokens": 412,\n               "llm.completion_tokens": 88, "llm.cost_usd": 0.0042}'} /> : null}
+      message={<span>No LLM calls in this window. Traza recognizes the OpenLLMetry / OTel GenAI conventions (<code>gen_ai.*</code>, <code>llm.usage.*</code>) and its native <code>llm.*</code> shorthand:</span>}
+      command={'"attributes": {"gen_ai.system": "openai", "gen_ai.request.model": "gpt-4o",\n               "gen_ai.usage.prompt_tokens": 412, "gen_ai.usage.completion_tokens": 88}'} /> : null}
     {rows && rows.length ? <>
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 12, marginBottom: 16 }}>
         <StatTile label="LLM calls" value={fmtNum(totals.calls)} />

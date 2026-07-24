@@ -14,11 +14,12 @@
 //! - `GET /v1/spans?service=&name=&min_duration_ns=&since_ns=&until_ns=&limit=`
 //!   responds with the matching spans ordered by start time.
 //! - `GET /v1/stats` responds with engine statistics.
-//! - `GET /v1/sessions?since=&until=&limit=` lists sessions (spans carrying
-//!   the `session.id` attribute), most recent activity first.
+//! - `GET /v1/sessions?since=&until=&limit=` lists sessions (spans carrying a
+//!   recognized session key: `session.id`, `gen_ai.conversation.id`, or a
+//!   `traceloop.association.properties.*` key), most recent activity first.
 //! - `GET /v1/sessions/<id>` responds with the session rollup and its
 //!   per-trace breakdown, or 404.
-//! - `GET /v1/stats/llm?group_by=model|service|session|day&since=&until=`
+//! - `GET /v1/stats/llm?group_by=model|provider|service|session|day&since=&until=`
 //!   responds with token/cost aggregation rows.
 //! - `POST /v1/flush` forces buffered spans into a durable segment.
 //! - `POST /v1/traces` accepts OTLP/HTTP JSON or binary protobuf.
@@ -555,7 +556,7 @@ fn handle_connection(
                         return respond(
                             &mut stream,
                             400,
-                            json!({"error": "group_by must be model|service|session|day"}),
+                            json!({"error": "group_by must be model|provider|service|session|day"}),
                         )
                     }
                 },

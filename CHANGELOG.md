@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Traza now follows the [OpenLLMetry](https://github.com/traceloop/openllmetry)
+  standard (Traceloop's OpenTelemetry GenAI conventions). Sessions, token/cost
+  analytics, and the dashboard recognize `gen_ai.*`, `llm.usage.*`, and
+  `traceloop.*` attributes natively, so an OpenLLMetry-instrumented app
+  populates every derived view over OTLP with no attribute renaming. A new
+  `src/semconv.rs` normalization layer resolves model, provider, tokens, cost,
+  and session identity from either the OpenLLMetry keys or Traza's native
+  `llm.*` / `session.id` shorthand (native behavior is unchanged).
+- `GET /v1/stats/llm?group_by=provider` rolls token/cost figures up by
+  `gen_ai.system`.
+- Sessions are grouped by any recognized session key (`session.id`,
+  `gen_ai.conversation.id`, or a `traceloop.association.properties.*` key), and
+  each session reports the `session_attribute` that grouped it. The dashboard's
+  span detail renders provider/model/token chips and a Messages panel from the
+  OpenLLMetry `gen_ai.prompt.*` / `gen_ai.completion.*` attributes.
+
 ### Changed
 
 - License is now Apache-2.0 only (previously dual MIT OR Apache-2.0).

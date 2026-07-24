@@ -137,6 +137,7 @@ export function App() {
   const [head, second] = route.parts;
   const activeTab = head === 'traces' ? 'spans' : (TABS.some((t) => t.id === head) ? head : 'spans');
   const sessionFilter = route.params.get('session') || '';
+  const sessionFilterAttr = route.params.get('session_attr') || 'session.id';
 
   let view;
   if (head === 'traces' && second) {
@@ -148,7 +149,8 @@ export function App() {
   } else if (head === 'sessions' && second) {
     view = <SessionDetailView key={second + ':' + authVersion} sessionId={second}
       openTrace={(traceId) => navigate(['traces', traceId])}
-      filterSpans={(id) => navigate(['spans'], { session: id })} />;
+      filterSpans={(id, attr) => navigate(['spans'],
+        attr && attr !== 'session.id' ? { session: id, session_attr: attr } : { session: id })} />;
   } else if (head === 'sessions') {
     view = <SessionsView key={'sessions:' + authVersion} openSession={(id) => navigate(['sessions', id])} />;
   } else if (head === 'analytics') {
@@ -156,8 +158,9 @@ export function App() {
   } else if (head === 'store') {
     view = <StoreView key={'store:' + authVersion} pushToast={pushToast} />;
   } else {
-    view = <SpansView key={'spans:' + sessionFilter + ':' + authVersion}
+    view = <SpansView key={'spans:' + sessionFilter + ':' + sessionFilterAttr + ':' + authVersion}
       sessionFilter={sessionFilter}
+      sessionFilterAttr={sessionFilterAttr}
       clearSessionFilter={() => navigate(['spans'])}
       openTrace={(traceId, spanId) => navigate(['traces', traceId], spanId ? { span: spanId } : undefined)} />;
   }
