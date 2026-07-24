@@ -13,6 +13,18 @@ export function fmtNum(value) {
   return typeof value === 'number' ? value.toLocaleString('en-US') : String(value ?? '');
 }
 
+/** Headline figures only: a billion-token total does not fit a stat tile at
+    24px mono, and a clipped number is worse than a rounded one. Tables and
+    tooltips keep the exact value via fmtNum. */
+export function fmtCompact(value) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return String(value ?? '');
+  const abs = Math.abs(value);
+  if (abs >= 1e12) return (value / 1e12).toFixed(2) + ' T';
+  if (abs >= 1e9) return (value / 1e9).toFixed(2) + ' B';
+  if (abs >= 1e6) return (value / 1e6).toFixed(2) + ' M';
+  return value.toLocaleString('en-US');
+}
+
 export function fmtCost(value) {
   return typeof value === 'number' ? value.toFixed(4) : String(value ?? '');
 }

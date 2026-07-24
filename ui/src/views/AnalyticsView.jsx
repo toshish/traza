@@ -1,6 +1,6 @@
 import React from 'react';
 import { api } from '../lib/api.js';
-import { fmtNum, fmtCost, fmtAvgLatency } from '../lib/format.js';
+import { fmtNum, fmtCost, fmtAvgLatency, fmtCompact } from '../lib/format.js';
 import { Section } from '../components/Section.jsx';
 import { Button } from '../components/primitives/Button.jsx';
 import { Select } from '../components/primitives/Select.jsx';
@@ -71,9 +71,9 @@ export function AnalyticsView() {
       command={'"attributes": {"gen_ai.system": "openai", "gen_ai.request.model": "gpt-4o",\n               "gen_ai.usage.prompt_tokens": 412, "gen_ai.usage.completion_tokens": 88}'} /> : null}
     {rows && rows.length ? <>
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 12, marginBottom: 16 }}>
-        <StatTile label="LLM calls" value={fmtNum(totals.calls)} />
-        <StatTile label="total tokens" value={fmtNum(totals.tokens)} />
-        <StatTile label="cost" value={fmtCost(totals.cost)} unit="USD" />
+        <StatTile label="LLM calls" value={fmtCompact(totals.calls)} title={fmtNum(totals.calls) + ' LLM calls'} />
+        <StatTile label="total tokens" value={fmtCompact(totals.tokens)} title={fmtNum(totals.tokens) + ' tokens'} />
+        <StatTile label="cost" value={fmtCompact(totals.cost)} unit="USD" title={fmtCost(totals.cost) + ' USD'} />
         <StatTile label="average latency" value={fmtAvgLatency(totals.durationNs, totals.calls) || '—'} />
         <StatTile label="errors" value={fmtNum(totals.errors)} />
       </div>

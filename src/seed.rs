@@ -167,6 +167,11 @@ pub struct SeedOptions {
     pub start_time_ns: u64,
     /// PRNG seed; the same seed reproduces the corpus exactly.
     pub seed: u64,
+    /// Distinguishes the ids of one batch from another. Span ids are numbered
+    /// from zero within a corpus, so generating a large store in chunks needs
+    /// a per-chunk namespace or the chunks would collide on the primary key
+    /// and silently upsert each other. Empty for a single corpus.
+    pub namespace: String,
     /// Size of the deliberately oversized prompt bodies, which must exceed the
     /// server's payload threshold to exercise offloading.
     pub big_payload_bytes: usize,
@@ -179,6 +184,7 @@ impl Default for SeedOptions {
             // 2026-01-05T00:00:00Z — a fixed, recognizable window.
             start_time_ns: 1_767_571_200 * SEC,
             seed: 0x7_4a_2a,
+            namespace: String::new(),
             big_payload_bytes: 300 * 1024,
         }
     }
@@ -257,7 +263,11 @@ struct Gen {
 impl Gen {
     fn id(&mut self, prefix: &str) -> String {
         self.counter += 1;
-        format!("{prefix}-{:06x}", self.counter)
+        if self.options.namespace.is_empty() {
+            format!("{prefix}-{:06x}", self.counter)
+        } else {
+            format!("{prefix}-{}-{:06x}", self.options.namespace, self.counter)
+        }
     }
 
     /// Advances the shared clock so traces spread realistically over days.
