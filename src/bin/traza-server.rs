@@ -24,9 +24,12 @@
 //! - `POST /v1/flush` forces buffered spans into a durable segment.
 //! - `POST /v1/traces` accepts OTLP/HTTP JSON or binary protobuf.
 //! - `GET /v1/export` streams chunked NDJSON with completion/count trailers.
-//!
-//! The server is a pure JSON API. The trace-browser UI lives in `ui/` and is a
-//! standalone SPA that talks to this API; it is not served by the binary.
+//! - `GET /` and `GET /dashboard` serve the built dashboard from `--ui-dir`
+//!   (default `./ui/dist`, produced by `ui/`'s `npm run build`). The page is
+//!   read from disk, never compiled in, so building the server needs no Node
+//!   toolchain and a rebuilt UI is picked up without restarting. The shell is
+//!   served before the auth gate — it carries no data, and its `/v1` calls
+//!   stay gated — and the routes 404 with build instructions when absent.
 
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream};
@@ -76,6 +79,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .map_or(4, usize::from)
         .max(4);
     let mut allow_unauthenticated_non_loopback = false;
+    let mut ui_dir = PathBuf::from("./ui/dist");
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < args.len() {
@@ -123,12 +127,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .parse::<usize>()?
                     .max(1);
             }
+            "--ui-dir" => {
+                i += 1;
+                ui_dir = PathBuf::from(args.get(i).ok_or("--ui-dir requires a value")?);
+            }
             "--allow-unauthenticated-non-loopback" => {
                 allow_unauthenticated_non_loopback = true;
             }
             "--help" | "-h" => {
                 println!(
-                    "Usage: traza-server --data-dir DIR --port PORT [--host ADDR] [--ttl-seconds N] [--flush-spans N] [--workers N] [--payload-threshold-bytes N (0 disables)] [--allow-unauthenticated-non-loopback]"
+                    "Usage: traza-server --data-dir DIR --port PORT [--host ADDR] [--ttl-seconds N] [--flush-spans N] [--workers N] [--payload-threshold-bytes N (0 disables)] [--ui-dir DIR (built dashboard; default ./ui/dist)] [--allow-unauthenticated-non-loopback]"
                 );
                 return Ok(());
             }
@@ -178,12 +186,26 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let actual_port = listener.local_addr()?.port();
     eprintln!("traza-server listening on {host}:{actual_port}");
 
+    // The dashboard is served from disk (ui/ `npm run build` output), never
+    // compiled in. A missing build is not fatal: the API runs, and the UI
+    // routes explain how to produce it.
+    let ui = Arc::new(traza::ui::UiRoot::new(&ui_dir));
+    if ui.is_available() {
+        eprintln!("traza-server serving dashboard from {}", ui_dir.display());
+    } else {
+        eprintln!(
+            "traza-server: no dashboard at {} (build it with: cd ui && npm ci && npm run build)",
+            ui_dir.display()
+        );
+    }
+
     let (http_tx, http_rx) = mpsc::sync_channel::<TcpStream>(HTTP_QUEUE_DEPTH);
     let http_rx = Arc::new(Mutex::new(http_rx));
     for number in 0..workers {
         let rx = Arc::clone(&http_rx);
         let worker_engine = Arc::clone(&engine);
         let worker_auth = Arc::clone(&auth);
+        let worker_ui = Arc::clone(&ui);
         thread::Builder::new()
             .name(format!("http-{number}"))
             .spawn(move || loop {
@@ -191,7 +213,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     Ok(stream) => stream,
                     Err(_) => break,
                 };
-                let _ = handle_connection(stream, &worker_engine, &worker_auth);
+                let _ = handle_connection(stream, &worker_engine, &worker_auth, &worker_ui);
             })?;
     }
 
@@ -217,6 +239,7 @@ fn handle_connection(
     mut stream: TcpStream,
     engine: &Store,
     auth: &Option<traza::auth::AuthConfig>,
+    ui: &traza::ui::UiRoot,
 ) -> io::Result<()> {
     // A silent or dribbling peer must not park this worker thread forever.
     let timeout = socket_timeout();
@@ -226,6 +249,33 @@ fn handle_connection(
         Ok(head) => head,
         Err(error) => return respond(&mut stream, 400, json!({"error": error.to_string()})),
     };
+    // The dashboard SHELL is served before the auth gate: the page must load
+    // in a browser without credentials, while every /v1 call it makes below
+    // stays gated (the page attaches the bearer token itself). Static assets
+    // carry no stored data, so this leaks nothing.
+    if head.method == "GET" {
+        let path = percent_decode(
+            head.target
+                .split_once('?')
+                .map_or(head.target.as_str(), |(path, _)| path),
+        );
+        if let Some(file) = ui.resolve(&path) {
+            return respond_file(&mut stream, &file);
+        }
+        if matches!(path.as_str(), "/" | "/dashboard" | "/dashboard/") {
+            return respond(
+                &mut stream,
+                404,
+                json!({
+                    "error": "no dashboard build found",
+                    "next": format!(
+                        "build it with: cd ui && npm ci && npm run build (serving {})",
+                        ui.directory().display()
+                    ),
+                }),
+            );
+        }
+    }
     // Auth verdicts need only the head: rejecting BEFORE the body read means
     // an unauthenticated client cannot make this server buffer 64 MiB.
     if let Some(config) = auth {
@@ -851,6 +901,20 @@ fn read_body(stream: &mut TcpStream, head: RequestHead) -> io::Result<Request> {
         content_type,
         body: buffered[header_end..header_end + content_length].to_vec(),
     })
+}
+
+/// Writes a static UI file. `no-store` keeps a rebuilt dashboard from being
+/// shadowed by a cached copy; `nosniff` stops a browser from reinterpreting a
+/// served asset as something more dangerous than its declared type.
+fn respond_file(stream: &mut TcpStream, file: &traza::ui::UiFile) -> io::Result<()> {
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        file.content_type,
+        file.bytes.len()
+    )?;
+    stream.write_all(&file.bytes)?;
+    stream.flush()
 }
 
 fn respond(stream: &mut TcpStream, status: u16, body: Value) -> io::Result<()> {

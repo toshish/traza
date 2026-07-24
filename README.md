@@ -2,13 +2,17 @@
 
 **A trace datastore with first-class LLM and agent observability — one binary from laptop to cluster.**
 
-Traza (Spanish for "trace") ingests OpenTelemetry or plain-JSON spans over HTTP, stores them durably, and answers trace lookups, filtered searches, and token/cost analytics in milliseconds — with no infrastructure to stand up. Two dependencies (`serde`, `serde_json`), no external database, and one deployment story at every size: today a single node that starts in milliseconds; the designed trajectory is replicated, highly available clusters of the same binary. A standalone React trace browser ([`ui/`](ui/)) talks to the same HTTP API.
+Traza (Spanish for "trace") ingests OpenTelemetry or plain-JSON spans over HTTP, stores them durably, and answers trace lookups, filtered searches, and token/cost analytics in milliseconds — with a built-in trace browser and no infrastructure to stand up. Two dependencies (`serde`, `serde_json`), no external database, and one deployment story at every size: today a single node that starts in milliseconds; the designed trajectory is replicated, highly available clusters of the same binary. The trace browser is a React app ([`ui/`](ui/)) that the server serves straight from its build output — nothing is compiled into the binary, so building the server still needs no Node toolchain.
 
 ```sh
 cargo build --release
+(cd ui && npm ci && npm run build)          # builds the dashboard into ui/dist
 ./target/release/traza-server --data-dir ./data --port 8080
-# JSON API on :8080; for the trace browser, run the ui/ app (see below)
+# open http://localhost:8080 — the server serves ui/dist
 ```
+
+The dashboard build is optional: without it the API runs exactly the same and
+`/` returns a 404 telling you how to build it.
 
 ## Why Traza
 
@@ -49,7 +53,7 @@ curl 'http://localhost:8080/v1/spans?service=checkout&attr.region=us-east&min_du
 curl http://localhost:8080/v1/stats
 ```
 
-Or skip curl entirely: the [`ui/`](ui/) trace browser (a standalone React app — `cd ui && npm ci && npm run dev`, pointed at your server) shows recent spans, a filter bar, per-trace waterfalls, span detail, sessions, and LLM analytics.
+Or skip curl entirely: the trace browser at `http://localhost:8080/` shows recent spans, a filter bar, per-trace waterfalls, span detail, sessions, and LLM analytics. It is a React app in [`ui/`](ui/); `npm run build` emits `ui/dist`, which the server serves (see [`--ui-dir`](#server-flags)). For UI development, `npm run dev` runs Vite on :5173 with `/v1` proxied to the server.
 
 **Span identity is a primary key.** `(trace_id, span_id)` uniquely names a span; re-ingesting it replaces the stored version (last write wins). Client retries are idempotent and never create duplicates.
 
@@ -169,7 +173,7 @@ TRAZA_TOKENS="rw:$(openssl rand -hex 16),ro:$(openssl rand -hex 16)" \
   traza-server --data-dir ./data
 ```
 
-Missing or unknown tokens get 401 with a `WWW-Authenticate: Bearer` challenge; insufficient scope gets 403. Comparison is constant-time; an invalid `TRAZA_TOKENS` refuses startup rather than silently running open. Without tokens, Traza permits loopback binds only; a non-loopback `--host` requires `TRAZA_TOKENS` or the explicit `--allow-unauthenticated-non-loopback` escape hatch. The [`ui/`](ui/) trace browser prompts for a token on the first 401 and holds it in `sessionStorage` only. TLS is reverse-proxy territory.
+Missing or unknown tokens get 401 with a `WWW-Authenticate: Bearer` challenge; insufficient scope gets 403. Comparison is constant-time; an invalid `TRAZA_TOKENS` refuses startup rather than silently running open. Without tokens, Traza permits loopback binds only; a non-loopback `--host` requires `TRAZA_TOKENS` or the explicit `--allow-unauthenticated-non-loopback` escape hatch. The dashboard SHELL itself stays open (it is static build output and carries no data) while every `/v1` call it makes remains gated; the page prompts for a token on the first 401 and holds it in `sessionStorage` only. TLS is reverse-proxy territory.
 
 **Retention.** `--ttl-seconds N` keeps a rolling window: a background pass compacts expired spans every minute, and annotations and payload files age out on the same window. Off by default — nothing is deleted unless you ask.
 
@@ -189,6 +193,7 @@ Missing or unknown tokens get 401 with a `WWW-Authenticate: Bearer` challenge; i
 | `--ttl-seconds N` | off | Rolling retention window |
 | `--flush-spans N` | `10000` | Buffered spans that trigger a durable flush |
 | `--payload-threshold-bytes N` | `262144` | Offload threshold for large string values; `0` disables |
+| `--ui-dir DIR` | `./ui/dist` | Built dashboard to serve at `/`; served from disk, so a rebuilt UI needs no server restart. Missing directory ⇒ the API runs and `/` 404s with build instructions |
 | `--allow-unauthenticated-non-loopback` | off | Explicitly allow an unsafe non-loopback bind without tokens |
 
 ## Performance
@@ -224,13 +229,13 @@ Two layers with one contract: never lose a completed write, never serve a torn o
 
 The **storage engine** buffers spans in memory and flushes sorted, immutable v2 segment files — JSON payloads with embedded record-offset, trace, and attribute indexes — via write-temp, fsync, atomic rename. Opening a store parses only the indexes; spans materialize on demand. Legacy v1 JSONL segments fail startup with a migration pointer rather than being silently misread. Filters narrow candidates through the indexes, then re-verify every predicate against the parsed span: an index accelerates a filter, it never changes its semantics.
 
-The **HTTP server** is a deliberately small HTTP/1.1 implementation on `std::net` — a bounded worker pool in front of the engine, which is its only datastore. There is no server-side log or side index; restart durability is the engine's.
+The **HTTP server** is a deliberately small HTTP/1.1 implementation on `std::net` — a bounded worker pool in front of the engine, which is its only datastore. There is no server-side log or side index; restart durability is the engine's. It also serves the dashboard's build directory as static files, resolved against the canonicalized root so no request can read outside it.
 
 Deeper reading: [segment format](docs/segment-format-v2.md) · [LLM conventions](docs/llm-semantics.md) · [HA design](docs/ha-design.md).
 
 ## Status and roadmap
 
-Traza is pre-1.0 and honest about it: on-disk formats may change between 0.x versions, and single-node is the current scope. Shipped and load-bearing today: durable segment storage with crash recovery, OTLP protobuf/JSON ingest, sessions and cost analytics, payload offloading, annotations, streaming export, bearer auth, and the standalone [`ui/`](ui/) trace browser.
+Traza is pre-1.0 and honest about it: on-disk formats may change between 0.x versions, and single-node is the current scope. Shipped and load-bearing today: durable segment storage with crash recovery, OTLP protobuf/JSON ingest, sessions and cost analytics, payload offloading, annotations, streaming export, bearer auth, and the [`ui/`](ui/) trace browser served from its build output.
 
 The destination is bigger than one node. The full product roadmap — durable v1 foundations (a write-ahead log and the identity model that must precede any format freeze), then replicated HA clusters and agent-native debugging depth, then columnar analytics at billion-span scale, then the enterprise control plane — lives in [docs/roadmap.md](docs/roadmap.md), with the HA architecture detailed in [docs/ha-design.md](docs/ha-design.md). Same binary, same API, at every phase.
 

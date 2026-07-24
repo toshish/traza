@@ -1,26 +1,27 @@
 # Traza dashboard (ui/)
 
-The trace browser: a standalone React + Vite app built to the Traza design
-system (tokens and components imported from the "Traza Design System"
-project on claude.ai/design). It is a single-page app that talks to a
-`traza-server` JSON API; it is **not** bundled into the server binary — run
-or deploy it separately.
+The trace browser: a React + Vite app built to the Traza design system
+(tokens and components imported from the "Traza Design System" project on
+claude.ai/design). It is a single-page app that talks to a `traza-server`
+JSON API.
+
+`npm run build` emits `dist/` — one self-contained `index.html` — and
+`traza-server` **serves that directory** (`--ui-dir`, default `./ui/dist`).
+Nothing is compiled into the binary: building the server needs no Node
+toolchain, and rebuilding the UI is picked up without restarting the server.
+`dist/` is git-ignored; build it where you deploy, or host it anywhere else
+that can reach the API.
 
 ## Working on it
 
 ```sh
 npm ci
 npm run dev     # dev server on :5173, /v1 proxied to localhost:8080
-npm run build   # vite build -> dist/ (a self-contained static SPA)
+npm run build   # vite build -> dist/ (served by traza-server)
 ```
 
 Run a server beside `npm run dev` for live data:
 `cargo run --release --bin traza-server -- --data-dir ./data --port 8080`.
-
-`npm run build` emits `dist/` — a self-contained static bundle you can host
-anywhere (any static file server, a CDN, or behind the same reverse proxy as
-the API). Point it at your server's origin; the client attaches the bearer
-token and calls `/v1/*`.
 
 ## Shape
 
