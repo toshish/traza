@@ -42,8 +42,8 @@ segments, crash recovery, journaled TTL compaction, larger-than-RAM
 file-backed reads), primary-key idempotent ingest, OTLP/HTTP protobuf+JSON,
 sessions and token/cost analytics, content-addressed payload offloading,
 append-only annotations, streaming NDJSON export with integrity trailers,
-bearer auth with scopes, safe bind defaults, bundled dashboard, measured
-benchmarks (116k spans/s ingest; sub-ms trace lookup at 10M spans).
+bearer auth with scopes, safe bind defaults, a standalone trace-browser UI,
+measured benchmarks (116k spans/s ingest; sub-ms trace lookup at 10M spans).
 
 **Known gap that shapes Phase 1:** `POST /v1/spans` acknowledges after the
 write buffer accepts the batch, and durability begins at segment flush. A

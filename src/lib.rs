@@ -9,12 +9,15 @@
 pub mod analytics;
 pub mod annotations;
 pub mod auth;
-pub mod dashboard;
 pub mod expiration;
+mod media;
 pub mod otlp;
 pub mod otlp_pb;
 pub mod payload;
+pub mod seed;
 pub mod segment_v2;
+pub mod semconv;
+pub mod ui;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -134,6 +137,12 @@ pub struct SpanFilter {
     pub since_ns: Option<u64>,
     /// Match spans starting at or before this timestamp.
     pub until_ns: Option<u64>,
+    /// Match spans belonging to this session, resolved across every recognized
+    /// session key (`session.id`, `gen_ai.conversation.id`, a
+    /// `traceloop.association.properties.*` key). Unlike an `attr.KEY` filter,
+    /// this unions the recognized keys, so a session whose spans use mixed
+    /// conventions is returned whole (see [`crate::semconv`]).
+    pub session: Option<String>,
     /// Maximum number of returned spans.
     pub limit: Option<usize>,
 }
@@ -701,6 +710,81 @@ impl Store {
         self.query_after(filter, None)
     }
 
+    /// Every span carrying `values` under ANY of `keys`, resolved under ONE
+    /// snapshot of the write buffer and segment list.
+    ///
+    /// The snapshot matters: resolving each key with its own [`Self::query`]
+    /// call let a span re-ingested between the calls be seen first in its
+    /// SUPERSEDED version, which the per-key dedupe then locked in — the newer
+    /// version arrived later under the same primary key and was discarded.
+    /// That broke last-write-wins during ordinary concurrent ingest. Holding
+    /// both locks across every key makes the union as atomic as a single
+    /// query, and precedence is the usual one: the write buffer wins, then the
+    /// newest segment.
+    ///
+    /// `values` lists the accepted encodings of one logical value (a session
+    /// id may arrive as the string `"42"` or the number `42`), so the caller
+    /// does not have to guess which JSON type a producer used.
+    pub(crate) fn query_attribute_union(
+        &self,
+        keys: &[&str],
+        values: &[Value],
+    ) -> Result<Vec<Span>> {
+        // Lock order: writer before segments (see Store field docs).
+        let writer = self.lock_writer()?;
+        let segments = self.lock_segments()?;
+        let matches = |span: &Span| {
+            keys.iter().any(|key| {
+                span.attributes
+                    .get(*key)
+                    .is_some_and(|held| values.iter().any(|value| held == value))
+            })
+        };
+
+        let mut result: Vec<Span> = Vec::new();
+        let mut claimed: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        // The buffer holds the newest version of anything it carries.
+        for span in writer.spans.iter() {
+            if matches(span) {
+                claimed.insert((span.trace_id.clone(), span.span_id.clone()));
+                result.push(span.clone());
+            }
+        }
+        // Any key present in the buffer supersedes every segment copy, even
+        // one the predicate does not select in its buffered version.
+        for (trace_id, span_id) in writer.index.keys() {
+            claimed.insert((trace_id.clone(), span_id.clone()));
+        }
+        // Newest segment first, so the first version claimed for a key wins.
+        for segment in segments.iter().rev() {
+            let seg = &segment.seg;
+            let mut offsets: Vec<u64> = Vec::new();
+            for key in keys {
+                for value in values {
+                    offsets.extend_from_slice(
+                        seg.attribute_posting_offsets_ref(key, &canonical_value(value)),
+                    );
+                }
+            }
+            offsets.sort_unstable();
+            offsets.dedup();
+            for offset in offsets {
+                let record = seg.record_at_offset(offset).map_err(segment_v2_error)?;
+                let span = record_to_span(&record)?;
+                // An index accelerates a filter, it never changes it.
+                if !matches(&span) {
+                    continue;
+                }
+                if claimed.insert((span.trace_id.clone(), span.span_id.clone())) {
+                    result.push(span);
+                }
+            }
+        }
+        sort_spans(&mut result);
+        Ok(result)
+    }
+
     /// Returns spans matching `filter` strictly after `cursor`.
     ///
     /// The cursor is compared using the same total order as [`Self::query`],
@@ -711,6 +795,21 @@ impl Store {
         filter: &SpanFilter,
         cursor: Option<&SpanCursor>,
     ) -> Result<Vec<Span>> {
+        // A session predicate unions candidates across recognized keys, which
+        // the single-key attribute index cannot express — resolve it up front,
+        // then apply the remaining predicates, order, and limit.
+        if let Some(session_id) = &filter.session {
+            let mut spans = self.resolve_session_spans(session_id)?;
+            spans.retain(|span| {
+                span_matches(span, filter)
+                    && cursor.map_or(true, |position| span_after_cursor(span, position))
+            });
+            sort_spans(&mut spans);
+            if let Some(limit) = filter.limit {
+                spans.truncate(limit);
+            }
+            return Ok(spans);
+        }
         let writer = self.lock_writer()?;
         let segments = self.lock_segments()?;
         let mut result = Vec::new();
@@ -846,25 +945,61 @@ impl Store {
             return Ok(result);
         }
 
-        // Primary-key semantics for unlimited queries: dedupe to the newest
-        // version of each (trace_id, span_id) BEFORE filtering, so a
-        // superseded older version can neither appear alongside nor instead
-        // of the version that currently holds the key.
-        let mut latest: std::collections::HashMap<(String, String), Span> =
-            std::collections::HashMap::new();
-        for segment in segments.iter() {
-            for span in segment.spans_parsed()? {
-                latest.insert((span.trace_id.clone(), span.span_id.clone()), span);
+        // Unlimited queries narrow candidates through the SAME index the
+        // limited path uses. Decoding every record to answer a selective
+        // filter made a session lookup on a 50k-span store take 1.3 s, and the
+        // cost grew with the store rather than with the answer.
+        //
+        // Primary-key semantics are preserved without materializing the
+        // corpus: a candidate is emitted only if no higher-precedence source
+        // (the write buffer, or a newer segment) also holds its key, which is
+        // an index lookup rather than a decode. Filtering a candidate before
+        // that check is safe — a superseded older version is dropped either
+        // way, and the version that currently holds the key is never
+        // superseded by definition.
+        for (position, segment) in segments.iter().enumerate() {
+            let seg = &segment.seg;
+            let offsets = if let Some(service) = &filter.service {
+                seg.attribute_posting_offsets_ref(IDX_SERVICE, service)
+            } else if let Some(name) = &filter.name {
+                seg.attribute_posting_offsets_ref(IDX_NAME, name)
+            } else if let Some((key, value)) = filter
+                .attributes
+                .iter()
+                .find(|(key, _)| !key.starts_with('\u{0}'))
+            {
+                seg.attribute_posting_offsets_ref(key, &canonical_value(value))
+            } else {
+                seg.record_offsets()
+            };
+            for offset in offsets {
+                let record = seg.record_at_offset(*offset).map_err(segment_v2_error)?;
+                let span = record_to_span(&record)?;
+                if !span_matches(&span, filter)
+                    || cursor.is_some_and(|bound| !span_after_cursor(&span, bound))
+                {
+                    continue;
+                }
+                if writer.contains_key(&span.trace_id, &span.span_id) {
+                    continue; // the buffer holds a newer version
+                }
+                let mut superseded = false;
+                for newer in segments.iter().skip(position + 1) {
+                    if newer.contains_key(&span.trace_id, &span.span_id)? {
+                        superseded = true;
+                        break;
+                    }
+                }
+                if !superseded {
+                    result.push(span);
+                }
             }
         }
         for span in writer.spans.iter() {
-            latest.insert((span.trace_id.clone(), span.span_id.clone()), span.clone());
-        }
-        for span in latest.into_values() {
-            if span_matches(&span, filter)
-                && cursor.map_or(true, |position| span_after_cursor(&span, position))
+            if span_matches(span, filter)
+                && cursor.map_or(true, |bound| span_after_cursor(span, bound))
             {
-                result.push(span);
+                result.push(span.clone());
             }
         }
 

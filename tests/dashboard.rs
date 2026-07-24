@@ -1,6 +1,7 @@
-//! Bundled-dashboard acceptance, process-level: the real server serves the
-//! embedded page at `/` and `/dashboard`; the page references no external
-//! URLs; with auth enabled the shell stays open while the API stays gated.
+//! The dashboard is served from disk (`--ui-dir`), not compiled in: the built
+//! SPA is handed out at the shell routes, assets keep their content types,
+//! path traversal is refused, the shell loads without credentials while the
+//! API stays gated, and a missing build degrades to a helpful 404.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -8,28 +9,35 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const DASHBOARD_HTML: &str = include_str!("../src/dashboard.html");
-
 struct Server {
     child: Child,
     port: u16,
 }
 
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 impl Server {
-    fn spawn(data_dir: &Path, tokens: Option<&str>) -> Self {
+    fn spawn(data_dir: &Path, ui_dir: &Path, tokens: Option<&str>) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_traza-server"));
         command
             .arg("--data-dir")
             .arg(data_dir)
+            .arg("--ui-dir")
+            .arg(ui_dir)
             .arg("--host")
             .arg("127.0.0.1")
             .arg("--port")
             .arg("0")
-            .env_remove("TRAZA_TOKENS")
             .stderr(Stdio::piped());
-        if let Some(tokens) = tokens {
-            command.env("TRAZA_TOKENS", tokens);
-        }
+        match tokens {
+            Some(value) => command.env("TRAZA_TOKENS", value),
+            None => command.env_remove("TRAZA_TOKENS"),
+        };
         let mut child = command.spawn().expect("spawns traza-server");
         let stderr = child.stderr.take().expect("stderr piped");
         let mut lines = BufReader::new(stderr).lines();
@@ -43,7 +51,9 @@ impl Server {
         Self { child, port }
     }
 
-    fn get(&self, target: &str, bearer: Option<&str>) -> (u16, String, String) {
+    /// Sends a raw request line target verbatim (so traversal attempts reach
+    /// the server unnormalized) and returns (status, headers, body).
+    fn raw_get(&self, target: &str, authorization: Option<&str>) -> (u16, String, String) {
         let mut stream = {
             let mut attempt = 0;
             loop {
@@ -57,29 +67,27 @@ impl Server {
                 }
             }
         };
-        let auth_header = bearer
-            .map(|token| format!("Authorization: Bearer {token}\r\n"))
+        let auth_header = authorization
+            .map(|value| format!("Authorization: Bearer {value}\r\n"))
             .unwrap_or_default();
         write!(
             stream,
             "GET {target} HTTP/1.1\r\nHost: x\r\n{auth_header}Connection: close\r\n\r\n"
         )
-        .expect("writes request");
+        .expect("writes");
         let mut response = Vec::new();
-        stream.read_to_end(&mut response).expect("reads response");
+        stream.read_to_end(&mut response).expect("reads");
         let text = String::from_utf8_lossy(&response).into_owned();
         let status = text
             .split_whitespace()
             .nth(1)
             .and_then(|code| code.parse().ok())
-            .expect("status code");
-        let (headers, body) = text.split_once("\r\n\r\n").unwrap_or((text.as_str(), ""));
-        (status, headers.to_ascii_lowercase(), body.to_owned())
-    }
-
-    fn kill(mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+            .expect("status");
+        let (headers, body) = text
+            .split_once("\r\n\r\n")
+            .map(|(head, body)| (head.to_owned(), body.to_owned()))
+            .unwrap_or((text.clone(), String::new()));
+        (status, headers, body)
     }
 }
 
@@ -94,112 +102,117 @@ fn test_dir(label: &str) -> PathBuf {
     dir
 }
 
-#[test]
-fn dashboard_route_serves_embedded_asset() {
-    let dir = test_dir("route");
-    let server = Server::spawn(&dir, None);
-    for target in ["/", "/dashboard", "/dashboard/"] {
-        let (status, headers, body) = server.get(target, None);
-        assert_eq!(status, 200, "{target}");
-        assert!(
-            headers.contains("content-type: text/html; charset=utf-8"),
-            "{target}: {headers}"
-        );
-        assert!(
-            headers.contains("x-content-type-options: nosniff"),
-            "{target} omits nosniff"
-        );
-        assert_eq!(
-            body, DASHBOARD_HTML,
-            "{target} did not serve the embedded asset"
-        );
-        assert!(
-            body[..30]
-                .to_ascii_lowercase()
-                .starts_with("<!doctype html>"),
-            "{target} body is not an HTML document"
-        );
-        assert!(
-            body.contains("<title>Traza</title>"),
-            "{target} page marker missing"
-        );
-    }
-    // Deeper dashboard paths are NOT the page: unknown assets fail loudly.
-    let (status, _, _) = server.get("/dashboard/app.js", None);
-    assert_eq!(
-        status, 404,
-        "unknown dashboard assets must not serve the page"
-    );
-    server.kill();
+/// A stand-in for `ui/dist`: the single-file index plus one asset.
+fn built_ui(label: &str) -> PathBuf {
+    let dist = test_dir(label).join("dist");
+    std::fs::create_dir_all(dist.join("assets")).expect("dist");
+    std::fs::write(
+        dist.join("index.html"),
+        "<!doctype html><title>Traza</title><div id=root></div>",
+    )
+    .expect("index");
+    std::fs::write(dist.join("assets/app.js"), "export const x = 1;").expect("asset");
+    dist
 }
 
 #[test]
-fn dashboard_references_no_external_urls() {
-    // The page must be self-contained: same-origin API paths only. A grep
-    // over the embedded asset is the spec's oracle for this criterion.
-    //
-    // The bundled React runtime carries a handful of URL-shaped string
-    // constants that are never fetched: the W3C XML namespace identifiers
-    // (`document.createElementNS` requires those exact strings) and the
-    // prefix React prints in minified-error console messages. Those exact
-    // strings are exempt; every other absolute URL fails the test.
-    const RUNTIME_IDENTIFIERS: &[&str] = &[
-        "http://www.w3.org/2000/svg",
-        "http://www.w3.org/1999/xlink",
-        "http://www.w3.org/1998/Math/MathML",
-        "http://www.w3.org/XML/1998/namespace",
-        "https://react.dev/errors/",
-    ];
-    for scheme in ["http://", "https://"] {
-        let mut searched = 0;
-        while let Some(found) = DASHBOARD_HTML[searched..].find(scheme) {
-            let at = searched + found;
-            let rest = &DASHBOARD_HTML[at..];
-            assert!(
-                RUNTIME_IDENTIFIERS
-                    .iter()
-                    .any(|identifier| rest.starts_with(identifier)),
-                "dashboard page references an external resource: {}",
-                &rest[..rest.len().min(60)]
-            );
-            searched = at + scheme.len();
-        }
-    }
-    // `srcset` itself appears as a DOM property name inside the React
-    // runtime; external srcset URLs are already caught by the scheme scan
-    // above, so only the protocol-relative form needs its own needle.
-    for needle in ["src=\"//", "href=\"//", "@import", "srcset=\"//"] {
+fn serves_the_built_spa_from_the_ui_directory() {
+    let dist = built_ui("serve");
+    let server = Server::spawn(&test_dir("serve-data"), &dist, None);
+
+    for route in ["/", "/dashboard", "/dashboard/"] {
+        let (status, headers, body) = server.raw_get(route, None);
+        assert_eq!(status, 200, "{route} serves the page: {headers}");
+        assert!(body.contains("<title>Traza</title>"), "{route}: {body}");
         assert!(
-            !DASHBOARD_HTML.contains(needle),
-            "dashboard page references an external resource ({needle})"
+            headers.contains("Content-Type: text/html; charset=utf-8"),
+            "{route} headers: {headers}"
+        );
+        assert!(
+            headers.contains("X-Content-Type-Options: nosniff"),
+            "{route} headers: {headers}"
         );
     }
+
+    // Assets are served with their own content type, so a multi-file build
+    // (should the single-file plugin ever be dropped) works unchanged.
+    let (status, headers, body) = server.raw_get("/assets/app.js", None);
+    assert_eq!(status, 200);
+    assert!(body.contains("export const x"));
     assert!(
-        DASHBOARD_HTML.contains("/v1/spans") && DASHBOARD_HTML.contains("/v1/traces/"),
-        "dashboard page must consume the existing JSON API"
+        headers.contains("Content-Type: text/javascript; charset=utf-8"),
+        "{headers}"
     );
+
+    // A rebuilt UI is picked up without restarting the server.
+    std::fs::write(
+        dist.join("index.html"),
+        "<!doctype html><title>Traza</title>rebuilt",
+    )
+    .expect("rewrite");
+    let (_, _, body) = server.raw_get("/", None);
     assert!(
-        DASHBOARD_HTML.contains("sessionStorage"),
-        "bearer token must live in sessionStorage only"
+        body.contains("rebuilt"),
+        "serves from disk each time: {body}"
     );
 }
 
 #[test]
-fn dashboard_shell_stays_open_when_auth_is_enabled() {
-    let dir = test_dir("authopen");
-    let server = Server::spawn(&dir, Some("rw:writer-token,ro:reader-token"));
+fn refuses_to_serve_outside_the_ui_directory() {
+    let dist = built_ui("traversal");
+    // A file next to dist/ that must never be reachable through the server.
+    let secret = dist.parent().expect("parent").join("traza-dash-secret.txt");
+    std::fs::write(&secret, "top secret").expect("write");
+    let server = Server::spawn(&test_dir("traversal-data"), &dist, None);
 
-    // The shell loads without credentials...
-    let (status, headers, body) = server.get("/", None);
-    assert_eq!(status, 200, "shell must stay open under auth");
-    assert!(headers.contains("content-type: text/html"));
+    for attack in [
+        "/../traza-dash-secret.txt",
+        "/assets/../../traza-dash-secret.txt",
+        "/%2e%2e/traza-dash-secret.txt",
+        "/../../etc/passwd",
+    ] {
+        let (status, _, body) = server.raw_get(attack, None);
+        assert_ne!(status, 200, "{attack} must not be served: {body}");
+        assert!(
+            !body.contains("top secret"),
+            "{attack} leaked the file: {body}"
+        );
+    }
+}
+
+#[test]
+fn the_shell_is_open_while_the_api_stays_gated() {
+    let dist = built_ui("auth");
+    let server = Server::spawn(&test_dir("auth-data"), &dist, Some("rw:secret-token"));
+
+    // The page itself carries no data and must load without credentials, so
+    // it can prompt for a token on its first 401.
+    let (status, _, body) = server.raw_get("/", None);
+    assert_eq!(status, 200, "shell loads unauthenticated: {body}");
     assert!(body.contains("<title>Traza</title>"));
 
-    // ...while the API the page consumes stays gated.
-    let (status, headers, _) = server.get("/v1/stats", None);
-    assert_eq!(status, 401, "API must remain gated under auth");
-    assert!(headers.contains("www-authenticate: bearer"));
-    let (status, _, _) = server.get("/v1/stats", Some("reader-token"));
-    assert_eq!(status, 200, "scoped token still reads the API");
-    server.kill();
+    // Every API call it makes stays gated.
+    let (status, headers, _) = server.raw_get("/v1/stats", None);
+    assert_eq!(status, 401, "API is gated: {headers}");
+    assert!(headers.contains("WWW-Authenticate: Bearer"), "{headers}");
+
+    let (status, _, _) = server.raw_get("/v1/stats", Some("secret-token"));
+    assert_eq!(status, 200, "a valid token reaches the API");
+}
+
+#[test]
+fn a_missing_build_degrades_to_a_helpful_404() {
+    let absent = test_dir("absent").join("dist");
+    let server = Server::spawn(&test_dir("absent-data"), &absent, None);
+
+    let (status, _, body) = server.raw_get("/", None);
+    assert_eq!(status, 404, "no build, no page: {body}");
+    assert!(
+        body.contains("npm run build"),
+        "404 should say how to build the UI: {body}"
+    );
+
+    // The API is unaffected by a missing dashboard.
+    let (status, _, _) = server.raw_get("/v1/stats", None);
+    assert_eq!(status, 200, "the API runs without a dashboard build");
 }

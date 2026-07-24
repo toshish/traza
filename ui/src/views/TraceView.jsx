@@ -1,7 +1,7 @@
 import React from 'react';
 import { api } from '../lib/api.js';
 import { fmtDurationNs, fmtTimeNs, fmtNum, fmtCost } from '../lib/format.js';
-import { waterfallOrder, collectPayloadRefs, llmUsage, sessionIdOf } from '../lib/spans.js';
+import { waterfallOrder, collectPayloadRefs, llmUsage, sessionIdOf, llmMessages } from '../lib/spans.js';
 import { Section } from '../components/Section.jsx';
 import { Button } from '../components/primitives/Button.jsx';
 import { Input } from '../components/primitives/Input.jsx';
@@ -15,6 +15,7 @@ import { CopyButton } from '../components/data/CopyButton.jsx';
 import { TraceWaterfall } from '../components/trace/TraceWaterfall.jsx';
 import { ScoreChip } from '../components/trace/ScoreChip.jsx';
 import { AnnotationTimeline } from '../components/trace/AnnotationTimeline.jsx';
+import { MessageList } from '../components/trace/MessageList.jsx';
 import { ErrorState } from '../components/feedback/ErrorState.jsx';
 import { LoadingBar } from '../components/feedback/LoadingBar.jsx';
 
@@ -75,6 +76,16 @@ function AnnotateModal({ open, traceId, spanId, onClose, onRecorded, pushToast }
   </Modal>;
 }
 
+function LlmMessages({ span }) {
+  const messages = llmMessages(span);
+  const loadPayload = React.useCallback((ref) => api.payload(ref), []);
+  if (!messages.length) return null;
+  return <div style={{ marginTop: 12 }}>
+    <div style={{ fontSize: 'var(--text-12)', fontWeight: 500, color: 'var(--ink-muted)', textTransform: 'uppercase', letterSpacing: 'var(--tracking-caps)', marginBottom: 6 }}>Messages</div>
+    <MessageList messages={messages} onLoadPayload={loadPayload} />
+  </div>;
+}
+
 function PayloadPanel({ span, pushToast }) {
   const refs = collectPayloadRefs(span);
   const [openRef, setOpenRef] = React.useState(null);
@@ -125,10 +136,11 @@ function SpanDetail({ span, annotations, onAnnotate, openSession, pushToast }) {
       { key: 'status', value: span.status || '—', color: span.status === 'error' ? 'var(--error)' : undefined },
       { key: 'start', value: fmtTimeNs(span.start_time_ns) },
       { key: 'duration', value: fmtDurationNs(span.end_time_ns - span.start_time_ns), measured: true },
-      ...(session ? [{ key: 'session.id', value: session }] : []),
+      ...(session ? [{ key: session.key, value: session.id }] : []),
     ]} />
-    {session ? <div style={{ marginTop: 6 }}><Button variant="ghost" size="sm" onClick={() => openSession(session)}>View session</Button></div> : null}
+    {session ? <div style={{ marginTop: 6 }}><Button variant="ghost" size="sm" onClick={() => openSession(session.id)}>View session</Button></div> : null}
     {usage ? <div style={{ display: 'flex', gap: 6, marginTop: 12, flexWrap: 'wrap' }}>
+      {usage.provider ? <Tag mono>{String(usage.provider)}</Tag> : null}
       {usage.model ? <Tag mono>{String(usage.model)}</Tag> : null}
       {usage.totalTokens != null ? <ScoreChip name="tokens" value={fmtNum(usage.totalTokens)} /> : null}
       {usage.promptTokens != null ? <ScoreChip name="prompt" value={fmtNum(usage.promptTokens)} /> : null}
@@ -136,6 +148,7 @@ function SpanDetail({ span, annotations, onAnnotate, openSession, pushToast }) {
       {usage.costUsd != null ? <ScoreChip name="cost USD" value={fmtCost(usage.costUsd)} /> : null}
       {usage.stopReason ? <Tag>{String(usage.stopReason)}</Tag> : null}
     </div> : null}
+    <LlmMessages span={span} />
     {Object.keys(span.attributes || {}).length ? <div style={{ marginTop: 12 }}>
       <div style={{ fontSize: 'var(--text-12)', fontWeight: 500, color: 'var(--ink-muted)', textTransform: 'uppercase', letterSpacing: 'var(--tracking-caps)', marginBottom: 6 }}>Attributes</div>
       <AttrTree data={span.attributes} />
@@ -167,7 +180,7 @@ function SpanDetail({ span, annotations, onAnnotate, openSession, pushToast }) {
 }
 
 /** One trace: waterfall, span detail, annotation timeline. */
-export function TraceView({ traceId, selectedSpanId, selectSpan, openSession, pushToast }) {
+export function TraceView({ traceId, selectedSpanId, selectSpan, openSession, openConversation, onBack, pushToast }) {
   const [data, setData] = React.useState(null);
   const [error, setError] = React.useState(null);
   const [loading, setLoading] = React.useState(true);
@@ -194,6 +207,8 @@ export function TraceView({ traceId, selectedSpanId, selectSpan, openSession, pu
   return <Section title={'Trace ' + traceId}
     action={<div style={{ display: 'flex', gap: 6 }}>
       <CopyButton text={traceId} label="copy id" />
+      {openConversation ? <Button variant="ghost" size="sm" onClick={openConversation}>Conversation</Button> : null}
+      {onBack ? <Button variant="ghost" size="sm" onClick={onBack}>Back</Button> : null}
       <Button variant="ghost" size="sm" onClick={fetchTrace}>Refresh</Button>
     </div>}>
     <LoadingBar active={loading} style={{ marginBottom: 8 }} />
