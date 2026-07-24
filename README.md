@@ -2,7 +2,7 @@
 
 **A trace datastore with first-class LLM and agent observability — one binary from laptop to cluster.**
 
-Traza (Spanish for "trace") ingests OpenTelemetry or plain-JSON spans over HTTP, stores them durably, and answers trace lookups, filtered searches, and token/cost analytics in milliseconds — with a built-in trace browser and no infrastructure to stand up. Two dependencies (`serde`, `serde_json`), no external database, and one deployment story at every size: today a single node that starts in milliseconds; the designed trajectory is replicated, highly available clusters of the same binary. The trace browser is a React app ([`ui/`](ui/)) that the server serves straight from its build output — nothing is compiled into the binary, so building the server still needs no Node toolchain.
+Traza (Spanish for "trace") ingests OpenTelemetry or plain-JSON spans over HTTP, stores them durably, and answers trace lookups, filtered searches, and token/cost analytics in milliseconds — with a trace browser and no infrastructure to stand up. Two dependencies (`serde`, `serde_json`), no external database, and one deployment story at every size: today a single node that starts in milliseconds; the designed trajectory is replicated, highly available clusters of the same binary. The trace browser is a React app ([`ui/`](ui/)) that the server serves straight from its build output — nothing is compiled into the binary, so building the server still needs no Node toolchain.
 
 ```sh
 cargo build --release
@@ -11,8 +11,15 @@ cargo build --release
 # open http://localhost:8080 — the server serves ui/dist
 ```
 
-The dashboard build is optional: without it the API runs exactly the same and
-`/` returns a 404 telling you how to build it.
+**The dashboard is a build artifact, not part of the binary.** `traza-server`
+compiles with no Node toolchain and embeds no HTML; it serves whatever built
+dashboard it finds on disk. So a `cargo install`ed or otherwise packaged
+binary ships the **API only** — until you give it a build. It looks in, in
+order: `--ui-dir`, `$TRAZA_UI_DIR`, `<directory of the binary>/ui`,
+`<binary>/../share/traza/ui`, then `./ui/dist`. Packagers should drop the
+build beside the executable as `ui/`; from a checkout, `npm run build` puts it
+at `./ui/dist`. Without any of them the API runs exactly the same, `/` returns
+a 404 saying how to build it, and startup logs every path it searched.
 
 ## Why Traza
 
@@ -193,7 +200,7 @@ Missing or unknown tokens get 401 with a `WWW-Authenticate: Bearer` challenge; i
 | `--ttl-seconds N` | off | Rolling retention window |
 | `--flush-spans N` | `10000` | Buffered spans that trigger a durable flush |
 | `--payload-threshold-bytes N` | `262144` | Offload threshold for large string values; `0` disables |
-| `--ui-dir DIR` | `./ui/dist` | Built dashboard to serve at `/`; served from disk, so a rebuilt UI needs no server restart. Missing directory ⇒ the API runs and `/` 404s with build instructions |
+| `--ui-dir DIR` | see below | Built dashboard to serve at `/`; served from disk, so a rebuilt UI needs no server restart. Unset ⇒ `$TRAZA_UI_DIR`, `<binary dir>/ui`, `<binary dir>/../share/traza/ui`, `./ui/dist`, first one containing `index.html`. None found ⇒ the API runs and `/` 404s with build instructions |
 | `--allow-unauthenticated-non-loopback` | off | Explicitly allow an unsafe non-loopback bind without tokens |
 
 ## Performance

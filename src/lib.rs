@@ -710,6 +710,81 @@ impl Store {
         self.query_after(filter, None)
     }
 
+    /// Every span carrying `values` under ANY of `keys`, resolved under ONE
+    /// snapshot of the write buffer and segment list.
+    ///
+    /// The snapshot matters: resolving each key with its own [`Self::query`]
+    /// call let a span re-ingested between the calls be seen first in its
+    /// SUPERSEDED version, which the per-key dedupe then locked in — the newer
+    /// version arrived later under the same primary key and was discarded.
+    /// That broke last-write-wins during ordinary concurrent ingest. Holding
+    /// both locks across every key makes the union as atomic as a single
+    /// query, and precedence is the usual one: the write buffer wins, then the
+    /// newest segment.
+    ///
+    /// `values` lists the accepted encodings of one logical value (a session
+    /// id may arrive as the string `"42"` or the number `42`), so the caller
+    /// does not have to guess which JSON type a producer used.
+    pub(crate) fn query_attribute_union(
+        &self,
+        keys: &[&str],
+        values: &[Value],
+    ) -> Result<Vec<Span>> {
+        // Lock order: writer before segments (see Store field docs).
+        let writer = self.lock_writer()?;
+        let segments = self.lock_segments()?;
+        let matches = |span: &Span| {
+            keys.iter().any(|key| {
+                span.attributes
+                    .get(*key)
+                    .is_some_and(|held| values.iter().any(|value| held == value))
+            })
+        };
+
+        let mut result: Vec<Span> = Vec::new();
+        let mut claimed: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        // The buffer holds the newest version of anything it carries.
+        for span in writer.spans.iter() {
+            if matches(span) {
+                claimed.insert((span.trace_id.clone(), span.span_id.clone()));
+                result.push(span.clone());
+            }
+        }
+        // Any key present in the buffer supersedes every segment copy, even
+        // one the predicate does not select in its buffered version.
+        for (trace_id, span_id) in writer.index.keys() {
+            claimed.insert((trace_id.clone(), span_id.clone()));
+        }
+        // Newest segment first, so the first version claimed for a key wins.
+        for segment in segments.iter().rev() {
+            let seg = &segment.seg;
+            let mut offsets: Vec<u64> = Vec::new();
+            for key in keys {
+                for value in values {
+                    offsets.extend_from_slice(
+                        seg.attribute_posting_offsets_ref(key, &canonical_value(value)),
+                    );
+                }
+            }
+            offsets.sort_unstable();
+            offsets.dedup();
+            for offset in offsets {
+                let record = seg.record_at_offset(offset).map_err(segment_v2_error)?;
+                let span = record_to_span(&record)?;
+                // An index accelerates a filter, it never changes it.
+                if !matches(&span) {
+                    continue;
+                }
+                if claimed.insert((span.trace_id.clone(), span.span_id.clone())) {
+                    result.push(span);
+                }
+            }
+        }
+        sort_spans(&mut result);
+        Ok(result)
+    }
+
     /// Returns spans matching `filter` strictly after `cursor`.
     ///
     /// The cursor is compared using the same total order as [`Self::query`],

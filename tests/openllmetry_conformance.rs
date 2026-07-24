@@ -338,3 +338,109 @@ fn session_filter_unions_mixed_convention_keys() {
 
     server.kill();
 }
+
+#[test]
+fn a_numeric_session_id_can_be_listed_and_opened() {
+    // Normalization stringifies numeric attributes, so a numeric
+    // gen_ai.conversation.id LISTS as a session. It must also be openable:
+    // matching only the JSON string left such a session visible but dead.
+    let dir = test_dir("numeric-session");
+    let server = Server::spawn(&dir);
+
+    let (status, body) = server.request(
+        "POST",
+        "/v1/spans",
+        Some(&json!([{
+            "trace_id": "tn", "span_id": "n1", "name": "openai.chat", "service": "agent",
+            "start_time_ns": 1_000_000_000u64, "end_time_ns": 1_002_000_000u64, "status": "ok",
+            "attributes": {
+                "gen_ai.provider.name": "openai",
+                "gen_ai.request.model": "gpt-4o",
+                "gen_ai.usage.input_tokens": 5,
+                "gen_ai.usage.output_tokens": 5,
+                "gen_ai.conversation.id": 4711
+            }
+        }])),
+    );
+    assert_eq!(status, 200, "ingest: {body}");
+
+    let (status, body) = server.request("GET", "/v1/sessions", None);
+    assert_eq!(status, 200);
+    let session = row_by(&body["sessions"], "session_id", "4711");
+    assert_eq!(session["span_count"], 1, "numeric id lists: {body}");
+
+    let (status, body) = server.request("GET", "/v1/sessions/4711", None);
+    assert_eq!(status, 200, "and it opens: {body}");
+    assert_eq!(body["span_count"], 1);
+
+    let (status, body) = server.request("GET", "/v1/spans?session=4711", None);
+    assert_eq!(status, 200);
+    assert_eq!(
+        body.as_array().map(Vec::len),
+        Some(1),
+        "and its spans are reachable: {body}"
+    );
+
+    server.kill();
+}
+
+#[test]
+fn a_re_ingested_span_is_counted_once_in_its_session() {
+    // The union across session keys must resolve under ONE snapshot: a span
+    // re-ingested under a different recognized key used to be seen first in
+    // its superseded version, which then locked the newer version out.
+    let dir = test_dir("session-supersede");
+    let server = Server::spawn(&dir);
+
+    let post = |attributes: serde_json::Value| {
+        json!([{
+            "trace_id": "ts", "span_id": "s1", "name": "openai.chat", "service": "agent",
+            "start_time_ns": 1_000_000_000u64, "end_time_ns": 1_002_000_000u64, "status": "ok",
+            "attributes": attributes
+        }])
+    };
+
+    // First version: grouped by the native key.
+    let (status, _) = server.request(
+        "POST",
+        "/v1/spans",
+        Some(&post(json!({
+            "gen_ai.request.model": "gpt-4o",
+            "gen_ai.usage.input_tokens": 10,
+            "gen_ai.usage.output_tokens": 10,
+            "session.id": "mix"
+        }))),
+    );
+    assert_eq!(status, 200);
+    server.request("POST", "/v1/flush", None);
+
+    // Re-ingested under the SAME primary key, now carrying both keys and
+    // different usage. Last write wins: 40 tokens, counted once.
+    let (status, _) = server.request(
+        "POST",
+        "/v1/spans",
+        Some(&post(json!({
+            "gen_ai.request.model": "gpt-4o",
+            "gen_ai.usage.input_tokens": 20,
+            "gen_ai.usage.output_tokens": 20,
+            "session.id": "mix",
+            "gen_ai.conversation.id": "mix"
+        }))),
+    );
+    assert_eq!(status, 200);
+
+    let (status, body) = server.request("GET", "/v1/sessions/mix", None);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["span_count"], 1, "one primary key, one span: {body}");
+    assert_eq!(body["total_tokens"], 40, "the NEWEST version wins: {body}");
+
+    let (status, body) = server.request("GET", "/v1/spans?session=mix", None);
+    assert_eq!(status, 200);
+    assert_eq!(
+        body.as_array().map(Vec::len),
+        Some(1),
+        "no duplicate from the key union: {body}"
+    );
+
+    server.kill();
+}
