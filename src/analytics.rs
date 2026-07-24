@@ -451,23 +451,30 @@ impl Store {
     /// `gen_ai.conversation.id`) lands in exactly one session. This is what
     /// makes a mixed-convention session queryable as a whole.
     pub(crate) fn resolve_session_spans(&self, session_id: &str) -> Result<Vec<Span>> {
-        let mut spans: Vec<Span> = Vec::new();
-        let mut seen: HashSet<(String, String)> = HashSet::new();
-        for key in semconv::SESSION_KEYS {
-            for span in self.query(&crate::SpanFilter {
-                attributes: vec![(key.to_owned(), Value::String(session_id.into()))],
-                limit: None,
-                ..crate::SpanFilter::default()
-            })? {
-                if !seen.insert((span.trace_id.clone(), span.span_id.clone())) {
-                    continue;
-                }
-                if semconv::facts(&span.attributes).session.as_deref() == Some(session_id) {
-                    spans.push(span);
+        // Session normalization stringifies numeric attributes, so a producer
+        // that sent `"gen_ai.conversation.id": 4711` yields the session id
+        // "4711". Matching only the JSON string would then list that session
+        // and refuse to open it. Accept every encoding the normalizer folds
+        // into the same id.
+        let mut values = vec![Value::String(session_id.to_owned())];
+        if let Ok(number) = session_id.parse::<u64>() {
+            values.push(Value::from(number));
+        } else if let Ok(number) = session_id.parse::<i64>() {
+            values.push(Value::from(number));
+        } else if let Ok(number) = session_id.parse::<f64>() {
+            if number.is_finite() {
+                if let Some(value) = serde_json::Number::from_f64(number) {
+                    values.push(Value::Number(value));
                 }
             }
         }
-        Ok(spans)
+        let candidates = self.query_attribute_union(&semconv::SESSION_KEYS, &values)?;
+        // The union over-selects: a span may carry a matching value under a
+        // LOWER-precedence key while its resolved session is something else.
+        Ok(candidates
+            .into_iter()
+            .filter(|span| semconv::facts(&span.attributes).session.as_deref() == Some(session_id))
+            .collect())
     }
 
     /// One session with its per-trace breakdown, or `None` when no span

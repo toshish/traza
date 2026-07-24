@@ -24,12 +24,15 @@
 //! - `POST /v1/flush` forces buffered spans into a durable segment.
 //! - `POST /v1/traces` accepts OTLP/HTTP JSON or binary protobuf.
 //! - `GET /v1/export` streams chunked NDJSON with completion/count trailers.
-//! - `GET /` and `GET /dashboard` serve the built dashboard from `--ui-dir`
-//!   (default `./ui/dist`, produced by `ui/`'s `npm run build`). The page is
-//!   read from disk, never compiled in, so building the server needs no Node
-//!   toolchain and a rebuilt UI is picked up without restarting. The shell is
+//! - `GET /` and `GET /dashboard` serve the built dashboard. It is read from
+//!   disk, never compiled in, so building the server needs no Node toolchain
+//!   and a rebuilt UI is picked up without restarting. With no `--ui-dir` the
+//!   server searches `$TRAZA_UI_DIR`, `<binary dir>/ui`,
+//!   `<binary dir>/../share/traza/ui`, then `./ui/dist` — so a packaged
+//!   install works by dropping the build beside the executable. The shell is
 //!   served before the auth gate — it carries no data, and its `/v1` calls
-//!   stay gated — and the routes 404 with build instructions when absent.
+//!   stay gated — and the routes 404, listing every path searched, when no
+//!   build is found.
 
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream};
@@ -79,7 +82,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .map_or(4, usize::from)
         .max(4);
     let mut allow_unauthenticated_non_loopback = false;
-    let mut ui_dir = PathBuf::from("./ui/dist");
+    let mut ui_dir: Option<PathBuf> = None;
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < args.len() {
@@ -129,14 +132,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--ui-dir" => {
                 i += 1;
-                ui_dir = PathBuf::from(args.get(i).ok_or("--ui-dir requires a value")?);
+                ui_dir = Some(PathBuf::from(
+                    args.get(i).ok_or("--ui-dir requires a value")?,
+                ));
             }
             "--allow-unauthenticated-non-loopback" => {
                 allow_unauthenticated_non_loopback = true;
             }
             "--help" | "-h" => {
                 println!(
-                    "Usage: traza-server --data-dir DIR --port PORT [--host ADDR] [--ttl-seconds N] [--flush-spans N] [--workers N] [--payload-threshold-bytes N (0 disables)] [--ui-dir DIR (built dashboard; default ./ui/dist)] [--allow-unauthenticated-non-loopback]"
+                    "Usage: traza-server --data-dir DIR --port PORT [--host ADDR] [--ttl-seconds N] [--flush-spans N] [--workers N] [--payload-threshold-bytes N (0 disables)] [--ui-dir DIR (built dashboard; default: TRAZA_UI_DIR, beside the binary, then ./ui/dist)] [--allow-unauthenticated-non-loopback]"
                 );
                 return Ok(());
             }
@@ -189,16 +194,30 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // The dashboard is served from disk (ui/ `npm run build` output), never
     // compiled in. A missing build is not fatal: the API runs, and the UI
     // routes explain how to produce it.
-    let ui = Arc::new(traza::ui::UiRoot::new(&ui_dir));
+    let ui = Arc::new(match ui_dir {
+        Some(explicit) => traza::ui::UiRoot::new(explicit),
+        None => traza::ui::UiRoot::discover(),
+    });
     if ui.is_available() {
         eprintln!(
             "traza-server serving dashboard from {}",
             ui.directory().display()
         );
     } else {
+        // Name every path tried: "no dashboard at ./ui/dist" tells an operator
+        // running an installed binary from some other directory nothing at all.
+        let searched = ui.searched();
+        if searched.is_empty() {
+            eprintln!("traza-server: no dashboard at {}", ui.directory().display());
+        } else {
+            eprintln!("traza-server: no dashboard found; looked in:");
+            for path in searched {
+                eprintln!("  {}", path.display());
+            }
+        }
         eprintln!(
-            "traza-server: no dashboard at {} (build it with: cd ui && npm ci && npm run build)",
-            ui.directory().display()
+            "traza-server: the API is unaffected. Build it with `cd ui && npm ci && npm run build`, \
+             or point --ui-dir (or TRAZA_UI_DIR) at a built copy."
         );
     }
 

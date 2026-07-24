@@ -30,6 +30,7 @@ pub struct UiFile {
 #[derive(Clone, Debug)]
 pub struct UiRoot {
     root: PathBuf,
+    searched: Vec<PathBuf>,
 }
 
 impl UiRoot {
@@ -51,12 +52,71 @@ impl UiRoot {
                 .collect();
             std::env::current_dir().map_or(root.clone(), |cwd| cwd.join(&trimmed))
         };
-        Self { root }
+        Self {
+            root,
+            searched: Vec::new(),
+        }
+    }
+
+    /// Locates the built dashboard for a server that was given no explicit
+    /// `--ui-dir`.
+    ///
+    /// A CWD-relative default alone only works when the server is launched
+    /// from a checkout: a `cargo install`ed or otherwise packaged binary has
+    /// no `./ui/dist` and would serve nothing. So the search also looks
+    /// BESIDE THE EXECUTABLE, which is where a package can put the build:
+    ///
+    /// 1. `TRAZA_UI_DIR`, for operators who place it anywhere else;
+    /// 2. `<exe dir>/ui`, the packaging convention;
+    /// 3. `<exe dir>/../share/traza/ui`, the Unix prefix convention;
+    /// 4. `./ui/dist`, the working copy after `npm run build`.
+    ///
+    /// Returns the first candidate that holds an `index.html`, else the last
+    /// one, so diagnostics name a concrete path. [`Self::searched`] lists
+    /// everything tried, which is what a "no dashboard" message should show.
+    pub fn discover() -> Self {
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if let Some(configured) = std::env::var_os("TRAZA_UI_DIR") {
+            candidates.push(PathBuf::from(configured));
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                candidates.push(dir.join("ui"));
+                candidates.push(dir.join("../share/traza/ui"));
+            }
+        }
+        candidates.push(PathBuf::from("./ui/dist"));
+
+        let mut searched = Vec::with_capacity(candidates.len());
+        let mut found: Option<UiRoot> = None;
+        for candidate in candidates {
+            let root = Self::new(candidate);
+            searched.push(root.root.clone());
+            if found.is_none() && root.is_available() {
+                found = Some(root);
+            }
+        }
+        let mut root = found.unwrap_or_else(|| {
+            Self::new(
+                searched
+                    .last()
+                    .cloned()
+                    .unwrap_or_else(|| "./ui/dist".into()),
+            )
+        });
+        root.searched = searched;
+        root
     }
 
     /// The configured root directory.
     pub fn directory(&self) -> &Path {
         &self.root
+    }
+
+    /// Every directory [`Self::discover`] looked in, for diagnostics. Empty
+    /// when the root was configured explicitly.
+    pub fn searched(&self) -> &[PathBuf] {
+        &self.searched
     }
 
     /// True when the root exists and holds an `index.html` to serve.
