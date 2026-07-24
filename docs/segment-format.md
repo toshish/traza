@@ -4,7 +4,7 @@
 > v2-only and file-backed: `Segment::open` reads the header and index sections,
 > then reads exact payload ranges on demand. Legacy v1 JSONL segments fail
 > startup with a migration pointer. Current behavior and guarantees are
-> documented in the README and `src/segment_v2.rs`; proposal language below is
+> documented in the README and `src/segment.rs`; proposal language below is
 > retained as design history.
 
 ## Problem (measured)
