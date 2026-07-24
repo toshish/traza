@@ -54,11 +54,24 @@ From surveying the current state of the art — general trace backends
 stacks, VictoriaTraces, Jaeger v2) and LLM/agent platforms (Langfuse,
 LangSmith, Braintrust, Arize Phoenix, W&B Weave, Opik, AgentOps, Laminar):
 
-- **The market validated the thesis.** Langfuse — the leading open-source
-  LLM observability platform — was acquired by ClickHouse (Jan 2026)
-  precisely because LLM observability at scale is a *database* problem.
-  Traza's angle is being that database natively, without the two-system
-  stack.
+- **The market validated the thesis, twice.** Langfuse — the leading
+  open-source LLM observability platform — was acquired by ClickHouse
+  (Jan 2026) precisely because LLM observability at scale is a *database*
+  problem. Braintrust reached the same conclusion from the other side and
+  built **Brainstore**, a purpose-built AI-log database: a single Rust
+  binary whose segments carry a row store, an inverted (full-text) index,
+  and a column store, with an object-storage WAL and a tiered
+  WAL→processing→indexed read merge. Traza's angle is the same class of
+  engine with a harder constraint Brainstore doesn't attempt: no external
+  metadata database, no lock service — Brainstore needs Postgres and
+  Redis beside it; Traza is one binary, full stop.
+- **Eval-first is the workflow bar, not a feature.** Braintrust's core
+  loop — datasets of examples, task runs, scorers grading outputs,
+  experiments diffing score distributions across versions, failing
+  production traces promoted into permanent regression datasets — is what
+  serious AI teams now call observability. A trace store that cannot
+  represent experiments, dataset versions, and scores as queryable records
+  is the substrate for that loop at best, not a product.
 - **Columnar + object storage is the scale architecture.** Tempo writes
   Parquet to S3; ClickHouse stacks query wide events in LSM columnar
   storage. Full-fidelity row storage wins for lookup; columnar projections
@@ -160,6 +173,13 @@ the same binary.*
   (service, name, duration, session, model, tokens, cost) so aggregation
   scans read columns, not records. Parquet-inspired, but embedded in the
   self-contained segment — no external file zoo.
+- **Full-text search over trace content.** A per-segment inverted index
+  over span names, string attributes, event content, and payload previews
+  — "find the session where the model said X" is a debugging primitive,
+  not a luxury (Brainstore ships an inverted index per segment for exactly
+  this reason). Same self-contained segment, same index-accelerates-but-
+  never-changes-semantics rule; offloaded payload bodies are indexed at
+  offload time so search never re-reads the blob store.
 - **Aggregation pushdown.** Rollup queries (`/v1/stats/llm`, sessions)
   execute against projections with late materialization; target:
   interactive (<1 s) group-bys over 1B spans.
@@ -199,9 +219,20 @@ These build on the session/annotation/payload foundations already shipped.*
 - **Anomaly surfacing.** Loop/runaway detection (repeated near-identical
   spans, token-burn spikes) and cost-budget alerts computed from the
   rollup layer, exposed as queryable events and dashboard badges.
-- **Dataset curation.** Saved export definitions with dedup/split
-  conventions, so "the eval set" is a named, reproducible query rather
-  than a script someone lost.
+- **Experiments, datasets, and scores as records.** The eval-first loop
+  needs a data model, and Traza already owns the primitives: dataset
+  versions are content-addressed snapshots of an export (immutable,
+  named, diffable — the payload CAS already does the storage); an
+  experiment is a record linking a dataset version to a set of task runs
+  (traces); scores are annotations attached to (experiment, example,
+  span). Score-distribution queries and experiment-vs-experiment diffs
+  become ordinary rollups. Traza runs no tasks and no scorers — CI or the
+  online-eval hook does — but the results live and query here.
+- **Semantic similarity search (opt-in).** Store externally computed
+  embeddings on spans and index them per segment for approximate
+  nearest-neighbor lookup — "find failures like this one" across sessions.
+  Embeddings arrive at ingest or by annotation; Traza never computes them
+  (the no-embedded-models principle holds).
 
 ## Phase 5 — Enterprise operation (v2.x+)
 
@@ -243,8 +274,12 @@ These build on the session/annotation/payload foundations already shipped.*
 ## Explicit non-goals
 
 - **Not a general observability suite.** Traces and their analytics —
-  no metrics TSDB, no log search engine. Correlate by trace-id with
-  whatever owns those.
+  no metrics TSDB, no general log storage. (Full-text search over *trace
+  content* is in scope — Phase 3; indexing your application's log firehose
+  is not.) Correlate by trace-id with whatever owns those.
+- **No external coupling, ever.** No metadata database, no lock service,
+  no coordinator beside the binary — the constraint that distinguishes
+  Traza from otherwise-similar engines that lean on Postgres and Redis.
 - **Not an eval model host.** Traza orchestrates eval loops and stores
   verdicts; it never runs or embeds judge models.
 - **Not a SQL engine.** The DSL stays small and purpose-built; teams who
