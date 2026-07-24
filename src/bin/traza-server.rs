@@ -24,8 +24,9 @@
 //! - `POST /v1/flush` forces buffered spans into a durable segment.
 //! - `POST /v1/traces` accepts OTLP/HTTP JSON or binary protobuf.
 //! - `GET /v1/export` streams chunked NDJSON with completion/count trailers.
-//! - `GET /` and `GET /dashboard` serve the bundled dashboard page (always
-//!   open — the shell carries no data; its API calls are auth-gated as above).
+//!
+//! The server is a pure JSON API. The trace-browser UI lives in `ui/` and is a
+//! standalone SPA that talks to this API; it is not served by the binary.
 
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream};
@@ -225,18 +226,6 @@ fn handle_connection(
         Ok(head) => head,
         Err(error) => return respond(&mut stream, 400, json!({"error": error.to_string()})),
     };
-    // The dashboard SHELL is served before the auth gate: the page must load
-    // in a browser without credentials, while every API call it makes below
-    // remains fully gated (the page itself attaches the bearer token).
-    if head.method == "GET" {
-        let path = head
-            .target
-            .split_once('?')
-            .map_or(head.target.as_str(), |(path, _)| path);
-        if let Some(page) = traza::dashboard::route(path) {
-            return respond_page(&mut stream, &page);
-        }
-    }
     // Auth verdicts need only the head: rejecting BEFORE the body read means
     // an unauthenticated client cannot make this server buffer 64 MiB.
     if let Some(config) = auth {
@@ -862,27 +851,6 @@ fn read_body(stream: &mut TcpStream, head: RequestHead) -> io::Result<Request> {
         content_type,
         body: buffered[header_end..header_end + content_length].to_vec(),
     })
-}
-
-fn respond_page(
-    stream: &mut TcpStream,
-    page: &traza::dashboard::DashboardResponse,
-) -> io::Result<()> {
-    let mut headers = String::new();
-    for (name, value) in page.headers {
-        headers.push_str(name);
-        headers.push_str(": ");
-        headers.push_str(value);
-        headers.push_str("\r\n");
-    }
-    write!(
-        stream,
-        "HTTP/1.1 {} OK\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
-        page.status,
-        page.body.len()
-    )?;
-    stream.write_all(page.body.as_bytes())?;
-    stream.flush()
 }
 
 fn respond(stream: &mut TcpStream, status: u16, body: Value) -> io::Result<()> {
