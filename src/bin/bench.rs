@@ -60,6 +60,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .arg(&data_dir)
         .arg("--port")
         .arg(port.to_string())
+        // Measure the DEFAULT contract. Benchmarking `buffered` would report a
+        // number no production deployment can rely on.
+        .arg("--durability")
+        .arg("wal")
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
         .spawn()?;
@@ -189,7 +193,7 @@ These values were measured by `cargo run --release --bin bench`; they are not es
 ## Results\n\n\
 | Metric | Measured | Target | Result |\n\
 |---|---:|---:|---|\n\
-| Sustained batched HTTP ingest | {ingest_rate:.0} spans/s | >= 50,000 spans/s | {} |\n\
+| Sustained batched HTTP ingest (durability=wal) | {ingest_rate:.0} spans/s | >= 50,000 spans/s | {} |\n\
 | Trace-by-id p95 | {:.3} ms | < 50 ms | {} |\n\
 | Attribute-filtered query p95 | {:.3} ms | < 300 ms | {} |\n\n\
 Additional percentiles:\n\n\
