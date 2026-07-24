@@ -135,6 +135,12 @@ pub struct SpanFilter {
     pub since_ns: Option<u64>,
     /// Match spans starting at or before this timestamp.
     pub until_ns: Option<u64>,
+    /// Match spans belonging to this session, resolved across every recognized
+    /// session key (`session.id`, `gen_ai.conversation.id`, a
+    /// `traceloop.association.properties.*` key). Unlike an `attr.KEY` filter,
+    /// this unions the recognized keys, so a session whose spans use mixed
+    /// conventions is returned whole (see [`crate::semconv`]).
+    pub session: Option<String>,
     /// Maximum number of returned spans.
     pub limit: Option<usize>,
 }
@@ -712,6 +718,21 @@ impl Store {
         filter: &SpanFilter,
         cursor: Option<&SpanCursor>,
     ) -> Result<Vec<Span>> {
+        // A session predicate unions candidates across recognized keys, which
+        // the single-key attribute index cannot express — resolve it up front,
+        // then apply the remaining predicates, order, and limit.
+        if let Some(session_id) = &filter.session {
+            let mut spans = self.resolve_session_spans(session_id)?;
+            spans.retain(|span| {
+                span_matches(span, filter)
+                    && cursor.map_or(true, |position| span_after_cursor(span, position))
+            });
+            sort_spans(&mut spans);
+            if let Some(limit) = filter.limit {
+                spans.truncate(limit);
+            }
+            return Ok(spans);
+        }
         let writer = self.lock_writer()?;
         let segments = self.lock_segments()?;
         let mut result = Vec::new();

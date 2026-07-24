@@ -69,14 +69,14 @@ SDK required:
   "service": "support-agent",
   "attributes": {
     "gen_ai.conversation.id": "chat-4711",   // groups traces into a session
-    "gen_ai.system": "openai",               // provider
+    "gen_ai.provider.name": "openai",         // provider
+    "gen_ai.operation.name": "chat",
     "gen_ai.request.model": "gpt-4o",
-    "gen_ai.usage.prompt_tokens": 412,
-    "gen_ai.usage.completion_tokens": 88,
-    "gen_ai.usage.cost": 0.0042,
+    "gen_ai.usage.input_tokens": 412,
+    "gen_ai.usage.output_tokens": 88,
     "gen_ai.response.finish_reason": "stop",
-    "gen_ai.prompt.0.role": "user",
-    "gen_ai.prompt.0.content": "..."
+    // messages: JSON gen_ai.input.messages / gen_ai.output.messages
+    "gen_ai.input.messages": "[{\"role\":\"user\",\"parts\":[{\"type\":\"text\",\"content\":\"...\"}]}]"
   }
 }
 ```
@@ -151,7 +151,7 @@ OpenLLMetry and OTel GenAI instrumentation lands queryable without translation: 
 | `GET` | `/v1/stats` | Physical record count, segment count, bytes on disk |
 | `POST` | `/v1/flush` | Force buffered spans into a durable segment |
 
-Search filters (ANDed; URL-encoded): `service` and `name` (exact match), `attr.KEY` (exact attribute match — bare values match strings, JSON literals match typed values; repeatable), `min_duration_ms`, `since`/`until` (Unix nanoseconds, inclusive), `limit` (default 100 on `/v1/spans`; exports are unbounded by default).
+Search filters (ANDed; URL-encoded): `service` and `name` (exact match), `attr.KEY` (exact attribute match — bare values match strings, JSON literals match typed values; repeatable), `session` (all spans of a session, unioning every recognized session key), `min_duration_ms`, `since`/`until` (Unix nanoseconds, inclusive), `limit` (default 100 on `/v1/spans`; exports are unbounded by default).
 
 Timestamps are integer Unix nanoseconds; `start_time_unix_nano` and the aliases `start_timestamp_ns`, `start_ns`, `start_time` are accepted (same for `end_*`). Unknown fields on a span are stored and returned verbatim. Invalid JSON is `400`; bodies are capped at 64 MiB; `503` means retry with backoff.
 

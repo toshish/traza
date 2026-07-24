@@ -703,6 +703,10 @@ fn filter_from_query(raw_query: &str) -> Result<SpanFilter, String> {
         match key.as_str() {
             "service" => filter.service = Some(value),
             "name" => filter.name = Some(value),
+            // Unions every recognized session key, so a mixed-convention
+            // session (some spans session.id, some gen_ai.conversation.id)
+            // returns whole — unlike attr.session.id, which sees one key.
+            "session" => filter.session = Some(value),
             "min_duration_ms" => {
                 let ms: u64 = value.parse().map_err(|_| "invalid min_duration_ms")?;
                 filter.min_duration_ns = Some(ms.saturating_mul(1_000_000));

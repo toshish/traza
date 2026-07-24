@@ -78,7 +78,7 @@ export function SessionDetailView({ sessionId, openTrace, filterSpans }) {
   return <Section title={'Session ' + sessionId}
     action={<div style={{ display: 'flex', gap: 6 }}>
       <CopyButton text={sessionId} label="copy id" />
-      <Button variant="ghost" size="sm" onClick={() => filterSpans(sessionId, detail && detail.session_attribute)}>Search its spans</Button>
+      <Button variant="ghost" size="sm" onClick={() => filterSpans(sessionId)}>Search its spans</Button>
       <Button variant="ghost" size="sm" onClick={fetchDetail}>Refresh</Button>
     </div>}>
     <LoadingBar active={loading} style={{ marginBottom: 8 }} />

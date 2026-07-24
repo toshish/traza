@@ -26,7 +26,7 @@ function toNs(local) {
 }
 
 /** Span search: the 6-field filter form, applied-filter chips, results table. */
-export function SpansView({ openTrace, sessionFilter, sessionFilterAttr = 'session.id', clearSessionFilter }) {
+export function SpansView({ openTrace, sessionFilter, clearSessionFilter }) {
   const [form, setForm] = React.useState({ service: '', name: '', attrKey: '', attrValue: '', minMs: '', since: '', until: '' });
   const [applied, setApplied] = React.useState(form);
   const [limit, setLimit] = React.useState(PAGE);
@@ -45,7 +45,9 @@ export function SpansView({ openTrace, sessionFilter, sessionFilterAttr = 'sessi
       limit: effectiveLimit,
     };
     if (filters.attrKey) params['attr.' + filters.attrKey] = filters.attrValue;
-    if (sessionFilter) params['attr.' + sessionFilterAttr] = sessionFilter;
+    // The dedicated session filter unions every recognized session key, so a
+    // mixed-convention session returns whole (see /v1/spans?session=).
+    if (sessionFilter) params.session = sessionFilter;
     try {
       setSpans(await api.spans(params));
     } catch (e) {
@@ -53,7 +55,7 @@ export function SpansView({ openTrace, sessionFilter, sessionFilterAttr = 'sessi
     } finally {
       setLoading(false);
     }
-  }, [sessionFilter, sessionFilterAttr]);
+  }, [sessionFilter]);
 
   React.useEffect(() => { fetchSpans(applied, limit); }, [fetchSpans]); // initial + session change
 
@@ -66,7 +68,7 @@ export function SpansView({ openTrace, sessionFilter, sessionFilterAttr = 'sessi
     applied.name && { field: 'name', value: applied.name },
     applied.attrKey && { field: 'attr.' + applied.attrKey, value: applied.attrValue },
     applied.minMs && { field: 'duration', op: '≥', value: applied.minMs + ' ms' },
-    sessionFilter && { field: sessionFilterAttr, value: sessionFilter, session: true },
+    sessionFilter && { field: 'session', value: sessionFilter, session: true },
   ].filter(Boolean);
 
   return <Section title="Spans" action={<Button variant="ghost" size="sm" onClick={() => fetchSpans(applied, limit)}>Refresh</Button>}>

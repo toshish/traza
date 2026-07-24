@@ -442,14 +442,15 @@ impl Store {
         Ok(sessions)
     }
 
-    /// One session with its per-trace breakdown, or `None` when no span
-    /// carries the id.
-    pub fn session(&self, session_id: &str) -> Result<Option<SessionDetail>> {
-        // A session id may arrive under any recognized key; each candidate key
-        // is an index-served point query. The union is then re-checked against
-        // the semconv precedence so a span whose RESOLVED session differs
-        // (for example it carries both a native `session.id` and a matching
-        // `gen_ai.conversation.id`) lands in exactly one session.
+    /// Every span belonging to `session_id`, resolved across ALL recognized
+    /// session keys (`session.id`, `gen_ai.conversation.id`, a
+    /// `traceloop.association.properties.*` key). Each candidate key is an
+    /// index-served point query; the union is re-checked against the semconv
+    /// precedence so a span whose RESOLVED session differs (for example it
+    /// carries both a native `session.id` and a matching
+    /// `gen_ai.conversation.id`) lands in exactly one session. This is what
+    /// makes a mixed-convention session queryable as a whole.
+    pub(crate) fn resolve_session_spans(&self, session_id: &str) -> Result<Vec<Span>> {
         let mut spans: Vec<Span> = Vec::new();
         let mut seen: HashSet<(String, String)> = HashSet::new();
         for key in semconv::SESSION_KEYS {
@@ -466,6 +467,13 @@ impl Store {
                 }
             }
         }
+        Ok(spans)
+    }
+
+    /// One session with its per-trace breakdown, or `None` when no span
+    /// carries the id.
+    pub fn session(&self, session_id: &str) -> Result<Option<SessionDetail>> {
+        let spans = self.resolve_session_spans(session_id)?;
         if spans.is_empty() {
             return Ok(None);
         }

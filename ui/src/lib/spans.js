@@ -83,21 +83,22 @@ function firstStr(attrs, keys) {
 }
 
 /** LLM usage figures when the span carries recognized LLM attributes, else
-    null. Resolves both the OpenLLMetry gen_ai.* conventions and Traza's native
-    llm.* shorthand (mirror of src/semconv.rs). */
+    null. Resolves both the OpenLLMetry / OTel GenAI conventions and Traza's
+    native llm.* shorthand (mirror of src/semconv.rs) — current OTel names
+    first, the deprecated names OTel replaced as aliases. */
 export function llmUsage(span) {
   const attrs = span.attributes || {};
   const model = firstStr(attrs, ['gen_ai.response.model', 'gen_ai.request.model', 'llm.model']);
-  const provider = firstStr(attrs, ['gen_ai.system']);
-  const promptTokens = firstNum(attrs, ['gen_ai.usage.prompt_tokens', 'gen_ai.usage.input_tokens', 'llm.prompt_tokens']);
-  const completionTokens = firstNum(attrs, ['gen_ai.usage.completion_tokens', 'gen_ai.usage.output_tokens', 'llm.completion_tokens']);
+  const provider = firstStr(attrs, ['gen_ai.provider.name', 'gen_ai.system']);
+  const promptTokens = firstNum(attrs, ['gen_ai.usage.input_tokens', 'gen_ai.usage.prompt_tokens', 'llm.prompt_tokens']);
+  const completionTokens = firstNum(attrs, ['gen_ai.usage.output_tokens', 'gen_ai.usage.completion_tokens', 'llm.completion_tokens']);
   const explicitTotal = firstNum(attrs, ['llm.usage.total_tokens', 'gen_ai.usage.total_tokens', 'llm.total_tokens']);
-  const costUsd = firstNum(attrs, ['gen_ai.usage.cost', 'llm.cost_usd']);
+  const costUsd = firstNum(attrs, ['llm.cost_usd', 'gen_ai.usage.cost']);
   const stopReason = firstStr(attrs, ['gen_ai.response.finish_reason', 'gen_ai.response.stop_reason', 'llm.stop_reason']);
-  const requestType = firstStr(attrs, ['llm.request.type']);
+  const operation = firstStr(attrs, ['gen_ai.operation.name', 'llm.request.type']);
   const spanKind = firstStr(attrs, ['traceloop.span.kind']);
   const anything = model != null || provider != null || promptTokens != null || completionTokens != null
-    || explicitTotal != null || costUsd != null || stopReason != null || requestType != null || spanKind === 'llm';
+    || explicitTotal != null || costUsd != null || stopReason != null || operation != null || spanKind === 'llm';
   if (!anything) return null;
   const totalTokens = explicitTotal != null ? explicitTotal
     : (promptTokens != null || completionTokens != null) ? (promptTokens || 0) + (completionTokens || 0) : null;
@@ -116,13 +117,55 @@ export function sessionIdOf(span) {
   return null;
 }
 
-/** Chat turns recovered from an LLM span, in order: OpenLLMetry indexed
-    attributes gen_ai.prompt.{i}.{role,content} / gen_ai.completion.{i}.{role,
-    content}, then Traza's native llm.prompt / llm.completion events. Content
-    may be an offloaded-payload reference (see isPayloadRef). */
+// Flattens one OTel GenAI message ({role, parts:[{type,content|...}]} or the
+// older {role, content}) to { role, content } where content is a string (or a
+// payload reference passed through untouched). Non-text parts (tool_call,
+// tool_call_response) are rendered compactly so nothing is silently dropped.
+function flattenGenAiMessage(message, direction) {
+  if (message == null || typeof message !== 'object') {
+    return { direction, role: undefined, content: message };
+  }
+  const role = message.role;
+  if (isPayloadRef(message.content)) return { direction, role, content: message.content };
+  if (typeof message.content === 'string') return { direction, role, content: message.content };
+  const parts = Array.isArray(message.parts) ? message.parts : null;
+  if (!parts) return { direction, role, content: JSON.stringify(message) };
+  const text = parts.map((p) => {
+    if (p == null || typeof p !== 'object') return String(p ?? '');
+    if (p.type === 'text' && typeof p.content === 'string') return p.content;
+    if (p.type === 'tool_call') return '[tool_call ' + (p.name || '') + ' ' + JSON.stringify(p.arguments ?? {}) + ']';
+    if (p.type === 'tool_call_response') return '[tool_result ' + JSON.stringify(p.result ?? p.response ?? '') + ']';
+    return JSON.stringify(p);
+  }).join('\n');
+  return { direction, role, content: text };
+}
+
+// Parses a gen_ai.{input,output}.messages attribute, which OpenLLMetry emits
+// JSON-encoded (a string) but native ingest may carry as an array.
+function parseMessagesAttr(value, direction) {
+  let arr = value;
+  if (typeof value === 'string') {
+    try { arr = JSON.parse(value); } catch (e) { return [{ direction, role: undefined, content: value }]; }
+  }
+  if (!Array.isArray(arr)) return [];
+  return arr.map((m) => flattenGenAiMessage(m, direction));
+}
+
+/** Chat turns recovered from an LLM span, in order. Recognizes, newest OTel
+    convention first: JSON gen_ai.input.messages / gen_ai.output.messages
+    ({role, parts:[{type,content}]}); then legacy indexed attributes
+    gen_ai.prompt.{i}.{role,content} / gen_ai.completion.{i}.{role,content};
+    then Traza's native llm.prompt / llm.completion events. Content may be an
+    offloaded-payload reference (see isPayloadRef). */
 export function llmMessages(span) {
   const attrs = span.attributes || {};
-  const collect = (kind) => {
+  if (attrs['gen_ai.input.messages'] != null || attrs['gen_ai.output.messages'] != null) {
+    return [
+      ...parseMessagesAttr(attrs['gen_ai.input.messages'], 'prompt'),
+      ...parseMessagesAttr(attrs['gen_ai.output.messages'], 'completion'),
+    ];
+  }
+  const collectIndexed = (kind) => {
     const prefix = 'gen_ai.' + kind + '.';
     const byIndex = new Map();
     for (const [key, value] of Object.entries(attrs)) {
@@ -147,5 +190,5 @@ export function llmMessages(span) {
       role: (e.attributes || {}).role,
       content: (e.attributes || {}).content,
     }));
-  return [...collect('prompt'), ...collect('completion'), ...events];
+  return [...collectIndexed('prompt'), ...collectIndexed('completion'), ...events];
 }
