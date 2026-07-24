@@ -33,12 +33,25 @@ pub struct UiRoot {
 }
 
 impl UiRoot {
-    /// Binds to `directory`. The path is kept as given; existence is checked
-    /// per request so a UI built after startup is served without a restart.
+    /// Binds to `directory`, resolved against the working directory so logs
+    /// and errors name the ABSOLUTE path that was searched. The default
+    /// `./ui/dist` is relative, and "no dashboard at ./ui/dist" does not tell
+    /// an operator which `./` the server meant. Existence is still checked per
+    /// request, so a UI built after startup is served without a restart.
     pub fn new(directory: impl Into<PathBuf>) -> Self {
-        Self {
-            root: directory.into(),
-        }
+        let root = directory.into();
+        let root = if root.is_absolute() {
+            root
+        } else {
+            // Drop `.` segments so the logged path reads as a real location
+            // rather than "/private/tmp/./ui/dist".
+            let trimmed: PathBuf = root
+                .components()
+                .filter(|part| !matches!(part, Component::CurDir))
+                .collect();
+            std::env::current_dir().map_or(root.clone(), |cwd| cwd.join(&trimmed))
+        };
+        Self { root }
     }
 
     /// The configured root directory.
