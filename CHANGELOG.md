@@ -24,11 +24,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     7.72 -> 1.82 ms, segments ~10,100 -> ~380. It costs about 31% of ingest
     throughput (59,025 -> 40,894 spans/s) and ~1.5 GB of resident memory for
     the merge working set.
-  - **The filtered-search target is still missed at that size**: p99 72.9 ms
-    against the project's own 50 ms bar (p50 and p95 are inside it). The
-    binding constraint is the `--compaction-max-segment-bytes` default
-    (256 MiB), which floors segment count near corpus/cap (~220 at 55 GB);
-    raising it is the identified lever and is not yet measured.
+  - With the 256 MiB default cap **the filtered-search target is missed at
+    that size**: p99 72.9 ms against the project's own 50 ms bar (p50 and
+    p95 are inside it). Raising `--compaction-max-segment-bytes` to 1 GiB
+    clears it — **p99 22.2 ms, p95 9.3 ms, p50 2.3 ms**, with trace lookup
+    p99 0.99 ms, measured on the same corpus through the same harness. The
+    binding constraint was the cap, not the algorithm: it floors segment
+    count near corpus/cap, and the sampled count fell from ~380 to ~100-125.
+  - That cap is a real trade, not a free win. Peak RSS rises 2.0 -> 6.7 GB
+    (a merge materializes its inputs, so the working set tracks the cap) and
+    sustained ingest falls a further 24%, 40,894 -> 31,267 spans/s. Measured
+    at 100M on one machine in a single run; untested above that size.
   - Uncompacted, every segment holds an open file descriptor — ~10,100 at
     100M, which would exhaust a default 1024-fd limit. A second reason not
     to disable compaction on large stores.
@@ -45,6 +51,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The benchmark can vary the segment size cap:
+  `TRAZA_BENCH_COMPACTION_MAX_SEGMENT_BYTES` passes
+  `--compaction-max-segment-bytes` to the server it spawns, parallel to the
+  existing `TRAZA_BENCH_COMPACTION_FANOUT`. It defaults to the real
+  `CompactionConfig::default()` value rather than a literal, so the two
+  cannot drift, and the configuration is named in the generated
+  `BENCHMARKS.md` row. Without this the cap could not be measured at all.
 - `Config` gains a `compaction` field (`None` disables).
 - README performance claims corrected against a measured 10,000,000-span run.
   The previous text dated from 0.3.1 and claimed search was "effectively
