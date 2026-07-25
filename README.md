@@ -209,15 +209,35 @@ One caveat worth stating plainly: `wal` and `flushed` issue `fsync`, which on **
 |---|---|---|
 | `--data-dir DIR` | `./data` | Directory for all state; created if missing |
 | `--host ADDR` / `--port PORT` | `127.0.0.1` / `8080` | Bind address and port |
+| `--profile NAME` | `balanced` | `throughput`, `balanced`, or `latency` — sets the write-path knobs as a coherent group (see [Profiles](#profiles)) |
 | `--max-connections N` | `1024` | Concurrent connections served; past it clients get `503` rather than being queued |
 | `--ttl-seconds N` | off | Rolling retention window |
 | `--flush-spans N` | `10000` | Buffered spans that trigger a durable flush |
+| `--wal-commit-window-us N` | off | Delay each fsync so more acknowledgements share it; `0` disables |
 | `--payload-threshold-bytes N` | `262144` | Offload threshold for large string values; `0` disables |
 | `--durability MODE` | `wal` | `buffered`, `wal`, or `flushed` — what an acknowledged write guarantees (see [Durability](#operating-traza)) |
 | `--compaction-fanout N` | `4` | Same-size segments merged into one, bounding filtered-search cost; `0` disables compaction |
 | `--compaction-max-segment-bytes N` | `268435456` | Ceiling on a merged segment, bounding merge memory and lock hold time; `0` for no ceiling |
 | `--ui-dir DIR` | see below | Built dashboard to serve at `/`; served from disk, so a rebuilt UI needs no server restart. Unset ⇒ `$TRAZA_UI_DIR`, `<binary dir>/ui`, `<binary dir>/../share/traza/ui`, `./ui/dist`, first one containing `index.html`. None found ⇒ the API runs and `/` 404s with build instructions |
 | `--allow-unauthenticated-non-loopback` | off | Explicitly allow an unsafe non-loopback bind without tokens |
+
+Every flag, every `Config` field, and the measured cost of each is documented in **[docs/configuration.md](docs/configuration.md)**.
+
+#### Profiles
+
+`--profile` sets the two write-path knobs whose cost curves turn on each other, so they can be chosen by intent rather than by reading the internals:
+
+| Profile | `--flush-spans` | `--wal-commit-window-us` | Pick it when |
+|---|---:|---:|---|
+| `throughput` | 30,000 | 500 | Ingest-bound and nothing blocks on an individual ack — backfill, firehose, a queue in front |
+| `balanced` (default) | 10,000 | off | Anything else. It is the default because it measured best overall, not because it is the middle |
+| `latency` | 3,000 | off | A client blocks on the ack and its **tail** matters — SDK timeouts, synchronous exporters |
+
+An explicit flag always beats the profile, **in either argument order**. **No profile changes `--durability`** — that is structural, not a convention: a profile cannot represent a durability, so no profile can silently make writes lossy. `buffered` stays an explicit opt-in.
+
+<!-- PROFILE-MEASUREMENTS -->
+
+The full measured comparison, the methodology (closed- vs open-loop load, and why latency measured under saturation is nearly meaningless), and where the profiles do **not** help are in [docs/configuration.md](docs/configuration.md).
 
 ## Performance
 

@@ -40,6 +40,9 @@ use serde_json::{json, Value};
 
 // ------------------------------------------------------------------ options
 
+/// The server's `--profile` values, in the order the report should show them.
+const PROFILES: [&str; 3] = ["throughput", "balanced", "latency"];
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Mode {
     /// Straight into `Store::ingest_batch`, no socket. Isolates engine cost.
@@ -72,18 +75,40 @@ struct Scenario {
     concurrency: usize,
     batch: usize,
     spans: usize,
+    /// Extra server flags, e.g. `--profile throughput`. Empty means the
+    /// server's own defaults.
+    server_args: Vec<String>,
+    /// Offered load in spans/s, or `None` for closed-loop (send as fast as
+    /// the server will take it).
+    ///
+    /// Closed-loop latency is not an independent measurement: with a fixed
+    /// number of saturating workers, Little's law pins it to
+    /// concurrency/throughput, so anything that raises throughput "improves"
+    /// latency and a latency-tuned configuration cannot be distinguished from
+    /// a fast one. Holding the ARRIVAL RATE fixed instead is what makes the
+    /// two separable.
+    offered_rate: Option<f64>,
 }
 
 impl Scenario {
     fn describe(&self) -> String {
+        let extra = if self.server_args.is_empty() {
+            String::new()
+        } else {
+            format!(", server {}", self.server_args.join(" "))
+        };
         if self.mode == Mode::Direct {
             return format!(
-                "direct engine, durability={}, batch={}, concurrency={}",
+                "direct engine, durability={}, batch={}, concurrency={}{extra}",
                 self.durability, self.batch, self.concurrency
             );
         }
+        let load = match self.offered_rate {
+            Some(rate) => format!(", offered {rate:.0} spans/s (open loop)"),
+            None => ", saturating (closed loop)".to_owned(),
+        };
         format!(
-            "http {}, keep-alive={}, durability={}, batch={}, concurrency={}",
+            "http {}, keep-alive={}, durability={}, batch={}, concurrency={}{load}{extra}",
             self.protocol.as_str(),
             if self.keep_alive { "on" } else { "off" },
             self.durability,
@@ -260,7 +285,7 @@ struct Server {
 }
 
 impl Server {
-    fn spawn(data_dir: &Path, durability: &str) -> Result<Self, String> {
+    fn spawn(data_dir: &Path, durability: &str, extra: &[String]) -> Result<Self, String> {
         let binary = release_binary("traza-server");
         let mut child = Command::new(&binary)
             .arg("--data-dir")
@@ -272,9 +297,12 @@ impl Server {
             .arg("--durability")
             .arg(durability)
             // Compaction off: it is a read-path optimization whose merges
-            // would otherwise steal CPU from the thing being measured.
+            // would otherwise steal CPU from the thing being measured. No
+            // profile changes it, so holding it off keeps a profile
+            // comparison to the knobs the profile actually sets.
             .arg("--compaction-fanout")
             .arg("0")
+            .args(extra)
             .env_remove("TRAZA_TOKENS")
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -483,6 +511,51 @@ fn median(values: &mut [f64]) -> f64 {
     }
 }
 
+/// Per-request latencies for one run, in milliseconds.
+///
+/// Exact samples, not a bucketed histogram: a run holds one `u64` per request,
+/// which even at batch=20 is a few tens of thousands of values. The server's
+/// own `/v1/metrics` percentiles are approximate by construction; these are
+/// not, and the two are reported separately rather than blended.
+#[derive(Clone, Debug, Default)]
+struct Latencies {
+    /// Sorted ascending on construction.
+    nanos: Vec<u64>,
+}
+
+impl Latencies {
+    fn new(mut nanos: Vec<u64>) -> Self {
+        nanos.sort_unstable();
+        Self { nanos }
+    }
+
+    /// Nearest-rank percentile, in milliseconds.
+    fn percentile(&self, quantile: f64) -> f64 {
+        if self.nanos.is_empty() {
+            return f64::NAN;
+        }
+        let rank = (quantile * self.nanos.len() as f64).ceil() as usize;
+        let index = rank.saturating_sub(1).min(self.nanos.len() - 1);
+        self.nanos[index] as f64 / 1e6
+    }
+
+    fn p50(&self) -> f64 {
+        self.percentile(0.50)
+    }
+
+    fn p95(&self) -> f64 {
+        self.percentile(0.95)
+    }
+
+    fn p99(&self) -> f64 {
+        self.percentile(0.99)
+    }
+
+    fn max_ms(&self) -> f64 {
+        self.nanos.last().map_or(f64::NAN, |ns| *ns as f64 / 1e6)
+    }
+}
+
 // ------------------------------------------------------------------ running
 
 struct RunResult {
@@ -491,6 +564,8 @@ struct RunResult {
     stored: u64,
     refused: u64,
     metrics: String,
+    /// One sample per request (per `ingest_batch` call in direct mode).
+    latency: Latencies,
 }
 
 /// One measured ingest run against a fresh server and data directory.
@@ -502,7 +577,7 @@ fn run_http(scenario: &Scenario, payloads: &Arc<Vec<Vec<u8>>>) -> Result<RunResu
     let data_dir =
         std::env::temp_dir().join(format!("traza-ingestbench-{}-{stamp}", std::process::id()));
     std::fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
-    let server = Server::spawn(&data_dir, &scenario.durability)?;
+    let server = Server::spawn(&data_dir, &scenario.durability, &scenario.server_args)?;
 
     let (path, content_type) = match scenario.protocol {
         Protocol::Json => ("/v1/spans", "application/json"),
@@ -511,15 +586,33 @@ fn run_http(scenario: &Scenario, payloads: &Arc<Vec<Vec<u8>>>) -> Result<RunResu
 
     let next = Arc::new(AtomicUsize::new(0));
     let failures = Arc::new(AtomicUsize::new(0));
+    // Worst observed gap between when a batch was DUE and when it actually
+    // went out. In an open-loop run this is the honest "did the offered rate
+    // exceed capacity" signal; see the check after the join.
+    let worst_lag_ns = Arc::new(AtomicUsize::new(0));
+    // Seconds between successive batch departures for the run as a whole.
+    let interval = scenario
+        .offered_rate
+        .map(|rate| scenario.batch as f64 / rate);
     // Every client connects and is ready before any of them starts sending,
     // so connection setup is not charged to the measured window.
     let ready = Arc::new(Barrier::new(scenario.concurrency + 1));
+    // A second rendezvous so the schedule origin is published before any
+    // worker can read it: `ready` releases every thread at once, which left
+    // the workers racing the main thread's write.
+    let go = Arc::new(Barrier::new(scenario.concurrency + 1));
+    // Established once, between the two barriers, so all workers share one
+    // schedule origin and it is exactly the run's start instant.
+    let origin = Arc::new(std::sync::OnceLock::<Instant>::new());
     let mut handles = Vec::new();
     for _ in 0..scenario.concurrency {
         let next = Arc::clone(&next);
         let failures = Arc::clone(&failures);
         let ready = Arc::clone(&ready);
+        let go = Arc::clone(&go);
         let payloads = Arc::clone(payloads);
+        let worst_lag_ns = Arc::clone(&worst_lag_ns);
+        let origin = Arc::clone(&origin);
         let port = server.port;
         let keep_alive = scenario.keep_alive;
         let path = path.to_owned();
@@ -533,13 +626,47 @@ fn run_http(scenario: &Scenario, payloads: &Arc<Vec<Vec<u8>>>) -> Result<RunResu
                 }
             }
             ready.wait();
+            go.wait();
+            let start = *origin
+                .get()
+                .expect("origin published before the go barrier");
+            let mut samples = Vec::new();
             loop {
                 let index = next.fetch_add(1, Ordering::Relaxed);
                 if index >= payloads.len() {
                     break;
                 }
-                match client.post(&path, &content_type, &payloads[index]) {
-                    Ok(status) if status / 100 == 2 => {}
+                // Open loop: batch `index` is DUE at a fixed offset from the
+                // run's origin, whatever the server is doing. Latency is
+                // measured from that due time rather than from the actual
+                // send, which is what keeps a backed-up server from hiding
+                // behind coordinated omission — if the client is late
+                // because the previous request was slow, the lateness belongs
+                // in the sample.
+                let due =
+                    interval.map(|seconds| start + Duration::from_secs_f64(seconds * index as f64));
+                if let Some(due) = due {
+                    let now = Instant::now();
+                    if now < due {
+                        std::thread::sleep(due - now);
+                    } else {
+                        let lag = (now - due).as_nanos() as usize;
+                        worst_lag_ns.fetch_max(lag, Ordering::Relaxed);
+                    }
+                }
+                // Closed loop: the client-observed latency of one
+                // acknowledged batch, request written to response read. In
+                // keep-alive-off runs it includes the reconnect, because that
+                // is what the mode costs.
+                let sent = Instant::now();
+                let outcome = client.post(&path, &content_type, &payloads[index]);
+                let done = Instant::now();
+                let observed = match due {
+                    Some(due) => done.saturating_duration_since(due),
+                    None => done - sent,
+                };
+                match outcome {
+                    Ok(status) if status / 100 == 2 => samples.push(observed.as_nanos() as u64),
                     Ok(status) => {
                         eprintln!("  batch {index} rejected with HTTP {status}");
                         failures.fetch_add(1, Ordering::Relaxed);
@@ -550,15 +677,38 @@ fn run_http(scenario: &Scenario, payloads: &Arc<Vec<Vec<u8>>>) -> Result<RunResu
                     }
                 }
             }
+            samples
         }));
     }
 
     ready.wait();
     let started = Instant::now();
+    let _ = origin.set(started);
+    go.wait();
+    let mut samples = Vec::new();
     for handle in handles {
-        handle.join().map_err(|_| "worker panicked")?;
+        samples.extend(handle.join().map_err(|_| "worker panicked")?);
     }
     let elapsed = started.elapsed();
+
+    // An open-loop run whose clients could not keep to the schedule did not
+    // measure the offered rate; it measured the server's capacity, and its
+    // latencies describe a queue rather than a configuration. Reject it
+    // rather than publish it, on the same principle as a shed connection.
+    if let Some(interval) = interval {
+        let lag = Duration::from_nanos(worst_lag_ns.load(Ordering::Relaxed) as u64);
+        // One batch-interval of slop absorbs scheduler jitter; sustained
+        // lateness beyond that means the arrival schedule was not met.
+        let tolerance = Duration::from_secs_f64(interval * 10.0);
+        if lag > tolerance {
+            return Err(format!(
+                "offered rate exceeded capacity: fell {:.1} ms behind schedule (tolerance {:.1} ms), \
+so this is a saturation measurement, not an open-loop one",
+                lag.as_secs_f64() * 1e3,
+                tolerance.as_secs_f64() * 1e3
+            ));
+        }
+    }
 
     let failed = failures.load(Ordering::Relaxed);
     if failed > 0 {
@@ -577,7 +727,7 @@ fn run_http(scenario: &Scenario, payloads: &Arc<Vec<Vec<u8>>>) -> Result<RunResu
     // the server still has what it acknowledged.
     if scenario.durability != "buffered" {
         drop(server);
-        let restarted = Server::spawn(&data_dir, &scenario.durability)?;
+        let restarted = Server::spawn(&data_dir, &scenario.durability, &scenario.server_args)?;
         let mut after = Client::new(restarted.port, true);
         let recovered = wait_for_records(&mut after, scenario.spans as u64).map_err(|error| {
             format!(
@@ -603,6 +753,7 @@ fn run_http(scenario: &Scenario, payloads: &Arc<Vec<Vec<u8>>>) -> Result<RunResu
         stored,
         refused,
         metrics,
+        latency: Latencies::new(samples),
     })
 }
 
@@ -690,6 +841,7 @@ fn run_direct(scenario: &Scenario) -> Result<RunResult, String> {
         let store = Arc::clone(&store);
         handles.push(std::thread::spawn(move || {
             ready.wait();
+            let mut samples = Vec::new();
             loop {
                 let index = next.fetch_add(1, Ordering::Relaxed);
                 if index >= batches.len() {
@@ -699,15 +851,21 @@ fn run_direct(scenario: &Scenario) -> Result<RunResult, String> {
                 // ever takes a given batch.
                 let batch = batches[index].lock().expect("batch").take();
                 if let Some(batch) = batch {
+                    // Only the engine call is timed; taking the batch out of
+                    // the handoff slot is harness bookkeeping.
+                    let started = Instant::now();
                     store.ingest_batch(batch).expect("direct ingest");
+                    samples.push(started.elapsed().as_nanos() as u64);
                 }
             }
+            samples
         }));
     }
     ready.wait();
     let started = Instant::now();
+    let mut samples = Vec::new();
     for handle in handles {
-        handle.join().map_err(|_| "worker panicked")?;
+        samples.extend(handle.join().map_err(|_| "worker panicked")?);
     }
     let elapsed = started.elapsed();
 
@@ -723,6 +881,7 @@ fn run_direct(scenario: &Scenario) -> Result<RunResult, String> {
         stored: stats.total_records as u64,
         refused: 0,
         metrics,
+        latency: Latencies::new(samples),
     })
 }
 
@@ -822,6 +981,11 @@ fn run() -> Result<(), String> {
     let mut only: Option<String> = None;
     let mut concurrencies: Vec<usize> = Vec::new();
     let mut batch = 1_000_usize;
+    // Extra server flags applied to every HTTP scenario, so a configuration
+    // can be swept without editing and rebuilding this file. This is how the
+    // profile constants were chosen rather than guessed.
+    let mut server_args: Vec<String> = Vec::new();
+    let mut offered_rate: Option<f64> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -849,9 +1013,25 @@ fn run() -> Result<(), String> {
                         .to_ascii_lowercase(),
                 );
             }
+            "--server-arg" => {
+                i += 1;
+                let raw = args.get(i).ok_or("--server-arg requires a value")?;
+                server_args.extend(raw.split_whitespace().map(str::to_owned));
+            }
+            "--offered-rate" => {
+                i += 1;
+                offered_rate = Some(
+                    args.get(i)
+                        .ok_or("--offered-rate requires a value")?
+                        .parse()
+                        .map_err(|_| "--offered-rate must be spans/s".to_owned())?,
+                );
+            }
             "--help" | "-h" => {
                 println!(
-                    "Usage: ingest-bench [--spans N] [--runs N] [--batch N] [--concurrency N ...] [--only SUBSTRING]"
+                    "Usage: ingest-bench [--spans N] [--runs N] [--batch N] [--concurrency N ...] \
+[--only SUBSTRING] [--server-arg \"--flag value\" ...] \
+[--offered-rate SPANS_PER_SEC (adds open-loop profile rows at a fixed arrival rate)]"
                 );
                 return Ok(());
             }
@@ -868,26 +1048,20 @@ fn run() -> Result<(), String> {
     }
 
     let mut scenarios = Vec::new();
-    scenarios.push(Scenario {
-        label: "direct-engine-wal".to_owned(),
-        mode: Mode::Direct,
-        protocol: Protocol::Json,
-        keep_alive: false,
-        durability: "wal".to_owned(),
-        concurrency: 8,
-        batch,
-        spans,
-    });
-    scenarios.push(Scenario {
-        label: "direct-engine-buffered".to_owned(),
-        mode: Mode::Direct,
-        protocol: Protocol::Json,
-        keep_alive: false,
-        durability: "buffered".to_owned(),
-        concurrency: 8,
-        batch,
-        spans,
-    });
+    for durability in ["wal", "buffered"] {
+        scenarios.push(Scenario {
+            label: format!("direct-engine-{durability}"),
+            mode: Mode::Direct,
+            protocol: Protocol::Json,
+            keep_alive: false,
+            durability: durability.to_owned(),
+            concurrency: 8,
+            batch,
+            spans,
+            server_args: Vec::new(),
+            offered_rate: None,
+        });
+    }
     // The keep-alive comparison, held at one concurrency so the only variable is
     // the connection policy.
     for keep_alive in [false, true] {
@@ -903,6 +1077,8 @@ fn run() -> Result<(), String> {
             concurrency: 8,
             batch,
             spans,
+            server_args: Vec::new(),
+            offered_rate: None,
         });
     }
     for concurrency in &concurrencies {
@@ -916,7 +1092,60 @@ fn run() -> Result<(), String> {
                 concurrency: *concurrency,
                 batch,
                 spans,
+                server_args: Vec::new(),
+                offered_rate: None,
             });
+        }
+    }
+    // The profile comparison. Every other variable is pinned — same protocol,
+    // same keep-alive, same durability, same corpus — so the only thing that
+    // differs between the rows at a given concurrency is `--profile`.
+    // Concurrency is swept because the profiles' whole disagreement is about
+    // what happens when there is, or is not, other work to batch with.
+    for profile in PROFILES {
+        for concurrency in &concurrencies {
+            scenarios.push(Scenario {
+                label: format!("profile-{profile}-c{concurrency}"),
+                mode: Mode::Http,
+                protocol: Protocol::Json,
+                keep_alive: true,
+                durability: "wal".to_owned(),
+                concurrency: *concurrency,
+                batch,
+                spans,
+                server_args: vec!["--profile".to_owned(), profile.to_owned()],
+                offered_rate: None,
+            });
+        }
+    }
+    // The same comparison under a FIXED arrival rate. This is the one that can
+    // say anything about latency: the closed-loop rows above cannot separate
+    // "lower latency" from "higher throughput", because with saturating
+    // workers the first follows arithmetically from the second.
+    if let Some(rate) = offered_rate {
+        for profile in PROFILES {
+            for concurrency in &concurrencies {
+                scenarios.push(Scenario {
+                    label: format!("profile-{profile}-openloop-c{concurrency}"),
+                    mode: Mode::Http,
+                    protocol: Protocol::Json,
+                    keep_alive: true,
+                    durability: "wal".to_owned(),
+                    concurrency: *concurrency,
+                    batch,
+                    spans,
+                    server_args: vec!["--profile".to_owned(), profile.to_owned()],
+                    offered_rate: Some(rate),
+                });
+            }
+        }
+    }
+
+    // Applied last so a swept flag beats a scenario's own (the server itself
+    // resolves duplicates last-wins, and this keeps that predictable).
+    if !server_args.is_empty() {
+        for scenario in &mut scenarios {
+            scenario.server_args.extend(server_args.iter().cloned());
         }
     }
 
@@ -947,9 +1176,20 @@ connection are reported as failures rather than as numbers.\n"
     );
     let _ = writeln!(
         report,
-        "| Scenario | Protocol | Keep-alive | Concurrency | Median spans/s | Min | Max |"
+        "Latency is the CLIENT-OBSERVED time for one acknowledged batch, sampled per \
+request and reduced to percentiles per run; the table reports the MEDIAN ACROSS RUNS \
+of each percentile. Read it with the load model in mind: this is a closed-loop \
+generator with a fixed number of workers, all saturating, so latency includes queueing \
+and by Little's law tracks concurrency divided by throughput. Latencies are therefore \
+only comparable BETWEEN ROWS AT THE SAME CONCURRENCY, and the honest place to look for \
+a deliberate delay's cost is the low-concurrency rows, where there is nothing to queue \
+behind.\n"
     );
-    let _ = writeln!(report, "|---|---|---|---:|---:|---:|---:|");
+    let _ = writeln!(
+        report,
+        "| Scenario | Protocol | Keep-alive | Concurrency | Median spans/s | Min | Max | p50 ms | p95 ms | p99 ms |"
+    );
+    let _ = writeln!(report, "|---|---|---|---:|---:|---:|---:|---:|---:|---:|");
 
     for scenario in &scenarios {
         if let Some(filter) = &only {
@@ -990,6 +1230,9 @@ connection are reported as failures rather than as numbers.\n"
         }
 
         let mut rates = Vec::new();
+        let mut p50s = Vec::new();
+        let mut p95s = Vec::new();
+        let mut p99s = Vec::new();
         let mut last_metrics = String::new();
         let mut failed: Option<String> = None;
         for attempt in 1..=runs {
@@ -1015,11 +1258,18 @@ connection are reported as failures rather than as numbers.\n"
                         break;
                     }
                     println!(
-                        "  run {attempt}: {:.0} spans/s ({:.2}s)",
+                        "  run {attempt}: {:.0} spans/s ({:.2}s), latency p50 {:.2} / p95 {:.2} / p99 {:.2} / max {:.2} ms",
                         result.rate,
-                        result.elapsed.as_secs_f64()
+                        result.elapsed.as_secs_f64(),
+                        result.latency.p50(),
+                        result.latency.p95(),
+                        result.latency.p99(),
+                        result.latency.max_ms()
                     );
                     rates.push(result.rate);
+                    p50s.push(result.latency.p50());
+                    p95s.push(result.latency.p95());
+                    p99s.push(result.latency.p99());
                     last_metrics = result.metrics;
                 }
                 Err(error) => {
@@ -1033,7 +1283,7 @@ connection are reported as failures rather than as numbers.\n"
             println!("  FAILED: {error}\n");
             let _ = writeln!(
                 report,
-                "| {} | {} | {} | {} | FAILED: {error} | | |",
+                "| {} | {} | {} | {} | FAILED: {error} | | | | | |",
                 scenario.label,
                 scenario.protocol.as_str(),
                 scenario.keep_alive,
@@ -1045,7 +1295,11 @@ connection are reported as failures rather than as numbers.\n"
         let min = rates.iter().cloned().fold(f64::INFINITY, f64::min);
         let max = rates.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
         let mid = median(&mut rates.clone());
+        let p50 = median(&mut p50s.clone());
+        let p95 = median(&mut p95s.clone());
+        let p99 = median(&mut p99s.clone());
         println!("  median: {mid:.0} spans/s (min {min:.0}, max {max:.0})");
+        println!("  latency (median of per-run percentiles): p50 {p50:.2} ms, p95 {p95:.2} ms, p99 {p99:.2} ms");
         let stages = stage_summary(&last_metrics);
         if !stages.is_empty() {
             println!("  stages (server-side totals across the run):");
@@ -1055,7 +1309,7 @@ connection are reported as failures rather than as numbers.\n"
 
         let _ = writeln!(
             report,
-            "| {} | {} | {} | {} | **{mid:.0}** | {min:.0} | {max:.0} |",
+            "| {} | {} | {} | {} | **{mid:.0}** | {min:.0} | {max:.0} | {p50:.2} | {p95:.2} | {p99:.2} |",
             scenario.label,
             scenario.protocol.as_str(),
             if scenario.mode == Mode::Direct {
