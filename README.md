@@ -223,7 +223,8 @@ One caveat worth stating plainly: `wal` and `flushed` issue `fsync`, which on **
 
 Measured on macOS/aarch64 (10 hardware threads) by the bundled end-to-end benchmark over a 1,000,000-span corpus ingested through the real HTTP path:
 
-- **Sustained ingest:** 116,618 spans/s (batched HTTP, client serialization and loopback included)
+- **Sustained ingest:** 116,618 spans/s (batched HTTP, single client, client serialization and loopback included)
+- **Sustained ingest, 16 concurrent clients:** 208,973 spans/s (`wal` durability, median of 5 runs — see [INGEST-BENCHMARK.md](INGEST-BENCHMARK.md))
 - **Trace lookup:** p95 0.64 ms
 - **Attribute-filtered search:** p95 3.3 ms
 

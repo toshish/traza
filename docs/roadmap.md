@@ -245,7 +245,26 @@ alongside results.
   ingest, annotation, payload, and compaction paths. `buffered` mode is
   tested to lose *only* unacknowledged-as-durable data.
 - **Throughput:** 250k spans/s sustained on the reference environment in
-  `wal` mode (keep-alive + protobuf), measured by the bundled benchmark.
+  `wal` mode, measured by the bundled benchmark. ***Status (0.16): 208,973
+  spans/s — NOT MET, 16% short***, median of 5 runs at concurrency 16 over a
+  1M-span corpus (`ingest-bench`; see [INGEST-BENCHMARK.md](../INGEST-BENCHMARK.md)).
+  Up from 108,881 on the same client before persistent connections and the
+  decode/WAL work landed, and the curve no longer flattens between 8 and 16
+  clients as it did.
+
+  The parenthetical this line used to carry — "(keep-alive + protobuf)" — did
+  not survive measurement. Protobuf is *slower* than JSON at every concurrency
+  (it decodes through a `serde_json::Value` DOM that the JSON route no longer
+  uses), and keep-alive is worth +11% at batch=20 and nothing at batch=1000.
+  Decode of any kind is 1.9% of the cost.
+
+  The real limit is the **writer lock, held ~88% of a run, of which 74% is
+  segment sealing** — work that needs no lock. That puts a hard ceiling near
+  212k spans/s on the current design regardless of client concurrency, which
+  is why the remaining gap is not a tuning problem. Moving the seal off the
+  lock requires a reader-visible "sealing" tier and a rotating WAL; both are
+  specified in INGEST-BENCHMARK.md, and an attempt that stopped short of them
+  was reverted rather than merged.
 - **Query latency:** p99 < 10 ms trace lookup and < 50 ms filtered search at
   a 100M-span store; RSS remains O(indexes). *Status at 10M (0.15):* trace
   lookup p99 4.65 ms already clears its bar and RSS held at 0.25 GB, but the
