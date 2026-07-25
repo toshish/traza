@@ -160,6 +160,7 @@ OpenLLMetry and OTel GenAI instrumentation lands queryable without translation: 
 | `GET` | `/v1/payloads/sha256/{hex}` | Raw bytes of an offloaded payload |
 | `GET` | `/v1/export?…` | Chunked NDJSON export with completion/count trailers |
 | `GET` | `/v1/stats` | Physical record count, segment count, bytes on disk |
+| `GET` | `/v1/metrics` | Prometheus text: per-stage ingest timings, request and connection counters |
 | `POST` | `/v1/flush` | Force buffered spans into a durable segment |
 
 Search filters (ANDed; URL-encoded): `service` and `name` (exact match), `attr.KEY` (exact attribute match — bare values match strings, JSON literals match typed values; repeatable), `session` (all spans of a session, unioning every recognized session key), `min_duration_ms`, `since`/`until` (Unix nanoseconds, inclusive), `limit` (default 100 on `/v1/spans`; exports are unbounded by default).
@@ -208,7 +209,7 @@ One caveat worth stating plainly: `wal` and `flushed` issue `fsync`, which on **
 |---|---|---|
 | `--data-dir DIR` | `./data` | Directory for all state; created if missing |
 | `--host ADDR` / `--port PORT` | `127.0.0.1` / `8080` | Bind address and port |
-| `--workers N` | CPUs (min 4) | HTTP worker threads |
+| `--max-connections N` | `1024` | Concurrent connections served; past it clients get `503` rather than being queued |
 | `--ttl-seconds N` | off | Rolling retention window |
 | `--flush-spans N` | `10000` | Buffered spans that trigger a durable flush |
 | `--payload-threshold-bytes N` | `262144` | Offload threshold for large string values; `0` disables |
