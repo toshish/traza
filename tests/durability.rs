@@ -400,10 +400,7 @@ fn acknowledged_over_one_connection(port: u16, worker: usize, rounds: usize) -> 
         // Read exactly one response, keeping any surplus for the next round.
         let mut chunk = [0_u8; 4096];
         let header_end = loop {
-            if let Some(position) = leftover
-                .windows(4)
-                .position(|window| window == b"\r\n\r\n")
-            {
+            if let Some(position) = leftover.windows(4).position(|window| window == b"\r\n\r\n") {
                 break position + 4;
             }
             match stream.read(&mut chunk) {
