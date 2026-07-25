@@ -230,7 +230,7 @@ Every flag, every `Config` field, and the measured cost of each is documented in
 | Profile | `--flush-spans` | `--wal-commit-window-us` | Pick it when |
 |---|---:|---:|---|
 | `throughput` | 30,000 | 500 | Ingest-bound and nothing blocks on an individual ack — backfill, firehose, a queue in front |
-| `balanced` (default) | 10,000 | off | Anything else. It is the default because it measured best overall, not because it is the middle |
+| `balanced` (default) | 10,000 | off | Anything else, and anything you have not measured. These are the long-standing defaults, unchanged |
 | `latency` | 3,000 | off | A client blocks on the ack and its **tail** matters — SDK timeouts, synchronous exporters |
 
 An explicit flag always beats the profile, **in either argument order**. **No profile changes `--durability`** — that is structural, not a convention: a profile cannot represent a durability, so no profile can silently make writes lossy. `buffered` stays an explicit opt-in.
