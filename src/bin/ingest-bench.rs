@@ -40,6 +40,9 @@ use serde_json::{json, Value};
 
 // ------------------------------------------------------------------ options
 
+/// The server's `--profile` values, in the order the report should show them.
+const PROFILES: [&str; 3] = ["throughput", "balanced", "latency"];
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Mode {
     /// Straight into `Store::ingest_batch`, no socket. Isolates engine cost.
@@ -47,12 +50,6 @@ enum Mode {
     Http,
 }
 
-/// Wire format AND the route that accepts it. These are separate variables and
-/// the enum names both, because conflating them is exactly how "protobuf is
-/// slower than JSON" got claimed from a measurement that could not show it: the
-/// old `Json` arm posted to the native route and the old `Protobuf` arm posted
-/// to the OTLP route, so every protobuf-vs-JSON delta also contained the entire
-/// OTLP semantic mapping. `OtlpJson` exists to hold the route fixed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Protocol {
     /// `/v1/spans`, native span JSON: `serde` straight to `Vec<Span>`, no
@@ -107,20 +104,41 @@ struct Scenario {
     concurrency: usize,
     batch: usize,
     spans: usize,
+    /// Extra server flags, e.g. `--profile throughput`. Empty means the
+    /// server's own defaults.
+    server_args: Vec<String>,
+    /// Offered load in spans/s, or `None` for closed-loop (send as fast as
+    /// the server will take it).
+    ///
+    /// Closed-loop latency is not an independent measurement: with a fixed
+    /// number of saturating workers, Little's law pins it to
+    /// concurrency/throughput, so anything that raises throughput "improves"
+    /// latency and a latency-tuned configuration cannot be distinguished from
+    /// a fast one. Holding the ARRIVAL RATE fixed instead is what makes the
+    /// two separable.
+    offered_rate: Option<f64>,
 }
 
 impl Scenario {
     fn describe(&self) -> String {
+        let extra = if self.server_args.is_empty() {
+            String::new()
+        } else {
+            format!(", server {}", self.server_args.join(" "))
+        };
         if self.mode == Mode::Direct {
             return format!(
-                "direct engine, durability={}, batch={}, concurrency={}",
+                "direct engine, durability={}, batch={}, concurrency={}{extra}",
                 self.durability, self.batch, self.concurrency
             );
         }
+        let load = match self.offered_rate {
+            Some(rate) => format!(", offered {rate:.0} spans/s (open loop)"),
+            None => ", saturating (closed loop)".to_owned(),
+        };
         format!(
-            "http {} -> {}, keep-alive={}, durability={}, batch={}, concurrency={}",
+            "http {}, keep-alive={}, durability={}, batch={}, concurrency={}{load}{extra}",
             self.protocol.as_str(),
-            self.protocol.route(),
             if self.keep_alive { "on" } else { "off" },
             self.durability,
             self.batch,
@@ -143,14 +161,6 @@ struct SpanSeed {
     group: String,
 }
 
-/// Spans per service. OTLP carries `service.name` per RESOURCE, so service has
-/// to vary in CONTIGUOUS RUNS rather than round-robin: a round-robin service
-/// would force the OTLP encoders into one ResourceSpans per span — the
-/// pathological shape — while the native encoder just repeated a string. All
-/// three encodings then carry the same spans in the same order, which is what
-/// makes the routes comparable.
-const SPANS_PER_SERVICE: usize = 50;
-
 fn seed(index: usize) -> SpanSeed {
     let trace_number = index / 10;
     let start_ns = 1_700_000_000_000_000_000_u64 + (index as u64 * 1_000_000);
@@ -162,7 +172,7 @@ fn seed(index: usize) -> SpanSeed {
         } else {
             "operation"
         },
-        service: format!("service-{}", (index / SPANS_PER_SERVICE) % 20),
+        service: format!("service-{}", index % 20),
         start_ns,
         end_ns: start_ns + 500_000 + ((index % 100) as u64 * 20_000),
         group: format!("group-{}", index % 100),
@@ -177,8 +187,6 @@ fn http_method(index: usize) -> &'static str {
     }
 }
 
-/// The contiguous single-service runs inside `[start, end)`, as
-/// `(service, run_start, run_end)`. One run becomes one OTLP `ResourceSpans`.
 fn resource_runs(start: usize, end: usize) -> Vec<(String, usize, usize)> {
     let mut runs: Vec<(String, usize, usize)> = Vec::new();
     for index in start..end {
@@ -191,41 +199,6 @@ fn resource_runs(start: usize, end: usize) -> Vec<(String, usize, usize)> {
     runs
 }
 
-fn json_batch(start: usize, end: usize) -> Vec<u8> {
-    let mut body = Vec::with_capacity(320 * (end - start));
-    body.push(b'[');
-    for index in start..end {
-        if index != start {
-            body.push(b',');
-        }
-        let seed = seed(index);
-        let span = json!({
-            "trace_id": seed.trace_id,
-            "span_id": seed.span_id,
-            "name": seed.name,
-            "service": seed.service,
-            "start_ns": seed.start_ns,
-            "end_ns": seed.end_ns,
-            "status": "ok",
-            "attributes": {
-                "benchmark.group": seed.group,
-                "http.method": http_method(index)
-            }
-        });
-        serde_json::to_writer(&mut body, &span).expect("json");
-    }
-    body.push(b']');
-    body
-}
-
-/// The same spans as [`json_batch`] and [`protobuf_batch`], encoded as an
-/// OTLP/HTTP JSON `ExportTraceServiceRequest`.
-///
-/// Canonical proto3-JSON encoding, which is what a real OTLP/HTTP JSON exporter
-/// emits and what the repo's own conformance fixture uses: 64-bit nanos as
-/// STRINGS, and the status code as the enum NAME. Both are more expensive to
-/// parse than the numeric forms the mapping also accepts, so this is the
-/// honest encoding rather than the flattering one.
 fn otlp_json_batch(start: usize, end: usize) -> Vec<u8> {
     let resource_spans: Vec<Value> = resource_runs(start, end)
         .into_iter()
@@ -258,6 +231,39 @@ fn otlp_json_batch(start: usize, end: usize) -> Vec<u8> {
         })
         .collect();
     serde_json::to_vec(&json!({ "resourceSpans": resource_spans })).expect("json")
+}
+
+fn decode_ns_per_span(metrics: &str) -> Option<f64> {
+    let sum = metric_value(metrics, "traza_http_decode_ns_sum")?;
+    let spans = metric_value(metrics, "traza_http_decoded_spans_total")?;
+    (spans > 0).then(|| sum as f64 / spans as f64)
+}
+
+fn json_batch(start: usize, end: usize) -> Vec<u8> {
+    let mut body = Vec::with_capacity(320 * (end - start));
+    body.push(b'[');
+    for index in start..end {
+        if index != start {
+            body.push(b',');
+        }
+        let seed = seed(index);
+        let span = json!({
+            "trace_id": seed.trace_id,
+            "span_id": seed.span_id,
+            "name": seed.name,
+            "service": seed.service,
+            "start_ns": seed.start_ns,
+            "end_ns": seed.end_ns,
+            "status": "ok",
+            "attributes": {
+                "benchmark.group": seed.group,
+                "http.method": http_method(index)
+            }
+        });
+        serde_json::to_writer(&mut body, &span).expect("json");
+    }
+    body.push(b']');
+    body
 }
 
 // ------------------------------------------------------- protobuf encoding
@@ -371,7 +377,7 @@ struct Server {
 }
 
 impl Server {
-    fn spawn(data_dir: &Path, durability: &str) -> Result<Self, String> {
+    fn spawn(data_dir: &Path, durability: &str, extra: &[String]) -> Result<Self, String> {
         let binary = release_binary("traza-server");
         let mut child = Command::new(&binary)
             .arg("--data-dir")
@@ -383,9 +389,12 @@ impl Server {
             .arg("--durability")
             .arg(durability)
             // Compaction off: it is a read-path optimization whose merges
-            // would otherwise steal CPU from the thing being measured.
+            // would otherwise steal CPU from the thing being measured. No
+            // profile changes it, so holding it off keeps a profile
+            // comparison to the knobs the profile actually sets.
             .arg("--compaction-fanout")
             .arg("0")
+            .args(extra)
             .env_remove("TRAZA_TOKENS")
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -594,6 +603,51 @@ fn median(values: &mut [f64]) -> f64 {
     }
 }
 
+/// Per-request latencies for one run, in milliseconds.
+///
+/// Exact samples, not a bucketed histogram: a run holds one `u64` per request,
+/// which even at batch=20 is a few tens of thousands of values. The server's
+/// own `/v1/metrics` percentiles are approximate by construction; these are
+/// not, and the two are reported separately rather than blended.
+#[derive(Clone, Debug, Default)]
+struct Latencies {
+    /// Sorted ascending on construction.
+    nanos: Vec<u64>,
+}
+
+impl Latencies {
+    fn new(mut nanos: Vec<u64>) -> Self {
+        nanos.sort_unstable();
+        Self { nanos }
+    }
+
+    /// Nearest-rank percentile, in milliseconds.
+    fn percentile(&self, quantile: f64) -> f64 {
+        if self.nanos.is_empty() {
+            return f64::NAN;
+        }
+        let rank = (quantile * self.nanos.len() as f64).ceil() as usize;
+        let index = rank.saturating_sub(1).min(self.nanos.len() - 1);
+        self.nanos[index] as f64 / 1e6
+    }
+
+    fn p50(&self) -> f64 {
+        self.percentile(0.50)
+    }
+
+    fn p95(&self) -> f64 {
+        self.percentile(0.95)
+    }
+
+    fn p99(&self) -> f64 {
+        self.percentile(0.99)
+    }
+
+    fn max_ms(&self) -> f64 {
+        self.nanos.last().map_or(f64::NAN, |ns| *ns as f64 / 1e6)
+    }
+}
+
 // ------------------------------------------------------------------ running
 
 struct RunResult {
@@ -602,6 +656,8 @@ struct RunResult {
     stored: u64,
     refused: u64,
     metrics: String,
+    /// One sample per request (per `ingest_batch` call in direct mode).
+    latency: Latencies,
 }
 
 /// One measured ingest run against a fresh server and data directory.
@@ -613,21 +669,41 @@ fn run_http(scenario: &Scenario, payloads: &Arc<Vec<Vec<u8>>>) -> Result<RunResu
     let data_dir =
         std::env::temp_dir().join(format!("traza-ingestbench-{}-{stamp}", std::process::id()));
     std::fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
-    let server = Server::spawn(&data_dir, &scenario.durability)?;
+    let server = Server::spawn(&data_dir, &scenario.durability, &scenario.server_args)?;
 
+    // Route and content type live on Protocol so a third protocol cannot be
+    // added without them agreeing.
     let (path, content_type) = (scenario.protocol.route(), scenario.protocol.content_type());
 
     let next = Arc::new(AtomicUsize::new(0));
     let failures = Arc::new(AtomicUsize::new(0));
+    // Worst observed gap between when a batch was DUE and when it actually
+    // went out. In an open-loop run this is the honest "did the offered rate
+    // exceed capacity" signal; see the check after the join.
+    let worst_lag_ns = Arc::new(AtomicUsize::new(0));
+    // Seconds between successive batch departures for the run as a whole.
+    let interval = scenario
+        .offered_rate
+        .map(|rate| scenario.batch as f64 / rate);
     // Every client connects and is ready before any of them starts sending,
     // so connection setup is not charged to the measured window.
     let ready = Arc::new(Barrier::new(scenario.concurrency + 1));
+    // A second rendezvous so the schedule origin is published before any
+    // worker can read it: `ready` releases every thread at once, which left
+    // the workers racing the main thread's write.
+    let go = Arc::new(Barrier::new(scenario.concurrency + 1));
+    // Established once, between the two barriers, so all workers share one
+    // schedule origin and it is exactly the run's start instant.
+    let origin = Arc::new(std::sync::OnceLock::<Instant>::new());
     let mut handles = Vec::new();
     for _ in 0..scenario.concurrency {
         let next = Arc::clone(&next);
         let failures = Arc::clone(&failures);
         let ready = Arc::clone(&ready);
+        let go = Arc::clone(&go);
         let payloads = Arc::clone(payloads);
+        let worst_lag_ns = Arc::clone(&worst_lag_ns);
+        let origin = Arc::clone(&origin);
         let port = server.port;
         let keep_alive = scenario.keep_alive;
         let path = path.to_owned();
@@ -641,13 +717,47 @@ fn run_http(scenario: &Scenario, payloads: &Arc<Vec<Vec<u8>>>) -> Result<RunResu
                 }
             }
             ready.wait();
+            go.wait();
+            let start = *origin
+                .get()
+                .expect("origin published before the go barrier");
+            let mut samples = Vec::new();
             loop {
                 let index = next.fetch_add(1, Ordering::Relaxed);
                 if index >= payloads.len() {
                     break;
                 }
-                match client.post(&path, &content_type, &payloads[index]) {
-                    Ok(status) if status / 100 == 2 => {}
+                // Open loop: batch `index` is DUE at a fixed offset from the
+                // run's origin, whatever the server is doing. Latency is
+                // measured from that due time rather than from the actual
+                // send, which is what keeps a backed-up server from hiding
+                // behind coordinated omission — if the client is late
+                // because the previous request was slow, the lateness belongs
+                // in the sample.
+                let due =
+                    interval.map(|seconds| start + Duration::from_secs_f64(seconds * index as f64));
+                if let Some(due) = due {
+                    let now = Instant::now();
+                    if now < due {
+                        std::thread::sleep(due - now);
+                    } else {
+                        let lag = (now - due).as_nanos() as usize;
+                        worst_lag_ns.fetch_max(lag, Ordering::Relaxed);
+                    }
+                }
+                // Closed loop: the client-observed latency of one
+                // acknowledged batch, request written to response read. In
+                // keep-alive-off runs it includes the reconnect, because that
+                // is what the mode costs.
+                let sent = Instant::now();
+                let outcome = client.post(&path, &content_type, &payloads[index]);
+                let done = Instant::now();
+                let observed = match due {
+                    Some(due) => done.saturating_duration_since(due),
+                    None => done - sent,
+                };
+                match outcome {
+                    Ok(status) if status / 100 == 2 => samples.push(observed.as_nanos() as u64),
                     Ok(status) => {
                         eprintln!("  batch {index} rejected with HTTP {status}");
                         failures.fetch_add(1, Ordering::Relaxed);
@@ -658,15 +768,41 @@ fn run_http(scenario: &Scenario, payloads: &Arc<Vec<Vec<u8>>>) -> Result<RunResu
                     }
                 }
             }
+            samples
         }));
     }
 
     ready.wait();
     let started = Instant::now();
+    let _ = origin.set(started);
+    go.wait();
+    let mut samples = Vec::new();
     for handle in handles {
-        handle.join().map_err(|_| "worker panicked")?;
+        samples.extend(handle.join().map_err(|_| "worker panicked")?);
     }
     let elapsed = started.elapsed();
+
+    // An open-loop run that could not sustain the offered rate did not measure
+    // the offered rate; it measured capacity, and its latencies describe a
+    // saturated queue rather than a configuration. Reject it rather than
+    // publish it, on the same principle as a shed connection.
+    //
+    // The test is DELIVERED RATE, not worst lateness. A single deep stall — a
+    // segment seal, say — makes the next several batches late without the run
+    // failing to deliver the load, and that lateness is precisely what the
+    // latency percentiles exist to report. Gating on worst lag would throw
+    // away the measurement for exhibiting the effect being measured; only
+    // lateness the run never recovers from shows up as a rate shortfall.
+    if let Some(offered) = scenario.offered_rate {
+        let achieved = scenario.spans as f64 / elapsed.as_secs_f64();
+        if achieved < offered * 0.95 {
+            return Err(format!(
+                "offered rate exceeded capacity: delivered {achieved:.0} of {offered:.0} spans/s \
+(worst lateness {:.1} ms), so this is a saturation measurement, not an open-loop one",
+                worst_lag_ns.load(Ordering::Relaxed) as f64 / 1e6
+            ));
+        }
+    }
 
     let failed = failures.load(Ordering::Relaxed);
     if failed > 0 {
@@ -685,7 +821,7 @@ fn run_http(scenario: &Scenario, payloads: &Arc<Vec<Vec<u8>>>) -> Result<RunResu
     // the server still has what it acknowledged.
     if scenario.durability != "buffered" {
         drop(server);
-        let restarted = Server::spawn(&data_dir, &scenario.durability)?;
+        let restarted = Server::spawn(&data_dir, &scenario.durability, &scenario.server_args)?;
         let mut after = Client::new(restarted.port, true);
         let recovered = wait_for_records(&mut after, scenario.spans as u64).map_err(|error| {
             format!(
@@ -711,6 +847,7 @@ fn run_http(scenario: &Scenario, payloads: &Arc<Vec<Vec<u8>>>) -> Result<RunResu
         stored,
         refused,
         metrics,
+        latency: Latencies::new(samples),
     })
 }
 
@@ -740,18 +877,6 @@ fn metric_value(metrics: &str, name: &str) -> Option<u64> {
         let (key, value) = line.split_once(' ')?;
         (key == name).then(|| value.trim().parse().ok())?
     })
-}
-
-/// Server-side nanoseconds of decode per span, from the server's own counters.
-///
-/// This is the number the protocol question actually turns on: it covers the
-/// wire decode plus, on `/v1/traces`, the OTLP-to-Span mapping, and NOTHING
-/// downstream. End-to-end spans/s cannot answer "which wire format is faster"
-/// because the writer lock dominates it; this can.
-fn decode_ns_per_span(metrics: &str) -> Option<f64> {
-    let sum = metric_value(metrics, "traza_http_decode_ns_sum")?;
-    let spans = metric_value(metrics, "traza_http_decoded_spans_total")?;
-    (spans > 0).then(|| sum as f64 / spans as f64)
 }
 
 /// Direct-engine run: no socket, no HTTP, no client. The floor that the HTTP
@@ -810,6 +935,7 @@ fn run_direct(scenario: &Scenario) -> Result<RunResult, String> {
         let store = Arc::clone(&store);
         handles.push(std::thread::spawn(move || {
             ready.wait();
+            let mut samples = Vec::new();
             loop {
                 let index = next.fetch_add(1, Ordering::Relaxed);
                 if index >= batches.len() {
@@ -819,15 +945,21 @@ fn run_direct(scenario: &Scenario) -> Result<RunResult, String> {
                 // ever takes a given batch.
                 let batch = batches[index].lock().expect("batch").take();
                 if let Some(batch) = batch {
+                    // Only the engine call is timed; taking the batch out of
+                    // the handoff slot is harness bookkeeping.
+                    let started = Instant::now();
                     store.ingest_batch(batch).expect("direct ingest");
+                    samples.push(started.elapsed().as_nanos() as u64);
                 }
             }
+            samples
         }));
     }
     ready.wait();
     let started = Instant::now();
+    let mut samples = Vec::new();
     for handle in handles {
-        handle.join().map_err(|_| "worker panicked")?;
+        samples.extend(handle.join().map_err(|_| "worker panicked")?);
     }
     let elapsed = started.elapsed();
 
@@ -843,6 +975,7 @@ fn run_direct(scenario: &Scenario) -> Result<RunResult, String> {
         stored: stats.total_records as u64,
         refused: 0,
         metrics,
+        latency: Latencies::new(samples),
     })
 }
 
@@ -874,6 +1007,16 @@ fn commit() -> String {
         .map(|text| text.trim().to_owned())
         .filter(|text| !text.is_empty())
         .unwrap_or_else(|| "unknown".to_owned())
+}
+
+/// A compact scenario label for a variant's flags: `--flush-spans 3000`
+/// becomes `flush-spans-3000`.
+fn variant_label(flags: &[String]) -> String {
+    flags
+        .iter()
+        .map(|flag| flag.trim_start_matches("--"))
+        .collect::<Vec<_>>()
+        .join("-")
 }
 
 /// The stages, ranked, from a scraped `/v1/metrics`.
@@ -942,6 +1085,16 @@ fn run() -> Result<(), String> {
     let mut only: Option<String> = None;
     let mut concurrencies: Vec<usize> = Vec::new();
     let mut batch = 1_000_usize;
+    // Extra server flags applied to every HTTP scenario, so a configuration
+    // can be swept without editing and rebuilding this file. This is how the
+    // profile constants were chosen rather than guessed.
+    let mut server_args: Vec<String> = Vec::new();
+    // One extra scenario per variant, so a parameter sweep is INTERLEAVED with
+    // everything else in a single run. Sweeping by re-invoking the harness
+    // once per value makes each value a separate block of wall-clock time,
+    // which is exactly the bias round-robin scheduling exists to remove.
+    let mut variants: Vec<Vec<String>> = Vec::new();
+    let mut offered_rate: Option<f64> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -969,9 +1122,35 @@ fn run() -> Result<(), String> {
                         .to_ascii_lowercase(),
                 );
             }
+            "--server-arg" => {
+                i += 1;
+                let raw = args.get(i).ok_or("--server-arg requires a value")?;
+                server_args.extend(raw.split_whitespace().map(str::to_owned));
+            }
+            "--variant" => {
+                i += 1;
+                let raw = args.get(i).ok_or("--variant requires a value")?;
+                let flags: Vec<String> = raw.split_whitespace().map(str::to_owned).collect();
+                if flags.is_empty() {
+                    return Err("--variant requires at least one flag".to_owned());
+                }
+                variants.push(flags);
+            }
+            "--offered-rate" => {
+                i += 1;
+                offered_rate = Some(
+                    args.get(i)
+                        .ok_or("--offered-rate requires a value")?
+                        .parse()
+                        .map_err(|_| "--offered-rate must be spans/s".to_owned())?,
+                );
+            }
             "--help" | "-h" => {
                 println!(
-                    "Usage: ingest-bench [--spans N] [--runs N] [--batch N] [--concurrency N ...] [--only SUBSTRING]"
+                    "Usage: ingest-bench [--spans N] [--runs N] [--batch N] [--concurrency N ...] \
+[--only SUBSTRING] [--server-arg \"--flag value\" ...] \
+[--variant \"--flag value\" ... (one extra interleaved scenario per variant)] \
+[--offered-rate SPANS_PER_SEC (adds open-loop rows at a fixed arrival rate)]"
                 );
                 return Ok(());
             }
@@ -988,26 +1167,20 @@ fn run() -> Result<(), String> {
     }
 
     let mut scenarios = Vec::new();
-    scenarios.push(Scenario {
-        label: "direct-engine-wal".to_owned(),
-        mode: Mode::Direct,
-        protocol: Protocol::NativeJson,
-        keep_alive: false,
-        durability: "wal".to_owned(),
-        concurrency: 8,
-        batch,
-        spans,
-    });
-    scenarios.push(Scenario {
-        label: "direct-engine-buffered".to_owned(),
-        mode: Mode::Direct,
-        protocol: Protocol::NativeJson,
-        keep_alive: false,
-        durability: "buffered".to_owned(),
-        concurrency: 8,
-        batch,
-        spans,
-    });
+    for durability in ["wal", "buffered"] {
+        scenarios.push(Scenario {
+            label: format!("direct-engine-{durability}"),
+            mode: Mode::Direct,
+            protocol: Protocol::NativeJson,
+            keep_alive: false,
+            durability: durability.to_owned(),
+            concurrency: 8,
+            batch,
+            spans,
+            server_args: Vec::new(),
+            offered_rate: None,
+        });
+    }
     // The keep-alive comparison, held at one concurrency so the only variable is
     // the connection policy.
     for keep_alive in [false, true] {
@@ -1023,11 +1196,10 @@ fn run() -> Result<(), String> {
             concurrency: 8,
             batch,
             spans,
+            server_args: Vec::new(),
+            offered_rate: None,
         });
     }
-    // Three protocols at each concurrency. otlp-json and otlp-protobuf share a
-    // route and a mapping, so their difference IS the wire format; native-json
-    // shares a wire format with otlp-json, so THAT difference is the mapping.
     for concurrency in &concurrencies {
         for protocol in [
             Protocol::NativeJson,
@@ -1043,7 +1215,96 @@ fn run() -> Result<(), String> {
                 concurrency: *concurrency,
                 batch,
                 spans,
+                server_args: Vec::new(),
+                offered_rate: None,
             });
+        }
+    }
+    // The profile comparison. Every other variable is pinned — same protocol,
+    // same keep-alive, same durability, same corpus — so the only thing that
+    // differs between the rows at a given concurrency is `--profile`.
+    // Concurrency is swept because the profiles' whole disagreement is about
+    // what happens when there is, or is not, other work to batch with.
+    for profile in PROFILES {
+        for concurrency in &concurrencies {
+            scenarios.push(Scenario {
+                label: format!("profile-{profile}-c{concurrency}"),
+                mode: Mode::Http,
+                protocol: Protocol::NativeJson,
+                keep_alive: true,
+                durability: "wal".to_owned(),
+                concurrency: *concurrency,
+                batch,
+                spans,
+                server_args: vec!["--profile".to_owned(), profile.to_owned()],
+                offered_rate: None,
+            });
+        }
+    }
+    // The same comparison under a FIXED arrival rate. This is the one that can
+    // say anything about latency: the closed-loop rows above cannot separate
+    // "lower latency" from "higher throughput", because with saturating
+    // workers the first follows arithmetically from the second.
+    if let Some(rate) = offered_rate {
+        for profile in PROFILES {
+            for concurrency in &concurrencies {
+                scenarios.push(Scenario {
+                    label: format!("profile-{profile}-openloop-c{concurrency}"),
+                    mode: Mode::Http,
+                    protocol: Protocol::NativeJson,
+                    keep_alive: true,
+                    durability: "wal".to_owned(),
+                    concurrency: *concurrency,
+                    batch,
+                    spans,
+                    server_args: vec!["--profile".to_owned(), profile.to_owned()],
+                    offered_rate: Some(rate),
+                });
+            }
+        }
+    }
+
+    // One scenario per --variant, at each concurrency, on the same base as the
+    // profile rows so a swept value is directly comparable with them.
+    for flags in &variants {
+        let label = variant_label(flags);
+        for concurrency in &concurrencies {
+            scenarios.push(Scenario {
+                label: format!("variant-{label}-c{concurrency}"),
+                mode: Mode::Http,
+                protocol: Protocol::NativeJson,
+                keep_alive: true,
+                durability: "wal".to_owned(),
+                concurrency: *concurrency,
+                batch,
+                spans,
+                server_args: flags.clone(),
+                offered_rate: None,
+            });
+        }
+        if let Some(rate) = offered_rate {
+            for concurrency in &concurrencies {
+                scenarios.push(Scenario {
+                    label: format!("variant-{label}-openloop-c{concurrency}"),
+                    mode: Mode::Http,
+                    protocol: Protocol::NativeJson,
+                    keep_alive: true,
+                    durability: "wal".to_owned(),
+                    concurrency: *concurrency,
+                    batch,
+                    spans,
+                    server_args: flags.clone(),
+                    offered_rate: Some(rate),
+                });
+            }
+        }
+    }
+
+    // Applied last so a swept flag beats a scenario's own (the server itself
+    // resolves duplicates last-wins, and this keeps that predictable).
+    if !server_args.is_empty() {
+        for scenario in &mut scenarios {
+            scenario.server_args.extend(server_args.iter().cloned());
         }
     }
 
@@ -1057,10 +1318,16 @@ fn run() -> Result<(), String> {
     println!();
 
     let mut report = String::new();
-    let _ = writeln!(report, "# Traza Ingest Benchmark\n");
+    // No H1 here: this block is spliced into a curated document between the
+    // generated markers, which supplies its own title and analysis.
     let _ = writeln!(
         report,
         "Every row is the MEDIAN of {runs} runs, each on a fresh data directory. \
+Scenarios are run ROUND-ROBIN rather than one at a time, and their order is \
+ROTATED each round, so each scenario's repeats are spread across the whole \
+wall-clock window and across positions within a round. Background load then \
+hits all of them alike instead of landing on whichever ran during a spike or \
+whichever is pinned to the same phase of a periodic load. \
 Payloads are generated before the clock starts, so these are server rates; \
 client encoding is reported separately. Runs that saw a failed batch or a shed \
 connection are reported as failures rather than as numbers.\n"
@@ -1074,161 +1341,256 @@ connection are reported as failures rather than as numbers.\n"
     );
     let _ = writeln!(
         report,
-        "| Scenario | Protocol | Route | Keep-alive | Concurrency | Median spans/s | Min | Max | Bytes/span | Decode ns/span |"
+        "Latency is the CLIENT-OBSERVED time for one acknowledged batch, sampled per \
+request and reduced to percentiles per run; the table reports the MEDIAN ACROSS RUNS \
+of each percentile. Read it with the load model in mind: this is a closed-loop \
+generator with a fixed number of workers, all saturating, so latency includes queueing \
+and by Little's law tracks concurrency divided by throughput. Latencies are therefore \
+only comparable BETWEEN ROWS AT THE SAME CONCURRENCY, and the honest place to look for \
+a deliberate delay's cost is the low-concurrency rows, where there is nothing to queue \
+behind.\n"
     );
-    let _ = writeln!(report, "|---|---|---|---|---:|---:|---:|---:|---:|---:|");
+    let _ = writeln!(
+        report,
+        "| Scenario | Protocol | Keep-alive | Concurrency | Median spans/s | Min | Max | p50 ms | p95 ms | p99 ms |"
+    );
+    let _ = writeln!(report, "|---|---|---|---:|---:|---:|---:|---:|---:|---:|");
 
-    for scenario in &scenarios {
-        if let Some(filter) = &only {
-            if !scenario.label.to_ascii_lowercase().contains(filter) {
+    let selected: Vec<&Scenario> = scenarios
+        .iter()
+        .filter(|scenario| match &only {
+            Some(filter) => scenario.label.to_ascii_lowercase().contains(filter),
+            None => true,
+        })
+        .collect();
+
+    // Payloads are shared across every scenario that wants the same wire
+    // format, so the corpus is built at most twice rather than once per
+    // scenario. Round-robin scheduling (below) needs them all resident at
+    // once, and re-encoding per scenario would cost more than it saves.
+    //
+    // Generation is outside every measured window; its cost is reported so
+    // the client's share of the work is visible rather than quietly excluded.
+    let mut corpus: Vec<(Protocol, Arc<Vec<Vec<u8>>>)> = Vec::new();
+    for protocol in [
+        Protocol::NativeJson,
+        Protocol::OtlpJson,
+        Protocol::OtlpProtobuf,
+    ] {
+        if !selected
+            .iter()
+            .any(|scenario| scenario.mode == Mode::Http && scenario.protocol == protocol)
+        {
+            continue;
+        }
+        let started = Instant::now();
+        let payloads: Vec<Vec<u8>> = (0..spans)
+            .step_by(batch)
+            .map(|start| {
+                let end = (start + batch).min(spans);
+                protocol.encode(start, end)
+            })
+            .collect();
+        let bytes: usize = payloads.iter().map(Vec::len).sum();
+        println!(
+            "client encode ({}): {:.2}s for {} batches ({:.1} MiB, {:.0} spans/s if it were the limit)",
+            protocol.as_str(),
+            started.elapsed().as_secs_f64(),
+            payloads.len(),
+            bytes as f64 / (1024.0 * 1024.0),
+            spans as f64 / started.elapsed().as_secs_f64()
+        );
+        corpus.push((protocol, Arc::new(payloads)));
+    }
+    println!();
+
+    /// What one scenario has accumulated across the rounds so far.
+    #[derive(Default)]
+    struct Accumulated {
+        rates: Vec<f64>,
+        p50s: Vec<f64>,
+        p95s: Vec<f64>,
+        p99s: Vec<f64>,
+        metrics: String,
+        failed: Option<String>,
+    }
+
+    let mut accumulated: Vec<Accumulated> = (0..selected.len())
+        .map(|_| Accumulated::default())
+        .collect();
+
+    // ROUND-ROBIN, not scenario-at-a-time. Running all of scenario A's repeats
+    // and then all of scenario B's makes the comparison a hostage to whatever
+    // else the machine was doing during each block: a load spike lands
+    // entirely on one configuration and shows up as a difference between
+    // configurations. Interleaving spreads every scenario's repeats across the
+    // whole wall-clock window, so drift and contention hit all of them alike
+    // and the median across rounds is comparing like with like. It costs
+    // nothing but ordering, and it is what makes a run on a machine that is
+    // not perfectly idle worth reporting at all.
+    for round in 1..=runs {
+        println!("--- round {round} of {runs} ---");
+        // Rotate the starting point each round. Round-robin alone equalizes
+        // across rounds but leaves POSITION WITHIN a round fixed, and
+        // background load on a shared machine oscillates on a timescale close
+        // to one round — so a scenario pinned to the same slot can sit in the
+        // same phase of that oscillation every time, which is a bias that
+        // looks exactly like a property of the configuration. Rotating means
+        // each scenario occupies a different slot each round.
+        //
+        // Rotation rather than a shuffle: it is deterministic, needs no RNG
+        // (this crate has two dependencies and neither is one), and spreads
+        // positions evenly instead of merely randomly.
+        let offset = (round - 1) % selected.len().max(1);
+        for step in 0..selected.len() {
+            let index = (step + offset) % selected.len();
+            let scenario = selected[index];
+            if accumulated[index].failed.is_some() {
                 continue;
             }
-        }
-        println!("{} — {}", scenario.label, scenario.describe());
-
-        // Payload generation is outside the measured window; its cost is
-        // reported so the client's share of the work is visible rather than
-        // quietly excluded.
-        let encode_started = Instant::now();
-        let payloads: Arc<Vec<Vec<u8>>> = Arc::new(if scenario.mode == Mode::Http {
-            (0..scenario.spans)
-                .step_by(scenario.batch)
-                .map(|start| {
-                    let end = (start + scenario.batch).min(scenario.spans);
-                    scenario.protocol.encode(start, end)
-                })
-                .collect()
-        } else {
-            Vec::new()
-        });
-        let encode_elapsed = encode_started.elapsed();
-        let mut bytes_per_span = 0.0_f64;
-        if scenario.mode == Mode::Http {
-            let bytes: usize = payloads.iter().map(Vec::len).sum();
-            bytes_per_span = bytes as f64 / scenario.spans as f64;
-            println!(
-                "  client encode: {:.2}s for {} batches ({:.1} MiB, {bytes_per_span:.1} bytes/span, {:.0} spans/s if it were the limit)",
-                encode_elapsed.as_secs_f64(),
-                payloads.len(),
-                bytes as f64 / (1024.0 * 1024.0),
-                scenario.spans as f64 / encode_elapsed.as_secs_f64()
-            );
-        }
-
-        let mut rates = Vec::new();
-        // Decode is measured PER RUN and reported as a median with its spread,
-        // like the rate. Reading it off the last run alone reported a single
-        // sample for the one number the protocol comparison turns on.
-        let mut decode_rates = Vec::new();
-        let mut last_metrics = String::new();
-        let mut failed: Option<String> = None;
-        for attempt in 1..=runs {
+            let payloads = corpus
+                .iter()
+                .find(|(protocol, _)| *protocol == scenario.protocol)
+                .map(|(_, payloads)| Arc::clone(payloads))
+                .unwrap_or_default();
             let result = if scenario.mode == Mode::Direct {
                 run_direct(scenario)
             } else {
                 run_http(scenario, &payloads)
             };
             match result {
+                Ok(result) if result.refused > 0 => {
+                    accumulated[index].failed = Some(format!(
+                        "server shed {} connections; the rate is not sustained",
+                        result.refused
+                    ));
+                }
+                Ok(result) if result.stored < scenario.spans as u64 => {
+                    accumulated[index].failed = Some(format!(
+                        "stored {} of {} spans",
+                        result.stored, scenario.spans
+                    ));
+                }
                 Ok(result) => {
-                    if result.refused > 0 {
-                        failed = Some(format!(
-                            "server shed {} connections; the rate is not sustained",
-                            result.refused
-                        ));
-                        break;
-                    }
-                    if result.stored < scenario.spans as u64 {
-                        failed = Some(format!(
-                            "stored {} of {} spans",
-                            result.stored, scenario.spans
-                        ));
-                        break;
-                    }
                     println!(
-                        "  run {attempt}: {:.0} spans/s ({:.2}s)",
+                        "  {}: {:.0} spans/s ({:.2}s), latency p50 {:.2} / p95 {:.2} / p99 {:.2} / max {:.2} ms",
+                        scenario.label,
                         result.rate,
-                        result.elapsed.as_secs_f64()
+                        result.elapsed.as_secs_f64(),
+                        result.latency.p50(),
+                        result.latency.p95(),
+                        result.latency.p99(),
+                        result.latency.max_ms()
                     );
-                    rates.push(result.rate);
-                    if let Some(ns) = decode_ns_per_span(&result.metrics) {
-                        decode_rates.push(ns);
-                    }
-                    last_metrics = result.metrics;
+                    let entry = &mut accumulated[index];
+                    entry.rates.push(result.rate);
+                    entry.p50s.push(result.latency.p50());
+                    entry.p95s.push(result.latency.p95());
+                    entry.p99s.push(result.latency.p99());
+                    entry.metrics = result.metrics;
                 }
-                Err(error) => {
-                    failed = Some(error);
-                    break;
-                }
+                Err(error) => accumulated[index].failed = Some(error),
+            }
+            if let Some(error) = &accumulated[index].failed {
+                println!("  {}: FAILED: {error}", scenario.label);
             }
         }
+        println!();
+    }
 
-        if let Some(error) = failed {
+    for (index, scenario) in selected.iter().enumerate() {
+        let entry = &accumulated[index];
+        println!("{} — {}", scenario.label, scenario.describe());
+        if let Some(error) = &entry.failed {
             println!("  FAILED: {error}\n");
             let _ = writeln!(
                 report,
-                "| {} | {} | {} | {} | {} | FAILED: {error} | | | | |",
+                "| {} | {} | {} | {} | FAILED: {error} | | | | | |",
                 scenario.label,
                 scenario.protocol.as_str(),
-                scenario.protocol.route(),
                 scenario.keep_alive,
                 scenario.concurrency
             );
             continue;
         }
 
-        let min = rates.iter().cloned().fold(f64::INFINITY, f64::min);
-        let max = rates.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        let mid = median(&mut rates.clone());
+        let min = entry.rates.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max = entry
+            .rates
+            .iter()
+            .cloned()
+            .fold(f64::NEG_INFINITY, f64::max);
+        let mid = median(&mut entry.rates.clone());
+        let p50 = median(&mut entry.p50s.clone());
+        let p95 = median(&mut entry.p95s.clone());
+        let p99 = median(&mut entry.p99s.clone());
         println!("  median: {mid:.0} spans/s (min {min:.0}, max {max:.0})");
-        let decode_ns = (!decode_rates.is_empty()).then(|| median(&mut decode_rates.clone()));
-        if let Some(ns) = decode_ns {
-            let low = decode_rates.iter().cloned().fold(f64::INFINITY, f64::min);
-            let high = decode_rates
-                .iter()
-                .cloned()
-                .fold(f64::NEG_INFINITY, f64::max);
-            println!(
-                "  decode: {ns:.0} ns/span median (min {low:.0}, max {high:.0}) \
-— wire decode + any OTLP mapping"
-            );
-        }
-        let stages = stage_summary(&last_metrics);
+        println!(
+            "  latency (median of per-run percentiles): p50 {p50:.2} ms, p95 {p95:.2} ms, p99 {p99:.2} ms"
+        );
+        let stages = stage_summary(&entry.metrics);
         if !stages.is_empty() {
-            println!("  stages (server-side totals across the run):");
+            println!("  stages (server-side totals, last round):");
             println!("{stages}");
         }
         println!();
 
         let _ = writeln!(
             report,
-            "| {} | {} | {} | {} | {} | **{mid:.0}** | {min:.0} | {max:.0} | {} | {} |",
+            "| {} | {} | {} | {} | **{mid:.0}** | {min:.0} | {max:.0} | {p50:.2} | {p95:.2} | {p99:.2} |",
             scenario.label,
-            if scenario.mode == Mode::Direct {
-                "—".to_owned()
-            } else {
-                scenario.protocol.as_str().to_owned()
-            },
-            if scenario.mode == Mode::Direct {
-                "—".to_owned()
-            } else {
-                scenario.protocol.route().to_owned()
-            },
+            scenario.protocol.as_str(),
             if scenario.mode == Mode::Direct {
                 "n/a".to_owned()
             } else {
                 scenario.keep_alive.to_string()
             },
-            scenario.concurrency,
-            if scenario.mode == Mode::Direct {
-                "—".to_owned()
-            } else {
-                format!("{bytes_per_span:.0}")
-            },
-            decode_ns.map_or_else(|| "—".to_owned(), |ns| format!("{ns:.0}")),
+            scenario.concurrency
         );
     }
 
-    std::fs::write("INGEST-BENCHMARK.md", &report).map_err(|e| e.to_string())?;
-    println!("Wrote INGEST-BENCHMARK.md");
+    write_report(&report)?;
+    Ok(())
+}
+
+const GENERATED_BEGIN: &str = "<!-- BEGIN GENERATED -->";
+const GENERATED_END: &str = "<!-- END GENERATED -->";
+
+/// Writes the report, preserving hand-written analysis.
+///
+/// This used to overwrite `INGEST-BENCHMARK.md` wholesale, which silently
+/// destroyed every paragraph of interpretation in it — the stage decomposition,
+/// the reasoning about what the numbers mean — each time anyone re-ran the
+/// benchmark. The generated table is an INPUT to that document, not the
+/// document. When the file marks a generated region, only that region is
+/// replaced; otherwise the file is written whole, so a fresh checkout still
+/// gets a complete report.
+fn write_report(report: &str) -> Result<(), String> {
+    let path = "INGEST-BENCHMARK.md";
+    if let Ok(existing) = std::fs::read_to_string(path) {
+        if let (Some(start), Some(end)) =
+            (existing.find(GENERATED_BEGIN), existing.find(GENERATED_END))
+        {
+            if start < end {
+                let mut merged = String::with_capacity(existing.len() + report.len());
+                merged.push_str(&existing[..start]);
+                merged.push_str(GENERATED_BEGIN);
+                merged.push('\n');
+                merged.push_str(report);
+                merged.push_str(&existing[end..]);
+                std::fs::write(path, merged).map_err(|e| e.to_string())?;
+                println!("Updated the generated section of {path}; prose preserved");
+                return Ok(());
+            }
+        }
+        // A file with no markers is analysis this harness must not clobber.
+        let aside = "INGEST-BENCHMARK.generated.md";
+        std::fs::write(aside, report).map_err(|e| e.to_string())?;
+        println!("{path} carries no {GENERATED_BEGIN} marker, so it was left alone; wrote {aside}");
+        return Ok(());
+    }
+    let fresh = format!("# Traza Ingest Benchmark\n\n{GENERATED_BEGIN}\n{report}{GENERATED_END}\n");
+    std::fs::write(path, fresh).map_err(|e| e.to_string())?;
+    println!("Wrote {path}");
     Ok(())
 }

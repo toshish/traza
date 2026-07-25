@@ -59,7 +59,7 @@ use std::thread;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use traza::{CompactionConfig, Config, Durability, Span, SpanCursor, SpanFilter, Store};
+use traza::{CompactionConfig, Config, Durability, Profile, Span, SpanCursor, SpanFilter, Store};
 
 const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 // Headers get a far tighter budget than bodies: without one, a 64 MiB
@@ -214,12 +214,44 @@ fn main() {
     }
 }
 
-fn run() -> Result<(), Box<dyn std::error::Error>> {
+const USAGE: &str = "Usage: traza-server --data-dir DIR --port PORT [--host ADDR] \
+[--profile throughput|balanced|latency (default balanced; sets flush-spans and wal-commit-window; \
+NEVER changes durability)] [--ttl-seconds N] [--flush-spans N] \
+[--max-connections N (default 1024)] [--payload-threshold-bytes N (0 disables)] \
+[--durability buffered|wal|flushed (default wal)] \
+[--wal-commit-window-us N (delay each fsync so more acks share it; 0 = off)] \
+[--compaction-fanout N (0 disables; default 4)] [--compaction-max-segment-bytes N] \
+[--ui-dir DIR (built dashboard; default: TRAZA_UI_DIR, beside the binary, then ./ui/dist)] \
+[--allow-unauthenticated-non-loopback]";
+
+/// Everything the command line decides, with the profile already resolved
+/// against the explicit flags.
+struct Options {
+    data_dir: PathBuf,
+    host: String,
+    port: u16,
+    max_connections: usize,
+    allow_unauthenticated_non_loopback: bool,
+    ui_dir: Option<PathBuf>,
+    profile: Profile,
+    compaction_enabled: bool,
+    config: Config,
+}
+
+/// Parses the command line. `Ok(None)` means `--help` was handled and there is
+/// nothing to run.
+///
+/// The profile-owned knobs are collected as `Option`s during the scan and
+/// resolved once, afterwards, against the profile. That is what makes
+/// precedence independent of argument order: an explicit `--flush-spans` is
+/// still `Some` whether it came before or after `--profile`, so it still wins.
+/// Resolving as each argument is seen would make `--profile` clobber a flag
+/// that preceded it.
+fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
     let mut data_dir = PathBuf::from("./data");
     let mut host = String::from("127.0.0.1");
     let mut port = 8080_u16;
     let mut ttl_seconds = None;
-    let mut flush_spans = 10_000_usize;
     let mut payload_threshold_bytes = 256 * 1024_usize;
     let mut max_connections = DEFAULT_MAX_CONNECTIONS;
     let mut allow_unauthenticated_non_loopback = false;
@@ -227,104 +259,147 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut durability = Durability::default();
     let mut compaction = CompactionConfig::default();
     let mut compaction_enabled = true;
-    let mut wal_commit_window_us = 0_u64;
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut profile = Profile::default();
+    // Profile-owned: `None` means "not given on the command line", which is
+    // exactly the question the resolve below asks.
+    let mut flush_spans: Option<usize> = None;
+    let mut wal_commit_window_us: Option<u64> = None;
+
+    let value = |i: usize, name: &str| -> Result<&String, String> {
+        args.get(i)
+            .ok_or_else(|| format!("{name} requires a value"))
+    };
+    let number = |i: usize, name: &str| -> Result<u64, String> {
+        value(i, name)?
+            .parse::<u64>()
+            .map_err(|_| format!("{name} must be a non-negative number"))
+    };
+
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--data-dir" => {
                 i += 1;
-                data_dir = PathBuf::from(args.get(i).ok_or("--data-dir requires a value")?);
+                data_dir = PathBuf::from(value(i, "--data-dir")?);
             }
             "--host" => {
                 i += 1;
-                host = args.get(i).ok_or("--host requires a value")?.clone();
+                host = value(i, "--host")?.clone();
             }
             "--port" => {
                 i += 1;
-                port = args.get(i).ok_or("--port requires a value")?.parse()?;
+                port = value(i, "--port")?
+                    .parse()
+                    .map_err(|_| "--port must be a port number".to_owned())?;
             }
             "--ttl-seconds" => {
                 i += 1;
-                ttl_seconds = Some(
-                    args.get(i)
-                        .ok_or("--ttl-seconds requires a value")?
-                        .parse()?,
-                );
+                ttl_seconds = Some(number(i, "--ttl-seconds")?);
             }
             "--payload-threshold-bytes" => {
                 i += 1;
-                payload_threshold_bytes = args
-                    .get(i)
-                    .ok_or("--payload-threshold-bytes requires a value")?
-                    .parse::<usize>()?;
+                payload_threshold_bytes = number(i, "--payload-threshold-bytes")? as usize;
             }
             "--flush-spans" => {
                 i += 1;
-                flush_spans = args
-                    .get(i)
-                    .ok_or("--flush-spans requires a value")?
-                    .parse::<usize>()?
-                    .max(1);
+                flush_spans = Some((number(i, "--flush-spans")? as usize).max(1));
             }
             "--max-connections" => {
                 i += 1;
-                max_connections = args
-                    .get(i)
-                    .ok_or("--max-connections requires a value")?
-                    .parse::<usize>()?
-                    .max(1);
+                max_connections = (number(i, "--max-connections")? as usize).max(1);
             }
             "--compaction-fanout" => {
                 i += 1;
-                let value: usize = args
-                    .get(i)
-                    .ok_or("--compaction-fanout requires a value")?
-                    .parse()?;
+                let fanout = number(i, "--compaction-fanout")? as usize;
                 // 0 or 1 cannot merge anything; treat as "off" rather than
                 // silently looping.
-                compaction_enabled = value >= 2;
-                compaction.fanout = value.max(2);
+                compaction_enabled = fanout >= 2;
+                compaction.fanout = fanout.max(2);
             }
             "--compaction-max-segment-bytes" => {
                 i += 1;
-                compaction.max_segment_bytes = args
-                    .get(i)
-                    .ok_or("--compaction-max-segment-bytes requires a value")?
-                    .parse()?;
+                compaction.max_segment_bytes = number(i, "--compaction-max-segment-bytes")?;
             }
             "--wal-commit-window-us" => {
                 i += 1;
-                wal_commit_window_us = args
-                    .get(i)
-                    .ok_or("--wal-commit-window-us requires a value")?
-                    .parse()?;
+                wal_commit_window_us = Some(number(i, "--wal-commit-window-us")?);
             }
             "--durability" => {
                 i += 1;
-                let name = args.get(i).ok_or("--durability requires a value")?;
-                durability =
-                    Durability::parse(name).ok_or("--durability must be buffered|wal|flushed")?;
+                let name = value(i, "--durability")?;
+                durability = Durability::parse(name)
+                    .ok_or_else(|| "--durability must be buffered|wal|flushed".to_owned())?;
+            }
+            "--profile" => {
+                i += 1;
+                let name = value(i, "--profile")?;
+                profile = Profile::parse(name)
+                    .ok_or_else(|| "--profile must be throughput|balanced|latency".to_owned())?;
             }
             "--ui-dir" => {
                 i += 1;
-                ui_dir = Some(PathBuf::from(
-                    args.get(i).ok_or("--ui-dir requires a value")?,
-                ));
+                ui_dir = Some(PathBuf::from(value(i, "--ui-dir")?));
             }
             "--allow-unauthenticated-non-loopback" => {
                 allow_unauthenticated_non_loopback = true;
             }
             "--help" | "-h" => {
-                println!(
-                    "Usage: traza-server --data-dir DIR --port PORT [--host ADDR] [--ttl-seconds N] [--flush-spans N] [--max-connections N (default 1024)] [--payload-threshold-bytes N (0 disables)] [--durability buffered|wal|flushed (default wal)] [--wal-commit-window-us N (delay each fsync so more acks share it; 0 = off)] [--compaction-fanout N (0 disables; default 4)] [--compaction-max-segment-bytes N] [--ui-dir DIR (built dashboard; default: TRAZA_UI_DIR, beside the binary, then ./ui/dist)] [--allow-unauthenticated-non-loopback]"
-                );
-                return Ok(());
+                println!("{USAGE}");
+                return Ok(None);
             }
-            other => return Err(format!("unknown argument: {other}").into()),
+            other => return Err(format!("unknown argument: {other}")),
         }
         i += 1;
     }
+
+    Ok(Some(Options {
+        data_dir,
+        host,
+        port,
+        max_connections,
+        allow_unauthenticated_non_loopback,
+        ui_dir,
+        profile,
+        compaction_enabled,
+        config: Config {
+            // Explicit flag beats profile beats built-in default, in that
+            // order and regardless of where each appeared.
+            flush_spans: flush_spans.unwrap_or_else(|| profile.flush_spans()),
+            wal_commit_window: match wal_commit_window_us {
+                // An explicit 0 is a real answer ("no window"), not an absent
+                // one, so it overrides a profile that wanted one.
+                Some(micros) => (micros > 0).then(|| Duration::from_micros(micros)),
+                None => profile.wal_commit_window(),
+            },
+            ttl_seconds,
+            // 0 disables offloading.
+            payload_threshold: (payload_threshold_bytes > 0).then_some(payload_threshold_bytes),
+            // Never profile-derived: what an acknowledgement guarantees is a
+            // contract with clients, not a performance setting.
+            durability,
+            compaction: compaction_enabled.then_some(compaction),
+        },
+    }))
+}
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let Some(options) = parse_args(&args)? else {
+        return Ok(());
+    };
+    let Options {
+        data_dir,
+        host,
+        port,
+        max_connections,
+        allow_unauthenticated_non_loopback,
+        ui_dir,
+        profile,
+        compaction_enabled,
+        config,
+    } = options;
+    let durability = config.durability;
+    let ttl_seconds = config.ttl_seconds;
 
     // Bearer auth from TRAZA_TOKENS; unset is allowed on loopback by default.
     // A set-but-invalid value refuses startup — running open when the operator
@@ -342,19 +417,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // In-flight 503 refusals, bounded so a connection flood cannot spawn
     // without limit.
     let refusals = Arc::new(AtomicUsize::new(0));
-    let engine = Arc::new(Store::open(
-        &data_dir,
-        Config {
-            flush_spans,
-            ttl_seconds,
-            // 0 disables offloading.
-            payload_threshold: (payload_threshold_bytes > 0).then_some(payload_threshold_bytes),
-            durability,
-            compaction: compaction_enabled.then_some(compaction),
-            wal_commit_window: (wal_commit_window_us > 0)
-                .then(|| Duration::from_micros(wal_commit_window_us)),
-        },
-    )?);
+    let engine = Arc::new(Store::open(&data_dir, config.clone())?);
 
     // TTL enforcement and segment compaction live in the engine; the server
     // only schedules them. Compaction ticks far more often than TTL: it is
@@ -402,6 +465,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "traza-server: durability=flushed — acknowledged writes are sealed into a segment"
         ),
     }
+    // The resolved values, not the profile name: a profile whose knobs were
+    // partly overridden by explicit flags is not the profile, and an operator
+    // reading the log should see what is actually in force.
+    eprintln!(
+        "traza-server: profile={} — flush-spans={}, wal-commit-window={}",
+        profile.as_str(),
+        config.flush_spans,
+        match config.wal_commit_window {
+            Some(window) => format!("{}us", window.as_micros()),
+            None => "off".to_owned(),
+        }
+    );
 
     // The dashboard is served from disk (ui/ `npm run build` output), never
     // compiled in. A missing build is not fatal: the API runs, and the UI
@@ -1452,5 +1527,178 @@ fn hex(byte: u8) -> Option<u8> {
         b'a'..=b'f' => Some(byte - b'a' + 10),
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(argv: &[&str]) -> Options {
+        let args: Vec<String> = argv.iter().map(|arg| (*arg).to_owned()).collect();
+        parse_args(&args)
+            .expect("parses")
+            .expect("not a help invocation")
+    }
+
+    #[test]
+    fn no_profile_is_the_balanced_defaults() {
+        let options = parse(&[]);
+        assert_eq!(options.profile, Profile::Balanced);
+        assert_eq!(options.config.flush_spans, Config::default().flush_spans);
+        assert_eq!(options.config.wal_commit_window, None);
+    }
+
+    #[test]
+    fn a_profile_sets_its_group_of_knobs() {
+        let throughput = parse(&["--profile", "throughput"]);
+        assert_eq!(
+            throughput.config.flush_spans,
+            Profile::Throughput.flush_spans()
+        );
+        assert_eq!(
+            throughput.config.wal_commit_window,
+            Profile::Throughput.wal_commit_window()
+        );
+
+        let latency = parse(&["--profile", "latency"]);
+        assert_eq!(latency.config.flush_spans, Profile::Latency.flush_spans());
+        assert_eq!(latency.config.wal_commit_window, None);
+    }
+
+    /// The precedence rule, checked in BOTH argument orders. Order-dependence
+    /// is the whole failure mode here: a parser that applied the profile as it
+    /// saw it would silently discard a `--flush-spans` that came first.
+    #[test]
+    fn an_explicit_flag_beats_the_profile_in_either_order() {
+        for argv in [
+            vec!["--profile", "throughput", "--flush-spans", "77"],
+            vec!["--flush-spans", "77", "--profile", "throughput"],
+        ] {
+            let options = parse(&argv);
+            assert_eq!(
+                options.config.flush_spans, 77,
+                "explicit --flush-spans lost to the profile in {argv:?}"
+            );
+            // The knobs the flag did NOT name still come from the profile.
+            assert_eq!(
+                options.config.wal_commit_window,
+                Profile::Throughput.wal_commit_window(),
+                "overriding one knob dropped the rest of the profile in {argv:?}"
+            );
+        }
+
+        for argv in [
+            vec!["--profile", "latency", "--wal-commit-window-us", "900"],
+            vec!["--wal-commit-window-us", "900", "--profile", "latency"],
+        ] {
+            let options = parse(&argv);
+            assert_eq!(
+                options.config.wal_commit_window,
+                Some(Duration::from_micros(900)),
+                "explicit --wal-commit-window-us lost to the profile in {argv:?}"
+            );
+            assert_eq!(options.config.flush_spans, Profile::Latency.flush_spans());
+        }
+    }
+
+    /// `0` means "no window", which is a different statement from "unset" and
+    /// has to survive a profile that asked for one.
+    #[test]
+    fn an_explicit_zero_window_overrides_a_profile_that_wants_one() {
+        assert!(Profile::Throughput.wal_commit_window().is_some());
+        for argv in [
+            vec!["--profile", "throughput", "--wal-commit-window-us", "0"],
+            vec!["--wal-commit-window-us", "0", "--profile", "throughput"],
+        ] {
+            assert_eq!(
+                parse(&argv).config.wal_commit_window,
+                None,
+                "explicit 0 did not turn the profile's window off in {argv:?}"
+            );
+        }
+    }
+
+    /// No profile may weaken the acknowledgement contract. The enum makes a
+    /// lossy profile unrepresentable; this pins the resolved behaviour so a
+    /// later "throughput means buffered" shortcut fails here.
+    #[test]
+    fn no_profile_changes_durability() {
+        for name in ["throughput", "balanced", "latency"] {
+            assert_eq!(
+                parse(&["--profile", name]).config.durability,
+                Durability::Wal,
+                "profile {name} moved durability off the default"
+            );
+            // And an explicitly chosen mode survives a profile untouched.
+            assert_eq!(
+                parse(&["--profile", name, "--durability", "flushed"])
+                    .config
+                    .durability,
+                Durability::Flushed
+            );
+        }
+        // Buffered stays reachable only by asking for it by name.
+        assert_eq!(
+            parse(&["--durability", "buffered"]).config.durability,
+            Durability::Buffered
+        );
+    }
+
+    /// Compaction is a read-path choice, so a write-path profile must leave it
+    /// alone — including the "off" an operator asked for.
+    #[test]
+    fn no_profile_changes_compaction() {
+        for name in ["throughput", "balanced", "latency"] {
+            let options = parse(&["--profile", name]);
+            assert_eq!(options.config.compaction, Some(CompactionConfig::default()));
+            assert!(options.compaction_enabled);
+            assert_eq!(
+                parse(&["--profile", name, "--compaction-fanout", "0"])
+                    .config
+                    .compaction,
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn the_last_profile_wins_and_an_unknown_one_is_refused() {
+        assert_eq!(
+            parse(&["--profile", "throughput", "--profile", "latency"]).profile,
+            Profile::Latency
+        );
+        assert!(parse_args(&["--profile".to_owned(), "fast".to_owned()]).is_err());
+        assert!(parse_args(&["--profile".to_owned()]).is_err());
+    }
+
+    /// Flags outside the profile's remit keep working under a profile, and
+    /// keep their own defaults when it does not name them.
+    #[test]
+    fn non_profile_flags_are_untouched_by_a_profile() {
+        let options = parse(&[
+            "--profile",
+            "throughput",
+            "--max-connections",
+            "32",
+            "--payload-threshold-bytes",
+            "0",
+            "--ttl-seconds",
+            "60",
+        ]);
+        assert_eq!(options.max_connections, 32);
+        assert_eq!(options.config.payload_threshold, None);
+        assert_eq!(options.config.ttl_seconds, Some(60));
+
+        let latency = parse(&["--profile", "latency"]);
+        assert_eq!(latency.max_connections, DEFAULT_MAX_CONNECTIONS);
+        assert_eq!(latency.config.payload_threshold, Some(256 * 1024));
+    }
+
+    #[test]
+    fn help_parses_to_nothing_to_run() {
+        assert!(parse_args(&["--help".to_owned()])
+            .expect("help is not an error")
+            .is_none());
     }
 }
