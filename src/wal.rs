@@ -70,6 +70,10 @@ struct WalState {
     syncing: bool,
 }
 
+/// A batch encoded into its on-disk frame. See [`Wal::encode`].
+#[derive(Debug)]
+pub(crate) struct Frame(Vec<u8>);
+
 /// The append-only log guarding acknowledged writes.
 #[derive(Debug)]
 pub(crate) struct Wal {
@@ -151,9 +155,14 @@ impl Wal {
         Ok(spans)
     }
 
-    /// Appends one batch and returns its LSN. The bytes are in the file but
-    /// NOT yet durable; the caller must [`Self::commit`] before acknowledging.
-    pub(crate) fn append(&self, spans: &[Span]) -> Result<u64> {
+    /// One batch serialized into its on-disk frame, ready to be appended.
+    ///
+    /// Encoding is separated from appending so the caller can do it BEFORE
+    /// taking the engine's writer lock. Serializing a thousand-span batch is
+    /// milliseconds of pure CPU; performing it under the lock stalled every
+    /// other ingesting thread for that entire time, which capped concurrent
+    /// ingest at roughly what one core could serialize.
+    pub(crate) fn encode(spans: &[Span]) -> Result<Frame> {
         let payload = serde_json::to_vec(spans)?;
         let length = u32::try_from(payload.len()).map_err(|_| {
             Error::Io(std::io::Error::new(
@@ -167,23 +176,30 @@ impl Wal {
                 "write-ahead log record exceeds the maximum record size",
             )));
         }
-        let mut frame = Vec::with_capacity(HEADER_BYTES + payload.len());
-        frame.extend_from_slice(&length.to_le_bytes());
-        frame.extend_from_slice(&crc32(&payload).to_le_bytes());
-        frame.extend_from_slice(&payload);
+        let mut bytes = Vec::with_capacity(HEADER_BYTES + payload.len());
+        bytes.extend_from_slice(&length.to_le_bytes());
+        bytes.extend_from_slice(&crc32(&payload).to_le_bytes());
+        bytes.extend_from_slice(&payload);
+        Ok(Frame(bytes))
+    }
 
+    /// Appends an encoded frame and returns its LSN. The bytes are in the file
+    /// but NOT yet durable; the caller must [`Self::commit`] before
+    /// acknowledging.
+    pub(crate) fn append(&self, frame: &Frame) -> Result<u64> {
         let mut state = self.lock()?;
         // The file is O_APPEND, so a single write_all lands contiguously at
         // the end even with other writers; the lock keeps LSNs ordered with
         // the bytes they name.
-        (&self.file).write_all(&frame)?;
+        (&self.file).write_all(&frame.0)?;
         state.written_lsn += 1;
         Ok(state.written_lsn)
     }
 
     /// Blocks until `lsn` is fsynced. Safe to call from many threads: one
     /// syncs, the rest wait and are covered by that sync.
-    pub(crate) fn commit(&self, lsn: u64) -> Result<()> {
+    pub(crate) fn commit(&self, lsn: u64, metrics: &crate::metrics::Metrics) -> Result<()> {
+        metrics.wal_commits.increment();
         let mut state = self.lock()?;
         loop {
             if state.durable_lsn >= lsn {
@@ -202,7 +218,7 @@ impl Wal {
             let target = state.written_lsn;
             drop(state);
 
-            let result = self.file.sync_data();
+            let result = metrics.wal_fsync.time(|| self.file.sync_data());
 
             state = self.lock()?;
             state.syncing = false;
@@ -241,6 +257,7 @@ impl Wal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::Metrics;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -268,11 +285,13 @@ mod tests {
         let dir = temp_dir("roundtrip");
         let wal = Wal::open(&dir).expect("opens");
         let lsn = wal
-            .append(&[span("t", "a", "one"), span("t", "b", "two")])
+            .append(&Wal::encode(&[span("t", "a", "one"), span("t", "b", "two")]).expect("encode"))
             .expect("append");
-        wal.commit(lsn).expect("commit");
-        let lsn = wal.append(&[span("t", "c", "three")]).expect("append");
-        wal.commit(lsn).expect("commit");
+        wal.commit(lsn, &Metrics::default()).expect("commit");
+        let lsn = wal
+            .append(&Wal::encode(&[span("t", "c", "three")]).expect("encode"))
+            .expect("append");
+        wal.commit(lsn, &Metrics::default()).expect("commit");
 
         let replayed = Wal::replay(&dir).expect("replay");
         assert_eq!(replayed.len(), 3);
@@ -293,10 +312,14 @@ mod tests {
     fn a_torn_trailing_record_is_dropped_and_earlier_ones_kept() {
         let dir = temp_dir("torn");
         let wal = Wal::open(&dir).expect("opens");
-        let lsn = wal.append(&[span("t", "a", "kept")]).expect("append");
-        wal.commit(lsn).expect("commit");
-        let lsn = wal.append(&[span("t", "b", "torn")]).expect("append");
-        wal.commit(lsn).expect("commit");
+        let lsn = wal
+            .append(&Wal::encode(&[span("t", "a", "kept")]).expect("encode"))
+            .expect("append");
+        wal.commit(lsn, &Metrics::default()).expect("commit");
+        let lsn = wal
+            .append(&Wal::encode(&[span("t", "b", "torn")]).expect("encode"))
+            .expect("append");
+        wal.commit(lsn, &Metrics::default()).expect("commit");
 
         // Chop the tail, as a crash mid-write would.
         let path = dir.join(WAL_FILE_NAME);
@@ -313,10 +336,14 @@ mod tests {
     fn a_corrupt_payload_ends_replay_without_being_trusted() {
         let dir = temp_dir("corrupt");
         let wal = Wal::open(&dir).expect("opens");
-        let lsn = wal.append(&[span("t", "a", "kept")]).expect("append");
-        wal.commit(lsn).expect("commit");
-        let lsn = wal.append(&[span("t", "b", "rotten")]).expect("append");
-        wal.commit(lsn).expect("commit");
+        let lsn = wal
+            .append(&Wal::encode(&[span("t", "a", "kept")]).expect("encode"))
+            .expect("append");
+        wal.commit(lsn, &Metrics::default()).expect("commit");
+        let lsn = wal
+            .append(&Wal::encode(&[span("t", "b", "rotten")]).expect("encode"))
+            .expect("append");
+        wal.commit(lsn, &Metrics::default()).expect("commit");
 
         // Flip a byte inside the SECOND record's payload.
         let path = dir.join(WAL_FILE_NAME);
@@ -334,11 +361,13 @@ mod tests {
     fn reset_discards_the_log_and_releases_waiters() {
         let dir = temp_dir("reset");
         let wal = Wal::open(&dir).expect("opens");
-        let lsn = wal.append(&[span("t", "a", "sealed")]).expect("append");
+        let lsn = wal
+            .append(&Wal::encode(&[span("t", "a", "sealed")]).expect("encode"))
+            .expect("append");
         wal.reset().expect("reset");
         assert!(Wal::replay(&dir).expect("replay").is_empty());
         // The record is in a segment now, so its commit is already satisfied.
-        wal.commit(lsn)
+        wal.commit(lsn, &Metrics::default())
             .expect("commit after reset returns immediately");
         assert_eq!(wal.size_bytes(), 0);
     }
@@ -353,8 +382,10 @@ mod tests {
             handles.push(std::thread::spawn(move || {
                 for index in 0..25 {
                     let id = format!("{worker}-{index}");
-                    let lsn = wal.append(&[span("t", &id, "x")]).expect("append");
-                    wal.commit(lsn).expect("commit");
+                    let lsn = wal
+                        .append(&Wal::encode(&[span("t", &id, "x")]).expect("encode"))
+                        .expect("append");
+                    wal.commit(lsn, &Metrics::default()).expect("commit");
                 }
             }));
         }
