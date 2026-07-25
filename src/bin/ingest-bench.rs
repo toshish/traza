@@ -918,6 +918,16 @@ fn commit() -> String {
         .unwrap_or_else(|| "unknown".to_owned())
 }
 
+/// A compact scenario label for a variant's flags: `--flush-spans 3000`
+/// becomes `flush-spans-3000`.
+fn variant_label(flags: &[String]) -> String {
+    flags
+        .iter()
+        .map(|flag| flag.trim_start_matches("--"))
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
 /// The stages, ranked, from a scraped `/v1/metrics`.
 fn stage_summary(metrics: &str) -> String {
     let stages = [
@@ -988,6 +998,11 @@ fn run() -> Result<(), String> {
     // can be swept without editing and rebuilding this file. This is how the
     // profile constants were chosen rather than guessed.
     let mut server_args: Vec<String> = Vec::new();
+    // One extra scenario per variant, so a parameter sweep is INTERLEAVED with
+    // everything else in a single run. Sweeping by re-invoking the harness
+    // once per value makes each value a separate block of wall-clock time,
+    // which is exactly the bias round-robin scheduling exists to remove.
+    let mut variants: Vec<Vec<String>> = Vec::new();
     let mut offered_rate: Option<f64> = None;
     let mut i = 0;
     while i < args.len() {
@@ -1021,6 +1036,15 @@ fn run() -> Result<(), String> {
                 let raw = args.get(i).ok_or("--server-arg requires a value")?;
                 server_args.extend(raw.split_whitespace().map(str::to_owned));
             }
+            "--variant" => {
+                i += 1;
+                let raw = args.get(i).ok_or("--variant requires a value")?;
+                let flags: Vec<String> = raw.split_whitespace().map(str::to_owned).collect();
+                if flags.is_empty() {
+                    return Err("--variant requires at least one flag".to_owned());
+                }
+                variants.push(flags);
+            }
             "--offered-rate" => {
                 i += 1;
                 offered_rate = Some(
@@ -1034,7 +1058,8 @@ fn run() -> Result<(), String> {
                 println!(
                     "Usage: ingest-bench [--spans N] [--runs N] [--batch N] [--concurrency N ...] \
 [--only SUBSTRING] [--server-arg \"--flag value\" ...] \
-[--offered-rate SPANS_PER_SEC (adds open-loop profile rows at a fixed arrival rate)]"
+[--variant \"--flag value\" ... (one extra interleaved scenario per variant)] \
+[--offered-rate SPANS_PER_SEC (adds open-loop rows at a fixed arrival rate)]"
                 );
                 return Ok(());
             }
@@ -1144,6 +1169,42 @@ fn run() -> Result<(), String> {
         }
     }
 
+    // One scenario per --variant, at each concurrency, on the same base as the
+    // profile rows so a swept value is directly comparable with them.
+    for flags in &variants {
+        let label = variant_label(flags);
+        for concurrency in &concurrencies {
+            scenarios.push(Scenario {
+                label: format!("variant-{label}-c{concurrency}"),
+                mode: Mode::Http,
+                protocol: Protocol::Json,
+                keep_alive: true,
+                durability: "wal".to_owned(),
+                concurrency: *concurrency,
+                batch,
+                spans,
+                server_args: flags.clone(),
+                offered_rate: None,
+            });
+        }
+        if let Some(rate) = offered_rate {
+            for concurrency in &concurrencies {
+                scenarios.push(Scenario {
+                    label: format!("variant-{label}-openloop-c{concurrency}"),
+                    mode: Mode::Http,
+                    protocol: Protocol::Json,
+                    keep_alive: true,
+                    durability: "wal".to_owned(),
+                    concurrency: *concurrency,
+                    batch,
+                    spans,
+                    server_args: flags.clone(),
+                    offered_rate: Some(rate),
+                });
+            }
+        }
+    }
+
     // Applied last so a swept flag beats a scenario's own (the server itself
     // resolves duplicates last-wins, and this keeps that predictable).
     if !server_args.is_empty() {
@@ -1166,9 +1227,11 @@ fn run() -> Result<(), String> {
     let _ = writeln!(
         report,
         "Every row is the MEDIAN of {runs} runs, each on a fresh data directory. \
-Scenarios are run ROUND-ROBIN rather than one at a time, so each scenario's \
-repeats are spread across the whole wall-clock window and background load hits \
-all of them alike instead of landing on whichever ran during a spike. \
+Scenarios are run ROUND-ROBIN rather than one at a time, and their order is \
+ROTATED each round, so each scenario's repeats are spread across the whole \
+wall-clock window and across positions within a round. Background load then \
+hits all of them alike instead of landing on whichever ran during a spike or \
+whichever is pinned to the same phase of a periodic load. \
 Payloads are generated before the clock starts, so these are server rates; \
 client encoding is reported separately. Runs that saw a failed batch or a shed \
 connection are reported as failures rather than as numbers.\n"
@@ -1270,7 +1333,21 @@ behind.\n"
     // not perfectly idle worth reporting at all.
     for round in 1..=runs {
         println!("--- round {round} of {runs} ---");
-        for (index, scenario) in selected.iter().enumerate() {
+        // Rotate the starting point each round. Round-robin alone equalizes
+        // across rounds but leaves POSITION WITHIN a round fixed, and
+        // background load on a shared machine oscillates on a timescale close
+        // to one round — so a scenario pinned to the same slot can sit in the
+        // same phase of that oscillation every time, which is a bias that
+        // looks exactly like a property of the configuration. Rotating means
+        // each scenario occupies a different slot each round.
+        //
+        // Rotation rather than a shuffle: it is deterministic, needs no RNG
+        // (this crate has two dependencies and neither is one), and spreads
+        // positions evenly instead of merely randomly.
+        let offset = (round - 1) % selected.len().max(1);
+        for step in 0..selected.len() {
+            let index = (step + offset) % selected.len();
+            let scenario = selected[index];
             if accumulated[index].failed.is_some() {
                 continue;
             }
@@ -1375,7 +1452,47 @@ behind.\n"
         );
     }
 
-    std::fs::write("INGEST-BENCHMARK.md", &report).map_err(|e| e.to_string())?;
-    println!("Wrote INGEST-BENCHMARK.md");
+    write_report(&report)?;
+    Ok(())
+}
+
+const GENERATED_BEGIN: &str = "<!-- BEGIN GENERATED -->";
+const GENERATED_END: &str = "<!-- END GENERATED -->";
+
+/// Writes the report, preserving hand-written analysis.
+///
+/// This used to overwrite `INGEST-BENCHMARK.md` wholesale, which silently
+/// destroyed every paragraph of interpretation in it — the stage decomposition,
+/// the reasoning about what the numbers mean — each time anyone re-ran the
+/// benchmark. The generated table is an INPUT to that document, not the
+/// document. When the file marks a generated region, only that region is
+/// replaced; otherwise the file is written whole, so a fresh checkout still
+/// gets a complete report.
+fn write_report(report: &str) -> Result<(), String> {
+    let path = "INGEST-BENCHMARK.md";
+    if let Ok(existing) = std::fs::read_to_string(path) {
+        if let (Some(start), Some(end)) =
+            (existing.find(GENERATED_BEGIN), existing.find(GENERATED_END))
+        {
+            if start < end {
+                let mut merged = String::with_capacity(existing.len() + report.len());
+                merged.push_str(&existing[..start]);
+                merged.push_str(GENERATED_BEGIN);
+                merged.push('\n');
+                merged.push_str(report);
+                merged.push_str(&existing[end..]);
+                std::fs::write(path, merged).map_err(|e| e.to_string())?;
+                println!("Updated the generated section of {path}; prose preserved");
+                return Ok(());
+            }
+        }
+        // A file with no markers is analysis this harness must not clobber.
+        let aside = "INGEST-BENCHMARK.generated.md";
+        std::fs::write(aside, report).map_err(|e| e.to_string())?;
+        println!("{path} carries no {GENERATED_BEGIN} marker, so it was left alone; wrote {aside}");
+        return Ok(());
+    }
+    std::fs::write(path, report).map_err(|e| e.to_string())?;
+    println!("Wrote {path}");
     Ok(())
 }

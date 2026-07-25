@@ -245,6 +245,15 @@ compaction disabled during the run (no profile changes it, so holding it off
 keeps the comparison to the knobs the profile actually sets), a fresh data
 directory per run, and payloads generated before the clock starts.
 
+Two consequences of that setup worth stating before the numbers:
+
+- **Compaction is off, so these absolute rates are higher than a default
+  deployment sees.** Compaction costs roughly 31% of ingest throughput at its
+  defaults. The profile *comparison* is the point; the absolute ceiling is not.
+- Scenarios run **round-robin**, one repeat of each per round, so every
+  configuration samples the same background load rather than whichever one
+  happened to run during a spike.
+
 <!-- MEASUREMENTS -->
 
 ## Watching whether the choice is working
