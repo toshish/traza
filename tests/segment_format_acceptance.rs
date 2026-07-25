@@ -1,4 +1,4 @@
-//! Focused segment-format-v2 acceptance target.
+//! Focused segment-format acceptance target.
 //!
 //! Each test emits one JSON evidence record so verification can distinguish the
 //! five required behavioral categories without relying on test names alone.
@@ -12,7 +12,7 @@ static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 fn temp_dir(label: &str) -> PathBuf {
     let sequence = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!(
-        "traza-segment-v2-{label}-{}-{sequence}",
+        "traza-segment-{label}-{}-{sequence}",
         std::process::id()
     ));
     let _ = fs::remove_dir_all(&path);
@@ -26,7 +26,7 @@ fn cleanup(path: &Path) {
 
 fn evidence(category: &str, checks: &[&str]) {
     println!(
-        "{{\"target\":\"segment_format_v2_acceptance\",\"category\":\"{}\",\"status\":\"passed\",\"checks\":[{}]}}",
+        "{{\"target\":\"segment_format_acceptance\",\"category\":\"{}\",\"status\":\"passed\",\"checks\":[{}]}}",
         category,
         checks
             .iter()
@@ -102,7 +102,15 @@ fn independently_encoded_fixture() -> Vec<u8> {
 fn format_conformance() {
     let bytes = independently_encoded_fixture();
 
-    assert_eq!(&bytes[0..8], b"TRAZASEG", "v2 magic");
+    assert_eq!(&bytes[0..8], b"TRAZASEG", "magic");
+    // Pin the fixture's magic to the REAL constant, so the two can never
+    // silently disagree again — they once did (the code wrote TRAZAV2 while
+    // this fixture and the docs said TRAZASEG).
+    assert_eq!(
+        traza::segment::MAGIC,
+        *b"TRAZASEG",
+        "the real magic must match the documented format"
+    );
     assert_eq!(get_u16(&bytes, 8), 2, "format version");
     assert_eq!(get_u32(&bytes, 12), 80, "fixed header length");
     assert_eq!(get_u64(&bytes, 16), 1, "record count");

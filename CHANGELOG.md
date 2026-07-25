@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Renamed the segment module `segment_v2` → `segment` (file, module,
+  `segment_error` helper, acceptance test, format doc): there is only one
+  segment format, so the version in the name was redundant. The suffix
+  constants flipped too — the current format is now the unmarked
+  `SEGMENT_SUFFIX` (`.seg`) and the unsupported legacy JSONL suffix is
+  `LEGACY_SEGMENT_SUFFIX`.
+- Reconciled the on-disk segment magic. The encoder wrote `TRAZAV2` while the
+  acceptance test and format doc expected `TRAZASEG`; they never met, because
+  the acceptance fixture is self-checked and was never fed to the real reader.
+  The magic is now `TRAZASEG` (the version lives in the `VERSION` field, not
+  the magic), matching the docs, and the acceptance test pins it to the real
+  `segment::MAGIC` constant so the two cannot drift again. **On-disk format
+  change:** existing `.seg` files written before this are no longer read
+  (acceptable pre-release; no data migration is provided).
+
 ## [0.15.0] - 2026-07-24
 
 Durability: an acknowledged write now means what the deployment says it means.

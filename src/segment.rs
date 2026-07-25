@@ -1,4 +1,7 @@
-//! Segment format v2 file-backed storage and persisted indexes.
+//! Segment file-backed storage and persisted indexes.
+//!
+//! The on-disk format is version 2 (see `MAGIC`/`VERSION`); version 1 (JSONL)
+//! is no longer read.
 //!
 //! An opened file-backed segment owns only its file handle and decoded index
 //! maps. In-memory segments built for encoding may own their bytes. Records are
@@ -12,9 +15,13 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-/// Eight-byte marker at the beginning of every v2 segment.
-pub const MAGIC: [u8; 8] = *b"TRAZAV2\0";
-/// On-disk format version written by this module.
+/// Eight-byte marker at the beginning of every segment file. The version
+/// lives in [`VERSION`], not in the magic, so the marker itself stays fixed
+/// across format revisions.
+pub const MAGIC: [u8; 8] = *b"TRAZASEG";
+/// On-disk format version written by this module. This — not the magic — is
+/// how the format generation is identified; the magic only says "a Traza
+/// segment". (JSONL v1 carried no magic; this indexed format is version 2.)
 pub const VERSION: u16 = 2;
 /// Fixed header size in bytes.
 pub const HEADER_LEN: usize = 80;
@@ -62,7 +69,7 @@ impl Header {
             return Err(Error::Corrupt("file is shorter than the v2 header"));
         }
         if bytes[..8] != MAGIC {
-            return Err(Error::Unsupported("segment magic is not v2"));
+            return Err(Error::Unsupported("not a Traza segment (bad magic)"));
         }
         let version = read_u16(bytes, 8)?;
         if version != VERSION {
@@ -571,7 +578,7 @@ impl Segment {
     }
 }
 
-/// Encodes records into a complete segment-format-v2 byte stream.
+/// Encodes records into a complete segment byte stream.
 pub fn encode(records: &[RecordInput]) -> Result<Vec<u8>, Error> {
     let mut record_region = Vec::new();
     let mut offsets = Vec::with_capacity(records.len());

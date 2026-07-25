@@ -251,7 +251,7 @@ The **storage engine** buffers spans in memory and flushes sorted, immutable v2 
 
 The **HTTP server** is a deliberately small HTTP/1.1 implementation on `std::net` — a bounded worker pool in front of the engine, which is its only datastore. There is no server-side log or side index; restart durability is the engine's. It also serves the dashboard's build directory as static files, resolved against the canonicalized root so no request can read outside it.
 
-Deeper reading: [segment format](docs/segment-format-v2.md) · [LLM conventions](docs/llm-semantics.md) · [HA design](docs/ha-design.md).
+Deeper reading: [segment format](docs/segment-format.md) · [LLM conventions](docs/llm-semantics.md) · [HA design](docs/ha-design.md).
 
 ## Status and roadmap
 
