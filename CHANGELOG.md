@@ -41,6 +41,23 @@ Ingest throughput: 108,881 -> 208,973 spans/s at 16 concurrent clients in
 - **`POST /v1/spans` decodes straight to `Vec<Span>`.** It used to parse to a
   `serde_json::Value`, deep-clone the array out of it, then re-walk that DOM
   once per span — three passes and three sets of allocations for one job.
+- **`POST /v1/traces` decodes straight to `Vec<Span>` too, for both
+  encodings.** Protobuf lowered to the OTLP/JSON `Value` shape and OTLP JSON
+  parsed into the same shape, and both then re-walked that DOM. Protobuf
+  additionally hex-encoded every trace and span id through a `format!` per
+  BYTE. Decode is now **9.2x cheaper for protobuf** (4,384 → 479 ns/span) and
+  **1.9x cheaper for OTLP JSON** (2,377 → 1,275 ns/span), medians of 5 runs of
+  1M spans at concurrency 1. Decode is ~2% of ingest cost, so this is a CPU
+  and correctness result, not a throughput one. The mapping rules the two
+  decoders must agree on are shared rather than duplicated, and a differential
+  test pins that agreement across every `AnyValue` variant.
+- **`ingest-bench` separates wire format from route.** It posted JSON to
+  `/v1/spans` and protobuf to `/v1/traces`, so every protocol comparison also
+  contained the OTLP mapping; on that basis this project claimed protobuf was
+  slower than JSON. A third protocol, `otlp-json`, holds the route fixed, and
+  scenario labels now name the route. Measured properly, **protobuf decodes
+  2.3–2.7x faster than OTLP JSON** on payloads 2.9x smaller. The benchmark
+  also reports bytes/span and decode ns/span per scenario.
 - **The WAL encodes a batch before taking the writer lock.** Serializing under
   the lock made every concurrent ingest wait on one thread's JSON encoding.
   Only the file write remains inside it.
