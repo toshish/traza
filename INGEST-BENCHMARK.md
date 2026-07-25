@@ -263,11 +263,13 @@ was one default.
 The roadmap attributes the target to "keep-alive + protobuf". Measurement
 supports neither attribution:
 
-- **Protobuf is slower than JSON at every concurrency** (65,480 vs 82,805 at
-  c1; 203,460 vs 208,973 at c16). The protobuf route decodes into a
-  `serde_json::Value` DOM and then maps that to spans, while the JSON route
-  now deserializes straight to `Vec<Span>`. A protobuf fast path would close
-  that gap — but it would be catching up to JSON, not passing it.
+- **Protobuf is not the lever, and it is not slow.** The controlled
+  comparison is in [Protocol](#protocol-what-a-wire-format-actually-costs)
+  above: with the route held fixed and both paths optimized, OTLP protobuf
+  decodes 2.3-2.7x FASTER than OTLP JSON. It cannot be what unlocks the target
+  either way, because decode is ~1.9% of ingest cost. (An earlier revision of
+  this section claimed the opposite, from a benchmark that compared two
+  different routes.)
 - **Keep-alive is worth +11% at batch=20** (10,221 vs 9,203 spans/s) and
   nothing at batch=1000, where it measured slightly *negative*. At 245 KB and
   ~5 ms of server work per request, a ~50 µs connect is under 1% of the cost.

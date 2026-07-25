@@ -66,22 +66,47 @@ Two readings matter more than the peak:
 same figure. Removing HTTP entirely — no socket, no parsing, no protocol —
 changes nothing. Whatever limits ingest is inside the engine.
 
-**The writer lock is the ceiling.** The stage breakdown in
+**The writer lock is the ceiling, and where it sits depends on
+`--flush-spans`.** The stage breakdown in
 [`INGEST-BENCHMARK.md`](../../INGEST-BENCHMARK.md#the-limiting-stage) shows the
-work performed while holding the writer lock at ~88% of the run's wall clock,
-which sets a hard ceiling near 212,000 spans/s for this design. The measured
-208,973 at concurrency 16 is essentially that ceiling, and no amount of client
-concurrency passes it. The project's own 250,000 spans/s target is **not met**,
-by 16%.
+work performed while holding the writer lock at ~88% of the run's wall clock at
+the default `--flush-spans 10,000`, which puts the ceiling near 218,000
+spans/s **at that setting**. An earlier version of this page called that a hard
+ceiling for the design; it is not. A seal carries a fixed cost — two fsyncs, a
+create and rename, a reopen-and-parse — on top of its per-span cost, so sealing
+less often amortizes the fixed part:
+
+| | `--flush-spans` 10,000 | `--flush-spans` 30,000 |
+|---|---:|---:|
+| Seals over 1M spans / mean seal | 100 / 34.5 ms | 33 / 74.6 ms |
+| Work done holding the writer lock | 4,581 ms | 3,336 ms |
+| Share of wall clock | 88% | 80% |
+| Implied ceiling | ~218,300/s | ~299,800/s |
+
+Tripling the spans per seal raised mean seal time only 2.17x, not 3x. Solving
+those two measured points gives roughly 14.4 ms fixed per seal plus 2.0 µs per
+span — *derived from the two measurements above, not independently measured.*
+
+**Against the 250,000 spans/s target:** `--profile throughput` at concurrency
+16 measured a median of **250,453 spans/s** (min 122,768, max 261,215), and a
+second run 261,782. The medians clear the target; the minima do not, and the
+spread is contention on a machine that never went idle. The target is therefore
+recorded as **not yet confirmed — re-measure on an idle machine**, not as met.
+What is established is that the shortfall was never a property of the design;
+most of it was one default.
 
 **Durability is the biggest single lever**, which is exactly what the mode names
 promise: `buffered` at 313,201 against `wal` at 193,637 in the same
 direct-engine scenario.
 
-> **Protobuf versus JSON throughput is currently being re-measured** and is
-> deliberately not stated here. The earlier comparison in the record did not
-> isolate the wire format, so any conclusion drawn from it about protobuf's
-> cost would be unsound. Use whichever your exporter speaks.
+**Protobuf versus JSON.** The controlled comparison now exists: holding the
+route fixed at `/v1/traces`, optimized OTLP protobuf decodes at 479 ns/span
+against optimized OTLP JSON at 1,275 ns/span — **2.7x faster** — on payloads
+2.9x smaller (117 vs 342 bytes/span). Protobuf was never slower as a wire
+format; it was slower as one implementation of one, and that implementation is
+fixed. This barely moves end-to-end throughput, because decode is ~1.9% of
+ingest cost and the writer lock reabsorbs the difference above concurrency 1.
+Prefer protobuf for wire size and CPU; use whichever your exporter speaks.
 
 ## Memory
 
