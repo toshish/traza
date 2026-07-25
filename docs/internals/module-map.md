@@ -1,0 +1,179 @@
+# Module map
+
+What each file in `src/` is responsible for, and where to start looking for a
+given change.
+
+## Crate rules
+
+Two direct dependencies, `serde` and `serde_json`. HTTP, threading, hashing,
+protobuf decoding, SHA-256, and file I/O are all standard library or
+hand-written. The crate is `#![forbid(unsafe_code)]` and `missing_docs` is
+denied, so every public item carries a doc comment and clippy enforces it.
+
+## The engine
+
+### [`src/lib.rs`](../../src/lib.rs)
+
+The datastore. `Store`, `Span`, `Event`, `Link`, `SpanFilter`, `SpanCursor`,
+`Config`, `CompactionConfig`, `Durability`, `Stats`, `Error`.
+
+It owns:
+
+- the write buffer and its primary-key upsert;
+- the ingest path (`ingest`, `ingest_batch`, `admit`) and the acknowledgement
+  ordering;
+- flushing and segment writing (`flush_locked`, `write_segment`);
+- every read path (`get_trace`, `query`, `query_after`, `stats`);
+- compaction (`compact_segments`, `merge_tail_run`), TTL expiry
+  (`compact_expired`, `expire_before`), and the supersede journal;
+- the single-writer directory lock, including stale-lock reclamation;
+- span↔record conversion and the reserved index keys.
+
+By far the largest file, and the one where the [invariants](invariants.md)
+live. Most engine changes start here.
+
+### [`src/segment.rs`](../../src/segment.rs)
+
+The on-disk segment format: encoding, parsing, and file-backed reading. An
+opened segment owns its file handle and decoded index maps only — records are
+decoded when a query selects their offsets, and no decoded record vector is
+retained. Byte layout: [segment format](../segment-format.md).
+
+### [`src/wal.rs`](../../src/wal.rs)
+
+The write-ahead log with group commit. Framing is
+`[u32 length][u32 crc32][payload]`, the payload being one batch's JSON. Replay
+stops at the first short or corrupt frame, so a torn tail is discarded and
+never interpreted. The fsync runs outside the state lock so concurrent batches
+coalesce into one sync; a waiter wakes when some sync has covered its LSN.
+
+Also the authoritative statement of the **macOS `fsync` caveat** — see
+[durability](../operations/durability.md).
+
+### [`src/payload.rs`](../../src/payload.rs)
+
+Content-addressed offloading of oversized string attribute values to
+`payloads/<aa>/<sha256>.bin`, replaced in the span by a `$payload` reference.
+Includes a dependency-free SHA-256 (FIPS 180-4) verified against the standard
+test vectors.
+
+### [`src/annotations.rs`](../../src/annotations.rs)
+
+Post-hoc annotations: an append-only JSONL log fsynced per append with an
+in-memory index by trace. A torn trailing line is ignored, matching the segment
+layer's crash-consistency stance.
+
+### [`src/analytics.rs`](../../src/analytics.rs)
+
+Sessions and LLM token/cost aggregation — derived views over ordinary spans, no
+new record type. Holds the per-segment rollup cache (segments are immutable, so
+a rollup is computed at most once per process and keyed by path) and the
+supersede prefilter that makes a cached rollup safe to reuse.
+
+### [`src/semconv.rs`](../../src/semconv.rs)
+
+Semantic-convention normalization: folds the OpenLLMetry / OTel GenAI
+vocabulary and Traza's native `llm.*` shorthand into one set of facts. A pure
+function over a span's attribute map. **This is the single source of truth for
+key precedence** — [`docs/llm-semantics.md`](../llm-semantics.md) documents it
+and `ui/src/lib/spans.js` mirrors it, so a change here needs all three to move
+together.
+
+### [`src/expiration.rs`](../../src/expiration.rs)
+
+A four-line placeholder. Expiration is implemented in `Store::expire_before` in
+`lib.rs`; this module reserves the unit and contains no public API.
+
+## Ingest surfaces
+
+### [`src/otlp.rs`](../../src/otlp.rs)
+
+OTLP/HTTP **JSON** ingest mapping: `ExportTraceServiceRequest` to `Span`. Hex
+ids lowercased, `*TimeUnixNano` accepted as string or number, typed `AnyValue`
+attributes flattened, resource `service.name` becoming the service, scope
+attributes merged beneath span attributes.
+
+### [`src/otlp_pb.rs`](../../src/otlp_pb.rs)
+
+OTLP/HTTP **binary protobuf**, hand-rolled and dependency-free. Rather than
+duplicating the mapping, it lowers protobuf into exactly the JSON `Value` shape
+`otlp.rs` expects and hands off — one mapping, two encodings, so every JSON
+conformance behaviour applies to protobuf automatically. All slicing is
+bounds-checked; malformed input yields a decode error, never a panic.
+
+## Server-side support
+
+### [`src/auth.rs`](../../src/auth.rs)
+
+Bearer authentication: `TRAZA_TOKENS` parsing, `ro`/`rw` scopes, constant-time
+token comparison, and the 401/403 verdicts. `AuthConfig` implements a redacted
+`Debug` so an accidental structured log cannot disclose credentials, and parse
+errors name the defect without echoing the value.
+
+### [`src/ui.rs`](../../src/ui.rs)
+
+Static serving of the built dashboard from a directory on disk: the discovery
+order for `--ui-dir`, the shell routes (`/`, `/dashboard`, `/dashboard/`),
+content types by extension, and path-traversal refusal against the
+canonicalized root.
+
+### [`src/metrics.rs`](../../src/metrics.rs)
+
+The instrumentation primitives (`Counter`, `Latency`) and the engine's
+`Metrics` set, plus Prometheus rendering. Latencies land in power-of-two
+nanosecond buckets, which is why percentiles are approximate — read the module
+docs before publishing a number from here. See
+[monitoring](../operations/monitoring.md).
+
+## Test and demo data
+
+### [`src/seed.rs`](../../src/seed.rs)
+
+Deterministic synthetic telemetry: the corpus `tests/scenarios.rs` asserts
+against and the `seed` binary loads. Aims at coverage of real shapes rather
+than volume — agentic tool-calling traces, all three attribute dialects,
+multi-turn sessions, multimodal messages, RAG, streaming, failures with linked
+retries, parallel fan-out, oversized payloads, and ordinary non-LLM traffic.
+The same options always produce the same corpus byte for byte.
+
+### [`src/media.rs`](../../src/media.rs)
+
+Synthesized demo media for that corpus — real PNG, GIF, WAV, and SVG bytes
+encoded from scratch with no image or audio crate, because the dashboard's
+media rendering only means anything if the bytes actually decode.
+
+## Binaries
+
+### [`src/bin/traza-server.rs`](../../src/bin/traza-server.rs)
+
+The HTTP/1.1 server: argument parsing, the connection pool and its bound,
+request framing, the auth gate, route dispatch, chunked export streaming, and
+server-side metrics. **The authoritative source for routes and query
+parameters** — the API reference is checked against this file, not the other
+way round.
+
+### [`src/bin/bench.rs`](../../src/bin/bench.rs)
+
+The canonical end-to-end benchmark. Builds and starts the release server, drives
+it over HTTP, and rewrites `BENCHMARKS.md` from its own measurements.
+
+### [`src/bin/ingest-bench.rs`](../../src/bin/ingest-bench.rs)
+
+The ingest matrix over protocol, keep-alive, concurrency, and durability.
+Reports the median of N runs with its spread and refuses to report a rate from
+a run that shed a connection or stored fewer spans than it acknowledged.
+
+### [`src/bin/seed.rs`](../../src/bin/seed.rs)
+
+Loads the seed corpus, either directly through the engine (`--data-dir`) or
+over HTTP into a running server (`--url`). Two modes because a data directory
+has exactly one writer.
+
+## Elsewhere in the tree
+
+| Path | What it is |
+|---|---|
+| [`tests/`](../../tests) | Integration tests — see [testing](testing.md) |
+| [`ui/`](../../ui) | The React dashboard; `npm run build` emits `ui/dist` |
+| [`ci.sh`](../../ci.sh) | The merge gate |
+| [`docs/`](../README.md) | This documentation set |
