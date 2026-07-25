@@ -350,3 +350,120 @@ fn concurrent_acknowledged_batches_all_survive() {
         "every batch acknowledged under group commit survives SIGKILL"
     );
 }
+
+/// Sends many requests down ONE connection, the way a real ingest client does
+/// now that connections persist. Returns how many were acknowledged 200.
+///
+/// Written out rather than reusing `request_to` because the whole point is the
+/// connection reuse: `request_to` opens a fresh socket per request and so
+/// cannot exercise the path where a response and the next request share a
+/// buffer.
+fn acknowledged_over_one_connection(port: u16, worker: usize, rounds: usize) -> usize {
+    let mut stream = {
+        let mut attempt = 0;
+        loop {
+            match TcpStream::connect(("127.0.0.1", port)) {
+                Ok(stream) => break stream,
+                Err(_) if attempt < 50 => {
+                    attempt += 1;
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("connect: {error}"),
+            }
+        }
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .expect("timeout");
+    let mut acknowledged = 0;
+    let mut leftover: Vec<u8> = Vec::new();
+    for round in 0..rounds {
+        let spans: Vec<Value> = (0..10)
+            .map(|index| {
+                json!({
+                    "trace_id": format!("ka-trace-{worker}"),
+                    "span_id": format!("span-{round}-{index}"),
+                    "name": "acknowledged", "service": "ingest",
+                    "start_time_ns": 1_000u64, "end_time_ns": 2_000u64,
+                    "attributes": {"marker": format!("ka{worker}")}
+                })
+            })
+            .collect();
+        let body = serde_json::to_vec(&Value::Array(spans)).expect("encodes");
+        let head = format!(
+            "POST /v1/spans HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        if stream.write_all(head.as_bytes()).is_err() || stream.write_all(&body).is_err() {
+            break;
+        }
+        // Read exactly one response, keeping any surplus for the next round.
+        let mut chunk = [0_u8; 4096];
+        let header_end = loop {
+            if let Some(position) = leftover
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+            {
+                break position + 4;
+            }
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => return acknowledged,
+                Ok(read) => leftover.extend_from_slice(&chunk[..read]),
+            }
+        };
+        let header = String::from_utf8_lossy(&leftover[..header_end]).into_owned();
+        let length: usize = header
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse().ok())?
+            })
+            .unwrap_or(0);
+        while leftover.len() < header_end + length {
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => return acknowledged,
+                Ok(read) => leftover.extend_from_slice(&chunk[..read]),
+            }
+        }
+        leftover.drain(..header_end + length);
+        if header.starts_with("HTTP/1.1 200") {
+            acknowledged += 1;
+        }
+    }
+    acknowledged
+}
+
+#[test]
+fn concurrent_keep_alive_clients_lose_nothing_they_were_promised() {
+    // Persistent connections changed the shape of concurrent ingest: many
+    // batches now arrive down one socket, and a response and the next request
+    // share a read buffer. A framing slip there would corrupt or drop an
+    // acknowledged batch, and only a count taken after SIGKILL would show it.
+    let dir = test_dir("wal-keepalive");
+    let mut server = Server::spawn(&dir, "wal");
+    let port = server.port;
+
+    let mut handles = Vec::new();
+    for worker in 0..8 {
+        handles.push(std::thread::spawn(move || {
+            acknowledged_over_one_connection(port, worker, 15)
+        }));
+    }
+    let acknowledged: usize = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("worker"))
+        .sum();
+    assert_eq!(acknowledged, 8 * 15, "every batch was acknowledged");
+
+    server.kill_hard();
+
+    let total: usize = (0..8)
+        .map(|worker| surviving_spans(&dir, &format!("ka{worker}")))
+        .sum();
+    assert_eq!(
+        total,
+        8 * 15 * 10,
+        "every span acknowledged over a persistent connection survives SIGKILL"
+    );
+}
