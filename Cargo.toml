@@ -30,6 +30,10 @@ path = "src/bin/bench.rs"
 name = "seed"
 path = "src/bin/seed.rs"
 
+[[bin]]
+name = "ingest-bench"
+path = "src/bin/ingest-bench.rs"
+
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
