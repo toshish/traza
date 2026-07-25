@@ -21,7 +21,12 @@ struct Server {
 
 impl Server {
     fn spawn(data_dir: &Path, durability: &str) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_traza-server"))
+        Self::spawn_with(data_dir, durability, &[])
+    }
+
+    fn spawn_with(data_dir: &Path, durability: &str, extra: &[&str]) -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_traza-server"));
+        let mut child = command
             .arg("--data-dir")
             .arg(data_dir)
             .arg("--host")
@@ -35,6 +40,7 @@ impl Server {
             .arg("--flush-spans")
             .arg("1000000")
             .env_remove("TRAZA_TOKENS")
+            .args(extra)
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawns traza-server");
@@ -348,5 +354,206 @@ fn concurrent_acknowledged_batches_all_survive() {
     assert_eq!(
         total, 800,
         "every batch acknowledged under group commit survives SIGKILL"
+    );
+}
+
+/// Sends many requests down ONE connection, the way a real ingest client does
+/// now that connections persist. Returns how many were acknowledged 200.
+///
+/// Written out rather than reusing `request_to` because the whole point is the
+/// connection reuse: `request_to` opens a fresh socket per request and so
+/// cannot exercise the path where a response and the next request share a
+/// buffer.
+fn acknowledged_over_one_connection(port: u16, worker: usize, rounds: usize) -> usize {
+    let mut stream = {
+        let mut attempt = 0;
+        loop {
+            match TcpStream::connect(("127.0.0.1", port)) {
+                Ok(stream) => break stream,
+                Err(_) if attempt < 50 => {
+                    attempt += 1;
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("connect: {error}"),
+            }
+        }
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .expect("timeout");
+    let mut acknowledged = 0;
+    let mut leftover: Vec<u8> = Vec::new();
+    for round in 0..rounds {
+        let spans: Vec<Value> = (0..10)
+            .map(|index| {
+                json!({
+                    "trace_id": format!("ka-trace-{worker}"),
+                    "span_id": format!("span-{round}-{index}"),
+                    "name": "acknowledged", "service": "ingest",
+                    "start_time_ns": 1_000u64, "end_time_ns": 2_000u64,
+                    "attributes": {"marker": format!("ka{worker}")}
+                })
+            })
+            .collect();
+        let body = serde_json::to_vec(&Value::Array(spans)).expect("encodes");
+        let head = format!(
+            "POST /v1/spans HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        if stream.write_all(head.as_bytes()).is_err() || stream.write_all(&body).is_err() {
+            break;
+        }
+        // Read exactly one response, keeping any surplus for the next round.
+        let mut chunk = [0_u8; 4096];
+        let header_end = loop {
+            if let Some(position) = leftover.windows(4).position(|window| window == b"\r\n\r\n") {
+                break position + 4;
+            }
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => return acknowledged,
+                Ok(read) => leftover.extend_from_slice(&chunk[..read]),
+            }
+        };
+        let header = String::from_utf8_lossy(&leftover[..header_end]).into_owned();
+        let length: usize = header
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse().ok())?
+            })
+            .unwrap_or(0);
+        while leftover.len() < header_end + length {
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => return acknowledged,
+                Ok(read) => leftover.extend_from_slice(&chunk[..read]),
+            }
+        }
+        leftover.drain(..header_end + length);
+        if header.starts_with("HTTP/1.1 200") {
+            acknowledged += 1;
+        }
+    }
+    acknowledged
+}
+
+#[test]
+fn concurrent_keep_alive_clients_lose_nothing_they_were_promised() {
+    // Persistent connections changed the shape of concurrent ingest: many
+    // batches now arrive down one socket, and a response and the next request
+    // share a read buffer. A framing slip there would corrupt or drop an
+    // acknowledged batch, and only a count taken after SIGKILL would show it.
+    let dir = test_dir("wal-keepalive");
+    let mut server = Server::spawn(&dir, "wal");
+    let port = server.port;
+
+    let mut handles = Vec::new();
+    for worker in 0..8 {
+        handles.push(std::thread::spawn(move || {
+            acknowledged_over_one_connection(port, worker, 15)
+        }));
+    }
+    let acknowledged: usize = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("worker"))
+        .sum();
+    assert_eq!(acknowledged, 8 * 15, "every batch was acknowledged");
+
+    server.kill_hard();
+
+    let total: usize = (0..8)
+        .map(|worker| surviving_spans(&dir, &format!("ka{worker}")))
+        .sum();
+    assert_eq!(
+        total,
+        8 * 15 * 10,
+        "every span acknowledged over a persistent connection survives SIGKILL"
+    );
+}
+
+/// One GET, returning the body as text. `request_to` parses JSON, which turns
+/// a Prometheus body into `Value::Null` and any assertion over it into a
+/// no-op.
+fn raw_get(port: u16, target: &str) -> String {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    write!(
+        stream,
+        "GET {target} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+    )
+    .expect("writes");
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).expect("reads");
+    let text = String::from_utf8_lossy(&response).into_owned();
+    text.split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_owned())
+        .unwrap_or_default()
+}
+
+#[test]
+fn a_commit_window_batches_more_acks_without_weakening_the_promise() {
+    // The window deliberately delays each fsync so more batches ride along on
+    // it. That is a latency-for-amortization trade and nothing else: an
+    // acknowledgement must still mean fsynced, so SIGKILL must still lose
+    // nothing. If the delay had been implemented by acknowledging early, this
+    // is the test that would catch it.
+    let dir = test_dir("wal-window");
+    let mut server = Server::spawn_with(&dir, "wal", &["--wal-commit-window-us", "2000"]);
+    let port = server.port;
+
+    let mut handles = Vec::new();
+    for worker in 0..8 {
+        handles.push(std::thread::spawn(move || {
+            for round in 0..10 {
+                let spans: Vec<Value> = (0..10)
+                    .map(|index| {
+                        json!({
+                            "trace_id": format!("win-{worker}"),
+                            "span_id": format!("span-{round}-{index}"),
+                            "name": "acknowledged", "service": "ingest",
+                            "start_time_ns": 1_000u64, "end_time_ns": 2_000u64,
+                            "attributes": {"marker": format!("win{worker}")}
+                        })
+                    })
+                    .collect();
+                let (status, _) = request_to(port, "POST", "/v1/spans", Some(&Value::Array(spans)));
+                assert_eq!(status, 200);
+            }
+        }));
+    }
+    for handle in handles {
+        handle.join().expect("worker");
+    }
+
+    // The window should have made each fsync cover several acknowledgements.
+    // Fetched as raw text: /v1/metrics is Prometheus exposition format, not
+    // JSON, so the JSON helper would hand back a null and quietly assert
+    // nothing.
+    let text = raw_get(port, "/v1/metrics");
+    let value = |name: &str| -> f64 {
+        text.lines()
+            .find_map(|line| {
+                let (key, value) = line.split_once(' ')?;
+                (key == name).then(|| value.trim().parse::<f64>().ok())?
+            })
+            .unwrap_or(0.0)
+    };
+    let commits = value("traza_wal_commits_total");
+    let fsyncs = value("traza_wal_fsync_ns_count");
+    assert!(
+        commits > 0.0 && fsyncs > 0.0,
+        "no commits recorded:\n{text}"
+    );
+    assert!(
+        commits / fsyncs > 1.0,
+        "the window should amortize fsync across acks, got {commits} acks / {fsyncs} fsyncs"
+    );
+
+    server.kill_hard();
+    let total: usize = (0..8)
+        .map(|worker| surviving_spans(&dir, &format!("win{worker}")))
+        .sum();
+    assert_eq!(
+        total, 800,
+        "a delayed fsync still precedes the acknowledgement it covers"
     );
 }

@@ -4,6 +4,9 @@ Conventions for tracing generative-AI workloads with Traza. They are plain
 span attributes and events — no server or engine support beyond recognizing
 the keys, and every recipe below runs against the standard filter API today.
 
+Prerequisites: the [data model](guide/data-model.md) for what a span is, and
+the [HTTP API reference](guide/http-api.md) for the routes these recipes use.
+
 Traza follows the [OpenLLMetry](https://github.com/traceloop/openllmetry)
 standard — Traceloop's OpenTelemetry-based conventions for LLM and agent
 tracing (the `opentelemetry-semantic-conventions-ai` package), built on the
@@ -46,6 +49,20 @@ ingest supplies one of those; it is not part of OpenLLMetry conformance.
 
 Attributes are indexed like any other, so exact-match filters on them are
 index-served.
+
+**A filtering gotcha worth knowing before you write a query.** `attr.KEY=VALUE`
+parses `VALUE` as JSON when it is valid JSON and treats it as a plain string
+otherwise. Token counts illustrate the trap, because the analytics path accepts
+them as numbers *or* numeric strings but the filter path compares by exact JSON
+equality:
+
+    GET /v1/spans?attr.gen_ai.usage.input_tokens=412       # matches the NUMBER 412
+    GET /v1/spans?attr.gen_ai.usage.input_tokens=%22412%22 # matches the STRING "412"
+
+So a rollup can count a stringified token value while a bare numeric filter
+misses the same span. Model and provider names are unaffected — they are not
+valid JSON, so they fall back to strings as you would expect. Full rules:
+[filter value types](guide/data-model.md#filter-value-types).
 
 ## Span names and kinds
 
@@ -123,6 +140,10 @@ Tool-call frequency for one tool (Traceloop tool spans):
 model, provider, service, session, or UTC day. Integer counters saturate at
 `u64::MAX` rather than wrapping, and non-finite cost strings are ignored.
 
+Remember that `/v1/spans` applies a **default limit of 100**; pass `limit`
+explicitly when a recipe should return more. `/v1/export` is unbounded by
+default and is the right route for anything dataset-sized.
+
 ## Payloads and annotations
 
 Prompt/completion text longer than the server's payload threshold is
@@ -152,3 +173,15 @@ strings, and events map to span events — so OpenLLMetry / OTel GenAI
 instrumentation lands queryable without translation. `service.name` on the
 OTLP resource becomes the span's service. gRPC is not served; use the
 `http/protobuf` exporter setting every OTel SDK supports.
+
+The complete OTLP field mapping is in [ingest](guide/ingest.md#otlp-mapping).
+
+## See also
+
+- [Getting started](guide/getting-started.md) — point an OTel SDK at Traza
+- [Data model](guide/data-model.md) — spans, primary key, attribute types
+- [HTTP API reference](guide/http-api.md) — every route and parameter
+- [Trace browser](guide/trace-browser.md) — the conversation and analytics views
+- [`src/semconv.rs`](../src/semconv.rs) — the single source of truth for key
+  precedence, mirrored by `ui/src/lib/spans.js` and pinned by
+  `tests/llm_semantics.rs` and `tests/openllmetry_conformance.rs`

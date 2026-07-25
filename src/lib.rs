@@ -11,6 +11,7 @@ pub mod annotations;
 pub mod auth;
 pub mod expiration;
 mod media;
+pub mod metrics;
 pub mod otlp;
 pub mod otlp_pb;
 pub mod payload;
@@ -29,7 +30,12 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+/// Nanoseconds since `started`, saturated into a `u64` (~584 years).
+fn elapsed_nanos(started: &Instant) -> u64 {
+    started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+}
 
 const LOCK_FILE_NAME: &str = "LOCK";
 const SEGMENT_PREFIX: &str = "segment-";
@@ -251,6 +257,111 @@ impl Default for CompactionConfig {
     }
 }
 
+/// A named group of write-path defaults trading ingest throughput against
+/// per-write latency.
+///
+/// The knobs on that axis are only coherent when set together — a large
+/// `flush_spans` and a zero `wal_commit_window` pull in opposite directions —
+/// and setting them together requires knowing what each does to the other. A
+/// profile is that knowledge, named, so an operator picks an intent instead of
+/// reverse-engineering the internals.
+///
+/// **A profile cannot change [`Durability`], and that is structural rather
+/// than conventional**: no variant carries one, so there is no value of
+/// `Profile` that weakens what an acknowledgement means. Durability is a
+/// correctness contract with clients, not a performance dial, and a profile
+/// named for speed that quietly made writes lossy would be exactly the trap
+/// worth designing out. [`Durability::Buffered`] stays an explicit opt-in.
+///
+/// Compaction is likewise untouched. It trades ingest throughput against
+/// *search* latency, not write latency, and disabling it is a cliff (segment
+/// count and file descriptors grow without bound) rather than a tuning
+/// choice — so every profile leaves it at [`CompactionConfig::default`] and
+/// read-path tuning stays on its own flags.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Profile {
+    /// Maximize sustained ingest. Waits [`Profile::wal_commit_window`] before
+    /// each fsync so more batches share it, and seals segments less often.
+    /// Costs per-write latency, most visibly at low concurrency where there is
+    /// nothing to batch with and the wait buys nothing.
+    Throughput,
+    /// The defaults: no deliberate fsync delay, segments sealed every 10,000
+    /// spans. What [`Config::default`] gives, so an unset profile changes
+    /// nothing.
+    #[default]
+    Balanced,
+    /// Minimize per-write acknowledgement latency and its tail. No fsync
+    /// delay, and small segment seals so the stall one write occasionally pays
+    /// for the whole buffer stays short.
+    Latency,
+}
+
+impl Profile {
+    /// Parses the CLI name.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "throughput" => Some(Self::Throughput),
+            "balanced" => Some(Self::Balanced),
+            "latency" => Some(Self::Latency),
+            _ => None,
+        }
+    }
+
+    /// The CLI name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Throughput => "throughput",
+            Self::Balanced => "balanced",
+            Self::Latency => "latency",
+        }
+    }
+
+    /// Buffered spans this profile seals a segment at.
+    ///
+    /// A seal is a stall charged to whichever write crosses the threshold, so
+    /// this is a tail-latency dial — but NOT a monotonic one, and these values
+    /// are measured turning points rather than round numbers (see
+    /// `docs/configuration.md`).
+    ///
+    /// A seal costs a fixed amount (two fsyncs, create/rename, reopen-and-
+    /// parse) on top of its per-span cost, so shrinking the threshold pays
+    /// that fixed cost more often. Past the turn it buys nothing and costs
+    /// everything: measured open loop, the p99 minimum is at 5,000, and
+    /// 3,000 is already worse. At 2,000 and below the store cannot sustain
+    /// 60k spans/s at all. `Latency` therefore sits at the bottom of the
+    /// curve, not at the smallest value available.
+    pub fn flush_spans(self) -> usize {
+        match self {
+            Self::Throughput => 30_000,
+            Self::Balanced => 10_000,
+            Self::Latency => 5_000,
+        }
+    }
+
+    /// How long this profile delays an fsync to collect more batches into it.
+    ///
+    /// Every acknowledgement in the window is delayed by up to this long, so
+    /// it is only ever paid for by the amortization it buys. 500us measured
+    /// best at small and medium batches and still positive at batch=1000;
+    /// beyond about 1 ms the delay costs more than the amortization returns.
+    pub fn wal_commit_window(self) -> Option<std::time::Duration> {
+        match self {
+            Self::Throughput => Some(std::time::Duration::from_micros(500)),
+            Self::Balanced | Self::Latency => None,
+        }
+    }
+
+    /// This profile's defaults as a [`Config`]. Durability and compaction are
+    /// whatever [`Config::default`] says; a profile does not set them.
+    pub fn config(self) -> Config {
+        Config {
+            flush_spans: self.flush_spans(),
+            wal_commit_window: self.wal_commit_window(),
+            ..Config::default()
+        }
+    }
+}
+
 /// Storage configuration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
@@ -270,6 +381,17 @@ pub struct Config {
     /// Enabled by default: without it, filtered-search latency grows without
     /// bound as segments accumulate.
     pub compaction: Option<CompactionConfig>,
+    /// How long a thread about to fsync the log waits for more batches to
+    /// join it. Zero (the default) syncs immediately.
+    ///
+    /// Group commit already amortizes fsync across whatever batches happen to
+    /// be in flight. This buys MORE amortization by deliberately waiting, and
+    /// the cost is exactly what it sounds like: every acknowledgement in the
+    /// window is delayed by up to this long. It helps when batches arrive
+    /// steadily but concurrency is too low to fill a sync on its own, and it
+    /// hurts an idle store, which is why it is off unless asked for. It never
+    /// weakens the guarantee — the acknowledgement still follows the fsync.
+    pub wal_commit_window: Option<std::time::Duration>,
 }
 
 impl Default for Config {
@@ -280,6 +402,7 @@ impl Default for Config {
             payload_threshold: None,
             durability: Durability::Wal,
             compaction: Some(CompactionConfig::default()),
+            wal_commit_window: None,
         }
     }
 }
@@ -493,6 +616,20 @@ impl WriteBuffer {
         self.index.clear();
     }
 
+    /// Reinstates spans taken out of the buffer, rebuilding the position index.
+    ///
+    /// The index maps a primary key to a POSITION, so handing back a reordered
+    /// vector without rebuilding it would leave `upsert` overwriting the wrong
+    /// span. Used only on the failed-seal path, which sorts before it writes.
+    fn restore(&mut self, spans: Vec<Span>) {
+        self.spans = spans;
+        self.index.clear();
+        for (position, span) in self.spans.iter().enumerate() {
+            self.index
+                .insert((span.trace_id.clone(), span.span_id.clone()), position);
+        }
+    }
+
     fn retain(&mut self, keep: impl Fn(&Span) -> bool) {
         self.spans.retain(&keep);
         self.index.clear();
@@ -662,6 +799,7 @@ pub struct Store {
     /// Present unless durability is [`Durability::Buffered`]. Guards the gap
     /// between acknowledging a write and sealing it into a segment.
     wal: Option<wal::Wal>,
+    metrics: metrics::Metrics,
     _directory_lock: DirectoryLock,
 }
 
@@ -702,7 +840,7 @@ impl Store {
                 for span in wal::Wal::replay(&directory)? {
                     buffer.upsert(span);
                 }
-                Some(wal::Wal::open(&directory)?)
+                Some(wal::Wal::open(&directory, config.wal_commit_window)?)
             };
             let next_segment = segments
                 .iter()
@@ -720,6 +858,7 @@ impl Store {
                 recent_payloads: payload::TouchRegistry::default(),
                 next_segment: AtomicU64::new(next_segment),
                 wal,
+                metrics: metrics::Metrics::default(),
                 _directory_lock: directory_lock,
             })
         })();
@@ -771,15 +910,30 @@ impl Store {
     /// fsync per request. A crash before step 3 loses the batch, which is
     /// correct — nothing was acknowledged yet.
     fn admit(&self, spans: Vec<Span>) -> Result<()> {
+        // Encode the log frame BEFORE taking the writer lock. Serializing a
+        // batch is pure CPU proportional to its size, and doing it under the
+        // lock made every concurrent ingest wait for it — the lock was held
+        // for the serialization of every batch in the system, one at a time.
+        // Only the file write has to be inside the lock (below).
+        let frame = match &self.wal {
+            Some(_) => Some(self.metrics.wal_encode.time(|| wal::Wal::encode(&spans))?),
+            None => None,
+        };
+        let admitted = spans.len() as u64;
+
         let mut pending_commit = None;
         {
+            let waited = Instant::now();
             let mut writer = self.lock_writer()?;
-            if let Some(log) = &self.wal {
-                pending_commit = Some(log.append(&spans)?);
+            self.metrics.writer_lock_wait.record(elapsed_nanos(&waited));
+            if let (Some(log), Some(frame)) = (&self.wal, &frame) {
+                pending_commit = Some(self.metrics.wal_write.time(|| log.append(frame))?);
             }
-            for span in spans {
-                writer.upsert(span);
-            }
+            self.metrics.buffer_upsert.time(|| {
+                for span in spans {
+                    writer.upsert(span);
+                }
+            });
             if self.should_flush(writer.len()) {
                 let mut segments = self.lock_segments()?;
                 // A sealed segment supersedes the log, so this also discards
@@ -789,9 +943,16 @@ impl Store {
             }
         }
         if let (Some(log), Some(lsn)) = (&self.wal, pending_commit) {
-            log.commit(lsn)?;
+            log.commit(lsn, &self.metrics)?;
         }
+        self.metrics.spans_admitted.add(admitted);
+        self.metrics.batches_admitted.increment();
         Ok(())
+    }
+
+    /// Per-stage ingest instrumentation. See [`metrics::Metrics`].
+    pub fn metrics(&self) -> &metrics::Metrics {
+        &self.metrics
     }
 
     /// What an acknowledged ingest currently guarantees.
@@ -1462,10 +1623,22 @@ impl Store {
             return Ok(());
         }
 
-        let mut pending = writer.spans.clone();
+        let sealing = Instant::now();
+        // Take the spans rather than cloning them: a seal moved the whole
+        // buffer (10,000 spans by default) through a deep clone for no reason.
+        // They go back if the write fails, so a failed seal still leaves the
+        // buffer — and therefore the acknowledged data — intact.
+        let mut pending = std::mem::take(&mut writer.spans);
         sort_spans(&mut pending);
         let id = self.next_segment.fetch_add(1, Ordering::Relaxed);
-        let segment = self.write_segment(id, &pending)?;
+        let segment = match self.write_segment(id, &pending) {
+            Ok(segment) => segment,
+            Err(error) => {
+                writer.restore(pending);
+                return Err(error);
+            }
+        };
+        let sealed = pending.len() as u64;
         writer.clear();
         segments.push(segment);
         segments.sort_by(|left, right| left.path.cmp(&right.path));
@@ -1476,6 +1649,8 @@ impl Store {
         if let Some(log) = &self.wal {
             log.reset()?;
         }
+        self.metrics.segment_seal.record(elapsed_nanos(&sealing));
+        self.metrics.segment_seal_spans.add(sealed);
         Ok(())
     }
 
