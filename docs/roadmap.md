@@ -252,11 +252,13 @@ alongside results.
   filtered-search bar is the open risk — uncompacted, it measured p99 220 ms
   at a tenth of the gate's corpus, because the cost is per-segment rather
   than per-span. Size-tiered compaction bounds the segment count, and the
-  gate has now been measured at its real corpus size. **At 100M spans
+  gate has now been measured at its real corpus size, against a measured
+  uncompacted baseline rather than an extrapolation. **At 100M spans
   (55 GB): trace lookup p99 1.82 ms and RSS 2.0 GB both PASS; filtered
   search p99 72.9 ms FAILS the 50 ms bar** (p50 9.8 ms and p95 27.1 ms are
-  inside it). Compaction is worth roughly 25-30x at that size and is not
-  sufficient by itself. The next lever is the
+  inside it). Uncompacted the same query measures p99 1664.6 ms, so
+  compaction is worth 22.8x at the tail and is still not sufficient by
+  itself. The next lever is the
   `--compaction-max-segment-bytes` default, which floors segment count near
   corpus/cap (~220 segments at 55 GB with the 256 MiB default); raising it
   should lower filter latency proportionally but is unmeasured. Beyond that,

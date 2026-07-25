@@ -228,20 +228,23 @@ Measured on macOS/aarch64 (10 hardware threads) by the bundled end-to-end benchm
 
 Limited queries decode only the records they return, so **trace lookup** is effectively scale-independent — measured p50 0.85 ms, p99 4.65 ms over a 10M-span store.
 
-**Filtered search costs one index probe per segment**, so its latency tracks the number of segments rather than the size of the corpus — which is what [size-tiered compaction](#server-flags) exists to bound. It is on by default. Measured:
+**Filtered search costs one index probe per segment**, so its latency tracks the number of segments rather than the size of the corpus — which is what [size-tiered compaction](#server-flags) exists to bound. It is on by default. Both columns below come from the same benchmark harness at 100M spans (55 GB on disk), differing only in `--compaction-fanout`:
 
-| | 10M uncompacted | 10M default | **100M default** |
-|---|---:|---:|---:|
-| Attribute filter p50 | 14.8 ms | 2.4 ms | **9.8 ms** |
-| Attribute filter p95 | 33.4 ms | 4.1 ms | **27.1 ms** |
-| Attribute filter p99 | 220 ms | 14.1 ms | **72.9 ms** |
-| Trace lookup p99 | 4.65 ms | 2.28 ms | **1.82 ms** |
-| Peak RSS | 0.25 GB | — | **2.0 GB** |
-| Sustained ingest | 54,942/s | 33,304/s | **40,894/s** |
+| 100M spans | uncompacted | **default compaction** | |
+|---|---:|---:|---|
+| Attribute filter p50 | 155.5 ms | **9.8 ms** | 15.8x |
+| Attribute filter p95 | 747.3 ms | **27.1 ms** | 27.6x |
+| Attribute filter p99 | 1664.6 ms | **72.9 ms** | 22.8x |
+| Trace lookup p99 | 7.72 ms | **1.82 ms** | 4.2x |
+| Segments | ~10,100 | **~380** | ~27x fewer |
+| Peak RSS | 0.43 GB | 2.0 GB | compaction costs memory |
+| Sustained ingest | 59,025/s | 40,894/s | -31% |
 
-Read that honestly: at 100M spans (55 GB on disk) **trace lookup and memory are excellent, and filtered-search p99 is 72.9 ms — over the 50 ms target this project sets itself**, though p50 and p95 sit well inside it, and uncompacted the same query would be on the order of seconds.
+Read that honestly. Compaction is worth roughly **16-28x** on filtered search and 4x on trace lookup, and it pays for that with about **31% of ingest throughput and ~1.5 GB of resident memory** for its merge working set. But **filtered-search p99 is still 72.9 ms at 100M, over the 50 ms target this project sets itself** — p50 and p95 are comfortably inside it; only the tail is not.
 
-The remaining gap at that size is a **tuning default, not the algorithm**: `--compaction-max-segment-bytes` (256 MiB) puts a floor of roughly *corpus ÷ cap* on the segment count — about 220 segments at 55 GB. Raising it lowers that floor proportionally, at the cost of more memory and a longer lock hold per merge. Large deployments should raise it; that combination has not been measured yet, so it is a lever rather than a promise.
+The remaining gap is a **tuning default, not the algorithm**: `--compaction-max-segment-bytes` (256 MiB) floors the segment count near *corpus / cap* — about 220 segments at 55 GB. Raising it lowers that floor proportionally, at the cost of more merge memory and a longer lock hold. Large deployments should raise it; that combination is not yet measured, so it is a lever rather than a promise.
+
+One operational note for the uncompacted path: every segment holds an open file descriptor, so ~10,100 segments means ~10,100 fds. That is fine against a large limit but would exhaust a default 1024-fd shell, which is a second reason not to run large stores with compaction disabled.
 
 Full percentiles and methodology are in [BENCHMARKS.md](BENCHMARKS.md), which is rewritten by the benchmark itself (`cargo run --release --bin bench`) — run it on your hardware rather than trusting ours. Those published figures are the 1,000,000-span corpus; `TRAZA_BENCH_SPANS` runs other sizes without overwriting them.
 
