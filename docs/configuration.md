@@ -132,8 +132,8 @@ span shape, so a profile guessing at it would be guessing at your data.
 ### Which one to pick
 
 Pick **`balanced`** unless you have a measurement that says otherwise. It is
-the default because it is the best compromise we measured, not because it is
-the midpoint of a list.
+the long-standing default, unchanged by this feature, so an existing
+deployment that adds `--profile balanced` gets exactly what it had.
 
 Pick **`throughput`** when you are ingest-bound and your consumers do not care
 when any individual batch is acknowledged — bulk backfill, log-style firehose
