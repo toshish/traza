@@ -5,6 +5,59 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Ingest throughput: 108,881 -> 208,973 spans/s at 16 concurrent clients in
+`wal` mode, measured through one client against both builds. The roadmap's
+250k target is still 16% away, and the benchmark now says exactly why.
+
+### Added
+
+- **Persistent HTTP connections.** Every response used to carry
+  `Connection: close`, so a client paid a connect and teardown per batch.
+  Keep-alive is now the default for HTTP/1.1. Worth +11% at batch=20 and
+  nothing at batch=1000 — the honest number, not the hoped-for one.
+- **`GET /v1/metrics`** in Prometheus text format: per-stage ingest timings
+  (writer-lock wait, WAL encode/write/fsync, buffer upsert, segment seal,
+  decode), request latency, and connection counters. Stage percentiles are
+  power-of-two bucket bounds and are documented as approximate; they exist to
+  rank stages, not to be published as latencies.
+- **`--max-connections`** (default 1024), replacing `--workers`. Keep-alive
+  means a connection occupies its handler until the client is done, so a fixed
+  worker pool would serve N clients and leave the rest queued indefinitely.
+  Past the limit clients get `503` rather than silence.
+- **`--wal-commit-window-us`** (default off): holds an fsync open briefly so
+  more batches join it. A latency-for-amortization trade that does not touch
+  the guarantee — the fsync still precedes the acknowledgement it covers.
+- **`ingest-bench`**, a benchmark matrix over protocol, keep-alive,
+  concurrency and durability. Reports the median of N runs with its spread,
+  refuses to report a rate from a run that shed a connection or stored fewer
+  spans than it acknowledged, and restarts the server to re-verify every
+  non-`buffered` result. `TRAZA_BENCH_SERVER` points it at another build so
+  before/after runs share one client.
+
+### Changed
+
+- **`POST /v1/spans` decodes straight to `Vec<Span>`.** It used to parse to a
+  `serde_json::Value`, deep-clone the array out of it, then re-walk that DOM
+  once per span — three passes and three sets of allocations for one job.
+- **The WAL encodes a batch before taking the writer lock.** Serializing under
+  the lock made every concurrent ingest wait on one thread's JSON encoding.
+  Only the file write remains inside it.
+- **Sealing a segment no longer clones the write buffer**, and puts the spans
+  back if the write fails.
+- Request framing is stricter now that connections persist: transfer-encoded
+  bodies and duplicate `Content-Length` headers are refused rather than
+  resolved, because either ambiguity lets one request be split in two with the
+  remainder attributed to the client's next request.
+
+### Fixed
+
+- A connection refused at the limit now reliably receives its `503`. Closing a
+  socket while the client's request bytes sat unread made the kernel send RST,
+  and the RST beat the response — backpressure surfaced as "connection reset
+  by peer".
+
 ## [0.16.0] - 2026-07-24
 
 Search that scales with the store: size-tiered compaction bounds the segment
