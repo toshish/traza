@@ -25,6 +25,21 @@
 //! - `POST /v1/flush` forces buffered spans into a durable segment.
 //! - `POST /v1/traces` accepts OTLP/HTTP JSON or binary protobuf.
 //! - `GET /v1/export` streams chunked NDJSON with completion/count trailers.
+//!   This is the one route that always closes its connection: it is chunked
+//!   with trailers and has no declared length.
+//! - `GET /v1/metrics` reports per-stage ingest timings and request counters
+//!   in Prometheus text format.
+//!
+//! **Connections persist.** HTTP/1.1 keep-alive is the default (HTTP/1.0 needs
+//! to ask), which makes request framing security-relevant: anything ambiguous
+//! about where a body ends would let one request be split into two, the second
+//! attributed to the client's next request. So transfer-encoded bodies and
+//! duplicate `Content-Length` headers are refused rather than resolved, and
+//! any response sent without reading the request's body closes the connection.
+//! Concurrency is bounded by CONNECTIONS, not by a queue: a persistent
+//! connection occupies its handler until the client is done with it, so
+//! queueing past the limit would leave clients waiting indefinitely instead of
+//! being told the server is full.
 //! - `GET /` and `GET /dashboard` serve the built dashboard. It is read from
 //!   disk, never compiled in, so building the server needs no Node toolchain
 //!   and a rebuilt UI is picked up without restarting. With no `--ui-dir` the
@@ -38,13 +53,13 @@
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use traza::{CompactionConfig, Config, Durability, Span, SpanCursor, SpanFilter, Store};
+use traza::{CompactionConfig, Config, Durability, Profile, Span, SpanCursor, SpanFilter, Store};
 
 const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 // Headers get a far tighter budget than bodies: without one, a 64 MiB
@@ -63,7 +78,134 @@ fn socket_timeout() -> Duration {
         .map(Duration::from_millis)
         .unwrap_or(SOCKET_TIMEOUT)
 }
-const HTTP_QUEUE_DEPTH: usize = 256;
+// A persistent connection is recycled rather than trusted indefinitely: this
+// bounds how long one client can hold a thread without reconnecting, and keeps
+// any per-connection state from growing without limit.
+const MAX_REQUESTS_PER_CONNECTION: usize = 100_000;
+// Concurrent connections. Keep-alive means a connection occupies its handler
+// for as long as the client keeps it open, so this — not a request queue — is
+// what bounds server concurrency. Past it, clients are refused immediately
+// with 503 instead of being silently queued behind long-lived connections.
+const DEFAULT_MAX_CONNECTIONS: usize = 1_024;
+// Concurrent in-flight 503 refusals. See the refusal path in `run`.
+const MAX_REFUSAL_THREADS: usize = 64;
+// How long a refusal will spend making itself deliverable before giving up.
+const REFUSAL_DEADLINE: Duration = Duration::from_millis(250);
+
+/// Tells a client the server is at its connection limit, and makes sure it can
+/// actually read that.
+///
+/// A plain write-then-close loses the response whenever the client's request
+/// is still sitting unread in the socket: `close(2)` with unread input sends
+/// RST, and the RST beats the buffered 503 to the client. Draining first turns
+/// that into an ordinary close.
+fn refuse_connection(mut stream: TcpStream) {
+    let body = b"{\"error\":\"server at connection limit\"}";
+    let _ = stream.set_write_timeout(Some(REFUSAL_DEADLINE));
+    let _ = stream.set_read_timeout(Some(REFUSAL_DEADLINE));
+    let head = format!(
+        "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    if stream.write_all(head.as_bytes()).is_err() || stream.write_all(body).is_err() {
+        return;
+    }
+    let _ = stream.flush();
+    // FIN now, so the client sees the end of the response even while we are
+    // still reading what it had already sent.
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let deadline = std::time::Instant::now() + REFUSAL_DEADLINE;
+    let mut sink = [0_u8; 4096];
+    while std::time::Instant::now() < deadline {
+        match stream.read(&mut sink) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => continue,
+        }
+    }
+}
+
+/// Server-side request instrumentation, alongside the engine's own.
+#[derive(Debug, Default)]
+struct ServerMetrics {
+    /// Requests served to completion.
+    requests: traza::metrics::Counter,
+    /// End-to-end handling time, from parsed head to written response.
+    request_latency: traza::metrics::Latency,
+    /// Requests refused by the auth gate.
+    rejected: traza::metrics::Counter,
+    /// Turning a request body into spans: JSON decode, or protobuf decode plus
+    /// the OTLP mapping. Separated from the engine stages so "the wire format
+    /// is the bottleneck" is a measurement rather than an assumption.
+    decode: traza::metrics::Latency,
+    /// Spans decoded, so decode cost per span is derivable.
+    decoded_spans: traza::metrics::Counter,
+    /// Connections refused because the server was at its connection limit.
+    /// The backpressure signal: nonzero means clients were shed, and any
+    /// throughput number measured during that window is suspect.
+    connections_refused: traza::metrics::Counter,
+    /// Connections accepted.
+    connections_accepted: traza::metrics::Counter,
+    /// Connections currently being served.
+    connections_live: AtomicUsize,
+}
+
+impl ServerMetrics {
+    fn render_prometheus(&self, into: &mut String) {
+        use std::fmt::Write as _;
+        let _ = writeln!(into, "# TYPE traza_http_requests_total counter");
+        let _ = writeln!(into, "traza_http_requests_total {}", self.requests.get());
+        let _ = writeln!(into, "# TYPE traza_http_rejected_total counter");
+        let _ = writeln!(into, "traza_http_rejected_total {}", self.rejected.get());
+        let _ = writeln!(into, "# TYPE traza_http_connections_refused_total counter");
+        let _ = writeln!(
+            into,
+            "traza_http_connections_refused_total {}",
+            self.connections_refused.get()
+        );
+        let _ = writeln!(into, "# TYPE traza_http_connections_accepted_total counter");
+        let _ = writeln!(
+            into,
+            "traza_http_connections_accepted_total {}",
+            self.connections_accepted.get()
+        );
+        let _ = writeln!(into, "# TYPE traza_http_connections_live gauge");
+        let _ = writeln!(
+            into,
+            "traza_http_connections_live {}",
+            self.connections_live.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(into, "# TYPE traza_http_decoded_spans_total counter");
+        let _ = writeln!(
+            into,
+            "traza_http_decoded_spans_total {}",
+            self.decoded_spans.get()
+        );
+        let _ = writeln!(into, "# TYPE traza_http_decode_ns_count counter");
+        let _ = writeln!(into, "traza_http_decode_ns_count {}", self.decode.count());
+        let _ = writeln!(into, "# TYPE traza_http_decode_ns_sum counter");
+        let _ = writeln!(into, "traza_http_decode_ns_sum {}", self.decode.total_ns());
+        let _ = writeln!(into, "# TYPE traza_http_decode_ns_max gauge");
+        let _ = writeln!(into, "traza_http_decode_ns_max {}", self.decode.max_ns());
+        let _ = writeln!(into, "# TYPE traza_http_request_ns_count counter");
+        let _ = writeln!(
+            into,
+            "traza_http_request_ns_count {}",
+            self.request_latency.count()
+        );
+        let _ = writeln!(into, "# TYPE traza_http_request_ns_sum counter");
+        let _ = writeln!(
+            into,
+            "traza_http_request_ns_sum {}",
+            self.request_latency.total_ns()
+        );
+        let _ = writeln!(into, "# TYPE traza_http_request_ns_max gauge");
+        let _ = writeln!(
+            into,
+            "traza_http_request_ns_max {}",
+            self.request_latency.max_ns()
+        );
+    }
+}
 
 fn main() {
     if let Err(error) = run() {
@@ -72,111 +214,192 @@ fn main() {
     }
 }
 
-fn run() -> Result<(), Box<dyn std::error::Error>> {
+const USAGE: &str = "Usage: traza-server --data-dir DIR --port PORT [--host ADDR] \
+[--profile throughput|balanced|latency (default balanced; sets flush-spans and wal-commit-window; \
+NEVER changes durability)] [--ttl-seconds N] [--flush-spans N] \
+[--max-connections N (default 1024)] [--payload-threshold-bytes N (0 disables)] \
+[--durability buffered|wal|flushed (default wal)] \
+[--wal-commit-window-us N (delay each fsync so more acks share it; 0 = off)] \
+[--compaction-fanout N (0 disables; default 4)] [--compaction-max-segment-bytes N] \
+[--ui-dir DIR (built dashboard; default: TRAZA_UI_DIR, beside the binary, then ./ui/dist)] \
+[--allow-unauthenticated-non-loopback]";
+
+/// Everything the command line decides, with the profile already resolved
+/// against the explicit flags.
+struct Options {
+    data_dir: PathBuf,
+    host: String,
+    port: u16,
+    max_connections: usize,
+    allow_unauthenticated_non_loopback: bool,
+    ui_dir: Option<PathBuf>,
+    profile: Profile,
+    compaction_enabled: bool,
+    config: Config,
+}
+
+/// Parses the command line. `Ok(None)` means `--help` was handled and there is
+/// nothing to run.
+///
+/// The profile-owned knobs are collected as `Option`s during the scan and
+/// resolved once, afterwards, against the profile. That is what makes
+/// precedence independent of argument order: an explicit `--flush-spans` is
+/// still `Some` whether it came before or after `--profile`, so it still wins.
+/// Resolving as each argument is seen would make `--profile` clobber a flag
+/// that preceded it.
+fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
     let mut data_dir = PathBuf::from("./data");
     let mut host = String::from("127.0.0.1");
     let mut port = 8080_u16;
     let mut ttl_seconds = None;
-    let mut flush_spans = 10_000_usize;
     let mut payload_threshold_bytes = 256 * 1024_usize;
-    let mut workers = thread::available_parallelism()
-        .map_or(4, usize::from)
-        .max(4);
+    let mut max_connections = DEFAULT_MAX_CONNECTIONS;
     let mut allow_unauthenticated_non_loopback = false;
     let mut ui_dir: Option<PathBuf> = None;
     let mut durability = Durability::default();
     let mut compaction = CompactionConfig::default();
     let mut compaction_enabled = true;
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut profile = Profile::default();
+    // Profile-owned: `None` means "not given on the command line", which is
+    // exactly the question the resolve below asks.
+    let mut flush_spans: Option<usize> = None;
+    let mut wal_commit_window_us: Option<u64> = None;
+
+    let value = |i: usize, name: &str| -> Result<&String, String> {
+        args.get(i)
+            .ok_or_else(|| format!("{name} requires a value"))
+    };
+    let number = |i: usize, name: &str| -> Result<u64, String> {
+        value(i, name)?
+            .parse::<u64>()
+            .map_err(|_| format!("{name} must be a non-negative number"))
+    };
+
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--data-dir" => {
                 i += 1;
-                data_dir = PathBuf::from(args.get(i).ok_or("--data-dir requires a value")?);
+                data_dir = PathBuf::from(value(i, "--data-dir")?);
             }
             "--host" => {
                 i += 1;
-                host = args.get(i).ok_or("--host requires a value")?.clone();
+                host = value(i, "--host")?.clone();
             }
             "--port" => {
                 i += 1;
-                port = args.get(i).ok_or("--port requires a value")?.parse()?;
+                port = value(i, "--port")?
+                    .parse()
+                    .map_err(|_| "--port must be a port number".to_owned())?;
             }
             "--ttl-seconds" => {
                 i += 1;
-                ttl_seconds = Some(
-                    args.get(i)
-                        .ok_or("--ttl-seconds requires a value")?
-                        .parse()?,
-                );
+                ttl_seconds = Some(number(i, "--ttl-seconds")?);
             }
             "--payload-threshold-bytes" => {
                 i += 1;
-                payload_threshold_bytes = args
-                    .get(i)
-                    .ok_or("--payload-threshold-bytes requires a value")?
-                    .parse::<usize>()?;
+                payload_threshold_bytes = number(i, "--payload-threshold-bytes")? as usize;
             }
             "--flush-spans" => {
                 i += 1;
-                flush_spans = args
-                    .get(i)
-                    .ok_or("--flush-spans requires a value")?
-                    .parse::<usize>()?
-                    .max(1);
+                flush_spans = Some((number(i, "--flush-spans")? as usize).max(1));
             }
-            "--workers" => {
+            "--max-connections" => {
                 i += 1;
-                workers = args
-                    .get(i)
-                    .ok_or("--workers requires a value")?
-                    .parse::<usize>()?
-                    .max(1);
+                max_connections = (number(i, "--max-connections")? as usize).max(1);
             }
             "--compaction-fanout" => {
                 i += 1;
-                let value: usize = args
-                    .get(i)
-                    .ok_or("--compaction-fanout requires a value")?
-                    .parse()?;
+                let fanout = number(i, "--compaction-fanout")? as usize;
                 // 0 or 1 cannot merge anything; treat as "off" rather than
                 // silently looping.
-                compaction_enabled = value >= 2;
-                compaction.fanout = value.max(2);
+                compaction_enabled = fanout >= 2;
+                compaction.fanout = fanout.max(2);
             }
             "--compaction-max-segment-bytes" => {
                 i += 1;
-                compaction.max_segment_bytes = args
-                    .get(i)
-                    .ok_or("--compaction-max-segment-bytes requires a value")?
-                    .parse()?;
+                compaction.max_segment_bytes = number(i, "--compaction-max-segment-bytes")?;
+            }
+            "--wal-commit-window-us" => {
+                i += 1;
+                wal_commit_window_us = Some(number(i, "--wal-commit-window-us")?);
             }
             "--durability" => {
                 i += 1;
-                let name = args.get(i).ok_or("--durability requires a value")?;
-                durability =
-                    Durability::parse(name).ok_or("--durability must be buffered|wal|flushed")?;
+                let name = value(i, "--durability")?;
+                durability = Durability::parse(name)
+                    .ok_or_else(|| "--durability must be buffered|wal|flushed".to_owned())?;
+            }
+            "--profile" => {
+                i += 1;
+                let name = value(i, "--profile")?;
+                profile = Profile::parse(name)
+                    .ok_or_else(|| "--profile must be throughput|balanced|latency".to_owned())?;
             }
             "--ui-dir" => {
                 i += 1;
-                ui_dir = Some(PathBuf::from(
-                    args.get(i).ok_or("--ui-dir requires a value")?,
-                ));
+                ui_dir = Some(PathBuf::from(value(i, "--ui-dir")?));
             }
             "--allow-unauthenticated-non-loopback" => {
                 allow_unauthenticated_non_loopback = true;
             }
             "--help" | "-h" => {
-                println!(
-                    "Usage: traza-server --data-dir DIR --port PORT [--host ADDR] [--ttl-seconds N] [--flush-spans N] [--workers N] [--payload-threshold-bytes N (0 disables)] [--durability buffered|wal|flushed (default wal)] [--compaction-fanout N (0 disables; default 4)] [--compaction-max-segment-bytes N] [--ui-dir DIR (built dashboard; default: TRAZA_UI_DIR, beside the binary, then ./ui/dist)] [--allow-unauthenticated-non-loopback]"
-                );
-                return Ok(());
+                println!("{USAGE}");
+                return Ok(None);
             }
-            other => return Err(format!("unknown argument: {other}").into()),
+            other => return Err(format!("unknown argument: {other}")),
         }
         i += 1;
     }
+
+    Ok(Some(Options {
+        data_dir,
+        host,
+        port,
+        max_connections,
+        allow_unauthenticated_non_loopback,
+        ui_dir,
+        profile,
+        compaction_enabled,
+        config: Config {
+            // Explicit flag beats profile beats built-in default, in that
+            // order and regardless of where each appeared.
+            flush_spans: flush_spans.unwrap_or_else(|| profile.flush_spans()),
+            wal_commit_window: match wal_commit_window_us {
+                // An explicit 0 is a real answer ("no window"), not an absent
+                // one, so it overrides a profile that wanted one.
+                Some(micros) => (micros > 0).then(|| Duration::from_micros(micros)),
+                None => profile.wal_commit_window(),
+            },
+            ttl_seconds,
+            // 0 disables offloading.
+            payload_threshold: (payload_threshold_bytes > 0).then_some(payload_threshold_bytes),
+            // Never profile-derived: what an acknowledgement guarantees is a
+            // contract with clients, not a performance setting.
+            durability,
+            compaction: compaction_enabled.then_some(compaction),
+        },
+    }))
+}
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let Some(options) = parse_args(&args)? else {
+        return Ok(());
+    };
+    let Options {
+        data_dir,
+        host,
+        port,
+        max_connections,
+        allow_unauthenticated_non_loopback,
+        ui_dir,
+        profile,
+        compaction_enabled,
+        config,
+    } = options;
+    let durability = config.durability;
+    let ttl_seconds = config.ttl_seconds;
 
     // Bearer auth from TRAZA_TOKENS; unset is allowed on loopback by default.
     // A set-but-invalid value refuses startup — running open when the operator
@@ -190,17 +413,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
     let auth = Arc::new(auth_config);
-    let engine = Arc::new(Store::open(
-        &data_dir,
-        Config {
-            flush_spans,
-            ttl_seconds,
-            // 0 disables offloading.
-            payload_threshold: (payload_threshold_bytes > 0).then_some(payload_threshold_bytes),
-            durability,
-            compaction: compaction_enabled.then_some(compaction),
-        },
-    )?);
+    let metrics = Arc::new(ServerMetrics::default());
+    // In-flight 503 refusals, bounded so a connection flood cannot spawn
+    // without limit.
+    let refusals = Arc::new(AtomicUsize::new(0));
+    let engine = Arc::new(Store::open(&data_dir, config.clone())?);
 
     // TTL enforcement and segment compaction live in the engine; the server
     // only schedules them. Compaction ticks far more often than TTL: it is
@@ -248,6 +465,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "traza-server: durability=flushed — acknowledged writes are sealed into a segment"
         ),
     }
+    // The resolved values, not the profile name: a profile whose knobs were
+    // partly overridden by explicit flags is not the profile, and an operator
+    // reading the log should see what is actually in force.
+    eprintln!(
+        "traza-server: profile={} — flush-spans={}, wal-commit-window={}",
+        profile.as_str(),
+        config.flush_spans,
+        match config.wal_commit_window {
+            Some(window) => format!("{}us", window.as_micros()),
+            None => "off".to_owned(),
+        }
+    );
 
     // The dashboard is served from disk (ui/ `npm run build` output), never
     // compiled in. A missing build is not fatal: the API runs, and the UI
@@ -279,30 +508,77 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let (http_tx, http_rx) = mpsc::sync_channel::<TcpStream>(HTTP_QUEUE_DEPTH);
-    let http_rx = Arc::new(Mutex::new(http_rx));
-    for number in 0..workers {
-        let rx = Arc::clone(&http_rx);
-        let worker_engine = Arc::clone(&engine);
-        let worker_auth = Arc::clone(&auth);
-        let worker_ui = Arc::clone(&ui);
-        thread::Builder::new()
-            .name(format!("http-{number}"))
-            .spawn(move || loop {
-                let stream = match rx.lock().expect("HTTP receiver poisoned").recv() {
-                    Ok(stream) => stream,
-                    Err(_) => break,
-                };
-                let _ = handle_connection(stream, &worker_engine, &worker_auth, &worker_ui);
-            })?;
-    }
-
+    // One thread per connection, hard-bounded.
+    //
+    // This replaced a fixed worker pool fed by a queue. With keep-alive a
+    // connection occupies its handler until the client closes it, so a pool of
+    // N threads serves at most N clients and the rest sit in the queue getting
+    // nothing — indistinguishable from a hang. Bounding CONNECTIONS instead
+    // makes the limit explicit and lets the server say so (503) rather than
+    // stall. Threads are cheap here because a keep-alive connection amortizes
+    // its spawn over every request it carries.
     for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                let _ = http_tx.send(stream);
+        let stream = match stream {
+            Ok(stream) => stream,
+            Err(error) => {
+                eprintln!("accept failed: {error}");
+                continue;
             }
-            Err(error) => eprintln!("accept failed: {error}"),
+        };
+        let live = metrics.connections_live.load(Ordering::Relaxed);
+        if live >= max_connections {
+            metrics.connections_refused.increment();
+            // Refuse loudly. Accepting and queueing would hide the overload as
+            // latency, which is what makes an overloaded server undiagnosable.
+            //
+            // The refusal runs on its own thread because delivering it takes
+            // time: closing a socket while the client's request bytes sit
+            // unread in the receive queue makes the kernel send RST, which
+            // discards the 503 the client was supposed to read. So the body
+            // has to be written, the write side shut down, and the inbound
+            // bytes drained — none of which may block the accept loop.
+            // Refusal threads are themselves bounded; past that, dropping the
+            // connection outright is the correct degradation under a flood.
+            if refusals.load(Ordering::Relaxed) < MAX_REFUSAL_THREADS {
+                refusals.fetch_add(1, Ordering::Relaxed);
+                let counter = Arc::clone(&refusals);
+                let spawned = thread::Builder::new()
+                    .name("traza-refuse".into())
+                    .spawn(move || {
+                        refuse_connection(stream);
+                        counter.fetch_sub(1, Ordering::Relaxed);
+                    });
+                if spawned.is_err() {
+                    refusals.fetch_sub(1, Ordering::Relaxed);
+                }
+            }
+            continue;
+        }
+        metrics.connections_live.fetch_add(1, Ordering::Relaxed);
+        metrics.connections_accepted.increment();
+        let connection_engine = Arc::clone(&engine);
+        let connection_auth = Arc::clone(&auth);
+        let connection_ui = Arc::clone(&ui);
+        let connection_metrics = Arc::clone(&metrics);
+        let spawned = thread::Builder::new()
+            .name("traza-http".into())
+            .spawn(move || {
+                let _ = handle_connection(
+                    stream,
+                    &connection_engine,
+                    &connection_auth,
+                    &connection_ui,
+                    &connection_metrics,
+                );
+                connection_metrics
+                    .connections_live
+                    .fetch_sub(1, Ordering::Relaxed);
+            });
+        if spawned.is_err() {
+            // Out of threads: undo the reservation so the count stays honest.
+            metrics.connections_live.fetch_sub(1, Ordering::Relaxed);
+            metrics.connections_refused.increment();
+            eprintln!("failed to spawn a connection handler");
         }
     }
     Ok(())
@@ -315,202 +591,275 @@ fn is_loopback_bind(host: &str) -> bool {
             .is_ok_and(|address| address.is_loopback())
 }
 
+/// Serves requests on one connection until the client or the server ends it.
+///
+/// Each iteration decides, before it answers, whether the connection can
+/// survive the response — the `Connection:` header the client sees and what
+/// this loop actually does must agree, or the client's framing breaks.
 fn handle_connection(
-    mut stream: TcpStream,
+    stream: TcpStream,
     engine: &Store,
     auth: &Option<traza::auth::AuthConfig>,
     ui: &traza::ui::UiRoot,
+    metrics: &ServerMetrics,
 ) -> io::Result<()> {
-    // A silent or dribbling peer must not park this worker thread forever.
+    // A silent or dribbling peer must not park this thread forever.
     let timeout = socket_timeout();
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
-    let head = match read_head(&mut stream) {
-        Ok(head) => head,
-        Err(error) => return respond(&mut stream, 400, json!({"error": error.to_string()})),
-    };
-    // The dashboard SHELL is served before the auth gate: the page must load
-    // in a browser without credentials, while every /v1 call it makes below
-    // stays gated (the page attaches the bearer token itself). Static assets
-    // carry no stored data, so this leaks nothing.
-    if head.method == "GET" {
-        let path = percent_decode(
-            head.target
-                .split_once('?')
-                .map_or(head.target.as_str(), |(path, _)| path),
-        );
-        if let Some(file) = ui.resolve(&path) {
-            return respond_file(&mut stream, &file);
-        }
-        if matches!(path.as_str(), "/" | "/dashboard" | "/dashboard/") {
-            return respond(
-                &mut stream,
-                404,
-                json!({
-                    "error": "no dashboard build found",
-                    "next": format!(
-                        "build it with: cd ui && npm ci && npm run build (serving {})",
-                        ui.directory().display()
-                    ),
-                }),
+    // Ingest is many small writes; without this each response pays a round
+    // trip for the client's ACK before the next one goes out.
+    let _ = stream.set_nodelay(true);
+    let mut connection = Connection::new(stream);
+
+    for _ in 0..MAX_REQUESTS_PER_CONNECTION {
+        let head = match connection.read_head() {
+            Ok(Some(head)) => head,
+            // A clean close at a request boundary is how keep-alive ends.
+            Ok(None) => return Ok(()),
+            Err(error) => {
+                // The head did not parse, so where the body ends is unknown
+                // and nothing further on this socket can be trusted.
+                let mut responder = connection.responder(false);
+                return responder.json(400, json!({"error": error.to_string()}));
+            }
+        };
+        let started = std::time::Instant::now();
+        // A request answered WITHOUT reading its body leaves those bytes in
+        // the socket, where they would be read as the next request. Any such
+        // path must close.
+        let body_is_unread = head.content_length > 0;
+        let keep_alive = head.wants_keep_alive();
+
+        // The dashboard SHELL is served before the auth gate: the page must
+        // load in a browser without credentials, while every /v1 call it makes
+        // below stays gated (the page attaches the bearer token itself).
+        // Static assets carry no stored data, so this leaks nothing.
+        if head.method == "GET" {
+            let path = percent_decode(
+                head.target
+                    .split_once('?')
+                    .map_or(head.target.as_str(), |(path, _)| path),
             );
+            if let Some(file) = ui.resolve(&path) {
+                let mut responder = connection.responder(keep_alive && !body_is_unread);
+                responder.file(&file)?;
+                if responder.keep_alive {
+                    continue;
+                }
+                return Ok(());
+            }
+            if matches!(path.as_str(), "/" | "/dashboard" | "/dashboard/") {
+                let mut responder = connection.responder(keep_alive && !body_is_unread);
+                responder.json(
+                    404,
+                    json!({
+                        "error": "no dashboard build found",
+                        "next": format!(
+                            "build it with: cd ui && npm ci && npm run build (serving {})",
+                            ui.directory().display()
+                        ),
+                    }),
+                )?;
+                if responder.keep_alive {
+                    continue;
+                }
+                return Ok(());
+            }
         }
-    }
-    // Auth verdicts need only the head: rejecting BEFORE the body read means
-    // an unauthenticated client cannot make this server buffer 64 MiB.
-    if let Some(config) = auth {
-        if let Err(failure) = config.authorize(head.authorization.as_deref(), &head.method) {
-            let challenge = failure
-                .www_authenticate()
-                .map(|value| format!("WWW-Authenticate: {value}\r\n"))
-                .unwrap_or_default();
-            let body = failure.body();
-            let reason = if failure.status() == 401 {
-                "Unauthorized"
-            } else {
-                "Forbidden"
-            };
-            write!(
-                stream,
-                "HTTP/1.1 {} {reason}\r\n{challenge}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                failure.status(),
-                body.len(),
-            )?;
+        // Auth verdicts need only the head: rejecting BEFORE the body read
+        // means an unauthenticated client cannot make this server buffer
+        // 64 MiB. The connection then closes, precisely because that body was
+        // never read.
+        if let Some(config) = auth {
+            if let Err(failure) = config.authorize(head.authorization.as_deref(), &head.method) {
+                metrics.rejected.increment();
+                let challenge = failure
+                    .www_authenticate()
+                    .map(|value| format!("WWW-Authenticate: {value}\r\n"))
+                    .unwrap_or_default();
+                let body = failure.body();
+                let reason = if failure.status() == 401 {
+                    "Unauthorized"
+                } else {
+                    "Forbidden"
+                };
+                let mut responder = connection.responder(false);
+                let head = format!(
+                    "HTTP/1.1 {} {reason}\r\n{challenge}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    failure.status(),
+                    body.len(),
+                );
+                return responder.raw(&head, body.as_bytes());
+            }
+        }
+        let body = match connection.read_body(&head) {
+            Ok(body) => body,
+            Err(error) => {
+                let mut responder = connection.responder(false);
+                return responder.json(400, json!({"error": error.to_string()}));
+            }
+        };
+        let request = Request {
+            method: head.method,
+            target: head.target,
+            content_type: head.content_type,
+            body,
+        };
+        let mut responder = connection.responder(keep_alive);
+        let result = serve_request(&mut responder, request, engine, metrics);
+        let persist = responder.keep_alive;
+        result?;
+        metrics
+            .request_latency
+            .record(started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
+        metrics.requests.increment();
+        if !persist {
             return Ok(());
         }
     }
-    let request = match read_body(&mut stream, head) {
-        Ok(request) => request,
-        Err(error) => return respond(&mut stream, 400, json!({"error": error.to_string()})),
-    };
+    Ok(())
+}
+
+/// Decodes an ingest body straight into spans.
+///
+/// Deliberately NOT via `serde_json::Value`: parsing to a DOM, cloning the
+/// array out of it, and then re-walking that DOM per span made three passes
+/// and three sets of allocations out of what serde can do in one. On the
+/// ingest hot path that was the single largest server-side cost.
+///
+/// The shape is either a bare array or `{"spans": [...]}`, distinguished by
+/// the first non-whitespace byte rather than by trying one and falling back —
+/// a failed attempt would have to re-parse from the start.
+fn decode_spans(body: &[u8]) -> Result<Vec<Span>, String> {
+    #[derive(serde::Deserialize)]
+    struct Envelope {
+        spans: Vec<Span>,
+    }
+    match body.iter().find(|byte| !byte.is_ascii_whitespace()) {
+        Some(b'[') => serde_json::from_slice::<Vec<Span>>(body).map_err(|error| error.to_string()),
+        Some(b'{') => serde_json::from_slice::<Envelope>(body)
+            .map(|envelope| envelope.spans)
+            .map_err(|error| error.to_string()),
+        _ => Err("body must be an array or {spans: [...]}".to_owned()),
+    }
+}
+
+fn serve_request(
+    responder: &mut Responder<'_>,
+    request: Request,
+    engine: &Store,
+    metrics: &ServerMetrics,
+) -> io::Result<()> {
     let (path, query) = request
         .target
         .split_once('?')
         .unwrap_or((&request.target, ""));
     match (request.method.as_str(), path) {
         ("POST", "/v1/spans") => {
-            let value: Value = match serde_json::from_slice(&request.body) {
-                Ok(value) => value,
-                Err(error) => {
-                    return respond(&mut stream, 400, json!({"error": error.to_string()}));
+            let spans = match metrics.decode.time(|| decode_spans(&request.body)) {
+                Ok(spans) => spans,
+                Err(error) => return responder.json(400, json!({"error": error})),
+            };
+            metrics.decoded_spans.add(spans.len() as u64);
+            // Both halves of the (trace_id, span_id) primary key must be
+            // non-empty: an empty span_id would make every such span in a
+            // trace one colliding key, silently upserted over each other while
+            // the response counts them all as accepted.
+            for (index, span) in spans.iter().enumerate() {
+                if span.trace_id.is_empty() {
+                    return responder.json(
+                        400,
+                        json!({"error": format!("span {index}: trace_id is empty")}),
+                    );
                 }
-            };
-            let raw_spans = if let Some(array) = value.as_array() {
-                array.clone()
-            } else if let Some(array) = value.get("spans").and_then(Value::as_array) {
-                array.clone()
-            } else {
-                return respond(
-                    &mut stream,
-                    400,
-                    json!({"error": "body must be an array or {spans: [...]}"}),
-                );
-            };
-            let mut spans = Vec::with_capacity(raw_spans.len());
-            for (index, raw) in raw_spans.into_iter().enumerate() {
-                match serde_json::from_value::<Span>(raw) {
-                    Ok(span) => {
-                        // Both halves of the (trace_id, span_id) primary key
-                        // must be non-empty: an empty span_id would make every
-                        // such span in a trace one colliding key, silently
-                        // upserted over each other while the response counts
-                        // them all as accepted.
-                        if span.trace_id.is_empty() {
-                            return respond(
-                                &mut stream,
-                                400,
-                                json!({"error": format!("span {index}: trace_id is empty")}),
-                            );
-                        }
-                        if span.span_id.is_empty() {
-                            return respond(
-                                &mut stream,
-                                400,
-                                json!({"error": format!("span {index}: span_id is empty")}),
-                            );
-                        }
-                        spans.push(span);
-                    }
-                    Err(error) => {
-                        return respond(
-                            &mut stream,
-                            400,
-                            json!({"error": format!("span {index}: {error}")}),
-                        );
-                    }
+                if span.span_id.is_empty() {
+                    return responder.json(
+                        400,
+                        json!({"error": format!("span {index}: span_id is empty")}),
+                    );
                 }
             }
             let accepted = spans.len();
             match engine.ingest_batch(spans) {
-                Ok(()) => respond(
-                    &mut stream,
+                Ok(()) => responder.json(
                     200,
                     // The client should never have to guess what a 200 promises.
                     json!({"accepted": accepted, "durability": engine.durability().as_str()}),
                 ),
-                Err(error) => respond(&mut stream, 503, json!({"error": error.to_string()})),
+                Err(error) => responder.json(503, json!({"error": error.to_string()})),
             }
         }
         ("POST", "/v1/traces") => {
             // OTLP/HTTP: an ExportTraceServiceRequest, binary protobuf or
-            // JSON by Content-Type. The protobuf decoder lowers to the JSON
-            // shape, so both encodings share one mapping (docs: README).
+            // JSON by Content-Type. Each encoding decodes straight to spans;
+            // the mapping rules they must agree on are shared rather than
+            // duplicated (docs: README, src/otlp.rs).
             let is_protobuf = request.content_type.starts_with("application/x-protobuf");
-            let value: Value = if is_protobuf {
-                match traza::otlp_pb::traces_request_to_json(&request.body) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        return respond(&mut stream, 400, json!({"error": error.to_string()}));
-                    }
+            // Timed as one stage: this covers the wire decode AND the
+            // OTLP-to-Span mapping, which is the whole cost of accepting a
+            // batch on this route.
+            let decoded = metrics.decode.time(|| {
+                if is_protobuf {
+                    traza::otlp_pb::spans_from_protobuf(&request.body)
+                        .map_err(|error| error.to_string())
+                } else {
+                    traza::otlp::spans_from_json(&request.body).map_err(|error| error.to_string())
                 }
-            } else {
-                match serde_json::from_slice(&request.body) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        return respond(&mut stream, 400, json!({"error": error.to_string()}));
-                    }
-                }
-            };
-            let spans = match traza::otlp::spans_from_request(&value) {
+            });
+            let spans = match decoded {
                 Ok(spans) => spans,
                 Err(error) => {
-                    return respond(&mut stream, 400, json!({"error": error.to_string()}));
+                    return responder.json(400, json!({"error": error}));
                 }
             };
+            metrics.decoded_spans.add(spans.len() as u64);
             match engine.ingest_batch(spans) {
                 Ok(()) if is_protobuf => {
                     // An empty ExportTraceServiceResponse is zero protobuf
                     // bytes; protobuf clients expect the matching media type.
-                    write!(
-                        stream,
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/x-protobuf\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                    )
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/x-protobuf\r\nContent-Length: 0\r\nConnection: {}\r\n\r\n",
+                        responder.connection_header()
+                    );
+                    responder.raw(&head, b"")
                 }
-                Ok(()) => respond(&mut stream, 200, json!({"partialSuccess": {}})),
-                Err(error) => respond(&mut stream, 503, json!({"error": error.to_string()})),
+                Ok(()) => responder.json(200, json!({"partialSuccess": {}})),
+                Err(error) => responder.json(503, json!({"error": error.to_string()})),
             }
         }
         ("POST", "/v1/flush") => match engine.flush() {
-            Ok(()) => respond(&mut stream, 200, json!({"flushed": true})),
-            Err(error) => respond(&mut stream, 503, json!({"error": error.to_string()})),
+            Ok(()) => responder.json(200, json!({"flushed": true})),
+            Err(error) => responder.json(503, json!({"error": error.to_string()})),
         },
         ("GET", "/v1/spans") => {
             let filter = match filter_from_query(query) {
                 Ok(filter) => filter,
-                Err(error) => return respond(&mut stream, 400, json!({"error": error})),
+                Err(error) => return responder.json(400, json!({"error": error})),
             };
             match engine.query(&filter) {
-                Ok(spans) => respond(
-                    &mut stream,
+                Ok(spans) => responder.json(
                     200,
                     serde_json::to_value(spans).unwrap_or_else(|_| Value::Array(Vec::new())),
                 ),
-                Err(error) => respond(&mut stream, 503, json!({"error": error.to_string()})),
+                Err(error) => responder.json(503, json!({"error": error.to_string()})),
             }
         }
+        ("GET", "/v1/metrics") => {
+            // Prometheus text format. Engine stages first, then the HTTP
+            // layer, so a reader sees the whole ingest path in one scrape.
+            let mut rendered = String::with_capacity(2048);
+            engine.metrics().render_prometheus(&mut rendered);
+            metrics.render_prometheus(&mut rendered);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n",
+                rendered.len(),
+                responder.connection_header()
+            );
+            responder.raw(&head, rendered.as_bytes())
+        }
         ("GET", "/v1/stats") => match engine.stats() {
-            Ok(stats) => respond(
-                &mut stream,
+            Ok(stats) => responder.json(
                 200,
                 json!({
                     // These are physical storage records. Historical versions
@@ -526,18 +875,17 @@ fn handle_connection(
                     "wal_bytes": stats.wal_bytes,
                 }),
             ),
-            Err(error) => respond(&mut stream, 503, json!({"error": error.to_string()})),
+            Err(error) => responder.json(503, json!({"error": error.to_string()})),
         },
         ("GET", _) if path.starts_with("/v1/traces/") => {
             let id = percent_decode(&path[11..]);
             match engine.get_trace(&id) {
                 Ok(spans) if spans.is_empty() => {
-                    respond(&mut stream, 404, json!({"error": "trace not found"}))
+                    responder.json(404, json!({"error": "trace not found"}))
                 }
                 Ok(spans) => {
                     let annotations = engine.annotations(&id, None, None).unwrap_or_default();
-                    respond(
-                        &mut stream,
+                    responder.json(
                         200,
                         json!({
                             "trace_id": id,
@@ -548,41 +896,38 @@ fn handle_connection(
                         }),
                     )
                 }
-                Err(error) => respond(&mut stream, 503, json!({"error": error.to_string()})),
+                Err(error) => responder.json(503, json!({"error": error.to_string()})),
             }
         }
         ("GET", "/v1/sessions") => {
             let (since, until, limit, group_by) = match analytics_query(query) {
                 Ok(parsed) => parsed,
-                Err(error) => return respond(&mut stream, 400, json!({"error": error})),
+                Err(error) => return responder.json(400, json!({"error": error})),
             };
             if group_by.is_some() {
-                return respond(
-                    &mut stream,
+                return responder.json(
                     400,
                     json!({"error": "group_by is not a /v1/sessions parameter"}),
                 );
             }
             match engine.sessions(since, until, limit.unwrap_or(100)) {
-                Ok(sessions) => respond(
-                    &mut stream,
+                Ok(sessions) => responder.json(
                     200,
                     json!({"sessions": serde_json::to_value(sessions)
                         .unwrap_or_else(|_| Value::Array(Vec::new()))}),
                 ),
-                Err(error) => respond(&mut stream, 503, json!({"error": error.to_string()})),
+                Err(error) => responder.json(503, json!({"error": error.to_string()})),
             }
         }
         ("GET", _) if path.starts_with("/v1/sessions/") => {
             let id = percent_decode(&path[13..]);
             match engine.session(&id) {
-                Ok(None) => respond(&mut stream, 404, json!({"error": "session not found"})),
-                Ok(Some(detail)) => respond(
-                    &mut stream,
+                Ok(None) => responder.json(404, json!({"error": "session not found"})),
+                Ok(Some(detail)) => responder.json(
                     200,
                     serde_json::to_value(detail).unwrap_or_else(|_| json!({})),
                 ),
-                Err(error) => respond(&mut stream, 503, json!({"error": error.to_string()})),
+                Err(error) => responder.json(503, json!({"error": error.to_string()})),
             }
         }
         ("POST", "/v1/annotations") => {
@@ -590,7 +935,7 @@ fn handle_connection(
                 match serde_json::from_slice(&request.body) {
                     Ok(annotation) => annotation,
                     Err(error) => {
-                        return respond(&mut stream, 400, json!({"error": error.to_string()}));
+                        return responder.json(400, json!({"error": error.to_string()}));
                     }
                 };
             let mut annotation = annotation;
@@ -602,11 +947,11 @@ fn handle_connection(
                     .min(u128::from(u64::MAX)) as u64;
             }
             match engine.annotate(annotation) {
-                Ok(()) => respond(&mut stream, 200, json!({"recorded": true})),
+                Ok(()) => responder.json(200, json!({"recorded": true})),
                 Err(traza::Error::InvalidSpan(reason)) => {
-                    respond(&mut stream, 400, json!({"error": reason}))
+                    responder.json(400, json!({"error": reason}))
                 }
-                Err(error) => respond(&mut stream, 503, json!({"error": error.to_string()})),
+                Err(error) => responder.json(503, json!({"error": error.to_string()})),
             }
         }
         ("GET", "/v1/annotations") => {
@@ -620,8 +965,7 @@ fn handle_connection(
                     "span_id" => span_id = Some(percent_decode(value)),
                     "name" => name = Some(percent_decode(value)),
                     other => {
-                        return respond(
-                            &mut stream,
+                        return responder.json(
                             400,
                             json!({"error": format!("unknown query parameter: {other}")}),
                         )
@@ -629,31 +973,30 @@ fn handle_connection(
                 }
             }
             let Some(trace_id) = trace_id else {
-                return respond(&mut stream, 400, json!({"error": "trace_id is required"}));
+                return responder.json(400, json!({"error": "trace_id is required"}));
             };
             match engine.annotations(&trace_id, span_id.as_deref(), name.as_deref()) {
-                Ok(annotations) => respond(
-                    &mut stream,
+                Ok(annotations) => responder.json(
                     200,
                     json!({"annotations": serde_json::to_value(annotations)
                         .unwrap_or_else(|_| Value::Array(Vec::new()))}),
                 ),
-                Err(error) => respond(&mut stream, 503, json!({"error": error.to_string()})),
+                Err(error) => responder.json(503, json!({"error": error.to_string()})),
             }
         }
         ("GET", _) if path.starts_with("/v1/payloads/") => {
             let reference = percent_decode(&path[13..]);
             match engine.payload(&reference) {
                 Ok(Some(bytes)) => {
-                    write!(
-                        stream,
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        bytes.len()
-                    )?;
-                    stream.write_all(&bytes)
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n",
+                        bytes.len(),
+                        responder.connection_header()
+                    );
+                    responder.raw(&head, &bytes)
                 }
-                Ok(None) => respond(&mut stream, 404, json!({"error": "payload not found"})),
-                Err(error) => respond(&mut stream, 503, json!({"error": error.to_string()})),
+                Ok(None) => responder.json(404, json!({"error": "payload not found"})),
+                Err(error) => responder.json(503, json!({"error": error.to_string()})),
             }
         }
         ("GET", "/v1/export") => {
@@ -665,44 +1008,45 @@ fn handle_connection(
                     filter.limit = None;
                     (filter, user_limit)
                 }
-                Err(error) => return respond(&mut stream, 400, json!({"error": error})),
+                Err(error) => return responder.json(400, json!({"error": error})),
             };
-            stream_export(&mut stream, engine, filter, user_limit)
+            // Chunked with trailers, terminated by the close. Keeping this
+            // connection alive would need the client to agree to trailers
+            // first; closing is correct and costs one connection per export.
+            responder.must_close();
+            stream_export(responder.stream, engine, filter, user_limit)
         }
         ("GET", "/v1/stats/llm") => {
             let (since, until, limit, group_by) = match analytics_query(query) {
                 Ok(parsed) => parsed,
-                Err(error) => return respond(&mut stream, 400, json!({"error": error})),
+                Err(error) => return responder.json(400, json!({"error": error})),
             };
-            let group_by = match group_by {
-                None => traza::analytics::LlmGroupBy::Model,
-                Some(name) => match traza::analytics::LlmGroupBy::parse(&name) {
-                    Some(group) => group,
-                    None => {
-                        return respond(
-                            &mut stream,
+            let group_by =
+                match group_by {
+                    None => traza::analytics::LlmGroupBy::Model,
+                    Some(name) => match traza::analytics::LlmGroupBy::parse(&name) {
+                        Some(group) => group,
+                        None => return responder.json(
                             400,
                             json!({"error": "group_by must be model|provider|service|session|day"}),
-                        )
-                    }
-                },
-            };
+                        ),
+                    },
+                };
             match engine.llm_aggregate(group_by, since, until) {
                 Ok(mut rows) => {
                     if let Some(limit) = limit {
                         rows.truncate(limit);
                     }
-                    respond(
-                        &mut stream,
+                    responder.json(
                         200,
                         json!({"rows": serde_json::to_value(rows)
                             .unwrap_or_else(|_| Value::Array(Vec::new()))}),
                     )
                 }
-                Err(error) => respond(&mut stream, 503, json!({"error": error.to_string()})),
+                Err(error) => responder.json(503, json!({"error": error.to_string()})),
             }
         }
-        _ => respond(&mut stream, 404, json!({"error": "not found"})),
+        _ => responder.json(404, json!({"error": "not found"})),
     }
 }
 
@@ -869,38 +1213,116 @@ struct Request {
 struct RequestHead {
     method: String,
     target: String,
+    /// Request-line version, uppercased. Decides the keep-alive default.
+    version: String,
     authorization: Option<String>,
     content_type: String,
+    /// Lowercased `Connection:` header value, empty when absent.
+    connection: String,
     content_length: usize,
-    /// Bytes read so far (headers plus any body prefix that arrived with them).
-    buffered: Vec<u8>,
     header_end: usize,
 }
 
-fn read_head(stream: &mut TcpStream) -> io::Result<RequestHead> {
-    let mut bytes = Vec::with_capacity(4096);
-    let mut buffer = [0_u8; 8192];
-    let header_end;
-    loop {
-        let read = stream.read(&mut buffer)?;
-        if read == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "incomplete request",
-            ));
-        }
-        bytes.extend_from_slice(&buffer[..read]);
-        if let Some(position) = find_bytes(&bytes, b"\r\n\r\n") {
-            header_end = position + 4;
-            break;
-        }
-        if bytes.len() > MAX_HEADER_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "request headers too large",
-            ));
+impl RequestHead {
+    /// Whether the client is willing to reuse this connection.
+    ///
+    /// HTTP/1.1 persists unless it says `close`; HTTP/1.0 closes unless it
+    /// says `keep-alive`. Compared token-wise because the header is a list —
+    /// `Connection: keep-alive, Upgrade` is one value, not two headers.
+    fn wants_keep_alive(&self) -> bool {
+        let tokens = || self.connection.split(',').map(str::trim);
+        if self.version == "HTTP/1.1" {
+            !tokens().any(|token| token == "close")
+        } else {
+            tokens().any(|token| token == "keep-alive")
         }
     }
+}
+
+/// One client connection, with the bytes it has read but not yet consumed.
+///
+/// Keep-alive is why this holds a buffer at all: a read for one request's body
+/// can pull in the head of the next, and a fresh per-request buffer would
+/// silently drop those bytes. Everything consumed is drained from the front,
+/// so what remains is always the start of the next request.
+struct Connection {
+    stream: TcpStream,
+    buffer: Vec<u8>,
+}
+
+impl Connection {
+    fn new(stream: TcpStream) -> Self {
+        Self {
+            stream,
+            buffer: Vec::with_capacity(8192),
+        }
+    }
+
+    /// Borrows the socket for one response, declaring up front whether the
+    /// connection survives it.
+    fn responder(&mut self, keep_alive: bool) -> Responder<'_> {
+        Responder {
+            stream: &mut self.stream,
+            keep_alive,
+        }
+    }
+
+    /// Reads the next request head.
+    ///
+    /// `Ok(None)` means the peer closed cleanly at a request boundary — the
+    /// ordinary end of a keep-alive connection, not an error.
+    fn read_head(&mut self) -> io::Result<Option<RequestHead>> {
+        let mut chunk = [0_u8; 8192];
+        let header_end = loop {
+            // Check BEFORE reading: a pipelined request may already be sitting
+            // in the buffer, and blocking on a read the client will never
+            // satisfy would hang it until the socket timeout.
+            if let Some(position) = find_bytes(&self.buffer, b"\r\n\r\n") {
+                break position + 4;
+            }
+            if self.buffer.len() > MAX_HEADER_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "request headers too large",
+                ));
+            }
+            let read = self.stream.read(&mut chunk)?;
+            if read == 0 {
+                if self.buffer.is_empty() {
+                    return Ok(None);
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "incomplete request",
+                ));
+            }
+            self.buffer.extend_from_slice(&chunk[..read]);
+        };
+        parse_head(&self.buffer, header_end).map(Some)
+    }
+
+    /// Reads `head`'s body and consumes the whole request from the buffer.
+    fn read_body(&mut self, head: &RequestHead) -> io::Result<Vec<u8>> {
+        let needed = head.header_end + head.content_length;
+        let mut chunk = [0_u8; 8192];
+        while self.buffer.len() < needed {
+            let read = self.stream.read(&mut chunk)?;
+            if read == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "incomplete body",
+                ));
+            }
+            self.buffer.extend_from_slice(&chunk[..read]);
+        }
+        let body = self.buffer[head.header_end..needed].to_vec();
+        // Whatever is left belongs to the next request.
+        self.buffer.drain(..needed);
+        Ok(body)
+    }
+}
+
+fn parse_head(bytes: &[u8], header_end: usize) -> io::Result<RequestHead> {
     // The in-loop check only bounds growth while SEARCHING; a terminator
     // arriving in the final chunk can still complete an oversized header,
     // so the found header must be re-checked against the cap.
@@ -916,6 +1338,12 @@ fn read_head(stream: &mut TcpStream) -> io::Result<RequestHead> {
     let mut request_line = lines.next().unwrap_or_default().split_whitespace();
     let method = request_line.next().unwrap_or_default().to_owned();
     let target = request_line.next().unwrap_or_default().to_owned();
+    // Absent version means HTTP/0.9, which has no keep-alive; defaulting to
+    // 1.0 makes the persistence decision below opt-in rather than assumed.
+    let version = request_line
+        .next()
+        .unwrap_or("HTTP/1.0")
+        .to_ascii_uppercase();
     if method.is_empty() || target.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -924,6 +1352,7 @@ fn read_head(stream: &mut TcpStream) -> io::Result<RequestHead> {
     }
     let mut authorization = None;
     let mut content_type = String::new();
+    let mut connection = String::new();
     let mut header_lines: Vec<&str> = Vec::new();
     for line in lines {
         if let Some((name, value)) = line.split_once(':') {
@@ -933,14 +1362,40 @@ fn read_head(stream: &mut TcpStream) -> io::Result<RequestHead> {
             if name.eq_ignore_ascii_case("content-type") {
                 content_type = value.trim().to_ascii_lowercase();
             }
+            if name.eq_ignore_ascii_case("connection") {
+                connection = value.trim().to_ascii_lowercase();
+            }
         }
         header_lines.push(line);
     }
-    let content_length = header_lines
+    // Once connections persist, request framing is security-relevant: anything
+    // ambiguous about where this body ends lets a crafted request be split
+    // into two, the second of which the server would attribute to the client's
+    // NEXT request. Both ambiguities are refused rather than resolved.
+    if header_lines
         .iter()
         .filter_map(|line| line.split_once(':'))
-        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-        .map(|(_, value)| value.trim().parse::<usize>())
+        .any(|(name, _)| name.eq_ignore_ascii_case("transfer-encoding"))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "transfer-encoded request bodies are not accepted; send Content-Length",
+        ));
+    }
+    let mut lengths = header_lines
+        .iter()
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .map(|(_, value)| value.trim());
+    let first = lengths.next();
+    if lengths.next().is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "duplicate content-length",
+        ));
+    }
+    let content_length = first
+        .map(|value| value.parse::<usize>())
         .transpose()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid content-length"))?
         .unwrap_or(0);
@@ -953,72 +1408,93 @@ fn read_head(stream: &mut TcpStream) -> io::Result<RequestHead> {
     Ok(RequestHead {
         method,
         target,
+        version,
         authorization,
         content_type,
+        connection,
         content_length,
-        buffered: bytes,
         header_end,
     })
 }
 
-fn read_body(stream: &mut TcpStream, head: RequestHead) -> io::Result<Request> {
-    let RequestHead {
-        method,
-        target,
-        content_type,
-        content_length,
-        mut buffered,
-        header_end,
-        ..
-    } = head;
-    let mut buffer = [0_u8; 8192];
-    while buffered.len() < header_end + content_length {
-        let read = stream.read(&mut buffer)?;
-        if read == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "incomplete body",
-            ));
+/// Writes one response on a connection, stamping the `Connection:` header that
+/// matches what the connection is actually going to do next.
+///
+/// The flag has to live here rather than at each call site because getting it
+/// wrong is a correctness bug, not a performance one: announcing keep-alive
+/// and then closing (or the reverse) desynchronizes the client's framing.
+struct Responder<'a> {
+    stream: &'a mut TcpStream,
+    /// Whether this connection will read another request after this response.
+    keep_alive: bool,
+}
+
+impl Responder<'_> {
+    fn connection_header(&self) -> &'static str {
+        if self.keep_alive {
+            "keep-alive"
+        } else {
+            "close"
         }
-        buffered.extend_from_slice(&buffer[..read]);
     }
-    Ok(Request {
-        method,
-        target,
-        content_type,
-        body: buffered[header_end..header_end + content_length].to_vec(),
-    })
-}
 
-/// Writes a static UI file. `no-store` keeps a rebuilt dashboard from being
-/// shadowed by a cached copy; `nosniff` stops a browser from reinterpreting a
-/// served asset as something more dangerous than its declared type.
-fn respond_file(stream: &mut TcpStream, file: &traza::ui::UiFile) -> io::Result<()> {
-    write!(
-        stream,
-        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        file.content_type,
-        file.bytes.len()
-    )?;
-    stream.write_all(&file.bytes)?;
-    stream.flush()
-}
+    /// Refuses to serve anything further on this connection.
+    ///
+    /// Used wherever the request framing is no longer trustworthy — a body we
+    /// declined to read, a malformed head — because leaving unread bytes in
+    /// the socket would let them be parsed as the NEXT request, which is
+    /// request smuggling.
+    fn must_close(&mut self) {
+        self.keep_alive = false;
+    }
 
-fn respond(stream: &mut TcpStream, status: u16, body: Value) -> io::Result<()> {
-    let encoded = serde_json::to_vec(&body)?;
-    let reason = match status {
-        200 => "OK",
-        400 => "Bad Request",
-        404 => "Not Found",
-        503 => "Service Unavailable",
-        _ => "Error",
-    };
-    write!(
-        stream,
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        encoded.len()
-    )?;
-    stream.write_all(&encoded)
+    /// Sends a JSON body. Head and body go out in one write: at ingest rates
+    /// the extra syscall per response is pure overhead.
+    fn json(&mut self, status: u16, body: Value) -> io::Result<()> {
+        let encoded = serde_json::to_vec(&body)?;
+        let reason = match status {
+            200 => "OK",
+            400 => "Bad Request",
+            404 => "Not Found",
+            413 => "Payload Too Large",
+            429 => "Too Many Requests",
+            503 => "Service Unavailable",
+            _ => "Error",
+        };
+        self.raw(
+            &format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n",
+                encoded.len(),
+                self.connection_header(),
+            ),
+            &encoded,
+        )
+    }
+
+    /// Writes a static UI file. `no-store` keeps a rebuilt dashboard from being
+    /// shadowed by a cached copy; `nosniff` stops a browser from
+    /// reinterpreting a served asset as something more dangerous than its
+    /// declared type.
+    fn file(&mut self, file: &traza::ui::UiFile) -> io::Result<()> {
+        self.raw(
+            &format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n",
+                file.content_type,
+                file.bytes.len(),
+                self.connection_header(),
+            ),
+            &file.bytes,
+        )
+    }
+
+    /// Sends a caller-built head followed by `body`, in a single write.
+    fn raw(&mut self, head: &str, body: &[u8]) -> io::Result<()> {
+        let mut out = Vec::with_capacity(head.len() + body.len());
+        out.extend_from_slice(head.as_bytes());
+        out.extend_from_slice(body);
+        self.stream.write_all(&out)?;
+        self.stream.flush()
+    }
 }
 
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -1051,5 +1527,178 @@ fn hex(byte: u8) -> Option<u8> {
         b'a'..=b'f' => Some(byte - b'a' + 10),
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(argv: &[&str]) -> Options {
+        let args: Vec<String> = argv.iter().map(|arg| (*arg).to_owned()).collect();
+        parse_args(&args)
+            .expect("parses")
+            .expect("not a help invocation")
+    }
+
+    #[test]
+    fn no_profile_is_the_balanced_defaults() {
+        let options = parse(&[]);
+        assert_eq!(options.profile, Profile::Balanced);
+        assert_eq!(options.config.flush_spans, Config::default().flush_spans);
+        assert_eq!(options.config.wal_commit_window, None);
+    }
+
+    #[test]
+    fn a_profile_sets_its_group_of_knobs() {
+        let throughput = parse(&["--profile", "throughput"]);
+        assert_eq!(
+            throughput.config.flush_spans,
+            Profile::Throughput.flush_spans()
+        );
+        assert_eq!(
+            throughput.config.wal_commit_window,
+            Profile::Throughput.wal_commit_window()
+        );
+
+        let latency = parse(&["--profile", "latency"]);
+        assert_eq!(latency.config.flush_spans, Profile::Latency.flush_spans());
+        assert_eq!(latency.config.wal_commit_window, None);
+    }
+
+    /// The precedence rule, checked in BOTH argument orders. Order-dependence
+    /// is the whole failure mode here: a parser that applied the profile as it
+    /// saw it would silently discard a `--flush-spans` that came first.
+    #[test]
+    fn an_explicit_flag_beats_the_profile_in_either_order() {
+        for argv in [
+            vec!["--profile", "throughput", "--flush-spans", "77"],
+            vec!["--flush-spans", "77", "--profile", "throughput"],
+        ] {
+            let options = parse(&argv);
+            assert_eq!(
+                options.config.flush_spans, 77,
+                "explicit --flush-spans lost to the profile in {argv:?}"
+            );
+            // The knobs the flag did NOT name still come from the profile.
+            assert_eq!(
+                options.config.wal_commit_window,
+                Profile::Throughput.wal_commit_window(),
+                "overriding one knob dropped the rest of the profile in {argv:?}"
+            );
+        }
+
+        for argv in [
+            vec!["--profile", "latency", "--wal-commit-window-us", "900"],
+            vec!["--wal-commit-window-us", "900", "--profile", "latency"],
+        ] {
+            let options = parse(&argv);
+            assert_eq!(
+                options.config.wal_commit_window,
+                Some(Duration::from_micros(900)),
+                "explicit --wal-commit-window-us lost to the profile in {argv:?}"
+            );
+            assert_eq!(options.config.flush_spans, Profile::Latency.flush_spans());
+        }
+    }
+
+    /// `0` means "no window", which is a different statement from "unset" and
+    /// has to survive a profile that asked for one.
+    #[test]
+    fn an_explicit_zero_window_overrides_a_profile_that_wants_one() {
+        assert!(Profile::Throughput.wal_commit_window().is_some());
+        for argv in [
+            vec!["--profile", "throughput", "--wal-commit-window-us", "0"],
+            vec!["--wal-commit-window-us", "0", "--profile", "throughput"],
+        ] {
+            assert_eq!(
+                parse(&argv).config.wal_commit_window,
+                None,
+                "explicit 0 did not turn the profile's window off in {argv:?}"
+            );
+        }
+    }
+
+    /// No profile may weaken the acknowledgement contract. The enum makes a
+    /// lossy profile unrepresentable; this pins the resolved behaviour so a
+    /// later "throughput means buffered" shortcut fails here.
+    #[test]
+    fn no_profile_changes_durability() {
+        for name in ["throughput", "balanced", "latency"] {
+            assert_eq!(
+                parse(&["--profile", name]).config.durability,
+                Durability::Wal,
+                "profile {name} moved durability off the default"
+            );
+            // And an explicitly chosen mode survives a profile untouched.
+            assert_eq!(
+                parse(&["--profile", name, "--durability", "flushed"])
+                    .config
+                    .durability,
+                Durability::Flushed
+            );
+        }
+        // Buffered stays reachable only by asking for it by name.
+        assert_eq!(
+            parse(&["--durability", "buffered"]).config.durability,
+            Durability::Buffered
+        );
+    }
+
+    /// Compaction is a read-path choice, so a write-path profile must leave it
+    /// alone — including the "off" an operator asked for.
+    #[test]
+    fn no_profile_changes_compaction() {
+        for name in ["throughput", "balanced", "latency"] {
+            let options = parse(&["--profile", name]);
+            assert_eq!(options.config.compaction, Some(CompactionConfig::default()));
+            assert!(options.compaction_enabled);
+            assert_eq!(
+                parse(&["--profile", name, "--compaction-fanout", "0"])
+                    .config
+                    .compaction,
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn the_last_profile_wins_and_an_unknown_one_is_refused() {
+        assert_eq!(
+            parse(&["--profile", "throughput", "--profile", "latency"]).profile,
+            Profile::Latency
+        );
+        assert!(parse_args(&["--profile".to_owned(), "fast".to_owned()]).is_err());
+        assert!(parse_args(&["--profile".to_owned()]).is_err());
+    }
+
+    /// Flags outside the profile's remit keep working under a profile, and
+    /// keep their own defaults when it does not name them.
+    #[test]
+    fn non_profile_flags_are_untouched_by_a_profile() {
+        let options = parse(&[
+            "--profile",
+            "throughput",
+            "--max-connections",
+            "32",
+            "--payload-threshold-bytes",
+            "0",
+            "--ttl-seconds",
+            "60",
+        ]);
+        assert_eq!(options.max_connections, 32);
+        assert_eq!(options.config.payload_threshold, None);
+        assert_eq!(options.config.ttl_seconds, Some(60));
+
+        let latency = parse(&["--profile", "latency"]);
+        assert_eq!(latency.max_connections, DEFAULT_MAX_CONNECTIONS);
+        assert_eq!(latency.config.payload_threshold, Some(256 * 1024));
+    }
+
+    #[test]
+    fn help_parses_to_nothing_to_run() {
+        assert!(parse_args(&["--help".to_owned()])
+            .expect("help is not an error")
+            .is_none());
     }
 }

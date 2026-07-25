@@ -5,6 +5,107 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.0] - 2026-07-25
+
+Ingest throughput roughly doubles at concurrency, and the record of why is
+corrected in three places where it was wrong. Persistent connections, OTLP
+decoded straight to spans for both wire formats, `--profile` for the
+throughput/latency tradeoff, and a documentation set for users, operators and
+developers.
+
+Ingest throughput: 108,881 -> 208,973 spans/s at 16 concurrent clients in
+`wal` mode, measured through one client against both builds. The roadmap's
+250k target is still 16% away, and the benchmark now says exactly why.
+
+### Added
+
+- **Persistent HTTP connections.** Every response used to carry
+  `Connection: close`, so a client paid a connect and teardown per batch.
+  Keep-alive is now the default for HTTP/1.1. Worth +11% at batch=20 and
+  nothing at batch=1000 — the honest number, not the hoped-for one.
+- **`GET /v1/metrics`** in Prometheus text format: per-stage ingest timings
+  (writer-lock wait, WAL encode/write/fsync, buffer upsert, segment seal,
+  decode), request latency, and connection counters. Stage percentiles are
+  power-of-two bucket bounds and are documented as approximate; they exist to
+  rank stages, not to be published as latencies.
+- **`--max-connections`** (default 1024), replacing `--workers`. Keep-alive
+  means a connection occupies its handler until the client is done, so a fixed
+  worker pool would serve N clients and leave the rest queued indefinitely.
+  Past the limit clients get `503` rather than silence.
+- **`--wal-commit-window-us`** (default off): holds an fsync open briefly so
+  more batches join it. A latency-for-amortization trade that does not touch
+  the guarantee — the fsync still precedes the acknowledgement it covers.
+- **`--profile throughput|balanced|latency`**, setting the write-path knobs
+  (`--flush-spans`, `--wal-commit-window-us`) as a coherent group so they can
+  be chosen by intent rather than by reading the internals. An explicit flag
+  always beats the profile, in either argument order. **No profile can change
+  `--durability`** — a profile cannot represent one, so none can silently make
+  writes lossy. Measured tradeoffs, including where each profile does *not*
+  help, are in [docs/configuration.md](docs/configuration.md).
+- **A documentation set for three audiences** under `docs/`: a user guide
+  (getting started, data model, ingest, full HTTP API reference, trace
+  browser), operations (deployment, durability, administration, monitoring,
+  capacity), and internals (architecture, the load-bearing invariants, module
+  map, testing, benchmarking). The README is now an overview that routes
+  onward rather than holding all of it.
+- **`ingest-bench`**, a benchmark matrix over protocol, keep-alive,
+  concurrency and durability. Reports the median of N runs with its spread,
+  refuses to report a rate from a run that shed a connection or stored fewer
+  spans than it acknowledged, and restarts the server to re-verify every
+  non-`buffered` result. `TRAZA_BENCH_SERVER` points it at another build so
+  before/after runs share one client.
+
+### Changed
+
+- **`POST /v1/spans` decodes straight to `Vec<Span>`.** It used to parse to a
+  `serde_json::Value`, deep-clone the array out of it, then re-walk that DOM
+  once per span — three passes and three sets of allocations for one job.
+- **`POST /v1/traces` decodes straight to `Vec<Span>` too, for both
+  encodings.** Protobuf lowered to the OTLP/JSON `Value` shape and OTLP JSON
+  parsed into the same shape, and both then re-walked that DOM. Protobuf
+  additionally hex-encoded every trace and span id through a `format!` per
+  BYTE. Decode is now **9.2x cheaper for protobuf** (4,384 → 479 ns/span) and
+  **1.9x cheaper for OTLP JSON** (2,377 → 1,275 ns/span), medians of 5 runs of
+  1M spans at concurrency 1. Decode is ~2% of ingest cost, so this is a CPU
+  and correctness result, not a throughput one. The mapping rules the two
+  decoders must agree on are shared rather than duplicated, and a differential
+  test pins that agreement across every `AnyValue` variant.
+- **`ingest-bench` measures latency, not just throughput**, with an open-loop
+  fixed-arrival-rate mode and coordinated-omission correction. Under a
+  closed-loop generator every saturating configuration reports latency that is
+  just concurrency over throughput, so the tradeoff a latency profile exists
+  to make was not visible at all. Scenarios also run round-robin with their
+  order rotated per round, so background load hits every configuration alike
+  instead of landing on whichever ran during a spike.
+- **`ingest-bench` separates wire format from route.** It posted JSON to
+  `/v1/spans` and protobuf to `/v1/traces`, so every protocol comparison also
+  contained the OTLP mapping; on that basis this project claimed protobuf was
+  slower than JSON. A third protocol, `otlp-json`, holds the route fixed, and
+  scenario labels now name the route. Measured properly, **protobuf decodes
+  2.3–2.7x faster than OTLP JSON** on payloads 2.9x smaller. The benchmark
+  also reports bytes/span and decode ns/span per scenario.
+- **The WAL encodes a batch before taking the writer lock.** Serializing under
+  the lock made every concurrent ingest wait on one thread's JSON encoding.
+  Only the file write remains inside it.
+- **Sealing a segment no longer clones the write buffer**, and puts the spans
+  back if the write fails.
+- Request framing is stricter now that connections persist: transfer-encoded
+  bodies and duplicate `Content-Length` headers are refused rather than
+  resolved, because either ambiguity lets one request be split in two with the
+  remainder attributed to the client's next request.
+
+### Fixed
+
+- **`bytesValue` attributes are no longer dropped.** An OTLP attribute of the
+  bytes variant was stored as `null` on both ingest paths, with no error and no
+  warning. It is now stored as lowercase hex, the same representation trace and
+  span ids use — protobuf's raw bytes and OTLP/HTTP JSON's base64 land on the
+  one value, so what an attribute holds does not depend on how it arrived.
+- A connection refused at the limit now reliably receives its `503`. Closing a
+  socket while the client's request bytes sat unread made the kernel send RST,
+  and the RST beat the response — backpressure surfaced as "connection reset
+  by peer".
+
 ## [0.16.0] - 2026-07-24
 
 Search that scales with the store: size-tiered compaction bounds the segment
