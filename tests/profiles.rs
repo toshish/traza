@@ -132,6 +132,56 @@ fn a_profile_flush_threshold_drives_actual_sealing() {
     let _ = std::fs::remove_dir_all(&balanced_dir);
 }
 
+/// `docs/configuration.md` tells operators that each profile knob is inert
+/// under a different durability mode. That claim is behaviour, so it is
+/// pinned here rather than left as prose that can quietly go stale.
+#[test]
+fn each_profile_knob_is_inert_under_one_durability_mode() {
+    // Under `flushed`, every call seals, so a large flush threshold does not
+    // hold anything back.
+    let dir = scratch("flushed-ignores-threshold");
+    let store = Store::open(
+        &dir,
+        Config {
+            durability: Durability::Flushed,
+            ..Profile::Throughput.config()
+        },
+    )
+    .expect("opens");
+    let spans: Vec<Span> = (0..10).map(span).collect();
+    assert!(spans.len() < Profile::Throughput.flush_spans());
+    store.ingest_batch(spans).expect("ingests");
+    let stats = store.stats().expect("stats");
+    assert!(
+        stats.segment_count > 0 && stats.buffered_records == 0,
+        "flushed honoured flush_spans instead of sealing every call: {stats:?}"
+    );
+    drop(store);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Under `buffered` there is no log at all, so a commit window has nothing
+    // to delay.
+    let dir = scratch("buffered-has-no-log");
+    let store = Store::open(
+        &dir,
+        Config {
+            durability: Durability::Buffered,
+            ..Profile::Throughput.config()
+        },
+    )
+    .expect("opens");
+    store
+        .ingest_batch((0..10).map(span).collect())
+        .expect("ingests");
+    assert_eq!(
+        store.stats().expect("stats").wal_bytes,
+        0,
+        "buffered wrote a log for the commit window to delay"
+    );
+    drop(store);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The startup banner reports the RESOLVED knobs, so an operator reading a log
 /// sees what is in force rather than a profile name that an explicit flag may
 /// have partly overridden. Driving the real binary also proves the resolved
