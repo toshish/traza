@@ -251,8 +251,10 @@ alongside results.
   lookup p99 4.65 ms already clears its bar and RSS held at 0.25 GB, but the
   filtered-search bar is the open risk — uncompacted, it measured p99 220 ms
   at a tenth of the gate's corpus, because the cost is per-segment rather
-  than per-span. Size-tiered compaction bounds the segment count; whether
-  that is enough at 100M is unproven and needs measuring at that size.
+  than per-span. Size-tiered compaction bounds the segment count and brought
+  that to p99 14.1 ms at 10M — inside the 50 ms bar, though at a tenth of the
+  gate's corpus. Whether it still holds at 100M is unproven and needs
+  measuring at that size; the ingest cost (about 39%) is the known price.
 - **Regression policy:** each gate runs ≥5 times; the reported statistic is
   the median with an interquartile range; a release blocks when the median
   regresses >10% *and* the change exceeds run-to-run noise for that metric.
