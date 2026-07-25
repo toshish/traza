@@ -309,6 +309,16 @@ impl Drop for Server {
 }
 
 fn release_binary(name: &str) -> PathBuf {
+    // TRAZA_BENCH_SERVER points the harness at a different build of the
+    // server — an older commit, say — so a before/after comparison runs
+    // through ONE client. Measuring the two with different clients would put
+    // the client's own change inside the difference being attributed to the
+    // server.
+    if name == "traza-server" {
+        if let Ok(path) = std::env::var("TRAZA_BENCH_SERVER") {
+            return PathBuf::from(path);
+        }
+    }
     let mut path = PathBuf::from("target").join("release").join(name);
     if cfg!(windows) {
         path.set_extension("exe");
@@ -367,11 +377,12 @@ impl Client {
         stream
             .write_all(&request)
             .map_err(|error| format!("write: {error}"))?;
-        let status = read_response(stream, &mut self.buffer)?;
-        if !self.keep_alive {
+        let (status, _, closing) = read_response(stream, &mut self.buffer)?;
+        if !self.keep_alive || closing {
             self.stream = None;
+            self.buffer.clear();
         }
-        Ok(status.0)
+        Ok(status)
     }
 
     fn get(&mut self, path: &str) -> Result<(u16, Vec<u8>), String> {
@@ -390,16 +401,20 @@ impl Client {
         stream
             .write_all(request.as_bytes())
             .map_err(|error| format!("write: {error}"))?;
-        let (status, body) = read_response(stream, &mut self.buffer)?;
-        if !self.keep_alive {
+        let (status, body, closing) = read_response(stream, &mut self.buffer)?;
+        if !self.keep_alive || closing {
             self.stream = None;
+            self.buffer.clear();
         }
         Ok((status, body))
     }
 }
 
 /// Reads one response, leaving any surplus bytes in `buffer` for the next.
-fn read_response(stream: &mut TcpStream, buffer: &mut Vec<u8>) -> Result<(u16, Vec<u8>), String> {
+fn read_response(
+    stream: &mut TcpStream,
+    buffer: &mut Vec<u8>,
+) -> Result<(u16, Vec<u8>, bool), String> {
     let mut chunk = [0_u8; 16384];
     let header_end = loop {
         if let Some(position) = find(buffer, b"\r\n\r\n") {
@@ -435,7 +450,19 @@ fn read_response(stream: &mut TcpStream, buffer: &mut Vec<u8>) -> Result<(u16, V
     }
     let body = buffer[header_end..header_end + length].to_vec();
     buffer.drain(..header_end + length);
-    Ok((status, body))
+    // A server may close regardless of what the client asked for — the
+    // pre-keep-alive server always did. Honouring that is what lets this one
+    // harness measure both, so the comparison is not confounded by using a
+    // different client for each.
+    let closing = head.lines().any(|line| {
+        line.split_once(':').is_some_and(|(name, value)| {
+            name.eq_ignore_ascii_case("connection")
+                && value
+                    .split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case("close"))
+        })
+    });
+    Ok((status, body, closing))
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
