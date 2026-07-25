@@ -431,7 +431,8 @@ fn json_links_round_trip_on_the_native_path() {
 ///
 /// Paired with [`differential_json`], which encodes the SAME request as
 /// OTLP/HTTP JSON. Every `AnyValue` variant appears, including the nested ones
-/// and the never-mapped one, because the two encodings are handled by two
+/// and the one the two encodings spell differently on the wire (bytes: raw
+/// here, base64 there), because the two encodings are handled by two
 /// independent decoders that must agree.
 fn differential_protobuf() -> Vec<u8> {
     let mut span1 = Vec::new();
@@ -641,9 +642,10 @@ fn otlp_json_and_protobuf_agree_on_one_payload() {
         first["attributes"]["a.kvlist"],
         serde_json::json!({"inner": "deep", "n": 3})
     );
-    // bytesValue has never been mapped onto an attribute by either encoding.
-    // Pinned so the two decoders cannot drift apart on it silently.
-    assert_eq!(first["attributes"]["a.bytes"], Value::Null);
+    // bytesValue is stored as lowercase hex, like trace and span ids — the
+    // protobuf raw bytes and the JSON base64 of the same three bytes have to
+    // land on the one representation, or a consumer cannot read either.
+    assert_eq!(first["attributes"]["a.bytes"], "010203");
     assert_eq!(
         first["attributes"]["scope.tag"], "alpha",
         "scope attributes merge in"
