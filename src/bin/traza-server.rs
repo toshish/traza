@@ -118,6 +118,12 @@ struct ServerMetrics {
     request_latency: traza::metrics::Latency,
     /// Requests refused by the auth gate.
     rejected: traza::metrics::Counter,
+    /// Turning a request body into spans: JSON decode, or protobuf decode plus
+    /// the OTLP mapping. Separated from the engine stages so "the wire format
+    /// is the bottleneck" is a measurement rather than an assumption.
+    decode: traza::metrics::Latency,
+    /// Spans decoded, so decode cost per span is derivable.
+    decoded_spans: traza::metrics::Counter,
     /// Connections refused because the server was at its connection limit.
     /// The backpressure signal: nonzero means clients were shed, and any
     /// throughput number measured during that window is suspect.
@@ -153,6 +159,18 @@ impl ServerMetrics {
             "traza_http_connections_live {}",
             self.connections_live.load(Ordering::Relaxed)
         );
+        let _ = writeln!(into, "# TYPE traza_http_decoded_spans_total counter");
+        let _ = writeln!(
+            into,
+            "traza_http_decoded_spans_total {}",
+            self.decoded_spans.get()
+        );
+        let _ = writeln!(into, "# TYPE traza_http_decode_ns_count counter");
+        let _ = writeln!(into, "traza_http_decode_ns_count {}", self.decode.count());
+        let _ = writeln!(into, "# TYPE traza_http_decode_ns_sum counter");
+        let _ = writeln!(into, "traza_http_decode_ns_sum {}", self.decode.total_ns());
+        let _ = writeln!(into, "# TYPE traza_http_decode_ns_max gauge");
+        let _ = writeln!(into, "traza_http_decode_ns_max {}", self.decode.max_ns());
         let _ = writeln!(into, "# TYPE traza_http_request_ns_count counter");
         let _ = writeln!(
             into,
@@ -639,10 +657,11 @@ fn serve_request(
         .unwrap_or((&request.target, ""));
     match (request.method.as_str(), path) {
         ("POST", "/v1/spans") => {
-            let spans = match decode_spans(&request.body) {
+            let spans = match metrics.decode.time(|| decode_spans(&request.body)) {
                 Ok(spans) => spans,
                 Err(error) => return responder.json(400, json!({"error": error})),
             };
+            metrics.decoded_spans.add(spans.len() as u64);
             // Both halves of the (trace_id, span_id) primary key must be
             // non-empty: an empty span_id would make every such span in a
             // trace one colliding key, silently upserted over each other while
@@ -676,27 +695,25 @@ fn serve_request(
             // JSON by Content-Type. The protobuf decoder lowers to the JSON
             // shape, so both encodings share one mapping (docs: README).
             let is_protobuf = request.content_type.starts_with("application/x-protobuf");
-            let value: Value = if is_protobuf {
-                match traza::otlp_pb::traces_request_to_json(&request.body) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        return responder.json(400, json!({"error": error.to_string()}));
-                    }
-                }
-            } else {
-                match serde_json::from_slice(&request.body) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        return responder.json(400, json!({"error": error.to_string()}));
-                    }
-                }
-            };
-            let spans = match traza::otlp::spans_from_request(&value) {
+            // Timed as one stage: for protobuf this covers the wire decode AND
+            // the OTLP-to-Span mapping, which is the whole cost of accepting a
+            // batch on this route.
+            let decoded = metrics.decode.time(|| {
+                let value: Value = if is_protobuf {
+                    traza::otlp_pb::traces_request_to_json(&request.body)
+                        .map_err(|error| error.to_string())?
+                } else {
+                    serde_json::from_slice(&request.body).map_err(|error| error.to_string())?
+                };
+                traza::otlp::spans_from_request(&value).map_err(|error| error.to_string())
+            });
+            let spans = match decoded {
                 Ok(spans) => spans,
                 Err(error) => {
-                    return responder.json(400, json!({"error": error.to_string()}));
+                    return responder.json(400, json!({"error": error}));
                 }
             };
+            metrics.decoded_spans.add(spans.len() as u64);
             match engine.ingest_batch(spans) {
                 Ok(()) if is_protobuf => {
                     // An empty ExportTraceServiceResponse is zero protobuf
