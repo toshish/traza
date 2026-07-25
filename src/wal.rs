@@ -81,11 +81,17 @@ pub(crate) struct Wal {
     path: PathBuf,
     state: Mutex<WalState>,
     synced: Condvar,
+    /// Deliberate delay before syncing, so more batches join the same fsync.
+    /// See [`crate::Config::wal_commit_window`].
+    commit_window: Option<std::time::Duration>,
 }
 
 impl Wal {
     /// Opens (creating if absent) the log in `directory`.
-    pub(crate) fn open(directory: &Path) -> Result<Self> {
+    pub(crate) fn open(
+        directory: &Path,
+        commit_window: Option<std::time::Duration>,
+    ) -> Result<Self> {
         let path = directory.join(WAL_FILE_NAME);
         let file = OpenOptions::new()
             .create(true)
@@ -97,6 +103,7 @@ impl Wal {
             path,
             state: Mutex::new(WalState::default()),
             synced: Condvar::new(),
+            commit_window: commit_window.filter(|window| !window.is_zero()),
         })
     }
 
@@ -215,8 +222,18 @@ impl Wal {
             state.syncing = true;
             // Everything written BEFORE the sync starts is covered by it;
             // anything later is conservatively left for the next sync.
-            let target = state.written_lsn;
+            let mut target = state.written_lsn;
             drop(state);
+
+            if let Some(window) = self.commit_window {
+                // Hold the sync open for a moment so batches arriving now ride
+                // along on it. The lock is NOT held across this sleep — the
+                // whole point is that appends keep landing while we wait.
+                std::thread::sleep(window);
+                // Those late arrivals are already in the file, so the sync
+                // about to run covers them too.
+                target = self.lock()?.written_lsn;
+            }
 
             let result = metrics.wal_fsync.time(|| self.file.sync_data());
 
@@ -283,7 +300,7 @@ mod tests {
     #[test]
     fn replays_what_it_committed_in_order() {
         let dir = temp_dir("roundtrip");
-        let wal = Wal::open(&dir).expect("opens");
+        let wal = Wal::open(&dir, None).expect("opens");
         let lsn = wal
             .append(&Wal::encode(&[span("t", "a", "one"), span("t", "b", "two")]).expect("encode"))
             .expect("append");
@@ -311,7 +328,7 @@ mod tests {
     #[test]
     fn a_torn_trailing_record_is_dropped_and_earlier_ones_kept() {
         let dir = temp_dir("torn");
-        let wal = Wal::open(&dir).expect("opens");
+        let wal = Wal::open(&dir, None).expect("opens");
         let lsn = wal
             .append(&Wal::encode(&[span("t", "a", "kept")]).expect("encode"))
             .expect("append");
@@ -335,7 +352,7 @@ mod tests {
     #[test]
     fn a_corrupt_payload_ends_replay_without_being_trusted() {
         let dir = temp_dir("corrupt");
-        let wal = Wal::open(&dir).expect("opens");
+        let wal = Wal::open(&dir, None).expect("opens");
         let lsn = wal
             .append(&Wal::encode(&[span("t", "a", "kept")]).expect("encode"))
             .expect("append");
@@ -360,7 +377,7 @@ mod tests {
     #[test]
     fn reset_discards_the_log_and_releases_waiters() {
         let dir = temp_dir("reset");
-        let wal = Wal::open(&dir).expect("opens");
+        let wal = Wal::open(&dir, None).expect("opens");
         let lsn = wal
             .append(&Wal::encode(&[span("t", "a", "sealed")]).expect("encode"))
             .expect("append");
@@ -375,7 +392,7 @@ mod tests {
     #[test]
     fn concurrent_commits_are_covered_by_group_syncs() {
         let dir = temp_dir("group");
-        let wal = Arc::new(Wal::open(&dir).expect("opens"));
+        let wal = Arc::new(Wal::open(&dir, None).expect("opens"));
         let mut handles = Vec::new();
         for worker in 0..8 {
             let wal = Arc::clone(&wal);

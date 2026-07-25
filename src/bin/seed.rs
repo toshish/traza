@@ -113,6 +113,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 flush_spans: 10_000,
                 ttl_seconds: None,
                 payload_threshold: (payload_threshold > 0).then_some(payload_threshold),
+                wal_commit_window: None,
             },
         )?),
         None => None,

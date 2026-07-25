@@ -276,6 +276,17 @@ pub struct Config {
     /// Enabled by default: without it, filtered-search latency grows without
     /// bound as segments accumulate.
     pub compaction: Option<CompactionConfig>,
+    /// How long a thread about to fsync the log waits for more batches to
+    /// join it. Zero (the default) syncs immediately.
+    ///
+    /// Group commit already amortizes fsync across whatever batches happen to
+    /// be in flight. This buys MORE amortization by deliberately waiting, and
+    /// the cost is exactly what it sounds like: every acknowledgement in the
+    /// window is delayed by up to this long. It helps when batches arrive
+    /// steadily but concurrency is too low to fill a sync on its own, and it
+    /// hurts an idle store, which is why it is off unless asked for. It never
+    /// weakens the guarantee — the acknowledgement still follows the fsync.
+    pub wal_commit_window: Option<std::time::Duration>,
 }
 
 impl Default for Config {
@@ -286,6 +297,7 @@ impl Default for Config {
             payload_threshold: None,
             durability: Durability::Wal,
             compaction: Some(CompactionConfig::default()),
+            wal_commit_window: None,
         }
     }
 }
@@ -723,7 +735,7 @@ impl Store {
                 for span in wal::Wal::replay(&directory)? {
                     buffer.upsert(span);
                 }
-                Some(wal::Wal::open(&directory)?)
+                Some(wal::Wal::open(&directory, config.wal_commit_window)?)
             };
             let next_segment = segments
                 .iter()
