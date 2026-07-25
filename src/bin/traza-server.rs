@@ -717,20 +717,20 @@ fn serve_request(
         }
         ("POST", "/v1/traces") => {
             // OTLP/HTTP: an ExportTraceServiceRequest, binary protobuf or
-            // JSON by Content-Type. The protobuf decoder lowers to the JSON
-            // shape, so both encodings share one mapping (docs: README).
+            // JSON by Content-Type. Each encoding decodes straight to spans;
+            // the mapping rules they must agree on are shared rather than
+            // duplicated (docs: README, src/otlp.rs).
             let is_protobuf = request.content_type.starts_with("application/x-protobuf");
-            // Timed as one stage: for protobuf this covers the wire decode AND
-            // the OTLP-to-Span mapping, which is the whole cost of accepting a
+            // Timed as one stage: this covers the wire decode AND the
+            // OTLP-to-Span mapping, which is the whole cost of accepting a
             // batch on this route.
             let decoded = metrics.decode.time(|| {
-                let value: Value = if is_protobuf {
-                    traza::otlp_pb::traces_request_to_json(&request.body)
-                        .map_err(|error| error.to_string())?
+                if is_protobuf {
+                    traza::otlp_pb::spans_from_protobuf(&request.body)
+                        .map_err(|error| error.to_string())
                 } else {
-                    serde_json::from_slice(&request.body).map_err(|error| error.to_string())?
-                };
-                traza::otlp::spans_from_request(&value).map_err(|error| error.to_string())
+                    traza::otlp::spans_from_json(&request.body).map_err(|error| error.to_string())
+                }
             });
             let spans = match decoded {
                 Ok(spans) => spans,

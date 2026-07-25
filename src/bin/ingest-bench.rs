@@ -47,17 +47,52 @@ enum Mode {
     Http,
 }
 
+/// Wire format AND the route that accepts it. These are separate variables and
+/// the enum names both, because conflating them is exactly how "protobuf is
+/// slower than JSON" got claimed from a measurement that could not show it: the
+/// old `Json` arm posted to the native route and the old `Protobuf` arm posted
+/// to the OTLP route, so every protobuf-vs-JSON delta also contained the entire
+/// OTLP semantic mapping. `OtlpJson` exists to hold the route fixed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Protocol {
-    Json,
-    Protobuf,
+    /// `/v1/spans`, native span JSON: `serde` straight to `Vec<Span>`, no
+    /// OTLP mapping at all. The floor the OTLP routes are measured against.
+    NativeJson,
+    /// `/v1/traces`, OTLP/HTTP JSON. Same route and same mapping as
+    /// `OtlpProtobuf`, so the only difference is the wire format.
+    OtlpJson,
+    /// `/v1/traces`, OTLP/HTTP binary protobuf.
+    OtlpProtobuf,
 }
 
 impl Protocol {
     fn as_str(self) -> &'static str {
         match self {
-            Protocol::Json => "json",
-            Protocol::Protobuf => "protobuf",
+            Protocol::NativeJson => "native-json",
+            Protocol::OtlpJson => "otlp-json",
+            Protocol::OtlpProtobuf => "otlp-protobuf",
+        }
+    }
+
+    fn route(self) -> &'static str {
+        match self {
+            Protocol::NativeJson => "/v1/spans",
+            Protocol::OtlpJson | Protocol::OtlpProtobuf => "/v1/traces",
+        }
+    }
+
+    fn content_type(self) -> &'static str {
+        match self {
+            Protocol::OtlpProtobuf => "application/x-protobuf",
+            Protocol::NativeJson | Protocol::OtlpJson => "application/json",
+        }
+    }
+
+    fn encode(self, start: usize, end: usize) -> Vec<u8> {
+        match self {
+            Protocol::NativeJson => json_batch(start, end),
+            Protocol::OtlpJson => otlp_json_batch(start, end),
+            Protocol::OtlpProtobuf => protobuf_batch(start, end),
         }
     }
 }
@@ -83,8 +118,9 @@ impl Scenario {
             );
         }
         format!(
-            "http {}, keep-alive={}, durability={}, batch={}, concurrency={}",
+            "http {} -> {}, keep-alive={}, durability={}, batch={}, concurrency={}",
             self.protocol.as_str(),
+            self.protocol.route(),
             if self.keep_alive { "on" } else { "off" },
             self.durability,
             self.batch,
@@ -107,6 +143,14 @@ struct SpanSeed {
     group: String,
 }
 
+/// Spans per service. OTLP carries `service.name` per RESOURCE, so service has
+/// to vary in CONTIGUOUS RUNS rather than round-robin: a round-robin service
+/// would force the OTLP encoders into one ResourceSpans per span — the
+/// pathological shape — while the native encoder just repeated a string. All
+/// three encodings then carry the same spans in the same order, which is what
+/// makes the routes comparable.
+const SPANS_PER_SERVICE: usize = 50;
+
 fn seed(index: usize) -> SpanSeed {
     let trace_number = index / 10;
     let start_ns = 1_700_000_000_000_000_000_u64 + (index as u64 * 1_000_000);
@@ -118,11 +162,33 @@ fn seed(index: usize) -> SpanSeed {
         } else {
             "operation"
         },
-        service: format!("service-{}", index % 20),
+        service: format!("service-{}", (index / SPANS_PER_SERVICE) % 20),
         start_ns,
         end_ns: start_ns + 500_000 + ((index % 100) as u64 * 20_000),
         group: format!("group-{}", index % 100),
     }
+}
+
+fn http_method(index: usize) -> &'static str {
+    if index % 2 == 0 {
+        "GET"
+    } else {
+        "POST"
+    }
+}
+
+/// The contiguous single-service runs inside `[start, end)`, as
+/// `(service, run_start, run_end)`. One run becomes one OTLP `ResourceSpans`.
+fn resource_runs(start: usize, end: usize) -> Vec<(String, usize, usize)> {
+    let mut runs: Vec<(String, usize, usize)> = Vec::new();
+    for index in start..end {
+        let service = seed(index).service;
+        match runs.last_mut() {
+            Some((last_service, _, run_end)) if *last_service == service => *run_end = index + 1,
+            _ => runs.push((service, index, index + 1)),
+        }
+    }
+    runs
 }
 
 fn json_batch(start: usize, end: usize) -> Vec<u8> {
@@ -143,13 +209,55 @@ fn json_batch(start: usize, end: usize) -> Vec<u8> {
             "status": "ok",
             "attributes": {
                 "benchmark.group": seed.group,
-                "http.method": if index % 2 == 0 { "GET" } else { "POST" }
+                "http.method": http_method(index)
             }
         });
         serde_json::to_writer(&mut body, &span).expect("json");
     }
     body.push(b']');
     body
+}
+
+/// The same spans as [`json_batch`] and [`protobuf_batch`], encoded as an
+/// OTLP/HTTP JSON `ExportTraceServiceRequest`.
+///
+/// Canonical proto3-JSON encoding, which is what a real OTLP/HTTP JSON exporter
+/// emits and what the repo's own conformance fixture uses: 64-bit nanos as
+/// STRINGS, and the status code as the enum NAME. Both are more expensive to
+/// parse than the numeric forms the mapping also accepts, so this is the
+/// honest encoding rather than the flattering one.
+fn otlp_json_batch(start: usize, end: usize) -> Vec<u8> {
+    let resource_spans: Vec<Value> = resource_runs(start, end)
+        .into_iter()
+        .map(|(service, run_start, run_end)| {
+            let spans: Vec<Value> = (run_start..run_end)
+                .map(|index| {
+                    let seed = seed(index);
+                    json!({
+                        "traceId": seed.trace_id,
+                        "spanId": seed.span_id,
+                        "name": seed.name,
+                        "startTimeUnixNano": seed.start_ns.to_string(),
+                        "endTimeUnixNano": seed.end_ns.to_string(),
+                        "status": {"code": "STATUS_CODE_OK"},
+                        "attributes": [
+                            {"key": "benchmark.group",
+                             "value": {"stringValue": seed.group}},
+                            {"key": "http.method",
+                             "value": {"stringValue": http_method(index)}}
+                        ]
+                    })
+                })
+                .collect();
+            json!({
+                "resource": {"attributes": [
+                    {"key": "service.name", "value": {"stringValue": service}}
+                ]},
+                "scopeSpans": [{"spans": spans}]
+            })
+        })
+        .collect();
+    serde_json::to_vec(&json!({ "resourceSpans": resource_spans })).expect("json")
 }
 
 // ------------------------------------------------------- protobuf encoding
@@ -204,51 +312,50 @@ fn string_attribute(key: &str, value: &str) -> Vec<u8> {
 /// path is that Traza has two dependencies; a benchmark that pulled in a
 /// codegen stack to test it would be measuring a program nobody ships.
 fn protobuf_batch(start: usize, end: usize) -> Vec<u8> {
-    let mut spans = Vec::with_capacity(64 * (end - start));
-    for index in start..end {
-        let seed = seed(index);
-        let mut span = Vec::with_capacity(256);
-        delimited(&mut span, 1, &unhex(&seed.trace_id));
-        delimited(&mut span, 2, &unhex(&seed.span_id));
-        delimited(&mut span, 5, seed.name.as_bytes());
-        fixed64(&mut span, 7, seed.start_ns);
-        fixed64(&mut span, 8, seed.end_ns);
-        delimited(
-            &mut span,
-            9,
-            &string_attribute("benchmark.group", &seed.group),
-        );
-        delimited(
-            &mut span,
-            9,
-            &string_attribute("http.method", if index % 2 == 0 { "GET" } else { "POST" }),
-        );
-        // Status { code = 2 } = STATUS_CODE_OK.
-        let mut status = Vec::new();
-        tag(&mut status, 2, 0);
-        varint(&mut status, 1);
-        delimited(&mut span, 15, &status);
-        // ScopeSpans.spans
-        delimited(&mut spans, 2, &span);
+    let mut request = Vec::with_capacity(256 * (end - start));
+    for (service, run_start, run_end) in resource_runs(start, end) {
+        let mut spans = Vec::with_capacity(256 * (run_end - run_start));
+        for index in run_start..run_end {
+            let seed = seed(index);
+            let mut span = Vec::with_capacity(256);
+            delimited(&mut span, 1, &unhex(&seed.trace_id));
+            delimited(&mut span, 2, &unhex(&seed.span_id));
+            delimited(&mut span, 5, seed.name.as_bytes());
+            fixed64(&mut span, 7, seed.start_ns);
+            fixed64(&mut span, 8, seed.end_ns);
+            delimited(
+                &mut span,
+                9,
+                &string_attribute("benchmark.group", &seed.group),
+            );
+            delimited(
+                &mut span,
+                9,
+                &string_attribute("http.method", http_method(index)),
+            );
+            // Status { string message = 2; StatusCode code = 3; }. This
+            // encoder wrote the code as field 2, which is `message` and a
+            // different wire type, so the decoder skipped it as an unknown
+            // field: every protobuf span in this corpus arrived with NO
+            // status while both JSON corpora carried "ok". Field 3.
+            let mut status = Vec::new();
+            tag(&mut status, 3, 0);
+            varint(&mut status, 1); // STATUS_CODE_OK
+            delimited(&mut span, 15, &status);
+            // ScopeSpans.spans
+            delimited(&mut spans, 2, &span);
+        }
+
+        // service.name is per-RESOURCE in OTLP, so one contiguous
+        // single-service run of spans becomes one ResourceSpans.
+        let mut resource = Vec::new();
+        delimited(&mut resource, 1, &string_attribute("service.name", &service));
+
+        let mut resource_spans = Vec::new();
+        delimited(&mut resource_spans, 1, &resource);
+        delimited(&mut resource_spans, 2, &spans);
+        delimited(&mut request, 1, &resource_spans);
     }
-
-    // service.name is per-RESOURCE in OTLP, so a batch is one resource. The
-    // JSON corpus varies service per span; protobuf cannot without one
-    // resource per span, so both encoders agree on a single service here and
-    // the comparison stays like-for-like.
-    let mut resource = Vec::new();
-    delimited(
-        &mut resource,
-        1,
-        &string_attribute("service.name", "service-0"),
-    );
-
-    let mut resource_spans = Vec::new();
-    delimited(&mut resource_spans, 1, &resource);
-    delimited(&mut resource_spans, 2, &spans);
-
-    let mut request = Vec::new();
-    delimited(&mut request, 1, &resource_spans);
     request
 }
 
@@ -504,10 +611,7 @@ fn run_http(scenario: &Scenario, payloads: &Arc<Vec<Vec<u8>>>) -> Result<RunResu
     std::fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
     let server = Server::spawn(&data_dir, &scenario.durability)?;
 
-    let (path, content_type) = match scenario.protocol {
-        Protocol::Json => ("/v1/spans", "application/json"),
-        Protocol::Protobuf => ("/v1/traces", "application/x-protobuf"),
-    };
+    let (path, content_type) = (scenario.protocol.route(), scenario.protocol.content_type());
 
     let next = Arc::new(AtomicUsize::new(0));
     let failures = Arc::new(AtomicUsize::new(0));
@@ -632,6 +736,18 @@ fn metric_value(metrics: &str, name: &str) -> Option<u64> {
         let (key, value) = line.split_once(' ')?;
         (key == name).then(|| value.trim().parse().ok())?
     })
+}
+
+/// Server-side nanoseconds of decode per span, from the server's own counters.
+///
+/// This is the number the protocol question actually turns on: it covers the
+/// wire decode plus, on `/v1/traces`, the OTLP-to-Span mapping, and NOTHING
+/// downstream. End-to-end spans/s cannot answer "which wire format is faster"
+/// because the writer lock dominates it; this can.
+fn decode_ns_per_span(metrics: &str) -> Option<f64> {
+    let sum = metric_value(metrics, "traza_http_decode_ns_sum")?;
+    let spans = metric_value(metrics, "traza_http_decoded_spans_total")?;
+    (spans > 0).then(|| sum as f64 / spans as f64)
 }
 
 /// Direct-engine run: no socket, no HTTP, no client. The floor that the HTTP
@@ -871,7 +987,7 @@ fn run() -> Result<(), String> {
     scenarios.push(Scenario {
         label: "direct-engine-wal".to_owned(),
         mode: Mode::Direct,
-        protocol: Protocol::Json,
+        protocol: Protocol::NativeJson,
         keep_alive: false,
         durability: "wal".to_owned(),
         concurrency: 8,
@@ -881,7 +997,7 @@ fn run() -> Result<(), String> {
     scenarios.push(Scenario {
         label: "direct-engine-buffered".to_owned(),
         mode: Mode::Direct,
-        protocol: Protocol::Json,
+        protocol: Protocol::NativeJson,
         keep_alive: false,
         durability: "buffered".to_owned(),
         concurrency: 8,
@@ -893,11 +1009,11 @@ fn run() -> Result<(), String> {
     for keep_alive in [false, true] {
         scenarios.push(Scenario {
             label: format!(
-                "http-json-wal-keepalive-{}",
+                "http-native-json-wal-keepalive-{}",
                 if keep_alive { "on" } else { "off" }
             ),
             mode: Mode::Http,
-            protocol: Protocol::Json,
+            protocol: Protocol::NativeJson,
             keep_alive,
             durability: "wal".to_owned(),
             concurrency: 8,
@@ -905,8 +1021,15 @@ fn run() -> Result<(), String> {
             spans,
         });
     }
+    // Three protocols at each concurrency. otlp-json and otlp-protobuf share a
+    // route and a mapping, so their difference IS the wire format; native-json
+    // shares a wire format with otlp-json, so THAT difference is the mapping.
     for concurrency in &concurrencies {
-        for protocol in [Protocol::Json, Protocol::Protobuf] {
+        for protocol in [
+            Protocol::NativeJson,
+            Protocol::OtlpJson,
+            Protocol::OtlpProtobuf,
+        ] {
             scenarios.push(Scenario {
                 label: format!("http-{}-wal-c{concurrency}", protocol.as_str()),
                 mode: Mode::Http,
@@ -947,9 +1070,12 @@ connection are reported as failures rather than as numbers.\n"
     );
     let _ = writeln!(
         report,
-        "| Scenario | Protocol | Keep-alive | Concurrency | Median spans/s | Min | Max |"
+        "| Scenario | Protocol | Route | Keep-alive | Concurrency | Median spans/s | Min | Max | Bytes/span | Decode ns/span |"
     );
-    let _ = writeln!(report, "|---|---|---|---:|---:|---:|---:|");
+    let _ = writeln!(
+        report,
+        "|---|---|---|---|---:|---:|---:|---:|---:|---:|"
+    );
 
     for scenario in &scenarios {
         if let Some(filter) = &only {
@@ -968,20 +1094,19 @@ connection are reported as failures rather than as numbers.\n"
                 .step_by(scenario.batch)
                 .map(|start| {
                     let end = (start + scenario.batch).min(scenario.spans);
-                    match scenario.protocol {
-                        Protocol::Json => json_batch(start, end),
-                        Protocol::Protobuf => protobuf_batch(start, end),
-                    }
+                    scenario.protocol.encode(start, end)
                 })
                 .collect()
         } else {
             Vec::new()
         });
         let encode_elapsed = encode_started.elapsed();
+        let mut bytes_per_span = 0.0_f64;
         if scenario.mode == Mode::Http {
             let bytes: usize = payloads.iter().map(Vec::len).sum();
+            bytes_per_span = bytes as f64 / scenario.spans as f64;
             println!(
-                "  client encode: {:.2}s for {} batches ({:.1} MiB, {:.0} spans/s if it were the limit)",
+                "  client encode: {:.2}s for {} batches ({:.1} MiB, {bytes_per_span:.1} bytes/span, {:.0} spans/s if it were the limit)",
                 encode_elapsed.as_secs_f64(),
                 payloads.len(),
                 bytes as f64 / (1024.0 * 1024.0),
@@ -1033,9 +1158,10 @@ connection are reported as failures rather than as numbers.\n"
             println!("  FAILED: {error}\n");
             let _ = writeln!(
                 report,
-                "| {} | {} | {} | {} | FAILED: {error} | | |",
+                "| {} | {} | {} | {} | {} | FAILED: {error} | | | | |",
                 scenario.label,
                 scenario.protocol.as_str(),
+                scenario.protocol.route(),
                 scenario.keep_alive,
                 scenario.concurrency
             );
@@ -1046,6 +1172,10 @@ connection are reported as failures rather than as numbers.\n"
         let max = rates.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
         let mid = median(&mut rates.clone());
         println!("  median: {mid:.0} spans/s (min {min:.0}, max {max:.0})");
+        let decode_ns = decode_ns_per_span(&last_metrics);
+        if let Some(ns) = decode_ns {
+            println!("  decode: {ns:.0} ns/span (wire decode + any OTLP mapping)");
+        }
         let stages = stage_summary(&last_metrics);
         if !stages.is_empty() {
             println!("  stages (server-side totals across the run):");
@@ -1055,15 +1185,30 @@ connection are reported as failures rather than as numbers.\n"
 
         let _ = writeln!(
             report,
-            "| {} | {} | {} | {} | **{mid:.0}** | {min:.0} | {max:.0} |",
+            "| {} | {} | {} | {} | {} | **{mid:.0}** | {min:.0} | {max:.0} | {} | {} |",
             scenario.label,
-            scenario.protocol.as_str(),
+            if scenario.mode == Mode::Direct {
+                "—".to_owned()
+            } else {
+                scenario.protocol.as_str().to_owned()
+            },
+            if scenario.mode == Mode::Direct {
+                "—".to_owned()
+            } else {
+                scenario.protocol.route().to_owned()
+            },
             if scenario.mode == Mode::Direct {
                 "n/a".to_owned()
             } else {
                 scenario.keep_alive.to_string()
             },
-            scenario.concurrency
+            scenario.concurrency,
+            if scenario.mode == Mode::Direct {
+                "—".to_owned()
+            } else {
+                format!("{bytes_per_span:.0}")
+            },
+            decode_ns.map_or_else(|| "—".to_owned(), |ns| format!("{ns:.0}")),
         );
     }
 
