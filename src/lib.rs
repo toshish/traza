@@ -257,6 +257,106 @@ impl Default for CompactionConfig {
     }
 }
 
+/// A named group of write-path defaults trading ingest throughput against
+/// per-write latency.
+///
+/// The knobs on that axis are only coherent when set together — a large
+/// `flush_spans` and a zero `wal_commit_window` pull in opposite directions —
+/// and setting them together requires knowing what each does to the other. A
+/// profile is that knowledge, named, so an operator picks an intent instead of
+/// reverse-engineering the internals.
+///
+/// **A profile cannot change [`Durability`], and that is structural rather
+/// than conventional**: no variant carries one, so there is no value of
+/// `Profile` that weakens what an acknowledgement means. Durability is a
+/// correctness contract with clients, not a performance dial, and a profile
+/// named for speed that quietly made writes lossy would be exactly the trap
+/// worth designing out. [`Durability::Buffered`] stays an explicit opt-in.
+///
+/// Compaction is likewise untouched. It trades ingest throughput against
+/// *search* latency, not write latency, and disabling it is a cliff (segment
+/// count and file descriptors grow without bound) rather than a tuning
+/// choice — so every profile leaves it at [`CompactionConfig::default`] and
+/// read-path tuning stays on its own flags.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Profile {
+    /// Maximize sustained ingest. Waits [`Profile::wal_commit_window`] before
+    /// each fsync so more batches share it, and seals segments less often.
+    /// Costs per-write latency, most visibly at low concurrency where there is
+    /// nothing to batch with and the wait buys nothing.
+    Throughput,
+    /// The defaults: no deliberate fsync delay, segments sealed every 10,000
+    /// spans. What [`Config::default`] gives, so an unset profile changes
+    /// nothing.
+    #[default]
+    Balanced,
+    /// Minimize per-write acknowledgement latency and its tail. No fsync
+    /// delay, and small segment seals so the stall one write occasionally pays
+    /// for the whole buffer stays short.
+    Latency,
+}
+
+impl Profile {
+    /// Parses the CLI name.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "throughput" => Some(Self::Throughput),
+            "balanced" => Some(Self::Balanced),
+            "latency" => Some(Self::Latency),
+            _ => None,
+        }
+    }
+
+    /// The CLI name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Throughput => "throughput",
+            Self::Balanced => "balanced",
+            Self::Latency => "latency",
+        }
+    }
+
+    /// Buffered spans this profile seals a segment at.
+    ///
+    /// A seal is a stall charged to whichever write crosses the threshold, so
+    /// this is a tail-latency dial: larger means rarer but longer stalls. The
+    /// curve is not monotonic in either direction and these values are the
+    /// measured turning points, not round numbers — see
+    /// `docs/configuration.md`. Below roughly 2,000 the fixed per-seal cost
+    /// dominates and BOTH throughput and latency get worse, so `Latency` sits
+    /// above that cliff rather than at the smallest value available.
+    pub fn flush_spans(self) -> usize {
+        match self {
+            Self::Throughput => 30_000,
+            Self::Balanced => 10_000,
+            Self::Latency => 3_000,
+        }
+    }
+
+    /// How long this profile delays an fsync to collect more batches into it.
+    ///
+    /// Every acknowledgement in the window is delayed by up to this long, so
+    /// it is only ever paid for by the amortization it buys. 500us measured
+    /// best at small and medium batches and still positive at batch=1000;
+    /// beyond about 1 ms the delay costs more than the amortization returns.
+    pub fn wal_commit_window(self) -> Option<std::time::Duration> {
+        match self {
+            Self::Throughput => Some(std::time::Duration::from_micros(500)),
+            Self::Balanced | Self::Latency => None,
+        }
+    }
+
+    /// This profile's defaults as a [`Config`]. Durability and compaction are
+    /// whatever [`Config::default`] says; a profile does not set them.
+    pub fn config(self) -> Config {
+        Config {
+            flush_spans: self.flush_spans(),
+            wal_commit_window: self.wal_commit_window(),
+            ..Config::default()
+        }
+    }
+}
+
 /// Storage configuration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
