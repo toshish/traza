@@ -64,6 +64,39 @@ a profile with one knob overridden is not the profile:
 traza-server: profile=throughput — flush-spans=30000, wal-commit-window=500us
 ```
 
+### A profile only fully applies under `wal`
+
+The two knobs a profile sets are each inert under a different durability mode,
+so a profile combined with a non-default `--durability` is partly a no-op. This
+is not a special case in the profile code — it falls out of what the modes do —
+but it is invisible from the flag names, so:
+
+| `--durability` | `--flush-spans` | `--wal-commit-window-us` |
+|---|---|---|
+| `buffered` | active | **no effect** — there is no log to fsync |
+| `wal` (default) | active | active |
+| `flushed` | **no effect** — every call seals a segment regardless | active |
+
+Profiles are tuned for and measured under `wal`, which is the default and the
+only mode where both knobs do anything.
+
+### The costs that are not latency
+
+`--flush-spans` sets how many spans sit in the write buffer before a segment is
+sealed, so raising it costs two things beyond tail latency:
+
+- **Write-buffer memory** scales with it directly. `throughput` holds up to
+  30,000 spans against `balanced`'s 10,000 and `latency`'s 3,000.
+- **Restart replay time.** The write-ahead log is reclaimed when a flush seals
+  its spans into a segment, so a larger flush window means more log to replay
+  after a restart. Watch `wal_bytes` in `/v1/stats`: it is exactly the work a
+  restart would redo.
+
+Neither is a reason to avoid `throughput` on a machine with headroom, but both
+are reasons not to raise `--flush-spans` far past it "because higher was
+faster" — throughput stops improving well before the memory and replay costs
+do. See the [measured curve](#the-flush-spans-curve).
+
 ### What a profile deliberately does not set
 
 **Durability.** No profile changes what an acknowledged write guarantees. This
