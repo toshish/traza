@@ -22,7 +22,7 @@
 //! requires. All slicing is bounds-checked; malformed input yields
 //! `DecodeError`, never a panic.
 
-use crate::otlp::{AnyValueParts, OtlpError, SpanParts};
+use crate::otlp::{hex, AnyValueParts, OtlpError, SpanParts};
 use crate::{Event, Link, Span};
 use serde_json::{Map, Value};
 
@@ -149,20 +149,6 @@ impl<'a> Reader<'a> {
 
 fn utf8(bytes: &[u8], what: &str) -> Decoded<String> {
     String::from_utf8(bytes.to_vec()).map_err(|_| err(format!("{what} is not UTF-8")))
-}
-
-const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
-
-/// Lowercase hex, by table. This was a `format!("{byte:02x}")` per byte — a
-/// formatter invocation and a throwaway `String` for every byte of every trace
-/// and span id, which on a 1M-span batch is 24 million of each.
-fn hex(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(HEX_DIGITS[usize::from(byte >> 4)] as char);
-        out.push(HEX_DIGITS[usize::from(byte & 0x0f)] as char);
-    }
-    out
 }
 
 // -------------------------------------------------------- message decoders
@@ -457,9 +443,9 @@ fn decode_any_value(bytes: &[u8], depth: u32) -> Decoded<Value> {
                 }
                 parts.kvlist = Some(values);
             }
-            // Field 7 is bytesValue. Neither encoding has ever mapped it onto
-            // an attribute, so it is skipped rather than hex-encoded for a
-            // caller that would discard it.
+            // BytesValue. Copied out because `AnyValueParts` owns what it
+            // carries; only an attribute that actually is bytes pays for it.
+            (7, 2) => parts.bytes = Some(reader.bytes_field()?.to_vec()),
             _ => reader.skip(wire_type)?,
         }
     }

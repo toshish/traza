@@ -124,9 +124,9 @@ fn status_text(code: Option<u64>) -> String {
 /// The `AnyValue` variants a decoder found, resolved to a plain JSON value.
 ///
 /// Kept as a struct of options rather than resolved on sight because the
-/// precedence is fixed (string, int, double, bool, array, kvlist) and must NOT
-/// depend on the order the fields happened to arrive in — JSON object key order
-/// and protobuf field order are both arbitrary.
+/// precedence is fixed (string, int, double, bool, array, kvlist, bytes) and
+/// must NOT depend on the order the fields happened to arrive in — JSON object
+/// key order and protobuf field order are both arbitrary.
 #[derive(Default)]
 pub(crate) struct AnyValueParts {
     pub string: Option<Value>,
@@ -135,12 +135,15 @@ pub(crate) struct AnyValueParts {
     pub boolean: Option<Value>,
     pub array: Option<Vec<Value>>,
     pub kvlist: Option<Map<String, Value>>,
+    /// The raw bytes, NOT the form they are stored in. The two encodings put
+    /// them on the wire differently — protobuf raw, proto3 JSON base64 — so
+    /// each decoder undoes its own encoding and [`AnyValueParts::resolve`]
+    /// alone decides what an attribute ends up holding.
+    pub bytes: Option<Vec<u8>>,
 }
 
 impl AnyValueParts {
-    /// Flattens to a plain JSON value. `bytesValue` is deliberately not a
-    /// variant here: neither encoding has ever mapped it, so it resolves to
-    /// null exactly as before.
+    /// Flattens to a plain JSON value.
     pub(crate) fn resolve(self) -> Value {
         if let Some(text) = self.string {
             return text;
@@ -167,8 +170,29 @@ impl AnyValueParts {
         if let Some(values) = self.kvlist {
             return Value::Object(values);
         }
+        if let Some(bytes) = self.bytes {
+            // Lowercase hex, the way trace and span ids are stored. What an
+            // attribute holds must not depend on which encoding delivered it,
+            // and hex is the one representation this store already speaks —
+            // so proto3 JSON's base64 is decoded on arrival rather than kept.
+            return Value::String(hex(&bytes));
+        }
         Value::Null
     }
+}
+
+const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+
+/// Lowercase hex, by table. This was a `format!("{byte:02x}")` per byte — a
+/// formatter invocation and a throwaway `String` for every byte of every trace
+/// and span id, which on a 1M-span batch is 24 million of each.
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX_DIGITS[usize::from(byte >> 4)] as char);
+        out.push(HEX_DIGITS[usize::from(byte & 0x0f)] as char);
+    }
+    out
 }
 
 /// Normalizes a hex id in place: ids are stored lowercased, and anything that
@@ -657,7 +681,8 @@ fn any_value<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Value, D::Err
                     "boolValue" => parts.boolean = Some(map.next_value()?),
                     "arrayValue" => parts.array = Some(map.next_value::<ArrayValue>()?.0),
                     "kvlistValue" => parts.kvlist = Some(map.next_value::<KvListValue>()?.0),
-                    // `bytesValue` lands here: never mapped, so it stays null.
+                    "bytesValue" => parts.bytes = map.next_value::<Base64Bytes>()?.0,
+                    // A key no variant claims — a newer `AnyValue` member, say.
                     _ => {
                         map.next_value::<IgnoredAny>()?;
                     }
@@ -675,6 +700,101 @@ fn any_value<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Value, D::Err
         lenient_fallbacks!(Value, Value::Null);
     }
     deserializer.deserialize_any(AnyValueVisitor)
+}
+
+/// A proto3-JSON `bytesValue`: base64 text. Anything else — a non-string
+/// shape, or text that is not base64 — reads as absent, so the attribute
+/// resolves to null the way every other shape mismatch in this module falls
+/// back to its default.
+struct Base64Bytes(Option<Vec<u8>>);
+
+impl<'de> Deserialize<'de> for Base64Bytes {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct BytesVisitor;
+        impl<'de> Visitor<'de> for BytesVisitor {
+            type Value = Base64Bytes;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("base64-encoded bytes")
+            }
+            fn visit_str<E: serde::de::Error>(self, text: &str) -> Result<Base64Bytes, E> {
+                Ok(Base64Bytes(base64_decode(text)))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Base64Bytes, A::Error> {
+                drain_map(map)?;
+                Ok(Base64Bytes(None))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Base64Bytes, A::Error> {
+                drain_seq(seq)?;
+                Ok(Base64Bytes(None))
+            }
+            fn visit_some<D: Deserializer<'de>>(self, inner: D) -> Result<Base64Bytes, D::Error> {
+                Base64Bytes::deserialize(inner)
+            }
+            // Not `lenient_fallbacks!`: this visitor defines its own
+            // `visit_str`, which is the one shape that yields bytes.
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Base64Bytes, E> {
+                Ok(Base64Bytes(None))
+            }
+            fn visit_none<E: serde::de::Error>(self) -> Result<Base64Bytes, E> {
+                Ok(Base64Bytes(None))
+            }
+            fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Base64Bytes, E> {
+                Ok(Base64Bytes(None))
+            }
+            fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Base64Bytes, E> {
+                Ok(Base64Bytes(None))
+            }
+            fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Base64Bytes, E> {
+                Ok(Base64Bytes(None))
+            }
+            fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Base64Bytes, E> {
+                Ok(Base64Bytes(None))
+            }
+        }
+        deserializer.deserialize_any(BytesVisitor)
+    }
+}
+
+/// Decodes proto3 JSON's `bytes` encoding, or `None` when the text is not
+/// base64 at all.
+///
+/// Both the standard (`+/`) and the URL-safe (`-_`) alphabet are accepted,
+/// padded or not, which is the range protobuf's own JSON parsers accept. An
+/// exporter that picks any of them means the same bytes, and must not lose the
+/// attribute over the choice.
+fn base64_decode(text: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(text.len() / 4 * 3);
+    let mut accumulator: u32 = 0;
+    let mut bits: u32 = 0;
+    let mut padded = false;
+    for byte in text.bytes() {
+        if byte == b'=' {
+            // Padding only ever ends a stream. Data after it would be two
+            // encodings concatenated, which is not one value.
+            padded = true;
+            continue;
+        }
+        if padded {
+            return None;
+        }
+        let sextet = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            _ => return None,
+        };
+        accumulator = (accumulator << 6) | u32::from(sextet);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((accumulator >> bits) as u8);
+        }
+    }
+    // Six leftover bits are a group of one character: it carries no whole
+    // byte, so the input was cut mid-value rather than merely left unpadded.
+    (bits != 6).then_some(out)
 }
 
 /// The `values` array of an `ArrayValue`/`KeyValueList`, or empty for any
@@ -751,5 +871,109 @@ struct KvListValue(Map<String, Value>);
 impl<'de> Deserialize<'de> for KvListValue {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         Ok(KvListValue(KvListInner::deserialize(deserializer)?.0 .0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One span carrying one attribute, so a single `AnyValue` can be mapped
+    /// through the real entry point rather than through the visitor directly.
+    fn attribute(value: Value) -> Value {
+        let span = spans_from_json(
+            serde_json::json!({"resourceSpans": [{"scopeSpans": [{"spans": [{
+                "traceId": "aa", "spanId": "bb",
+                "startTimeUnixNano": "1", "endTimeUnixNano": "2",
+                "attributes": [{"key": "a", "value": value}]
+            }]}]}]})
+            .to_string()
+            .as_bytes(),
+        )
+        .expect("maps")
+        .remove(0);
+        span.attributes["a"].clone()
+    }
+
+    #[test]
+    fn base64_matches_known_vectors() {
+        assert_eq!(base64_decode(""), Some(Vec::new()));
+        assert_eq!(base64_decode("Zg=="), Some(b"f".to_vec()));
+        assert_eq!(base64_decode("Zm8="), Some(b"fo".to_vec()));
+        assert_eq!(base64_decode("Zm9v"), Some(b"foo".to_vec()));
+        assert_eq!(base64_decode("Zm9vYmFy"), Some(b"foobar".to_vec()));
+    }
+
+    /// Padding is optional and either alphabet is fine: exporters differ, and
+    /// they all mean the same bytes.
+    #[test]
+    fn base64_accepts_unpadded_and_url_safe_text() {
+        assert_eq!(base64_decode("Zg"), Some(b"f".to_vec()));
+        assert_eq!(base64_decode("Zm8"), Some(b"fo".to_vec()));
+        assert_eq!(base64_decode("+/+/"), Some(vec![0xfb, 0xff, 0xbf]));
+        assert_eq!(base64_decode("-_-_"), Some(vec![0xfb, 0xff, 0xbf]));
+    }
+
+    #[test]
+    fn base64_rejects_text_that_is_not_base64() {
+        assert_eq!(base64_decode("Z"), None, "a lone character is truncated");
+        assert_eq!(base64_decode("Zm9v!"), None, "outside the alphabet");
+        assert_eq!(base64_decode("Zm 9v"), None, "whitespace is not skipped");
+        assert_eq!(base64_decode("Zg==Zg=="), None, "data after the padding");
+    }
+
+    #[test]
+    fn base64_round_trips_every_byte() {
+        let all: Vec<u8> = (0..=255).collect();
+        for length in 0..all.len() {
+            let bytes = &all[..length];
+            assert_eq!(
+                base64_decode(&crate::media::base64_encode(bytes)).as_deref(),
+                Some(bytes)
+            );
+        }
+    }
+
+    #[test]
+    fn bytes_attributes_are_stored_as_hex() {
+        assert_eq!(
+            attribute(serde_json::json!({"bytesValue": "AQID"})),
+            Value::String("010203".to_owned())
+        );
+        assert_eq!(
+            attribute(serde_json::json!({"bytesValue": ""})),
+            Value::String(String::new()),
+            "empty bytes are empty, not absent"
+        );
+    }
+
+    /// A `bytesValue` that is not base64 is not bytes; it reads as null rather
+    /// than failing the batch, which is how this module treats every other
+    /// value it cannot make sense of.
+    #[test]
+    fn unreadable_bytes_attributes_read_as_null() {
+        assert_eq!(
+            attribute(serde_json::json!({"bytesValue": "!!"})),
+            Value::Null
+        );
+        assert_eq!(attribute(serde_json::json!({"bytesValue": 7})), Value::Null);
+        assert_eq!(
+            attribute(serde_json::json!({"bytesValue": {"nested": true}})),
+            Value::Null
+        );
+    }
+
+    /// Precedence must not depend on key order: `stringValue` outranks
+    /// `bytesValue` whichever one the encoder wrote first.
+    #[test]
+    fn string_outranks_bytes_either_way_round() {
+        assert_eq!(
+            attribute(serde_json::json!({"stringValue": "s", "bytesValue": "AQID"})),
+            Value::String("s".to_owned())
+        );
+        assert_eq!(
+            attribute(serde_json::json!({"bytesValue": "AQID", "stringValue": "s"})),
+            Value::String("s".to_owned())
+        );
     }
 }

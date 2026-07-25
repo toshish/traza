@@ -53,6 +53,11 @@ Ingest throughput: 108,881 -> 208,973 spans/s at 16 concurrent clients in
 
 ### Fixed
 
+- **`bytesValue` attributes are no longer dropped.** An OTLP attribute of the
+  bytes variant was stored as `null` on both ingest paths, with no error and no
+  warning. It is now stored as lowercase hex, the same representation trace and
+  span ids use — protobuf's raw bytes and OTLP/HTTP JSON's base64 land on the
+  one value, so what an attribute holds does not depend on how it arrived.
 - A connection refused at the limit now reliably receives its `503`. Closing a
   socket while the client's request bytes sat unread made the kernel send RST,
   and the RST beat the response — backpressure surfaced as "connection reset
