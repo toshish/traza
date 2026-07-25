@@ -18,14 +18,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     filter p50 14.8 -> 2.4 ms, p95 33.4 -> 4.1 ms, p99 220 -> 14.1 ms
     (6-15x), and trace lookup p99 4.65 -> 2.28 ms. It costs ingest
     throughput, which is the trade the flag exists to let you make.
-  - Measured at **100M spans** (55 GB on disk), full fidelity: trace lookup
-    p99 1.82 ms and peak RSS 2.0 GB both clear the project's own targets
-    comfortably, but attribute-filter p99 was **72.9 ms against a 50 ms
-    target** — compaction is worth roughly 25-30x at that size and still
-    does not close the gap alone. The binding constraint is the
-    `--compaction-max-segment-bytes` default (256 MiB), which floors the
-    segment count near corpus/cap (~220 segments at 55 GB); raising it is
-    the identified lever and is not yet measured.
+  - Measured at **100M spans** (55 GB on disk), uncompacted vs default,
+    both through the same harness: attribute filter p50 155.5 -> 9.8 ms,
+    p95 747.3 -> 27.1 ms, p99 1664.6 -> 72.9 ms (16-28x), trace lookup p99
+    7.72 -> 1.82 ms, segments ~10,100 -> ~380. It costs about 31% of ingest
+    throughput (59,025 -> 40,894 spans/s) and ~1.5 GB of resident memory for
+    the merge working set.
+  - **The filtered-search target is still missed at that size**: p99 72.9 ms
+    against the project's own 50 ms bar (p50 and p95 are inside it). The
+    binding constraint is the `--compaction-max-segment-bytes` default
+    (256 MiB), which floors segment count near corpus/cap (~220 at 55 GB);
+    raising it is the identified lever and is not yet measured.
+  - Uncompacted, every segment holds an open file descriptor — ~10,100 at
+    100M, which would exhaust a default 1024-fd limit. A second reason not
+    to disable compaction on large stores.
   - Only the TAIL of the segment list is merged. Segment path order IS
     recency order, and a merged segment takes a fresh (newest) id, so
     merging a run from the middle would promote its spans past segments that
