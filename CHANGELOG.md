@@ -14,10 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Filtered search costs one index probe per segment, so a store that only
   appends flush-sized segments gets steadily slower to search as it grows.
   Compaction merges same-size segments to bound that count.
-  - Measured over 2M spans: 200 segments -> 51, attribute filter p50
-    3.00 ms -> 1.28 ms and p95 7.74 ms -> 3.33 ms. It costs ingest
-    throughput (that load ran 19 s -> 32 s), which is the trade the flag
-    exists to let you make.
+  - Measured over 10M spans, uncompacted vs default compaction: attribute
+    filter p50 14.8 -> 2.4 ms, p95 33.4 -> 4.1 ms, p99 220 -> 14.1 ms
+    (6-15x), and trace lookup p99 4.65 -> 2.28 ms. It costs about 39% of
+    ingest throughput (54,942 -> 33,304 spans/s), which is the trade the
+    flag exists to let you make.
   - Only the TAIL of the segment list is merged. Segment path order IS
     recency order, and a merged segment takes a fresh (newest) id, so
     merging a run from the middle would promote its spans past segments that

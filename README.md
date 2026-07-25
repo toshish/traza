@@ -228,7 +228,16 @@ Measured on macOS/aarch64 (10 hardware threads) by the bundled end-to-end benchm
 
 Limited queries decode only the records they return, so **trace lookup** is effectively scale-independent — measured p50 0.85 ms, p99 4.65 ms over a 10M-span store.
 
-**Filtered search is not scale-independent: it costs one index probe per segment.** A query narrows candidates through every segment's index, so its latency tracks the number of segments rather than the size of the corpus. Measured over the same 10M-span store, with segments left uncompacted, the attribute filter ran p50 14.8 ms / p99 220 ms across ~1000 segments — against p50 0.7 ms for the identical data in a single segment. This is what [size-tiered compaction](#server-flags) exists to bound; it is on by default (`--compaction-fanout`, 0 to disable), and compaction trades some ingest throughput for it.
+**Filtered search costs one index probe per segment**, so its latency tracks the number of segments rather than the size of the corpus — which is what [size-tiered compaction](#server-flags) exists to bound. It is on by default. Measured over the same 10M-span store:
+
+| 10M spans | uncompacted (~1000 segments) | **default compaction** |
+|---|---:|---:|
+| Attribute filter p50 | 14.8 ms | **2.4 ms** |
+| Attribute filter p99 | 220 ms | **14.1 ms** |
+| Trace lookup p99 | 4.65 ms | **2.28 ms** |
+| Sustained ingest | 54,942 spans/s | **33,304 spans/s** |
+
+Compaction buys a 6-15x improvement in filtered search and pays about **39% of ingest throughput** for it. That is a real trade, not a free win: `--compaction-fanout 0` turns it off for write-dominated deployments that rarely search.
 
 Full percentiles and methodology are in [BENCHMARKS.md](BENCHMARKS.md), which is rewritten by the benchmark itself (`cargo run --release --bin bench`) — run it on your hardware rather than trusting ours. Those published figures are the 1,000,000-span corpus; `TRAZA_BENCH_SPANS` runs other sizes without overwriting them.
 
