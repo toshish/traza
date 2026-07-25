@@ -5,7 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.17.0] - 2026-07-25
+
+Ingest throughput roughly doubles at concurrency, and the record of why is
+corrected in three places where it was wrong. Persistent connections, OTLP
+decoded straight to spans for both wire formats, `--profile` for the
+throughput/latency tradeoff, and a documentation set for users, operators and
+developers.
 
 Ingest throughput: 108,881 -> 208,973 spans/s at 16 concurrent clients in
 `wal` mode, measured through one client against both builds. The roadmap's
@@ -29,6 +35,19 @@ Ingest throughput: 108,881 -> 208,973 spans/s at 16 concurrent clients in
 - **`--wal-commit-window-us`** (default off): holds an fsync open briefly so
   more batches join it. A latency-for-amortization trade that does not touch
   the guarantee — the fsync still precedes the acknowledgement it covers.
+- **`--profile throughput|balanced|latency`**, setting the write-path knobs
+  (`--flush-spans`, `--wal-commit-window-us`) as a coherent group so they can
+  be chosen by intent rather than by reading the internals. An explicit flag
+  always beats the profile, in either argument order. **No profile can change
+  `--durability`** — a profile cannot represent one, so none can silently make
+  writes lossy. Measured tradeoffs, including where each profile does *not*
+  help, are in [docs/configuration.md](docs/configuration.md).
+- **A documentation set for three audiences** under `docs/`: a user guide
+  (getting started, data model, ingest, full HTTP API reference, trace
+  browser), operations (deployment, durability, administration, monitoring,
+  capacity), and internals (architecture, the load-bearing invariants, module
+  map, testing, benchmarking). The README is now an overview that routes
+  onward rather than holding all of it.
 - **`ingest-bench`**, a benchmark matrix over protocol, keep-alive,
   concurrency and durability. Reports the median of N runs with its spread,
   refuses to report a rate from a run that shed a connection or stored fewer
@@ -51,6 +70,13 @@ Ingest throughput: 108,881 -> 208,973 spans/s at 16 concurrent clients in
   and correctness result, not a throughput one. The mapping rules the two
   decoders must agree on are shared rather than duplicated, and a differential
   test pins that agreement across every `AnyValue` variant.
+- **`ingest-bench` measures latency, not just throughput**, with an open-loop
+  fixed-arrival-rate mode and coordinated-omission correction. Under a
+  closed-loop generator every saturating configuration reports latency that is
+  just concurrency over throughput, so the tradeoff a latency profile exists
+  to make was not visible at all. Scenarios also run round-robin with their
+  order rotated per round, so background load hits every configuration alike
+  instead of landing on whichever ran during a spike.
 - **`ingest-bench` separates wire format from route.** It posted JSON to
   `/v1/spans` and protobuf to `/v1/traces`, so every protocol comparison also
   contained the OTLP mapping; on that basis this project claimed protobuf was
