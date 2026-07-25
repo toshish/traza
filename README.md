@@ -228,23 +228,26 @@ Measured on macOS/aarch64 (10 hardware threads) by the bundled end-to-end benchm
 
 Limited queries decode only the records they return, so **trace lookup** is effectively scale-independent — measured p50 0.85 ms, p99 4.65 ms over a 10M-span store.
 
-**Filtered search costs one index probe per segment**, so its latency tracks the number of segments rather than the size of the corpus — which is what [size-tiered compaction](#server-flags) exists to bound. It is on by default. Both columns below come from the same benchmark harness at 100M spans (55 GB on disk), differing only in `--compaction-fanout`:
+**Filtered search costs one index probe per segment**, so its latency tracks the number of segments rather than the size of the corpus — which is what [size-tiered compaction](#server-flags) exists to bound. It is on by default. All three columns below come from the same benchmark harness at 100M spans (~55 GB on disk), differing only in `--compaction-fanout` and `--compaction-max-segment-bytes`:
 
-| 100M spans | uncompacted | **default compaction** | |
-|---|---:|---:|---|
-| Attribute filter p50 | 155.5 ms | **9.8 ms** | 15.8x |
-| Attribute filter p95 | 747.3 ms | **27.1 ms** | 27.6x |
-| Attribute filter p99 | 1664.6 ms | **72.9 ms** | 22.8x |
-| Trace lookup p99 | 7.72 ms | **1.82 ms** | 4.2x |
-| Segments † | ~10,100 | **~380** | ~27x fewer |
-| Peak RSS | 0.43 GB | 2.0 GB | compaction costs memory |
-| Sustained ingest | 59,025/s | 40,894/s | -31% |
+| 100M spans | uncompacted | default compaction (256 MiB cap) | **1 GiB cap** |
+|---|---:|---:|---:|
+| Attribute filter p50 | 155.5 ms | 9.8 ms | **2.3 ms** |
+| Attribute filter p95 | 747.3 ms | 27.1 ms | **9.3 ms** |
+| Attribute filter p99 | 1664.6 ms | 72.9 ms | **22.2 ms** |
+| Trace lookup p99 | 7.72 ms | 1.82 ms | **0.99 ms** |
+| Segments | ~10,100 † | ~380 † | **~100-125** ‡ |
+| Peak RSS | 0.43 GB | 2.0 GB | **6.7 GB** ‡ |
+| Sustained ingest | 59,025/s | 40,894/s | **31,267/s** |
 
-† Segment counts are extrapolated from mid-run samples (6,064 at 60M uncompacted, 191 at 50M compacted, both growing linearly); the benchmark deletes its data directory on exit. Every latency, memory and throughput figure above is measured.
+† Extrapolated from mid-run samples (6,064 at 60M uncompacted, 191 at 50M compacted, both growing linearly); the benchmark deletes its data directory on exit.
+‡ Sampled directly during the run at 20-second intervals, not extrapolated. The segment count oscillates between about 97 and 125 over the last 5 minutes of ingest as merges create and retire segments. Peak RSS is the maximum of those samples, so a shorter-lived merge spike between samples could exceed it. Every latency and throughput figure is measured.
 
-Read that honestly. Compaction is worth roughly **16-28x** on filtered search and 4x on trace lookup, and it pays for that with about **31% of ingest throughput and ~1.5 GB of resident memory** for its merge working set. But **filtered-search p99 is still 72.9 ms at 100M, over the 50 ms target this project sets itself** — p50 and p95 are comfortably inside it; only the tail is not.
+Read that honestly. Compaction is worth roughly **16-28x** on filtered search at the default cap, and raising the cap to 1 GiB is worth roughly another **3-4x** on top of that. **At a 1 GiB cap, filtered-search p99 is 22.2 ms at 100M — inside the 50 ms target this project sets itself**, where the 256 MiB default measures 72.9 ms and misses it.
 
-The remaining gap is a **tuning default, not the algorithm**: `--compaction-max-segment-bytes` (256 MiB) floors the segment count near *corpus / cap* — about 220 segments at 55 GB. Raising it lowers that floor proportionally, at the cost of more merge memory and a longer lock hold. Large deployments should raise it; that combination is not yet measured, so it is a lever rather than a promise.
+That win is paid for in memory and ingest. Peak RSS rises from 2.0 GB to 6.7 GB, because a merge materializes its inputs and a 4x larger cap means a proportionally larger merge working set; sustained ingest falls a further 24% (40,894/s to 31,267/s). Raising the cap is the right trade for a large store that is read more than it is written, and the wrong one for a memory-constrained host. Both configurations are one flag apart.
+
+This is measured at 100M spans on one machine. It is **not** measured beyond that size, and segment count still grows with the corpus, so the same tail will return at a large enough store — the structural answer remains a per-segment inverted index.
 
 One operational note for the uncompacted path: every segment holds an open file descriptor, so ~10,100 segments means ~10,100 fds. That is fine against a large limit but would exhaust a default 1024-fd shell, which is a second reason not to run large stores with compaction disabled.
 

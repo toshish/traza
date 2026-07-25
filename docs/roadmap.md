@@ -254,15 +254,26 @@ alongside results.
   than per-span. Size-tiered compaction bounds the segment count, and the
   gate has now been measured at its real corpus size, against a measured
   uncompacted baseline rather than an extrapolation. **At 100M spans
-  (55 GB): trace lookup p99 1.82 ms and RSS 2.0 GB both PASS; filtered
-  search p99 72.9 ms FAILS the 50 ms bar** (p50 9.8 ms and p95 27.1 ms are
-  inside it). Uncompacted the same query measures p99 1664.6 ms, so
-  compaction is worth 22.8x at the tail and is still not sufficient by
-  itself. The next lever is the
-  `--compaction-max-segment-bytes` default, which floors segment count near
-  corpus/cap (~220 segments at 55 GB with the 256 MiB default); raising it
-  should lower filter latency proportionally but is unmeasured. Beyond that,
-  the Phase 3 per-segment inverted index is the structural answer.
+  (~55 GB) with `--compaction-max-segment-bytes 1073741824` (1 GiB): trace
+  lookup p99 0.99 ms and filtered search p99 22.2 ms both PASS the gate**
+  (p50 2.3 ms, p95 9.3 ms). With the 256 MiB default the same corpus
+  measures filtered-search p99 72.9 ms and MISSES the bar, so the binding
+  constraint was the cap, not the algorithm — it floors segment count near
+  corpus/cap, and the measured count fell from ~380 to ~100-125. Uncompacted
+  the same query measures p99 1664.6 ms.
+  **Both latency criteria are met at 100M and only at 100M.** They are
+  untested above that size, on one machine, in a single run — the regression
+  policy below (≥5 runs, median with IQR) has not yet been applied to them.
+  The RSS criterion is the one this trade puts under strain: peak RSS is
+  6.7 GB at the 1 GiB cap against 2.0 GB at the default, because a merge
+  materializes its inputs, so the peak tracks the cap rather than the index
+  size. Between merges resident memory settles around 1.4-2.4 GB, so the
+  steady state is still O(indexes) and the transient is not; whether that
+  counts as meeting "RSS remains O(indexes)" is a judgement this gate should
+  make explicit before 1.0. Sustained ingest also falls from 40,894/s to
+  31,267/s. Segment count still grows with the corpus, so the tail returns
+  at a large enough store, and the Phase 3 per-segment inverted index
+  remains the structural answer.
 - **Regression policy:** each gate runs ≥5 times; the reported statistic is
   the median with an interquartile range; a release blocks when the median
   regresses >10% *and* the change exceeds run-to-run noise for that metric.
