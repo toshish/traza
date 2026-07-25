@@ -34,6 +34,7 @@ fn store_with_corpus(label: &str, options: &SeedOptions) -> (Store, traza::seed:
             // Bulk-loading a fixed corpus; the log would only add fsyncs to
             // data this test flushes explicitly anyway.
             durability: traza::Durability::Buffered,
+            compaction: None,
         },
     )
     .expect("opens");

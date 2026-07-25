@@ -198,7 +198,7 @@ Recovery is ordered: log records replay in append order, so a re-ingested span r
 
 One caveat worth stating plainly: `wal` and `flushed` issue `fsync`, which on **macOS does not flush the drive's own write cache** (that needs `F_FULLFSYNC`, which the Rust standard library does not expose and which this crate will not reach for while it has two dependencies and forbids unsafe code). On Linux, `fsync` carries the usual guarantee. A macOS laptop losing power can therefore still lose an acknowledged write; a kill -9, a panic, or an OS crash cannot, and that is what the durability suite proves.
 
-**Resources.** Memory is O(indexes), not O(data): segments are file-backed, only their parsed indexes stay resident, and span payloads are read on demand — measured 0.71 GB peak RSS serving a 10M-span (2.4 GB on disk) corpus. Stores larger than RAM serve correctly; disk latency applies to cold reads.
+**Resources.** Memory is O(indexes), not O(data): segments are file-backed, only their parsed indexes stay resident, and span payloads are read on demand — measured **0.25 GB peak RSS** serving a 10M-span corpus (**~6 GB on disk** for the benchmark's span shape). Stores larger than RAM serve correctly; disk latency applies to cold reads.
 
 **Scope.** One writer process per data directory (a stale lock from a dead process is reclaimed automatically). Single-node today; clustered HA is the designed next arc — see the [roadmap](#status-and-roadmap).
 
@@ -213,6 +213,8 @@ One caveat worth stating plainly: `wal` and `flushed` issue `fsync`, which on **
 | `--flush-spans N` | `10000` | Buffered spans that trigger a durable flush |
 | `--payload-threshold-bytes N` | `262144` | Offload threshold for large string values; `0` disables |
 | `--durability MODE` | `wal` | `buffered`, `wal`, or `flushed` — what an acknowledged write guarantees (see [Durability](#operating-traza)) |
+| `--compaction-fanout N` | `4` | Same-size segments merged into one, bounding filtered-search cost; `0` disables compaction |
+| `--compaction-max-segment-bytes N` | `268435456` | Ceiling on a merged segment, bounding merge memory and lock hold time; `0` for no ceiling |
 | `--ui-dir DIR` | see below | Built dashboard to serve at `/`; served from disk, so a rebuilt UI needs no server restart. Unset ⇒ `$TRAZA_UI_DIR`, `<binary dir>/ui`, `<binary dir>/../share/traza/ui`, `./ui/dist`, first one containing `index.html`. None found ⇒ the API runs and `/` 404s with build instructions |
 | `--allow-unauthenticated-non-loopback` | off | Explicitly allow an unsafe non-loopback bind without tokens |
 
@@ -224,7 +226,29 @@ Measured on macOS/aarch64 (10 hardware threads) by the bundled end-to-end benchm
 - **Trace lookup:** p95 0.64 ms
 - **Attribute-filtered search:** p95 3.3 ms
 
-Limited queries decode only the records they return, so lookup and search latency are effectively scale-independent: at 10M spans, trace lookup is p50 0.45 ms and the attribute filter p50 2.9 ms. Full percentiles and methodology are in [BENCHMARKS.md](BENCHMARKS.md), which is rewritten by the benchmark itself (`cargo run --release --bin bench`) — run it on your hardware rather than trusting ours.
+Limited queries decode only the records they return, so **trace lookup** is effectively scale-independent — measured p50 0.85 ms, p99 4.65 ms over a 10M-span store.
+
+**Filtered search costs one index probe per segment**, so its latency tracks the number of segments rather than the size of the corpus — which is what [size-tiered compaction](#server-flags) exists to bound. It is on by default. Both columns below come from the same benchmark harness at 100M spans (55 GB on disk), differing only in `--compaction-fanout`:
+
+| 100M spans | uncompacted | **default compaction** | |
+|---|---:|---:|---|
+| Attribute filter p50 | 155.5 ms | **9.8 ms** | 15.8x |
+| Attribute filter p95 | 747.3 ms | **27.1 ms** | 27.6x |
+| Attribute filter p99 | 1664.6 ms | **72.9 ms** | 22.8x |
+| Trace lookup p99 | 7.72 ms | **1.82 ms** | 4.2x |
+| Segments † | ~10,100 | **~380** | ~27x fewer |
+| Peak RSS | 0.43 GB | 2.0 GB | compaction costs memory |
+| Sustained ingest | 59,025/s | 40,894/s | -31% |
+
+† Segment counts are extrapolated from mid-run samples (6,064 at 60M uncompacted, 191 at 50M compacted, both growing linearly); the benchmark deletes its data directory on exit. Every latency, memory and throughput figure above is measured.
+
+Read that honestly. Compaction is worth roughly **16-28x** on filtered search and 4x on trace lookup, and it pays for that with about **31% of ingest throughput and ~1.5 GB of resident memory** for its merge working set. But **filtered-search p99 is still 72.9 ms at 100M, over the 50 ms target this project sets itself** — p50 and p95 are comfortably inside it; only the tail is not.
+
+The remaining gap is a **tuning default, not the algorithm**: `--compaction-max-segment-bytes` (256 MiB) floors the segment count near *corpus / cap* — about 220 segments at 55 GB. Raising it lowers that floor proportionally, at the cost of more merge memory and a longer lock hold. Large deployments should raise it; that combination is not yet measured, so it is a lever rather than a promise.
+
+One operational note for the uncompacted path: every segment holds an open file descriptor, so ~10,100 segments means ~10,100 fds. That is fine against a large limit but would exhaust a default 1024-fd shell, which is a second reason not to run large stores with compaction disabled.
+
+Full percentiles and methodology are in [BENCHMARKS.md](BENCHMARKS.md), which is rewritten by the benchmark itself (`cargo run --release --bin bench`) — run it on your hardware rather than trusting ours. Those published figures are the 1,000,000-span corpus; `TRAZA_BENCH_SPANS` runs other sizes without overwriting them.
 
 ## Using Traza as a library
 

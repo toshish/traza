@@ -44,7 +44,7 @@ use std::thread;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use traza::{Config, Durability, Span, SpanCursor, SpanFilter, Store};
+use traza::{CompactionConfig, Config, Durability, Span, SpanCursor, SpanFilter, Store};
 
 const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 // Headers get a far tighter budget than bodies: without one, a 64 MiB
@@ -85,6 +85,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut allow_unauthenticated_non_loopback = false;
     let mut ui_dir: Option<PathBuf> = None;
     let mut durability = Durability::default();
+    let mut compaction = CompactionConfig::default();
+    let mut compaction_enabled = true;
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < args.len() {
@@ -132,6 +134,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .parse::<usize>()?
                     .max(1);
             }
+            "--compaction-fanout" => {
+                i += 1;
+                let value: usize = args
+                    .get(i)
+                    .ok_or("--compaction-fanout requires a value")?
+                    .parse()?;
+                // 0 or 1 cannot merge anything; treat as "off" rather than
+                // silently looping.
+                compaction_enabled = value >= 2;
+                compaction.fanout = value.max(2);
+            }
+            "--compaction-max-segment-bytes" => {
+                i += 1;
+                compaction.max_segment_bytes = args
+                    .get(i)
+                    .ok_or("--compaction-max-segment-bytes requires a value")?
+                    .parse()?;
+            }
             "--durability" => {
                 i += 1;
                 let name = args.get(i).ok_or("--durability requires a value")?;
@@ -149,7 +169,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--help" | "-h" => {
                 println!(
-                    "Usage: traza-server --data-dir DIR --port PORT [--host ADDR] [--ttl-seconds N] [--flush-spans N] [--workers N] [--payload-threshold-bytes N (0 disables)] [--durability buffered|wal|flushed (default wal)] [--ui-dir DIR (built dashboard; default: TRAZA_UI_DIR, beside the binary, then ./ui/dist)] [--allow-unauthenticated-non-loopback]"
+                    "Usage: traza-server --data-dir DIR --port PORT [--host ADDR] [--ttl-seconds N] [--flush-spans N] [--workers N] [--payload-threshold-bytes N (0 disables)] [--durability buffered|wal|flushed (default wal)] [--compaction-fanout N (0 disables; default 4)] [--compaction-max-segment-bytes N] [--ui-dir DIR (built dashboard; default: TRAZA_UI_DIR, beside the binary, then ./ui/dist)] [--allow-unauthenticated-non-loopback]"
                 );
                 return Ok(());
             }
@@ -178,18 +198,33 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             // 0 disables offloading.
             payload_threshold: (payload_threshold_bytes > 0).then_some(payload_threshold_bytes),
             durability,
+            compaction: compaction_enabled.then_some(compaction),
         },
     )?);
 
-    // TTL enforcement lives in the engine; the server only schedules it.
-    if ttl_seconds.is_some() {
-        let compactor = Arc::clone(&engine);
+    // TTL enforcement and segment compaction live in the engine; the server
+    // only schedules them. Compaction ticks far more often than TTL: it is
+    // what keeps filtered-search latency flat as segments accumulate, and it
+    // is a no-op when no run qualifies.
+    if ttl_seconds.is_some() || compaction_enabled {
+        let maintainer = Arc::clone(&engine);
+        let ttl_enabled = ttl_seconds.is_some();
         thread::Builder::new()
-            .name("traza-compactor".into())
-            .spawn(move || loop {
-                thread::sleep(std::time::Duration::from_secs(60));
-                if let Err(error) = compactor.compact_expired() {
-                    eprintln!("compaction failed: {error}");
+            .name("traza-maintenance".into())
+            .spawn(move || {
+                let mut ticks = 0u64;
+                loop {
+                    thread::sleep(std::time::Duration::from_secs(5));
+                    ticks += 1;
+                    if let Err(error) = maintainer.compact_segments() {
+                        eprintln!("segment compaction failed: {error}");
+                    }
+                    // TTL keeps its documented one-minute cadence.
+                    if ttl_enabled && ticks % 12 == 0 {
+                        if let Err(error) = maintainer.compact_expired() {
+                            eprintln!("expiry compaction failed: {error}");
+                        }
+                    }
                 }
             })?;
     }

@@ -42,6 +42,7 @@ fn oversized_payloads_are_offloaded_and_readable() {
         Config {
             payload_threshold: Some(1_024),
             durability: traza::Durability::Buffered,
+            compaction: None,
             ..Config::default()
         },
     )
@@ -429,6 +430,7 @@ fn reingested_payload_survives_ttl_compaction() {
             ttl_seconds: Some(1),
             payload_threshold: Some(64),
             durability: traza::Durability::Buffered,
+            compaction: None,
             ..Config::default()
         },
     )
@@ -469,6 +471,7 @@ fn reingested_payload_survives_ttl_compaction() {
             ttl_seconds: Some(1),
             payload_threshold: Some(64),
             durability: traza::Durability::Buffered,
+            compaction: None,
             ..Config::default()
         },
     )
@@ -566,6 +569,7 @@ fn concurrent_identical_payload_ingest_all_succeed() {
             Config {
                 payload_threshold: Some(1_024),
                 durability: traza::Durability::Buffered,
+                compaction: None,
                 ..Config::default()
             },
         )
