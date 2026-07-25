@@ -198,7 +198,7 @@ Recovery is ordered: log records replay in append order, so a re-ingested span r
 
 One caveat worth stating plainly: `wal` and `flushed` issue `fsync`, which on **macOS does not flush the drive's own write cache** (that needs `F_FULLFSYNC`, which the Rust standard library does not expose and which this crate will not reach for while it has two dependencies and forbids unsafe code). On Linux, `fsync` carries the usual guarantee. A macOS laptop losing power can therefore still lose an acknowledged write; a kill -9, a panic, or an OS crash cannot, and that is what the durability suite proves.
 
-**Resources.** Memory is O(indexes), not O(data): segments are file-backed, only their parsed indexes stay resident, and span payloads are read on demand — measured 0.71 GB peak RSS serving a 10M-span (2.4 GB on disk) corpus. Stores larger than RAM serve correctly; disk latency applies to cold reads.
+**Resources.** Memory is O(indexes), not O(data): segments are file-backed, only their parsed indexes stay resident, and span payloads are read on demand — measured **0.25 GB peak RSS** serving a 10M-span corpus (**~6 GB on disk** for the benchmark's span shape). Stores larger than RAM serve correctly; disk latency applies to cold reads.
 
 **Scope.** One writer process per data directory (a stale lock from a dead process is reclaimed automatically). Single-node today; clustered HA is the designed next arc — see the [roadmap](#status-and-roadmap).
 
@@ -213,6 +213,8 @@ One caveat worth stating plainly: `wal` and `flushed` issue `fsync`, which on **
 | `--flush-spans N` | `10000` | Buffered spans that trigger a durable flush |
 | `--payload-threshold-bytes N` | `262144` | Offload threshold for large string values; `0` disables |
 | `--durability MODE` | `wal` | `buffered`, `wal`, or `flushed` — what an acknowledged write guarantees (see [Durability](#operating-traza)) |
+| `--compaction-fanout N` | `4` | Same-size segments merged into one, bounding filtered-search cost; `0` disables compaction |
+| `--compaction-max-segment-bytes N` | `268435456` | Ceiling on a merged segment, bounding merge memory and lock hold time; `0` for no ceiling |
 | `--ui-dir DIR` | see below | Built dashboard to serve at `/`; served from disk, so a rebuilt UI needs no server restart. Unset ⇒ `$TRAZA_UI_DIR`, `<binary dir>/ui`, `<binary dir>/../share/traza/ui`, `./ui/dist`, first one containing `index.html`. None found ⇒ the API runs and `/` 404s with build instructions |
 | `--allow-unauthenticated-non-loopback` | off | Explicitly allow an unsafe non-loopback bind without tokens |
 
@@ -224,7 +226,11 @@ Measured on macOS/aarch64 (10 hardware threads) by the bundled end-to-end benchm
 - **Trace lookup:** p95 0.64 ms
 - **Attribute-filtered search:** p95 3.3 ms
 
-Limited queries decode only the records they return, so lookup and search latency are effectively scale-independent: at 10M spans, trace lookup is p50 0.45 ms and the attribute filter p50 2.9 ms. Full percentiles and methodology are in [BENCHMARKS.md](BENCHMARKS.md), which is rewritten by the benchmark itself (`cargo run --release --bin bench`) — run it on your hardware rather than trusting ours.
+Limited queries decode only the records they return, so **trace lookup** is effectively scale-independent — measured p50 0.85 ms, p99 4.65 ms over a 10M-span store.
+
+**Filtered search is not scale-independent: it costs one index probe per segment.** A query narrows candidates through every segment's index, so its latency tracks the number of segments rather than the size of the corpus. Measured over the same 10M-span store, with segments left uncompacted, the attribute filter ran p50 14.8 ms / p99 220 ms across ~1000 segments — against p50 0.7 ms for the identical data in a single segment. This is what [size-tiered compaction](#server-flags) exists to bound; it is on by default (`--compaction-fanout`, 0 to disable), and compaction trades some ingest throughput for it.
+
+Full percentiles and methodology are in [BENCHMARKS.md](BENCHMARKS.md), which is rewritten by the benchmark itself (`cargo run --release --bin bench`) — run it on your hardware rather than trusting ours. Those published figures are the 1,000,000-span corpus; `TRAZA_BENCH_SPANS` runs other sizes without overwriting them.
 
 ## Using Traza as a library
 

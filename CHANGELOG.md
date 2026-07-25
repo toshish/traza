@@ -7,7 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Size-tiered compaction**, on by default and configurable with
+  `--compaction-fanout` (0 disables) and `--compaction-max-segment-bytes`.
+  Filtered search costs one index probe per segment, so a store that only
+  appends flush-sized segments gets steadily slower to search as it grows.
+  Compaction merges same-size segments to bound that count.
+  - Measured over 2M spans: 200 segments -> 51, attribute filter p50
+    3.00 ms -> 1.28 ms and p95 7.74 ms -> 3.33 ms. It costs ingest
+    throughput (that load ran 19 s -> 32 s), which is the trade the flag
+    exists to let you make.
+  - Only the TAIL of the segment list is merged. Segment path order IS
+    recency order, and a merged segment takes a fresh (newest) id, so
+    merging a run from the middle would promote its spans past segments that
+    legitimately supersede them.
+  - Crash safety reuses the existing supersede journal with one marker per
+    input, and the merged segment is renamed into place before any input is
+    deleted.
+  - TTL expiry keeps its one-minute cadence; compaction runs on a 5 s tick in
+    the same maintenance thread, which now also starts when only compaction
+    is enabled.
+
 ### Changed
+
+- `Config` gains a `compaction` field (`None` disables).
+- README performance claims corrected against a measured 10,000,000-span run.
+  The previous text dated from 0.3.1 and claimed search was "effectively
+  scale-independent" at p50 2.9 ms; the measured filter p50 was 14.8 ms
+  across ~1000 segments. The README now states that filtered search scales
+  with segment count, and reports measured RSS (0.25 GB, not 0.71 GB) and
+  disk (~6 GB for the benchmark's span shape, not 2.4 GB).
+
+
 
 - Renamed the segment module `segment_v2` → `segment` (file, module,
   `segment_error` helper, acceptance test, format doc): there is only one

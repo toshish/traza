@@ -247,7 +247,12 @@ alongside results.
 - **Throughput:** 250k spans/s sustained on the reference environment in
   `wal` mode (keep-alive + protobuf), measured by the bundled benchmark.
 - **Query latency:** p99 < 10 ms trace lookup and < 50 ms filtered search at
-  a 100M-span store; RSS remains O(indexes).
+  a 100M-span store; RSS remains O(indexes). *Status at 10M (0.15):* trace
+  lookup p99 4.65 ms already clears its bar and RSS held at 0.25 GB, but the
+  filtered-search bar is the open risk — uncompacted, it measured p99 220 ms
+  at a tenth of the gate's corpus, because the cost is per-segment rather
+  than per-span. Size-tiered compaction bounds the segment count; whether
+  that is enough at 100M is unproven and needs measuring at that size.
 - **Regression policy:** each gate runs ≥5 times; the reported statistic is
   the median with an interquartile range; a release blocks when the median
   regresses >10% *and* the change exceeds run-to-run noise for that metric.
