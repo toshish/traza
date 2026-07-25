@@ -251,10 +251,16 @@ alongside results.
   lookup p99 4.65 ms already clears its bar and RSS held at 0.25 GB, but the
   filtered-search bar is the open risk — uncompacted, it measured p99 220 ms
   at a tenth of the gate's corpus, because the cost is per-segment rather
-  than per-span. Size-tiered compaction bounds the segment count and brought
-  that to p99 14.1 ms at 10M — inside the 50 ms bar, though at a tenth of the
-  gate's corpus. Whether it still holds at 100M is unproven and needs
-  measuring at that size; the ingest cost (about 39%) is the known price.
+  than per-span. Size-tiered compaction bounds the segment count, and the
+  gate has now been measured at its real corpus size. **At 100M spans
+  (55 GB): trace lookup p99 1.82 ms and RSS 2.0 GB both PASS; filtered
+  search p99 72.9 ms FAILS the 50 ms bar** (p50 9.8 ms and p95 27.1 ms are
+  inside it). Compaction is worth roughly 25-30x at that size and is not
+  sufficient by itself. The next lever is the
+  `--compaction-max-segment-bytes` default, which floors segment count near
+  corpus/cap (~220 segments at 55 GB with the 256 MiB default); raising it
+  should lower filter latency proportionally but is unmeasured. Beyond that,
+  the Phase 3 per-segment inverted index is the structural answer.
 - **Regression policy:** each gate runs ≥5 times; the reported statistic is
   the median with an interquartile range; a release blocks when the median
   regresses >10% *and* the change exceeds run-to-run noise for that metric.
