@@ -1,11 +1,73 @@
 # Segment Format v2: indexed segments
 
-> Historical design note from the v0.3 transition. The current engine is
-> v2-only and file-backed: `Segment::open` reads the header and index sections,
-> then reads exact payload ranges on demand. Legacy v1 JSONL segments fail
-> startup with a migration pointer. Current behavior and guarantees are
-> documented in the README and `src/segment.rs`; proposal language below is
-> retained as design history.
+The shipped layout is described first; the original v0.3 design proposal is
+retained below it as history. **The proposal does not describe the format that
+shipped** — it predates the implementation and differs in the layout, the
+section list, and the compatibility story. Read the first section for the
+format; read the second only for the reasoning.
+
+## Shipped layout
+
+Verified against `src/segment.rs` (`Header::parse_with_total` and `encode`) and
+pinned by `tests/segment_format_acceptance.rs`.
+
+A segment is one file named `segment-<20-digit id>.seg`, written temp + fsync +
+atomic rename. It is a fixed 80-byte header followed by four contiguous
+sections, in this order, with no gaps and nothing trailing:
+
+```
+[ 80-byte header ]
+[ records        ]  encoded records, ascending timestamp order
+[ record offsets ]  u64 per record, relative to the record region
+[ trace index    ]  trace id -> record offsets
+[ attribute index]  (key, value) -> record offsets; runs to EOF
+```
+
+Header fields, little-endian, at fixed byte offsets:
+
+| Offset | Size | Field |
+|---:|---:|---|
+| 0 | 8 | magic, `TRAZASEG` |
+| 8 | 2 | format version (`2`) |
+| 10 | 2 | header length (`80`) |
+| 12 | 4 | reserved, zero |
+| 16 | 8 | record count |
+| 24 | 8 | records offset |
+| 32 | 8 | records length |
+| 40 | 8 | record-offset index offset |
+| 48 | 8 | record-offset index length |
+| 56 | 8 | trace index offset |
+| 64 | 8 | trace index length |
+| 72 | 8 | attribute index offset |
+
+The attribute index has no stored length: it runs from its offset to EOF, so
+its length is derived from the file size. The reader rejects a segment whose
+sections are not contiguous from the end of the header, whose record-offset
+index is not exactly `record_count * 8` bytes, or whose sections exceed the
+file.
+
+Each record is: timestamp `u64`, trace-id length `u32`, attribute count `u32`,
+payload length `u32`, reserved `u32`, then the trace id, then that many
+length-prefixed key/value pairs, then the opaque payload.
+
+`Segment::open` reads only the header and the three index sections into memory;
+record payloads stay on disk and are read by exact byte range on demand. That
+is what makes stores larger than RAM serveable.
+
+### Compatibility
+
+v1 JSONL segments are **not** readable. `Store::open` refuses a directory
+containing a `.jsonl` segment with an error pointing at traza 0.3.x for
+migration — failing loudly beats silently hiding persisted data.
+
+---
+
+# Original design proposal (v0.3, historical)
+
+Everything below is the proposal as written before implementation. It is kept
+for the reasoning behind the design, not as a description of the format. Where
+it disagrees with the section above — notably the trailing-footer arrangement,
+the JSONL payload, and readable v1 segments — the section above is correct.
 
 ## Problem (measured)
 

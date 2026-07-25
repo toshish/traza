@@ -74,6 +74,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   constants flipped too — the current format is now the unmarked
   `SEGMENT_SUFFIX` (`.seg`) and the unsupported legacy JSONL suffix is
   `LEGACY_SEGMENT_SUFFIX`.
+- `tests/segment_format_acceptance.rs` now asserts against the real encoder's
+  output instead of a fixture it invented. The old fixture described itself as
+  "deliberately independent" but was only ever checked against itself, never
+  fed to the reader — so it drifted into a layout Traza has never written (a
+  u32 header length at offset 12, three sections instead of four, a `.trz2`
+  extension) and passed continuously while asserting nothing. Feeding it to
+  `Segment::from_bytes` failed with `Corrupt("invalid v2 header length")`.
+  The tests still parse the header by hand at fixed offsets — that
+  independence is the point — but they parse bytes from
+  `segment::encode`, round-trip them through `Segment::from_bytes` and
+  `Segment::open`, and pin the four-section layout, the record encoding, and
+  what the reader must reject. `reopen_persistence` no longer writes bytes
+  and reads them back asserting equality (a test of `fs`, not of Traza).
+- `docs/segment-format.md` describes the layout that shipped. It previously
+  documented only the pre-implementation proposal — a trailing footer, a
+  JSONL payload, and readable v1 segments — none of which match
+  `src/segment.rs`; v1 JSONL is rejected with a migration pointer. The
+  proposal is retained below the real layout, marked as history.
 - Reconciled the on-disk segment magic. The encoder wrote `TRAZAV2` while the
   acceptance test and format doc expected `TRAZASEG`; they never met, because
   the acceptance fixture is self-checked and was never fed to the real reader.
