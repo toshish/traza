@@ -227,6 +227,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut durability = Durability::default();
     let mut compaction = CompactionConfig::default();
     let mut compaction_enabled = true;
+    let mut wal_commit_window_us = 0_u64;
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < args.len() {
@@ -292,6 +293,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .ok_or("--compaction-max-segment-bytes requires a value")?
                     .parse()?;
             }
+            "--wal-commit-window-us" => {
+                i += 1;
+                wal_commit_window_us = args
+                    .get(i)
+                    .ok_or("--wal-commit-window-us requires a value")?
+                    .parse()?;
+            }
             "--durability" => {
                 i += 1;
                 let name = args.get(i).ok_or("--durability requires a value")?;
@@ -309,7 +317,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--help" | "-h" => {
                 println!(
-                    "Usage: traza-server --data-dir DIR --port PORT [--host ADDR] [--ttl-seconds N] [--flush-spans N] [--max-connections N (default 1024)] [--payload-threshold-bytes N (0 disables)] [--durability buffered|wal|flushed (default wal)] [--compaction-fanout N (0 disables; default 4)] [--compaction-max-segment-bytes N] [--ui-dir DIR (built dashboard; default: TRAZA_UI_DIR, beside the binary, then ./ui/dist)] [--allow-unauthenticated-non-loopback]"
+                    "Usage: traza-server --data-dir DIR --port PORT [--host ADDR] [--ttl-seconds N] [--flush-spans N] [--max-connections N (default 1024)] [--payload-threshold-bytes N (0 disables)] [--durability buffered|wal|flushed (default wal)] [--wal-commit-window-us N (delay each fsync so more acks share it; 0 = off)] [--compaction-fanout N (0 disables; default 4)] [--compaction-max-segment-bytes N] [--ui-dir DIR (built dashboard; default: TRAZA_UI_DIR, beside the binary, then ./ui/dist)] [--allow-unauthenticated-non-loopback]"
                 );
                 return Ok(());
             }
@@ -343,6 +351,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             payload_threshold: (payload_threshold_bytes > 0).then_some(payload_threshold_bytes),
             durability,
             compaction: compaction_enabled.then_some(compaction),
+            wal_commit_window: (wal_commit_window_us > 0)
+                .then(|| Duration::from_micros(wal_commit_window_us)),
         },
     )?);
 

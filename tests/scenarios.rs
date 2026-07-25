@@ -35,6 +35,7 @@ fn store_with_corpus(label: &str, options: &SeedOptions) -> (Store, traza::seed:
             // data this test flushes explicitly anyway.
             durability: traza::Durability::Buffered,
             compaction: None,
+            wal_commit_window: None,
         },
     )
     .expect("opens");
