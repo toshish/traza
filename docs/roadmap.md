@@ -245,12 +245,16 @@ alongside results.
   ingest, annotation, payload, and compaction paths. `buffered` mode is
   tested to lose *only* unacknowledged-as-durable data.
 - **Throughput:** 250k spans/s sustained on the reference environment in
-  `wal` mode, measured by the bundled benchmark. ***Status (0.16): 208,973
-  spans/s — NOT MET, 16% short***, median of 5 runs at concurrency 16 over a
-  1M-span corpus (`ingest-bench`; see [INGEST-BENCHMARK.md](../INGEST-BENCHMARK.md)).
-  Up from 108,881 on the same client before persistent connections and the
-  decode/WAL work landed, and the curve no longer flattens between 8 and 16
-  clients as it did.
+  `wal` mode, measured by the bundled benchmark. ***Status (0.16): 250,453
+  spans/s with `--profile throughput` — the median clears the bar, but NOT
+  YET CONFIRMED***: median of 5 rotated rounds at concurrency 16 over a
+  1M-span corpus, min 122,768, max 261,215 (`ingest-bench`; see
+  [INGEST-BENCHMARK.md](../INGEST-BENCHMARK.md)). The spread straddles the
+  target because the host was shared during measurement (1-minute load average
+  6.5 to 47.8, mean 15.4). **Re-measure on an idle machine before calling this
+  met.** At the default `balanced` settings the same run measures 197,056, and
+  108,881 was the figure before persistent connections and the decode/WAL work
+  landed.
 
   The parenthetical this line used to carry — "(keep-alive + protobuf)" — did
   not survive measurement. Protobuf is *slower* than JSON at every concurrency
@@ -258,13 +262,28 @@ alongside results.
   uses), and keep-alive is worth +11% at batch=20 and nothing at batch=1000.
   Decode of any kind is 1.9% of the cost.
 
-  The real limit is the **writer lock, held ~88% of a run, of which 74% is
-  segment sealing** — work that needs no lock. That puts a hard ceiling near
-  212k spans/s on the current design regardless of client concurrency, which
-  is why the remaining gap is not a tuning problem. Moving the seal off the
-  lock requires a reader-visible "sealing" tier and a rotating WAL; both are
-  specified in INGEST-BENCHMARK.md, and an attempt that stopped short of them
-  was reverted rather than merged.
+  The limit is the **writer lock, of which segment sealing is most of the
+  time held** — work that needs no lock. An earlier version of this line
+  called that "a hard ceiling near 212k spans/s on the current design
+  regardless of client concurrency". **That was wrong.** The arithmetic behind
+  it was correct but was performed at a single value of `--flush-spans`
+  (10,000, the default). A seal carries a fixed cost — two fsyncs, a create
+  and rename, a reopen-and-parse — on top of its per-span cost, so sealing
+  less often amortizes the fixed part and the ceiling moves. It is a function
+  of the setting, not a property of the design.
+
+  Measured at concurrency 8 on a 1M-span corpus: in-lock work (wal write +
+  buffer upsert + segment seal) totals **4,581 ms at `--flush-spans 10000`**
+  (lock held 88%, implying ~218k spans/s) against **3,336 ms at
+  `--flush-spans 30000`** (lock held 80%, implying ~300k). Tripling the spans
+  per seal raised mean seal time only 2.17x, not 3x.
+
+  Sizing seals correctly reprices the constraint; it does not remove it. The
+  lock is still held ~80% of a run, and larger thresholds keep costing tail
+  latency and write-buffer memory, so the direction runs out. Moving the seal
+  off the lock requires a reader-visible "sealing" tier and a rotating WAL;
+  both are specified in INGEST-BENCHMARK.md, and an attempt that stopped short
+  of them was reverted rather than merged.
 - **Query latency:** p99 < 10 ms trace lookup and < 50 ms filtered search at
   a 100M-span store; RSS remains O(indexes). *Status at 10M (0.15):* trace
   lookup p99 4.65 ms already clears its bar and RSS held at 0.25 GB, but the

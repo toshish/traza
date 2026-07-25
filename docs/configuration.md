@@ -265,12 +265,13 @@ Two consequences of that setup worth stating before the numbers:
 
 These runs were **not** made on an idle machine, and the numbers should be read
 knowing that. The reference box is an Apple M1 Max (10 hardware threads,
-32 GB). Over the measurement window the 1-minute load average ranged from about
-**6 to 45**, sampled every 15 s. Two contributors: the developer's own
-unrelated software (a VM, dev servers, browsers), and — for the earlier, more
-heavily loaded part of the window — **a second agent running 1M-span benchmarks
-of this same codebase on the same host**. That second load is self-inflicted
-scheduling, not an environmental fact about Traza.
+32 GB). Sampled every 15 s across the measurement window, the 1-minute load
+average ran **min 6.5, mean 15.4, max 47.8**. Two contributors: the developer's
+own unrelated software (a VM, dev servers, browsers), and — for the earlier and
+most heavily loaded part of the window — **a second agent running 1M-span
+benchmarks of this same codebase on the same host**. That second load was
+scheduling, not an environmental fact about Traza, and it is the reason several
+rows below carry a min far under their median.
 
 The mitigations are structural rather than cosmetic:
 
@@ -420,6 +421,60 @@ single client sees close to raw per-request cost whatever the profile says.
 [the interaction table](#a-profile-only-fully-applies-under-wal). Under
 `buffered` the commit window does nothing; under `flushed` the flush threshold
 does nothing.
+
+### The profiles compared
+
+One run, 1,000,000 spans, batch 1000, median of 5 rotated rounds. Same corpus,
+same protocol, same durability; the only difference between rows at a given
+concurrency is `--profile`.
+
+**Capacity (closed loop, saturating):**
+
+| Concurrency | `throughput` | `balanced` | `latency` |
+|---:|---:|---:|---:|
+| 1 | 85,010 | 80,791 | 74,823 |
+| 4 | 173,092 | 159,716 | 134,573 |
+| 8 | **231,912** | 184,571 | 162,703 |
+| 16 | **250,453** | 197,056 | 157,681 |
+
+With spread, at the concurrency each is best measured (min–max over the 5
+rounds):
+
+| Profile | c16 median | min | max |
+|---|---:|---:|---:|
+| `throughput` | 250,453 | 122,768 | 261,215 |
+| `balanced` | 197,056 | 114,849 | 205,010 |
+| `latency` | 157,681 | 153,194 | 161,347 |
+
+`throughput` is **+27% over `balanced` at c16** and +26% at c8. `latency` costs
+**20% of capacity at c16** relative to `balanced`. The wide min–max on the
+first two rows is contention, not instability: their unlucky round ran while
+the host was busiest. `latency`'s narrow spread is a consequence of it being
+capacity-bound well below what the machine could deliver even when loaded.
+
+**Latency (open loop, 60,000 spans/s offered — the honest measurement):**
+
+| Concurrency | Profile | p50 | p95 | **p99** |
+|---:|---|---:|---:|---:|
+| 4 | `throughput` | 15.54 ms | 83.88 ms | 108.75 ms |
+| 4 | `balanced` | 18.51 ms | 48.94 ms | 79.58 ms |
+| 4 | **`latency`** | 18.64 ms | **40.73 ms** | **63.03 ms** |
+| 8 | `throughput` | 15.31 ms | 83.40 ms | 115.18 ms |
+| 8 | `balanced` | 16.76 ms | 47.81 ms | 74.94 ms |
+| 8 | **`latency`** | 19.73 ms | **40.77 ms** | 75.17 ms |
+
+That is the tradeoff, in the direction the names promise: `latency` takes p95
+from 48.94 ms to 40.73 ms at c4 (**-17%**) and p99 from 79.58 ms to 63.03 ms
+(**-21%**), while `throughput` is the worst of the three on both. Note also
+that `throughput` has the **best p50 and the worst tail** — a clean
+demonstration of why a profile chosen on median latency would be chosen wrong.
+
+Three rows are missing from that table because their runs were rejected rather
+than reported: `balanced` at c1 delivered 54,566 of 60,000 spans/s, `latency`
+at c1 delivered 42,493, and `latency` at c16 delivered 55,804. A single
+connection cannot offer 60,000 spans/s against these profiles' per-request
+cost, and `latency` at c16 hit its lower capacity ceiling during a loaded
+round. Those are real limits, not gaps in the data.
 
 <!-- MEASUREMENTS -->
 
