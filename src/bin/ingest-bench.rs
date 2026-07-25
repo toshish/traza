@@ -691,21 +691,24 @@ fn run_http(scenario: &Scenario, payloads: &Arc<Vec<Vec<u8>>>) -> Result<RunResu
     }
     let elapsed = started.elapsed();
 
-    // An open-loop run whose clients could not keep to the schedule did not
-    // measure the offered rate; it measured the server's capacity, and its
-    // latencies describe a queue rather than a configuration. Reject it
-    // rather than publish it, on the same principle as a shed connection.
-    if let Some(interval) = interval {
-        let lag = Duration::from_nanos(worst_lag_ns.load(Ordering::Relaxed) as u64);
-        // One batch-interval of slop absorbs scheduler jitter; sustained
-        // lateness beyond that means the arrival schedule was not met.
-        let tolerance = Duration::from_secs_f64(interval * 10.0);
-        if lag > tolerance {
+    // An open-loop run that could not sustain the offered rate did not measure
+    // the offered rate; it measured capacity, and its latencies describe a
+    // saturated queue rather than a configuration. Reject it rather than
+    // publish it, on the same principle as a shed connection.
+    //
+    // The test is DELIVERED RATE, not worst lateness. A single deep stall — a
+    // segment seal, say — makes the next several batches late without the run
+    // failing to deliver the load, and that lateness is precisely what the
+    // latency percentiles exist to report. Gating on worst lag would throw
+    // away the measurement for exhibiting the effect being measured; only
+    // lateness the run never recovers from shows up as a rate shortfall.
+    if let Some(offered) = scenario.offered_rate {
+        let achieved = scenario.spans as f64 / elapsed.as_secs_f64();
+        if achieved < offered * 0.95 {
             return Err(format!(
-                "offered rate exceeded capacity: fell {:.1} ms behind schedule (tolerance {:.1} ms), \
-so this is a saturation measurement, not an open-loop one",
-                lag.as_secs_f64() * 1e3,
-                tolerance.as_secs_f64() * 1e3
+                "offered rate exceeded capacity: delivered {achieved:.0} of {offered:.0} spans/s \
+(worst lateness {:.1} ms), so this is a saturation measurement, not an open-loop one",
+                worst_lag_ns.load(Ordering::Relaxed) as f64 / 1e6
             ));
         }
     }
