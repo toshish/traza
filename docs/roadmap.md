@@ -35,7 +35,7 @@ attribute convention bolted onto a request tracer. The product wins when:
   Features can be added; identity cannot be retrofitted.
 - **Small enough to audit.** Dependencies are budgeted, not vibes-based.
 
-## Where Traza stands (baseline, v0.15)
+## Where Traza stands (baseline, v0.16)
 
 Shipped and load-bearing: durable segment engine (immutable indexed
 segments, crash recovery, journaled TTL compaction, larger-than-RAM
