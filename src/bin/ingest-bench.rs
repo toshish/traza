@@ -1223,7 +1223,8 @@ fn run() -> Result<(), String> {
     println!();
 
     let mut report = String::new();
-    let _ = writeln!(report, "# Traza Ingest Benchmark\n");
+    // No H1 here: this block is spliced into a curated document between the
+    // generated markers, which supplies its own title and analysis.
     let _ = writeln!(
         report,
         "Every row is the MEDIAN of {runs} runs, each on a fresh data directory. \
@@ -1492,7 +1493,8 @@ fn write_report(report: &str) -> Result<(), String> {
         println!("{path} carries no {GENERATED_BEGIN} marker, so it was left alone; wrote {aside}");
         return Ok(());
     }
-    std::fs::write(path, report).map_err(|e| e.to_string())?;
+    let fresh = format!("# Traza Ingest Benchmark\n\n{GENERATED_BEGIN}\n{report}{GENERATED_END}\n");
+    std::fs::write(path, fresh).map_err(|e| e.to_string())?;
     println!("Wrote {path}");
     Ok(())
 }
