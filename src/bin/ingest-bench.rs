@@ -1116,6 +1116,10 @@ connection are reported as failures rather than as numbers.\n"
         }
 
         let mut rates = Vec::new();
+        // Decode is measured PER RUN and reported as a median with its spread,
+        // like the rate. Reading it off the last run alone reported a single
+        // sample for the one number the protocol comparison turns on.
+        let mut decode_rates = Vec::new();
         let mut last_metrics = String::new();
         let mut failed: Option<String> = None;
         for attempt in 1..=runs {
@@ -1146,6 +1150,9 @@ connection are reported as failures rather than as numbers.\n"
                         result.elapsed.as_secs_f64()
                     );
                     rates.push(result.rate);
+                    if let Some(ns) = decode_ns_per_span(&result.metrics) {
+                        decode_rates.push(ns);
+                    }
                     last_metrics = result.metrics;
                 }
                 Err(error) => {
@@ -1173,9 +1180,17 @@ connection are reported as failures rather than as numbers.\n"
         let max = rates.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
         let mid = median(&mut rates.clone());
         println!("  median: {mid:.0} spans/s (min {min:.0}, max {max:.0})");
-        let decode_ns = decode_ns_per_span(&last_metrics);
+        let decode_ns = (!decode_rates.is_empty()).then(|| median(&mut decode_rates.clone()));
         if let Some(ns) = decode_ns {
-            println!("  decode: {ns:.0} ns/span (wire decode + any OTLP mapping)");
+            let low = decode_rates.iter().cloned().fold(f64::INFINITY, f64::min);
+            let high = decode_rates
+                .iter()
+                .cloned()
+                .fold(f64::NEG_INFINITY, f64::max);
+            println!(
+                "  decode: {ns:.0} ns/span median (min {low:.0}, max {high:.0}) \
+— wire decode + any OTLP mapping"
+            );
         }
         let stages = stage_summary(&last_metrics);
         if !stages.is_empty() {
