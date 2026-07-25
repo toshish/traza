@@ -209,9 +209,11 @@ One caveat worth stating plainly: `wal` and `flushed` issue `fsync`, which on **
 |---|---|---|
 | `--data-dir DIR` | `./data` | Directory for all state; created if missing |
 | `--host ADDR` / `--port PORT` | `127.0.0.1` / `8080` | Bind address and port |
+| `--profile NAME` | `balanced` | `throughput`, `balanced`, or `latency` — sets the write-path knobs as a coherent group (see [Profiles](#profiles)) |
 | `--max-connections N` | `1024` | Concurrent connections served; past it clients get `503` rather than being queued |
 | `--ttl-seconds N` | off | Rolling retention window |
 | `--flush-spans N` | `10000` | Buffered spans that trigger a durable flush |
+| `--wal-commit-window-us N` | off | Delay each fsync so more acknowledgements share it; `0` disables |
 | `--payload-threshold-bytes N` | `262144` | Offload threshold for large string values; `0` disables |
 | `--durability MODE` | `wal` | `buffered`, `wal`, or `flushed` — what an acknowledged write guarantees (see [Durability](#operating-traza)) |
 | `--compaction-fanout N` | `4` | Same-size segments merged into one, bounding filtered-search cost; `0` disables compaction |
@@ -219,12 +221,38 @@ One caveat worth stating plainly: `wal` and `flushed` issue `fsync`, which on **
 | `--ui-dir DIR` | see below | Built dashboard to serve at `/`; served from disk, so a rebuilt UI needs no server restart. Unset ⇒ `$TRAZA_UI_DIR`, `<binary dir>/ui`, `<binary dir>/../share/traza/ui`, `./ui/dist`, first one containing `index.html`. None found ⇒ the API runs and `/` 404s with build instructions |
 | `--allow-unauthenticated-non-loopback` | off | Explicitly allow an unsafe non-loopback bind without tokens |
 
+Every flag, every `Config` field, and the measured cost of each is documented in **[docs/configuration.md](docs/configuration.md)**.
+
+#### Profiles
+
+`--profile` sets the two write-path knobs whose cost curves turn on each other, so they can be chosen by intent rather than by reading the internals:
+
+| Profile | `--flush-spans` | `--wal-commit-window-us` | Pick it when |
+|---|---:|---:|---|
+| `throughput` | 30,000 | 500 | Ingest-bound and nothing blocks on an individual ack — backfill, firehose, a queue in front |
+| `balanced` (default) | 10,000 | off | Anything else, and anything you have not measured. These are the long-standing defaults, unchanged |
+| `latency` | 5,000 | off | A client blocks on the ack and its **tail** matters — SDK timeouts, synchronous exporters |
+
+An explicit flag always beats the profile, **in either argument order**. **No profile changes `--durability`** — that is structural, not a convention: a profile cannot represent a durability, so no profile can silently make writes lossy. `buffered` stays an explicit opt-in.
+
+Measured, 1M spans, batch 1000, median of 5 rotated rounds on a **shared** machine (load average 6.5–47.8; see [docs/configuration.md](docs/configuration.md#load-conditions-stated)):
+
+| Profile | Capacity @ c16 | p95 @ 60k offered, c4 | p99 @ 60k offered, c4 |
+|---|---:|---:|---:|
+| `throughput` | **250,453** (min 122,768, max 261,215) | 83.88 ms | 108.75 ms |
+| `balanced` | 197,056 (min 114,849, max 205,010) | 48.94 ms | 79.58 ms |
+| `latency` | 157,681 (min 153,194, max 161,347) | **40.73 ms** | **63.03 ms** |
+
+`throughput` is +27% capacity over `balanced` and the worst tail of the three; `latency` gives up 20% of capacity for a 21% better p99. Latency is measured **open loop** at a fixed arrival rate — under a saturating client, latency is throughput's reciprocal and the comparison is meaningless.
+
+The full measured comparison, the methodology (closed- vs open-loop load, and why latency measured under saturation is nearly meaningless), and where the profiles do **not** help are in [docs/configuration.md](docs/configuration.md).
+
 ## Performance
 
 Measured on macOS/aarch64 (10 hardware threads) by the bundled end-to-end benchmark over a 1,000,000-span corpus ingested through the real HTTP path:
 
 - **Sustained ingest:** 116,618 spans/s (batched HTTP, single client, client serialization and loopback included)
-- **Sustained ingest, 16 concurrent clients:** 208,973 spans/s (`wal` durability, median of 5 runs — see [INGEST-BENCHMARK.md](INGEST-BENCHMARK.md))
+- **Sustained ingest, 16 concurrent clients:** 197,056 spans/s at the default `balanced` settings, **250,453 spans/s with `--profile throughput`** (`wal` durability, median of 5 rotated rounds on a shared machine — see [INGEST-BENCHMARK.md](INGEST-BENCHMARK.md) and [docs/configuration.md](docs/configuration.md))
 - **Trace lookup:** p95 0.64 ms
 - **Attribute-filtered search:** p95 3.3 ms
 
