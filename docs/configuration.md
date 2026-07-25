@@ -380,6 +380,47 @@ into its own sample instead of hiding it — the coordinated-omission correction
 A run that fails to deliver its offered rate is rejected rather than reported,
 which is what the two blank rows above are.
 
+### Where the profiles do not help
+
+Every one of these is measured, and several cut against the feature.
+
+**`latency` does not lower your median — it raises it.** At a fixed 60,000
+spans/s the `latency` profile's p50 is 27.44 ms against `balanced`'s 18.40 ms.
+What it buys is the tail: p95 47.45 ms against 55.99 ms, p99 52.56 ms against
+64.00 ms. That is the entire value proposition, and if your clients care about
+the median rather than the tail, this profile is a downgrade. Pick it for a
+timeout budget, never for "feels faster".
+
+**`throughput` costs about 29% of peak capacity to undo.** The `latency`
+profile's capacity is 97,857 spans/s against `balanced`'s 137,859 at the same
+concurrency. If your steady-state load is anywhere near your capacity, the
+`latency` profile will put you over it, and its better tail evaporates the
+moment you saturate — a saturated queue's tail is set by the queue, not by the
+seal size.
+
+**The commit window is nearly worthless on its own at large batches.** At
+batch 1000, `--wal-commit-window-us 500` on top of the default `--flush-spans`
+is within noise. It is worth +8% only once `--flush-spans` is at 30,000
+(224,261 → 241,804 at c8). The window amortizes fsync across batches that are
+waiting; when seals are frequent enough to be the bottleneck, there is nothing
+for it to amortize. This is why the two are set together and why setting the
+window alone is close to a no-op.
+
+**Batch size dominates the window's value.** The window's benefit scales with
+how many batches arrive during it. At batch 1000 a 500 µs window collects
+almost nothing; the effect is large only when batches are small and frequent.
+If your clients send large batches — most OTLP exporters do — do not expect
+this knob to do much.
+
+**Neither profile changes the low-concurrency picture much.** At concurrency 1
+there is no other work to batch an fsync with and no queue to smooth, so a
+single client sees close to raw per-request cost whatever the profile says.
+
+**Half of each profile is inert outside `--durability wal`.** See
+[the interaction table](#a-profile-only-fully-applies-under-wal). Under
+`buffered` the commit window does nothing; under `flushed` the flush threshold
+does nothing.
+
 <!-- MEASUREMENTS -->
 
 ## Watching whether the choice is working
