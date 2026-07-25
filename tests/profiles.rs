@@ -7,7 +7,9 @@
 //! checked here. The CLI half (a profile is only a default, and an explicit
 //! flag beats it) lives in `src/bin/traza-server.rs`.
 
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use traza::{CompactionConfig, Config, Durability, Profile, Span, Store};
@@ -128,6 +130,85 @@ fn a_profile_flush_threshold_drives_actual_sealing() {
     assert_eq!(stats.buffered_records, spans.len());
     drop(store);
     let _ = std::fs::remove_dir_all(&balanced_dir);
+}
+
+/// The startup banner reports the RESOLVED knobs, so an operator reading a log
+/// sees what is in force rather than a profile name that an explicit flag may
+/// have partly overridden. Driving the real binary also proves the resolved
+/// `Config` is the one actually handed to the engine, which parsing tests
+/// alone cannot show.
+fn announced_profile_line(extra: &[&str]) -> String {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("traza-profiles-banner-{stamp}"));
+    let mut child = Command::new(env!("CARGO_BIN_EXE_traza-server"))
+        .arg("--data-dir")
+        .arg(&dir)
+        .arg("--host")
+        .arg("127.0.0.1")
+        .arg("--port")
+        .arg("0")
+        .args(extra)
+        .env_remove("TRAZA_TOKENS")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawns traza-server");
+    let stderr = child.stderr.take().expect("stderr");
+    let mut found = String::new();
+    for line in BufReader::new(stderr).lines() {
+        let line = line.expect("stderr line");
+        if let Some(rest) = line.strip_prefix("traza-server: profile=") {
+            found = rest.to_owned();
+            break;
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(!found.is_empty(), "server never announced its profile");
+    found
+}
+
+#[test]
+fn the_server_announces_the_resolved_knobs() {
+    let banner = announced_profile_line(&["--profile", "throughput"]);
+    assert!(
+        banner.starts_with("throughput"),
+        "unexpected banner: {banner}"
+    );
+    assert!(
+        banner.contains(&format!(
+            "flush-spans={}",
+            Profile::Throughput.flush_spans()
+        )),
+        "unexpected banner: {banner}"
+    );
+    assert!(
+        banner.contains("wal-commit-window=500us"),
+        "unexpected banner: {banner}"
+    );
+
+    // An override has to be visible in the banner, not hidden behind the
+    // profile's name.
+    let overridden = announced_profile_line(&["--profile", "throughput", "--flush-spans", "1234"]);
+    assert!(
+        overridden.contains("flush-spans=1234"),
+        "the banner reported the profile's value, not the resolved one: {overridden}"
+    );
+    assert!(
+        overridden.contains("wal-commit-window=500us"),
+        "overriding one knob dropped the rest of the profile: {overridden}"
+    );
+
+    let default = announced_profile_line(&[]);
+    assert!(default.starts_with("balanced"), "unexpected: {default}");
+    assert!(
+        default.contains("wal-commit-window=off"),
+        "unexpected: {default}"
+    );
 }
 
 /// A profile changes when an acknowledgement arrives, never whether the data
