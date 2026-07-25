@@ -319,17 +319,22 @@ impl Profile {
     /// Buffered spans this profile seals a segment at.
     ///
     /// A seal is a stall charged to whichever write crosses the threshold, so
-    /// this is a tail-latency dial: larger means rarer but longer stalls. The
-    /// curve is not monotonic in either direction and these values are the
-    /// measured turning points, not round numbers — see
-    /// `docs/configuration.md`. Below roughly 2,000 the fixed per-seal cost
-    /// dominates and BOTH throughput and latency get worse, so `Latency` sits
-    /// above that cliff rather than at the smallest value available.
+    /// this is a tail-latency dial — but NOT a monotonic one, and these values
+    /// are measured turning points rather than round numbers (see
+    /// `docs/configuration.md`).
+    ///
+    /// A seal costs a fixed amount (two fsyncs, create/rename, reopen-and-
+    /// parse) on top of its per-span cost, so shrinking the threshold pays
+    /// that fixed cost more often. Past the turn it buys nothing and costs
+    /// everything: measured open loop, the p99 minimum is at 5,000, and
+    /// 3,000 is already worse. At 2,000 and below the store cannot sustain
+    /// 60k spans/s at all. `Latency` therefore sits at the bottom of the
+    /// curve, not at the smallest value available.
     pub fn flush_spans(self) -> usize {
         match self {
             Self::Throughput => 30_000,
             Self::Balanced => 10_000,
-            Self::Latency => 3_000,
+            Self::Latency => 5_000,
         }
     }
 

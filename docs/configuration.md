@@ -26,17 +26,24 @@ defaults, so a server with no `--profile` behaves as it always has.
 |---|---:|---:|
 | `throughput` | 30,000 | 500 |
 | `balanced` (default) | 10,000 | off |
-| `latency` | 3,000 | off |
+| `latency` | 5,000 | off |
 
 That is the whole of it. A profile sets two values, and the reason it is worth
 a flag is not the typing it saves — it is that these two knobs have
 **non-monotonic** cost curves that turn on each other, so picking them
 independently by intuition reliably lands on a worse configuration than either
-endpoint. The measurements are in
-[the tradeoff section](#the-throughputlatency-tradeoff-measured); the short
-version is that `--flush-spans 1000` is slower *and* higher-latency than
-`--flush-spans 3000`, which is not something the flag's description would ever
-tell you.
+endpoint. Two measured examples, both of which contradict the obvious guess:
+
+- `--flush-spans 1000` is not the low-latency setting. It cannot sustain
+  60,000 spans/s at all, and every threshold below 5,000 has a *worse* p99
+  than 5,000 does.
+- `--flush-spans 30000` on its own is worth +23% throughput; the 500 µs commit
+  window on its own is worth almost nothing at this batch size. Together they
+  are worth +33%, because the window only starts paying once seals are rare
+  enough for fsync to be the thing in the way.
+
+The full curves are in
+[the tradeoff section](#the-throughputlatency-tradeoff-measured).
 
 ### Precedence
 
@@ -86,7 +93,7 @@ only mode where both knobs do anything.
 sealed, so raising it costs two things beyond tail latency:
 
 - **Write-buffer memory** scales with it directly. `throughput` holds up to
-  30,000 spans against `balanced`'s 10,000 and `latency`'s 3,000.
+  30,000 spans against `balanced`'s 10,000 and `latency`'s 5,000.
 - **Restart replay time.** The write-ahead log is reclaimed when a flush seals
   its spans into a segment, so a larger flush window means more log to replay
   after a restart. Watch `wal_bytes` in `/v1/stats`: it is exactly the work a
@@ -253,6 +260,125 @@ Two consequences of that setup worth stating before the numbers:
 - Scenarios run **round-robin**, one repeat of each per round, so every
   configuration samples the same background load rather than whichever one
   happened to run during a spike.
+
+### Load conditions, stated
+
+These runs were **not** made on an idle machine, and the numbers should be read
+knowing that. The reference box is an Apple M1 Max (10 hardware threads,
+32 GB). Over the measurement window the 1-minute load average ranged from about
+**6 to 45**, sampled every 15 s. Two contributors: the developer's own
+unrelated software (a VM, dev servers, browsers), and — for the earlier, more
+heavily loaded part of the window — **a second agent running 1M-span benchmarks
+of this same codebase on the same host**. That second load is self-inflicted
+scheduling, not an environmental fact about Traza.
+
+The mitigations are structural rather than cosmetic:
+
+- Scenarios run **round-robin**, so every configuration samples the same load
+  over time rather than one of them owning a spike.
+- Their order is **rotated each round**, so no configuration is pinned to the
+  same phase of a periodic load.
+- Every row reports **min and max** alongside the median, so the spread is
+  visible instead of implied.
+
+The consequence: **relative comparisons between rows are sound; absolute rates
+are pessimistic.** Where a row's spread is wide, it is wide because rounds
+executed under materially different load, and the median mixes those
+conditions.
+
+### The two knobs interact — the measured grid
+
+1,000,000 spans per run, batch 1000, median of 5 rotated rounds.
+
+| `--flush-spans` | `--wal-commit-window-us` | c8 median spans/s | (min–max) | c16 median spans/s | (min–max) |
+|---:|---:|---:|---|---:|---|
+| 10,000 | 0 | 181,980 | 143,090–193,791 | 200,517 | 147,031–208,960 |
+| 20,000 | 0 | 211,431 | 165,377–222,315 | 221,398 | 169,192–227,929 |
+| 30,000 | 0 | 224,261 | 208,207–229,979 | 227,537 | 186,600–239,077 |
+| 50,000 | 0 | 220,909 | 178,804–236,628 | 230,601 | 178,116–239,945 |
+| 20,000 | 200 | 211,403 | 173,243–228,302 | 230,412 | 181,939–251,223 |
+| 30,000 | 200 | 233,370 | 179,070–248,626 | 255,778 | 198,262–263,659 |
+| **30,000** | **500** | **241,804** | 192,245–251,247 | **261,782** | 213,217–269,465 |
+
+Read the first and last rows together: `balanced` to `throughput` is
+**+33% at c8 and +31% at c16**. Neither knob gets there alone — 30,000 with no
+window is +23%/+13%, and the window only pays off once seals are rare enough
+that fsync is the thing in the way. That is what "these knobs turn on each
+other" means concretely, and it is why they are set as a group.
+
+`--flush-spans 50,000` is past the top: at c8 it is *slower* than 30,000 and
+its p99 is far worse (162.80 ms against 101.25 ms). More is not better.
+
+### The flush-spans curve
+
+This is the one worth studying before touching the flag, because both
+intuitions about it are wrong. "Smaller flushes mean lower latency" is wrong.
+"Bigger flushes mean more throughput" is wrong past a point. The knob is
+**non-monotonic in both directions**, and the turning points are not where you
+would guess.
+
+600,000 spans per run, batch 1000, concurrency 8, median of 5 rotated rounds.
+Closed loop measures capacity; open loop offers a fixed 60,000 spans/s — well
+under capacity for most rows — and measures the tail.
+
+| `--flush-spans` | Capacity (spans/s) | (min–max) | Open loop p50 | p95 | **p99** |
+|---:|---:|---|---:|---:|---:|
+| 1,000 | 36,857 | 34,270–47,715 | *cannot sustain 60k* | — | — |
+| 2,000 | 57,574 | 51,035–65,681 | *cannot sustain 60k* | — | — |
+| 3,000 | 74,077 | 66,940–79,731 | 33.36 ms | 48.43 ms | 56.43 ms |
+| **5,000** | **97,857** | 92,938–110,838 | 27.44 ms | **47.45 ms** | **52.56 ms** |
+| 10,000 | 137,859 | 133,755–147,249 | 18.40 ms | 55.99 ms | 64.00 ms |
+| 20,000 | 158,409 | 104,522–210,150 | 17.93 ms | 69.73 ms | 80.33 ms |
+| 30,000 | 165,329 | 149,997–225,258 | 15.66 ms | 84.04 ms | 98.22 ms |
+
+Three things fall out of that table:
+
+**The p99 minimum is at 5,000, and going lower makes it worse.** 3,000 has a
+*higher* p99 than 5,000 despite sealing more often. A seal costs a fixed amount
+regardless of size — two fsyncs, a create and rename, and a reopen-and-parse of
+the result — so halving the threshold does not halve the stall, it doubles how
+often you pay the fixed part. That is why `latency` is 5,000 and not the
+smallest number available.
+
+**Below 2,000 the store cannot keep up at all.** At `--flush-spans 1000` the
+harness could deliver only 37,389 of an offered 60,000 spans/s and the run was
+rejected rather than reported. Someone reaching for "the lowest latency
+setting" would land here and lose a third of their throughput *and* their
+latency.
+
+**p50 and p99 move in opposite directions.** p50 falls monotonically as the
+threshold rises (33.36 ms → 15.66 ms) while p99 rises (56.43 ms → 98.22 ms).
+Tuning on the median alone would push you straight to a large threshold and a
+bad tail. If you tune this yourself, tune on the percentile your clients
+actually feel.
+
+### Why the latency numbers here are open-loop
+
+This is a measurement trap worth naming, because falling into it produces a
+"latency" profile that is really just a slow one.
+
+Under a closed-loop generator — a fixed pool of workers each sending as fast as
+it can — Little's law fixes the relationship between the three quantities:
+mean latency is concurrency divided by throughput. Concurrency is held
+constant, so **latency becomes throughput's reciprocal and stops being an
+independent measurement.** Anything that raises throughput "improves" latency
+for free, and a configuration genuinely tuned for latency looks identical to
+one that is merely fast.
+
+The table above shows exactly this. Read the closed-loop columns and
+`--flush-spans 30000` looks like the *lowest*-latency setting on offer, because
+it is the fastest. Read the open-loop columns, where arrival rate is fixed at
+60,000 spans/s and the server's speed no longer sets the offered load, and
+30,000 has the **worst** tail in the table. The two readings disagree because
+only one of them is measuring latency.
+
+So `ingest-bench` measures both, and this document uses each for one purpose
+only: closed loop for capacity, open loop for latency. Open-loop samples are
+timed from **when a batch was due, not when it was actually sent**, so a client
+that falls behind because the previous request was slow carries that lateness
+into its own sample instead of hiding it — the coordinated-omission correction.
+A run that fails to deliver its offered rate is rejected rather than reported,
+which is what the two blank rows above are.
 
 <!-- MEASUREMENTS -->
 
