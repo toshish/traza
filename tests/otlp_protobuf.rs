@@ -159,7 +159,10 @@ impl Server {
     }
 
     fn post_otlp_json(&self, body: &Value) -> (u16, String) {
-        self.post(&serde_json::to_vec(body).expect("encodes"), "application/json")
+        self.post(
+            &serde_json::to_vec(body).expect("encodes"),
+            "application/json",
+        )
     }
 
     fn post(&self, body: &[u8], content_type: &str) -> (u16, String) {
@@ -462,7 +465,11 @@ fn differential_protobuf() -> Vec<u8> {
         &mut span1,
     );
     bytes_field(9, &key_value("a.bytes", &any_bytes(&[1, 2, 3])), &mut span1);
-    bytes_field(9, &key_value("shared", &any_string("from-span")), &mut span1);
+    bytes_field(
+        9,
+        &key_value("shared", &any_string("from-span")),
+        &mut span1,
+    );
     let mut event = Vec::new();
     fixed64_field(1, 1_500_000, &mut event);
     string_field(2, "retry", &mut event);
@@ -471,7 +478,11 @@ fn differential_protobuf() -> Vec<u8> {
     let mut link = Vec::new();
     bytes_field(1, &[0xBB_u8; 16], &mut link);
     bytes_field(2, &[0x02_u8; 8], &mut link);
-    bytes_field(4, &key_value("relation", &any_string("retry-of")), &mut link);
+    bytes_field(
+        4,
+        &key_value("relation", &any_string("retry-of")),
+        &mut link,
+    );
     bytes_field(13, &link, &mut span1);
     let mut status = Vec::new();
     string_field(2, "boom", &mut status);
@@ -488,7 +499,11 @@ fn differential_protobuf() -> Vec<u8> {
     let mut scope = Vec::new();
     string_field(1, "lib", &mut scope);
     bytes_field(3, &key_value("scope.tag", &any_string("alpha")), &mut scope);
-    bytes_field(3, &key_value("shared", &any_string("from-scope")), &mut scope);
+    bytes_field(
+        3,
+        &key_value("shared", &any_string("from-scope")),
+        &mut scope,
+    );
 
     let mut scope_spans = Vec::new();
     bytes_field(1, &scope, &mut scope_spans);

@@ -236,7 +236,11 @@ pub fn spans_from_json(body: &[u8]) -> Result<Vec<Span>, OtlpError> {
             let scope_attributes = scope_entry.scope.map(|scope| scope.attributes.0);
             let scope_attributes = scope_attributes.unwrap_or_default();
             for json_span in scope_entry.spans {
-                spans.push(json_span.into_parts()?.finish(&service, &scope_attributes)?);
+                spans.push(
+                    json_span
+                        .into_parts()?
+                        .finish(&service, &scope_attributes)?,
+                );
             }
         }
     }
@@ -712,7 +716,11 @@ macro_rules! values_wrapper {
     };
 }
 
-values_wrapper!(ArrayValueInner, LenientSeq<AnyValueItem>, "an OTLP ArrayValue");
+values_wrapper!(
+    ArrayValueInner,
+    LenientSeq<AnyValueItem>,
+    "an OTLP ArrayValue"
+);
 values_wrapper!(KvListInner, Attributes, "an OTLP KeyValueList");
 
 struct AnyValueItem(Value);
