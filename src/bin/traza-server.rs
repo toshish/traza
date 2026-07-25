@@ -25,6 +25,21 @@
 //! - `POST /v1/flush` forces buffered spans into a durable segment.
 //! - `POST /v1/traces` accepts OTLP/HTTP JSON or binary protobuf.
 //! - `GET /v1/export` streams chunked NDJSON with completion/count trailers.
+//!   This is the one route that always closes its connection: it is chunked
+//!   with trailers and has no declared length.
+//! - `GET /v1/metrics` reports per-stage ingest timings and request counters
+//!   in Prometheus text format.
+//!
+//! **Connections persist.** HTTP/1.1 keep-alive is the default (HTTP/1.0 needs
+//! to ask), which makes request framing security-relevant: anything ambiguous
+//! about where a body ends would let one request be split into two, the second
+//! attributed to the client's next request. So transfer-encoded bodies and
+//! duplicate `Content-Length` headers are refused rather than resolved, and
+//! any response sent without reading the request's body closes the connection.
+//! Concurrency is bounded by CONNECTIONS, not by a queue: a persistent
+//! connection occupies its handler until the client is done with it, so
+//! queueing past the limit would leave clients waiting indefinitely instead of
+//! being told the server is full.
 //! - `GET /` and `GET /dashboard` serve the built dashboard. It is read from
 //!   disk, never compiled in, so building the server needs no Node toolchain
 //!   and a rebuilt UI is picked up without restarting. With no `--ui-dir` the
