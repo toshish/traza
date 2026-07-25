@@ -1040,12 +1040,14 @@ fn flush_after_reopen_does_not_overwrite_segments() {
 }
 
 #[test]
-fn corrupt_v2_header_is_an_error_not_a_panic() {
+fn corrupt_segment_header_is_an_error_not_a_panic() {
     let dir = correctness_test_dir("corrupt-header");
-    // A file with the right magic but a nonsense attribute-index offset used
-    // to panic through unsigned subtraction (found in review).
+    // A file with the RIGHT magic (so it reaches the header parse) but a
+    // nonsense attribute-index offset, which used to panic through unsigned
+    // subtraction (found in review). The magic must stay current, or this
+    // short-circuits at the magic check and no longer tests the overflow.
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"TRAZAV2\0");
+    bytes.extend_from_slice(b"TRAZASEG");
     bytes.extend_from_slice(&2u16.to_le_bytes());
     bytes.extend_from_slice(&80u16.to_le_bytes());
     bytes.extend_from_slice(&[0u8; 4]);
