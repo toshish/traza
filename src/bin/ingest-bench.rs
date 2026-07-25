@@ -672,7 +672,16 @@ fn run_direct(scenario: &Scenario) -> Result<RunResult, String> {
 
     let next = Arc::new(AtomicUsize::new(0));
     let ready = Arc::new(Barrier::new(scenario.concurrency + 1));
-    let batches = Arc::new(batches);
+    // Each batch is HANDED OVER rather than cloned. Cloning inside the timed
+    // loop charged the engine for a thousand-span deep copy per batch, which
+    // is client work: it made the direct-engine floor look slower than the
+    // HTTP path it is supposed to bound.
+    let batches: Arc<Vec<std::sync::Mutex<Option<Vec<Span>>>>> = Arc::new(
+        batches
+            .into_iter()
+            .map(|batch| std::sync::Mutex::new(Some(batch)))
+            .collect(),
+    );
     let mut handles = Vec::new();
     for _ in 0..scenario.concurrency {
         let next = Arc::clone(&next);
@@ -686,9 +695,12 @@ fn run_direct(scenario: &Scenario) -> Result<RunResult, String> {
                 if index >= batches.len() {
                     break;
                 }
-                store
-                    .ingest_batch(batches[index].clone())
-                    .expect("direct ingest");
+                // Indices are handed out atomically, so exactly one worker
+                // ever takes a given batch.
+                let batch = batches[index].lock().expect("batch").take();
+                if let Some(batch) = batch {
+                    store.ingest_batch(batch).expect("direct ingest");
+                }
             }
         }));
     }
