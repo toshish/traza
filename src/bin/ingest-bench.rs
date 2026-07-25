@@ -1166,6 +1166,9 @@ fn run() -> Result<(), String> {
     let _ = writeln!(
         report,
         "Every row is the MEDIAN of {runs} runs, each on a fresh data directory. \
+Scenarios are run ROUND-ROBIN rather than one at a time, so each scenario's \
+repeats are spread across the whole wall-clock window and background load hits \
+all of them alike instead of landing on whichever ran during a spike. \
 Payloads are generated before the clock starts, so these are server rates; \
 client encoding is reported separately. Runs that saw a failed batch or a shed \
 connection are reported as failures rather than as numbers.\n"
@@ -1194,74 +1197,110 @@ behind.\n"
     );
     let _ = writeln!(report, "|---|---|---|---:|---:|---:|---:|---:|---:|---:|");
 
-    for scenario in &scenarios {
-        if let Some(filter) = &only {
-            if !scenario.label.to_ascii_lowercase().contains(filter) {
+    let selected: Vec<&Scenario> = scenarios
+        .iter()
+        .filter(|scenario| match &only {
+            Some(filter) => scenario.label.to_ascii_lowercase().contains(filter),
+            None => true,
+        })
+        .collect();
+
+    // Payloads are shared across every scenario that wants the same wire
+    // format, so the corpus is built at most twice rather than once per
+    // scenario. Round-robin scheduling (below) needs them all resident at
+    // once, and re-encoding per scenario would cost more than it saves.
+    //
+    // Generation is outside every measured window; its cost is reported so
+    // the client's share of the work is visible rather than quietly excluded.
+    let mut corpus: Vec<(Protocol, Arc<Vec<Vec<u8>>>)> = Vec::new();
+    for protocol in [Protocol::Json, Protocol::Protobuf] {
+        if !selected
+            .iter()
+            .any(|scenario| scenario.mode == Mode::Http && scenario.protocol == protocol)
+        {
+            continue;
+        }
+        let started = Instant::now();
+        let payloads: Vec<Vec<u8>> = (0..spans)
+            .step_by(batch)
+            .map(|start| {
+                let end = (start + batch).min(spans);
+                match protocol {
+                    Protocol::Json => json_batch(start, end),
+                    Protocol::Protobuf => protobuf_batch(start, end),
+                }
+            })
+            .collect();
+        let bytes: usize = payloads.iter().map(Vec::len).sum();
+        println!(
+            "client encode ({}): {:.2}s for {} batches ({:.1} MiB, {:.0} spans/s if it were the limit)",
+            protocol.as_str(),
+            started.elapsed().as_secs_f64(),
+            payloads.len(),
+            bytes as f64 / (1024.0 * 1024.0),
+            spans as f64 / started.elapsed().as_secs_f64()
+        );
+        corpus.push((protocol, Arc::new(payloads)));
+    }
+    println!();
+
+    /// What one scenario has accumulated across the rounds so far.
+    #[derive(Default)]
+    struct Accumulated {
+        rates: Vec<f64>,
+        p50s: Vec<f64>,
+        p95s: Vec<f64>,
+        p99s: Vec<f64>,
+        metrics: String,
+        failed: Option<String>,
+    }
+
+    let mut accumulated: Vec<Accumulated> = (0..selected.len())
+        .map(|_| Accumulated::default())
+        .collect();
+
+    // ROUND-ROBIN, not scenario-at-a-time. Running all of scenario A's repeats
+    // and then all of scenario B's makes the comparison a hostage to whatever
+    // else the machine was doing during each block: a load spike lands
+    // entirely on one configuration and shows up as a difference between
+    // configurations. Interleaving spreads every scenario's repeats across the
+    // whole wall-clock window, so drift and contention hit all of them alike
+    // and the median across rounds is comparing like with like. It costs
+    // nothing but ordering, and it is what makes a run on a machine that is
+    // not perfectly idle worth reporting at all.
+    for round in 1..=runs {
+        println!("--- round {round} of {runs} ---");
+        for (index, scenario) in selected.iter().enumerate() {
+            if accumulated[index].failed.is_some() {
                 continue;
             }
-        }
-        println!("{} — {}", scenario.label, scenario.describe());
-
-        // Payload generation is outside the measured window; its cost is
-        // reported so the client's share of the work is visible rather than
-        // quietly excluded.
-        let encode_started = Instant::now();
-        let payloads: Arc<Vec<Vec<u8>>> = Arc::new(if scenario.mode == Mode::Http {
-            (0..scenario.spans)
-                .step_by(scenario.batch)
-                .map(|start| {
-                    let end = (start + scenario.batch).min(scenario.spans);
-                    match scenario.protocol {
-                        Protocol::Json => json_batch(start, end),
-                        Protocol::Protobuf => protobuf_batch(start, end),
-                    }
-                })
-                .collect()
-        } else {
-            Vec::new()
-        });
-        let encode_elapsed = encode_started.elapsed();
-        if scenario.mode == Mode::Http {
-            let bytes: usize = payloads.iter().map(Vec::len).sum();
-            println!(
-                "  client encode: {:.2}s for {} batches ({:.1} MiB, {:.0} spans/s if it were the limit)",
-                encode_elapsed.as_secs_f64(),
-                payloads.len(),
-                bytes as f64 / (1024.0 * 1024.0),
-                scenario.spans as f64 / encode_elapsed.as_secs_f64()
-            );
-        }
-
-        let mut rates = Vec::new();
-        let mut p50s = Vec::new();
-        let mut p95s = Vec::new();
-        let mut p99s = Vec::new();
-        let mut last_metrics = String::new();
-        let mut failed: Option<String> = None;
-        for attempt in 1..=runs {
+            let payloads = corpus
+                .iter()
+                .find(|(protocol, _)| *protocol == scenario.protocol)
+                .map(|(_, payloads)| Arc::clone(payloads))
+                .unwrap_or_default();
             let result = if scenario.mode == Mode::Direct {
                 run_direct(scenario)
             } else {
                 run_http(scenario, &payloads)
             };
             match result {
+                Ok(result) if result.refused > 0 => {
+                    accumulated[index].failed = Some(format!(
+                        "server shed {} connections; the rate is not sustained",
+                        result.refused
+                    ));
+                }
+                Ok(result) if result.stored < scenario.spans as u64 => {
+                    accumulated[index].failed = Some(format!(
+                        "stored {} of {} spans",
+                        result.stored, scenario.spans
+                    ));
+                }
                 Ok(result) => {
-                    if result.refused > 0 {
-                        failed = Some(format!(
-                            "server shed {} connections; the rate is not sustained",
-                            result.refused
-                        ));
-                        break;
-                    }
-                    if result.stored < scenario.spans as u64 {
-                        failed = Some(format!(
-                            "stored {} of {} spans",
-                            result.stored, scenario.spans
-                        ));
-                        break;
-                    }
                     println!(
-                        "  run {attempt}: {:.0} spans/s ({:.2}s), latency p50 {:.2} / p95 {:.2} / p99 {:.2} / max {:.2} ms",
+                        "  {}: {:.0} spans/s ({:.2}s), latency p50 {:.2} / p95 {:.2} / p99 {:.2} / max {:.2} ms",
+                        scenario.label,
                         result.rate,
                         result.elapsed.as_secs_f64(),
                         result.latency.p50(),
@@ -1269,20 +1308,26 @@ behind.\n"
                         result.latency.p99(),
                         result.latency.max_ms()
                     );
-                    rates.push(result.rate);
-                    p50s.push(result.latency.p50());
-                    p95s.push(result.latency.p95());
-                    p99s.push(result.latency.p99());
-                    last_metrics = result.metrics;
+                    let entry = &mut accumulated[index];
+                    entry.rates.push(result.rate);
+                    entry.p50s.push(result.latency.p50());
+                    entry.p95s.push(result.latency.p95());
+                    entry.p99s.push(result.latency.p99());
+                    entry.metrics = result.metrics;
                 }
-                Err(error) => {
-                    failed = Some(error);
-                    break;
-                }
+                Err(error) => accumulated[index].failed = Some(error),
+            }
+            if let Some(error) = &accumulated[index].failed {
+                println!("  {}: FAILED: {error}", scenario.label);
             }
         }
+        println!();
+    }
 
-        if let Some(error) = failed {
+    for (index, scenario) in selected.iter().enumerate() {
+        let entry = &accumulated[index];
+        println!("{} — {}", scenario.label, scenario.describe());
+        if let Some(error) = &entry.failed {
             println!("  FAILED: {error}\n");
             let _ = writeln!(
                 report,
@@ -1295,17 +1340,23 @@ behind.\n"
             continue;
         }
 
-        let min = rates.iter().cloned().fold(f64::INFINITY, f64::min);
-        let max = rates.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        let mid = median(&mut rates.clone());
-        let p50 = median(&mut p50s.clone());
-        let p95 = median(&mut p95s.clone());
-        let p99 = median(&mut p99s.clone());
+        let min = entry.rates.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max = entry
+            .rates
+            .iter()
+            .cloned()
+            .fold(f64::NEG_INFINITY, f64::max);
+        let mid = median(&mut entry.rates.clone());
+        let p50 = median(&mut entry.p50s.clone());
+        let p95 = median(&mut entry.p95s.clone());
+        let p99 = median(&mut entry.p99s.clone());
         println!("  median: {mid:.0} spans/s (min {min:.0}, max {max:.0})");
-        println!("  latency (median of per-run percentiles): p50 {p50:.2} ms, p95 {p95:.2} ms, p99 {p99:.2} ms");
-        let stages = stage_summary(&last_metrics);
+        println!(
+            "  latency (median of per-run percentiles): p50 {p50:.2} ms, p95 {p95:.2} ms, p99 {p99:.2} ms"
+        );
+        let stages = stage_summary(&entry.metrics);
         if !stages.is_empty() {
-            println!("  stages (server-side totals across the run):");
+            println!("  stages (server-side totals, last round):");
             println!("{stages}");
         }
         println!();
