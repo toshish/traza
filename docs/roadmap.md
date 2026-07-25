@@ -253,10 +253,17 @@ alongside results.
   clients as it did.
 
   The parenthetical this line used to carry — "(keep-alive + protobuf)" — did
-  not survive measurement. Protobuf is *slower* than JSON at every concurrency
-  (it decodes through a `serde_json::Value` DOM that the JSON route no longer
-  uses), and keep-alive is worth +11% at batch=20 and nothing at batch=1000.
-  Decode of any kind is 1.9% of the cost.
+  not survive measurement, but not for the reason first recorded here. This
+  line briefly claimed protobuf was *slower* than JSON; that came from a
+  benchmark that posted JSON to `/v1/spans` and protobuf to `/v1/traces`, so
+  the difference contained the whole OTLP mapping and could not isolate the
+  wire format. Measured properly, with both encodings on `/v1/traces` and both
+  decoders lowering straight to `Span`, **protobuf decodes 2.3–2.7x FASTER
+  than OTLP JSON** (479 vs 1,275 ns/span at concurrency 1) on payloads 2.9x
+  smaller. It is the cheaper wire format. It still does not move this gate,
+  because **decode of any kind is 1.9% of ingest cost** — that, not a slow
+  protobuf, is why the attribution fails. Keep-alive is worth +11% at
+  batch=20 and nothing at batch=1000.
 
   The real limit is the **writer lock, held ~88% of a run, of which 74% is
   segment sealing** — work that needs no lock. That puts a hard ceiling near
