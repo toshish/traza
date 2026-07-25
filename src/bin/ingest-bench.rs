@@ -349,7 +349,11 @@ fn protobuf_batch(start: usize, end: usize) -> Vec<u8> {
         // service.name is per-RESOURCE in OTLP, so one contiguous
         // single-service run of spans becomes one ResourceSpans.
         let mut resource = Vec::new();
-        delimited(&mut resource, 1, &string_attribute("service.name", &service));
+        delimited(
+            &mut resource,
+            1,
+            &string_attribute("service.name", &service),
+        );
 
         let mut resource_spans = Vec::new();
         delimited(&mut resource_spans, 1, &resource);
@@ -1072,10 +1076,7 @@ connection are reported as failures rather than as numbers.\n"
         report,
         "| Scenario | Protocol | Route | Keep-alive | Concurrency | Median spans/s | Min | Max | Bytes/span | Decode ns/span |"
     );
-    let _ = writeln!(
-        report,
-        "|---|---|---|---|---:|---:|---:|---:|---:|---:|"
-    );
+    let _ = writeln!(report, "|---|---|---|---|---:|---:|---:|---:|---:|---:|");
 
     for scenario in &scenarios {
         if let Some(filter) = &only {
