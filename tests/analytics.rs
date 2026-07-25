@@ -66,6 +66,7 @@ fn sessions_aggregate_across_buffer_segments_and_reopen() {
     // and, end to end through SIGKILL, in tests/durability.rs.
     let buffered = Config {
         durability: traza::Durability::Buffered,
+        compaction: None,
         ..Config::default()
     };
     {
@@ -365,6 +366,7 @@ fn rollup_cache_survives_compaction_supersede() {
             ttl_seconds: Some(1),
             payload_threshold: None,
             durability: traza::Durability::Buffered,
+            compaction: None,
         },
     )
     .expect("opens");

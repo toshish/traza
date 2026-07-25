@@ -28,6 +28,11 @@ impl Drop for ServerGuard {
     }
 }
 
+/// Compaction fan-out for the benchmarked server; `0` disables compaction.
+fn compaction_fanout() -> String {
+    std::env::var("TRAZA_BENCH_COMPACTION_FANOUT").unwrap_or_else(|_| "4".to_owned())
+}
+
 fn span_count() -> usize {
     // TRAZA_BENCH_SPANS overrides the corpus size for scaling experiments.
     // BENCHMARKS.md is only rewritten for the canonical default corpus, so
@@ -64,6 +69,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // number no production deployment can rely on.
         .arg("--durability")
         .arg("wal")
+        // Compaction is on by default; TRAZA_BENCH_COMPACTION_FANOUT=0 measures
+        // the uncompacted baseline through this same harness, so the two are
+        // directly comparable rather than measured by different clients.
+        .arg("--compaction-fanout")
+        .arg(compaction_fanout())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
         .spawn()?;
@@ -193,7 +203,7 @@ These values were measured by `cargo run --release --bin bench`; they are not es
 ## Results\n\n\
 | Metric | Measured | Target | Result |\n\
 |---|---:|---:|---|\n\
-| Sustained batched HTTP ingest (durability=wal) | {ingest_rate:.0} spans/s | >= 50,000 spans/s | {} |\n\
+| Sustained batched HTTP ingest (durability=wal, compaction fanout={fanout}) | {ingest_rate:.0} spans/s | >= 50,000 spans/s | {} |\n\
 | Trace-by-id p95 | {:.3} ms | < 50 ms | {} |\n\
 | Attribute-filtered query p95 | {:.3} ms | < 300 ms | {} |\n\n\
 Additional percentiles:\n\n\
@@ -228,6 +238,7 @@ The ingest threshold is {}. The trace p95 threshold is {}. The filtered-query p9
         pass(ingest_rate >= 50_000.0),
         pass(trace_p95 < Duration::from_millis(50)),
         pass(filter_p95 < Duration::from_millis(300)),
+        fanout = compaction_fanout(),
     );
     report.push_str("\n## Verification Notes\n\n- Corpus declaration: `1000000` spans (1,000,000 spans).\n- Every reported result is measured by this benchmark run, never estimated.\n- Unsuccessful lookups are reported as misses.\n");
     if SPAN_COUNT == DEFAULT_SPAN_COUNT {
