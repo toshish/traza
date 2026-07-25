@@ -1352,9 +1352,12 @@ behind.\n"
     );
     let _ = writeln!(
         report,
-        "| Scenario | Protocol | Keep-alive | Concurrency | Median spans/s | Min | Max | p50 ms | p95 ms | p99 ms |"
+        "| Scenario | Protocol | Route | Keep-alive | Concurrency | Median spans/s | Min | Max | p50 ms | p95 ms | p99 ms | Bytes/span | Decode ns/span |"
     );
-    let _ = writeln!(report, "|---|---|---|---:|---:|---:|---:|---:|---:|---:|");
+    let _ = writeln!(
+        report,
+        "|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+    );
 
     let selected: Vec<&Scenario> = scenarios
         .iter()
@@ -1505,9 +1508,14 @@ behind.\n"
             println!("  FAILED: {error}\n");
             let _ = writeln!(
                 report,
-                "| {} | {} | {} | {} | FAILED: {error} | | | | | |",
+                "| {} | {} | {} | {} | {} | FAILED: {error} | | | | | | |",
                 scenario.label,
                 scenario.protocol.as_str(),
+                if scenario.mode == Mode::Direct {
+                    "n/a"
+                } else {
+                    scenario.protocol.route()
+                },
                 scenario.keep_alive,
                 scenario.concurrency
             );
@@ -1537,15 +1545,32 @@ behind.\n"
 
         let _ = writeln!(
             report,
-            "| {} | {} | {} | {} | **{mid:.0}** | {min:.0} | {max:.0} | {p50:.2} | {p95:.2} | {p99:.2} |",
+            "| {} | {} | {} | {} | {} | **{mid:.0}** | {min:.0} | {max:.0} | {p50:.2} | {p95:.2} | {p99:.2} | {} | {} |",
             scenario.label,
             scenario.protocol.as_str(),
+            if scenario.mode == Mode::Direct {
+                "n/a"
+            } else {
+                scenario.protocol.route()
+            },
             if scenario.mode == Mode::Direct {
                 "n/a".to_owned()
             } else {
                 scenario.keep_alive.to_string()
             },
-            scenario.concurrency
+            scenario.concurrency,
+            if scenario.mode == Mode::Direct {
+                "n/a".to_owned()
+            } else {
+                // Pure function of the protocol, so one batch is exact.
+                let sample = scenario.protocol.encode(0, scenario.batch);
+                (sample.len() / scenario.batch.max(1)).to_string()
+            },
+            // Decode is the only column that isolates the wire format from the
+            // engine, which is why it is reported next to the rate rather than
+            // buried in the stage summary.
+            decode_ns_per_span(&entry.metrics)
+                .map_or_else(|| "n/a".to_owned(), |ns| format!("{ns:.0}")),
         );
     }
 
