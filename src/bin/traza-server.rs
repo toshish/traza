@@ -38,8 +38,8 @@
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -63,7 +63,116 @@ fn socket_timeout() -> Duration {
         .map(Duration::from_millis)
         .unwrap_or(SOCKET_TIMEOUT)
 }
-const HTTP_QUEUE_DEPTH: usize = 256;
+// A persistent connection is recycled rather than trusted indefinitely: this
+// bounds how long one client can hold a thread without reconnecting, and keeps
+// any per-connection state from growing without limit.
+const MAX_REQUESTS_PER_CONNECTION: usize = 100_000;
+// Concurrent connections. Keep-alive means a connection occupies its handler
+// for as long as the client keeps it open, so this — not a request queue — is
+// what bounds server concurrency. Past it, clients are refused immediately
+// with 503 instead of being silently queued behind long-lived connections.
+const DEFAULT_MAX_CONNECTIONS: usize = 1_024;
+// Concurrent in-flight 503 refusals. See the refusal path in `run`.
+const MAX_REFUSAL_THREADS: usize = 64;
+// How long a refusal will spend making itself deliverable before giving up.
+const REFUSAL_DEADLINE: Duration = Duration::from_millis(250);
+
+/// Tells a client the server is at its connection limit, and makes sure it can
+/// actually read that.
+///
+/// A plain write-then-close loses the response whenever the client's request
+/// is still sitting unread in the socket: `close(2)` with unread input sends
+/// RST, and the RST beats the buffered 503 to the client. Draining first turns
+/// that into an ordinary close.
+fn refuse_connection(mut stream: TcpStream) {
+    let body = b"{\"error\":\"server at connection limit\"}";
+    let _ = stream.set_write_timeout(Some(REFUSAL_DEADLINE));
+    let _ = stream.set_read_timeout(Some(REFUSAL_DEADLINE));
+    let head = format!(
+        "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    if stream.write_all(head.as_bytes()).is_err() || stream.write_all(body).is_err() {
+        return;
+    }
+    let _ = stream.flush();
+    // FIN now, so the client sees the end of the response even while we are
+    // still reading what it had already sent.
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let deadline = std::time::Instant::now() + REFUSAL_DEADLINE;
+    let mut sink = [0_u8; 4096];
+    while std::time::Instant::now() < deadline {
+        match stream.read(&mut sink) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => continue,
+        }
+    }
+}
+
+/// Server-side request instrumentation, alongside the engine's own.
+#[derive(Debug, Default)]
+struct ServerMetrics {
+    /// Requests served to completion.
+    requests: traza::metrics::Counter,
+    /// End-to-end handling time, from parsed head to written response.
+    request_latency: traza::metrics::Latency,
+    /// Requests refused by the auth gate.
+    rejected: traza::metrics::Counter,
+    /// Connections refused because the server was at its connection limit.
+    /// The backpressure signal: nonzero means clients were shed, and any
+    /// throughput number measured during that window is suspect.
+    connections_refused: traza::metrics::Counter,
+    /// Connections accepted.
+    connections_accepted: traza::metrics::Counter,
+    /// Connections currently being served.
+    connections_live: AtomicUsize,
+}
+
+impl ServerMetrics {
+    fn render_prometheus(&self, into: &mut String) {
+        use std::fmt::Write as _;
+        let _ = writeln!(into, "# TYPE traza_http_requests_total counter");
+        let _ = writeln!(into, "traza_http_requests_total {}", self.requests.get());
+        let _ = writeln!(into, "# TYPE traza_http_rejected_total counter");
+        let _ = writeln!(into, "traza_http_rejected_total {}", self.rejected.get());
+        let _ = writeln!(into, "# TYPE traza_http_connections_refused_total counter");
+        let _ = writeln!(
+            into,
+            "traza_http_connections_refused_total {}",
+            self.connections_refused.get()
+        );
+        let _ = writeln!(into, "# TYPE traza_http_connections_accepted_total counter");
+        let _ = writeln!(
+            into,
+            "traza_http_connections_accepted_total {}",
+            self.connections_accepted.get()
+        );
+        let _ = writeln!(into, "# TYPE traza_http_connections_live gauge");
+        let _ = writeln!(
+            into,
+            "traza_http_connections_live {}",
+            self.connections_live.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(into, "# TYPE traza_http_request_ns_count counter");
+        let _ = writeln!(
+            into,
+            "traza_http_request_ns_count {}",
+            self.request_latency.count()
+        );
+        let _ = writeln!(into, "# TYPE traza_http_request_ns_sum counter");
+        let _ = writeln!(
+            into,
+            "traza_http_request_ns_sum {}",
+            self.request_latency.total_ns()
+        );
+        let _ = writeln!(into, "# TYPE traza_http_request_ns_max gauge");
+        let _ = writeln!(
+            into,
+            "traza_http_request_ns_max {}",
+            self.request_latency.max_ns()
+        );
+    }
+}
 
 fn main() {
     if let Err(error) = run() {
@@ -79,9 +188,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut ttl_seconds = None;
     let mut flush_spans = 10_000_usize;
     let mut payload_threshold_bytes = 256 * 1024_usize;
-    let mut workers = thread::available_parallelism()
-        .map_or(4, usize::from)
-        .max(4);
+    let mut max_connections = DEFAULT_MAX_CONNECTIONS;
     let mut allow_unauthenticated_non_loopback = false;
     let mut ui_dir: Option<PathBuf> = None;
     let mut durability = Durability::default();
@@ -126,11 +233,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .parse::<usize>()?
                     .max(1);
             }
-            "--workers" => {
+            "--max-connections" => {
                 i += 1;
-                workers = args
+                max_connections = args
                     .get(i)
-                    .ok_or("--workers requires a value")?
+                    .ok_or("--max-connections requires a value")?
                     .parse::<usize>()?
                     .max(1);
             }
@@ -169,7 +276,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--help" | "-h" => {
                 println!(
-                    "Usage: traza-server --data-dir DIR --port PORT [--host ADDR] [--ttl-seconds N] [--flush-spans N] [--workers N] [--payload-threshold-bytes N (0 disables)] [--durability buffered|wal|flushed (default wal)] [--compaction-fanout N (0 disables; default 4)] [--compaction-max-segment-bytes N] [--ui-dir DIR (built dashboard; default: TRAZA_UI_DIR, beside the binary, then ./ui/dist)] [--allow-unauthenticated-non-loopback]"
+                    "Usage: traza-server --data-dir DIR --port PORT [--host ADDR] [--ttl-seconds N] [--flush-spans N] [--max-connections N (default 1024)] [--payload-threshold-bytes N (0 disables)] [--durability buffered|wal|flushed (default wal)] [--compaction-fanout N (0 disables; default 4)] [--compaction-max-segment-bytes N] [--ui-dir DIR (built dashboard; default: TRAZA_UI_DIR, beside the binary, then ./ui/dist)] [--allow-unauthenticated-non-loopback]"
                 );
                 return Ok(());
             }
@@ -190,6 +297,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
     let auth = Arc::new(auth_config);
+    let metrics = Arc::new(ServerMetrics::default());
+    // In-flight 503 refusals, bounded so a connection flood cannot spawn
+    // without limit.
+    let refusals = Arc::new(AtomicUsize::new(0));
     let engine = Arc::new(Store::open(
         &data_dir,
         Config {
@@ -279,30 +390,77 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let (http_tx, http_rx) = mpsc::sync_channel::<TcpStream>(HTTP_QUEUE_DEPTH);
-    let http_rx = Arc::new(Mutex::new(http_rx));
-    for number in 0..workers {
-        let rx = Arc::clone(&http_rx);
-        let worker_engine = Arc::clone(&engine);
-        let worker_auth = Arc::clone(&auth);
-        let worker_ui = Arc::clone(&ui);
-        thread::Builder::new()
-            .name(format!("http-{number}"))
-            .spawn(move || loop {
-                let stream = match rx.lock().expect("HTTP receiver poisoned").recv() {
-                    Ok(stream) => stream,
-                    Err(_) => break,
-                };
-                let _ = handle_connection(stream, &worker_engine, &worker_auth, &worker_ui);
-            })?;
-    }
-
+    // One thread per connection, hard-bounded.
+    //
+    // This replaced a fixed worker pool fed by a queue. With keep-alive a
+    // connection occupies its handler until the client closes it, so a pool of
+    // N threads serves at most N clients and the rest sit in the queue getting
+    // nothing — indistinguishable from a hang. Bounding CONNECTIONS instead
+    // makes the limit explicit and lets the server say so (503) rather than
+    // stall. Threads are cheap here because a keep-alive connection amortizes
+    // its spawn over every request it carries.
     for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                let _ = http_tx.send(stream);
+        let stream = match stream {
+            Ok(stream) => stream,
+            Err(error) => {
+                eprintln!("accept failed: {error}");
+                continue;
             }
-            Err(error) => eprintln!("accept failed: {error}"),
+        };
+        let live = metrics.connections_live.load(Ordering::Relaxed);
+        if live >= max_connections {
+            metrics.connections_refused.increment();
+            // Refuse loudly. Accepting and queueing would hide the overload as
+            // latency, which is what makes an overloaded server undiagnosable.
+            //
+            // The refusal runs on its own thread because delivering it takes
+            // time: closing a socket while the client's request bytes sit
+            // unread in the receive queue makes the kernel send RST, which
+            // discards the 503 the client was supposed to read. So the body
+            // has to be written, the write side shut down, and the inbound
+            // bytes drained — none of which may block the accept loop.
+            // Refusal threads are themselves bounded; past that, dropping the
+            // connection outright is the correct degradation under a flood.
+            if refusals.load(Ordering::Relaxed) < MAX_REFUSAL_THREADS {
+                refusals.fetch_add(1, Ordering::Relaxed);
+                let counter = Arc::clone(&refusals);
+                let spawned = thread::Builder::new()
+                    .name("traza-refuse".into())
+                    .spawn(move || {
+                        refuse_connection(stream);
+                        counter.fetch_sub(1, Ordering::Relaxed);
+                    });
+                if spawned.is_err() {
+                    refusals.fetch_sub(1, Ordering::Relaxed);
+                }
+            }
+            continue;
+        }
+        metrics.connections_live.fetch_add(1, Ordering::Relaxed);
+        metrics.connections_accepted.increment();
+        let connection_engine = Arc::clone(&engine);
+        let connection_auth = Arc::clone(&auth);
+        let connection_ui = Arc::clone(&ui);
+        let connection_metrics = Arc::clone(&metrics);
+        let spawned = thread::Builder::new()
+            .name("traza-http".into())
+            .spawn(move || {
+                let _ = handle_connection(
+                    stream,
+                    &connection_engine,
+                    &connection_auth,
+                    &connection_ui,
+                    &connection_metrics,
+                );
+                connection_metrics
+                    .connections_live
+                    .fetch_sub(1, Ordering::Relaxed);
+            });
+        if spawned.is_err() {
+            // Out of threads: undo the reservation so the count stays honest.
+            metrics.connections_live.fetch_sub(1, Ordering::Relaxed);
+            metrics.connections_refused.increment();
+            eprintln!("failed to spawn a connection handler");
         }
     }
     Ok(())
@@ -315,140 +473,202 @@ fn is_loopback_bind(host: &str) -> bool {
             .is_ok_and(|address| address.is_loopback())
 }
 
+/// Serves requests on one connection until the client or the server ends it.
+///
+/// Each iteration decides, before it answers, whether the connection can
+/// survive the response — the `Connection:` header the client sees and what
+/// this loop actually does must agree, or the client's framing breaks.
 fn handle_connection(
-    mut stream: TcpStream,
+    stream: TcpStream,
     engine: &Store,
     auth: &Option<traza::auth::AuthConfig>,
     ui: &traza::ui::UiRoot,
+    metrics: &ServerMetrics,
 ) -> io::Result<()> {
-    // A silent or dribbling peer must not park this worker thread forever.
+    // A silent or dribbling peer must not park this thread forever.
     let timeout = socket_timeout();
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
-    let head = match read_head(&mut stream) {
-        Ok(head) => head,
-        Err(error) => return respond(&mut stream, 400, json!({"error": error.to_string()})),
-    };
-    // The dashboard SHELL is served before the auth gate: the page must load
-    // in a browser without credentials, while every /v1 call it makes below
-    // stays gated (the page attaches the bearer token itself). Static assets
-    // carry no stored data, so this leaks nothing.
-    if head.method == "GET" {
-        let path = percent_decode(
-            head.target
-                .split_once('?')
-                .map_or(head.target.as_str(), |(path, _)| path),
-        );
-        if let Some(file) = ui.resolve(&path) {
-            return respond_file(&mut stream, &file);
-        }
-        if matches!(path.as_str(), "/" | "/dashboard" | "/dashboard/") {
-            return respond(
-                &mut stream,
-                404,
-                json!({
-                    "error": "no dashboard build found",
-                    "next": format!(
-                        "build it with: cd ui && npm ci && npm run build (serving {})",
-                        ui.directory().display()
-                    ),
-                }),
+    // Ingest is many small writes; without this each response pays a round
+    // trip for the client's ACK before the next one goes out.
+    let _ = stream.set_nodelay(true);
+    let mut connection = Connection::new(stream);
+
+    for _ in 0..MAX_REQUESTS_PER_CONNECTION {
+        let head = match connection.read_head() {
+            Ok(Some(head)) => head,
+            // A clean close at a request boundary is how keep-alive ends.
+            Ok(None) => return Ok(()),
+            Err(error) => {
+                // The head did not parse, so where the body ends is unknown
+                // and nothing further on this socket can be trusted.
+                let mut responder = connection.responder(false);
+                return responder.json(400, json!({"error": error.to_string()}));
+            }
+        };
+        let started = std::time::Instant::now();
+        // A request answered WITHOUT reading its body leaves those bytes in
+        // the socket, where they would be read as the next request. Any such
+        // path must close.
+        let body_is_unread = head.content_length > 0;
+        let keep_alive = head.wants_keep_alive();
+
+        // The dashboard SHELL is served before the auth gate: the page must
+        // load in a browser without credentials, while every /v1 call it makes
+        // below stays gated (the page attaches the bearer token itself).
+        // Static assets carry no stored data, so this leaks nothing.
+        if head.method == "GET" {
+            let path = percent_decode(
+                head.target
+                    .split_once('?')
+                    .map_or(head.target.as_str(), |(path, _)| path),
             );
+            if let Some(file) = ui.resolve(&path) {
+                let mut responder = connection.responder(keep_alive && !body_is_unread);
+                responder.file(&file)?;
+                if responder.keep_alive {
+                    continue;
+                }
+                return Ok(());
+            }
+            if matches!(path.as_str(), "/" | "/dashboard" | "/dashboard/") {
+                let mut responder = connection.responder(keep_alive && !body_is_unread);
+                responder.json(
+                    404,
+                    json!({
+                        "error": "no dashboard build found",
+                        "next": format!(
+                            "build it with: cd ui && npm ci && npm run build (serving {})",
+                            ui.directory().display()
+                        ),
+                    }),
+                )?;
+                if responder.keep_alive {
+                    continue;
+                }
+                return Ok(());
+            }
         }
-    }
-    // Auth verdicts need only the head: rejecting BEFORE the body read means
-    // an unauthenticated client cannot make this server buffer 64 MiB.
-    if let Some(config) = auth {
-        if let Err(failure) = config.authorize(head.authorization.as_deref(), &head.method) {
-            let challenge = failure
-                .www_authenticate()
-                .map(|value| format!("WWW-Authenticate: {value}\r\n"))
-                .unwrap_or_default();
-            let body = failure.body();
-            let reason = if failure.status() == 401 {
-                "Unauthorized"
-            } else {
-                "Forbidden"
-            };
-            write!(
-                stream,
-                "HTTP/1.1 {} {reason}\r\n{challenge}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                failure.status(),
-                body.len(),
-            )?;
+        // Auth verdicts need only the head: rejecting BEFORE the body read
+        // means an unauthenticated client cannot make this server buffer
+        // 64 MiB. The connection then closes, precisely because that body was
+        // never read.
+        if let Some(config) = auth {
+            if let Err(failure) = config.authorize(head.authorization.as_deref(), &head.method) {
+                metrics.rejected.increment();
+                let challenge = failure
+                    .www_authenticate()
+                    .map(|value| format!("WWW-Authenticate: {value}\r\n"))
+                    .unwrap_or_default();
+                let body = failure.body();
+                let reason = if failure.status() == 401 {
+                    "Unauthorized"
+                } else {
+                    "Forbidden"
+                };
+                let mut responder = connection.responder(false);
+                let head = format!(
+                    "HTTP/1.1 {} {reason}\r\n{challenge}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    failure.status(),
+                    body.len(),
+                );
+                return responder.raw(&head, body.as_bytes());
+            }
+        }
+        let body = match connection.read_body(&head) {
+            Ok(body) => body,
+            Err(error) => {
+                let mut responder = connection.responder(false);
+                return responder.json(400, json!({"error": error.to_string()}));
+            }
+        };
+        let request = Request {
+            method: head.method,
+            target: head.target,
+            content_type: head.content_type,
+            body,
+        };
+        let mut responder = connection.responder(keep_alive);
+        let result = serve_request(&mut responder, request, engine, metrics);
+        let persist = responder.keep_alive;
+        result?;
+        metrics
+            .request_latency
+            .record(started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
+        metrics.requests.increment();
+        if !persist {
             return Ok(());
         }
     }
-    let request = match read_body(&mut stream, head) {
-        Ok(request) => request,
-        Err(error) => return respond(&mut stream, 400, json!({"error": error.to_string()})),
-    };
+    Ok(())
+}
+
+/// Decodes an ingest body straight into spans.
+///
+/// Deliberately NOT via `serde_json::Value`: parsing to a DOM, cloning the
+/// array out of it, and then re-walking that DOM per span made three passes
+/// and three sets of allocations out of what serde can do in one. On the
+/// ingest hot path that was the single largest server-side cost.
+///
+/// The shape is either a bare array or `{"spans": [...]}`, distinguished by
+/// the first non-whitespace byte rather than by trying one and falling back —
+/// a failed attempt would have to re-parse from the start.
+fn decode_spans(body: &[u8]) -> Result<Vec<Span>, String> {
+    #[derive(serde::Deserialize)]
+    struct Envelope {
+        spans: Vec<Span>,
+    }
+    match body.iter().find(|byte| !byte.is_ascii_whitespace()) {
+        Some(b'[') => serde_json::from_slice::<Vec<Span>>(body).map_err(|error| error.to_string()),
+        Some(b'{') => serde_json::from_slice::<Envelope>(body)
+            .map(|envelope| envelope.spans)
+            .map_err(|error| error.to_string()),
+        _ => Err("body must be an array or {spans: [...]}".to_owned()),
+    }
+}
+
+fn serve_request(
+    responder: &mut Responder<'_>,
+    request: Request,
+    engine: &Store,
+    metrics: &ServerMetrics,
+) -> io::Result<()> {
     let (path, query) = request
         .target
         .split_once('?')
         .unwrap_or((&request.target, ""));
     match (request.method.as_str(), path) {
         ("POST", "/v1/spans") => {
-            let value: Value = match serde_json::from_slice(&request.body) {
-                Ok(value) => value,
-                Err(error) => {
-                    return respond(&mut stream, 400, json!({"error": error.to_string()}));
+            let spans = match decode_spans(&request.body) {
+                Ok(spans) => spans,
+                Err(error) => return responder.json(400, json!({"error": error})),
+            };
+            // Both halves of the (trace_id, span_id) primary key must be
+            // non-empty: an empty span_id would make every such span in a
+            // trace one colliding key, silently upserted over each other while
+            // the response counts them all as accepted.
+            for (index, span) in spans.iter().enumerate() {
+                if span.trace_id.is_empty() {
+                    return responder.json(
+                        400,
+                        json!({"error": format!("span {index}: trace_id is empty")}),
+                    );
                 }
-            };
-            let raw_spans = if let Some(array) = value.as_array() {
-                array.clone()
-            } else if let Some(array) = value.get("spans").and_then(Value::as_array) {
-                array.clone()
-            } else {
-                return respond(
-                    &mut stream,
-                    400,
-                    json!({"error": "body must be an array or {spans: [...]}"}),
-                );
-            };
-            let mut spans = Vec::with_capacity(raw_spans.len());
-            for (index, raw) in raw_spans.into_iter().enumerate() {
-                match serde_json::from_value::<Span>(raw) {
-                    Ok(span) => {
-                        // Both halves of the (trace_id, span_id) primary key
-                        // must be non-empty: an empty span_id would make every
-                        // such span in a trace one colliding key, silently
-                        // upserted over each other while the response counts
-                        // them all as accepted.
-                        if span.trace_id.is_empty() {
-                            return respond(
-                                &mut stream,
-                                400,
-                                json!({"error": format!("span {index}: trace_id is empty")}),
-                            );
-                        }
-                        if span.span_id.is_empty() {
-                            return respond(
-                                &mut stream,
-                                400,
-                                json!({"error": format!("span {index}: span_id is empty")}),
-                            );
-                        }
-                        spans.push(span);
-                    }
-                    Err(error) => {
-                        return respond(
-                            &mut stream,
-                            400,
-                            json!({"error": format!("span {index}: {error}")}),
-                        );
-                    }
+                if span.span_id.is_empty() {
+                    return responder.json(
+                        400,
+                        json!({"error": format!("span {index}: span_id is empty")}),
+                    );
                 }
             }
             let accepted = spans.len();
             match engine.ingest_batch(spans) {
-                Ok(()) => respond(
-                    &mut stream,
+                Ok(()) => responder.json(
                     200,
                     // The client should never have to guess what a 200 promises.
                     json!({"accepted": accepted, "durability": engine.durability().as_str()}),
                 ),
-                Err(error) => respond(&mut stream, 503, json!({"error": error.to_string()})),
+                Err(error) => responder.json(503, json!({"error": error.to_string()})),
             }
         }
         ("POST", "/v1/traces") => {
@@ -460,57 +680,69 @@ fn handle_connection(
                 match traza::otlp_pb::traces_request_to_json(&request.body) {
                     Ok(value) => value,
                     Err(error) => {
-                        return respond(&mut stream, 400, json!({"error": error.to_string()}));
+                        return responder.json(400, json!({"error": error.to_string()}));
                     }
                 }
             } else {
                 match serde_json::from_slice(&request.body) {
                     Ok(value) => value,
                     Err(error) => {
-                        return respond(&mut stream, 400, json!({"error": error.to_string()}));
+                        return responder.json(400, json!({"error": error.to_string()}));
                     }
                 }
             };
             let spans = match traza::otlp::spans_from_request(&value) {
                 Ok(spans) => spans,
                 Err(error) => {
-                    return respond(&mut stream, 400, json!({"error": error.to_string()}));
+                    return responder.json(400, json!({"error": error.to_string()}));
                 }
             };
             match engine.ingest_batch(spans) {
                 Ok(()) if is_protobuf => {
                     // An empty ExportTraceServiceResponse is zero protobuf
                     // bytes; protobuf clients expect the matching media type.
-                    write!(
-                        stream,
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/x-protobuf\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                    )
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/x-protobuf\r\nContent-Length: 0\r\nConnection: {}\r\n\r\n",
+                        responder.connection_header()
+                    );
+                    responder.raw(&head, b"")
                 }
-                Ok(()) => respond(&mut stream, 200, json!({"partialSuccess": {}})),
-                Err(error) => respond(&mut stream, 503, json!({"error": error.to_string()})),
+                Ok(()) => responder.json(200, json!({"partialSuccess": {}})),
+                Err(error) => responder.json(503, json!({"error": error.to_string()})),
             }
         }
         ("POST", "/v1/flush") => match engine.flush() {
-            Ok(()) => respond(&mut stream, 200, json!({"flushed": true})),
-            Err(error) => respond(&mut stream, 503, json!({"error": error.to_string()})),
+            Ok(()) => responder.json(200, json!({"flushed": true})),
+            Err(error) => responder.json(503, json!({"error": error.to_string()})),
         },
         ("GET", "/v1/spans") => {
             let filter = match filter_from_query(query) {
                 Ok(filter) => filter,
-                Err(error) => return respond(&mut stream, 400, json!({"error": error})),
+                Err(error) => return responder.json(400, json!({"error": error})),
             };
             match engine.query(&filter) {
-                Ok(spans) => respond(
-                    &mut stream,
+                Ok(spans) => responder.json(
                     200,
                     serde_json::to_value(spans).unwrap_or_else(|_| Value::Array(Vec::new())),
                 ),
-                Err(error) => respond(&mut stream, 503, json!({"error": error.to_string()})),
+                Err(error) => responder.json(503, json!({"error": error.to_string()})),
             }
         }
+        ("GET", "/v1/metrics") => {
+            // Prometheus text format. Engine stages first, then the HTTP
+            // layer, so a reader sees the whole ingest path in one scrape.
+            let mut rendered = String::with_capacity(2048);
+            engine.metrics().render_prometheus(&mut rendered);
+            metrics.render_prometheus(&mut rendered);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n",
+                rendered.len(),
+                responder.connection_header()
+            );
+            responder.raw(&head, rendered.as_bytes())
+        }
         ("GET", "/v1/stats") => match engine.stats() {
-            Ok(stats) => respond(
-                &mut stream,
+            Ok(stats) => responder.json(
                 200,
                 json!({
                     // These are physical storage records. Historical versions
@@ -526,18 +758,17 @@ fn handle_connection(
                     "wal_bytes": stats.wal_bytes,
                 }),
             ),
-            Err(error) => respond(&mut stream, 503, json!({"error": error.to_string()})),
+            Err(error) => responder.json(503, json!({"error": error.to_string()})),
         },
         ("GET", _) if path.starts_with("/v1/traces/") => {
             let id = percent_decode(&path[11..]);
             match engine.get_trace(&id) {
                 Ok(spans) if spans.is_empty() => {
-                    respond(&mut stream, 404, json!({"error": "trace not found"}))
+                    responder.json(404, json!({"error": "trace not found"}))
                 }
                 Ok(spans) => {
                     let annotations = engine.annotations(&id, None, None).unwrap_or_default();
-                    respond(
-                        &mut stream,
+                    responder.json(
                         200,
                         json!({
                             "trace_id": id,
@@ -548,41 +779,38 @@ fn handle_connection(
                         }),
                     )
                 }
-                Err(error) => respond(&mut stream, 503, json!({"error": error.to_string()})),
+                Err(error) => responder.json(503, json!({"error": error.to_string()})),
             }
         }
         ("GET", "/v1/sessions") => {
             let (since, until, limit, group_by) = match analytics_query(query) {
                 Ok(parsed) => parsed,
-                Err(error) => return respond(&mut stream, 400, json!({"error": error})),
+                Err(error) => return responder.json(400, json!({"error": error})),
             };
             if group_by.is_some() {
-                return respond(
-                    &mut stream,
+                return responder.json(
                     400,
                     json!({"error": "group_by is not a /v1/sessions parameter"}),
                 );
             }
             match engine.sessions(since, until, limit.unwrap_or(100)) {
-                Ok(sessions) => respond(
-                    &mut stream,
+                Ok(sessions) => responder.json(
                     200,
                     json!({"sessions": serde_json::to_value(sessions)
                         .unwrap_or_else(|_| Value::Array(Vec::new()))}),
                 ),
-                Err(error) => respond(&mut stream, 503, json!({"error": error.to_string()})),
+                Err(error) => responder.json(503, json!({"error": error.to_string()})),
             }
         }
         ("GET", _) if path.starts_with("/v1/sessions/") => {
             let id = percent_decode(&path[13..]);
             match engine.session(&id) {
-                Ok(None) => respond(&mut stream, 404, json!({"error": "session not found"})),
-                Ok(Some(detail)) => respond(
-                    &mut stream,
+                Ok(None) => responder.json(404, json!({"error": "session not found"})),
+                Ok(Some(detail)) => responder.json(
                     200,
                     serde_json::to_value(detail).unwrap_or_else(|_| json!({})),
                 ),
-                Err(error) => respond(&mut stream, 503, json!({"error": error.to_string()})),
+                Err(error) => responder.json(503, json!({"error": error.to_string()})),
             }
         }
         ("POST", "/v1/annotations") => {
@@ -590,7 +818,7 @@ fn handle_connection(
                 match serde_json::from_slice(&request.body) {
                     Ok(annotation) => annotation,
                     Err(error) => {
-                        return respond(&mut stream, 400, json!({"error": error.to_string()}));
+                        return responder.json(400, json!({"error": error.to_string()}));
                     }
                 };
             let mut annotation = annotation;
@@ -602,11 +830,11 @@ fn handle_connection(
                     .min(u128::from(u64::MAX)) as u64;
             }
             match engine.annotate(annotation) {
-                Ok(()) => respond(&mut stream, 200, json!({"recorded": true})),
+                Ok(()) => responder.json(200, json!({"recorded": true})),
                 Err(traza::Error::InvalidSpan(reason)) => {
-                    respond(&mut stream, 400, json!({"error": reason}))
+                    responder.json(400, json!({"error": reason}))
                 }
-                Err(error) => respond(&mut stream, 503, json!({"error": error.to_string()})),
+                Err(error) => responder.json(503, json!({"error": error.to_string()})),
             }
         }
         ("GET", "/v1/annotations") => {
@@ -620,8 +848,7 @@ fn handle_connection(
                     "span_id" => span_id = Some(percent_decode(value)),
                     "name" => name = Some(percent_decode(value)),
                     other => {
-                        return respond(
-                            &mut stream,
+                        return responder.json(
                             400,
                             json!({"error": format!("unknown query parameter: {other}")}),
                         )
@@ -629,31 +856,30 @@ fn handle_connection(
                 }
             }
             let Some(trace_id) = trace_id else {
-                return respond(&mut stream, 400, json!({"error": "trace_id is required"}));
+                return responder.json(400, json!({"error": "trace_id is required"}));
             };
             match engine.annotations(&trace_id, span_id.as_deref(), name.as_deref()) {
-                Ok(annotations) => respond(
-                    &mut stream,
+                Ok(annotations) => responder.json(
                     200,
                     json!({"annotations": serde_json::to_value(annotations)
                         .unwrap_or_else(|_| Value::Array(Vec::new()))}),
                 ),
-                Err(error) => respond(&mut stream, 503, json!({"error": error.to_string()})),
+                Err(error) => responder.json(503, json!({"error": error.to_string()})),
             }
         }
         ("GET", _) if path.starts_with("/v1/payloads/") => {
             let reference = percent_decode(&path[13..]);
             match engine.payload(&reference) {
                 Ok(Some(bytes)) => {
-                    write!(
-                        stream,
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        bytes.len()
-                    )?;
-                    stream.write_all(&bytes)
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n",
+                        bytes.len(),
+                        responder.connection_header()
+                    );
+                    responder.raw(&head, &bytes)
                 }
-                Ok(None) => respond(&mut stream, 404, json!({"error": "payload not found"})),
-                Err(error) => respond(&mut stream, 503, json!({"error": error.to_string()})),
+                Ok(None) => responder.json(404, json!({"error": "payload not found"})),
+                Err(error) => responder.json(503, json!({"error": error.to_string()})),
             }
         }
         ("GET", "/v1/export") => {
@@ -665,44 +891,45 @@ fn handle_connection(
                     filter.limit = None;
                     (filter, user_limit)
                 }
-                Err(error) => return respond(&mut stream, 400, json!({"error": error})),
+                Err(error) => return responder.json(400, json!({"error": error})),
             };
-            stream_export(&mut stream, engine, filter, user_limit)
+            // Chunked with trailers, terminated by the close. Keeping this
+            // connection alive would need the client to agree to trailers
+            // first; closing is correct and costs one connection per export.
+            responder.must_close();
+            stream_export(responder.stream, engine, filter, user_limit)
         }
         ("GET", "/v1/stats/llm") => {
             let (since, until, limit, group_by) = match analytics_query(query) {
                 Ok(parsed) => parsed,
-                Err(error) => return respond(&mut stream, 400, json!({"error": error})),
+                Err(error) => return responder.json(400, json!({"error": error})),
             };
-            let group_by = match group_by {
-                None => traza::analytics::LlmGroupBy::Model,
-                Some(name) => match traza::analytics::LlmGroupBy::parse(&name) {
-                    Some(group) => group,
-                    None => {
-                        return respond(
-                            &mut stream,
+            let group_by =
+                match group_by {
+                    None => traza::analytics::LlmGroupBy::Model,
+                    Some(name) => match traza::analytics::LlmGroupBy::parse(&name) {
+                        Some(group) => group,
+                        None => return responder.json(
                             400,
                             json!({"error": "group_by must be model|provider|service|session|day"}),
-                        )
-                    }
-                },
-            };
+                        ),
+                    },
+                };
             match engine.llm_aggregate(group_by, since, until) {
                 Ok(mut rows) => {
                     if let Some(limit) = limit {
                         rows.truncate(limit);
                     }
-                    respond(
-                        &mut stream,
+                    responder.json(
                         200,
                         json!({"rows": serde_json::to_value(rows)
                             .unwrap_or_else(|_| Value::Array(Vec::new()))}),
                     )
                 }
-                Err(error) => respond(&mut stream, 503, json!({"error": error.to_string()})),
+                Err(error) => responder.json(503, json!({"error": error.to_string()})),
             }
         }
-        _ => respond(&mut stream, 404, json!({"error": "not found"})),
+        _ => responder.json(404, json!({"error": "not found"})),
     }
 }
 
@@ -869,38 +1096,116 @@ struct Request {
 struct RequestHead {
     method: String,
     target: String,
+    /// Request-line version, uppercased. Decides the keep-alive default.
+    version: String,
     authorization: Option<String>,
     content_type: String,
+    /// Lowercased `Connection:` header value, empty when absent.
+    connection: String,
     content_length: usize,
-    /// Bytes read so far (headers plus any body prefix that arrived with them).
-    buffered: Vec<u8>,
     header_end: usize,
 }
 
-fn read_head(stream: &mut TcpStream) -> io::Result<RequestHead> {
-    let mut bytes = Vec::with_capacity(4096);
-    let mut buffer = [0_u8; 8192];
-    let header_end;
-    loop {
-        let read = stream.read(&mut buffer)?;
-        if read == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "incomplete request",
-            ));
-        }
-        bytes.extend_from_slice(&buffer[..read]);
-        if let Some(position) = find_bytes(&bytes, b"\r\n\r\n") {
-            header_end = position + 4;
-            break;
-        }
-        if bytes.len() > MAX_HEADER_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "request headers too large",
-            ));
+impl RequestHead {
+    /// Whether the client is willing to reuse this connection.
+    ///
+    /// HTTP/1.1 persists unless it says `close`; HTTP/1.0 closes unless it
+    /// says `keep-alive`. Compared token-wise because the header is a list —
+    /// `Connection: keep-alive, Upgrade` is one value, not two headers.
+    fn wants_keep_alive(&self) -> bool {
+        let tokens = || self.connection.split(',').map(str::trim);
+        if self.version == "HTTP/1.1" {
+            !tokens().any(|token| token == "close")
+        } else {
+            tokens().any(|token| token == "keep-alive")
         }
     }
+}
+
+/// One client connection, with the bytes it has read but not yet consumed.
+///
+/// Keep-alive is why this holds a buffer at all: a read for one request's body
+/// can pull in the head of the next, and a fresh per-request buffer would
+/// silently drop those bytes. Everything consumed is drained from the front,
+/// so what remains is always the start of the next request.
+struct Connection {
+    stream: TcpStream,
+    buffer: Vec<u8>,
+}
+
+impl Connection {
+    fn new(stream: TcpStream) -> Self {
+        Self {
+            stream,
+            buffer: Vec::with_capacity(8192),
+        }
+    }
+
+    /// Borrows the socket for one response, declaring up front whether the
+    /// connection survives it.
+    fn responder(&mut self, keep_alive: bool) -> Responder<'_> {
+        Responder {
+            stream: &mut self.stream,
+            keep_alive,
+        }
+    }
+
+    /// Reads the next request head.
+    ///
+    /// `Ok(None)` means the peer closed cleanly at a request boundary — the
+    /// ordinary end of a keep-alive connection, not an error.
+    fn read_head(&mut self) -> io::Result<Option<RequestHead>> {
+        let mut chunk = [0_u8; 8192];
+        let header_end = loop {
+            // Check BEFORE reading: a pipelined request may already be sitting
+            // in the buffer, and blocking on a read the client will never
+            // satisfy would hang it until the socket timeout.
+            if let Some(position) = find_bytes(&self.buffer, b"\r\n\r\n") {
+                break position + 4;
+            }
+            if self.buffer.len() > MAX_HEADER_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "request headers too large",
+                ));
+            }
+            let read = self.stream.read(&mut chunk)?;
+            if read == 0 {
+                if self.buffer.is_empty() {
+                    return Ok(None);
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "incomplete request",
+                ));
+            }
+            self.buffer.extend_from_slice(&chunk[..read]);
+        };
+        parse_head(&self.buffer, header_end).map(Some)
+    }
+
+    /// Reads `head`'s body and consumes the whole request from the buffer.
+    fn read_body(&mut self, head: &RequestHead) -> io::Result<Vec<u8>> {
+        let needed = head.header_end + head.content_length;
+        let mut chunk = [0_u8; 8192];
+        while self.buffer.len() < needed {
+            let read = self.stream.read(&mut chunk)?;
+            if read == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "incomplete body",
+                ));
+            }
+            self.buffer.extend_from_slice(&chunk[..read]);
+        }
+        let body = self.buffer[head.header_end..needed].to_vec();
+        // Whatever is left belongs to the next request.
+        self.buffer.drain(..needed);
+        Ok(body)
+    }
+}
+
+fn parse_head(bytes: &[u8], header_end: usize) -> io::Result<RequestHead> {
     // The in-loop check only bounds growth while SEARCHING; a terminator
     // arriving in the final chunk can still complete an oversized header,
     // so the found header must be re-checked against the cap.
@@ -916,6 +1221,12 @@ fn read_head(stream: &mut TcpStream) -> io::Result<RequestHead> {
     let mut request_line = lines.next().unwrap_or_default().split_whitespace();
     let method = request_line.next().unwrap_or_default().to_owned();
     let target = request_line.next().unwrap_or_default().to_owned();
+    // Absent version means HTTP/0.9, which has no keep-alive; defaulting to
+    // 1.0 makes the persistence decision below opt-in rather than assumed.
+    let version = request_line
+        .next()
+        .unwrap_or("HTTP/1.0")
+        .to_ascii_uppercase();
     if method.is_empty() || target.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -924,6 +1235,7 @@ fn read_head(stream: &mut TcpStream) -> io::Result<RequestHead> {
     }
     let mut authorization = None;
     let mut content_type = String::new();
+    let mut connection = String::new();
     let mut header_lines: Vec<&str> = Vec::new();
     for line in lines {
         if let Some((name, value)) = line.split_once(':') {
@@ -933,14 +1245,40 @@ fn read_head(stream: &mut TcpStream) -> io::Result<RequestHead> {
             if name.eq_ignore_ascii_case("content-type") {
                 content_type = value.trim().to_ascii_lowercase();
             }
+            if name.eq_ignore_ascii_case("connection") {
+                connection = value.trim().to_ascii_lowercase();
+            }
         }
         header_lines.push(line);
     }
-    let content_length = header_lines
+    // Once connections persist, request framing is security-relevant: anything
+    // ambiguous about where this body ends lets a crafted request be split
+    // into two, the second of which the server would attribute to the client's
+    // NEXT request. Both ambiguities are refused rather than resolved.
+    if header_lines
         .iter()
         .filter_map(|line| line.split_once(':'))
-        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-        .map(|(_, value)| value.trim().parse::<usize>())
+        .any(|(name, _)| name.eq_ignore_ascii_case("transfer-encoding"))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "transfer-encoded request bodies are not accepted; send Content-Length",
+        ));
+    }
+    let mut lengths = header_lines
+        .iter()
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .map(|(_, value)| value.trim());
+    let first = lengths.next();
+    if lengths.next().is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "duplicate content-length",
+        ));
+    }
+    let content_length = first
+        .map(|value| value.parse::<usize>())
         .transpose()
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid content-length"))?
         .unwrap_or(0);
@@ -953,72 +1291,93 @@ fn read_head(stream: &mut TcpStream) -> io::Result<RequestHead> {
     Ok(RequestHead {
         method,
         target,
+        version,
         authorization,
         content_type,
+        connection,
         content_length,
-        buffered: bytes,
         header_end,
     })
 }
 
-fn read_body(stream: &mut TcpStream, head: RequestHead) -> io::Result<Request> {
-    let RequestHead {
-        method,
-        target,
-        content_type,
-        content_length,
-        mut buffered,
-        header_end,
-        ..
-    } = head;
-    let mut buffer = [0_u8; 8192];
-    while buffered.len() < header_end + content_length {
-        let read = stream.read(&mut buffer)?;
-        if read == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "incomplete body",
-            ));
+/// Writes one response on a connection, stamping the `Connection:` header that
+/// matches what the connection is actually going to do next.
+///
+/// The flag has to live here rather than at each call site because getting it
+/// wrong is a correctness bug, not a performance one: announcing keep-alive
+/// and then closing (or the reverse) desynchronizes the client's framing.
+struct Responder<'a> {
+    stream: &'a mut TcpStream,
+    /// Whether this connection will read another request after this response.
+    keep_alive: bool,
+}
+
+impl Responder<'_> {
+    fn connection_header(&self) -> &'static str {
+        if self.keep_alive {
+            "keep-alive"
+        } else {
+            "close"
         }
-        buffered.extend_from_slice(&buffer[..read]);
     }
-    Ok(Request {
-        method,
-        target,
-        content_type,
-        body: buffered[header_end..header_end + content_length].to_vec(),
-    })
-}
 
-/// Writes a static UI file. `no-store` keeps a rebuilt dashboard from being
-/// shadowed by a cached copy; `nosniff` stops a browser from reinterpreting a
-/// served asset as something more dangerous than its declared type.
-fn respond_file(stream: &mut TcpStream, file: &traza::ui::UiFile) -> io::Result<()> {
-    write!(
-        stream,
-        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        file.content_type,
-        file.bytes.len()
-    )?;
-    stream.write_all(&file.bytes)?;
-    stream.flush()
-}
+    /// Refuses to serve anything further on this connection.
+    ///
+    /// Used wherever the request framing is no longer trustworthy — a body we
+    /// declined to read, a malformed head — because leaving unread bytes in
+    /// the socket would let them be parsed as the NEXT request, which is
+    /// request smuggling.
+    fn must_close(&mut self) {
+        self.keep_alive = false;
+    }
 
-fn respond(stream: &mut TcpStream, status: u16, body: Value) -> io::Result<()> {
-    let encoded = serde_json::to_vec(&body)?;
-    let reason = match status {
-        200 => "OK",
-        400 => "Bad Request",
-        404 => "Not Found",
-        503 => "Service Unavailable",
-        _ => "Error",
-    };
-    write!(
-        stream,
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        encoded.len()
-    )?;
-    stream.write_all(&encoded)
+    /// Sends a JSON body. Head and body go out in one write: at ingest rates
+    /// the extra syscall per response is pure overhead.
+    fn json(&mut self, status: u16, body: Value) -> io::Result<()> {
+        let encoded = serde_json::to_vec(&body)?;
+        let reason = match status {
+            200 => "OK",
+            400 => "Bad Request",
+            404 => "Not Found",
+            413 => "Payload Too Large",
+            429 => "Too Many Requests",
+            503 => "Service Unavailable",
+            _ => "Error",
+        };
+        self.raw(
+            &format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n",
+                encoded.len(),
+                self.connection_header(),
+            ),
+            &encoded,
+        )
+    }
+
+    /// Writes a static UI file. `no-store` keeps a rebuilt dashboard from being
+    /// shadowed by a cached copy; `nosniff` stops a browser from
+    /// reinterpreting a served asset as something more dangerous than its
+    /// declared type.
+    fn file(&mut self, file: &traza::ui::UiFile) -> io::Result<()> {
+        self.raw(
+            &format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n",
+                file.content_type,
+                file.bytes.len(),
+                self.connection_header(),
+            ),
+            &file.bytes,
+        )
+    }
+
+    /// Sends a caller-built head followed by `body`, in a single write.
+    fn raw(&mut self, head: &str, body: &[u8]) -> io::Result<()> {
+        let mut out = Vec::with_capacity(head.len() + body.len());
+        out.extend_from_slice(head.as_bytes());
+        out.extend_from_slice(body);
+        self.stream.write_all(&out)?;
+        self.stream.flush()
+    }
 }
 
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
