@@ -236,9 +236,11 @@ Limited queries decode only the records they return, so **trace lookup** is effe
 | Attribute filter p95 | 747.3 ms | **27.1 ms** | 27.6x |
 | Attribute filter p99 | 1664.6 ms | **72.9 ms** | 22.8x |
 | Trace lookup p99 | 7.72 ms | **1.82 ms** | 4.2x |
-| Segments | ~10,100 | **~380** | ~27x fewer |
+| Segments † | ~10,100 | **~380** | ~27x fewer |
 | Peak RSS | 0.43 GB | 2.0 GB | compaction costs memory |
 | Sustained ingest | 59,025/s | 40,894/s | -31% |
+
+† Segment counts are extrapolated from mid-run samples (6,064 at 60M uncompacted, 191 at 50M compacted, both growing linearly); the benchmark deletes its data directory on exit. Every latency, memory and throughput figure above is measured.
 
 Read that honestly. Compaction is worth roughly **16-28x** on filtered search and 4x on trace lookup, and it pays for that with about **31% of ingest throughput and ~1.5 GB of resident memory** for its merge working set. But **filtered-search p99 is still 72.9 ms at 100M, over the 50 ms target this project sets itself** — p50 and p95 are comfortably inside it; only the tail is not.
 
