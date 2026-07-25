@@ -5,7 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.16.0] - 2026-07-24
+
+Search that scales with the store: size-tiered compaction bounds the segment
+count, and at a 1 GiB segment cap filtered-search p99 clears the project's own
+50 ms bar at 100M spans for the first time.
 
 ### Added
 
@@ -65,9 +69,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   across ~1000 segments. The README now states that filtered search scales
   with segment count, and reports measured RSS (0.25 GB, not 0.71 GB) and
   disk (~6 GB for the benchmark's span shape, not 2.4 GB).
-
-
-
 - Renamed the segment module `segment_v2` → `segment` (file, module,
   `segment_error` helper, acceptance test, format doc): there is only one
   segment format, so the version in the name was redundant. The suffix
