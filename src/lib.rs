@@ -9,6 +9,7 @@
 pub mod analytics;
 pub mod annotations;
 pub mod auth;
+pub mod content;
 pub mod expiration;
 pub mod hash;
 mod media;
@@ -24,6 +25,7 @@ mod wal;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use std::borrow::Cow;
 use std::error::Error as StdError;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -204,6 +206,19 @@ pub struct SpanFilter {
     /// entirely matches: "not an error" should include spans that never
     /// recorded a status.
     pub excluded_attributes: Vec<(String, Value)>,
+    /// Match spans whose text contains every word of this query.
+    ///
+    /// This is **word search, not substring search**: `refund` matches a span
+    /// saying "Refund the order" and does not match one saying "refunds". A
+    /// multi-word query is a conjunction, not a phrase — the words may appear
+    /// anywhere, in any order, across any of the span's text. The text
+    /// searched is every string value in the span's attributes and its events'
+    /// attributes, plus event names.
+    ///
+    /// The semantics are set by what the segment's content index can safely
+    /// over-approximate; see [`crate::content`] for why substring matching
+    /// would produce wrong answers rather than slow ones.
+    pub content: Option<String>,
     /// Result ordering. `None` keeps Traza's stable span order, which is the
     /// only order that can stream without materializing.
     pub sort: Option<SpanSort>,
@@ -607,6 +622,35 @@ fn canonical_value(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_default()
 }
 
+/// Every string a content search looks in, borrowed from the span.
+///
+/// One definition serves both sides: the encoder tokenizes exactly these
+/// strings into the segment's content index, and the query verifies against
+/// exactly these strings. Two traversals that disagreed — one indexing event
+/// attributes, say, and the other not — would produce a filter that finds
+/// spans the index cannot, or worse, misses spans it should have found.
+fn content_strs(span: &Span) -> Vec<&str> {
+    fn collect<'a>(value: &'a Value, out: &mut Vec<&'a str>) {
+        match value {
+            Value::String(text) => out.push(text),
+            Value::Array(items) => items.iter().for_each(|item| collect(item, out)),
+            Value::Object(map) => map.values().for_each(|item| collect(item, out)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for value in span.attributes.values() {
+        collect(value, &mut out);
+    }
+    for event in &span.events {
+        out.push(&event.name);
+        for value in event.attributes.values() {
+            collect(value, &mut out);
+        }
+    }
+    out
+}
+
 fn span_to_record(span: &Span) -> Result<segment::RecordInput> {
     let mut attributes = std::collections::BTreeMap::new();
     // User attributes first, and NUL-prefixed user keys are never indexed:
@@ -622,12 +666,19 @@ fn span_to_record(span: &Span) -> Result<segment::RecordInput> {
     }
     attributes.insert(IDX_SERVICE.to_owned(), span.service.clone());
     attributes.insert(IDX_NAME.to_owned(), span.name.clone());
+    // Content is carried unescaped and separately from `attributes`, whose
+    // values are canonical JSON. See `RecordInput::content`.
+    let content = content_strs(span)
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<String>>();
     Ok(segment::RecordInput::new(
         span.start_time_ns,
         span.trace_id.clone(),
         attributes,
         serde_json::to_vec(span)?,
-    ))
+    )
+    .with_content(content))
 }
 
 fn record_to_span(record: &segment::Record) -> Result<Span> {
@@ -1385,8 +1436,9 @@ fn narrow_session_spans(
     filter: &SpanFilter,
     cursor: Option<&SpanCursor>,
 ) -> Vec<Span> {
+    let content = filter.content.as_deref().map(content::Query::new);
     spans.retain(|span| {
-        span_matches(span, filter)
+        span_matches(span, filter, content.as_ref())
             && cursor.map_or(true, |position| span_after_cursor(span, position))
     });
     order_spans(&mut spans, filter.sort);
@@ -1498,6 +1550,9 @@ pub(crate) fn query_view(
         }
         return Ok(spans);
     }
+    // Parsed once for the whole query. Tokenizing the needle per candidate
+    // span would cost more than the index saves.
+    let content = filter.content.as_deref().map(content::Query::new);
     {
         let mut result = Vec::new();
 
@@ -1515,7 +1570,7 @@ pub(crate) fn query_view(
                 .spans
                 .iter()
                 .filter(|span| {
-                    span_matches(span, filter)
+                    span_matches(span, filter, content.as_ref())
                         && cursor.map_or(true, |position| span_after_cursor(span, position))
                 })
                 .map(|span| Span::clone(span))
@@ -1526,7 +1581,9 @@ pub(crate) fn query_view(
                 Parsed(Vec<Span>),
                 Lazy {
                     seg: &'a segment::Segment,
-                    offsets: &'a [u64],
+                    // Owned when the content index produced the candidates,
+                    // borrowed when an attribute posting list did.
+                    offsets: Cow<'a, [u64]>,
                 },
             }
             let mut sources: Vec<(Source<'_>, usize)> = vec![(Source::Parsed(buffered), 0)];
@@ -1541,9 +1598,16 @@ pub(crate) fn query_view(
                     metrics.segments_pruned_by_time.increment();
                     continue;
                 }
-                let offsets = select_probe(seg, filter);
+                if content
+                    .as_ref()
+                    .is_some_and(|query| !seg.may_contain_content(query))
+                {
+                    metrics.segments_pruned_by_content.increment();
+                    continue;
+                }
+                let offsets = select_probe(seg, filter, content.as_ref(), metrics)?;
                 let position = match cursor {
-                    Some(cursor) => first_offset_after(seg, offsets, cursor)?,
+                    Some(cursor) => first_offset_after(seg, &offsets, cursor)?,
                     None => 0,
                 };
                 sources.push((Source::Lazy { seg, offsets }, position));
@@ -1596,7 +1660,7 @@ pub(crate) fn query_view(
                 let span = heads[index].take().expect("selected head exists");
                 heads[index] = advance(&mut sources[index])?;
                 if index != 0
-                    && (!span_matches(&span, filter)
+                    && (!span_matches(&span, filter, content.as_ref())
                         || cursor.is_some_and(|position| !span_after_cursor(&span, position)))
                 {
                     continue;
@@ -1648,11 +1712,18 @@ pub(crate) fn query_view(
                 metrics.segments_pruned_by_time.increment();
                 continue;
             }
-            let offsets = select_probe(seg, filter);
-            for offset in offsets {
+            if content
+                .as_ref()
+                .is_some_and(|query| !seg.may_contain_content(query))
+            {
+                metrics.segments_pruned_by_content.increment();
+                continue;
+            }
+            let offsets = select_probe(seg, filter, content.as_ref(), metrics)?;
+            for offset in offsets.iter() {
                 let record = seg.record_at_offset(*offset).map_err(segment_error)?;
                 let span = record_to_span(&record)?;
-                if !span_matches(&span, filter)
+                if !span_matches(&span, filter, content.as_ref())
                     || cursor.is_some_and(|bound| !span_after_cursor(&span, bound))
                 {
                     continue;
@@ -1673,7 +1744,7 @@ pub(crate) fn query_view(
             }
         }
         for span in writer.spans.iter() {
-            if span_matches(span, filter)
+            if span_matches(span, filter, content.as_ref())
                 && cursor.map_or(true, |bound| span_after_cursor(span, bound))
             {
                 result.push(Span::clone(span));
@@ -2858,20 +2929,32 @@ fn order_spans(spans: &mut [Span], sort: Option<SpanSort>) {
 /// (Since segment v4 a list is a digest-keyed CANDIDATE set, so a length is
 /// an upper bound rather than a match count. The gap is a collision away from
 /// zero, and every candidate is checked by `span_matches` regardless.)
-fn select_probe<'a>(seg: &'a segment::Segment, filter: &SpanFilter) -> &'a [u64] {
-    let mut best: Option<&'a [u64]> = None;
-    let mut consider = |offsets: &'a [u64]| {
+fn select_probe<'a>(
+    seg: &'a segment::Segment,
+    filter: &SpanFilter,
+    content: Option<&content::Query>,
+    metrics: &metrics::Metrics,
+) -> Result<Cow<'a, [u64]>> {
+    let mut best: Option<Cow<'a, [u64]>> = None;
+    let mut consider = |offsets: Cow<'a, [u64]>| {
         // `Option::is_none_or` would read better but is newer than this
         // crate's MSRV.
-        if best.map_or(true, |current| offsets.len() < current.len()) {
+        if best
+            .as_ref()
+            .map_or(true, |current| offsets.len() < current.len())
+        {
             best = Some(offsets);
         }
     };
     if let Some(service) = &filter.service {
-        consider(seg.attribute_candidate_offsets(IDX_SERVICE, service));
+        consider(Cow::Borrowed(
+            seg.attribute_candidate_offsets(IDX_SERVICE, service),
+        ));
     }
     if let Some(name) = &filter.name {
-        consider(seg.attribute_candidate_offsets(IDX_NAME, name));
+        consider(Cow::Borrowed(
+            seg.attribute_candidate_offsets(IDX_NAME, name),
+        ));
     }
     for (key, value) in &filter.attributes {
         // Session keys are expanded by the caller into a union and cannot
@@ -2879,13 +2962,48 @@ fn select_probe<'a>(seg: &'a segment::Segment, filter: &SpanFilter) -> &'a [u64]
         if key.starts_with('\u{0}') {
             continue;
         }
-        consider(seg.attribute_candidate_offsets(key, &canonical_value(value)));
+        consider(Cow::Borrowed(
+            seg.attribute_candidate_offsets(key, &canonical_value(value)),
+        ));
+    }
+    // The content index is just another candidate source, and often the most
+    // selective one: an attribute probe narrows to a value, a content probe
+    // narrows to the 128-record blocks that may hold a word. It costs a few
+    // small reads, so it is consulted only when the filter asks for it.
+    if let Some(query) = content {
+        if let Some(offsets) = seg
+            .content_candidate_offsets(query)
+            .map_err(segment_error)?
+        {
+            metrics
+                .records_admitted_by_content
+                .add(offsets.len() as u64);
+            consider(Cow::Owned(offsets));
+        }
     }
     // Nothing indexable: every record is a candidate.
-    best.unwrap_or_else(|| seg.record_offsets())
+    Ok(best.unwrap_or_else(|| Cow::Borrowed(seg.record_offsets())))
 }
 
-fn span_matches(span: &Span, filter: &SpanFilter) -> bool {
+/// Whether `span` satisfies `filter`.
+///
+/// `content` is the filter's content query, parsed once by the caller rather
+/// than per span — tokenizing the needle for every candidate would cost more
+/// than the index saves. It is a separate parameter rather than a lookup
+/// inside `filter` so that every verification site has to acknowledge it: a
+/// path that forgot to check content would return spans that do not match,
+/// and the content index's whole safety argument is that the decoded span
+/// decides.
+fn span_matches(span: &Span, filter: &SpanFilter, content: Option<&content::Query>) -> bool {
+    if let Some(query) = content {
+        if !query.matches(content_strs(span).into_iter()) {
+            return false;
+        }
+    }
+    span_matches_without_content(span, filter)
+}
+
+fn span_matches_without_content(span: &Span, filter: &SpanFilter) -> bool {
     if filter
         .service
         .as_ref()
@@ -3253,6 +3371,7 @@ mod planner_tests {
                     trace_id: format!("t{index}"),
                     attributes,
                     payload: b"{}".to_vec(),
+                    content: Vec::new(),
                 }
             })
             .collect();
@@ -3278,7 +3397,9 @@ mod planner_tests {
             ..SpanFilter::default()
         };
         assert_eq!(
-            select_probe(&seg, &service_only).len(),
+            select_probe(&seg, &service_only, None, &metrics::Metrics::default())
+                .expect("plan")
+                .len(),
             100,
             "service alone can only probe the whole segment"
         );
@@ -3289,14 +3410,18 @@ mod planner_tests {
             ..SpanFilter::default()
         };
         assert_eq!(
-            select_probe(&seg, &both).len(),
+            select_probe(&seg, &both, None, &metrics::Metrics::default())
+                .expect("plan")
+                .len(),
             1,
             "with a selective attribute available, the scan must follow it"
         );
 
         let no_predicate = SpanFilter::default();
         assert_eq!(
-            select_probe(&seg, &no_predicate).len(),
+            select_probe(&seg, &no_predicate, None, &metrics::Metrics::default())
+                .expect("plan")
+                .len(),
             100,
             "with nothing indexable every record is a candidate"
         );
@@ -3312,6 +3437,10 @@ mod planner_tests {
             attributes: vec![("rare".to_owned(), Value::String("absent".to_owned()))],
             ..SpanFilter::default()
         };
-        assert!(select_probe(&seg, &absent).is_empty());
+        assert!(
+            select_probe(&seg, &absent, None, &metrics::Metrics::default())
+                .expect("plan")
+                .is_empty()
+        );
     }
 }

@@ -12,7 +12,7 @@
 //!   naming what the acknowledgement guarantees.
 //! - `GET /v1/traces/<trace_id>` responds `{"trace_id": .., "spans": [..]}`
 //!   or 404 `{"error": "trace not found"}`.
-//! - `GET /v1/spans?service=&name=&min_duration_ns=&since_ns=&until_ns=&limit=`
+//! - `GET /v1/spans?service=&name=&content=&min_duration_ns=&since_ns=&until_ns=&limit=`
 //!   responds with the matching spans ordered by start time.
 //! - `GET /v1/stats` responds with engine statistics.
 //! - `GET /v1/sessions?since=&until=&limit=` lists sessions (spans carrying a
@@ -1234,6 +1234,9 @@ fn filter_from_query(raw_query: &str) -> Result<SpanFilter, String> {
         match key.as_str() {
             "service" => filter.service = Some(value),
             "name" => filter.name = Some(value),
+            // Word search over the span's text. Not substring, not a phrase —
+            // see `SpanFilter::content`.
+            "content" | "q" => filter.content = Some(value),
             // Unions every recognized session key, so a mixed-convention
             // session (some spans session.id, some gen_ai.conversation.id)
             // returns whole — unlike attr.session.id, which sees one key.

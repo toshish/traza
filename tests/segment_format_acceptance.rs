@@ -21,7 +21,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use traza::segment::{self, RecordInput, Segment, HEADER_LEN, HEADER_LEN_V2, MAGIC, VERSION};
+use traza::segment::{
+    self, RecordInput, Segment, HEADER_LEN, HEADER_LEN_V2, HEADER_LEN_V3, MAGIC, VERSION,
+};
 
 static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 
@@ -115,6 +117,19 @@ mod offsets {
     /// v3 additions: the inclusive record timestamp range.
     pub const MIN_TIMESTAMP: usize = 80;
     pub const MAX_TIMESTAMP: usize = 88;
+    /// v5 addition: the content index, which is what now bounds the
+    /// attribute index — before v5 that section ran to EOF.
+    pub const CONTENT_INDEX_OFFSET: usize = 96;
+}
+
+/// Where the attribute index ends: the content index's offset from v5, and
+/// the end of the file before it.
+fn attribute_index_end(bytes: &[u8]) -> usize {
+    if get_u16(bytes, offsets::VERSION) >= 5 {
+        get_u64(bytes, offsets::CONTENT_INDEX_OFFSET) as usize
+    } else {
+        bytes.len()
+    }
 }
 
 #[test]
@@ -130,14 +145,18 @@ fn format_conformance() {
         "the real magic must match the documented format"
     );
     assert_eq!(get_u16(&bytes, offsets::VERSION), VERSION, "format version");
-    assert_eq!(get_u16(&bytes, offsets::VERSION), 4, "format version is 4");
+    assert_eq!(get_u16(&bytes, offsets::VERSION), 5, "format version is 5");
     assert_eq!(
         usize::from(get_u16(&bytes, offsets::HEADER_LEN)),
         HEADER_LEN,
         "header length field matches the exported constant"
     );
-    assert_eq!(HEADER_LEN, 96, "header is 96 bytes");
+    assert_eq!(HEADER_LEN, 104, "header is 104 bytes");
     assert_eq!(HEADER_LEN_V2, 80, "the v2 header this reader still accepts");
+    assert_eq!(
+        HEADER_LEN_V3, 96,
+        "the v3/v4 header this reader still accepts"
+    );
 
     // The v3 timestamp range, hand-parsed at its documented offsets. This is
     // the field a query uses to skip a segment without opening it, so a
@@ -186,10 +205,16 @@ fn format_conformance() {
         ),
         (
             get_u64(&bytes, offsets::ATTRIBUTE_INDEX_OFFSET),
-            // The attribute index runs to EOF; its length is implied by the
-            // file size rather than stored, so there is no field to read.
-            bytes.len() as u64 - get_u64(&bytes, offsets::ATTRIBUTE_INDEX_OFFSET),
+            // Neither the attribute nor the content index stores its own
+            // length. The attribute index is bounded by where the content
+            // index starts, and the content index runs to EOF.
+            attribute_index_end(&bytes) as u64 - get_u64(&bytes, offsets::ATTRIBUTE_INDEX_OFFSET),
             "attribute index",
+        ),
+        (
+            get_u64(&bytes, offsets::CONTENT_INDEX_OFFSET),
+            bytes.len() as u64 - get_u64(&bytes, offsets::CONTENT_INDEX_OFFSET),
+            "content index",
         ),
     ];
     let mut expected_start = HEADER_LEN as u64;
@@ -329,8 +354,8 @@ fn format_conformance() {
     }
     assert_eq!(
         cursor,
-        bytes.len(),
-        "the attribute section must account for every remaining byte"
+        attribute_index_end(&bytes),
+        "the attribute section must account for every byte up to the content index"
     );
     assert_eq!(
         total_postings,
@@ -345,7 +370,7 @@ fn format_conformance() {
     // corpus values are distinctive enough that a substring search is a fair
     // test, and this is the assertion that would fail if a future change
     // reintroduced value text into the index.
-    let section = &bytes[attribute_start..];
+    let section = &bytes[attribute_start..attribute_index_end(&bytes)];
     for record in &records {
         for value in record.attributes.values() {
             assert!(
@@ -729,26 +754,30 @@ fn encode_legacy(records: &[RecordInput], version: u16) -> Vec<u8> {
         }
     }
 
-    // Records, record offsets, and the trace index are unchanged from v3, so
-    // reuse the real encoder's bytes for them and swap only the tail.
+    // Records, record offsets, and the trace index are unchanged, so reuse the
+    // real encoder's bytes for them and swap only the tail. Before v5 there
+    // was no content index and the attribute section ran to EOF, so the
+    // content section is dropped entirely.
     let mut out = current[..attribute_start].to_vec();
     out.extend_from_slice(&section);
     out[8..10].copy_from_slice(&version.to_le_bytes());
-    if version == 2 {
-        // v2 has no timestamp range, so its header is 16 bytes shorter and
-        // every section slides down by that much.
-        const SHIFT: u64 = (HEADER_LEN - HEADER_LEN_V2) as u64;
-        let mut header = out[..HEADER_LEN_V2].to_vec();
-        header[10..12].copy_from_slice(&(HEADER_LEN_V2 as u16).to_le_bytes());
-        for offset_field in [24_usize, 40, 56, 72] {
-            let value = get_u64(&out, offset_field) - SHIFT;
-            header[offset_field..offset_field + 8].copy_from_slice(&value.to_le_bytes());
-        }
-        let mut shifted = header;
-        shifted.extend_from_slice(&out[HEADER_LEN..]);
-        return shifted;
+
+    // Older headers are shorter, so every section offset slides down.
+    let target_header = if version == 2 {
+        HEADER_LEN_V2
+    } else {
+        HEADER_LEN_V3
+    };
+    let shift = (HEADER_LEN - target_header) as u64;
+    let mut header = out[..target_header].to_vec();
+    header[10..12].copy_from_slice(&(target_header as u16).to_le_bytes());
+    for offset_field in [24_usize, 40, 56, 72] {
+        let value = get_u64(&out, offset_field) - shift;
+        header[offset_field..offset_field + 8].copy_from_slice(&value.to_le_bytes());
     }
-    out
+    let mut shifted = header;
+    shifted.extend_from_slice(&out[HEADER_LEN..]);
+    shifted
 }
 
 /// Whether `haystack` contains `needle` as a contiguous byte run.
@@ -802,10 +831,21 @@ fn forge_digest_collisions(bytes: &[u8], record_count: usize) -> Vec<u8> {
             section.extend_from_slice(&offset.to_le_bytes());
         }
     }
-    assert_eq!(cursor, bytes.len(), "consumed the whole attribute section");
+    let attribute_end = attribute_index_end(bytes);
+    assert_eq!(
+        cursor, attribute_end,
+        "consumed the whole attribute section"
+    );
 
+    // Inflating the posting lists moves the content index, so its offset in
+    // the header has to move with it or the reader rejects the file for
+    // non-contiguous sections.
     let mut out = bytes[..attribute_start].to_vec();
+    let content_offset = attribute_start + section.len();
+    out[offsets::CONTENT_INDEX_OFFSET..offsets::CONTENT_INDEX_OFFSET + 8]
+        .copy_from_slice(&(content_offset as u64).to_le_bytes());
     out.extend_from_slice(&section);
+    out.extend_from_slice(&bytes[attribute_end..]);
     out
 }
 
@@ -981,5 +1021,145 @@ fn a_v2_segment_still_reads_and_is_never_skipped_by_a_time_filter() {
     assert!(
         !v3_segment.may_contain_timestamps(Some(max + 1), None),
         "v3 can be ruled out, which is the whole point of the field"
+    );
+}
+
+#[test]
+fn the_content_index_holds_filters_and_never_the_text() {
+    // The content index exists so that text can be SEARCHED without being
+    // STORED. That is a property of the bytes, and it is the one a reader
+    // test cannot check: a reader that kept a copy of every indexed word
+    // would answer every query correctly and cost exactly what the index was
+    // built to avoid.
+    let records = vec![
+        RecordInput::new(
+            1_700_000_000_000_000_000,
+            "trace-a",
+            attributes(&[("service", "checkout")]),
+            b"first".to_vec(),
+        )
+        .with_content(vec![
+            "please issue a refund for the antidisestablishment order".to_owned(),
+        ]),
+        RecordInput::new(
+            1_700_000_000_000_000_100,
+            "trace-b",
+            attributes(&[("service", "billing")]),
+            b"second".to_vec(),
+        )
+        .with_content(vec!["the quarterly summary is ready".to_owned()]),
+    ];
+    let bytes = segment::encode(&records).expect("encode");
+
+    let start = get_u64(&bytes, offsets::CONTENT_INDEX_OFFSET) as usize;
+    let section = &bytes[start..];
+
+    // Prologue, hand-decoded at its documented layout.
+    assert_eq!(get_u32(section, 0), 0, "reserved word is zero");
+    let block_records = get_u32(section, 4);
+    let block_count = get_u32(section, 8);
+    let hash_count = get_u32(section, 12);
+    let summary_bits = get_u64(section, 16) as usize;
+    let block_bits = get_u64(section, 24) as usize;
+    assert_eq!(block_records, 128, "documented block size");
+    assert_eq!(block_count, 1, "two records fit in one block");
+    assert_eq!(hash_count, 4, "documented hash count");
+    assert!(summary_bits.is_power_of_two() && summary_bits >= 8);
+    assert!(block_bits.is_power_of_two() && block_bits >= 8);
+
+    // The section is exactly the prologue, the summary filter, and one
+    // bit-sliced row per bit position.
+    let row_bytes = (block_count as usize).div_ceil(8);
+    assert_eq!(
+        section.len(),
+        32 + summary_bits / 8 + block_bits * row_bytes,
+        "the content section must account for every byte"
+    );
+
+    // No indexed WORD may appear anywhere in it. These words are distinctive
+    // enough that a byte search is a fair test, and this assertion is what
+    // would fail if a future change stored a token list beside the filter.
+    for word in [
+        "antidisestablishment",
+        "refund",
+        "quarterly",
+        "summary",
+        "please",
+    ] {
+        assert!(
+            !contains(section, word.as_bytes()),
+            "the content index must not store the word {word:?}"
+        );
+    }
+
+    // And it still answers. Reading through the real segment: a word that is
+    // present must be admitted, and one that is absent must be rejected.
+    let opened = Segment::from_bytes(bytes).expect("open");
+    assert!(opened.has_content_index());
+    let present = traza::content::Query::new("antidisestablishment");
+    assert!(opened.may_contain_content(&present));
+    assert_eq!(
+        opened
+            .content_candidate_offsets(&present)
+            .expect("probe")
+            .expect("an indexable query is narrowed")
+            .len(),
+        2,
+        "both records share the one block, so both are candidates"
+    );
+
+    let absent = traza::content::Query::new("zygomorphic");
+    assert!(
+        !opened.may_contain_content(&absent),
+        "a word no record holds must be ruled out by the resident summary"
+    );
+
+    evidence(
+        "content_index",
+        &[
+            "prologue_layout",
+            "section_accounts_for_every_byte",
+            "no_indexed_word_is_stored",
+            "present_word_is_admitted",
+            "absent_word_is_ruled_out",
+        ],
+    );
+}
+
+#[test]
+fn a_segment_without_a_content_index_is_never_skipped_by_a_content_query() {
+    // Same discipline as the v2 timestamp range: absent must read as
+    // UNKNOWN, never as empty. A segment written before v5, or one carrying
+    // no indexable text, must be scanned. Reading absence as "holds nothing"
+    // would make content search silently return no rows.
+    let records = corpus(); // built with RecordInput::new -- no content
+    let bytes = segment::encode(&records).expect("encode");
+    let opened = Segment::from_bytes(bytes).expect("open");
+    assert!(
+        !opened.has_content_index(),
+        "records with no content text produce no content index"
+    );
+    let query = traza::content::Query::new("anything");
+    assert!(
+        opened.may_contain_content(&query),
+        "an absent index must never rule a segment out"
+    );
+    assert!(
+        opened
+            .content_candidate_offsets(&query)
+            .expect("probe")
+            .is_none(),
+        "and it must narrow nothing, so every record stays a candidate"
+    );
+
+    // A genuinely older segment reads the same way.
+    let v4 = encode_legacy(&records, 3);
+    let older = Segment::from_bytes(v4).expect("a v3 segment still opens");
+    assert!(!older.has_content_index());
+    assert!(older.may_contain_content(&query));
+
+    evidence(
+        "content_index_absent",
+        &["absent_index_never_prunes", "older_segment_never_prunes"],
     );
 }
