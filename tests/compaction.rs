@@ -7,7 +7,9 @@
 //! re-ingested span would be far worse than the slow search it fixes.
 
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
 use traza::{CompactionConfig, Config, Durability, Span, SpanFilter, Store};
@@ -837,4 +839,128 @@ fn a_stale_journal_does_not_roll_back_a_merge_that_committed() {
     let trace = store.get_trace("t").expect("trace");
     assert_eq!(trace.len(), 1);
     assert_eq!(trace[0].name, "v3", "and the data with it");
+}
+
+#[test]
+fn compaction_keeps_up_with_a_store_that_never_stops_ingesting() {
+    // Compaction used to DECLINE while a seal held an unpublished id, rather
+    // than wait for it. That is a correctness requirement — a seal holding a
+    // lower id publishes newer data, and merged output claiming a higher one
+    // would outrank it — but declining made it hostage to the write rate. A
+    // seal is in flight for much of the time under load, so a tick that
+    // checked once and gave up almost never found the store quiet: one tick
+    // in sixteen achieved anything at 25,000 spans/s, and the segment count
+    // climbed without bound while compaction ran on schedule and did nothing.
+    //
+    // A merge now waits for the seal permit, for the microseconds it takes to
+    // choose a run and claim its ids.
+    let dir = test_dir("sustained");
+    let store = Arc::new(
+        Store::open(
+            &dir,
+            Config {
+                durability: Durability::Buffered,
+                flush_spans: 200,
+                compaction: Some(CompactionConfig {
+                    fanout: 4,
+                    base_bytes: 8 * 1024 * 1024,
+                    max_segment_bytes: 256 * 1024 * 1024,
+                }),
+                ..Config::default()
+            },
+        )
+        .expect("opens"),
+    );
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let writers: Vec<_> = (0..3u64)
+        .map(|worker| {
+            let store = Arc::clone(&store);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut n = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    n += 1;
+                    store
+                        .ingest(span(
+                            &format!("t{worker}"),
+                            &format!("s-{worker}-{n}"),
+                            "op",
+                            1_000 + n,
+                        ))
+                        .expect("ingest");
+                }
+                n
+            })
+        })
+        .collect();
+
+    let mut productive = 0;
+    let mut peak = 0;
+    const TICKS: usize = 6;
+    for _ in 0..TICKS {
+        std::thread::sleep(Duration::from_millis(250));
+        // A tick compacts the backlog it found and RETURNS. Merging what
+        // arrives while it runs would keep it going for as long as the writes
+        // do — measured at 2,213 segments merged away in a single call that
+        // never came back. That failure cannot be caught after the call, so
+        // the call is given a deadline of its own.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || {
+                let _ = sender.send(store.compact_segments());
+            });
+        }
+        let removed = match receiver.recv_timeout(Duration::from_secs(20)) {
+            Ok(result) => result.expect("compacts"),
+            Err(_) => {
+                // Let the writers stop so the runaway merge can drain.
+                stop.store(true, Ordering::Relaxed);
+                panic!(
+                    "a tick did not return within 20s while writes continued: \
+                     it is merging what arrives instead of the backlog it found"
+                );
+            }
+        };
+        if removed > 0 {
+            productive += 1;
+        }
+        peak = peak.max(store.stats().expect("stats").segment_count);
+    }
+    stop.store(true, Ordering::Relaxed);
+    let ingested: u64 = writers
+        .into_iter()
+        .map(|handle| handle.join().expect("writer"))
+        .sum();
+
+    // Every tick found work and did it. The old behaviour managed one in
+    // sixteen, so even a much weaker bound than "all of them" separates them.
+    assert!(
+        productive >= TICKS - 1,
+        "only {productive} of {TICKS} ticks compacted anything under load"
+    );
+    // And the segment count stayed near what the flush threshold implies
+    // rather than tracking the whole run: unbounded growth is the symptom.
+    let seals = ingested / 200;
+    assert!(
+        (peak as u64) < seals / 2,
+        "segments peaked at {peak} against {seals} seals — compaction is not \
+         keeping up"
+    );
+
+    // Nothing was lost to all that merging under load. Counted through
+    // `stats` rather than a query: every span_id here is unique, so no
+    // physical record is a superseded version and the physical count IS the
+    // logical one — and a query for hundreds of thousands of rows across this
+    // many segments costs far more than the fact is worth.
+    store.flush().expect("flush");
+    store.compact_segments().expect("compacts");
+    let stats = store.stats().expect("stats");
+    assert_eq!(stats.buffered_records, 0, "the flush emptied the buffer");
+    assert_eq!(
+        stats.total_records as u64, ingested,
+        "every ingested span survives"
+    );
+    std::fs::remove_dir_all(&dir).expect("cleanup");
 }
