@@ -25,9 +25,10 @@ function toNs(local) {
   return Number.isFinite(ms) ? String(ms * 1e6) : '';
 }
 
-/** Span search: the 6-field filter form, applied-filter chips, results table. */
+/** Span search: content search plus the structured filter form, applied-filter
+ * chips, and the results table. */
 export function SpansView({ openTrace, sessionFilter, clearSessionFilter }) {
-  const [form, setForm] = React.useState({ service: '', name: '', attrKey: '', attrValue: '', minMs: '', since: '', until: '' });
+  const [form, setForm] = React.useState({ content: '', service: '', name: '', attrKey: '', attrValue: '', minMs: '', since: '', until: '' });
   const [applied, setApplied] = React.useState(form);
   const [limit, setLimit] = React.useState(PAGE);
   const [spans, setSpans] = React.useState(null);
@@ -38,6 +39,10 @@ export function SpansView({ openTrace, sessionFilter, clearSessionFilter }) {
   const fetchSpans = React.useCallback(async (filters, effectiveLimit) => {
     setLoading(true); setError(null);
     const params = {
+      // Word search over the span's text. Not substring, not a phrase --
+      // "refund" finds "Refund the order" and not "refunds". See
+      // /v1/spans?content= in the HTTP API guide.
+      content: filters.content,
       service: filters.service, name: filters.name,
       min_duration_ms: filters.minMs,
       since: filters.since ? toNs(filters.since) : '',
@@ -64,6 +69,7 @@ export function SpansView({ openTrace, sessionFilter, clearSessionFilter }) {
   const onKeyDown = (e) => { if (e.key === 'Enter') search(); };
 
   const chips = [
+    applied.content && { field: 'content', value: applied.content },
     applied.service && { field: 'service', value: applied.service },
     applied.name && { field: 'name', value: applied.name },
     applied.attrKey && { field: 'attr.' + applied.attrKey, value: applied.attrValue },
@@ -72,6 +78,15 @@ export function SpansView({ openTrace, sessionFilter, clearSessionFilter }) {
   ].filter(Boolean);
 
   return <Section title="Spans" action={<Button variant="ghost" size="sm" onClick={() => fetchSpans(applied, limit)}>Refresh</Button>}>
+    {/* Content search gets the full width and the first position: it is the
+        one filter a user reaches for without already knowing the schema. */}
+    <div style={{ marginBottom: 6 }}>
+      <Input size="sm" placeholder="search text in prompts, completions and events (words, not substrings)"
+        title={'Finds spans containing every word given, anywhere in their text.\n'
+          + 'Word matching, not substring: "refund" finds "Refund the order", not "refunds".\n'
+          + 'Multiple words are ANDed, in any order.'}
+        value={form.content} onChange={set('content')} onKeyDown={onKeyDown} style={{ width: '100%' }} />
+    </div>
     <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 6, marginBottom: 6 }}>
       <Input size="sm" placeholder="service" value={form.service} onChange={set('service')} onKeyDown={onKeyDown} />
       <Input size="sm" placeholder="name" value={form.name} onChange={set('name')} onKeyDown={onKeyDown} />
@@ -85,6 +100,7 @@ export function SpansView({ openTrace, sessionFilter, clearSessionFilter }) {
     {chips.length ? <FilterBar chips={chips} onRemoveChip={(c) => {
       if (c.session) { clearSessionFilter(); return; }
       const next = { ...applied };
+      if (c.field === 'content') next.content = '';
       if (c.field === 'service') next.service = '';
       if (c.field === 'name') next.name = '';
       if (c.field.startsWith('attr.')) { next.attrKey = ''; next.attrValue = ''; }

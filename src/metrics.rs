@@ -210,6 +210,21 @@ pub struct Metrics {
     /// scanned — so this counter is the only way to tell it is working, in a
     /// test or in production.
     pub segments_pruned_by_time: Counter,
+    /// Segments a content search skipped entirely because the segment's
+    /// resident summary filter proved none of its text holds every query word.
+    ///
+    /// Same reasoning as `segments_pruned_by_time`, and more load-bearing: a
+    /// content index that silently stopped pruning — a saturated filter, a
+    /// segment written before v5, indexing switched off — returns exactly the
+    /// same rows, just after reading the whole store. This counter and
+    /// `blocks_examined_by_content` are the difference between a working index
+    /// and a slow scan.
+    pub segments_pruned_by_content: Counter,
+    /// Records a content search had to decode and check after the per-block
+    /// filters narrowed the segment. Against the number of rows actually
+    /// returned, this is the index's real selectivity — and it is the number
+    /// that moves when a filter saturates.
+    pub records_admitted_by_content: Counter,
     /// Segments a query considered, pruned or not. The ratio against
     /// `segments_pruned_by_time` is how much of the store a time filter is
     /// actually eliminating.
@@ -227,7 +242,7 @@ impl Metrics {
     pub fn render_prometheus(&self, into: &mut String) {
         use std::fmt::Write as _;
 
-        let counters: [(&str, &Counter); 7] = [
+        let counters: [(&str, &Counter); 9] = [
             ("traza_spans_admitted_total", &self.spans_admitted),
             ("traza_batches_admitted_total", &self.batches_admitted),
             ("traza_wal_commits_total", &self.wal_commits),
@@ -239,6 +254,14 @@ impl Metrics {
             (
                 "traza_segments_pruned_by_time_total",
                 &self.segments_pruned_by_time,
+            ),
+            (
+                "traza_segments_pruned_by_content_total",
+                &self.segments_pruned_by_content,
+            ),
+            (
+                "traza_records_admitted_by_content_total",
+                &self.records_admitted_by_content,
             ),
             ("traza_segments_examined_total", &self.segments_examined),
         ];

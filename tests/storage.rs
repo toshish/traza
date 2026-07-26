@@ -77,6 +77,7 @@ fn buffer_flush_persists_sorted_batches() {
             durability: traza::Durability::Buffered,
             compaction: None,
             wal_commit_window: None,
+            content_index: true,
             flush_wal_bytes: None,
         },
     )
@@ -130,6 +131,7 @@ fn crash_recovery_preserves_flushed_spans() {
                 durability: traza::Durability::Buffered,
                 compaction: None,
                 wal_commit_window: None,
+                content_index: true,
                 flush_wal_bytes: None,
             },
         )
@@ -171,6 +173,7 @@ fn crash_recovery_preserves_flushed_spans() {
             durability: traza::Durability::Buffered,
             compaction: None,
             wal_commit_window: None,
+            content_index: true,
             flush_wal_bytes: None,
         },
     )
@@ -289,6 +292,7 @@ fn randomized_filters_match_naive_reference() {
             durability: traza::Durability::Buffered,
             compaction: None,
             wal_commit_window: None,
+            content_index: true,
             flush_wal_bytes: None,
         },
     )
@@ -381,6 +385,7 @@ fn ttl_compaction_drops_expired_segments() {
             durability: traza::Durability::Buffered,
             compaction: None,
             wal_commit_window: None,
+            content_index: true,
             flush_wal_bytes: None,
         },
     )
@@ -488,6 +493,7 @@ fn lock_order_no_deadlock() {
                 durability: traza::Durability::Buffered,
                 compaction: None,
                 wal_commit_window: None,
+                content_index: true,
                 flush_wal_bytes: None,
             },
         )
@@ -546,6 +552,7 @@ fn reads_never_miss_committed_spans() {
                 durability: traza::Durability::Buffered,
                 compaction: None,
                 wal_commit_window: None,
+                content_index: true,
                 flush_wal_bytes: None,
             },
         )
@@ -618,6 +625,7 @@ fn stale_temp_does_not_wedge_flush() {
             durability: traza::Durability::Buffered,
             compaction: None,
             wal_commit_window: None,
+            content_index: true,
             flush_wal_bytes: None,
         },
     )
@@ -675,6 +683,7 @@ fn second_open_is_rejected() {
         durability: traza::Durability::Buffered,
         compaction: None,
         wal_commit_window: None,
+        content_index: true,
         flush_wal_bytes: None,
     };
     let first = Store::open(&dir, config.clone()).expect("open first store");
@@ -1132,16 +1141,19 @@ fn nul_prefixed_attribute_cannot_poison_the_service_index() {
 }
 
 #[test]
-fn resident_index_bytes_tracks_attribute_value_cardinality() {
+fn resident_index_bytes_tracks_cardinality_and_not_value_size() {
     // The other half of the residency story, and the half a zero
-    // `resident_payload_bytes()` hides: the attribute index is keyed on whole
-    // attribute values, so its resident cost is driven by how many DISTINCT
-    // values a segment holds. Two stores with identical span counts and
-    // identical value sizes must differ by roughly the distinct-value bytes.
-    let value_bytes = 4_096;
+    // `resident_payload_bytes()` hides.
+    //
+    // Through segment v3 this test asserted the OPPOSITE — that distinct
+    // values cost their own bytes — because that is what the index did: it
+    // was keyed on whole attribute values, so a store of prompts held every
+    // prompt in RAM for the life of the segment. That is the defect v4 fixes,
+    // and this is the assertion that has to change with it. An index keyed on
+    // a digest costs the same for a status code and for a page of text.
     let spans = 400;
 
-    let measure = |label: &str, distinct: usize| -> (usize, usize) {
+    let measure = |label: &str, distinct: usize, value_bytes: usize| -> (usize, usize) {
         let dir = correctness_test_dir(label);
         // No offloading: an offloaded value leaves the index entirely, which
         // would make this test pass for the wrong reason.
@@ -1170,16 +1182,46 @@ fn resident_index_bytes_tracks_attribute_value_cardinality() {
         (bytes, entries)
     };
 
-    let (one_value, one_entry_count) = measure("index-residency-low", 1);
-    let (all_distinct, all_entry_count) = measure("index-residency-high", spans);
-
-    // Three indexed keys with one value each: prompt, service, name.
-    assert_eq!(one_entry_count, 3);
-    assert_eq!(all_entry_count, spans + 2);
+    // Same cardinality, values eight times larger. This is the claim: the
+    // resident index must not notice.
+    let (small_values, small_entries) = measure("index-residency-narrow", spans, 512);
+    let (large_values, large_entries) = measure("index-residency-wide", spans, 4_096);
+    assert_eq!(small_entries, large_entries, "cardinality is unchanged");
+    let growth = large_values as f64 / small_values as f64;
     assert!(
-        all_distinct > one_value + spans * value_bytes,
-        "distinct values must cost their own bytes: {all_distinct} vs {one_value} \
-         for {spans} values of {value_bytes} bytes"
+        growth < 1.05,
+        "an 8x larger value must not grow the resident index: \
+         {large_values} vs {small_values} bytes ({growth:.2}x)"
+    );
+    // Concretely: the old index would have grown by this much.
+    assert!(
+        large_values < small_values + spans * (4_096 - 512),
+        "the v3 index grew by the value-size delta; v4 must not"
+    );
+
+    // Cardinality, by contrast, is still what the attribute index costs.
+    // Compare against one shared value, and measure the DELTA rather than the
+    // ratio: most of the absolute figure at this scale is the record-offset
+    // table and the trace index, neither of which this change touches, and a
+    // ratio against that floor would be a statement about them instead.
+    let (one_value, one_entry_count) = measure("index-residency-low", 1, 4_096);
+    assert_eq!(one_entry_count, 3, "prompt, service, name — one value each");
+    assert_eq!(large_entries, spans + 2);
+    assert!(
+        large_values > one_value,
+        "cardinality must still drive residency: {large_values} vs {one_value}"
+    );
+
+    // The absolute scale is what makes this a fix rather than a shuffle: 400
+    // distinct 4 KiB prompts used to pin ~1.6 MB of text. Each additional
+    // index entry must now cost tens of bytes — a (u32, digest) key, a posting
+    // vector header, and one 8-byte offset.
+    let extra_entries = large_entries - one_entry_count;
+    let per_entry = (large_values - one_value) as f64 / extra_entries as f64;
+    assert!(
+        (16.0..128.0).contains(&per_entry),
+        "an index entry must cost tens of bytes, not a value: {per_entry:.0} bytes \
+         across {extra_entries} entries"
     );
 }
 
