@@ -215,6 +215,13 @@ pub struct SpanFilter {
     /// searched is every string value in the span's attributes and its events'
     /// attributes, plus event names.
     ///
+    /// **A value offloaded to the payload store is searchable only within the
+    /// preview kept inline** (256 characters). Offloading happens at ingest,
+    /// before anything indexes the span, so the rest of the text is not
+    /// present to be indexed or matched. With the server's default
+    /// `--payload-threshold-bytes` of 256 KiB almost nothing is offloaded and
+    /// this does not arise; it matters if you lower the threshold.
+    ///
     /// The semantics are set by what the segment's content index can safely
     /// over-approximate; see [`crate::content`] for why substring matching
     /// would produce wrong answers rather than slow ones.
@@ -636,6 +643,74 @@ fn canonical_value(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_default()
 }
 
+/// Every canonical encoding under which a span holding a value EQUAL to
+/// `value` — by [`attribute_equals`] — could have been indexed.
+///
+/// The index is keyed on canonical JSON, so `200` and `"200"` occupy two
+/// different entries. But `attribute_equals` deliberately treats them as the
+/// same value, because instrumentation is inconsistent about whether a status
+/// code or a token count is a number or a string. Probing only the caller's
+/// own encoding therefore made the index a FILTER rather than a superset: the
+/// other encoding's records were never candidates, so the type-agnostic
+/// comparison never got to see them and a query returned half its matches.
+///
+/// This is the rule every index in this crate obeys and the reason all of them
+/// are checked again against the decoded record: **an index may only narrow
+/// the work, never the answer.**
+fn attribute_encodings(value: &Value) -> Vec<String> {
+    let mut encodings = vec![canonical_value(value)];
+    // Containers are compared structurally, so there is no cross-type form.
+    let Some(text) = scalar_text(value) else {
+        return encodings;
+    };
+    let mut push = |candidate: &Value| {
+        let canonical = canonical_value(candidate);
+        if !encodings.contains(&canonical) {
+            encodings.push(canonical);
+        }
+    };
+    push(&Value::String(text.clone()));
+    // A number stored as a number. Parsing through serde_json is what keeps
+    // this consistent with how the value would have been canonicalized on the
+    // way in — "0200" and "1.50" are not JSON numbers that round-trip, and
+    // their scalar text would not have matched anyway.
+    if let Ok(parsed) = serde_json::from_str::<Value>(&text) {
+        if parsed.is_number() && scalar_text(&parsed).as_deref() == Some(text.as_str()) {
+            push(&parsed);
+        }
+    }
+    match text.as_str() {
+        "true" => push(&Value::Bool(true)),
+        "false" => push(&Value::Bool(false)),
+        _ => {}
+    }
+    encodings
+}
+
+/// Candidate offsets for an attribute equality, unioned across every encoding
+/// the value could have been stored under, in record order.
+///
+/// Record order is load-bearing: the lazy k-way merge and `first_offset_after`
+/// both require ascending offsets, so the union is sorted and deduplicated
+/// rather than concatenated.
+fn attribute_candidates<'a>(seg: &'a segment::Segment, key: &str, value: &Value) -> Cow<'a, [u64]> {
+    let encodings = attribute_encodings(value);
+    if encodings.len() == 1 {
+        return Cow::Borrowed(seg.attribute_candidate_offsets(key, &encodings[0]));
+    }
+    let mut merged: Vec<u64> = encodings
+        .iter()
+        .flat_map(|encoding| {
+            seg.attribute_candidate_offsets(key, encoding)
+                .iter()
+                .copied()
+        })
+        .collect();
+    merged.sort_unstable();
+    merged.dedup();
+    Cow::Owned(merged)
+}
+
 /// Every string a content search looks in, borrowed from the span.
 ///
 /// One definition serves both sides: the encoder tokenizes exactly these
@@ -648,7 +723,28 @@ fn content_strs(span: &Span) -> Vec<&str> {
         match value {
             Value::String(text) => out.push(text),
             Value::Array(items) => items.iter().for_each(|item| collect(item, out)),
-            Value::Object(map) => map.values().for_each(|item| collect(item, out)),
+            // An offloaded value is a reference object, and the only text of
+            // the original left in the span is its preview. Index exactly
+            // that: the `$payload` hash beside it is a 64-character hex
+            // string that no one will ever search for, and putting it in the
+            // filter only costs bits.
+            //
+            // The consequence is real and is documented rather than papered
+            // over: **an offloaded value is searchable only within its
+            // preview.** Both sides of the search read the span through this
+            // one function, so the index and the answer still agree exactly —
+            // there is no wrong result, only a bounded one. Covering the full
+            // text would mean reading the payload file at seal AND at every
+            // verification, which is why it is roadmap work rather than a
+            // line here.
+            Value::Object(map) => match map.get(payload::PAYLOAD_KEY) {
+                Some(Value::String(_)) => {
+                    if let Some(Value::String(preview)) = map.get("preview") {
+                        out.push(preview);
+                    }
+                }
+                _ => map.values().for_each(|item| collect(item, out)),
+            },
             _ => {}
         }
     }
@@ -1499,9 +1595,10 @@ pub(crate) fn attribute_union_view(
         let mut offsets: Vec<u64> = Vec::new();
         for key in keys {
             for value in values {
-                offsets.extend_from_slice(
-                    seg.attribute_candidate_offsets(key, &canonical_value(value)),
-                );
+                // Same superset rule as `select_probe`: a session id stored as
+                // a number under one convention and a string under another
+                // must still return the session whole.
+                offsets.extend_from_slice(&attribute_candidates(seg, key, value));
             }
         }
         offsets.sort_unstable();
@@ -1598,10 +1695,23 @@ pub(crate) fn query_view(
                     // Owned when the content index produced the candidates,
                     // borrowed when an attribute posting list did.
                     offsets: Cow<'a, [u64]>,
+                    /// This segment's index in `segments`.
+                    ///
+                    /// Carried explicitly because it is NOT the source's own
+                    /// index. Supersedence used to derive one from the other
+                    /// positionally, which held only while every segment
+                    /// produced a source; each `continue` in the loop below
+                    /// compresses `sources` and not `segments`, so a pruned
+                    /// segment shifted every later source onto the wrong
+                    /// neighbour and made a segment supersede ITSELF —
+                    /// dropping every row it held. Reachable through time
+                    /// pruning, and reachable on the default path once
+                    /// content pruning existed.
+                    segment_position: usize,
                 },
             }
             let mut sources: Vec<(Source<'_>, usize)> = vec![(Source::Parsed(buffered), 0)];
-            for segment in segments.iter() {
+            for (segment_position, segment) in segments.iter().enumerate() {
                 let seg = &segment.seg;
                 // Skip whole segments that cannot hold a matching timestamp.
                 // This is the only filter that eliminates a segment without
@@ -1624,7 +1734,14 @@ pub(crate) fn query_view(
                     Some(cursor) => first_offset_after(seg, &offsets, cursor)?,
                     None => 0,
                 };
-                sources.push((Source::Lazy { seg, offsets }, position));
+                sources.push((
+                    Source::Lazy {
+                        seg,
+                        offsets,
+                        segment_position,
+                    },
+                    position,
+                ));
             }
 
             let advance = |source: &mut (Source<'_>, usize)| -> Result<Option<Span>> {
@@ -1637,7 +1754,7 @@ pub(crate) fn query_view(
                         }
                         Ok(span)
                     }
-                    Source::Lazy { seg, offsets } => {
+                    Source::Lazy { seg, offsets, .. } => {
                         let Some(offset) = offsets.get(*pos).copied() else {
                             return Ok(None);
                         };
@@ -1683,21 +1800,28 @@ pub(crate) fn query_view(
                 if emitted.contains(&key) {
                     continue;
                 }
-                // Primary-key precedence: source 0 is the write buffer (it
-                // always wins); among segments, a LATER source index means a
-                // later flush and a newer version — a candidate loses to any
-                // higher-precedence source that also holds its key.
-                let superseded = if index == 0 {
-                    false
-                } else {
-                    writer.contains_key(&span.trace_id, &span.span_id)
-                        || segments
-                            .iter()
-                            .skip(index) // sources[i] maps to segments[i-1]
-                            .map(|segment| segment.contains_key(&span.trace_id, &span.span_id))
-                            .collect::<Result<Vec<_>>>()?
-                            .into_iter()
-                            .any(|contains| contains)
+                // Primary-key precedence: the write buffer always wins; among
+                // segments, a LATER segment means a later flush and a newer
+                // version, so a candidate loses to any higher-precedence
+                // source that also holds its key.
+                //
+                // The skip is anchored to the segment's OWN index, which the
+                // source carries. Deriving it from the source's index instead
+                // was correct only when nothing was pruned.
+                let superseded = match &sources[index].0 {
+                    Source::Parsed(_) => false,
+                    Source::Lazy {
+                        segment_position, ..
+                    } => {
+                        writer.contains_key(&span.trace_id, &span.span_id)
+                            || segments
+                                .iter()
+                                .skip(segment_position + 1)
+                                .map(|segment| segment.contains_key(&span.trace_id, &span.span_id))
+                                .collect::<Result<Vec<_>>>()?
+                                .into_iter()
+                                .any(|contains| contains)
+                    }
                 };
                 if !superseded {
                     emitted.insert(key);
@@ -2985,26 +3109,33 @@ fn select_probe<'a>(
     content: Option<&content::Query>,
     metrics: &metrics::Metrics,
 ) -> Result<Cow<'a, [u64]>> {
-    let mut best: Option<Cow<'a, [u64]>> = None;
-    let mut consider = |offsets: Cow<'a, [u64]>| {
+    // The chosen list, and whether the content index is what produced it.
+    // The flag exists so the admission metric counts records the query will
+    // actually decode: incrementing when the content list was merely
+    // CONSIDERED overcounted every query where a narrower attribute probe
+    // won, and those records are never read.
+    let mut best: Option<(Cow<'a, [u64]>, bool)> = None;
+    let mut consider = |offsets: Cow<'a, [u64]>, from_content: bool| {
         // `Option::is_none_or` would read better but is newer than this
         // crate's MSRV.
         if best
             .as_ref()
-            .map_or(true, |current| offsets.len() < current.len())
+            .map_or(true, |(current, _)| offsets.len() < current.len())
         {
-            best = Some(offsets);
+            best = Some((offsets, from_content));
         }
     };
     if let Some(service) = &filter.service {
-        consider(Cow::Borrowed(
-            seg.attribute_candidate_offsets(IDX_SERVICE, service),
-        ));
+        consider(
+            Cow::Borrowed(seg.attribute_candidate_offsets(IDX_SERVICE, service)),
+            false,
+        );
     }
     if let Some(name) = &filter.name {
-        consider(Cow::Borrowed(
-            seg.attribute_candidate_offsets(IDX_NAME, name),
-        ));
+        consider(
+            Cow::Borrowed(seg.attribute_candidate_offsets(IDX_NAME, name)),
+            false,
+        );
     }
     for (key, value) in &filter.attributes {
         // Session keys are expanded by the caller into a union and cannot
@@ -3012,9 +3143,7 @@ fn select_probe<'a>(
         if key.starts_with('\u{0}') {
             continue;
         }
-        consider(Cow::Borrowed(
-            seg.attribute_candidate_offsets(key, &canonical_value(value)),
-        ));
+        consider(attribute_candidates(seg, key, value), false);
     }
     // The content index is just another candidate source, and often the most
     // selective one: an attribute probe narrows to a value, a content probe
@@ -3025,14 +3154,19 @@ fn select_probe<'a>(
             .content_candidate_offsets(query)
             .map_err(segment_error)?
         {
-            metrics
-                .records_admitted_by_content
-                .add(offsets.len() as u64);
-            consider(Cow::Owned(offsets));
+            consider(Cow::Owned(offsets), true);
         }
     }
     // Nothing indexable: every record is a candidate.
-    Ok(best.unwrap_or_else(|| Cow::Borrowed(seg.record_offsets())))
+    let Some((offsets, from_content)) = best else {
+        return Ok(Cow::Borrowed(seg.record_offsets()));
+    };
+    if from_content {
+        metrics
+            .records_admitted_by_content
+            .add(offsets.len() as u64);
+    }
+    Ok(offsets)
 }
 
 /// Whether `span` satisfies `filter`.

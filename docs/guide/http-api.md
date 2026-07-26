@@ -176,6 +176,14 @@ directly:
   adjacent.
 - Words are runs of ASCII letters and digits. Text in other scripts is not
   tokenized, so `content=世界` matches nothing.
+- **An offloaded value is searchable only within its 256-character preview.**
+  A string attribute longer than `--payload-threshold-bytes` is moved to the
+  payload store at ingest — before anything indexes the span — and replaced
+  inline by a reference carrying a preview. Only that preview is searchable.
+  At the 256 KiB default almost nothing is offloaded; lower the threshold and
+  this becomes the rule rather than the exception. Search is bounded here, not
+  wrong: the index and the match are computed from the same text, so a span is
+  never skipped that would have matched.
 
 This is not an arbitrary restriction — it is what the index can answer
 *correctly*. A word index cannot soundly drive a substring search: it would

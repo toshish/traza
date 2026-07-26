@@ -491,8 +491,15 @@ the same binary.*
 
   Postings would also let a common term stop costing a scan — today a word in
   nearly every span measures 1.0x against no index at all, which is honest but
-  is the case the current design cannot improve. Payload text should be
-  indexed at offload time so search never re-reads the blob store.
+  is the case the current design cannot improve.
+
+  **Offloaded payload text should be indexed at offload time.** Today an
+  offloaded value is searchable only within its inline preview, because
+  offloading runs at ingest and the rest of the text is never present for
+  either the index or the match to see. Indexing at offload — where the full
+  text is still in hand — closes that without making search re-read the blob
+  store, and without the query-time payload reads that a naive fix would
+  require to keep the index and the answer agreeing.
 - **Aggregation pushdown.** Rollups execute against projections with late
   materialization; target interactive (<1 s) group-bys over 1B spans.
 - **Query language.** A small, stable filter/aggregation DSL for the queries
