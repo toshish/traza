@@ -214,18 +214,45 @@ The block below is written by the benchmark itself; everything outside the
 markers is analysis and survives a re-run.
 
 <!-- BEGIN GENERATED -->
-Every row is the MEDIAN of 1 runs, each on a fresh data directory. Scenarios are run ROUND-ROBIN rather than one at a time, and their order is ROTATED each round, so each scenario's repeats are spread across the whole wall-clock window and across positions within a round. Background load then hits all of them alike instead of landing on whichever ran during a spike or whichever is pinned to the same phase of a periodic load. Payloads are generated before the clock starts, so these are server rates; client encoding is reported separately. Runs that saw a failed batch or a shed connection are reported as failures rather than as numbers.
+Every row is the MEDIAN of 5 runs, each on a fresh data directory. Scenarios are run ROUND-ROBIN rather than one at a time, and their order is ROTATED each round, so each scenario's repeats are spread across the whole wall-clock window and across positions within a round. Background load then hits all of them alike instead of landing on whichever ran during a spike or whichever is pinned to the same phase of a periodic load. Payloads are generated before the clock starts, so these are server rates; client encoding is reported separately. Runs that saw a failed batch or a shed connection are reported as failures rather than as numbers.
 
 - Machine: macos/aarch64, 10 hardware threads, Apple M1 Max
-- Commit: `bc90dfb`
-- Corpus: 300000 spans per run, batch 1000
+- Commit: `e205232`
+- Corpus: 1000000 spans per run, batch 1000
 - Compaction: disabled during ingest runs (a read-path optimization; its merges would steal CPU from the measurement)
 
 Latency is the CLIENT-OBSERVED time for one acknowledged batch, sampled per request and reduced to percentiles per run; the table reports the MEDIAN ACROSS RUNS of each percentile. Read it with the load model in mind: this is a closed-loop generator with a fixed number of workers, all saturating, so latency includes queueing and by Little's law tracks concurrency divided by throughput. Latencies are therefore only comparable BETWEEN ROWS AT THE SAME CONCURRENCY, and the honest place to look for a deliberate delay's cost is the low-concurrency rows, where there is nothing to queue behind.
 
 | Scenario | Protocol | Route | Keep-alive | Concurrency | Median spans/s | Min | Max | p50 ms | p95 ms | p99 ms | Bytes/span | Decode ns/span |
 |---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| http-native-json-wal-c8 | native-json | /v1/spans | true | 8 | **215620** | 215620 | 215620 | 17.32 | 172.74 | 348.64 | 256 | 803 |
+| direct-engine-wal | native-json | n/a | n/a | 8 | **202567** | 128602 | 213958 | 18.11 | 202.89 | 428.91 | n/a | n/a |
+| direct-engine-buffered | native-json | n/a | n/a | 8 | **334702** | 185193 | 353729 | 0.21 | 56.81 | 623.16 | n/a | n/a |
+| http-native-json-wal-keepalive-off | native-json | /v1/spans | false | 8 | **157545** | 120673 | 217733 | 34.01 | 176.10 | 378.70 | 256 | 714 |
+| http-native-json-wal-keepalive-on | native-json | /v1/spans | true | 8 | **207645** | 151854 | 225870 | 17.66 | 191.44 | 412.13 | 256 | 743 |
+| http-native-json-wal-c1 | native-json | /v1/spans | true | 1 | **47926** | 40608 | 81796 | 14.95 | 72.45 | 80.51 | 256 | 609 |
+| http-otlp-json-wal-c1 | otlp-json | /v1/traces | true | 1 | **64203** | 42238 | 70343 | 10.96 | 47.78 | 61.42 | 455 | 2102 |
+| http-otlp-protobuf-wal-c1 | otlp-protobuf | /v1/traces | true | 1 | **77103** | 43604 | 81645 | 9.01 | 44.14 | 51.05 | 152 | 630 |
+| http-native-json-wal-c4 | native-json | /v1/spans | true | 4 | **187395** | 127571 | 200816 | 16.17 | 64.00 | 74.22 | 256 | 750 |
+| http-otlp-json-wal-c4 | otlp-json | /v1/traces | true | 4 | **180789** | 109944 | 192028 | 16.38 | 66.81 | 85.37 | 455 | 2440 |
+| http-otlp-protobuf-wal-c4 | otlp-protobuf | /v1/traces | true | 4 | **193587** | 120519 | 198759 | 15.72 | 62.82 | 74.26 | 152 | 735 |
+| http-native-json-wal-c8 | native-json | /v1/spans | true | 8 | **208519** | 157533 | 221480 | 17.13 | 197.51 | 409.30 | 256 | 778 |
+| http-otlp-json-wal-c8 | otlp-json | /v1/traces | true | 8 | **199955** | 145440 | 208080 | 19.59 | 201.02 | 415.94 | 455 | 2734 |
+| http-otlp-protobuf-wal-c8 | otlp-protobuf | /v1/traces | true | 8 | **218717** | 191364 | 226584 | 17.37 | 186.37 | 394.14 | 152 | 726 |
+| http-native-json-wal-c16 | native-json | /v1/spans | true | 16 | **212370** | 156388 | 221499 | 17.64 | 656.21 | 887.78 | 256 | 817 |
+| http-otlp-json-wal-c16 | otlp-json | /v1/traces | true | 16 | **193385** | 150866 | 209335 | 19.87 | 712.12 | 982.01 | 455 | 2734 |
+| http-otlp-protobuf-wal-c16 | otlp-protobuf | /v1/traces | true | 16 | **206929** | 164200 | 218873 | 18.08 | 671.82 | 927.86 | 152 | 797 |
+| profile-throughput-c1 | native-json | /v1/spans | true | 1 | **60837** | 44823 | 80866 | 11.00 | 27.33 | 113.26 | 256 | 597 |
+| profile-throughput-c4 | native-json | /v1/spans | true | 4 | **166732** | 93419 | 228729 | 14.08 | 44.52 | 146.74 | 256 | 749 |
+| profile-throughput-c8 | native-json | /v1/spans | true | 8 | **211727** | 164940 | 257517 | 15.61 | 105.14 | 477.15 | 256 | 931 |
+| profile-throughput-c16 | native-json | /v1/spans | true | 16 | **209488** | 177071 | 242172 | 19.92 | 204.10 | 1486.77 | 256 | 937 |
+| profile-balanced-c1 | native-json | /v1/spans | true | 1 | **62656** | 33256 | 74976 | 9.05 | 47.47 | 93.32 | 256 | 632 |
+| profile-balanced-c4 | native-json | /v1/spans | true | 4 | **170136** | 113634 | 173307 | 17.28 | 67.07 | 104.08 | 256 | 674 |
+| profile-balanced-c8 | native-json | /v1/spans | true | 8 | **190608** | 145789 | 212150 | 18.94 | 196.61 | 417.39 | 256 | 756 |
+| profile-balanced-c16 | native-json | /v1/spans | true | 16 | **189845** | 142757 | 200428 | 20.18 | 717.91 | 986.15 | 256 | 787 |
+| profile-latency-c1 | native-json | /v1/spans | true | 1 | **59646** | 41874 | 65549 | 10.02 | 42.32 | 62.88 | 256 | 576 |
+| profile-latency-c4 | native-json | /v1/spans | true | 4 | **165345** | 93958 | 176932 | 17.99 | 68.75 | 94.10 | 256 | 689 |
+| profile-latency-c8 | native-json | /v1/spans | true | 8 | **163900** | 143421 | 175231 | 18.54 | 254.93 | 347.22 | 256 | 708 |
+| profile-latency-c16 | native-json | /v1/spans | true | 16 | **169614** | 77994 | 182357 | 18.17 | 602.22 | 673.70 | 256 | 728 |
 <!-- END GENERATED -->
 
 
