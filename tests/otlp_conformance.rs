@@ -217,14 +217,14 @@ fn otlp_request_maps_onto_the_span_model() {
     let (status, body) = server.request("GET", "/v1/spans?service=checkout", None);
     assert_eq!(status, 200);
     assert_eq!(
-        body.as_array().map(Vec::len),
+        body["spans"].as_array().map(Vec::len),
         Some(2),
         "service filter: {body}"
     );
     let (status, body) = server.request("GET", "/v1/spans?attr.retries=3", None);
     assert_eq!(status, 200);
     assert_eq!(
-        body.as_array().map(Vec::len),
+        body["spans"].as_array().map(Vec::len),
         Some(1),
         "attr filter: {body}"
     );

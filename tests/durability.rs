@@ -152,7 +152,7 @@ fn surviving_spans(dir: &Path, marker: &str) -> usize {
         None,
     );
     assert_eq!(status, 200, "recovered store serves queries: {body}");
-    let count = body.as_array().map(Vec::len).unwrap_or(0);
+    let count = body["spans"].as_array().map(Vec::len).unwrap_or(0);
     let mut server = server;
     server.kill_hard();
     count
@@ -433,7 +433,7 @@ fn a_crash_during_a_seal_loses_nothing_it_acknowledged() {
                 None,
             );
             assert_eq!(status, 200, "the recovered store answers: {body}");
-            body.as_array().map(Vec::len).unwrap_or(0)
+            body["spans"].as_array().map(Vec::len).unwrap_or(0)
         })
         .sum();
     let mut recovered = recovered;
@@ -908,7 +908,7 @@ fn a_crash_during_a_grouped_merge_recovers_exactly() {
                     &format!("/v1/spans?attr.batch={worker}-{round}&limit=1000"),
                     Duration::from_secs(30),
                 );
-                let survived = body.as_array().map(Vec::len).unwrap_or(0);
+                let survived = body["spans"].as_array().map(Vec::len).unwrap_or(0);
                 assert_eq!(
                     survived, PER_BATCH,
                     "worker {worker}: batch {round} came back with {survived} \
@@ -921,7 +921,7 @@ fn a_crash_during_a_grouped_merge_recovers_exactly() {
                 &format!("/v1/spans?attr.marker=hot{worker}&limit=1000"),
                 Duration::from_secs(30),
             );
-            let hot = body.as_array().cloned().unwrap_or_default();
+            let hot = body["spans"].as_array().cloned().unwrap_or_default();
             assert_eq!(
                 hot.len(),
                 HOT_KEYS,
