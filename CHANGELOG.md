@@ -7,7 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Segment format v4: the attribute index is keyed by digest, not by value
+  text.** Through v3 the index held every distinct attribute value resident,
+  in full, for the life of the segment. For enum-shaped attributes that costs
+  nothing; for the data Traza exists to store it was fatal — an indexed
+  `gen_ai.prompt` is kilobytes, every value is distinct, and the resident
+  index therefore grew to roughly the size of the corpus text. A store that
+  reads records from disk on demand specifically so it can outgrow RAM was
+  pulling the largest part of each record back into RAM through its own index.
+
+  v4 interns attribute keys and replaces each value with a 128-bit digest, so
+  an entry costs the same for a status code and for a page of text. Measured
+  before and after on the same machine and command, 256 MiB of all-distinct
+  text: **391 MiB → 21.6 MiB** RSS on open at 2 KiB values, **439 MiB →
+  77.5 MiB** at 512 B. The 512 B cell is dearer because it holds four times as
+  many spans — cost tracks cardinality now, which is the point.
+
+  A digest probe returns candidates, so `attribute_posting_offsets_ref` is now
+  `attribute_candidate_offsets` and `Segment::query_attribute` verifies. At
+  128 bits nothing collides naturally, which means no ordinary test can tell a
+  verifying reader from a trusting one; the acceptance target forges the
+  collision instead.
+
+  v2 and v3 segments still open — their values are hashed and discarded at
+  open time, so an existing store gets the smaller steady state without being
+  rewritten.
+
 ### Added
+
+- **Content search: `GET /v1/spans?content=refund`.** Finds spans by the words
+  in their text — string attributes, nested message arrays, event attributes
+  and event names. Segment format v5 carries a Bloom filter over the words in
+  each 128-record block, stored bit-sliced (one row per bit position spanning
+  all blocks) so a probe reads tens of bytes per segment instead of every
+  block's whole bitmap. Only a per-segment summary filter is resident, capped
+  at 32 KiB, so the cost scales with segment count and not with text volume.
+
+  Measured against the same corpus with the index off, 200,000 spans holding
+  145 MiB of text: a word in one span **1.48 ms vs 1,258 ms (849x)**, two words
+  **0.74 ms vs 1,156 ms (1,554x)**, a word in no span **0.008 ms (146,000x)**,
+  and a word in nearly every span **1.0x** — with no selectivity to buy there
+  is nothing to win, and that row is published alongside the others. Disk cost
+  +0.1%, resident ~2 KiB per segment.
+
+  **It is word matching, not substring matching, and not phrase matching.**
+  `refund` does not match `refunds`. That is a soundness requirement rather
+  than a limitation of effort: a word index cannot over-approximate a
+  substring query, so driving one with it would skip spans that should have
+  matched — a wrong answer instead of a slow one.
+
+  `--no-content-index` / `Config::content_index` turns it off; content search
+  still works, by scanning.
+
+- **`traza_segments_pruned_by_content_total`** and
+  **`traza_records_admitted_by_content_total`** in `/v1/metrics`. A content
+  index that stops pruning returns byte-identical results and simply gets
+  slower, so these counters are the only way to see it happen.
 
 - **`traza_wal_lock_wait_ns_*` and `traza_wal_write_syscall_ns_*`** in
   `/v1/metrics`, splitting the log append into waiting for Traza's log lock

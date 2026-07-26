@@ -781,3 +781,77 @@ fn a_saturated_or_absent_content_index_is_slow_and_never_wrong() {
     assert_eq!(ids(&found), ["target"]);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn compaction_preserves_the_content_index() {
+    // A merge that silently dropped the content index would still return
+    // every correct row -- it would just scan for them. So this asserts the
+    // counter, not the result: without it, the failure mode is a store that
+    // gets slower the longer it runs and never says why.
+    let dir = test_dir("content-compaction");
+    let store = Store::open(
+        &dir,
+        Config {
+            durability: traza::Durability::Buffered,
+            compaction: Some(traza::CompactionConfig {
+                fanout: 2,
+                base_bytes: 1_024 * 1_024,
+                max_segment_bytes: 256 * 1_024 * 1_024,
+            }),
+            flush_spans: 2_000,
+            ..Config::default()
+        },
+    )
+    .expect("opens");
+
+    for index in 0..8_000usize {
+        let note = if index == 5_000 {
+            "the antidisestablishment clause applies".to_owned()
+        } else {
+            format!("routine completion number {index} about weather")
+        };
+        store
+            .ingest(span(
+                &format!("s{index}"),
+                1_000 + index as u64,
+                10,
+                json!({ "note": note }),
+            ))
+            .expect("ingest");
+    }
+    store.flush().expect("flush");
+    let merged = store.compact_segments().expect("compact");
+    assert!(
+        merged > 0,
+        "the corpus must actually merge for this to test anything"
+    );
+
+    let pruned_before = store.metrics().segments_pruned_by_content.get();
+    let admitted_before = store.metrics().records_admitted_by_content.get();
+    let found = store
+        .query(&SpanFilter {
+            content: Some("antidisestablishment".to_owned()),
+            ..SpanFilter::default()
+        })
+        .expect("content query");
+    assert_eq!(ids(&found), ["s5000"], "the answer survives the merge");
+
+    let admitted = store.metrics().records_admitted_by_content.get() - admitted_before;
+    let pruned = store.metrics().segments_pruned_by_content.get() - pruned_before;
+
+    // The lower bound is the load-bearing half. `records_admitted_by_content`
+    // only counts when a content index was actually consulted, so "admitted
+    // is small" is satisfied just as well by a merge that dropped the index
+    // entirely and admitted nothing through it -- which is exactly what a
+    // mutation check showed the first version of this test accepting.
+    assert!(
+        admitted >= 1,
+        "a merged segment must still carry a content index: nothing was \
+         admitted through one ({pruned} segments pruned)"
+    );
+    assert!(
+        admitted <= 384,
+        "the merged segment's block filters must still narrow: {admitted} records"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
