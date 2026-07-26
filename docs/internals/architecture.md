@@ -101,43 +101,74 @@ Ordering here *is* the durability contract:
 2. **Take the writer lock.** Append the frame to `wal.log` and upsert the batch
    into the write buffer, both under the lock, so a concurrent flush cannot
    seal a buffer that disagrees with the log.
-3. **If the buffer is now at `flush_spans`, seal** (below), still under the
-   lock. A sealed segment supersedes the log, so this also discards the log and
-   satisfies any commit waiting on it.
-4. **Release the lock.**
-5. **fsync, then return.**
+3. **Release the lock.**
+4. **fsync, then return.**
+5. **Seal, if the buffer has reached one of its bounds** (below) — outside the
+   lock, and outside step 2's lock on purpose.
 
 The fsync is deliberately outside the lock. That is what lets concurrent
 batches accumulate into a single sync — group commit — instead of serializing
 one fsync per request. A waiter wakes when *some* sync has covered its log
 sequence number.
 
-A crash before step 5 loses the batch, which is correct: nothing had been
+A crash before step 4 loses the batch, which is correct: nothing had been
 acknowledged. The response is sent only after the fsync it promises.
+`Durability::Flushed` is the exception to the ordering: it promises a *sealed
+segment* rather than an fsync, so it seals before returning and the segment
+supersedes the fsync it would otherwise have waited for.
 
 ### 6. Sealing a segment
 
-`flush_locked` takes the buffered spans (moves, not clones — a seal used to
-push 10,000 spans through a deep clone), sorts them into Traza's stable order,
-claims the next segment id, and writes:
+A seal has the same three-phase shape as compaction and expiry, and for the
+same reason — the I/O is the expensive part and it needs no lock:
 
-**encode → write to a temp file → `fsync` the file → atomic `rename` →
-`fsync` the directory.**
+1. **Drain, under a short writer lock.** The buffered spans are copied out as
+   `Arc<Span>` handles and the next segment id is claimed. Both cheap.
+2. **Write, with no engine lock held.** Sort into Traza's stable order, then
+   **encode → write to a temp file → `fsync` the file → atomic `rename` →
+   `fsync` the directory**. The segment is then **reopened file-backed**, so
+   the encoded buffer is dropped and it serves reads from disk immediately —
+   sealing never leaves a resident payload copy behind. This is the part that
+   used to hold the writer lock, and it was ~74% of everything that lock was
+   held for.
+3. **Publish and reconcile, under short locks.** The segment is pushed onto
+   the list; then the log is reclaimed and the sealed spans are dropped from
+   the buffer.
 
-The segment is then **reopened file-backed**, so the encoded buffer is dropped
-and the new segment serves reads from disk immediately — flushing never leaves
-a resident payload copy behind. Only then is the buffer cleared, the segment
-pushed onto the list, and the log truncated.
+Three details carry the correctness:
 
-If the write fails, the spans go back into the buffer: a failed seal leaves the
-acknowledged data intact.
+- **The drain copies; it does not remove.** Taking the spans out at step 1
+  would leave already-acknowledged data in neither the buffer nor a segment for
+  the whole of step 2 — briefly invisible to readers. A merge keeps its inputs
+  live and pinned until its output is published; a seal does the same, which is
+  why no reader needs to know a seal is happening.
+- **Eviction is by handle identity, not by key.** A span re-ingested during the
+  write is a newer version living in the buffer while the segment holds the
+  older one. The buffer outranks segments, so reads are correct — but the
+  eviction must drop only keys whose current value is still the sealed one.
+  `Arc::ptr_eq` answers that; comparing values cannot, because a span
+  re-ingested unchanged is a newer version that happens to look identical.
+- **The segment id is claimed at the drain.** Segment path order is recency
+  order, so an id claimed at completion could invert last-write-wins.
+  Compaction claims from the same counter and therefore declines to claim one
+  while a seal holds a lower unpublished id.
+
+One seal runs at a time, behind a permit; a second would drain the same spans
+the first already covers. Expiry takes the permit too, so a seal that drained
+before a deletion cannot publish its segment afterwards and resurrect what was
+deleted. Ingest never takes it while holding the writer lock — that would
+invert the lock order.
+
+If the write fails, nothing was published and nothing was removed: the buffer
+and the log are exactly as they were, and the next seal retries.
 
 ## The read path
 
 `query` takes the writer lock and then the segments lock — always in that order
-— and resolves the whole answer under that one snapshot. A concurrent flush can
-therefore neither hide a committed span (by moving it out of the buffer before
-the segment is visible) nor duplicate one (by showing both copies).
+— and resolves the whole answer under that one snapshot. A concurrent seal can
+therefore neither hide a committed span (its spans stay in the buffer until the
+segment is published) nor duplicate one (the buffer wins on the primary key
+while both copies exist).
 
 Precedence follows the primary key: the write buffer holds the newest version
 of anything it carries and always wins; among segments, a later path is a later

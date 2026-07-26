@@ -7,10 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Four defects from an independent review of v0.17, fixed and tested. They are
-symptoms of one gap — Traza has several recovery domains and nothing names a
-state they all agree on — so the class fix is designed too, and scheduled
-before 1.0 rather than as part of HA:
+## [0.19.0] - 2026-07-25
+
+**Segment sealing no longer holds the writer lock**, which was 74% of
+everything that lock was held for and 88% of a run's wall clock. Ingest rises
+37-116% depending on `--flush-spans`, and `--flush-spans` stops being a
+throughput setting at all.
+
+Alongside it, four defects from an independent review of v0.17, fixed and
+tested. They are symptoms of one gap — Traza has several recovery domains and
+nothing names a state they all agree on — so the class fix is designed too, and
+scheduled before 1.0 rather than as part of HA:
 [docs/generations-design.md](docs/generations-design.md).
 
 ### Fixed
@@ -75,6 +82,55 @@ before 1.0 rather than as part of HA:
 
 ### Changed
 
+- **Segment sealing no longer holds the writer lock.** It was the largest thing
+  the engine did while holding the lock every ingesting thread needs:
+  converting spans to records, encoding the segment, writing it, fsyncing it,
+  renaming it, fsyncing the directory and reopening the result — all on a
+  private vector no other thread can reach. Measured at concurrency 8 before
+  the change, the lock was held 88% of a run at the default `--flush-spans`
+  and **74% of that was the seal**; at `--flush-spans 5000` it was 97% and 81%.
+  A seal now drains the buffer under a short lock, does every byte of I/O with
+  nothing held, and publishes under a short lock — the shape compaction and
+  retention already had.
+
+  Before and after with the two builds alternated round-robin on a contended
+  host, median of four rounds at concurrency 8: `--profile throughput`
+  162,763 → **222,683** spans/s (+37%), `balanced` 116,612 → **176,004**
+  (+51%), `latency` 83,400 → **180,331** (+116%). Those levels are depressed
+  by background load; the round-robin is what makes the ratios trustworthy.
+  **`--flush-spans` has stopped being a throughput knob** — `latency` and
+  `balanced` now land within 3% of each other, where they used to span 2x — so
+  set it for the tail latency and buffer memory you want.
+
+  Two consequences worth knowing:
+  - **The write buffer can exceed `--flush-spans`** while a seal is in flight,
+    because ingest no longer waits for one. Past four times the threshold an
+    ingesting thread waits for the seal to publish, so it stays bounded — but
+    size memory for that bound.
+  - **`--flush-wal-bytes` now governs the log's real size** under sustained
+    ingest. A seal that empties the buffer still discards the whole log, so a
+    quiet store is unchanged; a busy one lets the log run to that bound between
+    reclamations rather than emptying it on every seal, because rewriting the
+    log to the survivors every time would put thousands of re-serialized spans
+    straight back under the writer lock. Restart replay is bounded by the
+    setting, which is what it always documented.
+
+  What made this safe rather than fast-and-wrong: the drain **copies** the
+  buffer instead of emptying it, so already-acknowledged spans are never in
+  neither the buffer nor a segment — a merge keeps its inputs live until its
+  output is published, and a seal now does the same. The buffer holds
+  `Arc<Span>` so that copy is pointer-sized and so the post-publish eviction
+  can ask *is the value under this key still the one I sealed* by handle
+  identity. Comparing values would have destroyed data: a span re-ingested
+  unchanged during a seal is a newer version that happens to look identical.
+  `tests/seal_concurrency.rs` races reads, ingest and expiry against a seal;
+  `tests/durability.rs` adds a SIGKILL taken mid-seal.
+- **`traza_segment_seal_locked_ns_*` and `traza_segment_seals_coalesced_total`**
+  are new on `/v1/metrics`. The first is the part of a seal that holds an
+  engine lock; against `traza_segment_seal` it is the only way to see that the
+  write is off the lock, because query results are identical either way. The
+  second counts seals that found another already in flight and declined to
+  start a second one.
 - **Compaction and retention no longer stop the server.** Both held the segment
   lock across parsing every input, materializing the result and fsyncing it;
   queries waited on that lock while holding the writer lock, so ingest queued
@@ -978,5 +1034,6 @@ completion trailers — clients parsing either surface must update.
 
 - This is an initial 0.1 release; consult README.md for the currently documented operational constraints and unsupported use cases.
 
-[Unreleased]: https://github.com/toshish/traza/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/toshish/traza/compare/v0.19.0...HEAD
+[0.19.0]: https://github.com/toshish/traza/releases/tag/v0.19.0
 [0.1.0]: https://github.com/toshish/traza/releases/tag/v0.1.0

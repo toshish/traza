@@ -1029,6 +1029,7 @@ fn stage_summary(metrics: &str) -> String {
         ("wal fsync", "traza_wal_fsync"),
         ("buffer upsert", "traza_buffer_upsert"),
         ("segment seal", "traza_segment_seal"),
+        ("segment seal (lock held)", "traza_segment_seal_locked"),
     ];
     let mut rows: Vec<(f64, String)> = Vec::new();
     for (label, prefix) in stages {
@@ -1054,6 +1055,29 @@ fn stage_summary(metrics: &str) -> String {
         .map(|(_, line)| format!("      {line}"))
         .collect::<Vec<_>>()
         .join("\n");
+    // The number the stage list cannot show on its own: what the writer lock
+    // was actually held for. `writer lock wait` above is the QUEUE for this,
+    // not a cost of its own, so summing the three stages that hold the lock is
+    // the only way to read saturation off this output.
+    let in_lock: u64 = ["traza_wal_write", "traza_buffer_upsert"]
+        .iter()
+        .chain(["traza_segment_seal_locked"].iter())
+        .filter_map(|prefix| metric_value(metrics, &format!("{prefix}_ns_sum")))
+        .sum();
+    if in_lock > 0 {
+        let _ = write!(
+            out,
+            "\n      IN-LOCK TOTAL (wal write + buffer upsert + seal's locked part): {:.0} ms",
+            in_lock as f64 / 1e6
+        );
+    }
+    let coalesced = metric_value(metrics, "traza_segment_seals_coalesced_total").unwrap_or(0);
+    if coalesced > 0 {
+        let _ = write!(
+            out,
+            "\n      seals coalesced into one already running: {coalesced}"
+        );
+    }
     if fsyncs > 0 {
         let _ = write!(
             out,

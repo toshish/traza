@@ -580,7 +580,7 @@ impl Store {
             .spans
             .iter()
             .filter(|span| in_window(span.start_time_ns, since_ns, until_ns))
-            .cloned()
+            .map(|span| Span::clone(span))
             .collect();
         // ALL buffer keys supersede segment copies, in-window or not.
         let buffer_keys: HashSet<(String, String)> = writer.index.keys().cloned().collect();

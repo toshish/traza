@@ -192,11 +192,20 @@ scan all take both guards up front and hold them across the whole resolution.
 against a buffer and a segment slice so the live store (holding both guards)
 and a pinned `SnapshotView` (owning its copy) run the same code.
 
-**Why it is subtle.** A flush moves spans out of the write buffer and into a
-new segment. A reader that samples the buffer, releases it, and then samples
-the segments can observe the moment in between and see neither copy. A reader
-that samples in the other order can see both. Only one snapshot spanning both
-is correct.
+**Why it is subtle.** A seal puts spans into a new segment and later takes them
+out of the write buffer. A reader that samples one side, releases it, and then
+samples the other can observe the moment in between and see neither copy, or
+see both. Only one snapshot spanning both is correct.
+
+**And why the seal itself must cooperate.** Holding both locks for the read is
+not sufficient on its own, because a seal now does its I/O with no lock held.
+If it removed the spans from the buffer at the drain, they would be in neither
+place for the whole of the write, and *every* read during that window would be
+consistent, atomic, and missing acknowledged data. The seal therefore never
+removes anything from visibility: the spans stay in the buffer until the
+segment is published, and are evicted afterwards — by handle identity, so a
+version re-ingested during the seal survives. See
+`tests/seal_concurrency.rs`; the pre-existing suite passes with this broken.
 
 The same trap applies to *multi-key* reads. Resolving each recognized session
 key with its own `query` call let a span re-ingested between the calls be seen
