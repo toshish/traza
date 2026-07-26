@@ -6,7 +6,7 @@
 //! well as the segment count. A compaction that loses the newest version of a
 //! re-ingested span would be far worse than the slow search it fixes.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
@@ -329,6 +329,55 @@ fn compaction_and_ttl_expiry_coexist() {
 /// A segment big enough that merging it is measurable work rather than an
 /// instant. Compaction is only interesting to the rest of the engine when it
 /// takes long enough to be in the way.
+/// Copies a one-span segment into `dir` under `name`, standing in for an
+/// output a merge had already written when it was interrupted.
+fn stage_output(dir: &Path, name: &str, version: &str) {
+    let staging = test_dir("staging");
+    let helper = Store::open(&staging, tiered(0)).expect("opens");
+    seal(&helper, vec![span("t", "s", version, 1_000)]);
+    drop(helper);
+    let staged = std::fs::read_dir(&staging)
+        .expect("read dir")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "seg"))
+        .expect("staged segment");
+    std::fs::copy(&staged, dir.join(name)).expect("copy");
+    std::fs::remove_dir_all(&staging).expect("cleanup");
+}
+
+fn segment_names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .expect("read dir")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".seg"))
+        .collect();
+    names.sort();
+    names
+}
+
+fn write_journal(dir: &Path, inputs: &[String], outputs: &[&str]) {
+    std::fs::write(
+        dir.join(format!(".supersede.{}.journal", outputs[0])),
+        format!(
+            "inputs {}\noutputs {}\n",
+            inputs.join(","),
+            outputs.join(",")
+        ),
+    )
+    .expect("journal");
+}
+
+fn journals(dir: &Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .expect("read dir")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(".supersede."))
+        .collect()
+}
+
 fn bulky_span(trace: &str, id: &str, start_ns: u64) -> Span {
     serde_json::from_value(json!({
         "trace_id": trace, "span_id": id, "name": "op", "service": "svc",
@@ -473,7 +522,319 @@ fn a_flush_during_a_merge_still_supersedes_merged_content() {
             "the flush is newer than the merge and must win: {:?}",
             hot.iter().map(|span| &span.name).collect::<Vec<_>>()
         );
+        // Whichever way the race went, the directory holds exactly the live
+        // segments and no journal. A merge that abandons publication has to
+        // take its outputs back off disk before dropping the journal that
+        // describes them — an orphan output outranks every input by id, so
+        // one left behind would be loaded at the next open and shadow them.
+        let on_disk = segment_names(&dir).len();
+        assert_eq!(
+            on_disk,
+            store.stats().expect("stats").segment_count,
+            "an abandoned merge left an output behind"
+        );
+        assert!(
+            journals(&dir).is_empty(),
+            "journals must be cleared: {:?}",
+            journals(&dir)
+        );
         drop(store);
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
+}
+
+/// Compaction that keeps the tiers meaningful: a 100-span segment (~31 KB)
+/// lands a tier above `base_bytes`, and a handful of spans lands below it —
+/// the same split the 8 MiB default produces between a full flush and a
+/// partial one.
+fn tiered(max_segment_bytes: u64) -> Config {
+    Config {
+        durability: Durability::Buffered,
+        compaction: Some(CompactionConfig {
+            fanout: 4,
+            base_bytes: 20_000,
+            max_segment_bytes,
+        }),
+        ..Config::default()
+    }
+}
+
+fn batch(store: &Store, count: usize, base: u64) {
+    seal(
+        store,
+        (0..count as u64)
+            .map(|i| {
+                let n = base + i;
+                span(&format!("t{n}"), "s1", "op", 1_000 + n)
+            })
+            .collect(),
+    );
+}
+
+#[test]
+fn a_partial_final_segment_does_not_stall_compaction() {
+    // Ingest seals when the write buffer hits `flush_spans`, and batches do
+    // not divide evenly, so the last segment of a finished load is a partial
+    // one. Below `base_bytes` it is a tier of its own, and anchoring the run
+    // on the LAST segment's tier made that a wall: the run was length 1,
+    // under `fanout`, and a store that stopped ingesting mid-segment — a bulk
+    // load, a seeded corpus, an archived store — kept every segment forever.
+    let dir = test_dir("partial-tail");
+    let store = Store::open(&dir, tiered(0)).expect("opens");
+
+    for full in 0..8u64 {
+        batch(&store, 100, full * 1_000);
+    }
+    // The partial flush: far below `base_bytes`, so a tier below its peers.
+    batch(&store, 3, 900_000);
+    assert_eq!(store.stats().expect("stats").segment_count, 9);
+
+    let removed = store.compact_segments().expect("compacts");
+    assert_eq!(removed, 8, "the whole run merges, partial tail included");
+    assert_eq!(store.stats().expect("stats").segment_count, 1);
+
+    let all = store
+        .query(&SpanFilter {
+            limit: None,
+            ..SpanFilter::default()
+        })
+        .expect("query");
+    assert_eq!(all.len(), 803, "every span survives, partial ones included");
+}
+
+#[test]
+fn a_partial_segment_in_the_middle_does_not_wall_off_the_prefix() {
+    // Same segment, no longer at the tail: ingest resumed after the store
+    // stopped. Nothing behind the tail is ever a merge candidate again, so a
+    // wall here froze the whole prefix permanently rather than briefly.
+    let dir = test_dir("partial-middle");
+    let store = Store::open(&dir, tiered(0)).expect("opens");
+
+    for full in 0..8u64 {
+        batch(&store, 100, full * 1_000);
+    }
+    batch(&store, 3, 900_000);
+    // Ingest resumes, burying the partial segment mid-list.
+    for full in 0..4u64 {
+        batch(&store, 100, 100_000 + full * 1_000);
+    }
+
+    store.compact_segments().expect("compacts");
+    assert_eq!(
+        store.stats().expect("stats").segment_count,
+        1,
+        "the buried partial segment is absorbed, not merged around"
+    );
+
+    let all = store
+        .query(&SpanFilter {
+            limit: None,
+            ..SpanFilter::default()
+        })
+        .expect("query");
+    assert_eq!(all.len(), 1_203);
+}
+
+#[test]
+fn a_backlog_compacts_down_to_the_size_cap() {
+    // The cap bounds each OUTPUT, not the run. Capping by truncating the run
+    // left a cap-sized segment at the tail with smaller ones behind it, and
+    // those were unreachable forever — one merge, then permanently stuck.
+    let dir = test_dir("backlog");
+    // ~500 KB, about 16 segments' worth.
+    let store = Store::open(&dir, tiered(500_000)).expect("opens");
+
+    for full in 0..60u64 {
+        batch(&store, 100, full * 1_000);
+    }
+    assert_eq!(store.stats().expect("stats").segment_count, 60);
+    let disk = store.stats().expect("stats").disk_bytes;
+
+    let removed = store.compact_segments().expect("compacts");
+    let after = store.stats().expect("stats").segment_count;
+    assert_eq!(removed, 60 - after);
+    // Four ~500 KB outputs for ~1.9 MB of input: the floor the cap implies,
+    // not the 46 that stopping the run at the cap used to leave.
+    // (d + n - 1) / n rather than div_ceil: the crate's MSRV is 1.70.
+    let floor = ((disk + 499_999) / 500_000) as usize;
+    assert!(
+        after <= floor + 1,
+        "backlog left {after} segments for {disk} bytes at a 500 KB cap \
+         (floor {floor})"
+    );
+
+    // And it is a fixed point: no further pass finds anything worth doing.
+    assert_eq!(store.compact_segments().expect("compacts"), 0);
+    assert_eq!(store.stats().expect("stats").segment_count, after);
+
+    let all = store
+        .query(&SpanFilter {
+            limit: None,
+            ..SpanFilter::default()
+        })
+        .expect("query");
+    assert_eq!(all.len(), 6_000, "every span survives a grouped merge");
+}
+
+#[test]
+fn a_grouped_merge_resolves_the_primary_key_across_its_outputs() {
+    // A run that splits into several outputs dedups WITHIN each group, not
+    // across them, so a key written in two groups lands in two outputs. What
+    // keeps last-write-wins intact is that the outputs take ids in group
+    // order — the same order their inputs had.
+    let dir = test_dir("grouped-lww");
+    // Small enough that 12 segments cannot become one.
+    let store = Store::open(&dir, tiered(120_000)).expect("opens");
+
+    // One key rewritten in every segment, plus bulk to force several groups.
+    for round in 0..12u64 {
+        let mut spans = vec![span("t", "s", &format!("v{round}"), 1_000)];
+        spans.extend((0..100u64).map(|i| {
+            let n = round * 1_000 + i;
+            span(&format!("bulk{n}"), "s1", "op", 2_000 + n)
+        }));
+        seal(&store, spans);
+    }
+    assert_eq!(store.stats().expect("stats").segment_count, 12);
+
+    store.compact_segments().expect("compacts");
+    let after = store.stats().expect("stats").segment_count;
+    assert!(
+        (2..12).contains(&after),
+        "the cap must split this run into several outputs, got {after}"
+    );
+
+    let trace = store.get_trace("t").expect("trace");
+    assert_eq!(trace.len(), 1, "one primary key, one span: {trace:?}");
+    assert_eq!(
+        trace[0].name, "v11",
+        "the newest version wins across group boundaries"
+    );
+
+    // And a write after the grouped merge still supersedes all of it.
+    seal(&store, vec![span("t", "s", "v12", 1_000)]);
+    let trace = store.get_trace("t").expect("trace");
+    assert_eq!(trace[0].name, "v12");
+}
+
+#[test]
+fn a_half_written_output_group_is_rolled_back_on_reopen() {
+    // A grouped merge is atomic or it is nothing. An output holds only its
+    // own group's view of a key, and it carries a higher id than every input,
+    // so one left beside intact inputs would shadow a newer version living in
+    // a group whose output never landed. Recovery must delete it, not keep it.
+    let dir = test_dir("rollback");
+    let store = Store::open(&dir, tiered(0)).expect("opens");
+    for round in 0..4u64 {
+        seal(&store, vec![span("t", "s", &format!("v{round}"), 1_000)]);
+    }
+    let inputs = segment_names(&dir);
+    assert_eq!(inputs.len(), 4);
+    drop(store);
+
+    // The wreckage of a crash midway through publishing a two-output group:
+    // the first output landed, the second never did, and EVERY input is still
+    // on disk because a merge deletes those last. The stand-in output holds
+    // the stale version, which is what a first group would hold.
+    let landed = "segment-00000000000000000099.seg";
+    let missing = "segment-00000000000000000100.seg";
+    stage_output(&dir, landed, "v0");
+    write_journal(&dir, &inputs, &[landed, missing]);
+
+    let store = Store::open(&dir, tiered(0)).expect("reopens");
+    assert!(
+        !dir.join(landed).exists(),
+        "the output that landed must be rolled back, not kept"
+    );
+    let trace = store.get_trace("t").expect("trace");
+    assert_eq!(trace.len(), 1);
+    assert_eq!(
+        trace[0].name, "v3",
+        "the inputs stay authoritative, so the newest version still wins"
+    );
+    assert!(
+        journals(&dir).is_empty(),
+        "journals must be cleared: {:?}",
+        journals(&dir)
+    );
+}
+
+#[test]
+fn a_merge_whose_input_deletion_had_started_rolls_forward() {
+    // The state a failed unlink leaves. Publication succeeded, so every
+    // output was durable; deleting the inputs then failed partway, the error
+    // was logged and the server kept running, and a later merge consumed one
+    // of the outputs. On reopen one input is gone and one output is missing.
+    //
+    // Deciding that per input would read the surviving input as "nothing was
+    // deleted yet" and roll back — deleting live outputs that hold the only
+    // copy of the input already removed. An input already gone is proof of
+    // the opposite, and it is a fact about the group, not about any one file.
+    let dir = test_dir("roll-forward");
+    let store = Store::open(&dir, tiered(0)).expect("opens");
+    seal(&store, vec![span("trace-a", "s", "kept-a", 1_000)]);
+    seal(&store, vec![span("trace-b", "s", "kept-b", 2_000)]);
+    let inputs = segment_names(&dir);
+    assert_eq!(inputs.len(), 2);
+    drop(store);
+
+    // Input A was unlinked, input B was not. Output 1 survives; output 2 has
+    // since been consumed by a later merge, whose own output carries its data
+    // — represented here by A's spans living on in the surviving output.
+    let survived = "segment-00000000000000000099.seg";
+    let consumed = "segment-00000000000000000100.seg";
+    stage_output(&dir, survived, "merged");
+    std::fs::remove_file(dir.join(&inputs[0])).expect("unlink A");
+    write_journal(&dir, &inputs, &[survived, consumed]);
+
+    let store = Store::open(&dir, tiered(0)).expect("reopens");
+    assert!(
+        dir.join(survived).exists(),
+        "a live output must not be rolled back once deletion had started"
+    );
+    assert!(
+        !dir.join(&inputs[1]).exists(),
+        "the deletion resumes instead: input B is finished off"
+    );
+    let trace = store.get_trace("t").expect("trace");
+    assert_eq!(trace.len(), 1, "the surviving output's data is intact");
+    assert_eq!(trace[0].name, "merged");
+    assert!(
+        journals(&dir).is_empty(),
+        "journals must be cleared: {:?}",
+        journals(&dir)
+    );
+}
+
+#[test]
+fn a_stale_journal_does_not_roll_back_a_merge_that_committed() {
+    // A journal that outlives the merge it describes, after a later merge
+    // consumed one of its outputs. Every input it names is gone, which is
+    // what tells recovery the merge committed and its outputs are live.
+    let dir = test_dir("stale-journal");
+    let store = Store::open(&dir, tiered(0)).expect("opens");
+    for round in 0..4u64 {
+        seal(&store, vec![span("t", "s", &format!("v{round}"), 1_000)]);
+    }
+    store.compact_segments().expect("compacts");
+    let live = segment_names(&dir);
+    assert_eq!(live.len(), 1, "the merge committed: {live:?}");
+    drop(store);
+
+    let inputs: Vec<String> = (0..4).map(|id| format!("segment-{id:020}.seg")).collect();
+    assert!(inputs.iter().all(|name| !dir.join(name).exists()));
+    write_journal(
+        &dir,
+        &inputs,
+        &[&live[0], "segment-00000000000000009999.seg"],
+    );
+
+    let store = Store::open(&dir, tiered(0)).expect("reopens");
+    assert!(
+        dir.join(&live[0]).exists(),
+        "a live output must survive a stale journal"
+    );
+    let trace = store.get_trace("t").expect("trace");
+    assert_eq!(trace.len(), 1);
+    assert_eq!(trace[0].name, "v3", "and the data with it");
 }

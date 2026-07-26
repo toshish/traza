@@ -784,10 +784,10 @@ fn supersede_journal_finishes_interrupted_rewrite() {
     let replacement = original.with_file_name(new_name);
     std::fs::copy(&original, &replacement).expect("replacement in place");
     std::fs::write(
-        dir.join(format!(".supersede.{old_name}.{new_name}.journal")),
-        format!("{old_name} -> {new_name}\n"),
+        dir.join(format!(".supersede.{new_name}.journal")),
+        format!("inputs {old_name}\noutputs {new_name}\n"),
     )
-    .expect("marker");
+    .expect("journal");
 
     let store = Store::open(&dir, Config::default()).expect("recovers");
     assert!(
@@ -823,21 +823,19 @@ fn supersede_journal_without_replacement_keeps_original() {
         })
         .expect("segment exists");
     let old_name = original.file_name().unwrap().to_string_lossy().into_owned();
-    let marker = dir.join(format!(
-        ".supersede.{old_name}.segment-00000000000000000099.seg.journal"
-    ));
+    let journal = dir.join(".supersede.segment-00000000000000000099.seg.journal");
     std::fs::write(
-        &marker,
-        format!("{old_name} -> segment-00000000000000000099.seg\n"),
+        &journal,
+        format!("inputs {old_name}\noutputs segment-00000000000000000099.seg\n"),
     )
-    .expect("marker");
+    .expect("journal");
 
     let store = Store::open(&dir, Config::default()).expect("recovers");
     assert!(
         original.exists(),
         "original must survive an aborted rewrite"
     );
-    assert!(!marker.exists(), "stale marker must be cleared");
+    assert!(!journal.exists(), "stale journal must be cleared");
     assert_eq!(store.get_trace("t-abort").expect("trace").len(), 1);
 }
 
