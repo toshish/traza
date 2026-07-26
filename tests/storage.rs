@@ -1635,3 +1635,44 @@ fn a_failed_segment_unlink_leaves_expiry_retryable() {
     drop(reopened);
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn expiry_finishes_when_the_segment_file_is_already_gone() {
+    // Deletion is retried on failure, so a retry has to make progress after a
+    // partial one: the unlink can land while the directory sync that makes it
+    // durable does not, and the next attempt then finds the file missing.
+    // Treating that as an error would strand the store on state that is
+    // already correct.
+    let dir = correctness_test_dir("expiry-already-gone");
+    let store = Store::open(
+        &dir,
+        Config {
+            flush_spans: 100_000,
+            durability: traza::Durability::Buffered,
+            compaction: None,
+            ..Config::default()
+        },
+    )
+    .expect("opens");
+    store
+        .ingest(span("t-old", "expired".into(), 1_000, 10))
+        .expect("ingest");
+    store.flush().expect("seals a fully expirable segment");
+
+    // Stand in for "the unlink landed, the sync did not, and we are retrying".
+    let segment = fs::read_dir(&dir)
+        .expect("read dir")
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .find(|path| path.extension().is_some_and(|ext| ext == "seg"))
+        .expect("segment");
+    fs::remove_file(&segment).expect("removes it out from under the store");
+
+    assert_eq!(
+        store.expire_before(5_000).expect("expiry completes"),
+        1,
+        "a segment that is already gone is a finished deletion, not an error"
+    );
+    assert_eq!(store.stats().expect("stats").segment_count, 0);
+    drop(store);
+    let _ = fs::remove_dir_all(&dir);
+}

@@ -103,11 +103,19 @@ Sequence numbers close it, and they must be persisted on **both** sides:
   generation's `folded_through`.** Anything at or before it is already inside
   the generation and is discarded, whether or not the file was truncated.
 
-Reclamation then stops being load-bearing for correctness. Truncating the log
-after a checkpoint becomes housekeeping — doing it late, or not at all, costs
-disk and replay time but cannot change what the store contains. That is the
-property the current engine does not have, where a stale log *is* a wrong
+Reclamation then stops being load-bearing for correctness. Dropping folded
+frames after a checkpoint becomes housekeeping — doing it late, or not at all,
+costs disk and replay time but cannot change what the store contains. That is
+the property the current engine does not have, where a stale log *is* a wrong
 answer.
+
+**Folded frames are a prefix, so they are rolled over, not truncated.**
+`set_len` removes a suffix; it cannot remove the front of a file. Reclaiming
+the folded prefix means staging a new log holding only the unfolded frames,
+fsyncing it, renaming it over `wal.log`, and fsyncing the directory — the same
+shape as `Wal::rewrite` today. (Truncation stays correct for the two cases that
+really are suffixes: dropping a torn tail at recovery, and clearing a log whose
+every frame is folded.)
 
 The frame format change is not free: `(epoch, sequence)` widens the header from
 8 bytes to 24 and is a format break, which is another reason this belongs
@@ -120,19 +128,35 @@ means the store opens onto exactly one state and loses no acknowledged write.
 
 | # | Step | Crash immediately after leaves | Recovery |
 |---|---|---|---|
-| 1 | Seal the buffer into segment files under `generations/N+1/engine/` | Orphan files, no manifest | `CURRENT` still names N; the orphan directory is swept. Frames still in the log replay onto N. Safe |
+| 1 | Seal the buffer into segment files under `generations/N+1/engine/`, each fsynced | Orphan files, no manifest | `CURRENT` still names N; the orphan directory is swept. Frames still in the log replay onto N. Safe |
 | 2 | Write and fsync `state-manifest.json` for N+1, recording `folded_through` | A complete generation nothing points at | `CURRENT` still names N. N+1 is unreferenced and swept (or reused by the retried checkpoint, since it is byte-identical). Safe |
-| 3 | fsync the generation directory | As above | As above. Safe |
-| 4 | Rename `CURRENT` → N+1 | The new generation is live; the log still holds every folded frame | Frames at or before N+1's `folded_through` are discarded by rule. **This is the step the epoch exists for.** Safe |
-| 5 | Truncate the log to the first unfolded frame | Nothing outstanding | Housekeeping only. Safe |
-| 6 | Reclaim generation N | Both generations on disk | `CURRENT` names N+1; N is unreferenced and swept unless pinned. Safe |
+| 3 | fsync `generations/N+1/` | As above | As above. Safe |
+| 4 | Write and fsync `CURRENT.tmp` naming N+1 | A staged pointer nothing reads | `CURRENT` still names N. The temp is swept. Safe |
+| 5 | Rename `CURRENT.tmp` → `CURRENT` | The rename is visible but **not yet durable** | Either outcome is safe *because the log has not been touched*: if the rename survives, folded frames are excluded by `folded_through`; if it is rolled back, `CURRENT` names N and the complete log replays onto N. Safe |
+| 6 | **fsync the data directory** | `CURRENT` durably names N+1; the log still holds every folded frame | Frames at or before N+1's `folded_through` are discarded by rule. **This is the commit point, and the step the epoch exists for.** Safe |
+| 7 | Roll the log over: stage the unfolded frames, fsync, rename over `wal.log`, fsync the directory | Either the old log (all frames) or the new one (unfolded only) | Both replay to the same state, since folded frames are excluded by rule. Safe |
+| 8 | Reclaim generation N | Both generations on disk | `CURRENT` names N+1; N is unreferenced and swept unless pinned. Safe |
 
-Two ordering rules fall out and are not negotiable: **the manifest is durable
-before `CURRENT` moves** (or a restart points at a generation whose contents
-are not proven), and **the log is truncated only after `CURRENT` moves** (or a
-crash between them loses the frames that neither side holds). Step 4 is the
-commit point; everything before it is retryable and everything after it is
-bookkeeping.
+Three ordering rules fall out, and none is negotiable:
+
+1. **The manifest is durable before `CURRENT` moves**, or a restart points at a
+   generation whose contents are not proven.
+2. **`CURRENT` is durable — written, renamed, and the directory fsynced —
+   before a single folded frame is reclaimed.** A rename is visible immediately
+   but is not crash-durable until its directory is synced, so reclaiming frames
+   between steps 5 and 6 risks the one combination that loses data: a durable
+   log reclamation against a `CURRENT` that rolls back to N, taking
+   acknowledged writes with it. Steps 5–7 exist as three steps for exactly this
+   reason.
+3. **The log is reclaimed only after that**, and by rewriting the prefix away
+   rather than truncating.
+
+Everything before step 6 is retryable; everything after it is bookkeeping.
+
+The shipped engine already follows rule 2 in the one place it applies today:
+`flush_locked` calls `write_segment`, which fsyncs the segment, renames it into
+place and fsyncs the data directory, and only then calls `Wal::reset`. The
+generation form is the same discipline over a bigger unit.
 
 An install (§Install below) commits at the same rename and inherits the same
 matrix, with the added rule that a staged generation is verified before
@@ -146,10 +170,12 @@ is what `SnapshotView` does today for spans; the generation form extends it to
 annotations and payload bytes, which a span export currently cannot pin at all.
 
 **Checkpoint.** Seal the write buffer, fold the log into the generation, write
-a manifest recording the `(epoch, sequence)` it folded through, fsync, and
-publish by renaming `CURRENT`. Truncating the log follows and is housekeeping:
-after the rename, folded frames are already excluded by sequence, so a crash
-before the truncation lands changes nothing. See the crash matrix above.
+a manifest recording the `(epoch, sequence)` it folded through, fsync it, then
+publish: stage `CURRENT.tmp`, rename it over `CURRENT`, and fsync the data
+directory. That directory fsync is the commit point. Reclaiming the folded
+prefix follows it — never before — and is housekeeping: the frames are already
+excluded by sequence, so a crash before the roll-over lands changes nothing.
+See the crash matrix above.
 
 **Verify.** Re-read a manifest and check every digest. A store can then answer
 "is this generation intact" without inferring it from whether parsing happened
@@ -179,7 +205,7 @@ the swap is one rename of a file whose contents are a single name.
 - **Recovery** becomes: load `CURRENT`, replay only the frames after its
   `folded_through`, and have one place — the manifest — that says how much of
   the log belongs to this generation, instead of inferring it from whether the
-  log happened to be truncated.
+  log happened to have been reclaimed.
 
 ## Cost, honestly
 

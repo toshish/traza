@@ -60,6 +60,13 @@ before 1.0 rather than as part of HA:
   expiry leaves the store exactly as retryable as it found it. `Wal::rewrite`
   additionally moves every fallible step before its rename, so its failure is
   never ambiguous about which log is live.
+- **A deleted segment file was reported gone before the deletion was durable.**
+  An unlink is visible immediately but survives a crash only once the directory
+  entry it removed is synced, so expiry could report a segment deleted — and
+  drop it from the live list — over a file a crash would bring back, spans and
+  all. Expiry and compaction now sync the directory after unlinking and before
+  anything downstream depends on it, and the unlink is idempotent so a retry
+  after a partial one can finish instead of failing forever on `NotFound`.
 - **Retention rewrote segments under a new id**, which moved them to the newest
   position in an order that *is* recency order — so after a partial expiry a
   re-ingested span could revert to an older version held by the rewritten
@@ -90,7 +97,13 @@ before 1.0 rather than as part of HA:
   a global `wal.log` are two recovery authorities that no rename can publish
   together, so the design now stamps every frame with the generation epoch it
   belongs to, records `folded_through` in the manifest, and replays only frames
-  after it — with an explicit checkpoint crash matrix naming the commit point.
+  after it. Publishing `CURRENT` is staged, renamed and **directory-fsynced
+  before a single folded frame is reclaimed** — a rename is not crash-durable
+  until then, and a durable log reclamation against a `CURRENT` that rolls back
+  is the one combination that loses acknowledged writes. The crash matrix
+  covers both sides of that fsync, and reclaiming folded frames is described as
+  the roll-over it has to be: they are a prefix, and truncation only removes a
+  suffix.
 
 ## [0.18.0] - 2026-07-25
 
