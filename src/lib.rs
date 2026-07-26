@@ -1137,13 +1137,21 @@ pub struct Store {
     // seal already covers everything the second one would drain — while
     // costing a duplicate copy of the same spans on disk.
     //
-    // Expiry takes it too. A seal that drained before a deletion ran would
-    // otherwise publish its segment afterwards and resurrect exactly the spans
-    // expiry just removed from the buffer, the log, and every segment it knew
-    // about. Ingest keeps flowing while expiry holds it — its seals coalesce
-    // into the next one — with one exception worth knowing about:
-    // [`Durability::Flushed`] must seal before it acknowledges, so under that
-    // mode an ingest waits out a running deletion.
+    // Both rewriters take it too, for different spans of time. Expiry holds
+    // it for its whole deletion: a seal that drained before the deletion ran
+    // would otherwise publish its segment afterwards and resurrect exactly the
+    // spans expiry just removed from the buffer, the log, and every segment it
+    // knew about. Compaction holds it only while it chooses a run and claims
+    // the ids for its outputs, because a seal holding an unpublished lower id
+    // would sort before merged output that is strictly older.
+    //
+    // Ingest mostly keeps flowing while a rewriter holds it, because a seal
+    // that cannot take it coalesces into the next one. Two paths wait instead,
+    // and both are worth knowing about: [`Durability::Flushed`] must seal
+    // before it acknowledges, and any mode blocks once the buffer has reached
+    // four times `flush_spans` (see `seal_must_not_be_skipped`), where waiting
+    // is the backpressure. Under either, an ingest waits out a running
+    // deletion — but only the microseconds of a compaction's claim.
     //
     // An ingesting thread NEVER takes this while holding the writer lock: it
     // releases the writer lock first and then seals. The order above is what
@@ -2063,11 +2071,20 @@ impl Store {
             // so while it is held here no seal is outstanding, and every seal
             // afterwards claims an id above the ones taken below.
             //
-            // **Held only long enough to choose the run and claim the ids**,
-            // microseconds, and never across the merge itself. Expiry holds
-            // this same permit for its whole deletion, which is why ingest is
-            // documented as unaffected by it — a seal that cannot take it
-            // coalesces into the next one rather than waiting.
+            // **Held only long enough to choose the run and claim the ids** —
+            // microseconds — and never across the merge itself. Acquiring it
+            // is the slow half, not holding it: a seal owns the permit from
+            // its drain through the write, the fsync, the rename, the reopen
+            // and the reconcile, so a merge arriving mid-seal waits out all
+            // of that. The wait is bounded by one seal and falls on the
+            // maintenance thread, which has nothing else to do.
+            //
+            // Most ingest is unaffected, because a seal that cannot take the
+            // permit coalesces into the next one instead of waiting. Two
+            // paths do wait: [`Durability::Flushed`], which must seal before
+            // it acknowledges, and any mode once the buffer has reached four
+            // times `flush_spans`, where waiting IS the backpressure. Both
+            // wait only on the microseconds this holds it — never on a merge.
             //
             // Declining instead — the earlier design — starved compaction
             // outright. A seal is in flight for much of the time under a
@@ -2075,8 +2092,9 @@ impl Store {
             // never found the store quiet: measured at 25,000 spans/s, one
             // tick in sixteen achieved anything and the segment count climbed
             // without bound, which is precisely what compaction exists to
-            // stop. Waiting microseconds for the permit costs nothing and
-            // makes a tick's progress independent of the write rate.
+            // stop. Waiting out a seal costs a tick one seal; declining cost
+            // it the whole tick, and made progress a function of the write
+            // rate rather than of the backlog.
             let _permit = self
                 .sealing
                 .lock()
@@ -2252,8 +2270,13 @@ impl Store {
         // clean the buffer, the log and every segment it knew about, and then
         // watch a segment land holding exactly the spans it just deleted.
         // Waiting for the permit also keeps a new seal from starting until the
-        // deletion is complete. Ingest is unaffected: it never takes this
-        // lock, its seals simply coalesce into the next one.
+        // deletion is complete. Most ingest is unaffected: it never takes this
+        // lock, and its seals simply coalesce into the next one. Two paths do
+        // wait, and this permit is held for a whole deletion rather than the
+        // microseconds compaction needs, so the wait is real —
+        // [`Durability::Flushed`] must seal before it acknowledges, and any
+        // mode blocks once the buffer reaches four times `flush_spans` (see
+        // `seal_must_not_be_skipped`).
         let _permit = self
             .sealing
             .lock()
