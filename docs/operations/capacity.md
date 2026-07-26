@@ -264,10 +264,24 @@ the same span count and the same global cardinality can differ eightfold.
 the threshold is moved to the content-addressed payload store and replaced
 inline by a reference object, so it never enters the attribute index. The
 default is 262,144 bytes, which almost no prompt reaches — lowering it to a
-few kilobytes is what takes prompt text out of RAM. It costs a file write per
-distinct value at ingest and an extra read to display one, and the reference
-object still carries a 256-character preview, so cost falls to roughly that
-preview per distinct value rather than to zero.
+few kilobytes is what takes prompt text out of RAM. Measured on the 2 KiB,
+all-distinct corpus above, the only change being `--payload-threshold-bytes
+1024`:
+
+| | Inline (default threshold) | Offloaded |
+|---|---:|---:|
+| RSS on open | 391 MiB | **81 MiB** |
+| Approx. resident index | 279 MiB | 69 MiB |
+| Segment bytes on disk | 825 MiB | 195 MiB |
+
+This does not make the cost constant — the reference object carries a
+256-character preview, which is itself distinct per value, so residency falls
+to roughly the preview rather than to zero and stays linear in distinct
+values. The saving therefore grows with value size: ~5x at 2 KiB, and
+proportionally more the larger the prompts are. It is not free at ingest
+either — each distinct value becomes a written, fsynced file, and this run
+took roughly 25 minutes against 8 seconds inline. Displaying an offloaded
+value costs an extra read.
 
 **Not indexing the attribute at all.** A user attribute whose key begins with
 a NUL byte is stored verbatim in the span and skipped by the index entirely.
