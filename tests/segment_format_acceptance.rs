@@ -130,7 +130,7 @@ fn format_conformance() {
         "the real magic must match the documented format"
     );
     assert_eq!(get_u16(&bytes, offsets::VERSION), VERSION, "format version");
-    assert_eq!(get_u16(&bytes, offsets::VERSION), 3, "format version is 3");
+    assert_eq!(get_u16(&bytes, offsets::VERSION), 4, "format version is 4");
     assert_eq!(
         usize::from(get_u16(&bytes, offsets::HEADER_LEN)),
         HEADER_LEN,
@@ -283,6 +283,78 @@ fn format_conformance() {
         "payload follows the attributes"
     );
 
+    // The v4 attribute section, hand-decoded at its documented layout: a key
+    // dictionary (u32 count, then length-prefixed names), then entries of
+    // (u32 key id, 16-byte value digest, u32 posting count, u64 postings).
+    //
+    // The point of the hand-decode is that the VALUE TEXT IS NOT THERE. That
+    // is the entire memory fix, and it is a property of the bytes, not of the
+    // reader — a reader that quietly kept a copy would still pass every query
+    // test in this file.
+    let attribute_start = get_u64(&bytes, offsets::ATTRIBUTE_INDEX_OFFSET) as usize;
+    let mut cursor = attribute_start;
+    let key_count = get_u32(&bytes, cursor) as usize;
+    cursor += 4;
+    let mut dictionary = Vec::new();
+    for _ in 0..key_count {
+        let key_len = get_u32(&bytes, cursor) as usize;
+        cursor += 4;
+        dictionary.push(std::str::from_utf8(&bytes[cursor..cursor + key_len]).expect("utf-8 key"));
+        cursor += key_len;
+    }
+    let expected_keys: std::collections::BTreeSet<&str> = records
+        .iter()
+        .flat_map(|record| record.attributes.keys().map(String::as_str))
+        .collect();
+    assert_eq!(
+        dictionary,
+        expected_keys.iter().copied().collect::<Vec<&str>>(),
+        "the key dictionary holds every distinct attribute key, sorted"
+    );
+
+    let entry_count = get_u32(&bytes, cursor) as usize;
+    cursor += 4;
+    let mut total_postings = 0usize;
+    for _ in 0..entry_count {
+        let key_id = get_u32(&bytes, cursor) as usize;
+        assert!(key_id < key_count, "entry names a key in the dictionary");
+        cursor += 4;
+        // The digest occupies exactly 16 bytes; no length prefix, because a
+        // digest has a fixed width where a value did not.
+        cursor += 16;
+        let posting_count = get_u32(&bytes, cursor) as usize;
+        cursor += 4;
+        total_postings += posting_count;
+        cursor += posting_count * 8;
+    }
+    assert_eq!(
+        cursor,
+        bytes.len(),
+        "the attribute section must account for every remaining byte"
+    );
+    assert_eq!(
+        total_postings,
+        records
+            .iter()
+            .map(|record| record.attributes.len())
+            .sum::<usize>(),
+        "every (record, attribute) pair is posted exactly once"
+    );
+
+    // No attribute VALUE may appear anywhere in the attribute section. The
+    // corpus values are distinctive enough that a substring search is a fair
+    // test, and this is the assertion that would fail if a future change
+    // reintroduced value text into the index.
+    let section = &bytes[attribute_start..];
+    for record in &records {
+        for value in record.attributes.values() {
+            assert!(
+                !contains(section, value.as_bytes()),
+                "attribute value {value:?} must not be stored in the v4 index"
+            );
+        }
+    }
+
     // Finally: the hand-parsed view and the production parser must agree.
     let parsed = Segment::from_bytes(bytes.clone())
         .expect("the real reader accepts the real encoder's output");
@@ -318,6 +390,9 @@ fn format_conformance() {
             "offset_index_length",
             "ascending_record_offsets",
             "record_encoding",
+            "attribute_key_dictionary",
+            "attribute_entries_are_digest_keyed",
+            "no_attribute_value_text_in_the_index",
             "hand_parse_matches_production_parse",
         ],
     );
@@ -506,7 +581,9 @@ fn byte_residency() {
 
     // Offsets are how records are addressed; they are recorded per record.
     assert_eq!(opened.record_offsets().len(), records.len());
-    let postings = opened.attribute_posting_offsets("service", "checkout");
+    let postings = opened
+        .attribute_candidate_offsets("service", "checkout")
+        .to_vec();
     assert_eq!(
         postings.len(),
         2,
@@ -613,18 +690,250 @@ fn foreign_bytes_are_rejected() {
 /// Built by transformation rather than kept as a fixture because a checked-in
 /// binary blob rots silently — nothing would tell us it had stopped
 /// resembling what 0.16 actually wrote.
-fn downgrade_to_v2(v3: &[u8]) -> Vec<u8> {
-    const SHIFT: u64 = (HEADER_LEN - HEADER_LEN_V2) as u64;
-    let mut header = v3[..HEADER_LEN_V2].to_vec();
-    header[8..10].copy_from_slice(&2_u16.to_le_bytes());
-    header[10..12].copy_from_slice(&(HEADER_LEN_V2 as u16).to_le_bytes());
-    for offset_field in [24_usize, 40, 56, 72] {
-        let value = get_u64(v3, offset_field) - SHIFT;
-        header[offset_field..offset_field + 8].copy_from_slice(&value.to_le_bytes());
+/// Builds a genuinely OLD segment: a v2 or v3 header over the pre-v4
+/// attribute section, which stored attribute value TEXT rather than a digest.
+///
+/// An earlier version of this helper only rewrote the header and kept the
+/// current section bytes, which tested nothing about reading old files — the
+/// result was a version number the engine had never actually written. Real
+/// legacy bytes are what exercise the upgrade-on-open path, and that path is
+/// the reason `MIN_READABLE_VERSION` is still 2.
+fn encode_legacy(records: &[RecordInput], version: u16) -> Vec<u8> {
+    assert!((2..=3).contains(&version), "legacy means v2 or v3");
+    let current = segment::encode(records).expect("encode");
+    let attribute_start = get_u64(&current, offsets::ATTRIBUTE_INDEX_OFFSET) as usize;
+    let offsets_offset = get_u64(&current, offsets::OFFSETS_OFFSET) as usize;
+
+    // Rebuild the postings against the real record offsets, then write them
+    // in the pre-v4 encoding: key text, value text, then the offsets.
+    let mut index: BTreeMap<(&str, &str), Vec<u64>> = BTreeMap::new();
+    for (ordinal, record) in records.iter().enumerate() {
+        let offset = get_u64(&current, offsets_offset + ordinal * 8);
+        for (key, value) in &record.attributes {
+            index
+                .entry((key.as_str(), value.as_str()))
+                .or_default()
+                .push(offset);
+        }
     }
-    let mut out = header;
-    out.extend_from_slice(&v3[HEADER_LEN..]);
+    let mut section = Vec::new();
+    section.extend_from_slice(&(index.len() as u32).to_le_bytes());
+    for ((key, value), postings) in &index {
+        section.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        section.extend_from_slice(key.as_bytes());
+        section.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        section.extend_from_slice(value.as_bytes());
+        section.extend_from_slice(&(postings.len() as u32).to_le_bytes());
+        for offset in postings {
+            section.extend_from_slice(&offset.to_le_bytes());
+        }
+    }
+
+    // Records, record offsets, and the trace index are unchanged from v3, so
+    // reuse the real encoder's bytes for them and swap only the tail.
+    let mut out = current[..attribute_start].to_vec();
+    out.extend_from_slice(&section);
+    out[8..10].copy_from_slice(&version.to_le_bytes());
+    if version == 2 {
+        // v2 has no timestamp range, so its header is 16 bytes shorter and
+        // every section slides down by that much.
+        const SHIFT: u64 = (HEADER_LEN - HEADER_LEN_V2) as u64;
+        let mut header = out[..HEADER_LEN_V2].to_vec();
+        header[10..12].copy_from_slice(&(HEADER_LEN_V2 as u16).to_le_bytes());
+        for offset_field in [24_usize, 40, 56, 72] {
+            let value = get_u64(&out, offset_field) - SHIFT;
+            header[offset_field..offset_field + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        let mut shifted = header;
+        shifted.extend_from_slice(&out[HEADER_LEN..]);
+        return shifted;
+    }
     out
+}
+
+/// Whether `haystack` contains `needle` as a contiguous byte run.
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack.len() >= needle.len()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+}
+
+/// Rewrites the v4 attribute section so every entry posts every record — the
+/// shape a digest collision produces, made deterministic.
+///
+/// A 128-bit digest will not collide naturally inside a test, or inside a
+/// human lifetime of running Traza. That is exactly why the safety argument
+/// cannot be left to chance: no test that merely queries a normal segment can
+/// tell a verifying reader from a trusting one. Forging the collision is the
+/// only way to make the difference observable.
+fn forge_digest_collisions(bytes: &[u8], record_count: usize) -> Vec<u8> {
+    let attribute_start = get_u64(bytes, offsets::ATTRIBUTE_INDEX_OFFSET) as usize;
+    let offsets_offset = get_u64(bytes, offsets::OFFSETS_OFFSET) as usize;
+    let all: Vec<u64> = (0..record_count)
+        .map(|ordinal| get_u64(bytes, offsets_offset + ordinal * 8))
+        .collect();
+
+    let mut cursor = attribute_start;
+    let key_count = get_u32(bytes, cursor) as usize;
+    cursor += 4;
+    let dictionary_start = cursor;
+    for _ in 0..key_count {
+        cursor += 4 + get_u32(bytes, cursor) as usize;
+    }
+    let dictionary = &bytes[dictionary_start..cursor];
+    let entry_count = get_u32(bytes, cursor) as usize;
+    cursor += 4;
+
+    let mut section = Vec::new();
+    section.extend_from_slice(&(key_count as u32).to_le_bytes());
+    section.extend_from_slice(dictionary);
+    section.extend_from_slice(&(entry_count as u32).to_le_bytes());
+    for _ in 0..entry_count {
+        section.extend_from_slice(&bytes[cursor..cursor + 4]); // key id
+        cursor += 4;
+        section.extend_from_slice(&bytes[cursor..cursor + 16]); // digest
+        cursor += 16;
+        let posting_count = get_u32(bytes, cursor) as usize;
+        cursor += 4 + posting_count * 8;
+        section.extend_from_slice(&(all.len() as u32).to_le_bytes());
+        for offset in &all {
+            section.extend_from_slice(&offset.to_le_bytes());
+        }
+    }
+    assert_eq!(cursor, bytes.len(), "consumed the whole attribute section");
+
+    let mut out = bytes[..attribute_start].to_vec();
+    out.extend_from_slice(&section);
+    out
+}
+
+#[test]
+fn a_digest_collision_cannot_produce_a_wrong_row() {
+    // The v4 index answers with candidates, so correctness rests entirely on
+    // the reader checking each candidate against the record it points at.
+    // Here every posting list names every record; a reader that trusted the
+    // index would return all three rows for every query.
+    let records = corpus();
+    let honest = segment::encode(&records).expect("encode");
+    let forged = forge_digest_collisions(&honest, records.len());
+
+    let segment = Segment::from_bytes(forged).expect("the forged segment still parses");
+
+    let checkout = segment
+        .query_attribute("service", "checkout")
+        .expect("attribute query");
+    assert_eq!(
+        checkout.len(),
+        2,
+        "verification must discard the candidates that do not hold the value"
+    );
+    assert!(checkout
+        .iter()
+        .all(|record| record.attributes()["service"] == "checkout"));
+
+    let billing = segment
+        .query_attribute("service", "billing")
+        .expect("attribute query");
+    assert_eq!(billing.len(), 1);
+    assert_eq!(billing[0].payload(), b"third");
+
+    // A value no record holds must come back empty even though the index
+    // offers a full posting list for its key.
+    assert_eq!(
+        segment
+            .query_attribute("status", "cancelled")
+            .expect("miss")
+            .len(),
+        0,
+        "a candidate list must never invent a match"
+    );
+
+    // The unverified surface is honest about what it returns: three
+    // candidates, which is what makes the check above load-bearing.
+    assert_eq!(
+        segment
+            .attribute_candidate_offsets("service", "checkout")
+            .len(),
+        3,
+        "the probe itself is a superset, by construction"
+    );
+
+    evidence(
+        "collision_safety",
+        &[
+            "forged_collision_parses",
+            "query_attribute_verifies_candidates",
+            "absent_value_returns_empty",
+            "probe_is_a_superset",
+        ],
+    );
+}
+
+#[test]
+fn an_old_segments_value_text_is_dropped_when_it_is_opened() {
+    // v2 and v3 stored attribute values as text. Opening one must not carry
+    // that text into memory — otherwise the memory fix applies only to data
+    // written after the upgrade, and an operator's existing store keeps
+    // paying the old cost until every segment happens to be rewritten.
+    let records = corpus();
+    for version in [2_u16, 3] {
+        let bytes = encode_legacy(&records, version);
+        assert_eq!(
+            get_u16(&bytes, offsets::VERSION),
+            version,
+            "fixture really is v{version}"
+        );
+        // Sanity: the fixture genuinely contains the old value text, so the
+        // assertion below is testing the reader rather than an empty section.
+        let attribute_start = get_u64(&bytes, offsets::ATTRIBUTE_INDEX_OFFSET) as usize;
+        assert!(
+            contains(&bytes[attribute_start..], b"checkout"),
+            "the v{version} fixture must actually store value text"
+        );
+
+        let segment = Segment::from_bytes(bytes).expect("an old segment still opens");
+
+        // Queries still work, through the digest index built at open time.
+        let found = segment
+            .query_attribute("service", "checkout")
+            .expect("attribute query");
+        assert_eq!(found.len(), 2, "v{version} attribute lookup still resolves");
+        assert!(
+            found
+                .iter()
+                .all(|record| record.attributes()["service"] == "checkout"),
+            "no foreign value may leak through the upgraded index"
+        );
+        assert_eq!(
+            segment
+                .query_attribute("service", "absent")
+                .expect("miss")
+                .len(),
+            0
+        );
+
+        // And the resident index is the small one. Three records with two
+        // attributes each cannot exceed a few hundred bytes of postings and
+        // dictionary; the old form would additionally hold every value.
+        assert_eq!(
+            segment.attribute_index_len(),
+            4,
+            "four distinct (key, value) pairs in the corpus"
+        );
+    }
+
+    evidence(
+        "legacy_upgrade",
+        &[
+            "v2_opens",
+            "v3_opens",
+            "value_text_present_in_fixture",
+            "attribute_query_resolves_after_upgrade",
+            "upgraded_index_cardinality",
+        ],
+    );
 }
 
 #[test]
@@ -635,9 +944,9 @@ fn a_v2_segment_still_reads_and_is_never_skipped_by_a_time_filter() {
     // is data loss that looks like an empty result.
     let records = corpus();
     let v3 = segment::encode(&records).expect("encode");
-    let v2 = downgrade_to_v2(&v3);
+    let v2 = encode_legacy(&records, 2);
 
-    assert_eq!(get_u16(&v2, offsets::VERSION), 2, "downgraded to v2");
+    assert_eq!(get_u16(&v2, offsets::VERSION), 2, "encoded as v2");
     assert_eq!(
         usize::from(get_u16(&v2, offsets::HEADER_LEN)),
         HEADER_LEN_V2

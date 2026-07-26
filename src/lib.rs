@@ -10,6 +10,7 @@ pub mod analytics;
 pub mod annotations;
 pub mod auth;
 pub mod expiration;
+pub mod hash;
 mod media;
 pub mod metrics;
 pub mod otlp;
@@ -1433,7 +1434,7 @@ pub(crate) fn attribute_union_view(
         for key in keys {
             for value in values {
                 offsets.extend_from_slice(
-                    seg.attribute_posting_offsets_ref(key, &canonical_value(value)),
+                    seg.attribute_candidate_offsets(key, &canonical_value(value)),
                 );
             }
         }
@@ -2853,7 +2854,10 @@ fn order_spans(spans: &mut [Span], sort: Option<SpanSort>) {
 /// discards them. Adding a precise filter to a service query made it slower.
 ///
 /// Posting lists are already materialized in the index, so their lengths are
-/// exact, not estimated — the smallest one is genuinely the least work.
+/// counted, not estimated — the smallest one is genuinely the least work.
+/// (Since segment v4 a list is a digest-keyed CANDIDATE set, so a length is
+/// an upper bound rather than a match count. The gap is a collision away from
+/// zero, and every candidate is checked by `span_matches` regardless.)
 fn select_probe<'a>(seg: &'a segment::Segment, filter: &SpanFilter) -> &'a [u64] {
     let mut best: Option<&'a [u64]> = None;
     let mut consider = |offsets: &'a [u64]| {
@@ -2864,10 +2868,10 @@ fn select_probe<'a>(seg: &'a segment::Segment, filter: &SpanFilter) -> &'a [u64]
         }
     };
     if let Some(service) = &filter.service {
-        consider(seg.attribute_posting_offsets_ref(IDX_SERVICE, service));
+        consider(seg.attribute_candidate_offsets(IDX_SERVICE, service));
     }
     if let Some(name) = &filter.name {
-        consider(seg.attribute_posting_offsets_ref(IDX_NAME, name));
+        consider(seg.attribute_candidate_offsets(IDX_NAME, name));
     }
     for (key, value) in &filter.attributes {
         // Session keys are expanded by the caller into a union and cannot
@@ -2875,7 +2879,7 @@ fn select_probe<'a>(seg: &'a segment::Segment, filter: &SpanFilter) -> &'a [u64]
         if key.starts_with('\u{0}') {
             continue;
         }
-        consider(seg.attribute_posting_offsets_ref(key, &canonical_value(value)));
+        consider(seg.attribute_candidate_offsets(key, &canonical_value(value)));
     }
     // Nothing indexable: every record is a candidate.
     best.unwrap_or_else(|| seg.record_offsets())
