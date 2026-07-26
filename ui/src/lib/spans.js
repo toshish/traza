@@ -34,6 +34,64 @@ export function waterfallOrder(spans) {
 
 /** True when an attribute/event value is an offloaded-payload reference:
     {"$payload": "sha256/…", "bytes": N, "preview": "…"}. */
+/** Time a span spent in itself rather than waiting on its children.
+
+    A waterfall shows where time went; without self time it only shows where
+    time was, and a 8s root that spent 7.9s in one child looks identical to
+    one that spent 8s of its own. Overlapping children are unioned rather than
+    summed — concurrent tool calls are the normal case in an agent trace, and
+    summing them would report negative self time. */
+export function selfTimeNs(span, children) {
+  const total = span.end_time_ns - span.start_time_ns;
+  if (!children || !children.length) return total;
+  const intervals = children
+    .map((child) => [child.start_time_ns, child.end_time_ns])
+    .sort((a, b) => a[0] - b[0]);
+  let covered = 0;
+  let [start, end] = intervals[0];
+  for (const [from, to] of intervals.slice(1)) {
+    if (from > end) { covered += end - start; [start, end] = [from, to]; }
+    else if (to > end) end = to;
+  }
+  covered += end - start;
+  return Math.max(0, total - covered);
+}
+
+/** The chain of spans that determines the trace's duration.
+
+    At each level the critical path follows the child that finishes last:
+    shortening anything off this path cannot make the trace faster, which is
+    the only thing worth knowing when a run is too slow. */
+export function criticalPath(spans) {
+  if (!spans.length) return new Set();
+  const byParent = new Map();
+  for (const span of spans) {
+    const key = span.parent_span_id || '';
+    if (!byParent.has(key)) byParent.set(key, []);
+    byParent.get(key).push(span);
+  }
+  const roots = spans.filter((s) => !s.parent_span_id || !spans.some((o) => o.span_id === s.parent_span_id));
+  const path = new Set();
+  let current = roots.sort((a, b) => (b.end_time_ns - b.start_time_ns) - (a.end_time_ns - a.start_time_ns))[0];
+  while (current) {
+    path.add(current.span_id);
+    const children = byParent.get(current.span_id) || [];
+    current = children.sort((a, b) => b.end_time_ns - a.end_time_ns)[0];
+  }
+  return path;
+}
+
+/** Children of each span, keyed by parent span id. */
+export function childrenOf(spans) {
+  const map = new Map();
+  for (const span of spans) {
+    if (!span.parent_span_id) continue;
+    if (!map.has(span.parent_span_id)) map.set(span.parent_span_id, []);
+    map.get(span.parent_span_id).push(span);
+  }
+  return map;
+}
+
 export function isPayloadRef(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
     && typeof value.$payload === 'string';
