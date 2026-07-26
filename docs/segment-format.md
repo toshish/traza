@@ -1,4 +1,4 @@
-# Segment Format v2: indexed segments
+# Segment Format v5: indexed segments
 
 The shipped layout is described first; the original v0.3 design proposal is
 retained below it as history. **The proposal does not describe the format that
@@ -12,15 +12,16 @@ Verified against `src/segment.rs` (`Header::parse_with_total` and `encode`) and
 pinned by `tests/segment_format_acceptance.rs`.
 
 A segment is one file named `segment-<20-digit id>.seg`, written temp + fsync +
-atomic rename. It is a fixed 80-byte header followed by four contiguous
+atomic rename. It is a fixed 104-byte header followed by five contiguous
 sections, in this order, with no gaps and nothing trailing:
 
 ```
-[ 80-byte header ]
-[ records        ]  encoded records, ascending timestamp order
-[ record offsets ]  u64 per record, relative to the record region
-[ trace index    ]  trace id -> record offsets
-[ attribute index]  (key, value) -> record offsets; runs to EOF
+[ 104-byte header ]
+[ records         ]  encoded records, ascending timestamp order
+[ record offsets  ]  u64 per record, relative to the record region
+[ trace index     ]  trace id -> record offsets
+[ attribute index ]  (key id, value digest) -> record offsets
+[ content index   ]  word filters per 128-record block; runs to EOF
 ```
 
 Header fields, little-endian, at fixed byte offsets:
@@ -28,8 +29,8 @@ Header fields, little-endian, at fixed byte offsets:
 | Offset | Size | Field |
 |---:|---:|---|
 | 0 | 8 | magic, `TRAZASEG` |
-| 8 | 2 | format version (`2`) |
-| 10 | 2 | header length (`80`) |
+| 8 | 2 | format version (`5`) |
+| 10 | 2 | header length (`104`) |
 | 12 | 4 | reserved, zero |
 | 16 | 8 | record count |
 | 24 | 8 | records offset |
@@ -39,26 +40,124 @@ Header fields, little-endian, at fixed byte offsets:
 | 56 | 8 | trace index offset |
 | 64 | 8 | trace index length |
 | 72 | 8 | attribute index offset |
+| 80 | 8 | minimum record timestamp (v3+) |
+| 88 | 8 | maximum record timestamp (v3+) |
+| 96 | 8 | content index offset (v5+) |
 
-The attribute index has no stored length: it runs from its offset to EOF, so
-its length is derived from the file size. The reader rejects a segment whose
+Neither the attribute index nor the content index stores its own length. The
+attribute index is bounded by where the content index begins; the content
+index runs to EOF. (Before v5 the attribute index itself ran to EOF, which is
+why adding a fifth section needed a header field.) The reader rejects a segment whose
 sections are not contiguous from the end of the header, whose record-offset
 index is not exactly `record_count * 8` bytes, or whose sections exceed the
 file.
 
 Each record is: timestamp `u64`, trace-id length `u32`, attribute count `u32`,
 payload length `u32`, reserved `u32`, then the trace id, then that many
-length-prefixed key/value pairs, then the opaque payload.
+length-prefixed key/value pairs, then the opaque payload. **Records carry
+attribute value text; the index does not.**
 
-`Segment::open` reads only the header and the three index sections into memory;
-record payloads stay on disk and are read by exact byte range on demand. That
-is what makes stores larger than RAM serveable.
+### The attribute index
+
+```
+u32                     key count
+  u32 + bytes           each attribute key name, length-prefixed
+u32                     entry count
+  u32                   key id (index into the dictionary above)
+  16 bytes              digest of (key, value), see src/hash.rs
+  u32                   posting count
+  u64 × posting count   record offsets, ascending
+```
+
+Entries are written in `(key id, digest)` order, and the dictionary in sorted
+key order, so encoding the same records twice produces identical bytes.
+
+Keys are interned because they are a schema — tens of them, repeated on every
+span, and an operator needs their names to read a cost report. Values are
+replaced by a digest because they are data: unbounded in size, and for LLM
+traffic they *are* the corpus. Through v3 the index stored value text, and a
+store of prompts therefore held every prompt in RAM for the life of the
+segment. See [capacity](operations/capacity.md#memory) for what that cost.
+
+**A digest probe returns candidates, not matches.** Every caller must check a
+decoded record against the filter before returning it;
+`Segment::attribute_candidate_offsets` is named to make that unmissable, and
+`tests/segment_format_acceptance.rs` forges a collision to prove the check is
+load-bearing. A 128-bit digest will not collide naturally, which is exactly
+why the safety argument cannot rest on a passing query test.
+
+### The content index
+
+Answers "which spans mention this word" without storing the words.
+
+```
+u32   reserved, zero
+u32   records per block (128)
+u32   block count (0 means: no content index, see below)
+u32   hashes per token (4)
+u64   summary filter size in bits
+u64   block filter size in bits
+[ summary filter    ]  one Bloom over every token in the segment
+[ bit-sliced blocks ]  one ROW per bit position, one BIT per block
+```
+
+Records are grouped into blocks of 128. Each block has a Bloom filter over the
+distinct tokens of its records' text, and those filters are stored
+**transposed**: row *p* holds bit *p* of every block's filter.
+
+That transposition is the whole design. Stored per block, testing one word
+against a segment means reading every block's entire bitmap — hundreds of
+kilobytes to look at a handful of bits. Stored as rows, the same test is one
+read of `block_count` bits, so a two-word query reads tens of bytes per
+segment. Only the summary filter is held resident, capped at 32 KiB, which is
+why the content index's memory cost scales with segment count and not with how
+much text a store holds.
+
+Tokens are maximal runs of ASCII alphanumerics, lowercased, truncated at 40
+bytes; the tokenizer and the bit derivation are format constants pinned by
+test in `src/content.rs`.
+
+**A block filter admits candidates, never answers.** Bloom filters have false
+positives, and a block is 128 records wide, so most admitted records will not
+match; `content::Query::matches` against the decoded span decides. This also
+fixes the feature's semantics: content search is WORD search, because a word
+index cannot soundly over-approximate a substring search. Searching `refund`
+against a span reading `refunds were issued` would be skipped by the filter
+while a substring match would have returned it — a wrong answer, not a slow
+one. See `src/content.rs` for the full argument.
+
+**`block_count = 0` means the index is absent, not empty.** A segment written
+before v5, one whose records carry no indexable text, or one written with
+`--no-content-index` must be SCANNED by a content query. Reading absence as
+"holds nothing" would make content search silently return no rows — the same
+trap as v2's missing timestamp range.
+
+`Segment::open` reads only the header, the three index sections, and the
+content index's prologue and summary filter into memory; record payloads and
+the bit-sliced block rows stay on disk and are read by exact byte range on
+demand. That is what makes stores larger than RAM serveable.
 
 ### Compatibility
 
 v1 JSONL segments are **not** readable. `Store::open` refuses a directory
 containing a `.jsonl` segment with an error pointing at traza 0.3.x for
 migration — failing loudly beats silently hiding persisted data.
+
+Versions 2, 3 and 4 are readable and need no migration step:
+
+- **v2** has an 80-byte header and no timestamp range. A query treats its
+  range as unknown, which means "cannot rule this segment out" — never
+  "empty". Reading it as empty would drop every v2 segment from every
+  time-filtered query, which is data loss that looks like a normal result.
+- **v2 and v3** store attribute value text in the index. Their values are
+  hashed and discarded while the segment is opened, so an existing store gets
+  the v4 steady-state memory cost without being rewritten. Peak memory *during*
+  that open is still the old cost, bounded by one segment.
+- **v2, v3 and v4** carry no content index. A content query scans them rather
+  than skipping them: the same rows come back, at the cost of a scan.
+
+New segments are always written at v5, including those produced by compaction,
+so a store converts as it merges.
 
 ---
 

@@ -55,9 +55,15 @@ export function windowOf(range, now = Date.now()) {
   return { sinceNs: (now - found.ms) * 1e6, untilNs: now * 1e6 };
 }
 
-/** An empty query: no predicates, last hour, newest first. */
+/** An empty query: no text, no predicates, last hour, newest first.
+
+    `content` is a field rather than a predicate on purpose. It is the one
+    filter somebody reaches for without already knowing the schema, so it gets
+    its own full-width control above the builder instead of being one row among
+    several — and it is word matching, not a substring or a phrase, which no
+    predicate operator would say correctly. */
 export function emptyQuery() {
-  return { preds: [], range: '1h', sort: '', limit: 100 };
+  return { content: '', preds: [], range: '1h', sort: '', limit: 100 };
 }
 
 /** Turns predicates into API parameters.
@@ -67,6 +73,7 @@ export function emptyQuery() {
     attribute, and the old single-pair form could not say it at all. */
 export function toParams(q, { includeWindow = true, extra = {} } = {}) {
   const params = {};
+  if (q.content && q.content.trim()) params.content = q.content.trim();
   const push = (key, value) => {
     if (value === '' || value == null) return;
     if (params[key] === undefined) params[key] = value;
@@ -116,6 +123,10 @@ const unescape = (text) => String(text).replace(/%([0-9a-f]{2})/gi, (_, hex) => 
 /** Serializes a query into hash-route parameters. */
 export function toHash(q) {
   const out = {};
+  // `c`, not `q`: the hash already spends `q` on the predicate list, and the
+  // API spends it as its own alias for content. Separate namespaces, but one
+  // letter meaning two things in the same URL is a trap for the next reader.
+  if (q.content && q.content.trim()) out.c = q.content.trim();
   if (q.preds && q.preds.length) {
     out.q = q.preds
       .filter((p) => String(p.value ?? '') !== '' || p.field === 'status')
@@ -131,6 +142,7 @@ export function toHash(q) {
 /** Reads a query back out of hash-route parameters. */
 export function fromHash(params) {
   const q = emptyQuery();
+  if (params.get('c')) q.content = params.get('c');
   const raw = params.get('q');
   if (raw) {
     q.preds = raw.split(P_SEP).filter(Boolean).map((chunk) => {

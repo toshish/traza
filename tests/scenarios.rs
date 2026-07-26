@@ -36,6 +36,7 @@ fn store_with_corpus(label: &str, options: &SeedOptions) -> (Store, traza::seed:
             durability: traza::Durability::Buffered,
             compaction: None,
             wal_commit_window: None,
+            content_index: true,
             flush_wal_bytes: None,
         },
     )

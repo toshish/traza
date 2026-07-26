@@ -3,17 +3,23 @@
 //! The store's stated memory rule was "O(indexes), not O(data)": segments are
 //! file-backed, only their parsed indexes stay resident, payloads are read on
 //! demand. Every clause of that is true. What it does not say is how large
-//! "indexes" gets, and for LLM traffic that is the whole question, because
-//! `Segment` keys its attribute index on the **entire attribute value**:
+//! "indexes" gets, and for LLM traffic that used to be the whole question,
+//! because through segment v3 `Segment` keyed its attribute index on the
+//! **entire attribute value**:
 //!
 //! ```text
 //! attribute_index: HashMap<(String, String), Vec<u64>>
 //! ```
 //!
-//! Every distinct prompt or completion short enough to stay inline is
+//! Every distinct prompt or completion short enough to stay inline was
 //! therefore pinned in RAM, in full, for the life of the segment. This
-//! harness measures that, and it is built around three ways the measurement
-//! could quietly lie:
+//! harness is what measured that. Segment v4 keys the index on a 128-bit
+//! digest instead, so the cost now tracks how MANY distinct values a segment
+//! holds rather than how large they are — and this harness is what has to
+//! keep that claim honest, since the two are indistinguishable on any corpus
+//! whose values are short.
+//!
+//! It is built around three ways the measurement could quietly lie:
 //!
 //! - **`Store::resident_payload_bytes()` reports zero by design.** It counts
 //!   the payload encoding and deliberately excludes indexes, so measuring

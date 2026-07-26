@@ -7,8 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Segment format v4: the attribute index is keyed by digest, not by value
+  text.** Through v3 the index held every distinct attribute value resident,
+  in full, for the life of the segment. For enum-shaped attributes that costs
+  nothing; for the data Traza exists to store it was fatal — an indexed
+  `gen_ai.prompt` is kilobytes, every value is distinct, and the resident
+  index therefore grew to roughly the size of the corpus text. A store that
+  reads records from disk on demand specifically so it can outgrow RAM was
+  pulling the largest part of each record back into RAM through its own index.
+
+  v4 interns attribute keys and replaces each value with a 128-bit digest, so
+  an entry costs the same for a status code and for a page of text. Measured
+  before and after on the same machine and command, 256 MiB of all-distinct
+  text: **391 MiB → 21.6 MiB** RSS on open at 2 KiB values, **439 MiB →
+  77.5 MiB** at 512 B. The 512 B cell is dearer because it holds four times as
+  many spans — cost tracks cardinality now, which is the point.
+
+  A digest probe returns candidates, so `attribute_posting_offsets_ref` is now
+  `attribute_candidate_offsets` and `Segment::query_attribute` verifies. At
+  128 bits nothing collides naturally, which means no ordinary test can tell a
+  verifying reader from a trusting one; the acceptance target forges the
+  collision instead.
+
+  v2 and v3 segments still open — their values are hashed and discarded at
+  open time, so an existing store gets the smaller steady state without being
+  rewritten.
+
 ### Added
 
+- **Content search: `GET /v1/spans?content=refund`.** Finds spans by the words
+  in their text — string attributes, nested message arrays, event attributes
+  and event names. Segment format v5 carries a Bloom filter over the words in
+  each 128-record block, stored bit-sliced (one row per bit position spanning
+  all blocks) so a probe reads tens of bytes per segment instead of every
+  block's whole bitmap. Only a per-segment summary filter is resident, capped
+  at 32 KiB, so the cost scales with segment count and not with text volume.
+
+  Measured against the same corpus with the index off, 200,000 spans holding
+  145 MiB of text: a word in one span **1.48 ms vs 1,258 ms (849x)**, two words
+  **0.74 ms vs 1,156 ms (1,554x)**, a word in no span **0.008 ms (146,000x)**,
+  and a word in nearly every span **1.0x** — with no selectivity to buy there
+  is nothing to win, and that row is published alongside the others. Disk cost
+  +0.1%, resident ~2 KiB per segment.
+
+  **It is word matching, not substring matching, and not phrase matching.**
+  `refund` does not match `refunds`. That is a soundness requirement rather
+  than a limitation of effort: a word index cannot over-approximate a
+  substring query, so driving one with it would skip spans that should have
+  matched — a wrong answer instead of a slow one.
+
+  `--no-content-index` / `Config::content_index` turns it off; content search
+  still works, by scanning.
+
+- **`traza_segments_pruned_by_content_total`** and
+  **`traza_records_admitted_by_content_total`** in `/v1/metrics`. A content
+  index that stops pruning returns byte-identical results and simply gets
+  slower, so these counters are the only way to see it happen.
 - **`status=` and `not_status=` on span search.** Every aggregate in the store
   counted errors from `Span::status`, but nothing could select on it: the
   filter walked `span.attributes` only. The natural-looking `attr.status=error`
@@ -59,6 +115,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Widening `--wal-commit-window-us` from off to 2,000 cut fsyncs 40% and the
   mean append 57%. Documented in the configuration reference: the lever for a
   large `wal_write` is fsync frequency, not the engine's locking.
+- **`INDEX-MEM-BENCHMARK.md` and `INDEX-MEM-BENCHMARK.json`** — the committed
+  measurement record behind the memory figures, with commit SHA, machine,
+  timestamp, load average per row, `compacted_away`, and the raw per-cell
+  results. The prose numbers were previously traceable only to a binary.
 
 ### Changed
 
@@ -96,6 +156,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A store under sustained ingest was never compacted.** A merge declined
+  outright when a seal held a claimed-but-unpublished segment id, rather than
+  waiting for it. The guard is a correctness requirement — that seal publishes
+  newer data under a lower id, and merged output taking a higher one would
+  outrank it, inverting last-write-wins — but declining made compaction
+  hostage to the write rate. A seal is in flight for much of the time under
+  load, so a tick that checked once and gave up almost never found the store
+  quiet: measured at 25,000 spans/s, **one tick in sixteen achieved anything**
+  and the segment count grew without bound (14 to 215 in six seconds) while
+  compaction ran on schedule and did nothing. It recovered the instant writes
+  paused, which is why the effect is invisible on an idle store and total on a
+  busy one — the case compaction exists for.
+
+  A merge now takes the seal permit instead of testing a counter, **held**
+  only long enough to choose a run and claim its output ids. Acquiring it is
+  the slow half: a seal owns the permit from drain through write, fsync,
+  rename, reopen and reconcile, so a merge arriving mid-seal waits out all of
+  that — bounded by one seal, and on the maintenance thread. Expiry already
+  takes the same permit and holds it for a whole deletion.
+
+  Most ingest is unaffected, because a seal that cannot take the permit
+  coalesces into the next one. Two paths wait rather than coalesce:
+  `Durability::Flushed`, which must seal before it acknowledges, and any mode
+  once the buffer reaches four times `flush_spans`, where waiting is the
+  backpressure. Both wait only on the microseconds a merge holds the permit,
+  never on the merge itself.
+
+  Under the same load every tick now compacts, and the segment count stays
+  bounded — oscillating between 15 and 80 over six seconds, against 14 climbing
+  to 215 before. The `unpublished_seals` counter is gone; the permit is what it
+  was approximating.
+
+  Choosing the run moved inside those guards too. Scanning first and then
+  re-checking under the lock left a window for a seal to land and make the
+  answer stale, which retired the whole tick.
+
+  And a tick is now bounded to the backlog it **found**: segments sealed after
+  it started are left for the next one. Without that, merging kept pace with
+  arrivals and a single call ran until the writes stopped — 2,213 segments
+  merged away and still going.
 - **The index-memory benchmark's "peak RSS" was not a peak.** It took one RSS
   sample after `compact_segments()` returned — after the merge has freed its
   working set — so it measured the trough and the capacity guide published it
@@ -165,13 +265,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   recovery must roll forward instead. A journal that saw one input at a time
   could not tell those apart and would delete live segments holding the only
   copy of an input already removed.
-
-### Added
-
-- **`INDEX-MEM-BENCHMARK.md` and `INDEX-MEM-BENCHMARK.json`** — the committed
-  measurement record behind the memory figures, with commit SHA, machine,
-  timestamp, load average per row, `compacted_away`, and the raw per-cell
-  results. The prose numbers were previously traceable only to a binary.
 
 ## [0.19.0] - 2026-07-25
 

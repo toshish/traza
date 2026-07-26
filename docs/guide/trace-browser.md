@@ -94,12 +94,19 @@ The comparison is one request: the window is fetched as
 
 ## Traces
 
-`#/traces` — span search built on a **predicate list** rather than a fixed
-form. Each row is field / operator / value, and the operator picks the
-parameter family: `=` is `attr.KEY`, `≠` is `not_attr.KEY`, `≥` and `≤` are
-`min_attr` / `max_attr`. Two predicates on one key send it twice, which the
-old single-pair form could not express at all. `status` maps to the span's own
-status field, not an attribute.
+`#/traces` — text search over a predicate builder.
+
+**Content search takes the full width and the first position**, because it is
+the one filter you can use without already knowing the schema. It maps to
+[`GET /v1/spans?content=`](http-api.md#content-search-content): word matching,
+not substring and not a phrase, so `refund` finds "Refund the order" and not
+"refunds", and several words are ANDed in any order. `/` focuses it.
+
+Below it, a **predicate list** rather than a fixed form. Each row is field /
+operator / value, and the operator picks the parameter family: `=` is
+`attr.KEY`, `≠` is `not_attr.KEY`, `≥` and `≤` are `min_attr` / `max_attr`. Two
+predicates on one key send it twice, which the old single-pair form could not
+express at all. `status` maps to the span's own status field, not an attribute.
 
 Above the table: a **volume chart you can drag** to set the window, and the
 range presets. Below it, the **query cost** — how long the query took, how
