@@ -418,6 +418,23 @@ waiting; when seals are frequent enough to be the bottleneck, there is nothing
 for it to amortize. This is why the two are set together and why setting the
 window alone is close to a no-op.
 
+**That was measured before sealing moved off the writer lock (v0.19.0), and
+the window has a second effect that measurement could not see.** An `fsync` in
+flight blocks concurrent `write` calls to the same file in the kernel, so
+fsync frequency sets the cost of the log *append*, not just the cost of the
+sync. Measured at concurrency 8 on an otherwise identical load: the same
+append costs **0.076 ms at concurrency 1 and 1.778 ms at concurrency 8** — a
+23x slowdown of one syscall, with Traza's own log lock measured at zero wait,
+so the serialization is the kernel's and not the engine's. Widening the window
+from off to 2,000 µs cut fsyncs by 40% (112 to 67) and the mean append by
+**57%** (2.761 to 1.176 ms).
+
+So on a write-heavy deployment the window buys back append time as well as
+sync time. `traza_wal_write_syscall_ns_*` and `traza_wal_lock_wait_ns_*` in
+[`/v1/metrics`](operations/monitoring.md) separate the two: a large
+`wal_write` with a near-zero `wal_lock_wait` is the kernel serializing against
+fsync, and the lever for it is fsync frequency, not the engine.
+
 **Batch size dominates the window's value.** The window's benefit scales with
 how many batches arrive during it. At batch 1000 a 500 µs window collects
 almost nothing; the effect is large only when batches are small and frequent.

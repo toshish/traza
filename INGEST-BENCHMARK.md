@@ -214,20 +214,18 @@ The block below is written by the benchmark itself; everything outside the
 markers is analysis and survives a re-run.
 
 <!-- BEGIN GENERATED -->
-Every row is the MEDIAN of 2 runs, each on a fresh data directory. Scenarios are run ROUND-ROBIN rather than one at a time, and their order is ROTATED each round, so each scenario's repeats are spread across the whole wall-clock window and across positions within a round. Background load then hits all of them alike instead of landing on whichever ran during a spike or whichever is pinned to the same phase of a periodic load. Payloads are generated before the clock starts, so these are server rates; client encoding is reported separately. Runs that saw a failed batch or a shed connection are reported as failures rather than as numbers.
+Every row is the MEDIAN of 1 runs, each on a fresh data directory. Scenarios are run ROUND-ROBIN rather than one at a time, and their order is ROTATED each round, so each scenario's repeats are spread across the whole wall-clock window and across positions within a round. Background load then hits all of them alike instead of landing on whichever ran during a spike or whichever is pinned to the same phase of a periodic load. Payloads are generated before the clock starts, so these are server rates; client encoding is reported separately. Runs that saw a failed batch or a shed connection are reported as failures rather than as numbers.
 
 - Machine: macos/aarch64, 10 hardware threads, Apple M1 Max
-- Commit: `0e999ad`
-- Corpus: 1000000 spans per run, batch 1000
+- Commit: `bc90dfb`
+- Corpus: 300000 spans per run, batch 1000
 - Compaction: disabled during ingest runs (a read-path optimization; its merges would steal CPU from the measurement)
 
 Latency is the CLIENT-OBSERVED time for one acknowledged batch, sampled per request and reduced to percentiles per run; the table reports the MEDIAN ACROSS RUNS of each percentile. Read it with the load model in mind: this is a closed-loop generator with a fixed number of workers, all saturating, so latency includes queueing and by Little's law tracks concurrency divided by throughput. Latencies are therefore only comparable BETWEEN ROWS AT THE SAME CONCURRENCY, and the honest place to look for a deliberate delay's cost is the low-concurrency rows, where there is nothing to queue behind.
 
 | Scenario | Protocol | Route | Keep-alive | Concurrency | Median spans/s | Min | Max | p50 ms | p95 ms | p99 ms | Bytes/span | Decode ns/span |
 |---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| profile-throughput-c8 | native-json | /v1/spans | true | 8 | **213433** | 209750 | 217117 | 29.87 | 107.07 | 170.86 | 256 | 755 |
-| profile-balanced-c8 | native-json | /v1/spans | true | 8 | **171868** | 167665 | 176070 | 33.38 | 127.97 | 347.32 | 256 | 740 |
-| profile-latency-c8 | native-json | /v1/spans | true | 8 | **134308** | 134147 | 134469 | 27.01 | 294.56 | 422.80 | 256 | 701 |
+| http-native-json-wal-c8 | native-json | /v1/spans | true | 8 | **215620** | 215620 | 215620 | 17.32 | 172.74 | 348.64 | 256 | 803 |
 <!-- END GENERATED -->
 
 

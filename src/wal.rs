@@ -273,12 +273,20 @@ impl Wal {
     /// Appends an encoded frame and returns its LSN. The bytes are in the file
     /// but NOT yet durable; the caller must [`Self::commit`] before
     /// acknowledging.
-    pub(crate) fn append(&self, frame: &Frame) -> Result<u64> {
+    pub(crate) fn append(&self, frame: &Frame, metrics: &crate::metrics::Metrics) -> Result<u64> {
+        let waited = std::time::Instant::now();
         let mut state = self.lock()?;
+        metrics
+            .wal_lock_wait
+            .record(waited.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
+        let writing = std::time::Instant::now();
         // The file is O_APPEND, so a single write_all lands contiguously at
         // the end even with other writers; the lock keeps LSNs ordered with
         // the bytes they name.
         state.file.write_all(&frame.0)?;
+        metrics
+            .wal_write_syscall
+            .record(writing.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
         state.bytes += frame.len();
         state.written_lsn += 1;
         Ok(state.written_lsn)
@@ -500,7 +508,7 @@ mod tests {
 
     fn append_committed(wal: &Wal, spans: &[Span]) {
         let lsn = wal
-            .append(&Wal::encode(spans).expect("encode"))
+            .append(&Wal::encode(spans).expect("encode"), &Metrics::default())
             .expect("append");
         wal.commit(lsn, &Metrics::default()).expect("commit");
     }
@@ -658,7 +666,10 @@ mod tests {
         let dir = temp_dir("reset");
         let wal = Wal::open(&dir, None).expect("opens");
         let lsn = wal
-            .append(&Wal::encode(&[span("t", "a", "sealed")]).expect("encode"))
+            .append(
+                &Wal::encode(&[span("t", "a", "sealed")]).expect("encode"),
+                &Metrics::default(),
+            )
             .expect("append");
         wal.reset().expect("reset");
         assert!(replayed(&dir).expect("replay").is_empty());
@@ -723,7 +734,10 @@ mod tests {
                 for index in 0..25 {
                     let id = format!("{worker}-{index}");
                     let lsn = wal
-                        .append(&Wal::encode(&[span("t", &id, "x")]).expect("encode"))
+                        .append(
+                            &Wal::encode(&[span("t", &id, "x")]).expect("encode"),
+                            &Metrics::default(),
+                        )
                         .expect("append");
                     wal.commit(lsn, &Metrics::default()).expect("commit");
                 }

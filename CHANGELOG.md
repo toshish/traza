@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [Unreleased]
+
+### Added
+
+- **`traza_wal_lock_wait_ns_*` and `traza_wal_write_syscall_ns_*`** in
+  `/v1/metrics`, splitting the log append into waiting for Traza's log lock
+  and the `write` itself. `traza_wal_write` covered both, which made the
+  dominant remaining in-lock cost unattributable: it looked equally like lock
+  contention and like slow I/O, and those want opposite fixes.
+
+  The split settled it. Traza's log lock measures **zero** wait; the time is
+  the syscall. And the syscall is not slow on its own — the same append costs
+  **0.076 ms at concurrency 1 and 1.778 ms at concurrency 8**, a 23x
+  difference in one syscall with no lock involved, because an `fsync` in
+  flight blocks concurrent `write` calls to the same file inside the kernel.
+  Widening `--wal-commit-window-us` from off to 2,000 cut fsyncs 40% and the
+  mean append 57%. Documented in the configuration reference: the lever for a
+  large `wal_write` is fsync frequency, not the engine's locking.
+
 ## [0.19.0] - 2026-07-25
 
 **Segment sealing no longer holds the writer lock**, which was 74% of
