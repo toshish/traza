@@ -1493,3 +1493,145 @@ fn an_expiry_rewrite_keeps_its_place_in_recency_order() {
     drop(store);
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// True when this process can write through a read-only directory anyway,
+/// which is how the permission-based fault injection below stops being a
+/// fault. Root is the usual case (containers, some CI).
+fn ignores_directory_permissions() -> bool {
+    std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim() == "0")
+        .unwrap_or(false)
+}
+
+#[test]
+fn a_failed_log_rewrite_leaves_expiry_retryable() {
+    // Found in review: expiry dropped the span from the write buffer BEFORE
+    // the log rewrite succeeded. A failed rewrite therefore left memory ahead
+    // of the recovery authority — and the retry saw nothing left to expire,
+    // returned Ok(0), and never repaired the log, so the restart resurrected
+    // the span. Durable first, then the infallible in-memory swap.
+    let dir = correctness_test_dir("expiry-wal-failure");
+    let store = Store::open(&dir, wal_config(100_000)).expect("opens");
+    store
+        .ingest(span("t-old", "expired".into(), 1_000, 10))
+        .expect("acknowledged");
+    store
+        .ingest(span("t-new", "survivor".into(), 9_000, 10))
+        .expect("acknowledged");
+    let before = store.stats().expect("stats");
+
+    // Occupy the rewrite's staging path with a directory: the staging open
+    // then fails deterministically, whatever the platform or the uid.
+    let blocker = dir.join(".wal.log.rewrite.tmp");
+    fs::create_dir(&blocker).expect("blocks staging");
+
+    let failed = store.expire_before(5_000);
+    assert!(
+        failed.is_err(),
+        "the log rewrite could not be staged, so expiry must fail: {failed:?}"
+    );
+    let after_failure = store.stats().expect("stats");
+    assert_eq!(
+        after_failure.buffered_records, 2,
+        "a failed expiry must leave memory and the log agreeing, not drop the \
+         span from memory alone"
+    );
+    assert_eq!(
+        after_failure.wal_bytes, before.wal_bytes,
+        "and it must not have touched the log either"
+    );
+
+    // The retry is what repairs it, which only works if the first attempt left
+    // something to retry.
+    fs::remove_dir(&blocker).expect("unblocks staging");
+    assert_eq!(
+        store.expire_before(5_000).expect("retry"),
+        1,
+        "the retry still has the expired span to remove"
+    );
+    assert!(store.stats().expect("stats").wal_bytes < before.wal_bytes);
+    drop(store);
+
+    let reopened = Store::open(&dir, wal_config(100_000)).expect("reopens");
+    assert_eq!(
+        queried_ids(&reopened, &SpanFilter::default()),
+        vec!["survivor".to_owned()],
+        "the expired span must not survive the failure-then-retry path"
+    );
+    drop(reopened);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_failed_segment_unlink_leaves_expiry_retryable() {
+    // The same defect on the segment path: a fully expired segment was removed
+    // from the live list before its file was unlinked, so a failed unlink left
+    // the store reporting zero segments over a file that was still there — and
+    // the retry, seeing no segments, returned Ok(0). The restart loaded the
+    // segment and resurrected its spans.
+    if ignores_directory_permissions() {
+        eprintln!("skipped: this process writes through read-only directories");
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = correctness_test_dir("expiry-unlink-failure");
+    let store = Store::open(
+        &dir,
+        Config {
+            flush_spans: 100_000,
+            durability: traza::Durability::Buffered,
+            compaction: None,
+            ..Config::default()
+        },
+    )
+    .expect("opens");
+    store
+        .ingest(span("t-old", "expired".into(), 1_000, 10))
+        .expect("ingest");
+    store.flush().expect("seals a fully expirable segment");
+    assert_eq!(store.stats().expect("stats").segment_count, 1);
+
+    // Unlinking needs write permission on the directory, not on the file.
+    let readonly = fs::Permissions::from_mode(0o555);
+    let writable = fs::Permissions::from_mode(0o755);
+    fs::set_permissions(&dir, readonly).expect("read-only");
+
+    let failed = store.expire_before(5_000);
+    assert!(
+        failed.is_err(),
+        "the segment file could not be unlinked, so expiry must fail: {failed:?}"
+    );
+    assert_eq!(
+        store.stats().expect("stats").segment_count,
+        1,
+        "a segment that is still on disk must still be in the live list"
+    );
+
+    fs::set_permissions(&dir, writable).expect("writable");
+    assert_eq!(
+        store.expire_before(5_000).expect("retry"),
+        1,
+        "the retry still has the segment to remove"
+    );
+    assert_eq!(store.stats().expect("stats").segment_count, 0);
+    drop(store);
+
+    let reopened = Store::open(
+        &dir,
+        Config {
+            durability: traza::Durability::Buffered,
+            compaction: None,
+            ..Config::default()
+        },
+    )
+    .expect("reopens");
+    assert!(
+        queried_ids(&reopened, &SpanFilter::default()).is_empty(),
+        "the expired segment must not come back"
+    );
+    drop(reopened);
+    let _ = fs::remove_dir_all(&dir);
+}

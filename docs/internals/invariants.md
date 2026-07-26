@@ -300,13 +300,26 @@ counts unique buffered records, upserts since the last seal, AND log bytes
 workload that keeps updating the same keys — the buffer stayed at one record
 while the log grew without limit and restart replay grew with it.
 
-**What breaks it.** Expiring from the buffer alone. Treating any replay failure
-as a torn tail. Leaving a torn tail in the file. Deriving the flush threshold
-from `writer.len()` alone.
+**A failed deletion must stay retryable.** Durable state moves first, memory
+second, and the step that moves memory cannot fail: the log rewrite before the
+buffer `retain`, the unlink before the segment leaves the live list. The other
+order is worse than it looks — it does not merely leave the two disagreeing, it
+leaves *nothing for the retry to find*. A second expiry pass over an
+already-cleaned buffer removes nothing, reports `Ok(0)`, and never repairs the
+durable side, so the failure becomes permanent and the restart resurrects the
+data. Any new operation that deletes must be able to return `Err` without
+having consumed its own evidence.
+
+**What breaks it.** Expiring from the buffer alone. Mutating memory before the
+durable change it stands for. Treating any replay failure as a torn tail.
+Leaving a torn tail in the file. Deriving the flush threshold from
+`writer.len()` alone.
 
 **Symptom.** Expired spans that return after a restart; acknowledged batches
 that vanish silently after a bad sector; a log that grows without bound under
-retries and an OOM on the restart that has to replay it.
+retries and an OOM on the restart that has to replay it; a full disk or a
+permission error turning one failed maintenance pass into permanently divergent
+state.
 
 ---
 

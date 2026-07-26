@@ -49,6 +49,17 @@ before 1.0 rather than as part of HA:
   unique records, and a new `--flush-wal-bytes` (default 64 MiB) bounds the log
   directly. Recovery also streams frames instead of reading the whole log into
   memory.
+- **A failed expiry was not retryable, and resurrected spans.** Expiry mutated
+  memory before the durable change it corresponded to: it dropped the span from
+  the write buffer before the log rewrite succeeded, and removed a fully
+  expired segment from the live list before unlinking its file. Either failure
+  left memory ahead of the recovery authority — and left nothing for the retry
+  to find, so the next pass reported `Ok(0)`, never repaired the log or the
+  file, and the restart brought the data back. Both now change durable state
+  first and memory second, with the in-memory step infallible, so a failed
+  expiry leaves the store exactly as retryable as it found it. `Wal::rewrite`
+  additionally moves every fallible step before its rename, so its failure is
+  never ambiguous about which log is live.
 - **Retention rewrote segments under a new id**, which moved them to the newest
   position in an order that *is* recency order — so after a partial expiry a
   re-ingested span could revert to an older version held by the rewritten
@@ -66,12 +77,20 @@ before 1.0 rather than as part of HA:
   they pinned is still there. A new maintenance lock serializes the two against
   each other, and only against each other. `tests/compaction.rs` measures it:
   the slowest read or ingest during a merge must be a fraction of the merge.
+  What this buys is that reads and ingest no longer *wait* on maintenance; they
+  still share CPU and disk with it, and that contention remains unmeasured.
 - **`Store::snapshot`** is public API, returning a `SnapshotView` that answers
   from one pinned instant however the store changes afterwards. Any multi-step
   read should use it; a lock cannot span pages.
 - **`Error::WalCorrupt`** is a new variant, for the refusal above.
 - **`Config::flush_wal_bytes`** is a new field (`Some(64 MiB)` by default). A
   `Config` built by struct literal needs it; `..Config::default()` does not.
+  Documented in the library `Config` table alongside the server flag.
+- **The generations design carries the log inside the boundary.** `CURRENT` and
+  a global `wal.log` are two recovery authorities that no rename can publish
+  together, so the design now stamps every frame with the generation epoch it
+  belongs to, records `folded_through` in the manifest, and replays only frames
+  after it — with an explicit checkpoint crash matrix naming the commit point.
 
 ## [0.18.0] - 2026-07-25
 

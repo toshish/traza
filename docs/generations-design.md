@@ -69,8 +69,9 @@ data/
         segment-*.seg
         annotations.jsonl
         payloads/
-      state-manifest.json      -- files, digests, applied sequence, created-at
-  wal.log                      -- the delta on top of CURRENT
+      state-manifest.json      -- files, digests, folded-through, created-at
+  wal.log                      -- frames after CURRENT's folded-through point,
+                               -- each stamped with the epoch it belongs to
   incoming/                    -- staging for an install
 ```
 
@@ -80,6 +81,63 @@ Two rules give the model its value:
 2. **`CURRENT` is published by one atomic rename**, and it is the only thing
    that decides which generation a restart loads.
 
+### The log is inside the boundary, not beside it
+
+A first draft of this design left `wal.log` as a single global file next to
+`CURRENT`, and that reintroduces the exact defect the model exists to remove:
+**two recovery authorities that cannot be published together.** `CURRENT` and
+the log are separate filesystem objects, so no rename makes "generation N+1 is
+live" and "the frames folded into it are gone" one event. A crash between them
+replays stale frames — spans that generation N+1 already contains, and worse,
+spans it deliberately does *not* contain, because a checkpoint that applied a
+retention decision would have those frames replay the deletion away.
+
+Sequence numbers close it, and they must be persisted on **both** sides:
+
+- Every frame header carries `(epoch, sequence)`. The epoch is the generation
+  id the frame was appended under; the sequence is monotonic within it.
+- Every manifest records `folded_through: (epoch, sequence)` — the last frame
+  the generation contains — and the `(epoch, sequence)` at which appends
+  against it begin.
+- **Recovery replays a frame only if it is strictly after the live
+  generation's `folded_through`.** Anything at or before it is already inside
+  the generation and is discarded, whether or not the file was truncated.
+
+Reclamation then stops being load-bearing for correctness. Truncating the log
+after a checkpoint becomes housekeeping — doing it late, or not at all, costs
+disk and replay time but cannot change what the store contains. That is the
+property the current engine does not have, where a stale log *is* a wrong
+answer.
+
+The frame format change is not free: `(epoch, sequence)` widens the header from
+8 bytes to 24 and is a format break, which is another reason this belongs
+before the freeze rather than after it.
+
+### Checkpoint crash matrix
+
+The checkpoint sequence, and what a crash at each point leaves. "Safe" here
+means the store opens onto exactly one state and loses no acknowledged write.
+
+| # | Step | Crash immediately after leaves | Recovery |
+|---|---|---|---|
+| 1 | Seal the buffer into segment files under `generations/N+1/engine/` | Orphan files, no manifest | `CURRENT` still names N; the orphan directory is swept. Frames still in the log replay onto N. Safe |
+| 2 | Write and fsync `state-manifest.json` for N+1, recording `folded_through` | A complete generation nothing points at | `CURRENT` still names N. N+1 is unreferenced and swept (or reused by the retried checkpoint, since it is byte-identical). Safe |
+| 3 | fsync the generation directory | As above | As above. Safe |
+| 4 | Rename `CURRENT` → N+1 | The new generation is live; the log still holds every folded frame | Frames at or before N+1's `folded_through` are discarded by rule. **This is the step the epoch exists for.** Safe |
+| 5 | Truncate the log to the first unfolded frame | Nothing outstanding | Housekeeping only. Safe |
+| 6 | Reclaim generation N | Both generations on disk | `CURRENT` names N+1; N is unreferenced and swept unless pinned. Safe |
+
+Two ordering rules fall out and are not negotiable: **the manifest is durable
+before `CURRENT` moves** (or a restart points at a generation whose contents
+are not proven), and **the log is truncated only after `CURRENT` moves** (or a
+crash between them loses the frames that neither side holds). Step 4 is the
+commit point; everything before it is retryable and everything after it is
+bookkeeping.
+
+An install (§Install below) commits at the same rename and inherits the same
+matrix, with the added rule that a staged generation is verified before
+`CURRENT` can name it.
+
 ## The four operations
 
 **Pin.** Take a reference to the live generation plus the write buffer as it
@@ -88,9 +146,10 @@ is what `SnapshotView` does today for spans; the generation form extends it to
 annotations and payload bytes, which a span export currently cannot pin at all.
 
 **Checkpoint.** Seal the write buffer, fold the log into the generation, write
-a new manifest naming an applied sequence number, fsync, and publish by
-renaming `CURRENT`. After a checkpoint the log is empty by construction rather
-than by a separate reclamation step.
+a manifest recording the `(epoch, sequence)` it folded through, fsync, and
+publish by renaming `CURRENT`. Truncating the log follows and is housekeeping:
+after the rename, folded frames are already excluded by sequence, so a crash
+before the truncation lands changes nothing. See the crash matrix above.
 
 **Verify.** Re-read a manifest and check every digest. A store can then answer
 "is this generation intact" without inferring it from whether parsing happened
@@ -117,8 +176,10 @@ the swap is one rename of a file whose contents are a single name.
 - **Replication** becomes: ship generations plus the log delta between them —
   which is exactly what the HA design's snapshot transfer needs. Phase 2 stops
   having to invent it.
-- **Recovery** becomes: load `CURRENT`, replay the log delta, and have one
-  place that says how much of the log belongs to this generation.
+- **Recovery** becomes: load `CURRENT`, replay only the frames after its
+  `folded_through`, and have one place — the manifest — that says how much of
+  the log belongs to this generation, instead of inferring it from whether the
+  log happened to be truncated.
 
 ## Cost, honestly
 
@@ -134,6 +195,9 @@ the swap is one rename of a file whose contents are a single name.
   directory becomes generation zero at first open. This is a one-way migration
   and must ship before the format freeze, per the roadmap's "identity before
   features" principle.
+- **The log frame format changes** to carry `(epoch, sequence)` — a 24-byte
+  header instead of 8. Also freeze-critical, and the reason the epoch rule is
+  part of this design rather than a later refinement.
 - **It is a substantial change to `src/lib.rs`**, the file the
   [invariants](internals/invariants.md) live in. Several of those invariants
   (1, 5, 6, 10) become properties of the generation boundary instead of rules
