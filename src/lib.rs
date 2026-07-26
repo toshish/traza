@@ -131,6 +131,55 @@ pub struct Span {
     pub extra: Map<String, Value>,
 }
 
+/// How many matches a sorted query will rank before refusing.
+///
+/// Sorting has to see every match, so an unbounded sorted query over a
+/// low-selectivity filter would materialize the store. The limit is generous
+/// enough for real triage and small enough to stay bounded.
+pub const SORT_CANDIDATE_LIMIT: usize = 200_000;
+
+/// Result ordering for [`SpanFilter::sort`].
+///
+/// Sorting costs what it always costs: a sorted answer cannot be streamed,
+/// because the last record read may belong first. An unsorted query stops as
+/// soon as it has `limit` matches; a sorted one must find every match, order
+/// them, and then truncate. That is why unsorted stays the default even though
+/// "slowest first" is usually the question being asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SpanSort {
+    /// Longest duration first — the triage order.
+    DurationDesc,
+    /// Shortest duration first.
+    DurationAsc,
+    /// Most recent start first.
+    StartDesc,
+    /// Oldest start first. Traza's natural order, but stated explicitly.
+    StartAsc,
+}
+
+impl SpanSort {
+    /// Parses the `sort=` query value, or `None` if unrecognized.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "duration_desc" | "-duration" => Some(Self::DurationDesc),
+            "duration_asc" | "duration" => Some(Self::DurationAsc),
+            "start_desc" | "-start" => Some(Self::StartDesc),
+            "start_asc" | "start" => Some(Self::StartAsc),
+            _ => None,
+        }
+    }
+
+    fn compare(self, left: &Span, right: &Span) -> std::cmp::Ordering {
+        let duration = |span: &Span| span.end_time_ns.saturating_sub(span.start_time_ns);
+        match self {
+            Self::DurationDesc => duration(right).cmp(&duration(left)),
+            Self::DurationAsc => duration(left).cmp(&duration(right)),
+            Self::StartDesc => right.start_time_ns.cmp(&left.start_time_ns),
+            Self::StartAsc => left.start_time_ns.cmp(&right.start_time_ns),
+        }
+    }
+}
+
 /// Conditions used to select spans.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SpanFilter {
@@ -142,6 +191,21 @@ pub struct SpanFilter {
     pub attributes: Vec<(String, Value)>,
     /// Match spans whose duration is at least this many nanoseconds.
     pub min_duration_ns: Option<u64>,
+    /// Match spans whose duration is at most this many nanoseconds.
+    pub max_duration_ns: Option<u64>,
+    /// Attribute lower bounds, compared numerically. Analytics could already
+    /// aggregate token counts and cost while search could not find them, so
+    /// "which calls cost more than a cent" was unanswerable.
+    pub min_attributes: Vec<(String, f64)>,
+    /// Attribute upper bounds, compared numerically.
+    pub max_attributes: Vec<(String, f64)>,
+    /// Attributes that must NOT equal this value. A span missing the key
+    /// entirely matches: "not an error" should include spans that never
+    /// recorded a status.
+    pub excluded_attributes: Vec<(String, Value)>,
+    /// Result ordering. `None` keeps Traza's stable span order, which is the
+    /// only order that can stream without materializing.
+    pub sort: Option<SpanSort>,
     /// Match spans starting at or after this timestamp.
     pub since_ns: Option<u64>,
     /// Match spans starting at or before this timestamp.
@@ -441,6 +505,11 @@ pub enum Error {
     LockPoisoned(&'static str),
     /// A span violated an ingest invariant (empty primary-key id).
     InvalidSpan(&'static str),
+    /// A query asked for more work than the store will do — currently, a
+    /// sorted query matching more spans than it will rank. Refused rather
+    /// than answered approximately: a truncated ranking is a wrong answer
+    /// that looks like a right one.
+    QueryTooBroad(String),
 }
 
 impl fmt::Display for Error {
@@ -451,6 +520,7 @@ impl fmt::Display for Error {
             Self::AlreadyOpen => write!(f, "store is already open by another writer"),
             Self::LockPoisoned(name) => write!(f, "storage lock poisoned: {name}"),
             Self::InvalidSpan(reason) => write!(f, "invalid span: {reason}"),
+            Self::QueryTooBroad(reason) => write!(f, "query too broad: {reason}"),
         }
     }
 }
@@ -460,7 +530,10 @@ impl StdError for Error {
         match self {
             Self::Io(error) => Some(error),
             Self::Json(error) => Some(error),
-            Self::AlreadyOpen | Self::LockPoisoned(_) | Self::InvalidSpan(_) => None,
+            Self::AlreadyOpen
+            | Self::LockPoisoned(_)
+            | Self::InvalidSpan(_)
+            | Self::QueryTooBroad(_) => None,
         }
     }
 }
@@ -1104,7 +1177,36 @@ impl Store {
                 span_matches(span, filter)
                     && cursor.map_or(true, |position| span_after_cursor(span, position))
             });
-            sort_spans(&mut spans);
+            order_spans(&mut spans, filter.sort);
+            if let Some(limit) = filter.limit {
+                spans.truncate(limit);
+            }
+            return Ok(spans);
+        }
+        // A sorted answer cannot be streamed: the record that belongs first
+        // may be the last one read, so `limit` cannot stop the scan early.
+        // Re-run unlimited, order, then truncate. Refusing past a ceiling
+        // rather than truncating first is deliberate — a "ten slowest" that
+        // silently ranked the first ten thousand matches would be wrong, and
+        // wrong quietly.
+        if let Some(sort) = filter.sort {
+            let unlimited = SpanFilter {
+                limit: None,
+                sort: None,
+                ..filter.clone()
+            };
+            let mut spans = self.query_after(&unlimited, cursor)?;
+            if spans.len() > SORT_CANDIDATE_LIMIT {
+                return Err(Error::QueryTooBroad(format!(
+                    "sorting {} matches exceeds the {SORT_CANDIDATE_LIMIT} candidate limit; \
+                     narrow the filter (time range, service, or an attribute) and retry",
+                    spans.len()
+                )));
+            }
+            spans.sort_by(|left, right| {
+                sort.compare(left, right)
+                    .then_with(|| compare_spans(left, right))
+            });
             if let Some(limit) = filter.limit {
                 spans.truncate(limit);
             }
@@ -1145,19 +1247,16 @@ impl Store {
             let mut sources: Vec<(Source<'_>, usize)> = vec![(Source::Parsed(buffered), 0)];
             for segment in segments.iter() {
                 let seg = &segment.seg;
-                let offsets = if let Some(service) = &filter.service {
-                    seg.attribute_posting_offsets_ref(IDX_SERVICE, service)
-                } else if let Some(name) = &filter.name {
-                    seg.attribute_posting_offsets_ref(IDX_NAME, name)
-                } else if let Some((key, value)) = filter
-                    .attributes
-                    .iter()
-                    .find(|(key, _)| !key.starts_with('\u{0}'))
-                {
-                    seg.attribute_posting_offsets_ref(key, &canonical_value(value))
-                } else {
-                    seg.record_offsets()
-                };
+                // Skip whole segments that cannot hold a matching timestamp.
+                // This is the only filter that eliminates a segment without
+                // reading it, and "the last N minutes" is the commonest
+                // filter an observability store sees.
+                self.metrics.segments_examined.increment();
+                if !seg.may_contain_timestamps(filter.since_ns, filter.until_ns) {
+                    self.metrics.segments_pruned_by_time.increment();
+                    continue;
+                }
+                let offsets = select_probe(seg, filter);
                 let position = match cursor {
                     Some(cursor) => first_offset_after(seg, offsets, cursor)?,
                     None => 0,
@@ -1259,19 +1358,12 @@ impl Store {
         // superseded by definition.
         for (position, segment) in segments.iter().enumerate() {
             let seg = &segment.seg;
-            let offsets = if let Some(service) = &filter.service {
-                seg.attribute_posting_offsets_ref(IDX_SERVICE, service)
-            } else if let Some(name) = &filter.name {
-                seg.attribute_posting_offsets_ref(IDX_NAME, name)
-            } else if let Some((key, value)) = filter
-                .attributes
-                .iter()
-                .find(|(key, _)| !key.starts_with('\u{0}'))
-            {
-                seg.attribute_posting_offsets_ref(key, &canonical_value(value))
-            } else {
-                seg.record_offsets()
-            };
+            self.metrics.segments_examined.increment();
+            if !seg.may_contain_timestamps(filter.since_ns, filter.until_ns) {
+                self.metrics.segments_pruned_by_time.increment();
+                continue;
+            }
+            let offsets = select_probe(seg, filter);
             for offset in offsets {
                 let record = seg.record_at_offset(*offset).map_err(segment_error)?;
                 let span = record_to_span(&record)?;
@@ -1858,6 +1950,59 @@ fn sort_spans(spans: &mut [Span]) {
     spans.sort_by(compare_spans);
 }
 
+/// Orders by an explicit request, falling back to Traza's stable span order.
+/// The stable order is also the tie-break, so equal keys never come back in a
+/// different sequence between two identical queries.
+fn order_spans(spans: &mut [Span], sort: Option<SpanSort>) {
+    match sort {
+        None => sort_spans(spans),
+        Some(sort) => spans.sort_by(|left, right| {
+            sort.compare(left, right)
+                .then_with(|| compare_spans(left, right))
+        }),
+    }
+}
+
+/// Picks the index probe that narrows the read the most.
+///
+/// Only ONE predicate can drive the scan — the rest are checked per record —
+/// so which one is chosen decides how much work the query does. This used to
+/// be a fixed order: service, then name, then whichever attribute happened to
+/// come first. That order tends to pick the WORST candidate, because
+/// `service` is usually the least selective thing in a trace store: with
+/// twenty services and a hundred distinct attribute values, probing by
+/// service reads five times more records than probing by attribute, and then
+/// discards them. Adding a precise filter to a service query made it slower.
+///
+/// Posting lists are already materialized in the index, so their lengths are
+/// exact, not estimated — the smallest one is genuinely the least work.
+fn select_probe<'a>(seg: &'a segment::Segment, filter: &SpanFilter) -> &'a [u64] {
+    let mut best: Option<&'a [u64]> = None;
+    let mut consider = |offsets: &'a [u64]| {
+        // `Option::is_none_or` would read better but is newer than this
+        // crate's MSRV.
+        if best.map_or(true, |current| offsets.len() < current.len()) {
+            best = Some(offsets);
+        }
+    };
+    if let Some(service) = &filter.service {
+        consider(seg.attribute_posting_offsets_ref(IDX_SERVICE, service));
+    }
+    if let Some(name) = &filter.name {
+        consider(seg.attribute_posting_offsets_ref(IDX_NAME, name));
+    }
+    for (key, value) in &filter.attributes {
+        // Session keys are expanded by the caller into a union and cannot
+        // drive a single probe.
+        if key.starts_with('\u{0}') {
+            continue;
+        }
+        consider(seg.attribute_posting_offsets_ref(key, &canonical_value(value)));
+    }
+    // Nothing indexable: every record is a candidate.
+    best.unwrap_or_else(|| seg.record_offsets())
+}
+
 fn span_matches(span: &Span, filter: &SpanFilter) -> bool {
     if filter
         .service
@@ -1887,10 +2032,79 @@ fn span_matches(span: &Span, filter: &SpanFilter) -> bool {
     {
         return false;
     }
+    if filter
+        .max_duration_ns
+        .is_some_and(|maximum| span.end_time_ns.saturating_sub(span.start_time_ns) > maximum)
+    {
+        return false;
+    }
+    if !filter
+        .min_attributes
+        .iter()
+        .all(|(key, bound)| numeric_attribute(span, key).is_some_and(|value| value >= *bound))
+    {
+        return false;
+    }
+    if !filter
+        .max_attributes
+        .iter()
+        .all(|(key, bound)| numeric_attribute(span, key).is_some_and(|value| value <= *bound))
+    {
+        return false;
+    }
+    // A missing key is NOT an exclusion: `not_attr.status=error` means "not
+    // known to be an error", which includes spans carrying no status at all.
+    if filter
+        .excluded_attributes
+        .iter()
+        .any(|(key, value)| span.attributes.get(key) == Some(value))
+    {
+        return false;
+    }
     filter
         .attributes
         .iter()
-        .all(|(key, value)| span.attributes.get(key) == Some(value))
+        .all(|(key, value)| attribute_equals(span, key, value))
+}
+
+/// An attribute read as a number, whether it was stored as one or as a string.
+///
+/// Instrumentation is inconsistent about this — OpenLLMetry emits token counts
+/// as integers, some SDKs stringify them — and a range filter that only
+/// understood one encoding would silently miss half a corpus.
+fn numeric_attribute(span: &Span, key: &str) -> Option<f64> {
+    match span.attributes.get(key)? {
+        Value::Number(number) => number.as_f64(),
+        Value::String(text) => text.parse().ok(),
+        _ => None,
+    }
+}
+
+/// Equality that does not depend on how the value was typed on the wire.
+///
+/// `attr.code=200` used to parse as JSON whenever the text was valid JSON, so
+/// it matched the NUMBER 200 and could never match the STRING "200" — and an
+/// empty result set is indistinguishable from no such data. Both readings now
+/// match, which is the behaviour a caller who typed `200` expects.
+fn attribute_equals(span: &Span, key: &str, value: &Value) -> bool {
+    match span.attributes.get(key) {
+        None => false,
+        Some(stored) if stored == value => true,
+        Some(stored) => scalar_text(stored)
+            .zip(scalar_text(value))
+            .is_some_and(|(stored, wanted)| stored == wanted),
+    }
+}
+
+/// The text form of a scalar, for cross-type comparison. Containers return
+/// `None`: two arrays that render alike are not the same array.
+fn scalar_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Number(number) => Some(number.to_string()),
+        Value::Bool(flag) => Some(flag.to_string()),
+        _ => None,
+    }
 }
 
 fn load_segments(directory: &Path) -> Result<Vec<Segment>> {
@@ -1978,4 +2192,95 @@ fn sync_directory(directory: &Path) -> Result<()> {
 #[cfg(not(unix))]
 fn sync_directory(_directory: &Path) -> Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod planner_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    /// Builds a one-segment store shape in memory: 100 records sharing one
+    /// service, 1 of them carrying a rare attribute.
+    fn segment_with_skewed_selectivity() -> segment::Segment {
+        let records: Vec<segment::RecordInput> = (0..100)
+            .map(|index| {
+                let mut attributes = BTreeMap::new();
+                // IDX_SERVICE is the synthetic key the engine indexes
+                // `service` under; every record shares one value, so its
+                // posting list is the whole segment.
+                attributes.insert(IDX_SERVICE.to_owned(), "svc".to_owned());
+                attributes.insert(
+                    "rare".to_owned(),
+                    canonical_value(&Value::String(if index == 7 {
+                        "yes".to_owned()
+                    } else {
+                        "no".to_owned()
+                    })),
+                );
+                segment::RecordInput {
+                    timestamp: 1_000 + index,
+                    trace_id: format!("t{index}"),
+                    attributes,
+                    payload: b"{}".to_vec(),
+                }
+            })
+            .collect();
+        let bytes = segment::encode(&records).expect("encode");
+        segment::Segment::from_bytes(bytes).expect("open")
+    }
+
+    #[test]
+    fn the_probe_is_the_smallest_posting_list_not_the_first_predicate() {
+        // The regression this guards: the planner took a fixed order
+        // (service, then name, then first attribute), and `service` is
+        // usually the LEAST selective thing in a trace store. Adding a
+        // precise attribute to a service query then read 100 records instead
+        // of 1 and discarded 99 — adding a filter made the query slower.
+        //
+        // Asserted as a unit test because this is a performance property:
+        // both plans return identical results, so no correctness test can
+        // tell them apart (a mutation check confirmed exactly that).
+        let seg = segment_with_skewed_selectivity();
+
+        let service_only = SpanFilter {
+            service: Some("svc".to_owned()),
+            ..SpanFilter::default()
+        };
+        assert_eq!(
+            select_probe(&seg, &service_only).len(),
+            100,
+            "service alone can only probe the whole segment"
+        );
+
+        let both = SpanFilter {
+            service: Some("svc".to_owned()),
+            attributes: vec![("rare".to_owned(), Value::String("yes".to_owned()))],
+            ..SpanFilter::default()
+        };
+        assert_eq!(
+            select_probe(&seg, &both).len(),
+            1,
+            "with a selective attribute available, the scan must follow it"
+        );
+
+        let no_predicate = SpanFilter::default();
+        assert_eq!(
+            select_probe(&seg, &no_predicate).len(),
+            100,
+            "with nothing indexable every record is a candidate"
+        );
+    }
+
+    #[test]
+    fn a_predicate_matching_nothing_probes_nothing() {
+        // The best possible plan for an impossible predicate is an empty
+        // candidate list, not a full scan that filters everything out.
+        let seg = segment_with_skewed_selectivity();
+        let absent = SpanFilter {
+            service: Some("svc".to_owned()),
+            attributes: vec![("rare".to_owned(), Value::String("absent".to_owned()))],
+            ..SpanFilter::default()
+        };
+        assert!(select_probe(&seg, &absent).is_empty());
+    }
 }

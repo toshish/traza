@@ -5,6 +5,60 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Search gains the predicates its analytics already implied, and stops
+answering two classes of question with a silent empty result.
+
+### Added
+
+- **Range, negation and ordering predicates**: `min_attr.KEY` / `max_attr.KEY`
+  (numeric, reading stringified numbers too), `not_attr.KEY`,
+  `max_duration_ms` / `max_duration_ns`, and `sort=duration|-duration|start|-start`.
+  Token and cost analytics could already aggregate what search could not find,
+  so "which calls cost more than a cent" and "the ten slowest" were
+  unanswerable. `not_attr.KEY` keeps spans that lack the key entirely — "not
+  known to be an error" includes spans that never recorded a status.
+- **Segment timestamp ranges (format v3)**, letting a time-filtered query skip
+  a segment without opening it. `since`/`until` were pure post-filters, so a
+  "last 15 minutes" search read every segment in the store. v2 segments are
+  still read; they carry no range, are never skipped, and age out through
+  compaction.
+
+  **No latency improvement is claimed for this yet.** Pruning is verified to
+  skip the right segments by counter, but an attempt to measure the payoff
+  produced a *negative* result (a windowed query slower than an unwindowed
+  one) on a 40-segment store under load. Forty segments is far too few for
+  per-segment probe cost to dominate — the compaction work needed thousands
+  before the effect was visible — so the benchmark was measuring noise. The
+  mechanism is sound and the work avoided is real; the latency benefit is
+  unmeasured, and is recorded as unmeasured rather than assumed.
+- **`traza_segments_pruned_by_time_total`** and
+  **`traza_segments_examined_total`** in `/v1/metrics`. Pruning is invisible
+  from results — a skipped segment and a scanned one give the same answer — so
+  these are the only way to see it working.
+
+### Changed
+
+- **Attribute filters match scalars by value, not by type.** `attr.code=200`
+  now finds spans that stored `200` and spans that stored `"200"`. Previously
+  only the JSON reading matched, so a store of stringified codes answered
+  every such query with an empty array indistinguishable from no-such-data.
+  Containers still compare structurally.
+- **The index probe is chosen by selectivity rather than by a fixed order.**
+  Only one predicate can drive a scan; the planner took `service`, then
+  `name`, then whichever attribute came first. `service` is usually the least
+  selective term in a trace store, so adding a precise attribute filter to a
+  service query made it *slower* — it read every span of the service and
+  discarded almost all of them. The smallest posting list now wins.
+
+### Fixed
+
+- A sorted query ranks **every** match rather than the first page. Sorting
+  cannot stream, so past an internal candidate ceiling the query is refused
+  with `400` and guidance to narrow it — a "ten slowest" computed over an
+  arbitrary first page is a wrong answer that looks like a right one.
+
 ## [0.17.0] - 2026-07-25
 
 Ingest throughput roughly doubles at concurrency, and the record of why is
