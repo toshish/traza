@@ -31,8 +31,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   working set — so it measured the trough and the capacity guide published it
   as the peak. A comment claimed a peak sampler existed; none did. RSS is now
   sampled every 20 ms by a background thread for the duration of the merge,
-  and the real figures are 1.7-2.3x higher: a store serving in 10 MiB peaks at
-  **1,203 MiB** to compact itself, not 721.
+  and the real figures are far higher: a store serving in 10 MiB peaks at
+  **1,204 MiB** to compact itself, not 721. Every completed merge in the
+  record peaks between 1,204 and 1,601 MiB, taken at load average
+  36-45 and varying up to 8% between runs of the same matrix — the order of
+  magnitude is the finding, not the individual figures.
 - **A failed probe was published as a zero-memory result.** A child that died
   produced an empty JSON object, and the reporter turned missing fields into
   `0.0` — so the most important failure this benchmark can have, the child
