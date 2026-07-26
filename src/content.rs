@@ -124,16 +124,25 @@ pub fn tokens(text: &str) -> Vec<String> {
     out
 }
 
-/// The key a token is hashed under: the token itself, or its first
-/// [`MAX_TOKEN_LEN`] bytes if it is longer.
+/// The key a token is hashed under: the token itself, or its longest prefix
+/// that fits in [`MAX_TOKEN_LEN`] bytes and ends on a character boundary.
 ///
-/// Tokens are runs of ASCII alphanumerics by construction, so a byte cut is
-/// always a character boundary.
+/// The tokenizer only ever produces ASCII, where the cut is always at
+/// `MAX_TOKEN_LEN` exactly and the on-disk format is therefore unaffected by
+/// the boundary walk. But this is a public, safe function, and slicing at a
+/// fixed byte index panics on valid UTF-8 the moment a caller passes anything
+/// else — `"a".repeat(39) + "é"` bisects the `é`. A safe API that panics on
+/// well-formed input is a defect regardless of who calls it today.
 pub fn probe_key(token: &str) -> &str {
-    match token.len() > MAX_TOKEN_LEN {
-        true => &token[..MAX_TOKEN_LEN],
-        false => token,
+    if token.len() <= MAX_TOKEN_LEN {
+        return token;
     }
+    // `str::floor_char_boundary` would say this directly but is unstable.
+    let mut end = MAX_TOKEN_LEN;
+    while end > 0 && !token.is_char_boundary(end) {
+        end -= 1;
+    }
+    &token[..end]
 }
 
 /// The distinct PROBE KEYS across many texts — what a filter is built from.
@@ -256,8 +265,11 @@ impl Bloom {
         self.bits.len() * 8
     }
 
-    /// Records that `token` is present.
+    /// Records that `token` is present. A zero-length filter records nothing.
     pub fn insert(&mut self, token: &str) {
+        if self.bits.is_empty() {
+            return;
+        }
         for position in bit_positions(token, self.bit_len()) {
             self.bits[position / 8] |= 1 << (position % 8);
         }
@@ -265,7 +277,14 @@ impl Bloom {
 
     /// Whether `token` MAY be present. `false` means definitely absent, which
     /// is the only direction this structure can be trusted in.
+    ///
+    /// A zero-length filter answers `true` for everything — it holds no
+    /// evidence, and "unknown" must read as "cannot rule out" or a filter
+    /// would start deleting results.
     pub fn may_contain(&self, token: &str) -> bool {
+        if self.bits.is_empty() {
+            return true;
+        }
         bit_positions(token, self.bit_len())
             .all(|position| self.bits[position / 8] & (1 << (position % 8)) != 0)
     }
@@ -297,17 +316,24 @@ impl Bloom {
 /// Public because a bit-sliced filter is probed position by position rather
 /// than through [`Bloom`] — see the segment's content index, which stores one
 /// row per position so that testing a token across every block is one read.
+///
+/// `bit_len` is expected to be a non-zero power of two, which every filter
+/// this crate builds or reads is (the decoder rejects anything else). Zero
+/// yields no positions rather than underflowing the mask.
 pub fn bit_positions(token: &str, bit_len: usize) -> impl Iterator<Item = usize> {
+    let count = match bit_len {
+        0 => 0,
+        _ => u64::from(HASH_COUNT),
+    };
     let digest = hash128(probe_key(token).as_bytes());
     let low = u64::from_le_bytes(digest.0[..8].try_into().expect("8 bytes"));
     let high = u64::from_le_bytes(digest.0[8..].try_into().expect("8 bytes"));
-    let mask = (bit_len - 1) as u64;
+    let mask = (bit_len.max(1) - 1) as u64;
     // A zero step would make all k positions identical, collapsing the filter
     // to k=1 for that token. Forcing it odd also keeps the progression from
     // cycling early against a power-of-two mask.
     let step = high | 1;
-    (0..u64::from(HASH_COUNT))
-        .map(move |i| (low.wrapping_add(i.wrapping_mul(step)) & mask) as usize)
+    (0..count).map(move |i| (low.wrapping_add(i.wrapping_mul(step)) & mask) as usize)
 }
 
 /// The filter size for `distinct_tokens`, in bits: eight bits each, rounded up
@@ -349,7 +375,8 @@ pub fn build<'a>(
 #[cfg(test)]
 mod tests {
     use super::{
-        build, for_each_token, size_bits, tokens, Bloom, Query, HASH_COUNT, MAX_TOKEN_LEN,
+        bit_positions, build, for_each_token, probe_key, size_bits, tokens, Bloom, Query,
+        HASH_COUNT, MAX_TOKEN_LEN,
     };
 
     fn one(text: &str) -> std::iter::Once<&str> {
@@ -387,7 +414,7 @@ mod tests {
             std::slice::from_ref(&long),
             "the token itself is whole"
         );
-        assert_eq!(super::probe_key(&long).len(), MAX_TOKEN_LEN);
+        assert_eq!(probe_key(&long).len(), MAX_TOKEN_LEN);
 
         let first = format!("{}aaa", "z".repeat(MAX_TOKEN_LEN));
         let second = format!("{}bbb", "z".repeat(MAX_TOKEN_LEN));
@@ -511,6 +538,55 @@ mod tests {
         for token in corpus.iter().take(200) {
             assert!(bloom.may_contain(token), "no false negatives, ever");
         }
+    }
+
+    #[test]
+    fn the_public_helpers_do_not_panic_on_valid_utf8() {
+        // These are safe, public functions. The tokenizer only ever hands
+        // them ASCII, so slicing at a fixed byte index was invisible in
+        // practice -- and still a defect: a caller passing well-formed UTF-8
+        // whose 40th byte lands mid-character got a panic.
+        let multibyte = format!("{}\u{e9}", "a".repeat(39));
+        assert_eq!(multibyte.len(), 41, "byte 40 bisects the last character");
+        assert_eq!(
+            probe_key(&multibyte).len(),
+            39,
+            "the cut retreats to a character boundary"
+        );
+
+        let mut bloom = Bloom::new(size_bits(8, 64, 4096));
+        bloom.insert(&multibyte);
+        assert!(bloom.may_contain(&multibyte));
+
+        // Whole multi-byte tokens, and one that ends exactly on the cap.
+        for token in [
+            "\u{4e16}\u{754c}",
+            &"\u{e9}".repeat(30),
+            &"a".repeat(MAX_TOKEN_LEN),
+        ] {
+            let key = probe_key(token);
+            assert!(token.starts_with(key));
+            bloom.insert(token);
+            assert!(bloom.may_contain(token));
+        }
+    }
+
+    #[test]
+    fn a_zero_length_filter_rules_nothing_out() {
+        // `from_bytes` is public and a caller can hand it an empty vector.
+        // The mask derivation used to underflow on it. "No evidence" has to
+        // read as "cannot rule out", the same discipline an absent index
+        // follows -- the opposite reading deletes results.
+        let empty = Bloom::from_bytes(Vec::new());
+        assert_eq!(empty.bit_len(), 0);
+        assert!(empty.may_contain("anything"));
+        assert!(empty.may_contain_all(&["a".to_owned(), "b".to_owned()]));
+        assert_eq!(empty.fill_ratio(), 0.0);
+        assert_eq!(bit_positions("anything", 0).count(), 0);
+
+        let mut empty = Bloom::from_bytes(Vec::new());
+        empty.insert("anything");
+        assert!(empty.may_contain("anything"), "still rules nothing out");
     }
 
     #[test]

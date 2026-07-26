@@ -1116,3 +1116,74 @@ fn the_content_admission_metric_counts_only_records_the_query_reads() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn a_user_object_carrying_a_payload_key_is_still_searchable() {
+    // `$payload` is Traza's marker for an offloaded value, but nothing stops
+    // a tool call's arguments from having a field of that name. Treating any
+    // object that has one as a reference -- and indexing only its `preview` --
+    // silently removed every other field of that object from search.
+    let (store, dir) = content_store("content-payload-key");
+    store
+        .ingest(span(
+            "tool",
+            1_000,
+            10,
+            json!({"arguments": {"$payload": "business-value", "query": "nestedneedle"}}),
+        ))
+        .expect("ingest");
+    store.flush().expect("flush");
+
+    let found = store
+        .query(&SpanFilter {
+            content: Some("nestedneedle".to_owned()),
+            ..SpanFilter::default()
+        })
+        .expect("content query");
+    assert_eq!(
+        ids(&found),
+        ["tool"],
+        "a sibling field of a $payload key must still be indexed"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn a_genuinely_offloaded_value_still_indexes_only_its_preview() {
+    // The other side of the same change: relaxing the reference check must
+    // not start indexing the whole reference object.
+    let dir = test_dir("content-offload-preview");
+    let store = Store::open(
+        &dir,
+        Config {
+            durability: traza::Durability::Buffered,
+            compaction: None,
+            payload_threshold: Some(512),
+            ..Config::default()
+        },
+    )
+    .expect("opens");
+    let mut text = String::from("earlyword ");
+    text.push_str(&"filler ".repeat(200));
+    text.push_str("lateword");
+    store
+        .ingest(span("big", 1_000, 10, json!({ "gen_ai.prompt": text })))
+        .expect("ingest");
+    store.flush().expect("flush");
+
+    let probe = |needle: &str| {
+        store
+            .query(&SpanFilter {
+                content: Some(needle.to_owned()),
+                ..SpanFilter::default()
+            })
+            .expect("content query")
+    };
+    assert_eq!(ids(&probe("earlyword")), ["big"], "the preview is indexed");
+    assert!(probe("lateword").is_empty(), "text past the preview is not");
+    assert!(
+        probe("sha256").is_empty(),
+        "the reference hash is not indexed as prose"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
