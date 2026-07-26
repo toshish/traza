@@ -178,6 +178,18 @@ pub struct Metrics {
     pub segment_seal: Latency,
     /// Spans written out by seals, for seal cost per span.
     pub segment_seal_spans: Counter,
+    /// Segments a query skipped entirely because their timestamp range could
+    /// not overlap the requested window.
+    ///
+    /// Exposed because time pruning is invisible from results alone — a
+    /// correct answer looks identical whether the segment was skipped or
+    /// scanned — so this counter is the only way to tell it is working, in a
+    /// test or in production.
+    pub segments_pruned_by_time: Counter,
+    /// Segments a query considered, pruned or not. The ratio against
+    /// `segments_pruned_by_time` is how much of the store a time filter is
+    /// actually eliminating.
+    pub segments_examined: Counter,
 }
 
 impl Metrics {
@@ -191,11 +203,16 @@ impl Metrics {
     pub fn render_prometheus(&self, into: &mut String) {
         use std::fmt::Write as _;
 
-        let counters: [(&str, &Counter); 4] = [
+        let counters: [(&str, &Counter); 6] = [
             ("traza_spans_admitted_total", &self.spans_admitted),
             ("traza_batches_admitted_total", &self.batches_admitted),
             ("traza_wal_commits_total", &self.wal_commits),
             ("traza_segment_seal_spans_total", &self.segment_seal_spans),
+            (
+                "traza_segments_pruned_by_time_total",
+                &self.segments_pruned_by_time,
+            ),
+            ("traza_segments_examined_total", &self.segments_examined),
         ];
         for (name, counter) in counters {
             let _ = writeln!(into, "# TYPE {name} counter");

@@ -21,7 +21,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use traza::segment::{self, RecordInput, Segment, HEADER_LEN, MAGIC, VERSION};
+use traza::segment::{self, RecordInput, Segment, HEADER_LEN, HEADER_LEN_V2, MAGIC, VERSION};
 
 static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 
@@ -112,6 +112,9 @@ mod offsets {
     pub const TRACE_INDEX_OFFSET: usize = 56;
     pub const TRACE_INDEX_LEN: usize = 64;
     pub const ATTRIBUTE_INDEX_OFFSET: usize = 72;
+    /// v3 additions: the inclusive record timestamp range.
+    pub const MIN_TIMESTAMP: usize = 80;
+    pub const MAX_TIMESTAMP: usize = 88;
 }
 
 #[test]
@@ -127,13 +130,30 @@ fn format_conformance() {
         "the real magic must match the documented format"
     );
     assert_eq!(get_u16(&bytes, offsets::VERSION), VERSION, "format version");
-    assert_eq!(get_u16(&bytes, offsets::VERSION), 2, "format version is 2");
+    assert_eq!(get_u16(&bytes, offsets::VERSION), 3, "format version is 3");
     assert_eq!(
         usize::from(get_u16(&bytes, offsets::HEADER_LEN)),
         HEADER_LEN,
         "header length field matches the exported constant"
     );
-    assert_eq!(HEADER_LEN, 80, "header is 80 bytes");
+    assert_eq!(HEADER_LEN, 96, "header is 96 bytes");
+    assert_eq!(HEADER_LEN_V2, 80, "the v2 header this reader still accepts");
+
+    // The v3 timestamp range, hand-parsed at its documented offsets. This is
+    // the field a query uses to skip a segment without opening it, so a
+    // wrong value here silently drops results rather than corrupting a read.
+    let expected_min = records.iter().map(|r| r.timestamp).min().expect("records");
+    let expected_max = records.iter().map(|r| r.timestamp).max().expect("records");
+    assert_eq!(
+        get_u64(&bytes, offsets::MIN_TIMESTAMP),
+        expected_min,
+        "minimum record timestamp"
+    );
+    assert_eq!(
+        get_u64(&bytes, offsets::MAX_TIMESTAMP),
+        expected_max,
+        "maximum record timestamp"
+    );
     assert_eq!(
         get_u32(&bytes, offsets::RESERVED),
         0,
@@ -583,5 +603,74 @@ fn foreign_bytes_are_rejected() {
             "non_contiguous_sections_refused",
             "truncation_refused",
         ],
+    );
+}
+
+/// Rewrites v3 bytes into a genuine v2 segment: version 2, an 80-byte header
+/// with no timestamp range, and every section offset shifted down by the 16
+/// bytes the range occupied.
+///
+/// Built by transformation rather than kept as a fixture because a checked-in
+/// binary blob rots silently — nothing would tell us it had stopped
+/// resembling what 0.16 actually wrote.
+fn downgrade_to_v2(v3: &[u8]) -> Vec<u8> {
+    const SHIFT: u64 = (HEADER_LEN - HEADER_LEN_V2) as u64;
+    let mut header = v3[..HEADER_LEN_V2].to_vec();
+    header[8..10].copy_from_slice(&2_u16.to_le_bytes());
+    header[10..12].copy_from_slice(&(HEADER_LEN_V2 as u16).to_le_bytes());
+    for offset_field in [24_usize, 40, 56, 72] {
+        let value = get_u64(v3, offset_field) - SHIFT;
+        header[offset_field..offset_field + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    let mut out = header;
+    out.extend_from_slice(&v3[HEADER_LEN..]);
+    out
+}
+
+#[test]
+fn a_v2_segment_still_reads_and_is_never_skipped_by_a_time_filter() {
+    // A v2 segment carries no timestamp range. "Unknown" has to mean "cannot
+    // rule this out" — if it were read as an empty range instead, every v2
+    // segment in a store would vanish from every time-filtered query, which
+    // is data loss that looks like an empty result.
+    let records = corpus();
+    let v3 = segment::encode(&records).expect("encode");
+    let v2 = downgrade_to_v2(&v3);
+
+    assert_eq!(get_u16(&v2, offsets::VERSION), 2, "downgraded to v2");
+    assert_eq!(
+        usize::from(get_u16(&v2, offsets::HEADER_LEN)),
+        HEADER_LEN_V2
+    );
+
+    let segment = Segment::from_bytes(v2).expect("a v2 segment still opens");
+    assert_eq!(
+        segment.header().record_count,
+        records.len() as u64,
+        "every record is still readable"
+    );
+    assert_eq!(
+        segment.timestamp_range(),
+        None,
+        "v2 carries no range, so the range is unknown rather than empty"
+    );
+
+    // The load-bearing assertion: unknown range means the segment must be
+    // considered for every window, including ones it may not actually
+    // intersect.
+    assert!(
+        segment.may_contain_timestamps(Some(0), Some(1)),
+        "a v2 segment must never be skipped"
+    );
+    assert!(segment.may_contain_timestamps(Some(u64::MAX - 1), None));
+    assert!(segment.may_contain_timestamps(None, Some(0)));
+
+    // And a v3 segment over the same records DOES carry a usable range.
+    let v3_segment = Segment::from_bytes(v3).expect("v3 opens");
+    let (min, max) = v3_segment.timestamp_range().expect("v3 has a range");
+    assert!(min <= max);
+    assert!(
+        !v3_segment.may_contain_timestamps(Some(max + 1), None),
+        "v3 can be ruled out, which is the whole point of the field"
     );
 }

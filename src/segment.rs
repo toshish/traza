@@ -22,9 +22,22 @@ pub const MAGIC: [u8; 8] = *b"TRAZASEG";
 /// On-disk format version written by this module. This — not the magic — is
 /// how the format generation is identified; the magic only says "a Traza
 /// segment". (JSONL v1 carried no magic; this indexed format is version 2.)
-pub const VERSION: u16 = 2;
-/// Fixed header size in bytes.
-pub const HEADER_LEN: usize = 80;
+pub const VERSION: u16 = 3;
+/// Fixed header size written by this module.
+///
+/// v3 appends the segment's timestamp range to the v2 header. Time is the
+/// most common filter an observability store sees and it was the one thing a
+/// query could not use to skip work: `since`/`until` were pure post-filters,
+/// so a "last 15 minutes" search opened and scanned every segment in the
+/// store. Two u64s in the header let a query eliminate a whole segment
+/// without touching it.
+pub const HEADER_LEN: usize = 96;
+/// v2 header size. Still readable: a v2 segment simply carries no timestamp
+/// range, and a query treats its range as unknown and cannot skip it — which
+/// is exactly the behaviour that existed before v3.
+pub const HEADER_LEN_V2: usize = 80;
+/// Oldest format this module can read.
+pub const MIN_READABLE_VERSION: u16 = 2;
 
 const RECORD_FIXED_LEN: usize = 8 + 4 + 4 + 4 + 4;
 
@@ -53,6 +66,10 @@ pub struct Header {
     pub attribute_index_offset: u64,
     /// Length of the attribute index.
     pub attribute_index_len: u64,
+    /// Inclusive `(min, max)` record timestamp, or `None` on a v2 segment
+    /// that predates the field. `None` means unknown, never "empty": a query
+    /// must scan a segment whose range it cannot rule out.
+    pub timestamps: Option<(u64, u64)>,
 }
 
 impl Header {
@@ -65,19 +82,26 @@ impl Header {
     /// against `total` (the real file length) — the file-backed open hands in
     /// only the head bytes.
     pub fn parse_with_total(bytes: &[u8], total: u64) -> Result<Self, Error> {
-        if bytes.len() < HEADER_LEN {
-            return Err(Error::Corrupt("file is shorter than the v2 header"));
+        if bytes.len() < HEADER_LEN_V2 {
+            return Err(Error::Corrupt("file is shorter than the smallest header"));
         }
         if bytes[..8] != MAGIC {
             return Err(Error::Unsupported("not a Traza segment (bad magic)"));
         }
         let version = read_u16(bytes, 8)?;
-        if version != VERSION {
+        if !(MIN_READABLE_VERSION..=VERSION).contains(&version) {
             return Err(Error::Unsupported("unsupported segment version"));
         }
         let header_len = read_u16(bytes, 10)?;
-        if usize::from(header_len) != HEADER_LEN {
-            return Err(Error::Corrupt("invalid v2 header length"));
+        let expected_header_len = match version {
+            2 => HEADER_LEN_V2,
+            _ => HEADER_LEN,
+        };
+        if usize::from(header_len) != expected_header_len {
+            return Err(Error::Corrupt("header length does not match the version"));
+        }
+        if bytes.len() < expected_header_len {
+            return Err(Error::Corrupt("file is shorter than its declared header"));
         }
         let header = Self {
             version,
@@ -93,6 +117,13 @@ impl Header {
             attribute_index_len: total
                 .checked_sub(read_u64(bytes, 72)?)
                 .ok_or(Error::Corrupt("attribute index offset beyond file"))?,
+            // v2 predates the range. `None` means "unknown", which makes a
+            // query scan the segment rather than wrongly skip it.
+            timestamps: if version >= 3 {
+                Some((read_u64(bytes, 80)?, read_u64(bytes, 88)?))
+            } else {
+                None
+            },
         };
         header.validate_total(total)?;
         Ok(header)
@@ -493,6 +524,38 @@ impl Segment {
         Ok(())
     }
 
+    /// Inclusive `(min, max)` record timestamp, or `None` when the segment
+    /// predates the field and its range is therefore unknown.
+    ///
+    /// Callers must treat `None` as "cannot rule this segment out". Reading it
+    /// as an empty range would silently drop results from every v2 segment in
+    /// the store.
+    pub fn timestamp_range(&self) -> Option<(u64, u64)> {
+        self.header().timestamps
+    }
+
+    /// Whether any record here can fall inside `[since, until]`.
+    ///
+    /// This is the whole point of the v3 range: a query that answers `false`
+    /// skips the segment without reading a byte of it.
+    pub fn may_contain_timestamps(&self, since: Option<u64>, until: Option<u64>) -> bool {
+        let Some((min, max)) = self.timestamp_range() else {
+            // Unknown range: it might. See `timestamp_range`.
+            return true;
+        };
+        if min > max {
+            // Empty segment; nothing can match.
+            return false;
+        }
+        if since.is_some_and(|since| max < since) {
+            return false;
+        }
+        if until.is_some_and(|until| min > until) {
+            return false;
+        }
+        true
+    }
+
     /// All record offsets in record (timestamp) order — the lazy full-scan
     /// candidate list when no index applies.
     pub fn record_offsets(&self) -> &[u64] {
@@ -632,6 +695,14 @@ pub fn encode(records: &[RecordInput]) -> Result<Vec<u8>, Error> {
     put_u64(&mut bytes, trace_index_offset);
     put_u64(&mut bytes, trace_region.len() as u64);
     put_u64(&mut bytes, attribute_index_offset);
+    // Inclusive timestamp range. An empty segment gets an empty range
+    // (min > max), which can never overlap a query and is therefore always
+    // skippable — the correct answer for a segment holding nothing.
+    let (min_ts, max_ts) = records.iter().fold((u64::MAX, 0_u64), |(lo, hi), record| {
+        (lo.min(record.timestamp), hi.max(record.timestamp))
+    });
+    put_u64(&mut bytes, min_ts);
+    put_u64(&mut bytes, max_ts);
     debug_assert_eq!(bytes.len(), HEADER_LEN);
     bytes.extend_from_slice(&record_region);
     bytes.extend_from_slice(&offset_region);

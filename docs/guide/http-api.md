@@ -134,16 +134,56 @@ Filtered span search, ordered by Traza's stable span order
 | `name` | string | Exact match on the operation name |
 | `attr.KEY` | JSON or string | Exact attribute match. Repeatable — each occurrence adds a condition |
 | `session` | string | Every span of a session, unioning all recognized session keys |
+| `not_attr.KEY` | JSON or string | Exclude spans whose attribute equals this. A span missing the key entirely is **kept**. Repeatable |
+| `min_attr.KEY` | number | Attribute is at least this, compared numerically. Repeatable |
+| `max_attr.KEY` | number | Attribute is at most this, compared numerically. Repeatable |
 | `min_duration_ms` | integer | Minimum `end - start`, in milliseconds |
 | `min_duration_ns` | integer | Minimum `end - start`, in nanoseconds |
+| `max_duration_ms` | integer | Maximum `end - start`, in milliseconds |
+| `max_duration_ns` | integer | Maximum `end - start`, in nanoseconds |
 | `since` / `since_ns` | integer | Only spans starting at or after this Unix-nanosecond timestamp |
 | `until` / `until_ns` | integer | Only spans starting at or before this timestamp |
+| `sort` | string | `duration` / `-duration` / `start` / `-start` (a leading `-` is descending). Omit for Traza's stable order |
 | `limit` | integer | Maximum spans returned. **Default 100**, applied after filtering |
 
-`attr.KEY=VALUE` parses `VALUE` as JSON when it is valid JSON and treats it as
-a plain string otherwise — so `attr.code=200` matches the number `200` while
-`attr.code=%22200%22` matches the string `"200"`. See
-[filter value types](data-model.md#filter-value-types).
+`attr.KEY=VALUE` **matches a scalar regardless of how it was typed on the
+wire.** `attr.code=200` finds spans that stored the number `200` and spans
+that stored the string `"200"`. This matters because instrumentation is
+inconsistent about it — several SDKs stringify token counts and status codes —
+and the previous behaviour matched only the number, so a store full of
+stringified values answered every such query with an empty array that was
+indistinguishable from "no such data". Matching is still exact: `200` does not
+match `20`, and containers (arrays, objects) compare structurally.
+
+`min_attr.KEY` / `max_attr.KEY` read the attribute as a number whether it was
+stored as one or as a string, so `min_attr.llm.usage.total_tokens=1000` works
+across both conventions. A span whose attribute is absent or non-numeric does
+not match a numeric bound.
+
+`not_attr.KEY` deliberately **keeps** spans that lack the key:
+`not_attr.status=error` means "not known to be an error", which includes spans
+that never recorded a status. Treating a missing key as excluded would hide
+most of a corpus behind a filter that reads like it only removes failures.
+
+**Sorting costs a full scan.** Without `sort`, a query stops as soon as it has
+`limit` matches. With it, every match must be found before any can be ranked,
+so `sort` is refused with `400` past an internal candidate ceiling — narrow
+with a time range, `service`, or an attribute and retry. Returning the "ten
+slowest" out of an arbitrary first page would be a wrong answer that looks
+like a right one.
+
+**Time ranges skip whole segments.** `since` / `until` are compared against
+each segment's stored timestamp range, so a segment that cannot contain a
+match is never opened. `traza_segments_pruned_by_time_total` and
+`traza_segments_examined_total` in [`/v1/metrics`](../operations/monitoring.md)
+show how much of the store a given window is eliminating. Segments written
+before v0.18 carry no range and are always scanned; they age out through
+normal compaction.
+
+The work avoided is real and counter-verified, but **no latency figure is
+published for it yet**: the only measurement attempted so far ran on a
+40-segment store, which is too small for per-segment cost to be visible above
+noise. Expect it to matter in proportion to segment count, like compaction.
 
 `session=` is not the same as `attr.session.id=`: it unions every recognized
 session key, so a session whose spans use mixed conventions returns whole.
@@ -152,6 +192,9 @@ session key, so a session whose spans use mixed conventions returns whole.
 
 ```sh
 curl 'http://localhost:8080/v1/spans?service=checkout&attr.region=us-east&min_duration_ms=2&limit=50'
+
+# The ten slowest non-OK calls in a window that cost over a cent
+curl 'http://localhost:8080/v1/spans?since_ns=1700000000000000000&until_ns=1700003600000000000&not_attr.status=ok&min_attr.llm.cost_usd=0.01&sort=-duration&limit=10'
 ```
 
 ```json
