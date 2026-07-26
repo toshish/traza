@@ -343,7 +343,10 @@ alongside results.
   at 78-85%. **Re-measure on an idle machine**, and expect the log device
   rather than the engine's locking to be what the answer turns on.
 - **Query latency:** p99 < 10 ms trace lookup and < 50 ms filtered search at
-  a 100M-span store; RSS remains O(indexes). *Status at 10M (0.15):* trace
+  a 100M-span store; RSS remains O(indexes). **The RSS half of this gate is
+  mis-stated and is not currently met for LLM corpora** — see the memory gate
+  below; it is kept here only because the latency halves are measured against
+  it. *Status at 10M (0.15):* trace
   lookup p99 4.65 ms already clears its bar and RSS held at 0.25 GB, but the
   filtered-search bar is the open risk — uncompacted, it measured p99 220 ms
   at a tenth of the gate's corpus, because the cost is per-segment rather
@@ -364,12 +367,33 @@ alongside results.
   6.7 GB at the 1 GiB cap against 2.0 GB at the default, because a merge
   materializes its inputs, so the peak tracks the cap rather than the index
   size. Between merges resident memory settles around 1.4-2.4 GB, so the
-  steady state is still O(indexes) and the transient is not; whether that
-  counts as meeting "RSS remains O(indexes)" is a judgement this gate should
-  make explicit before 1.0. Sustained ingest also falls from 40,894/s to
+  transient is plainly not O(indexes); the steady state is, but only in the
+  sense the memory gate below now spells out, and every figure in this
+  paragraph was measured on a corpus with five enum-valued attributes.
+  Sustained ingest also falls from 40,894/s to
   31,267/s. Segment count still grows with the corpus, so the tail returns
   at a large enough store, and the Phase 3 per-segment inverted index
   remains the structural answer.
+- **Memory:** *this gate replaces the "RSS remains O(indexes)" clause above,
+  which was true only for the corpus it was measured on.* Resident memory is
+  bounded independently of corpus size for **low-cardinality** indexed
+  attributes and is **linear in indexed text** otherwise, because the
+  attribute index is keyed on the whole attribute value and
+  `Segment::open` decodes it eagerly. Measured (`index-mem-bench`): 10M spans
+  with six enum-valued attributes open in 846 MiB, entirely postings at
+  8 bytes per span per indexed attribute; one 2 KiB indexed prompt per span
+  measures RSS ≈ 1.44 × the text ingested, extrapolating to ~29 GB at 10M
+  spans. Deduplication is per segment, so global repetition does not help
+  once distinct values exceed `--flush-spans` — 10% and 100% unique cost
+  identically at 512 B and 2 KiB values. Full results:
+  [capacity](operations/capacity.md#memory).
+  **The bar for 1.0:** an LLM corpus of 10M spans carrying a 2 KiB indexed
+  prompt each serves within 4 GB RSS. That needs the Phase 3 hashed-key or
+  dictionary-encoded attribute index (store a digest, not the value —
+  `payload::sha256_hex` truncated, never `DefaultHasher`, which is randomly
+  seeded per process and cannot be persisted). Until then the documented
+  mitigation is `--payload-threshold-bytes`, and the docs say so rather than
+  implying the problem does not exist.
 - **Regression policy:** each gate runs ≥5 times; the reported statistic is
   the median with an interquartile range; a release blocks when the median
   regresses >10% *and* the change exceeds run-to-run noise for that metric.
