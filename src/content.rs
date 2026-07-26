@@ -44,9 +44,12 @@
 //!
 //! # What the tokenizer sees
 //!
-//! Tokens are maximal runs of ASCII alphanumerics, lowercased, truncated at
-//! [`MAX_TOKEN_LEN`]. Everything else — punctuation, whitespace, JSON
-//! structure — is a separator. Non-ASCII bytes are separators too: this is an
+//! Tokens are maximal runs of ASCII alphanumerics, lowercased. Everything
+//! else — punctuation, whitespace, JSON structure — is a separator. Tokens
+//! longer than [`MAX_TOKEN_LEN`] are *hashed* under their first
+//! `MAX_TOKEN_LEN` bytes, which bounds the filter; they are still *compared*
+//! in full, so two long words sharing a prefix cost a decode rather than
+//! producing a match. Non-ASCII bytes are separators too: this is an
 //! ASCII tokenizer and it does not pretend otherwise. Text in a script it
 //! cannot segment produces no tokens, and a query for it declares itself
 //! unindexable (see [`Query::is_indexable`]) so the planner scans instead of
@@ -56,15 +59,20 @@ use std::collections::HashSet;
 
 use crate::hash::hash128;
 
-/// Longest token indexed, in bytes. Runs longer than this are truncated to
-/// their first `MAX_TOKEN_LEN` bytes.
+/// Longest token PROBED, in bytes. A longer token is hashed under its first
+/// `MAX_TOKEN_LEN` bytes.
 ///
 /// Without a cap, one base64 blob or minified payload contributes a token as
 /// large as itself and as distinct as itself, which is exactly the unbounded
-/// cardinality this index exists to avoid. Truncation makes two long runs
-/// sharing a prefix indistinguishable, which costs a verified candidate and
-/// never an answer — [`Query::matches`] truncates identically, so the two
-/// still agree.
+/// cardinality this index exists to avoid.
+///
+/// **The cap applies to the filter and to nothing else.** Two different words
+/// sharing their first 40 bytes therefore land on the same bits and are
+/// candidates for each other — which is precisely what a Bloom filter already
+/// permits, and it costs a decode. [`Query::matches`] compares tokens IN FULL,
+/// so a candidate admitted by a shared prefix is rejected there. An earlier
+/// version truncated on both sides "so the two agree", which made them agree
+/// on a wrong answer: two distinct words matched each other in results.
 pub const MAX_TOKEN_LEN: usize = 40;
 
 /// Number of bit positions each token sets. Four is the practical optimum for
@@ -93,8 +101,9 @@ pub fn for_each_token(text: &str, f: &mut impl FnMut(&str)) {
             continue;
         }
         if index > start {
-            let end = start + (index - start).min(MAX_TOKEN_LEN);
-            let run = &text[start..end];
+            // The whole run, untruncated. Truncation belongs to the filter
+            // (see `bit_positions`), not to what a match is compared against.
+            let run = &text[start..index];
             if run.bytes().any(|byte| byte.is_ascii_uppercase()) {
                 buffer.clear();
                 buffer.extend(run.chars().map(|c| c.to_ascii_lowercase()));
@@ -115,15 +124,33 @@ pub fn tokens(text: &str) -> Vec<String> {
     out
 }
 
-/// The distinct tokens across many texts.
-pub fn distinct_tokens<'a>(texts: impl Iterator<Item = &'a str>) -> HashSet<String> {
+/// The key a token is hashed under: the token itself, or its first
+/// [`MAX_TOKEN_LEN`] bytes if it is longer.
+///
+/// Tokens are runs of ASCII alphanumerics by construction, so a byte cut is
+/// always a character boundary.
+pub fn probe_key(token: &str) -> &str {
+    match token.len() > MAX_TOKEN_LEN {
+        true => &token[..MAX_TOKEN_LEN],
+        false => token,
+    }
+}
+
+/// The distinct PROBE KEYS across many texts — what a filter is built from.
+///
+/// Deliberately not the distinct tokens: this set exists to be inserted into a
+/// Bloom filter, and holding full-length tokens here would put an unbounded
+/// amount of text in a transient set while the filter it feeds is fixed-size.
+/// Matching never consults this; it walks the text with [`for_each_token`].
+pub fn distinct_probe_keys<'a>(texts: impl Iterator<Item = &'a str>) -> HashSet<String> {
     let mut distinct = HashSet::new();
     for text in texts {
         for_each_token(text, &mut |token| {
+            let key = probe_key(token);
             // `contains` on a borrowed &str avoids allocating for the repeats,
             // which in prose are the overwhelming majority.
-            if !distinct.contains(token) {
-                distinct.insert(token.to_owned());
+            if !distinct.contains(key) {
+                distinct.insert(key.to_owned());
             }
         });
     }
@@ -271,7 +298,7 @@ impl Bloom {
 /// than through [`Bloom`] — see the segment's content index, which stores one
 /// row per position so that testing a token across every block is one read.
 pub fn bit_positions(token: &str, bit_len: usize) -> impl Iterator<Item = usize> {
-    let digest = hash128(token.as_bytes());
+    let digest = hash128(probe_key(token).as_bytes());
     let low = u64::from_le_bytes(digest.0[..8].try_into().expect("8 bytes"));
     let high = u64::from_le_bytes(digest.0[8..].try_into().expect("8 bytes"));
     let mask = (bit_len - 1) as u64;
@@ -311,7 +338,7 @@ pub fn build<'a>(
     // one token per occurrence rather than per distinct value is the
     // difference between an index costing a fraction of a seal and one that
     // dominates it.
-    let distinct = distinct_tokens(texts);
+    let distinct = distinct_probe_keys(texts);
     let mut bloom = Bloom::new(size_bits(distinct.len(), min_bytes, max_bytes));
     for token in &distinct {
         bloom.insert(token);
@@ -351,16 +378,37 @@ mod tests {
     }
 
     #[test]
-    fn long_runs_are_truncated_rather_than_indexed_whole() {
+    fn long_runs_are_truncated_for_the_filter_and_nowhere_else() {
+        // The cap is a property of the FILTER. A token is tokenized whole,
+        // and hashed under its first MAX_TOKEN_LEN bytes.
         let long = "a".repeat(MAX_TOKEN_LEN + 25);
-        assert_eq!(tokens(&long), ["a".repeat(MAX_TOKEN_LEN)]);
-        // Two long runs sharing a prefix collapse to one token. The query side
-        // truncates identically, so this costs a verified candidate and never
-        // an answer.
+        assert_eq!(
+            tokens(&long),
+            std::slice::from_ref(&long),
+            "the token itself is whole"
+        );
+        assert_eq!(super::probe_key(&long).len(), MAX_TOKEN_LEN);
+
         let first = format!("{}aaa", "z".repeat(MAX_TOKEN_LEN));
         let second = format!("{}bbb", "z".repeat(MAX_TOKEN_LEN));
-        assert_eq!(tokens(&first), tokens(&second));
-        assert!(Query::new(&first).matches(one(&second)));
+
+        // They share a probe key, so each is a CANDIDATE for the other. That
+        // is a Bloom filter behaving normally.
+        let mut bloom = Bloom::new(size_bits(8, 64, 4096));
+        bloom.insert(&second);
+        assert!(
+            bloom.may_contain(&first),
+            "a shared 40-byte prefix must still admit the candidate"
+        );
+
+        // And matching must reject it. An earlier version truncated on both
+        // sides "so the two agree" -- they agreed on a wrong answer, and two
+        // distinct words matched each other in results.
+        assert!(
+            !Query::new(&first).matches(one(&second)),
+            "distinct words sharing a prefix must not match"
+        );
+        assert!(Query::new(&first).matches(one(&first)));
     }
 
     #[test]

@@ -855,3 +855,264 @@ fn compaction_preserves_the_content_index() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn content_pruning_does_not_make_a_segment_supersede_itself() {
+    // Regression, P1. Limited queries map source index -> segment index
+    // POSITIONALLY. Every `continue` in the segment loop compresses `sources`
+    // without compressing `segments`, so a surviving segment is checked for
+    // supersedence against ITSELF and every row it holds is dropped.
+    //
+    // Content pruning made this reachable on the default path -- an HTTP
+    // query carries limit=100 -- but time pruning could already trigger it,
+    // so both are asserted here.
+    let (store, dir) = content_store("prune-supersede");
+    // Segment 0: no needle. Segment 1: the needle.
+    for index in 0..200usize {
+        store
+            .ingest(span(
+                &format!("old{index}"),
+                1_000 + index as u64,
+                10,
+                json!({"note": "ordinary completion text"}),
+            ))
+            .expect("ingest");
+    }
+    store.flush().expect("flush");
+    store
+        .ingest(span(
+            "target",
+            900_000,
+            10,
+            json!({"note": "rareneedle here"}),
+        ))
+        .expect("ingest");
+    store.flush().expect("flush");
+    assert_eq!(store.stats().expect("stats").segment_count, 2);
+
+    let found = store
+        .query(&SpanFilter {
+            content: Some("rareneedle".to_owned()),
+            limit: Some(100),
+            ..SpanFilter::default()
+        })
+        .expect("content query");
+    assert_eq!(
+        ids(&found),
+        ["target"],
+        "the surviving segment's row must not be dropped as superseded by itself"
+    );
+
+    // The same shape via time pruning, with no content filter involved.
+    let by_time = store
+        .query(&SpanFilter {
+            since_ns: Some(800_000),
+            limit: Some(100),
+            ..SpanFilter::default()
+        })
+        .expect("time query");
+    assert_eq!(
+        ids(&by_time),
+        ["target"],
+        "time pruning must not shift the supersedence mapping either"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn attribute_typing_is_agnostic_after_sealing_too() {
+    // Regression. `attr.code=200` is documented to match the number 200 and
+    // the string "200". It did -- in the write buffer. The segment index is
+    // keyed on the CANONICAL JSON of the value, so probing with `200` finds
+    // only records that stored a number, and the string record is never a
+    // candidate. The index was acting as a filter rather than a superset.
+    //
+    // The existing test for this never flushed, so it only ever exercised
+    // the buffer.
+    let (store, dir) = store("typing-sealed");
+    store
+        .ingest(span("numeric", 1_000, 10, json!({"code": 200})))
+        .expect("ingest");
+    store
+        .ingest(span("stringy", 2_000, 10, json!({"code": "200"})))
+        .expect("ingest");
+    store.flush().expect("flush");
+    assert!(store.stats().expect("stats").segment_count > 0);
+
+    for probe in [json!(200), json!("200")] {
+        let found = store
+            .query(&SpanFilter {
+                attributes: vec![("code".to_owned(), probe.clone())],
+                limit: None,
+                ..SpanFilter::default()
+            })
+            .expect("query");
+        let mut got = ids(&found);
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            ["numeric", "stringy"],
+            "probing a sealed segment with {probe} must find both encodings"
+        );
+    }
+
+    // Still exact after sealing: a prefix is not a match.
+    assert!(store
+        .query(&SpanFilter {
+            attributes: vec![("code".to_owned(), json!("20"))],
+            limit: None,
+            ..SpanFilter::default()
+        })
+        .expect("query")
+        .is_empty());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn an_offloaded_value_is_searchable_only_within_its_preview() {
+    // Offloading runs at ingest, before anything indexes the span, so the
+    // text beyond the inline preview is simply not present for either the
+    // index or the match to see. That is a bounded feature, not a wrong one:
+    // both sides read the span through the same function, so a span is never
+    // SKIPPED that would have matched. This pins the boundary so the
+    // documented limit stays the real one.
+    let dir = test_dir("content-offload");
+    let store = Store::open(
+        &dir,
+        Config {
+            durability: traza::Durability::Buffered,
+            compaction: None,
+            payload_threshold: Some(512),
+            ..Config::default()
+        },
+    )
+    .expect("opens");
+
+    // "earlyword" lands inside the 256-character preview; "lateword" does not.
+    let mut text = String::from("earlyword ");
+    text.push_str(&"filler ".repeat(200));
+    text.push_str("lateword");
+    assert!(text.len() > 512, "the value must actually offload");
+    store
+        .ingest(span("big", 1_000, 10, json!({ "gen_ai.prompt": text })))
+        .expect("ingest");
+    store.flush().expect("flush");
+
+    let early = store
+        .query(&SpanFilter {
+            content: Some("earlyword".to_owned()),
+            ..SpanFilter::default()
+        })
+        .expect("content query");
+    assert_eq!(ids(&early), ["big"], "the preview is searchable");
+
+    let late = store
+        .query(&SpanFilter {
+            content: Some("lateword".to_owned()),
+            ..SpanFilter::default()
+        })
+        .expect("content query");
+    assert!(
+        late.is_empty(),
+        "text past the preview is not indexed, and this is the documented limit"
+    );
+
+    // The `$payload` hash is not indexed as if it were prose.
+    let hashish = store
+        .query(&SpanFilter {
+            content: Some("sha256".to_owned()),
+            ..SpanFilter::default()
+        })
+        .expect("content query");
+    assert!(hashish.is_empty(), "the reference itself is not content");
+
+    // Below the threshold nothing offloads and the whole value is searchable,
+    // which is the default posture at 256 KiB.
+    let inline_dir = test_dir("content-inline");
+    let inline = Store::open(
+        &inline_dir,
+        Config {
+            durability: traza::Durability::Buffered,
+            compaction: None,
+            payload_threshold: Some(1024 * 1024),
+            ..Config::default()
+        },
+    )
+    .expect("opens");
+    let mut wide = String::from("earlyword ");
+    wide.push_str(&"filler ".repeat(200));
+    wide.push_str("lateword");
+    inline
+        .ingest(span("small", 1_000, 10, json!({ "gen_ai.prompt": wide })))
+        .expect("ingest");
+    inline.flush().expect("flush");
+    assert_eq!(
+        ids(&inline
+            .query(&SpanFilter {
+                content: Some("lateword".to_owned()),
+                ..SpanFilter::default()
+            })
+            .expect("content query")),
+        ["small"],
+        "an inline value is searchable in full"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+    let _ = std::fs::remove_dir_all(inline_dir);
+}
+
+#[test]
+fn the_content_admission_metric_counts_only_records_the_query_reads() {
+    // The counter is meant to answer "how much did the content index make us
+    // decode". It used to be incremented as soon as the content candidates
+    // were COMPUTED, before the planner compared them against the attribute
+    // probes -- so a query narrowed by an attribute still reported the whole
+    // content candidate list as admitted, and the selectivity signal read as
+    // though the index were far worse than it is.
+    let (store, dir) = content_store("content-metric");
+    for index in 0..2_000usize {
+        store
+            .ingest(span(
+                &format!("s{index}"),
+                1_000 + index as u64,
+                10,
+                json!({
+                    // Every span carries the word, so content alone is useless.
+                    "note": "shared completion text",
+                    // Exactly one carries the attribute.
+                    "rare": if index == 7 { "yes" } else { "no" },
+                }),
+            ))
+            .expect("ingest");
+    }
+    store.flush().expect("flush");
+
+    let before = store.metrics().records_admitted_by_content.get();
+    let found = store
+        .query(&SpanFilter {
+            content: Some("shared".to_owned()),
+            attributes: vec![("rare".to_owned(), json!("yes"))],
+            ..SpanFilter::default()
+        })
+        .expect("query");
+    assert_eq!(ids(&found), ["s7"], "the answer is unaffected");
+    let admitted = store.metrics().records_admitted_by_content.get() - before;
+    assert_eq!(
+        admitted, 0,
+        "the attribute probe won, so no record was read on the content \
+         index's account: {admitted} counted"
+    );
+
+    // When content DOES drive the scan, it is counted.
+    let before = store.metrics().records_admitted_by_content.get();
+    let _ = store
+        .query(&SpanFilter {
+            content: Some("shared".to_owned()),
+            ..SpanFilter::default()
+        })
+        .expect("query");
+    assert!(
+        store.metrics().records_admitted_by_content.get() > before,
+        "a content-driven scan must still be counted"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}

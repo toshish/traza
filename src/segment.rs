@@ -1190,7 +1190,7 @@ fn encode_content_index(records: &[RecordInput]) -> Vec<u8> {
     let mut block_tokens: Vec<std::collections::HashSet<String>> = Vec::with_capacity(block_count);
     let mut all_tokens: std::collections::HashSet<String> = std::collections::HashSet::new();
     for chunk in records.chunks(block_records) {
-        let tokens = content::distinct_tokens(
+        let tokens = content::distinct_probe_keys(
             chunk
                 .iter()
                 .flat_map(|record| record.content.iter().map(String::as_str)),
