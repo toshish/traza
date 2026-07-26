@@ -215,7 +215,8 @@ same values a `--profile` would give the server.
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `flush_spans` | `usize` | `10_000` | As `--flush-spans`. Zero disables size-triggered flushing. |
+| `flush_spans` | `usize` | `10_000` | As `--flush-spans`: applied to unique buffered records and to upserts since the last seal. Zero disables both record thresholds. |
+| `flush_wal_bytes` | `Option<u64>` | `Some(64 MiB)` | As `--flush-wal-bytes`. `None` removes the byte bound, leaving only the record thresholds. Ignored under `Durability::Buffered`, which keeps no log. |
 | `ttl_seconds` | `Option<u64>` | `None` | As `--ttl-seconds`. The engine implements it; scheduling the pass is the caller's job. |
 | `payload_threshold` | `Option<usize>` | `None` | As `--payload-threshold-bytes`. **The library default differs from the server's**: the library offloads nothing unless asked, while `traza-server` defaults to 262,144 bytes. |
 | `durability` | `Durability` | `Wal` | As `--durability`. |

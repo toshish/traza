@@ -1839,17 +1839,35 @@ impl Store {
     /// [`Self::expire_before`] with the maintenance lock already held.
     fn expire_before_locked(&self, cutoff_ns: u64) -> Result<usize> {
         // ---- buffer and log --------------------------------------------
+        // Durable state moves FIRST, memory second, and the step that moves
+        // memory cannot fail. Dropping the span from the buffer before the log
+        // rewrite succeeded left the two disagreeing on failure — and worse,
+        // left nothing for a retry to find: the next call saw an already-clean
+        // buffer, reported that it had removed nothing, and never repaired the
+        // log, so the restart resurrected the span. An expiry that returns an
+        // error must leave the store exactly as retryable as it found it.
         let mut removed = {
             let mut writer = self.lock_writer()?;
-            let before_buffer = writer.len();
-            writer.retain(|span| span.end_time_ns >= cutoff_ns);
-            let removed = before_buffer - writer.len();
-            if removed > 0 {
+            let expired = writer
+                .spans
+                .iter()
+                .filter(|span| span.end_time_ns < cutoff_ns)
+                .count();
+            if expired > 0 {
                 if let Some(log) = &self.wal {
-                    log.rewrite(&writer.spans)?;
+                    // Borrowed, not cloned: the frame is serialized from
+                    // references, so computing the survivors costs pointers
+                    // rather than a copy of the buffer.
+                    let survivors: Vec<&Span> = writer
+                        .spans
+                        .iter()
+                        .filter(|span| span.end_time_ns >= cutoff_ns)
+                        .collect();
+                    log.rewrite(&survivors)?;
                 }
+                writer.retain(|span| span.end_time_ns >= cutoff_ns);
             }
-            removed
+            expired
         };
 
         // ---- segments: pinned, rewritten with no engine lock held -------
@@ -1880,9 +1898,18 @@ impl Store {
                     self.rewrite_segment_in_place(&segment.path, &kept)?,
                 )),
             };
+            // Off disk FIRST, out of the live list second — same rule as the
+            // buffer above. Removing it from the list first meant a failed
+            // unlink left the store reporting a segment that is still there,
+            // with nothing for the retry to find and the file waiting to be
+            // loaded again at the next open. A pinned reader is undisturbed by
+            // the unlink: it holds its own descriptor.
+            if replacement.is_none() {
+                fs::remove_file(&segment.path)?;
+            }
             // Publish this one before rewriting the next, so an I/O failure
             // partway through leaves everything already rewritten correctly
-            // represented rather than stranded.
+            // represented rather than stranded. Nothing below can fail.
             {
                 let mut segments = self.lock_segments()?;
                 if let Some(position) = segments
@@ -1896,11 +1923,6 @@ impl Store {
                         }
                     }
                 }
-            }
-            if replacement.is_none() {
-                // Out of the list first, then off disk. A reader that pinned
-                // it keeps its own descriptor and finishes undisturbed.
-                fs::remove_file(&segment.path)?;
             }
             // Rollups are keyed by path, and this path now holds different
             // bytes (or none) — a cached rollup would still count the spans

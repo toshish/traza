@@ -148,12 +148,14 @@ The measured effect is large — see [capacity](capacity.md#filtered-search-and-
   fall. Raising it improves filtered search and costs memory. `0` removes the
   ceiling.
 
-**A merge does not stop the server.** Its inputs are pinned, every byte of
+**A merge does not block the server.** Its inputs are pinned, every byte of
 parsing, merging and fsyncing happens with no engine lock held, and only the
 swap that publishes the result takes one — briefly, and after re-checking that
-the inputs are still what it pinned. Reads and ingest continue at full speed
-throughout, so `--compaction-max-segment-bytes` is a memory dial rather than a
-stall dial.
+the inputs are still what it pinned. Reads and ingest therefore never wait on
+the merge, which makes `--compaction-max-segment-bytes` a memory dial rather
+than a stall dial. They do still share CPU and disk with it: a merge is real
+work, and the effect of that contention on concurrent read and write latency is
+**not measured** — see [capacity](capacity.md).
 
 Merges run in the same maintenance thread as TTL, on a 5-second tick, and are a
 no-op when no run qualifies.

@@ -243,6 +243,13 @@ impl Wal {
     /// other ingesting thread for that entire time, which capped concurrent
     /// ingest at roughly what one core could serialize.
     pub(crate) fn encode(spans: &[Span]) -> Result<Frame> {
+        Self::encode_batch(spans)
+    }
+
+    /// [`Self::encode`] over any sequence that serializes as a span array —
+    /// `&[Span]` on the ingest path, `&[&Span]` on the rewrite path, where
+    /// copying the surviving half of the buffer to frame it would be waste.
+    pub(crate) fn encode_batch<S: serde::Serialize>(spans: &[S]) -> Result<Frame> {
         let payload = serde_json::to_vec(spans)?;
         let length = u32::try_from(payload.len()).map_err(|_| {
             Error::Io(io::Error::new(
@@ -356,14 +363,15 @@ impl Wal {
     /// can interleave; an in-flight commit is satisfied for the same reason
     /// [`Self::reset`] satisfies one — the content it was waiting on is
     /// durable in the file this publishes, or it was deliberately expired.
-    pub(crate) fn rewrite(&self, spans: &[Span]) -> Result<()> {
+    pub(crate) fn rewrite<S: serde::Serialize>(&self, spans: &[S]) -> Result<()> {
         let frame = match spans.is_empty() {
             true => None,
-            false => Some(Self::encode(spans)?),
+            false => Some(Self::encode_batch(spans)?),
         };
+        let bytes = frame.as_ref().map_or(0, Frame::len);
         let mut state = self.lock()?;
         let temp = self.directory.join(WAL_REWRITE_TEMP);
-        {
+        let staged = (|| -> Result<File> {
             let mut file = OpenOptions::new()
                 .write(true)
                 .create(true)
@@ -373,20 +381,38 @@ impl Wal {
                 file.write_all(&frame.0)?;
             }
             file.sync_all()?;
-        }
+            // The append handle is opened on the STAGED inode, before the
+            // rename carries that inode to the published name. Opening it
+            // afterwards would put a fallible step after the point of no
+            // return: if that open failed, the log on disk would already be
+            // the new one while this `Wal` still pointed at the orphaned old
+            // one, and the caller would have no way to tell which state it was
+            // in. Everything that can fail now happens before the rename.
+            Ok(OpenOptions::new().append(true).read(true).open(&temp)?)
+        })();
+        let published = match staged {
+            Ok(published) => published,
+            Err(error) => {
+                // Nothing was replaced: the live log is untouched and the
+                // caller may retry as if this had never run.
+                let _ = fs::remove_file(&temp);
+                return Err(error);
+            }
+        };
         fs::rename(&temp, &self.path)?;
-        crate::sync_directory(&self.directory)?;
-        // The rename orphaned the inode the old descriptor names; append
-        // through the published file from here on.
-        state.file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .read(true)
-            .open(&self.path)?;
-        state.bytes = frame.map_or(0, |frame| frame.len());
+
+        // Past the rename the new log IS the log, so the in-memory state is
+        // updated unconditionally — it can never disagree with the file — and
+        // only then is the last remaining error reported. A crash before that
+        // directory sync lands leaves the OLD log, which still holds the spans
+        // the caller has not yet dropped from memory: recoverable, and in the
+        // safe direction (a deletion is retried, never a deletion undone).
+        state.file = published;
+        state.bytes = bytes;
         state.durable_lsn = state.written_lsn;
         self.synced.notify_all();
-        Ok(())
+        drop(state);
+        crate::sync_directory(&self.directory)
     }
 
     /// Bytes the log currently holds — the work a restart would replay, and
@@ -681,7 +707,7 @@ mod tests {
         let dir = temp_dir("rewrite-empty");
         let wal = Wal::open(&dir, None).expect("opens");
         append_committed(&wal, &[span("t", "a", "expired")]);
-        wal.rewrite(&[]).expect("rewrite");
+        wal.rewrite::<Span>(&[]).expect("rewrite");
         assert_eq!(wal.size_bytes(), 0);
         assert!(replayed(&dir).expect("replay").is_empty());
     }

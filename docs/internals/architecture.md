@@ -213,10 +213,12 @@ Both are **rewriting** operations: they take the maintenance lock (so only one
 runs at a time), pin the segments they will replace, do every byte of parsing,
 writing and fsyncing with no engine lock held, and take the segment lock back
 only to publish — revalidating first that what they pinned is still there.
-Reads and ingest run at full speed throughout. This is not a nicety: holding
-the segment lock across a merge made queries wait for it, and a waiting query
-holds the writer lock, so ingest queued behind the query. A large merge was an
-outage.
+Reads and ingest therefore never wait on a merge or an expiry pass. This is not
+a nicety: holding the segment lock across a merge made queries wait for it, and
+a waiting query holds the writer lock, so ingest queued behind the query. A
+large merge was an outage. What this does *not* claim is that maintenance is
+free — it competes for CPU and disk like any other work, and that contention is
+unmeasured.
 
 ## Satellite stores
 

@@ -57,7 +57,7 @@ socket; files that exercise the engine use `traza::Store` directly.
 
 | File | Tests | Covers |
 |---|---:|---|
-| [`storage.rs`](../../tests/storage.rs) | 30 | The engine end to end: persistence, crash recovery, filter correctness, ordering, TTL compaction (including that expiry reaches the write-ahead log, so an expired span cannot return across a restart), log-corruption refusal, the flush bounds that keep the log finite, pinned snapshot views, concurrency, second-open rejection |
+| [`storage.rs`](../../tests/storage.rs) | 32 | The engine end to end: persistence, crash recovery, filter correctness, ordering, TTL compaction (including that expiry reaches the write-ahead log, so an expired span cannot return across a restart), log-corruption refusal, the flush bounds that keep the log finite, pinned snapshot views, the retryability of a failed expiry under injected I/O faults, concurrency, second-open rejection |
 | [`scenarios.rs`](../../tests/scenarios.rs) | 14 | Derived views over the deliberately messy seed corpus — three attribute dialects, agent trees, multimodal payloads, linked retries, fan-out. Guards rollups that are right on a tidy fixture and wrong on real data |
 | [`keepalive.rs`](../../tests/keepalive.rs) | 11 | Persistent connections. Not "is it faster" but "does the server ever leave bytes on a socket it intends to reuse" — request smuggling is the risk. Asserts the `Connection` header **and** the behaviour, because a response that says `keep-alive` while the server closes desynchronizes any client that believes it |
 | [`payloads_annotations.rs`](../../tests/payloads_annotations.rs) | 10 | Payload offloading, content addressing, annotations, and streaming export |
