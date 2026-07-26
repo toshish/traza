@@ -10,21 +10,52 @@
 //! span, so at the default batch of 1,000 the instrumentation is far below the
 //! noise floor of the thing it measures. Nothing here allocates or locks.
 //!
-//! **Percentiles are approximate, on purpose.** Latencies land in power-of-two
-//! nanosecond buckets, so a reported percentile is the upper bound of the
-//! bucket the true value falls in — at most 2x high, never low. That is the
-//! right trade for "which stage dominates", and it is why the benchmark still
-//! measures end-to-end request latency exactly, from the client, with a plain
-//! `Instant`. Do not publish these numbers as request latencies; they exist to
-//! rank stages against each other.
+//! **Percentiles are bounded, not exact.** Latencies land in log-linear
+//! buckets — each power of two split into [`SUB_COUNT`] even steps — so a
+//! reported percentile is the upper bound of the bucket the true value falls
+//! in: **at most 1/16 (6.25%) high, never low.** That is close enough to put on
+//! a screen, which the previous power-of-two bucketing was not: it could be
+//! twice the truth, and the guide had to say so.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-/// Number of power-of-two buckets. Bucket `i` holds `[2^i, 2^(i+1))` ns, so 41
-/// buckets reach ~18 minutes — far past any stage that could still be called a
-/// bottleneck rather than a hang.
-const BUCKETS: usize = 41;
+/// Bits of sub-bucket resolution within each power of two. Four gives sixteen
+/// steps per octave, bounding a percentile's relative error at 1/16.
+pub const SUB_BITS: u32 = 4;
+/// Sub-buckets per power of two.
+pub const SUB_COUNT: u64 = 1 << SUB_BITS;
+/// Buckets needed to cover every `u64` nanosecond value.
+pub const BUCKET_COUNT: usize = 1024;
+
+/// The bucket a duration falls in.
+///
+/// Values below `2 * SUB_COUNT` are counted exactly; above that, each octave
+/// is split into `SUB_COUNT` even steps. One `leading_zeros` and one shift —
+/// cheap enough to sit on the ingest path.
+pub fn bucket_index(value_ns: u64) -> usize {
+    if value_ns < SUB_COUNT * 2 {
+        return value_ns as usize;
+    }
+    let octave = 63 - value_ns.leading_zeros();
+    let sub = (value_ns >> (octave - SUB_BITS)) & (SUB_COUNT - 1);
+    ((octave - SUB_BITS) as usize) * SUB_COUNT as usize + SUB_COUNT as usize + sub as usize
+}
+
+/// The largest duration that lands in `index`.
+///
+/// Percentiles report this, so a published figure is never below the truth.
+pub fn bucket_upper_bound(index: usize) -> u64 {
+    let index = index as u64;
+    if index < SUB_COUNT * 2 {
+        return index;
+    }
+    let row = (index - SUB_COUNT) / SUB_COUNT;
+    let sub = (index - SUB_COUNT) % SUB_COUNT;
+    let octave = row + u64::from(SUB_BITS);
+    let step = 1u64 << (octave - u64::from(SUB_BITS));
+    (1u64 << octave) + (sub + 1) * step - 1
+}
 
 /// A count/total/max/histogram summary of one stage's duration.
 #[derive(Debug)]
@@ -32,17 +63,19 @@ pub struct Latency {
     count: AtomicU64,
     total_ns: AtomicU64,
     max_ns: AtomicU64,
-    buckets: [AtomicU64; BUCKETS],
+    // Boxed rather than inline: at 1024 buckets this is 8 KiB, and `Metrics`
+    // holds nine of them. Keeping the array behind one pointer stops the
+    // struct from making every `Store` move copy 80 KiB.
+    buckets: Box<[AtomicU64]>,
 }
 
-// Hand-written because std only derives `Default` for arrays up to 32 long.
 impl Default for Latency {
     fn default() -> Self {
         Self {
             count: AtomicU64::new(0),
             total_ns: AtomicU64::new(0),
             max_ns: AtomicU64::new(0),
-            buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            buckets: (0..BUCKET_COUNT).map(|_| AtomicU64::new(0)).collect(),
         }
     }
 }
@@ -52,9 +85,7 @@ impl Latency {
     pub fn record(&self, nanos: u64) {
         self.count.fetch_add(1, Ordering::Relaxed);
         self.total_ns.fetch_add(nanos, Ordering::Relaxed);
-        // 64 - leading_zeros is floor(log2)+1; bucket 0 collects sub-2ns.
-        let bucket = (64 - nanos.leading_zeros()) as usize;
-        self.buckets[bucket.min(BUCKETS - 1)].fetch_add(1, Ordering::Relaxed);
+        self.buckets[bucket_index(nanos).min(BUCKET_COUNT - 1)].fetch_add(1, Ordering::Relaxed);
         let mut observed = self.max_ns.load(Ordering::Relaxed);
         while nanos > observed {
             match self.max_ns.compare_exchange_weak(
@@ -99,9 +130,8 @@ impl Latency {
         self.total_ns().checked_div(self.count()).unwrap_or(0)
     }
 
-    /// Approximate percentile in nanoseconds: the upper bound of the bucket
-    /// the true value falls in, so the answer is at most 2x high and never
-    /// low. See the module docs before reporting this anywhere.
+    /// Percentile in nanoseconds: the upper bound of the bucket the true value
+    /// falls in, so the answer is at most 6.25% high and never low.
     pub fn percentile_ns(&self, percent: f64) -> u64 {
         let total = self.count();
         if total == 0 {
@@ -112,13 +142,8 @@ impl Latency {
         for (index, bucket) in self.buckets.iter().enumerate() {
             seen += bucket.load(Ordering::Relaxed);
             if seen >= rank {
-                // Bucket `index` covers [2^(index-1), 2^index); report the
-                // exclusive upper bound.
-                return if index == 0 {
-                    1
-                } else {
-                    1u64 << (index - 1) << 1
-                };
+                // The top bucket is wide; never claim more than was observed.
+                return bucket_upper_bound(index).min(self.max_ns());
             }
         }
         self.max_ns()
@@ -265,9 +290,13 @@ impl Metrics {
             let _ = writeln!(into, "{name}_ns_sum {}", stage.total_ns());
             let _ = writeln!(into, "# TYPE {name}_ns_max gauge");
             let _ = writeln!(into, "{name}_ns_max {}", stage.max_ns());
-            // Approximate: bucket upper bounds. See the type docs.
+            // Bucket upper bounds: at most 6.25% high, never low. See the
+            // type docs. p95 is emitted alongside p50/p99 because it is the
+            // figure the dashboard and the README both quote.
             let _ = writeln!(into, "# TYPE {name}_ns_p50 gauge");
             let _ = writeln!(into, "{name}_ns_p50 {}", stage.percentile_ns(50.0));
+            let _ = writeln!(into, "# TYPE {name}_ns_p95 gauge");
+            let _ = writeln!(into, "{name}_ns_p95 {}", stage.percentile_ns(95.0));
             let _ = writeln!(into, "# TYPE {name}_ns_p99 gauge");
             let _ = writeln!(into, "{name}_ns_p99 {}", stage.percentile_ns(99.0));
         }

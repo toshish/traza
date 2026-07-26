@@ -124,13 +124,74 @@ fn refuse_connection(mut stream: TcpStream) {
     }
 }
 
+/// Which kind of work a request was, for latency attribution.
+///
+/// One global request histogram could not answer "how fast are queries": an
+/// ingest batch and a trace lookup differ by orders of magnitude, and blending
+/// them produced a number that described neither. The classes are coarse on
+/// purpose — per-path histograms would grow without bound as routes are added,
+/// and nobody tunes at that resolution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RouteClass {
+    /// Span ingest, native or OTLP.
+    Ingest,
+    /// A trace or session fetched by id.
+    Lookup,
+    /// Filtered span search and export.
+    Search,
+    /// Aggregation: analytics, series, duration, failures.
+    Stats,
+    /// Everything else — dashboard assets, metrics, flush.
+    Other,
+}
+
+impl RouteClass {
+    /// Classifies a request by method and path.
+    fn of(method: &str, path: &str) -> Self {
+        match (method, path) {
+            ("POST", "/v1/spans" | "/v1/traces") => Self::Ingest,
+            ("GET", "/v1/spans" | "/v1/export") => Self::Search,
+            ("GET", path) if path.starts_with("/v1/stats") => Self::Stats,
+            ("GET", "/v1/sessions") => Self::Stats,
+            ("GET", path)
+                if path.starts_with("/v1/traces/")
+                    || path.starts_with("/v1/sessions/")
+                    || path.starts_with("/v1/payloads/") =>
+            {
+                Self::Lookup
+            }
+            ("GET", "/v1/annotations") => Self::Lookup,
+            _ => Self::Other,
+        }
+    }
+
+    /// The metric-name infix for this class.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ingest => "ingest",
+            Self::Lookup => "lookup",
+            Self::Search => "search",
+            Self::Stats => "stats",
+            Self::Other => "other",
+        }
+    }
+}
+
 /// Server-side request instrumentation, alongside the engine's own.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct ServerMetrics {
+    /// When the process began serving, for uptime.
+    started: std::time::Instant,
     /// Requests served to completion.
     requests: traza::metrics::Counter,
     /// End-to-end handling time, from parsed head to written response.
     request_latency: traza::metrics::Latency,
+    /// The same, split by [`RouteClass`], in that enum's declaration order.
+    by_class: [traza::metrics::Latency; 5],
+    /// Responses issued per status class, indexed `2xx, 4xx, 5xx`.
+    status_2xx: traza::metrics::Counter,
+    status_4xx: traza::metrics::Counter,
+    status_5xx: traza::metrics::Counter,
     /// Requests refused by the auth gate.
     rejected: traza::metrics::Counter,
     /// Turning a request body into spans: JSON decode, or protobuf decode plus
@@ -149,9 +210,37 @@ struct ServerMetrics {
     connections_live: AtomicUsize,
 }
 
+// `Instant` has no `Default`, and the right value is "when this was built" —
+// which is process start, since the server makes exactly one of these.
+impl Default for ServerMetrics {
+    fn default() -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            requests: traza::metrics::Counter::default(),
+            request_latency: traza::metrics::Latency::default(),
+            by_class: std::array::from_fn(|_| traza::metrics::Latency::default()),
+            status_2xx: traza::metrics::Counter::default(),
+            status_4xx: traza::metrics::Counter::default(),
+            status_5xx: traza::metrics::Counter::default(),
+            rejected: traza::metrics::Counter::default(),
+            decode: traza::metrics::Latency::default(),
+            decoded_spans: traza::metrics::Counter::default(),
+            connections_refused: traza::metrics::Counter::default(),
+            connections_accepted: traza::metrics::Counter::default(),
+            connections_live: AtomicUsize::new(0),
+        }
+    }
+}
+
 impl ServerMetrics {
     fn render_prometheus(&self, into: &mut String) {
         use std::fmt::Write as _;
+        let _ = writeln!(into, "# TYPE traza_uptime_seconds gauge");
+        let _ = writeln!(
+            into,
+            "traza_uptime_seconds {}",
+            self.started.elapsed().as_secs()
+        );
         let _ = writeln!(into, "# TYPE traza_http_requests_total counter");
         let _ = writeln!(into, "traza_http_requests_total {}", self.requests.get());
         let _ = writeln!(into, "# TYPE traza_http_rejected_total counter");
@@ -204,6 +293,130 @@ impl ServerMetrics {
             "traza_http_request_ns_max {}",
             self.request_latency.max_ns()
         );
+        // Percentiles are now bucket upper bounds within 6.25%, which is
+        // close enough to publish — the coarse power-of-two bucketing that
+        // made the old guidance "do not publish these" is gone.
+        for percentile in [50.0, 95.0, 99.0] {
+            let _ = writeln!(into, "# TYPE traza_http_request_ns_p{percentile:.0} gauge");
+            let _ = writeln!(
+                into,
+                "traza_http_request_ns_p{percentile:.0} {}",
+                self.request_latency.percentile_ns(percentile)
+            );
+        }
+        for (class, latency) in Self::CLASSES.iter().zip(self.by_class.iter()) {
+            let label = class.label();
+            let _ = writeln!(into, "# TYPE traza_http_{label}_ns_count counter");
+            let _ = writeln!(into, "traza_http_{label}_ns_count {}", latency.count());
+            let _ = writeln!(into, "# TYPE traza_http_{label}_ns_sum counter");
+            let _ = writeln!(into, "traza_http_{label}_ns_sum {}", latency.total_ns());
+            for percentile in [50.0, 95.0, 99.0] {
+                let _ = writeln!(into, "# TYPE traza_http_{label}_ns_p{percentile:.0} gauge");
+                let _ = writeln!(
+                    into,
+                    "traza_http_{label}_ns_p{percentile:.0} {}",
+                    latency.percentile_ns(percentile)
+                );
+            }
+        }
+        for (name, counter) in [
+            ("traza_http_responses_2xx_total", &self.status_2xx),
+            ("traza_http_responses_4xx_total", &self.status_4xx),
+            ("traza_http_responses_5xx_total", &self.status_5xx),
+        ] {
+            let _ = writeln!(into, "# TYPE {name} counter");
+            let _ = writeln!(into, "{name} {}", counter.get());
+        }
+    }
+
+    /// The route classes, in the order [`Self::by_class`] stores them.
+    const CLASSES: [RouteClass; 5] = [
+        RouteClass::Ingest,
+        RouteClass::Lookup,
+        RouteClass::Search,
+        RouteClass::Stats,
+        RouteClass::Other,
+    ];
+
+    /// Records one served request against its class.
+    fn observe(&self, class: RouteClass, elapsed_ns: u64, status: u16) {
+        self.request_latency.record(elapsed_ns);
+        self.requests.increment();
+        if let Some(position) = Self::CLASSES.iter().position(|entry| *entry == class) {
+            self.by_class[position].record(elapsed_ns);
+        }
+        match status {
+            200..=299 => self.status_2xx.increment(),
+            400..=499 => self.status_4xx.increment(),
+            500..=599 => self.status_5xx.increment(),
+            _ => {}
+        }
+    }
+
+    /// Everything the Server screen shows, as JSON.
+    ///
+    /// The dashboard used to have no way to reach any of this: `/v1/metrics`
+    /// speaks Prometheus text, and asking a browser to parse an exposition
+    /// format to draw a chart is a parser nobody should have to write.
+    fn as_json(&self, engine: &Store) -> Value {
+        let engine_metrics = engine.metrics();
+        let classes: serde_json::Map<String, Value> = Self::CLASSES
+            .iter()
+            .zip(self.by_class.iter())
+            .map(|(class, latency)| {
+                (
+                    class.label().to_owned(),
+                    json!({
+                        "count": latency.count(),
+                        "mean_ns": latency.mean_ns(),
+                        "max_ns": latency.max_ns(),
+                        "p50_ns": latency.percentile_ns(50.0),
+                        "p95_ns": latency.percentile_ns(95.0),
+                        "p99_ns": latency.percentile_ns(99.0),
+                    }),
+                )
+            })
+            .collect();
+        json!({
+            "uptime_ns": self.started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+            "requests": {
+                "total": self.requests.get(),
+                "rejected": self.rejected.get(),
+                "responses_2xx": self.status_2xx.get(),
+                "responses_4xx": self.status_4xx.get(),
+                "responses_5xx": self.status_5xx.get(),
+                "mean_ns": self.request_latency.mean_ns(),
+                "max_ns": self.request_latency.max_ns(),
+                "p50_ns": self.request_latency.percentile_ns(50.0),
+                "p95_ns": self.request_latency.percentile_ns(95.0),
+                "p99_ns": self.request_latency.percentile_ns(99.0),
+            },
+            "by_class": classes,
+            "connections": {
+                "accepted": self.connections_accepted.get(),
+                "refused": self.connections_refused.get(),
+                "live": self.connections_live.load(Ordering::Relaxed),
+            },
+            "decode": {
+                "spans": self.decoded_spans.get(),
+                "mean_ns": self.decode.mean_ns(),
+                "p95_ns": self.decode.percentile_ns(95.0),
+            },
+            "ingest": {
+                "spans_admitted": engine_metrics.spans_admitted.get(),
+                "batches_admitted": engine_metrics.batches_admitted.get(),
+                "wal_commits": engine_metrics.wal_commits.get(),
+                "wal_fsync_p95_ns": engine_metrics.wal_fsync.percentile_ns(95.0),
+                "segment_seal_p95_ns": engine_metrics.segment_seal.percentile_ns(95.0),
+            },
+            "pruning": {
+                "segments_examined": engine_metrics.segments_examined.get(),
+                "segments_pruned_by_time": engine_metrics.segments_pruned_by_time.get(),
+            },
+            // Percentiles are bucket upper bounds; state the bound rather than
+            // letting a reader assume the figures are exact.
+            "percentile_error_bound": 0.0625,
+        })
     }
 }
 
@@ -716,13 +929,21 @@ fn handle_connection(
             body,
         };
         let mut responder = connection.responder(keep_alive);
+        let class = RouteClass::of(&request.method, {
+            let target = &request.target;
+            target
+                .split_once('?')
+                .map_or(target.as_str(), |(path, _)| path)
+        });
         let result = serve_request(&mut responder, request, engine, metrics);
         let persist = responder.keep_alive;
+        let status = responder.status;
         result?;
-        metrics
-            .request_latency
-            .record(started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
-        metrics.requests.increment();
+        metrics.observe(
+            class,
+            started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+            status.unwrap_or(200),
+        );
         if !persist {
             return Ok(());
         }
@@ -842,15 +1063,39 @@ fn serve_request(
             Err(error) => responder.json(503, json!({"error": error.to_string()})),
         },
         ("GET", "/v1/spans") => {
-            let filter = match filter_from_query(query) {
-                Ok(filter) => filter,
+            let (filter, cursor) = match span_query_from(query) {
+                Ok(parsed) => parsed,
                 Err(error) => return responder.json(400, json!({"error": error})),
             };
-            match engine.query(&filter) {
-                Ok(spans) => responder.json(
-                    200,
-                    serde_json::to_value(spans).unwrap_or_else(|_| Value::Array(Vec::new())),
-                ),
+            let limit = filter.limit;
+            match engine.query_costed(&filter, cursor.as_ref()) {
+                Ok((spans, cost)) => {
+                    // A cursor is offered only when the page came back full.
+                    // A short page has already reached the end of the match
+                    // set, and handing out a cursor there would invite a
+                    // round trip that can only return nothing.
+                    let next = limit
+                        .filter(|limit| spans.len() >= *limit)
+                        .and_then(|_| spans.last())
+                        .map(|span| traza::SpanCursor::from(span).to_token());
+                    responder.json(
+                        200,
+                        json!({
+                            "spans": serde_json::to_value(spans)
+                                .unwrap_or_else(|_| Value::Array(Vec::new())),
+                            "next_cursor": next,
+                            // What the query actually touched. The dashboard
+                            // shows this rather than asserting the store is
+                            // fast; a time filter that prunes nothing is then
+                            // visible instead of merely disappointing.
+                            "cost": {
+                                "elapsed_ns": cost.elapsed_ns,
+                                "segments_examined": cost.segments_examined,
+                                "segments_pruned": cost.segments_pruned,
+                            },
+                        }),
+                    )
+                }
                 // A too-broad query is the caller's to fix; 503 would tell
                 // them to retry with backoff, and retrying cannot help.
                 Err(error @ traza::Error::QueryTooBroad(_)) => {
@@ -859,6 +1104,10 @@ fn serve_request(
                 Err(error) => responder.json(503, json!({"error": error.to_string()})),
             }
         }
+        // The same numbers as /v1/metrics, shaped for a browser. Prometheus
+        // text is for scrapers; a dashboard should not ship an exposition
+        // parser just to draw one chart.
+        ("GET", "/v1/metrics.json") => responder.json(200, metrics.as_json(engine)),
         ("GET", "/v1/metrics") => {
             // Prometheus text format. Engine stages first, then the HTTP
             // layer, so a reader sees the whole ingest path in one scrape.
@@ -972,12 +1221,30 @@ fn serve_request(
             let mut trace_id = None;
             let mut span_id = None;
             let mut name = None;
+            let mut source_prefix = None;
+            let mut since_ns = None;
+            let mut until_ns = None;
+            let mut limit = None;
             for pair in query.split('&').filter(|pair| !pair.is_empty()) {
                 let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+                let value = percent_decode(value);
                 match percent_decode(key).as_str() {
-                    "trace_id" => trace_id = Some(percent_decode(value)),
-                    "span_id" => span_id = Some(percent_decode(value)),
-                    "name" => name = Some(percent_decode(value)),
+                    "trace_id" => trace_id = Some(value),
+                    "span_id" => span_id = Some(value),
+                    "name" => name = Some(value),
+                    "source" => source_prefix = Some(value),
+                    "since" | "since_ns" => match value.parse() {
+                        Ok(parsed) => since_ns = Some(parsed),
+                        Err(_) => return responder.json(400, json!({"error": "invalid since"})),
+                    },
+                    "until" | "until_ns" => match value.parse() {
+                        Ok(parsed) => until_ns = Some(parsed),
+                        Err(_) => return responder.json(400, json!({"error": "invalid until"})),
+                    },
+                    "limit" => match value.parse() {
+                        Ok(parsed) => limit = Some(parsed),
+                        Err(_) => return responder.json(400, json!({"error": "invalid limit"})),
+                    },
                     other => {
                         return responder.json(
                             400,
@@ -986,10 +1253,19 @@ fn serve_request(
                     }
                 }
             }
-            let Some(trace_id) = trace_id else {
-                return responder.json(400, json!({"error": "trace_id is required"}));
+            // `trace_id` used to be required, which made an eval run
+            // unreadable: its scores exist per trace, but nobody wants them
+            // one trace at a time. It is now one narrowing among several.
+            let narrow = traza::annotations::AnnotationQuery {
+                trace_id: trace_id.as_deref(),
+                span_id: span_id.as_deref(),
+                name: name.as_deref(),
+                source_prefix: source_prefix.as_deref(),
+                since_ns,
+                until_ns,
+                limit,
             };
-            match engine.annotations(&trace_id, span_id.as_deref(), name.as_deref()) {
+            match engine.search_annotations(&narrow) {
                 Ok(annotations) => responder.json(
                     200,
                     json!({"annotations": serde_json::to_value(annotations)
@@ -1060,8 +1336,139 @@ fn serve_request(
                 Err(error) => responder.json(503, json!({"error": error.to_string()})),
             }
         }
+        ("GET", "/v1/stats/series") => {
+            let request = match series_query_from(query) {
+                Ok(parsed) => parsed,
+                Err(error) => return responder.json(400, json!({"error": error})),
+            };
+            let SeriesRequest {
+                filter,
+                buckets,
+                window,
+            } = request;
+            let Some((since_ns, until_ns)) = window else {
+                return responder.json(
+                    400,
+                    json!({"error": "since and until are required for a series"}),
+                );
+            };
+            if until_ns <= since_ns {
+                return responder.json(400, json!({"error": "until must be after since"}));
+            }
+            match engine.series(&filter, since_ns, until_ns, buckets.unwrap_or(24)) {
+                Ok(series) => responder.json(
+                    200,
+                    serde_json::to_value(series).unwrap_or_else(|_| json!({})),
+                ),
+                Err(error) => responder.json(503, json!({"error": error.to_string()})),
+            }
+        }
+        ("GET", "/v1/stats/duration") => {
+            let (filter, _) = match span_query_from(query) {
+                Ok(parsed) => parsed,
+                Err(error) => return responder.json(400, json!({"error": error})),
+            };
+            match engine.duration_histogram(&filter) {
+                Ok(histogram) => responder.json(
+                    200,
+                    json!({
+                        "count": histogram.count(),
+                        "min_ns": histogram.min_ns(),
+                        "max_ns": histogram.max_ns(),
+                        "mean_ns": histogram.mean_ns(),
+                        "p50_ns": histogram.percentile_ns(50.0),
+                        "p75_ns": histogram.percentile_ns(75.0),
+                        "p90_ns": histogram.percentile_ns(90.0),
+                        "p95_ns": histogram.percentile_ns(95.0),
+                        "p99_ns": histogram.percentile_ns(99.0),
+                        // Only occupied buckets travel: a nanosecond-to-minute
+                        // range occupies a few dozen of a thousand, and the
+                        // zeros would be almost the entire payload.
+                        "buckets": histogram
+                            .occupied()
+                            .into_iter()
+                            .map(|(upper_ns, count)| json!({"upper_ns": upper_ns, "count": count}))
+                            .collect::<Vec<_>>(),
+                    }),
+                ),
+                Err(error) => responder.json(503, json!({"error": error.to_string()})),
+            }
+        }
+        ("GET", "/v1/stats/failures") => {
+            let (filter, _) = match span_query_from(query) {
+                Ok(parsed) => parsed,
+                Err(error) => return responder.json(400, json!({"error": error})),
+            };
+            let limit = filter.limit.unwrap_or(100);
+            match engine.failures(&filter, limit) {
+                Ok(groups) => responder.json(
+                    200,
+                    json!({"groups": serde_json::to_value(groups)
+                        .unwrap_or_else(|_| Value::Array(Vec::new()))}),
+                ),
+                Err(error) => responder.json(503, json!({"error": error.to_string()})),
+            }
+        }
+        ("GET", "/v1/stats/slowest") => {
+            let (filter, _) = match span_query_from(query) {
+                Ok(parsed) => parsed,
+                Err(error) => return responder.json(400, json!({"error": error})),
+            };
+            let limit = filter.limit.unwrap_or(10);
+            match engine.slowest_spans(&filter, limit) {
+                Ok(spans) => responder.json(
+                    200,
+                    json!({"spans": serde_json::to_value(spans)
+                        .unwrap_or_else(|_| Value::Array(Vec::new()))}),
+                ),
+                Err(error) => responder.json(503, json!({"error": error.to_string()})),
+            }
+        }
         _ => responder.json(404, json!({"error": "not found"})),
     }
+}
+
+/// A parsed series request.
+///
+/// The window is held separately from the filter because a series needs it as
+/// a hard range rather than as an optional narrowing: without both bounds
+/// there is nothing to divide into buckets.
+struct SeriesRequest {
+    filter: SpanFilter,
+    buckets: Option<usize>,
+    window: Option<(u64, u64)>,
+}
+
+/// Parses a series request. `buckets` is the one parameter
+/// [`span_query_from`] does not know, so it is stripped before delegating.
+fn series_query_from(raw_query: &str) -> Result<SeriesRequest, String> {
+    let mut buckets = None;
+    let mut kept = String::with_capacity(raw_query.len());
+    for pair in raw_query.split('&').filter(|pair| !pair.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if percent_decode(key) == "buckets" {
+            buckets = Some(
+                percent_decode(value)
+                    .parse()
+                    .map_err(|_| "invalid buckets")?,
+            );
+            continue;
+        }
+        if !kept.is_empty() {
+            kept.push('&');
+        }
+        kept.push_str(pair);
+    }
+    let (filter, _) = span_query_from(&kept)?;
+    let window = match (filter.since_ns, filter.until_ns) {
+        (Some(since), Some(until)) => Some((since, until)),
+        _ => None,
+    };
+    Ok(SeriesRequest {
+        filter,
+        buckets,
+        window,
+    })
 }
 
 /// Streams an export as chunked NDJSON in constant-size pages.
@@ -1189,11 +1596,21 @@ fn analytics_query(
 }
 
 fn filter_from_query(raw_query: &str) -> Result<SpanFilter, String> {
+    span_query_from(raw_query).map(|(filter, _)| filter)
+}
+
+/// Parses a span search: the filter plus an optional pagination cursor.
+///
+/// The cursor is not part of [`SpanFilter`] because it is not a predicate —
+/// it says where the previous page stopped, and the same filter answers
+/// differently on each page by design.
+fn span_query_from(raw_query: &str) -> Result<(SpanFilter, Option<traza::SpanCursor>), String> {
     // The README's contract: default limit 100, applied after filtering.
     let mut filter = SpanFilter {
         limit: Some(100),
         ..SpanFilter::default()
     };
+    let mut cursor = None;
     for pair in raw_query.split('&').filter(|pair| !pair.is_empty()) {
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
         let key = percent_decode(key);
@@ -1234,6 +1651,17 @@ fn filter_from_query(raw_query: &str) -> Result<SpanFilter, String> {
         match key.as_str() {
             "service" => filter.service = Some(value),
             "name" => filter.name = Some(value),
+            // The span's own status field, not an attribute. `attr.status=`
+            // reads an attribute most instrumentation never writes, so it
+            // looked like this filter existed while answering nothing.
+            "status" => filter.status = Some(value),
+            "not_status" => filter.excluded_statuses.push(value),
+            "cursor" => {
+                cursor = Some(
+                    traza::SpanCursor::from_token(&value)
+                        .ok_or("cursor is not a token this server issued")?,
+                );
+            }
             // Unions every recognized session key, so a mixed-convention
             // session (some spans session.id, some gen_ai.conversation.id)
             // returns whole — unlike attr.session.id, which sees one key.
@@ -1272,7 +1700,7 @@ fn filter_from_query(raw_query: &str) -> Result<SpanFilter, String> {
             other => return Err(format!("unknown query parameter: {other}")),
         }
     }
-    Ok(filter)
+    Ok((filter, cursor))
 }
 
 struct Request {
@@ -1339,6 +1767,7 @@ impl Connection {
         Responder {
             stream: &mut self.stream,
             keep_alive,
+            status: None,
         }
     }
 
@@ -1502,6 +1931,11 @@ struct Responder<'a> {
     stream: &'a mut TcpStream,
     /// Whether this connection will read another request after this response.
     keep_alive: bool,
+    /// Status of the response actually sent, for per-class accounting. A
+    /// request that never reached a responder leaves this `None` and is not
+    /// counted — an uncounted request beats one filed under a status it
+    /// never had.
+    status: Option<u16>,
 }
 
 impl Responder<'_> {
@@ -1526,6 +1960,7 @@ impl Responder<'_> {
     /// Sends a JSON body. Head and body go out in one write: at ingest rates
     /// the extra syscall per response is pure overhead.
     fn json(&mut self, status: u16, body: Value) -> io::Result<()> {
+        self.status = Some(status);
         let encoded = serde_json::to_vec(&body)?;
         let reason = match status {
             200 => "OK",

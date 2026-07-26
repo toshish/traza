@@ -203,7 +203,7 @@ fn server_read_query_round_trip_uses_engine() {
 
     let (status, body) = server.request("GET", &format!("/v1/spans?service={service_a}"), None);
     assert_eq!(status, 200, "query failed: {body}");
-    let spans = body.as_array().expect("query returns an array");
+    let spans = body["spans"].as_array().expect("query returns an array");
     assert_eq!(spans.len(), 2, "service filter must isolate svc-a: {body}");
     assert!(spans
         .iter()
@@ -219,13 +219,13 @@ fn server_read_query_round_trip_uses_engine() {
         None,
     );
     assert_eq!(status, 200);
-    let spans = body.as_array().expect("array");
+    let spans = body["spans"].as_array().expect("array");
     assert_eq!(spans.len(), 1);
     assert_eq!(spans[0]["span_id"], "b1");
 
     let (status, body) = server.request("GET", "/v1/spans?service=absent-service", None);
     assert_eq!(status, 200);
-    assert_eq!(body.as_array().map(Vec::len), Some(0));
+    assert_eq!(body["spans"].as_array().map(Vec::len), Some(0));
     server.kill();
 }
 
@@ -435,26 +435,26 @@ fn server_supports_the_documented_filters() {
     // attr.KEY: bare string value.
     let (status, body) = server.request("GET", "/v1/spans?attr.region=us-east", None);
     assert_eq!(status, 200, "attr filter must be accepted: {body}");
-    let spans = body.as_array().expect("array");
+    let spans = body["spans"].as_array().expect("array");
     assert_eq!(spans.len(), 1, "{body}");
     assert_eq!(spans[0]["span_id"], "fast");
 
     // attr.KEY: JSON literal matches a typed value.
     let (status, body) = server.request("GET", "/v1/spans?attr.retries=3", None);
     assert_eq!(status, 200);
-    assert_eq!(body.as_array().map(Vec::len), Some(1));
+    assert_eq!(body["spans"].as_array().map(Vec::len), Some(1));
 
     // min_duration_ms in milliseconds.
     let (status, body) = server.request("GET", "/v1/spans?min_duration_ms=10", None);
     assert_eq!(status, 200, "min_duration_ms must be accepted: {body}");
-    let spans = body.as_array().expect("array");
+    let spans = body["spans"].as_array().expect("array");
     assert_eq!(spans.len(), 1);
     assert_eq!(spans[0]["span_id"], "slow");
 
     // since/until in Unix nanoseconds.
     let (status, body) = server.request("GET", "/v1/spans?since=4000000&until=6000000", None);
     assert_eq!(status, 200, "since/until must be accepted: {body}");
-    assert_eq!(body.as_array().map(Vec::len), Some(1));
+    assert_eq!(body["spans"].as_array().map(Vec::len), Some(1));
 
     // Documented stats keys.
     let (status, body) = server.request("GET", "/v1/stats", None);

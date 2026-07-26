@@ -10,6 +10,7 @@ pub mod analytics;
 pub mod annotations;
 pub mod auth;
 pub mod expiration;
+pub mod insights;
 mod media;
 pub mod metrics;
 pub mod otlp;
@@ -189,6 +190,18 @@ pub struct SpanFilter {
     pub name: Option<String>,
     /// Match spans containing all of these attribute key/value pairs.
     pub attributes: Vec<(String, Value)>,
+    /// Match only spans whose completion status equals this.
+    ///
+    /// This reads the span's own `status` field, NOT an attribute. The two are
+    /// easy to confuse — `attr.status=error` matches an *attribute* named
+    /// `status`, which most instrumentation never writes — and without this
+    /// field "show me the failures" was unanswerable even though every
+    /// aggregate in the store already counted errors from `Span::status`.
+    pub status: Option<String>,
+    /// Statuses that must NOT match. Unlike [`Self::excluded_attributes`], a
+    /// span always has a status, so there is no missing-key case: an empty
+    /// status is a value like any other and `not_status=error` keeps it.
+    pub excluded_statuses: Vec<String>,
     /// Match spans whose duration is at least this many nanoseconds.
     pub min_duration_ns: Option<u64>,
     /// Match spans whose duration is at most this many nanoseconds.
@@ -246,6 +259,92 @@ impl From<&Span> for SpanCursor {
             span_id: span.span_id.clone(),
         }
     }
+}
+
+/// The base64url alphabet, unpadded — safe in a query string without escaping.
+const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+impl SpanCursor {
+    /// Encodes the cursor as one opaque URL-safe token.
+    ///
+    /// Opaque on purpose: a client that cannot parse the token cannot come to
+    /// depend on its layout, which leaves the ordering key free to change. The
+    /// payload is `start | end | trace_len | trace | span`, so an id
+    /// containing any byte — including the delimiters a text encoding would
+    /// need — round-trips exactly.
+    pub fn to_token(&self) -> String {
+        let trace = self.trace_id.as_bytes();
+        let span = self.span_id.as_bytes();
+        let mut raw = Vec::with_capacity(20 + trace.len() + span.len());
+        raw.extend_from_slice(&self.start_time_ns.to_be_bytes());
+        raw.extend_from_slice(&self.end_time_ns.to_be_bytes());
+        raw.extend_from_slice(&(trace.len() as u32).to_be_bytes());
+        raw.extend_from_slice(trace);
+        raw.extend_from_slice(span);
+        // `div_ceil` is stable only since 1.73; this crate supports 1.70.
+        let mut out = String::with_capacity(((raw.len() + 2) / 3) * 4);
+        for chunk in raw.chunks(3) {
+            let bits = (u32::from(chunk[0]) << 16)
+                | (u32::from(chunk.get(1).copied().unwrap_or(0)) << 8)
+                | u32::from(chunk.get(2).copied().unwrap_or(0));
+            let take = chunk.len() + 1;
+            for index in 0..take {
+                out.push(B64[((bits >> (18 - 6 * index)) & 0x3F) as usize] as char);
+            }
+        }
+        out
+    }
+
+    /// Parses a token produced by [`Self::to_token`].
+    ///
+    /// Returns `None` for anything that is not one, so a stale or hand-edited
+    /// cursor is a `400` rather than a silently wrong page.
+    pub fn from_token(token: &str) -> Option<Self> {
+        let mut raw = Vec::with_capacity(token.len() * 3 / 4);
+        let mut bits = 0u32;
+        let mut have = 0u32;
+        for byte in token.bytes() {
+            let value = B64.iter().position(|candidate| *candidate == byte)? as u32;
+            bits = (bits << 6) | value;
+            have += 6;
+            if have >= 8 {
+                have -= 8;
+                raw.push((bits >> have) as u8);
+            }
+        }
+        if raw.len() < 20 {
+            return None;
+        }
+        let start_time_ns = u64::from_be_bytes(raw[0..8].try_into().ok()?);
+        let end_time_ns = u64::from_be_bytes(raw[8..16].try_into().ok()?);
+        let trace_len = u32::from_be_bytes(raw[16..20].try_into().ok()?) as usize;
+        let rest = raw.get(20..)?;
+        let trace = rest.get(..trace_len)?;
+        let span = rest.get(trace_len..)?;
+        Some(Self {
+            start_time_ns,
+            end_time_ns,
+            trace_id: String::from_utf8(trace.to_vec()).ok()?,
+            span_id: String::from_utf8(span.to_vec()).ok()?,
+        })
+    }
+}
+
+/// What one query actually had to do, reported back with its results.
+///
+/// Traza's argument is that a filtered search is cheap; a dashboard that never
+/// says how cheap asks its users to take that on faith. These are the numbers
+/// behind the claim, counted per query rather than sampled from the process-wide
+/// counters — those race under concurrent readers and cannot be attributed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct QueryCost {
+    /// Segments the query considered, pruned or not.
+    pub segments_examined: u32,
+    /// Segments skipped whole because their timestamp range could not hold a
+    /// match. The work a time filter avoided.
+    pub segments_pruned: u32,
+    /// Wall-clock nanoseconds spent inside the engine, excluding serialization.
+    pub elapsed_ns: u64,
 }
 
 /// What an acknowledged write guarantees.
@@ -1301,6 +1400,31 @@ impl Store {
         query_view(&writer, &segments, &self.metrics, filter, cursor)
     }
 
+    /// [`Self::query_after`], additionally reporting what the query cost.
+    ///
+    /// The timer covers only the engine: lock acquisition, segment selection
+    /// and decoding. Serializing the answer is the caller's time, and folding
+    /// it in here would make the reported figure depend on how many bytes the
+    /// client asked for rather than on how much of the store was read.
+    pub fn query_costed(
+        &self,
+        filter: &SpanFilter,
+        cursor: Option<&SpanCursor>,
+    ) -> Result<(Vec<Span>, QueryCost)> {
+        let started = std::time::Instant::now();
+        let mut cost = QueryCost::default();
+        let spans = if let Some(session_id) = &filter.session {
+            let spans = self.resolve_session_spans(session_id)?;
+            narrow_session_spans(spans, filter, cursor)
+        } else {
+            let writer = self.lock_writer()?;
+            let segments = self.lock_segments()?;
+            query_view_costed(&writer, &segments, &self.metrics, filter, cursor, &mut cost)?
+        };
+        cost.elapsed_ns = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+        Ok((spans, cost))
+    }
+
     /// Pins the store as it is now and returns a view that keeps answering
     /// from that instant.
     ///
@@ -1469,6 +1593,29 @@ pub(crate) fn query_view(
     filter: &SpanFilter,
     cursor: Option<&SpanCursor>,
 ) -> Result<Vec<Span>> {
+    query_view_costed(
+        writer,
+        segments,
+        metrics,
+        filter,
+        cursor,
+        &mut QueryCost::default(),
+    )
+}
+
+/// [`query_view`], additionally reporting what the query had to touch.
+///
+/// The process-wide counters cannot answer this: several readers share them,
+/// so a before/after difference attributes another thread's work to this query.
+/// The cost is accumulated on the stack instead, which is free.
+pub(crate) fn query_view_costed(
+    writer: &WriteBuffer,
+    segments: &[std::sync::Arc<Segment>],
+    metrics: &metrics::Metrics,
+    filter: &SpanFilter,
+    cursor: Option<&SpanCursor>,
+    cost: &mut QueryCost,
+) -> Result<Vec<Span>> {
     // A sorted answer cannot be streamed: the record that belongs first may be
     // the last one read, so `limit` cannot stop the scan early. Re-run
     // unlimited, order, then truncate. Refusing past a ceiling rather than
@@ -1480,7 +1627,7 @@ pub(crate) fn query_view(
             sort: None,
             ..filter.clone()
         };
-        let mut spans = query_view(writer, segments, metrics, &unlimited, cursor)?;
+        let mut spans = query_view_costed(writer, segments, metrics, &unlimited, cursor, cost)?;
         if spans.len() > SORT_CANDIDATE_LIMIT {
             return Err(Error::QueryTooBroad(format!(
                 "sorting {} matches exceeds the {SORT_CANDIDATE_LIMIT} candidate limit; \
@@ -1536,8 +1683,10 @@ pub(crate) fn query_view(
                 // reading it, and "the last N minutes" is the commonest
                 // filter an observability store sees.
                 metrics.segments_examined.increment();
+                cost.segments_examined += 1;
                 if !seg.may_contain_timestamps(filter.since_ns, filter.until_ns) {
                     metrics.segments_pruned_by_time.increment();
+                    cost.segments_pruned += 1;
                     continue;
                 }
                 let offsets = select_probe(seg, filter);
@@ -1643,8 +1792,10 @@ pub(crate) fn query_view(
         for (position, segment) in segments.iter().enumerate() {
             let seg = &segment.seg;
             metrics.segments_examined.increment();
+            cost.segments_examined += 1;
             if !seg.may_contain_timestamps(filter.since_ns, filter.until_ns) {
                 metrics.segments_pruned_by_time.increment();
+                cost.segments_pruned += 1;
                 continue;
             }
             let offsets = select_probe(seg, filter);
@@ -1684,7 +1835,102 @@ pub(crate) fn query_view(
     }
 }
 
+/// Calls `visit` once per matching span without ever holding them all.
+///
+/// This is [`query_view`]'s unlimited path with the collecting `Vec` replaced
+/// by a visitor, and it exists because the aggregation routes fold a window
+/// into a few hundred bytes: materializing a million spans to produce a
+/// twenty-bucket histogram would make the answer's cost proportional to the
+/// corpus rather than to the answer. Order is not established — no caller of a
+/// commutative fold needs it, and sorting would reintroduce the full
+/// materialization this avoids.
+///
+/// Primary-key precedence matches the query path exactly: a candidate is
+/// dropped if the write buffer or any newer segment also holds its key.
+pub(crate) fn fold_view(
+    writer: &WriteBuffer,
+    segments: &[std::sync::Arc<Segment>],
+    metrics: &metrics::Metrics,
+    filter: &SpanFilter,
+    cost: &mut QueryCost,
+    visit: &mut impl FnMut(&Span),
+) -> Result<()> {
+    for (position, segment) in segments.iter().enumerate() {
+        let seg = &segment.seg;
+        metrics.segments_examined.increment();
+        cost.segments_examined += 1;
+        if !seg.may_contain_timestamps(filter.since_ns, filter.until_ns) {
+            metrics.segments_pruned_by_time.increment();
+            cost.segments_pruned += 1;
+            continue;
+        }
+        for offset in select_probe(seg, filter) {
+            let record = seg.record_at_offset(*offset).map_err(segment_error)?;
+            let span = record_to_span(&record)?;
+            if !span_matches(&span, filter) {
+                continue;
+            }
+            if writer.contains_key(&span.trace_id, &span.span_id) {
+                continue; // the buffer holds a newer version
+            }
+            let mut superseded = false;
+            for newer in segments.iter().skip(position + 1) {
+                if newer.contains_key(&span.trace_id, &span.span_id)? {
+                    superseded = true;
+                    break;
+                }
+            }
+            if !superseded {
+                visit(&span);
+            }
+        }
+    }
+    for span in writer.spans.iter() {
+        if span_matches(span, filter) {
+            visit(span);
+        }
+    }
+    Ok(())
+}
+
 impl Store {
+    /// Folds every span matching `filter` through `visit`, in constant memory.
+    ///
+    /// `filter.limit` and `filter.sort` are ignored: a fold is over the whole
+    /// match set, and truncating or ordering it would silently change the
+    /// aggregate rather than the presentation.
+    pub fn fold_spans(
+        &self,
+        filter: &SpanFilter,
+        mut visit: impl FnMut(&Span),
+    ) -> Result<QueryCost> {
+        let started = std::time::Instant::now();
+        let mut cost = QueryCost::default();
+        if let Some(session_id) = &filter.session {
+            // A session unions several attribute keys, which no single index
+            // expresses. Its span count is bounded by one conversation, so
+            // resolving it up front costs a conversation, not a corpus.
+            for span in self.resolve_session_spans(session_id)? {
+                if span_matches(&span, filter) {
+                    visit(&span);
+                }
+            }
+        } else {
+            let writer = self.lock_writer()?;
+            let segments = self.lock_segments()?;
+            fold_view(
+                &writer,
+                &segments,
+                &self.metrics,
+                filter,
+                &mut cost,
+                &mut visit,
+            )?;
+        }
+        cost.elapsed_ns = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+        Ok(cost)
+    }
+
     /// Returns current buffer, segment, physical-record, and disk statistics.
     ///
     /// Persisted counts are physical records rather than logical
@@ -1723,6 +1969,15 @@ impl Store {
         name: Option<&str>,
     ) -> Result<Vec<annotations::Annotation>> {
         self.annotations.query(trace_id, span_id, name)
+    }
+
+    /// Annotations matching `narrow`, newest first, across every trace unless
+    /// one is named. See [`annotations::AnnotationQuery`].
+    pub fn search_annotations(
+        &self,
+        narrow: &annotations::AnnotationQuery<'_>,
+    ) -> Result<Vec<annotations::Annotation>> {
+        self.annotations.search(narrow)
     }
 
     /// Reads an offloaded payload by its `sha256/<hex>` reference.
@@ -2890,6 +3145,16 @@ fn span_matches(span: &Span, filter: &SpanFilter) -> bool {
         return false;
     }
     if filter.name.as_ref().is_some_and(|name| span.name != *name) {
+        return false;
+    }
+    if filter
+        .status
+        .as_ref()
+        .is_some_and(|status| span.status != *status)
+    {
+        return false;
+    }
+    if filter.excluded_statuses.contains(&span.status) {
         return false;
     }
     if filter
