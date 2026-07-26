@@ -1,8 +1,14 @@
 # Capacity and performance
 
-Every number on this page comes from a committed measurement record. None is
-estimated, and none is carried over from a version that no longer exists.
-Where a figure's configuration is not recorded, this page says so rather than
+Every number on this page comes from a committed measurement record —
+[`INDEX-MEM-BENCHMARK.md`](../../INDEX-MEM-BENCHMARK.md) and its raw
+[`INDEX-MEM-BENCHMARK.json`](../../INDEX-MEM-BENCHMARK.json) for the memory
+figures, [`BENCHMARKS.md`](../../BENCHMARKS.md) and
+[`INGEST-BENCHMARK.md`](../../INGEST-BENCHMARK.md) for the rest — except where
+a figure is **explicitly labelled an extrapolation**, of which this page
+contains exactly one (the 29 GB projection below, marked as such at the point
+it is used). Nothing is carried over from a version that no longer exists, and
+where a figure's configuration is not recorded, this page says so rather than
 guessing.
 
 **Run the benchmarks on your own hardware.** These were measured on one
@@ -321,11 +327,34 @@ single line item is `gen_ai.input.messages`: 48,069 distinct values holding
 141 MiB resident, more than every conventional attribute in the store
 combined.
 
-Note the direction of the compaction rows: **RSS rises with compaction.** A
-merge materializes its inputs, so the working set tracks the segment-size cap
-rather than the index size. Measured here, a store whose steady-state open
-cost was 10 MiB peaked at 721 MiB while merging; one at 391 MiB peaked at
-1053 MiB. The transient is not O(indexes) by anybody's definition.
+Note the direction of the compaction rows: **RSS rises sharply with
+compaction.** A merge materializes its inputs, so the working set tracks the
+segment-size cap rather than the index size.
+
+An earlier revision of this page gave that transient as "peaked at 721 MiB"
+and "1053 MiB". Both were wrong, and understated. The benchmark took **one RSS
+sample after `compact_segments()` returned** — by which point the merge has
+freed its working set — so it measured the trough and published it as a peak.
+RSS is now sampled every 20 ms by a background thread for the duration of the
+merge:
+
+| Steady-state open | **Peak during merge** | Settled after |
+|---:|---:|---:|
+| 10 MiB | **1,203 MiB** | 783 MiB |
+| 116 MiB | **1,344 MiB** | 899 MiB |
+| 116 MiB | **1,602 MiB** | 1,106 MiB |
+
+A store serving in 10 MiB needs **over a gigabyte** to compact itself. Size a
+host for the merge, not for the steady state. The transient is not O(indexes)
+by anybody's definition.
+
+**These five rows are the only compaction measurements on this page.** Of 26
+configurations, 21 merged nothing at all — `compact_segments()` returned 0 —
+and the benchmark now reports those as "did not merge" rather than printing
+their steady-state RSS in a column headed compaction. Every configuration that
+merged held 13 segments; every one that did not held 4 or fewer. That is a
+compaction defect under separate investigation, and until it is understood
+this table describes merges on 512-byte-value corpora and nothing wider.
 
 ### Reproducing all of this
 
