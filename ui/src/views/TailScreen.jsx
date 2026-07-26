@@ -13,6 +13,21 @@ import { Card, Chip, LiveDot, Mono } from '../components/primitives/Chrome.jsx';
 
 const MAX_ROWS = 300;
 const TICK_MS = 1500;
+/** Rows per request while draining a tick. */
+const PAGE = 200;
+/** Pages one tick will drain before yielding. A burst larger than this is
+    picked up by the next tick rather than blocking this one — the tail stays
+    responsive, and the cursor means nothing is lost in between. */
+const MAX_PAGES_PER_TICK = 5;
+
+/** A span's primary key, as one string.
+ *
+ *  Structured rather than concatenated with a separator: trace and span ids
+ *  are arbitrary strings, so any delimiter can appear inside one — and
+ *  reaching for a control byte to dodge that is how a literal NUL ends up in
+ *  a source file, which makes git treat it as binary and hides it from diff,
+ *  blame and grep. */
+const spanKey = (span) => JSON.stringify([span.trace_id, span.span_id]);
 
 export function TailScreen({ go }) {
   const [rows, setRows] = React.useState([]);
@@ -24,16 +39,26 @@ export function TailScreen({ go }) {
   const since = React.useRef(null);
   const buffer = React.useRef([]);
   const lastTick = React.useRef(null);
+  const inFlight = React.useRef(false);
 
   // Reset the watermark when the filter changes: a narrower tail should show
   // what is arriving now, not resume from where the wider one stopped.
-  React.useEffect(() => { since.current = null; buffer.current = []; setRows([]); setPending(0); },
-    [service, errorsOnly]);
+  React.useEffect(() => {
+    since.current = null;
+    buffer.current = [];
+    setRows([]);
+    setPending(0);
+  }, [service, errorsOnly]);
 
   usePoll(async () => {
+    // Ticks must not overlap. A slow response used to let the next tick start
+    // against the same watermark, so both pages landed and the tail showed
+    // every span twice.
+    if (inFlight.current) return;
+    inFlight.current = true;
     try {
-      const params = {
-        limit: 200,
+      const base = {
+        limit: PAGE,
         service: service || undefined,
         status: errorsOnly ? 'error' : undefined,
         // First tick starts from now rather than the beginning of the store:
@@ -41,14 +66,32 @@ export function TailScreen({ go }) {
         // would bury that under history.
         since: since.current ?? Math.round((Date.now() - 5000) * 1e6),
       };
-      const page = await api.spans(params);
-      const fresh = page.spans || [];
+
+      // Drain by CURSOR, not by advancing the watermark past the newest
+      // timestamp seen. Bumping to max(start)+1 silently skipped every span
+      // that shared the last timestamp of a full page — and spans batched by
+      // an SDK routinely share one. The cursor carries the full ordering key,
+      // so a page boundary inside a timestamp resumes exactly where it left.
+      const fresh = [];
+      let cursor = null;
+      for (let page = 0; page < MAX_PAGES_PER_TICK; page += 1) {
+        // eslint-disable-next-line no-await-in-loop
+        const answer = await api.spans(cursor ? { ...base, cursor } : base);
+        const batch = answer.spans || [];
+        fresh.push(...batch);
+        cursor = answer.next_cursor || null;
+        if (!cursor) break;
+      }
+
       if (fresh.length) {
-        const newest = Math.max(...fresh.map((s) => s.start_time_ns));
-        since.current = newest + 1;
+        // The watermark moves to the last span in stable order, and the next
+        // tick re-asks from there with `since`; the cursor covers within-tick
+        // paging, `since` covers between ticks.
+        since.current = fresh[fresh.length - 1].start_time_ns;
       } else if (since.current == null) {
         since.current = Math.round(Date.now() * 1e6);
       }
+
       const now = performance.now();
       if (lastTick.current) {
         const seconds = Math.max(0.001, (now - lastTick.current) / 1000);
@@ -56,13 +99,25 @@ export function TailScreen({ go }) {
       }
       lastTick.current = now;
       if (!fresh.length) return;
+
       if (paused) {
-        buffer.current = [...fresh, ...buffer.current].slice(0, MAX_ROWS);
+        buffer.current = [...fresh.slice().reverse(), ...buffer.current].slice(0, MAX_ROWS);
         setPending(buffer.current.length);
       } else {
-        setRows((all) => [...fresh.reverse(), ...all].slice(0, MAX_ROWS));
+        setRows((all) => {
+          // `since` is inclusive, so the span the watermark points at comes
+          // back on the next tick. Dropping by primary key is what keeps it
+          // from appearing twice.
+          const already = new Set(all.map(spanKey));
+          const added = fresh.filter((s) => !already.has(spanKey(s)));
+          return [...added.reverse(), ...all].slice(0, MAX_ROWS);
+        });
       }
-    } catch (e) { /* a dropped tick is the next tick's problem */ }
+    } catch (e) {
+      /* a dropped tick is the next tick's problem */
+    } finally {
+      inFlight.current = false;
+    }
   }, TICK_MS, true);
 
   const resume = () => {

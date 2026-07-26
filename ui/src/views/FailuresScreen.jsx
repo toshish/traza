@@ -30,7 +30,12 @@ export function FailuresScreen({ go }) {
   );
 
   const groups = failures.data?.groups || [];
-  const total = groups.reduce((sum, group) => sum + group.count, 0);
+  // The API's total over every matching span. The page is truncated to a
+  // limit, so summing it would make each signature's share of "all failures"
+  // proportionally larger the more signatures existed.
+  const total = failures.data?.total ?? 0;
+  const omitted = failures.data?.groups_omitted ?? 0;
+  const untracked = failures.data?.spans_untracked ?? 0;
   const buckets = series.data?.buckets || [];
   const spans = buckets.reduce((sum, b) => sum + b.spans, 0);
   const errors = buckets.reduce((sum, b) => sum + b.errors, 0);
@@ -119,6 +124,19 @@ export function FailuresScreen({ go }) {
           <Num muted>{fmtAgo(group.last_seen_ns)} ago</Num>
         </div>
       ))}
+      {/* A truncated table that does not say it is truncated reads as the
+          whole picture. Both cuts are reported, because they mean different
+          things: `omitted` is groups measured but not shown, `untracked` is
+          spans whose signature was never measured at all. */}
+      {omitted || untracked ? <div style={{
+        padding: '9px 12px', fontSize: 12, color: 'var(--ink-muted)',
+        borderTop: '1px solid var(--hairline)',
+      }}>
+        Showing {fmtNum(groups.length)} of <Mono>{fmtNum(failures.data.distinct)}</Mono> signatures
+        across <Mono color="var(--error)">{fmtNum(total)}</Mono> failed spans
+        {untracked ? <> · <Mono color="var(--warn)">{fmtNum(untracked)}</Mono> spans exceeded the
+          signature limit and are counted in the total but not grouped</> : null}
+      </div> : null}
     </Card> : null}
   </div>;
 }

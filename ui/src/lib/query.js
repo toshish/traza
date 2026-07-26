@@ -133,10 +133,40 @@ export function toHash(q) {
       .map((p) => [escape(p.field), escape(p.op), escape(p.value)].join(F_SEP))
       .join(P_SEP);
   }
-  if (q.range && q.range !== '1h') out.t = typeof q.range === 'string' ? q.range : '';
+  // A range is either a preset id or an absolute pair. Both have to survive
+  // the URL: the volume brush produces an absolute one, and serializing it as
+  // an empty string — which is what `typeof range === 'string' ? … : ''` did —
+  // silently threw the drag away and restored the default window.
+  if (q.range && q.range !== '1h') {
+    if (typeof q.range === 'string') out.t = q.range;
+    else if (q.range.sinceNs && q.range.untilNs) {
+      out.t = `${Math.round(q.range.sinceNs)}${ABS_SEP}${Math.round(q.range.untilNs)}`;
+    }
+  }
   if (q.sort) out.s = q.sort;
   if (q.limit && q.limit !== 100) out.n = String(q.limit);
   return out;
+}
+
+/** Separates the two halves of an absolute window in the hash. A dash cannot
+    appear in a decimal nanosecond timestamp, so it needs no escaping. */
+const ABS_SEP = '-';
+
+/** Reads a `t=` value: a preset id, or `<sinceNs>-<untilNs>`. */
+function parseRange(raw) {
+  if (!raw) return null;
+  const at = raw.indexOf(ABS_SEP);
+  if (at > 0) {
+    const sinceNs = Number(raw.slice(0, at));
+    const untilNs = Number(raw.slice(at + 1));
+    // Both halves must be finite and ordered, or this is not a window —
+    // treat a mangled one as absent rather than as a range of nonsense.
+    if (Number.isFinite(sinceNs) && Number.isFinite(untilNs) && untilNs > sinceNs) {
+      return { sinceNs, untilNs };
+    }
+    return null;
+  }
+  return RANGES.some((r) => r.id === raw) ? raw : null;
 }
 
 /** Reads a query back out of hash-route parameters. */
@@ -150,7 +180,8 @@ export function fromHash(params) {
       return predicate(unescape(field || 'service'), unescape(op || '='), unescape(rest.join(F_SEP) || ''));
     });
   }
-  if (params.get('t')) q.range = params.get('t');
+  const range = parseRange(params.get('t'));
+  if (range) q.range = range;
   if (params.get('s')) q.sort = params.get('s');
   if (params.get('n')) q.limit = Number(params.get('n')) || 100;
   return q;

@@ -1,9 +1,10 @@
 import React from 'react';
 import { api } from '../lib/api.js';
-import { useRead } from '../lib/route.js';
+import { useRead, usePoll } from '../lib/route.js';
 import { RANGES, windowOf } from '../lib/query.js';
 import {
-  fmtCompact, fmtCost, fmtDelta, fmtDurationNs, fmtNum, fmtPercent, fmtAgo, fmtClockNs, fmtWindowLabel,
+  durabilityMeans, fmtCompact, fmtCost, fmtDelta, fmtDurationNs, fmtNum, fmtPercent, fmtAgo,
+  fmtClockNs, fmtWindowLabel,
 } from '../lib/format.js';
 import { Card, Chip, Eyebrow, ErrorState, LiveDot, LoadingBar, Skeleton } from '../components/primitives/Chrome.jsx';
 import { Sparkbar, StackedSparkbar } from '../components/charts/Marks.jsx';
@@ -63,9 +64,19 @@ function Lead({ tone, kind, delta, children, footer, chart, onClick }) {
 
 const M = ({ children, color }) => <span style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color }}>{children}</span>;
 
+/** How often a screen labelled "live" actually re-reads. */
+const REFRESH_MS = 15000;
+
 export function OverviewScreen({ go }) {
   const [range, setRange] = React.useState('24h');
-  const window = React.useMemo(() => windowOf(range), [range]);
+  // The screen says "live", so it has to be. The window was resolved once at
+  // mount and never again: every figure, spark and lead card was frozen at the
+  // moment the tab opened, and the dot pulsed over it. `tick` re-resolves the
+  // relative window, which re-runs every read below it.
+  const [tick, setTick] = React.useState(0);
+  usePoll(() => setTick((n) => n + 1), REFRESH_MS);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const window = React.useMemo(() => windowOf(range), [range, tick]);
 
   // The window is split in half so "since yesterday" is a comparison the
   // server computes, not a second request: buckets 0..n/2 are the previous
@@ -102,7 +113,10 @@ export function OverviewScreen({ go }) {
   const p95Before = Math.max(...before.map((b) => b.p95_ns || 0), 0);
 
   const worstFailure = failures.data?.groups?.[0];
-  const totalFailures = (failures.data?.groups || []).reduce((t, g) => t + g.count, 0);
+  // The server's own count of every matching span, not the sum of the five
+  // groups it returned. Summing a truncated page made the top signature's
+  // share read as a far larger fraction of failures than it was.
+  const totalFailures = failures.data?.total ?? 0;
   const topModel = models.data?.rows?.[0];
   const modelCost = (models.data?.rows || []).reduce((t, r) => t + r.cost_usd, 0);
 
@@ -217,8 +231,7 @@ export function OverviewScreen({ go }) {
             Answered <M color="var(--accent)">{fmtNum(metrics.data.requests.total)}</M> requests at{' '}
             <M color="var(--accent)">p95 {fmtDurationNs(metrics.data.requests.p95_ns)}</M>. Admitted{' '}
             <M color="var(--accent)">{fmtNum(metrics.data.ingest.spans_admitted)}</M> spans. Durability is{' '}
-            <M>{metrics.data.durability || 'wal'}</M> — an acknowledged write survives a kill&#8209;9, a panic,
-            or an OS crash.
+            <M>{metrics.data.durability || '—'}</M> — {durabilityMeans(metrics.data.durability)}.
           </div>
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 10 }}>
             {[

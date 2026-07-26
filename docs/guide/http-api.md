@@ -462,6 +462,12 @@ rather than wrapping; non-finite cost values are ignored.
 for an unrecognized dimension; `400` for an unknown parameter. `503` on store
 failure.
 
+**The aggregation routes below do not block ingest.** Each folds the match set
+in one pass and constant memory, against a snapshot taken up front — one copy
+of the bounded write buffer and one reference per segment — so a scan of the
+whole corpus runs alongside writes rather than stopping them, and reports one
+coherent instant rather than a moving one.
+
 ### `GET /v1/stats/series`
 
 Buckets matching spans into even time buckets. Accepts every
@@ -520,8 +526,27 @@ curl 'http://localhost:8080/v1/stats/failures?since=1700000000000000000&limit=20
 ```
 
 ```json
-{"groups":[{"service":"checkout-api","name":"tool.refund_lookup","status":"error","count":142,"first_seen_ns":1700000000000000000,"last_seen_ns":1700003600000000000,"example_trace_id":"trace-9f2c","example_span_id":"span-a","p50_ns":325000000,"p95_ns":812000000}]}
+{"groups":[{"service":"checkout-api","name":"tool.refund_lookup","status":"error","count":142,"first_seen_ns":1700000000000000000,"last_seen_ns":1700003600000000000,"example_trace_id":"trace-9f2c","example_span_id":"span-a","p50_ns":325000000,"p95_ns":812000000}],"total":169,"distinct":7,"groups_omitted":0,"spans_untracked":0}
 ```
+
+| Field | Type | Description |
+|---|---|---|
+| `groups` | array | Signatures, most frequent first, truncated to `limit` |
+| `total` | integer | **Every** matching span, counted before truncation |
+| `distinct` | integer | Signatures seen, up to the cardinality bound |
+| `groups_omitted` | integer | Signatures measured but cut by `limit` |
+| `spans_untracked` | integer | Spans whose signature was never tracked because the cardinality bound was reached |
+
+**Use `total` as the denominator for a share, not the sum of `groups`.** The
+returned page is truncated, so summing it overstates every signature's
+fraction of the whole — by more, the more signatures exist.
+
+**Grouping is bounded at 4,096 distinct signatures.** Each tracked signature
+costs a duration histogram, so an unbounded map turns high-cardinality error
+text — an id or a timestamp in a span name — into gigabytes of server memory
+to answer a question whose useful form is twenty rows. Past the bound, spans
+are counted into `total` but not grouped, and `spans_untracked` says how many.
+A non-zero value means `distinct` is a floor.
 
 Grouping happens server-side because the input can be every error in the
 window while the useful answer is a dozen rows: shipping the spans so a client
@@ -544,7 +569,9 @@ curl 'http://localhost:8080/v1/stats/slowest?since=1700000000000000000&limit=10'
 
 Unlike `sort=-duration` on [`GET /v1/spans`](#get-v1spans), this route has no
 candidate ceiling: it keeps only `limit` spans while folding, so memory is
-bounded by the answer rather than by the match set.
+bounded by the answer rather than by the match set. `limit` is itself capped at
+1,000 — a tail is read, not paged, and a larger request is a way to ask the
+server to hold the match set in memory.
 
 ---
 
@@ -692,13 +719,17 @@ exposition parser in order to draw one chart is a parser nobody should have to
 write.
 
 ```json
-{"uptime_ns":535200000000000,"requests":{"total":184204,"rejected":0,"responses_2xx":184204,"responses_4xx":0,"responses_5xx":0,"mean_ns":1210880,"max_ns":75821375,"p50_ns":1703935,"p95_ns":2818047,"p99_ns":9437183},"by_class":{"search":{"count":8,"mean_ns":22375885,"max_ns":75821375,"p50_ns":1703935,"p95_ns":2818047,"p99_ns":9437183},"lookup":{},"stats":{},"ingest":{},"other":{}},"connections":{"accepted":12,"refused":0,"live":1},"decode":{"spans":2417882,"mean_ns":91375,"p95_ns":131071},"ingest":{"spans_admitted":2417882,"batches_admitted":2418,"wal_commits":2418,"wal_fsync_p95_ns":9879551,"segment_seal_p95_ns":0},"pruning":{"segments_examined":340,"segments_pruned_by_time":328},"percentile_error_bound":0.0625}
+{"uptime_ns":535200000000000,"durability":"wal","requests":{"total":184204,"rejected":0,"responses_2xx":184204,"responses_4xx":0,"responses_5xx":0,"mean_ns":1210880,"max_ns":75821375,"p50_ns":1703935,"p95_ns":2818047,"p99_ns":9437183},"by_class":{"search":{"count":8,"mean_ns":22375885,"max_ns":75821375,"p50_ns":1703935,"p95_ns":2818047,"p99_ns":9437183},"lookup":{},"stats":{},"ingest":{},"other":{}},"connections":{"accepted":12,"refused":0,"live":1},"decode":{"spans":2417882,"mean_ns":91375,"p95_ns":131071},"ingest":{"spans_admitted":2417882,"batches_admitted":2418,"wal_commits":2418,"wal_fsync_p95_ns":9879551,"segment_seal_p95_ns":0},"pruning":{"segments_examined":340,"segments_pruned_by_time":328},"percentile_error_bound":0.0625}
 ```
 
 Request latency is split by **route class** — `ingest`, `lookup`, `search`,
 `stats`, `other` — because an ingest batch and a trace lookup differ by orders
 of magnitude and one blended histogram described neither. `by_class` carries
 `count`, `mean_ns`, `max_ns` and the three percentiles for each.
+
+`durability` is the same value [`GET /v1/stats`](#get-v1stats) reports, carried
+here so a client showing server health does not have to infer what an
+acknowledged write guarantees — or, as the dashboard once did, default it.
 
 `percentile_error_bound` is stated in the payload rather than left implicit:
 every `p*_ns` here is a bucket upper bound, at most that fraction high and

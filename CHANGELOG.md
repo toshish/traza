@@ -7,6 +7,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Aggregations no longer block ingest.** `fold_spans` held the writer and
+  segment locks for the length of a full-corpus scan, so any series, duration,
+  failure or slowest query stalled writes until it finished — and the Overview
+  screen starts four at once. It now folds against a snapshot: one copy of the
+  bounded write buffer, one reference per segment, locks released before the
+  scan. That also makes an aggregate a reading of one instant rather than of a
+  moving store. Guarded by `tests/fold_concurrency.rs`, which fails against the
+  previous implementation.
+
+- **Three arithmetic overflows reachable from valid requests.** A span with
+  `end_time_ns = u64::MAX` panicked the duration histogram's top bucket bound;
+  `until=u64::MAX` overflowed the series bucket width; `limit=u64::MAX`
+  overflowed the tail's allocation. Debug builds panicked and closed the
+  connection with no response; release builds would have wrapped, producing
+  wrong series math and an effectively unbounded limit. All three now use
+  checked or saturating arithmetic, with endpoint caps where a bound is also
+  the right policy.
+
+- **Failure grouping was unbounded in memory.** Every distinct
+  `(service, name, status)` allocated a duration histogram and `limit` applied
+  only after collecting them all, so high-cardinality error text — an id in a
+  span name — could reach gigabytes before returning twenty rows. Bounded at
+  4,096 signatures, with `spans_untracked` reporting what the bound excluded.
+
+- **The dashboard could state a durability guarantee the server never made.**
+  Both the Server and Overview screens printed the `wal` sentence — "survives a
+  kill-9, a panic, or an OS crash" — unconditionally, and Overview read a
+  `durability` field `/v1/metrics.json` did not have, defaulting it to `wal`.
+  A `buffered` server, which promises the opposite, was described as durable.
+  The field is now served, and the wording is derived from it in one place.
+
+- **Drag-to-zoom silently reverted.** An absolute window serialized into the
+  hash as `t=""` and read back as the `1h` default, so every brush selection
+  snapped back to the last hour. Absolute ranges now round-trip as
+  `t=<since>-<until>`, and a malformed one falls back instead of becoming a
+  range of nonsense.
+
+- **Live tail could skip spans permanently.** It advanced its watermark to
+  `max(start_time_ns) + 1` and ignored `next_cursor`, so when more spans shared
+  the last timestamp of a page than the page held — routine for an SDK-batched
+  flush — the remainder were never returned. It now drains by cursor, and
+  overlapping ticks are prevented rather than deduplicated after the fact.
+
+- **`AbortSignal` did not cancel the request.** The shared coalesced request
+  was started with no signal, so aborting rejected the caller's promise while
+  the fetch, connection and server-side scan continued — the opposite of the
+  intent on a screen that re-queries per keystroke. Subscribers are now
+  reference-counted: one leaving cancels nothing, the last one cancels the work.
+
+- **A screen labelled "live" never refreshed.** Overview resolved its window
+  once at mount and polled nothing, so every figure was frozen at the moment
+  the tab opened while the live dot pulsed over it.
+
+- **Failure shares were computed against truncated data.** Both screens summed
+  the groups they had been sent — a page cut to a limit — and used that as the
+  denominator, inflating every signature's share of "all failures". The API now
+  returns `total`, counted before truncation.
+
+- **Query cost under-reported content pruning.** Both search paths incremented
+  the process-wide counter but not the per-query `segments_pruned`, so a
+  content-narrowed search understated the work it had avoided.
+
 ### Changed
 
 - **Segment format v4: the attribute index is keyed by digest, not by value

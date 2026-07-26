@@ -1661,6 +1661,26 @@ impl SnapshotView<'_> {
         query_view(&self.buffer, &self.segments, self.metrics, filter, cursor)
     }
 
+    /// Folds every matching span through `visit`, reporting what it cost.
+    ///
+    /// A view holds no engine lock, so a scan of the whole corpus runs
+    /// alongside ingest instead of blocking it. See [`Store::fold_spans`].
+    pub(crate) fn fold(
+        &self,
+        filter: &SpanFilter,
+        cost: &mut QueryCost,
+        visit: &mut impl FnMut(&Span),
+    ) -> Result<()> {
+        fold_view(
+            &self.buffer,
+            &self.segments,
+            self.metrics,
+            filter,
+            cost,
+            visit,
+        )
+    }
+
     /// Number of segments the view pins, for diagnostics and tests.
     pub fn pinned_segment_count(&self) -> usize {
         self.segments.len()
@@ -1881,6 +1901,7 @@ pub(crate) fn query_view_costed(
                     .is_some_and(|query| !seg.may_contain_content(query))
                 {
                     metrics.segments_pruned_by_content.increment();
+                    cost.segments_pruned += 1;
                     continue;
                 }
                 let offsets = select_probe(seg, filter, content.as_ref(), metrics)?;
@@ -2011,6 +2032,7 @@ pub(crate) fn query_view_costed(
                 .is_some_and(|query| !seg.may_contain_content(query))
             {
                 metrics.segments_pruned_by_content.increment();
+                cost.segments_pruned += 1;
                 continue;
             }
             let offsets = select_probe(seg, filter, content.as_ref(), metrics)?;
@@ -2131,6 +2153,14 @@ impl Store {
     /// `filter.limit` and `filter.sort` are ignored: a fold is over the whole
     /// match set, and truncating or ordering it would silently change the
     /// aggregate rather than the presentation.
+    ///
+    /// **The engine locks are not held across the scan.** A fold reads the
+    /// whole corpus, so holding the writer lock for its duration would let any
+    /// aggregation — a dashboard drawing four of them at once — stall ingest
+    /// for as long as the scan takes. The work happens against a
+    /// [`SnapshotView`], whose cost is one copy of the bounded write buffer
+    /// and one `Arc` clone per segment. That also makes the answer coherent:
+    /// a fold sees one instant of the store rather than a moving one.
     pub fn fold_spans(
         &self,
         filter: &SpanFilter,
@@ -2149,16 +2179,8 @@ impl Store {
                 }
             }
         } else {
-            let writer = self.lock_writer()?;
-            let segments = self.lock_segments()?;
-            fold_view(
-                &writer,
-                &segments,
-                &self.metrics,
-                filter,
-                &mut cost,
-                &mut visit,
-            )?;
+            let view = self.snapshot()?; // takes both locks, then releases them
+            view.fold(filter, &mut cost, &mut visit)?;
         }
         cost.elapsed_ns = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
         Ok(cost)
