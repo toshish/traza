@@ -196,53 +196,20 @@ The block below is written by the benchmark itself; everything outside the
 markers is analysis and survives a re-run.
 
 <!-- BEGIN GENERATED -->
-Every row is the MEDIAN of 5 runs, each on a fresh data directory. Scenarios are run ROUND-ROBIN rather than one at a time, and their order is ROTATED each round, so each scenario's repeats are spread across the whole wall-clock window and across positions within a round. Background load then hits all of them alike instead of landing on whichever ran during a spike or whichever is pinned to the same phase of a periodic load. Payloads are generated before the clock starts, so these are server rates; client encoding is reported separately. Runs that saw a failed batch or a shed connection are reported as failures rather than as numbers.
+Every row is the MEDIAN of 3 runs, each on a fresh data directory. Scenarios are run ROUND-ROBIN rather than one at a time, and their order is ROTATED each round, so each scenario's repeats are spread across the whole wall-clock window and across positions within a round. Background load then hits all of them alike instead of landing on whichever ran during a spike or whichever is pinned to the same phase of a periodic load. Payloads are generated before the clock starts, so these are server rates; client encoding is reported separately. Runs that saw a failed batch or a shed connection are reported as failures rather than as numbers.
 
 - Machine: macos/aarch64, 10 hardware threads, Apple M1 Max
-- Commit: `985d236`
+- Commit: `ddd185a`
 - Corpus: 1000000 spans per run, batch 1000
 - Compaction: disabled during ingest runs (a read-path optimization; its merges would steal CPU from the measurement)
 
 Latency is the CLIENT-OBSERVED time for one acknowledged batch, sampled per request and reduced to percentiles per run; the table reports the MEDIAN ACROSS RUNS of each percentile. Read it with the load model in mind: this is a closed-loop generator with a fixed number of workers, all saturating, so latency includes queueing and by Little's law tracks concurrency divided by throughput. Latencies are therefore only comparable BETWEEN ROWS AT THE SAME CONCURRENCY, and the honest place to look for a deliberate delay's cost is the low-concurrency rows, where there is nothing to queue behind.
 
-| Scenario | Protocol | Keep-alive | Concurrency | Median spans/s | Min | Max | p50 ms | p95 ms | p99 ms |
-|---|---|---|---:|---:|---:|---:|---:|---:|---:|
-| direct-engine-wal | json | n/a | 8 | **197230** | 110709 | 197992 | 45.09 | 53.11 | 60.88 |
-| direct-engine-buffered | json | n/a | 8 | **317212** | 215499 | 326041 | 0.17 | 128.25 | 236.07 |
-| http-json-wal-keepalive-off | json | false | 8 | **122592** | 82877 | 193848 | 57.76 | 90.46 | 103.26 |
-| http-json-wal-keepalive-on | json | true | 8 | **127073** | 80524 | 192642 | 68.34 | 88.16 | 99.93 |
-| http-json-wal-c1 | json | true | 1 | **64019** | 35874 | 84270 | 10.04 | 42.69 | 57.32 |
-| http-protobuf-wal-c1 | protobuf | true | 1 | **46066** | 36046 | 61752 | 13.98 | 58.36 | 67.76 |
-| http-json-wal-c4 | json | true | 4 | **161033** | 77059 | 166574 | 15.04 | 45.18 | 51.64 |
-| http-protobuf-wal-c4 | protobuf | true | 4 | **139674** | 54092 | 142027 | 19.91 | 49.48 | 54.08 |
-| http-json-wal-c8 | json | true | 8 | **139140** | 73501 | 196846 | 47.40 | 82.13 | 96.22 |
-| http-protobuf-wal-c8 | protobuf | true | 8 | **172593** | 88283 | 181015 | 50.21 | 60.74 | 68.15 |
-| http-json-wal-c16 | json | true | 16 | **185486** | 82539 | 205200 | 89.17 | 115.68 | 165.22 |
-| http-protobuf-wal-c16 | protobuf | true | 16 | **188379** | 103302 | 199422 | 91.25 | 108.95 | 157.00 |
-| profile-throughput-c1 | json | true | 1 | **85010** | 61004 | 86189 | 9.07 | 13.34 | 80.06 |
-| profile-throughput-c4 | json | true | 4 | **173092** | 77643 | 177324 | 12.64 | 91.98 | 104.66 |
-| profile-throughput-c8 | json | true | 8 | **231912** | 117628 | 241066 | 13.32 | 99.19 | 107.36 |
-| profile-throughput-c16 | json | true | 16 | **250453** | 122768 | 261215 | 90.23 | 112.08 | 168.47 |
-| profile-balanced-c1 | json | true | 1 | **80791** | 46899 | 84397 | 9.01 | 38.40 | 44.12 |
-| profile-balanced-c4 | json | true | 4 | **159716** | 108801 | 165339 | 15.12 | 46.44 | 50.98 |
-| profile-balanced-c8 | json | true | 8 | **184571** | 111761 | 195149 | 45.97 | 55.94 | 114.37 |
-| profile-balanced-c16 | json | true | 16 | **197056** | 114849 | 205010 | 86.07 | 105.13 | 174.99 |
-| profile-latency-c1 | json | true | 1 | **74823** | 57675 | 79199 | 8.98 | 29.78 | 38.46 |
-| profile-latency-c4 | json | true | 4 | **134573** | 116698 | 139764 | 31.61 | 39.97 | 46.07 |
-| profile-latency-c8 | json | true | 8 | **162703** | 157871 | 165534 | 50.80 | 63.14 | 69.98 |
-| profile-latency-c16 | json | true | 16 | **157681** | 153194 | 161347 | 98.12 | 121.03 | 132.90 |
-| profile-throughput-openloop-c1 | json | true | 1 | **60019** | 60003 | 60024 | 12.79 | 79.13 | 92.94 |
-| profile-throughput-openloop-c4 | json | true | 4 | **60003** | 59982 | 60008 | 15.54 | 83.88 | 108.75 |
-| profile-throughput-openloop-c8 | json | true | 8 | **60009** | 59916 | 60019 | 15.31 | 83.40 | 115.18 |
-| profile-throughput-openloop-c16 | json | true | 16 | **59995** | 59750 | 60021 | 14.36 | 83.20 | 134.20 |
-| profile-balanced-openloop-c1 | json | true | 1 | FAILED: offered rate exceeded capacity: delivered 54566 of 60000 spans/s (worst lateness 2475.1 ms), so this is a saturation measurement, not an open-loop one | | | | | |
-| profile-balanced-openloop-c4 | json | true | 4 | **59898** | 59839 | 59911 | 18.51 | 48.94 | 79.58 |
-| profile-balanced-openloop-c8 | json | true | 8 | **59886** | 59862 | 59914 | 16.76 | 47.81 | 74.94 |
-| profile-balanced-openloop-c16 | json | true | 16 | **59889** | 59811 | 59923 | 15.33 | 46.22 | 59.50 |
-| profile-latency-openloop-c1 | json | true | 1 | FAILED: offered rate exceeded capacity: delivered 42493 of 60000 spans/s (worst lateness 6837.1 ms), so this is a saturation measurement, not an open-loop one | | | | | |
-| profile-latency-openloop-c4 | json | true | 4 | **59925** | 59875 | 59955 | 18.64 | 40.73 | 63.03 |
-| profile-latency-openloop-c8 | json | true | 8 | **59934** | 59924 | 59944 | 19.73 | 40.77 | 75.17 |
-| profile-latency-openloop-c16 | json | true | 16 | FAILED: offered rate exceeded capacity: delivered 55804 of 60000 spans/s (worst lateness 1223.2 ms), so this is a saturation measurement, not an open-loop one | | | | | |
+| Scenario | Protocol | Route | Keep-alive | Concurrency | Median spans/s | Min | Max | p50 ms | p95 ms | p99 ms | Bytes/span | Decode ns/span |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| profile-throughput-c8 | native-json | /v1/spans | true | 8 | **243792** | 236951 | 244474 | 12.07 | 94.00 | 108.04 | 256 | 834 |
+| profile-balanced-c8 | native-json | /v1/spans | true | 8 | **192896** | 179467 | 195099 | 45.92 | 54.21 | 60.93 | 256 | 780 |
+| profile-latency-c8 | native-json | /v1/spans | true | 8 | **159949** | 151787 | 161023 | 51.17 | 64.82 | 73.95 | 256 | 850 |
 <!-- END GENERATED -->
 
 

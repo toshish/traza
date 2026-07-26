@@ -174,8 +174,23 @@ pub struct Metrics {
     pub wal_commits: Counter,
     /// Upserting a batch into the write buffer (inside the writer lock).
     pub buffer_upsert: Latency,
-    /// Sealing the write buffer into a segment.
+    /// Sealing the write buffer into a segment, end to end.
     pub segment_seal: Latency,
+    /// The part of a seal that holds an engine lock: draining the buffer,
+    /// publishing the finished segment, and reconciling buffer and log
+    /// afterwards. Everything else — encode, write, fsync, rename, reopen —
+    /// runs with no lock held.
+    ///
+    /// **This is the pair that makes "sealing is off the lock" checkable.**
+    /// A correctness test cannot see the difference: the same spans come back
+    /// either way. The ratio `segment_seal_locked / segment_seal` can, and it
+    /// goes to 1 the moment a seal is performed under the writer lock again.
+    pub segment_seal_locked: Latency,
+    /// Seals that found another already in flight and declined to start a
+    /// second one. The spans are still in the write buffer, so the running
+    /// seal covers them; this counts how often that happens rather than
+    /// leaving it invisible.
+    pub segment_seals_coalesced: Counter,
     /// Spans written out by seals, for seal cost per span.
     pub segment_seal_spans: Counter,
     /// Segments a query skipped entirely because their timestamp range could
@@ -203,11 +218,15 @@ impl Metrics {
     pub fn render_prometheus(&self, into: &mut String) {
         use std::fmt::Write as _;
 
-        let counters: [(&str, &Counter); 6] = [
+        let counters: [(&str, &Counter); 7] = [
             ("traza_spans_admitted_total", &self.spans_admitted),
             ("traza_batches_admitted_total", &self.batches_admitted),
             ("traza_wal_commits_total", &self.wal_commits),
             ("traza_segment_seal_spans_total", &self.segment_seal_spans),
+            (
+                "traza_segment_seals_coalesced_total",
+                &self.segment_seals_coalesced,
+            ),
             (
                 "traza_segments_pruned_by_time_total",
                 &self.segments_pruned_by_time,
@@ -219,13 +238,14 @@ impl Metrics {
             let _ = writeln!(into, "{name} {}", counter.get());
         }
 
-        let stages: [(&str, &Latency); 6] = [
+        let stages: [(&str, &Latency); 7] = [
             ("traza_writer_lock_wait", &self.writer_lock_wait),
             ("traza_wal_encode", &self.wal_encode),
             ("traza_wal_write", &self.wal_write),
             ("traza_wal_fsync", &self.wal_fsync),
             ("traza_buffer_upsert", &self.buffer_upsert),
             ("traza_segment_seal", &self.segment_seal),
+            ("traza_segment_seal_locked", &self.segment_seal_locked),
         ];
         for (name, stage) in stages {
             let _ = writeln!(into, "# TYPE {name}_ns_count counter");
