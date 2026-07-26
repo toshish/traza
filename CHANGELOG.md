@@ -82,13 +82,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   floor instead of 0, and a store compacting as it ingests settled at 10
   segments where it previously drifted to 30.
 
-  The supersede journal is now `.supersede.<old>.journal` and names the whole
-  output group, because no single output supersedes an input on its own.
-  Recovery deletes an input only once every output is present and parses, and
+  The compaction journal is now one record per merge —
+  `.supersede.<first-output>.journal`, naming every input and every output —
+  because which way to finish an interrupted merge is a fact about the group.
+  Recovery deletes the inputs once every output is present and parses, and
   otherwise **rolls the merge back** — a lone output carries a higher id than
   every input while holding only its own group's view of a key, so left beside
   intact inputs it would shadow a newer version in a group whose output never
-  landed. Markers written by earlier versions still parse.
+  landed. Rollback requires *every* input still to be present: any one already
+  gone proves deletion had started, which happens only after every output was
+  durable, so a missing output is one a later merge has since consumed and
+  recovery must roll forward instead. A journal that saw one input at a time
+  could not tell those apart and would delete live segments holding the only
+  copy of an input already removed.
 
 ### Added
 

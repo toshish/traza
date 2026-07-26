@@ -1886,23 +1886,22 @@ impl Store {
             })
             .collect();
 
-        // Journal every input before any replacement exists, so recovery can
-        // finish the merge from either side without inspecting content. Each
-        // marker names ALL the outputs: an input is superseded by the group of
-        // them together, and deleting it while only some exist would drop the
-        // spans the missing ones were to carry.
-        let mut markers = Vec::with_capacity(inputs.len());
-        for path in &input_paths {
-            let old_name = path
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            markers.push(write_supersede_marker(
-                &self.directory,
-                &old_name,
-                &new_names,
-            )?);
-        }
+        // Journal the whole merge before any replacement exists, so recovery
+        // can finish it from either side without inspecting content. ONE
+        // journal naming every input and every output, because the merge is
+        // one transaction: which way an interrupted merge has to be finished
+        // is a fact about the group, and a journal that saw a single input
+        // could not tell "nothing was deleted yet" from "deletion had
+        // started", which are opposite answers.
+        let old_names: Vec<String> = input_paths
+            .iter()
+            .map(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            })
+            .collect();
+        let journal = write_merge_journal(&self.directory, &old_names, &new_names)?;
 
         // ---- merge: no engine lock held --------------------------------
         // One group at a time, so a merge holds one output's worth of spans
@@ -1954,19 +1953,26 @@ impl Store {
             }
         };
         if !published {
-            // Nothing was replaced, so nothing may look replaced. Remove the
-            // orphans BEFORE their markers: a crash in the other order would
-            // let recovery see a complete replacement and delete inputs it
-            // does not actually supersede. A half-written set is exactly as
-            // dangerous — an output holds only its own group's view of a key,
-            // so leaving one beside intact inputs would let it shadow a newer
-            // version in a group whose output never landed.
+            // Nothing was replaced, so nothing may look replaced. The orphans
+            // go first and DURABLY, and only then the journal: a crash in the
+            // other order — or an unlink that failed and was shrugged off —
+            // leaves an output with nothing left to describe it, and the next
+            // open loads it like any other segment. That is not a cosmetic
+            // leak. An output holds only its own group's view of a key and
+            // carries a higher id than every input, so one sitting beside
+            // intact inputs shadows a newer version in a group whose output
+            // never landed.
+            //
+            // Handles first: an output is opened file-backed as it is written,
+            // and a platform that refuses to unlink an open file would fail
+            // every removal below while the merge still holds them.
+            drop(outputs);
             for name in &new_names {
-                let _ = fs::remove_file(self.directory.join(name));
+                unlink_segment(&self.directory.join(name))?;
             }
-            for marker in markers {
-                let _ = fs::remove_file(marker);
-            }
+            sync_directory(&self.directory)?;
+            fs::remove_file(&journal)?;
+            sync_directory(&self.directory)?;
             return written.map(|()| 0);
         }
 
@@ -1979,16 +1985,14 @@ impl Store {
         for path in &input_paths {
             unlink_segment(path)?;
         }
-        // Durable before the markers are dropped: a marker is what lets
+        // Durable before the journal is dropped: the journal is what lets
         // recovery finish an unlink that a crash rolled back, so it must
-        // outlive any unlink that is not yet durable.
+        // outlive any unlink that is not yet durable. An unlink that fails
+        // outright leaves the journal in place by the `?` above, and recovery
+        // finishes the deletion from there.
         sync_directory(&self.directory)?;
-        // A marker that outlives the merge it describes stays harmless: the
-        // inputs it names are gone, which is what tells recovery this merge
-        // committed and its outputs are not to be rolled back.
-        for marker in markers {
-            let _ = fs::remove_file(marker);
-        }
+        let _ = fs::remove_file(&journal);
+        sync_directory(&self.directory)?;
         // Rollups are keyed by path; the inputs' entries are now dead.
         if let Ok(mut rollups) = self.rollups.lock() {
             rollups.retain(|path, _| !input_paths.contains(path));
@@ -2673,49 +2677,92 @@ fn run_position(
     })
 }
 
-/// Compaction supersede journal: a marker recording that a rewritten segment
-/// replaces an original. Written BEFORE the replacement, deleted after the
-/// original is removed, so recovery can finish an interrupted rewrite in
-/// either direction without ever guessing from content — content-based
-/// duplicate healing silently destroyed legitimately re-ingested identical
-/// spans (found in review: acknowledged duplicate cardinality must survive
-/// restart).
-fn supersede_marker_path(directory: &Path, old_name: &str) -> PathBuf {
-    directory.join(format!(".supersede.{old_name}.journal"))
+/// Compaction journal: one record per merge, naming the segments it consumes
+/// and the segments that replace them. Written BEFORE any replacement exists,
+/// deleted after the originals are removed, so recovery can finish an
+/// interrupted merge in either direction without ever guessing from content —
+/// content-based duplicate healing silently destroyed legitimately re-ingested
+/// identical spans (found in review: acknowledged duplicate cardinality must
+/// survive restart).
+fn merge_journal_path(directory: &Path, first_output: &str) -> PathBuf {
+    directory.join(format!(".supersede.{first_output}.journal"))
 }
 
-/// Records that `new_names` — the merge's outputs, as a group — supersede
-/// `old_name`. The whole group is named because no single output supersedes
-/// the input on its own: each holds only its own group's view of a key.
-fn write_supersede_marker(
-    directory: &Path,
-    old_name: &str,
-    new_names: &[String],
-) -> Result<PathBuf> {
-    let path = supersede_marker_path(directory, old_name);
+/// Records a merge as one transaction: every input it consumes and every
+/// output that together supersede them.
+///
+/// Named for its first output, whose id is claimed under the segment lock and
+/// so is unique and ascending — which makes path order merge order when
+/// recovery has more than one to finish.
+fn write_merge_journal(directory: &Path, inputs: &[String], outputs: &[String]) -> Result<PathBuf> {
+    let path = merge_journal_path(directory, outputs.first().map_or("", String::as_str));
     let mut options = OpenOptions::new();
     options.write(true).create(true).truncate(true);
     let mut file = options.open(&path)?;
-    writeln!(file, "{old_name} -> {}", new_names.join(","))?;
+    writeln!(file, "inputs {}", inputs.join(","))?;
+    writeln!(file, "outputs {}", outputs.join(","))?;
     file.sync_all()?;
     sync_directory(directory)?;
     Ok(path)
 }
 
-/// Finishes interrupted compaction rewrites recorded in supersede markers.
+/// Finishes one interrupted merge, given its journal's contents.
 ///
-/// If every replacement exists and is complete, the original is deleted (the
-/// crash hit between the last replacement's rename and the original's
-/// delete). If any is missing the merge is rolled back instead: the
-/// replacements that did land are deleted and the originals — untouched until
-/// a merge commits — stay authoritative. Rolling back rather than keeping the
-/// partial set is what a grouped merge requires, because an output carries
-/// only its own group's last-write-wins view; left beside intact inputs, and
-/// holding a higher id than all of them, it would shadow a newer version of
-/// any key whose group never produced its output. The marker is removed
-/// either way.
+/// **The decision is about the group, never a single file.** A merge deletes
+/// its inputs only once every output is durable, so "every input is still
+/// here" is what proves it never committed — and that is the only state in
+/// which undoing it is right. Any input already gone proves the opposite:
+/// deletion had started, so every output was durable at that moment, and an
+/// output missing now is simply one a LATER merge has since consumed, with
+/// that merge's own output carrying the data forward. Undoing then would
+/// delete live segments holding the only copy of an input already removed.
+fn recover_merge(directory: &Path, journal: &str) -> Result<()> {
+    let field = |key: &str| -> Vec<&str> {
+        journal
+            .lines()
+            .find_map(|line| line.trim().strip_prefix(key))
+            .map(|rest| rest.split(',').filter(|name| !name.is_empty()).collect())
+            .unwrap_or_default()
+    };
+    let inputs = field("inputs ");
+    let outputs = field("outputs ");
+    if outputs.is_empty() {
+        // Nothing this journal describes can exist yet. Either a crash tore
+        // it mid-fsync — it is written before the first output — or it was
+        // left by a version that journaled one input at a time, whose merges
+        // produced a single output renamed atomically, so the store is
+        // consistent whichever side that crash landed on.
+        return Ok(());
+    }
+    let ready = |name: &str| {
+        let path = directory.join(name);
+        path.exists() && (!name.ends_with(SEGMENT_SUFFIX) || segment::Segment::open(&path).is_ok())
+    };
+    let committed = outputs.iter().all(|name| ready(name));
+    let untouched = inputs.iter().all(|name| directory.join(name).exists());
+    if committed || !untouched {
+        // Forward: the outputs stand and the inputs are dead. Idempotent, so
+        // a second crash mid-deletion simply resumes here.
+        for name in &inputs {
+            unlink_segment(&directory.join(name))?;
+        }
+    } else {
+        // Back: no output may outlive a merge that never committed.
+        for name in &outputs {
+            unlink_segment(&directory.join(name))?;
+        }
+    }
+    sync_directory(directory)
+}
+
+/// Finishes interrupted merges recorded in the compaction journal.
+///
+/// Each journal is one merge, resolved as a unit by [`recover_merge`] and then
+/// removed — the removal last and synced, so a journal never disappears before
+/// the deletions it authorized are durable. Journals are taken in path order,
+/// which is merge order: each is named for its first output, and ids ascend.
 fn recover_supersede_markers(directory: &Path) -> Result<()> {
-    let mut markers = Vec::new();
+    let mut journals = Vec::new();
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
         if !entry.file_type()?.is_file() {
@@ -2723,41 +2770,14 @@ fn recover_supersede_markers(directory: &Path) -> Result<()> {
         }
         let name = entry.file_name().to_string_lossy().into_owned();
         if name.starts_with(".supersede.") && name.ends_with(".journal") {
-            markers.push(entry.path());
+            journals.push(entry.path());
         }
     }
-    for marker in markers {
-        let parsed = fs::read_to_string(&marker).unwrap_or_default();
-        if let Some((old_name, new_names)) = parsed.trim().split_once(" -> ") {
-            let new_names: Vec<&str> = new_names.split(',').filter(|n| !n.is_empty()).collect();
-            let ready = |name: &str| {
-                let path = directory.join(name);
-                path.exists()
-                    && (!name.ends_with(SEGMENT_SUFFIX) || segment::Segment::open(&path).is_ok())
-            };
-            let old_path = directory.join(old_name);
-            if !new_names.is_empty() && new_names.iter().all(|name| ready(name)) {
-                if old_path.exists() {
-                    fs::remove_file(&old_path)?;
-                }
-            } else if old_path.exists() {
-                // Rolling back, and the input's presence is what licenses it.
-                // A merge deletes its inputs only once every output is
-                // durable, so an input still on disk proves this merge never
-                // committed and its outputs are safe to remove. Gone means it
-                // DID commit — and then a missing output is one a later merge
-                // consumed, with the rest of the group live. Deleting those
-                // because a marker outlived its merge would be the one way
-                // this journal could destroy data.
-                for name in &new_names {
-                    let path = directory.join(name);
-                    if path.exists() {
-                        fs::remove_file(&path)?;
-                    }
-                }
-            }
-        }
-        fs::remove_file(&marker)?;
+    journals.sort();
+    for journal in journals {
+        recover_merge(directory, &fs::read_to_string(&journal).unwrap_or_default())?;
+        fs::remove_file(&journal)?;
+        sync_directory(directory)?;
     }
     Ok(())
 }
