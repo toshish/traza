@@ -357,6 +357,84 @@ fn concurrent_acknowledged_batches_all_survive() {
     );
 }
 
+#[test]
+fn a_crash_during_a_seal_loses_nothing_it_acknowledged() {
+    // Sealing runs off the writer lock, which opens a window the old design
+    // did not have: a segment can be fsynced, renamed and visible while the
+    // log records it supersedes are still on disk and the buffer still holds
+    // the spans. A crash anywhere in there must recover to the same store.
+    //
+    // The threshold is deliberately low, so seals run continuously and the
+    // SIGKILL below lands inside one rather than between them. Both directions
+    // are failures: losing an acknowledged span, or recovering a duplicate of
+    // one because the segment and the replayed log disagreed about identity.
+    // The kill has to land WHILE a seal is running. Waiting for the clients to
+    // finish would not test anything: a seal runs on the thread whose batch
+    // triggered it, so by the time the last request is answered every seal it
+    // started has already published. The clients are given far more work than
+    // they can finish and the server is killed underneath them.
+    const PER_BATCH: usize = 400;
+    let dir = test_dir("seal-crash");
+    // Small threshold, fat spans: seals are frequent AND each one is real
+    // work, so a kill at an arbitrary instant has a good chance of landing
+    // inside one. Compaction is off — it would merge segments underneath the
+    // measurement and add nothing to what is being tested.
+    let mut server = Server::spawn_with(
+        &dir,
+        "wal",
+        &["--flush-spans", "2000", "--compaction-fanout", "0"],
+    );
+    let port = server.port;
+
+    let mut handles = Vec::new();
+    for worker in 0..4 {
+        handles.push(std::thread::spawn(move || {
+            acknowledged_batches(port, worker, 100_000, PER_BATCH, 256)
+        }));
+    }
+    std::thread::sleep(Duration::from_millis(600));
+    server.kill_hard();
+
+    let acknowledged: usize = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("worker"))
+        .sum();
+    assert!(
+        acknowledged > 30,
+        "the run must have acknowledged enough to have sealed several times, \
+         got {acknowledged} batches"
+    );
+
+    // ONE recovery serving all four queries. Recovery is the expensive half of
+    // this test, and `/v1/stats` cannot answer it: it reports PHYSICAL records,
+    // so a span that recovery finds in both a published segment and the
+    // replayed log would count twice and hide a loss somewhere else. A query
+    // resolves the primary key.
+    let recovered = Server::spawn(&dir, "wal");
+    let survived: usize = (0..4)
+        .map(|worker| {
+            let (status, body) = request_to(
+                recovered.port,
+                "GET",
+                &format!("/v1/spans?attr.marker=ka{worker}&limit=1000000"),
+                None,
+            );
+            assert_eq!(status, 200, "the recovered store answers: {body}");
+            body.as_array().map(Vec::len).unwrap_or(0)
+        })
+        .sum();
+    let mut recovered = recovered;
+    recovered.kill_hard();
+
+    assert!(
+        survived >= acknowledged * PER_BATCH,
+        "{survived} spans survived a SIGKILL taken mid-seal, but {} were \
+         acknowledged: the log was reclaimed before the segment that \
+         supersedes it was durable",
+        acknowledged * PER_BATCH
+    );
+}
+
 /// Sends many requests down ONE connection, the way a real ingest client does
 /// now that connections persist. Returns how many were acknowledged 200.
 ///
@@ -365,6 +443,21 @@ fn concurrent_acknowledged_batches_all_survive() {
 /// cannot exercise the path where a response and the next request share a
 /// buffer.
 fn acknowledged_over_one_connection(port: u16, worker: usize, rounds: usize) -> usize {
+    acknowledged_batches(port, worker, rounds, 10, 0)
+}
+
+/// [`acknowledged_over_one_connection`] with the batch shape spelled out.
+///
+/// `per_batch` and `detail_bytes` exist because how much a seal has to write
+/// decides how wide the window a mid-seal crash has to land in is. Ten empty
+/// spans per batch seals in microseconds and tests nothing about that window.
+fn acknowledged_batches(
+    port: u16,
+    worker: usize,
+    rounds: usize,
+    per_batch: usize,
+    detail_bytes: usize,
+) -> usize {
     let mut stream = {
         let mut attempt = 0;
         loop {
@@ -383,15 +476,16 @@ fn acknowledged_over_one_connection(port: u16, worker: usize, rounds: usize) -> 
         .expect("timeout");
     let mut acknowledged = 0;
     let mut leftover: Vec<u8> = Vec::new();
+    let detail = "x".repeat(detail_bytes);
     for round in 0..rounds {
-        let spans: Vec<Value> = (0..10)
+        let spans: Vec<Value> = (0..per_batch)
             .map(|index| {
                 json!({
                     "trace_id": format!("ka-trace-{worker}"),
                     "span_id": format!("span-{round}-{index}"),
                     "name": "acknowledged", "service": "ingest",
                     "start_time_ns": 1_000u64, "end_time_ns": 2_000u64,
-                    "attributes": {"marker": format!("ka{worker}")}
+                    "attributes": {"marker": format!("ka{worker}"), "detail": detail}
                 })
             })
             .collect();
