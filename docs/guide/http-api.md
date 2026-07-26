@@ -172,9 +172,10 @@ with a time range, `service`, or an attribute and retry. Returning the "ten
 slowest" out of an arbitrary first page would be a wrong answer that looks
 like a right one.
 
-**Time ranges skip whole segments.** `since` / `until` are compared against
-each segment's stored timestamp range, so a segment that cannot contain a
-match is never opened. `traza_segments_pruned_by_time_total` and
+**Time ranges skip a segment's records.** `since` / `until` are compared
+against each segment's stored timestamp range, so a segment that cannot
+contain a
+match has none of its records read. `traza_segments_pruned_by_time_total` and
 `traza_segments_examined_total` in [`/v1/metrics`](../operations/monitoring.md)
 show how much of the store a given window is eliminating. Segments written
 before v0.18 carry no range and are always scanned; they age out through
