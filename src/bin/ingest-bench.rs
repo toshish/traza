@@ -1026,6 +1026,8 @@ fn stage_summary(metrics: &str) -> String {
         ("writer lock wait", "traza_writer_lock_wait"),
         ("wal encode", "traza_wal_encode"),
         ("wal write", "traza_wal_write"),
+        ("  .. wal lock wait", "traza_wal_lock_wait"),
+        ("  .. wal write syscall", "traza_wal_write_syscall"),
         ("wal fsync", "traza_wal_fsync"),
         ("buffer upsert", "traza_buffer_upsert"),
         ("segment seal", "traza_segment_seal"),
