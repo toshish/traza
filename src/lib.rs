@@ -2114,6 +2114,38 @@ impl Store {
             .sum())
     }
 
+    /// **Approximate** bytes held resident by the persisted segments' decoded
+    /// indexes.
+    ///
+    /// The necessary companion to [`Self::resident_payload_bytes`], which by
+    /// design counts only the payload encoding and is therefore zero however
+    /// large the indexes get. Reading that zero as "nothing is resident"
+    /// is the mistake this method exists to prevent: `Segment::open` decodes
+    /// the whole attribute index, whose keys are complete attribute values,
+    /// and keeps it for the life of the segment. See
+    /// [`segment::Segment::approx_index_bytes`] for exactly what is and is
+    /// not counted — it is a floor, not an allocator measurement.
+    pub fn resident_index_bytes(&self) -> Result<usize> {
+        let segments = self.lock_segments()?;
+        Ok(segments
+            .iter()
+            .map(|segment| segment.seg.approx_index_bytes())
+            .sum())
+    }
+
+    /// Distinct indexed `(key, value)` attribute pairs held resident across
+    /// all persisted segments, summed per segment.
+    ///
+    /// Summed, not deduplicated: a value present in two segments is decoded
+    /// and retained twice, and that double count is the real resident cost.
+    pub fn resident_attribute_index_entries(&self) -> Result<usize> {
+        let segments = self.lock_segments()?;
+        Ok(segments
+            .iter()
+            .map(|segment| segment.seg.attribute_index_len())
+            .sum())
+    }
+
     fn lock_writer(&self) -> Result<MutexGuard<'_, WriteBuffer>> {
         self.writer
             .lock()
