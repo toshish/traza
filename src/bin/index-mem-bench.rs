@@ -225,13 +225,29 @@ fn make_span(index: usize, cell: &Cell) -> Span {
 /// `ps -o rss=` reports KiB on both macOS and Linux and needs no dependency.
 /// It is the *current* RSS, not the peak; the peak sampler below covers that.
 fn rss_bytes() -> u64 {
-    Command::new("ps")
+    // Every failure here is fatal, by design. This function used to fold a
+    // missing `ps`, a non-zero exit, invalid UTF-8 and an unparseable number
+    // all into 0 — so removing `ps` from PATH produced a complete run in
+    // which a real four-segment merge reported 0 MiB open, 0 MiB peak and
+    // 0 MiB settled. Zero is syntactically valid, so no amount of strictness
+    // downstream can catch it; a memory benchmark whose instrument silently
+    // reads zero is worse than one that does not run.
+    let output = Command::new("ps")
         .args(["-o", "rss=", "-p", &std::process::id().to_string()])
         .output()
-        .ok()
-        .and_then(|out| String::from_utf8(out.stdout).ok())
-        .and_then(|text| text.trim().parse::<u64>().ok())
-        .map_or(0, |kib| kib * 1024)
+        .unwrap_or_else(|error| panic!("cannot measure RSS: running `ps` failed: {error}"));
+    assert!(
+        output.status.success(),
+        "cannot measure RSS: `ps` exited {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout)
+        .unwrap_or_else(|error| panic!("cannot measure RSS: `ps` output is not UTF-8: {error}"));
+    let kib: u64 = text.trim().parse().unwrap_or_else(|error| {
+        panic!("cannot measure RSS: `ps` printed {text:?}, which does not parse: {error}")
+    });
+    kib * 1024
 }
 
 fn load_average() -> String {
@@ -492,6 +508,55 @@ fn run_probe(exe: &Path, directory: &Path, cell: &Cell, threshold: usize, compac
     })
 }
 
+fn run_probe_by_key(exe: &Path, directory: &Path, cell: &Cell, threshold: usize) -> Value {
+    let output = Command::new(exe)
+        .arg("--probe")
+        .arg(directory)
+        .arg("--by-key")
+        .arg("--flush-spans")
+        .arg(cell.flush_spans.to_string())
+        .arg("--payload-threshold")
+        .arg(threshold.to_string())
+        .output()
+        .expect("spawn by-key probe");
+    if !output.status.success() {
+        panic!(
+            "by-key probe FAILED for {cell:?}: status {}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let parsed: Value = serde_json::from_str(text.trim()).unwrap_or_else(|error| {
+        panic!("by-key probe for {cell:?} produced unparseable output ({error}):\n{text}")
+    });
+    parsed["by_attribute_key"].clone()
+}
+
+/// The commit this binary was built from, and whether the tree was dirty.
+///
+/// Recording a clean SHA from a dirty tree is worse than recording nothing: it
+/// claims the results are reproducible at a revision that does not contain the
+/// code that produced them. The first version of this record did exactly that
+/// — it named a commit whose sampler was the one being replaced.
+fn provenance() -> (String, bool) {
+    let sha = Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|t| t.trim().to_owned())
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| "unknown".to_owned());
+    let dirty = Command::new("git")
+        .args(["status", "--porcelain"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .is_some_and(|t| !t.trim().is_empty());
+    (sha, dirty)
+}
+
 // --------------------------------------------------------------- the cell
 
 fn run_cell(exe: &Path, root: &Path, cell: &Cell, threshold: usize, keep: bool) -> Value {
@@ -529,6 +594,12 @@ fn run_cell(exe: &Path, root: &Path, cell: &Cell, threshold: usize, keep: bool) 
     let offloaded = payload_file_count(&directory);
 
     let reopen = run_probe(exe, &directory, cell, threshold, false);
+    // Its own invocation, before the compaction probe consumes the store:
+    // computing it reopens and decodes every segment, so it cannot share a
+    // process with an RSS reading. Isolating it is not enough — an earlier
+    // revision isolated it and then never called it, which quietly deleted
+    // the per-key breakdown from every result.
+    let by_key = run_probe_by_key(exe, &directory, cell, threshold);
     let compacted = run_probe(exe, &directory, cell, threshold, true);
     if !keep {
         let _ = fs::remove_dir_all(&directory);
@@ -557,6 +628,7 @@ fn run_cell(exe: &Path, root: &Path, cell: &Cell, threshold: usize, keep: bool) 
         "offloaded_payload_files": offloaded,
         "load_average": load_average(),
         "reopen": reopen,
+        "by_attribute_key": by_key,
         "compacted": compacted,
     })
 }
@@ -740,6 +812,8 @@ fn main() {
     let mut compact = false;
     let mut by_key = false;
     let mut run_matrix = false;
+    let mut emit_record: Option<String> = None;
+    let mut allow_dirty = false;
     let mut value_bytes = 2 * 1024_usize;
     let mut unique_pct = 100_u32;
     let mut attrs = 1_usize;
@@ -768,6 +842,8 @@ fn main() {
             "--compact" => compact = true,
             "--by-key" => by_key = true,
             "--matrix" => run_matrix = true,
+            "--emit-record" => emit_record = Some(next("--emit-record")),
+            "--allow-dirty" => allow_dirty = true,
             "--value-bytes" => value_bytes = next("--value-bytes").parse().expect("integer"),
             "--unique-pct" => unique_pct = next("--unique-pct").parse().expect("integer"),
             "--attrs" => attrs = next("--attrs").parse().expect("integer"),
@@ -851,6 +927,47 @@ fn main() {
     }
 
     println!("{}", report(&results));
+
+    // Emit the committed record from the harness itself. The first version of
+    // this record was produced by an uncommitted script, so the transformation
+    // from raw results to published document was not reproducible at all.
+    if let Some(stem) = emit_record {
+        let (commit, dirty) = provenance();
+        assert!(
+            !dirty || allow_dirty,
+            "refusing to write a measurement record from a dirty tree: the record would name \
+             commit {commit}, which does not contain the code that produced it. Commit the \
+             harness, re-run, then commit the record — or pass --allow-dirty to mark the \
+             record provisional."
+        );
+        let json_path = format!("{stem}.json");
+        let md_path = format!("{stem}.md");
+        let document = json!({
+            "commit": commit,
+            "dirty_tree": dirty,
+            "machine": machine(),
+            "generated_unix": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs()),
+            "command": format!(
+                "cargo run --release --bin index-mem-bench -- --matrix --text-budget-mib {} --emit-record {stem}",
+                text_budget / (1024 * 1024)
+            ),
+            "payload_offload_threshold_bytes": threshold,
+            "rss_sample_interval_ms": 20,
+            "results": results,
+        });
+        std::fs::write(&json_path, format!("{document:#}\n")).expect("write record json");
+        let mut markdown = format!(
+            "# Resident index memory: measurement record\n\n             Generated by `{}`.\n\n             - Commit: `{commit}`{}\n             - Machine: {}\n             - Raw per-cell results: [`{json_path}`]({json_path})\n             - RSS is sampled every 20 ms by a background thread for the duration of each              merge; every other RSS figure is a single reading in a freshly spawned child.\n             - Load average is recorded per row: this machine was not idle.\n\n",
+            document["command"].as_str().unwrap_or_default(),
+            if dirty { " **(DIRTY TREE — provisional)**" } else { "" },
+            machine(),
+        );
+        markdown.push_str(&report(&results));
+        std::fs::write(&md_path, markdown).expect("write record markdown");
+        println!("Wrote {md_path} and {json_path}");
+    }
     println!("load average at end: {}", load_average());
 }
 

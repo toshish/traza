@@ -1109,6 +1109,7 @@ fn run() -> Result<(), String> {
     let mut spans = 500_000_usize;
     let mut runs = 5_usize;
     let mut only: Option<String> = None;
+    let mut publish = false;
     let mut concurrencies: Vec<usize> = Vec::new();
     let mut batch = 1_000_usize;
     // Extra server flags applied to every HTTP scenario, so a configuration
@@ -1140,6 +1141,7 @@ fn run() -> Result<(), String> {
                 i += 1;
                 concurrencies.push(parse_usize(&args, i, "--concurrency")?);
             }
+            "--publish" => publish = true,
             "--only" => {
                 i += 1;
                 only = Some(
@@ -1600,9 +1602,14 @@ behind.\n"
         );
     }
 
-    write_report(&report)?;
+    write_report(&report, publish, &only, runs, spans)?;
     Ok(())
 }
+
+/// Publication floor. A median over fewer repeats than this, or a corpus this
+/// short, is a diagnostic rather than a record.
+const MIN_PUBLISHABLE_RUNS: usize = 5;
+const MIN_PUBLISHABLE_SPANS: usize = 1_000_000;
 
 const GENERATED_BEGIN: &str = "<!-- BEGIN GENERATED -->";
 const GENERATED_END: &str = "<!-- END GENERATED -->";
@@ -1616,8 +1623,43 @@ const GENERATED_END: &str = "<!-- END GENERATED -->";
 /// document. When the file marks a generated region, only that region is
 /// replaced; otherwise the file is written whole, so a fresh checkout still
 /// gets a complete report.
-fn write_report(report: &str) -> Result<(), String> {
+fn write_report(
+    report: &str,
+    publish: bool,
+    only: &Option<String>,
+    runs: usize,
+    spans: usize,
+) -> Result<(), String> {
     let path = "INGEST-BENCHMARK.md";
+    // Publication is opt-in, and a PARTIAL run may never publish.
+    //
+    // Preserving the prose was not enough. The generated table is itself a
+    // published record, and every diagnostic run overwrote it — a single
+    // `--only native-json-wal-c8 --spans 300000` invocation replaced the
+    // twelve-row matrix with one row reading "MEDIAN of 1 runs", while the
+    // surrounding analysis went on discussing concurrency-16 and profile rows
+    // that were no longer in the table. Answering a narrow question must not
+    // be able to retract the broad answer.
+    if !publish {
+        println!(
+            "\n(not published: pass --publish to update {path}. \
+             The table above is this run only.)"
+        );
+        return Ok(());
+    }
+    if let Some(filter) = only {
+        return Err(format!(
+            "refusing to publish a filtered run (--only {filter}): {path} is the full matrix, \
+             and a subset would silently retract every scenario it omits"
+        ));
+    }
+    if runs < MIN_PUBLISHABLE_RUNS || spans < MIN_PUBLISHABLE_SPANS {
+        return Err(format!(
+            "refusing to publish {runs} run(s) of {spans} spans: the published matrix is \
+             at least {MIN_PUBLISHABLE_RUNS} runs of {MIN_PUBLISHABLE_SPANS} spans, because a \
+             median needs repeats and a short corpus does not reach steady state"
+        ));
+    }
     if let Ok(existing) = std::fs::read_to_string(path) {
         if let (Some(start), Some(end)) =
             (existing.find(GENERATED_BEGIN), existing.find(GENERATED_END))
