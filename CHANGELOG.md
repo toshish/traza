@@ -5,7 +5,10 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.18.0] - 2026-07-25
+
+Search stops answering real questions with silence, and gains the predicates
+its own analytics already implied.
 
 Search gains the predicates its analytics already implied, and stops
 answering two classes of question with a silent empty result.
