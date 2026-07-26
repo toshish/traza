@@ -231,7 +231,38 @@ would be a planning failure.
   policy. Post-1.0: no breaking change without a major version and a
   migration path.
 
-### 1.5 Acceptance gates for 1.0
+### 1.5 One recovery domain: generations and checkpoints
+
+Traza currently has several independent recovery domains — the write-ahead log
+and write buffer, segments, `annotations.jsonl`, `payloads/`, retention
+decisions, and export pagination. Each has its own durability rule and its own
+idea of "now"; nothing names a state they all agree on.
+
+An independent review of v0.17 found four defects that are, read together, four
+symptoms of that: retention changed memory but not the recovery authority;
+export paged a store that moved underneath it; log recovery could not tell safe
+tail damage from damage that changes what the store contains; and the flush
+policy bounded a recovery cost with a memory-shaped number. All four are fixed
+and tested, but each fix leaves behind a rule a future change has to remember
+rather than a boundary it cannot cross.
+
+The fix for the class is the generation/checkpoint model already specified for
+HA — an immutable, self-describing, complete logical state published by one
+atomic `CURRENT` rename, with `pin`, `checkpoint`, `verify` and `install` as
+its operations. It belongs **here**, in Phase 1: it changes the directory
+layout, so it must land before the format freeze, and once it exists backup,
+export, retention and replication become versions of one operation instead of
+four independent ones. Phase 2 then adds consensus on top of an engine that
+already has the boundary Raft assumes, rather than introducing both at once.
+
+Design and sequencing: [generations and checkpoints](generations-design.md).
+
+**Acceptance:** an existing data directory migrates to generation zero at first
+open; backup is pin-verify-copy with no server stop; export pins spans,
+annotations and payloads together; a published deletion is durable when
+`CURRENT` moves and provably absent from every domain afterwards.
+
+### 1.6 Acceptance gates for 1.0
 
 Gates are only credible if reproducible, so the **reference environment is
 specified, not implied**: named CPU model and core count, RAM, storage class
@@ -469,7 +500,7 @@ v0.14+   1.1 durability (WAL + ack contract) — first, everything rests on it
              eval entity model, tail sampling) — before any format freeze
          1.3 product-thesis minimum (eval workflow + content search)
          1.4 operability (keep-alive, metrics, backup, packaging)
-v1.0     Stability contract + §1.5 gates met on the specified reference
+v1.0     Stability contract + §1.6 gates met on the specified reference
          environment
 v1.x     Phase 2 in parallel: HA (2a) and agent-native depth (2b)
 v2.0     Replicated clusters GA; rolling upgrades

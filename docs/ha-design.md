@@ -252,7 +252,12 @@ manifest publication replays commands; a crash after publication starts after th
 Raft log compaction never removes entries newer than the last durably installed
 snapshot.
 
-This requires new, narrow engine APIs before networked HA work begins:
+This requires new, narrow engine APIs before networked HA work begins. They are
+not HA APIs: a single node needs the same boundary for backup, export and
+retention, and building it here first is proposed as Phase 1 work in
+[generations and checkpoints](generations-design.md). HA then consumes it
+rather than introducing it.
+
 
 ```text
 apply_committed(log_id, command)

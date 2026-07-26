@@ -145,6 +145,8 @@ Full percentiles, the 10M and 100M scaling runs, the ingest matrix, and an hones
 
 Traza is pre-1.0 and honest about it: on-disk formats may change between 0.x versions, and single-node is the current scope. Shipped and load-bearing today: durable segment storage with a write-ahead log and crash recovery, size-tiered compaction, OTLP protobuf/JSON ingest, sessions and cost analytics, payload offloading, annotations, streaming export, bearer auth, Prometheus metrics, and the [`ui/`](ui/) trace browser served from its build output.
 
+Known architectural gap: query-visible state lives in several independent recovery domains (the write-ahead log and buffer, segments, annotations, payload files), and nothing yet names one state they all agree on. Backup, export, retention and replication are consequently four mechanisms rather than one. The generation/checkpoint boundary that fixes the class is designed in [docs/generations-design.md](docs/generations-design.md) and scheduled before 1.0.
+
 The destination is bigger than one node. The full product roadmap — durable v1 foundations, then replicated HA clusters and agent-native debugging depth, then columnar analytics at billion-span scale, then the enterprise control plane — lives in [docs/roadmap.md](docs/roadmap.md), with the HA architecture detailed in [docs/ha-design.md](docs/ha-design.md). Same binary, same API, at every phase.
 
 Deliberately out of scope: a metrics/logs suite, embedded eval models, general SQL, and framework SDKs — the [roadmap](docs/roadmap.md#explicit-non-goals) explains why.

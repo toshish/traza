@@ -109,9 +109,21 @@ A background pass runs **every minute** and removes:
 
 `--ttl-seconds 0` means **disabled**, not "expire everything now".
 
-Expiry rewrites the segments it touches, using the same journal-first,
-write-temp-fsync-rename discipline as any other rewrite, so an interrupted pass
-is finished correctly at the next open.
+Expiry rewrites the segments it touches with the same
+write-temp-fsync-rename discipline as any other rewrite — onto the same file
+name, so an expired segment keeps its place in recency order — and an
+interrupted pass leaves either the original or the survivors, never both.
+
+**Expiry deletes, it does not merely hide.** A span still in the write buffer
+lives in the write-ahead log too, so expiry rewrites the log to exactly the
+spans that survived. The expired bytes leave the disk in that pass rather than
+being marked dead, and a restart cannot bring the span back. This matters
+twice: retention that a restart undoes is not retention, and if you are
+deleting telemetry because someone asked you to, the log is one of the places
+it has to leave.
+
+Retention runs with reads and ingest fully live. Only one rewriting pass —
+expiry or compaction — runs at a time.
 
 ## Compaction
 
@@ -131,10 +143,19 @@ The measured effect is large — see [capacity](capacity.md#filtered-search-and-
   merge. Larger merges less often but leaves more segments to search. `0` or
   `1` cannot merge anything and are treated as "off" rather than looping.
 - `--compaction-max-segment-bytes N` (default 268435456, i.e. 256 MiB) — the
-  ceiling on a merged segment. This bounds both the memory a merge needs (it
-  materializes its inputs) and how long the segment lock is held; the cost is a
-  floor on how far the segment count can fall. Raising it improves filtered
-  search and costs memory and ingest throughput. `0` removes the ceiling.
+  ceiling on a merged segment. This bounds the memory a merge needs, since it
+  materializes its inputs; the cost is a floor on how far the segment count can
+  fall. Raising it improves filtered search and costs memory. `0` removes the
+  ceiling.
+
+**A merge does not block the server.** Its inputs are pinned, every byte of
+parsing, merging and fsyncing happens with no engine lock held, and only the
+swap that publishes the result takes one — briefly, and after re-checking that
+the inputs are still what it pinned. Reads and ingest therefore never wait on
+the merge, which makes `--compaction-max-segment-bytes` a memory dial rather
+than a stall dial. They do still share CPU and disk with it: a merge is real
+work, and the effect of that contention on concurrent read and write latency is
+**not measured** — see [capacity](capacity.md).
 
 Merges run in the same maintenance thread as TTL, on a 5-second tick, and are a
 no-op when no run qualifies.
