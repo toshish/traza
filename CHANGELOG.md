@@ -83,6 +83,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A store under sustained ingest was never compacted.** A merge declined
+  outright when a seal held a claimed-but-unpublished segment id, rather than
+  waiting for it. The guard is a correctness requirement — that seal publishes
+  newer data under a lower id, and merged output taking a higher one would
+  outrank it, inverting last-write-wins — but declining made compaction
+  hostage to the write rate. A seal is in flight for much of the time under
+  load, so a tick that checked once and gave up almost never found the store
+  quiet: measured at 25,000 spans/s, **one tick in sixteen achieved anything**
+  and the segment count grew without bound (14 to 215 in six seconds) while
+  compaction ran on schedule and did nothing. It recovered the instant writes
+  paused, which is why the effect is invisible on an idle store and total on a
+  busy one — the case compaction exists for.
+
+  A merge now takes the seal permit instead of testing a counter, held only
+  long enough to choose a run and claim its output ids. Expiry already takes
+  the same permit, for its whole deletion; compaction needs microseconds of
+  it. Ingest is unaffected either way: a seal that cannot take the permit
+  coalesces into the next one rather than waiting. Under the same load every
+  tick now compacts, and the segment count stays flat instead of climbing.
+  The `unpublished_seals` counter is gone — the permit is what it was
+  approximating.
+
+  Choosing the run moved inside those guards too. Scanning first and then
+  re-checking under the lock left a window for a seal to land and make the
+  answer stale, which retired the whole tick.
+
+  And a tick is now bounded to the backlog it **found**: segments sealed after
+  it started are left for the next one. Without that, merging kept pace with
+  arrivals and a single call ran until the writes stopped — 2,213 segments
+  merged away and still going.
 - **The index-memory benchmark's "peak RSS" was not a peak.** It took one RSS
   sample after `compact_segments()` returned — after the merge has freed its
   working set — so it measured the trough and the capacity guide published it

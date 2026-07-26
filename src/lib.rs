@@ -1159,13 +1159,6 @@ pub struct Store {
     recent_payloads: payload::TouchRegistry,
     annotations: annotations::AnnotationLog,
     next_segment: AtomicU64,
-    /// Seals that have claimed a segment id but not yet published it.
-    ///
-    /// Read and written ONLY while holding the `segments` lock, which is what
-    /// makes it atomic with respect to id claims and is why `Relaxed` is
-    /// enough. Compaction consults it before claiming an id of its own: see
-    /// [`Store::merge_tail_run`].
-    unpublished_seals: AtomicU64,
     /// Present unless durability is [`Durability::Buffered`]. Guards the gap
     /// between acknowledging a write and sealing it into a segment.
     wal: Option<wal::Wal>,
@@ -1231,7 +1224,6 @@ impl Store {
                 rollups: Mutex::new(std::collections::HashMap::new()),
                 recent_payloads: payload::TouchRegistry::default(),
                 next_segment: AtomicU64::new(next_segment),
-                unpublished_seals: AtomicU64::new(0),
                 wal,
                 metrics: metrics::Metrics::default(),
                 _directory_lock: directory_lock,
@@ -2038,17 +2030,19 @@ impl Store {
         let _maintenance = self.lock_maintenance()?;
         let mut merged_away = 0usize;
         // Each pass merges one run; a merge can create a run one tier up, so
-        // loop until nothing qualifies. Bounded by the tier count.
+        // loop until nothing qualifies. Bounded by the tier count. Choosing
+        // the run is `merge_tail_run`'s own job, done under the locks it pins
+        // with — scanning out here first only created a window for a seal to
+        // land and make the answer stale.
+        // A tick compacts the backlog it FOUND. Every segment sealed after
+        // this point is left for the next one: merging those too would keep
+        // this call running for as long as writes keep arriving, and a
+        // maintenance pass that never returns is not maintenance. Measured
+        // without it, one call merged away 2,213 segments and was still going.
+        let watermark = self.next_segment.load(Ordering::Relaxed);
         loop {
-            let segments = self.lock_segments()?;
-            let Some(run) = tail_run_to_merge(&segments, &settings) else {
-                break;
-            };
-            drop(segments);
-            let merged = self.merge_tail_run(run, &settings)?;
+            let merged = self.merge_tail_run(&settings, watermark)?;
             if merged == 0 {
-                // The run went stale between the scan and the publish. Stop
-                // rather than spin; the next scheduled pass picks it up.
                 break;
             }
             merged_away += merged;
@@ -2056,42 +2050,61 @@ impl Store {
         Ok(merged_away)
     }
 
-    /// Merges the last `run` segments into as few segments as the size cap
-    /// allows. Returns segments removed, or zero if the run stopped qualifying
-    /// before the result could be published.
-    fn merge_tail_run(&self, run: usize, settings: &CompactionConfig) -> Result<usize> {
+    /// Merges the tail run, if one qualifies, into as few segments as the size
+    /// cap allows. Returns segments removed, or zero if nothing qualified or
+    /// the run stopped qualifying before the result could be published.
+    fn merge_tail_run(&self, settings: &CompactionConfig, watermark: u64) -> Result<usize> {
         // ---- pin: short critical section -------------------------------
-        let (inputs, chunks, first_id) = {
-            let segments = self.lock_segments()?;
-            // Re-check under the lock: the set may have changed since the scan.
-            if tail_run_to_merge(&segments, settings) != Some(run) {
-                return Ok(0);
-            }
+        let (inputs, chunks, first_id, run) = {
             // A seal that has already claimed a LOWER id but not yet published
-            // it would end up sorting before this merge's output, which holds
-            // strictly older data — last-write-wins, inverted. The id claims
-            // are ordered by this lock, so declining here is enough: once no
-            // seal is outstanding, every future one claims above this merge.
-            // Bailing costs nothing; the next compaction tick rescans.
-            if self.unpublished_seals.load(Ordering::Relaxed) > 0 {
+            // it would end up sorting before this merge's outputs, which hold
+            // strictly older data — last-write-wins, inverted. The seal permit
+            // is what rules that out: a seal holds it from drain to publish,
+            // so while it is held here no seal is outstanding, and every seal
+            // afterwards claims an id above the ones taken below.
+            //
+            // **Held only long enough to choose the run and claim the ids**,
+            // microseconds, and never across the merge itself. Expiry holds
+            // this same permit for its whole deletion, which is why ingest is
+            // documented as unaffected by it — a seal that cannot take it
+            // coalesces into the next one rather than waiting.
+            //
+            // Declining instead — the earlier design — starved compaction
+            // outright. A seal is in flight for much of the time under a
+            // sustained load, so a tick that checked once and gave up almost
+            // never found the store quiet: measured at 25,000 spans/s, one
+            // tick in sixteen achieved anything and the segment count climbed
+            // without bound, which is precisely what compaction exists to
+            // stop. Waiting microseconds for the permit costs nothing and
+            // makes a tick's progress independent of the write rate.
+            let _permit = self
+                .sealing
+                .lock()
+                .map_err(|_| Error::LockPoisoned("sealing"))?;
+            let segments = self.lock_segments()?;
+            let Some(run) = tail_run_to_merge(&segments, settings) else {
                 return Ok(0);
-            }
+            };
             let start = segments.len() - run;
             let inputs: Vec<std::sync::Arc<Segment>> = segments[start..].to_vec();
+            // Nothing here predates the tick, so this run is entirely work
+            // that arrived while it ran. Leave it to the next one.
+            if segment_number(&inputs[0].path).is_some_and(|id| id >= watermark) {
+                return Ok(0);
+            }
             let chunks = merge_chunks(&inputs, settings);
-            // The ids are claimed HERE, under the lock, and together with the
-            // check above that is what keeps a concurrent seal ordered
-            // correctly. No seal is between its drain and its publish at this
-            // instant, so every segment that appears while this merge runs
-            // claims a HIGHER id — and therefore sorts after the merged
-            // outputs, which is exactly right: it was written later. Claiming
-            // the ids after the merge would invert that and let merged (older)
-            // versions win over freshly sealed ones. One contiguous block, so
-            // the outputs keep their groups' order among themselves too.
+            // The ids are claimed HERE, under both guards, which is what keeps
+            // a concurrent seal ordered correctly: every segment that appears
+            // while this merge runs claims a HIGHER id, and therefore sorts
+            // after the merged outputs — exactly right, it was written later.
+            // Claiming the ids after the merge would invert that and let
+            // merged (older) versions win over freshly sealed ones. One
+            // contiguous block, so the outputs keep their groups' order among
+            // themselves too.
             let first_id = self
                 .next_segment
                 .fetch_add(chunks.len() as u64, Ordering::Relaxed);
-            (inputs, chunks, first_id)
+            (inputs, chunks, first_id, run)
         };
         let input_paths: Vec<PathBuf> = inputs.iter().map(|segment| segment.path.clone()).collect();
         let new_names: Vec<String> = (0..chunks.len() as u64)
@@ -2594,10 +2607,11 @@ impl Store {
             let upserts = writer.upserts;
             // Claimed under the segments lock, which is what orders it against
             // a concurrent compaction: see the doc comment above and
-            // `merge_tail_run`. The in-flight count is published under the
-            // same lock so compaction can see that a lower id is outstanding.
+            // `merge_tail_run`. What keeps this id ordered against a merge's
+            // is the seal permit this thread already holds — a merge claims
+            // its own ids only while holding it, so it cannot be between this
+            // drain and its publish.
             let _segments = self.lock_segments()?;
-            self.unpublished_seals.fetch_add(1, Ordering::Relaxed);
             let id = self.next_segment.fetch_add(1, Ordering::Relaxed);
             self.metrics
                 .segment_seal_locked
@@ -2616,8 +2630,6 @@ impl Store {
                 // and the log still hold every acknowledged span exactly as
                 // they did before. A failed seal is a no-op, retried by the
                 // next one.
-                let _unclaim = self.lock_segments()?;
-                self.unpublished_seals.fetch_sub(1, Ordering::Relaxed);
                 return Err(error);
             }
         };
@@ -2628,7 +2640,6 @@ impl Store {
             let locked = Instant::now();
             segments.push(std::sync::Arc::new(segment));
             segments.sort_by(|left, right| left.path.cmp(&right.path));
-            self.unpublished_seals.fetch_sub(1, Ordering::Relaxed);
             self.metrics
                 .segment_seal_locked
                 .record(elapsed_nanos(&locked));
@@ -3491,10 +3502,13 @@ mod seal_tests {
     }
 
     #[test]
-    fn compaction_declines_while_a_seal_holds_an_unpublished_id() {
+    fn compaction_waits_for_a_seal_rather_than_claiming_an_id_beside_it() {
         // A seal that claimed a LOWER id but has not published it yet would
-        // sort BEFORE a merge that claims its id now — and the merge's output
-        // is strictly older data, so it would win. Compaction must wait.
+        // sort BEFORE a merge that claims its id now — and the merge's outputs
+        // are strictly older data, so they would win. The seal permit is what
+        // rules that out, and compaction WAITS for it. Declining instead was
+        // correct and useless: a seal is in flight for much of the time under
+        // load, so compaction simply stopped running.
         let dir = test_dir("compaction-guard");
         let config = Config {
             durability: Durability::Buffered,
@@ -3505,7 +3519,7 @@ mod seal_tests {
             }),
             ..Config::default()
         };
-        let store = Store::open(&dir, config).expect("open");
+        let store = std::sync::Arc::new(Store::open(&dir, config).expect("open"));
         for index in 0..4 {
             store
                 .ingest(span("t", &format!("s{index}"), "v1"))
@@ -3514,19 +3528,26 @@ mod seal_tests {
         }
         assert_eq!(store.stats().expect("stats").segment_count, 4);
 
-        // Stand in for a seal that has claimed an id and not yet published.
-        store.unpublished_seals.store(1, Ordering::Relaxed);
+        // Stand in for a seal between its drain and its publish.
+        let permit = store.sealing.lock().expect("permit");
+        let compactor = {
+            let store = std::sync::Arc::clone(&store);
+            std::thread::spawn(move || store.compact_segments().expect("compact"))
+        };
+        // It must not have published anything while the permit is out. Not a
+        // proof on its own — the thread may simply not have run yet — but it
+        // fails loudly if compaction ever stops taking the permit at all.
+        std::thread::sleep(std::time::Duration::from_millis(50));
         assert_eq!(
-            store.compact_segments().expect("compact"),
-            0,
-            "compaction must not claim an id above an outstanding seal's"
+            store.stats().expect("stats").segment_count,
+            4,
+            "no merge may publish while a seal holds an unpublished id"
         );
-        assert_eq!(store.stats().expect("stats").segment_count, 4);
 
-        store.unpublished_seals.store(0, Ordering::Relaxed);
+        drop(permit);
         assert!(
-            store.compact_segments().expect("compact") > 0,
-            "and must proceed as soon as none is outstanding"
+            compactor.join().expect("compactor") > 0,
+            "and it must proceed once the permit is free, not give up"
         );
         let _ = fs::remove_dir_all(&dir);
     }
