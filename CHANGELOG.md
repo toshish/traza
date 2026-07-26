@@ -80,9 +80,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Widening `--wal-commit-window-us` from off to 2,000 cut fsyncs 40% and the
   mean append 57%. Documented in the configuration reference: the lever for a
   large `wal_write` is fsync frequency, not the engine's locking.
+- **`INDEX-MEM-BENCHMARK.md` and `INDEX-MEM-BENCHMARK.json`** — the committed
+  measurement record behind the memory figures, with commit SHA, machine,
+  timestamp, load average per row, `compacted_away`, and the raw per-cell
+  results. The prose numbers were previously traceable only to a binary.
 
 ### Fixed
 
+- **A store under sustained ingest was never compacted.** A merge declined
+  outright when a seal held a claimed-but-unpublished segment id, rather than
+  waiting for it. The guard is a correctness requirement — that seal publishes
+  newer data under a lower id, and merged output taking a higher one would
+  outrank it, inverting last-write-wins — but declining made compaction
+  hostage to the write rate. A seal is in flight for much of the time under
+  load, so a tick that checked once and gave up almost never found the store
+  quiet: measured at 25,000 spans/s, **one tick in sixteen achieved anything**
+  and the segment count grew without bound (14 to 215 in six seconds) while
+  compaction ran on schedule and did nothing. It recovered the instant writes
+  paused, which is why the effect is invisible on an idle store and total on a
+  busy one — the case compaction exists for.
+
+  A merge now takes the seal permit instead of testing a counter, **held**
+  only long enough to choose a run and claim its output ids. Acquiring it is
+  the slow half: a seal owns the permit from drain through write, fsync,
+  rename, reopen and reconcile, so a merge arriving mid-seal waits out all of
+  that — bounded by one seal, and on the maintenance thread. Expiry already
+  takes the same permit and holds it for a whole deletion.
+
+  Most ingest is unaffected, because a seal that cannot take the permit
+  coalesces into the next one. Two paths wait rather than coalesce:
+  `Durability::Flushed`, which must seal before it acknowledges, and any mode
+  once the buffer reaches four times `flush_spans`, where waiting is the
+  backpressure. Both wait only on the microseconds a merge holds the permit,
+  never on the merge itself.
+
+  Under the same load every tick now compacts, and the segment count stays
+  bounded — oscillating between 15 and 80 over six seconds, against 14 climbing
+  to 215 before. The `unpublished_seals` counter is gone; the permit is what it
+  was approximating.
+
+  Choosing the run moved inside those guards too. Scanning first and then
+  re-checking under the lock left a window for a seal to land and make the
+  answer stale, which retired the whole tick.
+
+  And a tick is now bounded to the backlog it **found**: segments sealed after
+  it started are left for the next one. Without that, merging kept pace with
+  arrivals and a single call ran until the writes stopped — 2,213 segments
+  merged away and still going.
 - **The index-memory benchmark's "peak RSS" was not a peak.** It took one RSS
   sample after `compact_segments()` returned — after the merge has freed its
   working set — so it measured the trough and the capacity guide published it
@@ -152,13 +196,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   recovery must roll forward instead. A journal that saw one input at a time
   could not tell those apart and would delete live segments holding the only
   copy of an input already removed.
-
-### Added
-
-- **`INDEX-MEM-BENCHMARK.md` and `INDEX-MEM-BENCHMARK.json`** — the committed
-  measurement record behind the memory figures, with commit SHA, machine,
-  timestamp, load average per row, `compacted_away`, and the raw per-cell
-  results. The prose numbers were previously traceable only to a binary.
 
 ## [0.19.0] - 2026-07-25
 
