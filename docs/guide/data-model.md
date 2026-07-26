@@ -180,20 +180,28 @@ the span. See
 
 ## Filter value types
 
-Search filters compare attribute values by exact JSON equality, which makes the
-*type* of the value you send significant. `attr.KEY=VALUE` parses `VALUE` as
-JSON when it is valid JSON, and falls back to a plain string when it is not:
+Search filters compare **scalars by value, not by type.** `attr.code=200`
+matches a span that stored the number `200` and a span that stored the string
+`"200"`:
 
 | Query | Matches |
 |---|---|
-| `attr.region=us-east` | the string `"us-east"` (not valid JSON, so a string) |
-| `attr.code=200` | the **number** `200` |
-| `attr.code=%22200%22` | the **string** `"200"` |
-| `attr.flag=true` | the **boolean** `true` |
-| `attr.flag=%22true%22` | the **string** `"true"` |
+| `attr.region=us-east` | the string `"us-east"` |
+| `attr.code=200` | the number `200` **and** the string `"200"` |
+| `attr.flag=true` | the boolean `true` **and** the string `"true"` |
 | `attr.thing=null` | JSON `null` |
+| `attr.code=20` | neither — equality is not a prefix match |
 
-The consequence worth remembering: to match a *string* attribute whose value
-looks like a JSON literal — `"200"`, `"true"`, `"null"` — you must send it
-quoted and URL-encoded (`%22200%22`). A bare `200` will not match the string
-`"200"`.
+This is deliberate, and it is a change from earlier versions. Instrumentation
+is inconsistent about whether a status code or a token count is a number or a
+string — several SDKs stringify both — and the old behaviour matched only the
+JSON reading. A store full of stringified codes answered `attr.code=200` with
+an empty array, which is indistinguishable from "no span has that code". A
+filter that silently cannot match is worse than one that is merely strict.
+
+Containers are exempt: arrays and objects still compare structurally, because
+two different arrays that happen to render alike are not the same array.
+
+Numeric comparisons use the same rule. `min_attr.llm.usage.total_tokens=1000`
+reads the attribute as a number whether it was stored as `1000` or `"1000"`,
+so a corpus with mixed conventions filters correctly.

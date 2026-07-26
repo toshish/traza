@@ -842,6 +842,11 @@ fn serve_request(
                     200,
                     serde_json::to_value(spans).unwrap_or_else(|_| Value::Array(Vec::new())),
                 ),
+                // A too-broad query is the caller's to fix; 503 would tell
+                // them to retry with backoff, and retrying cannot help.
+                Err(error @ traza::Error::QueryTooBroad(_)) => {
+                    responder.json(400, json!({"error": error.to_string()}))
+                }
                 Err(error) => responder.json(503, json!({"error": error.to_string()})),
             }
         }
@@ -1163,11 +1168,36 @@ fn filter_from_query(raw_query: &str) -> Result<SpanFilter, String> {
         let key = percent_decode(key);
         let value = percent_decode(value);
         if let Some(attribute) = key.strip_prefix("attr.") {
-            // Bare values match string attributes; JSON literals match typed
-            // values — the documented attr.KEY semantics.
+            // The value is parsed as JSON when it looks like JSON, but the
+            // engine compares scalars by text as well as by type, so
+            // `attr.code=200` matches whether the span stored 200 or "200".
+            // It used to match only the number, and a store full of
+            // stringified codes answered every such query with nothing.
             let parsed = serde_json::from_str::<Value>(&value)
                 .unwrap_or_else(|_| Value::String(value.clone()));
             filter.attributes.push((attribute.to_owned(), parsed));
+            continue;
+        }
+        if let Some(attribute) = key.strip_prefix("not_attr.") {
+            let parsed = serde_json::from_str::<Value>(&value)
+                .unwrap_or_else(|_| Value::String(value.clone()));
+            filter
+                .excluded_attributes
+                .push((attribute.to_owned(), parsed));
+            continue;
+        }
+        if let Some(attribute) = key.strip_prefix("min_attr.") {
+            let bound: f64 = value
+                .parse()
+                .map_err(|_| format!("min_attr.{attribute} must be a number"))?;
+            filter.min_attributes.push((attribute.to_owned(), bound));
+            continue;
+        }
+        if let Some(attribute) = key.strip_prefix("max_attr.") {
+            let bound: f64 = value
+                .parse()
+                .map_err(|_| format!("max_attr.{attribute} must be a number"))?;
+            filter.max_attributes.push((attribute.to_owned(), bound));
             continue;
         }
         match key.as_str() {
@@ -1190,6 +1220,20 @@ fn filter_from_query(raw_query: &str) -> Result<SpanFilter, String> {
             }
             "until" | "until_ns" => {
                 filter.until_ns = Some(value.parse().map_err(|_| "invalid until")?);
+            }
+            "max_duration_ms" => {
+                let ms: u64 = value.parse().map_err(|_| "invalid max_duration_ms")?;
+                filter.max_duration_ns = Some(ms.saturating_mul(1_000_000));
+            }
+            "max_duration_ns" => {
+                filter.max_duration_ns =
+                    Some(value.parse().map_err(|_| "invalid max_duration_ns")?);
+            }
+            "sort" => {
+                filter.sort = Some(traza::SpanSort::parse(&value).ok_or(
+                    "sort must be one of duration|-duration|start|-start \
+                     (or the long forms duration_asc, duration_desc, start_asc, start_desc)",
+                )?);
             }
             "limit" => {
                 filter.limit = Some(value.parse().map_err(|_| "invalid limit")?);

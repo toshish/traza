@@ -353,6 +353,7 @@ fn randomized_filters_match_naive_reference() {
             until_ns,
             session: None,
             limit: (query_index % 5 == 0).then(|| 1 + rng.below(75) as usize),
+            ..SpanFilter::default()
         };
 
         let expected = naive_query_ids(&spans, &filter);
