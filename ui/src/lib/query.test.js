@@ -136,6 +136,38 @@ describe('a query survives a round trip through the URL', () => {
   });
 });
 
+describe('an absolute window survives the URL', () => {
+  // The volume brush produces an absolute range. It used to serialize as
+  // `t=""` and read back as the '1h' default, so every drag-to-zoom silently
+  // snapped back to the last hour.
+  it('round-trips a brushed range instead of dropping it', () => {
+    const brushed = { ...emptyQuery(), range: { sinceNs: 111000, untilNs: 222000 } };
+    const hash = toHash(brushed);
+    expect(hash.t).toBe('111000-222000');
+    const restored = fromHash(new URLSearchParams(hash));
+    expect(restored.range).toEqual({ sinceNs: 111000, untilNs: 222000 });
+    expect(windowOf(restored.range)).toEqual({ sinceNs: 111000, untilNs: 222000 });
+  });
+
+  it('still round-trips a preset', () => {
+    const restored = fromHash(new URLSearchParams(toHash({ ...emptyQuery(), range: '24h' })));
+    expect(restored.range).toBe('24h');
+  });
+
+  it('reaches the API as real bounds', () => {
+    const params = toParams({ ...emptyQuery(), range: { sinceNs: 111000, untilNs: 222000 } });
+    expect(params.since).toBe(111000);
+    expect(params.until).toBe(222000);
+  });
+
+  it('falls back rather than trusting a mangled window', () => {
+    // A hand-edited or truncated `t=` must not become a range of nonsense.
+    expect(fromHash(new URLSearchParams({ t: 'zzz' })).range).toBe('1h');
+    expect(fromHash(new URLSearchParams({ t: '9-1' })).range).toBe('1h');
+    expect(fromHash(new URLSearchParams({ t: '5-' })).range).toBe('1h');
+  });
+});
+
 describe('operators are offered only where they mean something', () => {
   it('gives duration only its bounds', () => {
     expect(opsFor('duration_ms')).toEqual(['≥', '≤']);

@@ -1,7 +1,9 @@
 import React from 'react';
 import { api } from '../lib/api.js';
 import { useRead, usePoll } from '../lib/route.js';
-import { fmtBytes, fmtDurationNs, fmtNum, fmtPercent, fmtRate, fmtUptime } from '../lib/format.js';
+import {
+  durabilityMeans, fmtBytes, fmtDurationNs, fmtNum, fmtPercent, fmtRate, fmtUptime,
+} from '../lib/format.js';
 import { Card, Eyebrow, ErrorState, Mono, Skeleton } from '../components/primitives/Chrome.jsx';
 import { Sparkbar, ShareBar } from '../components/charts/Marks.jsx';
 
@@ -76,8 +78,9 @@ export function ServerScreen() {
         <Mono color="var(--accent)">{fmtNum(m.ingest.spans_admitted)}</Mono> spans, and answered{' '}
         <Mono color="var(--accent)">{fmtNum(m.requests.total)}</Mono> requests at{' '}
         <Mono color="var(--accent)">p95 {fmtDurationNs(m.requests.p95_ns)}</Mono>. Durability is{' '}
-        <Mono>{stats.data?.durability || '—'}</Mono> — an acknowledged write survives a kill&#8209;9, a
-        panic, or an OS crash. Every figure here is counted by this process, not estimated.
+        <Mono>{m.durability || stats.data?.durability || '—'}</Mono> —{' '}
+        {durabilityMeans(m.durability || stats.data?.durability)}. Every figure here is counted by
+        this process, not estimated.
       </div>
       <div style={{
         marginTop: 10, paddingTop: 10, borderTop: '1px solid var(--hairline)',
@@ -195,8 +198,10 @@ export function ServerScreen() {
       <Card>
         <Eyebrow style={{ marginBottom: 10 }}>Durability and connections</Eyebrow>
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2,1fr)', gap: 12 }}>
-          <Stat label="durability" value={stats.data?.durability || '—'}
-            note="what an acknowledged write guarantees" />
+          <Stat label="durability" value={m.durability || stats.data?.durability || '—'}
+            tone={(m.durability || stats.data?.durability) === 'buffered' ? 'var(--warn)' : undefined}
+            note={(m.durability || stats.data?.durability) === 'buffered'
+              ? 'acknowledged writes are not durable' : 'what an acknowledged write guarantees'} />
           <Stat label="WAL bytes" value={stats.data ? fmtBytes(stats.data.wal_bytes) : '—'}
             note="the work a restart would replay" />
           <Stat label="wal fsync p95" value={fmtDurationNs(m.ingest.wal_fsync_p95_ns)} />

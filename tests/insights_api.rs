@@ -610,3 +610,190 @@ fn content_search_composes_with_the_aggregations() {
 
     server.kill();
 }
+
+#[test]
+fn extreme_but_valid_inputs_answer_instead_of_panicking() {
+    // Every one of these was a panic reachable from a well-formed request, so
+    // the server closed the connection with no response at all. They are
+    // arithmetic edges, not malformed input: a span really can carry
+    // `end_time_ns = u64::MAX`, and a caller really can ask for an unbounded
+    // window.
+    let dir = test_dir("extremes");
+    let server = Server::spawn(&dir);
+    let (status, body) = server.request(
+        "POST",
+        "/v1/spans",
+        Some(&json!({"spans": [{
+            "trace_id": "t", "span_id": "s", "name": "n", "service": "v",
+            "status": "error", "start_time_ns": 0u64, "end_time_ns": u64::MAX,
+            "attributes": {},
+        }]})),
+    );
+    assert_eq!(status, 200, "{body}");
+
+    // The top duration bucket's upper bound is not representable.
+    let (status, body) = server.request("GET", "/v1/stats/duration", None);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["count"], 1);
+    assert!(body["p95_ns"].as_u64().is_some(), "{body}");
+
+    // `span + buckets - 1` overflows on an unbounded window.
+    let (status, body) = server.request(
+        "GET",
+        &format!("/v1/stats/series?since=0&until={}&buckets=4", u64::MAX),
+        None,
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["buckets"].as_array().map(Vec::len), Some(4), "{body}");
+
+    // `Vec::with_capacity(limit + 1)` overflows, and an unbounded limit is a
+    // request to hold the match set in memory.
+    let (status, body) = server.request(
+        "GET",
+        &format!("/v1/stats/slowest?limit={}", u64::MAX),
+        None,
+    );
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = server.request(
+        "GET",
+        &format!("/v1/stats/failures?limit={}", u64::MAX),
+        None,
+    );
+    assert_eq!(status, 200, "{body}");
+
+    // A reversed window is the caller's error, and says so rather than
+    // producing a bucket count nobody asked for.
+    let (status, _) = server.request(
+        "GET",
+        &format!("/v1/stats/series?since={}&until=0&buckets=4", u64::MAX),
+        None,
+    );
+    assert_eq!(status, 400);
+
+    // Zero buckets is clamped, not divided by.
+    let (status, body) = server.request("GET", "/v1/stats/series?since=0&until=10&buckets=0", None);
+    assert_eq!(status, 200, "{body}");
+    server.kill();
+}
+
+#[test]
+fn a_failure_report_states_its_own_totals_and_truncation() {
+    // The share of "all failures" a signature accounts for was computed in the
+    // browser by summing the groups it had been sent — a page truncated to a
+    // limit — so every share was inflated by exactly the amount the response
+    // left out. The denominator now comes from the server.
+    let dir = test_dir("failure-total");
+    let server = Server::spawn(&dir);
+
+    // Twelve distinct signatures, one span each, plus nine more on one of them.
+    let mut spans: Vec<Value> = Vec::new();
+    for index in 0..12u64 {
+        spans.push(json!({
+            "trace_id": format!("f-{index:02}"), "span_id": "s", "name": format!("op{index}"),
+            "service": "svc", "status": "error",
+            "start_time_ns": BASE_NS + index, "end_time_ns": BASE_NS + index + 1_000_000,
+            "attributes": {},
+        }));
+    }
+    for extra in 0..9u64 {
+        spans.push(json!({
+            "trace_id": format!("f-hot-{extra}"), "span_id": "s", "name": "op0",
+            "service": "svc", "status": "error",
+            "start_time_ns": BASE_NS + 100 + extra, "end_time_ns": BASE_NS + 100 + extra + 1_000_000,
+            "attributes": {},
+        }));
+    }
+    let (status, body) = server.request("POST", "/v1/spans", Some(&json!({"spans": spans})));
+    assert_eq!(status, 200, "{body}");
+
+    // Ask for three groups out of twelve.
+    let (status, body) = server.request("GET", "/v1/stats/failures?limit=3", None);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["groups"].as_array().map(Vec::len), Some(3), "{body}");
+    assert_eq!(body["total"], 21, "total counts every failed span: {body}");
+    assert_eq!(body["distinct"], 12, "{body}");
+    assert_eq!(body["groups_omitted"], 9, "{body}");
+    assert_eq!(body["spans_untracked"], 0, "{body}");
+
+    // The top signature is 10 of 21 — under half. Summing the returned page
+    // (10 + 1 + 1 = 12) would have reported it as 83%.
+    let top = body["groups"][0]["count"].as_u64().expect("count");
+    assert_eq!(top, 10, "{body}");
+    let honest = (top as f64) / body["total"].as_f64().expect("total");
+    assert!(
+        honest < 0.5,
+        "share must be against the real total: {honest}"
+    );
+    server.kill();
+}
+
+#[test]
+fn a_cursor_returns_spans_that_share_one_timestamp() {
+    // The live tail advanced its watermark to `max(start_time_ns) + 1`, so when
+    // more spans shared the last timestamp of a page than the page could hold,
+    // the remainder were skipped forever. An SDK flushing a batch produces
+    // exactly that: many spans, one timestamp. Paging by cursor has to reach
+    // all of them, and this is the property the tail now depends on.
+    let dir = test_dir("same-timestamp");
+    let server = Server::spawn(&dir);
+
+    // 250 spans, every one at the SAME start time, so nothing but the full
+    // ordering key can separate them.
+    let spans: Vec<Value> = (0..250u64)
+        .map(|index| {
+            json!({
+                "trace_id": format!("same-{index:04}"),
+                "span_id": "s1",
+                "name": "batch.flush",
+                "service": "svc",
+                "status": "ok",
+                "start_time_ns": BASE_NS,
+                "end_time_ns": BASE_NS + 1_000_000,
+                "attributes": {},
+            })
+        })
+        .collect();
+    let (status, body) = server.request("POST", "/v1/spans", Some(&json!({"spans": spans})));
+    assert_eq!(status, 200, "{body}");
+
+    // Page through in tens. Every span must appear exactly once.
+    let mut seen: Vec<String> = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..40 {
+        let target = match &cursor {
+            Some(token) => format!("/v1/spans?limit=10&cursor={token}"),
+            None => "/v1/spans?limit=10".to_owned(),
+        };
+        let (status, page) = server.request("GET", &target, None);
+        assert_eq!(status, 200, "{page}");
+        for span in page["spans"].as_array().expect("spans") {
+            seen.push(span["trace_id"].as_str().unwrap_or_default().to_owned());
+        }
+        match page["next_cursor"].as_str() {
+            Some(token) => cursor = Some(token.to_owned()),
+            None => break,
+        }
+    }
+
+    assert_eq!(
+        seen.len(),
+        250,
+        "paging must reach every span at the shared timestamp"
+    );
+    let mut unique = seen.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), 250, "and must not repeat any of them");
+
+    // The watermark approach the tail used to take: everything at this
+    // timestamp is >= it, so `since` alone can never advance past the batch.
+    // Confirm the API does return them all under a plain `since`, which is
+    // what makes the cursor the only correct way to drain.
+    let (_, body) = server.request("GET", &format!("/v1/spans?since={BASE_NS}&limit=10"), None);
+    assert_eq!(body["spans"].as_array().map(Vec::len), Some(10));
+    assert!(
+        body["next_cursor"].as_str().is_some(),
+        "a full page inside one timestamp must offer a cursor: {body}"
+    );
+    server.kill();
+}

@@ -53,8 +53,17 @@ pub fn bucket_upper_bound(index: usize) -> u64 {
     let row = (index - SUB_COUNT) / SUB_COUNT;
     let sub = (index - SUB_COUNT) % SUB_COUNT;
     let octave = row + u64::from(SUB_BITS);
+    // The top row's bound is not representable: at octave 63 the last
+    // sub-bucket ends at 2^64 - 1 + 1. A span with `end_time_ns = u64::MAX`
+    // reaches it through an ordinary duration query, so this arithmetic is on
+    // a request path and must not panic in debug or wrap in release.
+    if octave >= 64 {
+        return u64::MAX;
+    }
     let step = 1u64 << (octave - u64::from(SUB_BITS));
-    (1u64 << octave) + (sub + 1) * step - 1
+    (1u64 << octave)
+        .saturating_add((sub + 1).saturating_mul(step))
+        .saturating_sub(1)
 }
 
 /// A count/total/max/histogram summary of one stage's duration.

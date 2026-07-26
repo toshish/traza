@@ -123,6 +123,27 @@ export function fmtWindowLabel(sinceNs, untilNs) {
   return `${since.slice(11, 16)} – ${until.slice(11, 16)}Z`;
 }
 
+/** What an acknowledged write actually guarantees, in the server's own terms.
+
+    This lives here, once, because a screen must never phrase it itself. Both
+    the Server and Overview screens used to print the `wal` sentence — "survives
+    a kill-9, a panic, or an OS crash" — unconditionally, so a `buffered`
+    server, which promises the exact opposite, was told it was durable. An
+    unknown mode says so rather than guessing: the honest answer to "what does
+    this promise" is sometimes "I have not been told". */
+export function durabilityMeans(mode) {
+  switch (mode) {
+    case 'wal':
+      return 'an acknowledged write is fsynced to the write-ahead log and recovered on restart, so it survives a kill‑9, a panic, or an OS crash';
+    case 'flushed':
+      return 'an acknowledged write is already sealed into a segment before the response, the strongest mode and the slowest';
+    case 'buffered':
+      return 'an acknowledged write is in memory only and is lost if this process dies — fast, and not durable';
+    default:
+      return 'the server has not reported a durability mode';
+  }
+}
+
 /** Uptime as "6 d 04:11", the shape the Server screen states it in. */
 export function fmtUptime(ns) {
   const total = Math.floor(ns / 1e9);

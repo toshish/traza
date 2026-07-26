@@ -18,6 +18,18 @@ use crate::{Result, Span, SpanFilter, Store};
 // which surface reported it.
 use crate::metrics::{bucket_index, bucket_upper_bound, BUCKET_COUNT};
 
+/// Most distinct failure signatures tracked in one grouping.
+///
+/// Each tracked signature costs a duration histogram — a few KiB — so an
+/// unbounded map turns a corpus with high-cardinality error text into
+/// gigabytes of server memory while the answer anybody wants is the top
+/// twenty. Past this bound new signatures are counted, not tracked, and the
+/// response says so rather than quietly reporting a subset as the whole.
+const MAX_FAILURE_GROUPS: usize = 4096;
+
+/// Most spans a tail request will rank. See [`Store::slowest_spans`].
+const SLOWEST_LIMIT: usize = 1000;
+
 /// A duration distribution held in fixed-width log-linear buckets.
 ///
 /// Traza already had a power-of-two latency histogram, and its own monitoring
@@ -185,6 +197,24 @@ pub struct FailureGroup {
     pub p95_ns: u64,
 }
 
+/// Failure groups plus the totals a caller needs to read them honestly.
+#[derive(Clone, Debug, Serialize)]
+pub struct FailureReport {
+    /// The groups, most frequent first, truncated to the requested limit.
+    pub groups: Vec<FailureGroup>,
+    /// Every matching span, counted before any truncation. A share computed
+    /// against the returned groups' subtotal overstates itself, sometimes by a
+    /// lot, so the denominator is supplied rather than inferred.
+    pub total: u64,
+    /// Distinct signatures seen, up to the cardinality bound.
+    pub distinct: usize,
+    /// Signatures measured but not returned, because `limit` cut them.
+    pub groups_omitted: usize,
+    /// Spans whose signature was never tracked because the cardinality bound
+    /// was already reached. Non-zero means `distinct` is a floor, not a count.
+    pub spans_untracked: u64,
+}
+
 /// Accumulator for one failure signature while folding.
 #[derive(Debug)]
 struct FailureAccumulator {
@@ -215,8 +245,14 @@ impl Store {
         // down would drop the final partial bucket, which on a live window is
         // the only one anybody is watching.
         // Ceiling division written the long way: `div_ceil` is stable only
-        // since 1.73 and this crate supports 1.70.
-        let bucket_ns = ((span_ns + bucket_count as u64 - 1) / bucket_count as u64).max(1);
+        // since 1.73 and this crate supports 1.70. Saturating, because a
+        // caller may legitimately pass `until = u64::MAX` and the naive
+        // `span + count - 1` overflows on exactly that input.
+        let bucket_ns = span_ns
+            .saturating_add(bucket_count as u64 - 1)
+            .checked_div(bucket_count as u64)
+            .unwrap_or(1)
+            .max(1);
 
         let mut spans = vec![0u64; bucket_count];
         let mut errors = vec![0u64; bucket_count];
@@ -297,8 +333,10 @@ impl Store {
     /// answer is a dozen rows and the input can be every error in the window:
     /// shipping the spans so the client could group them would move megabytes
     /// to produce a table that fits on a screen.
-    pub fn failures(&self, filter: &SpanFilter, limit: usize) -> Result<Vec<FailureGroup>> {
+    pub fn failures(&self, filter: &SpanFilter, limit: usize) -> Result<FailureReport> {
         let mut groups: HashMap<(String, String, String), FailureAccumulator> = HashMap::new();
+        let mut total = 0u64;
+        let mut untracked = 0u64;
         let errors_only = SpanFilter {
             // An explicit status filter wins: "failures, but only the 503s" is
             // a narrowing of this screen, not a contradiction of it.
@@ -308,15 +346,31 @@ impl Store {
             ..filter.clone()
         };
         self.fold_spans(&errors_only, |span| {
+            // Counted before anything is decided about tracking, so the total
+            // is the truth even when the map is full. A share computed against
+            // a truncated subtotal reads as a much larger fraction than it is.
+            total += 1;
             let key = (span.service.clone(), span.name.clone(), span.status.clone());
-            let entry = groups.entry(key).or_insert_with(|| FailureAccumulator {
-                count: 0,
-                first_seen_ns: u64::MAX,
-                last_seen_ns: 0,
-                example_trace_id: String::new(),
-                example_span_id: String::new(),
-                durations: DurationHistogram::default(),
-            });
+            let entry = match groups.get_mut(&key) {
+                Some(entry) => entry,
+                None => {
+                    // High-cardinality error text — an id or a timestamp in a
+                    // span name — would otherwise allocate a histogram per
+                    // distinct string until the process died.
+                    if groups.len() >= MAX_FAILURE_GROUPS {
+                        untracked += 1;
+                        return;
+                    }
+                    groups.entry(key).or_insert_with(|| FailureAccumulator {
+                        count: 0,
+                        first_seen_ns: u64::MAX,
+                        last_seen_ns: 0,
+                        example_trace_id: String::new(),
+                        example_span_id: String::new(),
+                        durations: DurationHistogram::default(),
+                    })
+                }
+            };
             entry.count += 1;
             entry.first_seen_ns = entry.first_seen_ns.min(span.start_time_ns);
             // Keep the most recent example: when a signature is still firing,
@@ -333,6 +387,7 @@ impl Store {
                 .record(span.end_time_ns.saturating_sub(span.start_time_ns));
         })?;
 
+        let distinct = groups.len();
         let mut rows: Vec<FailureGroup> = groups
             .into_iter()
             .map(|((service, name, status), entry)| FailureGroup {
@@ -360,8 +415,18 @@ impl Store {
                 .then_with(|| left.service.cmp(&right.service))
                 .then_with(|| left.name.cmp(&right.name))
         });
+        let returned = rows.len().min(limit);
         rows.truncate(limit);
-        Ok(rows)
+        Ok(FailureReport {
+            groups: rows,
+            total,
+            distinct,
+            // Two different truncations, and a client needs to tell them
+            // apart: `limit` cut the response, the cardinality bound cut what
+            // was measured at all.
+            groups_omitted: distinct.saturating_sub(returned),
+            spans_untracked: untracked,
+        })
     }
 
     /// The slowest matching spans, for the tail behind a latency distribution.
@@ -370,7 +435,12 @@ impl Store {
     /// drawing the distribution — never pays for ranking, and so the ranking
     /// path can bound its own memory to `limit` rather than to the match set.
     pub fn slowest_spans(&self, filter: &SpanFilter, limit: usize) -> Result<Vec<Span>> {
-        let mut worst: Vec<Span> = Vec::with_capacity(limit + 1);
+        // A tail is read, not paged: the point is the handful of outliers
+        // behind a distribution. Capping here keeps `limit` from being a way
+        // to ask the server to hold the whole match set in memory — and stops
+        // `limit + 1` overflowing on `usize::MAX`.
+        let limit = limit.min(SLOWEST_LIMIT);
+        let mut worst: Vec<Span> = Vec::with_capacity(limit.saturating_add(1));
         let unbounded = SpanFilter {
             limit: None,
             sort: None,

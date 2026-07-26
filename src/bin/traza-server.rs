@@ -379,6 +379,11 @@ impl ServerMetrics {
             .collect();
         json!({
             "uptime_ns": self.started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+            // What an acknowledged write actually guarantees. Absent from this
+            // payload before, so the dashboard's fallback rendered every
+            // server as `wal` — including a `buffered` one, which promises the
+            // opposite. A screen must not be able to invent this.
+            "durability": engine.durability().as_str(),
             "requests": {
                 "total": self.requests.get(),
                 "rejected": self.rejected.get(),
@@ -1408,10 +1413,9 @@ fn serve_request(
             };
             let limit = filter.limit.unwrap_or(100);
             match engine.failures(&filter, limit) {
-                Ok(groups) => responder.json(
+                Ok(report) => responder.json(
                     200,
-                    json!({"groups": serde_json::to_value(groups)
-                        .unwrap_or_else(|_| Value::Array(Vec::new()))}),
+                    serde_json::to_value(report).unwrap_or_else(|_| json!({})),
                 ),
                 Err(error) => responder.json(503, json!({"error": error.to_string()})),
             }

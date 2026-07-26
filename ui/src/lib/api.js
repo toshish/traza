@@ -106,37 +106,64 @@ function query(params) {
   return pairs.length ? '?' + pairs.join('&') : '';
 }
 
-// In-flight GETs by URL. A panel that asks for a window another panel is
-// already fetching joins that request instead of opening a second one.
+// In-flight GETs by URL: `{controller, subscribers, promise}`. A panel that
+// asks for a window another panel is already fetching joins that request
+// instead of opening a second one, and the request is cancelled once the last
+// subscriber has gone.
 const inFlight = new Map();
 
-function coalesce(url) {
-  const existing = inFlight.get(url);
-  if (existing) return existing;
-  // The shared request carries no caller signal on purpose: one subscriber
-  // walking away must not cancel the answer the others are still waiting for.
-  // Aborting is handled per subscriber in `read`.
-  const pending = request(url).finally(() => inFlight.delete(url));
-  // A rejection with no subscriber attached yet would be an unhandled
-  // rejection; this no-op handler keeps the shared promise settled quietly
-  // while each subscriber still sees the error through its own `.then`.
-  pending.catch(() => {});
-  inFlight.set(url, pending);
-  return pending;
-}
+/** A coalesced GET whose underlying request is cancelled when — and only
+    when — every subscriber has walked away.
 
-/** A coalesced GET that still honours the caller's own abort. */
+    The first attempt gave the shared request no signal at all, so aborting
+    rejected the caller's promise while the fetch, the connection and the
+    server-side scan all continued. On a screen that re-queries per keystroke
+    that is the opposite of the intent: the abort existed precisely to stop
+    paying for an answer nobody wants. Reference counting gets both halves —
+    one subscriber leaving cancels nothing, the last one leaving cancels the
+    work. */
 function read(url, signal) {
-  const shared = coalesce(url);
-  if (!signal) return shared;
+  let entry = inFlight.get(url);
+  if (!entry) {
+    const controller = new AbortController();
+    entry = { controller, subscribers: 0, promise: null };
+    entry.promise = request(url, { signal: controller.signal })
+      .finally(() => inFlight.delete(url));
+    // Nothing may be attached yet when this settles; without a sink a
+    // rejection surfaces as an unhandled promise rejection.
+    entry.promise.catch(() => {});
+    inFlight.set(url, entry);
+  }
+
+  entry.subscribers += 1;
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    entry.subscribers -= 1;
+    if (entry.subscribers <= 0) {
+      inFlight.delete(url);
+      entry.controller.abort();
+    }
+  };
+
+  if (!signal) return entry.promise.finally(release);
+
   return new Promise((resolve, reject) => {
     if (signal.aborted) {
+      release();
       reject(abortError());
       return;
     }
-    const onAbort = () => reject(abortError());
+    const onAbort = () => {
+      release();
+      reject(abortError());
+    };
     signal.addEventListener('abort', onAbort, { once: true });
-    shared.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort));
+    entry.promise.then(resolve, reject).finally(() => {
+      signal.removeEventListener('abort', onAbort);
+      release();
+    });
   });
 }
 
