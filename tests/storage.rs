@@ -1134,6 +1134,58 @@ fn nul_prefixed_attribute_cannot_poison_the_service_index() {
 }
 
 #[test]
+fn resident_index_bytes_tracks_attribute_value_cardinality() {
+    // The other half of the residency story, and the half a zero
+    // `resident_payload_bytes()` hides: the attribute index is keyed on whole
+    // attribute values, so its resident cost is driven by how many DISTINCT
+    // values a segment holds. Two stores with identical span counts and
+    // identical value sizes must differ by roughly the distinct-value bytes.
+    let value_bytes = 4_096;
+    let spans = 400;
+
+    let measure = |label: &str, distinct: usize| -> (usize, usize) {
+        let dir = correctness_test_dir(label);
+        // No offloading: an offloaded value leaves the index entirely, which
+        // would make this test pass for the wrong reason.
+        let config = Config {
+            payload_threshold: None,
+            ..Config::default()
+        };
+        let store = Store::open(&dir, config).expect("opens");
+        for i in 0..spans {
+            let mut span = span("t-idx", format!("s{i}"), 1_000 + i as u64, 10);
+            let text = format!("{:0>width$}", i % distinct, width = value_bytes);
+            span.attributes
+                .insert("prompt".to_owned(), serde_json::Value::String(text));
+            store.ingest(span).expect("ingest");
+        }
+        store.flush().expect("flush");
+        let bytes = store.resident_index_bytes().expect("index bytes");
+        let entries = store
+            .resident_attribute_index_entries()
+            .expect("index entries");
+        assert_eq!(
+            store.resident_payload_bytes().expect("payload bytes"),
+            0,
+            "payload residency must stay zero regardless of index size"
+        );
+        (bytes, entries)
+    };
+
+    let (one_value, one_entry_count) = measure("index-residency-low", 1);
+    let (all_distinct, all_entry_count) = measure("index-residency-high", spans);
+
+    // Three indexed keys with one value each: prompt, service, name.
+    assert_eq!(one_entry_count, 3);
+    assert_eq!(all_entry_count, spans + 2);
+    assert!(
+        all_distinct > one_value + spans * value_bytes,
+        "distinct values must cost their own bytes: {all_distinct} vs {one_value} \
+         for {spans} values of {value_bytes} bytes"
+    );
+}
+
+#[test]
 fn file_backed_segments_hold_no_resident_payload() {
     // Leg 1, larger-than-RAM: segments hold parsed indexes only — payload
     // bytes are read on demand from the file. Zero resident payload after
