@@ -448,6 +448,10 @@ fn metrics_report_the_stages_the_benchmark_reads() {
         "traza_spans_admitted_total 3",
         "traza_batches_admitted_total 3",
         "traza_writer_lock_wait_ns_count",
+        // The two halves of the log append. The benchmark reads both to tell
+        // a contended lock from a slow device, so their names are a contract.
+        "traza_wal_lock_wait_ns_count",
+        "traza_wal_write_syscall_ns_count",
         "traza_buffer_upsert_ns_count",
         "traza_http_requests_total",
         "traza_http_connections_live",

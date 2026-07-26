@@ -421,13 +421,21 @@ window alone is close to a no-op.
 **That was measured before sealing moved off the writer lock (v0.19.0), and
 the window has a second effect that measurement could not see.** An `fsync` in
 flight blocks concurrent `write` calls to the same file in the kernel, so
-fsync frequency sets the cost of the log *append*, not just the cost of the
-sync. Measured at concurrency 8 on an otherwise identical load: the same
-append costs **0.076 ms at concurrency 1 and 1.778 ms at concurrency 8** — a
-23x slowdown of one syscall, with Traza's own log lock measured at zero wait,
-so the serialization is the kernel's and not the engine's. Widening the window
-from off to 2,000 µs cut fsyncs by 40% (112 to 67) and the mean append by
-**57%** (2.761 to 1.176 ms).
+fsync frequency appears to set the cost of the log *append*, not just the cost
+of the sync. Measured on macOS/APFS at concurrency 8: the same append costs
+**0.076 ms at concurrency 1 and 1.778 ms at concurrency 8** — a 23x difference
+in one syscall, with Traza's own log lock measured at zero wait, so the
+serialization is not the engine's. Widening the window from off to 2,000 µs
+cut fsyncs by 40% (112 to 67) and the mean append by **57%** (2.761 to
+1.176 ms).
+
+*Scope of that claim:* the correlation is measured and reproducible here; the
+mechanism — an in-flight `fsync` blocking concurrent `write` calls to the same
+file inside the kernel — is the explanation those numbers fit, not something
+this measurement isolates. It has been observed only on macOS/APFS, on one
+machine, and the underlying figures live in prose rather than a committed
+record. Treat the lever as real and the causal story as provisional; on Linux
+or another filesystem, re-measure before assuming it transfers.
 
 So on a write-heavy deployment the window buys back append time as well as
 sync time. `traza_wal_write_syscall_ns_*` and `traza_wal_lock_wait_ns_*` in

@@ -60,7 +60,9 @@ the noise floor of what it measures.
 |---|---|
 | `traza_writer_lock_wait` | Waiting to acquire the writer lock — **the contention signal** |
 | `traza_wal_encode` | Encoding a batch into its log frame. Measured deliberately *outside* the writer lock |
-| `traza_wal_write` | Writing the frame to the log file (inside the writer lock) |
+| `traza_wal_write` | Appending the frame to the log: the log's own lock plus the write (inside the writer lock) |
+| `traza_wal_lock_wait` | The log-lock half of `wal_write` |
+| `traza_wal_write_syscall` | The `write` half of `wal_write`, with the log lock already held |
 | `traza_wal_fsync` | The fsync. The one stage that is not CPU |
 | `traza_buffer_upsert` | Upserting a batch into the write buffer (inside the writer lock) |
 | `traza_segment_seal` | Sealing the write buffer into a segment, end to end |
