@@ -26,13 +26,14 @@
 //! every probe a CANDIDATE list rather than an answer — see
 //! [`Segment::attribute_candidate_offsets`].
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::content;
 use crate::hash::{hash_attribute, Hash128};
 
 /// Eight-byte marker at the beginning of every segment file. The version
@@ -42,25 +43,47 @@ pub const MAGIC: [u8; 8] = *b"TRAZASEG";
 /// On-disk format version written by this module. This — not the magic — is
 /// how the format generation is identified; the magic only says "a Traza
 /// segment". (JSONL v1 carried no magic; this indexed format is version 2.)
-pub const VERSION: u16 = 4;
+pub const VERSION: u16 = 5;
 /// Fixed header size written by this module.
 ///
-/// v3 appends the segment's timestamp range to the v2 header. Time is the
-/// most common filter an observability store sees and it was the one thing a
-/// query could not use to skip work: `since`/`until` were pure post-filters,
-/// so a "last 15 minutes" search opened and scanned every segment in the
-/// store. Two u64s in the header let a query eliminate a whole segment
-/// without touching it.
-///
-/// v4 changes only the attribute index's own encoding — see
-/// [`AttributeIndex`] — so the header keeps its v3 shape and length.
-pub const HEADER_LEN: usize = 96;
+/// v5 appends the content index's section offset. The attribute index used to
+/// run to EOF and derive its length from the file size; with a fifth section
+/// after it, that offset is what bounds it.
+pub const HEADER_LEN: usize = 104;
+/// v3/v4 header size. v3 appended the segment's timestamp range to the v2
+/// header. Time is the most common filter an observability store sees and it
+/// was the one thing a query could not use to skip work: `since`/`until` were
+/// pure post-filters, so a "last 15 minutes" search opened and scanned every
+/// segment in the store. Two u64s in the header let a query eliminate a whole
+/// segment without touching it.
+pub const HEADER_LEN_V3: usize = 96;
 /// v2 header size. Still readable: a v2 segment simply carries no timestamp
 /// range, and a query treats its range as unknown and cannot skip it — which
 /// is exactly the behaviour that existed before v3.
 pub const HEADER_LEN_V2: usize = 80;
 /// Oldest format this module can read.
 pub const MIN_READABLE_VERSION: u16 = 2;
+
+/// Records covered by one content-index block.
+///
+/// This is the granularity a content query narrows to: a block whose filter
+/// admits the query has all of its records decoded and checked. Smaller blocks
+/// prune more precisely but make the bit-sliced matrix taller relative to the
+/// data; 128 keeps the index near 1-2% of segment size while still discarding
+/// 99% of a segment on a selective term.
+pub const CONTENT_BLOCK_RECORDS: u32 = 128;
+/// Bounds on one block filter's size. The upper bound is what stops a block of
+/// pathologically varied text from sizing its own filter without limit.
+const CONTENT_BLOCK_MIN_BYTES: usize = 64;
+const CONTENT_BLOCK_MAX_BYTES: usize = 8 * 1024;
+/// Bounds on the per-segment summary filter, which is the only part of the
+/// content index held resident. The upper bound is the whole resident-memory
+/// story: total cost is at most this times the number of open segments, and it
+/// does not depend on how much text those segments hold.
+const CONTENT_SUMMARY_MIN_BYTES: usize = 256;
+const CONTENT_SUMMARY_MAX_BYTES: usize = 32 * 1024;
+/// Fixed prologue of the content section, before any bitmap.
+const CONTENT_PROLOGUE_LEN: usize = 32;
 
 const RECORD_FIXED_LEN: usize = 8 + 4 + 4 + 4 + 4;
 
@@ -93,6 +116,10 @@ pub struct Header {
     /// that predates the field. `None` means unknown, never "empty": a query
     /// must scan a segment whose range it cannot rule out.
     pub timestamps: Option<(u64, u64)>,
+    /// Byte offset and length of the content index, or `None` before v5.
+    /// `None` means unknown, on the same reading as `timestamps`: a content
+    /// query must consider a segment whose text it cannot rule out.
+    pub content: Option<(u64, u64)>,
 }
 
 impl Header {
@@ -118,6 +145,7 @@ impl Header {
         let header_len = read_u16(bytes, 10)?;
         let expected_header_len = match version {
             2 => HEADER_LEN_V2,
+            3 | 4 => HEADER_LEN_V3,
             _ => HEADER_LEN,
         };
         if usize::from(header_len) != expected_header_len {
@@ -126,6 +154,15 @@ impl Header {
         if bytes.len() < expected_header_len {
             return Err(Error::Corrupt("file is shorter than its declared header"));
         }
+        let attribute_index_offset = read_u64(bytes, 72)?;
+        // Before v5 the attribute index ran to EOF. From v5 the content index
+        // follows it, so its offset is what bounds the attribute section.
+        let content_offset = if version >= 5 {
+            Some(read_u64(bytes, 96)?)
+        } else {
+            None
+        };
+        let attribute_index_end = content_offset.unwrap_or(total);
         let header = Self {
             version,
             header_len,
@@ -136,9 +173,9 @@ impl Header {
             offsets_len: read_u64(bytes, 48)?,
             trace_index_offset: read_u64(bytes, 56)?,
             trace_index_len: read_u64(bytes, 64)?,
-            attribute_index_offset: read_u64(bytes, 72)?,
-            attribute_index_len: total
-                .checked_sub(read_u64(bytes, 72)?)
+            attribute_index_offset,
+            attribute_index_len: attribute_index_end
+                .checked_sub(attribute_index_offset)
                 .ok_or(Error::Corrupt("attribute index offset beyond file"))?,
             // v2 predates the range. `None` means "unknown", which makes a
             // query scan the segment rather than wrongly skip it.
@@ -147,18 +184,30 @@ impl Header {
             } else {
                 None
             },
+            content: match content_offset {
+                Some(offset) => Some((
+                    offset,
+                    total
+                        .checked_sub(offset)
+                        .ok_or(Error::Corrupt("content index offset beyond file"))?,
+                )),
+                None => None,
+            },
         };
         header.validate_total(total)?;
         Ok(header)
     }
 
     fn validate_total(&self, file_len: u64) -> Result<(), Error> {
-        let sections = [
+        let mut sections = vec![
             (self.records_offset, self.records_len),
             (self.offsets_offset, self.offsets_len),
             (self.trace_index_offset, self.trace_index_len),
             (self.attribute_index_offset, self.attribute_index_len),
         ];
+        if let Some(content) = self.content {
+            sections.push(content);
+        }
         let mut expected = u64::from(self.header_len);
         for (offset, len) in sections {
             if offset != expected {
@@ -196,10 +245,21 @@ pub struct RecordInput {
     pub attributes: BTreeMap<String, String>,
     /// Opaque payload bytes returned unchanged by queries.
     pub payload: Vec<u8>,
+    /// Raw text this record should be findable by, for content search.
+    ///
+    /// Separate from `attributes` because those hold values in their canonical
+    /// JSON form — a string value arrives here as `"hello\nworld"`, quotes,
+    /// escapes and all. Tokenizing that would index `nworld`, and a search for
+    /// `world` would silently miss. Content search needs the text as a human
+    /// wrote it, so the caller supplies it unescaped.
+    ///
+    /// Empty means "index no content for this record". A record with no
+    /// content is simply never a content-search candidate.
+    pub content: Vec<String>,
 }
 
 impl RecordInput {
-    /// Creates an input record.
+    /// Creates an input record with no content-search text.
     pub fn new(
         timestamp: u64,
         trace_id: impl Into<String>,
@@ -211,7 +271,14 @@ impl RecordInput {
             trace_id: trace_id.into(),
             attributes,
             payload: payload.into(),
+            content: Vec::new(),
         }
+    }
+
+    /// Attaches the raw text this record should be findable by.
+    pub fn with_content(mut self, content: Vec<String>) -> Self {
+        self.content = content;
+        self
     }
 }
 
@@ -355,6 +422,66 @@ impl AttributeIndex {
     }
 }
 
+/// The content index: a per-segment summary filter held resident, and a
+/// bit-sliced matrix of per-block filters left on disk.
+///
+/// The layout is what makes this affordable to probe. Storing each block's
+/// filter contiguously would mean reading every block's whole bitmap — several
+/// hundred kilobytes per segment — to test a handful of bits in each. Stored
+/// transposed, one ROW per bit position spanning all blocks, testing a bit
+/// across the entire segment is a single read of `block_count` bits. A
+/// two-word query touches `2 x HASH_COUNT` rows, so it reads tens of bytes per
+/// segment instead of hundreds of kilobytes.
+#[derive(Debug)]
+struct ContentIndex {
+    /// Records per block; the last block may be short.
+    block_records: u32,
+    block_count: u32,
+    /// Bits in one block's filter, which is also the number of rows.
+    block_bits: u64,
+    /// Bytes per row: one bit per block, rounded up.
+    row_bytes: u64,
+    /// Absolute file offset of row 0.
+    rows_offset: u64,
+    /// The only resident part.
+    summary: content::Bloom,
+}
+
+impl ContentIndex {
+    /// Whether any block may hold every token — the cheap, resident test that
+    /// skips a whole segment without reading a byte of it.
+    fn may_contain(&self, query: &content::Query) -> bool {
+        self.summary.may_contain_all(query.tokens())
+    }
+
+    /// Blocks whose filters admit every token, as a bitmap over block indexes.
+    fn candidate_blocks(
+        &self,
+        query: &content::Query,
+        backing: &Backing,
+    ) -> Result<Vec<u8>, Error> {
+        let row_bytes = self.row_bytes as usize;
+        // Start with every block admitted, then intersect one row at a time.
+        let mut admitted = vec![0xffu8; row_bytes];
+        for token in query.tokens() {
+            for position in content::bit_positions(token, self.block_bits as usize) {
+                let offset = self
+                    .rows_offset
+                    .checked_add(position as u64 * self.row_bytes)
+                    .ok_or(Error::Corrupt("content row offset overflow"))?;
+                let row = backing.read_range(offset, self.row_bytes)?;
+                for (target, source) in admitted.iter_mut().zip(row.iter()) {
+                    *target &= *source;
+                }
+                if admitted.iter().all(|byte| *byte == 0) {
+                    return Ok(admitted);
+                }
+            }
+        }
+        Ok(admitted)
+    }
+}
+
 /// An opened segment backed by either a file or encoded memory.
 ///
 /// File-backed segments retain only offsets and persisted index postings.
@@ -366,6 +493,9 @@ pub struct Segment {
     record_offsets: Vec<u64>,
     trace_index: HashMap<String, Vec<u64>>,
     attribute_index: AttributeIndex,
+    /// `None` on a segment written before v5, or one with no indexable text.
+    /// Absent means unknown, so a content query cannot skip the segment.
+    content: Option<ContentIndex>,
     /// Diagnostic only: whether the last query narrowed through an index.
     /// Atomic rather than `Cell` because a segment is shared across reader
     /// threads — pinned views and the segment list both hand out `&Segment`.
@@ -457,12 +587,22 @@ impl Segment {
             )?,
             &header,
         )?;
+        let content = match header.content {
+            Some((offset, len)) => decode_content_head(
+                section(&bytes, offset, len)?,
+                offset,
+                len,
+                header.record_count,
+            )?,
+            None => None,
+        };
         Ok(Self {
             backing: Backing::Resident(bytes),
             header,
             record_offsets,
             trace_index,
             attribute_index,
+            content,
             last_query_used_index: AtomicBool::new(false),
         })
     }
@@ -512,6 +652,23 @@ impl Segment {
         let attribute_bytes =
             read_section(header.attribute_index_offset, header.attribute_index_len)?;
         let attribute_index = read_attribute_index(&attribute_bytes, &header)?;
+        // Only the prologue and the summary filter are read: the bit-sliced
+        // block rows stay on disk and are fetched a row at a time by a query.
+        let content = match header.content {
+            Some((offset, len)) => {
+                let prologue_len = (CONTENT_PROLOGUE_LEN as u64).min(len);
+                let prologue = read_section(offset, prologue_len)?;
+                let summary_bits = if prologue.len() >= CONTENT_PROLOGUE_LEN {
+                    read_u64(&prologue, 16)?
+                } else {
+                    0
+                };
+                let head_len = (CONTENT_PROLOGUE_LEN as u64 + summary_bits / 8).min(len);
+                let head = read_section(offset, head_len)?;
+                decode_content_head(&head, offset, len, header.record_count)?
+            }
+            None => None,
+        };
         Ok(Self {
             backing: Backing::File {
                 file: std::sync::Mutex::new(file),
@@ -521,6 +678,7 @@ impl Segment {
             record_offsets,
             trace_index,
             attribute_index,
+            content,
             last_query_used_index: AtomicBool::new(false),
         })
     }
@@ -749,6 +907,82 @@ impl Segment {
         self.attribute_index.candidates(key, value)
     }
 
+    /// Whether this segment may hold a record matching `query`.
+    ///
+    /// Answered from the resident summary filter alone — no I/O — so a store
+    /// with hundreds of segments discards most of them for the cost of a few
+    /// hash lookups each. `true` on a segment with no content index, because
+    /// absent means unknown.
+    pub fn may_contain_content(&self, query: &content::Query) -> bool {
+        match &self.content {
+            Some(index) if query.is_indexable() => index.may_contain(query),
+            _ => true,
+        }
+    }
+
+    /// CANDIDATE record offsets for a content query, or `None` when the index
+    /// cannot narrow it and every record is a candidate.
+    ///
+    /// Reads one bit-sliced row per (token, hash) pair — tens of bytes for a
+    /// typical query — and returns the records of every block those rows
+    /// admit. Like every index in this crate the result is a superset: a Bloom
+    /// filter has false positives, and blocks are 128 records wide, so most
+    /// candidates will not match. [`content::Query::matches`] against the
+    /// decoded span is what decides.
+    pub fn content_candidate_offsets(
+        &self,
+        query: &content::Query,
+    ) -> Result<Option<Vec<u64>>, Error> {
+        let Some(index) = &self.content else {
+            return Ok(None);
+        };
+        if !query.is_indexable() {
+            return Ok(None);
+        }
+        if !index.may_contain(query) {
+            self.last_query_used_index.store(true, Ordering::Relaxed);
+            return Ok(Some(Vec::new()));
+        }
+        let admitted = index.candidate_blocks(query, &self.backing)?;
+        self.last_query_used_index.store(true, Ordering::Relaxed);
+        let block_records = index.block_records as usize;
+        let mut offsets = Vec::new();
+        for block in 0..index.block_count as usize {
+            if admitted[block / 8] & (1 << (block % 8)) == 0 {
+                continue;
+            }
+            let start = block * block_records;
+            let end = (start + block_records).min(self.record_offsets.len());
+            offsets.extend_from_slice(&self.record_offsets[start..end]);
+        }
+        Ok(Some(offsets))
+    }
+
+    /// Whether this segment carries a content index at all.
+    pub fn has_content_index(&self) -> bool {
+        self.content.is_some()
+    }
+
+    /// Fraction of the resident summary filter's bits that are set, or `None`
+    /// without a content index.
+    ///
+    /// A ratio approaching 1.0 means the filter has saturated: it still cannot
+    /// return a wrong answer, but it has stopped skipping segments and content
+    /// search has degraded to a scan. This is the number that says so.
+    pub fn content_summary_fill(&self) -> Option<f64> {
+        self.content
+            .as_ref()
+            .map(|index| index.summary.fill_ratio())
+    }
+
+    /// Resident bytes held by the content index — the summary filter only.
+    /// The bit-sliced block rows stay on disk.
+    pub fn content_resident_bytes(&self) -> usize {
+        self.content
+            .as_ref()
+            .map_or(0, |index| index.summary.as_bytes().len())
+    }
+
     /// Timestamp of the record at a posting offset without decoding it: the
     /// timestamp is the record's first fixed field.
     pub fn timestamp_at(&self, relative_offset: u64) -> Result<u64, Error> {
@@ -856,18 +1090,21 @@ pub fn encode(records: &[RecordInput]) -> Result<Vec<u8>, Error> {
     }
     let trace_region = encode_string_index(&trace_index, false)?;
     let attribute_region = encode_attribute_index(&attribute_keys, &attribute_index)?;
+    let content_region = encode_content_index(records);
 
     let records_offset = HEADER_LEN as u64;
     let offsets_offset = records_offset + record_region.len() as u64;
     let trace_index_offset = offsets_offset + offset_region.len() as u64;
     let attribute_index_offset = trace_index_offset + trace_region.len() as u64;
+    let content_index_offset = attribute_index_offset + attribute_region.len() as u64;
 
     let mut bytes = Vec::with_capacity(
         HEADER_LEN
             + record_region.len()
             + offset_region.len()
             + trace_region.len()
-            + attribute_region.len(),
+            + attribute_region.len()
+            + content_region.len(),
     );
     bytes.extend_from_slice(&MAGIC);
     put_u16(&mut bytes, VERSION);
@@ -889,12 +1126,173 @@ pub fn encode(records: &[RecordInput]) -> Result<Vec<u8>, Error> {
     });
     put_u64(&mut bytes, min_ts);
     put_u64(&mut bytes, max_ts);
+    put_u64(&mut bytes, content_index_offset);
     debug_assert_eq!(bytes.len(), HEADER_LEN);
     bytes.extend_from_slice(&record_region);
     bytes.extend_from_slice(&offset_region);
     bytes.extend_from_slice(&trace_region);
     bytes.extend_from_slice(&attribute_region);
+    bytes.extend_from_slice(&content_region);
     Ok(bytes)
+}
+
+/// Ceiling division. `usize::div_ceil` is newer than this crate's MSRV.
+fn div_ceil(value: usize, divisor: usize) -> usize {
+    value / divisor + usize::from(value % divisor != 0)
+}
+
+/// Ceiling division for `u64`, for the same reason.
+fn div_ceil_u64(value: u64, divisor: u64) -> u64 {
+    value / divisor + u64::from(value % divisor != 0)
+}
+
+/// Builds the content index over `records`.
+///
+/// Records are grouped into blocks of [`CONTENT_BLOCK_RECORDS`]. Each block
+/// gets a Bloom filter over the distinct tokens of its records' text, and
+/// those filters are written TRANSPOSED — one row per bit position, one bit
+/// per block — so that a query can test a token against every block in the
+/// segment with a single small read. See [`ContentIndex`].
+///
+/// A segment whose records carry no content text writes the prologue with zero
+/// blocks, which the reader treats as "no content index" rather than as "no
+/// content": an absent index can never be used to skip anything.
+fn encode_content_index(records: &[RecordInput]) -> Vec<u8> {
+    let block_records = CONTENT_BLOCK_RECORDS as usize;
+    let block_count = div_ceil(records.len(), block_records);
+    let indexable = records.iter().any(|record| !record.content.is_empty());
+    if block_count == 0 || !indexable {
+        let mut out = Vec::with_capacity(CONTENT_PROLOGUE_LEN);
+        put_u32(&mut out, 0);
+        put_u32(&mut out, CONTENT_BLOCK_RECORDS);
+        put_u32(&mut out, 0);
+        put_u32(&mut out, content::HASH_COUNT);
+        put_u64(&mut out, 0);
+        put_u64(&mut out, 0);
+        debug_assert_eq!(out.len(), CONTENT_PROLOGUE_LEN);
+        return out;
+    }
+
+    // Per-block token sets, plus the segment-wide set for the summary.
+    let mut block_tokens: Vec<std::collections::HashSet<String>> = Vec::with_capacity(block_count);
+    let mut all_tokens: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for chunk in records.chunks(block_records) {
+        let tokens = content::distinct_tokens(
+            chunk
+                .iter()
+                .flat_map(|record| record.content.iter().map(String::as_str)),
+        );
+        for token in &tokens {
+            if !all_tokens.contains(token.as_str()) {
+                all_tokens.insert(token.clone());
+            }
+        }
+        block_tokens.push(tokens);
+    }
+
+    // One filter size for the whole segment, taken from its busiest block, so
+    // that a row is a fixed stride and needs no offset table.
+    let widest = block_tokens.iter().map(HashSet::len).max().unwrap_or(0);
+    let block_bits = content::size_bits(widest, CONTENT_BLOCK_MIN_BYTES, CONTENT_BLOCK_MAX_BYTES);
+    let row_bytes = div_ceil(block_count, 8);
+
+    let mut summary = content::Bloom::new(content::size_bits(
+        all_tokens.len(),
+        CONTENT_SUMMARY_MIN_BYTES,
+        CONTENT_SUMMARY_MAX_BYTES,
+    ));
+    for token in &all_tokens {
+        summary.insert(token);
+    }
+
+    let mut rows = vec![0u8; block_bits * row_bytes];
+    for (block, tokens) in block_tokens.iter().enumerate() {
+        for token in tokens {
+            for position in content::bit_positions(token, block_bits) {
+                rows[position * row_bytes + block / 8] |= 1 << (block % 8);
+            }
+        }
+    }
+
+    let mut out = Vec::with_capacity(CONTENT_PROLOGUE_LEN + summary.as_bytes().len() + rows.len());
+    put_u32(&mut out, 0);
+    put_u32(&mut out, CONTENT_BLOCK_RECORDS);
+    put_u32(&mut out, block_count as u32);
+    put_u32(&mut out, content::HASH_COUNT);
+    put_u64(&mut out, summary.bit_len() as u64);
+    put_u64(&mut out, block_bits as u64);
+    debug_assert_eq!(out.len(), CONTENT_PROLOGUE_LEN);
+    out.extend_from_slice(summary.as_bytes());
+    out.extend_from_slice(&rows);
+    out
+}
+
+/// Parses the content section's prologue and resident summary filter from the
+/// FRONT of the section, without needing the bit-sliced rows that follow.
+///
+/// `head` must hold at least the prologue and the summary; `section_len` is
+/// the section's full length, against which the declared sizes are checked.
+/// Splitting it this way is what lets a file-backed open read a few kilobytes
+/// instead of the whole index.
+fn decode_content_head(
+    head: &[u8],
+    section_offset: u64,
+    section_len: u64,
+    record_count: u64,
+) -> Result<Option<ContentIndex>, Error> {
+    let data = head;
+    if data.len() < CONTENT_PROLOGUE_LEN {
+        return Err(Error::Corrupt("content index is shorter than its prologue"));
+    }
+    let block_records = read_u32(data, 4)?;
+    let block_count = read_u32(data, 8)?;
+    let hash_count = read_u32(data, 12)?;
+    let summary_bits = read_u64(data, 16)?;
+    let block_bits = read_u64(data, 24)?;
+
+    if block_count == 0 {
+        // Written by a segment with no indexable text, or with content
+        // indexing switched off. "Absent" must read as unknown, never as
+        // empty: a filter that skipped every segment would turn content
+        // search into a query that silently returns nothing.
+        return Ok(None);
+    }
+    if hash_count != content::HASH_COUNT {
+        return Err(Error::Unsupported(
+            "content index was built with a different hash count",
+        ));
+    }
+    if block_records == 0 {
+        return Err(Error::Corrupt("content index has a zero block size"));
+    }
+    let expected_blocks = div_ceil_u64(record_count, u64::from(block_records));
+    if u64::from(block_count) != expected_blocks {
+        return Err(Error::Corrupt("content index block count does not match"));
+    }
+    if !summary_bits.is_power_of_two() || !block_bits.is_power_of_two() {
+        return Err(Error::Corrupt("content filter size is not a power of two"));
+    }
+    let row_bytes = div_ceil_u64(u64::from(block_count), 8);
+    let summary_bytes = summary_bits / 8;
+    let expected_len = CONTENT_PROLOGUE_LEN as u64 + summary_bytes + block_bits * row_bytes;
+    if section_len != expected_len {
+        return Err(Error::Corrupt(
+            "content index length does not match its header",
+        ));
+    }
+    let summary_start = CONTENT_PROLOGUE_LEN;
+    let summary_end = summary_start + summary_bytes as usize;
+    if data.len() < summary_end {
+        return Err(Error::Corrupt("content index summary is truncated"));
+    }
+    Ok(Some(ContentIndex {
+        block_records,
+        block_count,
+        block_bits,
+        row_bytes,
+        rows_offset: section_offset + summary_end as u64,
+        summary: content::Bloom::from_bytes(data[summary_start..summary_end].to_vec()),
+    }))
 }
 
 /// Encodes records and atomically replaces a destination file where supported.

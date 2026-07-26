@@ -422,3 +422,362 @@ fn a_sort_over_too_many_matches_is_refused_rather_than_answered_wrongly() {
     assert_eq!(narrowed.len(), 3);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+// ---------------------------------------------------------------- content
+
+/// A store whose segments are small enough that several exist, so that segment
+/// and block pruning have something to prune.
+fn content_store(label: &str) -> (Store, PathBuf) {
+    let dir = test_dir(label);
+    let store = Store::open(
+        &dir,
+        Config {
+            durability: traza::Durability::Buffered,
+            compaction: None,
+            flush_spans: 200,
+            ..Config::default()
+        },
+    )
+    .expect("opens");
+    (store, dir)
+}
+
+#[test]
+fn content_search_finds_words_anywhere_in_a_spans_text() {
+    let (store, dir) = content_store("content-basic");
+    store
+        .ingest(span(
+            "prompt",
+            1_000,
+            10,
+            json!({"gen_ai.prompt": "Please issue a refund for order 4471"}),
+        ))
+        .expect("ingest");
+    store
+        .ingest(span(
+            "completion",
+            2_000,
+            10,
+            json!({"gen_ai.completion": "I have processed the REFUND."}),
+        ))
+        .expect("ingest");
+    store
+        .ingest(span(
+            "nested",
+            3_000,
+            10,
+            json!({"gen_ai.input.messages": [
+                {"role": "user", "content": "where is my refund"},
+                {"role": "assistant", "content": "checking"}
+            ]}),
+        ))
+        .expect("ingest");
+    store
+        .ingest(span(
+            "unrelated",
+            4_000,
+            10,
+            json!({"gen_ai.prompt": "summarize the quarterly report"}),
+        ))
+        .expect("ingest");
+    store.flush().expect("flush");
+
+    let found = store
+        .query(&SpanFilter {
+            content: Some("refund".to_owned()),
+            ..SpanFilter::default()
+        })
+        .expect("content query");
+    let mut got = ids(&found);
+    got.sort_unstable();
+    assert_eq!(
+        got,
+        ["completion", "nested", "prompt"],
+        "case, punctuation and nesting must not hide a match"
+    );
+
+    // A conjunction, not a phrase: both words must be present, anywhere.
+    let both = store
+        .query(&SpanFilter {
+            content: Some("refund order".to_owned()),
+            ..SpanFilter::default()
+        })
+        .expect("content query");
+    assert_eq!(ids(&both), ["prompt"]);
+
+    let none = store
+        .query(&SpanFilter {
+            content: Some("refund chargeback".to_owned()),
+            ..SpanFilter::default()
+        })
+        .expect("content query");
+    assert!(none.is_empty(), "a word no span holds excludes every span");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn content_search_is_word_matching_not_substring_matching() {
+    // This is the semantic the Bloom filter can safely over-approximate. If
+    // "refund" matched "refunds", the index would skip that span and the
+    // answer would be WRONG rather than slow -- see src/content.rs.
+    let (store, dir) = content_store("content-words");
+    store
+        .ingest(span(
+            "plural",
+            1_000,
+            10,
+            json!({"note": "refunds were issued"}),
+        ))
+        .expect("ingest");
+    store
+        .ingest(span(
+            "prefixed",
+            2_000,
+            10,
+            json!({"note": "prerefund hold"}),
+        ))
+        .expect("ingest");
+    store
+        .ingest(span("exact", 3_000, 10, json!({"note": "refund issued"})))
+        .expect("ingest");
+    store.flush().expect("flush");
+
+    let found = store
+        .query(&SpanFilter {
+            content: Some("refund".to_owned()),
+            ..SpanFilter::default()
+        })
+        .expect("content query");
+    assert_eq!(
+        ids(&found),
+        ["exact"],
+        "only the whole word matches; the index cannot support substrings"
+    );
+
+    // And the words that ARE whole still resolve.
+    let plural = store
+        .query(&SpanFilter {
+            content: Some("refunds".to_owned()),
+            ..SpanFilter::default()
+        })
+        .expect("content query");
+    assert_eq!(ids(&plural), ["plural"]);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn content_search_reaches_buffered_spans_and_events() {
+    let (store, dir) = content_store("content-buffer");
+    let mut with_event: Span = span("evented", 1_000, 10, json!({}));
+    with_event.events.push(
+        serde_json::from_value(json!({
+            "name": "tool.call",
+            "timestamp_ns": 1_005,
+            "attributes": {"arguments": "{\"city\":\"Lisbon\"}"}
+        }))
+        .expect("event"),
+    );
+    store.ingest(with_event).expect("ingest");
+    store
+        .ingest(span(
+            "buffered",
+            2_000,
+            10,
+            json!({"note": "unflushed lisbon"}),
+        ))
+        .expect("ingest");
+
+    // Nothing is flushed: both spans are in the write buffer, which has no
+    // index at all and must still answer.
+    let found = store
+        .query(&SpanFilter {
+            content: Some("lisbon".to_owned()),
+            ..SpanFilter::default()
+        })
+        .expect("content query");
+    let mut got = ids(&found);
+    got.sort_unstable();
+    assert_eq!(got, ["buffered", "evented"]);
+
+    // An event NAME is searchable too.
+    let by_event = store
+        .query(&SpanFilter {
+            content: Some("tool call".to_owned()),
+            ..SpanFilter::default()
+        })
+        .expect("content query");
+    assert_eq!(ids(&by_event), ["evented"]);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn a_content_query_the_index_cannot_help_with_still_answers() {
+    // Punctuation and non-ASCII tokenize to nothing. The planner must scan
+    // rather than let an empty conjunction admit or reject everything.
+    let (store, dir) = content_store("content-unindexable");
+    store
+        .ingest(span("cjk", 1_000, 10, json!({"note": "世界 hello"})))
+        .expect("ingest");
+    store.flush().expect("flush");
+
+    let unindexable = store
+        .query(&SpanFilter {
+            content: Some("世界".to_owned()),
+            ..SpanFilter::default()
+        })
+        .expect("content query");
+    assert!(
+        unindexable.is_empty(),
+        "no tokens means no match, not every match"
+    );
+
+    // The ASCII word beside it is found normally.
+    let ascii = store
+        .query(&SpanFilter {
+            content: Some("hello".to_owned()),
+            ..SpanFilter::default()
+        })
+        .expect("content query");
+    assert_eq!(ids(&ascii), ["cjk"]);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn content_search_composes_with_the_other_predicates() {
+    let (store, dir) = content_store("content-compose");
+    for index in 0..10u64 {
+        let mut s = span(
+            &format!("s{index}"),
+            1_000 + index * 1_000,
+            10 + index,
+            json!({"note": "refund requested", "tier": if index % 2 == 0 { "gold" } else { "silver" }}),
+        );
+        s.service = format!("svc-{}", index % 3);
+        store.ingest(s).expect("ingest");
+    }
+    store.flush().expect("flush");
+
+    let narrowed = store
+        .query(&SpanFilter {
+            content: Some("refund".to_owned()),
+            attributes: vec![("tier".to_owned(), json!("gold"))],
+            since_ns: Some(3_000),
+            ..SpanFilter::default()
+        })
+        .expect("content query");
+    let mut got = ids(&narrowed);
+    got.sort_unstable();
+    assert_eq!(got, ["s2", "s4", "s6", "s8"]);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn the_content_index_prunes_segments_and_blocks_rather_than_scanning() {
+    // Correctness cannot detect this. A store that ignored the content index
+    // entirely and checked every span by hand returns byte-identical results;
+    // the only difference is how much it read. So the assertions here are on
+    // the counters, and a mutation check confirmed that disabling either the
+    // segment-level or the block-level filter fails them.
+    // Segments must be several BLOCKS wide for block pruning to have anything
+    // to prove: at 200 spans a segment is two blocks, and admitting both
+    // looks the same as admitting one. 2,000 spans is sixteen blocks.
+    let dir = test_dir("content-pruning");
+    let store = Store::open(
+        &dir,
+        Config {
+            durability: traza::Durability::Buffered,
+            compaction: None,
+            flush_spans: 2_000,
+            ..Config::default()
+        },
+    )
+    .expect("opens");
+    let total = 8_000usize;
+    for index in 0..total {
+        let note = if index == 2_500 {
+            "the antidisestablishment clause applies".to_owned()
+        } else {
+            format!("routine completion number {index} about weather and traffic")
+        };
+        store
+            .ingest(span(
+                &format!("s{index}"),
+                1_000 + index as u64,
+                10,
+                json!({ "note": note }),
+            ))
+            .expect("ingest");
+    }
+    store.flush().expect("flush");
+    let segments = store.stats().expect("stats").segment_count;
+    assert!(segments >= 4, "expected several segments, got {segments}");
+
+    let pruned_before = store.metrics().segments_pruned_by_content.get();
+    let admitted_before = store.metrics().records_admitted_by_content.get();
+    let found = store
+        .query(&SpanFilter {
+            content: Some("antidisestablishment".to_owned()),
+            ..SpanFilter::default()
+        })
+        .expect("content query");
+    assert_eq!(ids(&found), ["s2500"], "the answer is still exactly right");
+
+    let pruned = store.metrics().segments_pruned_by_content.get() - pruned_before;
+    let admitted = store.metrics().records_admitted_by_content.get() - admitted_before;
+
+    // The resident summary filter should eliminate nearly every segment
+    // without touching the file.
+    assert!(
+        pruned as usize >= segments - 2,
+        "the summary filter must skip almost every segment: pruned {pruned} of {segments}"
+    );
+    // And within whatever survives, the bit-sliced block filters must narrow
+    // to a block or two rather than admitting the segment whole. A segment is
+    // 2,000 records here, so anything near that means the block filters are
+    // not being consulted.
+    assert!(
+        admitted <= 384,
+        "block filters must narrow to a few blocks, not a whole 2,000-record \
+         segment: {admitted} records admitted out of {total}"
+    );
+    assert!(
+        admitted >= 1,
+        "the block holding the match must be admitted"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn a_saturated_or_absent_content_index_is_slow_and_never_wrong() {
+    // The failure mode that must stay safe: a segment with no content index
+    // at all -- written before v5, or holding no indexable text -- must be
+    // scanned, not skipped. Skipping it would turn content search into a
+    // query that silently returns nothing.
+    let (store, dir) = content_store("content-absent");
+    // Spans whose only text is non-ASCII produce no tokens, so their segments
+    // carry no usable content index.
+    for index in 0..300usize {
+        store
+            .ingest(span(
+                &format!("s{index}"),
+                1_000 + index as u64,
+                10,
+                json!({ "note": format!("世界{index}") }),
+            ))
+            .expect("ingest");
+    }
+    // One span in the same store does carry an indexable word.
+    store
+        .ingest(span("target", 9_000, 10, json!({"note": "findable"})))
+        .expect("ingest");
+    store.flush().expect("flush");
+
+    let found = store
+        .query(&SpanFilter {
+            content: Some("findable".to_owned()),
+            ..SpanFilter::default()
+        })
+        .expect("content query");
+    assert_eq!(ids(&found), ["target"]);
+    let _ = std::fs::remove_dir_all(dir);
+}
