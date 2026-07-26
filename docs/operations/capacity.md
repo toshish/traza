@@ -282,6 +282,73 @@ that existing tuning can be unwound rather than cargo-culted:
 whose key begins with a NUL byte is stored verbatim in the span and skipped by
 the index entirely.
 
+### Content search
+
+`?content=refund` finds spans by the words in their text. It is served by a
+per-segment word filter (segment format v5), and its cost profile is worth
+understanding because it is very good in one regime and does nothing in
+another.
+
+Measured with `cargo run --release --bin content-bench`, which runs the same
+corpus twice — once with the index and once with `--no-content-index` — so the
+comparison is two measurements rather than one measurement and a memory.
+200,000 spans carrying a prompt and a completion of 60 words each, 145 MiB of
+text, 100 segments, no compaction, load average 7-10:
+
+| Query | Matches | With index | Without | Speedup |
+|---|---:|---:|---:|---:|
+| A word in one span | 1 | 1.48 ms | 1,258 ms | **849x** |
+| Two words, one span | 1 | 0.74 ms | 1,156 ms | **1,554x** |
+| A word in ~every span | 195,526 | 1,156 ms | 1,120 ms | 1.0x |
+| A word in no span | 0 | 0.008 ms | 1,163 ms | **146,000x** |
+
+Read the third row as carefully as the first. **When nearly everything
+matches, the index cannot help and does not pretend to** — it costs about 3%
+and saves nothing, because the work is decoding and returning 195,526 spans,
+not finding them. The index buys selectivity; a query with none gets none.
+
+The fourth row is the common case in practice and the cheapest: a word no
+segment holds is rejected from the resident summary filters alone, without
+opening a single file.
+
+**Latency is flat in corpus size, which is the property that matters.** The
+same cells at 50,000 spans measured 0.72 ms for the rare term against 285 ms
+scanning. Four times the corpus took the scan from 285 ms to 1,258 ms and the
+indexed query from 0.72 ms to 1.48 ms.
+
+What it costs:
+
+| | 50,000 spans | 200,000 spans |
+|---|---:|---:|
+| Segment bytes added | +0.1% | +0.1% |
+| Resident filters | 0.05 MiB | 0.20 MiB |
+| Resident per segment | ~2 KiB | ~2 KiB |
+
+**The resident cost scales with segment count, not with text**, because only
+the per-segment summary filter stays in RAM — the per-block filters are read
+from disk a row at a time. It is capped at 32 KiB per segment, so even a store
+with a thousand segments cannot spend more than 32 MiB on it.
+
+**The ingest cost is not resolved by these runs and should not be quoted.**
+The 50,000-span cell measured 0.80 s with the index against 0.62 s without;
+the 200,000-span cell measured 3.26 s against 3.33 s — the opposite sign. Both
+are single runs on a machine at load average 7-10, and the honest reading is
+that seal-time tokenization is somewhere between free and about 30%, which is
+too wide to publish. Re-measure on an idle machine before relying on it.
+
+Two operational signals, both on `/v1/metrics`:
+
+- `traza_segments_pruned_by_content_total` against
+  `traza_segments_examined_total` — how much of the store the summary filters
+  are eliminating. If this goes to zero, content search has degraded to a scan
+  and results will look identical while latency does not.
+- `traza_records_admitted_by_content_total` against the rows actually
+  returned — the block filters' real selectivity. A ratio that climbs means
+  the filters are saturating.
+
+`--no-content-index` turns the index off. Content search still works; it
+scans.
+
 ### What v4 does not fix
 
 **The trace index is still keyed on trace-id text.** It is now the largest

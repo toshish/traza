@@ -1043,8 +1043,17 @@ impl Segment {
     }
 }
 
-/// Encodes records into a complete segment byte stream.
+/// Encodes records into a complete segment byte stream, with a content index.
 pub fn encode(records: &[RecordInput]) -> Result<Vec<u8>, Error> {
+    encode_with(records, true)
+}
+
+/// Encodes records, optionally omitting the content index.
+///
+/// A segment without one is still searchable — it is scanned rather than
+/// skipped — so this trades query latency for seal-time CPU and about 1-2% of
+/// segment size. See `Config::content_index`.
+pub fn encode_with(records: &[RecordInput], content_index: bool) -> Result<Vec<u8>, Error> {
     let mut record_region = Vec::new();
     let mut offsets = Vec::with_capacity(records.len());
     let mut trace_index: BTreeMap<(String, String), Vec<u64>> = BTreeMap::new();
@@ -1090,7 +1099,11 @@ pub fn encode(records: &[RecordInput]) -> Result<Vec<u8>, Error> {
     }
     let trace_region = encode_string_index(&trace_index, false)?;
     let attribute_region = encode_attribute_index(&attribute_keys, &attribute_index)?;
-    let content_region = encode_content_index(records);
+    let content_region = if content_index {
+        encode_content_index(records)
+    } else {
+        encode_content_index(&[])
+    };
 
     let records_offset = HEADER_LEN as u64;
     let offsets_offset = records_offset + record_region.len() as u64;
