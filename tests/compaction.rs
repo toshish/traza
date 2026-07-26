@@ -6,7 +6,7 @@
 //! well as the segment count. A compaction that loses the newest version of a
 //! re-ingested span would be far worse than the slow search it fixes.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
@@ -329,6 +329,55 @@ fn compaction_and_ttl_expiry_coexist() {
 /// A segment big enough that merging it is measurable work rather than an
 /// instant. Compaction is only interesting to the rest of the engine when it
 /// takes long enough to be in the way.
+/// Copies a one-span segment into `dir` under `name`, standing in for an
+/// output a merge had already written when it was interrupted.
+fn stage_output(dir: &Path, name: &str, version: &str) {
+    let staging = test_dir("staging");
+    let helper = Store::open(&staging, tiered(0)).expect("opens");
+    seal(&helper, vec![span("t", "s", version, 1_000)]);
+    drop(helper);
+    let staged = std::fs::read_dir(&staging)
+        .expect("read dir")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "seg"))
+        .expect("staged segment");
+    std::fs::copy(&staged, dir.join(name)).expect("copy");
+    std::fs::remove_dir_all(&staging).expect("cleanup");
+}
+
+fn segment_names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .expect("read dir")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".seg"))
+        .collect();
+    names.sort();
+    names
+}
+
+fn write_journal(dir: &Path, inputs: &[String], outputs: &[&str]) {
+    std::fs::write(
+        dir.join(format!(".supersede.{}.journal", outputs[0])),
+        format!(
+            "inputs {}\noutputs {}\n",
+            inputs.join(","),
+            outputs.join(",")
+        ),
+    )
+    .expect("journal");
+}
+
+fn journals(dir: &Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .expect("read dir")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(".supersede."))
+        .collect()
+}
+
 fn bulky_span(trace: &str, id: &str, start_ns: u64) -> Span {
     serde_json::from_value(json!({
         "trace_id": trace, "span_id": id, "name": "op", "service": "svc",
@@ -472,6 +521,22 @@ fn a_flush_during_a_merge_still_supersedes_merged_content() {
             hot.iter().all(|span| span.name == "new"),
             "the flush is newer than the merge and must win: {:?}",
             hot.iter().map(|span| &span.name).collect::<Vec<_>>()
+        );
+        // Whichever way the race went, the directory holds exactly the live
+        // segments and no journal. A merge that abandons publication has to
+        // take its outputs back off disk before dropping the journal that
+        // describes them — an orphan output outranks every input by id, so
+        // one left behind would be loaded at the next open and shadow them.
+        let on_disk = segment_names(&dir).len();
+        assert_eq!(
+            on_disk,
+            store.stats().expect("stats").segment_count,
+            "an abandoned merge left an output behind"
+        );
+        assert!(
+            journals(&dir).is_empty(),
+            "journals must be cleared: {:?}",
+            journals(&dir)
         );
         drop(store);
         std::fs::remove_dir_all(&dir).expect("cleanup");
@@ -663,46 +728,22 @@ fn a_half_written_output_group_is_rolled_back_on_reopen() {
     for round in 0..4u64 {
         seal(&store, vec![span("t", "s", &format!("v{round}"), 1_000)]);
     }
-    let inputs: Vec<String> = std::fs::read_dir(&dir)
-        .expect("read dir")
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .filter(|name| name.ends_with(".seg"))
-        .collect();
+    let inputs = segment_names(&dir);
     assert_eq!(inputs.len(), 4);
     drop(store);
 
-    // Stage the wreckage of a crash midway through publishing a two-output
-    // group: the first output landed, the second never did, and every input
-    // is still on disk because a merge deletes those last. The stand-in
-    // output holds the STALE version, which is what a first group would hold.
-    let survivor = "segment-00000000000000000099.seg";
+    // The wreckage of a crash midway through publishing a two-output group:
+    // the first output landed, the second never did, and EVERY input is still
+    // on disk because a merge deletes those last. The stand-in output holds
+    // the stale version, which is what a first group would hold.
+    let landed = "segment-00000000000000000099.seg";
     let missing = "segment-00000000000000000100.seg";
-    {
-        let staging = test_dir("rollback-src");
-        let helper = Store::open(&staging, tiered(0)).expect("opens");
-        seal(&helper, vec![span("t", "s", "v0", 1_000)]);
-        drop(helper);
-        let staged = std::fs::read_dir(&staging)
-            .expect("read dir")
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.path())
-            .find(|path| path.extension().is_some_and(|ext| ext == "seg"))
-            .expect("staged segment");
-        std::fs::copy(&staged, dir.join(survivor)).expect("copy");
-        std::fs::remove_dir_all(&staging).expect("cleanup");
-    }
-    for input in &inputs {
-        std::fs::write(
-            dir.join(format!(".supersede.{input}.journal")),
-            format!("{input} -> {survivor},{missing}\n"),
-        )
-        .expect("marker");
-    }
+    stage_output(&dir, landed, "v0");
+    write_journal(&dir, &inputs, &[landed, missing]);
 
     let store = Store::open(&dir, tiered(0)).expect("reopens");
     assert!(
-        !dir.join(survivor).exists(),
+        !dir.join(landed).exists(),
         "the output that landed must be rolled back, not kept"
     );
     let trace = store.get_trace("t").expect("trace");
@@ -711,58 +752,87 @@ fn a_half_written_output_group_is_rolled_back_on_reopen() {
         trace[0].name, "v3",
         "the inputs stay authoritative, so the newest version still wins"
     );
-
-    let leftovers: Vec<String> = std::fs::read_dir(&dir)
-        .expect("read dir")
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .filter(|name| name.starts_with(".supersede."))
-        .collect();
     assert!(
-        leftovers.is_empty(),
-        "markers must be cleared: {leftovers:?}"
+        journals(&dir).is_empty(),
+        "journals must be cleared: {:?}",
+        journals(&dir)
     );
 }
 
 #[test]
-fn a_stale_marker_does_not_roll_back_a_merge_that_committed() {
-    // The one way the rollback branch could destroy data: a marker outlives
-    // the merge it describes, a later merge consumes one of its outputs, and
-    // recovery reads the gap as a half-written group and deletes the rest —
-    // which are live. A merge deletes its inputs only once every output is
-    // durable, so the input's absence proves this merge committed, and that
-    // is what withholds the rollback.
-    let dir = test_dir("stale-marker");
+fn a_merge_whose_input_deletion_had_started_rolls_forward() {
+    // The state a failed unlink leaves. Publication succeeded, so every
+    // output was durable; deleting the inputs then failed partway, the error
+    // was logged and the server kept running, and a later merge consumed one
+    // of the outputs. On reopen one input is gone and one output is missing.
+    //
+    // Deciding that per input would read the surviving input as "nothing was
+    // deleted yet" and roll back — deleting live outputs that hold the only
+    // copy of the input already removed. An input already gone is proof of
+    // the opposite, and it is a fact about the group, not about any one file.
+    let dir = test_dir("roll-forward");
+    let store = Store::open(&dir, tiered(0)).expect("opens");
+    seal(&store, vec![span("trace-a", "s", "kept-a", 1_000)]);
+    seal(&store, vec![span("trace-b", "s", "kept-b", 2_000)]);
+    let inputs = segment_names(&dir);
+    assert_eq!(inputs.len(), 2);
+    drop(store);
+
+    // Input A was unlinked, input B was not. Output 1 survives; output 2 has
+    // since been consumed by a later merge, whose own output carries its data
+    // — represented here by A's spans living on in the surviving output.
+    let survived = "segment-00000000000000000099.seg";
+    let consumed = "segment-00000000000000000100.seg";
+    stage_output(&dir, survived, "merged");
+    std::fs::remove_file(dir.join(&inputs[0])).expect("unlink A");
+    write_journal(&dir, &inputs, &[survived, consumed]);
+
+    let store = Store::open(&dir, tiered(0)).expect("reopens");
+    assert!(
+        dir.join(survived).exists(),
+        "a live output must not be rolled back once deletion had started"
+    );
+    assert!(
+        !dir.join(&inputs[1]).exists(),
+        "the deletion resumes instead: input B is finished off"
+    );
+    let trace = store.get_trace("t").expect("trace");
+    assert_eq!(trace.len(), 1, "the surviving output's data is intact");
+    assert_eq!(trace[0].name, "merged");
+    assert!(
+        journals(&dir).is_empty(),
+        "journals must be cleared: {:?}",
+        journals(&dir)
+    );
+}
+
+#[test]
+fn a_stale_journal_does_not_roll_back_a_merge_that_committed() {
+    // A journal that outlives the merge it describes, after a later merge
+    // consumed one of its outputs. Every input it names is gone, which is
+    // what tells recovery the merge committed and its outputs are live.
+    let dir = test_dir("stale-journal");
     let store = Store::open(&dir, tiered(0)).expect("opens");
     for round in 0..4u64 {
         seal(&store, vec![span("t", "s", &format!("v{round}"), 1_000)]);
     }
     store.compact_segments().expect("compacts");
-    let live: Vec<String> = std::fs::read_dir(&dir)
-        .expect("read dir")
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .filter(|name| name.ends_with(".seg"))
-        .collect();
+    let live = segment_names(&dir);
     assert_eq!(live.len(), 1, "the merge committed: {live:?}");
     drop(store);
 
-    // A marker left behind by that merge, naming its output plus one a later
-    // merge has since consumed. Its input is gone, as a committed merge
-    // leaves things.
-    std::fs::write(
-        dir.join(".supersede.segment-00000000000000000000.seg.journal"),
-        format!(
-            "segment-00000000000000000000.seg -> {},segment-00000000000000009999.seg\n",
-            live[0]
-        ),
-    )
-    .expect("marker");
+    let inputs: Vec<String> = (0..4).map(|id| format!("segment-{id:020}.seg")).collect();
+    assert!(inputs.iter().all(|name| !dir.join(name).exists()));
+    write_journal(
+        &dir,
+        &inputs,
+        &[&live[0], "segment-00000000000000009999.seg"],
+    );
 
     let store = Store::open(&dir, tiered(0)).expect("reopens");
     assert!(
         dir.join(&live[0]).exists(),
-        "a live output must survive a stale marker"
+        "a live output must survive a stale journal"
     );
     let trace = store.get_trace("t").expect("trace");
     assert_eq!(trace.len(), 1);
