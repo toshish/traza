@@ -200,6 +200,15 @@ left beside intact inputs would therefore shadow a newer version living in a
 group whose output never landed. A partial group is not a smaller correct
 merge; it is a wrong one.
 
+**Proven by SIGKILL, not only by staged files.**
+`a_crash_during_a_grouped_merge_recovers_exactly` in
+[`tests/durability.rs`](../../tests/durability.rs) kills the server inside a
+real merge — it waits for the journal to appear rather than timing a guess,
+and each attempt waits a little longer so the kill lands before the first
+output, among them, and past them. Recovery then has to bring back every
+acknowledged batch whole and resolve hot keys to a version no older than the
+last one acknowledged.
+
 **Why one journal and not one per input.** Which way to finish an interrupted
 merge is a fact about the whole group. A journal that saw a single input could
 not tell "nothing was deleted yet" from "deletion had started" — opposite
