@@ -25,17 +25,41 @@ Run a server beside `npm run dev` for live data:
 
 ## Shape
 
-- `src/styles.css` — design tokens (paper/dark themes, type, space) + base.
-- `src/components/` — the design-system port: primitives, data, trace,
-  charts, feedback. Keep these faithful to the design project; app-specific
-  composition belongs in views.
-- `src/views/` — Spans, Trace, Sessions, Analytics, Store.
-- `src/lib/` — API client (bearer token in sessionStorage, 401 → token
-  prompt), formatting, span-tree helpers.
-- Routing is hash-based (`#/spans`, `#/traces/<id>`, …), so the app works from
+- `src/styles.css` — design tokens (paper/dark themes, type, space, the
+  measured ramp and categorical ladder, density) + base.
+- `src/components/`
+  - `primitives/Chrome.jsx` — Card, Chip, Eyebrow, Kbd, Figure, LoadingBar,
+    empty and error states. The small surfaces every screen is built from.
+  - `charts/Marks.jsx` — the drawn marks: sparklines, volume brush,
+    distribution with percentile marks, time ruler and axis, share bar.
+  - `nav/` — the rail, the header, the command palette.
+  - `data/`, `trace/` — attribute tree, code block, message list.
+- `src/views/` — one file per screen, seventeen of them.
+- `src/lib/`
+  - `api.js` — API client. Bearer token in sessionStorage, 401 → token prompt.
+    Reads take an `AbortSignal`, identical in-flight GETs are coalesced, and
+    paging uses the server's cursor.
+  - `query.js` — **the query as a value.** Predicates serialize into the hash
+    route, out of it, into API parameters and into curl. Sharing, saved views,
+    "copy as curl" and the matching export all fall out of that one
+    representation.
+  - `route.js` — hash routing, `useRead` (aborts the superseded request),
+    `usePoll` (stops in a background tab), `useKeys`, `useStored`.
+  - `format.js`, `spans.js` — formatting, span-tree and critical-path helpers.
+- Routing is hash-based (`#/traces`, `#/trace/<id>`, …), so the app works from
   any static host without server-side route rewrites.
 
 Design rules that reviewers hold the line on: one accent (terracotta),
-reserved for measured values; mono + `tabular-nums` for every figure; flat
-surfaces with hairline borders; no spinners (the loading bar), no emoji,
-no exclamation marks in copy.
+reserved for measured values — the `--measure-*` ramp is more of that one hue,
+never a second; comparisons use the ink ladder (`--series-*`). Mono +
+`tabular-nums` for every figure; flat surfaces with hairline borders; no
+spinners (the loading bar), no emoji, no exclamation marks in copy.
+
+Two rules specific to this rebuild:
+
+- **A percentile is never reported as a mean.** Where the API gives both, the
+  screen shows the percentile; where it gives a bucketed percentile, the screen
+  states the error bound rather than implying exactness.
+- **A number that can be clicked, is.** Every count links to the rows behind
+  it; a red error count that goes nowhere is the thing this rebuild set out to
+  remove.

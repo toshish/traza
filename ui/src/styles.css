@@ -27,6 +27,18 @@
      that sit on paper without shouting. */
   --syn-keyword: #7A4A78; --syn-string: #3F6E4A; --syn-number: #9A6B1F;
   --syn-comment: #A39B8F; --syn-property: #3A5F8A; --syn-punct: #6E675E;
+  /* Measured ramp: five steps from tint to accent-hover, for density in
+     histograms and heatmaps. Still ONE hue — it is the same measurement,
+     more of it — so the "one accent, reserved for measured things" rule
+     holds. A second hue would make density read as a second meaning. */
+  --measure-1: #F5E3DA; --measure-2: #E8B9A3; --measure-3: #D88C68;
+  --measure-4: #C65D3B; --measure-5: #A84B2D;
+  /* Categorical ladder: comparing five series needs five distinguishable
+     marks without inventing five hues. Ink at four opacities, plus the
+     accent for whichever series is in focus. */
+  --series-focus: var(--accent);
+  --series-1: rgba(31, 27, 23, 0.70); --series-2: rgba(31, 27, 23, 0.50);
+  --series-3: rgba(31, 27, 23, 0.32); --series-4: rgba(31, 27, 23, 0.18);
 }
 [data-theme="dark"] {
   --bg: #191512; --bg-raised: #211D19; --bg-sunken: #131009;
@@ -38,6 +50,10 @@
   --series-compare: rgba(237, 231, 221, 0.4);
   --syn-keyword: #C79BC4; --syn-string: #8FBF9B; --syn-number: #D9AE6A;
   --syn-comment: #6B645A; --syn-property: #89B4DE; --syn-punct: #9C9489;
+  --measure-1: #3A251C; --measure-2: #7A3F29; --measure-3: #B0603D;
+  --measure-4: #E07A52; --measure-5: #E98F6B;
+  --series-1: rgba(237, 231, 221, 0.70); --series-2: rgba(237, 231, 221, 0.50);
+  --series-3: rgba(237, 231, 221, 0.32); --series-4: rgba(237, 231, 221, 0.18);
 }
 
 /* ------------------------------------------------ typography tokens */
@@ -62,11 +78,21 @@
   --radius-control: 3px; --radius-card: 6px; --radius-bar: 1.5px;
   --border-hairline: 1px solid var(--hairline);
   --focus-ring: 2px solid var(--accent); --focus-offset: 1px;
-  --row-comfortable: 40px; --row-dense: 28px;
+  --row-comfortable: 40px; --row-dense: 28px; --row-compact: 24px;
+  --rail-width: 212px; --rail-width-collapsed: 52px;
   --dur-fast: 120ms;
   --dur-base: 160ms;
   --ease-out: cubic-bezier(0, 0, 0.2, 1);
 }
+
+/* Density is a document-level choice, not a per-table prop: a dense table
+   beside a comfortable one is the thing that makes a dashboard feel
+   assembled rather than designed. Rows read these three. */
+[data-density="comfortable"] { --row-h: 34px; --row-py: 7px; --cell-fs: 13px; }
+[data-density="dense"] { --row-h: 26px; --row-py: 3px; --cell-fs: 12px; }
+
+@keyframes tzload { 0% { left: -30%; } 100% { left: 100%; } }
+@keyframes tzpulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
 
 /* ------------------------------------------------ base */
 * { box-sizing: border-box; }
