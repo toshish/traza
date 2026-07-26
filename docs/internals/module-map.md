@@ -23,9 +23,12 @@ It owns:
 - the ingest path (`ingest`, `ingest_batch`, `admit`) and the acknowledgement
   ordering;
 - flushing and segment writing (`flush_locked`, `write_segment`);
-- every read path (`get_trace`, `query`, `query_after`, `stats`);
+- every read path (`get_trace`, `query`, `query_after`, `stats`), the pinned
+  `SnapshotView` a multi-page read pages through, and the resolution both share
+  (`query_view`, `attribute_union_view`);
 - compaction (`compact_segments`, `merge_tail_run`), TTL expiry
-  (`compact_expired`, `expire_before`), and the supersede journal;
+  (`compact_expired`, `expire_before`), the maintenance lock that serializes
+  them, and the supersede journal;
 - the single-writer directory lock, including stale-lock reclamation;
 - span↔record conversion and the reserved index keys.
 
@@ -42,10 +45,15 @@ retained. Byte layout: [segment format](../segment-format.md).
 ### [`src/wal.rs`](../../src/wal.rs)
 
 The write-ahead log with group commit. Framing is
-`[u32 length][u32 crc32][payload]`, the payload being one batch's JSON. Replay
-stops at the first short or corrupt frame, so a torn tail is discarded and
-never interpreted. The fsync runs outside the state lock so concurrent batches
-coalesce into one sync; a waiter wakes when some sync has covered its LSN.
+`[u32 length][u32 crc32][payload]`, the payload being one batch's JSON.
+Recovery streams frames one at a time and distinguishes a torn tail (bytes the
+frame declared are missing — dropped, and the file truncated back to the last
+good frame) from interior damage (a complete frame that fails its checksum or
+decode — refuses to open, because frames after it may be acknowledged batches).
+`rewrite` replaces the log with a given set of spans, which is how retention
+deletes from the recovery authority rather than only from memory. The fsync
+runs outside the state lock so concurrent batches coalesce into one sync; a
+waiter wakes when some sync has covered its LSN.
 
 Also the authoritative statement of the **macOS `fsync` caveat** — see
 [durability](../operations/durability.md).

@@ -5,6 +5,106 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Four defects from an independent review of v0.17, fixed and tested. They are
+symptoms of one gap — Traza has several recovery domains and nothing names a
+state they all agree on — so the class fix is designed too, and scheduled
+before 1.0 rather than as part of HA:
+[docs/generations-design.md](docs/generations-design.md).
+
+### Fixed
+
+- **TTL-expired spans came back after a restart.** Expiry removed them from the
+  write buffer and left the write-ahead log records that carried them intact,
+  so recovery replayed the expired span and `record_count` went back up.
+  Expiry now rewrites the log to exactly the spans that survived — staged and
+  renamed, because the survivors are still acknowledged and must not be lost to
+  a crash mid-rewrite. The expired bytes leave the disk in that pass rather than
+  being marked dead, which is also what "deleted on request" has to mean.
+- **Damage in the middle of the write-ahead log silently dropped acknowledged
+  batches.** Replay stopped at the first length, CRC or JSON failure and
+  returned everything before it as if that were the whole log: three fsynced
+  frames with a corrupt second one recovered as one, and the third vanished
+  without a word. Recovery now distinguishes the two cases. A frame missing
+  bytes it declared can only be the interrupted final append — it is dropped,
+  and the file is truncated back to the last complete frame so those bytes
+  cannot become interior bytes after the next append. A frame that is complete
+  but fails its checksum or decode fails the open, naming the byte offset and
+  what moving the log aside would cost. See
+  [when the log will not open](docs/operations/durability.md#when-the-log-will-not-open).
+- **A concurrent export was not one dataset.** `GET /v1/export` ran an
+  independent query per 4,096-row page, so a span re-ingested behind the cursor
+  was emitted twice — 5,001 rows and two versions of one primary key, under
+  `X-Traza-Export-Complete: true`. Export now pins a `SnapshotView` and pages
+  that: the write buffer is copied and the segment set is reference-counted, so
+  compaction and expiry may unlink files the export is still reading and the
+  space returns when it finishes. `complete: true` now means "this is the whole
+  dataset as of the first byte", each primary key appearing at most once.
+- **Hot-key updates grew the log without bound.** The automatic flush threshold
+  counted unique buffered records, which an update to an existing key never
+  advances: with `--flush-spans 2`, 500 acknowledged updates to one key left
+  `buffered_records: 1`, `segment_count: 0` and a log of 108 KB that would never
+  seal. `--flush-spans` now applies to upserts since the last seal as well as to
+  unique records, and a new `--flush-wal-bytes` (default 64 MiB) bounds the log
+  directly. Recovery also streams frames instead of reading the whole log into
+  memory.
+- **A failed expiry was not retryable, and resurrected spans.** Expiry mutated
+  memory before the durable change it corresponded to: it dropped the span from
+  the write buffer before the log rewrite succeeded, and removed a fully
+  expired segment from the live list before unlinking its file. Either failure
+  left memory ahead of the recovery authority — and left nothing for the retry
+  to find, so the next pass reported `Ok(0)`, never repaired the log or the
+  file, and the restart brought the data back. Both now change durable state
+  first and memory second, with the in-memory step infallible, so a failed
+  expiry leaves the store exactly as retryable as it found it. `Wal::rewrite`
+  additionally moves every fallible step before its rename, so its failure is
+  never ambiguous about which log is live.
+- **A deleted segment file was reported gone before the deletion was durable.**
+  An unlink is visible immediately but survives a crash only once the directory
+  entry it removed is synced, so expiry could report a segment deleted — and
+  drop it from the live list — over a file a crash would bring back, spans and
+  all. Expiry and compaction now sync the directory after unlinking and before
+  anything downstream depends on it, and the unlink is idempotent so a retry
+  after a partial one can finish instead of failing forever on `NotFound`.
+- **Retention rewrote segments under a new id**, which moved them to the newest
+  position in an order that *is* recency order — so after a partial expiry a
+  re-ingested span could revert to an older version held by the rewritten
+  segment. The survivors are renamed onto the same name now, keeping the
+  segment's place. Found while fixing the above.
+
+### Changed
+
+- **Compaction and retention no longer stop the server.** Both held the segment
+  lock across parsing every input, materializing the result and fsyncing it;
+  queries waited on that lock while holding the writer lock, so ingest queued
+  behind the queries. A merge measured in gigabytes was an outage measured in
+  gigabytes. Both now pin their inputs, do every byte of I/O with no engine lock
+  held, and take the lock back only to publish — after re-checking that what
+  they pinned is still there. A new maintenance lock serializes the two against
+  each other, and only against each other. `tests/compaction.rs` measures it:
+  the slowest read or ingest during a merge must be a fraction of the merge.
+  What this buys is that reads and ingest no longer *wait* on maintenance; they
+  still share CPU and disk with it, and that contention remains unmeasured.
+- **`Store::snapshot`** is public API, returning a `SnapshotView` that answers
+  from one pinned instant however the store changes afterwards. Any multi-step
+  read should use it; a lock cannot span pages.
+- **`Error::WalCorrupt`** is a new variant, for the refusal above.
+- **`Config::flush_wal_bytes`** is a new field (`Some(64 MiB)` by default). A
+  `Config` built by struct literal needs it; `..Config::default()` does not.
+  Documented in the library `Config` table alongside the server flag.
+- **The generations design carries the log inside the boundary.** `CURRENT` and
+  a global `wal.log` are two recovery authorities that no rename can publish
+  together, so the design now stamps every frame with the generation epoch it
+  belongs to, records `folded_through` in the manifest, and replays only frames
+  after it. Publishing `CURRENT` is staged, renamed and **directory-fsynced
+  before a single folded frame is reclaimed** — a rename is not crash-durable
+  until then, and a durable log reclamation against a `CURRENT` that rolls back
+  is the one combination that loses acknowledged writes. The crash matrix
+  covers both sides of that fsync, and reclaiming folded frames is described as
+  the roll-over it has to be: they are a prefix, and truncation only removes a
+  suffix.
+
 ## [0.18.0] - 2026-07-25
 
 Search stops answering real questions with silence, and gains the predicates

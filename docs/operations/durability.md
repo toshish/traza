@@ -115,11 +115,16 @@ Recovery is **ordered**, and it follows journals rather than content.
 - **Log records replay in append order** and are upserted in that order, so a
   re-ingested span recovers as its newest version — exactly as last-write-wins
   had it before the crash.
-- **A torn or corrupt trailing record is discarded.** Frames carry a length and
-  a CRC32; replay stops at the first short or corrupt frame and keeps
-  everything before it. Trailing garbage is never interpreted. Discarding is
-  correct: that record had not been acknowledged, because the acknowledgement
-  follows the fsync.
+- **A torn trailing record is discarded; interior damage refuses to start.**
+  Frames carry a length and a CRC32. A frame missing bytes it declared can only
+  be the append the crash interrupted — it was never acknowledged, because the
+  acknowledgement follows the fsync — so it is dropped, and the log is
+  truncated back to the last complete frame so the garbage cannot end up in the
+  middle later. A frame that is *complete* but fails its checksum or its decode
+  is different in kind: frames after it may be perfectly good acknowledged
+  batches, and resuming from the prefix would discard them without a word. The
+  store refuses to open instead, naming the byte offset. See
+  [when the log will not open](#when-the-log-will-not-open).
 - **Segments appear atomically.** Write to a temp file, fsync the file, rename
   into place, fsync the directory. A reader sees a complete segment or no
   segment.
@@ -135,6 +140,44 @@ Recovery is **ordered**, and it follows journals rather than content.
 - **A stale directory lock is reclaimed.** A lock naming a PID that verifiably
   no longer exists does not wedge the store; a live owner still rejects the
   open.
+
+- **Retention deletes from the log too.** Expiring a buffered span rewrites
+  the log to exactly the spans that survived, so a restart cannot replay what
+  TTL removed and the expired bytes leave the disk in that pass.
+
+## When the log will not open
+
+A store whose `wal.log` is damaged anywhere but its final append refuses to
+start:
+
+```
+traza-server: write-ahead log is corrupt: the frame at byte 4096 of wal.log is
+complete but fails its checksum. This is not an interrupted final append, so
+frames after it may be acknowledged batches that resuming would drop silently.
+Recover or move wal.log aside deliberately — moving it aside discards every
+acknowledged batch not yet sealed into a segment
+```
+
+This is a deliberate stop, not a bug. What it is telling you is that the log
+cannot be resumed without a decision only you can make, and it is refusing to
+make that decision by silently losing data.
+
+What to do, in order:
+
+1. **Take a copy of the whole data directory** before touching anything.
+2. **Check the hardware.** Interior damage in a file that is only ever appended
+   to and fsynced is not something the store can cause. Look for storage
+   errors, a bad volume, or a filesystem that lost writes on a power cut.
+3. **Restore from backup** if you have one — the segments plus a matching log
+   is the complete state.
+4. **If you must start now**, move `wal.log` aside. The store opens on its
+   segments alone, and you lose every acknowledged batch that had not yet been
+   sealed into a segment — bounded by `--flush-spans` and `--flush-wal-bytes`.
+   Keep the file: it is evidence, and the frames after the damage are usually
+   still readable by hand.
+
+`--durability buffered` ignores the log entirely and will open regardless. That
+is not a workaround: it discards the log's contents on the next flush.
 
 ## Choosing a mode
 
@@ -175,6 +218,13 @@ truncate the log — it narrows the window but does not eliminate it.
 Restore is a directory copy into place with **no server running against it**.
 Remember the single-writer rule: never point two processes at one directory,
 including a backup agent that writes.
+
+**A logical alternative, live.** `GET /v1/export` pins the store when it starts
+and streams that one state, so a hot export is a self-consistent logical
+dataset — every span exactly once, as of the instant the export began — with
+the server still serving. It is not a substitute for a physical backup: it
+carries spans, not annotations, payload files, or the log. Use it to move a
+dataset, not to restore a node.
 
 ## See also
 

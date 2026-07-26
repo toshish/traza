@@ -260,6 +260,17 @@ means the stream failed *after* its `200` response had begun — the only way to
 signal that, since the status line is long gone. `X-Traza-Export-Count` is the
 number of rows actually emitted and can be cross-checked.
 
+**An export is a snapshot.** The store is pinned when the export starts, and
+every page comes from that one state. Spans ingested, replaced, or expired
+while the stream is running do not appear and do not change what does: the
+output is exactly the dataset that existed at the first byte, with each
+primary key appearing at most once. `complete: true` therefore means "this is
+that whole dataset", not merely "the connection ended tidily".
+
+A pinned export holds the segment files it is reading, so compaction and
+retention cannot reclaim their disk space until it finishes. Exporting a large
+store over a slow connection delays reclamation for as long as it runs.
+
 This route always closes its connection.
 
 ```sh

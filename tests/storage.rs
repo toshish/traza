@@ -77,6 +77,7 @@ fn buffer_flush_persists_sorted_batches() {
             durability: traza::Durability::Buffered,
             compaction: None,
             wal_commit_window: None,
+            flush_wal_bytes: None,
         },
     )
     .expect("open store");
@@ -129,6 +130,7 @@ fn crash_recovery_preserves_flushed_spans() {
                 durability: traza::Durability::Buffered,
                 compaction: None,
                 wal_commit_window: None,
+                flush_wal_bytes: None,
             },
         )
         .expect("open initial store");
@@ -169,6 +171,7 @@ fn crash_recovery_preserves_flushed_spans() {
             durability: traza::Durability::Buffered,
             compaction: None,
             wal_commit_window: None,
+            flush_wal_bytes: None,
         },
     )
     .expect("reopen store after dropping unflushed data");
@@ -286,6 +289,7 @@ fn randomized_filters_match_naive_reference() {
             durability: traza::Durability::Buffered,
             compaction: None,
             wal_commit_window: None,
+            flush_wal_bytes: None,
         },
     )
     .expect("open store");
@@ -377,6 +381,7 @@ fn ttl_compaction_drops_expired_segments() {
             durability: traza::Durability::Buffered,
             compaction: None,
             wal_commit_window: None,
+            flush_wal_bytes: None,
         },
     )
     .expect("open store");
@@ -483,6 +488,7 @@ fn lock_order_no_deadlock() {
                 durability: traza::Durability::Buffered,
                 compaction: None,
                 wal_commit_window: None,
+                flush_wal_bytes: None,
             },
         )
         .expect("open store"),
@@ -540,6 +546,7 @@ fn reads_never_miss_committed_spans() {
                 durability: traza::Durability::Buffered,
                 compaction: None,
                 wal_commit_window: None,
+                flush_wal_bytes: None,
             },
         )
         .expect("open store"),
@@ -611,6 +618,7 @@ fn stale_temp_does_not_wedge_flush() {
             durability: traza::Durability::Buffered,
             compaction: None,
             wal_commit_window: None,
+            flush_wal_bytes: None,
         },
     )
     .expect("recover store with stale temp");
@@ -667,6 +675,7 @@ fn second_open_is_rejected() {
         durability: traza::Durability::Buffered,
         compaction: None,
         wal_commit_window: None,
+        flush_wal_bytes: None,
     };
     let first = Store::open(&dir, config.clone()).expect("open first store");
     let second = Store::open(&dir, config.clone());
@@ -1156,4 +1165,514 @@ fn file_backed_segments_hold_no_resident_payload() {
         })
         .expect("limited filter");
     assert_eq!(filtered.len(), 50, "index-served reads work file-backed");
+}
+
+/// A store whose acknowledgements are backed by the log, with a threshold high
+/// enough that nothing seals unless the test asks for it.
+fn wal_config(flush_spans: usize) -> Config {
+    Config {
+        flush_spans,
+        durability: traza::Durability::Wal,
+        compaction: None,
+        ..Config::default()
+    }
+}
+
+#[test]
+fn ttl_expiry_reaches_the_write_ahead_log() {
+    // Found in review: expiry removed spans from the write buffer and left the
+    // log records that carried them in place, so a restart replayed the
+    // expired span and it came back. Retention a restart undoes is not
+    // retention, and telemetry deleted on request must not be recoverable
+    // from the log.
+    let dir = correctness_test_dir("ttl-wal");
+    let store = Store::open(&dir, wal_config(100_000)).expect("opens");
+    store
+        .ingest(span("t-old", "expired".into(), 1_000, 10))
+        .expect("acknowledged in wal mode");
+    store
+        .ingest(span("t-new", "survivor".into(), 9_000, 10))
+        .expect("acknowledged in wal mode");
+    let before = store.stats().expect("stats");
+    assert_eq!(before.buffered_records, 2);
+    assert!(before.wal_bytes > 0, "both spans are in the log");
+
+    assert_eq!(store.expire_before(5_000).expect("expires"), 1);
+    let after = store.stats().expect("stats");
+    assert_eq!(after.buffered_records, 1);
+    assert!(
+        after.wal_bytes > 0 && after.wal_bytes < before.wal_bytes,
+        "the log is rewritten to the survivors, not left holding the expired \
+         span: {before:?} -> {after:?}"
+    );
+    drop(store);
+
+    let reopened = Store::open(&dir, wal_config(100_000)).expect("reopens");
+    let ids = queried_ids(&reopened, &SpanFilter::default());
+    assert_eq!(
+        ids,
+        vec!["survivor".to_owned()],
+        "the expired span must not come back across a restart"
+    );
+    assert_eq!(reopened.stats().expect("stats").buffered_records, 1);
+    drop(reopened);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn expiring_everything_empties_the_log() {
+    let dir = correctness_test_dir("ttl-wal-empty");
+    let store = Store::open(&dir, wal_config(100_000)).expect("opens");
+    store
+        .ingest(span("t-old", "expired".into(), 1_000, 10))
+        .expect("ingest");
+    assert_eq!(store.expire_before(5_000).expect("expires"), 1);
+    assert_eq!(
+        store.stats().expect("stats").wal_bytes,
+        0,
+        "nothing survived, so nothing is left to replay"
+    );
+    drop(store);
+
+    let reopened = Store::open(&dir, wal_config(100_000)).expect("reopens");
+    assert!(queried_ids(&reopened, &SpanFilter::default()).is_empty());
+    drop(reopened);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_damaged_interior_log_frame_refuses_to_open() {
+    // Found in review: replay stopped at the first bad frame and reported
+    // success, so three acknowledged batches with damage in the second came
+    // back as one — the third vanished without a word. Interior damage is not
+    // a torn tail and must not be resolved by guessing.
+    let dir = correctness_test_dir("wal-interior");
+    let store = Store::open(&dir, wal_config(100_000)).expect("opens");
+    for (index, id) in ["one", "two", "three"].iter().enumerate() {
+        store
+            .ingest(span("t", (*id).to_owned(), 1_000 + index as u64, 10))
+            .expect("acknowledged");
+    }
+    drop(store);
+
+    // Corrupt a payload byte in the SECOND of the three frames. Every byte the
+    // frame declared is present, so this cannot be an interrupted append.
+    let log = dir.join("wal.log");
+    let mut bytes = fs::read(&log).expect("read log");
+    let first_frame = 8 + u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+    let target = first_frame + 10;
+    bytes[target] ^= 0xFF;
+    fs::write(&log, &bytes).expect("write log");
+
+    match Store::open(&dir, wal_config(100_000)) {
+        Err(Error::WalCorrupt(message)) => {
+            assert!(
+                message.contains("wal.log"),
+                "the operator is told which file: {message}"
+            );
+        }
+        Ok(_) => panic!("opening must not silently drop the batches after the damage"),
+        Err(other) => panic!("expected a corruption error, got {other}"),
+    }
+
+    // Moving the log aside is the deliberate, lossy escape hatch.
+    fs::rename(&log, dir.join("wal.log.quarantine")).expect("quarantine");
+    let store = Store::open(&dir, wal_config(100_000)).expect("opens without the log");
+    assert!(queried_ids(&store, &SpanFilter::default()).is_empty());
+    drop(store);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn repeated_updates_to_one_key_still_reach_a_flush() {
+    // Found in review: the flush threshold counted unique buffered records, so
+    // a workload updating one key never reached it — the buffer stayed at one
+    // record while the log grew with every acknowledged write, without bound.
+    let dir = correctness_test_dir("hot-key");
+    let store = Store::open(&dir, wal_config(8)).expect("opens");
+    for round in 0..500u64 {
+        let mut hot = span("t-hot", "hot".into(), 1_000, 10);
+        hot.attributes
+            .insert("round".to_owned(), Value::from(round));
+        store.ingest(hot).expect("acknowledged");
+    }
+
+    let stats = store.stats().expect("stats");
+    assert!(
+        stats.segment_count > 0,
+        "updates are work and must seal: {stats:?}"
+    );
+    assert!(
+        stats.wal_bytes < 8_000,
+        "the log holds at most a threshold's worth of updates: {stats:?}"
+    );
+
+    // Bounding the log must not cost the answer.
+    let spans = store.get_trace("t-hot").expect("trace");
+    assert_eq!(spans.len(), 1, "one key, one span: {spans:?}");
+    assert_eq!(spans[0].attributes["round"], Value::from(499u64));
+    drop(store);
+
+    let reopened = Store::open(&dir, wal_config(8)).expect("reopens");
+    let spans = reopened.get_trace("t-hot").expect("trace");
+    assert_eq!(spans.len(), 1);
+    assert_eq!(
+        spans[0].attributes["round"],
+        Value::from(499u64),
+        "the newest version survives the seal and the restart"
+    );
+    drop(reopened);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_log_byte_bound_seals_even_without_the_record_bound() {
+    let dir = correctness_test_dir("wal-bytes");
+    let store = Store::open(
+        &dir,
+        Config {
+            // Unreachable record bounds: the byte bound is the only one left.
+            flush_spans: 1_000_000,
+            flush_wal_bytes: Some(16 * 1024),
+            durability: traza::Durability::Wal,
+            compaction: None,
+            ..Config::default()
+        },
+    )
+    .expect("opens");
+    for index in 0..400u64 {
+        store
+            .ingest(span("t-bytes", format!("s{index}"), 1_000 + index, 10))
+            .expect("acknowledged");
+    }
+    let stats = store.stats().expect("stats");
+    assert!(
+        stats.segment_count > 0 && stats.wal_bytes < 32 * 1024,
+        "the byte bound seals on its own: {stats:?}"
+    );
+    assert_eq!(
+        store.get_trace("t-bytes").expect("trace").len(),
+        400,
+        "every acknowledged span is still readable"
+    );
+    drop(store);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_pinned_snapshot_is_one_dataset_while_the_store_changes() {
+    // Found in review: export paged the LIVE store, so a span re-ingested
+    // behind the cursor was emitted a second time and the result held two
+    // versions of one primary key while the trailer said "complete".
+    let dir = correctness_test_dir("snapshot");
+    let store = Store::open(&dir, Config::default()).expect("opens");
+    for index in 0..500u64 {
+        store
+            .ingest(span("t-export", format!("s{index:03}"), 1_000 + index, 10))
+            .expect("ingest");
+    }
+    store.flush().expect("flush");
+
+    let view = store.snapshot().expect("pins");
+
+    // Everything an export can race with: a replaced span, a new span, a seal,
+    // and expiry deleting a pinned segment out from under the view.
+    let mut replaced = span("t-export", "s000".into(), 1_000, 10);
+    replaced
+        .attributes
+        .insert("version".to_owned(), Value::from("second"));
+    store.ingest(replaced).expect("re-ingest");
+    store
+        .ingest(span("t-export", "s999".into(), 9_999, 10))
+        .expect("ingest");
+    store.flush().expect("flush");
+    store.expire_before(1_200).expect("expires");
+
+    // Page the view exactly as export does.
+    let mut cursor: Option<SpanCursor> = None;
+    let mut seen: Vec<Span> = Vec::new();
+    loop {
+        let page = view
+            .query_after(
+                &SpanFilter {
+                    limit: Some(64),
+                    ..SpanFilter::default()
+                },
+                cursor.as_ref(),
+            )
+            .expect("page");
+        if page.is_empty() {
+            break;
+        }
+        cursor = Some(SpanCursor::from(page.last().expect("last")));
+        seen.extend(page);
+    }
+
+    assert_eq!(seen.len(), 500, "the view is the dataset it pinned");
+    let unique: HashSet<(String, String)> = seen
+        .iter()
+        .map(|span| (span.trace_id.clone(), span.span_id.clone()))
+        .collect();
+    assert_eq!(unique.len(), 500, "no primary key appears twice");
+    let first = seen
+        .iter()
+        .find(|span| span.span_id == "s000")
+        .expect("s000");
+    assert!(
+        !first.attributes.contains_key("version"),
+        "the view holds the version that existed when it was pinned"
+    );
+    assert!(
+        !seen.iter().any(|span| span.span_id == "s999"),
+        "a span ingested after the pin is not part of the dataset"
+    );
+
+    // The live store meanwhile reflects every one of those changes.
+    let live = queried_ids(&store, &SpanFilter::default());
+    assert!(live.contains(&"s999".to_owned()));
+    assert!(
+        !live.contains(&"s000".to_owned()),
+        "expiry removed the earliest spans from the live store"
+    );
+    drop(view);
+    drop(store);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_expiry_rewrite_keeps_its_place_in_recency_order() {
+    // Segment path order IS recency order, so a rewrite that took a fresh
+    // (highest) id moved an old segment to the newest position — and its stale
+    // version of a re-ingested span then won. Found while making expiry reach
+    // the log: the survivors are renamed onto the same name now.
+    let dir = correctness_test_dir("expiry-order");
+    let store = Store::open(
+        &dir,
+        Config {
+            flush_spans: 100_000,
+            durability: traza::Durability::Buffered,
+            compaction: None,
+            ..Config::default()
+        },
+    )
+    .expect("opens");
+
+    // Older segment: the shared key at v1, plus a span that will expire.
+    let mut first = span("t-order", "shared".into(), 8_000, 10);
+    first
+        .attributes
+        .insert("version".to_owned(), Value::from("first"));
+    store.ingest(first).expect("ingest");
+    store
+        .ingest(span("t-order", "doomed".into(), 1_000, 10))
+        .expect("ingest");
+    store.flush().expect("seals the older segment");
+
+    // Newer segment: the shared key at v2. Nothing here expires, so only the
+    // older segment is rewritten.
+    let mut second = span("t-order", "shared".into(), 8_000, 10);
+    second
+        .attributes
+        .insert("version".to_owned(), Value::from("second"));
+    store.ingest(second).expect("ingest");
+    store.flush().expect("seals the newer segment");
+
+    assert_eq!(store.expire_before(5_000).expect("expires"), 1);
+
+    let shared = store
+        .get_trace("t-order")
+        .expect("trace")
+        .into_iter()
+        .find(|span| span.span_id == "shared")
+        .expect("shared span");
+    assert_eq!(
+        shared.attributes["version"],
+        Value::from("second"),
+        "rewriting the older segment must not promote it past the newer one"
+    );
+    drop(store);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// True when this process can write through a read-only directory anyway,
+/// which is how the permission-based fault injection below stops being a
+/// fault. Root is the usual case (containers, some CI).
+fn ignores_directory_permissions() -> bool {
+    std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim() == "0")
+        .unwrap_or(false)
+}
+
+#[test]
+fn a_failed_log_rewrite_leaves_expiry_retryable() {
+    // Found in review: expiry dropped the span from the write buffer BEFORE
+    // the log rewrite succeeded. A failed rewrite therefore left memory ahead
+    // of the recovery authority — and the retry saw nothing left to expire,
+    // returned Ok(0), and never repaired the log, so the restart resurrected
+    // the span. Durable first, then the infallible in-memory swap.
+    let dir = correctness_test_dir("expiry-wal-failure");
+    let store = Store::open(&dir, wal_config(100_000)).expect("opens");
+    store
+        .ingest(span("t-old", "expired".into(), 1_000, 10))
+        .expect("acknowledged");
+    store
+        .ingest(span("t-new", "survivor".into(), 9_000, 10))
+        .expect("acknowledged");
+    let before = store.stats().expect("stats");
+
+    // Occupy the rewrite's staging path with a directory: the staging open
+    // then fails deterministically, whatever the platform or the uid.
+    let blocker = dir.join(".wal.log.rewrite.tmp");
+    fs::create_dir(&blocker).expect("blocks staging");
+
+    let failed = store.expire_before(5_000);
+    assert!(
+        failed.is_err(),
+        "the log rewrite could not be staged, so expiry must fail: {failed:?}"
+    );
+    let after_failure = store.stats().expect("stats");
+    assert_eq!(
+        after_failure.buffered_records, 2,
+        "a failed expiry must leave memory and the log agreeing, not drop the \
+         span from memory alone"
+    );
+    assert_eq!(
+        after_failure.wal_bytes, before.wal_bytes,
+        "and it must not have touched the log either"
+    );
+
+    // The retry is what repairs it, which only works if the first attempt left
+    // something to retry.
+    fs::remove_dir(&blocker).expect("unblocks staging");
+    assert_eq!(
+        store.expire_before(5_000).expect("retry"),
+        1,
+        "the retry still has the expired span to remove"
+    );
+    assert!(store.stats().expect("stats").wal_bytes < before.wal_bytes);
+    drop(store);
+
+    let reopened = Store::open(&dir, wal_config(100_000)).expect("reopens");
+    assert_eq!(
+        queried_ids(&reopened, &SpanFilter::default()),
+        vec!["survivor".to_owned()],
+        "the expired span must not survive the failure-then-retry path"
+    );
+    drop(reopened);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_failed_segment_unlink_leaves_expiry_retryable() {
+    // The same defect on the segment path: a fully expired segment was removed
+    // from the live list before its file was unlinked, so a failed unlink left
+    // the store reporting zero segments over a file that was still there — and
+    // the retry, seeing no segments, returned Ok(0). The restart loaded the
+    // segment and resurrected its spans.
+    if ignores_directory_permissions() {
+        eprintln!("skipped: this process writes through read-only directories");
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = correctness_test_dir("expiry-unlink-failure");
+    let store = Store::open(
+        &dir,
+        Config {
+            flush_spans: 100_000,
+            durability: traza::Durability::Buffered,
+            compaction: None,
+            ..Config::default()
+        },
+    )
+    .expect("opens");
+    store
+        .ingest(span("t-old", "expired".into(), 1_000, 10))
+        .expect("ingest");
+    store.flush().expect("seals a fully expirable segment");
+    assert_eq!(store.stats().expect("stats").segment_count, 1);
+
+    // Unlinking needs write permission on the directory, not on the file.
+    let readonly = fs::Permissions::from_mode(0o555);
+    let writable = fs::Permissions::from_mode(0o755);
+    fs::set_permissions(&dir, readonly).expect("read-only");
+
+    let failed = store.expire_before(5_000);
+    assert!(
+        failed.is_err(),
+        "the segment file could not be unlinked, so expiry must fail: {failed:?}"
+    );
+    assert_eq!(
+        store.stats().expect("stats").segment_count,
+        1,
+        "a segment that is still on disk must still be in the live list"
+    );
+
+    fs::set_permissions(&dir, writable).expect("writable");
+    assert_eq!(
+        store.expire_before(5_000).expect("retry"),
+        1,
+        "the retry still has the segment to remove"
+    );
+    assert_eq!(store.stats().expect("stats").segment_count, 0);
+    drop(store);
+
+    let reopened = Store::open(
+        &dir,
+        Config {
+            durability: traza::Durability::Buffered,
+            compaction: None,
+            ..Config::default()
+        },
+    )
+    .expect("reopens");
+    assert!(
+        queried_ids(&reopened, &SpanFilter::default()).is_empty(),
+        "the expired segment must not come back"
+    );
+    drop(reopened);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn expiry_finishes_when_the_segment_file_is_already_gone() {
+    // Deletion is retried on failure, so a retry has to make progress after a
+    // partial one: the unlink can land while the directory sync that makes it
+    // durable does not, and the next attempt then finds the file missing.
+    // Treating that as an error would strand the store on state that is
+    // already correct.
+    let dir = correctness_test_dir("expiry-already-gone");
+    let store = Store::open(
+        &dir,
+        Config {
+            flush_spans: 100_000,
+            durability: traza::Durability::Buffered,
+            compaction: None,
+            ..Config::default()
+        },
+    )
+    .expect("opens");
+    store
+        .ingest(span("t-old", "expired".into(), 1_000, 10))
+        .expect("ingest");
+    store.flush().expect("seals a fully expirable segment");
+
+    // Stand in for "the unlink landed, the sync did not, and we are retrying".
+    let segment = fs::read_dir(&dir)
+        .expect("read dir")
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .find(|path| path.extension().is_some_and(|ext| ext == "seg"))
+        .expect("segment");
+    fs::remove_file(&segment).expect("removes it out from under the store");
+
+    assert_eq!(
+        store.expire_before(5_000).expect("expiry completes"),
+        1,
+        "a segment that is already gone is a finished deletion, not an error"
+    );
+    assert_eq!(store.stats().expect("stats").segment_count, 0);
+    drop(store);
+    let _ = fs::remove_dir_all(&dir);
 }

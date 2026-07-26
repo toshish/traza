@@ -75,6 +75,9 @@ Changing Traza's code.
 ## Project direction
 
 - **[Roadmap](roadmap.md)** — phases, acceptance gates, and explicit non-goals.
+- **[Generations and checkpoints](generations-design.md)** — the proposed
+  single-node state boundary that would make backup, export, retention and
+  replication one mechanism. Design, not shipped behaviour.
 - **[High-availability design](ha-design.md)** — the replicated, clustered
   trajectory. Design, not shipped behaviour; today's scope is single-node.
 
