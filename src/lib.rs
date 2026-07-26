@@ -723,28 +723,33 @@ fn content_strs(span: &Span) -> Vec<&str> {
         match value {
             Value::String(text) => out.push(text),
             Value::Array(items) => items.iter().for_each(|item| collect(item, out)),
-            // An offloaded value is a reference object, and the only text of
-            // the original left in the span is its preview. Index exactly
-            // that: the `$payload` hash beside it is a 64-character hex
-            // string that no one will ever search for, and putting it in the
-            // filter only costs bits.
+            // Objects recurse normally, with ONE field skipped: the value of
+            // a `$payload` key. That key marks an offloaded value, whose
+            // reference carries a 64-character hex digest nobody will search
+            // for — indexing it only costs filter bits.
             //
-            // The consequence is real and is documented rather than papered
-            // over: **an offloaded value is searchable only within its
+            // Skipping the field rather than special-casing the whole object
+            // is deliberate. `$payload` is Traza's marker, but nothing stops a
+            // tool call's arguments from having a field of that name, and
+            // treating any object that has one as a reference removed every
+            // sibling field from search. Recursing everywhere else gives the
+            // same result for a genuine reference — its other fields are
+            // `bytes` (a number, not text) and `preview` — while ordinary
+            // nested data stays searchable, and it needs no guess about
+            // whether a reference is real.
+            //
+            // The bounded coverage that remains is documented rather than
+            // papered over: **an offloaded value is searchable only within its
             // preview.** Both sides of the search read the span through this
             // one function, so the index and the answer still agree exactly —
             // there is no wrong result, only a bounded one. Covering the full
             // text would mean reading the payload file at seal AND at every
             // verification, which is why it is roadmap work rather than a
             // line here.
-            Value::Object(map) => match map.get(payload::PAYLOAD_KEY) {
-                Some(Value::String(_)) => {
-                    if let Some(Value::String(preview)) = map.get("preview") {
-                        out.push(preview);
-                    }
-                }
-                _ => map.values().for_each(|item| collect(item, out)),
-            },
+            Value::Object(map) => map
+                .iter()
+                .filter(|(key, _)| key.as_str() != payload::PAYLOAD_KEY)
+                .for_each(|(_, item)| collect(item, out)),
             _ => {}
         }
     }
