@@ -66,26 +66,55 @@ Two readings matter more than the peak:
 same figure. Removing HTTP entirely — no socket, no parsing, no protocol —
 changes nothing. Whatever limits ingest is inside the engine.
 
-**The writer lock is the ceiling, and where it sits depends on
-`--flush-spans`.** The stage breakdown in
-[`INGEST-BENCHMARK.md`](../../INGEST-BENCHMARK.md#the-limiting-stage) shows the
-work performed while holding the writer lock at ~88% of the run's wall clock at
-the default `--flush-spans 10,000`, which puts the ceiling near 218,000
-spans/s **at that setting**. An earlier version of this page called that a hard
-ceiling for the design; it is not. A seal carries a fixed cost — two fsyncs, a
-create and rename, a reopen-and-parse — on top of its per-span cost, so sealing
-less often amortizes the fixed part:
+**The writer lock was the ceiling, and sealing was most of it. Sealing is now
+off the lock.** The stage breakdown in
+[`INGEST-BENCHMARK.md`](../../INGEST-BENCHMARK.md#the-limiting-stage) put the
+work performed while holding the writer lock at 88% of the run's wall clock at
+the default `--flush-spans 10,000` — and **74% of that was one thing**: writing
+the segment. Encoding it, fsyncing it, renaming it and reopening it all happen
+on a private vector no other thread can reach, so none of it needed the lock.
+The seal now drains the buffer under a short lock, writes with nothing held,
+and publishes under a short lock.
 
-| | `--flush-spans` 10,000 | `--flush-spans` 30,000 |
-|---|---:|---:|
-| Seals over 1M spans / mean seal | 100 / 34.5 ms | 33 / 74.6 ms |
-| Work done holding the writer lock | 4,581 ms | 3,336 ms |
-| Share of wall clock | 88% | 80% |
-| Implied ceiling | ~218,300/s | ~299,800/s |
+Measured before and after with the two builds alternated round-robin on a
+loaded host (1-minute load average 8.9-12.8; **read the ratio, not the level**
+— see [load conditions](../../INGEST-BENCHMARK.md#load-conditions)), 1M spans
+at concurrency 8, median of four rounds:
 
-Tripling the spans per seal raised mean seal time only 2.17x, not 3x. Solving
-those two measured points gives roughly 14.4 ms fixed per seal plus 2.0 µs per
-span — *derived from the two measurements above, not independently measured.*
+| `--profile` (`--flush-spans`) | Before | After | Change |
+|---|---:|---:|---:|
+| `throughput` (30,000) | 162,763 | **222,683** | **+37%** |
+| `balanced` (10,000) | 116,612 | **176,004** | **+51%** |
+| `latency` (5,000) | 83,400 | **180,331** | **+116%** |
+
+**The operational consequence is that `--flush-spans` is no longer a throughput
+knob.** It used to span a 2x range, because sealing more often meant stopping
+every ingesting thread more often; `latency` and `balanced` now measure within
+3% of each other. Tune it for the tail latency and buffer memory you want, not
+to buy throughput. `writer lock wait` — the contention signal — fell 62% at
+`balanced` over the same 1,000 batches.
+
+**The lock is still busy; `wal write` is now what it is busy with.** Sealing
+fell from 74% of in-lock work to 10-15%, and appending to the log rose to
+78-85% of it. If ingest is your bottleneck now, the thing to look at is **the
+log device**, not the engine: `traza_wal_write_ns_sum` and
+`traza_wal_fsync_ns_sum` against wall clock, and the group-commit ratio.
+`--wal-commit-window-us` and faster storage are the levers there; a bigger
+`--flush-spans` no longer is.
+
+Two things this changed that an operator should know:
+
+- **The write buffer can exceed `--flush-spans`** while a seal is in flight,
+  because ingest no longer waits for one. It is bounded: past four times the
+  threshold an ingesting thread waits for the seal to publish. Size memory for
+  that bound, not for the threshold.
+- **`--flush-wal-bytes` (64 MiB by default) now governs the log's real size.**
+  A seal that empties the buffer still discards the whole log, so a quiet store
+  behaves as before; under sustained ingest the log runs up to that bound
+  between reclamations rather than being emptied on every seal. Restart replay
+  is bounded by this setting. Lower it if you need faster restarts; the cost is
+  reclaiming more often, and reclamation is the one part of a seal that still
+  takes the writer lock.
 
 **Against the 250,000 spans/s target:** `--profile throughput` at concurrency
 16 measured a median of **250,453 spans/s** (min 122,768, max 261,215), and a

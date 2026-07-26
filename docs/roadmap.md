@@ -300,7 +300,7 @@ alongside results.
   protobuf, is why the attribution fails. Keep-alive is worth +11% at
   batch=20 and nothing at batch=1000.
 
-  The limit is the **writer lock, of which segment sealing is most of the
+  The limit was the **writer lock, of which segment sealing was most of the
   time held** — work that needs no lock. An earlier version of this line
   called that "a hard ceiling near 212k spans/s on the current design
   regardless of client concurrency". **That was wrong.** The arithmetic behind
@@ -310,18 +310,38 @@ alongside results.
   less often amortizes the fixed part and the ceiling moves. It is a function
   of the setting, not a property of the design.
 
-  Measured at concurrency 8 on a 1M-span corpus: in-lock work (wal write +
-  buffer upsert + segment seal) totals **4,581 ms at `--flush-spans 10000`**
-  (lock held 88%, implying ~218k spans/s) against **3,336 ms at
-  `--flush-spans 30000`** (lock held 80%, implying ~300k). Tripling the spans
-  per seal raised mean seal time only 2.17x, not 3x.
+  **Sealing now runs with no engine lock held (0.19).** Re-measured on
+  `ddd185a` before the change, at concurrency 8 on a 1M-span corpus, in-lock
+  work (wal write + buffer upsert + segment seal) was **4,911 ms at
+  `--flush-spans 10000`** — lock held 88%, of which sealing was 74% — and
+  **6,371 ms at `--flush-spans 5000`**, lock held 97%. PR #15's WAL rework did
+  not change that conclusion; it only made `wal fsync` the next candidate. The
+  seal now drains the buffer under a short lock, writes with nothing held, and
+  publishes under a short lock, exactly as compaction and expiry do.
 
-  Sizing seals correctly reprices the constraint; it does not remove it. The
-  lock is still held ~80% of a run, and larger thresholds keep costing tail
-  latency and write-buffer memory, so the direction runs out. Moving the seal
-  off the lock requires a reader-visible "sealing" tier and a rotating WAL;
-  both are specified in INGEST-BENCHMARK.md, and an attempt that stopped short
-  of them was reverted rather than merged.
+  Measured before and after with the two builds alternated round-robin on a
+  contended host, median of four rounds at concurrency 8: `throughput`
+  162,763 → **222,683** (+37%), `balanced` 116,612 → **176,004** (+51%),
+  `latency` 83,400 → **180,331** (+116%). Those levels are depressed by the
+  load; the ratios are what the round-robin supports. The structural result is
+  that **`--flush-spans` stopped being a throughput knob** — `latency` and
+  `balanced` now measure within 3% of each other, where before they spanned
+  2x.
+
+  Two v0.17 conclusions recorded here were wrong and are corrected in
+  INGEST-BENCHMARK.md: moving the seal off the lock needs **neither** a
+  reader-visible "sealing" tier (the spans simply stay in the write buffer
+  until the segment is published, as a merge keeps its inputs live) **nor** a
+  rotating WAL (reclamation rides `--flush-wal-bytes` instead of running on
+  every seal).
+
+  **The gate is still open and the 0.19 matrix cannot close it.** It was taken
+  with an unrelated process holding a core throughout, and it puts concurrency
+  16 *below* concurrency 8 at every profile — oversubscription, not an engine
+  limit. What changed is the *reason* the gate is open: sealing is no longer
+  the constraint (10-15% of in-lock work, from 74-81%), and `wal write` now is,
+  at 78-85%. **Re-measure on an idle machine**, and expect the log device
+  rather than the engine's locking to be what the answer turns on.
 - **Query latency:** p99 < 10 ms trace lookup and < 50 ms filtered search at
   a 100M-span store; RSS remains O(indexes). *Status at 10M (0.15):* trace
   lookup p99 4.65 ms already clears its bar and RSS held at 0.25 GB, but the

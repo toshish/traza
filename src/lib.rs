@@ -1137,6 +1137,7 @@ impl Store {
 
         let mut pending_commit = None;
         let seal_now;
+        let seal_must_wait;
         {
             let waited = Instant::now();
             let mut writer = self.lock_writer()?;
@@ -1150,6 +1151,7 @@ impl Store {
                 }
             });
             seal_now = self.should_flush(&writer);
+            seal_must_wait = self.seal_must_not_be_skipped(&writer);
         }
 
         // `flushed` promises the caller a SEALED segment, so its seal must
@@ -1169,7 +1171,11 @@ impl Store {
             log.commit(lsn, &self.metrics)?;
         }
         if seal_now && !synchronous {
-            self.seal(SealWait::SkipIfBusy)?;
+            let wait = match seal_must_wait {
+                true => SealWait::ForPermit,
+                false => SealWait::SkipIfBusy,
+            };
+            self.seal(wait)?;
         }
         self.metrics.spans_admitted.add(admitted);
         self.metrics.batches_admitted.increment();
@@ -2153,6 +2159,27 @@ impl Store {
         }
     }
 
+    /// Whether ingest should WAIT for the seal permit rather than let its seal
+    /// coalesce into the one already running.
+    ///
+    /// Sealing under the writer lock throttled ingest for free: a thread could
+    /// not admit a batch while a seal was running, so the buffer could never
+    /// outgrow its threshold by more than one batch. Sealing off the lock
+    /// removes that, and removes it in the one direction that matters — if
+    /// ingest sustainably outruns sealing, the buffer grows without bound and
+    /// the process runs out of memory rather than pushing back.
+    ///
+    /// So the throttle is put back, deliberately and only at the extreme. Up
+    /// to this much overshoot the seal stays fully concurrent, which is the
+    /// point of the change; past it an ingesting thread blocks until the
+    /// running seal publishes, and the buffer stops growing. Four times the
+    /// threshold, because normal overshoot is "whatever arrives during one
+    /// seal" and a seal that has fallen four thresholds behind is not
+    /// overshoot, it is a store that cannot keep up.
+    fn seal_must_not_be_skipped(&self, writer: &WriteBuffer) -> bool {
+        self.config.flush_spans > 0 && writer.len() >= self.config.flush_spans.saturating_mul(4)
+    }
+
     /// Seals the write buffer into one segment, doing the I/O with no engine
     /// lock held.
     ///
@@ -2211,9 +2238,14 @@ impl Store {
         let sealing = Instant::now();
 
         // ---- drain: short critical section ------------------------------
-        let locked = Instant::now();
+        // Every `segment_seal_locked` sample starts AFTER the guard is
+        // acquired. Timing from before it would fold in lock WAIT, which is
+        // already `writer_lock_wait`, and would make the in-lock total exceed
+        // wall clock under contention — a number that cannot be summed is not
+        // a saturation measurement.
         let drained = {
             let writer = self.lock_writer()?;
+            let locked = Instant::now();
             if writer.is_empty() {
                 return Ok(());
             }
@@ -2230,11 +2262,11 @@ impl Store {
             let _segments = self.lock_segments()?;
             self.unpublished_seals.fetch_add(1, Ordering::Relaxed);
             let id = self.next_segment.fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .segment_seal_locked
+                .record(elapsed_nanos(&locked));
             Drained { spans, upserts, id }
         };
-        self.metrics
-            .segment_seal_locked
-            .record(elapsed_nanos(&locked));
 
         // ---- write: no engine lock held ---------------------------------
         let mut pending = drained.spans;
@@ -2254,12 +2286,15 @@ impl Store {
         };
 
         // ---- publish and reconcile: short critical sections --------------
-        let locked = Instant::now();
         {
             let mut segments = self.lock_segments()?;
+            let locked = Instant::now();
             segments.push(std::sync::Arc::new(segment));
             segments.sort_by(|left, right| left.path.cmp(&right.path));
             self.unpublished_seals.fetch_sub(1, Ordering::Relaxed);
+            self.metrics
+                .segment_seal_locked
+                .record(elapsed_nanos(&locked));
         }
         let sealed = pending.len() as u64;
         // `pending` stays alive across the reconcile below: the eviction test
@@ -2267,9 +2302,6 @@ impl Store {
         // every address in the set still belongs to a live allocation.
         self.reconcile_after_publish(&pending, drained.upserts)?;
         drop(pending);
-        self.metrics
-            .segment_seal_locked
-            .record(elapsed_nanos(&locked));
         self.metrics.segment_seal.record(elapsed_nanos(&sealing));
         self.metrics.segment_seal_spans.add(sealed);
         Ok(())
@@ -2298,6 +2330,7 @@ impl Store {
             published.iter().map(std::sync::Arc::as_ptr).collect();
 
         let mut writer = self.lock_writer()?;
+        let locked = Instant::now();
         if let Some(log) = &self.wal {
             let survivors: Vec<&Span> = writer
                 .spans
@@ -2329,6 +2362,9 @@ impl Store {
         // update-heavy workload postpone its seals indefinitely, which is the
         // failure `upserts` exists to prevent.
         writer.upserts = writer.upserts.saturating_sub(upserts_at_drain);
+        self.metrics
+            .segment_seal_locked
+            .record(elapsed_nanos(&locked));
         Ok(())
     }
 
