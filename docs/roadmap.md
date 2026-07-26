@@ -198,11 +198,21 @@ would be a planning failure.
   into a dataset version, run an experiment (task execution stays external),
   record scores, and query score distributions and experiment-over-experiment
   diffs as ordinary rollups.
-- **Minimal content search:** substring/token matching over span names,
-  string attributes, event content, and payload previews, executed through
-  the existing index-then-verify path. This validates the debugging
-  primitive ("find the session where the model said X") without waiting
-  for the full per-segment inverted index in Phase 3.
+- **Minimal content search** — **shipped**, and larger than "minimal". Word
+  matching over string attributes, nested message arrays, event attributes and
+  event names, via `?content=`, executed through the existing
+  index-then-verify path. It did not wait for a per-segment inverted index
+  because it did not need one: a per-block Bloom filter over words, stored
+  bit-sliced so a probe reads tens of bytes per segment, measured **849-1,554x
+  against a scan** on selective terms at 200,000 spans, for +0.1% on disk and
+  ~2 KiB resident per segment.
+
+  Scope actually delivered is narrower than the line above in one way and
+  wider in another. It is **word** matching, not substring matching — a word
+  index cannot soundly drive a substring query, and the alternative was
+  silently wrong answers rather than slow ones. Payload previews are covered
+  only where the reference object is reachable as a string attribute. See
+  [the segment format](segment-format.md#the-content-index).
 
 ### 1.4 Operability and release engineering
 
@@ -468,9 +478,28 @@ the same binary.*
   segments carry columnar projections of hot fields (service, name,
   duration, session, model, tokens, cost) so aggregation scans read columns,
   not records — embedded in the self-contained segment.
-- **Full per-segment inverted index**, generalizing §1.3's minimal content
-  search: span names, string attributes, event content, and payload text
-  indexed at offload time so search never re-reads the blob store.
+- **Full per-segment inverted index**, generalizing §1.3's shipped content
+  search. The Bloom-filter index that shipped answers "which blocks may hold
+  this word" and nothing more, which is why the three things it cannot do all
+  come from the same root — it stores no postings:
+
+  - **Substring and prefix matching.** `refund` cannot find `refunds`.
+  - **Phrase and proximity.** A multi-word query is a conjunction; word
+    ORDER is not recorded.
+  - **Ranking.** There are no term frequencies, so there is nothing to rank
+    by; results come back in Traza's stable span order.
+
+  Postings would also let a common term stop costing a scan — today a word in
+  nearly every span measures 1.0x against no index at all, which is honest but
+  is the case the current design cannot improve.
+
+  **Offloaded payload text should be indexed at offload time.** Today an
+  offloaded value is searchable only within its inline preview, because
+  offloading runs at ingest and the rest of the text is never present for
+  either the index or the match to see. Indexing at offload — where the full
+  text is still in hand — closes that without making search re-read the blob
+  store, and without the query-time payload reads that a naive fix would
+  require to keep the index and the answer agreeing.
 - **Aggregation pushdown.** Rollups execute against projections with late
   materialization; target interactive (<1 s) group-bys over 1B spans.
 - **Query language.** A small, stable filter/aggregation DSL for the queries

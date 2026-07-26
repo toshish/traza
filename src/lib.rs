@@ -9,7 +9,9 @@
 pub mod analytics;
 pub mod annotations;
 pub mod auth;
+pub mod content;
 pub mod expiration;
+pub mod hash;
 pub mod insights;
 mod media;
 pub mod metrics;
@@ -24,6 +26,7 @@ mod wal;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use std::borrow::Cow;
 use std::error::Error as StdError;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -216,6 +219,26 @@ pub struct SpanFilter {
     /// entirely matches: "not an error" should include spans that never
     /// recorded a status.
     pub excluded_attributes: Vec<(String, Value)>,
+    /// Match spans whose text contains every word of this query.
+    ///
+    /// This is **word search, not substring search**: `refund` matches a span
+    /// saying "Refund the order" and does not match one saying "refunds". A
+    /// multi-word query is a conjunction, not a phrase — the words may appear
+    /// anywhere, in any order, across any of the span's text. The text
+    /// searched is every string value in the span's attributes and its events'
+    /// attributes, plus event names.
+    ///
+    /// **A value offloaded to the payload store is searchable only within the
+    /// preview kept inline** (256 characters). Offloading happens at ingest,
+    /// before anything indexes the span, so the rest of the text is not
+    /// present to be indexed or matched. With the server's default
+    /// `--payload-threshold-bytes` of 256 KiB almost nothing is offloaded and
+    /// this does not arise; it matters if you lower the threshold.
+    ///
+    /// The semantics are set by what the segment's content index can safely
+    /// over-approximate; see [`crate::content`] for why substring matching
+    /// would produce wrong answers rather than slow ones.
+    pub content: Option<String>,
     /// Result ordering. `None` keeps Traza's stable span order, which is the
     /// only order that can stream without materializing.
     pub sort: Option<SpanSort>,
@@ -583,6 +606,19 @@ pub struct Config {
     /// hurts an idle store, which is why it is off unless asked for. It never
     /// weakens the guarantee — the acknowledgement still follows the fsync.
     pub wal_commit_window: Option<std::time::Duration>,
+    /// Whether sealed segments carry a content index, making
+    /// [`SpanFilter::content`] fast. On by default.
+    ///
+    /// Turning it off does not remove the ability to search — a segment with
+    /// no content index is scanned instead of skipped, so the same query
+    /// returns the same rows and simply costs what a scan costs. What it
+    /// removes is the index's price: tokenizing every span's text at seal
+    /// time, and roughly 1-2% of segment size on disk.
+    ///
+    /// Leave it on unless a measurement says otherwise. It is exposed mainly
+    /// so that the measurement is possible: with it, the same corpus can be
+    /// queried with and without the index and the difference attributed.
+    pub content_index: bool,
 }
 
 /// Default ceiling on log bytes before a flush seals the buffer. Large enough
@@ -600,6 +636,7 @@ impl Default for Config {
             durability: Durability::Wal,
             compaction: Some(CompactionConfig::default()),
             wal_commit_window: None,
+            content_index: true,
         }
     }
 }
@@ -705,6 +742,129 @@ fn canonical_value(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_default()
 }
 
+/// Every canonical encoding under which a span holding a value EQUAL to
+/// `value` — by [`attribute_equals`] — could have been indexed.
+///
+/// The index is keyed on canonical JSON, so `200` and `"200"` occupy two
+/// different entries. But `attribute_equals` deliberately treats them as the
+/// same value, because instrumentation is inconsistent about whether a status
+/// code or a token count is a number or a string. Probing only the caller's
+/// own encoding therefore made the index a FILTER rather than a superset: the
+/// other encoding's records were never candidates, so the type-agnostic
+/// comparison never got to see them and a query returned half its matches.
+///
+/// This is the rule every index in this crate obeys and the reason all of them
+/// are checked again against the decoded record: **an index may only narrow
+/// the work, never the answer.**
+fn attribute_encodings(value: &Value) -> Vec<String> {
+    let mut encodings = vec![canonical_value(value)];
+    // Containers are compared structurally, so there is no cross-type form.
+    let Some(text) = scalar_text(value) else {
+        return encodings;
+    };
+    let mut push = |candidate: &Value| {
+        let canonical = canonical_value(candidate);
+        if !encodings.contains(&canonical) {
+            encodings.push(canonical);
+        }
+    };
+    push(&Value::String(text.clone()));
+    // A number stored as a number. Parsing through serde_json is what keeps
+    // this consistent with how the value would have been canonicalized on the
+    // way in — "0200" and "1.50" are not JSON numbers that round-trip, and
+    // their scalar text would not have matched anyway.
+    if let Ok(parsed) = serde_json::from_str::<Value>(&text) {
+        if parsed.is_number() && scalar_text(&parsed).as_deref() == Some(text.as_str()) {
+            push(&parsed);
+        }
+    }
+    match text.as_str() {
+        "true" => push(&Value::Bool(true)),
+        "false" => push(&Value::Bool(false)),
+        _ => {}
+    }
+    encodings
+}
+
+/// Candidate offsets for an attribute equality, unioned across every encoding
+/// the value could have been stored under, in record order.
+///
+/// Record order is load-bearing: the lazy k-way merge and `first_offset_after`
+/// both require ascending offsets, so the union is sorted and deduplicated
+/// rather than concatenated.
+fn attribute_candidates<'a>(seg: &'a segment::Segment, key: &str, value: &Value) -> Cow<'a, [u64]> {
+    let encodings = attribute_encodings(value);
+    if encodings.len() == 1 {
+        return Cow::Borrowed(seg.attribute_candidate_offsets(key, &encodings[0]));
+    }
+    let mut merged: Vec<u64> = encodings
+        .iter()
+        .flat_map(|encoding| {
+            seg.attribute_candidate_offsets(key, encoding)
+                .iter()
+                .copied()
+        })
+        .collect();
+    merged.sort_unstable();
+    merged.dedup();
+    Cow::Owned(merged)
+}
+
+/// Every string a content search looks in, borrowed from the span.
+///
+/// One definition serves both sides: the encoder tokenizes exactly these
+/// strings into the segment's content index, and the query verifies against
+/// exactly these strings. Two traversals that disagreed — one indexing event
+/// attributes, say, and the other not — would produce a filter that finds
+/// spans the index cannot, or worse, misses spans it should have found.
+fn content_strs(span: &Span) -> Vec<&str> {
+    fn collect<'a>(value: &'a Value, out: &mut Vec<&'a str>) {
+        match value {
+            Value::String(text) => out.push(text),
+            Value::Array(items) => items.iter().for_each(|item| collect(item, out)),
+            // Objects recurse normally, with ONE field skipped: the value of
+            // a `$payload` key. That key marks an offloaded value, whose
+            // reference carries a 64-character hex digest nobody will search
+            // for — indexing it only costs filter bits.
+            //
+            // Skipping the field rather than special-casing the whole object
+            // is deliberate. `$payload` is Traza's marker, but nothing stops a
+            // tool call's arguments from having a field of that name, and
+            // treating any object that has one as a reference removed every
+            // sibling field from search. Recursing everywhere else gives the
+            // same result for a genuine reference — its other fields are
+            // `bytes` (a number, not text) and `preview` — while ordinary
+            // nested data stays searchable, and it needs no guess about
+            // whether a reference is real.
+            //
+            // The bounded coverage that remains is documented rather than
+            // papered over: **an offloaded value is searchable only within its
+            // preview.** Both sides of the search read the span through this
+            // one function, so the index and the answer still agree exactly —
+            // there is no wrong result, only a bounded one. Covering the full
+            // text would mean reading the payload file at seal AND at every
+            // verification, which is why it is roadmap work rather than a
+            // line here.
+            Value::Object(map) => map
+                .iter()
+                .filter(|(key, _)| key.as_str() != payload::PAYLOAD_KEY)
+                .for_each(|(_, item)| collect(item, out)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for value in span.attributes.values() {
+        collect(value, &mut out);
+    }
+    for event in &span.events {
+        out.push(&event.name);
+        for value in event.attributes.values() {
+            collect(value, &mut out);
+        }
+    }
+    out
+}
+
 fn span_to_record(span: &Span) -> Result<segment::RecordInput> {
     let mut attributes = std::collections::BTreeMap::new();
     // User attributes first, and NUL-prefixed user keys are never indexed:
@@ -720,12 +880,19 @@ fn span_to_record(span: &Span) -> Result<segment::RecordInput> {
     }
     attributes.insert(IDX_SERVICE.to_owned(), span.service.clone());
     attributes.insert(IDX_NAME.to_owned(), span.name.clone());
+    // Content is carried unescaped and separately from `attributes`, whose
+    // values are canonical JSON. See `RecordInput::content`.
+    let content = content_strs(span)
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<String>>();
     Ok(segment::RecordInput::new(
         span.start_time_ns,
         span.trace_id.clone(),
         attributes,
         serde_json::to_vec(span)?,
-    ))
+    )
+    .with_content(content))
 }
 
 fn record_to_span(record: &segment::Record) -> Result<Span> {
@@ -1069,13 +1236,21 @@ pub struct Store {
     // seal already covers everything the second one would drain — while
     // costing a duplicate copy of the same spans on disk.
     //
-    // Expiry takes it too. A seal that drained before a deletion ran would
-    // otherwise publish its segment afterwards and resurrect exactly the spans
-    // expiry just removed from the buffer, the log, and every segment it knew
-    // about. Ingest keeps flowing while expiry holds it — its seals coalesce
-    // into the next one — with one exception worth knowing about:
-    // [`Durability::Flushed`] must seal before it acknowledges, so under that
-    // mode an ingest waits out a running deletion.
+    // Both rewriters take it too, for different spans of time. Expiry holds
+    // it for its whole deletion: a seal that drained before the deletion ran
+    // would otherwise publish its segment afterwards and resurrect exactly the
+    // spans expiry just removed from the buffer, the log, and every segment it
+    // knew about. Compaction holds it only while it chooses a run and claims
+    // the ids for its outputs, because a seal holding an unpublished lower id
+    // would sort before merged output that is strictly older.
+    //
+    // Ingest mostly keeps flowing while a rewriter holds it, because a seal
+    // that cannot take it coalesces into the next one. Two paths wait instead,
+    // and both are worth knowing about: [`Durability::Flushed`] must seal
+    // before it acknowledges, and any mode blocks once the buffer has reached
+    // four times `flush_spans` (see `seal_must_not_be_skipped`), where waiting
+    // is the backpressure. Under either, an ingest waits out a running
+    // deletion — but only the microseconds of a compaction's claim.
     //
     // An ingesting thread NEVER takes this while holding the writer lock: it
     // releases the writer lock first and then seals. The order above is what
@@ -1091,13 +1266,6 @@ pub struct Store {
     recent_payloads: payload::TouchRegistry,
     annotations: annotations::AnnotationLog,
     next_segment: AtomicU64,
-    /// Seals that have claimed a segment id but not yet published it.
-    ///
-    /// Read and written ONLY while holding the `segments` lock, which is what
-    /// makes it atomic with respect to id claims and is why `Relaxed` is
-    /// enough. Compaction consults it before claiming an id of its own: see
-    /// [`Store::merge_tail_run`].
-    unpublished_seals: AtomicU64,
     /// Present unless durability is [`Durability::Buffered`]. Guards the gap
     /// between acknowledging a write and sealing it into a segment.
     wal: Option<wal::Wal>,
@@ -1163,7 +1331,6 @@ impl Store {
                 rollups: Mutex::new(std::collections::HashMap::new()),
                 recent_payloads: payload::TouchRegistry::default(),
                 next_segment: AtomicU64::new(next_segment),
-                unpublished_seals: AtomicU64::new(0),
                 wal,
                 metrics: metrics::Metrics::default(),
                 _directory_lock: directory_lock,
@@ -1508,8 +1675,9 @@ fn narrow_session_spans(
     filter: &SpanFilter,
     cursor: Option<&SpanCursor>,
 ) -> Vec<Span> {
+    let content = filter.content.as_deref().map(content::Query::new);
     spans.retain(|span| {
-        span_matches(span, filter)
+        span_matches(span, filter, content.as_ref())
             && cursor.map_or(true, |position| span_after_cursor(span, position))
     });
     order_spans(&mut spans, filter.sort);
@@ -1556,9 +1724,10 @@ pub(crate) fn attribute_union_view(
         let mut offsets: Vec<u64> = Vec::new();
         for key in keys {
             for value in values {
-                offsets.extend_from_slice(
-                    seg.attribute_posting_offsets_ref(key, &canonical_value(value)),
-                );
+                // Same superset rule as `select_probe`: a session id stored as
+                // a number under one convention and a string under another
+                // must still return the session whole.
+                offsets.extend_from_slice(&attribute_candidates(seg, key, value));
             }
         }
         offsets.sort_unstable();
@@ -1644,6 +1813,9 @@ pub(crate) fn query_view_costed(
         }
         return Ok(spans);
     }
+    // Parsed once for the whole query. Tokenizing the needle per candidate
+    // span would cost more than the index saves.
+    let content = filter.content.as_deref().map(content::Query::new);
     {
         let mut result = Vec::new();
 
@@ -1661,7 +1833,7 @@ pub(crate) fn query_view_costed(
                 .spans
                 .iter()
                 .filter(|span| {
-                    span_matches(span, filter)
+                    span_matches(span, filter, content.as_ref())
                         && cursor.map_or(true, |position| span_after_cursor(span, position))
                 })
                 .map(|span| Span::clone(span))
@@ -1672,11 +1844,26 @@ pub(crate) fn query_view_costed(
                 Parsed(Vec<Span>),
                 Lazy {
                     seg: &'a segment::Segment,
-                    offsets: &'a [u64],
+                    // Owned when the content index produced the candidates,
+                    // borrowed when an attribute posting list did.
+                    offsets: Cow<'a, [u64]>,
+                    /// This segment's index in `segments`.
+                    ///
+                    /// Carried explicitly because it is NOT the source's own
+                    /// index. Supersedence used to derive one from the other
+                    /// positionally, which held only while every segment
+                    /// produced a source; each `continue` in the loop below
+                    /// compresses `sources` and not `segments`, so a pruned
+                    /// segment shifted every later source onto the wrong
+                    /// neighbour and made a segment supersede ITSELF —
+                    /// dropping every row it held. Reachable through time
+                    /// pruning, and reachable on the default path once
+                    /// content pruning existed.
+                    segment_position: usize,
                 },
             }
             let mut sources: Vec<(Source<'_>, usize)> = vec![(Source::Parsed(buffered), 0)];
-            for segment in segments.iter() {
+            for (segment_position, segment) in segments.iter().enumerate() {
                 let seg = &segment.seg;
                 // Skip whole segments that cannot hold a matching timestamp.
                 // This is the only filter that eliminates a segment without
@@ -1689,12 +1876,26 @@ pub(crate) fn query_view_costed(
                     cost.segments_pruned += 1;
                     continue;
                 }
-                let offsets = select_probe(seg, filter);
+                if content
+                    .as_ref()
+                    .is_some_and(|query| !seg.may_contain_content(query))
+                {
+                    metrics.segments_pruned_by_content.increment();
+                    continue;
+                }
+                let offsets = select_probe(seg, filter, content.as_ref(), metrics)?;
                 let position = match cursor {
-                    Some(cursor) => first_offset_after(seg, offsets, cursor)?,
+                    Some(cursor) => first_offset_after(seg, &offsets, cursor)?,
                     None => 0,
                 };
-                sources.push((Source::Lazy { seg, offsets }, position));
+                sources.push((
+                    Source::Lazy {
+                        seg,
+                        offsets,
+                        segment_position,
+                    },
+                    position,
+                ));
             }
 
             let advance = |source: &mut (Source<'_>, usize)| -> Result<Option<Span>> {
@@ -1707,7 +1908,7 @@ pub(crate) fn query_view_costed(
                         }
                         Ok(span)
                     }
-                    Source::Lazy { seg, offsets } => {
+                    Source::Lazy { seg, offsets, .. } => {
                         let Some(offset) = offsets.get(*pos).copied() else {
                             return Ok(None);
                         };
@@ -1744,7 +1945,7 @@ pub(crate) fn query_view_costed(
                 let span = heads[index].take().expect("selected head exists");
                 heads[index] = advance(&mut sources[index])?;
                 if index != 0
-                    && (!span_matches(&span, filter)
+                    && (!span_matches(&span, filter, content.as_ref())
                         || cursor.is_some_and(|position| !span_after_cursor(&span, position)))
                 {
                     continue;
@@ -1753,21 +1954,28 @@ pub(crate) fn query_view_costed(
                 if emitted.contains(&key) {
                     continue;
                 }
-                // Primary-key precedence: source 0 is the write buffer (it
-                // always wins); among segments, a LATER source index means a
-                // later flush and a newer version — a candidate loses to any
-                // higher-precedence source that also holds its key.
-                let superseded = if index == 0 {
-                    false
-                } else {
-                    writer.contains_key(&span.trace_id, &span.span_id)
-                        || segments
-                            .iter()
-                            .skip(index) // sources[i] maps to segments[i-1]
-                            .map(|segment| segment.contains_key(&span.trace_id, &span.span_id))
-                            .collect::<Result<Vec<_>>>()?
-                            .into_iter()
-                            .any(|contains| contains)
+                // Primary-key precedence: the write buffer always wins; among
+                // segments, a LATER segment means a later flush and a newer
+                // version, so a candidate loses to any higher-precedence
+                // source that also holds its key.
+                //
+                // The skip is anchored to the segment's OWN index, which the
+                // source carries. Deriving it from the source's index instead
+                // was correct only when nothing was pruned.
+                let superseded = match &sources[index].0 {
+                    Source::Parsed(_) => false,
+                    Source::Lazy {
+                        segment_position, ..
+                    } => {
+                        writer.contains_key(&span.trace_id, &span.span_id)
+                            || segments
+                                .iter()
+                                .skip(segment_position + 1)
+                                .map(|segment| segment.contains_key(&span.trace_id, &span.span_id))
+                                .collect::<Result<Vec<_>>>()?
+                                .into_iter()
+                                .any(|contains| contains)
+                    }
                 };
                 if !superseded {
                     emitted.insert(key);
@@ -1798,11 +2006,18 @@ pub(crate) fn query_view_costed(
                 cost.segments_pruned += 1;
                 continue;
             }
-            let offsets = select_probe(seg, filter);
-            for offset in offsets {
+            if content
+                .as_ref()
+                .is_some_and(|query| !seg.may_contain_content(query))
+            {
+                metrics.segments_pruned_by_content.increment();
+                continue;
+            }
+            let offsets = select_probe(seg, filter, content.as_ref(), metrics)?;
+            for offset in offsets.iter() {
                 let record = seg.record_at_offset(*offset).map_err(segment_error)?;
                 let span = record_to_span(&record)?;
-                if !span_matches(&span, filter)
+                if !span_matches(&span, filter, content.as_ref())
                     || cursor.is_some_and(|bound| !span_after_cursor(&span, bound))
                 {
                     continue;
@@ -1823,7 +2038,7 @@ pub(crate) fn query_view_costed(
             }
         }
         for span in writer.spans.iter() {
-            if span_matches(span, filter)
+            if span_matches(span, filter, content.as_ref())
                 && cursor.map_or(true, |bound| span_after_cursor(span, bound))
             {
                 result.push(Span::clone(span));
@@ -1855,6 +2070,10 @@ pub(crate) fn fold_view(
     cost: &mut QueryCost,
     visit: &mut impl FnMut(&Span),
 ) -> Result<()> {
+    // Parsed once for the whole fold, exactly as the query path does it: the
+    // tokenizer runs per call, and running it per segment would put it on the
+    // hot loop of every aggregation.
+    let content = filter.content.as_deref().map(content::Query::new);
     for (position, segment) in segments.iter().enumerate() {
         let seg = &segment.seg;
         metrics.segments_examined.increment();
@@ -1864,10 +2083,23 @@ pub(crate) fn fold_view(
             cost.segments_pruned += 1;
             continue;
         }
-        for offset in select_probe(seg, filter) {
+        // A segment whose content index cannot hold every queried word is
+        // skipped whole, like a time range that cannot match. Counted into
+        // `segments_pruned` so an aggregation reports the same saving the
+        // search path does.
+        if content
+            .as_ref()
+            .is_some_and(|query| !seg.may_contain_content(query))
+        {
+            metrics.segments_pruned_by_content.increment();
+            cost.segments_pruned += 1;
+            continue;
+        }
+        let offsets = select_probe(seg, filter, content.as_ref(), metrics)?;
+        for offset in offsets.iter() {
             let record = seg.record_at_offset(*offset).map_err(segment_error)?;
             let span = record_to_span(&record)?;
-            if !span_matches(&span, filter) {
+            if !span_matches(&span, filter, content.as_ref()) {
                 continue;
             }
             if writer.contains_key(&span.trace_id, &span.span_id) {
@@ -1886,7 +2118,7 @@ pub(crate) fn fold_view(
         }
     }
     for span in writer.spans.iter() {
-        if span_matches(span, filter) {
+        if span_matches(span, filter, content.as_ref()) {
             visit(span);
         }
     }
@@ -1910,8 +2142,9 @@ impl Store {
             // A session unions several attribute keys, which no single index
             // expresses. Its span count is bounded by one conversation, so
             // resolving it up front costs a conversation, not a corpus.
+            let content = filter.content.as_deref().map(content::Query::new);
             for span in self.resolve_session_spans(session_id)? {
-                if span_matches(&span, filter) {
+                if span_matches(&span, filter, content.as_ref()) {
                     visit(&span);
                 }
             }
@@ -2078,17 +2311,19 @@ impl Store {
         let _maintenance = self.lock_maintenance()?;
         let mut merged_away = 0usize;
         // Each pass merges one run; a merge can create a run one tier up, so
-        // loop until nothing qualifies. Bounded by the tier count.
+        // loop until nothing qualifies. Bounded by the tier count. Choosing
+        // the run is `merge_tail_run`'s own job, done under the locks it pins
+        // with — scanning out here first only created a window for a seal to
+        // land and make the answer stale.
+        // A tick compacts the backlog it FOUND. Every segment sealed after
+        // this point is left for the next one: merging those too would keep
+        // this call running for as long as writes keep arriving, and a
+        // maintenance pass that never returns is not maintenance. Measured
+        // without it, one call merged away 2,213 segments and was still going.
+        let watermark = self.next_segment.load(Ordering::Relaxed);
         loop {
-            let segments = self.lock_segments()?;
-            let Some(run) = tail_run_to_merge(&segments, &settings) else {
-                break;
-            };
-            drop(segments);
-            let merged = self.merge_tail_run(run, &settings)?;
+            let merged = self.merge_tail_run(&settings, watermark)?;
             if merged == 0 {
-                // The run went stale between the scan and the publish. Stop
-                // rather than spin; the next scheduled pass picks it up.
                 break;
             }
             merged_away += merged;
@@ -2096,42 +2331,71 @@ impl Store {
         Ok(merged_away)
     }
 
-    /// Merges the last `run` segments into as few segments as the size cap
-    /// allows. Returns segments removed, or zero if the run stopped qualifying
-    /// before the result could be published.
-    fn merge_tail_run(&self, run: usize, settings: &CompactionConfig) -> Result<usize> {
+    /// Merges the tail run, if one qualifies, into as few segments as the size
+    /// cap allows. Returns segments removed, or zero if nothing qualified or
+    /// the run stopped qualifying before the result could be published.
+    fn merge_tail_run(&self, settings: &CompactionConfig, watermark: u64) -> Result<usize> {
         // ---- pin: short critical section -------------------------------
-        let (inputs, chunks, first_id) = {
-            let segments = self.lock_segments()?;
-            // Re-check under the lock: the set may have changed since the scan.
-            if tail_run_to_merge(&segments, settings) != Some(run) {
-                return Ok(0);
-            }
+        let (inputs, chunks, first_id, run) = {
             // A seal that has already claimed a LOWER id but not yet published
-            // it would end up sorting before this merge's output, which holds
-            // strictly older data — last-write-wins, inverted. The id claims
-            // are ordered by this lock, so declining here is enough: once no
-            // seal is outstanding, every future one claims above this merge.
-            // Bailing costs nothing; the next compaction tick rescans.
-            if self.unpublished_seals.load(Ordering::Relaxed) > 0 {
+            // it would end up sorting before this merge's outputs, which hold
+            // strictly older data — last-write-wins, inverted. The seal permit
+            // is what rules that out: a seal holds it from drain to publish,
+            // so while it is held here no seal is outstanding, and every seal
+            // afterwards claims an id above the ones taken below.
+            //
+            // **Held only long enough to choose the run and claim the ids** —
+            // microseconds — and never across the merge itself. Acquiring it
+            // is the slow half, not holding it: a seal owns the permit from
+            // its drain through the write, the fsync, the rename, the reopen
+            // and the reconcile, so a merge arriving mid-seal waits out all
+            // of that. The wait is bounded by one seal and falls on the
+            // maintenance thread, which has nothing else to do.
+            //
+            // Most ingest is unaffected, because a seal that cannot take the
+            // permit coalesces into the next one instead of waiting. Two
+            // paths do wait: [`Durability::Flushed`], which must seal before
+            // it acknowledges, and any mode once the buffer has reached four
+            // times `flush_spans`, where waiting IS the backpressure. Both
+            // wait only on the microseconds this holds it — never on a merge.
+            //
+            // Declining instead — the earlier design — starved compaction
+            // outright. A seal is in flight for much of the time under a
+            // sustained load, so a tick that checked once and gave up almost
+            // never found the store quiet: measured at 25,000 spans/s, one
+            // tick in sixteen achieved anything and the segment count climbed
+            // without bound, which is precisely what compaction exists to
+            // stop. Waiting out a seal costs a tick one seal; declining cost
+            // it the whole tick, and made progress a function of the write
+            // rate rather than of the backlog.
+            let _permit = self
+                .sealing
+                .lock()
+                .map_err(|_| Error::LockPoisoned("sealing"))?;
+            let segments = self.lock_segments()?;
+            let Some(run) = tail_run_to_merge(&segments, settings) else {
                 return Ok(0);
-            }
+            };
             let start = segments.len() - run;
             let inputs: Vec<std::sync::Arc<Segment>> = segments[start..].to_vec();
+            // Nothing here predates the tick, so this run is entirely work
+            // that arrived while it ran. Leave it to the next one.
+            if segment_number(&inputs[0].path).is_some_and(|id| id >= watermark) {
+                return Ok(0);
+            }
             let chunks = merge_chunks(&inputs, settings);
-            // The ids are claimed HERE, under the lock, and together with the
-            // check above that is what keeps a concurrent seal ordered
-            // correctly. No seal is between its drain and its publish at this
-            // instant, so every segment that appears while this merge runs
-            // claims a HIGHER id — and therefore sorts after the merged
-            // outputs, which is exactly right: it was written later. Claiming
-            // the ids after the merge would invert that and let merged (older)
-            // versions win over freshly sealed ones. One contiguous block, so
-            // the outputs keep their groups' order among themselves too.
+            // The ids are claimed HERE, under both guards, which is what keeps
+            // a concurrent seal ordered correctly: every segment that appears
+            // while this merge runs claims a HIGHER id, and therefore sorts
+            // after the merged outputs — exactly right, it was written later.
+            // Claiming the ids after the merge would invert that and let
+            // merged (older) versions win over freshly sealed ones. One
+            // contiguous block, so the outputs keep their groups' order among
+            // themselves too.
             let first_id = self
                 .next_segment
                 .fetch_add(chunks.len() as u64, Ordering::Relaxed);
-            (inputs, chunks, first_id)
+            (inputs, chunks, first_id, run)
         };
         let input_paths: Vec<PathBuf> = inputs.iter().map(|segment| segment.path.clone()).collect();
         let new_names: Vec<String> = (0..chunks.len() as u64)
@@ -2279,8 +2543,13 @@ impl Store {
         // clean the buffer, the log and every segment it knew about, and then
         // watch a segment land holding exactly the spans it just deleted.
         // Waiting for the permit also keeps a new seal from starting until the
-        // deletion is complete. Ingest is unaffected: it never takes this
-        // lock, its seals simply coalesce into the next one.
+        // deletion is complete. Most ingest is unaffected: it never takes this
+        // lock, and its seals simply coalesce into the next one. Two paths do
+        // wait, and this permit is held for a whole deletion rather than the
+        // microseconds compaction needs, so the wait is real —
+        // [`Durability::Flushed`] must seal before it acknowledges, and any
+        // mode blocks once the buffer reaches four times `flush_spans` (see
+        // `seal_must_not_be_skipped`).
         let _permit = self
             .sealing
             .lock()
@@ -2443,6 +2712,41 @@ impl Store {
             .sum())
     }
 
+    /// Bytes the content index holds resident across all segments: the
+    /// per-segment summary filters only.
+    ///
+    /// The per-block filters that do the real narrowing stay on disk and are
+    /// read a row at a time, so this figure scales with SEGMENT COUNT and not
+    /// with how much text the store holds. That is the property that makes
+    /// content search compatible with a store larger than RAM, and this is the
+    /// number that would betray it if it stopped being true.
+    pub fn resident_content_index_bytes(&self) -> Result<usize> {
+        let segments = self.lock_segments()?;
+        Ok(segments
+            .iter()
+            .map(|segment| segment.seg.content_resident_bytes())
+            .sum())
+    }
+
+    /// Mean fill ratio of the resident content summary filters, or `None` when
+    /// no segment carries a content index.
+    ///
+    /// A value approaching 1.0 means the filters have saturated: they still
+    /// cannot return a wrong answer, but they have stopped skipping segments
+    /// and content search has quietly degraded to a scan. Nothing in a query's
+    /// results would show that.
+    pub fn content_summary_fill(&self) -> Result<Option<f64>> {
+        let segments = self.lock_segments()?;
+        let fills: Vec<f64> = segments
+            .iter()
+            .filter_map(|segment| segment.seg.content_summary_fill())
+            .collect();
+        if fills.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(fills.iter().sum::<f64>() / fills.len() as f64))
+    }
+
     /// Distinct indexed `(key, value)` attribute pairs held resident across
     /// all persisted segments, summed per segment.
     ///
@@ -2599,10 +2903,11 @@ impl Store {
             let upserts = writer.upserts;
             // Claimed under the segments lock, which is what orders it against
             // a concurrent compaction: see the doc comment above and
-            // `merge_tail_run`. The in-flight count is published under the
-            // same lock so compaction can see that a lower id is outstanding.
+            // `merge_tail_run`. What keeps this id ordered against a merge's
+            // is the seal permit this thread already holds — a merge claims
+            // its own ids only while holding it, so it cannot be between this
+            // drain and its publish.
             let _segments = self.lock_segments()?;
-            self.unpublished_seals.fetch_add(1, Ordering::Relaxed);
             let id = self.next_segment.fetch_add(1, Ordering::Relaxed);
             self.metrics
                 .segment_seal_locked
@@ -2621,8 +2926,6 @@ impl Store {
                 // and the log still hold every acknowledged span exactly as
                 // they did before. A failed seal is a no-op, retried by the
                 // next one.
-                let _unclaim = self.lock_segments()?;
-                self.unpublished_seals.fetch_sub(1, Ordering::Relaxed);
                 return Err(error);
             }
         };
@@ -2633,7 +2936,6 @@ impl Store {
             let locked = Instant::now();
             segments.push(std::sync::Arc::new(segment));
             segments.sort_by(|left, right| left.path.cmp(&right.path));
-            self.unpublished_seals.fetch_sub(1, Ordering::Relaxed);
             self.metrics
                 .segment_seal_locked
                 .record(elapsed_nanos(&locked));
@@ -2764,7 +3066,8 @@ impl Store {
                 .iter()
                 .map(|span| span_to_record(span.borrow()))
                 .collect::<Result<Vec<_>>>()?;
-            let encoded = segment::encode(&records).map_err(segment_error)?;
+            let encoded =
+                segment::encode_with(&records, self.config.content_index).map_err(segment_error)?;
             let mut options = OpenOptions::new();
             options.write(true).create_new(true);
             let mut file = options.open(&temp_path)?;
@@ -3108,21 +3411,43 @@ fn order_spans(spans: &mut [Span], sort: Option<SpanSort>) {
 /// discards them. Adding a precise filter to a service query made it slower.
 ///
 /// Posting lists are already materialized in the index, so their lengths are
-/// exact, not estimated — the smallest one is genuinely the least work.
-fn select_probe<'a>(seg: &'a segment::Segment, filter: &SpanFilter) -> &'a [u64] {
-    let mut best: Option<&'a [u64]> = None;
-    let mut consider = |offsets: &'a [u64]| {
+/// counted, not estimated — the smallest one is genuinely the least work.
+/// (Since segment v4 a list is a digest-keyed CANDIDATE set, so a length is
+/// an upper bound rather than a match count. The gap is a collision away from
+/// zero, and every candidate is checked by `span_matches` regardless.)
+fn select_probe<'a>(
+    seg: &'a segment::Segment,
+    filter: &SpanFilter,
+    content: Option<&content::Query>,
+    metrics: &metrics::Metrics,
+) -> Result<Cow<'a, [u64]>> {
+    // The chosen list, and whether the content index is what produced it.
+    // The flag exists so the admission metric counts records the query will
+    // actually decode: incrementing when the content list was merely
+    // CONSIDERED overcounted every query where a narrower attribute probe
+    // won, and those records are never read.
+    let mut best: Option<(Cow<'a, [u64]>, bool)> = None;
+    let mut consider = |offsets: Cow<'a, [u64]>, from_content: bool| {
         // `Option::is_none_or` would read better but is newer than this
         // crate's MSRV.
-        if best.map_or(true, |current| offsets.len() < current.len()) {
-            best = Some(offsets);
+        if best
+            .as_ref()
+            .map_or(true, |(current, _)| offsets.len() < current.len())
+        {
+            best = Some((offsets, from_content));
         }
     };
     if let Some(service) = &filter.service {
-        consider(seg.attribute_posting_offsets_ref(IDX_SERVICE, service));
+        consider(
+            Cow::Borrowed(seg.attribute_candidate_offsets(IDX_SERVICE, service)),
+            false,
+        );
     }
     if let Some(name) = &filter.name {
-        consider(seg.attribute_posting_offsets_ref(IDX_NAME, name));
+        consider(
+            Cow::Borrowed(seg.attribute_candidate_offsets(IDX_NAME, name)),
+            false,
+        );
     }
     for (key, value) in &filter.attributes {
         // Session keys are expanded by the caller into a union and cannot
@@ -3130,13 +3455,51 @@ fn select_probe<'a>(seg: &'a segment::Segment, filter: &SpanFilter) -> &'a [u64]
         if key.starts_with('\u{0}') {
             continue;
         }
-        consider(seg.attribute_posting_offsets_ref(key, &canonical_value(value)));
+        consider(attribute_candidates(seg, key, value), false);
+    }
+    // The content index is just another candidate source, and often the most
+    // selective one: an attribute probe narrows to a value, a content probe
+    // narrows to the 128-record blocks that may hold a word. It costs a few
+    // small reads, so it is consulted only when the filter asks for it.
+    if let Some(query) = content {
+        if let Some(offsets) = seg
+            .content_candidate_offsets(query)
+            .map_err(segment_error)?
+        {
+            consider(Cow::Owned(offsets), true);
+        }
     }
     // Nothing indexable: every record is a candidate.
-    best.unwrap_or_else(|| seg.record_offsets())
+    let Some((offsets, from_content)) = best else {
+        return Ok(Cow::Borrowed(seg.record_offsets()));
+    };
+    if from_content {
+        metrics
+            .records_admitted_by_content
+            .add(offsets.len() as u64);
+    }
+    Ok(offsets)
 }
 
-fn span_matches(span: &Span, filter: &SpanFilter) -> bool {
+/// Whether `span` satisfies `filter`.
+///
+/// `content` is the filter's content query, parsed once by the caller rather
+/// than per span — tokenizing the needle for every candidate would cost more
+/// than the index saves. It is a separate parameter rather than a lookup
+/// inside `filter` so that every verification site has to acknowledge it: a
+/// path that forgot to check content would return spans that do not match,
+/// and the content index's whole safety argument is that the decoded span
+/// decides.
+fn span_matches(span: &Span, filter: &SpanFilter, content: Option<&content::Query>) -> bool {
+    if let Some(query) = content {
+        if !query.matches(content_strs(span).into_iter()) {
+            return false;
+        }
+    }
+    span_matches_without_content(span, filter)
+}
+
+fn span_matches_without_content(span: &Span, filter: &SpanFilter) -> bool {
     if filter
         .service
         .as_ref()
@@ -3445,10 +3808,13 @@ mod seal_tests {
     }
 
     #[test]
-    fn compaction_declines_while_a_seal_holds_an_unpublished_id() {
+    fn compaction_waits_for_a_seal_rather_than_claiming_an_id_beside_it() {
         // A seal that claimed a LOWER id but has not published it yet would
-        // sort BEFORE a merge that claims its id now — and the merge's output
-        // is strictly older data, so it would win. Compaction must wait.
+        // sort BEFORE a merge that claims its id now — and the merge's outputs
+        // are strictly older data, so they would win. The seal permit is what
+        // rules that out, and compaction WAITS for it. Declining instead was
+        // correct and useless: a seal is in flight for much of the time under
+        // load, so compaction simply stopped running.
         let dir = test_dir("compaction-guard");
         let config = Config {
             durability: Durability::Buffered,
@@ -3459,7 +3825,7 @@ mod seal_tests {
             }),
             ..Config::default()
         };
-        let store = Store::open(&dir, config).expect("open");
+        let store = std::sync::Arc::new(Store::open(&dir, config).expect("open"));
         for index in 0..4 {
             store
                 .ingest(span("t", &format!("s{index}"), "v1"))
@@ -3468,19 +3834,26 @@ mod seal_tests {
         }
         assert_eq!(store.stats().expect("stats").segment_count, 4);
 
-        // Stand in for a seal that has claimed an id and not yet published.
-        store.unpublished_seals.store(1, Ordering::Relaxed);
+        // Stand in for a seal between its drain and its publish.
+        let permit = store.sealing.lock().expect("permit");
+        let compactor = {
+            let store = std::sync::Arc::clone(&store);
+            std::thread::spawn(move || store.compact_segments().expect("compact"))
+        };
+        // It must not have published anything while the permit is out. Not a
+        // proof on its own — the thread may simply not have run yet — but it
+        // fails loudly if compaction ever stops taking the permit at all.
+        std::thread::sleep(std::time::Duration::from_millis(50));
         assert_eq!(
-            store.compact_segments().expect("compact"),
-            0,
-            "compaction must not claim an id above an outstanding seal's"
+            store.stats().expect("stats").segment_count,
+            4,
+            "no merge may publish while a seal holds an unpublished id"
         );
-        assert_eq!(store.stats().expect("stats").segment_count, 4);
 
-        store.unpublished_seals.store(0, Ordering::Relaxed);
+        drop(permit);
         assert!(
-            store.compact_segments().expect("compact") > 0,
-            "and must proceed as soon as none is outstanding"
+            compactor.join().expect("compactor") > 0,
+            "and it must proceed once the permit is free, not give up"
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -3514,6 +3887,7 @@ mod planner_tests {
                     trace_id: format!("t{index}"),
                     attributes,
                     payload: b"{}".to_vec(),
+                    content: Vec::new(),
                 }
             })
             .collect();
@@ -3539,7 +3913,9 @@ mod planner_tests {
             ..SpanFilter::default()
         };
         assert_eq!(
-            select_probe(&seg, &service_only).len(),
+            select_probe(&seg, &service_only, None, &metrics::Metrics::default())
+                .expect("plan")
+                .len(),
             100,
             "service alone can only probe the whole segment"
         );
@@ -3550,14 +3926,18 @@ mod planner_tests {
             ..SpanFilter::default()
         };
         assert_eq!(
-            select_probe(&seg, &both).len(),
+            select_probe(&seg, &both, None, &metrics::Metrics::default())
+                .expect("plan")
+                .len(),
             1,
             "with a selective attribute available, the scan must follow it"
         );
 
         let no_predicate = SpanFilter::default();
         assert_eq!(
-            select_probe(&seg, &no_predicate).len(),
+            select_probe(&seg, &no_predicate, None, &metrics::Metrics::default())
+                .expect("plan")
+                .len(),
             100,
             "with nothing indexable every record is a candidate"
         );
@@ -3573,6 +3953,10 @@ mod planner_tests {
             attributes: vec![("rare".to_owned(), Value::String("absent".to_owned()))],
             ..SpanFilter::default()
         };
-        assert!(select_probe(&seg, &absent).is_empty());
+        assert!(
+            select_probe(&seg, &absent, None, &metrics::Metrics::default())
+                .expect("plan")
+                .is_empty()
+        );
     }
 }

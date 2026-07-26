@@ -183,7 +183,9 @@ export function TracesScreen({ go, params }) {
     else if (event.key === 'e') { event.preventDefault(); go(['store'], toHash(applied)); }
     else if (event.key === '/') {
       event.preventDefault();
-      document.querySelector('input[aria-label="Field"]')?.focus();
+      // `/` goes to the text search, not the predicate builder: it is the
+      // control somebody reaching for a keyboard shortcut means.
+      document.querySelector('input[aria-label="Search text"]')?.focus();
     }
   }, [rows, selected, applied, go]);
 
@@ -222,6 +224,24 @@ export function TracesScreen({ go, params }) {
           <Chip tone="primary" onClick={() => apply(query)}>Search</Chip>
         </span>
       </div>
+      {/* Content search gets the full width and the first position: it is the
+          one filter a user reaches for without already knowing the schema.
+          Word matching, not substring — "refund" finds "Refund the order" and
+          not "refunds" — which is why it is a field of its own rather than a
+          predicate row whose operator would have to lie about the semantics. */}
+      <input value={query.content}
+        onChange={(e) => setQuery((q) => ({ ...q, content: e.target.value }))}
+        onKeyDown={(e) => { if (e.key === 'Enter') apply(query); }}
+        aria-label="Search text"
+        placeholder="search text in prompts, completions and events (words, not substrings)"
+        title={'Finds spans containing every word given, anywhere in their text.\n'
+          + 'Word matching, not substring: "refund" finds "Refund the order", not "refunds".\n'
+          + 'Multiple words are ANDed, in any order.'}
+        style={{
+          width: '100%', padding: '5px 9px', marginBottom: 8,
+          border: '1px solid var(--hairline)', borderRadius: 'var(--radius-control)',
+          background: 'var(--bg)', fontSize: 13, color: 'var(--ink)', outline: 'none',
+        }} />
       <div style={{ display: 'grid', gap: 5 }}>
         {query.preds.map((pred, index) => <PredicateRow key={pred.id} pred={pred}
           onChange={(next) => setQuery((q) => ({
@@ -237,8 +257,8 @@ export function TracesScreen({ go, params }) {
             + predicate
           </Chip>
           <span style={{ fontSize: 12, color: 'var(--ink-faint)' }}>
-            or press <Kbd>/</Kbd> to type{' '}
-            <code style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>min_attr.llm.usage.total_tokens=4000</code> directly
+            press <Kbd>/</Kbd> for the text search · a predicate narrows it, for example{' '}
+            <code style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>min_attr.llm.usage.total_tokens ≥ 4000</code>
           </span>
         </div>
       </div>

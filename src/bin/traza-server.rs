@@ -12,7 +12,7 @@
 //!   naming what the acknowledgement guarantees.
 //! - `GET /v1/traces/<trace_id>` responds `{"trace_id": .., "spans": [..]}`
 //!   or 404 `{"error": "trace not found"}`.
-//! - `GET /v1/spans?service=&name=&min_duration_ns=&since_ns=&until_ns=&limit=`
+//! - `GET /v1/spans?service=&name=&content=&min_duration_ns=&since_ns=&until_ns=&limit=`
 //!   responds with the matching spans ordered by start time.
 //! - `GET /v1/stats` responds with engine statistics.
 //! - `GET /v1/sessions?since=&until=&limit=` lists sessions (spans carrying a
@@ -436,6 +436,7 @@ default 64MiB)] \
 [--durability buffered|wal|flushed (default wal)] \
 [--wal-commit-window-us N (delay each fsync so more acks share it; 0 = off)] \
 [--compaction-fanout N (0 disables; default 4)] [--compaction-max-segment-bytes N] \
+[--no-content-index (content search still works, by scanning)] \
 [--ui-dir DIR (built dashboard; default: TRAZA_UI_DIR, beside the binary, then ./ui/dist)] \
 [--allow-unauthenticated-non-loopback]";
 
@@ -474,6 +475,7 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
     let mut durability = Durability::default();
     let mut compaction = CompactionConfig::default();
     let mut compaction_enabled = true;
+    let mut content_index = true;
     let mut flush_wal_bytes = traza::DEFAULT_FLUSH_WAL_BYTES;
     let mut profile = Profile::default();
     // Profile-owned: `None` means "not given on the command line", which is
@@ -544,6 +546,10 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
                 i += 1;
                 wal_commit_window_us = Some(number(i, "--wal-commit-window-us")?);
             }
+            // Content search still works without it — segments are scanned
+            // rather than skipped — so this trades query latency for seal CPU
+            // and about 1-2% of segment size.
+            "--no-content-index" => content_index = false,
             "--durability" => {
                 i += 1;
                 let name = value(i, "--durability")?;
@@ -599,6 +605,7 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
             // Never profile-derived: what an acknowledgement guarantees is a
             // contract with clients, not a performance setting.
             durability,
+            content_index,
             compaction: compaction_enabled.then_some(compaction),
         },
     }))
@@ -1656,6 +1663,9 @@ fn span_query_from(raw_query: &str) -> Result<(SpanFilter, Option<traza::SpanCur
             // looked like this filter existed while answering nothing.
             "status" => filter.status = Some(value),
             "not_status" => filter.excluded_statuses.push(value),
+            // Word search over the span's text. Not substring, not a phrase —
+            // see `SpanFilter::content`.
+            "content" | "q" => filter.content = Some(value),
             "cursor" => {
                 cursor = Some(
                     traza::SpanCursor::from_token(&value)

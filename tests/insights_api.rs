@@ -524,3 +524,89 @@ fn prometheus_output_carries_the_new_series() {
     }
     server.kill();
 }
+
+#[test]
+fn content_search_composes_with_the_aggregations() {
+    // The merge that brought content search together with these routes put a
+    // filter the aggregations had never seen through `fold_spans`. Nothing
+    // covered that pairing: each side was tested against the search path only,
+    // and a fold that dropped `content` would answer these routes over the
+    // whole corpus while looking perfectly healthy.
+    let dir = test_dir("content-fold");
+    let server = Server::spawn(&dir);
+
+    let spans: Vec<Value> = (0..10u64)
+        .map(|index| {
+            let start = BASE_NS + index * 1_000_000_000;
+            json!({
+                "trace_id": format!("ct-{index:02}"),
+                "span_id": "s1",
+                "name": "tool.lookup",
+                "service": "svc",
+                "status": if index < 3 { "error" } else { "ok" },
+                "start_time_ns": start,
+                "end_time_ns": start + (index + 1) * 10_000_000,
+                // Half the corpus is about refunds, half about shipping. The
+                // words are distinct so a leaked filter is unmistakable.
+                "attributes": { "note": if index < 5 { "refund the order" } else { "shipping label" } },
+            })
+        })
+        .collect();
+    let (status, body) = server.request("POST", "/v1/spans", Some(&json!({ "spans": spans })));
+    assert_eq!(status, 200, "{body}");
+
+    // Baseline: the search path agrees the split is five and five.
+    let (_, body) = server.request("GET", "/v1/spans?content=refund&limit=100", None);
+    assert_eq!(body["spans"].as_array().map(Vec::len), Some(5), "{body}");
+
+    // The distribution must see the same five, not all ten.
+    let (status, body) = server.request("GET", "/v1/stats/duration?content=refund", None);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["count"], 5, "content must narrow the fold: {body}");
+
+    // Failures: three of the refund spans are errors, none of the shipping ones.
+    let (status, body) = server.request("GET", "/v1/stats/failures?content=refund", None);
+    assert_eq!(status, 200, "{body}");
+    let total: u64 = body["groups"]
+        .as_array()
+        .expect("groups")
+        .iter()
+        .map(|group| group["count"].as_u64().unwrap_or(0))
+        .sum();
+    assert_eq!(total, 3, "{body}");
+
+    // A word in the corpus but not in this half must fold to nothing.
+    let (_, body) = server.request("GET", "/v1/stats/duration?content=shipping", None);
+    assert_eq!(body["count"], 5, "{body}");
+    let (_, body) = server.request("GET", "/v1/stats/duration?content=refund%20shipping", None);
+    assert_eq!(
+        body["count"], 0,
+        "words are ANDed, so no span has both: {body}"
+    );
+
+    // The series buckets the narrowed set, not the corpus.
+    let until = BASE_NS + 11_000_000_000;
+    let (status, body) = server.request(
+        "GET",
+        &format!("/v1/stats/series?since={BASE_NS}&until={until}&buckets=5&content=refund"),
+        None,
+    );
+    assert_eq!(status, 200, "{body}");
+    let counted: u64 = body["buckets"]
+        .as_array()
+        .expect("buckets")
+        .iter()
+        .map(|bucket| bucket["spans"].as_u64().unwrap_or(0))
+        .sum();
+    assert_eq!(counted, 5, "{body}");
+
+    // And the tail ranks within the narrowed set: the slowest refund span is
+    // index 4 at 50ms, not index 9 at 100ms.
+    let (_, body) = server.request("GET", "/v1/stats/slowest?content=refund&limit=1", None);
+    let span = &body["spans"][0];
+    let duration =
+        span["end_time_ns"].as_u64().unwrap_or(0) - span["start_time_ns"].as_u64().unwrap_or(0);
+    assert_eq!(duration, 50_000_000, "ranked outside the filter: {body}");
+
+    server.kill();
+}

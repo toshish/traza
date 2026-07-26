@@ -69,6 +69,41 @@ describe('predicates map onto the API the store actually exposes', () => {
   });
 });
 
+describe('content search', () => {
+  it('maps onto the API parameter the store understands', () => {
+    const params = toParams({ ...withPreds(), content: 'refund order' });
+    expect(params.content).toBe('refund order');
+  });
+
+  it('composes with predicates rather than replacing them', () => {
+    const params = toParams({
+      ...withPreds(predicate('service', '=', 'checkout')),
+      content: 'refund',
+    });
+    expect(params.content).toBe('refund');
+    expect(params.service).toBe('checkout');
+  });
+
+  it('is dropped when blank, so an empty box is not a filter', () => {
+    expect(toParams({ ...withPreds(), content: '   ' }).content).toBeUndefined();
+  });
+
+  it('round-trips through the URL alongside predicates', () => {
+    // `c`, not `q` — the hash spends `q` on the predicate list.
+    const original = { ...withPreds(predicate('status', '=', 'error')), content: 'refund order' };
+    const hash = toHash(original);
+    expect(hash.c).toBe('refund order');
+    const restored = fromHash(new URLSearchParams(hash));
+    expect(restored.content).toBe('refund order');
+    expect(toParams(restored)).toEqual(toParams(original));
+  });
+
+  it('reaches the curl command', () => {
+    const command = toCurl({ ...withPreds(), content: 'refund order' }, 'http://x');
+    expect(command).toContain('content=refund%20order');
+  });
+});
+
 describe('a query survives a round trip through the URL', () => {
   it('restores every predicate', () => {
     const original = withPreds(

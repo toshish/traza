@@ -154,12 +154,13 @@ Prefer protobuf for wire size and CPU; use whichever your exporter speaks.
 
 ## Memory
 
-**Payloads are not resident. Indexes are — and for a text attribute the index
-*is* the text.** Both halves have to be said together. Said alone, the first
-half ("memory is O(indexes), not O(data)") reads as a size-independence
-promise, and it is not one. What is bounded independently of corpus size is
-the *payload*; what is not bounded is the set of distinct indexed attribute
-values, which for LLM traffic is the bulk of the data.
+**Payloads are not resident. Indexes are, and their cost tracks
+*cardinality* — how many distinct values a segment holds — not the size of
+those values.** The second clause is new in segment format v4. Through v3 the
+attribute index was keyed on the value text itself, and for LLM traffic the
+index therefore *was* the corpus; that regime, and what it cost, is recorded
+below because operators running stores written before v4 still need to
+recognize it.
 
 The payload half is true, structural, and asserted by the test suite. An open
 segment holds a file handle, its record-offset table and its two decoded
@@ -168,61 +169,82 @@ are never retained — not even by the flush that just wrote them.
 `Store::resident_persisted_span_structs()` and
 `Store::resident_payload_bytes()` are both zero after open and after flush.
 
-The index half is the part that was missing. `Segment` keys its attribute
-index on the **entire attribute value**:
-
-```rust
-attribute_index: HashMap<(String, String), Vec<u64>>
-```
-
-and `Segment::open` decodes it in full, eagerly. Every distinct indexed value
-that stayed below `--payload-threshold-bytes` is therefore pinned in RAM,
-verbatim, for as long as the segment is open. Note also that
-`resident_payload_bytes()` deliberately excludes indexes, so it reports zero
-however large they get: it is not a memory-safety signal on its own.
-`Store::resident_index_bytes()` and
+Note that `resident_payload_bytes()` deliberately excludes indexes, so it
+reports zero however large they get: it is not a memory-safety signal on its
+own. `Store::resident_index_bytes()` and
 `Store::resident_attribute_index_entries()` report the other half. Both are
 documented as approximate — exact allocator accounting needs a dependency
 this crate does not take.
 
 ### The cost model
 
+Since v4 the attribute index interns keys in a per-segment dictionary and
+stores a 128-bit digest in place of each value:
+
 ```text
-resident ≈ Σ over segments ( bytes of distinct key/value pairs in that segment )
-         + 8 bytes × spans × indexed attributes        (postings)
-         + 8 bytes × spans                             (record offsets)
-         + the trace index
+resident ≈ 20 bytes × distinct (key, value) pairs per segment  (index entries)
+         + 8 bytes × spans × indexed attributes                (postings)
+         + 8 bytes × spans                                     (record offsets)
+         + the trace index                                     (still keyed on text)
 ```
 
-The first term is near zero for conventional tracing and unbounded for
-indexed prompts. The rest is a floor that nothing gets under.
+Every term is now bounded by span *count* and attribute *cardinality*. None of
+them is bounded by attribute value size, which is the property that was
+missing. Measured end to end, an index entry costs roughly **150 bytes of
+RSS** including postings, hash-table slack and allocator overhead.
 
-**Deduplication is per segment, and that is the trap.** A value that recurs
-across segments is decoded and held once *per segment*. So global repetition
-rate is not what you pay for — repetition *within a segment* is. Once the
-number of distinct values in flight exceeds `--flush-spans`, no segment ever
-sees a repeat and the index holds one copy of every value ingested.
-
-### Where the rule holds: low-cardinality attributes
+**Deduplication is still per segment.** A value that recurs across segments is
+counted once *per segment*, so repetition *within* a segment is what saves an
+entry. This matters far less than it used to: an entry is 20 bytes rather than
+a prompt.
 
 For what conventional tracing indexes — service, operation name,
-`http.method`, `http.status_code`, `db.system`, a deployment tier: tens to
-thousands of short distinct values — the value bytes vanish and only the
-postings floor remains. That floor is genuinely independent of span size, and
-in this regime a store far larger than RAM serves correctly exactly as
-advertised.
-
-Measured: 10,000,000 spans, six indexed attributes, between 1 and 50 distinct
-values each, 8.4 GiB on disk across 977 segments — **846 MiB RSS on open**.
-The per-key breakdown is flat at ~80 MB per indexed key, which is
+`http.method`, `db.system`, a deployment tier: tens to thousands of short
+distinct values — the postings floor was always the whole cost, and v4 does
+not change it. Measured under v3: 10,000,000 spans, six indexed attributes,
+between 1 and 50 distinct values each, 8.4 GiB on disk across 977 segments —
+**846 MiB RSS on open**, with the per-key breakdown flat at ~80 MB, which is
 10,000,000 × 8 bytes of postings and nothing else. Span size never entered
-into it.
+into it, and under v4 it still does not.
 
-### Where it stops holding: indexed text
+### What this cost, measured
 
-It stops as soon as an indexed attribute carries prompt or completion text,
-and it stops *hard*. One indexed text attribute, `--flush-spans 10000`,
-256 MiB of attribute text ingested in every row:
+One indexed text attribute, `--flush-spans 10000`, 256 MiB of attribute text
+ingested, all values distinct — the corpus shape that broke the v3 model.
+Same machine, same command, the commit before and after the change:
+
+| Cell | | v3 (text-keyed) | v4 (digest-keyed) |
+|---|---|---:|---:|
+| 2 KiB × 131,072 | RSS on open | 391 MiB | **21.6 MiB** |
+| | Approx. resident index | 279 MiB | 16.5 MiB |
+| | Attribute index on disk | 262 MiB | 6.0 MiB |
+| | Segment bytes on disk | 825 MiB | 569 MiB |
+| 512 B × 524,288 | RSS on open | 439 MiB | **77.5 MiB** |
+| | Approx. resident index | 348 MiB | 65.3 MiB |
+| | Attribute index on disk | 282 MiB | 24.0 MiB |
+| | Segment bytes on disk | 997 MiB | 740 MiB |
+
+Both cells hold the same 256 MiB of text. That the 512 B cell still costs
+3.6× the 2 KiB cell is the model working as designed, not a residual defect:
+it holds four times as many spans, so four times as many index entries and
+postings. Cost tracks cardinality now, and cardinality is what differs.
+
+**These two cells are spot measurements, not a matrix.** They were taken one
+run each at load average 18-22 on a machine that was not idle. RSS has proved
+insensitive to that load (three repeats of one cell previously landed within
+0.2 MiB), and the effect here is 5-18×, far outside any plausible noise. But
+the rest of the matrix below — every 10%-distinct row, 8 KiB, 64 KiB,
+clustering, `--payload-threshold-bytes` — **has not been re-measured since
+v4** and is marked accordingly.
+
+### The v3 figures, kept for stores written before v4
+
+Every row in this section describes the text-keyed index. A v2 or v3 segment
+still opens, and its values are hashed and discarded at open time, so these
+costs do **not** persist after an upgrade — but they are what the recorded
+figures elsewhere in this repository were measured under.
+
+One indexed text attribute, `--flush-spans 10000`, 256 MiB of text per row:
 
 | Value size | Distinct values | Segments | Approx. resident index | RSS on open |
 |---|---:|---:|---:|---:|
@@ -235,75 +257,112 @@ and it stops *hard*. One indexed text attribute, `--flush-spans 10000`,
 | 64 KiB | 4,096 (100%) | 1 | 257 MiB | 580 MiB |
 | 64 KiB | 409 (10%) | 1 | 26 MiB | 60 MiB |
 
-Read the 512 B and 2 KiB rows twice: **10% distinct costs exactly what 100%
-distinct costs.** At those sizes 256 MiB of text is more than 10,000 spans'
-worth even at a tenth uniqueness, so every segment is full of values it will
-never see again, and the tenfold "saving" is worth nothing. Larger values are
-*cheaper* per byte of text at a fixed uniqueness ratio, for the same reason
-in reverse: fewer spans fit in a segment, so a segment sees fewer distinct
-values.
+Under v3 this scaled linearly with text, which was the whole problem. 2 KiB
+values, all distinct: 256 / 512 / 1024 MiB of text cost 391 / 759 / 1498 MiB
+RSS, a least-squares fit of **RSS ≈ 1.44 × (indexed text) + 22 MiB**.
+Extrapolating it, 10M spans each carrying one 2 KiB prompt was 20 GB of text
+and roughly **29 GB of RSS** — a store that would not open on a 32 GB machine.
+The same extrapolation against the v4 measurement above gives roughly 1.6 GB.
 
-It scales linearly, which is the whole problem. 2 KiB values, all distinct:
+Two v3 mitigations are now largely obsolete, and are recorded here only so
+that existing tuning can be unwound rather than cargo-culted:
 
-| Attribute text ingested | RSS on open |
-|---:|---:|
-| 256 MiB | 391 MiB |
-| 512 MiB | 759 MiB |
-| 1024 MiB | 1498 MiB |
+- **Temporal clustering** (confining repeats of a value to one segment) cut
+  the 2 KiB / 10%-distinct cell from 391 MiB to 50 MiB. It still helps under
+  v4, by the same per-segment-dedup mechanism, but the amount it can save is
+  now 20 bytes per avoided entry.
+- **`--payload-threshold-bytes`**, lowered to a few kilobytes, took prompt
+  text out of the index entirely: 391 MiB → 81 MiB on the 2 KiB cell. It cost
+  an fsynced file per distinct value, which took that run from 8 seconds to
+  roughly 25 minutes, and an extra read to display a value. **Under v4 this
+  is no longer a memory tactic** — the index costs the same either way — so
+  set the threshold on the merits of on-disk size and record width alone.
 
-A least-squares fit over those three points is **RSS ≈ 1.44 × (indexed text)
-+ 22 MiB**. A second indexed text attribute doubles the text and doubles the
-cost (391 → 775 MiB). Extrapolating that line — an extrapolation, not a
-measurement — 10M spans each carrying one 2 KiB indexed prompt is 20 GB of
-text and roughly **29 GB of RSS**. Such a store does not open on a 32 GB
-machine.
+**Not indexing the attribute at all** remains available: a user attribute
+whose key begins with a NUL byte is stored verbatim in the span and skipped by
+the index entirely.
 
-### What actually helps
+### Content search
 
-**Temporal clustering, when you have it.** Because deduplication is per
-segment, confining each distinct value to one segment collapses the cost.
-Same corpora as above, the only change being whether repeats of a value are
-spread across the run or arrive together:
+`?content=refund` finds spans by the words in their text. It is served by a
+per-segment word filter (segment format v5), and its cost profile is worth
+understanding because it is very good in one regime and does nothing in
+another.
 
-| Corpus | Repeats spread out | Repeats clustered |
+Measured with `cargo run --release --bin content-bench`, which runs the same
+corpus twice — once with the index and once with `--no-content-index` — so the
+comparison is two measurements rather than one measurement and a memory.
+200,000 spans carrying a prompt and a completion of 60 words each, 145 MiB of
+text, 100 segments, no compaction, load average 7-10:
+
+| Query | Matches | With index | Without | Speedup |
+|---|---:|---:|---:|---:|
+| A word in one span | 1 | 1.48 ms | 1,258 ms | **849x** |
+| Two words, one span | 1 | 0.74 ms | 1,156 ms | **1,554x** |
+| A word in ~every span | 195,526 | 1,156 ms | 1,120 ms | 1.0x |
+| A word in no span | 0 | 0.008 ms | 1,163 ms | **146,000x** |
+
+Read the third row as carefully as the first. **When nearly everything
+matches, the index cannot help and does not pretend to** — it costs about 3%
+and saves nothing, because the work is decoding and returning 195,526 spans,
+not finding them. The index buys selectivity; a query with none gets none.
+
+The fourth row is the common case in practice and the cheapest: a word no
+segment holds is rejected from the resident summary filters alone, without
+opening a single file.
+
+**Latency is flat in corpus size, which is the property that matters.** The
+same cells at 50,000 spans measured 0.72 ms for the rare term against 285 ms
+scanning. Four times the corpus took the scan from 285 ms to 1,258 ms and the
+indexed query from 0.72 ms to 1.48 ms.
+
+What it costs:
+
+| | 50,000 spans | 200,000 spans |
 |---|---:|---:|
-| 2 KiB, 10% distinct | 391 MiB | 50 MiB |
-| 2 KiB, 50% distinct | 391 MiB | 200 MiB |
-| 8 KiB, 10% distinct | 156 MiB | 57 MiB |
-| 8 KiB, 50% distinct | 448 MiB | 226 MiB |
+| Segment bytes added | +0.1% | +0.1% |
+| Resident filters | 0.05 MiB | 0.20 MiB |
+| Resident per segment | ~2 KiB | ~2 KiB |
 
-This is not usually a dial you control, but it explains why two stores with
-the same span count and the same global cardinality can differ eightfold.
+**The resident cost scales with segment count, not with text**, because only
+the per-segment summary filter stays in RAM — the per-block filters are read
+from disk a row at a time. It is capped at 32 KiB per segment, so even a store
+with a thousand segments cannot spend more than 32 MiB on it.
 
-**`--payload-threshold-bytes`, which is a dial you do control.** A value above
-the threshold is moved to the content-addressed payload store and replaced
-inline by a reference object, so it never enters the attribute index. The
-default is 262,144 bytes, which almost no prompt reaches — lowering it to a
-few kilobytes is what takes prompt text out of RAM. Measured on the 2 KiB,
-all-distinct corpus above, the only change being `--payload-threshold-bytes
-1024`:
+**The ingest cost is not resolved by these runs and should not be quoted.**
+The 50,000-span cell measured 0.80 s with the index against 0.62 s without;
+the 200,000-span cell measured 3.26 s against 3.33 s — the opposite sign. Both
+are single runs on a machine at load average 7-10, and the honest reading is
+that seal-time tokenization is somewhere between free and about 30%, which is
+too wide to publish. Re-measure on an idle machine before relying on it.
 
-| | Inline (default threshold) | Offloaded |
-|---|---:|---:|
-| RSS on open | 391 MiB | **81 MiB** |
-| Approx. resident index | 279 MiB | 69 MiB |
-| Segment bytes on disk | 825 MiB | 195 MiB |
+Two operational signals, both on `/v1/metrics`:
 
-This does not make the cost constant — the reference object carries a
-256-character preview, which is itself distinct per value, so residency falls
-to roughly the preview rather than to zero and stays linear in distinct
-values. The saving therefore grows with value size: ~5x at 2 KiB, and
-proportionally more the larger the prompts are. It is not free at ingest
-either — each distinct value becomes a written, fsynced file, and this run
-took roughly 25 minutes against 8 seconds inline. Displaying an offloaded
-value costs an extra read.
+- `traza_segments_pruned_by_content_total` against
+  `traza_segments_examined_total` — how much of the store the summary filters
+  are eliminating. If this goes to zero, content search has degraded to a scan
+  and results will look identical while latency does not.
+- `traza_records_admitted_by_content_total` against the rows actually
+  returned — the block filters' real selectivity. A ratio that climbs means
+  the filters are saturating.
 
-**Not indexing the attribute at all.** A user attribute whose key begins with
-a NUL byte is stored verbatim in the span and skipped by the index entirely.
+`--no-content-index` turns the index off. Content search still works; it
+scans.
 
-**`--flush-spans`, weakly.** Smaller segments hold fewer distinct values each,
-but only help when values repeat. At 2 KiB and all-distinct, 5,000 / 10,000 /
-30,000 measured 382 / 391 / 457 MiB — a real but second-order effect.
+### What v4 does not fix
+
+**The trace index is still keyed on trace-id text.** It is now the largest
+text-keyed structure a segment holds. This is bounded — a trace id is 32 hex
+characters, not a prompt — so it scales with span count rather than with
+payload size, but it is a real term and it is why the 512 B cell's floor is
+not lower than it is.
+
+**Compaction's transient is untouched.** A merge materializes its inputs, so
+its peak tracks the segment-size cap and not the index. Measured on the 2 KiB
+cell, peak RSS during merge was 1,587 MiB under v3 and 1,362 MiB under v4:
+the merge got slightly cheaper because the index it rewrites is smaller, and
+it is still three orders of magnitude above the steady state. Size a host for
+the merge, not for the steady state.
 
 ### The recorded figures, and what is wrong with them
 
@@ -369,14 +428,23 @@ the habit this page is trying to break. What is stable across both runs, and
 is the point, is the order of magnitude: a merge costs roughly a gigabyte and
 a half regardless of how small the store it is merging.
 
-**These 5 rows are the only compaction measurements on this page.** Of
-26 configurations, 21 merged nothing at all —
-`compact_segments()` returned 0 — and the benchmark reports those as "did not
-merge" rather than printing their steady-state RSS in a column headed
-compaction. Every configuration that merged held 13 segments; every one that
-did not held 4 or fewer. That is a compaction defect under separate
-investigation, and until it is understood this table describes merges on
-512-byte-value corpora and nothing wider.
+**These 5 rows are the only compaction measurements on this page**, and they
+come from a matrix in which 21 of 26 configurations merged nothing at all.
+That had two causes, and only one of them was a defect:
+
+- A **partial tail segment masked the qualifying run behind it**, so a corpus
+  that ended mid-segment declined to merge however many full segments it
+  held. Fixed by [#21](https://github.com/toshish/traza/pull/21), and verified
+  after the merge: 45,000 spans (four full segments plus a 5,000-span tail)
+  now merges 3 of 5 where the same shape previously merged nothing.
+- The remaining non-merging cells held **three full-size segments, below the
+  default fanout of 4**. Declining to merge those is the policy working. The
+  matrix simply used cell sizes that did not reach the threshold.
+
+So the table is still narrow — it describes merges on 512-byte-value corpora
+and nothing wider — but because of how the cells were sized, not because
+compaction refuses wider ones. Re-running the matrix with span counts that
+reach fanout is what closes this, and it has not been done yet.
 
 ### Reproducing all of this
 
