@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The index-memory benchmark's "peak RSS" was not a peak.** It took one RSS
+  sample after `compact_segments()` returned — after the merge has freed its
+  working set — so it measured the trough and the capacity guide published it
+  as the peak. A comment claimed a peak sampler existed; none did. RSS is now
+  sampled every 20 ms by a background thread for the duration of the merge,
+  and the real figures are 1.7-2.3x higher: a store serving in 10 MiB peaks at
+  **1,203 MiB** to compact itself, not 721.
+- **A failed probe was published as a zero-memory result.** A child that died
+  produced an empty JSON object, and the reporter turned missing fields into
+  `0.0` — so the most important failure this benchmark can have, the child
+  being OOM-killed on the very configuration whose memory is in question,
+  rendered as `0.0 MiB`: the best-looking number in the table. Probe failure
+  and unparseable output now abort, naming the configuration and the child's
+  stderr. Verified by simulating an OOM kill.
+- **Compaction rows were reported for runs that never compacted.** 21 of 26
+  configurations return 0 from `compact_segments()`, and their steady-state
+  RSS was appearing under a compaction heading. They now read "did not merge".
+- Per-key index diagnostics moved to their own `--by-key` invocation: computing
+  them reopens and decodes every segment, and the allocator held those freed
+  blocks across the RSS reading that followed.
+- The capacity guide claimed "none is estimated" while carrying an explicitly
+  extrapolated 29 GB projection. It now states the exception and cites the
+  measurement records by name.
+
+### Added
+
+- **`INDEX-MEM-BENCHMARK.md` and `INDEX-MEM-BENCHMARK.json`** — the committed
+  measurement record behind the memory figures, with commit SHA, machine,
+  timestamp, load average per row, `compacted_away`, and the raw per-cell
+  results. The prose numbers were previously traceable only to a binary.
+
 ## [Unreleased]
 
 ### Added

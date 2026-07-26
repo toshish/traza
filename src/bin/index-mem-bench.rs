@@ -391,23 +391,70 @@ fn probe(directory: &Path, flush_spans: usize, payload_threshold: usize, compact
         "resident_payload_bytes": payload_bytes,
         "segments": stats.segment_count,
         "records": stats.total_records,
-        "by_attribute_key": cost_by_key(directory),
     });
 
     if compact {
+        // Sample RSS THROUGHOUT the merge, not once after it returns.
+        //
+        // A merge's whole point here is its transient working set, which is
+        // freed by the time `compact_segments` hands control back — so a
+        // single post-hoc sample measures the trough and reports it as the
+        // peak. An earlier version of this benchmark did exactly that, and
+        // the figures it produced were published as peaks.
+        //
+        // Nothing else in this process allocates while the sampler runs: the
+        // per-key diagnostics moved to their own invocation (`--by-key`)
+        // because reopening every segment to compute them left the allocator
+        // holding freed blocks that inflated the next reading.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let peak = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(rss_bytes()));
+        let sampler = {
+            let stop = std::sync::Arc::clone(&stop);
+            let peak = std::sync::Arc::clone(&peak);
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let now = rss_bytes();
+                    peak.fetch_max(now, std::sync::atomic::Ordering::Relaxed);
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                peak.fetch_max(rss_bytes(), std::sync::atomic::Ordering::Relaxed);
+            })
+        };
+
         let started = Instant::now();
         let merged = store.compact_segments().expect("probe: compact");
-        let rss_compacted = rss_bytes();
+        let compact_seconds = started.elapsed().as_secs_f64();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        sampler.join().expect("probe: sampler");
+
+        let settled = rss_bytes();
         let after = store.resident_index_bytes().expect("probe: index bytes");
         let stats = store.stats().expect("probe: stats");
         report["compacted_away"] = json!(merged);
-        report["compact_seconds"] = json!(started.elapsed().as_secs_f64());
-        report["rss_compacted"] = json!(rss_compacted);
+        report["compact_seconds"] = json!(compact_seconds);
+        // Reported separately and named for what they are. A peak is only
+        // meaningful if a merge actually ran, which `compacted_away` says.
+        report["rss_peak_during_compaction"] =
+            json!(peak.load(std::sync::atomic::Ordering::Relaxed));
+        report["rss_settled_after_compaction"] = json!(settled);
+        report["rss_sample_interval_ms"] = json!(20);
         report["resident_index_bytes_compacted"] = json!(after);
         report["segments_compacted"] = json!(stats.segment_count);
     }
 
     println!("{report}");
+}
+
+/// Per-key index costs, in their own invocation.
+///
+/// Kept out of `probe` because computing them reopens and decodes every
+/// segment; the allocator holds those freed blocks, and the next RSS reading
+/// in the same process is then measuring this diagnostic rather than the
+/// store.
+fn probe_by_key(directory: &Path, flush_spans: usize, payload_threshold: usize) {
+    let _store = Store::open(directory, store_config(flush_spans, payload_threshold))
+        .expect("probe: open store");
+    println!("{}", json!({ "by_attribute_key": cost_by_key(directory) }));
 }
 
 fn run_probe(exe: &Path, directory: &Path, cell: &Cell, threshold: usize, compact: bool) -> Value {
@@ -423,12 +470,26 @@ fn run_probe(exe: &Path, directory: &Path, cell: &Cell, threshold: usize, compac
         command.arg("--compact");
     }
     let output = command.output().expect("spawn probe");
+    // A failed probe must NOT become an empty object. Missing fields read as
+    // 0.0 downstream, so the most important failure this benchmark can have —
+    // the child being OOM-killed on the configuration whose memory we are
+    // measuring — would otherwise be published as "0.0 MiB", the best-looking
+    // number in the table.
     if !output.status.success() {
-        eprintln!("probe failed: {}", String::from_utf8_lossy(&output.stderr));
-        return json!({});
+        panic!(
+            "probe FAILED for {cell:?} (threshold {threshold}, compact {compact}): \
+             status {}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
     let text = String::from_utf8_lossy(&output.stdout);
-    serde_json::from_str(text.trim()).unwrap_or_else(|_| json!({}))
+    serde_json::from_str(text.trim()).unwrap_or_else(|error| {
+        panic!(
+            "probe for {cell:?} produced unparseable output ({error}):\n{text}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })
 }
 
 // --------------------------------------------------------------- the cell
@@ -603,12 +664,28 @@ fn mib(bytes: f64) -> String {
     format!("{:.1}", bytes / (1024.0 * 1024.0))
 }
 
+/// Reads a numeric field, refusing to invent one.
+///
+/// This used to default to 0.0 for a missing path, which turned every
+/// upstream failure into a row of flattering zeros.
 fn number(value: &Value, path: &[&str]) -> f64 {
     let mut current = value;
     for key in path {
         current = &current[*key];
     }
-    current.as_f64().unwrap_or(0.0)
+    current
+        .as_f64()
+        .unwrap_or_else(|| panic!("missing or non-numeric field {path:?} in probe output: {value}"))
+}
+
+/// Reads a field that is legitimately absent in some configurations (a peak
+/// only exists where a merge ran), distinguishing that from a lost value.
+fn optional_number(value: &Value, path: &[&str]) -> Option<f64> {
+    let mut current = value;
+    for key in path {
+        current = &current[*key];
+    }
+    current.as_f64()
 }
 
 fn report(results: &[Value]) -> String {
@@ -621,7 +698,16 @@ fn report(results: &[Value]) -> String {
         let reopen_rss = number(result, &["reopen", "rss_open"]);
         let reopen_start = number(result, &["reopen", "rss_start"]);
         let index = number(result, &["reopen", "resident_index_bytes"]);
-        let compacted_rss = number(result, &["compacted", "rss_compacted"]);
+        // A peak is only meaningful if a merge actually happened. Several
+        // stores in this matrix return 0 from compact_segments (tracked
+        // separately), and reporting their RSS as a merge peak would be
+        // reporting the steady state under another name.
+        let merged_away = optional_number(result, &["compacted", "compacted_away"]).unwrap_or(0.0);
+        let compacted_peak = if merged_away > 0.0 {
+            optional_number(result, &["compacted", "rss_peak_during_compaction"])
+        } else {
+            None
+        };
         let per_gb = if text > 0.0 {
             (reopen_rss - reopen_start) * (1024.0 * 1024.0 * 1024.0) / text
         } else {
@@ -637,7 +723,7 @@ fn report(results: &[Value]) -> String {
             mib(number(result, &["on_disk_attribute_index_bytes"])),
             mib(index),
             mib(reopen_rss),
-            mib(compacted_rss),
+            compacted_peak.map_or_else(|| "did not merge".to_owned(), |v| mib(v).to_string()),
             mib(per_gb),
         ));
     }
@@ -652,6 +738,7 @@ fn main() {
 
     let mut probe_dir: Option<PathBuf> = None;
     let mut compact = false;
+    let mut by_key = false;
     let mut run_matrix = false;
     let mut value_bytes = 2 * 1024_usize;
     let mut unique_pct = 100_u32;
@@ -679,6 +766,7 @@ fn main() {
         match argument {
             "--probe" => probe_dir = Some(PathBuf::from(next("--probe"))),
             "--compact" => compact = true,
+            "--by-key" => by_key = true,
             "--matrix" => run_matrix = true,
             "--value-bytes" => value_bytes = next("--value-bytes").parse().expect("integer"),
             "--unique-pct" => unique_pct = next("--unique-pct").parse().expect("integer"),
@@ -710,7 +798,11 @@ fn main() {
     }
 
     if let Some(directory) = probe_dir {
-        probe(&directory, flush_spans, threshold, compact);
+        if by_key {
+            probe_by_key(&directory, flush_spans, threshold);
+        } else {
+            probe(&directory, flush_spans, threshold, compact);
+        }
         return;
     }
 
