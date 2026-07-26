@@ -1143,7 +1143,11 @@ impl Store {
             let mut writer = self.lock_writer()?;
             self.metrics.writer_lock_wait.record(elapsed_nanos(&waited));
             if let (Some(log), Some(frame)) = (&self.wal, &frame) {
-                pending_commit = Some(self.metrics.wal_write.time(|| log.append(frame))?);
+                pending_commit = Some(
+                    self.metrics
+                        .wal_write
+                        .time(|| log.append(frame, &self.metrics))?,
+                );
             }
             self.metrics.buffer_upsert.time(|| {
                 for span in spans {
