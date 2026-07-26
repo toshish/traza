@@ -387,7 +387,15 @@ impl Segment {
 
     /// Opens a v2 segment FILE-BACKED: only the header and index sections are
     /// read into memory; record payloads stay on disk and are fetched on
-    /// demand. This is the larger-than-RAM path — resident cost is O(indexes).
+    /// demand. This is the larger-than-RAM path.
+    ///
+    /// "Only the indexes" is not the same as "a bounded amount". The index
+    /// sections are decoded EAGERLY and in full, and `attribute_index` is
+    /// keyed on whole attribute values, so this call's resident cost is the
+    /// total size of the segment's distinct key/value pairs plus 8 bytes per
+    /// posting. For enum-valued attributes that is small and effectively
+    /// independent of span size; for an indexed prompt it is the prompt text.
+    /// [`Self::approx_index_bytes`] measures it.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
         use std::io::{Read, Seek, SeekFrom};
         let mut file = fs::File::open(path)?;
@@ -436,6 +444,72 @@ impl Segment {
     /// file for `from_bytes` segments, zero for file-backed ones.
     pub fn resident_bytes(&self) -> usize {
         self.backing.resident_len()
+    }
+
+    /// **Approximate** bytes held resident by this segment's decoded indexes.
+    ///
+    /// [`Self::resident_bytes`] answers "how much of the *file* is in
+    /// memory", which is zero for a file-backed segment. That is the number
+    /// the larger-than-RAM rule is stated in, and on its own it is
+    /// misleading: the indexes are decoded eagerly by [`Self::open`] and stay
+    /// resident for the life of the segment. This counts them.
+    ///
+    /// It is approximate, and it has to be: exact allocator accounting needs
+    /// either a dependency or `unsafe`, and this crate permits neither. What
+    /// is counted is the structural sum — every `String` and `Vec` the
+    /// indexes own, at its allocated capacity, plus each hash table's bucket
+    /// array. What is NOT counted is the allocator's per-allocation
+    /// bookkeeping and size-class rounding, which apply once per string and
+    /// once per posting list, nor the segment struct itself. **Read it as a
+    /// floor.** Process RSS runs above it.
+    pub fn approx_index_bytes(&self) -> usize {
+        let offsets = self.record_offsets.capacity() * std::mem::size_of::<u64>();
+        let traces = hash_table_bytes::<String, Vec<u64>>(self.trace_index.capacity())
+            + self
+                .trace_index
+                .iter()
+                .map(|(key, postings)| {
+                    key.capacity() + postings.capacity() * std::mem::size_of::<u64>()
+                })
+                .sum::<usize>();
+        let attributes =
+            hash_table_bytes::<(String, String), Vec<u64>>(self.attribute_index.capacity())
+                + self
+                    .attribute_index
+                    .iter()
+                    .map(|((key, value), postings)| {
+                        key.capacity()
+                            + value.capacity()
+                            + postings.capacity() * std::mem::size_of::<u64>()
+                    })
+                    .sum::<usize>();
+        offsets + traces + attributes
+    }
+
+    /// Distinct `(key, value)` pairs in the resident attribute index — the
+    /// cardinality that [`Self::approx_index_bytes`] is driven by.
+    pub fn attribute_index_len(&self) -> usize {
+        self.attribute_index.len()
+    }
+
+    /// Resident attribute-index cost split by attribute KEY: distinct values
+    /// and approximate bytes, on the same basis as
+    /// [`Self::approx_index_bytes`] minus the shared table array.
+    ///
+    /// A total cannot answer the only question an operator actually has when
+    /// the number is too big — *which attribute is doing this* — and the
+    /// answer is rarely uniform: one indexed prompt can outweigh every
+    /// conventional attribute in the store combined.
+    pub fn attribute_index_cost_by_key(&self) -> BTreeMap<String, (usize, usize)> {
+        let mut by_key: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+        for ((key, value), postings) in &self.attribute_index {
+            let entry = by_key.entry(key.clone()).or_insert((0, 0));
+            entry.0 += 1;
+            entry.1 += key.capacity()
+                + value.capacity()
+                + postings.capacity() * std::mem::size_of::<u64>();
+        }
+        by_key
     }
 
     /// Encodes records and constructs a byte-resident segment.
@@ -904,6 +978,30 @@ fn decode_string_index(
         return Err(Error::Corrupt("index contains trailing bytes"));
     }
     Ok(index)
+}
+
+/// Bytes a `std` hash table's bucket array occupies for a given
+/// [`HashMap::capacity`], to within the group padding.
+///
+/// `capacity()` reports how many entries fit before a resize, not the bucket
+/// count, and the two differ by hashbrown's 7/8 load factor. Inverting that
+/// is what makes the estimate track a large index rather than undercount it
+/// by an eighth: below eight entries the table is a fixed 4 or 8 buckets,
+/// above it `capacity` is exactly `buckets / 8 * 7`. Each bucket costs one
+/// `(K, V)` slot plus one control byte; the trailing group-width control
+/// padding (8 or 16 bytes) is ignored as noise.
+fn hash_table_bytes<K, V>(capacity: usize) -> usize {
+    if capacity == 0 {
+        return 0;
+    }
+    let buckets = if capacity < 4 {
+        4
+    } else if capacity < 8 {
+        8
+    } else {
+        (capacity / 7 * 8).next_power_of_two()
+    };
+    buckets * (std::mem::size_of::<(K, V)>() + 1)
 }
 
 fn section(bytes: &[u8], offset: u64, len: u64) -> Result<&[u8], Error> {

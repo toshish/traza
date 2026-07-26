@@ -80,7 +80,7 @@ a single-threaded test will not find it.
 
 ---
 
-## 3. Memory is O(indexes), not O(data)
+## 3. Payloads are never resident
 
 **The rule.** Segments are file-backed. A loaded segment holds a file handle
 plus its parsed indexes; record payloads are read from disk by exact byte range
@@ -104,6 +104,18 @@ store that serves correctly at 100M spans into one that OOMs.
 
 **Symptom.** Resident memory tracks corpus size instead of index size. Stores
 larger than RAM stop working.
+
+**What this invariant does NOT say.** It used to be titled "memory is
+O(indexes), not O(data)", and that title claimed more than the invariant
+proves. Indexes are resident, `attribute_index` is keyed on the **whole
+attribute value**, and `Segment::open` decodes it eagerly — so for an indexed
+prompt the index *is* the data, and resident memory is linear in it
+(measured: RSS ≈ 1.44 × indexed text; see
+[capacity](../operations/capacity.md#memory)). The two hooks above are
+therefore necessary and not sufficient: both are zero no matter how large the
+attribute index gets. `Store::resident_index_bytes()` reports the other half,
+approximately. **Never cite `resident_payload_bytes() == 0` as evidence that a
+store's memory is bounded.**
 
 ---
 
