@@ -67,25 +67,34 @@ operation can pin its inputs, do its I/O with no engine lock held, and publish
 under a short revalidated critical section without also having to reason about
 the other one running concurrently.
 
-`sealing` admits one seal at a time, and a seal holds it from drain to publish.
+`sealing` admits one seal at a time, and a seal holds it from drain to publish
+— through the write, the fsync, the rename, the reopen and the reconcile.
 **Both rewriters take it as well**, for different spans of time and different
 reasons. Expiry holds it for its whole deletion, or a seal that drained first
 would publish afterwards and resurrect what was just deleted. Compaction holds
 it only long enough to choose a run and claim its output ids — a seal holding
 an unpublished lower id would sort before merged output that is strictly
 older, and inverting that inverts last-write-wins. An ingesting thread never
-takes it while holding the writer lock, and a seal that cannot take it
-coalesces into the next one rather than waiting, which is why ingest keeps
-flowing while a rewriter holds it.
+takes it while holding the writer lock.
+
+Ingest mostly keeps flowing while a rewriter holds it, because a seal that
+cannot take the permit coalesces into the next one. **Two paths wait rather
+than coalesce**: [`Durability::Flushed`], which must seal before it
+acknowledges, and any mode once the buffer reaches four times `flush_spans`,
+where waiting is the backpressure. Under either, an ingest waits out a running
+deletion — but only the microseconds of a compaction's claim.
 
 **Waiting for `sealing` is not optional for compaction.** Declining when a
 seal was in flight, the earlier design, is correct and useless: under a
 sustained write load a seal is in flight most of the time, so a tick that
 checked once and gave up almost never found the store quiet. Measured at
 25,000 spans/s, one tick in sixteen achieved anything and the segment count
-grew without bound while compaction ran on schedule. Any guard on this path
-has to be one compaction can wait out in microseconds, not one it can lose to
-the write rate.
+grew without bound while compaction ran on schedule. Note the asymmetry in
+what each side waits for: a merge arriving mid-seal waits out that whole seal,
+milliseconds, on the maintenance thread that has nothing else to do — while
+what a waiting ingest can face from a merge is only the microseconds it holds
+the permit to claim ids. Any guard here has to be one compaction can wait out,
+not one it can lose to the write rate.
 
 **Where.** Documented on the `Store` fields in
 [`src/lib.rs`](../../src/lib.rs); the helpers are `lock_maintenance`,
