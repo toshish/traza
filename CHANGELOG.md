@@ -67,6 +67,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   denominator, inflating every signature's share of "all failures". The API now
   returns `total`, counted before truncation.
 
+- **A series window near the top of the `u64` range still panicked.** The
+  previous round fixed the bucket width and left the bucket *starts* unchecked
+  three lines below it, so `since + width * index` overflowed for any window
+  close to `u64::MAX`. The saturating ceiling was also one nanosecond short per
+  bucket on a full-range window, leaving the last bucket ending before the
+  window did. Starts are saturating and clamped to `until`; the ceiling is
+  quotient plus non-zero remainder.
+
+- **The live tail stranded bursts one page budget further out.** Carrying the
+  cursor only *within* a tick moved the threshold from 200 rows to 1,000 rather
+  than removing it: a burst larger than the budget was still abandoned, and the
+  watermark cannot rescue it because every span in an equal-timestamp burst is
+  `>= since`. An unfinished cursor chain now survives the tick that could not
+  finish it, and the watermark advances only once the chain is exhausted. The
+  polling state machine moved to `ui/src/lib/tail.js` so it is testable without
+  a DOM — which is where both of its bugs were actually found.
+
+- **Overview compared the wrong periods.** One selected window was split down
+  the middle, so "24h" showed the last twelve hours against the twelve before
+  them while the label said "previous 24h" — and the failure and model cards
+  queried the full 24 hours, so three cards on one screen described three
+  different spans of time. Two full periods are resolved now: the series covers
+  both with the midpoint exactly on the boundary, and the other cards are
+  scoped to the current period.
+
+- **A settling request could evict its own replacement.** The in-flight map was
+  cleared unconditionally in the finalizer, so an aborted request finishing
+  after a fresh one had taken its slot deleted the live entry and made the next
+  caller open a third. Eviction is identity-checked.
+
+- **Overview's refresh was partial.** The tick re-ran the window-dependent
+  reads but sessions and metrics kept empty dependency arrays, so "Server, in
+  its own words" stayed frozen under a live indicator.
+
+- **A paused tail buffered duplicates.** `since` is inclusive and the paused
+  path skipped the primary-key check, so a quiet page was re-buffered until it
+  filled. Both paths share one dedupe now.
+
 - **Query cost under-reported content pruning.** Both search paths incremented
   the process-wide counter but not the per-query `segments_pruned`, so a
   content-narrowed search understated the work it had avoided.

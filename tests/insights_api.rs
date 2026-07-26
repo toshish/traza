@@ -797,3 +797,89 @@ fn a_cursor_returns_spans_that_share_one_timestamp() {
     );
     server.kill();
 }
+
+#[test]
+fn a_series_window_at_the_top_of_the_range_answers_and_covers_itself() {
+    // The previous round fixed the bucket WIDTH and left the bucket STARTS
+    // unchecked three lines below it, so a window near `u64::MAX` still
+    // panicked — `since + width * index` overflows long before the last
+    // bucket. The saturating ceiling was also one nanosecond short per bucket
+    // on a full-range window, which left the last bucket ending before the
+    // window did.
+    let dir = test_dir("series-top");
+    let server = Server::spawn(&dir);
+
+    for window in [
+        format!("since={}&until={}", u64::MAX - 10, u64::MAX),
+        format!("since=0&until={}", u64::MAX),
+        format!("since={}&until={}", u64::MAX - 1, u64::MAX),
+    ] {
+        let target = format!("/v1/stats/series?{window}&buckets=24");
+        let (status, body) = server.request("GET", &target, None);
+        assert_eq!(status, 200, "{target} -> {body}");
+
+        let buckets = body["buckets"].as_array().expect("buckets");
+        assert_eq!(buckets.len(), 24, "{target}");
+
+        let width = body["bucket_ns"].as_u64().expect("bucket_ns");
+        let until = body["until_ns"].as_u64().expect("until_ns");
+        let since = body["since_ns"].as_u64().expect("since_ns");
+
+        // Ascending, never past the window, and the last one reaches its end.
+        let mut previous = 0u64;
+        for (index, bucket) in buckets.iter().enumerate() {
+            let start = bucket["start_ns"].as_u64().expect("start_ns");
+            assert!(
+                start >= since,
+                "bucket {index} starts before the window: {body}"
+            );
+            assert!(
+                start <= until,
+                "bucket {index} starts past the window: {body}"
+            );
+            if index > 0 {
+                assert!(start >= previous, "bucket starts went backwards: {body}");
+            }
+            previous = start;
+        }
+        let last = buckets[buckets.len() - 1]["start_ns"]
+            .as_u64()
+            .expect("start_ns");
+        assert!(
+            last.saturating_add(width) >= until,
+            "the last bucket ends before the window does — the ceiling is short: {body}"
+        );
+    }
+    server.kill();
+}
+
+#[test]
+fn a_series_covers_its_window_for_ordinary_sizes_too() {
+    // The coverage property is not special to the extremes; a window that does
+    // not divide evenly by the bucket count must still be covered.
+    let dir = test_dir("series-cover");
+    let server = Server::spawn(&dir);
+    for (span, buckets) in [
+        (100u64, 24usize),
+        (1_000, 7),
+        (23, 24),
+        (1, 512),
+        (1_000_000_007, 48),
+    ] {
+        let target = format!(
+            "/v1/stats/series?since={BASE_NS}&until={}&buckets={buckets}",
+            BASE_NS + span
+        );
+        let (status, body) = server.request("GET", &target, None);
+        assert_eq!(status, 200, "{target} -> {body}");
+        let rows = body["buckets"].as_array().expect("buckets");
+        assert_eq!(rows.len(), buckets, "{target}");
+        let width = body["bucket_ns"].as_u64().expect("bucket_ns");
+        let last = rows[rows.len() - 1]["start_ns"].as_u64().expect("start_ns");
+        assert!(
+            last + width >= BASE_NS + span,
+            "span {span} over {buckets} buckets leaves the tail uncovered: {body}"
+        );
+    }
+    server.kill();
+}

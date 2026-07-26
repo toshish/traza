@@ -244,15 +244,14 @@ impl Store {
         // Round up so the last bucket ends at or after `until_ns`; rounding
         // down would drop the final partial bucket, which on a live window is
         // the only one anybody is watching.
-        // Ceiling division written the long way: `div_ceil` is stable only
-        // since 1.73 and this crate supports 1.70. Saturating, because a
-        // caller may legitimately pass `until = u64::MAX` and the naive
-        // `span + count - 1` overflows on exactly that input.
-        let bucket_ns = span_ns
-            .saturating_add(bucket_count as u64 - 1)
-            .checked_div(bucket_count as u64)
-            .unwrap_or(1)
-            .max(1);
+        // Ceiling division, written as quotient plus a non-zero remainder.
+        // `div_ceil` is stable only since 1.73 and this crate supports 1.70,
+        // and the obvious longhand — `(span + count - 1) / count` — overflows
+        // on `until = u64::MAX`. Saturating that addition does not rescue it:
+        // the sum clamps to `u64::MAX`, which is one short of the true ceiling
+        // and leaves the last bucket ending before the window does.
+        let divisor = bucket_count as u64;
+        let bucket_ns = (span_ns / divisor + u64::from(span_ns % divisor != 0)).max(1);
 
         let mut spans = vec![0u64; bucket_count];
         let mut errors = vec![0u64; bucket_count];
@@ -295,7 +294,13 @@ impl Store {
 
         let buckets = (0..bucket_count)
             .map(|index| SeriesBucket {
-                start_ns: since_ns + bucket_ns * index as u64,
+                // Saturating and clamped to the window. `since + width * i`
+                // overflows for any window sitting near the top of the range —
+                // reachable with a plain `since`/`until` pair — and a bucket
+                // start past `until` describes no time the window covers.
+                start_ns: since_ns
+                    .saturating_add(bucket_ns.saturating_mul(index as u64))
+                    .min(until_ns),
                 spans: spans[index],
                 errors: errors[index],
                 llm_calls: llm_calls[index],
