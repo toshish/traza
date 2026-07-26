@@ -1,19 +1,39 @@
 //! Segment file-backed storage and persisted indexes.
 //!
-//! The on-disk format is version 2 (see `MAGIC`/`VERSION`); version 1 (JSONL)
-//! is no longer read.
+//! The on-disk format is version 4 (see `MAGIC`/`VERSION`); versions 2 and 3
+//! are still read, and version 1 (JSONL) is not.
 //!
 //! An opened file-backed segment owns only its file handle and decoded index
 //! maps. In-memory segments built for encoding may own their bytes. Records are
 //! decoded only when a query selects their offsets; no decoded record vector
 //! is retained by [`Segment`].
+//!
+//! # Why the attribute index is hashed
+//!
+//! Through v3 the attribute index was keyed on the attribute VALUE TEXT, and
+//! every opened segment held every distinct value resident for its whole life.
+//! For enum-shaped attributes — `service`, `status`, a model name — that is
+//! nothing. For the data Traza exists to store it is fatal: an indexed
+//! `gen_ai.prompt` is kilobytes, every value is distinct, and the resident
+//! index therefore grew to roughly the size of the corpus text. A store that
+//! reads records from disk on demand specifically so it can outgrow RAM was
+//! pulling the largest part of each record back into RAM through its own
+//! index.
+//!
+//! v4 keys the index on a 128-bit digest of the value instead (see
+//! [`crate::hash`]), so a posting entry costs 20 bytes whether the value is a
+//! status code or a page of text. The digest is not reversible, which makes
+//! every probe a CANDIDATE list rather than an answer — see
+//! [`Segment::attribute_candidate_offsets`].
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs;
 use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+use crate::hash::{hash_attribute, Hash128};
 
 /// Eight-byte marker at the beginning of every segment file. The version
 /// lives in [`VERSION`], not in the magic, so the marker itself stays fixed
@@ -22,7 +42,7 @@ pub const MAGIC: [u8; 8] = *b"TRAZASEG";
 /// On-disk format version written by this module. This — not the magic — is
 /// how the format generation is identified; the magic only says "a Traza
 /// segment". (JSONL v1 carried no magic; this indexed format is version 2.)
-pub const VERSION: u16 = 3;
+pub const VERSION: u16 = 4;
 /// Fixed header size written by this module.
 ///
 /// v3 appends the segment's timestamp range to the v2 header. Time is the
@@ -31,6 +51,9 @@ pub const VERSION: u16 = 3;
 /// so a "last 15 minutes" search opened and scanned every segment in the
 /// store. Two u64s in the header let a query eliminate a whole segment
 /// without touching it.
+///
+/// v4 changes only the attribute index's own encoding — see
+/// [`AttributeIndex`] — so the header keeps its v3 shape and length.
 pub const HEADER_LEN: usize = 96;
 /// v2 header size. Still readable: a v2 segment simply carries no timestamp
 /// range, and a query treats its range as unknown and cannot skip it — which
@@ -272,7 +295,67 @@ impl From<std::str::Utf8Error> for Error {
     }
 }
 
-/// An opened v2 segment backed by either a file or encoded memory.
+/// The resident attribute index: attribute keys held once by name, values
+/// held only as digests.
+///
+/// Splitting keys from values this way is what bounds the structure. Attribute
+/// KEYS are a schema — a store sees tens of them, they repeat on every span,
+/// and an operator needs their names to understand a cost report — so they are
+/// interned once in a dictionary and referred to by a `u32`. Attribute VALUES
+/// are data, unbounded in both size and cardinality, so they are never
+/// retained at all: only [`Hash128`] of the `(key, value)` pair survives.
+///
+/// The cost of one distinct value is therefore `size_of::<(u32, Hash128)>()`
+/// plus 8 bytes per posting, independent of how long the value was.
+#[derive(Debug, Default)]
+struct AttributeIndex {
+    /// Attribute key names, indexed by key id.
+    keys: Vec<String>,
+    /// Reverse dictionary for probe lookups.
+    key_ids: HashMap<String, u32>,
+    /// `(key id, value digest)` to record offsets, in record order.
+    postings: HashMap<(u32, Hash128), Vec<u64>>,
+}
+
+impl AttributeIndex {
+    fn key_id(&self, key: &str) -> Option<u32> {
+        self.key_ids.get(key).copied()
+    }
+
+    /// Candidate offsets for a `(key, value)` probe. Empty when the segment
+    /// has never seen the key, which is the common case for a filter on an
+    /// attribute a given service does not emit.
+    fn candidates(&self, key: &str, value: &str) -> &[u64] {
+        let Some(id) = self.key_id(key) else {
+            return &[];
+        };
+        self.postings
+            .get(&(id, hash_attribute(key, value)))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    fn len(&self) -> usize {
+        self.postings.len()
+    }
+
+    /// Approximate resident bytes, on the same "structural sum at allocated
+    /// capacity" basis as [`Segment::approx_index_bytes`].
+    fn approx_bytes(&self) -> usize {
+        let dictionary = self.keys.iter().map(String::capacity).sum::<usize>()
+            + self.key_ids.keys().map(String::capacity).sum::<usize>()
+            + hash_table_bytes::<String, u32>(self.key_ids.capacity())
+            + self.keys.capacity() * std::mem::size_of::<String>();
+        let entries = hash_table_bytes::<(u32, Hash128), Vec<u64>>(self.postings.capacity())
+            + self
+                .postings
+                .values()
+                .map(|postings| postings.capacity() * std::mem::size_of::<u64>())
+                .sum::<usize>();
+        dictionary + entries
+    }
+}
+
+/// An opened segment backed by either a file or encoded memory.
 ///
 /// File-backed segments retain only offsets and persisted index postings.
 /// Query results are decoded from their exact byte ranges on demand.
@@ -282,7 +365,7 @@ pub struct Segment {
     header: Header,
     record_offsets: Vec<u64>,
     trace_index: HashMap<String, Vec<u64>>,
-    attribute_index: HashMap<(String, String), Vec<u64>>,
+    attribute_index: AttributeIndex,
     /// Diagnostic only: whether the last query narrowed through an index.
     /// Atomic rather than `Cell` because a segment is shared across reader
     /// threads — pinned views and the segment list both hand out `&Segment`.
@@ -366,14 +449,13 @@ impl Segment {
         .into_iter()
         .map(|((key, _), offsets)| (key, offsets))
         .collect();
-        let attribute_index = decode_string_index(
+        let attribute_index = read_attribute_index(
             section(
                 &bytes,
                 header.attribute_index_offset,
                 header.attribute_index_len,
             )?,
-            true,
-            header.record_count,
+            &header,
         )?;
         Ok(Self {
             backing: Backing::Resident(bytes),
@@ -390,12 +472,15 @@ impl Segment {
     /// demand. This is the larger-than-RAM path.
     ///
     /// "Only the indexes" is not the same as "a bounded amount". The index
-    /// sections are decoded EAGERLY and in full, and `attribute_index` is
-    /// keyed on whole attribute values, so this call's resident cost is the
-    /// total size of the segment's distinct key/value pairs plus 8 bytes per
-    /// posting. For enum-valued attributes that is small and effectively
-    /// independent of span size; for an indexed prompt it is the prompt text.
-    /// [`Self::approx_index_bytes`] measures it.
+    /// sections are decoded EAGERLY and in full, so this call's resident cost
+    /// scales with the segment's index CARDINALITY: roughly 20 bytes per
+    /// distinct `(attribute key, value)` pair plus 8 bytes per posting, plus
+    /// the trace index, which is still keyed on trace-id text.
+    ///
+    /// What it no longer scales with is the SIZE of attribute values. Through
+    /// v3 it did, and an indexed prompt cost its own text; v4 keys the
+    /// attribute index on a digest instead. [`Self::approx_index_bytes`]
+    /// measures the result.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
         use std::io::{Read, Seek, SeekFrom};
         let mut file = fs::File::open(path)?;
@@ -426,7 +511,7 @@ impl Segment {
             .collect();
         let attribute_bytes =
             read_section(header.attribute_index_offset, header.attribute_index_len)?;
-        let attribute_index = decode_string_index(&attribute_bytes, true, header.record_count)?;
+        let attribute_index = read_attribute_index(&attribute_bytes, &header)?;
         Ok(Self {
             backing: Backing::File {
                 file: std::sync::Mutex::new(file),
@@ -472,18 +557,7 @@ impl Segment {
                     key.capacity() + postings.capacity() * std::mem::size_of::<u64>()
                 })
                 .sum::<usize>();
-        let attributes =
-            hash_table_bytes::<(String, String), Vec<u64>>(self.attribute_index.capacity())
-                + self
-                    .attribute_index
-                    .iter()
-                    .map(|((key, value), postings)| {
-                        key.capacity()
-                            + value.capacity()
-                            + postings.capacity() * std::mem::size_of::<u64>()
-                    })
-                    .sum::<usize>();
-        offsets + traces + attributes
+        offsets + traces + self.attribute_index.approx_bytes()
     }
 
     /// Distinct `(key, value)` pairs in the resident attribute index — the
@@ -498,15 +572,19 @@ impl Segment {
     ///
     /// A total cannot answer the only question an operator actually has when
     /// the number is too big — *which attribute is doing this* — and the
-    /// answer is rarely uniform: one indexed prompt can outweigh every
-    /// conventional attribute in the store combined.
+    /// answer is rarely uniform. Since v4 the answer is far flatter than it
+    /// used to be: an entry costs the same whether its value was `"error"` or
+    /// a page of generated text, so what shows up here now is genuine
+    /// CARDINALITY rather than text volume.
     pub fn attribute_index_cost_by_key(&self) -> BTreeMap<String, (usize, usize)> {
         let mut by_key: BTreeMap<String, (usize, usize)> = BTreeMap::new();
-        for ((key, value), postings) in &self.attribute_index {
+        for ((key_id, _), postings) in &self.attribute_index.postings {
+            let Some(key) = self.attribute_index.keys.get(*key_id as usize) else {
+                continue;
+            };
             let entry = by_key.entry(key.clone()).or_insert((0, 0));
             entry.0 += 1;
-            entry.1 += key.capacity()
-                + value.capacity()
+            entry.1 += std::mem::size_of::<(u32, Hash128)>()
                 + postings.capacity() * std::mem::size_of::<u64>();
         }
         by_key
@@ -566,12 +644,22 @@ impl Segment {
     }
 
     /// Looks up records for an exact attribute key/value pair.
+    ///
+    /// The index is probed by digest, so it answers with candidates; each one
+    /// is then checked against the value actually stored in the record. A
+    /// digest collision therefore costs a wasted decode and cannot produce a
+    /// wrong row.
     pub fn query_attribute(&self, key: &str, value: &str) -> Result<Vec<Record>, Error> {
         self.last_query_used_index.store(true, Ordering::Relaxed);
-        self.decode_postings(
-            self.attribute_index
-                .get(&(key.to_owned(), value.to_owned())),
-        )
+        let mut records = Vec::new();
+        for offset in self.attribute_index.candidates(key, value) {
+            let record = self.decode_at(*offset)?;
+            if record.attributes.get(key).map(String::as_str) == Some(value) {
+                records.push(record);
+            }
+        }
+        records.sort_by_key(|record| record.timestamp);
+        Ok(records)
     }
 
     /// Returns records in the inclusive timestamp range in stable timestamp order.
@@ -639,23 +727,26 @@ impl Segment {
         &self.record_offsets
     }
 
-    /// Raw posting offsets for one attribute key/value pair, in record
+    /// CANDIDATE record offsets for one attribute key/value pair, in record
     /// (timestamp) order — no records are decoded. The lazy query path pairs
     /// this with [`Self::timestamp_at`] and [`Self::record_at_offset`] so a
     /// limited query decodes only the records it returns.
-    pub fn attribute_posting_offsets(&self, key: &str, value: &str) -> Vec<u64> {
-        self.attribute_posting_offsets_ref(key, value).to_vec()
-    }
-
-    /// Borrowed posting offsets for one attribute key/value pair.
     ///
-    /// This avoids cloning a potentially corpus-sized posting list for each
-    /// bounded query page.
-    pub fn attribute_posting_offsets_ref(&self, key: &str, value: &str) -> &[u64] {
+    /// # Candidates, not matches
+    ///
+    /// The index is keyed on a 128-bit digest of the value, so this list is a
+    /// superset: a caller MUST check each decoded record against the filter
+    /// before returning it. Every caller in this crate already does, because
+    /// an index has never been allowed to change a filter's answer — only to
+    /// narrow the work it takes to compute one. The name says "candidate" so
+    /// that a future caller cannot mistake it for a resolved answer.
+    ///
+    /// The superset is tiny. A collision needs two distinct values in one
+    /// segment whose digests agree in all 128 bits; at a million distinct
+    /// values per segment the odds are about one in 10^26.
+    pub fn attribute_candidate_offsets(&self, key: &str, value: &str) -> &[u64] {
         self.last_query_used_index.store(true, Ordering::Relaxed);
-        self.attribute_index
-            .get(&(key.to_owned(), value.to_owned()))
-            .map_or(&[], Vec::as_slice)
+        self.attribute_index.candidates(key, value)
     }
 
     /// Timestamp of the record at a posting offset without decoding it: the
@@ -723,7 +814,22 @@ pub fn encode(records: &[RecordInput]) -> Result<Vec<u8>, Error> {
     let mut record_region = Vec::new();
     let mut offsets = Vec::with_capacity(records.len());
     let mut trace_index: BTreeMap<(String, String), Vec<u64>> = BTreeMap::new();
-    let mut attribute_index: BTreeMap<(String, String), Vec<u64>> = BTreeMap::new();
+
+    // Assign key ids from the sorted set of distinct keys, so the dictionary
+    // depends on WHICH keys appear and never on the order records arrived in.
+    // Two encodings of the same records must produce identical bytes.
+    let attribute_keys: Vec<String> = records
+        .iter()
+        .flat_map(|record| record.attributes.keys().cloned())
+        .collect::<BTreeSet<String>>()
+        .into_iter()
+        .collect();
+    let key_ids: HashMap<&str, u32> = attribute_keys
+        .iter()
+        .enumerate()
+        .map(|(id, key)| (key.as_str(), id as u32))
+        .collect();
+    let mut attribute_index: BTreeMap<(u32, Hash128), Vec<u64>> = BTreeMap::new();
 
     for record in records {
         let offset = record_region.len() as u64;
@@ -734,8 +840,11 @@ pub fn encode(records: &[RecordInput]) -> Result<Vec<u8>, Error> {
             .or_default()
             .push(offset);
         for (key, value) in &record.attributes {
+            let id = *key_ids
+                .get(key.as_str())
+                .expect("every attribute key is in the dictionary");
             attribute_index
-                .entry((key.clone(), value.clone()))
+                .entry((id, hash_attribute(key, value)))
                 .or_default()
                 .push(offset);
         }
@@ -746,7 +855,7 @@ pub fn encode(records: &[RecordInput]) -> Result<Vec<u8>, Error> {
         put_u64(&mut offset_region, *offset);
     }
     let trace_region = encode_string_index(&trace_index, false)?;
-    let attribute_region = encode_string_index(&attribute_index, true)?;
+    let attribute_region = encode_attribute_index(&attribute_keys, &attribute_index)?;
 
     let records_offset = HEADER_LEN as u64;
     let offsets_offset = records_offset + record_region.len() as u64;
@@ -920,6 +1029,147 @@ fn decode_offsets(bytes: &[u8], header: &Header) -> Result<Vec<u64>, Error> {
         ));
     }
     Ok(offsets)
+}
+
+/// Encodes the v4 attribute section: a key dictionary, then one entry per
+/// distinct `(key, value)` pair carrying the value's digest instead of its
+/// text.
+///
+/// Entries are written in `(key id, digest)` order so that encoding the same
+/// records twice produces the same bytes — segment files are compared byte for
+/// byte by the format acceptance tests, and a merge must be reproducible.
+fn encode_attribute_index(
+    keys: &[String],
+    postings: &BTreeMap<(u32, Hash128), Vec<u64>>,
+) -> Result<Vec<u8>, Error> {
+    let mut output = Vec::new();
+    put_u32(
+        &mut output,
+        u32::try_from(keys.len()).map_err(|_| Error::TooLarge("attribute key dictionary"))?,
+    );
+    for key in keys {
+        put_len_bytes(&mut output, key.as_bytes(), "index key")?;
+    }
+    put_u32(
+        &mut output,
+        u32::try_from(postings.len()).map_err(|_| Error::TooLarge("index"))?,
+    );
+    for ((key_id, digest), offsets) in postings {
+        put_u32(&mut output, *key_id);
+        output.extend_from_slice(digest.as_bytes());
+        put_u32(
+            &mut output,
+            u32::try_from(offsets.len()).map_err(|_| Error::TooLarge("postings"))?,
+        );
+        for offset in offsets {
+            put_u64(&mut output, *offset);
+        }
+    }
+    Ok(output)
+}
+
+/// Decodes the v4 attribute section.
+fn decode_attribute_index(data: &[u8], record_count: u64) -> Result<AttributeIndex, Error> {
+    let mut cursor = 0usize;
+    let key_count = take_u32(data, &mut cursor)? as usize;
+    let mut keys = Vec::with_capacity(key_count);
+    let mut key_ids = HashMap::with_capacity(key_count);
+    for id in 0..key_count {
+        let key = std::str::from_utf8(take_len_bytes(data, &mut cursor, data.len())?)?.to_owned();
+        if key_ids.insert(key.clone(), id as u32).is_some() {
+            return Err(Error::Corrupt("attribute key dictionary has a duplicate"));
+        }
+        keys.push(key);
+    }
+    let entry_count = take_u32(data, &mut cursor)? as usize;
+    let mut postings = HashMap::with_capacity(entry_count);
+    for _ in 0..entry_count {
+        let key_id = take_u32(data, &mut cursor)?;
+        if key_id as usize >= keys.len() {
+            return Err(Error::Corrupt("attribute entry names an unknown key"));
+        }
+        let digest = take_digest(data, &mut cursor)?;
+        let posting_count = take_u32(data, &mut cursor)? as usize;
+        if posting_count as u64 > record_count {
+            return Err(Error::Corrupt("index has too many postings"));
+        }
+        let mut offsets = Vec::with_capacity(posting_count);
+        for _ in 0..posting_count {
+            offsets.push(take_u64(data, &mut cursor)?);
+        }
+        if postings.insert((key_id, digest), offsets).is_some() {
+            return Err(Error::Corrupt("index contains a duplicate key"));
+        }
+    }
+    if cursor != data.len() {
+        return Err(Error::Corrupt("index contains trailing bytes"));
+    }
+    Ok(AttributeIndex {
+        keys,
+        key_ids,
+        postings,
+    })
+}
+
+/// Decodes a v2/v3 attribute section — which stores value TEXT — into the v4
+/// resident form by hashing each value as it is read.
+///
+/// The text is not retained. It is, however, materialized transiently: peak
+/// memory while opening an old segment is still the old cost, and only the
+/// steady state improves. That is the price of not rewriting files on
+/// upgrade, and it is bounded by one segment rather than by the store.
+fn upgrade_attribute_index(data: &[u8], record_count: u64) -> Result<AttributeIndex, Error> {
+    let legacy = decode_string_index(data, true, record_count)?;
+    let mut index = AttributeIndex::default();
+    for ((key, value), offsets) in legacy {
+        let id = match index.key_ids.get(&key) {
+            Some(id) => *id,
+            None => {
+                let id = u32::try_from(index.keys.len())
+                    .map_err(|_| Error::TooLarge("attribute key dictionary"))?;
+                index.key_ids.insert(key.clone(), id);
+                index.keys.push(key.clone());
+                id
+            }
+        };
+        let digest = hash_attribute(&key, &value);
+        // A v2/v3 section cannot contain a duplicate (key, value) — the
+        // legacy decoder rejects that — so a collision here would be a real
+        // digest collision. Merge rather than drop: the postings must stay
+        // complete, and verification downstream sorts out which record
+        // actually holds which value.
+        index
+            .postings
+            .entry((id, digest))
+            .or_insert_with(Vec::new)
+            .extend_from_slice(&offsets);
+    }
+    for offsets in index.postings.values_mut() {
+        offsets.sort_unstable();
+        offsets.dedup();
+        offsets.shrink_to_fit();
+    }
+    Ok(index)
+}
+
+/// Reads the attribute section in whichever encoding the header declares.
+fn read_attribute_index(data: &[u8], header: &Header) -> Result<AttributeIndex, Error> {
+    if header.version >= 4 {
+        decode_attribute_index(data, header.record_count)
+    } else {
+        upgrade_attribute_index(data, header.record_count)
+    }
+}
+
+fn take_digest(data: &[u8], cursor: &mut usize) -> Result<Hash128, Error> {
+    let end = cursor
+        .checked_add(16)
+        .filter(|end| *end <= data.len())
+        .ok_or(Error::Corrupt("truncated attribute digest"))?;
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&data[*cursor..end]);
+    *cursor = end;
+    Ok(Hash128::from_bytes(bytes))
 }
 
 fn encode_string_index(
