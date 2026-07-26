@@ -345,25 +345,38 @@ and "1053 MiB". Both were wrong, and understated. The benchmark took **one RSS
 sample after `compact_segments()` returned** — by which point the merge has
 freed its working set — so it measured the trough and published it as a peak.
 RSS is now sampled every 20 ms by a background thread for the duration of the
-merge:
+merge. From [`INDEX-MEM-BENCHMARK.json`]( ../../INDEX-MEM-BENCHMARK.json),
+every configuration whose merge completed:
 
 | Steady-state open | **Peak during merge** | Settled after |
 |---:|---:|---:|
-| 10 MiB | **1,203 MiB** | 783 MiB |
-| 116 MiB | **1,344 MiB** | 899 MiB |
-| 116 MiB | **1,602 MiB** | 1,106 MiB |
+| 10 MiB | **1,204 MiB** | 788 MiB |
+| 14 MiB | **1,271 MiB** | 796 MiB |
+| 116 MiB | **1,292 MiB** | 928 MiB |
+| 116 MiB | **1,426 MiB** | 1,008 MiB |
+| 116 MiB | **1,601 MiB** | 1,102 MiB |
 
-A store serving in 10 MiB needs **over a gigabyte** to compact itself. Size a
-host for the merge, not for the steady state. The transient is not O(indexes)
-by anybody's definition.
+**A store serving in 10 MiB needs over a gigabyte to compact itself.**
+Size a host for the merge, not for the steady state. The transient is not
+O(indexes) by anybody's definition.
 
-**These five rows are the only compaction measurements on this page.** Of 26
-configurations, 21 merged nothing at all — `compact_segments()` returned 0 —
-and the benchmark now reports those as "did not merge" rather than printing
-their steady-state RSS in a column headed compaction. Every configuration that
-merged held 13 segments; every one that did not held 4 or fewer. That is a
-compaction defect under separate investigation, and until it is understood
-this table describes merges on 512-byte-value corpora and nothing wider.
+Read the individual figures as approximate. They were taken at **load average
+36-45 on a machine that was not idle**, one run per configuration, and an
+earlier run of the same matrix produced peaks differing by **up to 8%** —
+those earlier figures are deliberately not quoted here, because the record
+that held them has been superseded and citing a number with no live record is
+the habit this page is trying to break. What is stable across both runs, and
+is the point, is the order of magnitude: a merge costs roughly a gigabyte and
+a half regardless of how small the store it is merging.
+
+**These 5 rows are the only compaction measurements on this page.** Of
+26 configurations, 21 merged nothing at all —
+`compact_segments()` returned 0 — and the benchmark reports those as "did not
+merge" rather than printing their steady-state RSS in a column headed
+compaction. Every configuration that merged held 13 segments; every one that
+did not held 4 or fewer. That is a compaction defect under separate
+investigation, and until it is understood this table describes merges on
+512-byte-value corpora and nothing wider.
 
 ### Reproducing all of this
 
