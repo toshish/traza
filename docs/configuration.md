@@ -168,6 +168,7 @@ better p95/p99 with peak capacity. Do not pick it hoping for a lower median;
 | `--ttl-seconds N` | off | Rolling retention window. A background pass compacts expired spans every minute; annotations and payload files age out on the same window. Costs a periodic compaction pass. |
 | `--max-connections N` | `1024` | Concurrent connections served; past it clients get `503` rather than being queued. Costs one thread per live connection. |
 | `--payload-threshold-bytes N` | `262144` | String attribute values longer than this are offloaded to the content-addressed payload store and replaced by a reference. `0` disables. Costs an extra file write per offloaded value; saves segment size and buffer memory. |
+| `--no-content-index` | off (index is built) | Stops writing the per-segment word filters that make `?content=` fast. **Content search still works** — a segment without the index is scanned rather than skipped, so the same rows come back at the cost of a scan. Saves seal-time tokenization and ~0.1% of segment size. Exposed mainly so the index's value can be measured rather than assumed; see [capacity](operations/capacity.md#content-search). |
 | `--compaction-fanout N` | `4` | Same-size segments merged into one. `0` or `1` disables compaction entirely. Lower merges more often (fewer segments, faster search, more ingest cost); higher merges less often. |
 | `--compaction-max-segment-bytes N` | `268435456` (256 MiB) | Ceiling on a merged segment. Bounds the memory a merge needs, since it materializes its inputs; the cost is a floor on how far the segment count can fall. A merge holds no engine lock, so this does not bound a stall. |
 | `--ui-dir DIR` | discovered | Built dashboard to serve at `/`. Unset ⇒ `$TRAZA_UI_DIR`, `<binary dir>/ui`, `<binary dir>/../share/traza/ui`, `./ui/dist`, first containing `index.html`. None found ⇒ the API runs and `/` 404s with build instructions. |
@@ -222,6 +223,7 @@ same values a `--profile` would give the server.
 | `durability` | `Durability` | `Wal` | As `--durability`. |
 | `compaction` | `Option<CompactionConfig>` | `Some(default)` | `None` disables compaction. |
 | `wal_commit_window` | `Option<Duration>` | `None` | As `--wal-commit-window-us`. |
+| `content_index` | `bool` | `true` | As `--no-content-index` inverted. `false` omits the content index from sealed segments; `SpanFilter::content` still returns the same rows, by scanning. |
 
 `CompactionConfig`:
 

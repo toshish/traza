@@ -77,6 +77,7 @@ fn buffer_flush_persists_sorted_batches() {
             durability: traza::Durability::Buffered,
             compaction: None,
             wal_commit_window: None,
+            content_index: true,
             flush_wal_bytes: None,
         },
     )
@@ -130,6 +131,7 @@ fn crash_recovery_preserves_flushed_spans() {
                 durability: traza::Durability::Buffered,
                 compaction: None,
                 wal_commit_window: None,
+                content_index: true,
                 flush_wal_bytes: None,
             },
         )
@@ -171,6 +173,7 @@ fn crash_recovery_preserves_flushed_spans() {
             durability: traza::Durability::Buffered,
             compaction: None,
             wal_commit_window: None,
+            content_index: true,
             flush_wal_bytes: None,
         },
     )
@@ -289,6 +292,7 @@ fn randomized_filters_match_naive_reference() {
             durability: traza::Durability::Buffered,
             compaction: None,
             wal_commit_window: None,
+            content_index: true,
             flush_wal_bytes: None,
         },
     )
@@ -381,6 +385,7 @@ fn ttl_compaction_drops_expired_segments() {
             durability: traza::Durability::Buffered,
             compaction: None,
             wal_commit_window: None,
+            content_index: true,
             flush_wal_bytes: None,
         },
     )
@@ -488,6 +493,7 @@ fn lock_order_no_deadlock() {
                 durability: traza::Durability::Buffered,
                 compaction: None,
                 wal_commit_window: None,
+                content_index: true,
                 flush_wal_bytes: None,
             },
         )
@@ -546,6 +552,7 @@ fn reads_never_miss_committed_spans() {
                 durability: traza::Durability::Buffered,
                 compaction: None,
                 wal_commit_window: None,
+                content_index: true,
                 flush_wal_bytes: None,
             },
         )
@@ -618,6 +625,7 @@ fn stale_temp_does_not_wedge_flush() {
             durability: traza::Durability::Buffered,
             compaction: None,
             wal_commit_window: None,
+            content_index: true,
             flush_wal_bytes: None,
         },
     )
@@ -675,6 +683,7 @@ fn second_open_is_rejected() {
         durability: traza::Durability::Buffered,
         compaction: None,
         wal_commit_window: None,
+        content_index: true,
         flush_wal_bytes: None,
     };
     let first = Store::open(&dir, config.clone()).expect("open first store");

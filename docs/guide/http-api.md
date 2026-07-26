@@ -133,6 +133,7 @@ Filtered span search, ordered by Traza's stable span order
 | `service` | string | Exact match on the emitting service |
 | `name` | string | Exact match on the operation name |
 | `attr.KEY` | JSON or string | Exact attribute match. Repeatable — each occurrence adds a condition |
+| `content` / `q` | string | Spans whose text contains **every word** given. See below |
 | `session` | string | Every span of a session, unioning all recognized session keys |
 | `not_attr.KEY` | JSON or string | Exclude spans whose attribute equals this. A span missing the key entirely is **kept**. Repeatable |
 | `min_attr.KEY` | number | Attribute is at least this, compared numerically. Repeatable |
@@ -145,6 +146,49 @@ Filtered span search, ordered by Traza's stable span order
 | `until` / `until_ns` | integer | Only spans starting at or before this timestamp |
 | `sort` | string | `duration` / `-duration` / `start` / `-start` (a leading `-` is descending). Omit for Traza's stable order |
 | `limit` | integer | Maximum spans returned. **Default 100**, applied after filtering |
+
+#### Content search: `content=`
+
+`content=refund` returns spans whose text contains the word *refund*. The text
+searched is every string value in the span's attributes and its events'
+attributes, plus event names — so a prompt, a completion, a tool call's
+arguments and a nested message array are all covered.
+
+```
+GET /v1/spans?content=refund&since=1700000000000000000&limit=50
+```
+
+**It is word search, not substring search, and not a phrase search.** Those
+three differences are the ones that surprise people, so they are worth stating
+directly:
+
+| Query | Matches `Refund the order` | Matches `refunds were issued` |
+|---|---|---|
+| `content=refund` | yes | **no** |
+| `content=refunds` | no | yes |
+| `content=refund order` | yes (both words present) | no |
+
+- Case and punctuation are ignored: `refund`, `Refund`, `"refund"` and
+  `refund,` are the same word.
+- There is no stemming. `refund` and `refunds` are different words.
+- A multi-word query is a **conjunction**: every word must appear somewhere in
+  the span, in any order. `content=refund order` does not require them
+  adjacent.
+- Words are runs of ASCII letters and digits. Text in other scripts is not
+  tokenized, so `content=世界` matches nothing.
+
+This is not an arbitrary restriction — it is what the index can answer
+*correctly*. A word index cannot soundly drive a substring search: it would
+have to skip the span reading `refunds were issued` when you searched
+`refund`, and skipping it is a wrong answer rather than a slow one. See
+[the segment format](../segment-format.md#the-content-index).
+
+To find spans by the *whole value* of an attribute rather than a word inside
+it, use `attr.KEY=VALUE`, which is exact and separately indexed.
+
+Content search composes with every other parameter, and is fast when it is
+selective — see [capacity](../operations/capacity.md#content-search) for
+measured latencies, including the case where it cannot help.
 
 `attr.KEY=VALUE` **matches a scalar regardless of how it was typed on the
 wire.** `attr.code=200` finds spans that stored the number `200` and spans

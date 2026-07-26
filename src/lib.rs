@@ -500,6 +500,19 @@ pub struct Config {
     /// hurts an idle store, which is why it is off unless asked for. It never
     /// weakens the guarantee — the acknowledgement still follows the fsync.
     pub wal_commit_window: Option<std::time::Duration>,
+    /// Whether sealed segments carry a content index, making
+    /// [`SpanFilter::content`] fast. On by default.
+    ///
+    /// Turning it off does not remove the ability to search — a segment with
+    /// no content index is scanned instead of skipped, so the same query
+    /// returns the same rows and simply costs what a scan costs. What it
+    /// removes is the index's price: tokenizing every span's text at seal
+    /// time, and roughly 1-2% of segment size on disk.
+    ///
+    /// Leave it on unless a measurement says otherwise. It is exposed mainly
+    /// so that the measurement is possible: with it, the same corpus can be
+    /// queried with and without the index and the difference attributed.
+    pub content_index: bool,
 }
 
 /// Default ceiling on log bytes before a flush seals the buffer. Large enough
@@ -517,6 +530,7 @@ impl Default for Config {
             durability: Durability::Wal,
             compaction: Some(CompactionConfig::default()),
             wal_commit_window: None,
+            content_index: true,
         }
     }
 }
@@ -2260,6 +2274,41 @@ impl Store {
             .sum())
     }
 
+    /// Bytes the content index holds resident across all segments: the
+    /// per-segment summary filters only.
+    ///
+    /// The per-block filters that do the real narrowing stay on disk and are
+    /// read a row at a time, so this figure scales with SEGMENT COUNT and not
+    /// with how much text the store holds. That is the property that makes
+    /// content search compatible with a store larger than RAM, and this is the
+    /// number that would betray it if it stopped being true.
+    pub fn resident_content_index_bytes(&self) -> Result<usize> {
+        let segments = self.lock_segments()?;
+        Ok(segments
+            .iter()
+            .map(|segment| segment.seg.content_resident_bytes())
+            .sum())
+    }
+
+    /// Mean fill ratio of the resident content summary filters, or `None` when
+    /// no segment carries a content index.
+    ///
+    /// A value approaching 1.0 means the filters have saturated: they still
+    /// cannot return a wrong answer, but they have stopped skipping segments
+    /// and content search has quietly degraded to a scan. Nothing in a query's
+    /// results would show that.
+    pub fn content_summary_fill(&self) -> Result<Option<f64>> {
+        let segments = self.lock_segments()?;
+        let fills: Vec<f64> = segments
+            .iter()
+            .filter_map(|segment| segment.seg.content_summary_fill())
+            .collect();
+        if fills.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(fills.iter().sum::<f64>() / fills.len() as f64))
+    }
+
     /// Distinct indexed `(key, value)` attribute pairs held resident across
     /// all persisted segments, summed per segment.
     ///
@@ -2581,7 +2630,8 @@ impl Store {
                 .iter()
                 .map(|span| span_to_record(span.borrow()))
                 .collect::<Result<Vec<_>>>()?;
-            let encoded = segment::encode(&records).map_err(segment_error)?;
+            let encoded =
+                segment::encode_with(&records, self.config.content_index).map_err(segment_error)?;
             let mut options = OpenOptions::new();
             options.write(true).create_new(true);
             let mut file = options.open(&temp_path)?;
