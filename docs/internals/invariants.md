@@ -38,9 +38,15 @@ a zero-padded id precisely so lexical path order matches numeric id order.
   same name for exactly this reason.
 - **Claiming a merged segment's id after the merge instead of before.** The
   merge runs without the segment lock, so a flush can publish while it works.
-  The id is claimed under the lock at pin time, which is what guarantees every
-  segment appearing afterwards sorts *after* the merged output — it was written
-  later, and must win.
+  The ids are claimed under the lock at pin time, which is what guarantees
+  every segment appearing afterwards sorts *after* the merged outputs — it was
+  written later, and must win.
+- **Handing a merge's outputs ids out of group order.** A run merges into a
+  group of outputs, one per consecutive slice of the run, and dedup happens
+  *within* a slice — so a key written in two slices lands in two outputs. The
+  ids are claimed as one contiguous block and assigned in slice order, which
+  is what makes the later output — holding the later version — sort after the
+  earlier one, exactly as its source segments did.
 
 **Symptom.** A re-ingested span reverts to an older version, at some point
 after a compaction or a concurrent flush. Nothing errors.
@@ -160,21 +166,36 @@ recoverable) or parses into wrong data (silent, not).
 ## 5. Compaction is crash-safe through the supersede journal
 
 **The rule.** Before a rewrite replaces a segment, a marker file
-`.supersede.<old>.<new>.journal` is written and fsynced. It is deleted only
-after the original is removed. Recovery at open follows **the journal, never
-the content.**
+`.supersede.<old>.journal` is written and fsynced, naming every output the
+input is superseded by. It is deleted only after the original is removed.
+Recovery at open follows **the journal, never the content.**
 
 **Where.** `write_supersede_marker` / `recover_supersede_markers` in
 [`src/lib.rs`](../../src/lib.rs), used by `compact_segments`. Expiry does not
 need it: it renames the survivors onto the same name, so there is never a
 window in which a replacement exists beside its original.
 
-**The recovery rule.** If the replacement exists and parses, delete the
-original — the crash landed between rename and delete. If the replacement never
-materialized, delete nothing; the original stays authoritative and the merge is
-simply retried. The marker is removed either way. The merged segment is written
-and renamed into place **before** any input is deleted, so no window drops
-data.
+**The recovery rule.** If **every** replacement exists and parses, delete the
+original — the crash landed between the last rename and the delete. Otherwise,
+*if the original is still there*, roll the merge back: delete the replacements
+that did land, and the original stays authoritative so the merge is simply
+retried. The marker is removed either way. Outputs are written and renamed
+into place **before** any input is deleted, so no window drops data.
+
+**Why rollback, and why all-or-nothing.** A run merges into a *group* of
+outputs (invariant 4), and each output holds only its own group's
+last-write-wins view of a key while carrying a higher id than every input. One
+left beside intact inputs would therefore shadow a newer version living in a
+group whose output never landed. A partial group is not a smaller correct
+merge; it is a wrong one.
+
+**Why the original's presence is what licenses a rollback.** A merge deletes
+its inputs only once every output is durable, so an input still on disk proves
+the merge never committed. Gone proves it did — and then a missing output is
+simply one a later merge has since consumed, with the rest of the group live.
+Rolling those back because a marker outlived its merge is the one way this
+journal could destroy data, and the check on the original is what rules it
+out.
 
 **Why not content-based healing.** An earlier version deduplicated segments by
 inspecting their content, and that silently destroyed legitimately re-ingested

@@ -1786,11 +1786,22 @@ impl Store {
     /// promote its spans past segments that legitimately supersede them, so
     /// this only ever compacts the tail.
     ///
+    /// **A run merges into a GROUP of segments, not one.** Capping the output
+    /// by truncating the run instead left a cap-sized segment at the tail,
+    /// one tier above the segments behind it, and those were then unreachable
+    /// forever — tail-only means nothing behind the tail is ever a candidate
+    /// again. So the run is split into consecutive groups of at most
+    /// [`CompactionConfig::max_segment_bytes`] and each becomes one output,
+    /// taking ids in group order ([`merge_chunks`]). Last-write-wins survives
+    /// because that order is the inputs' order: a key in two groups lands in
+    /// two outputs, and the later output holds the later version.
+    ///
     /// **Crash safety** reuses the existing supersede journal, one marker per
-    /// input. Recovery deletes an input only once the merged segment is
-    /// present and parses; otherwise the inputs stay authoritative and the
-    /// merge is simply retried. The merged segment is written and renamed
-    /// into place BEFORE any input is deleted, so no window drops data.
+    /// input, each naming the whole output group. Recovery deletes an input
+    /// only once every output is present and parses; if any is missing it
+    /// deletes the ones that landed and the inputs stay authoritative, so the
+    /// merge is simply retried. Outputs are written and renamed into place
+    /// BEFORE any input is deleted, so no window drops data.
     ///
     /// **Reads and ingest continue throughout.** A merge parses every input,
     /// materializes the union, and fsyncs the replacement; holding the segment
@@ -1830,11 +1841,12 @@ impl Store {
         Ok(merged_away)
     }
 
-    /// Merges the last `run` segments into one. Returns segments removed, or
-    /// zero if the run stopped qualifying before the result could be published.
+    /// Merges the last `run` segments into as few segments as the size cap
+    /// allows. Returns segments removed, or zero if the run stopped qualifying
+    /// before the result could be published.
     fn merge_tail_run(&self, run: usize, settings: &CompactionConfig) -> Result<usize> {
         // ---- pin: short critical section -------------------------------
-        let (inputs, id) = {
+        let (inputs, chunks, first_id) = {
             let segments = self.lock_segments()?;
             // Re-check under the lock: the set may have changed since the scan.
             if tail_run_to_merge(&segments, settings) != Some(run) {
@@ -1851,42 +1863,34 @@ impl Store {
             }
             let start = segments.len() - run;
             let inputs: Vec<std::sync::Arc<Segment>> = segments[start..].to_vec();
-            // The id is claimed HERE, under the lock, and together with the
+            let chunks = merge_chunks(&inputs, settings);
+            // The ids are claimed HERE, under the lock, and together with the
             // check above that is what keeps a concurrent seal ordered
             // correctly. No seal is between its drain and its publish at this
             // instant, so every segment that appears while this merge runs
             // claims a HIGHER id — and therefore sorts after the merged
-            // output, which is exactly right: it was written later. Claiming
-            // the id after the merge would invert that and let merged (older)
-            // versions win over freshly sealed ones.
-            let id = self.next_segment.fetch_add(1, Ordering::Relaxed);
-            (inputs, id)
+            // outputs, which is exactly right: it was written later. Claiming
+            // the ids after the merge would invert that and let merged (older)
+            // versions win over freshly sealed ones. One contiguous block, so
+            // the outputs keep their groups' order among themselves too.
+            let first_id = self
+                .next_segment
+                .fetch_add(chunks.len() as u64, Ordering::Relaxed);
+            (inputs, chunks, first_id)
         };
         let input_paths: Vec<PathBuf> = inputs.iter().map(|segment| segment.path.clone()).collect();
-
-        // ---- merge: no engine lock held --------------------------------
-        // Oldest first, so a later segment's version of a key overwrites an
-        // earlier one — the same last-write-wins rule reads apply.
-        let mut latest: std::collections::HashMap<(String, String), Span> =
-            std::collections::HashMap::new();
-        let mut order: Vec<(String, String)> = Vec::new();
-        for segment in &inputs {
-            for span in segment.spans_parsed()? {
-                let key = (span.trace_id.clone(), span.span_id.clone());
-                if latest.insert(key.clone(), span).is_none() {
-                    order.push(key);
-                }
-            }
-        }
-        let mut merged: Vec<Span> = order
-            .into_iter()
-            .filter_map(|key| latest.remove(&key))
+        let new_names: Vec<String> = (0..chunks.len() as u64)
+            .map(|offset| {
+                let id = first_id + offset;
+                format!("{SEGMENT_PREFIX}{id:020}{SEGMENT_SUFFIX}")
+            })
             .collect();
-        sort_spans(&mut merged);
 
-        let new_name = format!("{SEGMENT_PREFIX}{id:020}{SEGMENT_SUFFIX}");
-        // Journal every input before the replacement exists, so recovery can
-        // finish the merge from either side without inspecting content.
+        // Journal every input before any replacement exists, so recovery can
+        // finish the merge from either side without inspecting content. Each
+        // marker names ALL the outputs: an input is superseded by the group of
+        // them together, and deleting it while only some exist would drop the
+        // spans the missing ones were to carry.
         let mut markers = Vec::with_capacity(inputs.len());
         for path in &input_paths {
             let old_name = path
@@ -1896,18 +1900,53 @@ impl Store {
             markers.push(write_supersede_marker(
                 &self.directory,
                 &old_name,
-                &new_name,
+                &new_names,
             )?);
         }
-        let new_segment = self.write_segment(id, &merged)?;
-        let new_path = new_segment.path.clone();
+
+        // ---- merge: no engine lock held --------------------------------
+        // One group at a time, so a merge holds one output's worth of spans
+        // rather than the whole run's.
+        let mut outputs: Vec<Segment> = Vec::with_capacity(chunks.len());
+        let written = (|| -> Result<()> {
+            let mut consumed = 0usize;
+            for (offset, size) in chunks.iter().enumerate() {
+                let group = &inputs[consumed..consumed + size];
+                consumed += size;
+                // Oldest first, so a later segment's version of a key
+                // overwrites an earlier one — the same last-write-wins rule
+                // reads apply. Across groups the outputs' ids carry that
+                // order instead.
+                let mut latest: std::collections::HashMap<(String, String), Span> =
+                    std::collections::HashMap::new();
+                let mut order: Vec<(String, String)> = Vec::new();
+                for segment in group {
+                    for span in segment.spans_parsed()? {
+                        let key = (span.trace_id.clone(), span.span_id.clone());
+                        if latest.insert(key.clone(), span).is_none() {
+                            order.push(key);
+                        }
+                    }
+                }
+                let mut merged: Vec<Span> = order
+                    .into_iter()
+                    .filter_map(|key| latest.remove(&key))
+                    .collect();
+                sort_spans(&mut merged);
+                outputs.push(self.write_segment(first_id + offset as u64, &merged)?);
+            }
+            Ok(())
+        })();
 
         // ---- publish: short critical section, revalidated ---------------
-        let published = {
+        let published = written.is_ok() && {
             let mut segments = self.lock_segments()?;
             match run_position(&segments, &inputs) {
                 Some(start) => {
-                    segments.splice(start..start + run, [std::sync::Arc::new(new_segment)]);
+                    let replacements = std::mem::take(&mut outputs)
+                        .into_iter()
+                        .map(std::sync::Arc::new);
+                    segments.splice(start..start + run, replacements);
                     segments.sort_by(|left, right| left.path.cmp(&right.path));
                     true
                 }
@@ -1916,14 +1955,19 @@ impl Store {
         };
         if !published {
             // Nothing was replaced, so nothing may look replaced. Remove the
-            // orphan BEFORE its markers: a crash in the other order would let
-            // recovery see a complete replacement and delete inputs it does
-            // not actually supersede.
-            let _ = fs::remove_file(&new_path);
+            // orphans BEFORE their markers: a crash in the other order would
+            // let recovery see a complete replacement and delete inputs it
+            // does not actually supersede. A half-written set is exactly as
+            // dangerous — an output holds only its own group's view of a key,
+            // so leaving one beside intact inputs would let it shadow a newer
+            // version in a group whose output never landed.
+            for name in &new_names {
+                let _ = fs::remove_file(self.directory.join(name));
+            }
             for marker in markers {
                 let _ = fs::remove_file(marker);
             }
-            return Ok(0);
+            return written.map(|()| 0);
         }
 
         // The merged segment is durable and visible, so the inputs are dead.
@@ -1939,6 +1983,9 @@ impl Store {
         // recovery finish an unlink that a crash rolled back, so it must
         // outlive any unlink that is not yet durable.
         sync_directory(&self.directory)?;
+        // A marker that outlives the merge it describes stays harmless: the
+        // inputs it names are gone, which is what tells recovery this merge
+        // committed and its outputs are not to be rolled back.
         for marker in markers {
             let _ = fs::remove_file(marker);
         }
@@ -1946,7 +1993,7 @@ impl Store {
         if let Ok(mut rollups) = self.rollups.lock() {
             rollups.retain(|path, _| !input_paths.contains(path));
         }
-        Ok(input_paths.len().saturating_sub(1))
+        Ok(input_paths.len().saturating_sub(new_names.len()))
     }
 
     /// Removes spans ending before `cutoff_ns` and returns the number removed.
@@ -2501,11 +2548,25 @@ fn size_tier(bytes: u64, settings: &CompactionConfig) -> u32 {
     tier
 }
 
-/// Length of the maximal same-tier run at the TAIL of `segments`, when that
-/// run is long enough to merge and small enough to stay under the size cap.
+/// Length of the maximal same-tier run at the TAIL of `segments`, when
+/// merging that run would leave fewer segments than it consumed.
 ///
 /// Tail-only is a correctness requirement, not a simplification: see
 /// [`Store::compact_segments`].
+///
+/// **Only a LARGER segment ends the run.** The tier that matters is the
+/// largest in the run, not the tier of the last segment, and a segment
+/// smaller than that rides along as a passenger. Anchoring on the last
+/// segment and stopping at any tier change made every tier discontinuity
+/// permanent, in both directions. Ingest flushes a partial segment whenever a
+/// batch does not divide evenly into `flush_spans`, and a partial below
+/// `base_bytes` is tier 0 among tier-1 neighbours: at the tail it made the
+/// run length 1, below `fanout`, so nothing merged; once ingest moved past it
+/// it became a wall in the middle, and since nothing behind the tail is ever
+/// a candidate again, everything older than it was frozen for good.
+/// Absorbing a smaller neighbour costs almost nothing — it is a rounding
+/// error against the run it joins — whereas stopping at one costs the whole
+/// prefix.
 fn tail_run_to_merge(
     segments: &[std::sync::Arc<Segment>],
     settings: &CompactionConfig,
@@ -2513,32 +2574,82 @@ fn tail_run_to_merge(
     if segments.len() < settings.fanout {
         return None;
     }
-    let tier = size_tier(segments.last()?.bytes, settings);
+    let mut tier = size_tier(segments.last()?.bytes, settings);
     let mut run = 0usize;
-    let mut total = 0u64;
+    // Only segments AT the anchor tier count toward `fanout`; passengers are
+    // in the run but do not justify it. Merging four tiny segments into a
+    // 256 MiB one is the write amplification the tiers exist to prevent, so
+    // a passenger must never be what makes a run look long enough.
+    let mut counted = 0usize;
     for segment in segments.iter().rev() {
-        if size_tier(segment.bytes, settings) != tier {
-            break;
+        let segment_tier = size_tier(segment.bytes, settings);
+        if segment_tier > tier {
+            if counted >= settings.fanout {
+                // A run worth merging already, and the bigger segment behind
+                // it is exactly what should not be rewritten to absorb it.
+                break;
+            }
+            // Otherwise it becomes the anchor: the smaller ones picked up so
+            // far were the passengers, and this is the real run.
+            tier = segment_tier;
+            counted = 0;
         }
-        let projected = total.saturating_add(segment.bytes);
-        // Stop before exceeding the cap, but only once we already have enough
-        // to merge — otherwise a single oversized segment blocks the tier.
-        if settings.max_segment_bytes > 0
-            && projected > settings.max_segment_bytes
-            && run >= settings.fanout
-        {
-            break;
-        }
-        total = projected;
         run += 1;
+        if segment_tier == tier {
+            counted += 1;
+        }
     }
-    if run >= settings.fanout
-        && !(settings.max_segment_bytes > 0 && total > settings.max_segment_bytes)
-    {
-        Some(run)
-    } else {
-        None
+    if counted < settings.fanout {
+        return None;
     }
+    // The size cap bounds each OUTPUT, not the run, because the merge emits
+    // as many segments as it needs (see `merge_chunks`). What the run must
+    // still clear is that merging it is worth doing at all: a run already
+    // made of cap-sized segments would be rewritten byte for byte to produce
+    // exactly as many segments as it consumed.
+    let start = segments.len() - run;
+    if merge_chunks(&segments[start..], settings).len() >= run {
+        return None;
+    }
+    Some(run)
+}
+
+/// Splits a merge's inputs into the consecutive groups that each become one
+/// output segment, so no output exceeds `max_segment_bytes`.
+///
+/// Grouping rather than one big merge is what lets compaction work down a
+/// backlog. A capped merge used to stop partway along the run and leave a
+/// cap-sized segment at the tail, which — being a different tier from the
+/// smaller segments behind it — blocked them permanently, so a store that
+/// accumulated segments faster than it compacted them could never catch up.
+///
+/// Groups are consecutive and their outputs take ascending ids in the same
+/// order, which is what keeps last-write-wins intact: a key present in two
+/// groups lands in two outputs, and the later output — holding the version
+/// from the later input — sorts after the earlier one, exactly as its source
+/// segments did. That is why dedup can stay within a group, and why a merge
+/// only ever needs one group's spans in memory at a time.
+fn merge_chunks(run: &[std::sync::Arc<Segment>], settings: &CompactionConfig) -> Vec<usize> {
+    let mut chunks = Vec::new();
+    let mut current = 0usize;
+    let mut total = 0u64;
+    for segment in run {
+        let projected = total.saturating_add(segment.bytes);
+        // A segment larger than the cap on its own still forms a group: the
+        // cap cannot be honoured for it either way, and refusing would stall.
+        if current > 0 && settings.max_segment_bytes > 0 && projected > settings.max_segment_bytes {
+            chunks.push(current);
+            current = 1;
+            total = segment.bytes;
+        } else {
+            current += 1;
+            total = projected;
+        }
+    }
+    if current > 0 {
+        chunks.push(current);
+    }
+    chunks
 }
 
 /// Where `run` sits in `segments`, by identity, or `None` if it is no longer
@@ -2569,16 +2680,23 @@ fn run_position(
 /// duplicate healing silently destroyed legitimately re-ingested identical
 /// spans (found in review: acknowledged duplicate cardinality must survive
 /// restart).
-fn supersede_marker_path(directory: &Path, old_name: &str, new_name: &str) -> PathBuf {
-    directory.join(format!(".supersede.{old_name}.{new_name}.journal"))
+fn supersede_marker_path(directory: &Path, old_name: &str) -> PathBuf {
+    directory.join(format!(".supersede.{old_name}.journal"))
 }
 
-fn write_supersede_marker(directory: &Path, old_name: &str, new_name: &str) -> Result<PathBuf> {
-    let path = supersede_marker_path(directory, old_name, new_name);
+/// Records that `new_names` — the merge's outputs, as a group — supersede
+/// `old_name`. The whole group is named because no single output supersedes
+/// the input on its own: each holds only its own group's view of a key.
+fn write_supersede_marker(
+    directory: &Path,
+    old_name: &str,
+    new_names: &[String],
+) -> Result<PathBuf> {
+    let path = supersede_marker_path(directory, old_name);
     let mut options = OpenOptions::new();
     options.write(true).create(true).truncate(true);
     let mut file = options.open(&path)?;
-    writeln!(file, "{old_name} -> {new_name}")?;
+    writeln!(file, "{old_name} -> {}", new_names.join(","))?;
     file.sync_all()?;
     sync_directory(directory)?;
     Ok(path)
@@ -2586,10 +2704,16 @@ fn write_supersede_marker(directory: &Path, old_name: &str, new_name: &str) -> R
 
 /// Finishes interrupted compaction rewrites recorded in supersede markers.
 ///
-/// If the replacement exists and is complete, the original is deleted (the
-/// crash hit between replacement rename and original delete). If the
-/// replacement never materialized, nothing is deleted — the original remains
-/// authoritative. The marker is removed either way.
+/// If every replacement exists and is complete, the original is deleted (the
+/// crash hit between the last replacement's rename and the original's
+/// delete). If any is missing the merge is rolled back instead: the
+/// replacements that did land are deleted and the originals — untouched until
+/// a merge commits — stay authoritative. Rolling back rather than keeping the
+/// partial set is what a grouped merge requires, because an output carries
+/// only its own group's last-write-wins view; left beside intact inputs, and
+/// holding a higher id than all of them, it would shadow a newer version of
+/// any key whose group never produced its output. The marker is removed
+/// either way.
 fn recover_supersede_markers(directory: &Path) -> Result<()> {
     let mut markers = Vec::new();
     for entry in fs::read_dir(directory)? {
@@ -2604,14 +2728,33 @@ fn recover_supersede_markers(directory: &Path) -> Result<()> {
     }
     for marker in markers {
         let parsed = fs::read_to_string(&marker).unwrap_or_default();
-        if let Some((old_name, new_name)) = parsed.trim().split_once(" -> ") {
+        if let Some((old_name, new_names)) = parsed.trim().split_once(" -> ") {
+            let new_names: Vec<&str> = new_names.split(',').filter(|n| !n.is_empty()).collect();
+            let ready = |name: &str| {
+                let path = directory.join(name);
+                path.exists()
+                    && (!name.ends_with(SEGMENT_SUFFIX) || segment::Segment::open(&path).is_ok())
+            };
             let old_path = directory.join(old_name);
-            let new_path = directory.join(new_name);
-            let replacement_ready = new_path.exists()
-                && (!new_name.ends_with(SEGMENT_SUFFIX)
-                    || segment::Segment::open(&new_path).is_ok());
-            if replacement_ready && old_path.exists() {
-                fs::remove_file(&old_path)?;
+            if !new_names.is_empty() && new_names.iter().all(|name| ready(name)) {
+                if old_path.exists() {
+                    fs::remove_file(&old_path)?;
+                }
+            } else if old_path.exists() {
+                // Rolling back, and the input's presence is what licenses it.
+                // A merge deletes its inputs only once every output is
+                // durable, so an input still on disk proves this merge never
+                // committed and its outputs are safe to remove. Gone means it
+                // DID commit — and then a missing output is one a later merge
+                // consumed, with the rest of the group live. Deleting those
+                // because a marker outlived its merge would be the one way
+                // this journal could destroy data.
+                for name in &new_names {
+                    let path = directory.join(name);
+                    if path.exists() {
+                        fs::remove_file(&path)?;
+                    }
+                }
             }
         }
         fs::remove_file(&marker)?;
