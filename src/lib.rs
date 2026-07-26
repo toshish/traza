@@ -1807,8 +1807,12 @@ impl Store {
         // errors while an export is reading, and the merge is simply retried
         // on the next tick — the store stays correct either way.)
         for path in &input_paths {
-            fs::remove_file(path)?;
+            unlink_segment(path)?;
         }
+        // Durable before the markers are dropped: a marker is what lets
+        // recovery finish an unlink that a crash rolled back, so it must
+        // outlive any unlink that is not yet durable.
+        sync_directory(&self.directory)?;
         for marker in markers {
             let _ = fs::remove_file(marker);
         }
@@ -1905,7 +1909,12 @@ impl Store {
             // loaded again at the next open. A pinned reader is undisturbed by
             // the unlink: it holds its own descriptor.
             if replacement.is_none() {
-                fs::remove_file(&segment.path)?;
+                unlink_segment(&segment.path)?;
+                // An unlink is visible immediately and durable only when the
+                // directory entry it removed is synced. Reporting the deletion
+                // before that would let a crash bring the file — and the spans
+                // TTL just removed — back.
+                sync_directory(&self.directory)?;
             }
             // Publish this one before rewriting the next, so an I/O failure
             // partway through leaves everything already rewritten correctly
@@ -2522,6 +2531,21 @@ fn is_segment_file(path: &Path) -> bool {
             name.starts_with(SEGMENT_PREFIX)
                 && (name.ends_with(LEGACY_SEGMENT_SUFFIX) || name.ends_with(SEGMENT_SUFFIX))
         })
+}
+
+/// Unlinks a segment file, treating "already gone" as success.
+///
+/// Deletion is retried on failure, and a retry has to be able to make progress
+/// after a partial one: an unlink can land while the directory sync that makes
+/// it durable does not, so the next attempt legitimately finds the file
+/// missing. Failing on `NotFound` would turn that into a permanent error over
+/// state that is already correct.
+fn unlink_segment(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(Error::Io(error)),
+    }
 }
 
 fn segment_number(path: &Path) -> Option<u64> {

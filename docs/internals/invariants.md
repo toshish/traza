@@ -127,6 +127,16 @@ reader sees the complete file or no file, never a partial one. The file fsync
 must precede the rename or the rename can be durable while its contents are
 not. The directory fsync is what makes the rename itself durable.
 
+**The same rule runs in reverse for deletion.** An unlink is visible
+immediately and durable only once the directory entry it removed is synced, so
+nothing may *act* on a file being gone — report the deletion, drop the segment
+from the live list, reclaim the log that still holds its spans — before that
+sync. `expire_before` and `merge_tail_run` both sync the directory after
+unlinking and before anything downstream depends on it. Deletion is also
+idempotent (`unlink_segment` treats `NotFound` as done), because a retry after
+an unlink that landed without its sync must be able to finish rather than fail
+forever on state that is already correct.
+
 **What breaks it.** Writing directly to the final path. Skipping the directory
 fsync. Reordering fsync after rename.
 
