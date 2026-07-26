@@ -72,15 +72,25 @@ fn every_compaction_peak_the_guide_quotes_exists_in_the_record() {
         .nth(1)
         .expect("the guide discusses the compaction transient");
     let section = section.split("## ").next().unwrap_or(section);
-    // Split on anything that is not a digit or a comma, so a range written
-    // "1,204-1,601 MiB" is checked as two figures rather than one nonsense
-    // token.
-    for candidate in section.split(|c: char| !c.is_ascii_digit() && c != ',') {
-        let candidate = candidate.trim_matches(',');
-        if candidate.len() >= 5 && candidate.contains(',') {
+    // Only figures actually denominated in MiB are RSS claims. Scanning every
+    // comma-formatted number instead swept up span counts ("45,000 spans")
+    // and demanded they name a merge, which is a false positive rather than
+    // drift. A figure written "1,204-1,601 MiB" is checked as two figures,
+    // because each half is walked back from its own unit.
+    for (index, _) in section.match_indices(" MiB") {
+        let figure: String = section[..index]
+            .chars()
+            .rev()
+            .take_while(|c| c.is_ascii_digit() || *c == ',')
+            .collect::<Vec<char>>()
+            .into_iter()
+            .rev()
+            .collect();
+        let figure = figure.trim_matches(',');
+        if figure.len() >= 5 && figure.contains(',') {
             assert!(
-                known.contains(candidate),
-                "the capacity guide quotes {candidate} MiB in its compaction section, but no \
+                known.contains(figure),
+                "the capacity guide quotes {figure} MiB in its compaction section, but no \
                  completed merge in the committed record produced that figure. Known values: \
                  {known:?}. Regenerating the record without updating the prose is how these \
                  drift apart."

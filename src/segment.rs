@@ -1,19 +1,40 @@
 //! Segment file-backed storage and persisted indexes.
 //!
-//! The on-disk format is version 2 (see `MAGIC`/`VERSION`); version 1 (JSONL)
-//! is no longer read.
+//! The on-disk format is version 4 (see `MAGIC`/`VERSION`); versions 2 and 3
+//! are still read, and version 1 (JSONL) is not.
 //!
 //! An opened file-backed segment owns only its file handle and decoded index
 //! maps. In-memory segments built for encoding may own their bytes. Records are
 //! decoded only when a query selects their offsets; no decoded record vector
 //! is retained by [`Segment`].
+//!
+//! # Why the attribute index is hashed
+//!
+//! Through v3 the attribute index was keyed on the attribute VALUE TEXT, and
+//! every opened segment held every distinct value resident for its whole life.
+//! For enum-shaped attributes — `service`, `status`, a model name — that is
+//! nothing. For the data Traza exists to store it is fatal: an indexed
+//! `gen_ai.prompt` is kilobytes, every value is distinct, and the resident
+//! index therefore grew to roughly the size of the corpus text. A store that
+//! reads records from disk on demand specifically so it can outgrow RAM was
+//! pulling the largest part of each record back into RAM through its own
+//! index.
+//!
+//! v4 keys the index on a 128-bit digest of the value instead (see
+//! [`crate::hash`]), so a posting entry costs 20 bytes whether the value is a
+//! status code or a page of text. The digest is not reversible, which makes
+//! every probe a CANDIDATE list rather than an answer — see
+//! [`Segment::attribute_candidate_offsets`].
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+use crate::content;
+use crate::hash::{hash_attribute, Hash128};
 
 /// Eight-byte marker at the beginning of every segment file. The version
 /// lives in [`VERSION`], not in the magic, so the marker itself stays fixed
@@ -22,22 +43,47 @@ pub const MAGIC: [u8; 8] = *b"TRAZASEG";
 /// On-disk format version written by this module. This — not the magic — is
 /// how the format generation is identified; the magic only says "a Traza
 /// segment". (JSONL v1 carried no magic; this indexed format is version 2.)
-pub const VERSION: u16 = 3;
+pub const VERSION: u16 = 5;
 /// Fixed header size written by this module.
 ///
-/// v3 appends the segment's timestamp range to the v2 header. Time is the
-/// most common filter an observability store sees and it was the one thing a
-/// query could not use to skip work: `since`/`until` were pure post-filters,
-/// so a "last 15 minutes" search opened and scanned every segment in the
-/// store. Two u64s in the header let a query eliminate a whole segment
-/// without touching it.
-pub const HEADER_LEN: usize = 96;
+/// v5 appends the content index's section offset. The attribute index used to
+/// run to EOF and derive its length from the file size; with a fifth section
+/// after it, that offset is what bounds it.
+pub const HEADER_LEN: usize = 104;
+/// v3/v4 header size. v3 appended the segment's timestamp range to the v2
+/// header. Time is the most common filter an observability store sees and it
+/// was the one thing a query could not use to skip work: `since`/`until` were
+/// pure post-filters, so a "last 15 minutes" search opened and scanned every
+/// segment in the store. Two u64s in the header let a query eliminate a whole
+/// segment without touching it.
+pub const HEADER_LEN_V3: usize = 96;
 /// v2 header size. Still readable: a v2 segment simply carries no timestamp
 /// range, and a query treats its range as unknown and cannot skip it — which
 /// is exactly the behaviour that existed before v3.
 pub const HEADER_LEN_V2: usize = 80;
 /// Oldest format this module can read.
 pub const MIN_READABLE_VERSION: u16 = 2;
+
+/// Records covered by one content-index block.
+///
+/// This is the granularity a content query narrows to: a block whose filter
+/// admits the query has all of its records decoded and checked. Smaller blocks
+/// prune more precisely but make the bit-sliced matrix taller relative to the
+/// data; 128 keeps the index near 1-2% of segment size while still discarding
+/// 99% of a segment on a selective term.
+pub const CONTENT_BLOCK_RECORDS: u32 = 128;
+/// Bounds on one block filter's size. The upper bound is what stops a block of
+/// pathologically varied text from sizing its own filter without limit.
+const CONTENT_BLOCK_MIN_BYTES: usize = 64;
+const CONTENT_BLOCK_MAX_BYTES: usize = 8 * 1024;
+/// Bounds on the per-segment summary filter, which is the only part of the
+/// content index held resident. The upper bound is the whole resident-memory
+/// story: total cost is at most this times the number of open segments, and it
+/// does not depend on how much text those segments hold.
+const CONTENT_SUMMARY_MIN_BYTES: usize = 256;
+const CONTENT_SUMMARY_MAX_BYTES: usize = 32 * 1024;
+/// Fixed prologue of the content section, before any bitmap.
+const CONTENT_PROLOGUE_LEN: usize = 32;
 
 const RECORD_FIXED_LEN: usize = 8 + 4 + 4 + 4 + 4;
 
@@ -70,6 +116,10 @@ pub struct Header {
     /// that predates the field. `None` means unknown, never "empty": a query
     /// must scan a segment whose range it cannot rule out.
     pub timestamps: Option<(u64, u64)>,
+    /// Byte offset and length of the content index, or `None` before v5.
+    /// `None` means unknown, on the same reading as `timestamps`: a content
+    /// query must consider a segment whose text it cannot rule out.
+    pub content: Option<(u64, u64)>,
 }
 
 impl Header {
@@ -95,6 +145,7 @@ impl Header {
         let header_len = read_u16(bytes, 10)?;
         let expected_header_len = match version {
             2 => HEADER_LEN_V2,
+            3 | 4 => HEADER_LEN_V3,
             _ => HEADER_LEN,
         };
         if usize::from(header_len) != expected_header_len {
@@ -103,6 +154,15 @@ impl Header {
         if bytes.len() < expected_header_len {
             return Err(Error::Corrupt("file is shorter than its declared header"));
         }
+        let attribute_index_offset = read_u64(bytes, 72)?;
+        // Before v5 the attribute index ran to EOF. From v5 the content index
+        // follows it, so its offset is what bounds the attribute section.
+        let content_offset = if version >= 5 {
+            Some(read_u64(bytes, 96)?)
+        } else {
+            None
+        };
+        let attribute_index_end = content_offset.unwrap_or(total);
         let header = Self {
             version,
             header_len,
@@ -113,9 +173,9 @@ impl Header {
             offsets_len: read_u64(bytes, 48)?,
             trace_index_offset: read_u64(bytes, 56)?,
             trace_index_len: read_u64(bytes, 64)?,
-            attribute_index_offset: read_u64(bytes, 72)?,
-            attribute_index_len: total
-                .checked_sub(read_u64(bytes, 72)?)
+            attribute_index_offset,
+            attribute_index_len: attribute_index_end
+                .checked_sub(attribute_index_offset)
                 .ok_or(Error::Corrupt("attribute index offset beyond file"))?,
             // v2 predates the range. `None` means "unknown", which makes a
             // query scan the segment rather than wrongly skip it.
@@ -124,18 +184,30 @@ impl Header {
             } else {
                 None
             },
+            content: match content_offset {
+                Some(offset) => Some((
+                    offset,
+                    total
+                        .checked_sub(offset)
+                        .ok_or(Error::Corrupt("content index offset beyond file"))?,
+                )),
+                None => None,
+            },
         };
         header.validate_total(total)?;
         Ok(header)
     }
 
     fn validate_total(&self, file_len: u64) -> Result<(), Error> {
-        let sections = [
+        let mut sections = vec![
             (self.records_offset, self.records_len),
             (self.offsets_offset, self.offsets_len),
             (self.trace_index_offset, self.trace_index_len),
             (self.attribute_index_offset, self.attribute_index_len),
         ];
+        if let Some(content) = self.content {
+            sections.push(content);
+        }
         let mut expected = u64::from(self.header_len);
         for (offset, len) in sections {
             if offset != expected {
@@ -173,10 +245,21 @@ pub struct RecordInput {
     pub attributes: BTreeMap<String, String>,
     /// Opaque payload bytes returned unchanged by queries.
     pub payload: Vec<u8>,
+    /// Raw text this record should be findable by, for content search.
+    ///
+    /// Separate from `attributes` because those hold values in their canonical
+    /// JSON form — a string value arrives here as `"hello\nworld"`, quotes,
+    /// escapes and all. Tokenizing that would index `nworld`, and a search for
+    /// `world` would silently miss. Content search needs the text as a human
+    /// wrote it, so the caller supplies it unescaped.
+    ///
+    /// Empty means "index no content for this record". A record with no
+    /// content is simply never a content-search candidate.
+    pub content: Vec<String>,
 }
 
 impl RecordInput {
-    /// Creates an input record.
+    /// Creates an input record with no content-search text.
     pub fn new(
         timestamp: u64,
         trace_id: impl Into<String>,
@@ -188,7 +271,14 @@ impl RecordInput {
             trace_id: trace_id.into(),
             attributes,
             payload: payload.into(),
+            content: Vec::new(),
         }
+    }
+
+    /// Attaches the raw text this record should be findable by.
+    pub fn with_content(mut self, content: Vec<String>) -> Self {
+        self.content = content;
+        self
     }
 }
 
@@ -272,7 +362,127 @@ impl From<std::str::Utf8Error> for Error {
     }
 }
 
-/// An opened v2 segment backed by either a file or encoded memory.
+/// The resident attribute index: attribute keys held once by name, values
+/// held only as digests.
+///
+/// Splitting keys from values this way is what bounds the structure. Attribute
+/// KEYS are a schema — a store sees tens of them, they repeat on every span,
+/// and an operator needs their names to understand a cost report — so they are
+/// interned once in a dictionary and referred to by a `u32`. Attribute VALUES
+/// are data, unbounded in both size and cardinality, so they are never
+/// retained at all: only [`Hash128`] of the `(key, value)` pair survives.
+///
+/// The cost of one distinct value is therefore `size_of::<(u32, Hash128)>()`
+/// plus 8 bytes per posting, independent of how long the value was.
+#[derive(Debug, Default)]
+struct AttributeIndex {
+    /// Attribute key names, indexed by key id.
+    keys: Vec<String>,
+    /// Reverse dictionary for probe lookups.
+    key_ids: HashMap<String, u32>,
+    /// `(key id, value digest)` to record offsets, in record order.
+    postings: HashMap<(u32, Hash128), Vec<u64>>,
+}
+
+impl AttributeIndex {
+    fn key_id(&self, key: &str) -> Option<u32> {
+        self.key_ids.get(key).copied()
+    }
+
+    /// Candidate offsets for a `(key, value)` probe. Empty when the segment
+    /// has never seen the key, which is the common case for a filter on an
+    /// attribute a given service does not emit.
+    fn candidates(&self, key: &str, value: &str) -> &[u64] {
+        let Some(id) = self.key_id(key) else {
+            return &[];
+        };
+        self.postings
+            .get(&(id, hash_attribute(key, value)))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    fn len(&self) -> usize {
+        self.postings.len()
+    }
+
+    /// Approximate resident bytes, on the same "structural sum at allocated
+    /// capacity" basis as [`Segment::approx_index_bytes`].
+    fn approx_bytes(&self) -> usize {
+        let dictionary = self.keys.iter().map(String::capacity).sum::<usize>()
+            + self.key_ids.keys().map(String::capacity).sum::<usize>()
+            + hash_table_bytes::<String, u32>(self.key_ids.capacity())
+            + self.keys.capacity() * std::mem::size_of::<String>();
+        let entries = hash_table_bytes::<(u32, Hash128), Vec<u64>>(self.postings.capacity())
+            + self
+                .postings
+                .values()
+                .map(|postings| postings.capacity() * std::mem::size_of::<u64>())
+                .sum::<usize>();
+        dictionary + entries
+    }
+}
+
+/// The content index: a per-segment summary filter held resident, and a
+/// bit-sliced matrix of per-block filters left on disk.
+///
+/// The layout is what makes this affordable to probe. Storing each block's
+/// filter contiguously would mean reading every block's whole bitmap — several
+/// hundred kilobytes per segment — to test a handful of bits in each. Stored
+/// transposed, one ROW per bit position spanning all blocks, testing a bit
+/// across the entire segment is a single read of `block_count` bits. A
+/// two-word query touches `2 x HASH_COUNT` rows, so it reads tens of bytes per
+/// segment instead of hundreds of kilobytes.
+#[derive(Debug)]
+struct ContentIndex {
+    /// Records per block; the last block may be short.
+    block_records: u32,
+    block_count: u32,
+    /// Bits in one block's filter, which is also the number of rows.
+    block_bits: u64,
+    /// Bytes per row: one bit per block, rounded up.
+    row_bytes: u64,
+    /// Absolute file offset of row 0.
+    rows_offset: u64,
+    /// The only resident part.
+    summary: content::Bloom,
+}
+
+impl ContentIndex {
+    /// Whether any block may hold every token — the cheap, resident test that
+    /// skips a whole segment without reading a byte of it.
+    fn may_contain(&self, query: &content::Query) -> bool {
+        self.summary.may_contain_all(query.tokens())
+    }
+
+    /// Blocks whose filters admit every token, as a bitmap over block indexes.
+    fn candidate_blocks(
+        &self,
+        query: &content::Query,
+        backing: &Backing,
+    ) -> Result<Vec<u8>, Error> {
+        let row_bytes = self.row_bytes as usize;
+        // Start with every block admitted, then intersect one row at a time.
+        let mut admitted = vec![0xffu8; row_bytes];
+        for token in query.tokens() {
+            for position in content::bit_positions(token, self.block_bits as usize) {
+                let offset = self
+                    .rows_offset
+                    .checked_add(position as u64 * self.row_bytes)
+                    .ok_or(Error::Corrupt("content row offset overflow"))?;
+                let row = backing.read_range(offset, self.row_bytes)?;
+                for (target, source) in admitted.iter_mut().zip(row.iter()) {
+                    *target &= *source;
+                }
+                if admitted.iter().all(|byte| *byte == 0) {
+                    return Ok(admitted);
+                }
+            }
+        }
+        Ok(admitted)
+    }
+}
+
+/// An opened segment backed by either a file or encoded memory.
 ///
 /// File-backed segments retain only offsets and persisted index postings.
 /// Query results are decoded from their exact byte ranges on demand.
@@ -282,7 +492,10 @@ pub struct Segment {
     header: Header,
     record_offsets: Vec<u64>,
     trace_index: HashMap<String, Vec<u64>>,
-    attribute_index: HashMap<(String, String), Vec<u64>>,
+    attribute_index: AttributeIndex,
+    /// `None` on a segment written before v5, or one with no indexable text.
+    /// Absent means unknown, so a content query cannot skip the segment.
+    content: Option<ContentIndex>,
     /// Diagnostic only: whether the last query narrowed through an index.
     /// Atomic rather than `Cell` because a segment is shared across reader
     /// threads — pinned views and the segment list both hand out `&Segment`.
@@ -366,21 +579,30 @@ impl Segment {
         .into_iter()
         .map(|((key, _), offsets)| (key, offsets))
         .collect();
-        let attribute_index = decode_string_index(
+        let attribute_index = read_attribute_index(
             section(
                 &bytes,
                 header.attribute_index_offset,
                 header.attribute_index_len,
             )?,
-            true,
-            header.record_count,
+            &header,
         )?;
+        let content = match header.content {
+            Some((offset, len)) => decode_content_head(
+                section(&bytes, offset, len)?,
+                offset,
+                len,
+                header.record_count,
+            )?,
+            None => None,
+        };
         Ok(Self {
             backing: Backing::Resident(bytes),
             header,
             record_offsets,
             trace_index,
             attribute_index,
+            content,
             last_query_used_index: AtomicBool::new(false),
         })
     }
@@ -390,12 +612,15 @@ impl Segment {
     /// demand. This is the larger-than-RAM path.
     ///
     /// "Only the indexes" is not the same as "a bounded amount". The index
-    /// sections are decoded EAGERLY and in full, and `attribute_index` is
-    /// keyed on whole attribute values, so this call's resident cost is the
-    /// total size of the segment's distinct key/value pairs plus 8 bytes per
-    /// posting. For enum-valued attributes that is small and effectively
-    /// independent of span size; for an indexed prompt it is the prompt text.
-    /// [`Self::approx_index_bytes`] measures it.
+    /// sections are decoded EAGERLY and in full, so this call's resident cost
+    /// scales with the segment's index CARDINALITY: roughly 20 bytes per
+    /// distinct `(attribute key, value)` pair plus 8 bytes per posting, plus
+    /// the trace index, which is still keyed on trace-id text.
+    ///
+    /// What it no longer scales with is the SIZE of attribute values. Through
+    /// v3 it did, and an indexed prompt cost its own text; v4 keys the
+    /// attribute index on a digest instead. [`Self::approx_index_bytes`]
+    /// measures the result.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
         use std::io::{Read, Seek, SeekFrom};
         let mut file = fs::File::open(path)?;
@@ -426,7 +651,24 @@ impl Segment {
             .collect();
         let attribute_bytes =
             read_section(header.attribute_index_offset, header.attribute_index_len)?;
-        let attribute_index = decode_string_index(&attribute_bytes, true, header.record_count)?;
+        let attribute_index = read_attribute_index(&attribute_bytes, &header)?;
+        // Only the prologue and the summary filter are read: the bit-sliced
+        // block rows stay on disk and are fetched a row at a time by a query.
+        let content = match header.content {
+            Some((offset, len)) => {
+                let prologue_len = (CONTENT_PROLOGUE_LEN as u64).min(len);
+                let prologue = read_section(offset, prologue_len)?;
+                let summary_bits = if prologue.len() >= CONTENT_PROLOGUE_LEN {
+                    read_u64(&prologue, 16)?
+                } else {
+                    0
+                };
+                let head_len = (CONTENT_PROLOGUE_LEN as u64 + summary_bits / 8).min(len);
+                let head = read_section(offset, head_len)?;
+                decode_content_head(&head, offset, len, header.record_count)?
+            }
+            None => None,
+        };
         Ok(Self {
             backing: Backing::File {
                 file: std::sync::Mutex::new(file),
@@ -436,6 +678,7 @@ impl Segment {
             record_offsets,
             trace_index,
             attribute_index,
+            content,
             last_query_used_index: AtomicBool::new(false),
         })
     }
@@ -472,18 +715,7 @@ impl Segment {
                     key.capacity() + postings.capacity() * std::mem::size_of::<u64>()
                 })
                 .sum::<usize>();
-        let attributes =
-            hash_table_bytes::<(String, String), Vec<u64>>(self.attribute_index.capacity())
-                + self
-                    .attribute_index
-                    .iter()
-                    .map(|((key, value), postings)| {
-                        key.capacity()
-                            + value.capacity()
-                            + postings.capacity() * std::mem::size_of::<u64>()
-                    })
-                    .sum::<usize>();
-        offsets + traces + attributes
+        offsets + traces + self.attribute_index.approx_bytes()
     }
 
     /// Distinct `(key, value)` pairs in the resident attribute index — the
@@ -498,15 +730,19 @@ impl Segment {
     ///
     /// A total cannot answer the only question an operator actually has when
     /// the number is too big — *which attribute is doing this* — and the
-    /// answer is rarely uniform: one indexed prompt can outweigh every
-    /// conventional attribute in the store combined.
+    /// answer is rarely uniform. Since v4 the answer is far flatter than it
+    /// used to be: an entry costs the same whether its value was `"error"` or
+    /// a page of generated text, so what shows up here now is genuine
+    /// CARDINALITY rather than text volume.
     pub fn attribute_index_cost_by_key(&self) -> BTreeMap<String, (usize, usize)> {
         let mut by_key: BTreeMap<String, (usize, usize)> = BTreeMap::new();
-        for ((key, value), postings) in &self.attribute_index {
+        for ((key_id, _), postings) in &self.attribute_index.postings {
+            let Some(key) = self.attribute_index.keys.get(*key_id as usize) else {
+                continue;
+            };
             let entry = by_key.entry(key.clone()).or_insert((0, 0));
             entry.0 += 1;
-            entry.1 += key.capacity()
-                + value.capacity()
+            entry.1 += std::mem::size_of::<(u32, Hash128)>()
                 + postings.capacity() * std::mem::size_of::<u64>();
         }
         by_key
@@ -566,12 +802,22 @@ impl Segment {
     }
 
     /// Looks up records for an exact attribute key/value pair.
+    ///
+    /// The index is probed by digest, so it answers with candidates; each one
+    /// is then checked against the value actually stored in the record. A
+    /// digest collision therefore costs a wasted decode and cannot produce a
+    /// wrong row.
     pub fn query_attribute(&self, key: &str, value: &str) -> Result<Vec<Record>, Error> {
         self.last_query_used_index.store(true, Ordering::Relaxed);
-        self.decode_postings(
-            self.attribute_index
-                .get(&(key.to_owned(), value.to_owned())),
-        )
+        let mut records = Vec::new();
+        for offset in self.attribute_index.candidates(key, value) {
+            let record = self.decode_at(*offset)?;
+            if record.attributes.get(key).map(String::as_str) == Some(value) {
+                records.push(record);
+            }
+        }
+        records.sort_by_key(|record| record.timestamp);
+        Ok(records)
     }
 
     /// Returns records in the inclusive timestamp range in stable timestamp order.
@@ -639,23 +885,102 @@ impl Segment {
         &self.record_offsets
     }
 
-    /// Raw posting offsets for one attribute key/value pair, in record
+    /// CANDIDATE record offsets for one attribute key/value pair, in record
     /// (timestamp) order — no records are decoded. The lazy query path pairs
     /// this with [`Self::timestamp_at`] and [`Self::record_at_offset`] so a
     /// limited query decodes only the records it returns.
-    pub fn attribute_posting_offsets(&self, key: &str, value: &str) -> Vec<u64> {
-        self.attribute_posting_offsets_ref(key, value).to_vec()
+    ///
+    /// # Candidates, not matches
+    ///
+    /// The index is keyed on a 128-bit digest of the value, so this list is a
+    /// superset: a caller MUST check each decoded record against the filter
+    /// before returning it. Every caller in this crate already does, because
+    /// an index has never been allowed to change a filter's answer — only to
+    /// narrow the work it takes to compute one. The name says "candidate" so
+    /// that a future caller cannot mistake it for a resolved answer.
+    ///
+    /// The superset is tiny. A collision needs two distinct values in one
+    /// segment whose digests agree in all 128 bits; at a million distinct
+    /// values per segment the odds are about one in 10^26.
+    pub fn attribute_candidate_offsets(&self, key: &str, value: &str) -> &[u64] {
+        self.last_query_used_index.store(true, Ordering::Relaxed);
+        self.attribute_index.candidates(key, value)
     }
 
-    /// Borrowed posting offsets for one attribute key/value pair.
+    /// Whether this segment may hold a record matching `query`.
     ///
-    /// This avoids cloning a potentially corpus-sized posting list for each
-    /// bounded query page.
-    pub fn attribute_posting_offsets_ref(&self, key: &str, value: &str) -> &[u64] {
+    /// Answered from the resident summary filter alone — no I/O — so a store
+    /// with hundreds of segments discards most of them for the cost of a few
+    /// hash lookups each. `true` on a segment with no content index, because
+    /// absent means unknown.
+    pub fn may_contain_content(&self, query: &content::Query) -> bool {
+        match &self.content {
+            Some(index) if query.is_indexable() => index.may_contain(query),
+            _ => true,
+        }
+    }
+
+    /// CANDIDATE record offsets for a content query, or `None` when the index
+    /// cannot narrow it and every record is a candidate.
+    ///
+    /// Reads one bit-sliced row per (token, hash) pair — tens of bytes for a
+    /// typical query — and returns the records of every block those rows
+    /// admit. Like every index in this crate the result is a superset: a Bloom
+    /// filter has false positives, and blocks are 128 records wide, so most
+    /// candidates will not match. [`content::Query::matches`] against the
+    /// decoded span is what decides.
+    pub fn content_candidate_offsets(
+        &self,
+        query: &content::Query,
+    ) -> Result<Option<Vec<u64>>, Error> {
+        let Some(index) = &self.content else {
+            return Ok(None);
+        };
+        if !query.is_indexable() {
+            return Ok(None);
+        }
+        if !index.may_contain(query) {
+            self.last_query_used_index.store(true, Ordering::Relaxed);
+            return Ok(Some(Vec::new()));
+        }
+        let admitted = index.candidate_blocks(query, &self.backing)?;
         self.last_query_used_index.store(true, Ordering::Relaxed);
-        self.attribute_index
-            .get(&(key.to_owned(), value.to_owned()))
-            .map_or(&[], Vec::as_slice)
+        let block_records = index.block_records as usize;
+        let mut offsets = Vec::new();
+        for block in 0..index.block_count as usize {
+            if admitted[block / 8] & (1 << (block % 8)) == 0 {
+                continue;
+            }
+            let start = block * block_records;
+            let end = (start + block_records).min(self.record_offsets.len());
+            offsets.extend_from_slice(&self.record_offsets[start..end]);
+        }
+        Ok(Some(offsets))
+    }
+
+    /// Whether this segment carries a content index at all.
+    pub fn has_content_index(&self) -> bool {
+        self.content.is_some()
+    }
+
+    /// Fraction of the resident summary filter's bits that are set, or `None`
+    /// without a content index.
+    ///
+    /// A ratio approaching 1.0 means the filter has saturated: it still cannot
+    /// return a wrong answer, but it has stopped skipping segments and content
+    /// search has degraded to a scan. This is the number that says so.
+    pub fn content_summary_fill(&self) -> Option<f64> {
+        self.content
+            .as_ref()
+            .map(|index| index.summary.fill_ratio())
+    }
+
+    /// Resident bytes held by the content index — the summary filter only.
+    /// The bit-sliced block rows stay on disk.
+    pub fn content_resident_bytes(&self) -> usize {
+        self.content
+            .as_ref()
+            .map_or(0, |index| index.summary.as_bytes().len())
     }
 
     /// Timestamp of the record at a posting offset without decoding it: the
@@ -718,12 +1043,36 @@ impl Segment {
     }
 }
 
-/// Encodes records into a complete segment byte stream.
+/// Encodes records into a complete segment byte stream, with a content index.
 pub fn encode(records: &[RecordInput]) -> Result<Vec<u8>, Error> {
+    encode_with(records, true)
+}
+
+/// Encodes records, optionally omitting the content index.
+///
+/// A segment without one is still searchable — it is scanned rather than
+/// skipped — so this trades query latency for seal-time CPU and about 1-2% of
+/// segment size. See `Config::content_index`.
+pub fn encode_with(records: &[RecordInput], content_index: bool) -> Result<Vec<u8>, Error> {
     let mut record_region = Vec::new();
     let mut offsets = Vec::with_capacity(records.len());
     let mut trace_index: BTreeMap<(String, String), Vec<u64>> = BTreeMap::new();
-    let mut attribute_index: BTreeMap<(String, String), Vec<u64>> = BTreeMap::new();
+
+    // Assign key ids from the sorted set of distinct keys, so the dictionary
+    // depends on WHICH keys appear and never on the order records arrived in.
+    // Two encodings of the same records must produce identical bytes.
+    let attribute_keys: Vec<String> = records
+        .iter()
+        .flat_map(|record| record.attributes.keys().cloned())
+        .collect::<BTreeSet<String>>()
+        .into_iter()
+        .collect();
+    let key_ids: HashMap<&str, u32> = attribute_keys
+        .iter()
+        .enumerate()
+        .map(|(id, key)| (key.as_str(), id as u32))
+        .collect();
+    let mut attribute_index: BTreeMap<(u32, Hash128), Vec<u64>> = BTreeMap::new();
 
     for record in records {
         let offset = record_region.len() as u64;
@@ -734,8 +1083,11 @@ pub fn encode(records: &[RecordInput]) -> Result<Vec<u8>, Error> {
             .or_default()
             .push(offset);
         for (key, value) in &record.attributes {
+            let id = *key_ids
+                .get(key.as_str())
+                .expect("every attribute key is in the dictionary");
             attribute_index
-                .entry((key.clone(), value.clone()))
+                .entry((id, hash_attribute(key, value)))
                 .or_default()
                 .push(offset);
         }
@@ -746,19 +1098,26 @@ pub fn encode(records: &[RecordInput]) -> Result<Vec<u8>, Error> {
         put_u64(&mut offset_region, *offset);
     }
     let trace_region = encode_string_index(&trace_index, false)?;
-    let attribute_region = encode_string_index(&attribute_index, true)?;
+    let attribute_region = encode_attribute_index(&attribute_keys, &attribute_index)?;
+    let content_region = if content_index {
+        encode_content_index(records)
+    } else {
+        encode_content_index(&[])
+    };
 
     let records_offset = HEADER_LEN as u64;
     let offsets_offset = records_offset + record_region.len() as u64;
     let trace_index_offset = offsets_offset + offset_region.len() as u64;
     let attribute_index_offset = trace_index_offset + trace_region.len() as u64;
+    let content_index_offset = attribute_index_offset + attribute_region.len() as u64;
 
     let mut bytes = Vec::with_capacity(
         HEADER_LEN
             + record_region.len()
             + offset_region.len()
             + trace_region.len()
-            + attribute_region.len(),
+            + attribute_region.len()
+            + content_region.len(),
     );
     bytes.extend_from_slice(&MAGIC);
     put_u16(&mut bytes, VERSION);
@@ -780,12 +1139,173 @@ pub fn encode(records: &[RecordInput]) -> Result<Vec<u8>, Error> {
     });
     put_u64(&mut bytes, min_ts);
     put_u64(&mut bytes, max_ts);
+    put_u64(&mut bytes, content_index_offset);
     debug_assert_eq!(bytes.len(), HEADER_LEN);
     bytes.extend_from_slice(&record_region);
     bytes.extend_from_slice(&offset_region);
     bytes.extend_from_slice(&trace_region);
     bytes.extend_from_slice(&attribute_region);
+    bytes.extend_from_slice(&content_region);
     Ok(bytes)
+}
+
+/// Ceiling division. `usize::div_ceil` is newer than this crate's MSRV.
+fn div_ceil(value: usize, divisor: usize) -> usize {
+    value / divisor + usize::from(value % divisor != 0)
+}
+
+/// Ceiling division for `u64`, for the same reason.
+fn div_ceil_u64(value: u64, divisor: u64) -> u64 {
+    value / divisor + u64::from(value % divisor != 0)
+}
+
+/// Builds the content index over `records`.
+///
+/// Records are grouped into blocks of [`CONTENT_BLOCK_RECORDS`]. Each block
+/// gets a Bloom filter over the distinct tokens of its records' text, and
+/// those filters are written TRANSPOSED — one row per bit position, one bit
+/// per block — so that a query can test a token against every block in the
+/// segment with a single small read. See [`ContentIndex`].
+///
+/// A segment whose records carry no content text writes the prologue with zero
+/// blocks, which the reader treats as "no content index" rather than as "no
+/// content": an absent index can never be used to skip anything.
+fn encode_content_index(records: &[RecordInput]) -> Vec<u8> {
+    let block_records = CONTENT_BLOCK_RECORDS as usize;
+    let block_count = div_ceil(records.len(), block_records);
+    let indexable = records.iter().any(|record| !record.content.is_empty());
+    if block_count == 0 || !indexable {
+        let mut out = Vec::with_capacity(CONTENT_PROLOGUE_LEN);
+        put_u32(&mut out, 0);
+        put_u32(&mut out, CONTENT_BLOCK_RECORDS);
+        put_u32(&mut out, 0);
+        put_u32(&mut out, content::HASH_COUNT);
+        put_u64(&mut out, 0);
+        put_u64(&mut out, 0);
+        debug_assert_eq!(out.len(), CONTENT_PROLOGUE_LEN);
+        return out;
+    }
+
+    // Per-block token sets, plus the segment-wide set for the summary.
+    let mut block_tokens: Vec<std::collections::HashSet<String>> = Vec::with_capacity(block_count);
+    let mut all_tokens: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for chunk in records.chunks(block_records) {
+        let tokens = content::distinct_probe_keys(
+            chunk
+                .iter()
+                .flat_map(|record| record.content.iter().map(String::as_str)),
+        );
+        for token in &tokens {
+            if !all_tokens.contains(token.as_str()) {
+                all_tokens.insert(token.clone());
+            }
+        }
+        block_tokens.push(tokens);
+    }
+
+    // One filter size for the whole segment, taken from its busiest block, so
+    // that a row is a fixed stride and needs no offset table.
+    let widest = block_tokens.iter().map(HashSet::len).max().unwrap_or(0);
+    let block_bits = content::size_bits(widest, CONTENT_BLOCK_MIN_BYTES, CONTENT_BLOCK_MAX_BYTES);
+    let row_bytes = div_ceil(block_count, 8);
+
+    let mut summary = content::Bloom::new(content::size_bits(
+        all_tokens.len(),
+        CONTENT_SUMMARY_MIN_BYTES,
+        CONTENT_SUMMARY_MAX_BYTES,
+    ));
+    for token in &all_tokens {
+        summary.insert(token);
+    }
+
+    let mut rows = vec![0u8; block_bits * row_bytes];
+    for (block, tokens) in block_tokens.iter().enumerate() {
+        for token in tokens {
+            for position in content::bit_positions(token, block_bits) {
+                rows[position * row_bytes + block / 8] |= 1 << (block % 8);
+            }
+        }
+    }
+
+    let mut out = Vec::with_capacity(CONTENT_PROLOGUE_LEN + summary.as_bytes().len() + rows.len());
+    put_u32(&mut out, 0);
+    put_u32(&mut out, CONTENT_BLOCK_RECORDS);
+    put_u32(&mut out, block_count as u32);
+    put_u32(&mut out, content::HASH_COUNT);
+    put_u64(&mut out, summary.bit_len() as u64);
+    put_u64(&mut out, block_bits as u64);
+    debug_assert_eq!(out.len(), CONTENT_PROLOGUE_LEN);
+    out.extend_from_slice(summary.as_bytes());
+    out.extend_from_slice(&rows);
+    out
+}
+
+/// Parses the content section's prologue and resident summary filter from the
+/// FRONT of the section, without needing the bit-sliced rows that follow.
+///
+/// `head` must hold at least the prologue and the summary; `section_len` is
+/// the section's full length, against which the declared sizes are checked.
+/// Splitting it this way is what lets a file-backed open read a few kilobytes
+/// instead of the whole index.
+fn decode_content_head(
+    head: &[u8],
+    section_offset: u64,
+    section_len: u64,
+    record_count: u64,
+) -> Result<Option<ContentIndex>, Error> {
+    let data = head;
+    if data.len() < CONTENT_PROLOGUE_LEN {
+        return Err(Error::Corrupt("content index is shorter than its prologue"));
+    }
+    let block_records = read_u32(data, 4)?;
+    let block_count = read_u32(data, 8)?;
+    let hash_count = read_u32(data, 12)?;
+    let summary_bits = read_u64(data, 16)?;
+    let block_bits = read_u64(data, 24)?;
+
+    if block_count == 0 {
+        // Written by a segment with no indexable text, or with content
+        // indexing switched off. "Absent" must read as unknown, never as
+        // empty: a filter that skipped every segment would turn content
+        // search into a query that silently returns nothing.
+        return Ok(None);
+    }
+    if hash_count != content::HASH_COUNT {
+        return Err(Error::Unsupported(
+            "content index was built with a different hash count",
+        ));
+    }
+    if block_records == 0 {
+        return Err(Error::Corrupt("content index has a zero block size"));
+    }
+    let expected_blocks = div_ceil_u64(record_count, u64::from(block_records));
+    if u64::from(block_count) != expected_blocks {
+        return Err(Error::Corrupt("content index block count does not match"));
+    }
+    if !summary_bits.is_power_of_two() || !block_bits.is_power_of_two() {
+        return Err(Error::Corrupt("content filter size is not a power of two"));
+    }
+    let row_bytes = div_ceil_u64(u64::from(block_count), 8);
+    let summary_bytes = summary_bits / 8;
+    let expected_len = CONTENT_PROLOGUE_LEN as u64 + summary_bytes + block_bits * row_bytes;
+    if section_len != expected_len {
+        return Err(Error::Corrupt(
+            "content index length does not match its header",
+        ));
+    }
+    let summary_start = CONTENT_PROLOGUE_LEN;
+    let summary_end = summary_start + summary_bytes as usize;
+    if data.len() < summary_end {
+        return Err(Error::Corrupt("content index summary is truncated"));
+    }
+    Ok(Some(ContentIndex {
+        block_records,
+        block_count,
+        block_bits,
+        row_bytes,
+        rows_offset: section_offset + summary_end as u64,
+        summary: content::Bloom::from_bytes(data[summary_start..summary_end].to_vec()),
+    }))
 }
 
 /// Encodes records and atomically replaces a destination file where supported.
@@ -920,6 +1440,147 @@ fn decode_offsets(bytes: &[u8], header: &Header) -> Result<Vec<u64>, Error> {
         ));
     }
     Ok(offsets)
+}
+
+/// Encodes the v4 attribute section: a key dictionary, then one entry per
+/// distinct `(key, value)` pair carrying the value's digest instead of its
+/// text.
+///
+/// Entries are written in `(key id, digest)` order so that encoding the same
+/// records twice produces the same bytes — segment files are compared byte for
+/// byte by the format acceptance tests, and a merge must be reproducible.
+fn encode_attribute_index(
+    keys: &[String],
+    postings: &BTreeMap<(u32, Hash128), Vec<u64>>,
+) -> Result<Vec<u8>, Error> {
+    let mut output = Vec::new();
+    put_u32(
+        &mut output,
+        u32::try_from(keys.len()).map_err(|_| Error::TooLarge("attribute key dictionary"))?,
+    );
+    for key in keys {
+        put_len_bytes(&mut output, key.as_bytes(), "index key")?;
+    }
+    put_u32(
+        &mut output,
+        u32::try_from(postings.len()).map_err(|_| Error::TooLarge("index"))?,
+    );
+    for ((key_id, digest), offsets) in postings {
+        put_u32(&mut output, *key_id);
+        output.extend_from_slice(digest.as_bytes());
+        put_u32(
+            &mut output,
+            u32::try_from(offsets.len()).map_err(|_| Error::TooLarge("postings"))?,
+        );
+        for offset in offsets {
+            put_u64(&mut output, *offset);
+        }
+    }
+    Ok(output)
+}
+
+/// Decodes the v4 attribute section.
+fn decode_attribute_index(data: &[u8], record_count: u64) -> Result<AttributeIndex, Error> {
+    let mut cursor = 0usize;
+    let key_count = take_u32(data, &mut cursor)? as usize;
+    let mut keys = Vec::with_capacity(key_count);
+    let mut key_ids = HashMap::with_capacity(key_count);
+    for id in 0..key_count {
+        let key = std::str::from_utf8(take_len_bytes(data, &mut cursor, data.len())?)?.to_owned();
+        if key_ids.insert(key.clone(), id as u32).is_some() {
+            return Err(Error::Corrupt("attribute key dictionary has a duplicate"));
+        }
+        keys.push(key);
+    }
+    let entry_count = take_u32(data, &mut cursor)? as usize;
+    let mut postings = HashMap::with_capacity(entry_count);
+    for _ in 0..entry_count {
+        let key_id = take_u32(data, &mut cursor)?;
+        if key_id as usize >= keys.len() {
+            return Err(Error::Corrupt("attribute entry names an unknown key"));
+        }
+        let digest = take_digest(data, &mut cursor)?;
+        let posting_count = take_u32(data, &mut cursor)? as usize;
+        if posting_count as u64 > record_count {
+            return Err(Error::Corrupt("index has too many postings"));
+        }
+        let mut offsets = Vec::with_capacity(posting_count);
+        for _ in 0..posting_count {
+            offsets.push(take_u64(data, &mut cursor)?);
+        }
+        if postings.insert((key_id, digest), offsets).is_some() {
+            return Err(Error::Corrupt("index contains a duplicate key"));
+        }
+    }
+    if cursor != data.len() {
+        return Err(Error::Corrupt("index contains trailing bytes"));
+    }
+    Ok(AttributeIndex {
+        keys,
+        key_ids,
+        postings,
+    })
+}
+
+/// Decodes a v2/v3 attribute section — which stores value TEXT — into the v4
+/// resident form by hashing each value as it is read.
+///
+/// The text is not retained. It is, however, materialized transiently: peak
+/// memory while opening an old segment is still the old cost, and only the
+/// steady state improves. That is the price of not rewriting files on
+/// upgrade, and it is bounded by one segment rather than by the store.
+fn upgrade_attribute_index(data: &[u8], record_count: u64) -> Result<AttributeIndex, Error> {
+    let legacy = decode_string_index(data, true, record_count)?;
+    let mut index = AttributeIndex::default();
+    for ((key, value), offsets) in legacy {
+        let id = match index.key_ids.get(&key) {
+            Some(id) => *id,
+            None => {
+                let id = u32::try_from(index.keys.len())
+                    .map_err(|_| Error::TooLarge("attribute key dictionary"))?;
+                index.key_ids.insert(key.clone(), id);
+                index.keys.push(key.clone());
+                id
+            }
+        };
+        let digest = hash_attribute(&key, &value);
+        // A v2/v3 section cannot contain a duplicate (key, value) — the
+        // legacy decoder rejects that — so a collision here would be a real
+        // digest collision. Merge rather than drop: the postings must stay
+        // complete, and verification downstream sorts out which record
+        // actually holds which value.
+        index
+            .postings
+            .entry((id, digest))
+            .or_insert_with(Vec::new)
+            .extend_from_slice(&offsets);
+    }
+    for offsets in index.postings.values_mut() {
+        offsets.sort_unstable();
+        offsets.dedup();
+        offsets.shrink_to_fit();
+    }
+    Ok(index)
+}
+
+/// Reads the attribute section in whichever encoding the header declares.
+fn read_attribute_index(data: &[u8], header: &Header) -> Result<AttributeIndex, Error> {
+    if header.version >= 4 {
+        decode_attribute_index(data, header.record_count)
+    } else {
+        upgrade_attribute_index(data, header.record_count)
+    }
+}
+
+fn take_digest(data: &[u8], cursor: &mut usize) -> Result<Hash128, Error> {
+    let end = cursor
+        .checked_add(16)
+        .filter(|end| *end <= data.len())
+        .ok_or(Error::Corrupt("truncated attribute digest"))?;
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&data[*cursor..end]);
+    *cursor = end;
+    Ok(Hash128::from_bytes(bytes))
 }
 
 fn encode_string_index(
