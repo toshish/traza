@@ -438,14 +438,26 @@ pub struct Config {
     /// tiny while the log grows with every write. Ingest cost is per
     /// operation, so the threshold is too.
     pub flush_spans: usize,
-    /// Write-ahead log bytes that trigger an automatic flush, or `None` to
-    /// leave the log bounded only by [`Self::flush_spans`].
+    /// Write-ahead log bytes that trigger a seal and reclaim the log, or
+    /// `None` to leave the log bounded only by [`Self::flush_spans`].
     ///
     /// The record thresholds count logical work; this one bounds the physical
     /// consequence. It is the backstop that keeps the log — and therefore
     /// restart replay time — bounded no matter how large individual spans are
     /// or how the workload distributes over keys. Ignored in
     /// [`Durability::Buffered`], which keeps no log.
+    ///
+    /// **This is the log's real size bound, and it became load-bearing when
+    /// sealing moved off the writer lock.** A seal that empties the buffer
+    /// still discards the whole log, so an idle or lightly loaded store
+    /// behaves exactly as before. Under sustained ingest the buffer is never
+    /// empty at publish time — spans keep arriving while the segment is being
+    /// written — and reclaiming to the survivors on every seal would put a
+    /// re-serialization of thousands of spans back under the writer lock, most
+    /// of what moving the write off it just bought. So the log is reclaimed
+    /// when it reaches this bound instead, and the cost amortizes over every
+    /// seal since the last reclaim. Leaving records in the log is always safe:
+    /// replaying a span a segment already holds upserts it to the same value.
     pub flush_wal_bytes: Option<u64>,
     /// Retention period in seconds; zero disables TTL expiration.
     pub ttl_seconds: Option<u64>,
@@ -681,9 +693,21 @@ fn validate_span(span: &Span) -> Result<()> {
 /// (trace_id, span_id) is the span's PRIMARY KEY: re-ingesting an existing
 /// key replaces the buffered version in place — retries are idempotent and
 /// never create a second acknowledged copy.
+///
+/// **Why the spans are behind an `Arc`.** A seal has to take the buffer's
+/// contents away with it and write them with no lock held, while the buffer
+/// stays readable — so the drain is a copy, and a deep copy of ten thousand
+/// spans is exactly the cost the seal is trying to stop paying under the lock.
+/// Sharing the span makes the drain a pointer copy. It also answers the
+/// question the seal has to ask when it finishes: *is the value under this key
+/// still the one I sealed, or did someone re-ingest it while I was writing?*
+/// [`std::sync::Arc::ptr_eq`] answers that exactly. Comparing VALUES would
+/// not: a span legitimately re-ingested unchanged is a newer version that
+/// happens to look identical, and this codebase has already lost data once to
+/// content-based identity (see `recover_supersede_markers`).
 #[derive(Debug, Default)]
 struct WriteBuffer {
-    spans: Vec<Span>,
+    spans: Vec<std::sync::Arc<Span>>,
     index: std::collections::HashMap<(String, String), usize>,
     /// Spans upserted since the last seal, counting replacements. `spans.len()`
     /// deliberately does not: an update to a buffered key leaves the record
@@ -696,6 +720,11 @@ impl WriteBuffer {
     fn upsert(&mut self, span: Span) {
         let key = (span.trace_id.clone(), span.span_id.clone());
         self.upserts += 1;
+        // A fresh allocation every time, including for a replacement: the old
+        // handle may be held by a seal in flight, and the seal decides what to
+        // evict by comparing handles. Mutating in place would make the newer
+        // version indistinguishable from the sealed one and get it evicted.
+        let span = std::sync::Arc::new(span);
         match self.index.get(&key) {
             Some(&position) => self.spans[position] = span,
             None => {
@@ -718,34 +747,62 @@ impl WriteBuffer {
             .contains_key(&(trace_id.to_owned(), span_id.to_owned()))
     }
 
-    fn clear(&mut self) {
-        self.spans.clear();
-        self.index.clear();
-        self.upserts = 0;
-    }
-
-    /// Reinstates spans taken out of the buffer, rebuilding the position index.
+    /// Adopts `spans` as the whole buffer, rebuilding the position index.
     ///
-    /// The index maps a primary key to a POSITION, so handing back a reordered
-    /// vector without rebuilding it would leave `upsert` overwriting the wrong
-    /// span. Used only on the failed-seal path, which sorts before it writes.
-    fn restore(&mut self, spans: Vec<Span>) {
+    /// The index maps a primary key to a POSITION, so adopting a vector
+    /// without rebuilding it would leave `upsert` overwriting the wrong span.
+    fn restore(&mut self, spans: Vec<std::sync::Arc<Span>>) {
         self.spans = spans;
-        self.index.clear();
-        for (position, span) in self.spans.iter().enumerate() {
-            self.index
-                .insert((span.trace_id.clone(), span.span_id.clone()), position);
-        }
+        self.reindex();
     }
 
     fn retain(&mut self, keep: impl Fn(&Span) -> bool) {
-        self.spans.retain(&keep);
+        self.spans.retain(|span| keep(span));
+        self.reindex();
+    }
+
+    /// Drops every span whose handle `sealed` recognizes, and reindexes.
+    ///
+    /// The predicate is handle identity rather than key membership: a key
+    /// re-ingested while the seal was writing holds a DIFFERENT handle, so it
+    /// survives here and is sealed by the next pass. Dropping it by key would
+    /// destroy the newer version and leave the segment's older one live.
+    fn evict_sealed(&mut self, sealed: &std::collections::HashSet<*const Span>) {
+        self.spans
+            .retain(|span| !sealed.contains(&std::sync::Arc::as_ptr(span)));
+        self.reindex();
+    }
+
+    fn reindex(&mut self) {
         self.index.clear();
         for (position, span) in self.spans.iter().enumerate() {
             self.index
                 .insert((span.trace_id.clone(), span.span_id.clone()), position);
         }
     }
+}
+
+/// Whether a seal may decline to run because another is already in flight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SealWait {
+    /// Wait for the permit. Used where the caller was promised a segment:
+    /// [`Store::flush`] and [`Durability::Flushed`].
+    ForPermit,
+    /// Give up if another seal holds the permit. Its drain covers everything
+    /// this one would have written, because sealed spans stay in the buffer
+    /// until they are published.
+    SkipIfBusy,
+}
+
+/// What one seal took out of the write buffer, and the id it will publish
+/// under. See [`Store::seal`].
+#[derive(Debug)]
+struct Drained {
+    spans: Vec<std::sync::Arc<Span>>,
+    /// `WriteBuffer::upserts` as it stood at the drain, so the publish can
+    /// subtract exactly what this segment accounted for.
+    upserts: usize,
+    id: u64,
 }
 
 #[derive(Debug)]
@@ -894,9 +951,10 @@ impl Drop for DirectoryLock {
 pub struct Store {
     directory: PathBuf,
     config: Config,
-    // Locking discipline: maintenance first, then writer, then segments, and
-    // retain that order until every guard is dropped. The rollup cache is
-    // leaf-level: acquired briefly and never while taking another lock.
+    // Locking discipline: maintenance first, then sealing, then writer, then
+    // segments, and retain that order until every guard is dropped. The rollup
+    // cache is leaf-level: acquired briefly and never while taking another
+    // lock.
     //
     // `maintenance` serializes the two operations that REPLACE segment files —
     // compaction and expiry — against each other. It is not a read lock and
@@ -905,6 +963,25 @@ pub struct Store {
     // no engine lock held, and publish under a short revalidated critical
     // section without also having to reason about the other one.
     maintenance: Mutex<()>,
+    // `sealing` admits ONE seal at a time, and it is not the writer lock:
+    // ingest runs throughout a seal, which is the entire point of
+    // [`Store::seal`]. A second seal starting concurrently would buy nothing —
+    // sealed spans stay in the buffer until they are published, so the running
+    // seal already covers everything the second one would drain — while
+    // costing a duplicate copy of the same spans on disk.
+    //
+    // Expiry takes it too. A seal that drained before a deletion ran would
+    // otherwise publish its segment afterwards and resurrect exactly the spans
+    // expiry just removed from the buffer, the log, and every segment it knew
+    // about. Ingest keeps flowing while expiry holds it — its seals coalesce
+    // into the next one — with one exception worth knowing about:
+    // [`Durability::Flushed`] must seal before it acknowledges, so under that
+    // mode an ingest waits out a running deletion.
+    //
+    // An ingesting thread NEVER takes this while holding the writer lock: it
+    // releases the writer lock first and then seals. The order above is what
+    // that rule is written down as.
+    sealing: Mutex<()>,
     writer: Mutex<WriteBuffer>,
     // Segments are `Arc` so a reader can PIN the set it resolved against and
     // keep reading after compaction or expiry has replaced the files. A
@@ -915,6 +992,13 @@ pub struct Store {
     recent_payloads: payload::TouchRegistry,
     annotations: annotations::AnnotationLog,
     next_segment: AtomicU64,
+    /// Seals that have claimed a segment id but not yet published it.
+    ///
+    /// Read and written ONLY while holding the `segments` lock, which is what
+    /// makes it atomic with respect to id claims and is why `Relaxed` is
+    /// enough. Compaction consults it before claiming an id of its own: see
+    /// [`Store::merge_tail_run`].
+    unpublished_seals: AtomicU64,
     /// Present unless durability is [`Durability::Buffered`]. Guards the gap
     /// between acknowledging a write and sealing it into a segment.
     wal: Option<wal::Wal>,
@@ -974,11 +1058,13 @@ impl Store {
                 directory,
                 config,
                 maintenance: Mutex::new(()),
+                sealing: Mutex::new(()),
                 writer: Mutex::new(buffer),
                 segments: Mutex::new(segments),
                 rollups: Mutex::new(std::collections::HashMap::new()),
                 recent_payloads: payload::TouchRegistry::default(),
                 next_segment: AtomicU64::new(next_segment),
+                unpublished_seals: AtomicU64::new(0),
                 wal,
                 metrics: metrics::Metrics::default(),
                 _directory_lock: directory_lock,
@@ -1022,15 +1108,21 @@ impl Store {
     ///
     /// Ordering is the whole contract:
     /// 1. append the batch to the log and upsert it into the buffer, both
-    ///    under the writer lock, so a concurrent flush cannot seal a buffer
+    ///    under the writer lock, so a concurrent seal cannot drain a buffer
     ///    that disagrees with the log;
     /// 2. release the lock;
-    /// 3. fsync, and only then return.
+    /// 3. fsync, and only then return;
+    /// 4. seal, if the buffer has reached one of its bounds.
     ///
     /// The fsync deliberately happens OUTSIDE the lock: that is what lets
     /// concurrent batches accumulate into one sync instead of serializing an
     /// fsync per request. A crash before step 3 loses the batch, which is
     /// correct — nothing was acknowledged yet.
+    ///
+    /// **Step 4 is outside the lock too, and it is outside step 1-3's lock on
+    /// purpose.** Taking the seal permit while holding the writer lock would
+    /// invert the lock order (see the `sealing` field) and deadlock against
+    /// expiry.
     fn admit(&self, spans: Vec<Span>) -> Result<()> {
         // Encode the log frame BEFORE taking the writer lock. Serializing a
         // batch is pure CPU proportional to its size, and doing it under the
@@ -1044,6 +1136,8 @@ impl Store {
         let admitted = spans.len() as u64;
 
         let mut pending_commit = None;
+        let seal_now;
+        let seal_must_wait;
         {
             let waited = Instant::now();
             let mut writer = self.lock_writer()?;
@@ -1056,16 +1150,32 @@ impl Store {
                     writer.upsert(span);
                 }
             });
-            if self.should_flush(&writer) {
-                let mut segments = self.lock_segments()?;
-                // A sealed segment supersedes the log, so this also discards
-                // it and satisfies any commit still waiting on it.
-                self.flush_locked(&mut writer, &mut segments)?;
-                pending_commit = None;
-            }
+            seal_now = self.should_flush(&writer);
+            seal_must_wait = self.seal_must_not_be_skipped(&writer);
+        }
+
+        // `flushed` promises the caller a SEALED segment, so its seal must
+        // finish before this returns and it must not be skipped because
+        // another one happens to be running — it waits for the permit. Every
+        // other mode promises an fsync, which the commit below already
+        // provides, so its seal is an optimization that may coalesce into a
+        // seal already in flight.
+        let synchronous = self.config.durability == Durability::Flushed;
+        if seal_now && synchronous {
+            // The segment supersedes the log for everything it holds, so the
+            // acknowledgement no longer needs the fsync this batch queued.
+            pending_commit = None;
+            self.seal(SealWait::ForPermit)?;
         }
         if let (Some(log), Some(lsn)) = (&self.wal, pending_commit) {
             log.commit(lsn, &self.metrics)?;
+        }
+        if seal_now && !synchronous {
+            let wait = match seal_must_wait {
+                true => SealWait::ForPermit,
+                false => SealWait::SkipIfBusy,
+            };
+            self.seal(wait)?;
         }
         self.metrics.spans_admitted.add(admitted);
         self.metrics.batches_admitted.increment();
@@ -1088,10 +1198,13 @@ impl Store {
     }
 
     /// Persists every currently buffered span as one sorted segment.
+    ///
+    /// Synchronous: when this returns, the spans that were buffered when it
+    /// was called are in a segment on disk. Spans ingested by other threads
+    /// WHILE it runs may still be buffered afterwards — they arrived after the
+    /// snapshot this call sealed, and the next seal takes them.
     pub fn flush(&self) -> Result<()> {
-        let mut writer = self.lock_writer()?;
-        let mut segments = self.lock_segments()?;
-        self.flush_locked(&mut writer, &mut segments)
+        self.seal(SealWait::ForPermit)
     }
 
     /// Returns all spans belonging to `trace_id`, ordered by start time.
@@ -1115,7 +1228,7 @@ impl Store {
         }
         for span in writer.spans.iter() {
             if span.trace_id == trace_id {
-                latest.insert(span.span_id.clone(), span.clone());
+                latest.insert(span.span_id.clone(), Span::clone(span));
             }
         }
         result.extend(latest.into_values());
@@ -1301,7 +1414,7 @@ pub(crate) fn attribute_union_view(
     for span in buffer.spans.iter() {
         if matches(span) {
             claimed.insert((span.trace_id.clone(), span.span_id.clone()));
-            result.push(span.clone());
+            result.push(Span::clone(span));
         }
     }
     // Any key present in the buffer supersedes every segment copy, even
@@ -1400,7 +1513,7 @@ pub(crate) fn query_view(
                     span_matches(span, filter)
                         && cursor.map_or(true, |position| span_after_cursor(span, position))
                 })
-                .cloned()
+                .map(|span| Span::clone(span))
                 .collect();
             sort_spans(&mut buffered);
 
@@ -1558,7 +1671,7 @@ pub(crate) fn query_view(
             if span_matches(span, filter)
                 && cursor.map_or(true, |bound| span_after_cursor(span, bound))
             {
-                result.push(span.clone());
+                result.push(Span::clone(span));
             }
         }
 
@@ -1723,16 +1836,25 @@ impl Store {
             if tail_run_to_merge(&segments, settings) != Some(run) {
                 return Ok(0);
             }
+            // A seal that has already claimed a LOWER id but not yet published
+            // it would end up sorting before this merge's output, which holds
+            // strictly older data — last-write-wins, inverted. The id claims
+            // are ordered by this lock, so declining here is enough: once no
+            // seal is outstanding, every future one claims above this merge.
+            // Bailing costs nothing; the next compaction tick rescans.
+            if self.unpublished_seals.load(Ordering::Relaxed) > 0 {
+                return Ok(0);
+            }
             let start = segments.len() - run;
             let inputs: Vec<std::sync::Arc<Segment>> = segments[start..].to_vec();
-            // The id is claimed HERE, under the lock, and that is what keeps a
-            // concurrent flush ordered correctly. A flush holds this same lock
-            // from claiming its id through pushing its segment, so every
-            // segment that appears while this merge runs necessarily has a
-            // HIGHER id — and therefore sorts after the merged output, which
-            // is exactly right: it was written later. Claiming the id after
-            // the merge would invert that and let merged (older) versions win
-            // over freshly flushed ones.
+            // The id is claimed HERE, under the lock, and together with the
+            // check above that is what keeps a concurrent seal ordered
+            // correctly. No seal is between its drain and its publish at this
+            // instant, so every segment that appears while this merge runs
+            // claims a HIGHER id — and therefore sorts after the merged
+            // output, which is exactly right: it was written later. Claiming
+            // the id after the merge would invert that and let merged (older)
+            // versions win over freshly sealed ones.
             let id = self.next_segment.fetch_add(1, Ordering::Relaxed);
             (inputs, id)
         };
@@ -1842,6 +1964,18 @@ impl Store {
 
     /// [`Self::expire_before`] with the maintenance lock already held.
     fn expire_before_locked(&self, cutoff_ns: u64) -> Result<usize> {
+        // A seal in flight drained its spans BEFORE this deletion ran and
+        // publishes its segment AFTER, so without this permit an expiry could
+        // clean the buffer, the log and every segment it knew about, and then
+        // watch a segment land holding exactly the spans it just deleted.
+        // Waiting for the permit also keeps a new seal from starting until the
+        // deletion is complete. Ingest is unaffected: it never takes this
+        // lock, its seals simply coalesce into the next one.
+        let _permit = self
+            .sealing
+            .lock()
+            .map_err(|_| Error::LockPoisoned("sealing"))?;
+
         // ---- buffer and log --------------------------------------------
         // Durable state moves FIRST, memory second, and the step that moves
         // memory cannot fail. Dropping the span from the buffer before the log
@@ -1866,6 +2000,7 @@ impl Store {
                         .spans
                         .iter()
                         .filter(|span| span.end_time_ns >= cutoff_ns)
+                        .map(|span| span.as_ref())
                         .collect();
                     log.rewrite(&survivors)?;
                 }
@@ -2024,47 +2159,224 @@ impl Store {
         }
     }
 
-    fn flush_locked(
-        &self,
-        writer: &mut WriteBuffer,
-        segments: &mut Vec<std::sync::Arc<Segment>>,
-    ) -> Result<()> {
-        if writer.is_empty() {
-            return Ok(());
-        }
+    /// Whether ingest should WAIT for the seal permit rather than let its seal
+    /// coalesce into the one already running.
+    ///
+    /// Sealing under the writer lock throttled ingest for free: a thread could
+    /// not admit a batch while a seal was running, so the buffer could never
+    /// outgrow its threshold by more than one batch. Sealing off the lock
+    /// removes that, and removes it in the one direction that matters — if
+    /// ingest sustainably outruns sealing, the buffer grows without bound and
+    /// the process runs out of memory rather than pushing back.
+    ///
+    /// So the throttle is put back, deliberately and only at the extreme. Up
+    /// to this much overshoot the seal stays fully concurrent, which is the
+    /// point of the change; past it an ingesting thread blocks until the
+    /// running seal publishes, and the buffer stops growing. Four times the
+    /// threshold, because normal overshoot is "whatever arrives during one
+    /// seal" and a seal that has fallen four thresholds behind is not
+    /// overshoot, it is a store that cannot keep up.
+    fn seal_must_not_be_skipped(&self, writer: &WriteBuffer) -> bool {
+        self.config.flush_spans > 0 && writer.len() >= self.config.flush_spans.saturating_mul(4)
+    }
 
+    /// Seals the write buffer into one segment, doing the I/O with no engine
+    /// lock held.
+    ///
+    /// The shape is [`Self::merge_tail_run`]'s, for the same reasons:
+    ///
+    /// 1. **Drain under a short lock.** The spans are copied out as shared
+    ///    handles and the segment id is claimed. Both under the lock, both
+    ///    cheap.
+    /// 2. **Write with nothing held.** Converting spans to records, encoding
+    ///    the segment, writing it, fsyncing it, renaming it, fsyncing the
+    ///    directory and reopening the result was the single largest thing this
+    ///    engine did while holding the lock every ingesting thread needs. It
+    ///    touches only a private vector; it never needed the lock at all.
+    /// 3. **Publish under a short lock, then reconcile.**
+    ///
+    /// **The drain is a copy, not a removal, and that is the invariant.**
+    /// Taking the spans out at step 1 would leave already-acknowledged data in
+    /// neither the buffer nor a segment for the whole of step 2 — briefly
+    /// invisible to readers, which is exactly what [`Self::get_trace`]
+    /// promises cannot happen. The merge never removes data from visibility
+    /// either: its inputs stay live and pinned until the output is published.
+    /// A seal does the same, and evicts only afterwards.
+    ///
+    /// **The segment id is claimed at drain time, not at write time.** Segment
+    /// path order IS recency order here, so two seals completing out of order
+    /// with ids claimed at completion would silently invert last-write-wins.
+    /// The permit means two seals cannot currently overlap, so this is not the
+    /// only thing standing between the store and that bug — but it is the one
+    /// that states the invariant locally, rather than leaving segment ordering
+    /// as a consequence of how seals happen to be scheduled.
+    /// [`Self::merge_tail_run`] claims its id early for the same reason.
+    fn seal(&self, wait: SealWait) -> Result<()> {
+        let _permit = match wait {
+            SealWait::ForPermit => self
+                .sealing
+                .lock()
+                .map_err(|_| Error::LockPoisoned("sealing"))?,
+            SealWait::SkipIfBusy => match self.sealing.try_lock() {
+                Ok(permit) => permit,
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    // Everything this seal would have drained is still in the
+                    // buffer, so the running seal already covers it.
+                    self.metrics.segment_seals_coalesced.increment();
+                    return Ok(());
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err(Error::LockPoisoned("sealing"))
+                }
+            },
+        };
+        self.seal_with_permit()
+    }
+
+    /// [`Self::seal`] with the seal permit already held.
+    fn seal_with_permit(&self) -> Result<()> {
         let sealing = Instant::now();
-        // Take the spans rather than cloning them: a seal moved the whole
-        // buffer (10,000 spans by default) through a deep clone for no reason.
-        // They go back if the write fails, so a failed seal still leaves the
-        // buffer — and therefore the acknowledged data — intact.
-        let mut pending = std::mem::take(&mut writer.spans);
-        sort_spans(&mut pending);
-        let id = self.next_segment.fetch_add(1, Ordering::Relaxed);
-        let segment = match self.write_segment(id, &pending) {
+
+        // ---- drain: short critical section ------------------------------
+        // Every `segment_seal_locked` sample starts AFTER the guard is
+        // acquired. Timing from before it would fold in lock WAIT, which is
+        // already `writer_lock_wait`, and would make the in-lock total exceed
+        // wall clock under contention — a number that cannot be summed is not
+        // a saturation measurement.
+        let drained = {
+            let writer = self.lock_writer()?;
+            let locked = Instant::now();
+            if writer.is_empty() {
+                return Ok(());
+            }
+            // Cloning a `Vec<Arc<Span>>` copies pointers, not spans. This is
+            // why the buffer holds handles: the same drain over `Vec<Span>`
+            // would deep-copy ten thousand spans under the lock and give back
+            // a good part of what moving the write off it just bought.
+            let spans = writer.spans.clone();
+            let upserts = writer.upserts;
+            // Claimed under the segments lock, which is what orders it against
+            // a concurrent compaction: see the doc comment above and
+            // `merge_tail_run`. The in-flight count is published under the
+            // same lock so compaction can see that a lower id is outstanding.
+            let _segments = self.lock_segments()?;
+            self.unpublished_seals.fetch_add(1, Ordering::Relaxed);
+            let id = self.next_segment.fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .segment_seal_locked
+                .record(elapsed_nanos(&locked));
+            Drained { spans, upserts, id }
+        };
+
+        // ---- write: no engine lock held ---------------------------------
+        let mut pending = drained.spans;
+        pending.sort_by(|left, right| compare_spans(left, right));
+        let written = self.write_segment(drained.id, &pending);
+        let segment = match written {
             Ok(segment) => segment,
             Err(error) => {
-                writer.restore(pending);
+                // Nothing was published and nothing was removed — the buffer
+                // and the log still hold every acknowledged span exactly as
+                // they did before. A failed seal is a no-op, retried by the
+                // next one.
+                let _unclaim = self.lock_segments()?;
+                self.unpublished_seals.fetch_sub(1, Ordering::Relaxed);
                 return Err(error);
             }
         };
-        let sealed = pending.len() as u64;
-        writer.clear();
-        segments.push(std::sync::Arc::new(segment));
-        segments.sort_by(|left, right| left.path.cmp(&right.path));
-        // The segment is fsynced and renamed, so every log record it covers is
-        // superseded. Reclaim AFTER the segment lands: a crash in between
-        // simply replays records the segment already holds, which upsert
-        // resolves to the same state.
-        if let Some(log) = &self.wal {
-            log.reset()?;
+
+        // ---- publish and reconcile: short critical sections --------------
+        {
+            let mut segments = self.lock_segments()?;
+            let locked = Instant::now();
+            segments.push(std::sync::Arc::new(segment));
+            segments.sort_by(|left, right| left.path.cmp(&right.path));
+            self.unpublished_seals.fetch_sub(1, Ordering::Relaxed);
+            self.metrics
+                .segment_seal_locked
+                .record(elapsed_nanos(&locked));
         }
+        let sealed = pending.len() as u64;
+        // `pending` stays alive across the reconcile below: the eviction test
+        // is handle identity, and identity by address is only meaningful while
+        // every address in the set still belongs to a live allocation.
+        self.reconcile_after_publish(&pending, drained.upserts)?;
+        drop(pending);
         self.metrics.segment_seal.record(elapsed_nanos(&sealing));
         self.metrics.segment_seal_spans.add(sealed);
         Ok(())
     }
 
-    fn write_segment(&self, id: u64, spans: &[Span]) -> Result<Segment> {
+    /// Drops the published spans from the buffer and reclaims the log.
+    ///
+    /// **Ordering.** The segment is already fsynced, renamed and visible, so
+    /// it — not the log — is now the durable authority for everything in
+    /// `published`. That is what makes both removals below legal, and it is
+    /// why they happen after the publish rather than before it.
+    ///
+    /// Within this function the rule from the log-reclamation review still
+    /// holds: **the durable change happens before the in-memory change it
+    /// stands for.** The log is rewritten to the survivors first and the
+    /// buffer drops the sealed spans second, so a rewrite that fails leaves
+    /// the buffer untouched and the whole reconcile retryable by the next
+    /// seal. The reverse order left memory ahead of the recovery authority
+    /// with nothing for a retry to find.
+    fn reconcile_after_publish(
+        &self,
+        published: &[std::sync::Arc<Span>],
+        upserts_at_drain: usize,
+    ) -> Result<()> {
+        let sealed: std::collections::HashSet<*const Span> =
+            published.iter().map(std::sync::Arc::as_ptr).collect();
+
+        let mut writer = self.lock_writer()?;
+        let locked = Instant::now();
+        if let Some(log) = &self.wal {
+            let survivors: Vec<&Span> = writer
+                .spans
+                .iter()
+                .filter(|span| !sealed.contains(&std::sync::Arc::as_ptr(span)))
+                .map(|span| span.as_ref())
+                .collect();
+            if survivors.is_empty() {
+                // Nothing acknowledged is outside a segment any more, so the
+                // whole log goes. Truncation, not a staged rewrite.
+                log.reset()?;
+            } else if self.log_needs_reclaiming(log) {
+                // Reclaiming on EVERY seal would put a re-encode of the
+                // survivors back under the writer lock — at a sustained
+                // 250k spans/s that is thousands of spans re-serialized per
+                // seal, which is most of what moving the write off the lock
+                // just bought. Leaving records in the log is always safe:
+                // replaying a span the segment already holds upserts it to the
+                // same value. So the log is reclaimed on the bound that
+                // exists to bound it, `flush_wal_bytes`, and the cost
+                // amortizes across every seal since the last reclaim.
+                log.rewrite(&survivors)?;
+            }
+        }
+        writer.evict_sealed(&sealed);
+        // The upserts that produced this segment are accounted for; the ones
+        // admitted while it was being written are not, and must still count
+        // toward the next seal. Zeroing the counter instead would let an
+        // update-heavy workload postpone its seals indefinitely, which is the
+        // failure `upserts` exists to prevent.
+        writer.upserts = writer.upserts.saturating_sub(upserts_at_drain);
+        self.metrics
+            .segment_seal_locked
+            .record(elapsed_nanos(&locked));
+        Ok(())
+    }
+
+    /// Whether the log has grown past the bound that exists to bound it.
+    fn log_needs_reclaiming(&self, log: &wal::Wal) -> bool {
+        match self.config.flush_wal_bytes {
+            Some(limit) => limit > 0 && log.size_bytes() >= limit,
+            None => false,
+        }
+    }
+
+    fn write_segment<S: std::borrow::Borrow<Span>>(&self, id: u64, spans: &[S]) -> Result<Segment> {
         let file_name = format!("{SEGMENT_PREFIX}{id:020}{SEGMENT_SUFFIX}");
         let final_path = self.directory.join(&file_name);
         if final_path.exists() {
@@ -2092,7 +2404,11 @@ impl Store {
     /// Encodes `spans`, fsyncs them into a temp file, and renames that onto
     /// `final_path`. The rename is what makes a segment appear atomically: a
     /// reader sees the whole file or none of it, never a partial one.
-    fn seal_segment(&self, final_path: &Path, spans: &[Span]) -> Result<Segment> {
+    fn seal_segment<S: std::borrow::Borrow<Span>>(
+        &self,
+        final_path: &Path,
+        spans: &[S],
+    ) -> Result<Segment> {
         let file_name = final_path
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
@@ -2104,7 +2420,7 @@ impl Store {
         let write_result = (|| {
             let records = spans
                 .iter()
-                .map(span_to_record)
+                .map(|span| span_to_record(span.borrow()))
                 .collect::<Result<Vec<_>>>()?;
             let encoded = segment::encode(&records).map_err(segment_error)?;
             let mut options = OpenOptions::new();
@@ -2570,6 +2886,140 @@ pub(crate) fn sync_directory(directory: &Path) -> Result<()> {
 #[cfg(not(unix))]
 pub(crate) fn sync_directory(_directory: &Path) -> Result<()> {
     Ok(())
+}
+
+/// The two rules an unlocked seal rests on, tested where they can be stated
+/// deterministically instead of raced for.
+///
+/// Both are invisible from query results under any single-threaded test, which
+/// is exactly why they get their own tests here rather than being left to the
+/// concurrency suite to stumble over.
+#[cfg(test)]
+mod seal_tests {
+    use super::*;
+
+    fn span(trace: &str, id: &str, name: &str) -> Span {
+        serde_json::from_value(serde_json::json!({
+            "trace_id": trace, "span_id": id, "name": name, "service": "svc",
+            "start_time_ns": 1_000u64, "end_time_ns": 1_100u64,
+            "attributes": {}
+        }))
+        .expect("span")
+    }
+
+    fn test_dir(label: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("traza-seal-{label}-{}-{nonce}", std::process::id()));
+        fs::create_dir_all(&dir).expect("dir");
+        dir
+    }
+
+    fn sealed_set(spans: &[std::sync::Arc<Span>]) -> std::collections::HashSet<*const Span> {
+        spans.iter().map(std::sync::Arc::as_ptr).collect()
+    }
+
+    #[test]
+    fn eviction_drops_exactly_what_was_sealed() {
+        let mut buffer = WriteBuffer::default();
+        buffer.upsert(span("t", "a", "v1"));
+        buffer.upsert(span("t", "b", "v1"));
+        let drained = buffer.spans.clone();
+
+        buffer.evict_sealed(&sealed_set(&drained));
+        assert!(buffer.is_empty(), "both sealed keys are gone");
+        assert!(!buffer.contains_key("t", "a"));
+    }
+
+    #[test]
+    fn a_key_reingested_during_a_seal_survives_the_publish() {
+        // The whole reason the buffer holds handles rather than values. The
+        // seal drains "v1", "v2" is ingested while the segment is being
+        // written, and the publish must NOT treat the key as sealed: the
+        // segment holds v1, so dropping v2 would leave the older version live
+        // and lose an acknowledged write.
+        let mut buffer = WriteBuffer::default();
+        buffer.upsert(span("t", "a", "v1"));
+        buffer.upsert(span("t", "b", "v1"));
+        let drained = buffer.spans.clone();
+
+        buffer.upsert(span("t", "a", "v2"));
+        buffer.evict_sealed(&sealed_set(&drained));
+
+        assert_eq!(buffer.len(), 1, "only the re-ingested key remains");
+        assert_eq!(buffer.spans[0].span_id, "a");
+        assert_eq!(
+            buffer.spans[0].name, "v2",
+            "the newer version survived the seal that carried the older one"
+        );
+        // The index has to follow the eviction, or the next upsert of this key
+        // writes over the wrong slot.
+        assert!(buffer.contains_key("t", "a"));
+        assert!(!buffer.contains_key("t", "b"));
+    }
+
+    #[test]
+    fn an_identical_reingest_is_still_a_newer_version() {
+        // Identity, not equality. A span re-ingested unchanged is a NEWER
+        // version that happens to look the same; a value comparison would call
+        // it sealed and drop it, which is the same content-based-identity
+        // mistake `recover_supersede_markers` exists to avoid.
+        let mut buffer = WriteBuffer::default();
+        buffer.upsert(span("t", "a", "v1"));
+        let drained = buffer.spans.clone();
+        buffer.upsert(span("t", "a", "v1"));
+
+        buffer.evict_sealed(&sealed_set(&drained));
+        assert_eq!(
+            buffer.len(),
+            1,
+            "an unchanged re-ingest is a live buffer entry, not a sealed one"
+        );
+    }
+
+    #[test]
+    fn compaction_declines_while_a_seal_holds_an_unpublished_id() {
+        // A seal that claimed a LOWER id but has not published it yet would
+        // sort BEFORE a merge that claims its id now — and the merge's output
+        // is strictly older data, so it would win. Compaction must wait.
+        let dir = test_dir("compaction-guard");
+        let config = Config {
+            durability: Durability::Buffered,
+            compaction: Some(CompactionConfig {
+                fanout: 2,
+                base_bytes: 1,
+                max_segment_bytes: 0,
+            }),
+            ..Config::default()
+        };
+        let store = Store::open(&dir, config).expect("open");
+        for index in 0..4 {
+            store
+                .ingest(span("t", &format!("s{index}"), "v1"))
+                .expect("ingest");
+            store.flush().expect("flush");
+        }
+        assert_eq!(store.stats().expect("stats").segment_count, 4);
+
+        // Stand in for a seal that has claimed an id and not yet published.
+        store.unpublished_seals.store(1, Ordering::Relaxed);
+        assert_eq!(
+            store.compact_segments().expect("compact"),
+            0,
+            "compaction must not claim an id above an outstanding seal's"
+        );
+        assert_eq!(store.stats().expect("stats").segment_count, 4);
+
+        store.unpublished_seals.store(0, Ordering::Relaxed);
+        assert!(
+            store.compact_segments().expect("compact") > 0,
+            "and must proceed as soon as none is outstanding"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]
