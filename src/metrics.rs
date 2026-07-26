@@ -166,6 +166,15 @@ pub struct Metrics {
     pub wal_encode: Latency,
     /// Writing the frame to the log file (inside the writer lock).
     pub wal_write: Latency,
+    /// Waiting for the log's own state lock, inside `wal_write`.
+    ///
+    /// Split out because `wal_write` covers the lock acquisition as well as
+    /// the write, and a committing thread holds that same lock around its
+    /// bookkeeping — so a large `wal_write` can mean contention rather than a
+    /// slow device, and the two want opposite fixes.
+    pub wal_lock_wait: Latency,
+    /// The `write_all` itself, with the log's state lock already held.
+    pub wal_write_syscall: Latency,
     /// `fsync`. The one stage that is not CPU.
     pub wal_fsync: Latency,
     /// Calls to `commit`, whether or not they performed their own fsync.
@@ -238,10 +247,12 @@ impl Metrics {
             let _ = writeln!(into, "{name} {}", counter.get());
         }
 
-        let stages: [(&str, &Latency); 7] = [
+        let stages: [(&str, &Latency); 9] = [
             ("traza_writer_lock_wait", &self.writer_lock_wait),
             ("traza_wal_encode", &self.wal_encode),
             ("traza_wal_write", &self.wal_write),
+            ("traza_wal_lock_wait", &self.wal_lock_wait),
+            ("traza_wal_write_syscall", &self.wal_write_syscall),
             ("traza_wal_fsync", &self.wal_fsync),
             ("traza_buffer_upsert", &self.buffer_upsert),
             ("traza_segment_seal", &self.segment_seal),
