@@ -540,20 +540,33 @@ fn run_probe_by_key(exe: &Path, directory: &Path, cell: &Cell, threshold: usize)
 /// code that produced them. The first version of this record did exactly that
 /// — it named a commit whose sampler was the one being replaced.
 fn provenance() -> (String, bool) {
-    let sha = Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|t| t.trim().to_owned())
-        .filter(|t| !t.is_empty())
-        .unwrap_or_else(|| "unknown".to_owned());
-    let dirty = Command::new("git")
-        .args(["status", "--porcelain"])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .is_some_and(|t| !t.trim().is_empty());
+    // Both git calls are fatal on failure. The first version returned
+    // ("unknown", false) when git was missing — so a failure to establish
+    // provenance produced a record asserting a CLEAN tree, which is the
+    // strongest claim it can make and the one least supported by the
+    // evidence. This is the third instance of the same bug shape in this
+    // file: an instrument that cannot measure must not return the reassuring
+    // value.
+    let git = |args: &[&str]| -> String {
+        let out = Command::new("git")
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("cannot establish provenance: `git {args:?}` failed: {e}"));
+        assert!(
+            out.status.success(),
+            "cannot establish provenance: `git {args:?}` exited {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout)
+            .unwrap_or_else(|e| panic!("cannot establish provenance: git output not UTF-8: {e}"))
+    };
+    let sha = git(&["rev-parse", "--short", "HEAD"]).trim().to_owned();
+    assert!(
+        !sha.is_empty(),
+        "cannot establish provenance: git printed an empty revision"
+    );
+    let dirty = !git(&["status", "--porcelain"]).trim().is_empty();
     (sha, dirty)
 }
 
@@ -750,16 +763,6 @@ fn number(value: &Value, path: &[&str]) -> f64 {
         .unwrap_or_else(|| panic!("missing or non-numeric field {path:?} in probe output: {value}"))
 }
 
-/// Reads a field that is legitimately absent in some configurations (a peak
-/// only exists where a merge ran), distinguishing that from a lost value.
-fn optional_number(value: &Value, path: &[&str]) -> Option<f64> {
-    let mut current = value;
-    for key in path {
-        current = &current[*key];
-    }
-    current.as_f64()
-}
-
 fn report(results: &[Value]) -> String {
     let mut out = String::new();
     out.push_str("\n| cell | spans | distinct | text MiB | disk MiB | idx MiB (disk) | ");
@@ -774,9 +777,15 @@ fn report(results: &[Value]) -> String {
         // stores in this matrix return 0 from compact_segments (tracked
         // separately), and reporting their RSS as a merge peak would be
         // reporting the steady state under another name.
-        let merged_away = optional_number(result, &["compacted", "compacted_away"]).unwrap_or(0.0);
-        let compacted_peak = if merged_away > 0.0 {
-            optional_number(result, &["compacted", "rss_peak_during_compaction"])
+        // Strict once the compaction probe ran: `compacted_away` and the peak
+        // are both emitted unconditionally by a successful probe, so a missing
+        // one is an instrument failure, not a configuration that did not
+        // merge. Reading them leniently turned that failure into "did not
+        // merge" — a calm, wrong answer.
+        let compacted_peak = if result.get("compacted").is_some() {
+            let merged_away = number(result, &["compacted", "compacted_away"]);
+            (merged_away > 0.0)
+                .then(|| number(result, &["compacted", "rss_peak_during_compaction"]))
         } else {
             None
         };
@@ -932,6 +941,15 @@ fn main() {
     // this record was produced by an uncommitted script, so the transformation
     // from raw results to published document was not reproducible at all.
     if let Some(stem) = emit_record {
+        // A record is a claim about a canonical matrix. Emitting one from a
+        // single hand-specified cell produced a document with one row and an
+        // embedded command advertising `--matrix`, which is a lie the file
+        // tells about itself.
+        assert!(
+            run_matrix,
+            "--emit-record describes a canonical matrix, so it requires --matrix; \
+             a single-cell run is a diagnostic and has no record to write"
+        );
         let (commit, dirty) = provenance();
         assert!(
             !dirty || allow_dirty,
@@ -949,10 +967,10 @@ fn main() {
             "generated_unix": std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs()),
-            "command": format!(
-                "cargo run --release --bin index-mem-bench -- --matrix --text-budget-mib {} --emit-record {stem}",
-                text_budget / (1024 * 1024)
-            ),
+            // The real argv, not a reconstruction: a hand-written command
+            // string drifts from what was actually run, and did.
+            "command": std::env::args().collect::<Vec<_>>().join(" "),
+            "result_count": results.len(),
             "payload_offload_threshold_bytes": threshold,
             "rss_sample_interval_ms": 20,
             "results": results,
