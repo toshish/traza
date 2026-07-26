@@ -162,13 +162,14 @@ better p95/p99 with peak capacity. Do not pick it hoping for a lower median;
 | `--port PORT` | `8080` | Bind port. `0` binds an ephemeral port and announces it on stderr. |
 | `--profile NAME` | `balanced` | Sets `--flush-spans` and `--wal-commit-window-us` as a group. Never changes durability. See [Profiles](#profiles). |
 | `--durability MODE` | `wal` | What a `200` guarantees. `buffered` is fastest and **loses acknowledged writes on a crash**; `wal` fsyncs to the log; `flushed` seals a segment per call. Costs: see the table below. |
-| `--flush-spans N` | `10000` | Buffered spans that trigger sealing a segment. The seal is a stall charged to whichever write crosses the threshold, so this sets **how often you stall and for how long**. Not monotonic in either direction — see [the tradeoff](#the-throughputlatency-tradeoff-measured). |
+| `--flush-spans N` | `10000` | Threshold for sealing a segment, applied to **both** the number of unique buffered spans and the number of upserts since the last seal. The seal is a stall charged to whichever write crosses the threshold, so this sets **how often you stall and for how long**. Not monotonic in either direction — see [the tradeoff](#the-throughputlatency-tradeoff-measured). |
+| `--flush-wal-bytes N` | `67108864` (64 MiB) | Seals when the write-ahead log reaches this size, whatever the record counts say. The backstop that bounds restart replay time and log disk use for any span size or key distribution. `0` removes it, leaving only the record thresholds. Ignored under `--durability buffered`, which keeps no log. |
 | `--wal-commit-window-us N` | `0` (off) | Delays each fsync by up to this long so more batches join it. Costs every acknowledgement in the window up to that delay. Buys nothing on an idle store and a lot on a busy one with small batches. Never weakens the guarantee: the ack still follows the fsync. |
 | `--ttl-seconds N` | off | Rolling retention window. A background pass compacts expired spans every minute; annotations and payload files age out on the same window. Costs a periodic compaction pass. |
 | `--max-connections N` | `1024` | Concurrent connections served; past it clients get `503` rather than being queued. Costs one thread per live connection. |
 | `--payload-threshold-bytes N` | `262144` | String attribute values longer than this are offloaded to the content-addressed payload store and replaced by a reference. `0` disables. Costs an extra file write per offloaded value; saves segment size and buffer memory. |
 | `--compaction-fanout N` | `4` | Same-size segments merged into one. `0` or `1` disables compaction entirely. Lower merges more often (fewer segments, faster search, more ingest cost); higher merges less often. |
-| `--compaction-max-segment-bytes N` | `268435456` (256 MiB) | Ceiling on a merged segment. Bounds merge memory (a merge materializes its inputs) and how long the segment lock is held; the cost is a floor on how far the segment count can fall. |
+| `--compaction-max-segment-bytes N` | `268435456` (256 MiB) | Ceiling on a merged segment. Bounds the memory a merge needs, since it materializes its inputs; the cost is a floor on how far the segment count can fall. A merge holds no engine lock, so this does not bound a stall. |
 | `--ui-dir DIR` | discovered | Built dashboard to serve at `/`. Unset ⇒ `$TRAZA_UI_DIR`, `<binary dir>/ui`, `<binary dir>/../share/traza/ui`, `./ui/dist`, first containing `index.html`. None found ⇒ the API runs and `/` 404s with build instructions. |
 | `--allow-unauthenticated-non-loopback` | off | Explicitly permit an unauthenticated non-loopback bind. |
 
@@ -179,6 +180,15 @@ better p95/p99 with peak capacity. Do not pick it hoping for a lower median;
 | `buffered` | accepted in memory; a crash loses anything not yet flushed | fastest, **lossy by design** |
 | `wal` (default) | fsynced to the write-ahead log and recovered on restart | one group-committed fsync per batch |
 | `flushed` | present in a sealed segment | a segment write per call |
+
+**Why `--flush-spans` counts upserts too.** A span is identified by
+`(trace_id, span_id)`, so re-ingesting one replaces it in place. A workload
+that keeps updating the same keys — retries, or spans enriched as they
+complete — therefore adds log records without ever adding a buffered record.
+Counting only records made the threshold unreachable for exactly that shape of
+workload: the buffer stayed at a handful of spans while the log grew without
+limit, and a restart had to replay all of it. Both counts, plus the byte
+ceiling, is what makes "bounded recovery work" true regardless of workload.
 
 `wal` and `flushed` issue `fsync`, which **on macOS does not flush the drive's
 own write cache**. A macOS host losing power can still lose an acknowledged

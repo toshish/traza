@@ -111,6 +111,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 durability: traza::Durability::Buffered,
                 compaction: Some(traza::CompactionConfig::default()),
                 flush_spans: 10_000,
+                flush_wal_bytes: None,
                 ttl_seconds: None,
                 payload_threshold: (payload_threshold > 0).then_some(payload_threshold),
                 wal_commit_window: None,

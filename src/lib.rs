@@ -429,8 +429,24 @@ impl Profile {
 /// Storage configuration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
-    /// Number of buffered spans that triggers an automatic flush.
+    /// Automatic flush threshold, counted BOTH ways: unique buffered records,
+    /// and upserts admitted since the last flush.
+    ///
+    /// Counting only unique records made the threshold unreachable for a
+    /// workload that keeps updating the same keys — a retried or
+    /// progressively-enriched span never adds a record, so the buffer stays
+    /// tiny while the log grows with every write. Ingest cost is per
+    /// operation, so the threshold is too.
     pub flush_spans: usize,
+    /// Write-ahead log bytes that trigger an automatic flush, or `None` to
+    /// leave the log bounded only by [`Self::flush_spans`].
+    ///
+    /// The record thresholds count logical work; this one bounds the physical
+    /// consequence. It is the backstop that keeps the log — and therefore
+    /// restart replay time — bounded no matter how large individual spans are
+    /// or how the workload distributes over keys. Ignored in
+    /// [`Durability::Buffered`], which keeps no log.
+    pub flush_wal_bytes: Option<u64>,
     /// Retention period in seconds; zero disables TTL expiration.
     pub ttl_seconds: Option<u64>,
     /// String attribute values longer than this many bytes are offloaded to
@@ -458,10 +474,16 @@ pub struct Config {
     pub wal_commit_window: Option<std::time::Duration>,
 }
 
+/// Default ceiling on log bytes before a flush seals the buffer. Large enough
+/// that ordinary ingest never reaches it before the record threshold does,
+/// small enough that a restart replays it in well under a second.
+pub const DEFAULT_FLUSH_WAL_BYTES: u64 = 64 * 1024 * 1024;
+
 impl Default for Config {
     fn default() -> Self {
         Self {
             flush_spans: 10_000,
+            flush_wal_bytes: Some(DEFAULT_FLUSH_WAL_BYTES),
             ttl_seconds: None,
             payload_threshold: None,
             durability: Durability::Wal,
@@ -510,6 +532,10 @@ pub enum Error {
     /// than answered approximately: a truncated ranking is a wrong answer
     /// that looks like a right one.
     QueryTooBroad(String),
+    /// The write-ahead log is damaged somewhere other than its final append,
+    /// so recovering the prefix would silently drop acknowledged batches that
+    /// come after the damage. Refusing to open is the only honest answer.
+    WalCorrupt(String),
 }
 
 impl fmt::Display for Error {
@@ -521,6 +547,7 @@ impl fmt::Display for Error {
             Self::LockPoisoned(name) => write!(f, "storage lock poisoned: {name}"),
             Self::InvalidSpan(reason) => write!(f, "invalid span: {reason}"),
             Self::QueryTooBroad(reason) => write!(f, "query too broad: {reason}"),
+            Self::WalCorrupt(detail) => write!(f, "write-ahead log is corrupt: {detail}"),
         }
     }
 }
@@ -533,7 +560,8 @@ impl StdError for Error {
             Self::AlreadyOpen
             | Self::LockPoisoned(_)
             | Self::InvalidSpan(_)
-            | Self::QueryTooBroad(_) => None,
+            | Self::QueryTooBroad(_)
+            | Self::WalCorrupt(_) => None,
         }
     }
 }
@@ -657,11 +685,17 @@ fn validate_span(span: &Span) -> Result<()> {
 struct WriteBuffer {
     spans: Vec<Span>,
     index: std::collections::HashMap<(String, String), usize>,
+    /// Spans upserted since the last seal, counting replacements. `spans.len()`
+    /// deliberately does not: an update to a buffered key leaves the record
+    /// count untouched while still costing a log record, so the flush policy
+    /// needs both numbers (see [`Config::flush_spans`]).
+    upserts: usize,
 }
 
 impl WriteBuffer {
     fn upsert(&mut self, span: Span) {
         let key = (span.trace_id.clone(), span.span_id.clone());
+        self.upserts += 1;
         match self.index.get(&key) {
             Some(&position) => self.spans[position] = span,
             None => {
@@ -687,6 +721,7 @@ impl WriteBuffer {
     fn clear(&mut self) {
         self.spans.clear();
         self.index.clear();
+        self.upserts = 0;
     }
 
     /// Reinstates spans taken out of the buffer, rebuilding the position index.
@@ -859,12 +894,23 @@ impl Drop for DirectoryLock {
 pub struct Store {
     directory: PathBuf,
     config: Config,
-    // Locking discipline: whenever both locks are needed, acquire writer first
-    // and segments second, and retain that order until both guards are dropped.
-    // The rollup cache is leaf-level: acquired briefly and never while taking
-    // another lock.
+    // Locking discipline: maintenance first, then writer, then segments, and
+    // retain that order until every guard is dropped. The rollup cache is
+    // leaf-level: acquired briefly and never while taking another lock.
+    //
+    // `maintenance` serializes the two operations that REPLACE segment files —
+    // compaction and expiry — against each other. It is not a read lock and
+    // not an ingest lock: both proceed throughout, which is the point. It
+    // exists so each of those operations can pin its inputs, do its I/O with
+    // no engine lock held, and publish under a short revalidated critical
+    // section without also having to reason about the other one.
+    maintenance: Mutex<()>,
     writer: Mutex<WriteBuffer>,
-    segments: Mutex<Vec<Segment>>,
+    // Segments are `Arc` so a reader can PIN the set it resolved against and
+    // keep reading after compaction or expiry has replaced the files. A
+    // segment holds its own open descriptor, so an unlinked-but-pinned segment
+    // still serves its records.
+    segments: Mutex<Vec<std::sync::Arc<Segment>>>,
     rollups: Mutex<std::collections::HashMap<PathBuf, std::sync::Arc<analytics::SegmentRollup>>>,
     recent_payloads: payload::TouchRegistry,
     annotations: annotations::AnnotationLog,
@@ -910,9 +956,11 @@ impl Store {
                 // restarting in wal mode must still recover it.
                 None
             } else {
-                for span in wal::Wal::replay(&directory)? {
-                    buffer.upsert(span);
-                }
+                // Recovery may refuse to proceed (see `Wal::recover`): a log
+                // damaged anywhere but its final append cannot be resumed
+                // without dropping acknowledged batches, and dropping them
+                // quietly is worse than not starting.
+                wal::Wal::recover(&directory, |span| buffer.upsert(span))?;
                 Some(wal::Wal::open(&directory, config.wal_commit_window)?)
             };
             let next_segment = segments
@@ -925,6 +973,7 @@ impl Store {
                 annotations: annotations::AnnotationLog::open(&directory)?,
                 directory,
                 config,
+                maintenance: Mutex::new(()),
                 writer: Mutex::new(buffer),
                 segments: Mutex::new(segments),
                 rollups: Mutex::new(std::collections::HashMap::new()),
@@ -1007,7 +1056,7 @@ impl Store {
                     writer.upsert(span);
                 }
             });
-            if self.should_flush(writer.len()) {
+            if self.should_flush(&writer) {
                 let mut segments = self.lock_segments()?;
                 // A sealed segment supersedes the log, so this also discards
                 // it and satisfies any commit still waiting on it.
@@ -1106,56 +1155,7 @@ impl Store {
         // Lock order: writer before segments (see Store field docs).
         let writer = self.lock_writer()?;
         let segments = self.lock_segments()?;
-        let matches = |span: &Span| {
-            keys.iter().any(|key| {
-                span.attributes
-                    .get(*key)
-                    .is_some_and(|held| values.iter().any(|value| held == value))
-            })
-        };
-
-        let mut result: Vec<Span> = Vec::new();
-        let mut claimed: std::collections::HashSet<(String, String)> =
-            std::collections::HashSet::new();
-        // The buffer holds the newest version of anything it carries.
-        for span in writer.spans.iter() {
-            if matches(span) {
-                claimed.insert((span.trace_id.clone(), span.span_id.clone()));
-                result.push(span.clone());
-            }
-        }
-        // Any key present in the buffer supersedes every segment copy, even
-        // one the predicate does not select in its buffered version.
-        for (trace_id, span_id) in writer.index.keys() {
-            claimed.insert((trace_id.clone(), span_id.clone()));
-        }
-        // Newest segment first, so the first version claimed for a key wins.
-        for segment in segments.iter().rev() {
-            let seg = &segment.seg;
-            let mut offsets: Vec<u64> = Vec::new();
-            for key in keys {
-                for value in values {
-                    offsets.extend_from_slice(
-                        seg.attribute_posting_offsets_ref(key, &canonical_value(value)),
-                    );
-                }
-            }
-            offsets.sort_unstable();
-            offsets.dedup();
-            for offset in offsets {
-                let record = seg.record_at_offset(offset).map_err(segment_error)?;
-                let span = record_to_span(&record)?;
-                // An index accelerates a filter, it never changes it.
-                if !matches(&span) {
-                    continue;
-                }
-                if claimed.insert((span.trace_id.clone(), span.span_id.clone())) {
-                    result.push(span);
-                }
-            }
-        }
-        sort_spans(&mut result);
-        Ok(result)
+        attribute_union_view(&writer, &segments, keys, values)
     }
 
     /// Returns spans matching `filter` strictly after `cursor`.
@@ -1163,6 +1163,10 @@ impl Store {
     /// The cursor is compared using the same total order as [`Self::query`],
     /// allowing callers to paginate with a constant result bound even when
     /// many spans share one timestamp.
+    ///
+    /// Each call resolves against the store as it is NOW. Paginating a
+    /// changing store therefore walks a moving dataset; [`Self::snapshot`] is
+    /// the fixed one.
     pub fn query_after(
         &self,
         filter: &SpanFilter,
@@ -1172,48 +1176,211 @@ impl Store {
         // the single-key attribute index cannot express — resolve it up front,
         // then apply the remaining predicates, order, and limit.
         if let Some(session_id) = &filter.session {
-            let mut spans = self.resolve_session_spans(session_id)?;
-            spans.retain(|span| {
-                span_matches(span, filter)
-                    && cursor.map_or(true, |position| span_after_cursor(span, position))
-            });
-            order_spans(&mut spans, filter.sort);
-            if let Some(limit) = filter.limit {
-                spans.truncate(limit);
-            }
-            return Ok(spans);
-        }
-        // A sorted answer cannot be streamed: the record that belongs first
-        // may be the last one read, so `limit` cannot stop the scan early.
-        // Re-run unlimited, order, then truncate. Refusing past a ceiling
-        // rather than truncating first is deliberate — a "ten slowest" that
-        // silently ranked the first ten thousand matches would be wrong, and
-        // wrong quietly.
-        if let Some(sort) = filter.sort {
-            let unlimited = SpanFilter {
-                limit: None,
-                sort: None,
-                ..filter.clone()
-            };
-            let mut spans = self.query_after(&unlimited, cursor)?;
-            if spans.len() > SORT_CANDIDATE_LIMIT {
-                return Err(Error::QueryTooBroad(format!(
-                    "sorting {} matches exceeds the {SORT_CANDIDATE_LIMIT} candidate limit; \
-                     narrow the filter (time range, service, or an attribute) and retry",
-                    spans.len()
-                )));
-            }
-            spans.sort_by(|left, right| {
-                sort.compare(left, right)
-                    .then_with(|| compare_spans(left, right))
-            });
-            if let Some(limit) = filter.limit {
-                spans.truncate(limit);
-            }
-            return Ok(spans);
+            let spans = self.resolve_session_spans(session_id)?;
+            return Ok(narrow_session_spans(spans, filter, cursor));
         }
         let writer = self.lock_writer()?;
         let segments = self.lock_segments()?;
+        query_view(&writer, &segments, &self.metrics, filter, cursor)
+    }
+
+    /// Pins the store as it is now and returns a view that keeps answering
+    /// from that instant.
+    ///
+    /// A multi-page read that re-queries the live store between pages is not
+    /// reading one dataset: a span ingested mid-read can be missed, and one
+    /// re-ingested under a key an earlier page already emitted comes back a
+    /// second time — an export could report "complete" over output holding two
+    /// versions of the same primary key. A pinned view has neither problem,
+    /// because nothing about it changes after it is taken.
+    ///
+    /// What pinning costs: the write buffer is copied (at most
+    /// [`Config::flush_spans`] spans), and the segment files live at least as
+    /// long as the view. Compaction and expiry are free to unlink them
+    /// meanwhile — the view reads through descriptors it already holds — but
+    /// the bytes are not reclaimed until it drops, so a view is meant to be
+    /// held for one operation, not parked.
+    pub fn snapshot(&self) -> Result<SnapshotView<'_>> {
+        // Lock order: writer before segments (see Store field docs).
+        let writer = self.lock_writer()?;
+        let segments = self.lock_segments()?;
+        let mut buffer = WriteBuffer::default();
+        buffer.restore(writer.spans.clone());
+        Ok(SnapshotView {
+            buffer,
+            segments: segments.clone(),
+            metrics: &self.metrics,
+        })
+    }
+}
+
+/// An immutable, pinned view of the store: the write buffer as it stood when
+/// the view was taken, plus the segments live at that moment. See
+/// [`Store::snapshot`].
+///
+/// Reads answer exactly as the store would have at that instant, under the
+/// same primary-key precedence, and keep doing so however the store changes
+/// afterwards.
+#[derive(Debug)]
+pub struct SnapshotView<'a> {
+    buffer: WriteBuffer,
+    segments: Vec<std::sync::Arc<Segment>>,
+    /// Reads through a view are real reads and are counted as such. Borrowing
+    /// the store's counters is also what keeps a view from outliving the store
+    /// whose files it pins.
+    metrics: &'a metrics::Metrics,
+}
+
+impl SnapshotView<'_> {
+    /// Spans matching `filter`, in Traza's stable span order.
+    pub fn query(&self, filter: &SpanFilter) -> Result<Vec<Span>> {
+        self.query_after(filter, None)
+    }
+
+    /// Spans matching `filter` strictly after `cursor`, in Traza's stable span
+    /// order. Paging through a view with this is what makes a multi-page read
+    /// one coherent dataset.
+    pub fn query_after(
+        &self,
+        filter: &SpanFilter,
+        cursor: Option<&SpanCursor>,
+    ) -> Result<Vec<Span>> {
+        if let Some(session_id) = &filter.session {
+            let spans =
+                analytics::resolve_session_spans_in(&self.buffer, &self.segments, session_id)?;
+            return Ok(narrow_session_spans(spans, filter, cursor));
+        }
+        query_view(&self.buffer, &self.segments, self.metrics, filter, cursor)
+    }
+
+    /// Number of segments the view pins, for diagnostics and tests.
+    pub fn pinned_segment_count(&self) -> usize {
+        self.segments.len()
+    }
+}
+
+/// Applies the remaining predicates, order and limit to session candidates.
+/// Session resolution unions several attribute keys, so it cannot be expressed
+/// as one indexed filter; everything else about the query still applies.
+fn narrow_session_spans(
+    mut spans: Vec<Span>,
+    filter: &SpanFilter,
+    cursor: Option<&SpanCursor>,
+) -> Vec<Span> {
+    spans.retain(|span| {
+        span_matches(span, filter)
+            && cursor.map_or(true, |position| span_after_cursor(span, position))
+    });
+    order_spans(&mut spans, filter.sort);
+    if let Some(limit) = filter.limit {
+        spans.truncate(limit);
+    }
+    spans
+}
+
+/// Every span carrying `values` under ANY of `keys`, over one buffer and
+/// segment set. See [`Store::query_attribute_union`] for why the caller must
+/// hold both halves still while this runs.
+pub(crate) fn attribute_union_view(
+    buffer: &WriteBuffer,
+    segments: &[std::sync::Arc<Segment>],
+    keys: &[&str],
+    values: &[Value],
+) -> Result<Vec<Span>> {
+    let matches = |span: &Span| {
+        keys.iter().any(|key| {
+            span.attributes
+                .get(*key)
+                .is_some_and(|held| values.iter().any(|value| held == value))
+        })
+    };
+
+    let mut result: Vec<Span> = Vec::new();
+    let mut claimed: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    // The buffer holds the newest version of anything it carries.
+    for span in buffer.spans.iter() {
+        if matches(span) {
+            claimed.insert((span.trace_id.clone(), span.span_id.clone()));
+            result.push(span.clone());
+        }
+    }
+    // Any key present in the buffer supersedes every segment copy, even
+    // one the predicate does not select in its buffered version.
+    for (trace_id, span_id) in buffer.index.keys() {
+        claimed.insert((trace_id.clone(), span_id.clone()));
+    }
+    // Newest segment first, so the first version claimed for a key wins.
+    for segment in segments.iter().rev() {
+        let seg = &segment.seg;
+        let mut offsets: Vec<u64> = Vec::new();
+        for key in keys {
+            for value in values {
+                offsets.extend_from_slice(
+                    seg.attribute_posting_offsets_ref(key, &canonical_value(value)),
+                );
+            }
+        }
+        offsets.sort_unstable();
+        offsets.dedup();
+        for offset in offsets {
+            let record = seg.record_at_offset(offset).map_err(segment_error)?;
+            let span = record_to_span(&record)?;
+            // An index accelerates a filter, it never changes it.
+            if !matches(&span) {
+                continue;
+            }
+            if claimed.insert((span.trace_id.clone(), span.span_id.clone())) {
+                result.push(span);
+            }
+        }
+    }
+    sort_spans(&mut result);
+    Ok(result)
+}
+
+/// Resolves `filter` (and an optional `cursor`) over one buffer and segment
+/// set, under Traza's primary-key precedence: the buffer wins, then the newest
+/// segment.
+///
+/// The caller decides what "one set" means — the live store holds both locks
+/// across the call, a [`SnapshotView`] owns its copy — but it must be still
+/// for the duration either way. See invariant 6 in docs/internals/invariants.md.
+pub(crate) fn query_view(
+    writer: &WriteBuffer,
+    segments: &[std::sync::Arc<Segment>],
+    metrics: &metrics::Metrics,
+    filter: &SpanFilter,
+    cursor: Option<&SpanCursor>,
+) -> Result<Vec<Span>> {
+    // A sorted answer cannot be streamed: the record that belongs first may be
+    // the last one read, so `limit` cannot stop the scan early. Re-run
+    // unlimited, order, then truncate. Refusing past a ceiling rather than
+    // truncating first is deliberate — a "ten slowest" that silently ranked
+    // the first ten thousand matches would be wrong, and wrong quietly.
+    if let Some(sort) = filter.sort {
+        let unlimited = SpanFilter {
+            limit: None,
+            sort: None,
+            ..filter.clone()
+        };
+        let mut spans = query_view(writer, segments, metrics, &unlimited, cursor)?;
+        if spans.len() > SORT_CANDIDATE_LIMIT {
+            return Err(Error::QueryTooBroad(format!(
+                "sorting {} matches exceeds the {SORT_CANDIDATE_LIMIT} candidate limit; \
+                 narrow the filter (time range, service, or an attribute) and retry",
+                spans.len()
+            )));
+        }
+        spans.sort_by(|left, right| {
+            sort.compare(left, right)
+                .then_with(|| compare_spans(left, right))
+        });
+        if let Some(limit) = filter.limit {
+            spans.truncate(limit);
+        }
+        return Ok(spans);
+    }
+    {
         let mut result = Vec::new();
 
         // Limited queries take the lazy path: per-source candidates stay as
@@ -1251,9 +1418,9 @@ impl Store {
                 // This is the only filter that eliminates a segment without
                 // reading it, and "the last N minutes" is the commonest
                 // filter an observability store sees.
-                self.metrics.segments_examined.increment();
+                metrics.segments_examined.increment();
                 if !seg.may_contain_timestamps(filter.since_ns, filter.until_ns) {
-                    self.metrics.segments_pruned_by_time.increment();
+                    metrics.segments_pruned_by_time.increment();
                     continue;
                 }
                 let offsets = select_probe(seg, filter);
@@ -1358,9 +1525,9 @@ impl Store {
         // superseded by definition.
         for (position, segment) in segments.iter().enumerate() {
             let seg = &segment.seg;
-            self.metrics.segments_examined.increment();
+            metrics.segments_examined.increment();
             if !seg.may_contain_timestamps(filter.since_ns, filter.until_ns) {
-                self.metrics.segments_pruned_by_time.increment();
+                metrics.segments_pruned_by_time.increment();
                 continue;
             }
             let offsets = select_probe(seg, filter);
@@ -1398,7 +1565,9 @@ impl Store {
         sort_spans(&mut result);
         Ok(result)
     }
+}
 
+impl Store {
     /// Returns current buffer, segment, physical-record, and disk statistics.
     ///
     /// Persisted counts are physical records rather than logical
@@ -1407,7 +1576,7 @@ impl Store {
     pub fn stats(&self) -> Result<Stats> {
         let writer = self.lock_writer()?;
         let segments = self.lock_segments()?;
-        let persisted_records = segments.iter().map(Segment::record_count).sum();
+        let persisted_records = segments.iter().map(|segment| segment.record_count()).sum();
         let disk_bytes = segments.iter().map(|segment| segment.bytes).sum();
         let buffered_records = writer.len();
 
@@ -1462,7 +1631,8 @@ impl Store {
             .min(u128::from(u64::MAX)) as u64;
         let ttl_ns = ttl_seconds.saturating_mul(1_000_000_000);
         let cutoff_ns = now_ns.saturating_sub(ttl_ns);
-        let removed = self.expire_before(cutoff_ns)?;
+        let _maintenance = self.lock_maintenance()?;
+        let removed = self.expire_before_locked(cutoff_ns)?;
         // Same retention window for the satellite stores: annotations by
         // their own timestamps, payload files by mtime (an orphan payload
         // lingers at most one TTL past its span).
@@ -1504,6 +1674,14 @@ impl Store {
     /// present and parses; otherwise the inputs stay authoritative and the
     /// merge is simply retried. The merged segment is written and renamed
     /// into place BEFORE any input is deleted, so no window drops data.
+    ///
+    /// **Reads and ingest continue throughout.** A merge parses every input,
+    /// materializes the union, and fsyncs the replacement; holding the segment
+    /// lock across that stopped every query, and a blocked query holding the
+    /// writer lock then stopped ingest behind it — a multi-gigabyte merge
+    /// became a multi-gigabyte outage. Inputs are pinned instead
+    /// ([`Store::snapshot`] pins the same way), all of the work happens with
+    /// no engine lock held, and only the swap takes the lock back.
     pub fn compact_segments(&self) -> Result<usize> {
         let Some(settings) = self.config.compaction else {
             return Ok(0);
@@ -1511,6 +1689,10 @@ impl Store {
         if settings.fanout < 2 {
             return Ok(0);
         }
+        // One rewriter at a time. Compaction and expiry both replace segment
+        // files; serializing them is what lets each pin its inputs and trust
+        // that only ingest can have changed the set by publication time.
+        let _maintenance = self.lock_maintenance()?;
         let mut merged_away = 0usize;
         // Each pass merges one run; a merge can create a run one tier up, so
         // loop until nothing qualifies. Bounded by the tier count.
@@ -1520,30 +1702,49 @@ impl Store {
                 break;
             };
             drop(segments);
-            merged_away += self.merge_tail_run(run, &settings)?;
+            let merged = self.merge_tail_run(run, &settings)?;
+            if merged == 0 {
+                // The run went stale between the scan and the publish. Stop
+                // rather than spin; the next scheduled pass picks it up.
+                break;
+            }
+            merged_away += merged;
         }
         Ok(merged_away)
     }
 
-    /// Merges the last `run` segments into one. Returns segments removed.
+    /// Merges the last `run` segments into one. Returns segments removed, or
+    /// zero if the run stopped qualifying before the result could be published.
     fn merge_tail_run(&self, run: usize, settings: &CompactionConfig) -> Result<usize> {
-        let mut segments = self.lock_segments()?;
-        // Re-check under the lock: the set may have changed since the scan.
-        if tail_run_to_merge(&segments, settings) != Some(run) {
-            return Ok(0);
-        }
-        let start = segments.len() - run;
-        let inputs: Vec<PathBuf> = segments[start..]
-            .iter()
-            .map(|segment| segment.path.clone())
-            .collect();
+        // ---- pin: short critical section -------------------------------
+        let (inputs, id) = {
+            let segments = self.lock_segments()?;
+            // Re-check under the lock: the set may have changed since the scan.
+            if tail_run_to_merge(&segments, settings) != Some(run) {
+                return Ok(0);
+            }
+            let start = segments.len() - run;
+            let inputs: Vec<std::sync::Arc<Segment>> = segments[start..].to_vec();
+            // The id is claimed HERE, under the lock, and that is what keeps a
+            // concurrent flush ordered correctly. A flush holds this same lock
+            // from claiming its id through pushing its segment, so every
+            // segment that appears while this merge runs necessarily has a
+            // HIGHER id — and therefore sorts after the merged output, which
+            // is exactly right: it was written later. Claiming the id after
+            // the merge would invert that and let merged (older) versions win
+            // over freshly flushed ones.
+            let id = self.next_segment.fetch_add(1, Ordering::Relaxed);
+            (inputs, id)
+        };
+        let input_paths: Vec<PathBuf> = inputs.iter().map(|segment| segment.path.clone()).collect();
 
+        // ---- merge: no engine lock held --------------------------------
         // Oldest first, so a later segment's version of a key overwrites an
         // earlier one — the same last-write-wins rule reads apply.
         let mut latest: std::collections::HashMap<(String, String), Span> =
             std::collections::HashMap::new();
         let mut order: Vec<(String, String)> = Vec::new();
-        for segment in &segments[start..] {
+        for segment in &inputs {
             for span in segment.spans_parsed()? {
                 let key = (span.trace_id.clone(), span.span_id.clone());
                 if latest.insert(key.clone(), span).is_none() {
@@ -1557,13 +1758,12 @@ impl Store {
             .collect();
         sort_spans(&mut merged);
 
-        let id = self.next_segment.fetch_add(1, Ordering::Relaxed);
         let new_name = format!("{SEGMENT_PREFIX}{id:020}{SEGMENT_SUFFIX}");
         // Journal every input before the replacement exists, so recovery can
         // finish the merge from either side without inspecting content.
         let mut markers = Vec::with_capacity(inputs.len());
-        for input in &inputs {
-            let old_name = input
+        for path in &input_paths {
+            let old_name = path
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_default();
@@ -1574,86 +1774,141 @@ impl Store {
             )?);
         }
         let new_segment = self.write_segment(id, &merged)?;
-        for input in &inputs {
-            fs::remove_file(input)?;
+        let new_path = new_segment.path.clone();
+
+        // ---- publish: short critical section, revalidated ---------------
+        let published = {
+            let mut segments = self.lock_segments()?;
+            match run_position(&segments, &inputs) {
+                Some(start) => {
+                    segments.splice(start..start + run, [std::sync::Arc::new(new_segment)]);
+                    segments.sort_by(|left, right| left.path.cmp(&right.path));
+                    true
+                }
+                None => false,
+            }
+        };
+        if !published {
+            // Nothing was replaced, so nothing may look replaced. Remove the
+            // orphan BEFORE its markers: a crash in the other order would let
+            // recovery see a complete replacement and delete inputs it does
+            // not actually supersede.
+            let _ = fs::remove_file(&new_path);
+            for marker in markers {
+                let _ = fs::remove_file(marker);
+            }
+            return Ok(0);
+        }
+
+        // The merged segment is durable and visible, so the inputs are dead.
+        // A reader that pinned them keeps its own descriptors and finishes
+        // undisturbed; unlinking only takes the names away. (That is POSIX
+        // semantics. On a platform that refuses to unlink an open file this
+        // errors while an export is reading, and the merge is simply retried
+        // on the next tick — the store stays correct either way.)
+        for path in &input_paths {
+            fs::remove_file(path)?;
         }
         for marker in markers {
             let _ = fs::remove_file(marker);
         }
-
-        segments.truncate(start);
-        segments.push(new_segment);
-        segments.sort_by(|left, right| left.path.cmp(&right.path));
         // Rollups are keyed by path; the inputs' entries are now dead.
         if let Ok(mut rollups) = self.rollups.lock() {
-            rollups.retain(|path, _| !inputs.contains(path));
+            rollups.retain(|path, _| !input_paths.contains(path));
         }
-        Ok(inputs.len().saturating_sub(1))
+        Ok(input_paths.len().saturating_sub(1))
     }
 
     /// Removes spans ending before `cutoff_ns` and returns the number removed.
+    ///
+    /// **Expiry is a deletion, and a deletion has to reach the log.** Dropping
+    /// a span from the write buffer leaves the write-ahead log record that
+    /// carried it intact, so the next restart replays it and the expired span
+    /// is back — retention a restart undoes is not retention, and for anyone
+    /// deleting telemetry on request it is not deletion either. The log is
+    /// rewritten to exactly what survived.
+    ///
+    /// **Reads and ingest continue throughout**, as in
+    /// [`Self::compact_segments`]: segments are pinned, rewritten with no
+    /// engine lock held, and swapped in one at a time.
     pub fn expire_before(&self, cutoff_ns: u64) -> Result<usize> {
-        let mut writer = self.lock_writer()?;
-        let mut segments = self.lock_segments()?;
-        let before_buffer = writer.len();
-        writer.retain(|span| span.end_time_ns >= cutoff_ns);
-        let mut removed = before_buffer - writer.len();
+        let _maintenance = self.lock_maintenance()?;
+        self.expire_before_locked(cutoff_ns)
+    }
 
-        // The in-memory segment set is only replaced after every file
-        // operation has succeeded: an early error must leave the running
-        // store serving its previous (superset) view, never an empty one
-        // (found in review: mem::take + a fallible loop could wipe the
-        // in-memory set on the first I/O failure). Compaction is still not
-        // crash-ATOMIC across segments — there is no manifest yet — so a
-        // crash mid-compaction can leave both an old and its rewritten
-        // segment on disk until the next successful compaction; that bound
-        // is documented in the README limitations.
-        let mut replacement: Vec<Segment> = Vec::with_capacity(segments.len());
-        let mut removed_from_segments = 0usize;
-        for segment in segments.iter() {
+    /// [`Self::expire_before`] with the maintenance lock already held.
+    fn expire_before_locked(&self, cutoff_ns: u64) -> Result<usize> {
+        // ---- buffer and log --------------------------------------------
+        let mut removed = {
+            let mut writer = self.lock_writer()?;
+            let before_buffer = writer.len();
+            writer.retain(|span| span.end_time_ns >= cutoff_ns);
+            let removed = before_buffer - writer.len();
+            if removed > 0 {
+                if let Some(log) = &self.wal {
+                    log.rewrite(&writer.spans)?;
+                }
+            }
+            removed
+        };
+
+        // ---- segments: pinned, rewritten with no engine lock held -------
+        // Each survivor set is written to a temp file and renamed ONTO the
+        // segment it replaces. In place is not an optimization: segment path
+        // order is recency order, so handing the survivors a fresh (highest)
+        // id would move an old segment to the newest position and let its
+        // versions win over segments that legitimately supersede them. The
+        // rename is also what makes a supersede marker unnecessary here —
+        // there is no window where a replacement exists beside its original.
+        let pinned: Vec<std::sync::Arc<Segment>> = self.lock_segments()?.clone();
+        for segment in &pinned {
             let all = segment.spans_parsed()?;
             let total = all.len();
-            let kept: Vec<Span> = all
+            let mut kept: Vec<Span> = all
                 .into_iter()
                 .filter(|span| span.end_time_ns >= cutoff_ns)
                 .collect();
-            removed_from_segments += total - kept.len();
-
             if kept.len() == total {
-                replacement.push(Segment {
-                    path: segment.path.clone(),
-                    bytes: segment.bytes,
-                    seg: Box::new(segment::Segment::open(&segment.path).map_err(segment_error)?),
-                });
                 continue;
             }
-
-            if kept.is_empty() {
-                fs::remove_file(&segment.path)?;
-                continue;
-            }
-
-            let mut kept = kept;
+            removed += total - kept.len();
             sort_spans(&mut kept);
-            let id = self.next_segment.fetch_add(1, Ordering::Relaxed);
-            let old_name = segment
-                .path
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let new_name = format!("{SEGMENT_PREFIX}{id:020}{SEGMENT_SUFFIX}");
-            // Journal first: whichever side of the rewrite a crash lands on,
-            // recovery finishes it without content guessing.
-            let marker = write_supersede_marker(&self.directory, &old_name, &new_name)?;
-            let new_segment = self.write_segment(id, &kept)?;
-            fs::remove_file(&segment.path)?;
-            let _ = fs::remove_file(marker);
-            replacement.push(new_segment);
-        }
 
-        removed += removed_from_segments;
-        replacement.sort_by(|left, right| left.path.cmp(&right.path));
-        *segments = replacement;
+            let replacement = match kept.is_empty() {
+                true => None,
+                false => Some(std::sync::Arc::new(
+                    self.rewrite_segment_in_place(&segment.path, &kept)?,
+                )),
+            };
+            // Publish this one before rewriting the next, so an I/O failure
+            // partway through leaves everything already rewritten correctly
+            // represented rather than stranded.
+            {
+                let mut segments = self.lock_segments()?;
+                if let Some(position) = segments
+                    .iter()
+                    .position(|held| std::sync::Arc::ptr_eq(held, segment))
+                {
+                    match &replacement {
+                        Some(replacement) => segments[position] = replacement.clone(),
+                        None => {
+                            segments.remove(position);
+                        }
+                    }
+                }
+            }
+            if replacement.is_none() {
+                // Out of the list first, then off disk. A reader that pinned
+                // it keeps its own descriptor and finishes undisturbed.
+                fs::remove_file(&segment.path)?;
+            }
+            // Rollups are keyed by path, and this path now holds different
+            // bytes (or none) — a cached rollup would still count the spans
+            // that were just expired.
+            if let Ok(mut rollups) = self.rollups.lock() {
+                rollups.remove(&segment.path);
+            }
+        }
         Ok(removed)
     }
 
@@ -1664,7 +1919,10 @@ impl Store {
     pub fn persisted_segment_spans(&self) -> Result<Vec<Vec<Span>>> {
         let _writer = self.lock_writer()?;
         let segments = self.lock_segments()?;
-        segments.iter().map(Segment::spans_parsed).collect()
+        segments
+            .iter()
+            .map(|segment| segment.spans_parsed())
+            .collect()
     }
 
     /// Number of fully materialized `Span` structs held for PERSISTED data.
@@ -1696,21 +1954,50 @@ impl Store {
             .map_err(|_| Error::LockPoisoned("writer"))
     }
 
-    fn lock_segments(&self) -> Result<MutexGuard<'_, Vec<Segment>>> {
+    fn lock_segments(&self) -> Result<MutexGuard<'_, Vec<std::sync::Arc<Segment>>>> {
         self.segments
             .lock()
             .map_err(|_| Error::LockPoisoned("segments"))
     }
 
-    fn should_flush(&self, buffered: usize) -> bool {
-        // `flushed` acknowledges only sealed spans, so every call seals.
-        if self.config.durability == Durability::Flushed {
-            return buffered > 0;
-        }
-        self.config.flush_spans > 0 && buffered >= self.config.flush_spans
+    fn lock_maintenance(&self) -> Result<MutexGuard<'_, ()>> {
+        self.maintenance
+            .lock()
+            .map_err(|_| Error::LockPoisoned("maintenance"))
     }
 
-    fn flush_locked(&self, writer: &mut WriteBuffer, segments: &mut Vec<Segment>) -> Result<()> {
+    /// Whether the buffer has reached any of the bounds a seal enforces.
+    ///
+    /// Three bounds, because one number cannot express them all. Unique
+    /// buffered records bound MEMORY. Upserts since the last seal bound WORK:
+    /// a workload that keeps updating the same keys — retries, spans enriched
+    /// as they complete — adds records to the log without ever adding one to
+    /// the buffer, so a record-only threshold is simply never reached and the
+    /// log grows without limit. Log bytes bound the physical consequence and
+    /// therefore restart replay, whatever the span sizes or key distribution
+    /// turn out to be.
+    fn should_flush(&self, writer: &WriteBuffer) -> bool {
+        // `flushed` acknowledges only sealed spans, so every call seals.
+        if self.config.durability == Durability::Flushed {
+            return !writer.is_empty();
+        }
+        if self.config.flush_spans > 0
+            && (writer.len() >= self.config.flush_spans
+                || writer.upserts >= self.config.flush_spans)
+        {
+            return true;
+        }
+        match (self.config.flush_wal_bytes, &self.wal) {
+            (Some(limit), Some(log)) => limit > 0 && log.size_bytes() >= limit,
+            _ => false,
+        }
+    }
+
+    fn flush_locked(
+        &self,
+        writer: &mut WriteBuffer,
+        segments: &mut Vec<std::sync::Arc<Segment>>,
+    ) -> Result<()> {
         if writer.is_empty() {
             return Ok(());
         }
@@ -1732,7 +2019,7 @@ impl Store {
         };
         let sealed = pending.len() as u64;
         writer.clear();
-        segments.push(segment);
+        segments.push(std::sync::Arc::new(segment));
         segments.sort_by(|left, right| left.path.cmp(&right.path));
         // The segment is fsynced and renamed, so every log record it covers is
         // superseded. Reclaim AFTER the segment lands: a crash in between
@@ -1749,20 +2036,41 @@ impl Store {
     fn write_segment(&self, id: u64, spans: &[Span]) -> Result<Segment> {
         let file_name = format!("{SEGMENT_PREFIX}{id:020}{SEGMENT_SUFFIX}");
         let final_path = self.directory.join(&file_name);
+        if final_path.exists() {
+            return Err(Error::Io(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "segment id collision: {} already exists",
+                    final_path.display()
+                ),
+            )));
+        }
+        self.seal_segment(&final_path, spans)
+    }
+
+    /// Rewrites an existing segment to hold exactly `spans`.
+    ///
+    /// Same name, same id, same place in the segment order — see
+    /// [`Self::expire_before`] for why that is a correctness requirement and
+    /// not a convenience. The rename replaces the file atomically, so a crash
+    /// leaves either the original or the survivors and never both.
+    fn rewrite_segment_in_place(&self, path: &Path, spans: &[Span]) -> Result<Segment> {
+        self.seal_segment(path, spans)
+    }
+
+    /// Encodes `spans`, fsyncs them into a temp file, and renames that onto
+    /// `final_path`. The rename is what makes a segment appear atomically: a
+    /// reader sees the whole file or none of it, never a partial one.
+    fn seal_segment(&self, final_path: &Path, spans: &[Span]) -> Result<Segment> {
+        let file_name = final_path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
         let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let temp_name = format!(".{file_name}.{}.{}.tmp", std::process::id(), counter);
         let temp_path = self.directory.join(temp_name);
 
         let write_result = (|| {
-            if final_path.exists() {
-                return Err(Error::Io(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    format!(
-                        "segment id collision: {} already exists",
-                        final_path.display()
-                    ),
-                )));
-            }
             let records = spans
                 .iter()
                 .map(span_to_record)
@@ -1773,16 +2081,16 @@ impl Store {
             let mut file = options.open(&temp_path)?;
             file.write_all(&encoded)?;
             file.sync_all()?;
-            fs::rename(&temp_path, &final_path)?;
+            fs::rename(&temp_path, final_path)?;
             sync_directory(&self.directory)?;
-            let bytes = fs::metadata(&final_path)?.len();
+            let bytes = fs::metadata(final_path)?.len();
             // Reopen FILE-BACKED: the encoded buffer is dropped and the
             // segment serves reads from disk immediately — flushing never
             // leaves a resident payload copy behind.
             drop(encoded);
-            let seg = Box::new(segment::Segment::open(&final_path).map_err(segment_error)?);
+            let seg = Box::new(segment::Segment::open(final_path).map_err(segment_error)?);
             Ok(Segment {
-                path: final_path,
+                path: final_path.to_path_buf(),
                 bytes,
                 seg,
             })
@@ -1815,7 +2123,10 @@ fn size_tier(bytes: u64, settings: &CompactionConfig) -> u32 {
 ///
 /// Tail-only is a correctness requirement, not a simplification: see
 /// [`Store::compact_segments`].
-fn tail_run_to_merge(segments: &[Segment], settings: &CompactionConfig) -> Option<usize> {
+fn tail_run_to_merge(
+    segments: &[std::sync::Arc<Segment>],
+    settings: &CompactionConfig,
+) -> Option<usize> {
     if segments.len() < settings.fanout {
         return None;
     }
@@ -1845,6 +2156,27 @@ fn tail_run_to_merge(segments: &[Segment], settings: &CompactionConfig) -> Optio
     } else {
         None
     }
+}
+
+/// Where `run` sits in `segments`, by identity, or `None` if it is no longer
+/// there as one contiguous block.
+///
+/// Identity rather than path: this is the revalidation a merge does before
+/// publishing, and it has to answer "are these the same segments I pinned",
+/// which a path cannot say once files start being replaced in place.
+fn run_position(
+    segments: &[std::sync::Arc<Segment>],
+    run: &[std::sync::Arc<Segment>],
+) -> Option<usize> {
+    if run.is_empty() || segments.len() < run.len() {
+        return None;
+    }
+    (0..=segments.len() - run.len()).find(|start| {
+        segments[*start..*start + run.len()]
+            .iter()
+            .zip(run)
+            .all(|(held, pinned)| std::sync::Arc::ptr_eq(held, pinned))
+    })
 }
 
 /// Compaction supersede journal: a marker recording that a rewritten segment
@@ -2107,7 +2439,7 @@ fn scalar_text(value: &Value) -> Option<String> {
     }
 }
 
-fn load_segments(directory: &Path) -> Result<Vec<Segment>> {
+fn load_segments(directory: &Path) -> Result<Vec<std::sync::Arc<Segment>>> {
     let mut paths = Vec::new();
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
@@ -2137,11 +2469,11 @@ fn load_segments(directory: &Path) -> Result<Vec<Segment>> {
         }
         let bytes_meta = fs::metadata(&path)?.len();
         let seg = Box::new(segment::Segment::open(&path).map_err(segment_error)?);
-        segments.push(Segment {
+        segments.push(std::sync::Arc::new(Segment {
             path,
             bytes: bytes_meta,
             seg,
-        });
+        }));
     }
     Ok(segments)
 }
@@ -2184,13 +2516,13 @@ fn segment_number(path: &Path) -> Option<u64> {
 }
 
 #[cfg(unix)]
-fn sync_directory(directory: &Path) -> Result<()> {
+pub(crate) fn sync_directory(directory: &Path) -> Result<()> {
     File::open(directory)?.sync_all()?;
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn sync_directory(_directory: &Path) -> Result<()> {
+pub(crate) fn sync_directory(_directory: &Path) -> Result<()> {
     Ok(())
 }
 

@@ -31,23 +31,45 @@ a zero-padded id precisely so lexical path order matches numeric id order.
   them. `compact_segments` only ever compacts the tail for this reason.
 - Any naming scheme whose lexical order diverges from its recency order —
   including dropping the zero-padding.
+- **Rewriting a segment under a NEW id.** Expiry rewrites the segments it
+  touches; giving the survivors a fresh (highest) id would move an old segment
+  to the newest position and let its versions win over segments that
+  legitimately supersede it. `expire_before` renames the replacement onto the
+  same name for exactly this reason.
+- **Claiming a merged segment's id after the merge instead of before.** The
+  merge runs without the segment lock, so a flush can publish while it works.
+  The id is claimed under the lock at pin time, which is what guarantees every
+  segment appearing afterwards sorts *after* the merged output — it was written
+  later, and must win.
 
 **Symptom.** A re-ingested span reverts to an older version, at some point
 after a compaction or a concurrent flush. Nothing errors.
 
 ---
 
-## 2. Lock discipline: writer, then segments; the rollup cache is a leaf
+## 2. Lock discipline: maintenance, then writer, then segments; the rollup cache is a leaf
 
-**The rule.** Whenever both locks are needed, acquire `writer` first and
-`segments` second, and hold that order until both guards drop. The `rollups`
-cache is **leaf-level**: acquired briefly, released immediately, and never held
-while taking another lock.
+**The rule.** Whenever more than one is needed, acquire `maintenance` first,
+`writer` second and `segments` third, and hold that order until every guard
+drops. The `rollups` cache is **leaf-level**: acquired briefly, released
+immediately, and never held while taking another lock.
+
+`maintenance` serializes the two operations that replace segment files —
+compaction and expiry — against each other, and nothing else. It is not a read
+lock and not an ingest lock: both run throughout. It exists so each rewriting
+operation can pin its inputs, do its I/O with no engine lock held, and publish
+under a short revalidated critical section without also having to reason about
+the other one running concurrently.
 
 **Where.** Documented on the `Store` fields in
-[`src/lib.rs`](../../src/lib.rs); the helpers are `lock_writer` and
-`lock_segments`. `compact_segments` touches `rollups` only after its segment
-work, to drop entries for merged-away inputs.
+[`src/lib.rs`](../../src/lib.rs); the helpers are `lock_maintenance`,
+`lock_writer` and `lock_segments`. `expire_before` takes the maintenance lock
+and delegates to `expire_before_locked`, so `compact_expired` can hold it once
+across both halves without deadlocking on a re-entrant acquire.
+`compact_segments` touches `rollups` only after its segment work, to drop
+entries for merged-away inputs; `expire_before` drops the entry for each
+segment it rewrites, because a rollup is keyed by path and that path now holds
+different bytes.
 
 **What breaks it.** Any new code path that reaches for `segments` and then
 `writer`, or that calls into analytics (which locks `rollups`) while holding a
@@ -91,10 +113,14 @@ larger than RAM stop working.
 `.tmp` file, `fsync` the file, `rename` it into its final path, then `fsync`
 the directory.
 
-**Where.** `Store::write_segment`. The final path is checked for existence
-first, so a segment-id collision is an error rather than a silent overwrite. On
-any failure the temp file is removed, and `Store::open` sweeps orphaned temps
-left by an interrupted write.
+**Where.** `Store::seal_segment`, reached through `write_segment` (a new
+segment) and `rewrite_segment_in_place` (expiry replacing one). `write_segment`
+checks the final path for existence first, so a segment-id collision is an
+error rather than a silent overwrite; the in-place rewrite deliberately renames
+*onto* an existing name, which is what keeps its position in recency order
+(invariant 1) and what makes the replacement atomic without a journal. On any
+failure the temp file is removed, and `Store::open` sweeps orphaned temps left
+by an interrupted write.
 
 **Why each step.** The rename is what makes the segment appear atomically — a
 reader sees the complete file or no file, never a partial one. The file fsync
@@ -117,8 +143,9 @@ after the original is removed. Recovery at open follows **the journal, never
 the content.**
 
 **Where.** `write_supersede_marker` / `recover_supersede_markers` in
-[`src/lib.rs`](../../src/lib.rs), used by both `compact_segments` and
-`expire_before`.
+[`src/lib.rs`](../../src/lib.rs), used by `compact_segments`. Expiry does not
+need it: it renames the survivors onto the same name, so there is never a
+window in which a replacement exists beside its original.
 
 **The recovery rule.** If the replacement exists and parses, delete the
 original — the crash landed between rename and delete. If the replacement never
@@ -135,6 +162,12 @@ Recovery must never guess from content.
 **What breaks it.** Deleting an input before the replacement is renamed and
 verified. Journaling after the fact. Reintroducing content inspection.
 
+**Abandoning a merge is also journaled work.** The merge publishes under a
+short lock and revalidates that its pinned inputs are still there; if they are
+not, it deletes the replacement it wrote **before** deleting the markers.
+Doing it in the other order leaves a window where recovery sees a complete
+replacement and deletes inputs it does not actually supersede.
+
 ---
 
 ## 6. Reads take an atomic snapshot across the buffer and segments
@@ -145,6 +178,9 @@ flush can therefore neither **hide** a committed span nor **duplicate** one.
 
 **Where.** `get_trace`, `query`, `query_after`, `stats`, and the analytics
 scan all take both guards up front and hold them across the whole resolution.
+`query_view` and `attribute_union_view` are the resolutions themselves, written
+against a buffer and a segment slice so the live store (holding both guards)
+and a pinned `SnapshotView` (owning its copy) run the same code.
 
 **Why it is subtle.** A flush moves spans out of the write buffer and into a
 new segment. A reader that samples the buffer, releases it, and then samples
@@ -157,6 +193,18 @@ key with its own `query` call let a span re-ingested between the calls be seen
 first in its superseded version, which the per-key dedupe then locked in —
 breaking last-write-wins during ordinary concurrent ingest. `spans_with_any` now
 holds both locks across every key.
+
+**And to multi-PAGE reads, where a lock cannot help.** A paginated read cannot
+hold a lock between pages, so "one snapshot per call" is not enough: export
+paged the live store, and a span re-ingested behind the cursor came back a
+second time — output holding two versions of one primary key, under a trailer
+saying `complete: true`. The answer is to stop re-reading the store.
+`Store::snapshot` copies the write buffer and clones the segment `Arc`s, and
+every page comes from that one pinned view. Segments are reference-counted and
+each holds its own descriptor, so compaction and expiry may unlink the files
+while a view is reading them; the bytes are reclaimed when the last reader
+drops. **Any new operation that reads in more than one step must pin a view
+rather than re-query.**
 
 **Precedence, under that snapshot.** The write buffer holds the newest version
 of anything it carries and wins outright; among segments, a later index means a
@@ -226,7 +274,43 @@ SIGKILL. `tests/durability.rs` is the oracle: it kills the process and checks.
 
 ---
 
-## 10. The server owns no storage
+## 10. The log is the recovery authority — deletions and bounds included
+
+**The rule.** In `wal` mode the log, not the write buffer, decides what the
+store contains after a restart. Three things follow, and each was a bug before
+it was a rule.
+
+**Deleting from memory is not deleting.** `expire_before` removes expired spans
+from the buffer *and* rewrites the log to exactly what survived
+(`Wal::rewrite`, staged and renamed so the survivors — still acknowledged —
+cannot be lost to a crash mid-rewrite). Skip the rewrite and the next restart
+replays the expired span and it is back. This is a retention bug and a deletion
+bug at once: telemetry deleted on request must leave the log too.
+
+**A quiet stop in replay is data loss.** A frame missing bytes it declared is
+the interrupted final append and is dropped — and the file is truncated to the
+last good frame, so those bytes cannot become interior bytes after the next
+append. A frame that is complete but fails its checksum or its decode is
+interior damage, and frames after it may be acknowledged batches: recovery
+refuses to open rather than return the prefix as if it were the whole log.
+
+**The log must be bounded by work, not by cardinality.** The flush policy
+counts unique buffered records, upserts since the last seal, AND log bytes
+(`should_flush`). Counting only records made the threshold unreachable for a
+workload that keeps updating the same keys — the buffer stayed at one record
+while the log grew without limit and restart replay grew with it.
+
+**What breaks it.** Expiring from the buffer alone. Treating any replay failure
+as a torn tail. Leaving a torn tail in the file. Deriving the flush threshold
+from `writer.len()` alone.
+
+**Symptom.** Expired spans that return after a restart; acknowledged batches
+that vanish silently after a bad sector; a log that grows without bound under
+retries and an OOM on the restart that has to replay it.
+
+---
+
+## 11. The server owns no storage
 
 **The rule.** `traza-server` has no span storage of its own — no side log, no
 in-memory index, no cache. Every ingest goes through `traza::Store` and every
@@ -250,5 +334,10 @@ semantics. `tests/server_on_engine.rs` opens the server's data directory with
 - **Recovery follows the journal, never the content** (invariant 5).
 - **Order is the contract** — of segments (1), of locks (2), of fsync and
   acknowledgement (9).
+- **A change is not done until the recovery authority agrees with memory**
+  (invariant 10). Ask what a restart would say about it.
+- **Never resolve a correctness question by dropping data quietly.** Every one
+  of these rules has a failure mode whose only symptom is missing or resurrected
+  spans, which is why several of them end in "refuse" rather than "recover".
 - Before you finish, read [testing](testing.md): a test that guards one of
   these must be shown to **fail** when the behaviour is broken.

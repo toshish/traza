@@ -158,6 +158,15 @@ Two strategies share that snapshot:
 `query_after` adds an exclusive cursor in that same total order, which is the
 bounded pagination primitive `GET /v1/export` streams with.
 
+A lock cannot span pages, so a multi-page read needs more than a per-call
+snapshot: `Store::snapshot` copies the write buffer and clones the segment
+`Arc`s into a `SnapshotView` that answers from that one instant however the
+store changes afterwards. Segments are reference-counted and hold their own
+descriptors, so compaction and expiry unlink files a view is still reading and
+the space comes back when it drops. Export pages a view, which is what lets its
+`complete` trailer mean "this is the whole dataset" rather than "the connection
+ended tidily".
+
 ## Startup and recovery
 
 `Store::open`, in order:
@@ -170,10 +179,13 @@ bounded pagination primitive `GET /v1/export` streams with.
 3. **Finish interrupted compaction rewrites** from the supersede journal.
    Recovery follows the journal, never content.
 4. **Load segments** and sort them by path — which is recency order.
-5. **Replay the write-ahead log** into the buffer, before accepting any new
+5. **Recover the write-ahead log** into the buffer, before accepting any new
    write. Records are append-ordered and upserted in that order, so the newest
    version of a re-ingested key wins exactly as it did before the crash. A torn
-   or corrupt trailing record is discarded: it was never acknowledged.
+   trailing record is discarded — it was never acknowledged — and the file is
+   truncated to the last complete frame. Damage in a frame that *did* complete
+   fails the open instead: frames after it may be acknowledged batches, and
+   returning the prefix would drop them silently.
 6. Open the annotation log, replaying it into its in-memory index.
 
 A `buffered` store neither writes nor reads a log, and leaves any existing log
@@ -192,8 +204,19 @@ of the segment list is merged, for the reason in
 [invariants](invariants.md#1-segment-path-order-is-recency-order).
 
 **TTL expiry** removes spans, annotations, and payload files older than the
-retention window. Live payload references are computed *after* span expiry, so
-payloads referenced only by just-expired spans become sweepable.
+retention window, and rewrites the write-ahead log to the spans that survived —
+otherwise a restart replays what was just deleted. Live payload references are
+computed *after* span expiry, so payloads referenced only by just-expired spans
+become sweepable.
+
+Both are **rewriting** operations: they take the maintenance lock (so only one
+runs at a time), pin the segments they will replace, do every byte of parsing,
+writing and fsyncing with no engine lock held, and take the segment lock back
+only to publish — revalidating first that what they pinned is still there.
+Reads and ingest run at full speed throughout. This is not a nicety: holding
+the segment lock across a merge made queries wait for it, and a waiting query
+holds the writer lock, so ingest queued behind the query. A large merge was an
+outage.
 
 ## Satellite stores
 
