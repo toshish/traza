@@ -7,8 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [Unreleased]
-
 ### Added
 
 - **`traza_wal_lock_wait_ns_*` and `traza_wal_write_syscall_ns_*`** in
@@ -25,6 +23,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Widening `--wal-commit-window-us` from off to 2,000 cut fsyncs 40% and the
   mean append 57%. Documented in the configuration reference: the lever for a
   large `wal_write` is fsync frequency, not the engine's locking.
+
+### Fixed
+
+- **The index-memory benchmark's "peak RSS" was not a peak.** It took one RSS
+  sample after `compact_segments()` returned — after the merge has freed its
+  working set — so it measured the trough and the capacity guide published it
+  as the peak. A comment claimed a peak sampler existed; none did. RSS is now
+  sampled every 20 ms by a background thread for the duration of the merge,
+  and the real figures are far higher: a store serving in 10 MiB peaks at
+  **1,204 MiB** to compact itself, not 721. Every completed merge in the
+  record peaks between 1,204 and 1,601 MiB, taken at load average
+  36-45 and varying up to 8% between runs of the same matrix — the order of
+  magnitude is the finding, not the individual figures.
+- **A failed probe was published as a zero-memory result.** A child that died
+  produced an empty JSON object, and the reporter turned missing fields into
+  `0.0` — so the most important failure this benchmark can have, the child
+  being OOM-killed on the very configuration whose memory is in question,
+  rendered as `0.0 MiB`: the best-looking number in the table. Probe failure
+  and unparseable output now abort, naming the configuration and the child's
+  stderr. Verified by simulating an OOM kill.
+- **Compaction rows were reported for runs that never compacted.** 21 of 26
+  configurations return 0 from `compact_segments()`, and their steady-state
+  RSS was appearing under a compaction heading. They now read "did not merge".
+- Per-key index diagnostics moved to their own `--by-key` invocation: computing
+  them reopens and decodes every segment, and the allocator held those freed
+  blocks across the RSS reading that followed.
+- The capacity guide claimed "none is estimated" while carrying an explicitly
+  extrapolated 29 GB projection. It now states the exception and cites the
+  measurement records by name.
+
+### Added
+
+- **`INDEX-MEM-BENCHMARK.md` and `INDEX-MEM-BENCHMARK.json`** — the committed
+  measurement record behind the memory figures, with commit SHA, machine,
+  timestamp, load average per row, `compacted_away`, and the raw per-cell
+  results. The prose numbers were previously traceable only to a binary.
 
 ## [0.19.0] - 2026-07-25
 
