@@ -128,26 +128,31 @@ function read(url, signal) {
     const controller = new AbortController();
     entry = { controller, subscribers: 0, promise: null };
     entry.promise = request(url, { signal: controller.signal })
-      .finally(() => inFlight.delete(url));
+      // Only ever evict THIS entry. An unconditional `delete(url)` could run
+      // after an abort had already replaced the map slot with a fresh request
+      // for the same URL, evicting the live one and making the next caller
+      // open a third. Identity-checked, so a stale finalizer is a no-op.
+      .finally(() => forget(url, entry));
     // Nothing may be attached yet when this settles; without a sink a
     // rejection surfaces as an unhandled promise rejection.
     entry.promise.catch(() => {});
     inFlight.set(url, entry);
   }
 
-  entry.subscribers += 1;
+  const mine = entry;
+  mine.subscribers += 1;
   let released = false;
   const release = () => {
     if (released) return;
     released = true;
-    entry.subscribers -= 1;
-    if (entry.subscribers <= 0) {
-      inFlight.delete(url);
-      entry.controller.abort();
+    mine.subscribers -= 1;
+    if (mine.subscribers <= 0) {
+      forget(url, mine);
+      mine.controller.abort();
     }
   };
 
-  if (!signal) return entry.promise.finally(release);
+  if (!signal) return mine.promise.finally(release);
 
   return new Promise((resolve, reject) => {
     if (signal.aborted) {
@@ -160,11 +165,18 @@ function read(url, signal) {
       reject(abortError());
     };
     signal.addEventListener('abort', onAbort, { once: true });
-    entry.promise.then(resolve, reject).finally(() => {
+    mine.promise.then(resolve, reject).finally(() => {
       signal.removeEventListener('abort', onAbort);
       release();
     });
   });
+}
+
+/** Drops `url` from the in-flight map only if `entry` is still the one there.
+    Without the identity check a settling or aborted request can evict its own
+    replacement. */
+function forget(url, entry) {
+  if (inFlight.get(url) === entry) inFlight.delete(url);
 }
 
 function abortError() {

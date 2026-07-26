@@ -75,29 +75,58 @@ export function OverviewScreen({ go }) {
   // relative window, which re-runs every read below it.
   const [tick, setTick] = React.useState(0);
   usePoll(() => setTick((n) => n + 1), REFRESH_MS);
+  // TWO full periods, not one window cut in half.
+  //
+  // Splitting the selected range down the middle meant "24h" showed the last
+  // twelve hours against the twelve before them, under a label that said
+  // "previous 24h" — and the failure and model cards queried the whole 24
+  // hours, so three cards on one screen described three different spans of
+  // time. `current` is the range the user picked; `previous` is the same
+  // length immediately before it. One series request covers both, with the
+  // midpoint landing exactly on the boundary, so a comparison is still one
+  // round trip rather than two.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  const window = React.useMemo(() => windowOf(range), [range, tick]);
+  const current = React.useMemo(() => windowOf(range), [range, tick]);
+  const previous = React.useMemo(() => {
+    if (!current.sinceNs) return { sinceNs: null, untilNs: null };
+    const span = current.untilNs - current.sinceNs;
+    return { sinceNs: current.sinceNs - span, untilNs: current.sinceNs };
+  }, [current]);
 
-  // The window is split in half so "since yesterday" is a comparison the
-  // server computes, not a second request: buckets 0..n/2 are the previous
-  // period and n/2..n the current one.
+  // Even bucket count so the split is exact: the first half is `previous`,
+  // the second is `current`, with no bucket straddling the boundary.
+  const BUCKETS = 48;
   const series = useRead(
-    (signal) => api.series({ since: Math.round(window.sinceNs), until: Math.round(window.untilNs), buckets: 48 }, signal),
-    [window.sinceNs, window.untilNs],
-    { skip: !window.sinceNs },
+    (signal) => api.series({
+      since: Math.round(previous.sinceNs),
+      until: Math.round(current.untilNs),
+      buckets: BUCKETS,
+    }, signal),
+    [previous.sinceNs, current.untilNs],
+    { skip: !current.sinceNs },
   );
+  // Failures and models describe the CURRENT period only — they sit beside the
+  // tiles, and a card that silently covered twice the window the tiles did was
+  // the inconsistency worth removing.
   const failures = useRead(
-    (signal) => api.failures({ since: Math.round(window.sinceNs), until: Math.round(window.untilNs), limit: 5 }, signal),
-    [window.sinceNs, window.untilNs],
-    { skip: !window.sinceNs },
+    (signal) => api.failures({
+      since: Math.round(current.sinceNs), until: Math.round(current.untilNs), limit: 5,
+    }, signal),
+    [current.sinceNs, current.untilNs],
+    { skip: !current.sinceNs },
   );
   const models = useRead(
-    (signal) => api.llmStats({ group_by: 'model', since: Math.round(window.sinceNs), limit: 6 }, signal),
-    [window.sinceNs],
-    { skip: !window.sinceNs },
+    (signal) => api.llmStats({
+      group_by: 'model',
+      since: Math.round(current.sinceNs), until: Math.round(current.untilNs), limit: 6,
+    }, signal),
+    [current.sinceNs, current.untilNs],
+    { skip: !current.sinceNs },
   );
-  const sessions = useRead((signal) => api.sessions({ limit: 5 }, signal), []);
-  const metrics = useRead((signal) => api.metrics(signal), []);
+  // These two are window-independent, but they are still on a screen labelled
+  // live, so they follow the tick like everything else.
+  const sessions = useRead((signal) => api.sessions({ limit: 5 }, signal), [tick]);
+  const metrics = useRead((signal) => api.metrics(signal), [tick]);
 
   const buckets = series.data?.buckets || [];
   const half = Math.floor(buckets.length / 2);
@@ -129,7 +158,7 @@ export function OverviewScreen({ go }) {
         <Chip key={r.id} mono active={range === r.id} onClick={() => setRange(r.id)}>{r.label}</Chip>
       ))}
       <span style={{ fontSize: 12, color: 'var(--ink-faint)', fontFamily: 'var(--font-mono)', marginLeft: 4 }}>
-        {fmtWindowLabel(window.sinceNs, window.untilNs)}
+        {fmtWindowLabel(current.sinceNs, current.untilNs)}
       </span>
       <span style={{ marginLeft: 'auto', fontSize: 12, color: 'var(--ink-muted)', display: 'flex', alignItems: 'center', gap: 6 }}>
         <LiveDot />live
@@ -178,7 +207,7 @@ export function OverviewScreen({ go }) {
             }} />
           </div>}
           footer={`${fmtNum(spans)} spans in window · open the distribution →`}>
-          {p95 ? <>p95 moved from <M>{fmtDurationNs(p95Before)}</M> to <M color="var(--accent)">{fmtDurationNs(p95)}</M> across the window.</>
+          {p95 ? <>p95 was <M>{fmtDurationNs(p95Before)}</M> in the previous period and{' '}<M color="var(--accent)">{fmtDurationNs(p95)}</M> in this one.</>
             : 'No spans in this window yet.'}
         </Lead>
 
