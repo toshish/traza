@@ -47,12 +47,17 @@ trailers and has no declared length.
 | `GET` | [`/v1/sessions`](#get-v1sessions) | Sessions, most recent activity first |
 | `GET` | [`/v1/sessions/{id}`](#get-v1sessionsid) | One session's rollup and per-trace breakdown |
 | `GET` | [`/v1/stats/llm`](#get-v1statsllm) | Token and cost aggregation |
+| `GET` | [`/v1/stats/series`](#get-v1statsseries) | Volume, errors, tokens, cost and latency over time |
+| `GET` | [`/v1/stats/duration`](#get-v1statsduration) | Duration distribution and percentiles |
+| `GET` | [`/v1/stats/failures`](#get-v1statsfailures) | Errors grouped by signature |
+| `GET` | [`/v1/stats/slowest`](#get-v1statsslowest) | The slowest matching spans |
 | `POST` | [`/v1/annotations`](#post-v1annotations) | Attach a score or feedback record |
 | `GET` | [`/v1/annotations`](#get-v1annotations) | Query annotations |
 | `GET` | [`/v1/payloads/{reference}`](#get-v1payloadsreference) | Raw bytes of an offloaded payload |
 | `GET` | [`/v1/export`](#get-v1export) | Streaming NDJSON export |
 | `GET` | [`/v1/stats`](#get-v1stats) | Store statistics |
 | `GET` | [`/v1/metrics`](#get-v1metrics) | Prometheus text metrics |
+| `GET` | [`/v1/metrics.json`](#get-v1metricsjson) | The same metrics as JSON |
 | `GET` | [`/`, `/dashboard`](#get--and-dashboard) | The trace browser |
 
 ---
@@ -132,8 +137,11 @@ Filtered span search, ordered by Traza's stable span order
 |---|---|---|
 | `service` | string | Exact match on the emitting service |
 | `name` | string | Exact match on the operation name |
+| `status` | string | Exact match on the span's own `status` field |
+| `not_status` | string | Exclude spans with this status. Repeatable |
 | `attr.KEY` | JSON or string | Exact attribute match. Repeatable — each occurrence adds a condition |
 | `session` | string | Every span of a session, unioning all recognized session keys |
+| `cursor` | string | Opaque token from a previous response's `next_cursor`. Returns the page after it |
 | `not_attr.KEY` | JSON or string | Exclude spans whose attribute equals this. A span missing the key entirely is **kept**. Repeatable |
 | `min_attr.KEY` | number | Attribute is at least this, compared numerically. Repeatable |
 | `max_attr.KEY` | number | Attribute is at most this, compared numerically. Repeatable |
@@ -145,6 +153,15 @@ Filtered span search, ordered by Traza's stable span order
 | `until` / `until_ns` | integer | Only spans starting at or before this timestamp |
 | `sort` | string | `duration` / `-duration` / `start` / `-start` (a leading `-` is descending). Omit for Traza's stable order |
 | `limit` | integer | Maximum spans returned. **Default 100**, applied after filtering |
+
+**`status=` reads the span's own field; `attr.status=` reads an attribute.**
+These are different filters and the difference used to be a trap: every
+aggregate in the store counts errors from `Span::status`, but nothing could
+*select* on it, so the natural-looking `attr.status=error` matched an attribute
+most instrumentation never writes and returned an empty array indistinguishable
+from "no errors". Use `status=error` for failures and `not_status=error` for
+their complement. `not_status` has no missing-key subtlety — every span has a
+status, and an empty one is a value like any other.
 
 `attr.KEY=VALUE` **matches a scalar regardless of how it was typed on the
 wire.** `attr.code=200` finds spans that stored the number `200` and spans
@@ -189,20 +206,43 @@ noise. Expect it to matter in proportion to segment count, like compaction.
 `session=` is not the same as `attr.session.id=`: it unions every recognized
 session key, so a session whose spans use mixed conventions returns whole.
 
-**Response `200`.** A bare JSON array of spans — not an envelope.
+**Paging is by cursor, not by growing `limit`.** A response whose page came
+back full carries `next_cursor`; passing it back returns the spans strictly
+after the last one, in the same total order. Re-requesting with a larger
+`limit` instead re-reads and re-sends every row already in hand, which makes
+scrolling quadratic in the number of pages. A short page carries
+`next_cursor: null` — it has already reached the end, and a cursor there could
+only return nothing. The token is opaque; a malformed one is a `400` rather
+than a silently wrong page.
+
+**Response `200`.** An envelope: the spans, the cursor, and what the query
+cost.
 
 ```sh
 curl 'http://localhost:8080/v1/spans?service=checkout&attr.region=us-east&min_duration_ms=2&limit=50'
 
-# The ten slowest non-OK calls in a window that cost over a cent
-curl 'http://localhost:8080/v1/spans?since_ns=1700000000000000000&until_ns=1700003600000000000&not_attr.status=ok&min_attr.llm.cost_usd=0.01&sort=-duration&limit=10'
+# The ten slowest failed calls in a window that cost over a cent
+curl 'http://localhost:8080/v1/spans?since_ns=1700000000000000000&until_ns=1700003600000000000&status=error&min_attr.llm.cost_usd=0.01&sort=-duration&limit=10'
 ```
 
 ```json
-[{"attributes":{"http.method":"POST","region":"us-east"},"end_time_ns":1700000000002500000,"events":[],"name":"charge","parent_span_id":null,"service":"checkout","span_id":"span-1","start_time_ns":1700000000000000000,"status":"ok","trace_id":"trace-1"}]
+{"spans":[{"attributes":{"http.method":"POST","region":"us-east"},"end_time_ns":1700000000002500000,"events":[],"name":"charge","parent_span_id":null,"service":"checkout","span_id":"span-1","start_time_ns":1700000000000000000,"status":"ok","trace_id":"trace-1"}],"next_cursor":null,"cost":{"elapsed_ns":91375,"segments_examined":12,"segments_pruned":11}}
 ```
 
-An empty result is `[]`, not a `404`.
+| Field | Type | Description |
+|---|---|---|
+| `spans` | array | The matching spans, in Traza's stable order (or `sort` order) |
+| `next_cursor` | string or null | Pass as `cursor=` for the next page; `null` at the end |
+| `cost.elapsed_ns` | integer | Time inside the engine, excluding serialization |
+| `cost.segments_examined` | integer | Segments the query considered |
+| `cost.segments_pruned` | integer | Segments skipped whole because their timestamp range could not hold a match |
+
+`cost` is counted per query rather than sampled from the process-wide
+counters, which race under concurrent readers and cannot be attributed. It is
+what lets a caller — or the dashboard — state how much of the store a window
+actually eliminated instead of asserting that filtering is cheap.
+
+An empty result is `{"spans":[],...}`, not a `404`.
 
 **Errors.** `400` for an unknown parameter or an unparseable numeric value
 (`{"error":"invalid limit"}`, `{"error":"invalid min_duration_ms"}`,
@@ -370,6 +410,90 @@ rather than wrapping; non-finite cost values are ignored.
 for an unrecognized dimension; `400` for an unknown parameter. `503` on store
 failure.
 
+### `GET /v1/stats/series`
+
+Buckets matching spans into even time buckets. Accepts every
+[`GET /v1/spans`](#get-v1spans) filter, plus:
+
+| Parameter | Type | Description |
+|---|---|---|
+| `since` / `until` | integer | **Required.** The window, Unix nanoseconds |
+| `buckets` | integer | Bucket count, clamped to 1–512. Default 24 |
+
+One pass produces volume, errors, LLM calls, tokens, cost and duration
+percentiles together, because every surface that wants one of them wants
+several, and separate routes would mean separate scans of the same window.
+
+```sh
+curl 'http://localhost:8080/v1/stats/series?since=1700000000000000000&until=1700086400000000000&buckets=24&service=checkout'
+```
+
+```json
+{"since_ns":1700000000000000000,"until_ns":1700086400000000000,"bucket_ns":3600000000000,"buckets":[{"start_ns":1700000000000000000,"spans":412,"errors":7,"llm_calls":180,"total_tokens":220144,"cost_usd":0.7628,"p50_ns":1811939327,"p95_ns":7784628223}]}
+```
+
+`buckets` is always exactly the requested length, so a quiet period is a
+visible gap rather than something the caller reconstructs from timestamps.
+
+**Errors.** `400 {"error":"since and until are required for a series"}`;
+`400 {"error":"until must be after since"}`; `400` for an unknown parameter.
+
+### `GET /v1/stats/duration`
+
+The duration distribution of matching spans. Accepts every
+[`GET /v1/spans`](#get-v1spans) filter.
+
+```sh
+curl 'http://localhost:8080/v1/stats/duration?service=checkout&since=1700000000000000000'
+```
+
+```json
+{"count":1852,"min_ns":1000000,"max_ns":118000000000,"mean_ns":3402118942,"p50_ns":2550136831,"p75_ns":4160749567,"p90_ns":7516192767,"p95_ns":11274289151,"p99_ns":51539607551,"buckets":[{"upper_ns":1048575,"count":3}]}
+```
+
+Percentiles are the upper bound of a log-linear bucket: **at most 6.25% high,
+never low.** `min_ns`, `max_ns`, `mean_ns` and `count` are exact. Only occupied
+buckets are returned — a distribution spanning nanoseconds to minutes fills a
+few dozen of the thousand, and the zeros would be almost the whole payload.
+
+### `GET /v1/stats/failures`
+
+Error spans grouped by `(service, name, status)`, most frequent first. Accepts
+every [`GET /v1/spans`](#get-v1spans) filter; `limit` caps the group count
+(default 100). Without an explicit `status`, the filter defaults to
+`status=error`.
+
+```sh
+curl 'http://localhost:8080/v1/stats/failures?since=1700000000000000000&limit=20'
+```
+
+```json
+{"groups":[{"service":"checkout-api","name":"tool.refund_lookup","status":"error","count":142,"first_seen_ns":1700000000000000000,"last_seen_ns":1700003600000000000,"example_trace_id":"trace-9f2c","example_span_id":"span-a","p50_ns":325000000,"p95_ns":812000000}]}
+```
+
+Grouping happens server-side because the input can be every error in the
+window while the useful answer is a dozen rows: shipping the spans so a client
+could group them would move megabytes to fill one screen. `example_trace_id`
+is the most recent occurrence, so a group is something you can open.
+
+### `GET /v1/stats/slowest`
+
+The slowest matching spans, ranked across the whole match set rather than
+within an arbitrary first page. Accepts every
+[`GET /v1/spans`](#get-v1spans) filter; `limit` defaults to 10.
+
+```sh
+curl 'http://localhost:8080/v1/stats/slowest?since=1700000000000000000&limit=10'
+```
+
+```json
+{"spans":[{"trace_id":"trace-1","span_id":"span-1","name":"charge","service":"checkout","start_time_ns":1700000000000000000,"end_time_ns":1700000118000000000,"status":"ok","attributes":{},"events":[]}]}
+```
+
+Unlike `sort=-duration` on [`GET /v1/spans`](#get-v1spans), this route has no
+candidate ceiling: it keeps only `limit` spans while folding, so memory is
+bounded by the answer rather than by the match set.
+
 ---
 
 ## Annotations
@@ -407,22 +531,41 @@ engine rejects the annotation as invalid; `503` on store failure.
 
 ### `GET /v1/annotations`
 
+Every supplied narrowing must match. **All of them are optional** — an empty
+query returns every annotation, newest first.
+
 | Parameter | Type | Description |
 |---|---|---|
-| `trace_id` | string | **Required** |
+| `trace_id` | string | Narrow to one trace |
 | `span_id` | string | Narrow to one span |
 | `name` | string | Narrow to one annotation name |
+| `source` | string | Sources **starting with** this, so `human:` and `eval:` each select a family |
+| `since` / `since_ns` | integer | Recorded at or after this timestamp |
+| `until` / `until_ns` | integer | Recorded at or before this timestamp |
+| `limit` | integer | Maximum returned, applied after ordering |
+
+`trace_id` used to be required, which made an eval run unreadable: its scores
+exist per trace, but a run is a population and nobody wants it one trace at a
+time. Annotations are indexed in memory at human/eval scale, so the
+cross-trace path is a scan of that index rather than anything touching a
+segment.
+
+Results are newest first, tie-broken by `(trace_id, span_id, name)` so a bulk
+import sharing one timestamp still pages deterministically.
 
 ```sh
 curl 'http://localhost:8080/v1/annotations?trace_id=trace-2'
+
+# Everything a nightly evaluator scored in the last day
+curl 'http://localhost:8080/v1/annotations?source=eval:&since=1700000000000000000&limit=500'
 ```
 
 ```json
 {"annotations":[{"comment":"","name":"groundedness","source":"eval:nightly","span_id":"span-a","timestamp_ns":1785005352756011000,"trace_id":"trace-2","value":0.9}]}
 ```
 
-**Errors.** `400 {"error":"trace_id is required"}` when omitted; `400` for an
-unknown parameter. `503` on store failure.
+**Errors.** `400` for an unknown parameter or an unparseable number. `503` on
+store failure.
 
 ---
 
@@ -484,8 +627,30 @@ traza_spans_admitted_total 4
 ```
 
 Every metric name and its meaning is documented in
-[monitoring](../operations/monitoring.md). Read the caveat about stage
-percentiles there before graphing them.
+[monitoring](../operations/monitoring.md), including the accuracy bound on the
+percentile gauges.
+
+**Errors.** None — the route always renders.
+
+### `GET /v1/metrics.json`
+
+The same numbers as [`/v1/metrics`](#get-v1metrics), shaped for a browser.
+Prometheus text exposition is for scrapers; asking a dashboard to ship an
+exposition parser in order to draw one chart is a parser nobody should have to
+write.
+
+```json
+{"uptime_ns":535200000000000,"requests":{"total":184204,"rejected":0,"responses_2xx":184204,"responses_4xx":0,"responses_5xx":0,"mean_ns":1210880,"max_ns":75821375,"p50_ns":1703935,"p95_ns":2818047,"p99_ns":9437183},"by_class":{"search":{"count":8,"mean_ns":22375885,"max_ns":75821375,"p50_ns":1703935,"p95_ns":2818047,"p99_ns":9437183},"lookup":{},"stats":{},"ingest":{},"other":{}},"connections":{"accepted":12,"refused":0,"live":1},"decode":{"spans":2417882,"mean_ns":91375,"p95_ns":131071},"ingest":{"spans_admitted":2417882,"batches_admitted":2418,"wal_commits":2418,"wal_fsync_p95_ns":9879551,"segment_seal_p95_ns":0},"pruning":{"segments_examined":340,"segments_pruned_by_time":328},"percentile_error_bound":0.0625}
+```
+
+Request latency is split by **route class** — `ingest`, `lookup`, `search`,
+`stats`, `other` — because an ingest batch and a trace lookup differ by orders
+of magnitude and one blended histogram described neither. `by_class` carries
+`count`, `mean_ns`, `max_ns` and the three percentiles for each.
+
+`percentile_error_bound` is stated in the payload rather than left implicit:
+every `p*_ns` here is a bucket upper bound, at most that fraction high and
+never low. Counts, sums, means and maxima are exact.
 
 **Errors.** None — the route always renders.
 

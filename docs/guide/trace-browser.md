@@ -1,8 +1,9 @@
 # The trace browser
 
 Traza ships a dashboard: a React single-page app that talks to the same public
-`/v1` API any client uses. It shows recent spans, per-trace waterfalls, span
-detail, sessions, conversations, and LLM analytics.
+`/v1` API any client uses. Seventeen screens, grouped by the question you
+arrived with — what happened, how much did it cost, how good was it, is the
+server healthy.
 
 ## Getting it running
 
@@ -41,101 +42,197 @@ Routing is hash-based (`#/spans`, `#/traces/<id>`, …), so the app works from
 any static host with no server-side rewrites, and the URL of any view is
 shareable.
 
-Four tabs across the top:
+A left rail, grouped by intent. Four top tabs could not hold seventeen
+screens, and the content area is full-bleed so a waterfall gets the pixels it
+needs.
 
-| Tab | Route | Shows |
-|---|---|---|
-| **Spans** | `#/spans` | Filtered span search — the default landing view |
-| **Sessions** | `#/sessions` | One card per session, most recent activity first |
-| **Analytics** | `#/analytics` | LLM token and cost rollups |
-| **Store** | `#/store` | Store statistics, flush, and dataset export |
+| Group | Screens |
+|---|---|
+| **explore** | Overview `#/overview` · Traces `#/traces` · Sessions `#/sessions` · Live tail `#/tail` |
+| **measure** | Analytics `#/analytics` · Latency `#/latency` · Failures `#/failures` |
+| **evaluate** | Scores `#/scores` · Experiments `#/experiments` · Datasets `#/datasets` |
+| **operate** | Server `#/server` · Store `#/store` · Connect `#/connect` |
 
-Breadcrumbs appear once you are deeper than a tab, and Back always falls
-through to the parent view rather than stepping back through every span you
-clicked.
+Detail screens hang off those: `#/trace/<id>`, `#/sessions/<id>`,
+`#/conversation/traces/<id>`, `#/compare?a=…&b=…`.
 
-## Spans
+**A query lives in the URL.** The Traces screen serializes its predicates,
+window, sort and limit into the hash, so the search that found the bug is a
+link you can send. Editing a predicate replaces the history entry rather than
+pushing one, so Back leaves the screen instead of walking backwards through
+every keystroke.
 
-The landing view. A six-field filter form — service, name, one `attr` key and
-value, minimum duration in milliseconds, and a since/until window — maps
-directly onto [`GET /v1/spans`](http-api.md#get-v1spans) parameters. Applied
-filters show as chips you can remove individually.
+### Keyboard
 
-Results are a table, 100 rows a page, with **Load more** for the next page.
-Clicking a row opens its trace.
+| Key | Does |
+|---|---|
+| `⌘K` / `Ctrl-K` | Command palette — jump to a screen, or paste a trace or session id to open it directly |
+| `j` / `k` | Move the row cursor (Traces, Scores, the waterfall) |
+| `↵` | Open what the cursor is on |
+| `/` | Focus the predicate builder |
+| `e` | Export the current query |
+| `a` | Toggle agent mode in a trace |
+| `esc` | Reset a waterfall zoom, or close the palette |
 
-With an empty store the view tells you how to point an OTel exporter at this
-server, using the page's own origin.
+### Density and theme
+
+Both are document-level and persist across reloads. Density switches every
+table between comfortable (34px rows) and dense (26px); the theme toggle
+switches the whole token set between paper and the inverted notebook.
+
+## Overview
+
+`#/overview` — the screen that answers "where should I look" before you have
+decided what to look at. Five tiles (spans, errors, p95, spend, tokens) each
+with a sparkline and a change against the previous period, then three "worth a
+look" cards ranked by how much they moved, then the server's own summary and
+recent sessions. Every number on it is a link into the screen that explains it.
+
+The comparison is one request: the window is fetched as
+[`GET /v1/stats/series`](http-api.md#get-v1statsseries) and split in half, so
+"since yesterday" costs one scan rather than two.
+
+## Traces
+
+`#/traces` — span search built on a **predicate list** rather than a fixed
+form. Each row is field / operator / value, and the operator picks the
+parameter family: `=` is `attr.KEY`, `≠` is `not_attr.KEY`, `≥` and `≤` are
+`min_attr` / `max_attr`. Two predicates on one key send it twice, which the
+old single-pair form could not express at all. `status` maps to the span's own
+status field, not an attribute.
+
+Above the table: a **volume chart you can drag** to set the window, and the
+range presets. Below it, the **query cost** — how long the query took, how
+many segments were read, and what fraction the time filter pruned — read
+straight off the response envelope rather than asserted.
+
+Columns sort via `sort=`; paging uses the response cursor, so **Load more**
+costs one page instead of re-fetching everything already on screen.
+
+**Copy as curl** reproduces the exact query in a terminal. **Export NDJSON**
+and **Make a dataset** carry it to the Store and Datasets screens, so the
+export is the search rather than a retype.
 
 ## Trace
 
-`#/traces/<trace_id>` — the waterfall. Spans are laid out in tree order with a
-bar per span sized and positioned by its real start and duration, so nesting
-and overlap are visible at a glance.
+`#/trace/<id>` — the waterfall, as a reading instrument.
 
-Clicking a span selects it (the URL gains `?span=…`, replacing rather than
-pushing history, so Back leaves the trace instead of walking your clicks) and
-opens **Span detail**: identity, timings, status, service, and the full
-attribute tree. Attributes render as an expandable tree rather than a JSON
-blob, and payload references open in a modal that fetches the offloaded bytes
-from [`GET /v1/payloads`](http-api.md#get-v1payloadsreference).
+- A **time ruler** with real tick labels, and a **minimap** of the whole trace
+  with the zoom window drawn on it.
+- **Drag on the ruler to zoom**; `esc` resets.
+- **Carets collapse a subtree**, which is what makes a 200-span agent trace
+  readable.
+- The **critical path** — the chain that determines the trace's duration — is
+  drawn in the accent; everything off it is muted. Shortening an off-path span
+  cannot make the trace faster.
+- **Self time** is a separate column and a darker segment at the head of each
+  bar: the part of a span that is its own work rather than a child's.
+  Overlapping children are unioned, not summed, so concurrent tool calls do
+  not produce negative self time.
+- **Agent mode** hides framework and HTTP plumbing that carries no model call
+  and no error.
 
-Where a span carries prompt and completion content, a **Messages** panel
-renders it. It recognizes all three shapes described in
-[LLM semantics](../llm-semantics.md#prompt-and-completion-payloads): current
-OTel GenAI JSON messages, the legacy indexed `gen_ai.prompt.{i}.*` attributes,
-and native `llm.prompt` / `llm.completion` events.
-
-**Annotate** attaches a score or comment to the selected span (or to the trace)
-via [`POST /v1/annotations`](http-api.md#post-v1annotations). Existing
-annotations appear on a timeline beside the waterfall and as chips on the spans
-they judge. This needs an `rw` token when authentication is on.
-
-If the trace belongs to a session, a link jumps to that session.
+Selecting a span puts `?span=…` in the URL (replacing, not pushing) and opens
+its detail: timings, model and usage, the attribute tree, events, offloaded
+payloads, and its scores. A failed span offers the failure group it belongs to
+and a comparison against a clean run.
 
 ## Conversation
 
-`#/traces/<id>/conversation` and `#/sessions/<id>/conversation` — the same
-data as the waterfall, read as a transcript rather than a timeline. Every LLM
-span's messages in time order, flattened into the sequence a human wants to
-read.
+`#/conversation/traces/<id>` and `#/conversation/sessions/<id>` — the same
+data read as a transcript. A **turn rail** down the left lists every turn with
+its cost or latency, so the expensive turn is findable without reading the
+whole exchange.
 
-The reason this is a separate view: consecutive turns re-send the whole
-history, so replaying every span's prompt verbatim shows the same user message
-a dozen times. Each turn contributes only what is new since the previous one. A
-waterfall answers "what ran"; this answers "what was said".
+Consecutive turns re-send the whole history, so replaying every span's prompt
+verbatim would show the same user message a dozen times. Each turn contributes
+only what is new since the previous one. A waterfall answers "what ran"; this
+answers "what was said".
 
 ## Sessions
 
-`#/sessions` — one card per session, most recent activity first, backed by
-[`GET /v1/sessions`](http-api.md#get-v1sessions). Each card carries the span
-and trace counts, token totals, cost, error count, and activity window.
+`#/sessions` — a sortable table with the time window the API always had.
+Sort by recency, cost, errors, length, or **cost per turn** — the efficiency
+figure a team is actually managing. Opening one shows the aggregate tiles and
+the per-trace breakdown.
 
-Opening a session (`#/sessions/<id>`) shows the aggregate tiles plus the
-per-trace breakdown from
-[`GET /v1/sessions/{id}`](http-api.md#get-v1sessionsid). From there you can
-open any trace, read the whole conversation, or jump to Spans filtered to that
-session.
+## Live tail
+
+`#/tail` — spans as they land, with a pause bar and the arrival rate beside
+them. Polling is incremental: each tick asks only for spans newer than the
+last one seen, so the cost of watching is proportional to what arrived rather
+than to what is on screen. Pausing buffers and tells you how many are waiting.
 
 ## Analytics
 
-`#/analytics` — LLM rollups from
-[`GET /v1/stats/llm`](http-api.md#get-v1statsllm). Group by model, provider,
-service, session, or day; scope to all time, the last hour, the last 24 hours,
-or the last 7 days. Totals for calls, tokens, and cost sit above a table and a
-chart of the selected grouping.
+`#/analytics` — a **measure switcher** over any grouping. Cost, tokens, calls,
+latency, errors, cost per call, and cost per 1k tokens, grouped by model,
+provider, service, session or day, from
+[`GET /v1/stats/llm`](http-api.md#get-v1statsllm).
 
 Cost appears only where your ingest supplied it — cost is a Traza extension,
 not an OpenTelemetry GenAI attribute. See
 [LLM semantics](../llm-semantics.md#recognized-attributes).
 
+## Latency
+
+`#/latency` — the distribution and the traces behind its tail, from
+[`GET /v1/stats/duration`](http-api.md#get-v1statsduration). Percentile marks
+follow the system's one drawn convention: a solid ink hairline for the median,
+dashed for the tail. Below it, p95 over time — each bar a bucket's 95th
+percentile, never a mean — and the ten slowest spans, ranked by the server
+across the whole match set rather than within a page.
+
+## Failures
+
+`#/failures` — errors grouped by `(service, name, status)` from
+[`GET /v1/stats/failures`](http-api.md#get-v1statsfailures), with share, p50,
+p95, first and last seen. Every row opens its most recent example. "3 errors"
+used to be a red number that did nothing; the distance from noticing a failure
+to reading one is now a click.
+
+## Scores
+
+`#/scores` — annotations across traces, which needed
+[`GET /v1/annotations`](http-api.md#get-v1annotations) to stop requiring a
+`trace_id`. Numeric scores get a distribution, everything else a tally, each
+split human vs eval. Below that a **review queue**: `j`/`k` to move, `↵` to
+open the trace being judged.
+
+## Experiments
+
+`#/experiments` — A/B two cohorts on spans, percentiles and errors. A cohort is
+just a predicate, so anything you can filter by you can compare.
+
+## Datasets
+
+`#/datasets` — a saved search promoted to an eval set, with the export command
+it corresponds to. Datasets live in the browser: a dataset **is** a query, and
+the query is already reproducible from the curl command, so persisting it
+server-side would add a stateful surface holding nothing the store does not.
+
+## Server
+
+`#/server` — what this process has actually done. Uptime, spans admitted,
+requests answered, and **request latency split by route class** so search,
+lookup, stats and ingest are separable. Ingest and query rates are differenced
+client-side from the counters. Time-range pruning is stated as a proportion:
+how much of the store your windows have been eliminating.
+
+Percentiles carry their accuracy bound on screen — they are bucket upper
+bounds, at most 6.25% high and never low. See
+[monitoring](../operations/monitoring.md).
+
 ## Store
 
-`#/store` — the operator corner of the UI. Store statistics from
-[`GET /v1/stats`](http-api.md#get-v1stats) as tiles, a **Flush** button
-(`POST /v1/flush`, needs `rw`), and a **Dataset export** form that builds a
-[`GET /v1/export`](http-api.md#get-v1export) query from the same filter fields
-as the Spans view and downloads the NDJSON.
+`#/store` — the durability statement in words, the segment map, **Flush**
+(`POST /v1/flush`, needs `rw`), and a dataset export that reuses the query you
+arrived with rather than making you retype it.
+
+## Connect
+
+`#/connect` — first run. Two environment variables, then watch the first span
+arrive; the page polls and tells you the moment it does.
 
 ## Developing on the dashboard
 

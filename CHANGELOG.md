@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`status=` and `not_status=` on span search.** Every aggregate in the store
+  counted errors from `Span::status`, but nothing could select on it: the
+  filter walked `span.attributes` only. The natural-looking `attr.status=error`
+  therefore matched an *attribute* most instrumentation never writes and
+  returned an empty array indistinguishable from "no errors" — and the docs
+  used exactly that expression as their motivating example. "Show me the
+  failures" is now a query the API can answer.
+
+- **Cursor pagination on `GET /v1/spans`.** The engine has had `query_after`
+  and a total order for as long as export has existed; the HTTP surface never
+  exposed it, so clients paged by re-requesting with a larger `limit` — which
+  re-reads and re-sends every row already in hand. Responses now carry
+  `next_cursor`, and a short page carries `null` rather than a token that could
+  only return nothing.
+
+- **Per-query cost in the span-search response.** `cost.elapsed_ns`,
+  `segments_examined` and `segments_pruned`, counted per query rather than
+  sampled from the process-wide counters, which race under concurrent readers
+  and cannot be attributed. Traza's argument is that filtered search is cheap;
+  this is the evidence rather than the assertion.
+
+- **`GET /v1/stats/series`, `/duration`, `/failures`, `/slowest`.**
+  Aggregations that answer "where should I look": volume, errors, tokens, cost
+  and duration percentiles bucketed over a window; the duration distribution;
+  errors grouped by `(service, name, status)` with first/last seen and an
+  example to open; and the slowest matching spans ranked across the whole match
+  set. All four fold in one pass and constant memory through a new
+  `Store::fold_spans`, so the cost of an aggregate is proportional to the
+  answer rather than to the corpus — a twenty-bucket histogram no longer
+  materializes a million spans to produce it.
+
+- **`GET /v1/metrics.json`**, and **request latency split by route class**
+  (`ingest`, `lookup`, `search`, `stats`, `other`). One blended histogram over
+  ingest and search described neither: they differ by orders of magnitude. Also
+  adds `traza_uptime_seconds` and `traza_http_responses_{2xx,4xx,5xx}_total`.
+
 - **`traza_wal_lock_wait_ns_*` and `traza_wal_write_syscall_ns_*`** in
   `/v1/metrics`, splitting the log append into waiting for Traza's log lock
   and the `write` itself. `traza_wal_write` covered both, which made the
@@ -23,6 +59,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Widening `--wal-commit-window-us` from off to 2,000 cut fsyncs 40% and the
   mean append 57%. Documented in the configuration reference: the lever for a
   large `wal_write` is fsync frequency, not the engine's locking.
+
+### Changed
+
+- **Latency percentiles are now publishable: at most 6.25% high, never low.**
+  The stage histograms used plain power-of-two buckets, so a reported
+  percentile could be **2x** the truth — fine for ranking stages against each
+  other, and this project's own monitoring guide said in as many words not to
+  publish them as request latencies. Each octave is now split into sixteen even
+  steps. The record path gains one shift; each histogram grows to 8 KiB and
+  moves behind a `Box` so a `Store` does not carry 80 KiB inline. `_ns_p95` is
+  emitted alongside `_ns_p50`/`_ns_p99`, since p95 is the figure the README and
+  the dashboard both quote.
+
+- **`GET /v1/annotations` no longer requires `trace_id`**, and gained
+  `source` (prefix match), `since`, `until` and `limit`. Scores are produced
+  per trace but are only meaningful as a population; requiring a trace meant an
+  eval run could be read only one trace at a time, which is to say not at all.
+
+- **`GET /v1/spans` returns an envelope**, `{spans, next_cursor, cost}`, rather
+  than a bare array — the carrier for the two items above.
+
+- **The dashboard is rebuilt: seventeen screens on a left rail** grouped by the
+  question you arrived with, replacing four tabs over five views. New: Overview,
+  Latency, Failures, Scores, Experiments, Datasets, Live tail, Trace compare,
+  Server, Connect. Rebuilt: Traces (predicate builder reaching the whole
+  parameter surface, drag-to-zoom volume brush, sortable columns, cursor
+  paging, query cost) and Trace detail (time ruler, minimap, drag zoom,
+  subtree collapse, critical path, self time, agent mode).
+
+  A query is now a value that serializes into the hash route, so the search
+  that found the bug is a link you can send; `⌘K` opens a palette that takes a
+  pasted trace id, which previously had no front door at all. Reads carry an
+  `AbortSignal` so a superseded query stops occupying a connection, identical
+  in-flight GETs are coalesced, and polling stops in a background tab.
 
 ### Fixed
 
