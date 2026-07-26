@@ -217,6 +217,8 @@ fn main() {
 const USAGE: &str = "Usage: traza-server --data-dir DIR --port PORT [--host ADDR] \
 [--profile throughput|balanced|latency (default balanced; sets flush-spans and wal-commit-window; \
 NEVER changes durability)] [--ttl-seconds N] [--flush-spans N] \
+[--flush-wal-bytes N (seal when the write-ahead log reaches N bytes; 0 disables; \
+default 64MiB)] \
 [--max-connections N (default 1024)] [--payload-threshold-bytes N (0 disables)] \
 [--durability buffered|wal|flushed (default wal)] \
 [--wal-commit-window-us N (delay each fsync so more acks share it; 0 = off)] \
@@ -259,6 +261,7 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
     let mut durability = Durability::default();
     let mut compaction = CompactionConfig::default();
     let mut compaction_enabled = true;
+    let mut flush_wal_bytes = traza::DEFAULT_FLUSH_WAL_BYTES;
     let mut profile = Profile::default();
     // Profile-owned: `None` means "not given on the command line", which is
     // exactly the question the resolve below asks.
@@ -303,6 +306,10 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
             "--flush-spans" => {
                 i += 1;
                 flush_spans = Some((number(i, "--flush-spans")? as usize).max(1));
+            }
+            "--flush-wal-bytes" => {
+                i += 1;
+                flush_wal_bytes = number(i, "--flush-wal-bytes")?;
             }
             "--max-connections" => {
                 i += 1;
@@ -365,6 +372,8 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
             // Explicit flag beats profile beats built-in default, in that
             // order and regardless of where each appeared.
             flush_spans: flush_spans.unwrap_or_else(|| profile.flush_spans()),
+            // 0 removes the byte bound; the record bounds still apply.
+            flush_wal_bytes: (flush_wal_bytes > 0).then_some(flush_wal_bytes),
             wal_commit_window: match wal_commit_window_us {
                 // An explicit 0 is a real answer ("no window"), not an absent
                 // one, so it overrides a profile that wanted one.
@@ -1062,6 +1071,13 @@ fn serve_request(
 /// Completion and emitted row count are explicit HTTP trailers: a storage
 /// failure after `200 OK` is therefore distinguishable from a complete
 /// dataset without adding control objects to the NDJSON body.
+///
+/// **Every page comes from one pinned snapshot.** Paging the live store meant
+/// each page saw a different store: a span re-ingested behind the cursor came
+/// back a second time, so an export could report `complete: true` over output
+/// containing two versions of one primary key and a row count that matched no
+/// state the store was ever in. `X-Traza-Export-Complete: true` now means the
+/// stream is exactly the dataset that existed when the export began.
 fn stream_export(
     stream: &mut TcpStream,
     engine: &Store,
@@ -1069,6 +1085,21 @@ fn stream_export(
     user_limit: Option<usize>,
 ) -> io::Result<()> {
     const EXPORT_PAGE: usize = 4_096;
+
+    // Pin BEFORE the status line: pinning is the only part that can fail
+    // before any bytes are committed, so its failure is still a clean 503.
+    let view = match engine.snapshot() {
+        Ok(view) => view,
+        Err(error) => {
+            let body = json!({"error": error.to_string()}).to_string();
+            write!(
+                stream,
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )?;
+            return stream.flush();
+        }
+    };
 
     write!(
         stream,
@@ -1084,7 +1115,7 @@ fn stream_export(
         let page_size = remaining.min(EXPORT_PAGE);
         let mut page_filter = filter.clone();
         page_filter.limit = Some(page_size);
-        let page = match engine.query_after(&page_filter, cursor.as_ref()) {
+        let page = match view.query_after(&page_filter, cursor.as_ref()) {
             Ok(page) => page,
             Err(error) => {
                 eprintln!("export failed after {emitted} rows: {error}");

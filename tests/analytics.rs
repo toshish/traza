@@ -368,6 +368,7 @@ fn rollup_cache_survives_compaction_supersede() {
             durability: traza::Durability::Buffered,
             compaction: None,
             wal_commit_window: None,
+            flush_wal_bytes: None,
         },
     )
     .expect("opens");

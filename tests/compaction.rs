@@ -325,3 +325,155 @@ fn compaction_and_ttl_expiry_coexist() {
     );
     assert_eq!(all.len(), 4, "recent spans all survive both passes");
 }
+
+/// A segment big enough that merging it is measurable work rather than an
+/// instant. Compaction is only interesting to the rest of the engine when it
+/// takes long enough to be in the way.
+fn bulky_span(trace: &str, id: &str, start_ns: u64) -> Span {
+    serde_json::from_value(json!({
+        "trace_id": trace, "span_id": id, "name": "op", "service": "svc",
+        "start_time_ns": start_ns, "end_time_ns": start_ns + 100,
+        "attributes": {"group": "g1", "filler": "x".repeat(256)}
+    }))
+    .expect("span")
+}
+
+#[test]
+fn reads_and_ingest_continue_while_a_merge_runs() {
+    // Found in review: the merge held the segment lock across parsing every
+    // input, materializing the union, and fsyncing the replacement. Queries
+    // waited for that lock while holding the writer lock, so ingest queued
+    // behind them — a multi-gigabyte merge was a multi-gigabyte outage.
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let dir = test_dir("concurrent-merge");
+    let store = Arc::new(Store::open(&dir, eager(4)).expect("opens"));
+    for segment in 0..4u64 {
+        seal(
+            &store,
+            (0..4_000)
+                .map(|index| {
+                    let id = format!("s{segment}-{index}");
+                    bulky_span("t-bulk", &id, 1_000 + segment * 10_000 + index)
+                })
+                .collect(),
+        );
+    }
+    // The probe stays in the write buffer: sealing it would leave a tiny
+    // segment at the tail and no same-tier run to merge.
+    store
+        .ingest(span("t-probe", "probe", "probe", 500))
+        .expect("ingest");
+
+    let merging = Arc::new(AtomicBool::new(true));
+    let compactor = {
+        let store = Arc::clone(&store);
+        let merging = Arc::clone(&merging);
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let merged = store.compact_segments().expect("compacts");
+            merging.store(false, Ordering::SeqCst);
+            (merged, started.elapsed())
+        })
+    };
+
+    // The number that decides this is the SLOWEST operation, not the total.
+    // A reader that queues behind the merge still completes a burst of fast
+    // operations the moment the lock is released, so throughput alone cannot
+    // tell "never blocked" from "blocked once for the whole merge".
+    let completed = AtomicUsize::new(0);
+    let mut slowest = std::time::Duration::ZERO;
+    let mut ingested = 0u64;
+    while merging.load(Ordering::SeqCst) {
+        let started = std::time::Instant::now();
+        let probe = store.get_trace("t-probe").expect("read during merge");
+        store
+            .ingest(span("t-probe", &format!("live-{ingested}"), "live", 600))
+            .expect("ingest during merge");
+        let elapsed = started.elapsed();
+        ingested += 1;
+        assert!(!probe.is_empty(), "the probe span stays visible");
+        if merging.load(Ordering::SeqCst) {
+            completed.fetch_add(1, Ordering::Relaxed);
+            slowest = slowest.max(elapsed);
+        }
+    }
+    let (merged_away, merge_elapsed) = compactor.join().expect("compactor");
+
+    assert!(merged_away > 0, "the merge actually happened");
+    assert!(
+        merge_elapsed >= std::time::Duration::from_millis(100),
+        "the merge must be slow enough to be in the way, took {merge_elapsed:?}"
+    );
+    assert!(
+        slowest * 3 < merge_elapsed,
+        "no read or ingest may wait out the merge: slowest {slowest:?} against a \
+         {merge_elapsed:?} merge, over {} operations",
+        completed.load(Ordering::SeqCst)
+    );
+    // And nothing the merge or the concurrent writers did was lost.
+    let probe = store.get_trace("t-probe").expect("trace");
+    assert_eq!(probe.len(), ingested as usize + 1);
+    assert_eq!(
+        store
+            .query(&SpanFilter {
+                name: Some("op".into()),
+                ..SpanFilter::default()
+            })
+            .expect("query")
+            .len(),
+        16_000,
+        "every merged span survives"
+    );
+    std::fs::remove_dir_all(&dir).expect("cleanup");
+}
+
+#[test]
+fn a_flush_during_a_merge_still_supersedes_merged_content() {
+    // The merge no longer holds the segment lock, so a flush can land while it
+    // runs. Segment order is recency order, so the merged output must sort
+    // BEFORE that flush — otherwise re-ingested spans revert to the version
+    // the merge happened to capture.
+    use std::sync::Arc;
+
+    for round in 0..4u64 {
+        let dir = test_dir(&format!("merge-vs-flush-{round}"));
+        let store = Arc::new(Store::open(&dir, eager(4)).expect("opens"));
+        for segment in 0..4u64 {
+            let mut spans: Vec<Span> = (0..2_000)
+                .map(|index| {
+                    let id = format!("s{segment}-{index}");
+                    bulky_span("t-bulk", &id, 1_000 + segment * 10_000 + index)
+                })
+                .collect();
+            // Every segment carries the same 20 hot keys, so the merge has a
+            // version of each to lose.
+            spans.extend((0..20).map(|key| span("t-hot", &format!("k{key}"), "old", 900)));
+            seal(&store, spans);
+        }
+
+        let compactor = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || store.compact_segments().expect("compacts"))
+        };
+        // Replace every hot key while the merge is in flight.
+        for key in 0..20 {
+            store
+                .ingest(span("t-hot", &format!("k{key}"), "new", 900))
+                .expect("ingest");
+        }
+        store.flush().expect("flush");
+        compactor.join().expect("compactor");
+
+        let hot = store.get_trace("t-hot").expect("trace");
+        assert_eq!(hot.len(), 20, "one version per key: {}", hot.len());
+        assert!(
+            hot.iter().all(|span| span.name == "new"),
+            "the flush is newer than the merge and must win: {:?}",
+            hot.iter().map(|span| &span.name).collect::<Vec<_>>()
+        );
+        drop(store);
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+}

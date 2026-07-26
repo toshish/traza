@@ -8,12 +8,12 @@
 //! decoded only when a query selects their offsets; no decoded record vector
 //! is retained by [`Segment`].
 
-use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::fs;
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Eight-byte marker at the beginning of every segment file. The version
 /// lives in [`VERSION`], not in the magic, so the marker itself stays fixed
@@ -283,7 +283,10 @@ pub struct Segment {
     record_offsets: Vec<u64>,
     trace_index: HashMap<String, Vec<u64>>,
     attribute_index: HashMap<(String, String), Vec<u64>>,
-    last_query_used_index: Cell<bool>,
+    /// Diagnostic only: whether the last query narrowed through an index.
+    /// Atomic rather than `Cell` because a segment is shared across reader
+    /// threads — pinned views and the segment list both hand out `&Segment`.
+    last_query_used_index: AtomicBool,
 }
 
 /// Where a segment's payload bytes live.
@@ -378,7 +381,7 @@ impl Segment {
             record_offsets,
             trace_index,
             attribute_index,
-            last_query_used_index: Cell::new(false),
+            last_query_used_index: AtomicBool::new(false),
         })
     }
 
@@ -425,7 +428,7 @@ impl Segment {
             record_offsets,
             trace_index,
             attribute_index,
-            last_query_used_index: Cell::new(false),
+            last_query_used_index: AtomicBool::new(false),
         })
     }
 
@@ -470,12 +473,12 @@ impl Segment {
 
     /// Returns whether the most recent query selected candidates using an index.
     pub fn last_query_used_index(&self) -> bool {
-        self.last_query_used_index.get()
+        self.last_query_used_index.load(Ordering::Relaxed)
     }
 
     /// Decodes one record by ordinal through the persisted offset table.
     pub fn record(&self, ordinal: usize) -> Result<Option<Record>, Error> {
-        self.last_query_used_index.set(true);
+        self.last_query_used_index.store(true, Ordering::Relaxed);
         match self.record_offsets.get(ordinal) {
             Some(offset) => self.decode_at(*offset).map(Some),
             None => Ok(None),
@@ -484,13 +487,13 @@ impl Segment {
 
     /// Looks up records for an exact trace identifier.
     pub fn query_trace(&self, trace_id: &str) -> Result<Vec<Record>, Error> {
-        self.last_query_used_index.set(true);
+        self.last_query_used_index.store(true, Ordering::Relaxed);
         self.decode_postings(self.trace_index.get(trace_id))
     }
 
     /// Looks up records for an exact attribute key/value pair.
     pub fn query_attribute(&self, key: &str, value: &str) -> Result<Vec<Record>, Error> {
-        self.last_query_used_index.set(true);
+        self.last_query_used_index.store(true, Ordering::Relaxed);
         self.decode_postings(
             self.attribute_index
                 .get(&(key.to_owned(), value.to_owned())),
@@ -499,7 +502,7 @@ impl Segment {
 
     /// Returns records in the inclusive timestamp range in stable timestamp order.
     pub fn query_time_range(&self, start: u64, end: u64) -> Result<Vec<Record>, Error> {
-        self.last_query_used_index.set(false);
+        self.last_query_used_index.store(false, Ordering::Relaxed);
         if start > end {
             return Ok(Vec::new());
         }
@@ -575,7 +578,7 @@ impl Segment {
     /// This avoids cloning a potentially corpus-sized posting list for each
     /// bounded query page.
     pub fn attribute_posting_offsets_ref(&self, key: &str, value: &str) -> &[u64] {
-        self.last_query_used_index.set(true);
+        self.last_query_used_index.store(true, Ordering::Relaxed);
         self.attribute_index
             .get(&(key.to_owned(), value.to_owned()))
             .map_or(&[], Vec::as_slice)

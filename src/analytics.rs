@@ -451,30 +451,9 @@ impl Store {
     /// `gen_ai.conversation.id`) lands in exactly one session. This is what
     /// makes a mixed-convention session queryable as a whole.
     pub(crate) fn resolve_session_spans(&self, session_id: &str) -> Result<Vec<Span>> {
-        // Session normalization stringifies numeric attributes, so a producer
-        // that sent `"gen_ai.conversation.id": 4711` yields the session id
-        // "4711". Matching only the JSON string would then list that session
-        // and refuse to open it. Accept every encoding the normalizer folds
-        // into the same id.
-        let mut values = vec![Value::String(session_id.to_owned())];
-        if let Ok(number) = session_id.parse::<u64>() {
-            values.push(Value::from(number));
-        } else if let Ok(number) = session_id.parse::<i64>() {
-            values.push(Value::from(number));
-        } else if let Ok(number) = session_id.parse::<f64>() {
-            if number.is_finite() {
-                if let Some(value) = serde_json::Number::from_f64(number) {
-                    values.push(Value::Number(value));
-                }
-            }
-        }
-        let candidates = self.query_attribute_union(&semconv::SESSION_KEYS, &values)?;
-        // The union over-selects: a span may carry a matching value under a
-        // LOWER-precedence key while its resolved session is something else.
-        Ok(candidates
-            .into_iter()
-            .filter(|span| semconv::facts(&span.attributes).session.as_deref() == Some(session_id))
-            .collect())
+        let candidates =
+            self.query_attribute_union(&semconv::SESSION_KEYS, &session_values(session_id))?;
+        Ok(narrow_to_session(candidates, session_id))
     }
 
     /// One session with its per-trace breakdown, or `None` when no span
@@ -708,4 +687,52 @@ impl Store {
             .insert(segment.path.clone(), Arc::clone(&rollup));
         Ok(rollup)
     }
+}
+
+/// [`Store::resolve_session_spans`] against a buffer and segment set the
+/// caller is holding still — the pinned-view half of the same resolution, used
+/// by [`crate::SnapshotView`] so a paged export can filter by session.
+pub(crate) fn resolve_session_spans_in(
+    buffer: &crate::WriteBuffer,
+    segments: &[Arc<crate::Segment>],
+    session_id: &str,
+) -> Result<Vec<Span>> {
+    let candidates = crate::attribute_union_view(
+        buffer,
+        segments,
+        &semconv::SESSION_KEYS,
+        &session_values(session_id),
+    )?;
+    Ok(narrow_to_session(candidates, session_id))
+}
+
+/// Every JSON encoding that normalizes to the session id `session_id`.
+///
+/// Session normalization stringifies numeric attributes, so a producer that
+/// sent `"gen_ai.conversation.id": 4711` yields the session id "4711".
+/// Matching only the JSON string would then list that session and refuse to
+/// open it.
+fn session_values(session_id: &str) -> Vec<Value> {
+    let mut values = vec![Value::String(session_id.to_owned())];
+    if let Ok(number) = session_id.parse::<u64>() {
+        values.push(Value::from(number));
+    } else if let Ok(number) = session_id.parse::<i64>() {
+        values.push(Value::from(number));
+    } else if let Ok(number) = session_id.parse::<f64>() {
+        if number.is_finite() {
+            if let Some(value) = serde_json::Number::from_f64(number) {
+                values.push(Value::Number(value));
+            }
+        }
+    }
+    values
+}
+
+/// The attribute union over-selects: a span may carry a matching value under a
+/// LOWER-precedence key while its resolved session is something else.
+fn narrow_to_session(candidates: Vec<Span>, session_id: &str) -> Vec<Span> {
+    candidates
+        .into_iter()
+        .filter(|span| semconv::facts(&span.attributes).session.as_deref() == Some(session_id))
+        .collect()
 }
