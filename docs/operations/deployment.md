@@ -59,7 +59,7 @@ data/
   payloads/
     29/29927e…fa.bin                    content-addressed offloaded payloads
     66/660f56…51.bin
-  .supersede.<old>.<new>.journal        transient: an in-flight compaction rewrite
+  .supersede.<first-output>.journal     transient: an in-flight compaction merge
   .segment-….tmp                        transient: an in-flight segment write
 ```
 

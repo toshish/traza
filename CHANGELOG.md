@@ -52,6 +52,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The capacity guide claimed "none is estimated" while carrying an explicitly
   extrapolated 29 GB projection. It now states the exception and cites the
   measurement records by name.
+- **Compaction stopped permanently at the first segment that did not match its
+  neighbours' size tier.** `tail_run_to_merge` took the tier of the *last*
+  segment and walked back only while the tier matched, so any discontinuity at
+  the tail cut the run to length 1 — below `fanout` — and nothing merged. Two
+  ways that happened in practice, both measured. Ingest seals when the write
+  buffer reaches `flush_spans` and batches do not divide evenly, so a finished
+  load ends on a partial segment; below `base_bytes` it is a tier of its own,
+  and 10M spans at the defaults compacted **0 of 977 segments**. Separately, a
+  merge stopped by `max_segment_bytes` left a cap-sized segment at the tail,
+  one tier *above* the segments behind it, which froze those the same way: 20
+  equal segments went to 17 and then stuck. Neither self-healed. Nothing
+  behind the tail is ever a merge candidate again, so continued ingest
+  compacted only the region after the wall and left the prefix — hundreds or
+  thousands of segments — permanently unmerged. Filtered search costs one
+  index narrowing per segment, so this is the exact cost compaction exists to
+  bound.
+
+  Two changes. **Only a larger segment ends a run** — the tier that matters is
+  the largest in the run, and a smaller neighbour rides along as a passenger
+  rather than blocking it (passengers never count toward `fanout`, so four
+  tiny segments still cannot justify merging into a 256 MiB one). And **a run
+  now merges into a group of outputs rather than one**, splitting at
+  `max_segment_bytes` instead of truncating the run to fit, so the cap bounds
+  each output without stranding the remainder. Outputs take a contiguous block
+  of ids in group order, which is what keeps last-write-wins intact across
+  them; dedup stays within a group, so a merge still holds only one output's
+  spans in memory. On the shapes above: 977 segments now compact to the cap
+  floor instead of 0, and a store compacting as it ingests settled at 10
+  segments where it previously drifted to 30.
+
+  The compaction journal is now one record per merge —
+  `.supersede.<first-output>.journal`, naming every input and every output —
+  because which way to finish an interrupted merge is a fact about the group.
+  Recovery deletes the inputs once every output is present and parses, and
+  otherwise **rolls the merge back** — a lone output carries a higher id than
+  every input while holding only its own group's view of a key, so left beside
+  intact inputs it would shadow a newer version in a group whose output never
+  landed. Rollback requires *every* input still to be present: any one already
+  gone proves deletion had started, which happens only after every output was
+  durable, so a missing output is one a later merge has since consumed and
+  recovery must roll forward instead. A journal that saw one input at a time
+  could not tell those apart and would delete live segments holding the only
+  copy of an input already removed.
 
 ### Added
 

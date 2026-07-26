@@ -671,3 +671,301 @@ fn a_commit_window_batches_more_acks_without_weakening_the_promise() {
         "a delayed fsync still precedes the acknowledgement it covers"
     );
 }
+
+/// How often the hot keys are rewritten, in rounds. Often enough that many
+/// merge groups carry a version of them, rare enough that resolving the key
+/// does not have to walk a version in every segment in the store.
+const HOT_EVERY: usize = 8;
+
+/// Ingests batches until `until`. Each batch carries `per_batch` fresh spans
+/// tagged with its own batch number, and every `HOT_EVERY` rounds it also
+/// rewrites every hot key at that round's version. Returns how many batches
+/// the server acknowledged.
+///
+/// The hot keys are the point. A primary key rewritten across segment after
+/// segment gives a merge a version of it to lose, and gives recovery a way to
+/// prove it did not: a stale copy that outranked a newer one comes back as a
+/// version that went BACKWARDS, which no amount of counting spans would catch.
+///
+/// Batches are individually addressable so verification can check whole ones
+/// without asking for every span at once. A query's cost grows with the
+/// versions it must resolve across the segments it crosses, and this store is
+/// deliberately hundreds of segments deep.
+fn acknowledged_until(
+    port: u16,
+    worker: usize,
+    per_batch: usize,
+    hot_keys: usize,
+    until: std::time::Instant,
+) -> usize {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .expect("timeout");
+    let mut acknowledged = 0;
+    let mut leftover: Vec<u8> = Vec::new();
+    for round in 0.. {
+        if std::time::Instant::now() >= until {
+            break;
+        }
+        let mut spans: Vec<Value> = (0..per_batch)
+            .map(|index| {
+                json!({
+                    "trace_id": format!("gm-trace-{worker}"),
+                    "span_id": format!("bulk-{round}-{index}"),
+                    "name": "acknowledged", "service": "ingest",
+                    "start_time_ns": 1_000u64, "end_time_ns": 2_000u64,
+                    "attributes": {"batch": format!("{worker}-{round}")}
+                })
+            })
+            .collect();
+        if round % HOT_EVERY == 0 {
+            spans.extend((0..hot_keys).map(|key| {
+                json!({
+                    "trace_id": format!("gm-trace-{worker}"),
+                    "span_id": format!("hot-{key}"),
+                    "name": format!("v{round}"), "service": "ingest",
+                    "start_time_ns": 1_000u64, "end_time_ns": 2_000u64,
+                    "attributes": {"marker": format!("hot{worker}")}
+                })
+            }));
+        }
+        let body = serde_json::to_vec(&Value::Array(spans)).expect("encodes");
+        let head = format!(
+            "POST /v1/spans HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        if stream.write_all(head.as_bytes()).is_err() || stream.write_all(&body).is_err() {
+            break;
+        }
+        let mut chunk = [0_u8; 4096];
+        let header_end = loop {
+            if let Some(position) = leftover.windows(4).position(|window| window == b"\r\n\r\n") {
+                break position + 4;
+            }
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => return acknowledged,
+                Ok(read) => leftover.extend_from_slice(&chunk[..read]),
+            }
+        };
+        let header = String::from_utf8_lossy(&leftover[..header_end]).into_owned();
+        let length: usize = header
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse().ok())?
+            })
+            .unwrap_or(0);
+        while leftover.len() < header_end + length {
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => return acknowledged,
+                Ok(read) => leftover.extend_from_slice(&chunk[..read]),
+            }
+        }
+        leftover.drain(..header_end + length);
+        if header.starts_with("HTTP/1.1 200") {
+            acknowledged += 1;
+        }
+    }
+    acknowledged
+}
+
+fn matching_files(dir: &Path, predicate: impl Fn(&str) -> bool) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .expect("read dir")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| predicate(name))
+        .collect()
+}
+
+/// One request with a deadline, panicking rather than blocking forever.
+///
+/// The shared `request_to` waits indefinitely, which is right for the tests
+/// that use it. Verification after a crash is different: the failure this test
+/// exists to catch leaves duplicate versions of every hot key behind, and
+/// resolving a primary key costs the versions it must walk across the segments
+/// it crosses — so the regression makes queries pathologically slow before it
+/// makes them wrong. Without a deadline the test hangs instead of failing.
+fn request_within(port: u16, target: &str, limit: Duration) -> Value {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let target = target.to_owned();
+    let requested = target.clone();
+    std::thread::spawn(move || {
+        let _ = sender.send(request_to(port, "GET", &requested, None));
+    });
+    match receiver.recv_timeout(limit) {
+        Ok((status, body)) => {
+            assert_eq!(status, 200, "the recovered store answers: {body}");
+            body
+        }
+        Err(_) => panic!(
+            "{target} did not answer within {limit:?} — a recovered store this \
+             small resolves it in milliseconds unless it is carrying duplicate \
+             versions a merge should have rolled back"
+        ),
+    }
+}
+
+/// A compaction journal on disk means a merge is between its first output and
+/// its last input — the window recovery exists for.
+fn merge_in_flight(dir: &Path) -> bool {
+    !matching_files(dir, |name| name.starts_with(".supersede.")).is_empty()
+}
+
+#[test]
+fn a_crash_during_a_grouped_merge_recovers_exactly() {
+    // A merge replaces a run of segments with a GROUP of them, and the group
+    // is atomic or it is nothing. Each output holds only its own group's
+    // last-write-wins view of a key while outranking every input by id, so one
+    // that survives a crash its siblings did not — or that survives with no
+    // journal left to account for it — shadows the newer versions the missing
+    // outputs were to carry. Staged files can pose that state; only SIGKILL
+    // proves the real write ordering never produces anything else.
+    //
+    // The kill is aimed, and three things make that possible. The maintenance
+    // thread's first tick is five seconds after start. A merge declines while
+    // a seal holds an unpublished id, so it needs ingest to pause to get going
+    // at all — the load therefore stops before the tick. And the journal on
+    // disk says a merge is in flight, so the kill waits for one to appear
+    // rather than guessing at a duration that varies with the machine. Each
+    // attempt then waits a little longer than the last, landing at a different
+    // depth: before the first output, among them, and past them.
+    const PER_BATCH: usize = 4;
+    const HOT_KEYS: usize = 8;
+    const WORKERS: usize = 3;
+    const ATTEMPTS: usize = 3;
+
+    let mut landed_mid_merge = 0;
+    for attempt in 0..ATTEMPTS {
+        let dir = test_dir(&format!("grouped-merge-crash-{attempt}"));
+        // Small segments against a cap several of them wide, so every merge
+        // has to split its output across a group — the shape under test.
+        let mut server = Server::spawn_with(
+            &dir,
+            "wal",
+            &[
+                "--flush-spans",
+                "40",
+                "--compaction-fanout",
+                "4",
+                "--compaction-max-segment-bytes",
+                "60000",
+            ],
+        );
+        let port = server.port;
+        let tick = std::time::Instant::now() + Duration::from_secs(5);
+
+        // Stopping short of the tick is what lets compaction run at all: a
+        // merge declines while a seal holds an unpublished id, so a load that
+        // never pauses starves it and this would test nothing.
+        let stop = tick - Duration::from_millis(600);
+        let handles: Vec<_> = (0..WORKERS)
+            .map(|worker| {
+                std::thread::spawn(move || {
+                    acknowledged_until(port, worker, PER_BATCH, HOT_KEYS, stop)
+                })
+            })
+            .collect();
+        let acknowledged: Vec<usize> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("worker"))
+            .collect();
+        assert!(
+            acknowledged.iter().all(|count| *count > HOT_EVERY),
+            "every worker must have acknowledged enough to have sealed \
+             repeatedly and rewritten the hot keys: {acknowledged:?}"
+        );
+
+        let deadline = tick + Duration::from_secs(30);
+        let mut caught = false;
+        while std::time::Instant::now() < deadline {
+            if merge_in_flight(&dir) {
+                caught = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        if caught {
+            landed_mid_merge += 1;
+            // Deeper into the merge on each attempt.
+            std::thread::sleep(Duration::from_millis(attempt as u64 * 60));
+        }
+        server.kill_hard();
+
+        // Compaction off on the verification server: recovery is finished by
+        // the time it answers, and a maintenance thread merging underneath the
+        // queries only slows them down.
+        let recovered = Server::spawn_with(&dir, "wal", &["--compaction-fanout", "0"]);
+        for (worker, acknowledged) in acknowledged.iter().enumerate() {
+            // The last acknowledged batch, and one from the middle of the run
+            // that every merge has had a chance to rewrite. Whole batches, so
+            // a partially recovered one is a failure and not a rounding error.
+            for round in [acknowledged - 1, acknowledged / 2] {
+                let body = request_within(
+                    recovered.port,
+                    &format!("/v1/spans?attr.batch={worker}-{round}&limit=1000"),
+                    Duration::from_secs(30),
+                );
+                let survived = body.as_array().map(Vec::len).unwrap_or(0);
+                assert_eq!(
+                    survived, PER_BATCH,
+                    "worker {worker}: batch {round} came back with {survived} \
+                     of {PER_BATCH} spans after a SIGKILL taken mid-merge"
+                );
+            }
+
+            let body = request_within(
+                recovered.port,
+                &format!("/v1/spans?attr.marker=hot{worker}&limit=1000"),
+                Duration::from_secs(30),
+            );
+            let hot = body.as_array().cloned().unwrap_or_default();
+            assert_eq!(
+                hot.len(),
+                HOT_KEYS,
+                "worker {worker}: a primary key must survive exactly once, \
+                 got {} for {HOT_KEYS} keys",
+                hot.len()
+            );
+            // The newest hot version this worker had acknowledged. No key may
+            // come back older than that: a lower version is a stale copy that
+            // outranked a newer one — precisely what a half-published group
+            // causes, and why a partial group is rolled back rather than kept.
+            let floor = ((acknowledged - 1) / HOT_EVERY) * HOT_EVERY;
+            for span in &hot {
+                let name = span["name"].as_str().unwrap_or_default();
+                let version: usize = name
+                    .strip_prefix('v')
+                    .and_then(|digits| digits.parse().ok())
+                    .unwrap_or_else(|| panic!("worker {worker}: bad version {name:?}"));
+                assert!(
+                    version >= floor,
+                    "worker {worker}: {} came back at v{version} after v{floor} \
+                     was acknowledged — a stale copy outranked a newer one",
+                    span["span_id"].as_str().unwrap_or_default()
+                );
+            }
+        }
+        let mut recovered = recovered;
+        recovered.kill_hard();
+
+        // And recovery finished the job: nothing half-written is left behind
+        // to be loaded as if it were a segment.
+        let leftovers = matching_files(&dir, |name| {
+            name.starts_with(".supersede.") || name.ends_with(".tmp")
+        });
+        assert!(
+            leftovers.is_empty(),
+            "recovery left artifacts: {leftovers:?}"
+        );
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    assert!(
+        landed_mid_merge > 0,
+        "no SIGKILL landed inside a merge across {ATTEMPTS} attempts, so \
+         nothing about grouped-merge recovery was exercised"
+    );
+}

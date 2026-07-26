@@ -38,9 +38,15 @@ a zero-padded id precisely so lexical path order matches numeric id order.
   same name for exactly this reason.
 - **Claiming a merged segment's id after the merge instead of before.** The
   merge runs without the segment lock, so a flush can publish while it works.
-  The id is claimed under the lock at pin time, which is what guarantees every
-  segment appearing afterwards sorts *after* the merged output — it was written
-  later, and must win.
+  The ids are claimed under the lock at pin time, which is what guarantees
+  every segment appearing afterwards sorts *after* the merged outputs — it was
+  written later, and must win.
+- **Handing a merge's outputs ids out of group order.** A run merges into a
+  group of outputs, one per consecutive slice of the run, and dedup happens
+  *within* a slice — so a key written in two slices lands in two outputs. The
+  ids are claimed as one contiguous block and assigned in slice order, which
+  is what makes the later output — holding the later version — sort after the
+  earlier one, exactly as its source segments did.
 
 **Symptom.** A re-ingested span reverts to an older version, at some point
 after a compaction or a concurrent flush. Nothing errors.
@@ -159,36 +165,77 @@ recoverable) or parses into wrong data (silent, not).
 
 ## 5. Compaction is crash-safe through the supersede journal
 
-**The rule.** Before a rewrite replaces a segment, a marker file
-`.supersede.<old>.<new>.journal` is written and fsynced. It is deleted only
-after the original is removed. Recovery at open follows **the journal, never
-the content.**
+**The rule.** Before a merge writes anything, ONE journal file
+`.supersede.<first-output>.journal` is written and fsynced, naming **every**
+input it consumes and **every** output that replaces them. It is deleted only
+after the originals are removed, and that deletion is itself synced. Recovery
+at open follows **the journal, never the content.**
 
-**Where.** `write_supersede_marker` / `recover_supersede_markers` in
-[`src/lib.rs`](../../src/lib.rs), used by `compact_segments`. Expiry does not
-need it: it renames the survivors onto the same name, so there is never a
-window in which a replacement exists beside its original.
+**Where.** `write_merge_journal` / `recover_merge` /
+`recover_supersede_markers` in [`src/lib.rs`](../../src/lib.rs), used by
+`compact_segments`. Expiry does not need it: it renames the survivors onto the
+same name, so there is never a window in which a replacement exists beside its
+original.
 
-**The recovery rule.** If the replacement exists and parses, delete the
-original — the crash landed between rename and delete. If the replacement never
-materialized, delete nothing; the original stays authoritative and the merge is
-simply retried. The marker is removed either way. The merged segment is written
-and renamed into place **before** any input is deleted, so no window drops
-data.
+**The recovery rule, decided for the group and never one file at a time.**
+
+- Every output present and parsing → **forward**: delete the inputs. The crash
+  landed between the last rename and the deletes.
+- An output missing, but every input still present → **back**: delete the
+  outputs that did land. A merge deletes its inputs only once every output is
+  durable, so all of them still being here proves it never committed.
+- An output missing and any input already gone → **forward**. Deletion had
+  started, which happens only after every output was durable, so the missing
+  output is one a *later* merge has since consumed and that merge's output
+  carries the data on.
+
+Outputs are written and renamed into place **before** any input is deleted, so
+no window drops data. Every branch is idempotent, so a crash mid-recovery
+resumes rather than compounds.
+
+**Why rollback, and why all-or-nothing.** A run merges into a *group* of
+outputs (invariant 4), and each output holds only its own group's
+last-write-wins view of a key while carrying a higher id than every input. One
+left beside intact inputs would therefore shadow a newer version living in a
+group whose output never landed. A partial group is not a smaller correct
+merge; it is a wrong one.
+
+**Proven by SIGKILL, not only by staged files.**
+`a_crash_during_a_grouped_merge_recovers_exactly` in
+[`tests/durability.rs`](../../tests/durability.rs) kills the server inside a
+real merge — it waits for the journal to appear rather than timing a guess,
+and each attempt waits a little longer so the kill lands before the first
+output, among them, and past them. Recovery then has to bring back every
+acknowledged batch whole and resolve hot keys to a version no older than the
+last one acknowledged.
+
+**Why one journal and not one per input.** Which way to finish an interrupted
+merge is a fact about the whole group. A journal that saw a single input could
+not tell "nothing was deleted yet" from "deletion had started" — opposite
+answers — and reading the second as the first destroys data: it rolls back
+outputs that hold the only remaining copy of an input already deleted.
+Reproduced with a per-input journal: `get_trace` returned zero records after
+reopen. The rollback branch is the only one that deletes segments a merge did
+not create, so its precondition has to be the strongest thing available, and
+that is *every* input still being present.
 
 **Why not content-based healing.** An earlier version deduplicated segments by
 inspecting their content, and that silently destroyed legitimately re-ingested
 identical spans. Acknowledged duplicate cardinality must survive a restart.
 Recovery must never guess from content.
 
-**What breaks it.** Deleting an input before the replacement is renamed and
-verified. Journaling after the fact. Reintroducing content inspection.
+**What breaks it.** Deleting an input before the replacements are renamed and
+verified. Journaling after the fact. Journaling per input rather than per
+merge. Reintroducing content inspection.
 
 **Abandoning a merge is also journaled work.** The merge publishes under a
 short lock and revalidates that its pinned inputs are still there; if they are
-not, it deletes the replacement it wrote **before** deleting the markers.
-Doing it in the other order leaves a window where recovery sees a complete
-replacement and deletes inputs it does not actually supersede.
+not, it takes its outputs back off disk **and syncs** before deleting the
+journal that describes them. Ignoring a failed unlink, or dropping the journal
+first, leaves an output no journal accounts for — and the next open loads it
+like any other segment, outranking by id the very inputs it was supposed to
+replace. The merge drops its open output handles first, so a platform that
+refuses to unlink an open file does not fail every removal.
 
 ---
 
