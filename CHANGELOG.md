@@ -123,7 +123,9 @@ answering two classes of question with a silent empty result.
   unanswerable. `not_attr.KEY` keeps spans that lack the key entirely — "not
   known to be an error" includes spans that never recorded a status.
 - **Segment timestamp ranges (format v3)**, letting a time-filtered query skip
-  a segment without opening it. `since`/`until` were pure post-filters, so a
+  a segment's records. (Every segment is opened and its indexes parsed at
+  store startup; pruning avoids the record reads, not the open.)
+  `since`/`until` were pure post-filters, so a
   "last 15 minutes" search read every segment in the store. v2 segments are
   still read; they carry no range, are never skipped, and age out through
   compaction.
