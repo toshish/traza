@@ -24,12 +24,24 @@ specifically because they passed against broken code:
   reader, and pins the magic to the real constant so they cannot drift again.
 - The same rewrite removed a `reopen_persistence` case that wrote bytes and
   read them back asserting equality — a test of `fs`, not of Traza.
-- **`reads_never_miss_committed_spans`** is documented in
-  [`INGEST-BENCHMARK.md`](../../INGEST-BENCHMARK.md) as *not* catching the
-  visibility regression an unlocked seal would introduce: its writer is
-  single-threaded and `flush()` is synchronous end to end, so the window never
-  opens. That is why moving sealing off the writer lock was reverted rather
-  than merged — the suite as it stands would pass over the regression.
+- **`reads_never_miss_committed_spans` does not catch the visibility regression
+  an unlocked seal can introduce**, and this was verified rather than assumed.
+  Its writer is single-threaded and `flush()` is synchronous end to end, so the
+  window never opens. When sealing moved off the writer lock, the drain was
+  deliberately changed to *remove* the spans instead of copying them — the
+  exact v0.17 bug — and **the entire pre-existing suite passed, all 140 tests,
+  including the SIGKILL durability set.** Only the new
+  `tests/seal_concurrency.rs::reads_see_every_acknowledged_span_while_a_seal_is_in_flight`
+  failed, immediately and on every run. A correctness suite cannot see a
+  transient visibility hole unless something is reading during the hole.
+- **`tests/seal_concurrency.rs::a_seal_holds_an_engine_lock_for_a_small_fraction_of_its_work`**
+  is the shape to copy when asserting that work *moved*. Query results are
+  identical whether or not the seal holds the writer lock, so no assertion over
+  data can distinguish them; the test reads
+  `traza_segment_seal_locked` against `traza_segment_seal` instead. Putting the
+  write back under the lock takes that ratio from under 25% to 99.9%. **If you
+  are claiming a performance property, assert it through an observable —
+  a metric, a counter, a lock-hold measurement — never through query results.**
 
 The lesson generalizes. When you add a test:
 

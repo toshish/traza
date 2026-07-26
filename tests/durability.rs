@@ -10,6 +10,8 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
@@ -386,13 +388,24 @@ fn a_crash_during_a_seal_loses_nothing_it_acknowledged() {
     );
     let port = server.port;
 
+    // The kill is triggered by PROGRESS, not by a stopwatch. A fixed sleep made
+    // the precondition below depend on how loaded the machine happened to be
+    // while the rest of the suite ran beside it.
+    const BATCHES_BEFORE_KILL: usize = 60; // 24,000 spans: about a dozen seals
+    let progress = Arc::new(AtomicUsize::new(0));
     let mut handles = Vec::new();
     for worker in 0..4 {
+        let progress = Arc::clone(&progress);
         handles.push(std::thread::spawn(move || {
-            acknowledged_batches(port, worker, 100_000, PER_BATCH, 256)
+            acknowledged_batches(port, worker, 100_000, PER_BATCH, 256, Some(progress))
         }));
     }
-    std::thread::sleep(Duration::from_millis(600));
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while progress.load(Ordering::Acquire) < BATCHES_BEFORE_KILL
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(5));
+    }
     server.kill_hard();
 
     let acknowledged: usize = handles
@@ -400,7 +413,7 @@ fn a_crash_during_a_seal_loses_nothing_it_acknowledged() {
         .map(|handle| handle.join().expect("worker"))
         .sum();
     assert!(
-        acknowledged > 30,
+        acknowledged >= BATCHES_BEFORE_KILL,
         "the run must have acknowledged enough to have sealed several times, \
          got {acknowledged} batches"
     );
@@ -443,7 +456,7 @@ fn a_crash_during_a_seal_loses_nothing_it_acknowledged() {
 /// cannot exercise the path where a response and the next request share a
 /// buffer.
 fn acknowledged_over_one_connection(port: u16, worker: usize, rounds: usize) -> usize {
-    acknowledged_batches(port, worker, rounds, 10, 0)
+    acknowledged_batches(port, worker, rounds, 10, 0, None)
 }
 
 /// [`acknowledged_over_one_connection`] with the batch shape spelled out.
@@ -451,12 +464,16 @@ fn acknowledged_over_one_connection(port: u16, worker: usize, rounds: usize) -> 
 /// `per_batch` and `detail_bytes` exist because how much a seal has to write
 /// decides how wide the window a mid-seal crash has to land in is. Ten empty
 /// spans per batch seals in microseconds and tests nothing about that window.
+///
+/// `progress` counts acknowledgements as they happen, so a caller can kill the
+/// server after a known amount of work rather than after a guessed interval.
 fn acknowledged_batches(
     port: u16,
     worker: usize,
     rounds: usize,
     per_batch: usize,
     detail_bytes: usize,
+    progress: Option<Arc<AtomicUsize>>,
 ) -> usize {
     let mut stream = {
         let mut attempt = 0;
@@ -526,6 +543,9 @@ fn acknowledged_batches(
         leftover.drain(..header_end + length);
         if header.starts_with("HTTP/1.1 200") {
             acknowledged += 1;
+            if let Some(progress) = &progress {
+                progress.fetch_add(1, Ordering::Release);
+            }
         }
     }
     acknowledged

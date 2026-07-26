@@ -63,13 +63,25 @@ the noise floor of what it measures.
 | `traza_wal_write` | Writing the frame to the log file (inside the writer lock) |
 | `traza_wal_fsync` | The fsync. The one stage that is not CPU |
 | `traza_buffer_upsert` | Upserting a batch into the write buffer (inside the writer lock) |
-| `traza_segment_seal` | Sealing the write buffer into a segment |
+| `traza_segment_seal` | Sealing the write buffer into a segment, end to end |
+| `traza_segment_seal_locked` | The part of that seal which holds an engine lock — draining, publishing, reconciling. Everything else runs with nothing held |
 
 **Reading `writer_lock_wait` correctly.** It is not a cost, it is the **queue**
 for everything else. If it dominates, the fix is to do *less work while holding
 the lock*, not to make that work faster. The work performed under the lock is
-`wal_write + buffer_upsert + segment_seal`; comparing that sum against wall
-clock tells you how saturated the lock is.
+`wal_write + buffer_upsert + segment_seal_locked`; comparing that sum against
+wall clock tells you how saturated the lock is.
+
+**`segment_seal` is not in that sum, and that is the point.** A seal does its
+I/O with no lock held, so its wall time is not lock occupancy — use
+`segment_seal_locked` for saturation and `segment_seal` for what a seal costs.
+If `segment_seal_locked / segment_seal` climbs toward 1, something has put the
+segment write back under the lock. Expect it well under 0.25.
+
+`traza_segment_seals_coalesced_total` counts seals that found another already
+running and declined to start a second one; those spans are covered by the
+running seal. A high number alongside a write buffer above `--flush-spans` just
+means seals are back-to-back, which is normal under saturation.
 
 ### HTTP layer
 
@@ -136,9 +148,14 @@ a misconfigured client or someone probing. It does not distinguish 401 from
 superseded versions persist until compaction, and that a merge needs room for
 its output before its inputs are removed.
 
-**Restart replay is growing.** A `wal_bytes` that keeps climbing means flushes
-are not happening — check that `--flush-spans` is reachable for your traffic
-shape. It should fall to zero at each flush.
+**Restart replay is growing.** `wal_bytes` is bounded by `--flush-wal-bytes`
+(64 MiB by default), not by `--flush-spans`, and under sustained ingest it runs
+up to that bound between reclamations rather than emptying at every seal — a
+seal only discards the whole log when it leaves the buffer empty. So a
+`wal_bytes` that oscillates below the bound is healthy; one that sits *at* the
+bound means every seal is reclaiming, which is the case worth investigating.
+On a quiet store it should still fall to zero. If `wal_bytes` exceeds the bound
+persistently, check that `--flush-spans` is reachable for your traffic shape.
 
 **Segment count is climbing without bound.** `segment_count` rising steadily is
 the signature of compaction being off or unable to keep up, and it is what
@@ -152,10 +169,13 @@ concurrent load means batches are not coalescing;
 [`--wal-commit-window-us`](../configuration.md) is the lever, at the cost of
 added acknowledgement latency.
 
-**The writer lock is saturated.** `traza_writer_lock_wait_ns_sum` dominating,
-with `traza_segment_seal_ns_sum` as a large share of the work done under the
-lock, is the known ingest ceiling for this design. It is characterized in
-[`INGEST-BENCHMARK.md`](../../INGEST-BENCHMARK.md).
+**The writer lock is saturated.** Sum
+`traza_wal_write_ns_sum + traza_buffer_upsert_ns_sum +
+traza_segment_seal_locked_ns_sum` and compare it against wall clock. Sealing
+used to be ~74% of that sum and is now a small part of it, so a saturated lock
+today points at `wal_write` — which means the log device, not the engine. The
+decomposition and how it moved are in
+[`INGEST-BENCHMARK.md`](../../INGEST-BENCHMARK.md#the-limiting-stage).
 
 ### What not to alert on
 

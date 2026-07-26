@@ -19,6 +19,24 @@ the stored record count came up short, or if the server shed a connection.
 Every non-`buffered` run restarts the server and re-verifies the record count,
 because the mode's whole claim is that acknowledgement survives restart.
 
+## Load conditions
+
+**This machine is not a lab.** Sections are labelled with the conditions they
+were taken under, because the same code measures very differently on a quiet
+host and a busy one, and mixing the two silently is how a benchmark starts
+lying.
+
+- Sections marked **"on a quiet machine"** were taken with nothing else
+  running. Treat those as levels.
+- The [seal-off-the-lock comparison](#moving-the-seal-off-the-lock-what-it-bought)
+  was taken with a 1-minute load average between 8.9 and 12.8 on 10 hardware
+  threads, dominated by one unrelated process pinning a core for the whole
+  window. Its **before and after builds were alternated round-robin**, so the
+  ratio is sound and the absolute levels are depressed. Read the ratio.
+- Anything reported as a gate against
+  [the roadmap](docs/roadmap.md) says explicitly whether the host was idle.
+  A target is not met on a contended machine, however good the median looks.
+
 ## Protocol: what a wire format actually costs
 
 ### The comparison that was wrong
@@ -196,10 +214,10 @@ The block below is written by the benchmark itself; everything outside the
 markers is analysis and survives a re-run.
 
 <!-- BEGIN GENERATED -->
-Every row is the MEDIAN of 3 runs, each on a fresh data directory. Scenarios are run ROUND-ROBIN rather than one at a time, and their order is ROTATED each round, so each scenario's repeats are spread across the whole wall-clock window and across positions within a round. Background load then hits all of them alike instead of landing on whichever ran during a spike or whichever is pinned to the same phase of a periodic load. Payloads are generated before the clock starts, so these are server rates; client encoding is reported separately. Runs that saw a failed batch or a shed connection are reported as failures rather than as numbers.
+Every row is the MEDIAN of 2 runs, each on a fresh data directory. Scenarios are run ROUND-ROBIN rather than one at a time, and their order is ROTATED each round, so each scenario's repeats are spread across the whole wall-clock window and across positions within a round. Background load then hits all of them alike instead of landing on whichever ran during a spike or whichever is pinned to the same phase of a periodic load. Payloads are generated before the clock starts, so these are server rates; client encoding is reported separately. Runs that saw a failed batch or a shed connection are reported as failures rather than as numbers.
 
 - Machine: macos/aarch64, 10 hardware threads, Apple M1 Max
-- Commit: `ddd185a`
+- Commit: `0e999ad`
 - Corpus: 1000000 spans per run, batch 1000
 - Compaction: disabled during ingest runs (a read-path optimization; its merges would steal CPU from the measurement)
 
@@ -207,9 +225,9 @@ Latency is the CLIENT-OBSERVED time for one acknowledged batch, sampled per requ
 
 | Scenario | Protocol | Route | Keep-alive | Concurrency | Median spans/s | Min | Max | p50 ms | p95 ms | p99 ms | Bytes/span | Decode ns/span |
 |---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| profile-throughput-c8 | native-json | /v1/spans | true | 8 | **243792** | 236951 | 244474 | 12.07 | 94.00 | 108.04 | 256 | 834 |
-| profile-balanced-c8 | native-json | /v1/spans | true | 8 | **192896** | 179467 | 195099 | 45.92 | 54.21 | 60.93 | 256 | 780 |
-| profile-latency-c8 | native-json | /v1/spans | true | 8 | **159949** | 151787 | 161023 | 51.17 | 64.82 | 73.95 | 256 | 850 |
+| profile-throughput-c8 | native-json | /v1/spans | true | 8 | **213433** | 209750 | 217117 | 29.87 | 107.07 | 170.86 | 256 | 755 |
+| profile-balanced-c8 | native-json | /v1/spans | true | 8 | **171868** | 167665 | 176070 | 33.38 | 127.97 | 347.32 | 256 | 740 |
+| profile-latency-c8 | native-json | /v1/spans | true | 8 | **134308** | 134147 | 134469 | 27.01 | 294.56 | 422.80 | 256 | 701 |
 <!-- END GENERATED -->
 
 
@@ -218,14 +236,27 @@ is not the constraint anywhere in this table.
 
 ## Against the roadmap target
 
-**Target (§1.5): 250,000 spans/s sustained in `wal` mode. Best measured:
-250,453 (`--profile throughput`, concurrency 16, median of 5 rotated rounds,
-min 122,768, max 261,215). The median clears the bar; the spread straddles it,
-and the host was shared during measurement — see
-[the correction below](#correction-the-ceiling-is-a-setting-not-a-property-of-the-design)
-before treating the gate as closed.** At the default `balanced` settings the
-same run measures 197,056, so most of what used to look like a 16% design gap
-was one default.
+**Target (§1.6): 250,000 spans/s sustained in `wal` mode. STILL NOT
+CONFIRMED, and the most recent measurement cannot confirm it.**
+
+The best figure remains 250,453 spans/s (`--profile throughput`, concurrency
+16, median of 5 rotated rounds, min 122,768, max 261,215) taken at 0.16 on a
+host whose 1-minute load average ranged 6.5 to 47.8. The medians cleared the
+bar; the minima did not.
+
+The 0.19 matrix above was taken while an unrelated process held a core for the
+entire window, and it puts concurrency 16 **below** concurrency 8 at every
+profile (`throughput` 209,780 against 221,499). That inversion is the
+signature of oversubscription — 16 client threads plus server threads against
+9 usable hardware threads — not of an engine limit, and it means **this run
+says nothing about the gate one way or the other.** It is reported because
+hiding it would be worse, not because it is evidence.
+
+What the seal-off-the-lock work does change is the *reason* the gate is open.
+The ceiling was the writer lock, held 88% of a run at the default setting with
+sealing as three quarters of that. It is not that any more. The next thing to
+measure, on an idle machine, is `wal_write` and `wal_fsync` — see
+[the decomposition](#the-limiting-stage).
 
 The roadmap attributes the target to "keep-alive + protobuf". Measurement
 supports neither attribution:
@@ -249,57 +280,47 @@ socket, no parsing, no protocol — changes nothing.** Whatever limits ingest is
 inside the engine, which is why neither wire format nor connection work moves
 it.
 
-Server-side stage totals from `/v1/metrics`, one 1M-span run at c8 (8 client
-threads, ~42 s of client thread-time against a 5.32 s wall clock):
+Server-side stage totals from `/v1/metrics`, one 1M-span run at c8. Measured
+at `ddd185a`, the commit before sealing moved off the writer lock, on a machine
+carrying background load (1-minute load average 7.9 to 13.6 on 10 hardware
+threads, dominated by one unrelated process pinning a core):
 
-| Stage | Total | Calls | Mean |
+| Stage | `--flush-spans` 5,000 | 10,000 (default) | 30,000 |
 |---|---:|---:|---:|
-| writer lock wait | 25,970 ms | 1,000 | 25.97 ms |
-| **segment seal** | **3,473 ms** | 100 | 34.74 ms |
-| wal encode | 2,806 ms | 1,000 | 2.81 ms |
-| wal fsync | 1,871 ms | 363 | 5.15 ms |
-| wal write | 1,037 ms | 1,000 | 1.04 ms |
-| decode (wire → spans) | 811 ms | 1,000 | 0.81 ms |
-| buffer upsert | 196 ms | 1,000 | 0.20 ms |
-
-Group commit amortized 900 acknowledgements across 363 fsyncs (2.5x).
+| writer lock wait | 35,233 ms | 27,084 ms | 19,031 ms |
+| **segment seal** | **5,180 ms** / 200 calls | **3,616 ms** / 100 | **2,446 ms** / 33 |
+| wal encode | 2,880 ms | 2,853 ms | 2,858 ms |
+| wal fsync | 2,213 ms | 1,939 ms | 1,336 ms |
+| wal write | 1,003 ms | 1,099 ms | 596 ms |
+| decode (wire → spans) | 850 ms | 780 ms | 834 ms |
+| buffer upsert | 188 ms | 196 ms | 278 ms |
+| **In-lock total** | **6,371 ms** | **4,911 ms** | **3,320 ms** |
+| Wall clock | 6.59 s | 5.57 s | 4.09 s |
+| **Lock held** | **97%** | **88%** | **81%** |
+| **Sealing's share of in-lock** | **81%** | **74%** | **74%** |
 
 Read it as follows. `writer lock wait` is not a cost, it is the **queue** for
 everything else. The work actually performed while holding the writer lock is
-`wal write + buffer upsert + segment seal` = **4.706 s against a 5.32 s wall
-clock — the lock is held ~88% of the run.** It is saturated.
+`wal write + buffer upsert + segment seal`, and at the default setting that is
+4.911 s against a 5.57 s wall clock. **The lock is saturated, and roughly three
+quarters of what it is held for is sealing** — work that needs no lock at all.
+`write_segment` converts spans to records, encodes the segment, writes it,
+fsyncs, renames, fsyncs the directory, then reopens and parses the result, all
+on a private vector no other thread can reach. Only the final push into the
+segment list needs exclusion.
 
-**Of the time spent holding the lock, segment sealing is 74%** — and sealing
-needs no lock at all. `write_segment` converts spans to records, encodes the
-segment, writes it, fsyncs, renames, fsyncs the directory, then reopens and
-parses the result, all on a private vector no other thread can reach. Only the
-final push into the segment list needs exclusion.
+That decomposition was first taken on v0.17 and is reproduced here on
+`ddd185a` **after** the WAL rework of PR #15, which added a second flush
+trigger and 788 lines to `src/lib.rs`. The shares moved by a point or two; the
+conclusion did not. What PR #15 did change is the *floor*: `wal fsync` is now a
+comparable cost to sealing at the tighter thresholds, so relieving the lock
+does not make sealing free, it makes fsync the next thing to look at.
 
-Decode, by contrast, was 811 ms of ~42 s of client time — **1.9%** — before
-any of the protocol work above. **That is why a 9.2x faster protobuf decoder
-is not a throughput result.** It is a correct answer to which wire format is
-cheaper, and a real reduction in per-span CPU. It is not a route to 250k
-spans/s, and nothing here should be read as one.
-
-## Against the roadmap target
-
-**Target (§1.5): 250,000 spans/s sustained in `wal` mode. Best measured:
-208,973. NOT MET — 16% short.**
-
-The roadmap once attributed the target to "keep-alive + protobuf".
-Measurement supports neither attribution, though the protobuf half needs
-restating rather than repeating:
-
-- **Protobuf is the cheaper wire format to decode** — 2.3–2.7x cheaper than
-  OTLP JSON on the same route, once both decoders are written properly, and
-  2.9x smaller on the wire. But **decode is ~2% of ingest cost**, so choosing
-  it does not move the gate. Prefer it for bandwidth and CPU, not throughput.
-- **Keep-alive is worth +11% at batch=20** (10,221 vs 9,203 spans/s) and
-  nothing at batch=1000, where it measured slightly *negative*. At 245 KB and
-  ~5 ms of server work per request, a ~50 µs connect is under 1% of the cost.
-
-The real limit is the **writer lock, held ~88% of a run, of which 74% is
-segment sealing** — work that needs no lock.
+Decode, by contrast, is ~800 ms of ~42 s of client thread-time — **about 2%**.
+**That is why a 9.2x faster protobuf decoder is not a throughput result.** It
+is a correct answer to which wire format is cheaper, and a real reduction in
+per-span CPU. It is not a route to 250k spans/s, and nothing here should be
+read as one.
 
 ## Correction: the ceiling is a setting, not a property of the design
 
@@ -357,40 +378,154 @@ not be considered closed until it is re-measured on an idle machine.** What the
 measurement does establish is that the gap was never 16% of "the current
 design" — most of it was one default.
 
-## What moving the seal off the lock would still buy
+## Moving the seal off the lock: what it bought
 
 Sizing seals correctly amortizes the fixed cost; it does not remove it, and the
-lock is still held ~80% of a run at `--flush-spans 30000`. Larger thresholds
-keep paying in tail latency (p99 rises from 64.00 ms at 10,000 to 98.22 ms at
-30,000 under a fixed 60k spans/s arrival rate) and in write-buffer memory, so
-this direction runs out. Moving sealing off the lock is what removes the
-constraint rather than repricing it.
+lock was still held ~81% of a run at `--flush-spans 30000`. Larger thresholds
+keep paying in tail latency and in write-buffer memory, so that direction runs
+out. **Sealing now happens with no engine lock held** — drain under a short
+lock, write with nothing held, publish under a short lock, the shape PR #15
+gave compaction and expiry.
 
-Two constraints make that more than a local change — both found by attempting
-it:
+### Before and after, round-robin
 
-1. **Segment ids must be assigned when the buffer is drained, not when the
-   write finishes.** Segment path order *is* recency order in this engine, so
-   two overlapping seals finishing out of order would silently invert
-   last-write-wins.
-2. **Spans must stay visible while being sealed.** Taking them out of the
-   write buffer before the segment lands leaves already-acknowledged spans in
-   neither the buffer nor a segment — briefly invisible to readers, violating
-   the invariant `get_trace` documents. The existing
-   `reads_never_miss_committed_spans` test does *not* catch this: its writer is
-   single-threaded and `flush()` is synchronous end to end, so the window
-   never opens.
+The host was not idle (see [Load conditions](#load-conditions)), so the two
+builds were **alternated at invocation granularity** — before, after, before,
+after — for four rounds of a 1M-span corpus at concurrency 8, `wal` durability,
+1,000-span batches, compaction off. Drift in background load is shared between
+them instead of landing on whichever ran second. Each cell is the median of
+four rounds.
 
-The fix is a third "sealing" tier that readers consult between the segments
-and the write buffer (only three sites read the buffer directly), plus a WAL
-that rotates its active log aside at drain time instead of truncating it —
-truncation would discard records appended during an unlocked seal. Recovery
-then replays rotated logs in order before the active one. It needs a
-concurrent-ingest-during-seal test to be worth trusting.
+| `--profile` (`--flush-spans`) | Before | After | Change |
+|---|---:|---:|---:|
+| `throughput` (30,000) | 162,763 | **222,683** | **+37%** |
+| `balanced` (10,000) | 116,612 | **176,004** | **+51%** |
+| `latency` (5,000) | 83,400 | **180,331** | **+116%** |
 
-This was implemented far enough to find those two constraints, then reverted
-rather than merged: the visibility regression is precisely the kind the
-current suite would pass over.
+Two things in that table matter more than the percentages.
+
+**The profiles converge.** Before, `--flush-spans` spanned a 2x throughput
+range (83k to 163k) because a smaller threshold meant more seals and every seal
+stopped every ingesting thread. After, `latency` and `balanced` measure within
+3% of each other. Sealing more often is no longer expensive, which is the
+direct observable consequence of it not being on the critical path — and it is
+the setting a latency-sensitive deployment actually wants.
+
+**The contention signal collapses.** `writer lock wait` at `balanced` fell from
+42,455 ms to 15,919 ms over the same 1,000 batches, ~62%. That is threads no
+longer queueing behind a segment write.
+
+### The decomposition afterwards, and where the lock went
+
+`traza_segment_seal_locked` is the part of a seal that holds an engine lock —
+the drain, the publish, and the buffer-and-log reconcile. It is sampled from
+*after* each guard is acquired, so it is lock occupancy and not lock wait, and
+it can therefore be summed against the other in-lock stages. Same host, 1M
+spans at c8:
+
+| In-lock stage | `latency` | `balanced` | `throughput` |
+|---|---:|---:|---:|
+| wal write | 4,145 ms | 4,304 ms | 3,186 ms |
+| buffer upsert | 249 ms | 285 ms | 297 ms |
+| **segment seal (lock held)** | **468 ms** | **585 ms** | **620 ms** |
+| **In-lock total** | **4,861 ms** | **5,174 ms** | **4,102 ms** |
+| **Sealing's share of in-lock** | **10%** | **11%** | **15%** |
+| Seal wall time, all phases | 7,396 ms | 5,802 ms | 4,138 ms |
+| Seals over 1M spans | 129 | 60 | 29 |
+
+**Sealing went from 74-81% of in-lock work to 10-15%.** Only about a tenth of a
+seal's wall time is now spent holding anything.
+
+**The writer lock is still busy, and `wal write` is now what it is busy with** —
+78-85% of the in-lock total. Two things pushed it up from the ~1,100 ms it
+measured before the change: throughput rose, so the same 1,000 batches are
+written in less wall time; and the segment write now competes with the log
+write for the same device instead of being serialized behind the lock. So the
+next thing to attack is the log device and the write path to it, not the
+engine's locking. That is a different problem from the one this change solved,
+and it should be measured on an idle machine before anyone acts on it.
+
+Seal *count* falls (100 → 60 at `balanced`) while each seal covers more spans,
+because the buffer keeps filling while the segment is being written. Under
+saturation most batches find a seal already running and coalesce into it —
+`traza_segment_seals_coalesced_total` reached 916 of 1,000 batches at
+`balanced`. That is the design working, not a backlog.
+
+Two caveats stated plainly. These absolute numbers are **lower than the
+[quiet-machine figures](#the-engine-limit-measured-earlier-on-a-quiet-machine)
+elsewhere in this file** because the host was carrying an unrelated 100%-CPU
+process throughout; the *ratio* is what this measurement supports, not the
+level. And `segment seal` mean time rises sharply after the change (about 35 ms
+to about 145 ms at `balanced`) for two compounding reasons that are both
+expected: a seal now covers more spans, because the buffer keeps filling while
+the segment is written, and its wall clock now includes contending with the
+ingest that no longer waits for it. Seal *count* falls correspondingly. Neither
+is a regression; they are what "this work moved off the critical path" looks
+like from a stage timer.
+
+### The two constraints, corrected
+
+An earlier attempt on v0.17 found two constraints and proposed fixes for both.
+The constraints were real. **Both proposed fixes were wrong**, and the
+correction is the interesting part.
+
+1. **Segment ids must be claimed when the buffer is drained, not when the write
+   finishes.** Segment path order *is* recency order here, so two seals
+   finishing out of order would silently invert last-write-wins. This one
+   stands, and `merge_tail_run` already did it for the same reason. What was
+   missed is the *other* half: compaction claims ids from the same counter, so
+   a merge that claims an id while a seal holds a lower unpublished one would
+   sort its (strictly older) output above that seal's segment. Compaction now
+   declines while any seal is unpublished.
+
+2. **Spans must stay visible while being sealed.** Taking them out of the write
+   buffer before the segment lands leaves already-acknowledged spans in neither
+   the buffer nor a segment — briefly invisible to readers, violating the
+   invariant `get_trace` documents. Also true. But the proposed fix — a third
+   reader-visible "sealing" tier — was unnecessary. **The merge never removes
+   data from visibility**: its inputs stay live and pinned until the output is
+   published, then swap. A seal does the same. The spans stay in the write
+   buffer for the whole write and are evicted only after the segment is
+   published, so no reader ever consults a third place and no precedence rule
+   changes.
+
+   That leaves one real subtlety, and it is where content-based identity would
+   have destroyed data: a span re-ingested *during* the seal is a newer version
+   sitting in the buffer while the segment holds the older one. The buffer
+   outranks segments, so reads are already correct — but the post-publish
+   eviction must drop only keys whose current buffer value is still the one
+   that was sealed. Comparing values cannot answer that: a span re-ingested
+   unchanged is a newer version that happens to look identical. The write
+   buffer therefore holds `Arc<Span>` and the eviction test is handle identity.
+   That also makes the drain a pointer copy rather than a deep copy of ten
+   thousand spans under the lock, which is the cost the change exists to avoid.
+
+The **WAL rotation scheme** the earlier attempt designed was also dropped.
+`Wal::rewrite` (PR #15) already stages and renames a log containing exactly a
+given set of spans, and is crash-tested. But rewriting to the survivors on
+*every* seal puts a re-serialization of everything admitted during the write —
+thousands of spans at these rates — straight back under the writer lock, which
+is most of what the change just bought. Reclamation therefore happens on the
+bound that exists to bound the log, `--flush-wal-bytes` (64 MiB by default),
+and amortizes over every seal since the last reclaim. A seal that empties the
+buffer still discards the whole log, so an idle store behaves exactly as
+before. Leaving records in the log is always safe: replaying a span a segment
+already holds upserts it to the same value.
+
+### What it cost
+
+**Ingest is no longer throttled by sealing**, which was previously free
+backpressure: no batch could be admitted while a seal ran. Past four times
+`--flush-spans` of buffered records, an ingesting thread now waits for the seal
+permit rather than letting its seal coalesce, so the write buffer stays
+bounded. Below that bound, peak buffer memory is higher than before by roughly
+one seal's worth of arrivals.
+
+**`--flush-wal-bytes` became load-bearing.** Under sustained ingest the log now
+runs up to that bound between reclamations instead of being emptied on every
+seal, so restart replay is bounded by the setting rather than by one seal
+interval. That is what the setting has always documented; it is now the thing
+actually doing it.
 
 ## Reproducing
 

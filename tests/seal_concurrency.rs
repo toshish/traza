@@ -204,6 +204,60 @@ fn a_seal_holds_an_engine_lock_for_a_small_fraction_of_its_work() {
 }
 
 #[test]
+fn the_write_buffer_stays_bounded_when_ingest_outruns_sealing() {
+    // Sealing under the writer lock throttled ingest for free — no batch could
+    // be admitted while a seal ran. Off the lock that is gone, and gone in the
+    // one direction that matters: an ingest that sustainably outruns sealing
+    // would grow the buffer until the process died. Past a bounded overshoot
+    // an ingesting thread waits for the seal permit instead of skipping.
+    const FLUSH_SPANS: usize = 1_000;
+    let dir = test_dir("backpressure");
+    let store = store(&dir, FLUSH_SPANS, Durability::Wal);
+
+    let workers: Vec<_> = (0..6u64)
+        .map(|worker| {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || {
+                let mut high_water = 0usize;
+                for batch in 0..40u64 {
+                    let spans: Vec<Span> = (0..500)
+                        .map(|item| {
+                            span(
+                                "flood",
+                                &format!("w{worker}-b{batch:03}-{item:03}"),
+                                "flood",
+                            )
+                        })
+                        .collect();
+                    store.ingest_batch(spans).expect("ingest");
+                    high_water = high_water.max(store.buffered_span_count());
+                }
+                high_water
+            })
+        })
+        .collect();
+    let high_water = workers
+        .into_iter()
+        .map(|worker| worker.join().expect("worker"))
+        .max()
+        .unwrap_or(0);
+
+    // The bound is 4x the threshold plus whatever the threads holding the
+    // writer lock at that moment are admitting — six workers of 500 spans
+    // each. Anything near that is the throttle working; unbounded growth
+    // reaches the full 120,000-span corpus.
+    let ceiling = FLUSH_SPANS * 4 + 6 * 500 + FLUSH_SPANS;
+    assert!(
+        high_water <= ceiling,
+        "the write buffer reached {high_water} spans against a {FLUSH_SPANS}-span \
+         seal threshold (bound {ceiling}): ingest outran sealing and nothing \
+         pushed back"
+    );
+    store.flush().expect("flush");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn last_write_wins_never_goes_backwards_across_a_seal() {
     // The other half of the visibility rule. A key re-ingested WHILE its older
     // version is being sealed lives in the buffer while the segment holds the
