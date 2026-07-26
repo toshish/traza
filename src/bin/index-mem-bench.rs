@@ -225,13 +225,29 @@ fn make_span(index: usize, cell: &Cell) -> Span {
 /// `ps -o rss=` reports KiB on both macOS and Linux and needs no dependency.
 /// It is the *current* RSS, not the peak; the peak sampler below covers that.
 fn rss_bytes() -> u64 {
-    Command::new("ps")
+    // Every failure here is fatal, by design. This function used to fold a
+    // missing `ps`, a non-zero exit, invalid UTF-8 and an unparseable number
+    // all into 0 — so removing `ps` from PATH produced a complete run in
+    // which a real four-segment merge reported 0 MiB open, 0 MiB peak and
+    // 0 MiB settled. Zero is syntactically valid, so no amount of strictness
+    // downstream can catch it; a memory benchmark whose instrument silently
+    // reads zero is worse than one that does not run.
+    let output = Command::new("ps")
         .args(["-o", "rss=", "-p", &std::process::id().to_string()])
         .output()
-        .ok()
-        .and_then(|out| String::from_utf8(out.stdout).ok())
-        .and_then(|text| text.trim().parse::<u64>().ok())
-        .map_or(0, |kib| kib * 1024)
+        .unwrap_or_else(|error| panic!("cannot measure RSS: running `ps` failed: {error}"));
+    assert!(
+        output.status.success(),
+        "cannot measure RSS: `ps` exited {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout)
+        .unwrap_or_else(|error| panic!("cannot measure RSS: `ps` output is not UTF-8: {error}"));
+    let kib: u64 = text.trim().parse().unwrap_or_else(|error| {
+        panic!("cannot measure RSS: `ps` printed {text:?}, which does not parse: {error}")
+    });
+    kib * 1024
 }
 
 fn load_average() -> String {
@@ -391,23 +407,70 @@ fn probe(directory: &Path, flush_spans: usize, payload_threshold: usize, compact
         "resident_payload_bytes": payload_bytes,
         "segments": stats.segment_count,
         "records": stats.total_records,
-        "by_attribute_key": cost_by_key(directory),
     });
 
     if compact {
+        // Sample RSS THROUGHOUT the merge, not once after it returns.
+        //
+        // A merge's whole point here is its transient working set, which is
+        // freed by the time `compact_segments` hands control back — so a
+        // single post-hoc sample measures the trough and reports it as the
+        // peak. An earlier version of this benchmark did exactly that, and
+        // the figures it produced were published as peaks.
+        //
+        // Nothing else in this process allocates while the sampler runs: the
+        // per-key diagnostics moved to their own invocation (`--by-key`)
+        // because reopening every segment to compute them left the allocator
+        // holding freed blocks that inflated the next reading.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let peak = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(rss_bytes()));
+        let sampler = {
+            let stop = std::sync::Arc::clone(&stop);
+            let peak = std::sync::Arc::clone(&peak);
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let now = rss_bytes();
+                    peak.fetch_max(now, std::sync::atomic::Ordering::Relaxed);
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                peak.fetch_max(rss_bytes(), std::sync::atomic::Ordering::Relaxed);
+            })
+        };
+
         let started = Instant::now();
         let merged = store.compact_segments().expect("probe: compact");
-        let rss_compacted = rss_bytes();
+        let compact_seconds = started.elapsed().as_secs_f64();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        sampler.join().expect("probe: sampler");
+
+        let settled = rss_bytes();
         let after = store.resident_index_bytes().expect("probe: index bytes");
         let stats = store.stats().expect("probe: stats");
         report["compacted_away"] = json!(merged);
-        report["compact_seconds"] = json!(started.elapsed().as_secs_f64());
-        report["rss_compacted"] = json!(rss_compacted);
+        report["compact_seconds"] = json!(compact_seconds);
+        // Reported separately and named for what they are. A peak is only
+        // meaningful if a merge actually ran, which `compacted_away` says.
+        report["rss_peak_during_compaction"] =
+            json!(peak.load(std::sync::atomic::Ordering::Relaxed));
+        report["rss_settled_after_compaction"] = json!(settled);
+        report["rss_sample_interval_ms"] = json!(20);
         report["resident_index_bytes_compacted"] = json!(after);
         report["segments_compacted"] = json!(stats.segment_count);
     }
 
     println!("{report}");
+}
+
+/// Per-key index costs, in their own invocation.
+///
+/// Kept out of `probe` because computing them reopens and decodes every
+/// segment; the allocator holds those freed blocks, and the next RSS reading
+/// in the same process is then measuring this diagnostic rather than the
+/// store.
+fn probe_by_key(directory: &Path, flush_spans: usize, payload_threshold: usize) {
+    let _store = Store::open(directory, store_config(flush_spans, payload_threshold))
+        .expect("probe: open store");
+    println!("{}", json!({ "by_attribute_key": cost_by_key(directory) }));
 }
 
 fn run_probe(exe: &Path, directory: &Path, cell: &Cell, threshold: usize, compact: bool) -> Value {
@@ -423,12 +486,88 @@ fn run_probe(exe: &Path, directory: &Path, cell: &Cell, threshold: usize, compac
         command.arg("--compact");
     }
     let output = command.output().expect("spawn probe");
+    // A failed probe must NOT become an empty object. Missing fields read as
+    // 0.0 downstream, so the most important failure this benchmark can have —
+    // the child being OOM-killed on the configuration whose memory we are
+    // measuring — would otherwise be published as "0.0 MiB", the best-looking
+    // number in the table.
     if !output.status.success() {
-        eprintln!("probe failed: {}", String::from_utf8_lossy(&output.stderr));
-        return json!({});
+        panic!(
+            "probe FAILED for {cell:?} (threshold {threshold}, compact {compact}): \
+             status {}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
     let text = String::from_utf8_lossy(&output.stdout);
-    serde_json::from_str(text.trim()).unwrap_or_else(|_| json!({}))
+    serde_json::from_str(text.trim()).unwrap_or_else(|error| {
+        panic!(
+            "probe for {cell:?} produced unparseable output ({error}):\n{text}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })
+}
+
+fn run_probe_by_key(exe: &Path, directory: &Path, cell: &Cell, threshold: usize) -> Value {
+    let output = Command::new(exe)
+        .arg("--probe")
+        .arg(directory)
+        .arg("--by-key")
+        .arg("--flush-spans")
+        .arg(cell.flush_spans.to_string())
+        .arg("--payload-threshold")
+        .arg(threshold.to_string())
+        .output()
+        .expect("spawn by-key probe");
+    if !output.status.success() {
+        panic!(
+            "by-key probe FAILED for {cell:?}: status {}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let parsed: Value = serde_json::from_str(text.trim()).unwrap_or_else(|error| {
+        panic!("by-key probe for {cell:?} produced unparseable output ({error}):\n{text}")
+    });
+    parsed["by_attribute_key"].clone()
+}
+
+/// The commit this binary was built from, and whether the tree was dirty.
+///
+/// Recording a clean SHA from a dirty tree is worse than recording nothing: it
+/// claims the results are reproducible at a revision that does not contain the
+/// code that produced them. The first version of this record did exactly that
+/// — it named a commit whose sampler was the one being replaced.
+fn provenance() -> (String, bool) {
+    // Both git calls are fatal on failure. The first version returned
+    // ("unknown", false) when git was missing — so a failure to establish
+    // provenance produced a record asserting a CLEAN tree, which is the
+    // strongest claim it can make and the one least supported by the
+    // evidence. This is the third instance of the same bug shape in this
+    // file: an instrument that cannot measure must not return the reassuring
+    // value.
+    let git = |args: &[&str]| -> String {
+        let out = Command::new("git")
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("cannot establish provenance: `git {args:?}` failed: {e}"));
+        assert!(
+            out.status.success(),
+            "cannot establish provenance: `git {args:?}` exited {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout)
+            .unwrap_or_else(|e| panic!("cannot establish provenance: git output not UTF-8: {e}"))
+    };
+    let sha = git(&["rev-parse", "--short", "HEAD"]).trim().to_owned();
+    assert!(
+        !sha.is_empty(),
+        "cannot establish provenance: git printed an empty revision"
+    );
+    let dirty = !git(&["status", "--porcelain"]).trim().is_empty();
+    (sha, dirty)
 }
 
 // --------------------------------------------------------------- the cell
@@ -468,6 +607,12 @@ fn run_cell(exe: &Path, root: &Path, cell: &Cell, threshold: usize, keep: bool) 
     let offloaded = payload_file_count(&directory);
 
     let reopen = run_probe(exe, &directory, cell, threshold, false);
+    // Its own invocation, before the compaction probe consumes the store:
+    // computing it reopens and decodes every segment, so it cannot share a
+    // process with an RSS reading. Isolating it is not enough — an earlier
+    // revision isolated it and then never called it, which quietly deleted
+    // the per-key breakdown from every result.
+    let by_key = run_probe_by_key(exe, &directory, cell, threshold);
     let compacted = run_probe(exe, &directory, cell, threshold, true);
     if !keep {
         let _ = fs::remove_dir_all(&directory);
@@ -496,6 +641,7 @@ fn run_cell(exe: &Path, root: &Path, cell: &Cell, threshold: usize, keep: bool) 
         "offloaded_payload_files": offloaded,
         "load_average": load_average(),
         "reopen": reopen,
+        "by_attribute_key": by_key,
         "compacted": compacted,
     })
 }
@@ -603,12 +749,18 @@ fn mib(bytes: f64) -> String {
     format!("{:.1}", bytes / (1024.0 * 1024.0))
 }
 
+/// Reads a numeric field, refusing to invent one.
+///
+/// This used to default to 0.0 for a missing path, which turned every
+/// upstream failure into a row of flattering zeros.
 fn number(value: &Value, path: &[&str]) -> f64 {
     let mut current = value;
     for key in path {
         current = &current[*key];
     }
-    current.as_f64().unwrap_or(0.0)
+    current
+        .as_f64()
+        .unwrap_or_else(|| panic!("missing or non-numeric field {path:?} in probe output: {value}"))
 }
 
 fn report(results: &[Value]) -> String {
@@ -621,7 +773,22 @@ fn report(results: &[Value]) -> String {
         let reopen_rss = number(result, &["reopen", "rss_open"]);
         let reopen_start = number(result, &["reopen", "rss_start"]);
         let index = number(result, &["reopen", "resident_index_bytes"]);
-        let compacted_rss = number(result, &["compacted", "rss_compacted"]);
+        // A peak is only meaningful if a merge actually happened. Several
+        // stores in this matrix return 0 from compact_segments (tracked
+        // separately), and reporting their RSS as a merge peak would be
+        // reporting the steady state under another name.
+        // Strict once the compaction probe ran: `compacted_away` and the peak
+        // are both emitted unconditionally by a successful probe, so a missing
+        // one is an instrument failure, not a configuration that did not
+        // merge. Reading them leniently turned that failure into "did not
+        // merge" — a calm, wrong answer.
+        let compacted_peak = if result.get("compacted").is_some() {
+            let merged_away = number(result, &["compacted", "compacted_away"]);
+            (merged_away > 0.0)
+                .then(|| number(result, &["compacted", "rss_peak_during_compaction"]))
+        } else {
+            None
+        };
         let per_gb = if text > 0.0 {
             (reopen_rss - reopen_start) * (1024.0 * 1024.0 * 1024.0) / text
         } else {
@@ -637,7 +804,7 @@ fn report(results: &[Value]) -> String {
             mib(number(result, &["on_disk_attribute_index_bytes"])),
             mib(index),
             mib(reopen_rss),
-            mib(compacted_rss),
+            compacted_peak.map_or_else(|| "did not merge".to_owned(), |v| mib(v).to_string()),
             mib(per_gb),
         ));
     }
@@ -652,7 +819,10 @@ fn main() {
 
     let mut probe_dir: Option<PathBuf> = None;
     let mut compact = false;
+    let mut by_key = false;
     let mut run_matrix = false;
+    let mut emit_record: Option<String> = None;
+    let mut allow_dirty = false;
     let mut value_bytes = 2 * 1024_usize;
     let mut unique_pct = 100_u32;
     let mut attrs = 1_usize;
@@ -679,7 +849,10 @@ fn main() {
         match argument {
             "--probe" => probe_dir = Some(PathBuf::from(next("--probe"))),
             "--compact" => compact = true,
+            "--by-key" => by_key = true,
             "--matrix" => run_matrix = true,
+            "--emit-record" => emit_record = Some(next("--emit-record")),
+            "--allow-dirty" => allow_dirty = true,
             "--value-bytes" => value_bytes = next("--value-bytes").parse().expect("integer"),
             "--unique-pct" => unique_pct = next("--unique-pct").parse().expect("integer"),
             "--attrs" => attrs = next("--attrs").parse().expect("integer"),
@@ -710,7 +883,11 @@ fn main() {
     }
 
     if let Some(directory) = probe_dir {
-        probe(&directory, flush_spans, threshold, compact);
+        if by_key {
+            probe_by_key(&directory, flush_spans, threshold);
+        } else {
+            probe(&directory, flush_spans, threshold, compact);
+        }
         return;
     }
 
@@ -759,6 +936,56 @@ fn main() {
     }
 
     println!("{}", report(&results));
+
+    // Emit the committed record from the harness itself. The first version of
+    // this record was produced by an uncommitted script, so the transformation
+    // from raw results to published document was not reproducible at all.
+    if let Some(stem) = emit_record {
+        // A record is a claim about a canonical matrix. Emitting one from a
+        // single hand-specified cell produced a document with one row and an
+        // embedded command advertising `--matrix`, which is a lie the file
+        // tells about itself.
+        assert!(
+            run_matrix,
+            "--emit-record describes a canonical matrix, so it requires --matrix; \
+             a single-cell run is a diagnostic and has no record to write"
+        );
+        let (commit, dirty) = provenance();
+        assert!(
+            !dirty || allow_dirty,
+            "refusing to write a measurement record from a dirty tree: the record would name \
+             commit {commit}, which does not contain the code that produced it. Commit the \
+             harness, re-run, then commit the record — or pass --allow-dirty to mark the \
+             record provisional."
+        );
+        let json_path = format!("{stem}.json");
+        let md_path = format!("{stem}.md");
+        let document = json!({
+            "commit": commit,
+            "dirty_tree": dirty,
+            "machine": machine(),
+            "generated_unix": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs()),
+            // The real argv, not a reconstruction: a hand-written command
+            // string drifts from what was actually run, and did.
+            "command": std::env::args().collect::<Vec<_>>().join(" "),
+            "result_count": results.len(),
+            "payload_offload_threshold_bytes": threshold,
+            "rss_sample_interval_ms": 20,
+            "results": results,
+        });
+        std::fs::write(&json_path, format!("{document:#}\n")).expect("write record json");
+        let mut markdown = format!(
+            "# Resident index memory: measurement record\n\n             Generated by `{}`.\n\n             - Commit: `{commit}`{}\n             - Machine: {}\n             - Raw per-cell results: [`{json_path}`]({json_path})\n             - RSS is sampled every 20 ms by a background thread for the duration of each              merge; every other RSS figure is a single reading in a freshly spawned child.\n             - Load average is recorded per row: this machine was not idle.\n\n",
+            document["command"].as_str().unwrap_or_default(),
+            if dirty { " **(DIRTY TREE — provisional)**" } else { "" },
+            machine(),
+        );
+        markdown.push_str(&report(&results));
+        std::fs::write(&md_path, markdown).expect("write record markdown");
+        println!("Wrote {md_path} and {json_path}");
+    }
     println!("load average at end: {}", load_average());
 }
 

@@ -1,0 +1,1566 @@
+{
+  "command": "./target/release/index-mem-bench --matrix --text-budget-mib 64 --emit-record INDEX-MEM-BENCHMARK",
+  "commit": "de046d8",
+  "dirty_tree": false,
+  "generated_unix": 1785057256,
+  "machine": "macos/aarch64, 10 hardware threads, Apple M1 Max",
+  "payload_offload_threshold_bytes": 262144,
+  "result_count": 26,
+  "results": [
+    {
+      "attrs": 1,
+      "by_attribute_key": {
+        "\u0000name": {
+          "bytes": 1048836,
+          "values": 13
+        },
+        "\u0000service": {
+          "bytes": 1048849,
+          "values": 13
+        },
+        "gen_ai.prompt": {
+          "bytes": 1055427,
+          "values": 13
+        }
+      },
+      "compacted": {
+        "compact_seconds": 1.049038959,
+        "compacted_away": 12,
+        "records": 131072,
+        "resident_attribute_index_entries": 39,
+        "resident_index_bytes": 6853548,
+        "resident_index_bytes_compacted": 7144284,
+        "resident_payload_bytes": 0,
+        "rss_open": 10452992,
+        "rss_peak_during_compaction": 1262288896,
+        "rss_sample_interval_ms": 20,
+        "rss_settled_after_compaction": 826376192,
+        "rss_start": 1638400,
+        "segments": 13,
+        "segments_compacted": 1
+      },
+      "disk_bytes": 190751732,
+      "distinct_values": 1,
+      "flush_spans": 10000,
+      "ingest_seconds": 0.6666545,
+      "ingested_text_bytes": 67108864,
+      "label": "512B/0%/1attr/flush10000/interleaved",
+      "load_average": "45.27 33.85 26.01",
+      "offloaded_payload_files": 0,
+      "on_disk_attribute_index_bytes": 3153632,
+      "order": "interleaved",
+      "records": 131072,
+      "reopen": {
+        "records": 131072,
+        "resident_attribute_index_entries": 39,
+        "resident_index_bytes": 6853548,
+        "resident_payload_bytes": 0,
+        "rss_open": 10452992,
+        "rss_start": 1638400,
+        "segments": 13
+      },
+      "rss_after_ingest": 262291456,
+      "rss_base": 1802240,
+      "segments": 13,
+      "spans": 131072,
+      "unique_pct": 0,
+      "value_bytes": 512
+    },
+    {
+      "attrs": 1,
+      "by_attribute_key": {
+        "\u0000name": {
+          "bytes": 1048836,
+          "values": 13
+        },
+        "\u0000service": {
+          "bytes": 1048849,
+          "values": 13
+        },
+        "gen_ai.prompt": {
+          "bytes": 70123520,
+          "values": 131072
+        }
+      },
+      "compacted": {
+        "compact_seconds": 1.095595166,
+        "compacted_away": 12,
+        "records": 131072,
+        "resident_attribute_index_entries": 131098,
+        "resident_index_bytes": 91466261,
+        "resident_index_bytes_compacted": 15246886,
+        "resident_payload_bytes": 0,
+        "rss_open": 121208832,
+        "rss_peak_during_compaction": 1355055104,
+        "rss_sample_interval_ms": 20,
+        "rss_settled_after_compaction": 973242368,
+        "rss_start": 1638400,
+        "segments": 13,
+        "segments_compacted": 1
+      },
+      "disk_bytes": 261392533,
+      "distinct_values": 13107,
+      "flush_spans": 10000,
+      "ingest_seconds": 0.864763209,
+      "ingested_text_bytes": 67108864,
+      "label": "512B/10%/1attr/flush10000/interleaved",
+      "load_average": "45.27 33.85 26.01",
+      "offloaded_payload_files": 0,
+      "on_disk_attribute_index_bytes": 73794433,
+      "order": "interleaved",
+      "records": 131072,
+      "reopen": {
+        "records": 131072,
+        "resident_attribute_index_entries": 131098,
+        "resident_index_bytes": 91466261,
+        "resident_payload_bytes": 0,
+        "rss_open": 121225216,
+        "rss_start": 1638400,
+        "segments": 13
+      },
+      "rss_after_ingest": 194576384,
+      "rss_base": 262406144,
+      "segments": 13,
+      "spans": 131072,
+      "unique_pct": 10,
+      "value_bytes": 512
+    },
+    {
+      "attrs": 1,
+      "by_attribute_key": {
+        "\u0000name": {
+          "bytes": 1048836,
+          "values": 13
+        },
+        "\u0000service": {
+          "bytes": 1048849,
+          "values": 13
+        },
+        "gen_ai.prompt": {
+          "bytes": 70123520,
+          "values": 131072
+        }
+      },
+      "compacted": {
+        "compact_seconds": 1.181988167,
+        "compacted_away": 12,
+        "records": 131072,
+        "resident_attribute_index_entries": 131098,
+        "resident_index_bytes": 91466261,
+        "resident_index_bytes_compacted": 51249193,
+        "resident_payload_bytes": 0,
+        "rss_open": 121339904,
+        "rss_peak_during_compaction": 1494908928,
+        "rss_sample_interval_ms": 20,
+        "rss_settled_after_compaction": 1057243136,
+        "rss_start": 1638400,
+        "segments": 13,
+        "segments_compacted": 1
+      },
+      "disk_bytes": 261392533,
+      "distinct_values": 65536,
+      "flush_spans": 10000,
+      "ingest_seconds": 0.829595166,
+      "ingested_text_bytes": 67108864,
+      "label": "512B/50%/1attr/flush10000/interleaved",
+      "load_average": "42.76 33.52 25.94",
+      "offloaded_payload_files": 0,
+      "on_disk_attribute_index_bytes": 73794433,
+      "order": "interleaved",
+      "records": 131072,
+      "reopen": {
+        "records": 131072,
+        "resident_attribute_index_entries": 131098,
+        "resident_index_bytes": 91466261,
+        "resident_payload_bytes": 0,
+        "rss_open": 121274368,
+        "rss_start": 1638400,
+        "segments": 13
+      },
+      "rss_after_ingest": 513736704,
+      "rss_base": 200376320,
+      "segments": 13,
+      "spans": 131072,
+      "unique_pct": 50,
+      "value_bytes": 512
+    },
+    {
+      "attrs": 1,
+      "by_attribute_key": {
+        "\u0000name": {
+          "bytes": 1048836,
+          "values": 13
+        },
+        "\u0000service": {
+          "bytes": 1048849,
+          "values": 13
+        },
+        "gen_ai.prompt": {
+          "bytes": 70123520,
+          "values": 131072
+        }
+      },
+      "compacted": {
+        "compact_seconds": 1.26697175,
+        "compacted_away": 12,
+        "records": 131072,
+        "resident_attribute_index_entries": 131098,
+        "resident_index_bytes": 91466261,
+        "resident_index_bytes_compacted": 95354921,
+        "resident_payload_bytes": 0,
+        "rss_open": 121225216,
+        "rss_peak_during_compaction": 1678295040,
+        "rss_sample_interval_ms": 20,
+        "rss_settled_after_compaction": 1155874816,
+        "rss_start": 1638400,
+        "segments": 13,
+        "segments_compacted": 1
+      },
+      "disk_bytes": 261392533,
+      "distinct_values": 131072,
+      "flush_spans": 10000,
+      "ingest_seconds": 0.814012791,
+      "ingested_text_bytes": 67108864,
+      "label": "512B/100%/1attr/flush10000/interleaved",
+      "load_average": "40.30 33.17 25.85",
+      "offloaded_payload_files": 0,
+      "on_disk_attribute_index_bytes": 73794433,
+      "order": "interleaved",
+      "records": 131072,
+      "reopen": {
+        "records": 131072,
+        "resident_attribute_index_entries": 131098,
+        "resident_index_bytes": 91466261,
+        "resident_payload_bytes": 0,
+        "rss_open": 121356288,
+        "rss_start": 1638400,
+        "segments": 13
+      },
+      "rss_after_ingest": 808452096,
+      "rss_base": 513753088,
+      "segments": 13,
+      "spans": 131072,
+      "unique_pct": 100,
+      "value_bytes": 512
+    },
+    {
+      "attrs": 1,
+      "by_attribute_key": {
+        "\u0000name": {
+          "bytes": 262224,
+          "values": 4
+        },
+        "\u0000service": {
+          "bytes": 262228,
+          "values": 4
+        },
+        "gen_ai.prompt": {
+          "bytes": 270396,
+          "values": 4
+        }
+      },
+      "compacted": {
+        "compact_seconds": 1.167e-6,
+        "compacted_away": 0,
+        "records": 32768,
+        "resident_attribute_index_entries": 12,
+        "resident_index_bytes": 1720176,
+        "resident_index_bytes_compacted": 1720176,
+        "resident_payload_bytes": 0,
+        "rss_open": 4440064,
+        "rss_peak_during_compaction": 4505600,
+        "rss_sample_interval_ms": 20,
+        "rss_settled_after_compaction": 4521984,
+        "rss_start": 1638400,
+        "segments": 4,
+        "segments_compacted": 4
+      },
+      "disk_bytes": 148357904,
+      "distinct_values": 1,
+      "flush_spans": 10000,
+      "ingest_seconds": 0.314808875,
+      "ingested_text_bytes": 67108864,
+      "label": "2048B/0%/1attr/flush10000/interleaved",
+      "load_average": "40.30 33.17 25.85",
+      "offloaded_payload_files": 0,
+      "on_disk_attribute_index_bytes": 795008,
+      "order": "interleaved",
+      "records": 32768,
+      "reopen": {
+        "records": 32768,
+        "resident_attribute_index_entries": 12,
+        "resident_index_bytes": 1720176,
+        "resident_payload_bytes": 0,
+        "rss_open": 4423680,
+        "rss_start": 1638400,
+        "segments": 4
+      },
+      "rss_after_ingest": 1137098752,
+      "rss_base": 805912576,
+      "segments": 4,
+      "spans": 32768,
+      "unique_pct": 0,
+      "value_bytes": 2048
+    },
+    {
+      "attrs": 1,
+      "by_attribute_key": {
+        "\u0000name": {
+          "bytes": 262224,
+          "values": 4
+        },
+        "\u0000service": {
+          "bytes": 262228,
+          "values": 4
+        },
+        "gen_ai.prompt": {
+          "bytes": 24762332,
+          "values": 11876
+        }
+      },
+      "compacted": {
+        "compact_seconds": 1e-6,
+        "compacted_away": 0,
+        "records": 32768,
+        "resident_attribute_index_entries": 11884,
+        "resident_index_bytes": 27406976,
+        "resident_index_bytes_compacted": 27406976,
+        "resident_payload_bytes": 0,
+        "rss_open": 45596672,
+        "rss_peak_during_compaction": 45662208,
+        "rss_sample_interval_ms": 20,
+        "rss_settled_after_compaction": 45678592,
+        "rss_start": 1638400,
+        "segments": 4,
+        "segments_compacted": 4
+      },
+      "disk_bytes": 172992304,
+      "distinct_values": 3276,
+      "flush_spans": 10000,
+      "ingest_seconds": 0.344479833,
+      "ingested_text_bytes": 67108864,
+      "label": "2048B/10%/1attr/flush10000/interleaved",
+      "load_average": "40.30 33.17 25.85",
+      "offloaded_payload_files": 0,
+      "on_disk_attribute_index_bytes": 25429408,
+      "order": "interleaved",
+      "records": 32768,
+      "reopen": {
+        "records": 32768,
+        "resident_attribute_index_entries": 11884,
+        "resident_index_bytes": 27406976,
+        "resident_payload_bytes": 0,
+        "rss_open": 45613056,
+        "rss_start": 1638400,
+        "segments": 4
+      },
+      "rss_after_ingest": 1344077824,
+      "rss_base": 1137131520,
+      "segments": 4,
+      "spans": 32768,
+      "unique_pct": 10,
+      "value_bytes": 2048
+    },
+    {
+      "attrs": 1,
+      "by_attribute_key": {
+        "\u0000name": {
+          "bytes": 262224,
+          "values": 4
+        },
+        "\u0000service": {
+          "bytes": 262228,
+          "values": 4
+        },
+        "gen_ai.prompt": {
+          "bytes": 67862528,
+          "values": 32768
+        }
+      },
+      "compacted": {
+        "compact_seconds": 1.083e-6,
+        "compacted_away": 0,
+        "records": 32768,
+        "resident_attribute_index_entries": 32776,
+        "resident_index_bytes": 73198244,
+        "resident_index_bytes_compacted": 73198244,
+        "resident_payload_bytes": 0,
+        "rss_open": 124829696,
+        "rss_peak_during_compaction": 124911616,
+        "rss_sample_interval_ms": 20,
+        "rss_settled_after_compaction": 124928000,
+        "rss_start": 1638400,
+        "segments": 4,
+        "segments_compacted": 4
+      },
+      "disk_bytes": 216343204,
+      "distinct_values": 16384,
+      "flush_spans": 10000,
+      "ingest_seconds": 0.493815125,
+      "ingested_text_bytes": 67108864,
+      "label": "2048B/50%/1attr/flush10000/interleaved",
+      "load_average": "40.30 33.17 25.85",
+      "offloaded_payload_files": 0,
+      "on_disk_attribute_index_bytes": 68780308,
+      "order": "interleaved",
+      "records": 32768,
+      "reopen": {
+        "records": 32768,
+        "resident_attribute_index_entries": 32776,
+        "resident_index_bytes": 73198244,
+        "resident_payload_bytes": 0,
+        "rss_open": 124698624,
+        "rss_start": 1638400,
+        "segments": 4
+      },
+      "rss_after_ingest": 453787648,
+      "rss_base": 1344077824,
+      "segments": 4,
+      "spans": 32768,
+      "unique_pct": 50,
+      "value_bytes": 2048
+    },
+    {
+      "attrs": 1,
+      "by_attribute_key": {
+        "\u0000name": {
+          "bytes": 262224,
+          "values": 4
+        },
+        "\u0000service": {
+          "bytes": 262228,
+          "values": 4
+        },
+        "gen_ai.prompt": {
+          "bytes": 67862528,
+          "values": 32768
+        }
+      },
+      "compacted": {
+        "compact_seconds": 1.042e-6,
+        "compacted_away": 0,
+        "records": 32768,
+        "resident_attribute_index_entries": 32776,
+        "resident_index_bytes": 73198244,
+        "resident_index_bytes_compacted": 73198244,
+        "resident_payload_bytes": 0,
+        "rss_open": 124813312,
+        "rss_peak_during_compaction": 124878848,
+        "rss_sample_interval_ms": 20,
+        "rss_settled_after_compaction": 124895232,
+        "rss_start": 1638400,
+        "segments": 4,
+        "segments_compacted": 4
+      },
+      "disk_bytes": 216343204,
+      "distinct_values": 32768,
+      "flush_spans": 10000,
+      "ingest_seconds": 0.417478875,
+      "ingested_text_bytes": 67108864,
+      "label": "2048B/100%/1attr/flush10000/interleaved",
+      "load_average": "40.30 33.17 25.85",
+      "offloaded_payload_files": 0,
+      "on_disk_attribute_index_bytes": 68780308,
+      "order": "interleaved",
+      "records": 32768,
+      "reopen": {
+        "records": 32768,
+        "resident_attribute_index_entries": 32776,
+        "resident_index_bytes": 73198244,
+        "resident_payload_bytes": 0,
+        "rss_open": 124829696,
+        "rss_start": 1638400,
+        "segments": 4
+      },
+      "rss_after_ingest": 771227648,
+      "rss_base": 479592448,
+      "segments": 4,
+      "spans": 32768,
+      "unique_pct": 100,
+      "value_bytes": 2048
+    },
+    {
+      "attrs": 1,
+      "by_attribute_key": {
+        "\u0000name": {
+          "bytes": 65556,
+          "values": 1
+        },
+        "\u0000service": {
+          "bytes": 65557,
+          "values": 1
+        },
+        "gen_ai.prompt": {
+          "bytes": 73743,
+          "values": 1
+        }
+      },
+      "compacted": {
+        "compact_seconds": 7.08e-7,
+        "compacted_away": 0,
+        "records": 8192,
+        "resident_attribute_index_entries": 3,
+        "resident_index_bytes": 455004,
+        "resident_index_bytes_compacted": 455004,
+        "resident_payload_bytes": 0,
+        "rss_open": 2834432,
+        "rss_peak_during_compaction": 2899968,
+        "rss_sample_interval_ms": 20,
+        "rss_settled_after_compaction": 2916352,
+        "rss_start": 1638400,
+        "segments": 1,
+        "segments_compacted": 1
+      },
+      "disk_bytes": 137758916,
+      "distinct_values": 1,
+      "flush_spans": 10000,
+      "ingest_seconds": 0.234471375,
+      "ingested_text_bytes": 67108864,
+      "label": "8192B/0%/1attr/flush10000/interleaved",
+      "load_average": "40.30 33.17 25.85",
+      "offloaded_payload_files": 0,
+      "on_disk_attribute_index_bytes": 204896,
+      "order": "interleaved",
+      "records": 8192,
+      "reopen": {
+        "records": 8192,
+        "resident_attribute_index_entries": 3,
+        "resident_index_bytes": 455004,
+        "resident_payload_bytes": 0,
+        "rss_open": 2867200,
+        "rss_start": 1638400,
+        "segments": 1
+      },
+      "rss_after_ingest": 1450049536,
+      "rss_base": 771227648,
+      "segments": 1,
+      "spans": 8192,
+      "unique_pct": 0,
+      "value_bytes": 8192
+    },
+    {
+      "attrs": 1,
+      "by_attribute_key": {
+        "\u0000name": {
+          "bytes": 65556,
+          "values": 1
+        },
+        "\u0000service": {
+          "bytes": 65557,
+          "values": 1
+        },
+        "gen_ai.prompt": {
+          "bytes": 6787069,
+          "values": 819
+        }
+      },
+      "compacted": {
+        "compact_seconds": 9.59e-7,
+        "compacted_away": 0,
+        "records": 8192,
+        "resident_attribute_index_entries": 821,
+        "resident_index_bytes": 7242790,
+        "resident_index_bytes_compacted": 7242790,
+        "resident_payload_bytes": 0,
+        "rss_open": 18644992,
+        "rss_peak_during_compaction": 18710528,
+        "rss_sample_interval_ms": 20,
+        "rss_settled_after_compaction": 18726912,
+        "rss_start": 1638400,
+        "segments": 1,
+        "segments_compacted": 1
+      },
+      "disk_bytes": 144482058,
+      "distinct_values": 819,
+      "flush_spans": 10000,
+      "ingest_seconds": 0.211117834,
+      "ingested_text_bytes": 67108864,
+      "label": "8192B/10%/1attr/flush10000/interleaved",
+      "load_average": "40.30 33.17 25.85",
+      "offloaded_payload_files": 0,
+      "on_disk_attribute_index_bytes": 6928038,
+      "order": "interleaved",
+      "records": 8192,
+      "reopen": {
+        "records": 8192,
+        "resident_attribute_index_entries": 821,
+        "resident_index_bytes": 7242790,
+        "resident_payload_bytes": 0,
+        "rss_open": 18677760,
+        "rss_start": 1638400,
+        "segments": 1
+      },
+      "rss_after_ingest": 1758560256,
+      "rss_base": 1450065920,
+      "segments": 1,
+      "spans": 8192,
+      "unique_pct": 10,
+      "value_bytes": 8192
+    },
+    {
+      "attrs": 1,
+      "by_attribute_key": {
+        "\u0000name": {
+          "bytes": 65556,
+          "values": 1
+        },
+        "\u0000service": {
+          "bytes": 65557,
+          "values": 1
+        },
+        "gen_ai.prompt": {
+          "bytes": 33681408,
+          "values": 4096
+        }
+      },
+      "compacted": {
+        "compact_seconds": 9.16e-7,
+        "compacted_away": 0,
+        "records": 8192,
+        "resident_attribute_index_entries": 4098,
+        "resident_index_bytes": 34660393,
+        "resident_index_bytes_compacted": 34660393,
+        "resident_payload_bytes": 0,
+        "rss_open": 82165760,
+        "rss_peak_during_compaction": 82231296,
+        "rss_sample_interval_ms": 20,
+        "rss_settled_after_compaction": 82264064,
+        "rss_start": 1654784,
+        "segments": 1,
+        "segments_compacted": 1
+      },
+      "disk_bytes": 171415721,
+      "distinct_values": 4096,
+      "flush_spans": 10000,
+      "ingest_seconds": 0.261196333,
+      "ingested_text_bytes": 67108864,
+      "label": "8192B/50%/1attr/flush10000/interleaved",
+      "load_average": "40.30 33.17 25.85",
+      "offloaded_payload_files": 0,
+      "on_disk_attribute_index_bytes": 33861701,
+      "order": "interleaved",
+      "records": 8192,
+      "reopen": {
+        "records": 8192,
+        "resident_attribute_index_entries": 4098,
+        "resident_index_bytes": 34660393,
+        "resident_payload_bytes": 0,
+        "rss_open": 82296832,
+        "rss_start": 1638400,
+        "segments": 1
+      },
+      "rss_after_ingest": 2206433280,
+      "rss_base": 1758560256,
+      "segments": 1,
+      "spans": 8192,
+      "unique_pct": 50,
+      "value_bytes": 8192
+    },
+    {
+      "attrs": 1,
+      "by_attribute_key": {
+        "\u0000name": {
+          "bytes": 65556,
+          "values": 1
+        },
+        "\u0000service": {
+          "bytes": 65557,
+          "values": 1
+        },
+        "gen_ai.prompt": {
+          "bytes": 67297280,
+          "values": 8192
+        }
+      },
+      "compacted": {
+        "compact_seconds": 1.292e-6,
+        "compacted_away": 0,
+        "records": 8192,
+        "resident_attribute_index_entries": 8194,
+        "resident_index_bytes": 68874281,
+        "resident_index_bytes_compacted": 68874281,
+        "resident_payload_bytes": 0,
+        "rss_open": 161497088,
+        "rss_peak_during_compaction": 161562624,
+        "rss_sample_interval_ms": 20,
+        "rss_settled_after_compaction": 161579008,
+        "rss_start": 1638400,
+        "segments": 1,
+        "segments_compacted": 1
+      },
+      "disk_bytes": 205080745,
+      "distinct_values": 8192,
+      "flush_spans": 10000,
+      "ingest_seconds": 0.314371459,
+      "ingested_text_bytes": 67108864,
+      "label": "8192B/100%/1attr/flush10000/interleaved",
+      "load_average": "40.30 33.17 25.85",
+      "offloaded_payload_files": 0,
+      "on_disk_attribute_index_bytes": 67526725,
+      "order": "interleaved",
+      "records": 8192,
+      "reopen": {
+        "records": 8192,
+        "resident_attribute_index_entries": 8194,
+        "resident_index_bytes": 68874281,
+        "resident_payload_bytes": 0,
+        "rss_open": 161480704,
+        "rss_start": 1638400,
+        "segments": 1
+      },
+      "rss_after_ingest": 2706309120,
+      "rss_base": 2206449664,
+      "segments": 1,
+      "spans": 8192,
+      "unique_pct": 100,
+      "value_bytes": 8192
+    },
+    {
+      "attrs": 1,
+      "by_attribute_key": {
+        "\u0000name": {
+          "bytes": 8212,
+          "values": 1
+        },
+        "\u0000service": {
+          "bytes": 8213,
+          "values": 1
+        },
+        "gen_ai.prompt": {
+          "bytes": 73743,
+          "values": 1
+        }
+      },
+      "compacted": {
+        "compact_seconds": 1e-6,
+        "compacted_away": 0,
+        "records": 1024,
+        "resident_attribute_index_entries": 3,
+        "resident_index_bytes": 121692,
+        "resident_index_bytes_compacted": 121692,
+        "resident_payload_bytes": 0,
+        "rss_open": 2162688,
+        "rss_peak_during_compaction": 2228224,
+        "rss_sample_interval_ms": 20,
+        "rss_settled_after_compaction": 2260992,
+        "rss_start": 1638400,
+        "segments": 1,
+        "segments_compacted": 1
+      },
+      "disk_bytes": 134725060,
+      "distinct_values": 1,
+      "flush_spans": 10000,
+      "ingest_seconds": 0.199612583,
+      "ingested_text_bytes": 67108864,
+      "label": "65536B/0%/1attr/flush10000/interleaved",
+      "load_average": "40.30 33.17 25.85",
+      "offloaded_payload_files": 0,
+      "on_disk_attribute_index_bytes": 90208,
+      "order": "interleaved",
+      "records": 1024,
+      "reopen": {
+        "records": 1024,
+        "resident_attribute_index_entries": 3,
+        "resident_index_bytes": 121692,
+        "resident_payload_bytes": 0,
+        "rss_open": 2179072,
+        "rss_start": 1638400,
+        "segments": 1
+      },
+      "rss_after_ingest": 3056025600,
+      "rss_base": 2706325504,
+      "segments": 1,
+      "spans": 1024,
+      "unique_pct": 0,
+      "value_bytes": 65536
+    },
+    {
+      "attrs": 1,
+      "by_attribute_key": {
+        "\u0000name": {
+          "bytes": 8212,
+          "values": 1
+        },
+        "\u0000service": {
+          "bytes": 8213,
+          "values": 1
+        },
+        "gen_ai.prompt": {
+          "bytes": 6694394,
+          "values": 102
+        }
+      },
+      "compacted": {
+        "compact_seconds": 8.33e-7,
+        "compacted_away": 0,
+        "records": 1024,
+        "resident_attribute_index_entries": 104,
+        "resident_index_bytes": 6751395,
+        "resident_index_bytes_compacted": 6751395,
+        "resident_payload_bytes": 0,
+        "rss_open": 17203200,
+        "rss_peak_during_compaction": 17268736,
+        "rss_sample_interval_ms": 20,
+        "rss_settled_after_compaction": 17285120,
+        "rss_start": 1638400,
+        "segments": 1,
+        "segments_compacted": 1
+      },
+      "disk_bytes": 141346923,
+      "distinct_values": 102,
+      "flush_spans": 10000,
+      "ingest_seconds": 0.198412708,
+      "ingested_text_bytes": 67108864,
+      "label": "65536B/10%/1attr/flush10000/interleaved",
+      "load_average": "40.30 33.17 25.85",
+      "offloaded_payload_files": 0,
+      "on_disk_attribute_index_bytes": 6712071,
+      "order": "interleaved",
+      "records": 1024,
+      "reopen": {
+        "records": 1024,
+        "resident_attribute_index_entries": 104,
+        "resident_index_bytes": 6751395,
+        "resident_payload_bytes": 0,
+        "rss_open": 17203200,
+        "rss_start": 1638400,
+        "segments": 1
+      },
+      "rss_after_ingest": 3173400576,
+      "rss_base": 3056107520,
+      "segments": 1,
+      "spans": 1024,
+      "unique_pct": 10,
+      "value_bytes": 65536
+    },
+    {
+      "attrs": 1,
+      "by_attribute_key": {
+        "\u0000name": {
+          "bytes": 8212,
+          "values": 1
+        },
+        "\u0000service": {
+          "bytes": 8213,
+          "values": 1
+        },
+        "gen_ai.prompt": {
+          "bytes": 33570304,
+          "values": 512
+        }
+      },
+      "compacted": {
+        "compact_seconds": 1.417e-6,
+        "compacted_away": 0,
+        "records": 1024,
+        "resident_attribute_index_entries": 514,
+        "resident_index_bytes": 33692713,
+        "resident_index_bytes_compacted": 33692713,
+        "resident_payload_bytes": 0,
+        "rss_open": 77889536,
+        "rss_peak_during_compaction": 77955072,
+        "rss_sample_interval_ms": 20,
+        "rss_settled_after_compaction": 77971456,
+        "rss_start": 1638400,
+        "segments": 1,
+        "segments_compacted": 1
+      },
+      "disk_bytes": 168227753,
+      "distinct_values": 512,
+      "flush_spans": 10000,
+      "ingest_seconds": 0.242195125,
+      "ingested_text_bytes": 67108864,
+      "label": "65536B/50%/1attr/flush10000/interleaved",
+      "load_average": "38.27 32.86 25.79",
+      "offloaded_payload_files": 0,
+      "on_disk_attribute_index_bytes": 33592901,
+      "order": "interleaved",
+      "records": 1024,
+      "reopen": {
+        "records": 1024,
+        "resident_attribute_index_entries": 514,
+        "resident_index_bytes": 33692713,
+        "resident_payload_bytes": 0,
+        "rss_open": 77873152,
+        "rss_start": 1638400,
+        "segments": 1
+      },
+      "rss_after_ingest": 3420536832,
+      "rss_base": 3173367808,
+      "segments": 1,
+      "spans": 1024,
+      "unique_pct": 50,
+      "value_bytes": 65536
+    },
+    {
+      "attrs": 1,
+      "by_attribute_key": {
+        "\u0000name": {
+          "bytes": 8212,
+          "values": 1
+        },
+        "\u0000service": {
+          "bytes": 8213,
+          "values": 1
+        },
+        "gen_ai.prompt": {
+          "bytes": 67132416,
+          "values": 1024
+        }
+      },
+      "compacted": {
+        "compact_seconds": 1.041e-6,
+        "compacted_away": 0,
+        "records": 1024,
+        "resident_attribute_index_entries": 1026,
+        "resident_index_bytes": 67329577,
+        "resident_index_bytes_compacted": 67329577,
+        "resident_payload_bytes": 0,
+        "rss_open": 153649152,
+        "rss_peak_during_compaction": 153714688,
+        "rss_sample_interval_ms": 20,
+        "rss_settled_after_compaction": 153731072,
+        "rss_start": 1638400,
+        "segments": 1,
+        "segments_compacted": 1
+      },
+      "disk_bytes": 201796009,
+      "distinct_values": 1024,
+      "flush_spans": 10000,
+      "ingest_seconds": 0.256369834,
+      "ingested_text_bytes": 67108864,
+      "label": "65536B/100%/1attr/flush10000/interleaved",
+      "load_average": "38.27 32.86 25.79",
+      "offloaded_payload_files": 0,
+      "on_disk_attribute_index_bytes": 67161157,
+      "order": "interleaved",
+      "records": 1024,
+      "reopen": {
+        "records": 1024,
+        "resident_attribute_index_entries": 1026,
+        "resident_index_bytes": 67329577,
+        "resident_payload_bytes": 0,
+        "rss_open": 153632768,
+        "rss_start": 1638400,
+        "segments": 1
+      },
+      "rss_after_ingest": 3706929152,
+      "rss_base": 3423059968,
+      "segments": 1,
+      "spans": 1024,
+      "unique_pct": 100,
+      "value_bytes": 65536
+    },
+    {
+      "attrs": 1,
+      "by_attribute_key": {
+        "\u0000name": {
+          "bytes": 262224,
+          "values": 4
+        },
+        "\u0000service": {
+          "bytes": 262228,
+          "values": 4
+        },
+        "gen_ai.prompt": {
+          "bytes": 7026721,
+          "values": 3279
+        }
+      },
+      "compacted": {
+        "compact_seconds": 1.292e-6,
+        "compacted_away": 0,
+        "records": 32768,
+        "resident_attribute_index_entries": 3287,
+        "resident_index_bytes": 8942533,
+        "resident_index_bytes_compacted": 8942533,
+        "resident_payload_bytes": 0,
+        "rss_open": 16629760,
+        "rss_peak_during_compaction": 16744448,
+        "rss_sample_interval_ms": 20,
+        "rss_settled_after_compaction": 16760832,
+        "rss_start": 1638400,
+        "segments": 4,
+        "segments_compacted": 4
+      },
+      "disk_bytes": 155153529,
+      "distinct_values": 3276,
+      "flush_spans": 10000,
+      "ingest_seconds": 0.336259416,
+      "ingested_text_bytes": 67108864,
+      "label": "2048B/10%/1attr/flush10000/blocked",
+      "load_average": "38.27 32.86 25.79",
+      "offloaded_payload_files": 0,
+      "on_disk_attribute_index_bytes": 7590633,
+      "order": "blocked",
+      "records": 32768,
+      "reopen": {
+        "records": 32768,
+        "resident_attribute_index_entries": 3287,
+        "resident_index_bytes": 8942533,
+        "resident_payload_bytes": 0,
+        "rss_open": 16629760,
+        "rss_start": 1638400,
+        "segments": 4
+      },
+      "rss_after_ingest": 2449440768,
+      "rss_base": 2268053504,
+      "segments": 4,
+      "spans": 32768,
+      "unique_pct": 10,
+      "value_bytes": 2048
+    },
+    {
+      "attrs": 1,
+      "by_attribute_key": {
+        "\u0000name": {
+          "bytes": 262224,
+          "values": 4
+        },
+        "\u0000service": {
+          "bytes": 262228,
+          "values": 4
+        },
+        "gen_ai.prompt": {
+          "bytes": 34062336,
+          "values": 16384
+        }
+      },
+      "compacted": {
+        "compact_seconds": 1.208e-6,
+        "compacted_away": 0,
+        "records": 32768,
+        "resident_attribute_index_entries": 16392,
+        "resident_index_bytes": 37454500,
+        "resident_index_bytes_compacted": 37454500,
+        "resident_payload_bytes": 0,
+        "rss_open": 64405504,
+        "rss_peak_during_compaction": 64471040,
+        "rss_sample_interval_ms": 20,
+        "rss_settled_after_compaction": 64487424,
+        "rss_start": 1638400,
+        "segments": 4,
+        "segments_compacted": 4
+      },
+      "disk_bytes": 182346404,
+      "distinct_values": 16384,
+      "flush_spans": 10000,
+      "ingest_seconds": 0.392745667,
+      "ingested_text_bytes": 67108864,
+      "label": "2048B/50%/1attr/flush10000/blocked",
+      "load_average": "38.27 32.86 25.79",
+      "offloaded_payload_files": 0,
+      "on_disk_attribute_index_bytes": 34783508,
+      "order": "blocked",
+      "records": 32768,
+      "reopen": {
+        "records": 32768,
+        "resident_attribute_index_entries": 16392,
+        "resident_index_bytes": 37454500,
+        "resident_payload_bytes": 0,
+        "rss_open": 64503808,
+        "rss_start": 1638400,
+        "segments": 4
+      },
+      "rss_after_ingest": 2360770560,
+      "rss_base": 2451865600,
+      "segments": 4,
+      "spans": 32768,
+      "unique_pct": 50,
+      "value_bytes": 2048
+    },
+    {
+      "attrs": 1,
+      "by_attribute_key": {
+        "\u0000name": {
+          "bytes": 65556,
+          "values": 1
+        },
+        "\u0000service": {
+          "bytes": 65557,
+          "values": 1
+        },
+        "gen_ai.prompt": {
+          "bytes": 6787069,
+          "values": 819
+        }
+      },
+      "compacted": {
+        "compact_seconds": 1.584e-6,
+        "compacted_away": 0,
+        "records": 8192,
+        "resident_attribute_index_entries": 821,
+        "resident_index_bytes": 7242790,
+        "resident_index_bytes_compacted": 7242790,
+        "resident_payload_bytes": 0,
+        "rss_open": 18677760,
+        "rss_peak_during_compaction": 18776064,
+        "rss_sample_interval_ms": 20,
+        "rss_settled_after_compaction": 18792448,
+        "rss_start": 1638400,
+        "segments": 1,
+        "segments_compacted": 1
+      },
+      "disk_bytes": 144482058,
+      "distinct_values": 819,
+      "flush_spans": 10000,
+      "ingest_seconds": 0.387451875,
+      "ingested_text_bytes": 67108864,
+      "label": "8192B/10%/1attr/flush10000/blocked",
+      "load_average": "38.27 32.86 25.79",
+      "offloaded_payload_files": 0,
+      "on_disk_attribute_index_bytes": 6928038,
+      "order": "blocked",
+      "records": 8192,
+      "reopen": {
+        "records": 8192,
+        "resident_attribute_index_entries": 821,
+        "resident_index_bytes": 7242790,
+        "resident_payload_bytes": 0,
+        "rss_open": 18694144,
+        "rss_start": 1638400,
+        "segments": 1
+      },
+      "rss_after_ingest": 2848243712,
+      "rss_base": 2360770560,
+      "segments": 1,
+      "spans": 8192,
+      "unique_pct": 10,
+      "value_bytes": 8192
+    },
+    {
+      "attrs": 1,
+      "by_attribute_key": {
+        "\u0000name": {
+          "bytes": 65556,
+          "values": 1
+        },
+        "\u0000service": {
+          "bytes": 65557,
+          "values": 1
+        },
+        "gen_ai.prompt": {
+          "bytes": 33681408,
+          "values": 4096
+        }
+      },
+      "compacted": {
+        "compact_seconds": 1.083e-6,
+        "compacted_away": 0,
+        "records": 8192,
+        "resident_attribute_index_entries": 4098,
+        "resident_index_bytes": 34660393,
+        "resident_index_bytes_compacted": 34660393,
+        "resident_payload_bytes": 0,
+        "rss_open": 82182144,
+        "rss_peak_during_compaction": 82247680,
+        "rss_sample_interval_ms": 20,
+        "rss_settled_after_compaction": 82264064,
+        "rss_start": 1638400,
+        "segments": 1,
+        "segments_compacted": 1
+      },
+      "disk_bytes": 171415721,
+      "distinct_values": 4096,
+      "flush_spans": 10000,
+      "ingest_seconds": 0.286746333,
+      "ingested_text_bytes": 67108864,
+      "label": "8192B/50%/1attr/flush10000/blocked",
+      "load_average": "38.27 32.86 25.79",
+      "offloaded_payload_files": 0,
+      "on_disk_attribute_index_bytes": 33861701,
+      "order": "blocked",
+      "records": 8192,
+      "reopen": {
+        "records": 8192,
+        "resident_attribute_index_entries": 4098,
+        "resident_index_bytes": 34660393,
+        "resident_payload_bytes": 0,
+        "rss_open": 82182144,
+        "rss_start": 1638400,
+        "segments": 1
+      },
+      "rss_after_ingest": 2965405696,
+      "rss_base": 2848243712,
+      "segments": 1,
+      "spans": 8192,
+      "unique_pct": 50,
+      "value_bytes": 8192
+    },
+    {
+      "attrs": 2,
+      "by_attribute_key": {
+        "\u0000name": {
+          "bytes": 262224,
+          "values": 4
+        },
+        "\u0000service": {
+          "bytes": 262228,
+          "values": 4
+        },
+        "gen_ai.completion": {
+          "bytes": 67993600,
+          "values": 32768
+        },
+        "gen_ai.prompt": {
+          "bytes": 67862528,
+          "values": 32768
+        }
+      },
+      "compacted": {
+        "compact_seconds": 1.125e-6,
+        "compacted_away": 0,
+        "records": 32768,
+        "resident_attribute_index_entries": 65544,
+        "resident_index_bytes": 145078948,
+        "resident_index_bytes_compacted": 145078948,
+        "resident_payload_bytes": 0,
+        "rss_open": 245858304,
+        "rss_peak_during_compaction": 245923840,
+        "rss_sample_interval_ms": 20,
+        "rss_settled_after_compaction": 245940224,
+        "rss_start": 1638400,
+        "segments": 4,
+        "segments_compacted": 4
+      },
+      "disk_bytes": 420586148,
+      "distinct_values": 32768,
+      "flush_spans": 10000,
+      "ingest_seconds": 0.797246833,
+      "ingested_text_bytes": 134217728,
+      "label": "2048B/100%/2attr/flush10000/interleaved",
+      "load_average": "38.27 32.86 25.79",
+      "offloaded_payload_files": 0,
+      "on_disk_attribute_index_bytes": 137167124,
+      "order": "interleaved",
+      "records": 32768,
+      "reopen": {
+        "records": 32768,
+        "resident_attribute_index_entries": 65544,
+        "resident_index_bytes": 145078948,
+        "resident_payload_bytes": 0,
+        "rss_open": 245891072,
+        "rss_start": 1638400,
+        "segments": 4
+      },
+      "rss_after_ingest": 3770040320,
+      "rss_base": 2954592256,
+      "segments": 4,
+      "spans": 32768,
+      "unique_pct": 100,
+      "value_bytes": 2048
+    },
+    {
+      "attrs": 2,
+      "by_attribute_key": {
+        "\u0000name": {
+          "bytes": 65556,
+          "values": 1
+        },
+        "\u0000service": {
+          "bytes": 65557,
+          "values": 1
+        },
+        "gen_ai.completion": {
+          "bytes": 67330048,
+          "values": 8192
+        },
+        "gen_ai.prompt": {
+          "bytes": 67297280,
+          "values": 8192
+        }
+      },
+      "compacted": {
+        "compact_seconds": 1.25e-6,
+        "compacted_away": 0,
+        "records": 8192,
+        "resident_attribute_index_entries": 16386,
+        "resident_index_bytes": 137400361,
+        "resident_index_bytes_compacted": 137400361,
+        "resident_payload_bytes": 0,
+        "rss_open": 320372736,
+        "rss_peak_during_compaction": 320438272,
+        "rss_sample_interval_ms": 20,
+        "rss_settled_after_compaction": 320471040,
+        "rss_start": 1638400,
+        "segments": 1,
+        "segments_compacted": 1
+      },
+      "disk_bytes": 407136425,
+      "distinct_values": 8192,
+      "flush_spans": 10000,
+      "ingest_seconds": 0.836317917,
+      "ingested_text_bytes": 134217728,
+      "label": "8192B/100%/2attr/flush10000/interleaved",
+      "load_average": "37.77 32.85 25.83",
+      "offloaded_payload_files": 0,
+      "on_disk_attribute_index_bytes": 134955077,
+      "order": "interleaved",
+      "records": 8192,
+      "reopen": {
+        "records": 8192,
+        "resident_attribute_index_entries": 16386,
+        "resident_index_bytes": 137400361,
+        "resident_payload_bytes": 0,
+        "rss_open": 320520192,
+        "rss_start": 1638400,
+        "segments": 1
+      },
+      "rss_after_ingest": 4814798848,
+      "rss_base": 3676864512,
+      "segments": 1,
+      "spans": 8192,
+      "unique_pct": 100,
+      "value_bytes": 8192
+    },
+    {
+      "attrs": 1,
+      "by_attribute_key": {
+        "\u0000name": {
+          "bytes": 262284,
+          "values": 7
+        },
+        "\u0000service": {
+          "bytes": 262291,
+          "values": 7
+        },
+        "gen_ai.prompt": {
+          "bytes": 67862528,
+          "values": 32768
+        }
+      },
+      "compacted": {
+        "compact_seconds": 3e-6,
+        "compacted_away": 0,
+        "records": 32768,
+        "resident_attribute_index_entries": 32782,
+        "resident_index_bytes": 73198367,
+        "resident_index_bytes_compacted": 73198367,
+        "resident_payload_bytes": 0,
+        "rss_open": 114245632,
+        "rss_peak_during_compaction": 114311168,
+        "rss_sample_interval_ms": 20,
+        "rss_settled_after_compaction": 114327552,
+        "rss_start": 1638400,
+        "segments": 7,
+        "segments_compacted": 7
+      },
+      "disk_bytes": 216343711,
+      "distinct_values": 32768,
+      "flush_spans": 5000,
+      "ingest_seconds": 0.503843292,
+      "ingested_text_bytes": 67108864,
+      "label": "2048B/100%/1attr/flush5000/interleaved",
+      "load_average": "37.77 32.85 25.83",
+      "offloaded_payload_files": 0,
+      "on_disk_attribute_index_bytes": 68780515,
+      "order": "interleaved",
+      "records": 32768,
+      "reopen": {
+        "records": 32768,
+        "resident_attribute_index_entries": 32782,
+        "resident_index_bytes": 73198367,
+        "resident_payload_bytes": 0,
+        "rss_open": 114278400,
+        "rss_start": 1638400,
+        "segments": 7
+      },
+      "rss_after_ingest": 4183539712,
+      "rss_base": 3888070656,
+      "segments": 7,
+      "spans": 32768,
+      "unique_pct": 100,
+      "value_bytes": 2048
+    },
+    {
+      "attrs": 1,
+      "by_attribute_key": {
+        "\u0000name": {
+          "bytes": 262184,
+          "values": 2
+        },
+        "\u0000service": {
+          "bytes": 262186,
+          "values": 2
+        },
+        "gen_ai.prompt": {
+          "bytes": 67862528,
+          "values": 32768
+        }
+      },
+      "compacted": {
+        "compact_seconds": 1.167e-6,
+        "compacted_away": 0,
+        "records": 32768,
+        "resident_attribute_index_entries": 32772,
+        "resident_index_bytes": 74494546,
+        "resident_index_bytes_compacted": 74494546,
+        "resident_payload_bytes": 0,
+        "rss_open": 169033728,
+        "rss_peak_during_compaction": 169115648,
+        "rss_sample_interval_ms": 20,
+        "rss_settled_after_compaction": 169132032,
+        "rss_start": 1638400,
+        "segments": 2,
+        "segments_compacted": 2
+      },
+      "disk_bytes": 216342866,
+      "distinct_values": 32768,
+      "flush_spans": 30000,
+      "ingest_seconds": 1.028672417,
+      "ingested_text_bytes": 67108864,
+      "label": "2048B/100%/1attr/flush30000/interleaved",
+      "load_average": "37.77 32.85 25.83",
+      "offloaded_payload_files": 0,
+      "on_disk_attribute_index_bytes": 68780170,
+      "order": "interleaved",
+      "records": 32768,
+      "reopen": {
+        "records": 32768,
+        "resident_attribute_index_entries": 32772,
+        "resident_index_bytes": 74494546,
+        "resident_payload_bytes": 0,
+        "rss_open": 169328640,
+        "rss_start": 1638400,
+        "segments": 2
+      },
+      "rss_after_ingest": 1411366912,
+      "rss_base": 3623567360,
+      "segments": 2,
+      "spans": 32768,
+      "unique_pct": 100,
+      "value_bytes": 2048
+    },
+    {
+      "attrs": 1,
+      "by_attribute_key": {
+        "\u0000name": {
+          "bytes": 1048836,
+          "values": 13
+        },
+        "\u0000service": {
+          "bytes": 1048849,
+          "values": 13
+        },
+        "deployment.dimension0": {
+          "bytes": 1049551,
+          "values": 39
+        },
+        "deployment.dimension1": {
+          "bytes": 1057572,
+          "values": 351
+        },
+        "deployment.dimension2": {
+          "bytes": 1065684,
+          "values": 663
+        },
+        "gen_ai.prompt": {
+          "bytes": 1055427,
+          "values": 13
+        }
+      },
+      "compacted": {
+        "compact_seconds": 1.364856,
+        "compacted_away": 12,
+        "records": 131072,
+        "resident_attribute_index_entries": 1092,
+        "resident_index_bytes": 10144031,
+        "resident_index_bytes_compacted": 10301147,
+        "resident_payload_bytes": 0,
+        "rss_open": 14270464,
+        "rss_peak_during_compaction": 1332756480,
+        "rss_sample_interval_ms": 20,
+        "rss_settled_after_compaction": 835190784,
+        "rss_start": 1638400,
+        "segments": 13,
+        "segments_compacted": 1
+      },
+      "disk_bytes": 218692351,
+      "distinct_values": 1,
+      "flush_spans": 10000,
+      "ingest_seconds": 0.836130833,
+      "ingested_text_bytes": 67108864,
+      "label": "512B/0%/1attr+3enum/flush10000/interleaved",
+      "load_average": "35.95 32.55 25.76",
+      "offloaded_payload_files": 0,
+      "on_disk_attribute_index_bytes": 6339075,
+      "order": "interleaved",
+      "records": 131072,
+      "reopen": {
+        "records": 131072,
+        "resident_attribute_index_entries": 1092,
+        "resident_index_bytes": 10144031,
+        "resident_payload_bytes": 0,
+        "rss_open": 14221312,
+        "rss_start": 1638400,
+        "segments": 13
+      },
+      "rss_after_ingest": 1748713472,
+      "rss_base": 1475575808,
+      "segments": 13,
+      "spans": 131072,
+      "unique_pct": 0,
+      "value_bytes": 512
+    },
+    {
+      "attrs": 1,
+      "by_attribute_key": {
+        "\u0000name": {
+          "bytes": 8212,
+          "values": 1
+        },
+        "\u0000service": {
+          "bytes": 8213,
+          "values": 1
+        },
+        "gen_ai.prompt": {
+          "bytes": 67132416,
+          "values": 1024
+        }
+      },
+      "compacted": {
+        "compact_seconds": 8.75e-7,
+        "compacted_away": 0,
+        "records": 1024,
+        "resident_attribute_index_entries": 1026,
+        "resident_index_bytes": 67329577,
+        "resident_index_bytes_compacted": 67329577,
+        "resident_payload_bytes": 0,
+        "rss_open": 153649152,
+        "rss_peak_during_compaction": 153714688,
+        "rss_sample_interval_ms": 20,
+        "rss_settled_after_compaction": 153731072,
+        "rss_start": 1638400,
+        "segments": 1,
+        "segments_compacted": 1
+      },
+      "disk_bytes": 201796009,
+      "distinct_values": 1024,
+      "flush_spans": 1000,
+      "ingest_seconds": 0.305064542,
+      "ingested_text_bytes": 67108864,
+      "label": "65536B/100%/1attr/flush1000/interleaved",
+      "load_average": "35.95 32.55 25.76",
+      "offloaded_payload_files": 0,
+      "on_disk_attribute_index_bytes": 67161157,
+      "order": "interleaved",
+      "records": 1024,
+      "reopen": {
+        "records": 1024,
+        "resident_attribute_index_entries": 1026,
+        "resident_index_bytes": 67329577,
+        "resident_payload_bytes": 0,
+        "rss_open": 153649152,
+        "rss_start": 1638400,
+        "segments": 1
+      },
+      "rss_after_ingest": 2513092608,
+      "rss_base": 1748729856,
+      "segments": 1,
+      "spans": 1024,
+      "unique_pct": 100,
+      "value_bytes": 65536
+    }
+  ],
+  "rss_sample_interval_ms": 20
+}
