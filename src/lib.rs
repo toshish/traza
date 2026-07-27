@@ -640,6 +640,20 @@ pub struct Config {
     pub tail_ring_bytes: usize,
 }
 
+/// The last commit whose reader accepts every superseded segment format.
+///
+/// A commit rather than a release tag, and one rather than several, because
+/// neither alternative works for a real store. A store accumulates segments in
+/// whichever format was current when each was sealed, so it can hold several at
+/// once — naming "the release that wrote v2" sends an operator to a build that
+/// cannot read the v3 segments sitting beside it. And formats 4 and 5 were
+/// never tagged, so for those there is no release to name at all.
+///
+/// This commit reads 2 through 5 (`MIN_READABLE_VERSION` 2, `VERSION` 5), which
+/// covers every indexed format this project has written. Format 1 was JSONL and
+/// is refused separately, with its own message.
+pub const LEGACY_SEGMENT_READER: &str = "cf40bea";
+
 /// Default ceiling on log bytes before a flush seals the buffer. Large enough
 /// that ordinary ingest never reaches it before the record threshold does,
 /// small enough that a restart replays it in well under a second.
@@ -1989,7 +2003,7 @@ pub(crate) fn query_view_costed(
         let mut result = Vec::new();
 
         // Limited queries take the lazy path: per-source candidates stay as
-        // v2 posting/record offsets and a k-way merge decodes one head per
+        // segment posting/record offsets and a k-way merge decodes one head per
         // source. Heads are compared with the SAME total order used by
         // unlimited queries (start, end, trace, span). Comparing only the
         // timestamp made equal-time ties depend on segment/source order;
@@ -2843,7 +2857,7 @@ impl Store {
 
     /// Number of fully materialized `Span` structs held for PERSISTED data.
     ///
-    /// The v2 memory rule: this is zero after open and flush. Segments hold
+    /// The segment memory rule: this is zero after open and flush. Segments hold
     /// file handles plus indexes, and spans parse on demand.
     pub fn resident_persisted_span_structs(&self) -> Result<usize> {
         let segments = self.lock_segments()?;
@@ -3583,9 +3597,9 @@ fn order_spans(spans: &mut [Span], sort: Option<SpanSort>) {
 ///
 /// Posting lists are already materialized in the index, so their lengths are
 /// counted, not estimated — the smallest one is genuinely the least work.
-/// (Since segment v4 a list is a digest-keyed CANDIDATE set, so a length is
-/// an upper bound rather than a match count. The gap is a collision away from
-/// zero, and every candidate is checked by `span_matches` regardless.)
+/// (A list is a digest-keyed CANDIDATE set, so a length is an upper bound
+/// rather than a match count. The gap is a collision away from zero, and every
+/// candidate is checked by `span_matches` regardless.)
 fn select_probe<'a>(
     seg: &'a segment::Segment,
     filter: &SpanFilter,
@@ -3801,7 +3815,7 @@ fn load_segments(directory: &Path) -> Result<Vec<std::sync::Arc<Segment>>> {
             .extension()
             .is_some_and(|ext| ext.to_string_lossy() == SEGMENT_SUFFIX.trim_start_matches('.'));
         if !is_v2 {
-            // Pre-v2 JSONL segments are no longer supported: failing loudly
+            // Legacy JSONL segments (on-disk format 1) are not readable: failing loudly
             // beats silently hiding persisted data (migrate with 0.3.x).
             return Err(Error::Io(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -3813,7 +3827,57 @@ fn load_segments(directory: &Path) -> Result<Vec<std::sync::Arc<Segment>>> {
             )));
         }
         let bytes_meta = fs::metadata(&path)?.len();
-        let seg = Box::new(segment::Segment::open(&path).map_err(segment_error)?);
+        let seg = Box::new(segment::Segment::open(&path).map_err(|error| {
+            // Name the file, and give advice only where the cause is actually
+            // known. An earlier version attached "remove the data directory" to
+            // every `Unsupported`, which covers a corrupt magic byte as well as
+            // a version mismatch — so a single flipped bit in an otherwise
+            // intact store was answered with instructions to delete it.
+            //
+            // Nothing here ever recommends deleting data, and nothing claims
+            // more than the check established. A version mismatch is detected
+            // before any section bound is validated, so it does NOT prove the
+            // file is otherwise intact — it says only that another build reads
+            // this layout. The path it points at is a backup taken the way
+            // docs/operations/durability.md requires, not an export: an export
+            // carries spans (buffered ones included, since it pins a snapshot
+            // and the snapshot copies the write buffer) but leaves payload
+            // bytes and annotations behind.
+            let detail = match &error {
+                segment::Error::UnsupportedVersion { .. } => format!(
+                    "\nBack up the directory first — stop the server and copy it, \
+                     or take a filesystem snapshot atomic across the whole \
+                     directory. A file-by-file copy of a running store is not \
+                     safe.\n\
+                     A store can hold segments in SEVERAL formats — each build \
+                     writes the format of its day and leaves earlier segments \
+                     alone — so a reader has to cover all of them, not just \
+                     this one. Commit {LEGACY_SEGMENT_READER} reads formats 2 \
+                     through 5; build it and open the backup with that.\n\
+                     A span export carries every span, buffered ones included, \
+                     but offloaded values stay as $payload references and \
+                     annotations are not in it at all.\n\
+                     See docs/operations/durability.md#backups and \
+                     docs/segment-format.md."
+                ),
+                segment::Error::Unsupported(_) | segment::Error::Corrupt(_) => {
+                    // Deliberately does NOT say another build can read the rest:
+                    // `load_segments` aborts on the first unreadable segment, so
+                    // no build opens this store until the file is dealt with.
+                    "\nThis file is not a segment this build can interpret. It \
+                     may be truncated, damaged, or not a Traza file at all. No \
+                     build will open this store until it is resolved, so copy \
+                     the directory and inspect the file before changing \
+                     anything."
+                        .to_owned()
+                }
+                _ => String::new(),
+            };
+            Error::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{}: {error}{detail}", path.display()),
+            ))
+        })?);
         segments.push(std::sync::Arc::new(Segment {
             path,
             bytes: bytes_meta,
@@ -3864,7 +3928,7 @@ fn unlink_segment(path: &Path) -> Result<()> {
 
 fn segment_number(path: &Path) -> Option<u64> {
     let name = path.file_name()?.to_str()?;
-    // Both formats count: recognizing only .jsonl made a reopened v2-only
+    // Both suffixes count: recognizing only .jsonl made a reopened indexed-only
     // store restart numbering at zero, and the next flush RENAMED OVER
     // segment-…0000.seg — persisted spans destroyed (found in review,
     // reproduced across restart).
