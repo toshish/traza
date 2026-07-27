@@ -7,10 +7,13 @@
 //! `if version >= N` gates, each of which turned a field into an `Option` that
 //! every reader downstream had to treat as "unknown, so assume the worst" —
 //! a segment whose timestamp range could not be read had to be scanned. Those
-//! branches were compatibility with files that only ever existed before
-//! release, so they were deleted along with the second attribute-index decoder
-//! kept alive to read them. What is left is one shape, and the pruning path no
-//! longer carries a case where it cannot prune.
+//! branches were compatibility with formats that shipped in tagged 0.x
+//! releases and are no longer read, so they were deleted along with the second
+//! attribute-index decoder kept alive for them. What is left is one shape, and
+//! the pruning path no longer carries a case where it cannot prune. Stores
+//! written by those releases do not open; the README's pre-1.0 terms allow the
+//! break, and `Store::open` names the file and points at an export-and-reingest
+//! migration rather than at a fresh start.
 //!
 //! The version word stays. It is two bytes per file and it is the difference
 //! between refusing to open a future format and misparsing its header into
@@ -24,8 +27,9 @@
 //!
 //! # Why the attribute index is hashed
 //!
-//! Through v3 the attribute index was keyed on the attribute VALUE TEXT, and
-//! every opened segment held every distinct value resident for its whole life.
+//! Through format 3 — a layout this build no longer reads — the attribute
+//! index was keyed on the attribute VALUE TEXT, and every opened segment held
+//! every distinct value resident for its whole life.
 //! For enum-shaped attributes — `service`, `status`, a model name — that is
 //! nothing. For the data Traza exists to store it is fatal: an indexed
 //! `gen_ai.prompt` is kilobytes, every value is distinct, and the resident
@@ -62,7 +66,16 @@ pub const MAGIC: [u8; 8] = *b"TRAZASEG";
 /// which is the entire job of this constant: without it a later format's
 /// header would be parsed under this one's field layout and yield offsets that
 /// pass every bounds check while pointing at the wrong bytes.
-pub const VERSION: u16 = 1;
+///
+/// **The numbering never restarts.** Versions 1 through 5 were written by
+/// tagged releases — 1 was JSONL, 2 shipped in 0.16/0.17, 3 in 0.18/0.19, and 5
+/// immediately before this. Collapsing the reader to one format does not free
+/// those identifiers: reusing 2 for a different layout would mean a header
+/// declaring "2" is ambiguous between two incompatible files, which is the
+/// precise failure this field exists to prevent. Removing compatibility CODE
+/// and reusing compatibility IDENTIFIERS are different acts, and only the first
+/// is safe.
+pub const VERSION: u16 = 6;
 /// Fixed header size written by this module.
 pub const HEADER_LEN: usize = 104;
 
@@ -151,7 +164,10 @@ impl Header {
             // that satisfy every bounds check below while addressing the wrong
             // bytes, and the failure would surface as corrupt records rather
             // than as an unreadable file.
-            return Err(Error::Unsupported("unsupported segment version"));
+            return Err(Error::UnsupportedVersion {
+                found: version,
+                expected: VERSION,
+            });
         }
         let header_len = read_u16(bytes, 10)?;
         if usize::from(header_len) != HEADER_LEN {
@@ -307,7 +323,21 @@ pub enum Error {
     Io(io::Error),
     /// The input is structurally invalid or truncated.
     Corrupt(&'static str),
-    /// The file uses an unsupported magic or version.
+    /// The file is well-formed for some Traza format, but not this one.
+    ///
+    /// Separate from [`Self::Unsupported`] because the two call for opposite
+    /// responses. A version mismatch means the data is intact and readable by
+    /// another build; anything else under "unsupported" may be corruption or a
+    /// foreign file. Conflating them produced advice to delete the store in
+    /// response to a single flipped byte in a magic number.
+    UnsupportedVersion {
+        /// The version the file declares.
+        found: u16,
+        /// The version this build reads.
+        expected: u16,
+    },
+    /// The file is not something this module can interpret at all — a foreign
+    /// or corrupt magic, or an index built with incompatible parameters.
     Unsupported(&'static str),
     /// A string field is not valid UTF-8.
     Utf8(std::str::Utf8Error),
@@ -320,6 +350,10 @@ impl fmt::Display for Error {
         match self {
             Self::Io(error) => write!(f, "segment I/O error: {error}"),
             Self::Corrupt(message) => write!(f, "corrupt segment: {message}"),
+            Self::UnsupportedVersion { found, expected } => write!(
+                f,
+                "segment format v{found}, but this build reads v{expected}"
+            ),
             Self::Unsupported(message) => write!(f, "unsupported segment: {message}"),
             Self::Utf8(error) => write!(f, "invalid segment UTF-8: {error}"),
             Self::TooLarge(field) => write!(f, "segment {field} is too large"),
@@ -480,8 +514,9 @@ pub struct Segment {
     record_offsets: Vec<u64>,
     trace_index: HashMap<String, Vec<u64>>,
     attribute_index: AttributeIndex,
-    /// `None` on a segment written before v5, or one with no indexable text.
-    /// Absent means unknown, so a content query cannot skip the segment.
+    /// `None` when the segment holds no indexable text, or was written with
+    /// indexing switched off. Absent means unknown, so a content query cannot
+    /// skip the segment.
     content: Option<ContentIndex>,
     /// Diagnostic only: whether the last query narrowed through an index.
     /// Atomic rather than `Cell` because a segment is shared across reader
@@ -603,9 +638,9 @@ impl Segment {
     /// the trace index, which is still keyed on trace-id text.
     ///
     /// What it no longer scales with is the SIZE of attribute values. Through
-    /// v3 it did, and an indexed prompt cost its own text; v4 keys the
-    /// attribute index on a digest instead. [`Self::approx_index_bytes`]
-    /// measures the result.
+    /// format 3 it did, and an indexed prompt cost its own text; the attribute
+    /// index is keyed on a digest now. [`Self::approx_index_bytes`] measures
+    /// the result.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
         use std::io::{Read, Seek, SeekFrom};
         let mut file = fs::File::open(path)?;
@@ -1419,7 +1454,7 @@ fn decode_offsets(bytes: &[u8], header: &Header) -> Result<Vec<u64>, Error> {
     Ok(offsets)
 }
 
-/// Encodes the v4 attribute section: a key dictionary, then one entry per
+/// Encodes the attribute section: a key dictionary, then one entry per
 /// distinct `(key, value)` pair carrying the value's digest instead of its
 /// text.
 ///
@@ -1456,7 +1491,7 @@ fn encode_attribute_index(
     Ok(output)
 }
 
-/// Decodes the v4 attribute section.
+/// Decodes the attribute section.
 fn decode_attribute_index(data: &[u8], record_count: u64) -> Result<AttributeIndex, Error> {
     let mut cursor = 0usize;
     let key_count = take_u32(data, &mut cursor)? as usize;

@@ -249,7 +249,7 @@ pub struct Metrics {
     ///
     /// Same reasoning as `segments_pruned_by_time`, and more load-bearing: a
     /// content index that silently stopped pruning — a saturated filter, a
-    /// segment written before v5, indexing switched off — returns exactly the
+    /// segment with no indexable text, indexing switched off — returns exactly the
     /// same rows, just after reading the whole store. This counter and
     /// `blocks_examined_by_content` are the difference between a working index
     /// and a slow scan.

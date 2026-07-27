@@ -138,26 +138,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **The segment format collapsed to a single version.** It had grown by
-  appending header fields behind `if version >= N` gates, and each gate turned
-  a field into an `Option` that every reader downstream had to treat as
+- **The segment format collapsed to a single version, numbered 6.** It had
+  grown by appending header fields behind `if version >= N` gates, and each gate
+  turned a field into an `Option` that every reader downstream had to treat as
   "unknown, therefore assume the worst": a segment whose timestamp range could
   not be read had to be scanned by every time-bounded query, and a second
   attribute-index decoder existed only to read the encoding that predated
-  digests. All of that was compatibility with files that only ever existed
-  before release. `MIN_READABLE_VERSION`, `HEADER_LEN_V2`, `HEADER_LEN_V3` and
-  the legacy decoder are gone; `timestamps` and `content` are plain values, so
-  the pruning path no longer carries a case where it cannot prune.
+  digests. `MIN_READABLE_VERSION`, `HEADER_LEN_V2`, `HEADER_LEN_V3` and the
+  legacy decoder are gone; `timestamps` and `content` are plain values, so the
+  pruning path no longer carries a case where it cannot prune.
 
-  The version word stays, pinned at 1. Two bytes per file, and it is the
-  difference between refusing to open a format this reader does not know and
-  parsing its header at these offsets — which yields section bounds that pass
-  every validation check while addressing the wrong bytes, surfacing as corrupt
-  records rather than as an unreadable file.
+  **Upgrading makes existing stores unreadable.** Versions 2 through 5 were
+  written by tagged 0.x releases — 2 in v0.16/v0.17, 3 in v0.18/v0.19, 5 up to
+  the previous commit — so this is a real on-disk break for anyone running
+  those, not a cleanup of formats that never escaped. `Store::open` refuses such
+  a segment rather than misreading it, names the file, and points at the
+  migration: back up the directory, open it with the release that wrote it,
+  `GET /v1/export`, and re-ingest. The README's pre-1.0 terms permit this —
+  "on-disk formats may change between 0.x versions" — but permitted is not the
+  same as costless, and the work falls on whoever has data.
 
-  **This makes segments written by earlier builds unreadable.** `Store::open`
-  fails, naming the file and saying what to do, rather than misreading it.
-  There are no deployed stores, which is what makes now the time to do this.
+  The numbering deliberately does not restart. Removing compatibility *code* and
+  reusing compatibility *identifiers* are different acts: a header declaring "2"
+  must never be ambiguous between the layout v0.16 wrote and some later one, so
+  1 through 5 stay spent and the single readable format is 6.
+
+  The version word stays for the same reason it always should have. Two bytes
+  per file, and it is the difference between refusing to open a format this
+  reader does not know and parsing its header at these offsets — which yields
+  section bounds that pass every validation check while addressing the wrong
+  bytes.
 
 - **The logo is the revised mark from the design system.** The bars gained a
   stem, so the mark resolves as a lowercase "t" rather than four unanchored

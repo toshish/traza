@@ -1840,7 +1840,7 @@ pub(crate) fn query_view_costed(
         let mut result = Vec::new();
 
         // Limited queries take the lazy path: per-source candidates stay as
-        // v2 posting/record offsets and a k-way merge decodes one head per
+        // segment posting/record offsets and a k-way merge decodes one head per
         // source. Heads are compared with the SAME total order used by
         // unlimited queries (start, end, trace, span). Comparing only the
         // timestamp made equal-time ties depend on segment/source order;
@@ -2694,7 +2694,7 @@ impl Store {
 
     /// Number of fully materialized `Span` structs held for PERSISTED data.
     ///
-    /// The v2 memory rule: this is zero after open and flush. Segments hold
+    /// The segment memory rule: this is zero after open and flush. Segments hold
     /// file handles plus indexes, and spans parse on demand.
     pub fn resident_persisted_span_structs(&self) -> Result<usize> {
         let segments = self.lock_segments()?;
@@ -3434,9 +3434,9 @@ fn order_spans(spans: &mut [Span], sort: Option<SpanSort>) {
 ///
 /// Posting lists are already materialized in the index, so their lengths are
 /// counted, not estimated — the smallest one is genuinely the least work.
-/// (Since segment v4 a list is a digest-keyed CANDIDATE set, so a length is
-/// an upper bound rather than a match count. The gap is a collision away from
-/// zero, and every candidate is checked by `span_matches` regardless.)
+/// (A list is a digest-keyed CANDIDATE set, so a length is an upper bound
+/// rather than a match count. The gap is a collision away from zero, and every
+/// candidate is checked by `span_matches` regardless.)
 fn select_probe<'a>(
     seg: &'a segment::Segment,
     filter: &SpanFilter,
@@ -3652,7 +3652,7 @@ fn load_segments(directory: &Path) -> Result<Vec<std::sync::Arc<Segment>>> {
             .extension()
             .is_some_and(|ext| ext.to_string_lossy() == SEGMENT_SUFFIX.trim_start_matches('.'));
         if !is_v2 {
-            // Pre-v2 JSONL segments are no longer supported: failing loudly
+            // Legacy JSONL segments (on-disk format 1) are not readable: failing loudly
             // beats silently hiding persisted data (migrate with 0.3.x).
             return Err(Error::Io(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -3665,18 +3665,30 @@ fn load_segments(directory: &Path) -> Result<Vec<std::sync::Arc<Segment>>> {
         }
         let bytes_meta = fs::metadata(&path)?.len();
         let seg = Box::new(segment::Segment::open(&path).map_err(|error| {
-            // Name the file and say what to do. The common way to reach this
-            // is a store written by a build whose segment format differed:
-            // the reader refuses it rather than misparsing it, and "unsupported
-            // segment version" on its own tells an operator neither which file
-            // nor that the store is otherwise intact.
+            // Name the file, and give advice only where the cause is actually
+            // known. An earlier version attached "remove the data directory" to
+            // every `Unsupported`, which covers a corrupt magic byte as well as
+            // a version mismatch — so a single flipped bit in an otherwise
+            // intact store was answered with instructions to delete it.
+            //
+            // Nothing here ever recommends deleting data. A version mismatch
+            // means the file is intact and another build can read it; the
+            // migration path is an export, not a fresh start.
             let detail = match &error {
-                segment::Error::Unsupported(_) => format!(
-                    " — this build reads segment format v{}. Remove the data \
-                     directory to start fresh, or open it with the build that \
-                     wrote it",
-                    segment::VERSION
+                segment::Error::UnsupportedVersion { found, .. } => format!(
+                    "\nThe data is intact — this build cannot read that layout. \
+                     Back up the directory, open it with the traza release that \
+                     wrote v{found}, export with GET /v1/export, and re-ingest \
+                     into a new store via POST /v1/spans. On-disk formats may \
+                     change between 0.x releases; see CHANGELOG.md."
                 ),
+                segment::Error::Unsupported(_) | segment::Error::Corrupt(_) => {
+                    "\nThis file is not a segment this build can interpret. It \
+                     may be truncated, damaged, or not a Traza file at all. \
+                     Inspect it before changing anything: the rest of the store \
+                     is unaffected and still readable by an older build."
+                        .to_owned()
+                }
                 _ => String::new(),
             };
             Error::Io(io::Error::new(
@@ -3734,7 +3746,7 @@ fn unlink_segment(path: &Path) -> Result<()> {
 
 fn segment_number(path: &Path) -> Option<u64> {
     let name = path.file_name()?.to_str()?;
-    // Both formats count: recognizing only .jsonl made a reopened v2-only
+    // Both suffixes count: recognizing only .jsonl made a reopened indexed-only
     // store restart numbering at zero, and the next flush RENAMED OVER
     // segment-…0000.seg — persisted spans destroyed (found in review,
     // reproduced across restart).

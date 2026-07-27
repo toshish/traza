@@ -1770,13 +1770,78 @@ fn expiry_finishes_when_the_segment_file_is_already_gone() {
 }
 
 #[test]
-fn a_segment_from_another_format_fails_the_open_with_a_usable_message() {
-    // Collapsing the format to one version made every previously-written
-    // segment unreadable. That is the intended trade, but only if the failure
-    // says which file and what to do — "unsupported segment version" alone
-    // leaves an operator unable to tell a format change from corruption, and
-    // unable to find the file either way.
+fn a_version_mismatch_advises_migration_and_never_deletion() {
+    // Collapsing the format made segments from earlier releases unreadable.
+    // That is the intended trade, but the failure has to name the file and
+    // point at a path that PRESERVES the data. Telling an operator to remove
+    // the data directory is destructive advice for a store that is intact.
     let dir = TestDir::new("foreign-segment-version");
+    let segment = sealed_segment(&dir);
+
+    // Stamp a version this build does not write. The magic, the header length
+    // and every section bound stay valid, so nothing but the version word
+    // distinguishes it — which is exactly the case the check exists for.
+    let mut bytes = fs::read(&segment).expect("read segment");
+    let foreign = traza::segment::VERSION - 1;
+    bytes[8..10].copy_from_slice(&foreign.to_le_bytes());
+    fs::write(&segment, &bytes).expect("write segment");
+
+    let message = open_error(&dir);
+    assert!(
+        message.contains(&format!("segment format v{foreign}")),
+        "says which format the file is: {message}"
+    );
+    assert!(
+        message.contains(&segment.display().to_string()),
+        "names the file: {message}"
+    );
+    assert!(
+        message.contains("GET /v1/export"),
+        "points at a migration path: {message}"
+    );
+    assert!(
+        !message.to_lowercase().contains("remove the data directory")
+            && !message.to_lowercase().contains("start fresh"),
+        "must never advise deleting the store: {message}"
+    );
+}
+
+#[test]
+fn corruption_is_not_answered_with_advice_to_delete_the_store() {
+    // The regression this pins. A corrupt magic and a version mismatch both
+    // arrived as `Unsupported`, so one flipped byte in an otherwise healthy
+    // store was answered with instructions to delete it — the single most
+    // destructive thing an operator could do in response to a recoverable
+    // fault.
+    let dir = TestDir::new("corrupt-segment-magic");
+    let segment = sealed_segment(&dir);
+
+    let mut bytes = fs::read(&segment).expect("read segment");
+    bytes[0] = b'X';
+    fs::write(&segment, &bytes).expect("write segment");
+
+    let message = open_error(&dir);
+    assert!(
+        message.contains("bad magic"),
+        "says what is wrong: {message}"
+    );
+    assert!(
+        !message.to_lowercase().contains("remove the data directory")
+            && !message.to_lowercase().contains("start fresh"),
+        "corruption must never be answered with deletion advice: {message}"
+    );
+    assert!(
+        !message.contains("GET /v1/export"),
+        "and it is not a migration either — the cause is unknown: {message}"
+    );
+    assert!(
+        message.contains("Inspect it"),
+        "advises inspection instead: {message}"
+    );
+}
+
+/// Seals one span into a store and returns the segment file it wrote.
+fn sealed_segment(dir: &TestDir) -> PathBuf {
     {
         let store = Store::open(dir.path(), Config::default()).expect("open");
         store
@@ -1784,35 +1849,17 @@ fn a_segment_from_another_format_fails_the_open_with_a_usable_message() {
             .expect("ingest");
         store.flush().expect("flush");
     }
-
-    let segment = fs::read_dir(dir.path())
+    fs::read_dir(dir.path())
         .expect("read dir")
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
         .find(|path| path.extension().is_some_and(|ext| ext == "seg"))
-        .expect("a sealed segment");
+        .expect("a sealed segment")
+}
 
-    // Stamp a version this build does not write. The magic, the header length
-    // and every section bound stay valid, so nothing but the version word
-    // distinguishes it — which is exactly the case the check exists for.
-    let mut bytes = fs::read(&segment).expect("read segment");
-    let foreign = traza::segment::VERSION + 1;
-    bytes[8..10].copy_from_slice(&foreign.to_le_bytes());
-    fs::write(&segment, &bytes).expect("write segment");
-
-    let error = Store::open(dir.path(), Config::default())
+/// The error text from reopening a store whose segment has been tampered with.
+fn open_error(dir: &TestDir) -> String {
+    Store::open(dir.path(), Config::default())
         .err()
-        .expect("a store with an unreadable segment must not open");
-    let message = error.to_string();
-    assert!(
-        message.contains("unsupported segment version"),
-        "says what is wrong: {message}"
-    );
-    assert!(
-        message.contains(&segment.display().to_string()),
-        "names the file: {message}"
-    );
-    assert!(
-        message.contains("Remove the data directory"),
-        "says what to do: {message}"
-    );
+        .expect("a store with an unreadable segment must not open")
+        .to_string()
 }
