@@ -2,6 +2,7 @@ import React from 'react';
 import { fmtNum, fmtRate } from '../../lib/format.js';
 import { Kbd, LiveDot } from '../primitives/Chrome.jsx';
 import { Sparkbar } from '../charts/Marks.jsx';
+import { Lockup } from '../Logo.jsx';
 
 // The frame every screen sits in. Four top tabs could not hold seventeen
 // screens, so navigation is a left rail grouped by the question you arrived
@@ -55,15 +56,6 @@ export const SCREENS = {
   connect: ['Connect', 'point something at this server'],
 };
 
-function Logo({ size = 19 }) {
-  return <svg width={size} height={size} viewBox="0 0 48 48" fill="var(--accent)" aria-hidden="true">
-    <rect x="2" y="10" width="30" height="5" rx="1.5" />
-    <rect x="16" y="19" width="22" height="5" rx="1.5" />
-    <rect x="20" y="28" width="16" height="5" rx="1.5" />
-    <rect x="24" y="37" width="20" height="5" rx="1.5" />
-  </svg>;
-}
-
 function NavItem({ item, active, badge, onGo }) {
   const [hover, setHover] = React.useState(false);
   return <div onClick={() => onGo(item.id)} role="link" tabIndex={0}
@@ -102,11 +94,7 @@ export function NavRail({ screen, badges, ingest, onGo, version = '0.19' }) {
       display: 'flex', alignItems: 'center', gap: 9, padding: '14px 16px 13px',
       borderBottom: '1px solid var(--hairline)',
     }}>
-      <Logo />
-      <span style={{
-        fontFamily: 'var(--font-mono)', fontSize: 15, fontWeight: 500,
-        letterSpacing: '-0.01em', color: 'var(--ink)',
-      }}>traza</span>
+      <Lockup size={19} />
       <span style={{
         marginLeft: 'auto', fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--ink-faint)',
       }}>{version}</span>
