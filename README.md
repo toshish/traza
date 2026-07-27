@@ -33,6 +33,7 @@ doing.
 [data model](docs/guide/data-model.md) · [ingest](docs/guide/ingest.md) ·
 [HTTP API reference](docs/guide/http-api.md) ·
 [LLM semantics](docs/llm-semantics.md) ·
+[MCP server](docs/guide/mcp.md) ·
 [trace browser](docs/guide/trace-browser.md)
 
 **Operating Traza** — [deployment](docs/operations/deployment.md) ·
@@ -78,6 +79,8 @@ curl 'http://localhost:8080/v1/stats/llm?group_by=model'   # or provider | servi
 
 Prompt and completion payloads above `--payload-threshold-bytes` are offloaded to a content-addressed store and replaced inline by a `$payload` reference, so a repeated system prompt is stored once. Evals and human feedback attach after the fact via `POST /v1/annotations` without mutating spans, and `GET /v1/export` turns any search into a streaming NDJSON dataset. Conventions and query recipes: [LLM semantics](docs/llm-semantics.md).
 
+**Your agent can read its own traces.** `--mcp` serves a [Model Context Protocol](docs/guide/mcp.md) endpoint from the same binary — ten tools shaped like the questions people arrive with (what is failing, what is slow, where did the money go) rather than one per HTTP route. Results are bounded in tokens instead of rows: twenty spans by default, prompts omitted until asked for, every result capped, and every truncation stated, because a silently shortened answer gets reported as a complete one. Stored span text is returned inside a block marked untrusted and never reaches a tool description or an error message — and the server holds no fetcher, shell or outbound path for an injected instruction to actuate. Off by default; `claude mcp add --transport http traza http://localhost:8080/v1/mcp` once it is on.
+
 **A trace browser, served from its build output.** The dashboard is a React app in [`ui/`](ui/) that `traza-server` serves straight from `ui/dist` — nothing is compiled into the binary, so building the server needs no Node toolchain and a rebuilt UI is picked up without a restart. A packaged binary without a build ships the **API only**: `/` then returns a 404 explaining how to build it, and startup logs every path searched. See [trace browser](docs/guide/trace-browser.md) and [deployment](docs/operations/deployment.md#serving-the-dashboard).
 
 **Durability you choose and the server states.** `--durability` is `buffered`, `wal` (default), or `flushed`, and every ingest response echoes the mode so a client never has to guess what its `200` meant. One caveat stated plainly: `fsync` on **macOS does not flush the drive's own write cache**, so a power cut there can still lose an acknowledged write; a kill -9, a panic, or an OS crash cannot, on either platform. See [durability](docs/operations/durability.md).
@@ -101,6 +104,7 @@ Prompt and completion payloads above `--payload-threshold-bytes` are offloaded t
 | `GET` | `/v1/export?…` | Streaming NDJSON export with completion trailers |
 | `GET` | `/v1/stats`, `/v1/metrics` | Store statistics; Prometheus metrics |
 | `POST` | `/v1/flush` | Force buffered spans into a durable segment |
+| `POST` | `/v1/mcp` | Model Context Protocol endpoint (off unless `--mcp`) |
 
 Every parameter, response shape, and error is in the **[HTTP API reference](docs/guide/http-api.md)**.
 

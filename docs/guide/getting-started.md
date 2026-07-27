@@ -160,9 +160,30 @@ GenAI conventions land queryable with no attribute renaming: sessions, token
 counts, and model rollups populate on their own. See
 [ingest](ingest.md) and [LLM semantics](../llm-semantics.md).
 
+## 7. Let your agent read it
+
+Traza can serve the [Model Context Protocol](mcp.md), so the coding agent in
+your terminal can answer "why did last night's run cost four dollars" against
+this store instead of you pasting JSON between two windows. Restart with
+`--mcp`, then point a client at it:
+
+```sh
+traza-server --data-dir ./data --port 8080 --mcp
+```
+
+```sh
+claude mcp add --transport http traza http://localhost:8080/v1/mcp
+```
+
+Ask it to call `describe_store` first — service and model names differ per
+store, and that call is what stops an agent guessing one and reporting that
+nothing is wrong. The dashboard's **MCP** screen shows the live tool list and
+generates the configuration for clients that need a stdio subprocess instead.
+
 ## Where to go next
 
 - [Data model](data-model.md) — what a span is, and why re-ingesting one is safe
 - [HTTP API reference](http-api.md) — every route and parameter
+- [MCP server](mcp.md) — the tools, resources and prompts an agent gets
 - [Deployment](../operations/deployment.md) — running it somewhere that matters
 - [Configuration reference](../configuration.md) — every flag

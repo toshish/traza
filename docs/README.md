@@ -11,6 +11,7 @@ to the right document. Start with the row that matches what you are doing.
 | Send traces from my app or an OTel SDK | [Ingest](guide/ingest.md) |
 | Look up an exact route, parameter, or response shape | [HTTP API reference](guide/http-api.md) |
 | Query LLM/agent telemetry — sessions, tokens, cost | [LLM semantics](llm-semantics.md) |
+| Let a coding agent read the store over MCP | [MCP server](guide/mcp.md) |
 | Navigate the trace browser | [Trace browser](guide/trace-browser.md) |
 | Deploy, tune, or operate a server | [Operations](#operators) |
 | Change Traza's code | [Internals](#developers) |
@@ -32,6 +33,9 @@ Sending traces to Traza and getting answers back out.
 - **[LLM semantics](llm-semantics.md)** — the OpenLLMetry / OTel GenAI
   attributes Traza recognizes, sessions, token and cost analytics, prompt and
   completion payloads, span links, and query recipes.
+- **[MCP server](guide/mcp.md)** — the Model Context Protocol endpoint: its ten
+  tools, its resources and prompts, how results are bounded for a context
+  window, and the untrusted-content boundary stored span text is held behind.
 - **[Trace browser](guide/trace-browser.md)** — what each view shows and how to
   move between them.
 
@@ -78,10 +82,6 @@ Changing Traza's code.
 - **[Generations and checkpoints](generations-design.md)** — the proposed
   single-node state boundary that would make backup, export, retention and
   replication one mechanism. Design, not shipped behaviour.
-- **[MCP server](mcp-design.md)** — the proposed embedded Model Context
-  Protocol surface: a curated read API shaped for an agent's context window,
-  its tool set, and the untrusted-content boundary it has to hold. Design, not
-  shipped behaviour.
 - **[High-availability design](ha-design.md)** — the replicated, clustered
   trajectory. Design, not shipped behaviour; today's scope is single-node.
 

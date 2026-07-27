@@ -118,6 +118,22 @@ token comparison, and the 401/403 verdicts. `AuthConfig` implements a redacted
 `Debug` so an accidental structured log cannot disclose credentials, and parse
 errors name the defect without echoing the value.
 
+### [`src/mcp.rs`](../../src/mcp.rs)
+
+The Model Context Protocol surface: JSON-RPC framing, `initialize` and version
+negotiation, the ten tool schemas and handlers, five resources and three URI
+templates, four prompts, and the renderers that turn spans into something a
+context window can hold. Tool handlers call `Store` directly — never back
+through HTTP — so the module works with no listener in the process at all,
+which is what `tests/mcp.rs` relies on.
+
+Two things here are load-bearing rather than cosmetic. `sanitize` is the only
+path stored text may take into a result: it escapes control characters and
+neutralizes the telemetry delimiter, so a span value cannot forge a row or
+close the untrusted block early. And `clamp_report` is the last word on size —
+no result may exceed the configured ceiling, and no truncation may be silent.
+Documented in [the MCP guide](../guide/mcp.md).
+
 ### [`src/ui.rs`](../../src/ui.rs)
 
 Static serving of the built dashboard from a directory on disk: the discovery

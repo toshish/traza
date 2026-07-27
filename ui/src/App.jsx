@@ -24,6 +24,7 @@ import { CompareScreen } from './views/CompareScreen.jsx';
 import { ServerScreen } from './views/ServerScreen.jsx';
 import { StoreScreen } from './views/StoreScreen.jsx';
 import { ConnectScreen } from './views/ConnectScreen.jsx';
+import { McpScreen } from './views/McpScreen.jsx';
 
 /** How many samples the rail's ingest sparkline keeps. At a 5s poll this is
     about two minutes of history — long enough to show a shape, short enough
@@ -155,6 +156,7 @@ export function App() {
     case 'server': view = <ServerScreen key={'server:' + authVersion} {...common} />; break;
     case 'store': view = <StoreScreen key={'store:' + authVersion} {...common} />; break;
     case 'connect': view = <ConnectScreen key={'connect:' + authVersion} {...common} />; break;
+    case 'mcp': view = <McpScreen key={'mcp:' + authVersion} {...common} />; break;
     default: view = <OverviewScreen key={'overview:' + authVersion} {...common} />;
   }
 

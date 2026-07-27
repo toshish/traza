@@ -5,6 +5,65 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **An MCP server, embedded in `traza-server`: `POST /v1/mcp`.** Traza's read
+  path had two consumers — the dashboard and `curl` — and the one its own
+  vision implies was missing: the agent that produced the traces. `--mcp`
+  serves the [Model Context Protocol](docs/guide/mcp.md) from the same binary,
+  same port, same auth gate, with **no new dependency** (JSON-RPC is
+  `serde_json`; the transport is the HTTP server that already exists) and no
+  engine change. Tool handlers call `Store` directly rather than looping back
+  through the socket, which is why `tests/mcp.rs` can drive the whole surface
+  with no listener in the process.
+
+  **Ten tools, shaped like questions rather than routes**: `describe_store`,
+  `search_spans`, `get_trace`, `list_sessions`, `get_session`, `top_failures`,
+  `slowest_spans`, `analyze_cost`, `get_payload`, and `record_annotation`
+  behind two gates. A mechanical translation of the route index would have been
+  nineteen tools a model cannot tell apart. `describe_store` exists because an
+  agent that guesses a service name gets an empty result indistinguishable from
+  "nothing is wrong" and reports that everything is fine.
+
+  **Results are bounded in tokens, not rows.** One LLM span with a prompt and a
+  completion is 20–50 KB, so the REST default of `limit=100` would be an
+  unusable call that also costs money to fail: span tools default to 20, stored
+  content is omitted unless asked for, every result is capped by
+  `--mcp-max-result-bytes`, and **every truncation is stated along with the
+  argument that would have narrowed it** — a silently shortened answer gets
+  reported by a model as a complete one.
+
+  **Stored span text is treated as untrusted.** It is confined to a delimited
+  block with a preamble saying so, control characters are escaped so a newline
+  cannot forge a row, the delimiter is neutralized so a value cannot close the
+  block early, and it never reaches a tool name, description, or error message.
+  The load-bearing mitigation is architectural: the server has no fetcher, no
+  shell, no filesystem write and no outbound network path, so an injected
+  instruction has nothing to actuate.
+
+  Also: five resources and three URI templates (`traza://trace/{trace_id}` and
+  friends, so a trace id in a tool result is something a host can attach), four
+  prompts that each carry the live store overview as an embedded resource, a
+  `traza-server mcp --url` stdio bridge for clients that launch a subprocess,
+  and a dashboard **MCP** screen that reads the live surface from the running
+  server rather than describing what the build believes it to be.
+
+- **Per-tool authorization on the MCP route.** Every other route maps scope to
+  HTTP method, which is right where the method *is* the operation. MCP tunnels
+  reads and writes through one `POST`, so the method rule would either lock
+  every `ro` token out of a read-only surface or hand every caller the write
+  scope. `AuthConfig::scope_for` authenticates without applying it, and the
+  endpoint authorizes per tool: `ro` reaches every read tool, and
+  `record_annotation` needs `rw` *and* `--mcp-annotations`. A tool the token
+  cannot call is never advertised to it — a model shown one calls it, reads the
+  refusal as transient, and retries.
+
+- **A `mcp` route class in `/v1/metrics`.** One `POST /v1/mcp` can be a lookup,
+  a search or a whole-store rollup depending only on the tool named in the
+  body; filed under `other` alongside static assets it would describe neither.
+
 ## [0.20.0] - 2026-07-27
 
 ### Added
@@ -64,6 +123,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   The dashboard's Live tail consumes it over one held connection. An idle tail
   went from roughly forty empty round trips a minute to zero.
+
+### Added
 
 ### Fixed
 

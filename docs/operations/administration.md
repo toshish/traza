@@ -51,6 +51,20 @@ unauthenticated client cannot make the server buffer a 64 MiB body just by
 declaring one. A rejected request closes its connection, precisely because that
 body was never consumed.
 
+### The one route that authorizes per operation, not per method
+
+`POST /v1/mcp` is the exception, and it is deliberate. The `ro`/`rw` rule above
+maps scope to HTTP method because everywhere else the method *is* the
+operation. The [MCP endpoint](../guide/mcp.md) tunnels reads and writes alike
+through one `POST`, so applying the method rule there would either refuse every
+`ro` token a read-only surface or hand every caller that got in the write
+scope.
+
+The token is authenticated identically — same constant-time comparison, same
+401 — and then authorized per tool: a `ro` token reaches every read tool, and
+the single writing tool additionally requires `rw` **and** `--mcp-annotations`.
+A tool the presented token cannot call is not advertised to it.
+
 ### The non-loopback refusal
 
 Without `TRAZA_TOKENS`, a non-loopback `--host` is refused at startup:
@@ -83,7 +97,7 @@ token in `sessionStorage` only.
   restart again.
 - Give collectors and exporters an `rw` token; give dashboards, alerting, and
   anything read-only a `ro` token. A `ro` token cannot ingest, flush, or
-  annotate.
+  annotate — and over MCP it reaches the read tools but not the writer.
 - **Two similarly named variables.** `TRAZA_TOKENS` (plural) configures the
   *server's* credential set. `TRAZA_TOKEN` (singular) is the bearer token the
   bundled `seed --url` client sends. They are not interchangeable.

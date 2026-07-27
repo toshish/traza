@@ -31,6 +31,7 @@ export const NAV = [
     { id: 'server', label: 'Server' },
     { id: 'store', label: 'Store' },
     { id: 'connect', label: 'Connect' },
+    { id: 'mcp', label: 'MCP' },
   ] },
 ];
 
@@ -54,6 +55,7 @@ export const SCREENS = {
   server: ['Server', 'what this process has actually done'],
   store: ['Store', 'segments, durability, export'],
   connect: ['Connect', 'point something at this server'],
+  mcp: ['MCP', 'let an agent read this store'],
 };
 
 function NavItem({ item, active, badge, onGo }) {
