@@ -1,107 +1,112 @@
 import React from 'react';
 import { api } from '../lib/api.js';
-import { usePoll } from '../lib/route.js';
 import { fmtClockNs, fmtDurationNs, fmtNum, fmtRate } from '../lib/format.js';
 import { Card, Chip, LiveDot, Mono } from '../components/primitives/Chrome.jsx';
-import { newTailState, pollOnce } from '../lib/tail.js';
+import { newTailState, runTail } from '../lib/tail.js';
 
-// Spans as they land. The old table was a snapshot with a Refresh button,
-// which is the wrong shape for data that arrives continuously.
+// Spans as they land — over one held connection, not a poll.
 //
-// Polling is incremental: each tick asks only for spans newer than the last
-// one seen, so the cost of watching is proportional to what arrived rather
-// than to what is on screen. A paused tail stops asking entirely.
+// The screen used to ask `/v1/spans?since=<watermark>` every 1.5 seconds, and
+// that could not express what this screen claims to show. A span outliving one
+// tick starts before the watermark and arrives after it, so the server dropped
+// it permanently. The server now streams in admission order, which is the order
+// "as they land" actually means.
 //
-// Two invariants make it correct rather than merely incremental. Paging is by
-// cursor, because a watermark cannot separate spans that share a timestamp and
-// an SDK flush routinely produces hundreds that do. And the watermark advances
-// only when a cursor chain is exhausted, because moving it mid-chain re-reads
-// the burst's prefix forever and never reaches its end.
+// The network cost went the same direction: an idle tail was forty round trips
+// a minute returning nothing, and is now zero — one parked connection and a
+// heartbeat every fifteen seconds.
 
 const MAX_ROWS = 300;
-const TICK_MS = 1500;
+// Arrival rate is averaged over a sliding window rather than computed per
+// frame. Spans arrive in bursts of whatever the SDK flushed, so a per-frame
+// rate is a number that swings between zero and enormous and reads as noise.
+const RATE_WINDOW_MS = 5_000;
 
 export function TailScreen({ go }) {
   const [rows, setRows] = React.useState([]);
   const [paused, setPaused] = React.useState(false);
   const [pending, setPending] = React.useState(0);
   const [rate, setRate] = React.useState(null);
+  const [status, setStatus] = React.useState('live');
   const [service, setService] = React.useState('');
   const [errorsOnly, setErrorsOnly] = React.useState(false);
   const buffer = React.useRef([]);
-  const lastTick = React.useRef(null);
-  const inFlight = React.useRef(null);
-  // The polling state machine lives in lib/tail.js so it can be tested without
-  // a DOM — which is where its two real bugs were found.
-  const tail = React.useRef(newTailState());
-  // Which filter the in-flight poll belongs to. Replacing the state and
-  // clearing the screen does not un-send a request: a poll started under the
-  // old filter still resolves, and appended its rows to a screen now showing a
-  // different one. The generation is checked after the await.
-  const generation = React.useRef(0);
+  const arrivals = React.useRef([]);
+  // `paused` is read inside a long-lived async loop, which closed over the
+  // value it had when the stream opened. The ref is what the loop reads.
+  const pausedRef = React.useRef(false);
+  pausedRef.current = paused;
 
-  // Reset when the filter changes: a narrower tail should show what is arriving
-  // now, not resume a cursor chain belonging to the wider one.
   React.useEffect(() => {
-    generation.current += 1;
-    tail.current = newTailState();
-    buffer.current = [];
-    // NOT cleared here. Releasing the flag while the obsolete request is still
-    // running let a new poll start, and then that obsolete request's `finally`
-    // cleared the flag a second time — admitting a third poll alongside the
-    // second. The flag is a token now: only its owner may release it.
+    // One subscription per filter. Aborting is what ends the previous loop and
+    // releases its connection — there is no "ignore the late response" case to
+    // handle any more, because there is no response, only a stream that stops.
+    const controller = new AbortController();
+    const state = newTailState();
     setRows([]);
     setPending(0);
+    buffer.current = [];
+    arrivals.current = [];
+
+    const filter = {
+      service: service || undefined,
+      status: errorsOnly ? 'error' : undefined,
+    };
+
+    runTail(state, {
+      open: (params) => api.tailChunks(params, controller.signal),
+      filter,
+      signal: controller.signal,
+      onStatus: setStatus,
+      onSpans: (spans) => {
+        const now = Date.now();
+        arrivals.current = arrivals.current
+          .filter((at) => now - at < RATE_WINDOW_MS)
+          .concat(spans.map(() => now));
+        setRate((arrivals.current.length * 1000) / RATE_WINDOW_MS);
+
+        // Newest first, matching the table's order.
+        const newestFirst = spans.slice().reverse();
+        if (pausedRef.current) {
+          buffer.current = [...newestFirst, ...buffer.current].slice(0, MAX_ROWS);
+          setPending(buffer.current.length);
+        } else {
+          setRows((all) => [...newestFirst, ...all].slice(0, MAX_ROWS));
+        }
+      },
+      onGap: async () => {
+        // The client fell further behind than the server's ring retains, so
+        // what was missed cannot come from the stream. Backfilling by event
+        // time is the ordering this screen exists to avoid, but it is the
+        // honest recovery: the alternative is a view with an invisible hole,
+        // which is the exact failure the stream was built to end.
+        //
+        // The result REPLACES the rows rather than being prepended. What is on
+        // screen is an incremental view that is now known to be incomplete, and
+        // the two overlap — prepending would show the overlap twice and leave
+        // the hole underneath it. The buffered pause is discarded for the same
+        // reason. A visible refresh beats a plausible-looking lie.
+        try {
+          const answer = await api.spans(
+            // The filter has to travel with it. Without it a tail narrowed to
+            // errors would repopulate itself with every span in the store.
+            // `-start` because this needs the NEWEST rows, and the default
+            // ordering with a limit returns the oldest.
+            { ...filter, limit: MAX_ROWS, sort: '-start' },
+            controller.signal,
+          );
+          if (controller.signal.aborted) return;
+          buffer.current = [];
+          setPending(0);
+          setRows(answer.spans || []);
+        } catch (e) {
+          /* the stream resumes from the gap position regardless */
+        }
+      },
+    });
+
+    return () => controller.abort();
   }, [service, errorsOnly]);
-
-  usePoll(async () => {
-    // Ticks must not overlap. A slow response used to let the next tick start
-    // against the same watermark, so both pages landed and every span appeared
-    // twice.
-    if (inFlight.current) return;
-    const mine = generation.current;
-    // The token identifies the flight, so a late finalizer cannot free a slot
-    // it no longer owns.
-    const token = Symbol('poll');
-    inFlight.current = token;
-    const state = tail.current;
-    try {
-      const added = await pollOnce(
-        state,
-        (params) => api.spans(params),
-        {
-          filter: {
-            service: service || undefined,
-            status: errorsOnly ? 'error' : undefined,
-          },
-        },
-      );
-
-      // The filter changed while this was in flight: these rows describe a
-      // query nobody is looking at any more.
-      if (mine !== generation.current) return;
-
-      const now = performance.now();
-      if (lastTick.current) {
-        const seconds = Math.max(0.001, (now - lastTick.current) / 1000);
-        setRate(added.length / seconds);
-      }
-      lastTick.current = now;
-      if (!added.length) return;
-
-      const newestFirst = added.slice().reverse();
-      if (paused) {
-        buffer.current = [...newestFirst, ...buffer.current].slice(0, MAX_ROWS);
-        setPending(buffer.current.length);
-      } else {
-        setRows((all) => [...newestFirst, ...all].slice(0, MAX_ROWS));
-      }
-    } catch (e) {
-      /* a dropped tick is the next tick's problem */
-    } finally {
-      if (inFlight.current === token) inFlight.current = null;
-    }
-  }, TICK_MS, true);
 
   const resume = () => {
     // The buffer is already newest-first — each tick prepends its own
@@ -133,8 +138,9 @@ export function TailScreen({ go }) {
         setPending(0);
       }}>Clear</Chip>
       <span style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: 'var(--ink-muted)' }}>
-        <LiveDot color={paused ? 'var(--ink-faint)' : 'var(--ok)'} />
-        {paused ? 'paused' : 'live'}
+        <LiveDot color={paused ? 'var(--ink-faint)'
+          : status === 'reconnecting' ? 'var(--warn)' : 'var(--ok)'} />
+        {paused ? 'paused' : status}
         <span style={{ color: 'var(--ink-faint)' }}>·</span>
         <Mono color="var(--accent)">{rate == null ? '—' : fmtRate(rate)}</Mono>
         <span style={{ color: 'var(--ink-faint)' }}>·</span>

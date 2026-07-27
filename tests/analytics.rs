@@ -369,6 +369,7 @@ fn rollup_cache_survives_compaction_supersede() {
             compaction: None,
             wal_commit_window: None,
             content_index: true,
+            tail_ring_spans: traza::DEFAULT_TAIL_RING_SPANS,
             flush_wal_bytes: None,
         },
     )

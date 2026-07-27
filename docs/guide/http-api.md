@@ -55,6 +55,7 @@ trailers and has no declared length.
 | `GET` | [`/v1/annotations`](#get-v1annotations) | Query annotations |
 | `GET` | [`/v1/payloads/{reference}`](#get-v1payloadsreference) | Raw bytes of an offloaded payload |
 | `GET` | [`/v1/export`](#get-v1export) | Streaming NDJSON export |
+| `GET` | [`/v1/tail`](#get-v1tail) | Live span stream, in admission order |
 | `GET` | [`/v1/stats`](#get-v1stats) | Store statistics |
 | `GET` | [`/v1/metrics`](#get-v1metrics) | Prometheus text metrics |
 | `GET` | [`/v1/metrics.json`](#get-v1metricsjson) | The same metrics as JSON |
@@ -368,6 +369,83 @@ This route always closes its connection.
 
 ```sh
 curl 'http://localhost:8080/v1/export?service=support-agent' > dataset.ndjson
+```
+
+### `GET /v1/tail`
+
+Streams spans as they are admitted, as [server-sent events](https://html.spec.whatwg.org/multipage/server-sent-events.html).
+
+**This is the only route ordered by admission rather than event time**, and
+that is the reason it exists. `GET /v1/spans?since=` answers "what *started*
+after time T", which cannot express "what is arriving": a span that runs longer
+than the client's polling interval starts before the watermark and arrives
+after it, so a polling tail drops it permanently. Not late — never. The tail
+assigns each admission a sequence number instead, so a span is delivered when
+it lands regardless of when it started.
+
+**Parameters.** Every predicate [`GET /v1/spans`](#get-v1spans) accepts, except
+the event-time window, plus:
+
+| Parameter | Type | Description |
+|---|---|---|
+| `cursor` | string | Resume position from a previous frame. Omit to start fresh |
+| `backfill` | integer | Spans of history to open with. Default **200**, `0` for future-only. Ignored when `cursor` is given |
+| `limit` | integer | Maximum spans per frame. Default **200** |
+
+`since`, `since_ns`, `until` and `until_ns` are **rejected** with `400` rather
+than ignored — a tail cannot honour an event-time window, and silently dropping
+one would answer a different question than the one asked.
+
+**Response `200`.**
+
+```
+Content-Type: text/event-stream
+Transfer-Encoding: chunked
+Connection: close
+```
+
+Three frame types:
+
+```
+event: spans
+data: {"spans":[{...}],"cursor":"1763913600000000000.41"}
+
+event: gap
+data: {"cursor":"1763913600000000000.8192"}
+
+: tick
+```
+
+A `spans` frame carries matches in admission order and the position to resume
+from. Its `spans` array may be empty while `cursor` still advances — that means
+spans were admitted but none matched the filter, and the position moves so a
+narrow subscriber does not fall off the back of the ring.
+
+A **`gap`** frame means the subscriber fell further behind than the server
+retains and what was missed cannot come from this stream. Its `cursor` is the
+*oldest position still held*, not the newest, so a backfill by
+[`GET /v1/spans`](#get-v1spans) only has to cover what was actually dropped.
+The stream continues from that position.
+
+A line beginning `:` is a comment — the heartbeat, sent every 15 seconds on a
+quiet store. It is how an intermediary is kept from reaping the connection and
+how the server discovers a client has gone.
+
+**Cursors do not survive a restart.** The `epoch` half of the token identifies
+the process; a cursor from a previous one is reported as a gap rather than
+misread as a live position.
+
+**Retention is bounded and in memory.** The server keeps the last
+`--tail-ring-spans` admissions (default **8192**); beyond that a subscriber
+gaps. This costs no disk and adds no field to the stored span — see
+[`--tail-ring-spans`](../configuration.md) to trade memory for a longer
+reconnect window.
+
+This route always closes its connection, and is counted but never timed in
+[route-class metrics](../operations/monitoring.md).
+
+```sh
+curl -N 'http://localhost:8080/v1/tail?service=support-agent&backfill=0'
 ```
 
 ---

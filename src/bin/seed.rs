@@ -116,6 +116,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 payload_threshold: (payload_threshold > 0).then_some(payload_threshold),
                 wal_commit_window: None,
                 content_index: true,
+                // Nothing tails a seeder, and its whole job is to admit
+                // millions of spans, so retaining the last few thousand would
+                // be memory spent on an audience that does not exist.
+                tail_ring_spans: 1,
             },
         )?),
         None => None,

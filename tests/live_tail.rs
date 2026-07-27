@@ -1,0 +1,552 @@
+//! The live tail streams in admission order, not event-time order.
+//!
+//! The distinction is the entire reason this surface exists, so the first test
+//! below is written to fail against the design it replaced. Under event-time
+//! paging a client tracks a `start_time_ns` watermark; a span that runs longer
+//! than one poll interval starts BEFORE that watermark and arrives AFTER it, so
+//! the server filters it out permanently. It is not lag. The span is in the
+//! store, it matches the filter, and no later request will ever return it.
+//!
+//! `event_time_paging_still_loses_the_span_the_tail_delivers` holds both
+//! mechanisms against the same two spans and asserts the difference directly,
+//! so the guard cannot pass by accident if the tail ever quietly reverts to
+//! ordering by timestamp.
+
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpStream;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use serde_json::{json, Value};
+use traza::tail::TailRead;
+use traza::{Config, Durability, Span, SpanFilter, Store};
+
+fn test_dir(label: &str) -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "traza-live-tail-{label}-{}-{nonce}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("dir");
+    dir
+}
+
+fn span(trace: &str, id: &str, start_ns: u64, end_ns: u64) -> Span {
+    Span {
+        trace_id: trace.to_owned(),
+        span_id: id.to_owned(),
+        parent_span_id: None,
+        name: "op".to_owned(),
+        start_time_ns: start_ns,
+        end_time_ns: end_ns,
+        status: "ok".to_owned(),
+        service: "svc".to_owned(),
+        attributes: Default::default(),
+        events: Vec::new(),
+        links: Vec::new(),
+        extra: Default::default(),
+    }
+}
+
+fn store(label: &str) -> (Store, PathBuf) {
+    let dir = test_dir(label);
+    let config = Config {
+        durability: Durability::Buffered,
+        ..Config::default()
+    };
+    (Store::open(&dir, config).expect("store opens"), dir)
+}
+
+fn ids(read: &TailRead) -> Vec<String> {
+    match read {
+        TailRead::Batch { spans, .. } => spans.iter().map(|s| s.span_id.clone()).collect(),
+        TailRead::Gap { .. } => panic!("unexpected gap"),
+    }
+}
+
+fn cursor_of(read: &TailRead) -> traza::tail::TailCursor {
+    match read {
+        TailRead::Batch { cursor, .. } => *cursor,
+        TailRead::Gap { cursor } => *cursor,
+    }
+}
+
+#[test]
+fn event_time_paging_still_loses_the_span_the_tail_delivers() {
+    let (engine, _dir) = store("ordering");
+
+    // `a` starts at 10s. A watching client sees it and its watermark moves to
+    // 10s.
+    engine
+        .ingest_batch(vec![span("t1", "a", 10_000, 11_000)])
+        .expect("ingest a");
+    let first = engine.tail_after(None, 100, 100, &SpanFilter::default(), Duration::ZERO);
+    assert_eq!(ids(&first), ["a"]);
+    let cursor = cursor_of(&first);
+
+    // `b` STARTED at 5s and is only now finishing — a long-running operation
+    // that was already in flight when `a` began. It is admitted second.
+    engine
+        .ingest_batch(vec![span("t2", "b", 5_000, 30_000)])
+        .expect("ingest b");
+
+    // Event-time paging: the client asks for everything at or after its
+    // watermark. `b` started before it, so this is empty — permanently. This
+    // assertion is the bug, reproduced.
+    let missed = engine
+        .query(&SpanFilter {
+            since_ns: Some(10_000),
+            ..SpanFilter::default()
+        })
+        .expect("query");
+    assert!(
+        !missed.iter().any(|span| span.span_id == "b"),
+        "event-time paging is expected to miss `b`; if it does not, this test \
+         no longer proves anything and needs rewriting"
+    );
+
+    // The store holds it, so nothing was lost on ingest.
+    let everything = engine.query(&SpanFilter::default()).expect("query");
+    assert!(everything.iter().any(|span| span.span_id == "b"));
+
+    // Admission order delivers it. This is the line that fails against the
+    // design this replaced.
+    let second = engine.tail_after(
+        Some(cursor),
+        100,
+        100,
+        &SpanFilter::default(),
+        Duration::ZERO,
+    );
+    assert_eq!(
+        ids(&second),
+        ["b"],
+        "a span that started before the watermark must still be delivered when it lands"
+    );
+}
+
+#[test]
+fn a_settled_cursor_never_replays() {
+    let (engine, _dir) = store("settled");
+    engine
+        .ingest_batch(vec![
+            span("t1", "a", 1_000, 2_000),
+            span("t1", "b", 1_000, 2_000),
+        ])
+        .expect("ingest");
+
+    let first = engine.tail_after(None, 100, 100, &SpanFilter::default(), Duration::ZERO);
+    assert_eq!(ids(&first).len(), 2);
+    let mut cursor = cursor_of(&first);
+
+    // Identical timestamps, which no watermark can separate — the burst that
+    // made the previous implementation replay its first page forever.
+    for _ in 0..5 {
+        let read = engine.tail_after(
+            Some(cursor),
+            100,
+            100,
+            &SpanFilter::default(),
+            Duration::ZERO,
+        );
+        assert!(ids(&read).is_empty(), "settled cursor must be silent");
+        cursor = cursor_of(&read);
+    }
+}
+
+#[test]
+fn a_filter_applies_to_the_stream() {
+    let (engine, _dir) = store("filter");
+    let mut failed = span("t1", "bad", 1_000, 2_000);
+    failed.status = "error".to_owned();
+    engine
+        .ingest_batch(vec![span("t1", "good", 1_000, 2_000), failed])
+        .expect("ingest");
+
+    let read = engine.tail_after(
+        None,
+        100,
+        100,
+        &SpanFilter {
+            status: Some("error".to_owned()),
+            ..SpanFilter::default()
+        },
+        Duration::ZERO,
+    );
+    assert_eq!(ids(&read), ["bad"]);
+}
+
+#[test]
+fn falling_off_the_ring_reports_a_gap() {
+    let dir = test_dir("gap");
+    let engine = Store::open(
+        &dir,
+        Config {
+            durability: Durability::Buffered,
+            tail_ring_spans: 4,
+            ..Config::default()
+        },
+    )
+    .expect("store opens");
+
+    engine
+        .ingest_batch(vec![span("t1", "a", 1_000, 2_000)])
+        .expect("ingest");
+    let cursor =
+        cursor_of(&engine.tail_after(None, 100, 100, &SpanFilter::default(), Duration::ZERO));
+
+    for index in 0..8 {
+        engine
+            .ingest_batch(vec![span("t1", &format!("x{index}"), 3_000, 4_000)])
+            .expect("ingest");
+    }
+
+    // A gap is reported rather than entries being silently skipped: the client
+    // can recover from being told, and cannot recover from not being told.
+    let read = engine.tail_after(
+        Some(cursor),
+        100,
+        100,
+        &SpanFilter::default(),
+        Duration::ZERO,
+    );
+    assert!(
+        matches!(read, TailRead::Gap { .. }),
+        "a cursor older than the ring must gap, not skip"
+    );
+}
+
+#[test]
+fn a_waiting_subscriber_is_woken_by_an_ingest() {
+    use std::sync::Arc;
+
+    let (engine, _dir) = store("wake");
+    let engine = Arc::new(engine);
+    let head = engine.tail_head().expect("head");
+
+    let writer = Arc::clone(&engine);
+    let ingest = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        writer
+            .ingest_batch(vec![span("t1", "late", 1_000, 2_000)])
+            .expect("ingest");
+    });
+
+    // A five-second budget that must not be spent: the point is that the span
+    // is pushed to the waiting subscriber, not that the deadline eventually
+    // expires and it re-reads.
+    let started = Instant::now();
+    let read = engine.tail_after(
+        Some(head),
+        0,
+        100,
+        &SpanFilter::default(),
+        Duration::from_secs(5),
+    );
+    let waited = started.elapsed();
+    ingest.join().expect("ingest thread");
+
+    assert_eq!(ids(&read), ["late"]);
+    assert!(
+        waited < Duration::from_secs(4),
+        "delivery must follow the ingest, not the timeout (waited {waited:?})"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The HTTP surface.
+// ---------------------------------------------------------------------------
+
+struct Server {
+    child: Child,
+    port: u16,
+}
+
+impl Server {
+    fn spawn(data_dir: &Path) -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_traza-server"));
+        command
+            .arg("--data-dir")
+            .arg(data_dir)
+            .arg("--host")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg("0")
+            .arg("--durability")
+            .arg("buffered")
+            .env_remove("TRAZA_TOKENS")
+            .env("TRAZA_SOCKET_TIMEOUT_MS", "30000")
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().expect("spawns traza-server");
+        let stderr = child.stderr.take().expect("stderr piped");
+        let mut reader = BufReader::new(stderr);
+        let port = {
+            let mut line = String::new();
+            let mut startup = String::new();
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).expect("stderr read") == 0 {
+                    panic!("traza-server exited before listening:\n{startup}");
+                }
+                startup.push_str(&line);
+                if let Some(rest) = line.strip_prefix("traza-server listening on 127.0.0.1:") {
+                    break rest.trim().parse::<u16>().expect("port parses");
+                }
+            }
+        };
+        std::thread::spawn(move || for _ in reader.lines() {});
+        Self { child, port }
+    }
+
+    fn connect(&self) -> TcpStream {
+        let mut attempt = 0;
+        loop {
+            match TcpStream::connect(("127.0.0.1", self.port)) {
+                Ok(stream) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(10)))
+                        .expect("timeout");
+                    break stream;
+                }
+                Err(_) if attempt < 50 => {
+                    attempt += 1;
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("connect: {error}"),
+            }
+        }
+    }
+
+    fn ingest(&self, spans: Value) {
+        let body = spans.to_string();
+        let mut stream = self.connect();
+        write!(
+            stream,
+            "POST /v1/spans HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .expect("write ingest");
+        let mut answer = String::new();
+        stream.read_to_string(&mut answer).expect("read ingest");
+        assert!(
+            answer.starts_with("HTTP/1.1 2"),
+            "ingest rejected: {answer}"
+        );
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Reads the response head, then decodes chunked SSE frames on demand.
+struct Stream {
+    reader: BufReader<TcpStream>,
+}
+
+impl Stream {
+    fn open(server: &Server, query: &str) -> (String, Self) {
+        let mut socket = server.connect();
+        write!(
+            socket,
+            "GET /v1/tail{query} HTTP/1.1\r\nHost: x\r\nAccept: text/event-stream\r\n\r\n"
+        )
+        .expect("write request");
+        socket.flush().expect("flush");
+        let mut reader = BufReader::new(socket);
+        let mut head = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            let read = reader.read(&mut byte).expect("header byte");
+            assert_ne!(read, 0, "closed mid-header");
+            head.push(byte[0]);
+        }
+        (
+            String::from_utf8(head).expect("utf-8 head"),
+            Self { reader },
+        )
+    }
+
+    /// One chunked frame, as text. Blocks until the server sends one.
+    fn frame(&mut self) -> String {
+        let mut size_line = String::new();
+        self.reader.read_line(&mut size_line).expect("chunk size");
+        let size = usize::from_str_radix(size_line.trim(), 16).expect("hex chunk size");
+        let mut body = vec![0_u8; size];
+        self.reader.read_exact(&mut body).expect("chunk body");
+        let mut terminator = [0_u8; 2];
+        self.reader.read_exact(&mut terminator).expect("chunk CRLF");
+        String::from_utf8(body).expect("utf-8 frame")
+    }
+
+    /// The next `event: spans` frame's payload, skipping heartbeats.
+    fn next_spans(&mut self) -> Value {
+        for _ in 0..20 {
+            let frame = self.frame();
+            if let Some(data) = frame.strip_prefix("event: spans\ndata: ") {
+                return serde_json::from_str(data.trim_end()).expect("json payload");
+            }
+        }
+        panic!("no spans frame within 20 frames");
+    }
+}
+
+#[test]
+fn the_stream_delivers_a_span_that_started_before_the_one_already_seen() {
+    let dir = test_dir("http-order");
+    let server = Server::spawn(&dir);
+
+    server.ingest(json!([{
+        "trace_id": "t1", "span_id": "a", "name": "op", "service": "svc",
+        "start_time_ns": 10_000_u64, "end_time_ns": 11_000_u64, "status": "ok",
+    }]));
+
+    let (head, mut stream) = Stream::open(&server, "?backfill=100");
+    assert!(head.starts_with("HTTP/1.1 200 OK"), "{head}");
+    assert!(
+        head.to_lowercase()
+            .contains("content-type: text/event-stream"),
+        "{head}"
+    );
+
+    let opening = stream.next_spans();
+    let seen: Vec<&str> = opening["spans"]
+        .as_array()
+        .expect("spans array")
+        .iter()
+        .map(|span| span["span_id"].as_str().expect("span_id"))
+        .collect();
+    assert_eq!(seen, ["a"]);
+
+    // Started earlier, lands later — invisible to a `since=` watermark.
+    server.ingest(json!([{
+        "trace_id": "t2", "span_id": "b", "name": "op", "service": "svc",
+        "start_time_ns": 5_000_u64, "end_time_ns": 30_000_u64, "status": "ok",
+    }]));
+
+    let next = stream.next_spans();
+    let arrived: Vec<&str> = next["spans"]
+        .as_array()
+        .expect("spans array")
+        .iter()
+        .map(|span| span["span_id"].as_str().expect("span_id"))
+        .collect();
+    assert_eq!(
+        arrived,
+        ["b"],
+        "the late span must reach a connected client"
+    );
+    assert!(next["cursor"].is_string(), "every frame carries a position");
+}
+
+#[test]
+fn an_event_time_bound_is_refused_rather_than_ignored() {
+    let dir = test_dir("http-since");
+    let server = Server::spawn(&dir);
+    let (head, _stream) = Stream::open(&server, "?since=1000");
+    assert!(
+        head.starts_with("HTTP/1.1 400"),
+        "a tail cannot honour an event-time window, and must say so: {head}"
+    );
+}
+
+#[test]
+fn a_malformed_cursor_is_refused() {
+    let dir = test_dir("http-cursor");
+    let server = Server::spawn(&dir);
+    let (head, _stream) = Stream::open(&server, "?cursor=not-a-cursor");
+    assert!(head.starts_with("HTTP/1.1 400"), "{head}");
+}
+
+#[test]
+fn a_filter_narrows_the_stream() {
+    let dir = test_dir("http-filter");
+    let server = Server::spawn(&dir);
+    server.ingest(json!([
+        {"trace_id": "t1", "span_id": "ok1", "name": "op", "service": "svc",
+         "start_time_ns": 1_000_u64, "end_time_ns": 2_000_u64, "status": "ok"},
+        {"trace_id": "t1", "span_id": "bad1", "name": "op", "service": "svc",
+         "start_time_ns": 1_000_u64, "end_time_ns": 2_000_u64, "status": "error"},
+    ]));
+
+    let (_head, mut stream) = Stream::open(&server, "?backfill=100&status=error");
+    let opening = stream.next_spans();
+    let seen: Vec<&str> = opening["spans"]
+        .as_array()
+        .expect("spans array")
+        .iter()
+        .map(|span| span["span_id"].as_str().expect("span_id"))
+        .collect();
+    assert_eq!(seen, ["bad1"]);
+}
+
+fn server_metrics(server: &Server) -> Value {
+    let mut socket = server.connect();
+    write!(
+        socket,
+        "GET /v1/metrics.json HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+    )
+    .expect("write");
+    let mut answer = String::new();
+    socket.read_to_string(&mut answer).expect("read");
+    let body = answer.split("\r\n\r\n").nth(1).unwrap_or_default();
+    serde_json::from_str(body).expect("json metrics")
+}
+
+#[test]
+fn a_stream_is_counted_but_never_timed() {
+    // A tail lasts as long as the client watches. Recording that as a request
+    // latency would put hours into the histogram every dashboard tab derives
+    // its percentiles from.
+    let dir = test_dir("http-metrics");
+    let server = Server::spawn(&dir);
+    server.ingest(json!([{
+        "trace_id": "t1", "span_id": "a", "name": "op", "service": "svc",
+        "start_time_ns": 1_000_u64, "end_time_ns": 2_000_u64, "status": "ok",
+    }]));
+
+    {
+        let (_head, mut stream) = Stream::open(&server, "?backfill=100");
+        stream.next_spans();
+        // Hold it open long enough that a timed class would record it as a
+        // clearly non-zero duration.
+        std::thread::sleep(Duration::from_millis(300));
+    }
+
+    // The handler is parked on the ring waiting for spans, so it learns the
+    // client is gone only when it next tries to write. Ingesting is what makes
+    // it try — the same way a real disconnect is discovered.
+    let stream_class = {
+        let mut found = Value::Null;
+        for index in 0..30 {
+            server.ingest(json!([{
+                "trace_id": "t1", "span_id": format!("w{index}"), "name": "op",
+                "service": "svc", "start_time_ns": 1_000_u64,
+                "end_time_ns": 2_000_u64, "status": "ok",
+            }]));
+            let stats = server_metrics(&server);
+            if stats["by_class"]["stream"]["count"].as_u64().unwrap_or(0) >= 1 {
+                found = stats["by_class"]["stream"].clone();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        found
+    };
+    assert!(
+        stream_class["count"].as_u64().unwrap_or(0) >= 1,
+        "the stream is counted once its handler notices the disconnect: {stream_class}"
+    );
+    assert_eq!(
+        stream_class["max_ns"].as_u64(),
+        Some(0),
+        "a stream's duration must never enter the latency histogram: {stream_class}"
+    );
+}

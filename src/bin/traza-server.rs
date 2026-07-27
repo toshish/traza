@@ -25,8 +25,11 @@
 //! - `POST /v1/flush` forces buffered spans into a durable segment.
 //! - `POST /v1/traces` accepts OTLP/HTTP JSON or binary protobuf.
 //! - `GET /v1/export` streams chunked NDJSON with completion/count trailers.
-//!   This is the one route that always closes its connection: it is chunked
-//!   with trailers and has no declared length.
+//! - `GET /v1/tail` streams spans as server-sent events, in ADMISSION order —
+//!   the one surface not ordered by event time, because "as they land" cannot
+//!   be expressed as a `start_time_ns` window (see [`traza::tail`]).
+//!   Both stream routes always close their connection: neither has a declared
+//!   length, and neither ends until the consumer does.
 //! - `GET /v1/metrics` reports per-stage ingest timings and request counters
 //!   in Prometheus text format.
 //!
@@ -59,6 +62,7 @@ use std::thread;
 use std::time::Duration;
 
 use serde_json::{json, Value};
+use traza::tail::{TailCursor, TailRead};
 use traza::{CompactionConfig, Config, Durability, Profile, Span, SpanCursor, SpanFilter, Store};
 
 const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
@@ -137,10 +141,13 @@ enum RouteClass {
     Ingest,
     /// A trace or session fetched by id.
     Lookup,
-    /// Filtered span search and export.
+    /// Filtered span search.
     Search,
     /// Aggregation: analytics, series, duration, failures.
     Stats,
+    /// Responses held open for as long as the consumer wants them: the live
+    /// tail and export. Counted, never timed — see [`ServerMetrics::observe`].
+    Stream,
     /// Everything else — dashboard assets, metrics, flush.
     Other,
 }
@@ -150,7 +157,13 @@ impl RouteClass {
     fn of(method: &str, path: &str) -> Self {
         match (method, path) {
             ("POST", "/v1/spans" | "/v1/traces") => Self::Ingest,
-            ("GET", "/v1/spans" | "/v1/export") => Self::Search,
+            ("GET", "/v1/spans") => Self::Search,
+            // Long-lived responses, held open by the consumer rather than by
+            // the server's own work. Export moved out of `search` with the
+            // tail: its duration tracks dataset size, so it was already
+            // dragging the search percentiles toward whatever the largest
+            // export happened to be.
+            ("GET", "/v1/export" | "/v1/tail") => Self::Stream,
             ("GET", path) if path.starts_with("/v1/stats") => Self::Stats,
             ("GET", "/v1/sessions") => Self::Stats,
             ("GET", path)
@@ -172,6 +185,7 @@ impl RouteClass {
             Self::Lookup => "lookup",
             Self::Search => "search",
             Self::Stats => "stats",
+            Self::Stream => "stream",
             Self::Other => "other",
         }
     }
@@ -187,7 +201,11 @@ struct ServerMetrics {
     /// End-to-end handling time, from parsed head to written response.
     request_latency: traza::metrics::Latency,
     /// The same, split by [`RouteClass`], in that enum's declaration order.
-    by_class: [traza::metrics::Latency; 5],
+    ///
+    /// Must stay the same length as [`ServerMetrics::CLASSES`]. The reporting
+    /// zips the two, so a shorter array here does not fail to compile — it
+    /// silently drops the classes past the end.
+    by_class: [traza::metrics::Latency; Self::CLASSES.len()],
     /// Responses issued per status class, indexed `2xx, 4xx, 5xx`.
     status_2xx: traza::metrics::Counter,
     status_4xx: traza::metrics::Counter,
@@ -330,20 +348,35 @@ impl ServerMetrics {
     }
 
     /// The route classes, in the order [`Self::by_class`] stores them.
-    const CLASSES: [RouteClass; 5] = [
+    const CLASSES: [RouteClass; 6] = [
         RouteClass::Ingest,
         RouteClass::Lookup,
         RouteClass::Search,
         RouteClass::Stats,
+        RouteClass::Stream,
         RouteClass::Other,
     ];
 
     /// Records one served request against its class.
+    ///
+    /// Streams are counted but their duration is discarded, because for a
+    /// stream that number is not a latency. A tail lasts as long as a client
+    /// chooses to watch and an export as long as its dataset takes to send;
+    /// neither says anything about how fast the server is. Recorded, one
+    /// dashboard left open overnight would have set the p95 of every latency
+    /// panel on the page to eight hours.
     fn observe(&self, class: RouteClass, elapsed_ns: u64, status: u16) {
-        self.request_latency.record(elapsed_ns);
+        let timed = class != RouteClass::Stream;
+        if timed {
+            self.request_latency.record(elapsed_ns);
+        }
         self.requests.increment();
         if let Some(position) = Self::CLASSES.iter().position(|entry| *entry == class) {
-            self.by_class[position].record(elapsed_ns);
+            if timed {
+                self.by_class[position].record(elapsed_ns);
+            } else {
+                self.by_class[position].count_only();
+            }
         }
         match status {
             200..=299 => self.status_2xx.increment(),
@@ -486,6 +519,7 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
     // Profile-owned: `None` means "not given on the command line", which is
     // exactly the question the resolve below asks.
     let mut flush_spans: Option<usize> = None;
+    let mut tail_ring_spans = traza::DEFAULT_TAIL_RING_SPANS;
     let mut wal_commit_window_us: Option<u64> = None;
 
     let value = |i: usize, name: &str| -> Result<&String, String> {
@@ -530,6 +564,10 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
             "--flush-wal-bytes" => {
                 i += 1;
                 flush_wal_bytes = number(i, "--flush-wal-bytes")?;
+            }
+            "--tail-ring-spans" => {
+                i += 1;
+                tail_ring_spans = (number(i, "--tail-ring-spans")? as usize).max(1);
             }
             "--max-connections" => {
                 i += 1;
@@ -612,6 +650,7 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
             durability,
             content_index,
             compaction: compaction_enabled.then_some(compaction),
+            tail_ring_spans,
         },
     }))
 }
@@ -950,12 +989,17 @@ fn handle_connection(
         let result = serve_request(&mut responder, request, engine, metrics);
         let persist = responder.keep_alive;
         let status = responder.status;
-        result?;
+        // Observed BEFORE the error is propagated, because a write failure is
+        // still a request the server served. It also used to make streams
+        // uncountable: a tail ends when its client disconnects, so the write
+        // that discovers the disconnect always errors, and every tail ever
+        // served left the counter at zero.
         metrics.observe(
             class,
             started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
             status.unwrap_or(200),
         );
+        result?;
         if !persist {
             return Ok(());
         }
@@ -1318,6 +1362,16 @@ fn serve_request(
             responder.must_close();
             stream_export(responder.stream, engine, filter, user_limit)
         }
+        ("GET", "/v1/tail") => {
+            let (filter, cursor, backfill) = match tail_query_from(query) {
+                Ok(parsed) => parsed,
+                Err(error) => return responder.json(400, json!({"error": error})),
+            };
+            // Server-sent events, terminated by the close. The connection is
+            // the subscription: there is nothing to keep alive afterwards.
+            responder.must_close();
+            stream_tail(responder.stream, engine, &filter, cursor, backfill)
+        }
         ("GET", "/v1/stats/llm") => {
             let (since, until, limit, group_by) = match analytics_query(query) {
                 Ok(parsed) => parsed,
@@ -1558,6 +1612,138 @@ fn stream_export(
             return finish_export(stream, true, emitted);
         }
     }
+}
+
+/// How long a quiet tail waits before sending a comment frame.
+///
+/// Two jobs: it stops an intermediary from reaping a connection it believes is
+/// dead, and it is the only way the server learns the client is gone. A tail
+/// over a store that never receives a span would otherwise hold its thread
+/// until the process ended, because a reader that never writes never discovers
+/// a broken pipe.
+const TAIL_HEARTBEAT: Duration = Duration::from_secs(15);
+
+/// Spans of history a tail opens with when the client does not say.
+///
+/// Enough to fill the screen it is about to render. The backlog is free — it is
+/// already in the ring — and without it the tail opens blank and stays blank
+/// until something happens to be ingested, which reads as a broken page.
+const DEFAULT_TAIL_BACKFILL: usize = 200;
+
+/// Streams spans as they are admitted, as server-sent events.
+///
+/// This is the one surface ordered by ADMISSION rather than event time, and
+/// that is the whole reason it exists. Paging a tail by `start_time_ns` — what
+/// this replaced — drops any span that outlives one poll interval: the
+/// watermark moves past a long operation while it is still running, and the
+/// server then filters it out forever when it lands. Sequence numbers come
+/// from the store's admission ring, so a span is delivered when it arrives
+/// regardless of when it started.
+///
+/// Three frame types. `spans` carries matches and the position to resume from;
+/// `gap` says the subscriber fell further behind than the ring retains and
+/// must backfill by another means; a bare comment is the heartbeat.
+fn stream_tail(
+    stream: &mut TcpStream,
+    engine: &Store,
+    filter: &SpanFilter,
+    cursor: Option<TailCursor>,
+    backfill: usize,
+) -> io::Result<()> {
+    // `X-Accel-Buffering` is for reverse proxies that would otherwise hold
+    // frames until a buffer fills, which for a stream that emits a few hundred
+    // bytes at a time means indefinitely.
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nX-Accel-Buffering: no\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+    )?;
+    stream.flush()?;
+
+    let limit = filter.limit.unwrap_or(DEFAULT_TAIL_BACKFILL).max(1);
+    let mut cursor = cursor;
+    // Backlog is delivered once, on the opening read. Applying it again after
+    // every heartbeat would re-send the same history on every quiet tick.
+    let mut opening_backfill = backfill;
+
+    loop {
+        let read = engine.tail_after(cursor, opening_backfill, limit, filter, TAIL_HEARTBEAT);
+        opening_backfill = 0;
+        let frame = match read {
+            TailRead::Batch {
+                spans,
+                cursor: next,
+            } => {
+                let settled = Some(next) == cursor;
+                cursor = Some(next);
+                if spans.is_empty() && settled {
+                    // Nothing arrived within the heartbeat window. A comment
+                    // frame is valid SSE and the client ignores it, which is
+                    // exactly what a keepalive should be.
+                    ": tick\n\n".to_owned()
+                } else {
+                    // `Arc<Span>` is serialized through a reference rather than
+                    // directly: serde only implements `Serialize` for `Arc`
+                    // under its `rc` feature, which this crate does not enable.
+                    let rows: Vec<&Span> = spans.iter().map(|span| span.as_ref()).collect();
+                    let payload = json!({
+                        "spans": serde_json::to_value(&rows)
+                            .unwrap_or_else(|_| Value::Array(Vec::new())),
+                        "cursor": next.to_token(),
+                    });
+                    format!("event: spans\ndata: {payload}\n\n")
+                }
+            }
+            TailRead::Gap { cursor: floor } => {
+                cursor = Some(floor);
+                // The floor, not the head: the client's backfill only has to
+                // cover what the ring actually dropped.
+                let payload = json!({"cursor": floor.to_token()});
+                format!("event: gap\ndata: {payload}\n\n")
+            }
+        };
+        // A failed write is how a disconnect is detected — there is no other
+        // signal, and it is what ends this thread.
+        write_chunk(stream, frame.as_bytes())?;
+        stream.flush()?;
+    }
+}
+
+/// Query parser for the tail: the span filter, plus `cursor` and `backfill`.
+fn tail_query_from(raw_query: &str) -> Result<(SpanFilter, Option<TailCursor>, usize), String> {
+    let mut cursor = None;
+    let mut backfill = DEFAULT_TAIL_BACKFILL;
+    let mut rest: Vec<&str> = Vec::new();
+    for pair in raw_query.split('&').filter(|pair| !pair.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        match percent_decode(key).as_str() {
+            "cursor" => {
+                let token = percent_decode(value);
+                cursor = Some(
+                    TailCursor::parse(&token).ok_or("cursor is not a token this server issued")?,
+                );
+            }
+            "backfill" => {
+                backfill = percent_decode(value)
+                    .parse()
+                    .map_err(|_| "invalid backfill")?;
+            }
+            // Rejected rather than ignored. A tail is ordered by admission, so
+            // an event-time bound cannot be honoured here — and silently
+            // dropping it would answer a different question than the one asked,
+            // which is precisely the failure this endpoint was built to end.
+            "since" | "since_ns" | "until" | "until_ns" => {
+                return Err(format!(
+                    "{key} does not apply to a tail: it streams in admission order, \
+                     not event-time order. Use /v1/spans for a time window."
+                ));
+            }
+            _ => rest.push(pair),
+        }
+    }
+    // The remaining parameters are the ordinary span filter, so every
+    // predicate the search screen offers works here too, unchanged.
+    let (filter, _) = span_query_from(&rest.join("&"))?;
+    Ok((filter, cursor, backfill))
 }
 
 fn write_chunk(stream: &mut TcpStream, bytes: &[u8]) -> io::Result<()> {
