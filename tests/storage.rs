@@ -1792,6 +1792,10 @@ fn a_version_mismatch_advises_migration_and_never_deletion() {
         "says which format the file is: {message}"
     );
     assert!(
+        message.contains("durability.md#backups"),
+        "links the backup section by its real anchor: {message}"
+    );
+    assert!(
         message.contains(&segment.display().to_string()),
         "names the file: {message}"
     );
@@ -1838,16 +1842,14 @@ fn a_version_mismatch_advises_migration_and_never_deletion() {
 }
 
 #[test]
-fn version_guidance_never_names_a_release_that_does_not_exist() {
-    // Formats 4 and 5 were only ever on unreleased `main`. Telling an operator
-    // to "open it with the release that wrote v5" sends them looking for a tag
-    // that was never cut.
-    for (found, expected) in [
-        (2_u16, "v0.16 and v0.17"),
-        (3, "v0.18 and v0.19"),
-        (4, "never released"),
-        (5, "never released"),
-    ] {
+fn version_guidance_names_one_reader_that_covers_every_old_format() {
+    // Per-version advice is wrong for a real store. Segments accumulate in
+    // whichever format was current when each was sealed, so one directory can
+    // hold several at once — and "open it with the release that wrote v2"
+    // sends an operator to a build that cannot read the v3 segments sitting
+    // beside it. Formats 4 and 5 were never tagged, so for those there is no
+    // release to name at all.
+    for found in [2_u16, 3, 4, 5] {
         let dir = TestDir::new(&format!("version-guidance-{found}"));
         let segment = sealed_segment(&dir);
         let mut bytes = fs::read(&segment).expect("read segment");
@@ -1856,9 +1858,21 @@ fn version_guidance_never_names_a_release_that_does_not_exist() {
 
         let message = open_error(&dir);
         assert!(
-            message.contains(expected),
-            "format {found} guidance should say {expected:?}: {message}"
+            message.contains(traza::LEGACY_SEGMENT_READER),
+            "format {found} must point at the one reader covering 2-5: {message}"
         );
+        assert!(
+            message.contains("SEVERAL formats"),
+            "format {found} must warn that the store may be mixed: {message}"
+        );
+        // No version-specific release names, and nothing an operator cannot
+        // actually obtain.
+        for unreachable in ["v0.16", "v0.17", "v0.18", "v0.19", "untagged"] {
+            assert!(
+                !message.contains(unreachable),
+                "format {found} guidance must not name {unreachable}: {message}"
+            );
+        }
     }
 }
 
