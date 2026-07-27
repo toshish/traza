@@ -1796,8 +1796,16 @@ fn a_version_mismatch_advises_migration_and_never_deletion() {
         "names the file: {message}"
     );
     assert!(
-        message.contains("Copy the whole data directory"),
-        "the only lossless step comes first: {message}"
+        message.contains("Back up the directory first"),
+        "the preserving step comes first: {message}"
+    );
+    // A file-by-file copy of a running store is NOT safe, and the durability
+    // guide is explicit about it. Advice that says "copy the directory" without
+    // that qualification is wrong in the case an operator is most likely to be
+    // in: the server is running, which is why they are reading this.
+    assert!(
+        message.contains("stop the server") && message.contains("snapshot"),
+        "names a procedure that is actually safe: {message}"
     );
     // An export is NOT a backup, and advice that treats it as one loses the
     // payload store and every annotation. The message must not offer it as the
@@ -1807,8 +1815,15 @@ fn a_version_mismatch_advises_migration_and_never_deletion() {
         "must not prescribe export without naming what it drops: {message}"
     );
     assert!(
-        message.contains("annotations are not included"),
-        "names the omission explicitly: {message}"
+        message.contains("annotations are not in it") && message.contains("$payload"),
+        "names both omissions explicitly: {message}"
+    );
+    // And does NOT overstate them. An export pins a snapshot, and the snapshot
+    // copies the write buffer, so buffered spans ARE included — claiming
+    // otherwise sent an operator flushing before a migration for no reason.
+    assert!(
+        message.contains("buffered ones included"),
+        "must not imply unflushed spans are lost: {message}"
     );
     assert!(
         !message.contains("data is intact"),
