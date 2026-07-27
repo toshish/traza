@@ -2,7 +2,7 @@ import React from 'react';
 import { fmtNum, fmtRate } from '../../lib/format.js';
 import { Kbd, LiveDot } from '../primitives/Chrome.jsx';
 import { Sparkbar } from '../charts/Marks.jsx';
-import { Lockup } from '../Logo.jsx';
+import { Lockup, MARK_MIN_PX } from '../Logo.jsx';
 
 // The frame every screen sits in. Four top tabs could not hold seventeen
 // screens, so navigation is a left rail grouped by the question you arrived
@@ -94,7 +94,7 @@ export function NavRail({ screen, badges, ingest, onGo, version = '0.19' }) {
       display: 'flex', alignItems: 'center', gap: 9, padding: '14px 16px 13px',
       borderBottom: '1px solid var(--hairline)',
     }}>
-      <Lockup size={19} />
+      <Lockup size={MARK_MIN_PX} />
       <span style={{
         marginLeft: 'auto', fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--ink-faint)',
       }}>{version}</span>
