@@ -169,3 +169,46 @@ export async function runTail(state, options) {
     attempt += 1;
   }
 }
+
+// Gap bookkeeping.
+//
+// This lived in the component as two `useState` calls, and both of its bugs
+// lived there with it: `null` folded into a running total became zero, so an
+// uncounted break rendered nothing; and rebuilding the subscription reset the
+// counted half while leaving the uncounted half behind, so a new filter
+// inherited the old one's warning. Neither was reachable by a test, because
+// nothing but React could call it — the same reason the original polling bugs
+// survived review.
+//
+// It is a value and three functions now. The component holds one piece of state
+// and renders what `gapLabel` returns.
+
+/** No gaps seen. */
+export function newGapState() {
+  return { missed: 0, uncounted: 0 };
+}
+
+/** Records one gap. `missed` is a number when the server could count the loss,
+ *  and null when it could not — which happens on a restart, because sequence
+ *  numbers are per-process and the old position is not comparable.
+ *
+ *  Counted and uncounted breaks are kept apart rather than summed. Folding an
+ *  unknown into a total makes it zero, and zero renders as "nothing was lost",
+ *  which is the opposite of what happened. */
+export function recordGap(state, missed) {
+  return typeof missed === 'number'
+    ? { ...state, missed: state.missed + missed }
+    : { ...state, uncounted: state.uncounted + 1 };
+}
+
+/** What to show, or null for nothing.
+ *
+ *  An uncounted break makes any accompanying number a FLOOR rather than a
+ *  figure, so it is rendered as one. Reporting "5 missed" when an earlier break
+ *  could not be counted states a precision the data does not have. */
+export function gapLabel(state, format = String) {
+  if (state.uncounted && state.missed) return `${format(state.missed)}+ missed`;
+  if (state.uncounted) return 'spans missed';
+  if (state.missed) return `${format(state.missed)} missed`;
+  return null;
+}

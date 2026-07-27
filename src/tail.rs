@@ -402,6 +402,9 @@ fn advanced(read: &TailRead, from: Option<TailCursor>) -> bool {
 
 /// Roughly what retaining `span` costs, in bytes.
 ///
+/// Public so `tests/tail_memory.rs` can check it against a counting allocator
+/// — the only check that covers shapes nobody thought to write a case for.
+///
 /// Approximate on purpose. It counts the heap a span's own strings and JSON
 /// values hold and ignores per-allocation overhead, because the number is a
 /// budget input rather than an accounting figure — it has to track the thing
@@ -409,34 +412,77 @@ fn advanced(read: &TailRead, from: Option<TailCursor>) -> bool {
 ///
 /// Measured once per admitted span, and cheaper than what admit already does
 /// to the same span: the write-ahead log serializes it in full.
-fn approximate_bytes(span: &Span) -> usize {
+pub fn approximate_bytes(span: &Span) -> usize {
     const OVERHEAD: usize = std::mem::size_of::<Span>();
     /// Charged per map entry and per collection element, matching `value_bytes`.
     const ENTRY: usize = 48 + std::mem::size_of::<String>() + std::mem::size_of::<Value>();
 
+    // Destructured exhaustively, with no `..`, ON PURPOSE.
+    //
+    // Every hole found in this function so far was a place the walk did not
+    // reach: text-only counting missed structure, then structure-counting
+    // missed retained capacity. The remaining risk of the same kind is a field
+    // added to `Span` later and not added here — a silent undercount that no
+    // test would notice, because a test can only probe shapes someone thought
+    // of. This makes it a compile error instead.
+    //
+    // Serializing the span and measuring that would be exact for what goes on
+    // the wire, and wrong for what goes in the ring: a `Vec` with 100,000
+    // elements of spare capacity serializes to a few bytes while holding
+    // megabytes. The ring holds the allocation, so the allocation is what has
+    // to be counted.
+    let Span {
+        trace_id,
+        span_id,
+        parent_span_id,
+        name,
+        start_time_ns: _,
+        end_time_ns: _,
+        status,
+        service,
+        attributes,
+        events,
+        links,
+        extra,
+    } = span;
+
     let mut total = OVERHEAD
-        + span.trace_id.capacity()
-        + span.span_id.capacity()
-        + span.name.capacity()
-        + span.status.capacity()
-        + span.service.capacity()
-        + span.parent_span_id.as_ref().map_or(0, String::capacity);
-    for (key, value) in &span.attributes {
+        + trace_id.capacity()
+        + span_id.capacity()
+        + name.capacity()
+        + status.capacity()
+        + service.capacity()
+        + parent_span_id.as_ref().map_or(0, String::capacity);
+    for (key, value) in attributes {
         total += ENTRY + key.capacity() + value_bytes(value);
     }
-    for (key, value) in &span.extra {
+    for (key, value) in extra {
         total += ENTRY + key.capacity() + value_bytes(value);
     }
-    for event in &span.events {
-        total += std::mem::size_of::<crate::Event>() + event.name.capacity();
-        for (key, value) in &event.attributes {
+    // Both vectors are charged by capacity for the same reason as an array
+    // below: a truncated `Vec` keeps its allocation, and the ring keeps the
+    // `Vec`.
+    total += events.capacity() * std::mem::size_of::<crate::Event>();
+    for event in events {
+        let crate::Event {
+            name,
+            timestamp_ns: _,
+            attributes,
+        } = event;
+        total += name.capacity();
+        for (key, value) in attributes {
             total += ENTRY + key.capacity() + value_bytes(value);
         }
     }
-    for link in &span.links {
-        total +=
-            std::mem::size_of::<crate::Link>() + link.trace_id.capacity() + link.span_id.capacity();
-        for (key, value) in &link.attributes {
+    total += links.capacity() * std::mem::size_of::<crate::Link>();
+    for link in links {
+        let crate::Link {
+            trace_id,
+            span_id,
+            attributes,
+        } = link;
+        total += trace_id.capacity() + span_id.capacity();
+        for (key, value) in attributes {
             total += ENTRY + key.capacity() + value_bytes(value);
         }
     }
