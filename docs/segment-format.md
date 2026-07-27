@@ -171,10 +171,30 @@ corrupt records rather than as an unreadable file, which is the worse of the
 two. `a_superseded_format_is_refused_rather_than_misread` in
 `tests/segment_format_acceptance.rs` pins it.
 
-Adding a field later means incrementing the version to 7 and writing the new
-layout. Old files stop being readable at that point, which is the honest
-consequence of not carrying compatibility code, and is a decision to weigh
-against whatever data exists by then.
+### The policy from here
+
+This cut is a one-time exception, taken while the store holds no data anyone
+depends on. **"Every layout change makes all prior files unreadable" is not a
+policy** — it treats stored telemetry as disposable, and a datastore does not
+get to do that.
+
+The rule from v6 onward is three planes, kept apart on purpose:
+
+1. **Runtime reads exactly one canonical format.** No `if version >= N`, no
+   `Option` field standing in for "unknown", no compatibility branch in the
+   query path. That is what this change bought, and it is the part to preserve.
+2. **Version numbers stay monotonic.** An identifier written by a release is
+   never reused for a different layout.
+3. **A format bump ships with a migrator** — an explicit, resumable conversion
+   from the previous format into the current one, run offline or at startup,
+   never woven into the read path. Reading an old format is code that has to
+   exist somewhere; the win is that it lives there rather than in every query.
+
+Point 3 is the part this change does not pay for, and that is worth stating
+rather than hiding: a migrator from v2/v3/v5 would mean resurrecting precisely
+the decoders just deleted, to serve stores that do not exist. The debt was
+declined once, on the last occasion it could be declined cheaply. v6 is where
+it starts being paid.
 
 ---
 

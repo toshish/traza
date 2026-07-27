@@ -169,6 +169,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   section bounds that pass every validation check while addressing the wrong
   bytes.
 
+  **This is a one-time exception, not the policy.** From v6 onward a format bump
+  ships with a migrator: the runtime still reads one canonical format, and the
+  conversion from the previous one lives outside the query path rather than in
+  it. See [the segment format doc](docs/segment-format.md) for the rule. Doing
+  it here would have meant resurrecting the decoders this change deletes, for
+  stores that do not exist.
+
 - **The logo is the revised mark from the design system.** The bars gained a
   stem, so the mark resolves as a lowercase "t" rather than four unanchored
   rows. It is a component now (`ui/src/components/Logo.jsx`) rather than SVG
