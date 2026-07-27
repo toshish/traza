@@ -251,3 +251,56 @@ export function gapDetail(state) {
   causes.push('Anything missing is still in the store — search for it on Traces.');
   return causes.join(' ');
 }
+
+// Arrival rate.
+//
+// The window keeps BUCKETS holding counts, not one timestamp per span. The
+// obvious implementation — an array of arrival times, filtered to the window —
+// has to be capped or a burst becomes its own memory problem in the tab, and
+// capping it silently turns the cap into a rate ceiling: 2,000 samples over a
+// five-second window cannot express more than 400/s, so a 600/s stream read
+// 400/s and looked stable. Counts have no such ceiling, and the memory is fixed
+// by the window rather than by the traffic.
+
+/** Width of one bucket. Finer than this buys precision nobody reads; coarser
+    makes the rate visibly step as buckets expire. */
+export const RATE_BUCKET_MS = 250;
+/** How far back the rate averages. */
+export const RATE_WINDOW_MS = 5_000;
+
+/** An empty window. */
+export function newRateWindow() {
+  return { buckets: [] };
+}
+
+/** Adds `count` arrivals at `now`, dropping buckets that have aged out.
+ *
+ *  Bucket count is bounded by `RATE_WINDOW_MS / RATE_BUCKET_MS` — twenty — no
+ *  matter how many spans arrive. */
+export function recordArrivals(window, count, now) {
+  if (count <= 0) return trimRateWindow(window, now);
+  const at = Math.floor(now / RATE_BUCKET_MS) * RATE_BUCKET_MS;
+  const trimmed = trimRateWindow(window, now);
+  const last = trimmed.buckets[trimmed.buckets.length - 1];
+  if (last && last.at === at) {
+    const buckets = trimmed.buckets.slice(0, -1);
+    buckets.push({ at, count: last.count + count });
+    return { buckets };
+  }
+  return { buckets: [...trimmed.buckets, { at, count }] };
+}
+
+/** Drops buckets older than the window. */
+export function trimRateWindow(window, now) {
+  const floor = now - RATE_WINDOW_MS;
+  const buckets = window.buckets.filter((bucket) => bucket.at > floor);
+  return buckets.length === window.buckets.length ? window : { buckets };
+}
+
+/** Spans per second over the window, or null when nothing has been recorded. */
+export function ratePerSecond(window, now) {
+  const live = trimRateWindow(window, now);
+  if (!live.buckets.length) return 0;
+  const total = live.buckets.reduce((sum, bucket) => sum + bucket.count, 0);
+  return (total * 1000) / RATE_WINDOW_MS;
+}
