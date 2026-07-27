@@ -1796,14 +1796,55 @@ fn a_version_mismatch_advises_migration_and_never_deletion() {
         "names the file: {message}"
     );
     assert!(
-        message.contains("GET /v1/export"),
-        "points at a migration path: {message}"
+        message.contains("Copy the whole data directory"),
+        "the only lossless step comes first: {message}"
+    );
+    // An export is NOT a backup, and advice that treats it as one loses the
+    // payload store and every annotation. The message must not offer it as the
+    // migration; it must say what a copy is for.
+    assert!(
+        !message.contains("GET /v1/export") || message.contains("$payload"),
+        "must not prescribe export without naming what it drops: {message}"
+    );
+    assert!(
+        message.contains("annotations are not included"),
+        "names the omission explicitly: {message}"
+    );
+    assert!(
+        !message.contains("data is intact"),
+        "the version is checked BEFORE the section bounds, so intactness is \
+         not established: {message}"
     );
     assert!(
         !message.to_lowercase().contains("remove the data directory")
             && !message.to_lowercase().contains("start fresh"),
         "must never advise deleting the store: {message}"
     );
+}
+
+#[test]
+fn version_guidance_never_names_a_release_that_does_not_exist() {
+    // Formats 4 and 5 were only ever on unreleased `main`. Telling an operator
+    // to "open it with the release that wrote v5" sends them looking for a tag
+    // that was never cut.
+    for (found, expected) in [
+        (2_u16, "v0.16 and v0.17"),
+        (3, "v0.18 and v0.19"),
+        (4, "never released"),
+        (5, "never released"),
+    ] {
+        let dir = TestDir::new(&format!("version-guidance-{found}"));
+        let segment = sealed_segment(&dir);
+        let mut bytes = fs::read(&segment).expect("read segment");
+        bytes[8..10].copy_from_slice(&found.to_le_bytes());
+        fs::write(&segment, &bytes).expect("write segment");
+
+        let message = open_error(&dir);
+        assert!(
+            message.contains(expected),
+            "format {found} guidance should say {expected:?}: {message}"
+        );
+    }
 }
 
 #[test]
@@ -1835,8 +1876,14 @@ fn corruption_is_not_answered_with_advice_to_delete_the_store() {
         "and it is not a migration either — the cause is unknown: {message}"
     );
     assert!(
-        message.contains("Inspect it"),
+        message.contains("inspect the file"),
         "advises inspection instead: {message}"
+    );
+    // `load_segments` aborts on the first unreadable segment, so claiming an
+    // older build can still serve the rest is false.
+    assert!(
+        !message.contains("readable by an older build"),
+        "no build opens this store until the file is dealt with: {message}"
     );
 }
 

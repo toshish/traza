@@ -3676,17 +3676,36 @@ fn load_segments(directory: &Path) -> Result<Vec<std::sync::Arc<Segment>>> {
             // migration path is an export, not a fresh start.
             let detail = match &error {
                 segment::Error::UnsupportedVersion { found, .. } => format!(
-                    "\nThe data is intact — this build cannot read that layout. \
-                     Back up the directory, open it with the traza release that \
-                     wrote v{found}, export with GET /v1/export, and re-ingest \
-                     into a new store via POST /v1/spans. On-disk formats may \
-                     change between 0.x releases; see CHANGELOG.md."
+                    "\nCopy the whole data directory before doing anything else. \
+                     Segments, the write-ahead log, payload files and annotations \
+                     are all part of the store, and a span export captures only \
+                     the first: offloaded values stay as $payload references and \
+                     annotations are not included at all.\n{}\n\
+                     Reading the copy with that build is the only lossless path. \
+                     See docs/segment-format.md for the full procedure.",
+                    match found {
+                        2 => "Format 2 was written by v0.16 and v0.17.",
+                        3 => "Format 3 was written by v0.18 and v0.19.",
+                        // 4 and 5 existed only on unreleased main; naming a
+                        // release to open them with would send an operator
+                        // looking for a tag that does not exist.
+                        4 | 5 =>
+                            "Formats 4 and 5 were never released — only an \
+                                  untagged build of main reads them.",
+                        _ =>
+                            "No release of traza is known to have written that \
+                              format.",
+                    }
                 ),
                 segment::Error::Unsupported(_) | segment::Error::Corrupt(_) => {
+                    // Deliberately does NOT say another build can read the rest:
+                    // `load_segments` aborts on the first unreadable segment, so
+                    // no build opens this store until the file is dealt with.
                     "\nThis file is not a segment this build can interpret. It \
-                     may be truncated, damaged, or not a Traza file at all. \
-                     Inspect it before changing anything: the rest of the store \
-                     is unaffected and still readable by an older build."
+                     may be truncated, damaged, or not a Traza file at all. No \
+                     build will open this store until it is resolved, so copy \
+                     the directory and inspect the file before changing \
+                     anything."
                         .to_owned()
                 }
                 _ => String::new(),
