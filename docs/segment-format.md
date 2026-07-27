@@ -29,7 +29,7 @@ Header fields, little-endian, at fixed byte offsets:
 | Offset | Size | Field |
 |---:|---:|---|
 | 0 | 8 | magic, `TRAZASEG` |
-| 8 | 2 | format version (`1`) |
+| 8 | 2 | format version (`6`) |
 | 10 | 2 | header length (`104`) |
 | 12 | 4 | reserved, zero |
 | 16 | 8 | record count |
@@ -147,10 +147,21 @@ It was not always one. The format grew by appending header fields behind
 every reader downstream had to treat as "unknown, therefore assume the worst":
 a segment whose timestamp range could not be read had to be scanned by every
 time-bounded query, and a second attribute-index decoder existed solely to read
-the encoding that predated digests. Those were compatibility with files that
-only ever existed before release, so they were removed and the header fields
-became plain values. The pruning path no longer carries a case where it cannot
-prune.
+the encoding that predated digests. Those branches were removed and the header
+fields became plain values, so the pruning path no longer carries a case where
+it cannot prune.
+
+**Versions 1 through 5 shipped.** 1 was JSONL; 2 was written by v0.16 and
+v0.17; 3 by v0.18 and v0.19; 5 up to the commit before this one. None of them
+open now. The README's pre-1.0 terms permit an on-disk break between 0.x
+versions, and this is one: `Store::open` refuses such a segment, names it, and
+points at back-up plus `GET /v1/export` and re-ingest — never at deleting the
+directory, which would answer a recoverable condition with data loss.
+
+**The numbering does not restart.** Removing compatibility code and reusing
+compatibility identifiers are different acts. A header declaring "2" must stay
+unambiguously the layout v0.16 wrote, so those identifiers stay spent and the
+one readable format is **6**.
 
 **The version word stays.** Two bytes per file, and it is the difference
 between refusing to open a format this reader does not know and parsing its
@@ -160,10 +171,10 @@ corrupt records rather than as an unreadable file, which is the worse of the
 two. `a_superseded_format_is_refused_rather_than_misread` in
 `tests/segment_format_acceptance.rs` pins it.
 
-Adding a field later means incrementing the version and writing the new layout.
-Old files stop being readable at that point, which is the honest consequence
-of not carrying compatibility code, and is a decision to make against real
-deployed data rather than in advance of any.
+Adding a field later means incrementing the version to 7 and writing the new
+layout. Old files stop being readable at that point, which is the honest
+consequence of not carrying compatibility code, and is a decision to weigh
+against whatever data exists by then.
 
 ---
 

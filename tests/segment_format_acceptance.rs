@@ -142,7 +142,10 @@ fn format_conformance() {
         VERSION,
         "the encoder writes the one supported version"
     );
-    assert_eq!(VERSION, 1, "there is exactly one on-disk format");
+    assert_eq!(
+        VERSION, 6,
+        "one readable format, numbered after every version that shipped before it"
+    );
     assert_eq!(
         usize::from(get_u16(&bytes, offsets::HEADER_LEN)),
         HEADER_LEN,
@@ -879,8 +882,14 @@ fn a_superseded_format_is_refused_rather_than_misread() {
     // would be read at THIS format's offsets — producing section bounds that
     // pass validation while addressing the wrong bytes. Refusing to open is
     // the only outcome that surfaces as a problem rather than as data.
+    //
+    // 1 through 5 are covered because all five were written by tagged releases:
+    // 1 was JSONL, 2 shipped in 0.16/0.17, 3 in 0.18/0.19, 5 immediately before
+    // this. Those identifiers stay spent — reusing one for a different layout
+    // would make a header declaring it ambiguous between two incompatible
+    // files, which is the exact failure the field exists to prevent.
     let records = corpus();
-    for stale in [2_u16, 3, 4, 5] {
+    for stale in [1_u16, 2, 3, 4, 5] {
         let mut bytes = segment::encode(&records).expect("encode");
         bytes[offsets::VERSION..offsets::VERSION + 2].copy_from_slice(&stale.to_le_bytes());
         assert!(
