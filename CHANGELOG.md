@@ -148,6 +148,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   legacy decoder are gone; `timestamps` and `content` are plain values, so the
   pruning path no longer carries a case where it cannot prune.
 
+  The failure names **one commit** that reads every superseded format
+  (`traza::LEGACY_SEGMENT_READER`), not a per-version release. A store
+  accumulates segments in whichever format was current when each was sealed, so
+  one directory can hold several at once, and the release that reads the oldest
+  cannot read the newest.
+
   **Upgrading makes existing stores unreadable.** Versions 2 through 5 were
   written by tagged 0.x releases — 2 in v0.16/v0.17, 3 in v0.18/v0.19, 5 up to
   the previous commit — so this is a real on-disk break for anyone running

@@ -323,13 +323,18 @@ pub enum Error {
     Io(io::Error),
     /// The input is structurally invalid or truncated.
     Corrupt(&'static str),
-    /// The file is well-formed for some Traza format, but not this one.
+    /// The file declares a format version this build does not read.
     ///
-    /// Separate from [`Self::Unsupported`] because the two call for opposite
-    /// responses. A version mismatch means the data is intact and readable by
-    /// another build; anything else under "unsupported" may be corruption or a
-    /// foreign file. Conflating them produced advice to delete the store in
-    /// response to a single flipped byte in a magic number.
+    /// **This says nothing about the rest of the file.** The version word is
+    /// checked before any section bound is validated, so a file reported here
+    /// may also be truncated or corrupt — the check establishes only that this
+    /// reader is the wrong one, not that another reader will succeed.
+    ///
+    /// Separate from [`Self::Unsupported`] because the two call for different
+    /// responses: a version mismatch has a build that can probably read it,
+    /// while anything else under "unsupported" has no known reader at all.
+    /// Conflating them produced advice to delete the store in response to a
+    /// single flipped byte in a magic number.
     UnsupportedVersion {
         /// The version the file declares.
         found: u16,

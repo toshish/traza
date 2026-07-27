@@ -161,7 +161,7 @@ never advising deletion.
 ### Migrating between formats
 
 **Take a backup by one of the two procedures in the
-[durability guide](operations/durability.md#backup):** stop the server and copy
+[durability guide](operations/durability.md#backups):** stop the server and copy
 the directory, or take a filesystem snapshot that is atomic across the whole
 directory. Copying a live directory file by file is *not* safe — an in-flight
 flush can change the segment set between files — and that guide is the single
@@ -184,7 +184,18 @@ generation/checkpoint boundary is for, and it is scheduled before 1.0.
 
 So export-and-reingest is a complete migration only for a store with no
 offloaded payloads and no annotations. Otherwise: back up, and read the backup
-with the build that wrote it.
+with a build that can read it.
+
+**Which build?** Not "the release that wrote this segment". A store accumulates
+segments in whichever format was current when each was sealed, so one directory
+can hold several formats at once, and a release that reads the oldest of them
+cannot read the newest. Formats 4 and 5 were never tagged at all.
+
+One commit reads every indexed format this project has written — 2 through 5 —
+and that is what the error names: **`cf40bea`** (`MIN_READABLE_VERSION` 2,
+`VERSION` 5), exposed as `traza::LEGACY_SEGMENT_READER`. Build it, point it at
+the backup, and export from there. Format 1 was JSONL; it is refused separately
+and needs 0.3.x.
 
 ### The policy from here
 

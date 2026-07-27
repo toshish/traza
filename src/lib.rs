@@ -621,6 +621,20 @@ pub struct Config {
     pub content_index: bool,
 }
 
+/// The last commit whose reader accepts every superseded segment format.
+///
+/// A commit rather than a release tag, and one rather than several, because
+/// neither alternative works for a real store. A store accumulates segments in
+/// whichever format was current when each was sealed, so it can hold several at
+/// once — naming "the release that wrote v2" sends an operator to a build that
+/// cannot read the v3 segments sitting beside it. And formats 4 and 5 were
+/// never tagged, so for those there is no release to name at all.
+///
+/// This commit reads 2 through 5 (`MIN_READABLE_VERSION` 2, `VERSION` 5), which
+/// covers every indexed format this project has written. Format 1 was JSONL and
+/// is refused separately, with its own message.
+pub const LEGACY_SEGMENT_READER: &str = "cf40bea";
+
 /// Default ceiling on log bytes before a flush seals the buffer. Large enough
 /// that ordinary ingest never reaches it before the record threshold does,
 /// small enough that a restart replays it in well under a second.
@@ -3681,30 +3695,21 @@ fn load_segments(directory: &Path) -> Result<Vec<std::sync::Arc<Segment>>> {
             // and the snapshot copies the write buffer) but leaves payload
             // bytes and annotations behind.
             let detail = match &error {
-                segment::Error::UnsupportedVersion { found, .. } => format!(
+                segment::Error::UnsupportedVersion { .. } => format!(
                     "\nBack up the directory first — stop the server and copy it, \
                      or take a filesystem snapshot atomic across the whole \
                      directory. A file-by-file copy of a running store is not \
-                     safe. A span export is not a substitute: it carries every \
-                     span, buffered ones included, but offloaded values stay as \
-                     $payload references and annotations are not in it at \
-                     all.\n{}\n\
-                     Reading the backup with that build is the lossless path. \
-                     See docs/operations/durability.md and \
-                     docs/segment-format.md.",
-                    match found {
-                        2 => "Format 2 was written by v0.16 and v0.17.",
-                        3 => "Format 3 was written by v0.18 and v0.19.",
-                        // 4 and 5 existed only on unreleased main; naming a
-                        // release to open them with would send an operator
-                        // looking for a tag that does not exist.
-                        4 | 5 =>
-                            "Formats 4 and 5 were never released — only an \
-                                  untagged build of main reads them.",
-                        _ =>
-                            "No release of traza is known to have written that \
-                              format.",
-                    }
+                     safe.\n\
+                     A store can hold segments in SEVERAL formats — each build \
+                     writes the format of its day and leaves earlier segments \
+                     alone — so a reader has to cover all of them, not just \
+                     this one. Commit {LEGACY_SEGMENT_READER} reads formats 2 \
+                     through 5; build it and open the backup with that.\n\
+                     A span export carries every span, buffered ones included, \
+                     but offloaded values stay as $payload references and \
+                     annotations are not in it at all.\n\
+                     See docs/operations/durability.md#backups and \
+                     docs/segment-format.md."
                 ),
                 segment::Error::Unsupported(_) | segment::Error::Corrupt(_) => {
                     // Deliberately does NOT say another build can read the rest:
