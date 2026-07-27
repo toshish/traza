@@ -31,6 +31,16 @@
 //! persisted field. Until then this costs no disk, no format version and no
 //! branch in the query path.
 //!
+//! **"Admitted" means acknowledged.** A span enters the ring only after its
+//! ingest has succeeded — after the write-ahead log's fsync, and after the
+//! synchronous seal that `Durability::Flushed` promises. A live view is allowed
+//! to be bounded and to admit gaps; it is not allowed to show data the store
+//! never accepted. Publishing at the write-buffer upsert instead, which is
+//! where this began, let the tail show spans whose ingest then returned an
+//! error. Sequence numbers are therefore assigned in acknowledgement order,
+//! which is what a caller observed and what a replicated commit position would
+//! later refine into a total order.
+//!
 //! The ring holds `Arc<Span>` — the same handles [`crate::WriteBuffer`] holds —
 //! so a span in both costs one pointer here, not a copy. Entries outlive the
 //! buffer's eviction, which is the point: a span sealed into a segment two

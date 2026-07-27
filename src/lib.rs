@@ -1448,7 +1448,9 @@ impl Store {
     ///    that disagrees with the log;
     /// 2. release the lock;
     /// 3. fsync, and only then return;
-    /// 4. seal, if the buffer has reached one of its bounds.
+    /// 4. seal, if the buffer has reached one of its bounds;
+    /// 5. publish to the live tail, which is therefore a stream of
+    ///    ACKNOWLEDGED admissions rather than of attempted ones.
     ///
     /// The fsync deliberately happens OUTSIDE the lock: that is what lets
     /// concurrent batches accumulate into one sync instead of serializing an
@@ -1496,16 +1498,6 @@ impl Store {
             seal_must_wait = self.seal_must_not_be_skipped(&writer);
         }
 
-        // Publish to the tail OUTSIDE the writer lock, deliberately.
-        //
-        // Sequence numbers are assigned here, at push time, so they stay
-        // monotonic and gapless however two concurrent admits interleave — a
-        // batch that publishes second simply gets the higher numbers. That is
-        // the only property a subscriber's cursor depends on, so ordering the
-        // ring against the buffer would buy nothing and would put a second
-        // lock inside the writer lock to buy it.
-        self.tail.publish(&admitted_handles);
-
         // `flushed` promises the caller a SEALED segment, so its seal must
         // finish before this returns and it must not be skipped because
         // another one happens to be running — it waits for the permit. Every
@@ -1529,6 +1521,26 @@ impl Store {
             };
             self.seal(wait)?;
         }
+
+        // Publish to the tail LAST, once this batch is acknowledged.
+        //
+        // "Admitted" means acknowledged, and the boundary is here: every `?`
+        // above can still fail, and under `Durability::Wal` the fsync that
+        // makes the batch survivable has only just returned. Publishing
+        // earlier — which is what this did — let the tail show a span whose
+        // ingest then returned an error, or which a crash a millisecond later
+        // erased. A live view is allowed to be bounded and to admit gaps; it
+        // is not allowed to show data the store never accepted.
+        //
+        // It stays outside the writer lock, so sequence numbers are assigned
+        // in acknowledgement order rather than in write-buffer order. Under
+        // concurrency those can differ, and acknowledgement order is the more
+        // meaningful of the two: it is what a caller observed, and it is what
+        // a replicated commit position would later refine into a total order.
+        // The cursor only needs the numbers to be monotonic and gapless, which
+        // assigning them at push guarantees however threads interleave.
+        self.tail.publish(&admitted_handles);
+
         self.metrics.spans_admitted.add(admitted);
         self.metrics.batches_admitted.increment();
         Ok(())
