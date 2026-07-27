@@ -138,6 +138,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The segment format collapsed to a single version.** It had grown by
+  appending header fields behind `if version >= N` gates, and each gate turned
+  a field into an `Option` that every reader downstream had to treat as
+  "unknown, therefore assume the worst": a segment whose timestamp range could
+  not be read had to be scanned by every time-bounded query, and a second
+  attribute-index decoder existed only to read the encoding that predated
+  digests. All of that was compatibility with files that only ever existed
+  before release. `MIN_READABLE_VERSION`, `HEADER_LEN_V2`, `HEADER_LEN_V3` and
+  the legacy decoder are gone; `timestamps` and `content` are plain values, so
+  the pruning path no longer carries a case where it cannot prune.
+
+  The version word stays, pinned at 1. Two bytes per file, and it is the
+  difference between refusing to open a format this reader does not know and
+  parsing its header at these offsets — which yields section bounds that pass
+  every validation check while addressing the wrong bytes, surfacing as corrupt
+  records rather than as an unreadable file.
+
+  **This makes segments written by earlier builds unreadable.** `Store::open`
+  fails, naming the file and saying what to do, rather than misreading it.
+  There are no deployed stores, which is what makes now the time to do this.
+
 - **The logo is the revised mark from the design system.** The bars gained a
   stem, so the mark resolves as a lowercase "t" rather than four unanchored
   rows. It is a component now (`ui/src/components/Logo.jsx`) rather than SVG

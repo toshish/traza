@@ -21,9 +21,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use traza::segment::{
-    self, RecordInput, Segment, HEADER_LEN, HEADER_LEN_V2, HEADER_LEN_V3, MAGIC, VERSION,
-};
+use traza::segment::{self, RecordInput, Segment, HEADER_LEN, MAGIC, VERSION};
 
 static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 
@@ -114,22 +112,16 @@ mod offsets {
     pub const TRACE_INDEX_OFFSET: usize = 56;
     pub const TRACE_INDEX_LEN: usize = 64;
     pub const ATTRIBUTE_INDEX_OFFSET: usize = 72;
-    /// v3 additions: the inclusive record timestamp range.
+    /// The inclusive record timestamp range.
     pub const MIN_TIMESTAMP: usize = 80;
     pub const MAX_TIMESTAMP: usize = 88;
-    /// v5 addition: the content index, which is what now bounds the
-    /// attribute index — before v5 that section ran to EOF.
+    /// The content index, which is what bounds the attribute index.
     pub const CONTENT_INDEX_OFFSET: usize = 96;
 }
 
-/// Where the attribute index ends: the content index's offset from v5, and
-/// the end of the file before it.
+/// Where the attribute index ends: the content index's offset.
 fn attribute_index_end(bytes: &[u8]) -> usize {
-    if get_u16(bytes, offsets::VERSION) >= 5 {
-        get_u64(bytes, offsets::CONTENT_INDEX_OFFSET) as usize
-    } else {
-        bytes.len()
-    }
+    get_u64(bytes, offsets::CONTENT_INDEX_OFFSET) as usize
 }
 
 #[test]
@@ -145,20 +137,20 @@ fn format_conformance() {
         "the real magic must match the documented format"
     );
     assert_eq!(get_u16(&bytes, offsets::VERSION), VERSION, "format version");
-    assert_eq!(get_u16(&bytes, offsets::VERSION), 5, "format version is 5");
+    assert_eq!(
+        get_u16(&bytes, offsets::VERSION),
+        VERSION,
+        "the encoder writes the one supported version"
+    );
+    assert_eq!(VERSION, 1, "there is exactly one on-disk format");
     assert_eq!(
         usize::from(get_u16(&bytes, offsets::HEADER_LEN)),
         HEADER_LEN,
         "header length field matches the exported constant"
     );
     assert_eq!(HEADER_LEN, 104, "header is 104 bytes");
-    assert_eq!(HEADER_LEN_V2, 80, "the v2 header this reader still accepts");
-    assert_eq!(
-        HEADER_LEN_V3, 96,
-        "the v3/v4 header this reader still accepts"
-    );
 
-    // The v3 timestamp range, hand-parsed at its documented offsets. This is
+    // The timestamp range, hand-parsed at its documented offsets. This is
     // the field a query uses to skip a segment without opening it, so a
     // wrong value here silently drops results rather than corrupting a read.
     let expected_min = records.iter().map(|r| r.timestamp).min().expect("records");
@@ -708,78 +700,6 @@ fn foreign_bytes_are_rejected() {
     );
 }
 
-/// Rewrites v3 bytes into a genuine v2 segment: version 2, an 80-byte header
-/// with no timestamp range, and every section offset shifted down by the 16
-/// bytes the range occupied.
-///
-/// Built by transformation rather than kept as a fixture because a checked-in
-/// binary blob rots silently — nothing would tell us it had stopped
-/// resembling what 0.16 actually wrote.
-/// Builds a genuinely OLD segment: a v2 or v3 header over the pre-v4
-/// attribute section, which stored attribute value TEXT rather than a digest.
-///
-/// An earlier version of this helper only rewrote the header and kept the
-/// current section bytes, which tested nothing about reading old files — the
-/// result was a version number the engine had never actually written. Real
-/// legacy bytes are what exercise the upgrade-on-open path, and that path is
-/// the reason `MIN_READABLE_VERSION` is still 2.
-fn encode_legacy(records: &[RecordInput], version: u16) -> Vec<u8> {
-    assert!((2..=3).contains(&version), "legacy means v2 or v3");
-    let current = segment::encode(records).expect("encode");
-    let attribute_start = get_u64(&current, offsets::ATTRIBUTE_INDEX_OFFSET) as usize;
-    let offsets_offset = get_u64(&current, offsets::OFFSETS_OFFSET) as usize;
-
-    // Rebuild the postings against the real record offsets, then write them
-    // in the pre-v4 encoding: key text, value text, then the offsets.
-    let mut index: BTreeMap<(&str, &str), Vec<u64>> = BTreeMap::new();
-    for (ordinal, record) in records.iter().enumerate() {
-        let offset = get_u64(&current, offsets_offset + ordinal * 8);
-        for (key, value) in &record.attributes {
-            index
-                .entry((key.as_str(), value.as_str()))
-                .or_default()
-                .push(offset);
-        }
-    }
-    let mut section = Vec::new();
-    section.extend_from_slice(&(index.len() as u32).to_le_bytes());
-    for ((key, value), postings) in &index {
-        section.extend_from_slice(&(key.len() as u32).to_le_bytes());
-        section.extend_from_slice(key.as_bytes());
-        section.extend_from_slice(&(value.len() as u32).to_le_bytes());
-        section.extend_from_slice(value.as_bytes());
-        section.extend_from_slice(&(postings.len() as u32).to_le_bytes());
-        for offset in postings {
-            section.extend_from_slice(&offset.to_le_bytes());
-        }
-    }
-
-    // Records, record offsets, and the trace index are unchanged, so reuse the
-    // real encoder's bytes for them and swap only the tail. Before v5 there
-    // was no content index and the attribute section ran to EOF, so the
-    // content section is dropped entirely.
-    let mut out = current[..attribute_start].to_vec();
-    out.extend_from_slice(&section);
-    out[8..10].copy_from_slice(&version.to_le_bytes());
-
-    // Older headers are shorter, so every section offset slides down.
-    let target_header = if version == 2 {
-        HEADER_LEN_V2
-    } else {
-        HEADER_LEN_V3
-    };
-    let shift = (HEADER_LEN - target_header) as u64;
-    let mut header = out[..target_header].to_vec();
-    header[10..12].copy_from_slice(&(target_header as u16).to_le_bytes());
-    for offset_field in [24_usize, 40, 56, 72] {
-        let value = get_u64(&out, offset_field) - shift;
-        header[offset_field..offset_field + 8].copy_from_slice(&value.to_le_bytes());
-    }
-    let mut shifted = header;
-    shifted.extend_from_slice(&out[HEADER_LEN..]);
-    shifted
-}
-
 /// Whether `haystack` contains `needle` as a contiguous byte run.
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty()
@@ -912,115 +832,72 @@ fn a_digest_collision_cannot_produce_a_wrong_row() {
 }
 
 #[test]
-fn an_old_segments_value_text_is_dropped_when_it_is_opened() {
-    // v2 and v3 stored attribute values as text. Opening one must not carry
-    // that text into memory — otherwise the memory fix applies only to data
-    // written after the upgrade, and an operator's existing store keeps
-    // paying the old cost until every segment happens to be rewritten.
+fn the_timestamp_range_is_always_readable_and_can_rule_a_segment_out() {
+    // Every segment carries a range, so pruning never has to fall back to
+    // "unknown, scan it". That fallback used to exist for segments predating
+    // the field, and it meant a time-bounded query opened them in full.
     let records = corpus();
-    for version in [2_u16, 3] {
-        let bytes = encode_legacy(&records, version);
-        assert_eq!(
-            get_u16(&bytes, offsets::VERSION),
-            version,
-            "fixture really is v{version}"
-        );
-        // Sanity: the fixture genuinely contains the old value text, so the
-        // assertion below is testing the reader rather than an empty section.
-        let attribute_start = get_u64(&bytes, offsets::ATTRIBUTE_INDEX_OFFSET) as usize;
-        assert!(
-            contains(&bytes[attribute_start..], b"checkout"),
-            "the v{version} fixture must actually store value text"
-        );
+    let bytes = segment::encode(&records).expect("encode");
+    let segment = Segment::from_bytes(bytes).expect("opens");
 
-        let segment = Segment::from_bytes(bytes).expect("an old segment still opens");
+    let (min, max) = segment.timestamp_range();
+    assert_eq!(min, records.iter().map(|r| r.timestamp).min().expect("min"));
+    assert_eq!(max, records.iter().map(|r| r.timestamp).max().expect("max"));
 
-        // Queries still work, through the digest index built at open time.
-        let found = segment
-            .query_attribute("service", "checkout")
-            .expect("attribute query");
-        assert_eq!(found.len(), 2, "v{version} attribute lookup still resolves");
-        assert!(
-            found
-                .iter()
-                .all(|record| record.attributes()["service"] == "checkout"),
-            "no foreign value may leak through the upgraded index"
-        );
-        assert_eq!(
-            segment
-                .query_attribute("service", "absent")
-                .expect("miss")
-                .len(),
-            0
-        );
+    assert!(segment.may_contain_timestamps(Some(min), Some(max)));
+    assert!(
+        !segment.may_contain_timestamps(Some(max + 1), None),
+        "a segment strictly before the window is skipped without being read"
+    );
+    assert!(
+        !segment.may_contain_timestamps(None, Some(min - 1)),
+        "and likewise one strictly after it"
+    );
 
-        // And the resident index is the small one. Three records with two
-        // attributes each cannot exceed a few hundred bytes of postings and
-        // dictionary; the old form would additionally hold every value.
-        assert_eq!(
-            segment.attribute_index_len(),
-            4,
-            "four distinct (key, value) pairs in the corpus"
-        );
-    }
+    // An empty segment encodes an empty range, which is a real answer rather
+    // than an unknown one: it overlaps nothing and is always skippable.
+    let empty = Segment::from_bytes(segment::encode(&[]).expect("encode empty")).expect("opens");
+    let (empty_min, empty_max) = empty.timestamp_range();
+    assert!(empty_min > empty_max, "empty range, not unknown");
+    assert!(!empty.may_contain_timestamps(None, None));
 
     evidence(
-        "legacy_upgrade",
+        "timestamp_range",
         &[
-            "v2_opens",
-            "v3_opens",
-            "value_text_present_in_fixture",
-            "attribute_query_resolves_after_upgrade",
-            "upgraded_index_cardinality",
+            "range_always_present",
+            "segment_before_window_skipped",
+            "segment_after_window_skipped",
+            "empty_segment_is_empty_not_unknown",
         ],
     );
 }
 
 #[test]
-fn a_v2_segment_still_reads_and_is_never_skipped_by_a_time_filter() {
-    // A v2 segment carries no timestamp range. "Unknown" has to mean "cannot
-    // rule this out" — if it were read as an empty range instead, every v2
-    // segment in a store would vanish from every time-filtered query, which
-    // is data loss that looks like an empty result.
+fn a_superseded_format_is_refused_rather_than_misread() {
+    // The version word earns its two bytes here. Every superseded format had
+    // this magic and a plausible header, so without the check their fields
+    // would be read at THIS format's offsets — producing section bounds that
+    // pass validation while addressing the wrong bytes. Refusing to open is
+    // the only outcome that surfaces as a problem rather than as data.
     let records = corpus();
-    let v3 = segment::encode(&records).expect("encode");
-    let v2 = encode_legacy(&records, 2);
+    for stale in [2_u16, 3, 4, 5] {
+        let mut bytes = segment::encode(&records).expect("encode");
+        bytes[offsets::VERSION..offsets::VERSION + 2].copy_from_slice(&stale.to_le_bytes());
+        assert!(
+            Segment::from_bytes(bytes).is_err(),
+            "version {stale} is not this format and must be refused"
+        );
+    }
 
-    assert_eq!(get_u16(&v2, offsets::VERSION), 2, "encoded as v2");
-    assert_eq!(
-        usize::from(get_u16(&v2, offsets::HEADER_LEN)),
-        HEADER_LEN_V2
-    );
+    // A FUTURE version is refused on the same reasoning, which is what keeps
+    // this constant worth carrying after release.
+    let mut future = segment::encode(&records).expect("encode");
+    future[offsets::VERSION..offsets::VERSION + 2].copy_from_slice(&(VERSION + 1).to_le_bytes());
+    assert!(Segment::from_bytes(future).is_err(), "a future format too");
 
-    let segment = Segment::from_bytes(v2).expect("a v2 segment still opens");
-    assert_eq!(
-        segment.header().record_count,
-        records.len() as u64,
-        "every record is still readable"
-    );
-    assert_eq!(
-        segment.timestamp_range(),
-        None,
-        "v2 carries no range, so the range is unknown rather than empty"
-    );
-
-    // The load-bearing assertion: unknown range means the segment must be
-    // considered for every window, including ones it may not actually
-    // intersect.
-    assert!(
-        segment.may_contain_timestamps(Some(0), Some(1)),
-        "a v2 segment must never be skipped"
-    );
-    assert!(segment.may_contain_timestamps(Some(u64::MAX - 1), None));
-    assert!(segment.may_contain_timestamps(None, Some(0)));
-
-    // And a v3 segment over the same records DOES carry a usable range.
-    let v3_segment = Segment::from_bytes(v3).expect("v3 opens");
-    let (min, max) = v3_segment.timestamp_range().expect("v3 has a range");
-    assert!(min <= max);
-    assert!(
-        !v3_segment.may_contain_timestamps(Some(max + 1), None),
-        "v3 can be ruled out, which is the whole point of the field"
+    evidence(
+        "single_version",
+        &["superseded_versions_refused", "future_version_refused"],
     );
 }
 
@@ -1152,14 +1029,19 @@ fn a_segment_without_a_content_index_is_never_skipped_by_a_content_query() {
         "and it must narrow nothing, so every record stays a candidate"
     );
 
-    // A genuinely older segment reads the same way.
-    let v4 = encode_legacy(&records, 3);
-    let older = Segment::from_bytes(v4).expect("a v3 segment still opens");
-    assert!(!older.has_content_index());
-    assert!(older.may_contain_content(&query));
+    // A segment encoded with indexing switched off reads the same way: the
+    // section is present and declares zero blocks, so "indexed nothing" is
+    // stated rather than inferred from an absent section.
+    let unindexed = segment::encode_with(&records, false).expect("encode");
+    let opened = Segment::from_bytes(unindexed).expect("opens");
+    assert!(!opened.has_content_index());
+    assert!(opened.may_contain_content(&query));
 
     evidence(
         "content_index_absent",
-        &["absent_index_never_prunes", "older_segment_never_prunes"],
+        &[
+            "absent_index_never_prunes",
+            "unindexed_segment_never_prunes",
+        ],
     );
 }

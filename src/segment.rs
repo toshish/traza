@@ -1,7 +1,21 @@
 //! Segment file-backed storage and persisted indexes.
 //!
-//! The on-disk format is version 4 (see `MAGIC`/`VERSION`); versions 2 and 3
-//! are still read, and version 1 (JSONL) is not.
+//! The on-disk format has exactly one version (see `MAGIC`/`VERSION`), and a
+//! file declaring any other is refused rather than interpreted.
+//!
+//! It did not always. The format grew by appending header fields behind
+//! `if version >= N` gates, each of which turned a field into an `Option` that
+//! every reader downstream had to treat as "unknown, so assume the worst" —
+//! a segment whose timestamp range could not be read had to be scanned. Those
+//! branches were compatibility with files that only ever existed before
+//! release, so they were deleted along with the second attribute-index decoder
+//! kept alive to read them. What is left is one shape, and the pruning path no
+//! longer carries a case where it cannot prune.
+//!
+//! The version word stays. It is two bytes per file and it is the difference
+//! between refusing to open a future format and misparsing its header into
+//! plausible-looking garbage offsets — which is not a cost worth saving on the
+//! one occasion it matters.
 //!
 //! An opened file-backed segment owns only its file handle and decoded index
 //! maps. In-memory segments built for encoding may own their bytes. Records are
@@ -40,29 +54,17 @@ use crate::hash::{hash_attribute, Hash128};
 /// lives in [`VERSION`], not in the magic, so the marker itself stays fixed
 /// across format revisions.
 pub const MAGIC: [u8; 8] = *b"TRAZASEG";
-/// On-disk format version written by this module. This — not the magic — is
-/// how the format generation is identified; the magic only says "a Traza
-/// segment". (JSONL v1 carried no magic; this indexed format is version 2.)
-pub const VERSION: u16 = 5;
-/// Fixed header size written by this module.
+/// On-disk format version written and accepted by this module. This — not the
+/// magic — is how the format generation is identified; the magic only says
+/// "a Traza segment".
 ///
-/// v5 appends the content index's section offset. The attribute index used to
-/// run to EOF and derive its length from the file size; with a fifth section
-/// after it, that offset is what bounds it.
+/// Exactly one value is readable. A file declaring anything else is refused,
+/// which is the entire job of this constant: without it a later format's
+/// header would be parsed under this one's field layout and yield offsets that
+/// pass every bounds check while pointing at the wrong bytes.
+pub const VERSION: u16 = 1;
+/// Fixed header size written by this module.
 pub const HEADER_LEN: usize = 104;
-/// v3/v4 header size. v3 appended the segment's timestamp range to the v2
-/// header. Time is the most common filter an observability store sees and it
-/// was the one thing a query could not use to skip work: `since`/`until` were
-/// pure post-filters, so a "last 15 minutes" search opened and scanned every
-/// segment in the store. Two u64s in the header let a query eliminate a whole
-/// segment without touching it.
-pub const HEADER_LEN_V3: usize = 96;
-/// v2 header size. Still readable: a v2 segment simply carries no timestamp
-/// range, and a query treats its range as unknown and cannot skip it — which
-/// is exactly the behaviour that existed before v3.
-pub const HEADER_LEN_V2: usize = 80;
-/// Oldest format this module can read.
-pub const MIN_READABLE_VERSION: u16 = 2;
 
 /// Records covered by one content-index block.
 ///
@@ -87,7 +89,7 @@ const CONTENT_PROLOGUE_LEN: usize = 32;
 
 const RECORD_FIXED_LEN: usize = 8 + 4 + 4 + 4 + 4;
 
-/// Fixed v2 file header.
+/// Fixed file header.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Header {
     /// Format version.
@@ -112,14 +114,18 @@ pub struct Header {
     pub attribute_index_offset: u64,
     /// Length of the attribute index.
     pub attribute_index_len: u64,
-    /// Inclusive `(min, max)` record timestamp, or `None` on a v2 segment
-    /// that predates the field. `None` means unknown, never "empty": a query
-    /// must scan a segment whose range it cannot rule out.
-    pub timestamps: Option<(u64, u64)>,
-    /// Byte offset and length of the content index, or `None` before v5.
-    /// `None` means unknown, on the same reading as `timestamps`: a content
-    /// query must consider a segment whose text it cannot rule out.
-    pub content: Option<(u64, u64)>,
+    /// Inclusive `(min, max)` record timestamp.
+    ///
+    /// Always present, so a query can always try to rule the segment out. An
+    /// empty segment carries an empty range (`min > max`), which overlaps
+    /// nothing — that is a real answer, not an unknown one.
+    pub timestamps: (u64, u64),
+    /// Byte offset and length of the content index.
+    ///
+    /// Always present too. A segment written without content indexing still
+    /// carries the section: it holds a prologue declaring zero blocks, so
+    /// "indexed nothing" is stated in the section rather than by its absence.
+    pub content: (u64, u64),
 }
 
 impl Header {
@@ -132,37 +138,29 @@ impl Header {
     /// against `total` (the real file length) — the file-backed open hands in
     /// only the head bytes.
     pub fn parse_with_total(bytes: &[u8], total: u64) -> Result<Self, Error> {
-        if bytes.len() < HEADER_LEN_V2 {
-            return Err(Error::Corrupt("file is shorter than the smallest header"));
+        if bytes.len() < HEADER_LEN {
+            return Err(Error::Corrupt("file is shorter than the header"));
         }
         if bytes[..8] != MAGIC {
             return Err(Error::Unsupported("not a Traza segment (bad magic)"));
         }
         let version = read_u16(bytes, 8)?;
-        if !(MIN_READABLE_VERSION..=VERSION).contains(&version) {
+        if version != VERSION {
+            // Refusing is the point. Parsing a header this module does not
+            // recognize under this module's field layout would produce offsets
+            // that satisfy every bounds check below while addressing the wrong
+            // bytes, and the failure would surface as corrupt records rather
+            // than as an unreadable file.
             return Err(Error::Unsupported("unsupported segment version"));
         }
         let header_len = read_u16(bytes, 10)?;
-        let expected_header_len = match version {
-            2 => HEADER_LEN_V2,
-            3 | 4 => HEADER_LEN_V3,
-            _ => HEADER_LEN,
-        };
-        if usize::from(header_len) != expected_header_len {
+        if usize::from(header_len) != HEADER_LEN {
             return Err(Error::Corrupt("header length does not match the version"));
         }
-        if bytes.len() < expected_header_len {
-            return Err(Error::Corrupt("file is shorter than its declared header"));
-        }
         let attribute_index_offset = read_u64(bytes, 72)?;
-        // Before v5 the attribute index ran to EOF. From v5 the content index
-        // follows it, so its offset is what bounds the attribute section.
-        let content_offset = if version >= 5 {
-            Some(read_u64(bytes, 96)?)
-        } else {
-            None
-        };
-        let attribute_index_end = content_offset.unwrap_or(total);
+        // The content index follows the attribute index, so its offset is what
+        // bounds the attribute section.
+        let content_offset = read_u64(bytes, 96)?;
         let header = Self {
             version,
             header_len,
@@ -174,50 +172,39 @@ impl Header {
             trace_index_offset: read_u64(bytes, 56)?,
             trace_index_len: read_u64(bytes, 64)?,
             attribute_index_offset,
-            attribute_index_len: attribute_index_end
+            attribute_index_len: content_offset
                 .checked_sub(attribute_index_offset)
                 .ok_or(Error::Corrupt("attribute index offset beyond file"))?,
-            // v2 predates the range. `None` means "unknown", which makes a
-            // query scan the segment rather than wrongly skip it.
-            timestamps: if version >= 3 {
-                Some((read_u64(bytes, 80)?, read_u64(bytes, 88)?))
-            } else {
-                None
-            },
-            content: match content_offset {
-                Some(offset) => Some((
-                    offset,
-                    total
-                        .checked_sub(offset)
-                        .ok_or(Error::Corrupt("content index offset beyond file"))?,
-                )),
-                None => None,
-            },
+            timestamps: (read_u64(bytes, 80)?, read_u64(bytes, 88)?),
+            content: (
+                content_offset,
+                total
+                    .checked_sub(content_offset)
+                    .ok_or(Error::Corrupt("content index offset beyond file"))?,
+            ),
         };
         header.validate_total(total)?;
         Ok(header)
     }
 
     fn validate_total(&self, file_len: u64) -> Result<(), Error> {
-        let mut sections = vec![
+        let sections = [
             (self.records_offset, self.records_len),
             (self.offsets_offset, self.offsets_len),
             (self.trace_index_offset, self.trace_index_len),
             (self.attribute_index_offset, self.attribute_index_len),
+            self.content,
         ];
-        if let Some(content) = self.content {
-            sections.push(content);
-        }
         let mut expected = u64::from(self.header_len);
         for (offset, len) in sections {
             if offset != expected {
-                return Err(Error::Corrupt("v2 sections are not contiguous"));
+                return Err(Error::Corrupt("sections are not contiguous"));
             }
             expected = offset
                 .checked_add(len)
-                .ok_or(Error::Corrupt("v2 section bounds overflow"))?;
+                .ok_or(Error::Corrupt("section bounds overflow"))?;
             if expected > file_len {
-                return Err(Error::Corrupt("v2 section exceeds file bounds"));
+                return Err(Error::Corrupt("section exceeds file bounds"));
             }
         }
         if expected != file_len {
@@ -234,7 +221,7 @@ impl Header {
     }
 }
 
-/// A record supplied to the v2 encoder.
+/// A record supplied to the encoder.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecordInput {
     /// Record timestamp used for ordering and inclusive range filtering.
@@ -313,7 +300,7 @@ impl Record {
     }
 }
 
-/// Errors produced while encoding, opening, or querying a v2 segment.
+/// Errors produced while encoding, opening, or querying a segment.
 #[derive(Debug)]
 pub enum Error {
     /// Filesystem error.
@@ -332,7 +319,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(error) => write!(f, "segment I/O error: {error}"),
-            Self::Corrupt(message) => write!(f, "corrupt v2 segment: {message}"),
+            Self::Corrupt(message) => write!(f, "corrupt segment: {message}"),
             Self::Unsupported(message) => write!(f, "unsupported segment: {message}"),
             Self::Utf8(error) => write!(f, "invalid segment UTF-8: {error}"),
             Self::TooLarge(field) => write!(f, "segment {field} is too large"),
@@ -579,23 +566,21 @@ impl Segment {
         .into_iter()
         .map(|((key, _), offsets)| (key, offsets))
         .collect();
-        let attribute_index = read_attribute_index(
+        let attribute_index = decode_attribute_index(
             section(
                 &bytes,
                 header.attribute_index_offset,
                 header.attribute_index_len,
             )?,
-            &header,
+            header.record_count,
         )?;
-        let content = match header.content {
-            Some((offset, len)) => decode_content_head(
-                section(&bytes, offset, len)?,
-                offset,
-                len,
-                header.record_count,
-            )?,
-            None => None,
-        };
+        let (content_offset, content_len) = header.content;
+        let content = decode_content_head(
+            section(&bytes, content_offset, content_len)?,
+            content_offset,
+            content_len,
+            header.record_count,
+        )?;
         Ok(Self {
             backing: Backing::Resident(bytes),
             header,
@@ -607,7 +592,7 @@ impl Segment {
         })
     }
 
-    /// Opens a v2 segment FILE-BACKED: only the header and index sections are
+    /// Opens a segment FILE-BACKED: only the header and index sections are
     /// read into memory; record payloads stay on disk and are fetched on
     /// demand. This is the larger-than-RAM path.
     ///
@@ -651,23 +636,21 @@ impl Segment {
             .collect();
         let attribute_bytes =
             read_section(header.attribute_index_offset, header.attribute_index_len)?;
-        let attribute_index = read_attribute_index(&attribute_bytes, &header)?;
+        let attribute_index = decode_attribute_index(&attribute_bytes, header.record_count)?;
         // Only the prologue and the summary filter are read: the bit-sliced
         // block rows stay on disk and are fetched a row at a time by a query.
-        let content = match header.content {
-            Some((offset, len)) => {
-                let prologue_len = (CONTENT_PROLOGUE_LEN as u64).min(len);
-                let prologue = read_section(offset, prologue_len)?;
-                let summary_bits = if prologue.len() >= CONTENT_PROLOGUE_LEN {
-                    read_u64(&prologue, 16)?
-                } else {
-                    0
-                };
-                let head_len = (CONTENT_PROLOGUE_LEN as u64 + summary_bits / 8).min(len);
-                let head = read_section(offset, head_len)?;
-                decode_content_head(&head, offset, len, header.record_count)?
-            }
-            None => None,
+        let content = {
+            let (offset, len) = header.content;
+            let prologue_len = (CONTENT_PROLOGUE_LEN as u64).min(len);
+            let prologue = read_section(offset, prologue_len)?;
+            let summary_bits = if prologue.len() >= CONTENT_PROLOGUE_LEN {
+                read_u64(&prologue, 16)?
+            } else {
+                0
+            };
+            let head_len = (CONTENT_PROLOGUE_LEN as u64 + summary_bits / 8).min(len);
+            let head = read_section(offset, head_len)?;
+            decode_content_head(&head, offset, len, header.record_count)?
         };
         Ok(Self {
             backing: Backing::File {
@@ -847,25 +830,19 @@ impl Segment {
         Ok(())
     }
 
-    /// Inclusive `(min, max)` record timestamp, or `None` when the segment
-    /// predates the field and its range is therefore unknown.
-    ///
-    /// Callers must treat `None` as "cannot rule this segment out". Reading it
-    /// as an empty range would silently drop results from every v2 segment in
-    /// the store.
-    pub fn timestamp_range(&self) -> Option<(u64, u64)> {
+    /// Inclusive `(min, max)` record timestamp.
+    pub fn timestamp_range(&self) -> (u64, u64) {
         self.header().timestamps
     }
 
     /// Whether any record here can fall inside `[since, until]`.
     ///
-    /// This is the whole point of the v3 range: a query that answers `false`
-    /// skips the segment without reading a byte of it.
+    /// This is the whole point of the range: a query that answers `false` skips
+    /// the segment without reading a byte of it. There is no "unknown" case —
+    /// there used to be, for segments predating the field, and it meant every
+    /// time-bounded query scanned them in full.
     pub fn may_contain_timestamps(&self, since: Option<u64>, until: Option<u64>) -> bool {
-        let Some((min, max)) = self.timestamp_range() else {
-            // Unknown range: it might. See `timestamp_range`.
-            return true;
-        };
+        let (min, max) = self.timestamp_range();
         if min > max {
             // Empty segment; nothing can match.
             return false;
@@ -1520,56 +1497,6 @@ fn decode_attribute_index(data: &[u8], record_count: u64) -> Result<AttributeInd
         key_ids,
         postings,
     })
-}
-
-/// Decodes a v2/v3 attribute section — which stores value TEXT — into the v4
-/// resident form by hashing each value as it is read.
-///
-/// The text is not retained. It is, however, materialized transiently: peak
-/// memory while opening an old segment is still the old cost, and only the
-/// steady state improves. That is the price of not rewriting files on
-/// upgrade, and it is bounded by one segment rather than by the store.
-fn upgrade_attribute_index(data: &[u8], record_count: u64) -> Result<AttributeIndex, Error> {
-    let legacy = decode_string_index(data, true, record_count)?;
-    let mut index = AttributeIndex::default();
-    for ((key, value), offsets) in legacy {
-        let id = match index.key_ids.get(&key) {
-            Some(id) => *id,
-            None => {
-                let id = u32::try_from(index.keys.len())
-                    .map_err(|_| Error::TooLarge("attribute key dictionary"))?;
-                index.key_ids.insert(key.clone(), id);
-                index.keys.push(key.clone());
-                id
-            }
-        };
-        let digest = hash_attribute(&key, &value);
-        // A v2/v3 section cannot contain a duplicate (key, value) — the
-        // legacy decoder rejects that — so a collision here would be a real
-        // digest collision. Merge rather than drop: the postings must stay
-        // complete, and verification downstream sorts out which record
-        // actually holds which value.
-        index
-            .postings
-            .entry((id, digest))
-            .or_insert_with(Vec::new)
-            .extend_from_slice(&offsets);
-    }
-    for offsets in index.postings.values_mut() {
-        offsets.sort_unstable();
-        offsets.dedup();
-        offsets.shrink_to_fit();
-    }
-    Ok(index)
-}
-
-/// Reads the attribute section in whichever encoding the header declares.
-fn read_attribute_index(data: &[u8], header: &Header) -> Result<AttributeIndex, Error> {
-    if header.version >= 4 {
-        decode_attribute_index(data, header.record_count)
-    } else {
-        upgrade_attribute_index(data, header.record_count)
-    }
 }
 
 fn take_digest(data: &[u8], cursor: &mut usize) -> Result<Hash128, Error> {
