@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import {
+  newGapState,
+  recordGap,
+  gapLabel,
   newTailState, runTail, createFramer, parseFrame, backoffMs,
   RECONNECT_MIN_MS, RECONNECT_MAX_MS,
 } from './tail.js';
@@ -343,5 +346,43 @@ describe('a gap the server cannot count is still a visible gap', () => {
     });
 
     expect(seen).toEqual([42]);
+  });
+});
+
+describe('gap bookkeeping', () => {
+  it('keeps an uncounted break visible behind a counted one', () => {
+    // The reported bug: `onGap(null)` then `onGap(5)` rendered exactly
+    // "5 missed", hiding the earlier loss and claiming a precision the data
+    // does not have.
+    let state = newGapState();
+    state = recordGap(state, null);
+    expect(gapLabel(state)).toBe('spans missed');
+    state = recordGap(state, 5);
+    expect(gapLabel(state)).toBe('5+ missed');
+  });
+
+  it('reports an exact figure only when every break was counted', () => {
+    let state = newGapState();
+    state = recordGap(state, 3);
+    state = recordGap(state, 2);
+    expect(gapLabel(state)).toBe('5 missed');
+  });
+
+  it('shows nothing until something is actually lost', () => {
+    expect(gapLabel(newGapState())).toBeNull();
+    // A counted gap of zero is a real answer — the server knew, and it was
+    // none — so it must not raise a warning either.
+    expect(gapLabel(recordGap(newGapState(), 0))).toBeNull();
+  });
+
+  it('starts clean, so a rebuilt subscription inherits nothing', () => {
+    // Resetting only the counted half carried the uncounted flag across a
+    // filter change, and the new subscription showed a warning earned by the
+    // old one.
+    let state = newGapState();
+    state = recordGap(state, null);
+    state = recordGap(state, 9);
+    expect(gapLabel(state)).toBe('9+ missed');
+    expect(gapLabel(newGapState())).toBeNull();
   });
 });

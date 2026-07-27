@@ -2,7 +2,7 @@ import React from 'react';
 import { api } from '../lib/api.js';
 import { fmtClockNs, fmtDurationNs, fmtNum, fmtRate } from '../lib/format.js';
 import { Card, Chip, LiveDot, Mono } from '../components/primitives/Chrome.jsx';
-import { newTailState, runTail } from '../lib/tail.js';
+import { newTailState, runTail, newGapState, recordGap, gapLabel } from '../lib/tail.js';
 
 // Spans as they land — over one held connection, not a poll.
 //
@@ -33,14 +33,10 @@ export function TailScreen({ go }) {
   // Admissions the server dropped before this client could read them. Shown
   // rather than swallowed: the view is complete from the break onwards, and
   // saying so is the difference between a gap and a silent hole.
-  // Two separate facts. `missed` is how many admissions were lost where the
-  // server could count them; `gaps` is how many discontinuities happened at
-  // all. They come apart on a server restart: sequence numbers are per-process,
-  // so the count is genuinely unknowable and arrives as null — and treating
-  // null as zero showed no warning while silently clearing the screen, which is
-  // exactly the invisible discontinuity this feature exists to remove.
-  const [missed, setMissed] = React.useState(0);
-  const [unknownGaps, setUnknownGaps] = React.useState(0);
+  // Gap bookkeeping lives in lib/tail.js, where it can be tested. Both of its
+  // bugs — an unknown count folded to zero, and a reset that cleared only half
+  // the state — survived because nothing but React could reach it.
+  const [gapState, setGapState] = React.useState(newGapState);
   const [service, setService] = React.useState('');
   const [errorsOnly, setErrorsOnly] = React.useState(false);
   const buffer = React.useRef([]);
@@ -58,11 +54,9 @@ export function TailScreen({ go }) {
     const state = newTailState();
     setRows([]);
     setPending(0);
-    // Every piece of gap state, not just the counted half. A warning earned
-    // under the previous filter has nothing to do with this subscription, and
-    // leaving the uncounted flag behind carried it across.
-    setMissed(0);
-    setUnknownGaps(0);
+    // All of it: a warning earned under the previous filter has nothing to do
+    // with this subscription.
+    setGapState(newGapState());
     // Reset the DISPLAYED rate too, not just its inputs. Clearing the window
     // while leaving the number on screen left the previous filter's rate
     // standing over an empty table until something happened to arrive.
@@ -118,11 +112,7 @@ export function TailScreen({ go }) {
         buffer.current = [];
         setPending(0);
         setRows([]);
-        // A count and an absence of one are different facts and both have to
-        // survive. Folding them together made "unknown, then 5" render as
-        // exactly "5 missed", which understates the loss and reads as precise.
-        if (typeof count === 'number') setMissed((total) => total + count);
-        else setUnknownGaps((total) => total + 1);
+        setGapState((state) => recordGap(state, count));
       },
     });
 
@@ -160,19 +150,14 @@ export function TailScreen({ go }) {
         setRows([]);
         buffer.current = [];
         setPending(0);
-        setMissed(0);
-        setUnknownGaps(0);
+        setGapState(newGapState());
       }}>Clear</Chip>
-      {missed || unknownGaps ? <Chip
-        title={unknownGaps
+      {gapLabel(gapState, fmtNum) ? <Chip
+        title={gapState.uncounted
           ? 'The stream broke and the view was rebuilt from the live edge. At least one break could not be counted — a server restart renumbers the stream, so the loss across it is not measurable. Anything missing is still in the store; search for it on Traces.'
           : 'The stream fell further behind than the server retains, so these spans never reached this view. They are still in the store — search for them on Traces.'}
         style={{ background: 'var(--warn-tint)', borderColor: 'var(--warn)', color: 'var(--warn)' }}>
-        {/* An uncounted break makes any number a floor, so it is shown as one
-            rather than as an exact figure the data cannot support. */}
-        {missed && unknownGaps ? `${fmtNum(missed)}+ missed`
-          : missed ? `${fmtNum(missed)} missed`
-          : 'spans missed'}
+        {gapLabel(gapState, fmtNum)}
       </Chip> : null}
       <span style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: 'var(--ink-muted)' }}>
         <LiveDot color={paused ? 'var(--ink-faint)'
