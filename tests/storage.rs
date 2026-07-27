@@ -1768,3 +1768,51 @@ fn expiry_finishes_when_the_segment_file_is_already_gone() {
     drop(store);
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_segment_from_another_format_fails_the_open_with_a_usable_message() {
+    // Collapsing the format to one version made every previously-written
+    // segment unreadable. That is the intended trade, but only if the failure
+    // says which file and what to do — "unsupported segment version" alone
+    // leaves an operator unable to tell a format change from corruption, and
+    // unable to find the file either way.
+    let dir = TestDir::new("foreign-segment-version");
+    {
+        let store = Store::open(dir.path(), Config::default()).expect("open");
+        store
+            .ingest(span("trace-a", "span-a".to_owned(), 1_000, 10))
+            .expect("ingest");
+        store.flush().expect("flush");
+    }
+
+    let segment = fs::read_dir(dir.path())
+        .expect("read dir")
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .find(|path| path.extension().is_some_and(|ext| ext == "seg"))
+        .expect("a sealed segment");
+
+    // Stamp a version this build does not write. The magic, the header length
+    // and every section bound stay valid, so nothing but the version word
+    // distinguishes it — which is exactly the case the check exists for.
+    let mut bytes = fs::read(&segment).expect("read segment");
+    let foreign = traza::segment::VERSION + 1;
+    bytes[8..10].copy_from_slice(&foreign.to_le_bytes());
+    fs::write(&segment, &bytes).expect("write segment");
+
+    let error = Store::open(dir.path(), Config::default())
+        .err()
+        .expect("a store with an unreadable segment must not open");
+    let message = error.to_string();
+    assert!(
+        message.contains("unsupported segment version"),
+        "says what is wrong: {message}"
+    );
+    assert!(
+        message.contains(&segment.display().to_string()),
+        "names the file: {message}"
+    );
+    assert!(
+        message.contains("Remove the data directory"),
+        "says what to do: {message}"
+    );
+}

@@ -3664,7 +3664,26 @@ fn load_segments(directory: &Path) -> Result<Vec<std::sync::Arc<Segment>>> {
             )));
         }
         let bytes_meta = fs::metadata(&path)?.len();
-        let seg = Box::new(segment::Segment::open(&path).map_err(segment_error)?);
+        let seg = Box::new(segment::Segment::open(&path).map_err(|error| {
+            // Name the file and say what to do. The common way to reach this
+            // is a store written by a build whose segment format differed:
+            // the reader refuses it rather than misparsing it, and "unsupported
+            // segment version" on its own tells an operator neither which file
+            // nor that the store is otherwise intact.
+            let detail = match &error {
+                segment::Error::Unsupported(_) => format!(
+                    " — this build reads segment format v{}. Remove the data \
+                     directory to start fresh, or open it with the build that \
+                     wrote it",
+                    segment::VERSION
+                ),
+                _ => String::new(),
+            };
+            Error::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{}: {error}{detail}", path.display()),
+            ))
+        })?);
         segments.push(std::sync::Arc::new(Segment {
             path,
             bytes: bytes_meta,

@@ -1,4 +1,4 @@
-# Segment Format v5: indexed segments
+# Segment Format: indexed segments
 
 The shipped layout is described first; the original v0.3 design proposal is
 retained below it as history. **The proposal does not describe the format that
@@ -29,7 +29,7 @@ Header fields, little-endian, at fixed byte offsets:
 | Offset | Size | Field |
 |---:|---:|---|
 | 0 | 8 | magic, `TRAZASEG` |
-| 8 | 2 | format version (`5`) |
+| 8 | 2 | format version (`1`) |
 | 10 | 2 | header length (`104`) |
 | 12 | 4 | reserved, zero |
 | 16 | 8 | record count |
@@ -40,14 +40,13 @@ Header fields, little-endian, at fixed byte offsets:
 | 56 | 8 | trace index offset |
 | 64 | 8 | trace index length |
 | 72 | 8 | attribute index offset |
-| 80 | 8 | minimum record timestamp (v3+) |
-| 88 | 8 | maximum record timestamp (v3+) |
-| 96 | 8 | content index offset (v5+) |
+| 80 | 8 | minimum record timestamp |
+| 88 | 8 | maximum record timestamp |
+| 96 | 8 | content index offset |
 
 Neither the attribute index nor the content index stores its own length. The
 attribute index is bounded by where the content index begins; the content
-index runs to EOF. (Before v5 the attribute index itself ran to EOF, which is
-why adding a fifth section needed a header field.) The reader rejects a segment whose
+index runs to EOF. The reader rejects a segment whose
 sections are not contiguous from the end of the header, whose record-offset
 index is not exactly `record_count * 8` bytes, or whose sections exceed the
 file.
@@ -126,38 +125,45 @@ against a span reading `refunds were issued` would be skipped by the filter
 while a substring match would have returned it — a wrong answer, not a slow
 one. See `src/content.rs` for the full argument.
 
-**`block_count = 0` means the index is absent, not empty.** A segment written
-before v5, one whose records carry no indexable text, or one written with
-`--no-content-index` must be SCANNED by a content query. Reading absence as
-"holds nothing" would make content search silently return no rows — the same
-trap as v2's missing timestamp range.
+**`block_count = 0` means the index is absent, not empty.** A segment whose
+records carry no indexable text, or one written with `--no-content-index`, must
+be SCANNED by a content query. Reading absence as "holds nothing" would make
+content search silently return no rows. Note that the section is always
+present: "indexed nothing" is stated inside it rather than by its absence,
+which is what lets the header field bound the attribute index unconditionally.
 
 `Segment::open` reads only the header, the three index sections, and the
 content index's prologue and summary filter into memory; record payloads and
 the bit-sliced block rows stay on disk and are read by exact byte range on
 demand. That is what makes stores larger than RAM serveable.
 
-### Compatibility
+### Versioning
 
-v1 JSONL segments are **not** readable. `Store::open` refuses a directory
-containing a `.jsonl` segment with an error pointing at traza 0.3.x for
-migration — failing loudly beats silently hiding persisted data.
+**There is exactly one readable version.** A file declaring any other is
+refused, including a JSONL segment from 0.3.x, which carries no magic at all.
 
-Versions 2, 3 and 4 are readable and need no migration step:
+It was not always one. The format grew by appending header fields behind
+`if version >= N` gates, and each gate turned a field into an `Option` that
+every reader downstream had to treat as "unknown, therefore assume the worst":
+a segment whose timestamp range could not be read had to be scanned by every
+time-bounded query, and a second attribute-index decoder existed solely to read
+the encoding that predated digests. Those were compatibility with files that
+only ever existed before release, so they were removed and the header fields
+became plain values. The pruning path no longer carries a case where it cannot
+prune.
 
-- **v2** has an 80-byte header and no timestamp range. A query treats its
-  range as unknown, which means "cannot rule this segment out" — never
-  "empty". Reading it as empty would drop every v2 segment from every
-  time-filtered query, which is data loss that looks like a normal result.
-- **v2 and v3** store attribute value text in the index. Their values are
-  hashed and discarded while the segment is opened, so an existing store gets
-  the v4 steady-state memory cost without being rewritten. Peak memory *during*
-  that open is still the old cost, bounded by one segment.
-- **v2, v3 and v4** carry no content index. A content query scans them rather
-  than skipping them: the same rows come back, at the cost of a scan.
+**The version word stays.** Two bytes per file, and it is the difference
+between refusing to open a format this reader does not know and parsing its
+header at these offsets — which yields section bounds that pass every
+validation check while addressing the wrong bytes. That failure surfaces as
+corrupt records rather than as an unreadable file, which is the worse of the
+two. `a_superseded_format_is_refused_rather_than_misread` in
+`tests/segment_format_acceptance.rs` pins it.
 
-New segments are always written at v5, including those produced by compaction,
-so a store converts as it merges.
+Adding a field later means incrementing the version and writing the new layout.
+Old files stop being readable at that point, which is the honest consequence
+of not carrying compatibility code, and is a decision to make against real
+deployed data rather than in advance of any.
 
 ---
 
