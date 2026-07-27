@@ -21,6 +21,7 @@ pub mod payload;
 pub mod seed;
 pub mod segment;
 pub mod semconv;
+pub mod tail;
 pub mod ui;
 mod wal;
 
@@ -619,12 +620,26 @@ pub struct Config {
     /// so that the measurement is possible: with it, the same corpus can be
     /// queried with and without the index and the difference attributed.
     pub content_index: bool,
+    /// Spans retained in the live tail's admission ring (see [`tail`]).
+    ///
+    /// This is the tail's entire memory cost and its entire replay window. A
+    /// subscriber that falls further behind than this is told it gapped rather
+    /// than being silently skipped, so the bound is a latency budget, not a
+    /// correctness one: it decides how long a client may be disconnected before
+    /// resuming costs it a backfill query.
+    pub tail_ring_spans: usize,
 }
 
 /// Default ceiling on log bytes before a flush seals the buffer. Large enough
 /// that ordinary ingest never reaches it before the record threshold does,
 /// small enough that a restart replays it in well under a second.
 pub const DEFAULT_FLUSH_WAL_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Default admission-ring depth. At a few hundred bytes per span this is single
+/// -digit megabytes, and it covers minutes of a quiet store or seconds of a
+/// loud one — comfortably longer than a browser tab spends backgrounded
+/// between reconnects.
+pub const DEFAULT_TAIL_RING_SPANS: usize = 8_192;
 
 impl Default for Config {
     fn default() -> Self {
@@ -637,6 +652,7 @@ impl Default for Config {
             compaction: Some(CompactionConfig::default()),
             wal_commit_window: None,
             content_index: true,
+            tail_ring_spans: DEFAULT_TAIL_RING_SPANS,
         }
     }
 }
@@ -983,7 +999,14 @@ struct WriteBuffer {
 }
 
 impl WriteBuffer {
-    fn upsert(&mut self, span: Span) {
+    /// Inserts or replaces `span`, returning the handle now holding it.
+    ///
+    /// The handle is returned so ingest can publish the same allocation to the
+    /// tail ring (see [`crate::tail`]) instead of copying the span a second
+    /// time. It is a `Arc::clone`, so the ring costs one pointer per entry and
+    /// keeps the span alive after a seal evicts it from here — which is exactly
+    /// what a tail wants to keep showing.
+    fn upsert(&mut self, span: Span) -> std::sync::Arc<Span> {
         let key = (span.trace_id.clone(), span.span_id.clone());
         self.upserts += 1;
         // A fresh allocation every time, including for a replacement: the old
@@ -991,6 +1014,7 @@ impl WriteBuffer {
         // evict by comparing handles. Mutating in place would make the newer
         // version indistinguishable from the sealed one and get it evicted.
         let span = std::sync::Arc::new(span);
+        let handle = std::sync::Arc::clone(&span);
         match self.index.get(&key) {
             Some(&position) => self.spans[position] = span,
             None => {
@@ -998,6 +1022,7 @@ impl WriteBuffer {
                 self.spans.push(span);
             }
         }
+        handle
     }
 
     fn len(&self) -> usize {
@@ -1264,6 +1289,11 @@ pub struct Store {
     segments: Mutex<Vec<std::sync::Arc<Segment>>>,
     rollups: Mutex<std::collections::HashMap<PathBuf, std::sync::Arc<analytics::SegmentRollup>>>,
     recent_payloads: payload::TouchRegistry,
+    // The live tail's admission ring. It takes NO other lock and is never
+    // taken while another engine lock is held — ingest publishes to it after
+    // releasing the writer lock — so it sits outside the ordering above
+    // entirely rather than at the bottom of it.
+    tail: tail::TailChannel,
     annotations: annotations::AnnotationLog,
     next_segment: AtomicU64,
     /// Present unless durability is [`Durability::Buffered`]. Guards the gap
@@ -1311,7 +1341,14 @@ impl Store {
                 // damaged anywhere but its final append cannot be resumed
                 // without dropping acknowledged batches, and dropping them
                 // quietly is worse than not starting.
-                wal::Wal::recover(&directory, |span| buffer.upsert(span))?;
+                // The handle is discarded rather than published to the tail:
+                // these are spans admitted before the restart, and the tail is
+                // a live surface. Replaying them would show a reconnecting
+                // client the last buffer's worth of history as though it had
+                // just arrived.
+                wal::Wal::recover(&directory, |span| {
+                    buffer.upsert(span);
+                })?;
                 Some(wal::Wal::open(&directory, config.wal_commit_window)?)
             };
             let next_segment = segments
@@ -1319,6 +1356,7 @@ impl Store {
                 .filter_map(|segment| segment_number(&segment.path))
                 .max()
                 .map_or(0, |number| number.saturating_add(1));
+            let tail_ring_spans = config.tail_ring_spans;
 
             Ok(Self {
                 annotations: annotations::AnnotationLog::open(&directory)?,
@@ -1330,6 +1368,7 @@ impl Store {
                 segments: Mutex::new(segments),
                 rollups: Mutex::new(std::collections::HashMap::new()),
                 recent_payloads: payload::TouchRegistry::default(),
+                tail: tail::TailChannel::new(tail_ring_spans),
                 next_segment: AtomicU64::new(next_segment),
                 wal,
                 metrics: metrics::Metrics::default(),
@@ -1404,6 +1443,7 @@ impl Store {
         let mut pending_commit = None;
         let seal_now;
         let seal_must_wait;
+        let admitted_handles;
         {
             let waited = Instant::now();
             let mut writer = self.lock_writer()?;
@@ -1415,14 +1455,25 @@ impl Store {
                         .time(|| log.append(frame, &self.metrics))?,
                 );
             }
-            self.metrics.buffer_upsert.time(|| {
-                for span in spans {
-                    writer.upsert(span);
-                }
+            admitted_handles = self.metrics.buffer_upsert.time(|| {
+                spans
+                    .into_iter()
+                    .map(|span| writer.upsert(span))
+                    .collect::<Vec<_>>()
             });
             seal_now = self.should_flush(&writer);
             seal_must_wait = self.seal_must_not_be_skipped(&writer);
         }
+
+        // Publish to the tail OUTSIDE the writer lock, deliberately.
+        //
+        // Sequence numbers are assigned here, at push time, so they stay
+        // monotonic and gapless however two concurrent admits interleave — a
+        // batch that publishes second simply gets the higher numbers. That is
+        // the only property a subscriber's cursor depends on, so ordering the
+        // ring against the buffer would buy nothing and would put a second
+        // lock inside the writer lock to buy it.
+        self.tail.publish(&admitted_handles);
 
         // `flushed` promises the caller a SEALED segment, so its seal must
         // finish before this returns and it must not be skipped because
@@ -1465,6 +1516,40 @@ impl Store {
     /// Returns the current number of spans buffered in memory.
     pub fn buffered_span_count(&self) -> usize {
         self.writer.lock().map_or(0, |writer| writer.len())
+    }
+
+    /// The newest tail position — where a subscriber wanting only future spans
+    /// begins.
+    pub fn tail_head(&self) -> Option<tail::TailCursor> {
+        self.tail.head()
+    }
+
+    /// Waits up to `timeout` for spans admitted after `cursor` that match
+    /// `filter`.
+    ///
+    /// This is the live tail, and it is ordered by ADMISSION rather than event
+    /// time — see [`tail`] for why that distinction is the whole point. The
+    /// time bounds in `filter` are ignored here for the same reason: a tail
+    /// asks what is arriving, and answering that with `start_time_ns` is what
+    /// made long-running spans invisible.
+    ///
+    /// Takes only the ring's lock, so an idle subscriber parked here blocks
+    /// neither ingest nor any other query.
+    pub fn tail_after(
+        &self,
+        cursor: Option<tail::TailCursor>,
+        backfill: usize,
+        limit: usize,
+        filter: &SpanFilter,
+        timeout: std::time::Duration,
+    ) -> tail::TailRead {
+        // Content search works on the tail without any index: the ring holds
+        // whole spans, so the query runs against the text in memory rather than
+        // against the postings a segment would have needed at seal time.
+        let content = filter.content.as_deref().map(content::Query::new);
+        self.tail.wait(cursor, backfill, limit, timeout, &|span| {
+            span_matches(span, filter, content.as_ref())
+        })
     }
 
     /// Persists every currently buffered span as one sorted segment.
