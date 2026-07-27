@@ -120,6 +120,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 // millions of spans, so retaining the last few thousand would
                 // be memory spent on an audience that does not exist.
                 tail_ring_spans: 1,
+                tail_ring_bytes: 1,
             },
         )?),
         None => None,

@@ -37,6 +37,7 @@
 //! seconds ago is still what a tail wants to show.
 
 use crate::Span;
+use serde_json::Value;
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -99,17 +100,44 @@ pub enum TailRead {
         cursor: TailCursor,
     },
     /// The position is no longer in the ring, and what was missed cannot be
-    /// reconstructed from it.
+    /// reconstructed.
     ///
-    /// Carries the oldest position still retained rather than the newest, so a
-    /// client's backfill only has to cover the entries actually dropped.
+    /// **This carries no resumable position, deliberately.** An earlier design
+    /// returned the ring's floor so a client could "backfill only what was
+    /// dropped", and that was incoherent: the dropped entries are precisely the
+    /// ones no longer addressable, and the only other query surface is ordered
+    /// by event time, which cannot name an admission range at all. What it
+    /// actually produced was a fetch overlapping the entries the stream then
+    /// replayed, and duplicates with nothing to deduplicate them.
+    ///
+    /// A gap is a discontinuity. The subscriber discards what it has and the
+    /// stream resumes with a fresh backlog from the live edge — one ordered
+    /// source, no overlap, and no claim of completeness across the break.
     Gap {
-        /// Where to resume once the gap has been backfilled by another means.
-        cursor: TailCursor,
+        /// Admissions lost, or `None` when the position came from another
+        /// process and the count is therefore not comparable.
+        missed: Option<u64>,
     },
 }
 
+/// One retained admission and what it costs to retain.
+///
+/// The size is measured once, at push, and carried: recomputing it at eviction
+/// would walk a span's whole attribute map again, and measuring it against the
+/// span as it is now would drift if anything ever mutated in place.
+struct Entry {
+    span: Arc<Span>,
+    bytes: usize,
+}
+
 /// A bounded ring of recently admitted spans.
+///
+/// Bounded two ways, and it needs both. A count alone says nothing about
+/// memory: a span carrying a 64 KiB prompt is three orders of magnitude larger
+/// than one carrying a status code, and the ring is the sole owner of that
+/// allocation once a seal has evicted it from the write buffer. Counting only
+/// entries, 8,192 of them reached hundreds of megabytes of LLM text — exactly
+/// the residency the attribute index was rewritten to remove.
 pub struct TailRing {
     epoch: u64,
     /// The sequence number of `entries.front()`; when empty, the number the
@@ -119,20 +147,35 @@ pub struct TailRing {
     /// bytes of redundancy that can disagree with the ring's actual contents.
     /// The seq of `entries[i]` is `first_seq + i`, by construction.
     first_seq: u64,
-    entries: VecDeque<Arc<Span>>,
+    entries: VecDeque<Entry>,
     capacity: usize,
+    byte_budget: usize,
+    resident_bytes: usize,
 }
 
 impl TailRing {
-    /// A ring retaining at most `capacity` spans.
-    pub fn new(capacity: usize) -> Self {
+    /// A ring retaining at most `capacity` spans and `byte_budget` bytes of
+    /// them, whichever binds first.
+    pub fn new(capacity: usize, byte_budget: usize) -> Self {
         let capacity = capacity.max(1);
         Self {
             epoch: process_epoch(),
             first_seq: 0,
             entries: VecDeque::with_capacity(capacity.min(4_096)),
             capacity,
+            byte_budget: byte_budget.max(1),
+            resident_bytes: 0,
         }
+    }
+
+    /// Spans currently retained, and the bytes they hold.
+    pub fn usage(&self) -> (usize, usize) {
+        (self.entries.len(), self.resident_bytes)
+    }
+
+    /// The configured bounds, as `(spans, bytes)`.
+    pub fn limits(&self) -> (usize, usize) {
+        (self.capacity, self.byte_budget)
     }
 
     /// The sequence number the next admission will take.
@@ -157,11 +200,22 @@ impl TailRing {
         }
     }
 
-    /// Appends one admitted span, evicting the oldest if the ring is full.
+    /// Appends one admitted span, evicting the oldest until both bounds hold.
+    ///
+    /// The newest entry is never evicted, even when it alone exceeds the byte
+    /// budget. A tail that showed nothing because one span was large would be
+    /// a worse failure than briefly exceeding the bound, and the excess is
+    /// bounded by one span either way.
     fn push(&mut self, span: Arc<Span>) {
-        self.entries.push_back(span);
-        while self.entries.len() > self.capacity {
-            self.entries.pop_front();
+        let bytes = approximate_bytes(&span);
+        self.resident_bytes = self.resident_bytes.saturating_add(bytes);
+        self.entries.push_back(Entry { span, bytes });
+        while self.entries.len() > 1
+            && (self.entries.len() > self.capacity || self.resident_bytes > self.byte_budget)
+        {
+            if let Some(evicted) = self.entries.pop_front() {
+                self.resident_bytes = self.resident_bytes.saturating_sub(evicted.bytes);
+            }
             self.first_seq = self.first_seq.saturating_add(1);
         }
     }
@@ -192,7 +246,12 @@ impl TailRing {
                     || cursor.seq > self.next_seq()
                 {
                     return TailRead::Gap {
-                        cursor: self.floor(),
+                        // How many admissions were lost, when that is knowable.
+                        // A cursor from another process indexes a different
+                        // numbering, so subtracting from it would produce a
+                        // confident-looking number that means nothing.
+                        missed: (cursor.epoch == self.epoch)
+                            .then(|| self.first_seq.saturating_sub(cursor.seq)),
                     };
                 }
                 (cursor.seq - self.first_seq) as usize
@@ -201,13 +260,13 @@ impl TailRing {
 
         let mut spans = Vec::new();
         let mut consumed = 0_usize;
-        for span in self.entries.iter().skip(start) {
+        for entry in self.entries.iter().skip(start) {
             if spans.len() == limit {
                 break;
             }
             consumed += 1;
-            if keep(span) {
-                spans.push(Arc::clone(span));
+            if keep(&entry.span) {
+                spans.push(Arc::clone(&entry.span));
             }
         }
         TailRead::Batch {
@@ -233,12 +292,22 @@ pub struct TailChannel {
 }
 
 impl TailChannel {
-    /// A channel over a ring retaining at most `capacity` spans.
-    pub fn new(capacity: usize) -> Self {
+    /// A channel over a ring retaining at most `capacity` spans and
+    /// `byte_budget` bytes of them.
+    pub fn new(capacity: usize, byte_budget: usize) -> Self {
         Self {
-            ring: Mutex::new(TailRing::new(capacity)),
+            ring: Mutex::new(TailRing::new(capacity, byte_budget)),
             signal: Condvar::new(),
         }
+    }
+
+    /// Retained spans, retained bytes, and the two bounds — so an operator can
+    /// see which one is binding rather than inferring it.
+    pub fn usage(&self) -> Option<(usize, usize, usize, usize)> {
+        let ring = self.ring.lock().ok()?;
+        let (spans, bytes) = ring.usage();
+        let (capacity, budget) = ring.limits();
+        Some((spans, bytes, capacity, budget))
     }
 
     /// Records admitted spans and wakes every waiting subscriber.
@@ -293,24 +362,19 @@ impl TailChannel {
         // Read before waiting: the spans the subscriber asked for may already
         // be here, and a condvar only reports what happens AFTER the wait
         // begins. Waiting first would delay every resumption by one timeout.
-        let waiting = match ring.read(cursor, backfill, limit, keep) {
-            TailRead::Gap { cursor } => return TailRead::Gap { cursor },
-            found @ TailRead::Batch { .. } => {
-                if advanced(&found, cursor) {
-                    return found;
-                }
-                found
-            }
-        };
-        let resume = match &waiting {
-            TailRead::Batch { cursor, .. } => Some(*cursor),
-            TailRead::Gap { cursor } => Some(*cursor),
+        let resume = match ring.read(cursor, backfill, limit, keep) {
+            gap @ TailRead::Gap { .. } => return gap,
+            found @ TailRead::Batch { .. } if advanced(&found, cursor) => return found,
+            TailRead::Batch { cursor, .. } => cursor,
         };
         let (ring, _) = match self.signal.wait_timeout(ring, timeout) {
             Ok(pair) => pair,
             Err(_) => return unchanged(),
         };
-        ring.read(resume, backfill, limit, keep)
+        // `backfill` is deliberately not reapplied: the position is live now,
+        // so re-deriving a start from the head would resend history the
+        // subscriber has already been given.
+        ring.read(Some(resume), 0, limit, keep)
     }
 }
 
@@ -323,6 +387,59 @@ fn advanced(read: &TailRead, from: Option<TailCursor>) -> bool {
         // its starting position without waiting out a heartbeat.
         (TailRead::Batch { .. }, None) => true,
         (TailRead::Gap { .. }, _) => true,
+    }
+}
+
+/// Roughly what retaining `span` costs, in bytes.
+///
+/// Approximate on purpose. It counts the heap a span's own strings and JSON
+/// values hold and ignores per-allocation overhead, because the number is a
+/// budget input rather than an accounting figure — it has to track the thing
+/// that actually varies by orders of magnitude, which is text.
+///
+/// Measured once per admitted span, and cheaper than what admit already does
+/// to the same span: the write-ahead log serializes it in full.
+fn approximate_bytes(span: &Span) -> usize {
+    const OVERHEAD: usize = std::mem::size_of::<Span>();
+    let mut total = OVERHEAD
+        + span.trace_id.len()
+        + span.span_id.len()
+        + span.name.len()
+        + span.status.len()
+        + span.service.len()
+        + span.parent_span_id.as_ref().map_or(0, String::len);
+    for (key, value) in &span.attributes {
+        total += key.len() + value_bytes(value);
+    }
+    for (key, value) in &span.extra {
+        total += key.len() + value_bytes(value);
+    }
+    for event in &span.events {
+        total += event.name.len();
+        for (key, value) in &event.attributes {
+            total += key.len() + value_bytes(value);
+        }
+    }
+    for link in &span.links {
+        total += link.trace_id.len() + link.span_id.len();
+        for (key, value) in &link.attributes {
+            total += key.len() + value_bytes(value);
+        }
+    }
+    total
+}
+
+/// Heap held by one JSON value, recursively.
+fn value_bytes(value: &Value) -> usize {
+    match value {
+        Value::String(text) => text.len(),
+        Value::Array(items) => items.iter().map(value_bytes).sum::<usize>() + 8 * items.len(),
+        Value::Object(fields) => fields
+            .iter()
+            .map(|(key, nested)| key.len() + value_bytes(nested))
+            .sum(),
+        // Null, bool and number are stored inline in the enum.
+        _ => 0,
     }
 }
 
@@ -370,7 +487,7 @@ mod tests {
         // span that STARTED earlier than one already delivered leaves it
         // permanently invisible: it sorts below the watermark the client has
         // moved past. Admission order has no such hole.
-        let ring = TailChannel::new(16);
+        let ring = TailChannel::new(16, usize::MAX);
         ring.publish(&[span("a", 10_000)]);
         let first = ring.wait(None, 100, 100, Duration::ZERO, &all);
         let cursor = match first {
@@ -395,7 +512,7 @@ mod tests {
 
     #[test]
     fn a_cursor_never_replays_what_it_has_seen() {
-        let ring = TailChannel::new(16);
+        let ring = TailChannel::new(16, usize::MAX);
         ring.publish(&[span("a", 1), span("b", 2)]);
         let mut cursor = match ring.wait(None, 100, 100, Duration::ZERO, &all) {
             TailRead::Batch { spans, cursor } => {
@@ -423,7 +540,7 @@ mod tests {
         // 1,250 spans at ONE timestamp: the burst that no event-time watermark
         // can separate, because every one of them is `>= since`. Sequence
         // numbers are unique per admission, so the burst pages like any other.
-        let ring = TailChannel::new(4_096);
+        let ring = TailChannel::new(4_096, usize::MAX);
         let burst: Vec<_> = (0..1_250).map(|i| span(&format!("s{i}"), 5_000)).collect();
         ring.publish(&burst);
 
@@ -450,7 +567,7 @@ mod tests {
         // means "only what arrives from now on". The distinction matters
         // because the ring always holds a backlog — without it, every new
         // subscriber would be handed thousands of spans it did not ask for.
-        let ring = TailChannel::new(64);
+        let ring = TailChannel::new(64, usize::MAX);
         ring.publish(&[span("old", 1), span("older", 2)]);
         let cursor = match ring.wait(None, 0, 100, Duration::ZERO, &all) {
             TailRead::Batch { spans, cursor } => {
@@ -470,30 +587,117 @@ mod tests {
     }
 
     #[test]
-    fn falling_behind_the_ring_reports_a_gap_at_the_floor() {
-        let ring = TailChannel::new(4);
+    fn falling_behind_the_ring_reports_how_much_was_lost_and_no_position() {
+        let ring = TailChannel::new(4, usize::MAX);
         ring.publish(&[span("a", 1), span("b", 2)]);
         let cursor = match ring.wait(None, 100, 100, Duration::ZERO, &all) {
             TailRead::Batch { cursor, .. } => cursor,
             TailRead::Gap { .. } => panic!("no gap yet"),
         };
+        assert_eq!(cursor.seq, 2);
         // Turn the ring over completely.
         for i in 0..8 {
             ring.publish(&[span(&format!("x{i}"), 10 + i)]);
         }
         match ring.wait(Some(cursor), 100, 100, Duration::ZERO, &all) {
-            TailRead::Gap { cursor: floor } => {
-                // The floor, not the head: the client backfills only what was
-                // actually dropped.
-                assert_eq!(floor.seq, 6, "oldest retained of 10 admitted, cap 4");
+            TailRead::Gap { missed } => {
+                // Ten admitted, four retained, so the floor is 6 and everything
+                // from position 2 to 5 is gone: four admissions.
+                assert_eq!(missed, Some(4), "says how much was lost");
             }
             TailRead::Batch { .. } => panic!("evicted entries cannot be delivered"),
         }
     }
 
     #[test]
+    fn a_gap_from_another_process_reports_no_count() {
+        // Sequence numbers from a previous process index a different numbering,
+        // so subtracting them would produce a confident number that means
+        // nothing. `None` is the honest answer.
+        let ring = TailChannel::new(8, usize::MAX);
+        ring.publish(&[span("a", 1)]);
+        match ring.wait(
+            Some(TailCursor { epoch: 1, seq: 900 }),
+            100,
+            100,
+            Duration::ZERO,
+            &all,
+        ) {
+            TailRead::Gap { missed } => assert_eq!(missed, None),
+            TailRead::Batch { .. } => panic!("a foreign cursor must gap"),
+        }
+    }
+
+    #[test]
+    fn the_byte_budget_evicts_before_the_count_does() {
+        // The regression this exists for: a count-only bound let 8,192 spans
+        // carrying LLM prompts reach hundreds of megabytes, because the ring is
+        // the sole owner of a span once a seal has dropped it from the write
+        // buffer. Capacity here is 1,000 and would never bind.
+        let ring = TailChannel::new(1_000, 64 * 1024);
+        let big = "x".repeat(16 * 1024);
+        for i in 0..64 {
+            let mut wide = span(&format!("w{i}"), i as u64);
+            std::sync::Arc::get_mut(&mut wide)
+                .expect("sole handle")
+                .attributes
+                .insert("prompt".into(), Value::String(big.clone()));
+            ring.publish(&[wide]);
+        }
+
+        let (spans, bytes, max_spans, max_bytes) = ring.usage().expect("usage");
+        assert_eq!(max_spans, 1_000);
+        assert_eq!(max_bytes, 64 * 1024);
+        assert!(
+            spans < 10,
+            "the byte budget must bind long before the count: {spans} retained"
+        );
+        assert!(
+            bytes <= 64 * 1024 + 17 * 1024,
+            "residency stays at the budget plus at most the newest span: {bytes}"
+        );
+    }
+
+    #[test]
+    fn one_oversized_span_is_still_delivered() {
+        // A span larger than the whole budget must not evict itself, or a tail
+        // watching a store of large spans would show nothing at all.
+        let ring = TailChannel::new(100, 1_024);
+        let mut huge = span("huge", 1);
+        std::sync::Arc::get_mut(&mut huge)
+            .expect("sole handle")
+            .attributes
+            .insert("prompt".into(), Value::String("x".repeat(64 * 1024)));
+        ring.publish(&[huge]);
+
+        match ring.wait(None, 100, 100, Duration::ZERO, &all) {
+            TailRead::Batch { spans, .. } => {
+                assert_eq!(spans.len(), 1, "the newest entry is never evicted");
+                assert_eq!(spans[0].span_id, "huge");
+            }
+            TailRead::Gap { .. } => panic!("no gap"),
+        }
+    }
+
+    #[test]
+    fn size_tracks_text_rather_than_field_count() {
+        let narrow = span("a", 1);
+        let mut wide = span("b", 2);
+        std::sync::Arc::get_mut(&mut wide)
+            .expect("sole handle")
+            .attributes
+            .insert("prompt".into(), Value::String("x".repeat(32 * 1024)));
+        let small = approximate_bytes(&narrow);
+        let large = approximate_bytes(&wide);
+        assert!(
+            large > small + 32_000,
+            "the estimate must follow text: {small} vs {large}"
+        );
+    }
+
+    #[test]
     fn a_cursor_from_another_process_gaps_rather_than_skipping() {
-        let ring = TailChannel::new(8);
+        let ring = TailChannel::new(8, usize::MAX);
         ring.publish(&[span("a", 1)]);
         let stale = TailCursor { epoch: 1, seq: 0 };
         match ring.wait(Some(stale), 100, 100, Duration::ZERO, &all) {
@@ -509,7 +713,7 @@ mod tests {
         // Everything is rejected, so the batch is always empty — but the
         // cursor has to keep moving, or the subscriber falls off the back of
         // the ring and gaps on traffic it never asked for.
-        let ring = TailChannel::new(4);
+        let ring = TailChannel::new(4, usize::MAX);
         ring.publish(&[span("a", 1), span("b", 2)]);
         let none = |_: &Span| false;
         let cursor = match ring.wait(None, 100, 100, Duration::ZERO, &none) {
@@ -543,7 +747,7 @@ mod tests {
     #[test]
     fn a_waiting_subscriber_wakes_when_a_span_lands() {
         use std::sync::Arc as StdArc;
-        let ring = StdArc::new(TailChannel::new(16));
+        let ring = StdArc::new(TailChannel::new(16, usize::MAX));
         let head = ring.head().expect("fresh ring");
 
         let writer = StdArc::clone(&ring);

@@ -411,7 +411,7 @@ event: spans
 data: {"spans":[{...}],"cursor":"1763913600000000000.41"}
 
 event: gap
-data: {"cursor":"1763913600000000000.8192"}
+data: {"missed":20}
 
 : tick
 ```
@@ -422,10 +422,19 @@ spans were admitted but none matched the filter, and the position moves so a
 narrow subscriber does not fall off the back of the ring.
 
 A **`gap`** frame means the subscriber fell further behind than the server
-retains and what was missed cannot come from this stream. Its `cursor` is the
-*oldest position still held*, not the newest, so a backfill by
-[`GET /v1/spans`](#get-v1spans) only has to cover what was actually dropped.
-The stream continues from that position.
+retains. **It carries no position, deliberately.** The dropped entries are
+precisely the ones no longer addressable, and `/v1/spans` is ordered by event
+time, so it cannot name an admission range at all — there is no query that
+fetches "what was dropped". `missed` is how many admissions were lost, or
+`null` when the cursor came from a previous process and the count would not be
+comparable.
+
+A gap is a **discontinuity**. The server restarts the subscription at the live
+edge and the next `spans` frame is a fresh backlog; the client discards what it
+was holding and rebuilds from that frame. One ordered source, no overlap, and
+no claim of completeness across the break. Spans lost to a gap are still in the
+store — they are reachable through [`GET /v1/spans`](#get-v1spans), just not as
+part of this stream.
 
 A line beginning `:` is a comment — the heartbeat, sent every 15 seconds on a
 quiet store. It is how an intermediary is kept from reaping the connection and
@@ -435,11 +444,14 @@ how the server discovers a client has gone.
 the process; a cursor from a previous one is reported as a gap rather than
 misread as a live position.
 
-**Retention is bounded and in memory.** The server keeps the last
-`--tail-ring-spans` admissions (default **8192**); beyond that a subscriber
-gaps. This costs no disk and adds no field to the stored span — see
-[`--tail-ring-spans`](../configuration.md) to trade memory for a longer
-reconnect window.
+**Retention is bounded and in memory.** The server keeps recent admissions
+under two bounds, whichever binds first: `--tail-ring-spans` (default **8192**)
+and `--tail-ring-bytes` (default **32 MiB**). Beyond either, a subscriber gaps.
+The byte bound is the one that actually caps memory — the ring owns whole spans,
+and an LLM span carrying a prompt is orders of magnitude larger than one
+carrying a status code. This costs no disk and adds no field to the stored span.
+Current residency and both bounds are reported at
+[`GET /v1/metrics.json`](#get-v1metricsjson) under `tail_ring`.
 
 This route always closes its connection, and is counted but never timed in
 [route-class metrics](../operations/monitoring.md).

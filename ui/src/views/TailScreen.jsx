@@ -21,6 +21,8 @@ const MAX_ROWS = 300;
 // frame. Spans arrive in bursts of whatever the SDK flushed, so a per-frame
 // rate is a number that swings between zero and enormous and reads as noise.
 const RATE_WINDOW_MS = 5_000;
+// How often the window is re-evaluated when nothing is arriving.
+const RATE_TICK_MS = 1_000;
 
 export function TailScreen({ go }) {
   const [rows, setRows] = React.useState([]);
@@ -28,6 +30,10 @@ export function TailScreen({ go }) {
   const [pending, setPending] = React.useState(0);
   const [rate, setRate] = React.useState(null);
   const [status, setStatus] = React.useState('live');
+  // Admissions the server dropped before this client could read them. Shown
+  // rather than swallowed: the view is complete from the break onwards, and
+  // saying so is the difference between a gap and a silent hole.
+  const [missed, setMissed] = React.useState(0);
   const [service, setService] = React.useState('');
   const [errorsOnly, setErrorsOnly] = React.useState(false);
   const buffer = React.useRef([]);
@@ -45,6 +51,11 @@ export function TailScreen({ go }) {
     const state = newTailState();
     setRows([]);
     setPending(0);
+    // Reset the DISPLAYED rate too, not just its inputs. Clearing the window
+    // while leaving the number on screen left the previous filter's rate
+    // standing over an empty table until something happened to arrive.
+    setRate(null);
+    setMissed(0);
     buffer.current = [];
     arrivals.current = [];
 
@@ -52,6 +63,15 @@ export function TailScreen({ go }) {
       service: service || undefined,
       status: errorsOnly ? 'error' : undefined,
     };
+
+    // The rate is a sliding window, so it has to decay on its own. Computing it
+    // only when spans arrive meant a burst that stopped kept showing its peak
+    // rate indefinitely — the one reading that is certainly wrong.
+    const decay = setInterval(() => {
+      const now = Date.now();
+      arrivals.current = arrivals.current.filter((at) => now - at < RATE_WINDOW_MS);
+      setRate(arrivals.current.length ? (arrivals.current.length * 1000) / RATE_WINDOW_MS : 0);
+    }, RATE_TICK_MS);
 
     runTail(state, {
       open: (params) => api.tailChunks(params, controller.signal),
@@ -74,38 +94,27 @@ export function TailScreen({ go }) {
           setRows((all) => [...newestFirst, ...all].slice(0, MAX_ROWS));
         }
       },
-      onGap: async () => {
-        // The client fell further behind than the server's ring retains, so
-        // what was missed cannot come from the stream. Backfilling by event
-        // time is the ordering this screen exists to avoid, but it is the
-        // honest recovery: the alternative is a view with an invisible hole,
-        // which is the exact failure the stream was built to end.
+      onGap: (count) => {
+        // The stream fell further behind than the server retains. There is
+        // nothing to fetch: the dropped entries are exactly the ones no longer
+        // addressable, and `/v1/spans` is ordered by event time, so it cannot
+        // name an admission range at all. An earlier version queried it anyway
+        // and prepended the result, which overlapped the entries the stream
+        // then replayed and showed them twice.
         //
-        // The result REPLACES the rows rather than being prepended. What is on
-        // screen is an incremental view that is now known to be incomplete, and
-        // the two overlap — prepending would show the overlap twice and leave
-        // the hole underneath it. The buffered pause is discarded for the same
-        // reason. A visible refresh beats a plausible-looking lie.
-        try {
-          const answer = await api.spans(
-            // The filter has to travel with it. Without it a tail narrowed to
-            // errors would repopulate itself with every span in the store.
-            // `-start` because this needs the NEWEST rows, and the default
-            // ordering with a limit returns the oldest.
-            { ...filter, limit: MAX_ROWS, sort: '-start' },
-            controller.signal,
-          );
-          if (controller.signal.aborted) return;
-          buffer.current = [];
-          setPending(0);
-          setRows(answer.spans || []);
-        } catch (e) {
-          /* the stream resumes from the gap position regardless */
-        }
+        // So the view is discarded and the stream rebuilds it from the live
+        // edge. A visible break beats a plausible-looking splice.
+        buffer.current = [];
+        setPending(0);
+        setRows([]);
+        setMissed((total) => total + (count || 0));
       },
     });
 
-    return () => controller.abort();
+    return () => {
+      controller.abort();
+      clearInterval(decay);
+    };
   }, [service, errorsOnly]);
 
   const resume = () => {
@@ -136,7 +145,13 @@ export function TailScreen({ go }) {
         setRows([]);
         buffer.current = [];
         setPending(0);
+        setMissed(0);
       }}>Clear</Chip>
+      {missed ? <Chip
+        title="The stream fell further behind than the server retains, so these spans never reached this view. They are still in the store — search for them on Traces."
+        style={{ background: 'var(--warn-tint)', borderColor: 'var(--warn)', color: 'var(--warn)' }}>
+        {fmtNum(missed)} missed
+      </Chip> : null}
       <span style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: 'var(--ink-muted)' }}>
         <LiveDot color={paused ? 'var(--ink-faint)'
           : status === 'reconnecting' ? 'var(--warn)' : 'var(--ok)'} />
@@ -153,7 +168,7 @@ export function TailScreen({ go }) {
         display: 'grid', gridTemplateColumns: '104px 132px 1fr 100px 88px 70px',
         background: 'var(--bg-sunken)', borderBottom: '1px solid var(--hairline)',
       }}>
-        {['arrived', 'service', 'name', 'trace', 'duration', 'status'].map((label, i) => (
+        {['started', 'service', 'name', 'trace', 'duration', 'status'].map((label, i) => (
           <div key={label} style={{
             padding: '6px 10px', fontSize: 12, fontWeight: 500, color: 'var(--ink-muted)',
             textAlign: i === 4 ? 'right' : 'left', whiteSpace: 'nowrap',
