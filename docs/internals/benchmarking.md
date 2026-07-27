@@ -128,4 +128,4 @@ shows how to use them. Two cautions:
   stages against each other. **They are not request latencies and must not be
   published as such.** The benchmarks measure end-to-end request latency
   exactly, from the client, with a plain `Instant`. See
-  [monitoring](../operations/monitoring.md#a-caveat-you-must-not-skip).
+  [monitoring](../operations/monitoring.md#how-accurate-the-percentiles-are).
