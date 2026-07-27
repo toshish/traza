@@ -463,7 +463,13 @@ fn value_bytes(value: &Value) -> usize {
 
     match value {
         Value::String(text) => KEY + text.capacity(),
-        Value::Array(items) => SLOT * items.len() + items.iter().map(value_bytes).sum::<usize>(),
+        // CAPACITY, not length. A `Vec` grown to 100,000 elements and then
+        // truncated to one still owns the whole allocation, and a library
+        // caller can hand exactly that to `Store::ingest` — 32 such spans held
+        // 100 MB while the accounting reported 13 KB.
+        Value::Array(items) => {
+            SLOT * items.capacity() + items.iter().map(value_bytes).sum::<usize>()
+        }
         Value::Object(fields) => fields
             .iter()
             .map(|(key, nested)| ENTRY + KEY + key.capacity() + SLOT + value_bytes(nested))
@@ -506,6 +512,10 @@ mod tests {
             links: Vec::new(),
             extra: Default::default(),
         })
+    }
+
+    fn span_with_id(id: &str) -> Arc<Span> {
+        span(id, 1)
     }
 
     fn all(_: &Span) -> bool {
@@ -820,6 +830,56 @@ mod tests {
         assert!(
             spans <= 12,
             "count should be bounded by BYTES here, not by the 100k cap: {spans}"
+        );
+    }
+
+    #[test]
+    fn spare_collection_capacity_counts_against_the_byte_budget() {
+        // A `Vec` grown large and then truncated keeps its whole allocation.
+        // Charging `len()` let a caller build a 100,000-element array, cut it
+        // to one, and hand the retained allocation to `Store::ingest`: 32 such
+        // spans held 100 MB while the ring's accounting reported 13 KB against
+        // a 32 MiB budget. The ring keeps the `Vec`, so the ring must be
+        // charged for the `Vec`.
+        let mut wide = Vec::with_capacity(100_000);
+        wide.extend((0..100_000_u64).map(Value::from));
+        wide.truncate(1);
+        assert!(wide.capacity() >= 100_000, "the allocation is retained");
+
+        let mut span = span("s", 1);
+        Arc::get_mut(&mut span)
+            .expect("sole owner")
+            .attributes
+            .insert("wide".into(), Value::Array(wide));
+
+        let measured = approximate_bytes(&span);
+        assert!(
+            measured >= 100_000 * std::mem::size_of::<Value>(),
+            "retained capacity must be counted: {measured} bytes"
+        );
+
+        // And the ring evicts on it rather than filling with dead capacity.
+        let budget = measured * 4;
+        let ring = TailChannel::new(100_000, budget);
+        for index in 0..40 {
+            let mut wide = Vec::with_capacity(100_000);
+            wide.extend((0..100_000_u64).map(Value::from));
+            wide.truncate(1);
+            let mut one = span_with_id(&format!("s{index}"));
+            Arc::get_mut(&mut one)
+                .expect("sole owner")
+                .attributes
+                .insert("wide".into(), Value::Array(wide));
+            ring.publish(&[one]);
+        }
+        let (spans, bytes, _, _) = ring.usage().expect("usage");
+        assert!(
+            bytes <= budget,
+            "ring exceeded its budget: {bytes} > {budget}"
+        );
+        assert!(
+            spans <= 5,
+            "bounded by bytes, not by the 100k count cap: {spans}"
         );
     }
 

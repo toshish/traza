@@ -40,7 +40,7 @@ export function TailScreen({ go }) {
   // null as zero showed no warning while silently clearing the screen, which is
   // exactly the invisible discontinuity this feature exists to remove.
   const [missed, setMissed] = React.useState(0);
-  const [gaps, setGaps] = React.useState(0);
+  const [unknownGaps, setUnknownGaps] = React.useState(0);
   const [service, setService] = React.useState('');
   const [errorsOnly, setErrorsOnly] = React.useState(false);
   const buffer = React.useRef([]);
@@ -58,11 +58,15 @@ export function TailScreen({ go }) {
     const state = newTailState();
     setRows([]);
     setPending(0);
+    // Every piece of gap state, not just the counted half. A warning earned
+    // under the previous filter has nothing to do with this subscription, and
+    // leaving the uncounted flag behind carried it across.
+    setMissed(0);
+    setUnknownGaps(0);
     // Reset the DISPLAYED rate too, not just its inputs. Clearing the window
     // while leaving the number on screen left the previous filter's rate
     // standing over an empty table until something happened to arrive.
     setRate(null);
-    setMissed(0);
     buffer.current = [];
     arrivals.current = [];
 
@@ -114,8 +118,11 @@ export function TailScreen({ go }) {
         buffer.current = [];
         setPending(0);
         setRows([]);
-        setGaps((total) => total + 1);
+        // A count and an absence of one are different facts and both have to
+        // survive. Folding them together made "unknown, then 5" render as
+        // exactly "5 missed", which understates the loss and reads as precise.
         if (typeof count === 'number') setMissed((total) => total + count);
+        else setUnknownGaps((total) => total + 1);
       },
     });
 
@@ -154,14 +161,18 @@ export function TailScreen({ go }) {
         buffer.current = [];
         setPending(0);
         setMissed(0);
-        setGaps(0);
+        setUnknownGaps(0);
       }}>Clear</Chip>
-      {gaps ? <Chip
-        title={missed
-          ? 'The stream fell further behind than the server retains, so these spans never reached this view. They are still in the store — search for them on Traces.'
-          : 'The stream broke and the view was rebuilt from the live edge. The server could not say how many spans were missed — a restart renumbers the stream, so the count is not comparable. Anything missing is still in the store; search for it on Traces.'}
+      {missed || unknownGaps ? <Chip
+        title={unknownGaps
+          ? 'The stream broke and the view was rebuilt from the live edge. At least one break could not be counted — a server restart renumbers the stream, so the loss across it is not measurable. Anything missing is still in the store; search for it on Traces.'
+          : 'The stream fell further behind than the server retains, so these spans never reached this view. They are still in the store — search for them on Traces.'}
         style={{ background: 'var(--warn-tint)', borderColor: 'var(--warn)', color: 'var(--warn)' }}>
-        {missed ? `${fmtNum(missed)} missed` : 'spans missed'}
+        {/* An uncounted break makes any number a floor, so it is shown as one
+            rather than as an exact figure the data cannot support. */}
+        {missed && unknownGaps ? `${fmtNum(missed)}+ missed`
+          : missed ? `${fmtNum(missed)} missed`
+          : 'spans missed'}
       </Chip> : null}
       <span style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: 'var(--ink-muted)' }}>
         <LiveDot color={paused ? 'var(--ink-faint)'

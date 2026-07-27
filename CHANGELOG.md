@@ -28,14 +28,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tail_ring`.
 
   The ring is bounded by **bytes as well as count**, and the byte estimate
-  counts structure, not only text — a `Value` slot per element and per map
-  entry. Counting text alone left the ceiling bypassable by shape: deeply
-  nested JSON with no long strings measured at a fraction of what it held.
+  counts structure and retained capacity, not only text — a `Value` slot per
+  element and per map entry, and `capacity()` rather than `len()` for every
+  collection. Counting text alone left the ceiling bypassable by shape; counting
+  logical length left it bypassable by a `Vec` grown large and truncated, which
+  keeps its whole allocation.
 
   A gap is a **visible** discontinuity even when the server cannot count it. A
   cursor from before a restart is not comparable to the new numbering, so
   `missed` is `null` rather than a number, and the client shows the break
-  without inventing a count. `backfill` survives a gap unchanged, including
+  without inventing a count — tracking counted and uncounted breaks separately,
+  so "unknown, then 5" reads as `5+` rather than as an exact 5. `backfill` survives a gap unchanged, including
   `backfill=0`.
 
   A streamed span has been **acknowledged**: entries reach the ring only after
