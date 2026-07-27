@@ -1,135 +1,72 @@
 import React from 'react';
 import { api, getToken, setToken, onUnauthorized } from './lib/api.js';
-import { fmtNum } from './lib/format.js';
-import { Logo } from './components/Logo.jsx';
+import { useHashRoute, navigate, useKeys, usePoll, useStored } from './lib/route.js';
+import { NavRail, Header, SCREENS } from './components/nav/Shell.jsx';
+import { CommandPalette } from './components/nav/CommandPalette.jsx';
+import { Modal } from './components/primitives/Modal.jsx';
 import { Button } from './components/primitives/Button.jsx';
 import { Input } from './components/primitives/Input.jsx';
-import { Modal } from './components/primitives/Modal.jsx';
-import { Tabs } from './components/primitives/Tabs.jsx';
 import { Toast } from './components/primitives/Toast.jsx';
-import { SpansView } from './views/SpansView.jsx';
-import { TraceView } from './views/TraceView.jsx';
-import { SessionsView, SessionDetailView } from './views/SessionsView.jsx';
-import { AnalyticsView } from './views/AnalyticsView.jsx';
-import { ConversationView } from './views/ConversationView.jsx';
-import { StoreView } from './views/StoreView.jsx';
 
-// ------------------------------------------------------------------ routing
-// Hash routes, because the server intentionally serves only "/" and
-// "/dashboard": #/spans, #/traces/<id>?span=<id>, #/sessions,
-// #/sessions/<id>, #/analytics, #/store.
+import { OverviewScreen } from './views/OverviewScreen.jsx';
+import { TracesScreen } from './views/TracesScreen.jsx';
+import { TraceScreen } from './views/TraceScreen.jsx';
+import { SessionsScreen, SessionScreen } from './views/SessionsScreen.jsx';
+import { ConversationScreen } from './views/ConversationScreen.jsx';
+import { AnalyticsScreen } from './views/AnalyticsScreen.jsx';
+import { LatencyScreen } from './views/LatencyScreen.jsx';
+import { FailuresScreen } from './views/FailuresScreen.jsx';
+import { ScoresScreen } from './views/ScoresScreen.jsx';
+import { ExperimentsScreen } from './views/ExperimentsScreen.jsx';
+import { DatasetsScreen } from './views/DatasetsScreen.jsx';
+import { TailScreen } from './views/TailScreen.jsx';
+import { CompareScreen } from './views/CompareScreen.jsx';
+import { ServerScreen } from './views/ServerScreen.jsx';
+import { StoreScreen } from './views/StoreScreen.jsx';
+import { ConnectScreen } from './views/ConnectScreen.jsx';
 
-function parseHash(hash) {
-  const raw = (hash || '').replace(/^#\/?/, '');
-  const [pathPart, queryPart] = raw.split('?');
-  const parts = pathPart.split('/').filter(Boolean).map(decodeURIComponent);
-  const params = new URLSearchParams(queryPart || '');
-  return { parts, params };
-}
+/** How many samples the rail's ingest sparkline keeps. At a 5s poll this is
+    about two minutes of history — long enough to show a shape, short enough
+    that a burst three minutes ago is not still claiming the eye. */
+const PULSE_SAMPLES = 28;
 
-function useHashRoute() {
-  const [route, setRoute] = React.useState(() => parseHash(window.location.hash));
-  React.useEffect(() => {
-    const onChange = () => setRoute(parseHash(window.location.hash));
-    window.addEventListener('hashchange', onChange);
-    return () => window.removeEventListener('hashchange', onChange);
+/** Watches ingest by differencing the admitted-spans counter.
+
+    A rate is not a metric the server keeps — it keeps a counter, which is the
+    honest thing to keep — so the client differences it. One small JSON read
+    every five seconds serves the pulse, the record count, and the Server
+    screen's freshness, instead of three separate polls. */
+function useIngestPulse(authVersion) {
+  const [pulse, setPulse] = React.useState({ rate: null, spark: [], live: false, durability: null });
+  const previous = React.useRef(null);
+
+  const sample = React.useCallback(async () => {
+    try {
+      const [metrics, stats] = await Promise.all([api.metrics(), api.stats()]);
+      const admitted = metrics?.ingest?.spans_admitted ?? 0;
+      const now = performance.now();
+      const last = previous.current;
+      previous.current = { admitted, at: now };
+      if (!last) {
+        setPulse((p) => ({ ...p, durability: stats.durability, records: stats.record_count }));
+        return;
+      }
+      const seconds = Math.max(0.001, (now - last.at) / 1000);
+      const rate = Math.max(0, (admitted - last.admitted) / seconds);
+      setPulse((p) => ({
+        rate,
+        live: rate > 0,
+        durability: stats.durability,
+        records: stats.record_count,
+        spark: [...p.spark, rate].slice(-PULSE_SAMPLES),
+      }));
+    } catch (e) { /* the rail goes quiet; screens surface their own errors */ }
   }, []);
-  return route;
+
+  React.useEffect(() => { previous.current = null; sample(); }, [sample, authVersion]);
+  usePoll(sample, 5000);
+  return pulse;
 }
-
-function hashFor(parts, params) {
-  let hash = '#/' + parts.map(encodeURIComponent).join('/');
-  const query = params ? new URLSearchParams(params).toString() : '';
-  if (query) hash += '?' + query;
-  return hash;
-}
-
-/** Push a history entry (a real navigation) or replace the current one.
-    Selecting a span inside a trace REPLACES: it is a change of focus, not a
-    new place, and pushing it made Back step through every span you clicked
-    instead of leaving the trace. */
-function navigate(parts, params, { replace = false } = {}) {
-  const hash = hashFor(parts, params);
-  if (replace) {
-    const url = window.location.pathname + window.location.search + hash;
-    window.history.replaceState(null, '', url);
-    window.dispatchEvent(new HashChangeEvent('hashchange'));
-  } else {
-    window.location.hash = hash;
-  }
-}
-
-/** Browser history if there is somewhere to go back to, else a sensible
-    parent route, so Back is never a dead button. */
-function goBack(fallbackParts) {
-  if (window.history.length > 1) window.history.back();
-  else navigate(fallbackParts || ['spans']);
-}
-
-// ------------------------------------------------------------------ header
-
-function ThemeToggle() {
-  const [dark, setDark] = React.useState(() => document.documentElement.getAttribute('data-theme') === 'dark');
-  const toggle = () => {
-    const next = !dark;
-    setDark(next);
-    if (next) document.documentElement.setAttribute('data-theme', 'dark');
-    else document.documentElement.removeAttribute('data-theme');
-    try { localStorage.setItem('traza_theme', next ? 'dark' : 'light'); } catch (e) {}
-  };
-  return <button onClick={toggle} title={dark ? 'Switch to light theme' : 'Switch to dark theme'}
-    style={{ border: 'none', background: 'transparent', color: 'var(--ink-faint)', cursor: 'pointer', display: 'inline-flex', padding: 4 }}>
-    {dark
-      ? <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"></path></svg>
-      : <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"></path></svg>}
-  </button>;
-}
-
-function Header({ recordCount, onSetToken }) {
-  return <header style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '10px 16px', borderBottom: '1px solid var(--hairline)', background: 'var(--bg-raised)' }}>
-    <a href="#/spans" style={{ display: 'inline-flex', alignItems: 'center', gap: 12, textDecoration: 'none' }}>
-      <Logo size={20} />
-      <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-16)', fontWeight: 500, color: 'var(--ink)', letterSpacing: '-0.01em' }}>traza</span>
-    </a>
-    <span style={{ fontSize: 'var(--text-12)', color: 'var(--ink-muted)' }}>trace browser</span>
-    <span style={{ marginLeft: 'auto', fontFamily: 'var(--font-mono)', fontSize: 'var(--text-12)', fontVariantNumeric: 'tabular-nums', color: 'var(--ink-muted)' }}>
-      {recordCount == null ? '' : fmtNum(recordCount) + ' records'}
-    </span>
-    <ThemeToggle />
-    <Button size="sm" onClick={onSetToken}>Set token</Button>
-  </header>;
-}
-
-/* Where you are, and the way out. Hash routing gives the browser Back for
-   free, but a dashboard opened straight into a deep link has nothing behind
-   it — so Back falls through to the parent route and the trail is clickable. */
-function Breadcrumbs({ crumbs, onBack, onGo }) {
-  return <nav style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 10, fontFamily: 'var(--font-sans)', fontSize: 'var(--text-12)' }}>
-    <button onClick={onBack} title="Back"
-      style={{ display: 'inline-flex', alignItems: 'center', gap: 4, border: '1px solid var(--hairline)', borderRadius: 'var(--radius-control)', background: 'var(--bg-raised)', color: 'var(--ink-muted)', cursor: 'pointer', font: 'inherit', padding: '2px 8px' }}>
-      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M15 18l-6-6 6-6" /></svg>
-      Back
-    </button>
-    {crumbs.map((crumb, i) => <span key={i} style={{ display: 'inline-flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
-      {i > 0 ? <span style={{ color: 'var(--ink-faint)' }}>/</span> : null}
-      {crumb.to
-        ? <button onClick={() => onGo(crumb.to)}
-            style={{ border: 'none', background: 'transparent', color: 'var(--accent)', cursor: 'pointer', font: 'inherit', padding: 0 }}>
-            {crumb.label}
-          </button>
-        : <span style={{ color: 'var(--ink-muted)', fontFamily: 'var(--font-mono)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 320 }}>{crumb.label}</span>}
-    </span>)}
-  </nav>;
-}
-
-// ------------------------------------------------------------------ app
-
-const TABS = [
-  { id: 'spans', label: 'Spans' },
-  { id: 'sessions', label: 'Sessions' },
-  { id: 'analytics', label: 'Analytics' },
-  { id: 'store', label: 'Store' },
-];
 
 export function App() {
   const route = useHashRoute();
@@ -137,7 +74,9 @@ export function App() {
   const [tokenModal, setTokenModal] = React.useState(false);
   const [tokenDraft, setTokenDraft] = React.useState('');
   const [authVersion, setAuthVersion] = React.useState(0);
-  const [recordCount, setRecordCount] = React.useState(null);
+  const [palette, setPalette] = React.useState(false);
+  const [density, setDensity] = useStored('traza_density', 'comfortable');
+  const [theme, setTheme] = useStored('traza_theme', 'light');
   const authFailed = React.useRef(false);
 
   const pushToast = React.useCallback((toast) => {
@@ -145,6 +84,16 @@ export function App() {
     setToasts((list) => [...list, { ...toast, id }]);
     setTimeout(() => setToasts((list) => list.filter((t) => t.id !== id)), 5000);
   }, []);
+
+  // Theme and density are document-level so tokens cascade to every surface,
+  // including ones rendered into portals.
+  React.useEffect(() => {
+    if (theme === 'dark') document.documentElement.setAttribute('data-theme', 'dark');
+    else document.documentElement.removeAttribute('data-theme');
+  }, [theme]);
+  React.useEffect(() => {
+    document.documentElement.setAttribute('data-density', density);
+  }, [density]);
 
   // First 401 anywhere opens the token prompt (once until a token is set).
   React.useEffect(() => {
@@ -156,96 +105,82 @@ export function App() {
     });
   }, []);
 
-  // Header record count: poll gently; stop after a 401 until a token is set.
-  React.useEffect(() => {
-    let live = true;
-    const poll = async () => {
-      if (authFailed.current) return;
-      try {
-        const stats = await api.stats();
-        if (live) setRecordCount(stats.record_count);
-      } catch (e) { /* header stays quiet; views surface errors */ }
-    };
-    poll();
-    const timer = setInterval(poll, 15000);
-    return () => { live = false; clearInterval(timer); };
-  }, [authVersion]);
+  const pulse = useIngestPulse(authVersion);
 
   const applyToken = () => {
     setToken(tokenDraft.trim());
     setTokenDraft('');
     setTokenModal(false);
     authFailed.current = false;
-    setAuthVersion((v) => v + 1); // remounts the active view so it refetches
+    setAuthVersion((v) => v + 1);
   };
 
-  const [head, second] = route.parts;
-  const activeTab = head === 'traces' ? 'spans' : (TABS.some((t) => t.id === head) ? head : 'spans');
-  const sessionFilter = route.params.get('session') || '';
+  const [head, second, third] = route.parts;
+  const screen = head || 'overview';
+  const go = React.useCallback((parts, params) => navigate(Array.isArray(parts) ? parts : [parts], params), []);
 
-  const third = route.parts[2];
+  useKeys((event, { typing }) => {
+    const meta = event.metaKey || event.ctrlKey;
+    if (meta && event.key.toLowerCase() === 'k') {
+      event.preventDefault();
+      setPalette((open) => !open);
+      return;
+    }
+    if (typing || meta || event.altKey) return;
+    if (event.key === '?') { event.preventDefault(); go(['connect']); }
+  }, [go]);
 
+  const common = { pushToast, go, params: route.params, authVersion };
   let view;
-  if (head === 'traces' && second && third === 'conversation') {
-    view = <ConversationView key={'conv:' + second + ':' + authVersion} traceId={second}
-      onOpenTrace={(traceId, spanId) => navigate(['traces', traceId], spanId ? { span: spanId } : undefined)}
-      onBack={() => goBack(['traces', second])} backLabel="Back to trace" />;
-  } else if (head === 'traces' && second) {
-    view = <TraceView key={second + ':' + authVersion} traceId={second}
-      selectedSpanId={route.params.get('span') || ''}
-      // Focus, not navigation: replace so Back leaves the trace rather than
-      // stepping back through every span that was clicked.
-      selectSpan={(spanId) => navigate(['traces', second], spanId ? { span: spanId } : undefined, { replace: true })}
-      openSession={(id) => navigate(['sessions', id])}
-      openConversation={() => navigate(['traces', second, 'conversation'])}
-      onBack={() => goBack(['spans'])}
-      pushToast={pushToast} />;
-  } else if (head === 'sessions' && second && third === 'conversation') {
-    view = <ConversationView key={'conv:' + second + ':' + authVersion} sessionId={second}
-      onOpenTrace={(traceId, spanId) => navigate(['traces', traceId], spanId ? { span: spanId } : undefined)}
-      onBack={() => goBack(['sessions', second])} backLabel="Back to session" />;
-  } else if (head === 'sessions' && second) {
-    view = <SessionDetailView key={second + ':' + authVersion} sessionId={second}
-      openTrace={(traceId) => navigate(['traces', traceId])}
-      openConversation={() => navigate(['sessions', second, 'conversation'])}
-      onBack={() => goBack(['sessions'])}
-      filterSpans={(id) => navigate(['spans'], { session: id })} />;
-  } else if (head === 'sessions') {
-    view = <SessionsView key={'sessions:' + authVersion} openSession={(id) => navigate(['sessions', id])} />;
-  } else if (head === 'analytics') {
-    view = <AnalyticsView key={'analytics:' + authVersion} />;
-  } else if (head === 'store') {
-    view = <StoreView key={'store:' + authVersion} pushToast={pushToast} />;
-  } else {
-    view = <SpansView key={'spans:' + sessionFilter + ':' + authVersion}
-      sessionFilter={sessionFilter}
-      clearSessionFilter={() => navigate(['spans'])}
-      openTrace={(traceId, spanId) => navigate(['traces', traceId], spanId ? { span: spanId } : undefined)} />;
+  switch (screen) {
+    case 'traces': view = <TracesScreen key={'traces:' + authVersion} {...common} />; break;
+    case 'trace': view = <TraceScreen key={'trace:' + second + ':' + authVersion} traceId={second} {...common} />; break;
+    case 'sessions':
+      view = second
+        ? <SessionScreen key={'session:' + second + ':' + authVersion} sessionId={second} {...common} />
+        : <SessionsScreen key={'sessions:' + authVersion} {...common} />;
+      break;
+    case 'conversation':
+      view = <ConversationScreen key={'conv:' + second + ':' + third + ':' + authVersion}
+        kind={second} id={third} {...common} />;
+      break;
+    case 'analytics': view = <AnalyticsScreen key={'analytics:' + authVersion} {...common} />; break;
+    case 'latency': view = <LatencyScreen key={'latency:' + authVersion} {...common} />; break;
+    case 'failures': view = <FailuresScreen key={'failures:' + authVersion} {...common} />; break;
+    case 'scores': view = <ScoresScreen key={'scores:' + authVersion} {...common} />; break;
+    case 'experiments': view = <ExperimentsScreen key={'experiments:' + authVersion} {...common} />; break;
+    case 'datasets': view = <DatasetsScreen key={'datasets:' + authVersion} {...common} />; break;
+    case 'tail': view = <TailScreen key={'tail:' + authVersion} {...common} />; break;
+    case 'compare': view = <CompareScreen key={'compare:' + authVersion} {...common} />; break;
+    case 'server': view = <ServerScreen key={'server:' + authVersion} {...common} />; break;
+    case 'store': view = <StoreScreen key={'store:' + authVersion} {...common} />; break;
+    case 'connect': view = <ConnectScreen key={'connect:' + authVersion} {...common} />; break;
+    default: view = <OverviewScreen key={'overview:' + authVersion} {...common} />;
   }
 
-  // Where the current route sits, so every depth has a way out.
-  const crumbs = [];
-  if (head === 'traces' && second) {
-    crumbs.push({ label: 'Spans', to: ['spans'] });
-    crumbs.push(third === 'conversation'
-      ? { label: 'Trace ' + second, to: ['traces', second] }
-      : { label: 'Trace ' + second });
-    if (third === 'conversation') crumbs.push({ label: 'Conversation' });
-  } else if (head === 'sessions' && second) {
-    crumbs.push({ label: 'Sessions', to: ['sessions'] });
-    crumbs.push(third === 'conversation'
-      ? { label: second, to: ['sessions', second] }
-      : { label: second });
-    if (third === 'conversation') crumbs.push({ label: 'Conversation' });
-  }
+  // `traces/<id>` and `sessions/<id>` render the detail screens, but the rail
+  // should still show which section you are in.
+  const railScreen = screen === 'trace' ? 'traces'
+    : screen === 'conversation' ? (second === 'sessions' ? 'sessions' : 'traces')
+      : screen === 'compare' ? 'traces' : screen;
 
-  return <div style={{ minHeight: '100vh', background: 'var(--bg)' }}>
-    <Header recordCount={recordCount} onSetToken={() => setTokenModal(true)} />
-    <main style={{ maxWidth: 1400, margin: '0 auto', padding: '12px 16px' }}>
-      <Tabs tabs={TABS} active={activeTab} onChange={(id) => navigate([id])} style={{ marginBottom: 12 }} />
-      {crumbs.length ? <Breadcrumbs crumbs={crumbs} onBack={() => goBack(['spans'])} onGo={navigate} /> : null}
-      {view}
-    </main>
+  return <div style={{
+    display: 'flex', minHeight: '100vh', background: 'var(--bg)', color: 'var(--ink)',
+    fontFamily: 'var(--font-sans)', fontSize: 13,
+  }}>
+    <NavRail screen={railScreen} ingest={pulse} onGo={(id) => go([id])} />
+    <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column' }}>
+      <Header screen={SCREENS[screen] ? screen : 'overview'}
+        subtitle={screen === 'trace' && second ? second : undefined}
+        recordCount={pulse.records} density={density} onDensity={setDensity}
+        theme={theme} onTheme={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
+        onPalette={() => setPalette(true)} onToken={() => setTokenModal(true)} />
+      <main style={{ flex: 1, minWidth: 0, padding: '16px 20px 64px' }}>{view}</main>
+    </div>
+
+    <CommandPalette open={palette} onClose={() => setPalette(false)}
+      onNavigate={(parts) => go(parts)} />
+
     <Modal open={tokenModal} title="Set token" onClose={() => setTokenModal(false)} footer={<>
       {getToken() ? <Button onClick={() => { setToken(''); setTokenModal(false); setAuthVersion((v) => v + 1); }}>Clear token</Button> : null}
       <Button variant="primary" onClick={applyToken} disabled={!tokenDraft.trim()}>Set token</Button>
@@ -259,6 +194,7 @@ export function App() {
           onKeyDown={(e) => { if (e.key === 'Enter' && tokenDraft.trim()) applyToken(); }} />
       </div>
     </Modal>
+
     <div style={{ position: 'fixed', right: 16, bottom: 16, display: 'grid', gap: 8, zIndex: 60 }}>
       {toasts.map((t) => <Toast key={t.id} status={t.status} title={t.title} detail={t.detail}
         onDismiss={() => setToasts((list) => list.filter((x) => x.id !== t.id))} />)}

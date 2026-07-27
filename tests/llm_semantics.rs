@@ -168,7 +168,7 @@ fn documented_recipes_are_served_by_the_filter_api() {
     let (status, body) = server.request("GET", "/v1/spans?attr.llm.model=gpt-5.6-sol", None);
     assert_eq!(status, 200);
     assert_eq!(
-        body.as_array().map(Vec::len),
+        body["spans"].as_array().map(Vec::len),
         Some(2),
         "model filter: {body}"
     );
@@ -180,7 +180,7 @@ fn documented_recipes_are_served_by_the_filter_api() {
         None,
     );
     assert_eq!(status, 200);
-    let spans = body.as_array().expect("array");
+    let spans = body["spans"].as_array().expect("array");
     assert_eq!(spans.len(), 1);
     assert_eq!(spans[0]["attributes"]["llm.total_tokens"], 200);
 
@@ -191,7 +191,7 @@ fn documented_recipes_are_served_by_the_filter_api() {
         None,
     );
     assert_eq!(status, 200);
-    let spans = body.as_array().expect("array");
+    let spans = body["spans"].as_array().expect("array");
     assert_eq!(spans.len(), 1, "only the 3s completion: {body}");
     assert_eq!(spans[0]["span_id"], "a1");
 
@@ -202,7 +202,7 @@ fn documented_recipes_are_served_by_the_filter_api() {
         None,
     );
     assert_eq!(status, 200);
-    assert_eq!(body.as_array().map(Vec::len), Some(1));
+    assert_eq!(body["spans"].as_array().map(Vec::len), Some(1));
 
     // Payload conventions: prompt/completion ride events verbatim.
     let (status, body) = server.request("GET", "/v1/traces/t1", None);
@@ -244,7 +244,7 @@ fn conventions_flow_through_otlp() {
 
     let (status, body) = server.request("GET", "/v1/spans?attr.llm.model=gpt-5.6-sol", None);
     assert_eq!(status, 200);
-    let spans = body.as_array().expect("array");
+    let spans = body["spans"].as_array().expect("array");
     assert_eq!(spans.len(), 1, "OTLP llm.model indexed: {body}");
     assert_eq!(spans[0]["attributes"]["llm.total_tokens"], 200);
     assert_eq!(spans[0]["events"][0]["attributes"]["content"], "hi");

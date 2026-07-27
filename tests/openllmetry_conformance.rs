@@ -265,11 +265,11 @@ fn openllmetry_spans_populate_sessions_and_rollups() {
     let (status, body) = server.request("GET", "/v1/spans?attr.traceloop.span.kind=llm", None);
     assert_eq!(status, 200);
     assert_eq!(
-        body.as_array().map(Vec::len),
+        body["spans"].as_array().map(Vec::len),
         Some(1),
         "only span A: {body}"
     );
-    assert_eq!(body[0]["span_id"], "a1");
+    assert_eq!(body["spans"][0]["span_id"], "a1");
 
     server.kill();
 }
@@ -312,7 +312,7 @@ fn session_filter_unions_mixed_convention_keys() {
     let (status, body) = server.request("GET", "/v1/spans?session=mix", None);
     assert_eq!(status, 200);
     assert_eq!(
-        body.as_array().map(Vec::len),
+        body["spans"].as_array().map(Vec::len),
         Some(2),
         "session filter unions both keys: {body}"
     );
@@ -322,7 +322,7 @@ fn session_filter_unions_mixed_convention_keys() {
     let (status, body) = server.request("GET", "/v1/spans?attr.session.id=mix", None);
     assert_eq!(status, 200);
     assert_eq!(
-        body.as_array().map(Vec::len),
+        body["spans"].as_array().map(Vec::len),
         Some(1),
         "single key sees half"
     );
@@ -331,7 +331,7 @@ fn session_filter_unions_mixed_convention_keys() {
     let (status, body) = server.request("GET", "/v1/spans?session=mix&name=nope", None);
     assert_eq!(status, 200);
     assert_eq!(
-        body.as_array().map(Vec::len),
+        body["spans"].as_array().map(Vec::len),
         Some(0),
         "name predicate still applies"
     );
@@ -376,7 +376,7 @@ fn a_numeric_session_id_can_be_listed_and_opened() {
     let (status, body) = server.request("GET", "/v1/spans?session=4711", None);
     assert_eq!(status, 200);
     assert_eq!(
-        body.as_array().map(Vec::len),
+        body["spans"].as_array().map(Vec::len),
         Some(1),
         "and its spans are reachable: {body}"
     );
@@ -437,7 +437,7 @@ fn a_re_ingested_span_is_counted_once_in_its_session() {
     let (status, body) = server.request("GET", "/v1/spans?session=mix", None);
     assert_eq!(status, 200);
     assert_eq!(
-        body.as_array().map(Vec::len),
+        body["spans"].as_array().map(Vec::len),
         Some(1),
         "no duplicate from the key union: {body}"
     );

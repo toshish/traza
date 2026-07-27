@@ -23,24 +23,34 @@ traza_wal_fsync_ns_count 4
 Metrics are **per store**, not global. A process holding several stores gets
 separate numbers rather than one meaningless total.
 
-### A caveat you must not skip
+### How accurate the percentiles are
 
 Every stage below is exposed as `_ns_count`, `_ns_sum`, `_ns_max`, `_ns_p50`,
-and `_ns_p99`.
+`_ns_p95`, and `_ns_p99`.
 
-**The `_p50` and `_p99` gauges are approximate by construction.** Latencies land
-in power-of-two nanosecond buckets, so a reported percentile is the **upper
-bound of the bucket** the true value falls in: at most 2x high, never low. A
-p50 of `8388608` means "somewhere in (4 ms, 8 ms]", not "8.388608 ms".
+**A percentile gauge is the upper bound of the bucket the true value falls in:
+at most 1/16 (6.25%) high, never low.** Latencies land in log-linear buckets —
+each power of two split into sixteen even steps — so a p95 of `2818047` means
+"somewhere in (2.64 ms, 2.82 ms]". `_ns_count`, `_ns_sum` and `_ns_max` are
+exact; only the percentiles are bucketed.
 
-They are deliberately **not** exposed as Prometheus histograms with `le`
-buckets, because dressing power-of-two bounds up as a histogram would invite
-quantile math the resolution does not support.
+That bound is small enough to publish, and the dashboard's Server screen does
+publish it — stating the bound alongside the figures rather than implying an
+exactness the buckets do not have. `GET /v1/metrics.json` carries it as
+`percentile_error_bound`.
 
-**Use them to rank stages against each other. Do not publish them as request
-latencies.** `_ns_max` and `_ns_sum` are exact; only the percentiles are
-bucketed. Real request latency is measured from the client, with a plain
-`Instant`, by the benchmarks — see [benchmarking](../internals/benchmarking.md).
+> **This changed.** These buckets used to be plain powers of two, which made a
+> reported percentile up to **2x** the truth — fine for ranking stages against
+> each other, useless on a screen, and this guide said so. Sixteen sub-buckets
+> per octave costs one extra shift on the record path and 8 KiB per histogram,
+> which is the right trade for numbers a person is going to read.
+
+They are still deliberately **not** exposed as Prometheus histograms with `le`
+buckets: a `histogram_quantile` over these bounds would interpolate inside
+buckets whose edges are not where the interpolation assumes.
+
+For an exact end-to-end figure, the benchmarks still measure from the client
+with a plain `Instant` — see [benchmarking](../internals/benchmarking.md).
 
 ### Engine counters
 
@@ -95,11 +105,28 @@ means seals are back-to-back, which is normal under saturation.
 | `traza_http_connections_refused_total` | counter | Connections refused at `--max-connections` with a `503` |
 | `traza_http_connections_live` | gauge | Connections currently open |
 | `traza_http_decoded_spans_total` | counter | Spans decoded from request bodies |
+| `traza_http_responses_{2xx,4xx,5xx}_total` | counter | Responses by status class |
+| `traza_uptime_seconds` | gauge | Seconds since this process began serving |
 | `traza_http_decode_ns_{count,sum,max}` | — | Wire decode. For OTLP protobuf this covers the wire decode **and** the OTLP-to-span mapping, which is the whole cost of accepting a batch on that route |
-| `traza_http_request_ns_{count,sum,max}` | — | End-to-end request handling |
+| `traza_http_request_ns_{count,sum,max,p50,p95,p99}` | — | End-to-end request handling, every route together |
+| `traza_http_{ingest,lookup,search,stats,other}_ns_{count,sum,p50,p95,p99}` | — | The same, split by route class |
 
-`traza_http_decode` and `traza_http_request` expose count, sum, and max only —
-no percentile gauges.
+**Request latency is also split by route class**, because one blended
+histogram over ingest and search described neither: an ingest batch and a
+trace lookup differ by orders of magnitude. The classes are:
+
+| Class | Routes |
+|---|---|
+| `ingest` | `POST /v1/spans`, `POST /v1/traces` |
+| `search` | `GET /v1/spans`, `GET /v1/export` |
+| `lookup` | `GET /v1/traces/…`, `/v1/sessions/…`, `/v1/payloads/…`, `/v1/annotations` |
+| `stats` | `GET /v1/stats*`, `GET /v1/sessions` |
+| `other` | dashboard assets, `/v1/metrics`, `/v1/flush` |
+
+`traza_http_decode` still exposes count, sum and max only. Everything else
+above carries percentiles under the accuracy bound stated at the top of this
+page. [`GET /v1/metrics.json`](../guide/http-api.md#get-v1metricsjson) returns
+all of it as JSON, including that bound.
 
 ## `GET /v1/stats`
 
