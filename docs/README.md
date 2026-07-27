@@ -78,6 +78,10 @@ Changing Traza's code.
 - **[Generations and checkpoints](generations-design.md)** — the proposed
   single-node state boundary that would make backup, export, retention and
   replication one mechanism. Design, not shipped behaviour.
+- **[MCP server](mcp-design.md)** — the proposed embedded Model Context
+  Protocol surface: a curated read API shaped for an agent's context window,
+  its tool set, and the untrusted-content boundary it has to hold. Design, not
+  shipped behaviour.
 - **[High-availability design](ha-design.md)** — the replicated, clustered
   trajectory. Design, not shipped behaviour; today's scope is single-node.
 
