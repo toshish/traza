@@ -67,14 +67,14 @@ pub const MAGIC: [u8; 8] = *b"TRAZASEG";
 /// header would be parsed under this one's field layout and yield offsets that
 /// pass every bounds check while pointing at the wrong bytes.
 ///
-/// **The numbering never restarts.** Versions 1 through 5 were written by
-/// tagged releases — 1 was JSONL, 2 shipped in 0.16/0.17, 3 in 0.18/0.19, and 5
-/// immediately before this. Collapsing the reader to one format does not free
-/// those identifiers: reusing 2 for a different layout would mean a header
-/// declaring "2" is ambiguous between two incompatible files, which is the
-/// precise failure this field exists to prevent. Removing compatibility CODE
-/// and reusing compatibility IDENTIFIERS are different acts, and only the first
-/// is safe.
+/// **The numbering never restarts.** Versions 1 through 5 were all written by
+/// real builds: 1 was JSONL, 2 shipped in 0.16/0.17 and 3 in 0.18/0.19, while
+/// 4 and 5 existed only on unreleased `main`. Collapsing the reader to one
+/// format does not free those identifiers — reusing 2 for a different layout
+/// would mean a header declaring "2" is ambiguous between two incompatible
+/// files, which is the precise failure this field exists to prevent. Removing
+/// compatibility CODE and reusing compatibility IDENTIFIERS are different acts,
+/// and only the first is safe.
 pub const VERSION: u16 = 6;
 /// Fixed header size written by this module.
 pub const HEADER_LEN: usize = 104;

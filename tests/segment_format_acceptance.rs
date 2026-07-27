@@ -883,11 +883,12 @@ fn a_superseded_format_is_refused_rather_than_misread() {
     // pass validation while addressing the wrong bytes. Refusing to open is
     // the only outcome that surfaces as a problem rather than as data.
     //
-    // 1 through 5 are covered because all five were written by tagged releases:
-    // 1 was JSONL, 2 shipped in 0.16/0.17, 3 in 0.18/0.19, 5 immediately before
-    // this. Those identifiers stay spent — reusing one for a different layout
-    // would make a header declaring it ambiguous between two incompatible
-    // files, which is the exact failure the field exists to prevent.
+    // 1 through 5 are covered because all five were written by real builds:
+    // 1 was JSONL, 2 shipped in 0.16/0.17 and 3 in 0.18/0.19, while 4 and 5
+    // existed only on unreleased main. Those identifiers stay spent either way
+    // — reusing one for a different layout would make a header declaring it
+    // ambiguous between two incompatible files, which is the exact failure the
+    // field exists to prevent.
     let records = corpus();
     for stale in [1_u16, 2, 3, 4, 5] {
         let mut bytes = segment::encode(&records).expect("encode");

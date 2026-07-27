@@ -3671,18 +3671,27 @@ fn load_segments(directory: &Path) -> Result<Vec<std::sync::Arc<Segment>>> {
             // a version mismatch — so a single flipped bit in an otherwise
             // intact store was answered with instructions to delete it.
             //
-            // Nothing here ever recommends deleting data. A version mismatch
-            // means the file is intact and another build can read it; the
-            // migration path is an export, not a fresh start.
+            // Nothing here ever recommends deleting data, and nothing claims
+            // more than the check established. A version mismatch is detected
+            // before any section bound is validated, so it does NOT prove the
+            // file is otherwise intact — it says only that another build reads
+            // this layout. The path it points at is a backup taken the way
+            // docs/operations/durability.md requires, not an export: an export
+            // carries spans (buffered ones included, since it pins a snapshot
+            // and the snapshot copies the write buffer) but leaves payload
+            // bytes and annotations behind.
             let detail = match &error {
                 segment::Error::UnsupportedVersion { found, .. } => format!(
-                    "\nCopy the whole data directory before doing anything else. \
-                     Segments, the write-ahead log, payload files and annotations \
-                     are all part of the store, and a span export captures only \
-                     the first: offloaded values stay as $payload references and \
-                     annotations are not included at all.\n{}\n\
-                     Reading the copy with that build is the only lossless path. \
-                     See docs/segment-format.md for the full procedure.",
+                    "\nBack up the directory first — stop the server and copy it, \
+                     or take a filesystem snapshot atomic across the whole \
+                     directory. A file-by-file copy of a running store is not \
+                     safe. A span export is not a substitute: it carries every \
+                     span, buffered ones included, but offloaded values stay as \
+                     $payload references and annotations are not in it at \
+                     all.\n{}\n\
+                     Reading the backup with that build is the lossless path. \
+                     See docs/operations/durability.md and \
+                     docs/segment-format.md.",
                     match found {
                         2 => "Format 2 was written by v0.16 and v0.17.",
                         3 => "Format 3 was written by v0.18 and v0.19.",

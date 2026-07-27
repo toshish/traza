@@ -160,40 +160,31 @@ never advising deletion.
 
 ### Migrating between formats
 
-**Copy the data directory first.** That is the only step that preserves
-everything, and it is the only advice that is unconditionally safe.
+**Take a backup by one of the two procedures in the
+[durability guide](operations/durability.md#backup):** stop the server and copy
+the directory, or take a filesystem snapshot that is atomic across the whole
+directory. Copying a live directory file by file is *not* safe — an in-flight
+flush can change the segment set between files — and that guide is the single
+source of truth for it. Then read the copy with the build that wrote it.
 
-A span export is **not** a full backup, and using one as a migration loses data:
+A span export is a reasonable way to move a **dataset**, but it is not a
+migration of the store:
 
 | Part of the store | In `GET /v1/export`? |
 |---|---|
-| Spans | yes |
-| Offloaded attribute values | **no** — left as `{"$payload": "sha256/…"}` references; the bytes stay in the payload store |
+| Spans | **yes** — every one, as of the instant the export began. It pins a snapshot, and that snapshot copies the write buffer, so spans not yet sealed into a segment are included |
+| Offloaded attribute values | **no** — left as `{"$payload": "sha256/…"}` references; the bytes stay in `payloads/` |
 | Annotations | **no** — a separate surface (`/v1/annotations`) the export does not touch |
-| Write-ahead log | not applicable — its contents are spans, but any unflushed tail is lost unless the source store was flushed first |
 
-The design document is explicit about the underlying reason: a span export
-"cannot pin [annotations and payload bytes] at all" — there is no consistent
-point across the store's independent recovery domains for it to pin
-([generations-design.md](generations-design.md)). Closing that gap is what the
+The design document gives the underlying reason: a span export "cannot pin
+[annotations and payload bytes] at all" — there is no consistent point across
+the store's independent recovery domains for it to pin
+([generations-design.md](generations-design.md)). Closing that is what the
 generation/checkpoint boundary is for, and it is scheduled before 1.0.
 
-So the honest procedure today is: **copy the directory, and read the copy with
-the build that wrote it.** Export-and-reingest is a partial path, acceptable
-only when you know the store has no offloaded payloads and no annotations.
-
-**The numbering does not restart.** Removing compatibility code and reusing
-compatibility identifiers are different acts. A header declaring "2" must stay
-unambiguously the layout v0.16 wrote, so those identifiers stay spent and the
-one readable format is **6**.
-
-**The version word stays.** Two bytes per file, and it is the difference
-between refusing to open a format this reader does not know and parsing its
-header at these offsets — which yields section bounds that pass every
-validation check while addressing the wrong bytes. That failure surfaces as
-corrupt records rather than as an unreadable file, which is the worse of the
-two. `a_superseded_format_is_refused_rather_than_misread` in
-`tests/segment_format_acceptance.rs` pins it.
+So export-and-reingest is a complete migration only for a store with no
+offloaded payloads and no annotations. Otherwise: back up, and read the backup
+with the build that wrote it.
 
 ### The policy from here
 
