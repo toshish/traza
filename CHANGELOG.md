@@ -7,7 +7,146 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Aggregations no longer block ingest.** `fold_spans` held the writer and
+  segment locks for the length of a full-corpus scan, so any series, duration,
+  failure or slowest query stalled writes until it finished — and the Overview
+  screen starts four at once. It now folds against a snapshot: one copy of the
+  bounded write buffer, one reference per segment, locks released before the
+  scan. That also makes an aggregate a reading of one instant rather than of a
+  moving store. Guarded by `tests/fold_concurrency.rs`, which fails against the
+  previous implementation.
+
+- **Three arithmetic overflows reachable from valid requests.** A span with
+  `end_time_ns = u64::MAX` panicked the duration histogram's top bucket bound;
+  `until=u64::MAX` overflowed the series bucket width; `limit=u64::MAX`
+  overflowed the tail's allocation. Debug builds panicked and closed the
+  connection with no response; release builds would have wrapped, producing
+  wrong series math and an effectively unbounded limit. All three now use
+  checked or saturating arithmetic, with endpoint caps where a bound is also
+  the right policy.
+
+- **Failure grouping was unbounded in memory.** Every distinct
+  `(service, name, status)` allocated a duration histogram and `limit` applied
+  only after collecting them all, so high-cardinality error text — an id in a
+  span name — could reach gigabytes before returning twenty rows. Bounded at
+  4,096 signatures, with `spans_untracked` reporting what the bound excluded.
+
+- **The dashboard could state a durability guarantee the server never made.**
+  Both the Server and Overview screens printed the `wal` sentence — "survives a
+  kill-9, a panic, or an OS crash" — unconditionally, and Overview read a
+  `durability` field `/v1/metrics.json` did not have, defaulting it to `wal`.
+  A `buffered` server, which promises the opposite, was described as durable.
+  The field is now served, and the wording is derived from it in one place.
+
+- **Drag-to-zoom silently reverted.** An absolute window serialized into the
+  hash as `t=""` and read back as the `1h` default, so every brush selection
+  snapped back to the last hour. Absolute ranges now round-trip as
+  `t=<since>-<until>`, and a malformed one falls back instead of becoming a
+  range of nonsense.
+
+- **Live tail could skip spans permanently.** It advanced its watermark to
+  `max(start_time_ns) + 1` and ignored `next_cursor`, so when more spans shared
+  the last timestamp of a page than the page held — routine for an SDK-batched
+  flush — the remainder were never returned. It now drains by cursor, and
+  overlapping ticks are prevented rather than deduplicated after the fact.
+
+- **`AbortSignal` did not cancel the request.** The shared coalesced request
+  was started with no signal, so aborting rejected the caller's promise while
+  the fetch, connection and server-side scan continued — the opposite of the
+  intent on a screen that re-queries per keystroke. Subscribers are now
+  reference-counted: one leaving cancels nothing, the last one cancels the work.
+
+- **A screen labelled "live" never refreshed.** Overview resolved its window
+  once at mount and polled nothing, so every figure was frozen at the moment
+  the tab opened while the live dot pulsed over it.
+
+- **Failure shares were computed against truncated data.** Both screens summed
+  the groups they had been sent — a page cut to a limit — and used that as the
+  denominator, inflating every signature's share of "all failures". The API now
+  returns `total`, counted before truncation.
+
+- **A series window near the top of the `u64` range still panicked.** The
+  previous round fixed the bucket width and left the bucket *starts* unchecked
+  three lines below it, so `since + width * index` overflowed for any window
+  close to `u64::MAX`. The saturating ceiling was also one nanosecond short per
+  bucket on a full-range window, leaving the last bucket ending before the
+  window did. Starts are saturating and clamped to `until`; the ceiling is
+  quotient plus non-zero remainder.
+
+- **The live tail stranded bursts one page budget further out.** Carrying the
+  cursor only *within* a tick moved the threshold from 200 rows to 1,000 rather
+  than removing it: a burst larger than the budget was still abandoned, and the
+  watermark cannot rescue it because every span in an equal-timestamp burst is
+  `>= since`. An unfinished cursor chain now survives the tick that could not
+  finish it, and the watermark advances only once the chain is exhausted. The
+  polling state machine moved to `ui/src/lib/tail.js` so it is testable without
+  a DOM — which is where both of its bugs were actually found.
+
+- **Overview compared the wrong periods.** One selected window was split down
+  the middle, so "24h" showed the last twelve hours against the twelve before
+  them while the label said "previous 24h" — and the failure and model cards
+  queried the full 24 hours, so three cards on one screen described three
+  different spans of time. Two full periods are resolved now: the series covers
+  both with the midpoint exactly on the boundary, and the other cards are
+  scoped to the current period.
+
+- **A settling request could evict its own replacement.** The in-flight map was
+  cleared unconditionally in the finalizer, so an aborted request finishing
+  after a fresh one had taken its slot deleted the live entry and made the next
+  caller open a third. Eviction is identity-checked.
+
+- **Overview's refresh was partial.** The tick re-ran the window-dependent
+  reads but sessions and metrics kept empty dependency arrays, so "Server, in
+  its own words" stayed frozen under a live indicator.
+
+- **A paused tail buffered duplicates.** `since` is inclusive and the paused
+  path skipped the primary-key check, so a quiet page was re-buffered until it
+  filled. Both paths share one dedupe now.
+
+- **A drained equal-timestamp burst replayed forever.** The dedupe set was
+  evicted by size, but a burst sharing one timestamp cannot advance the
+  inclusive watermark, so its keys are needed on every later poll: 1,250 spans
+  at one timestamp cycled 1000, 250, 1000, 250… indefinitely. The set now
+  retains exactly the keys ON the watermark and prunes only when it moves —
+  bounded by one timestamp's membership, which is the minimum that is correct.
+  The previous test stopped the moment the drain completed, which is precisely
+  where the replay began.
+
+- **A filter change could admit rows from the previous filter.** Replacing the
+  tail's state and clearing the screen does not un-send a request; an in-flight
+  poll still resolved and appended its old-filter rows. Responses are checked
+  against a generation token.
+
+- **Overview's period p95 was the worst bucket's p95.** `max(bucket.p95)` is
+  not a percentile of a period, and one sparse slow bucket dragged it into
+  seconds while the true figure sat in milliseconds. Each period now reads a
+  duration histogram folded over the whole period.
+
+- **The top model's spend share used a truncated denominator.**
+  `/v1/stats/llm?limit=6` returns six rows, and their subtotal was the
+  denominator, so the share inflated by whatever the limit left out. The
+  series' total cost is the honest one.
+
+- **Resuming a paused tail reversed its chronology.** The buffer is already
+  newest-first, so reversing it handed back an oldest-first block.
+
+- **Query cost under-reported content pruning.** Both search paths incremented
+  the process-wide counter but not the per-query `segments_pruned`, so a
+  content-narrowed search understated the work it had avoided.
+
 ### Changed
+
+- **The logo is the revised mark from the design system.** The bars gained a
+  stem, so the mark resolves as a lowercase "t" rather than four unanchored
+  rows. It is a component now (`ui/src/components/Logo.jsx`) rather than SVG
+  inlined per site, defaulting to `currentColor` because the design system is
+  explicit that an img-referenced SVG cannot inherit page color and the
+  reversed lockup depends on it. The wordmark's tracking was a step off the
+  brand card (-0.01em against -0.02em). The favicon now uses the three-bar
+  variant the system specifies for 16px, where the four-bar mark loses its
+  rows.
 
 - **Segment format v4: the attribute index is keyed by digest, not by value
   text.** Through v3 the index held every distinct attribute value resident,
@@ -65,6 +204,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **`traza_records_admitted_by_content_total`** in `/v1/metrics`. A content
   index that stops pruning returns byte-identical results and simply gets
   slower, so these counters are the only way to see it happen.
+- **`status=` and `not_status=` on span search.** Every aggregate in the store
+  counted errors from `Span::status`, but nothing could select on it: the
+  filter walked `span.attributes` only. The natural-looking `attr.status=error`
+  therefore matched an *attribute* most instrumentation never writes and
+  returned an empty array indistinguishable from "no errors" — and the docs
+  used exactly that expression as their motivating example. "Show me the
+  failures" is now a query the API can answer.
+
+- **Cursor pagination on `GET /v1/spans`.** The engine has had `query_after`
+  and a total order for as long as export has existed; the HTTP surface never
+  exposed it, so clients paged by re-requesting with a larger `limit` — which
+  re-reads and re-sends every row already in hand. Responses now carry
+  `next_cursor`, and a short page carries `null` rather than a token that could
+  only return nothing.
+
+- **Per-query cost in the span-search response.** `cost.elapsed_ns`,
+  `segments_examined` and `segments_pruned`, counted per query rather than
+  sampled from the process-wide counters, which race under concurrent readers
+  and cannot be attributed. Traza's argument is that filtered search is cheap;
+  this is the evidence rather than the assertion.
+
+- **`GET /v1/stats/series`, `/duration`, `/failures`, `/slowest`.**
+  Aggregations that answer "where should I look": volume, errors, tokens, cost
+  and duration percentiles bucketed over a window; the duration distribution;
+  errors grouped by `(service, name, status)` with first/last seen and an
+  example to open; and the slowest matching spans ranked across the whole match
+  set. All four fold in one pass and constant memory through a new
+  `Store::fold_spans`, so the cost of an aggregate is proportional to the
+  answer rather than to the corpus — a twenty-bucket histogram no longer
+  materializes a million spans to produce it.
+
+- **`GET /v1/metrics.json`**, and **request latency split by route class**
+  (`ingest`, `lookup`, `search`, `stats`, `other`). One blended histogram over
+  ingest and search described neither: they differ by orders of magnitude. Also
+  adds `traza_uptime_seconds` and `traza_http_responses_{2xx,4xx,5xx}_total`.
 
 - **`traza_wal_lock_wait_ns_*` and `traza_wal_write_syscall_ns_*`** in
   `/v1/metrics`, splitting the log append into waiting for Traza's log lock
@@ -84,6 +258,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   measurement record behind the memory figures, with commit SHA, machine,
   timestamp, load average per row, `compacted_away`, and the raw per-cell
   results. The prose numbers were previously traceable only to a binary.
+
+### Changed
+
+- **Latency percentiles are now publishable: at most 6.25% high, never low.**
+  The stage histograms used plain power-of-two buckets, so a reported
+  percentile could be **2x** the truth — fine for ranking stages against each
+  other, and this project's own monitoring guide said in as many words not to
+  publish them as request latencies. Each octave is now split into sixteen even
+  steps. The record path gains one shift; each histogram grows to 8 KiB and
+  moves behind a `Box` so a `Store` does not carry 80 KiB inline. `_ns_p95` is
+  emitted alongside `_ns_p50`/`_ns_p99`, since p95 is the figure the README and
+  the dashboard both quote.
+
+- **`GET /v1/annotations` no longer requires `trace_id`**, and gained
+  `source` (prefix match), `since`, `until` and `limit`. Scores are produced
+  per trace but are only meaningful as a population; requiring a trace meant an
+  eval run could be read only one trace at a time, which is to say not at all.
+
+- **`GET /v1/spans` returns an envelope**, `{spans, next_cursor, cost}`, rather
+  than a bare array — the carrier for the two items above.
+
+- **The dashboard is rebuilt: seventeen screens on a left rail** grouped by the
+  question you arrived with, replacing four tabs over five views. New: Overview,
+  Latency, Failures, Scores, Experiments, Datasets, Live tail, Trace compare,
+  Server, Connect. Rebuilt: Traces (predicate builder reaching the whole
+  parameter surface, drag-to-zoom volume brush, sortable columns, cursor
+  paging, query cost) and Trace detail (time ruler, minimap, drag zoom,
+  subtree collapse, critical path, self time, agent mode).
+
+  A query is now a value that serializes into the hash route, so the search
+  that found the bug is a link you can send; `⌘K` opens a palette that takes a
+  pasted trace id, which previously had no front door at all. Reads carry an
+  `AbortSignal` so a superseded query stops occupying a connection, identical
+  in-flight GETs are coalesced, and polling stops in a background tab.
 
 ### Fixed
 

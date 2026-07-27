@@ -43,6 +43,60 @@ pub struct Annotation {
     pub timestamp_ns: u64,
 }
 
+/// Narrowings for an annotation search. Every supplied field must match; an
+/// empty query returns everything, newest first.
+#[derive(Clone, Debug, Default)]
+pub struct AnnotationQuery<'a> {
+    /// Restrict to one trace. Optional — scores are read across traces.
+    pub trace_id: Option<&'a str>,
+    /// Restrict to one span within the trace.
+    pub span_id: Option<&'a str>,
+    /// Restrict to one annotation name, for example `groundedness`.
+    pub name: Option<&'a str>,
+    /// Restrict to sources starting with this, so `human:` and `eval:`
+    /// separate a review queue from a nightly run without an exact match.
+    pub source_prefix: Option<&'a str>,
+    /// Recorded at or after this Unix-nanosecond timestamp.
+    pub since_ns: Option<u64>,
+    /// Recorded at or before this Unix-nanosecond timestamp.
+    pub until_ns: Option<u64>,
+    /// Maximum returned, applied after ordering.
+    pub limit: Option<usize>,
+}
+
+impl AnnotationQuery<'_> {
+    fn matches(&self, annotation: &Annotation) -> bool {
+        if self
+            .span_id
+            .is_some_and(|span_id| annotation.span_id != span_id)
+        {
+            return false;
+        }
+        if self.name.is_some_and(|name| annotation.name != name) {
+            return false;
+        }
+        if self
+            .source_prefix
+            .is_some_and(|prefix| !annotation.source.starts_with(prefix))
+        {
+            return false;
+        }
+        if self
+            .since_ns
+            .is_some_and(|since| annotation.timestamp_ns < since)
+        {
+            return false;
+        }
+        if self
+            .until_ns
+            .is_some_and(|until| annotation.timestamp_ns > until)
+        {
+            return false;
+        }
+        true
+    }
+}
+
 const LOG_NAME: &str = "annotations.jsonl";
 
 /// The append-only annotation log plus its in-memory trace index.
@@ -176,6 +230,55 @@ impl AnnotationLog {
                     .collect()
             })
             .unwrap_or_default())
+    }
+
+    /// Annotations matching every supplied narrowing, newest first.
+    ///
+    /// Unlike [`Self::query`] this does not require a trace: scores are
+    /// produced per trace but read across them — an eval run is a population,
+    /// not a lookup — and requiring `trace_id` meant the only way to see a
+    /// run's results was to already know every trace in it. The index is fully
+    /// in memory and annotation volume is human/eval scale, so the cross-trace
+    /// path is a scan of that map rather than anything touching a segment.
+    pub(crate) fn search(&self, narrow: &AnnotationQuery<'_>) -> Result<Vec<Annotation>> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| Error::LockPoisoned("annotations"))?;
+        let mut found: Vec<Annotation> = Vec::new();
+        let consider = |entries: &Vec<Annotation>, found: &mut Vec<Annotation>| {
+            for annotation in entries {
+                if narrow.matches(annotation) {
+                    found.push(annotation.clone());
+                }
+            }
+        };
+        match narrow.trace_id {
+            Some(trace_id) => {
+                if let Some(entries) = inner.by_trace.get(trace_id) {
+                    consider(entries, &mut found);
+                }
+            }
+            None => {
+                for entries in inner.by_trace.values() {
+                    consider(entries, &mut found);
+                }
+            }
+        }
+        // Newest first, then a stable tiebreak so equal timestamps — which
+        // a bulk eval import produces by the thousand — page deterministically.
+        found.sort_by(|left, right| {
+            right
+                .timestamp_ns
+                .cmp(&left.timestamp_ns)
+                .then_with(|| left.trace_id.cmp(&right.trace_id))
+                .then_with(|| left.span_id.cmp(&right.span_id))
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        if let Some(limit) = narrow.limit {
+            found.truncate(limit);
+        }
+        Ok(found)
     }
 
     /// Drops annotations older than `cutoff_ns` by rewriting the log

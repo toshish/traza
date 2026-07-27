@@ -60,3 +60,95 @@ export function fmtAvgLatency(durationNs, calls) {
   if (!calls) return '';
   return fmtDurationNs(durationNs / calls);
 }
+
+/** Clock time only: "08:20Z". Axis ticks and dense rows have no room for the
+    date, and every one of them shares the window shown above. */
+export function fmtClockNs(ns) {
+  if (!ns) return '';
+  return new Date(ns / 1e6).toISOString().slice(11, 16) + 'Z';
+}
+
+/** How long ago, coarsely: "4m", "2h", "3d". Recency is a glance, not a
+    measurement — anything finer invites reading precision that is not there. */
+export function fmtAgo(ns, now = Date.now()) {
+  if (!ns) return '';
+  const seconds = Math.max(0, (now - ns / 1e6) / 1000);
+  if (seconds < 60) return Math.floor(seconds) + 's';
+  if (seconds < 3600) return Math.floor(seconds / 60) + 'm';
+  if (seconds < 86400) return Math.floor(seconds / 3600) + 'h';
+  return Math.floor(seconds / 86400) + 'd';
+}
+
+/** A rate as a per-second figure: "4,812/s". */
+export function fmtRate(perSecond) {
+  if (!Number.isFinite(perSecond)) return '—';
+  if (perSecond >= 1000) return Math.round(perSecond).toLocaleString('en-US') + '/s';
+  if (perSecond >= 10) return perSecond.toFixed(0) + '/s';
+  return perSecond.toFixed(1) + '/s';
+}
+
+/** A ratio as a whole percent: "96%". */
+export function fmtPercent(part, whole) {
+  if (!whole) return '0%';
+  return Math.round((part / whole) * 100) + '%';
+}
+
+/** A signed relative change: "+41%", "−12%", or "—" when there is no base to
+    compare against. The minus is a real minus sign, not a hyphen: these sit
+    in tabular-nums columns where a hyphen reads a full step narrower. */
+export function fmtDelta(current, previous) {
+  if (!previous || !Number.isFinite(current) || !Number.isFinite(previous)) return '';
+  const change = (current - previous) / previous;
+  if (!Number.isFinite(change)) return '';
+  const sign = change >= 0 ? '+' : '−';
+  const magnitude = Math.abs(change);
+  if (magnitude >= 10) return sign + magnitude.toFixed(1) + '×';
+  return sign + Math.round(magnitude * 100) + '%';
+}
+
+/** A window's endpoints, disambiguated.
+
+    Clock-only endpoints are ambiguous for exactly the windows people use
+    most: a 24h range reads "21:21Z – 21:21Z", which looks like an empty
+    window rather than a full day. Anything spanning half a day or more
+    carries its dates. */
+export function fmtWindowLabel(sinceNs, untilNs) {
+  if (!sinceNs || !untilNs) return 'all time';
+  const span = untilNs - sinceNs;
+  const since = new Date(sinceNs / 1e6).toISOString();
+  const until = new Date(untilNs / 1e6).toISOString();
+  if (span >= 12 * 3600e9) {
+    return `${since.slice(0, 10)} ${since.slice(11, 16)} – ${until.slice(0, 10)} ${until.slice(11, 16)}Z`;
+  }
+  return `${since.slice(11, 16)} – ${until.slice(11, 16)}Z`;
+}
+
+/** What an acknowledged write actually guarantees, in the server's own terms.
+
+    This lives here, once, because a screen must never phrase it itself. Both
+    the Server and Overview screens used to print the `wal` sentence — "survives
+    a kill-9, a panic, or an OS crash" — unconditionally, so a `buffered`
+    server, which promises the exact opposite, was told it was durable. An
+    unknown mode says so rather than guessing: the honest answer to "what does
+    this promise" is sometimes "I have not been told". */
+export function durabilityMeans(mode) {
+  switch (mode) {
+    case 'wal':
+      return 'an acknowledged write is fsynced to the write-ahead log and recovered on restart, so it survives a kill‑9, a panic, or an OS crash';
+    case 'flushed':
+      return 'an acknowledged write is already sealed into a segment before the response, the strongest mode and the slowest';
+    case 'buffered':
+      return 'an acknowledged write is in memory only and is lost if this process dies — fast, and not durable';
+    default:
+      return 'the server has not reported a durability mode';
+  }
+}
+
+/** Uptime as "6 d 04:11", the shape the Server screen states it in. */
+export function fmtUptime(ns) {
+  const total = Math.floor(ns / 1e9);
+  const days = Math.floor(total / 86400);
+  const hours = String(Math.floor((total % 86400) / 3600)).padStart(2, '0');
+  const minutes = String(Math.floor((total % 3600) / 60)).padStart(2, '0');
+  return (days ? days + ' d ' : '') + hours + ':' + minutes;
+}

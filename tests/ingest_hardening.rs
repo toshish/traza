@@ -213,7 +213,7 @@ fn end_before_start_is_stored_and_never_panics_queries() {
     let (status, body) = server.request("GET", "/v1/spans?min_duration_ns=1", None);
     assert_eq!(status, 200);
     assert_eq!(
-        body.as_array().map(Vec::len),
+        body["spans"].as_array().map(Vec::len),
         Some(0),
         "inverted span has saturated zero duration"
     );
@@ -234,7 +234,7 @@ fn query_parameter_extremes_are_rejected_or_bounded() {
     // limit=0 is honored (empty page), huge limits are fine, junk is 400.
     let (status, body) = server.request("GET", "/v1/spans?limit=0", None);
     assert_eq!(status, 200);
-    assert_eq!(body.as_array().map(Vec::len), Some(0));
+    assert_eq!(body["spans"].as_array().map(Vec::len), Some(0));
     let (status, _) = server.request("GET", "/v1/spans?limit=18446744073709551615", None);
     assert_eq!(status, 200);
     for bad in [

@@ -146,3 +146,70 @@ describe('messageText', () => {
     expect(messageText(message)).toBe('see this\n[image a.png s3://b/a.png]');
   });
 });
+
+// ---------------------------------------------------------------- self time
+// Added with the rebuilt waterfall: a bar shows where time WAS, self time
+// shows where it WENT, and the two differ whenever a span has children.
+
+import { selfTimeNs, criticalPath, childrenOf } from './spans.js';
+
+const node = (id, parent, start, end) => ({
+  span_id: id, parent_span_id: parent, trace_id: 't',
+  start_time_ns: start, end_time_ns: end, name: id, service: 's', status: 'ok',
+});
+
+describe('selfTimeNs', () => {
+  it('is the whole duration when a span has no children', () => {
+    expect(selfTimeNs(node('a', null, 0, 100), [])).toBe(100);
+  });
+
+  it('subtracts a child that covers part of the span', () => {
+    expect(selfTimeNs(node('a', null, 0, 100), [node('b', 'a', 10, 60)])).toBe(50);
+  });
+
+  it('unions overlapping children rather than summing them', () => {
+    // Two concurrent tool calls are the normal case in an agent trace.
+    // Summing them would double-count the overlap and report negative
+    // self time on a span that was simply waiting on both at once.
+    const children = [node('b', 'a', 0, 60), node('c', 'a', 30, 80)];
+    expect(selfTimeNs(node('a', null, 0, 100), children)).toBe(20);
+  });
+
+  it('never goes negative when children outlast their parent', () => {
+    expect(selfTimeNs(node('a', null, 0, 50), [node('b', 'a', 0, 90)])).toBe(0);
+  });
+
+  it('counts a gap between children as the parent working', () => {
+    const children = [node('b', 'a', 0, 20), node('c', 'a', 60, 80)];
+    expect(selfTimeNs(node('a', null, 0, 100), children)).toBe(60);
+  });
+});
+
+describe('criticalPath', () => {
+  it('follows the child that finishes last at each level', () => {
+    const spans = [
+      node('root', null, 0, 100),
+      node('slow', 'root', 10, 90),
+      node('fast', 'root', 10, 20),
+      node('deep', 'slow', 20, 85),
+    ];
+    const path = criticalPath(spans);
+    expect(path.has('root')).toBe(true);
+    expect(path.has('slow')).toBe(true);
+    expect(path.has('deep')).toBe(true);
+    expect(path.has('fast')).toBe(false);
+  });
+
+  it('is empty for an empty trace rather than throwing', () => {
+    expect(criticalPath([]).size).toBe(0);
+  });
+});
+
+describe('childrenOf', () => {
+  it('groups spans under their parent and ignores roots', () => {
+    const spans = [node('root', null, 0, 10), node('a', 'root', 1, 2), node('b', 'root', 3, 4)];
+    const kids = childrenOf(spans);
+    expect(kids.get('root').map((s) => s.span_id)).toEqual(['a', 'b']);
+    expect(kids.has(null)).toBe(false);
+  });
+});

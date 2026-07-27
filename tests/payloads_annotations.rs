@@ -398,9 +398,18 @@ fn server_round_trips_payloads_annotations_and_export() {
     assert_eq!(status, 200);
     assert_eq!(body["annotations"][0]["value"], "up");
 
-    // Missing trace_id is a 400; unknown params rejected.
-    let (status, _) = server.json("GET", "/v1/annotations", None);
-    assert_eq!(status, 400);
+    // An unfiltered query is a cross-trace read, not an error: scores are
+    // recorded per trace but read as a population. Unknown params are still
+    // rejected — a typo must fail loudly rather than widen the result.
+    let (status, body) = server.json("GET", "/v1/annotations", None);
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        !body["annotations"]
+            .as_array()
+            .expect("annotations")
+            .is_empty(),
+        "an unfiltered query returns every annotation: {body}"
+    );
     let (status, _) = server.json("GET", "/v1/annotations?trace_id=t&x=1", None);
     assert_eq!(status, 400);
 
