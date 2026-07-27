@@ -237,12 +237,14 @@ the rest of the matrix below — every 10%-distinct row, 8 KiB, 64 KiB,
 clustering, `--payload-threshold-bytes` — **has not been re-measured since
 v4** and is marked accordingly.
 
-### The v3 figures, kept for stores written before v4
+### The text-keyed index figures, kept as the baseline they were measured under
 
-Every row in this section describes the text-keyed index. A v2 or v3 segment
-still opens, and its values are hashed and discarded at open time, so these
-costs do **not** persist after an upgrade — but they are what the recorded
-figures elsewhere in this repository were measured under.
+Every row in this section describes the superseded text-keyed attribute index.
+No readable segment uses it any more — the format collapsed to a single version
+and the decoder that read it was removed — so these costs describe nothing the
+store can produce today. They are kept because they are what the recorded
+figures elsewhere in this repository were measured against, and a comparison
+with no baseline is not a comparison.
 
 One indexed text attribute, `--flush-spans 10000`, 256 MiB of text per row:
 
