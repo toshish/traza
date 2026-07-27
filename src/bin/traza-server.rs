@@ -1737,7 +1737,11 @@ fn stream_tail(
                 // with nothing to deduplicate them, and claiming to have
                 // recovered an interval that no query can actually address.
                 cursor = None;
-                opening_backfill = backfill.max(DEFAULT_TAIL_BACKFILL);
+                // The subscriber's own backfill, not a forced default. A client
+                // that asked for zero history wants zero history after a gap
+                // too — overriding it sent four retained spans to a caller that
+                // had explicitly requested none.
+                opening_backfill = backfill;
                 let payload = json!({"missed": missed});
                 format!("event: gap\ndata: {payload}\n\n")
             }

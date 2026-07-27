@@ -440,6 +440,10 @@ A line beginning `:` is a comment — the heartbeat, sent every 15 seconds on a
 quiet store. It is how an intermediary is kept from reaping the connection and
 how the server discovers a client has gone.
 
+**A gap does not change `backfill`.** After a gap the stream resumes with the
+backlog you asked for — including none, if you asked for `backfill=0`. The
+server does not substitute a default.
+
 **A streamed span has been acknowledged.** Entries reach the stream only after
 the ingest that carried them succeeded — after the write-ahead log's fsync, and
 after the seal that `--durability flushed` promises. The tail is bounded and may

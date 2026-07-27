@@ -303,3 +303,45 @@ describe('the tail client', () => {
     expect(announced).toContain('reconnecting');
   });
 });
+
+describe('a gap the server cannot count is still a visible gap', () => {
+  it('reports an unknown count as null, never as zero', async () => {
+    // A cursor from before a restart cannot be compared to the new process's
+    // numbering, so `missed` is genuinely unknown and arrives as null. Folding
+    // that into a running total made it zero, which rendered no warning while
+    // the view was cleared underneath — the invisible discontinuity this
+    // feature exists to remove, reintroduced at the last hop. The consumer has
+    // to be able to tell "none were lost" from "we cannot know how many".
+    const state = newTailState();
+    state.cursor = '111.5';
+    const seen = [];
+    const controller = new AbortController();
+
+    await runTail(state, {
+      open: async () => source([gapFrame(null)]),
+      signal: controller.signal,
+      sleep: async () => controller.abort(),
+      onGap: (missed) => seen.push(missed),
+    });
+
+    expect(seen).toEqual([null]);
+    expect(seen[0]).not.toBe(0);
+    expect(state.cursor).toBeNull();
+  });
+
+  it('passes a known count through as a number', async () => {
+    const state = newTailState();
+    state.cursor = '111.5';
+    const seen = [];
+    const controller = new AbortController();
+
+    await runTail(state, {
+      open: async () => source([gapFrame(42)]),
+      signal: controller.signal,
+      sleep: async () => controller.abort(),
+      onGap: (missed) => seen.push(missed),
+    });
+
+    expect(seen).toEqual([42]);
+  });
+});
