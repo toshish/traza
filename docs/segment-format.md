@@ -151,12 +151,36 @@ the encoding that predated digests. Those branches were removed and the header
 fields became plain values, so the pruning path no longer carries a case where
 it cannot prune.
 
-**Versions 1 through 5 shipped.** 1 was JSONL; 2 was written by v0.16 and
-v0.17; 3 by v0.18 and v0.19; 5 up to the commit before this one. None of them
-open now. The README's pre-1.0 terms permit an on-disk break between 0.x
-versions, and this is one: `Store::open` refuses such a segment, names it, and
-points at back-up plus `GET /v1/export` and re-ingest — never at deleting the
-directory, which would answer a recoverable condition with data loss.
+**Versions 1 through 5 are spent.** 1 was JSONL. 2 was written by v0.16 and
+v0.17, 3 by v0.18 and v0.19. **4 and 5 were never released** — they existed only
+on unreleased `main`, so no tag writes them and no tag reads them. None of the
+five opens now. The README's pre-1.0 terms permit an on-disk break between 0.x
+versions, and this is one: `Store::open` refuses such a segment and names it,
+never advising deletion.
+
+### Migrating between formats
+
+**Copy the data directory first.** That is the only step that preserves
+everything, and it is the only advice that is unconditionally safe.
+
+A span export is **not** a full backup, and using one as a migration loses data:
+
+| Part of the store | In `GET /v1/export`? |
+|---|---|
+| Spans | yes |
+| Offloaded attribute values | **no** — left as `{"$payload": "sha256/…"}` references; the bytes stay in the payload store |
+| Annotations | **no** — a separate surface (`/v1/annotations`) the export does not touch |
+| Write-ahead log | not applicable — its contents are spans, but any unflushed tail is lost unless the source store was flushed first |
+
+The design document is explicit about the underlying reason: a span export
+"cannot pin [annotations and payload bytes] at all" — there is no consistent
+point across the store's independent recovery domains for it to pin
+([generations-design.md](generations-design.md)). Closing that gap is what the
+generation/checkpoint boundary is for, and it is scheduled before 1.0.
+
+So the honest procedure today is: **copy the directory, and read the copy with
+the build that wrote it.** Export-and-reingest is a partial path, acceptable
+only when you know the store has no offloaded payloads and no annotations.
 
 **The numbering does not restart.** Removing compatibility code and reusing
 compatibility identifiers are different acts. A header declaring "2" must stay
