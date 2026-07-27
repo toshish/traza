@@ -284,4 +284,49 @@ export const api = {
 
   exportPath: (filters) => '/v1/export' + query(filters),
   spansPath: (filters) => '/v1/spans' + query(filters),
+
+  /** One JSON-RPC call against the MCP endpoint.
+   *
+   *  Not routed through `read`: this is a POST, it is not coalescable by URL,
+   *  and — the reason it exists at all — a 404 here is a *state to display*
+   *  ("MCP is off") rather than an error to raise. The MCP screen shows the
+   *  live surface by asking the server for it, so what it lists is what an
+   *  agent would actually be offered rather than what this build believes.
+   *
+   *  Returns `{enabled, result, error}`. A JSON-RPC error is returned, not
+   *  thrown, for the same reason: it is the server's answer. */
+  mcp: async (method, params, signal) => {
+    let response;
+    try {
+      response = await fetch('/v1/mcp', {
+        method: 'POST',
+        headers: authHeaders({
+          'Content-Type': 'application/json',
+          'MCP-Protocol-Version': MCP_PROTOCOL_VERSION,
+        }),
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params: params || {} }),
+        signal,
+      });
+    } catch (e) {
+      if (isAbort(e)) throw e;
+      throw new ApiError(0, 'The server did not respond.',
+        'Check that traza-server is running and reachable, then retry.');
+    }
+    if (response.status === 404) return { enabled: false };
+    if (response.status === 401) {
+      if (unauthorizedHandler) unauthorizedHandler();
+      throw new ApiError(401, 'The MCP endpoint needs a bearer token.',
+        'Set a token from TRAZA_TOKENS with "Set token", then retry.');
+    }
+    const data = await response.json().catch(() => null);
+    if (!response.ok) {
+      throw new ApiError(response.status, (data && data.error) || 'MCP request failed.',
+        'See the server log for detail.');
+    }
+    return { enabled: true, result: data && data.result, error: data && data.error };
+  },
 };
+
+/** The revision the dashboard speaks. Sent on every MCP call, because the
+    server answers 400 to one it does not serve rather than guessing. */
+export const MCP_PROTOCOL_VERSION = '2025-11-25';
