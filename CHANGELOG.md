@@ -34,6 +34,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   logical length left it bypassable by a `Vec` grown large and truncated, which
   keeps its whole allocation.
 
+  The screen itself is under test now (`ui/src/views/TailScreen.test.jsx`,
+  jsdom + Testing Library), which found four defects nothing else could reach:
+  **resume produced no rows** — `setRows` was given an updater that read
+  `buffer.current`, and the buffer was cleared before React ran it; **every
+  keystroke in the service filter opened a new stream**, eight connections for
+  "checkout", now settled over 250 ms; **row keys included the array index**, so
+  prepending a batch changed every key and rebuilt all 300 rows per frame, now a
+  client-assigned id; and **a full pause buffer discarded its overflow
+  silently**, now counted and shown. The rate window is bounded by samples as
+  well as by duration.
+
   A gap is a **visible** discontinuity even when the server cannot count it. A
   cursor from before a restart is not comparable to the new numbering, so
   `missed` is `null` rather than a number, and the client shows the break

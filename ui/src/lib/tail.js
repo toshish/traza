@@ -183,9 +183,19 @@ export async function runTail(state, options) {
 // It is a value and three functions now. The component holds one piece of state
 // and renders what `gapLabel` returns.
 
-/** No gaps seen. */
+/** No spans unseen. */
 export function newGapState() {
-  return { missed: 0, uncounted: 0 };
+  return { missed: 0, uncounted: 0, dropped: 0 };
+}
+
+/** Records spans this client discarded because the paused buffer was full.
+ *
+ *  A different cause from a gap — the server had these and sent them; the tab
+ *  chose not to keep them — but the same consequence for the person reading the
+ *  screen, so it is surfaced rather than swallowed. Dropping is right: an
+ *  unbounded pause buffer is how a tab dies. Dropping quietly is not. */
+export function recordDropped(state, count) {
+  return count > 0 ? { ...state, dropped: state.dropped + count } : state;
 }
 
 /** Records one gap. `missed` is a number when the server could count the loss,
@@ -207,8 +217,37 @@ export function recordGap(state, missed) {
  *  figure, so it is rendered as one. Reporting "5 missed" when an earlier break
  *  could not be counted states a precision the data does not have. */
 export function gapLabel(state, format = String) {
-  if (state.uncounted && state.missed) return `${format(state.missed)}+ missed`;
+  const counted = state.missed + state.dropped;
+  if (state.uncounted && counted) return `${format(counted)}+ missed`;
   if (state.uncounted) return 'spans missed';
-  if (state.missed) return `${format(state.missed)} missed`;
+  if (counted) return `${format(counted)} missed`;
   return null;
+}
+
+/** Why spans are missing, in a sentence, for the label's tooltip.
+ *
+ *  The causes are genuinely different — the stream outran the server's ring,
+ *  the stream broke across a restart, the paused buffer filled — and a single
+ *  number cannot say which happened. The label carries the count; this carries
+ *  the explanation. */
+export function gapDetail(state) {
+  const causes = [];
+  if (state.missed) {
+    causes.push(
+      `${state.missed} never reached this tab: the stream fell further behind than the server retains.`,
+    );
+  }
+  if (state.uncounted) {
+    causes.push(
+      'At least one break could not be counted — a server restart renumbers the stream, so the loss across it is not measurable.',
+    );
+  }
+  if (state.dropped) {
+    causes.push(
+      `${state.dropped} arrived while paused and were discarded: the pause buffer is capped so a long pause cannot exhaust the tab.`,
+    );
+  }
+  if (!causes.length) return '';
+  causes.push('Anything missing is still in the store — search for it on Traces.');
+  return causes.join(' ');
 }

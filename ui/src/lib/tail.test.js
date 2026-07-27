@@ -2,7 +2,9 @@ import { describe, it, expect } from 'vitest';
 import {
   newGapState,
   recordGap,
+  recordDropped,
   gapLabel,
+  gapDetail,
   newTailState, runTail, createFramer, parseFrame, backoffMs,
   RECONNECT_MIN_MS, RECONNECT_MAX_MS,
 } from './tail.js';
@@ -384,5 +386,39 @@ describe('gap bookkeeping', () => {
     state = recordGap(state, 9);
     expect(gapLabel(state)).toBe('9+ missed');
     expect(gapLabel(newGapState())).toBeNull();
+  });
+});
+
+describe('spans dropped by a full pause buffer', () => {
+  it('counts toward the same warning as a server-side gap', () => {
+    // Different cause, same consequence for the reader: spans that existed and
+    // will not appear here. Dropping the overflow is correct — an unbounded
+    // pause buffer is how a tab dies — but doing it silently is not.
+    let state = newGapState();
+    state = recordDropped(state, 100);
+    expect(gapLabel(state)).toBe('100 missed');
+    state = recordGap(state, 5);
+    expect(gapLabel(state)).toBe('105 missed');
+  });
+
+  it('ignores a drop of nothing', () => {
+    expect(gapLabel(recordDropped(newGapState(), 0))).toBeNull();
+  });
+
+  it('explains each cause separately, because one number cannot', () => {
+    let state = newGapState();
+    state = recordGap(state, 5);
+    state = recordDropped(state, 100);
+    state = recordGap(state, null);
+    const detail = gapDetail(state);
+    expect(detail).toContain('5 never reached this tab');
+    expect(detail).toContain('100 arrived while paused');
+    expect(detail).toContain('could not be counted');
+    // And the label is a floor, because one of the three breaks has no number.
+    expect(gapLabel(state)).toBe('105+ missed');
+  });
+
+  it('says nothing when nothing is missing', () => {
+    expect(gapDetail(newGapState())).toBe('');
   });
 });
