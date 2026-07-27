@@ -27,7 +27,7 @@ export function newTailState() {
     sinceNs: null,
     // An unfinished {cursor, base}, carried BETWEEN ticks.
     chain: null,
-    seen: new Set(),
+    seen: new Map(),
   };
 }
 
@@ -37,15 +37,18 @@ export function newTailState() {
  *  envelope. `state` is mutated; `now` is injectable so a test does not depend
  *  on the clock.
  *
- *  Two invariants make this correct rather than merely incremental:
+ *  Three invariants make this correct rather than merely incremental:
  *
  *  - Paging is by cursor. A watermark cannot separate spans that share a
  *    timestamp, and an SDK flush routinely produces hundreds that do.
  *  - The watermark advances ONLY when a chain is exhausted. Moving it mid-chain
  *    re-reads the burst's prefix forever, because every span in an
  *    equal-timestamp burst is `>= since`.
+ *  - The dedupe set retains exactly the keys ON the watermark, and is pruned
+ *    only when the watermark moves. Evicting by size instead made a burst
+ *    that cannot advance the watermark replay indefinitely.
  */
-export async function pollOnce(state, fetchPage, { filter = {}, maxRows = 300, now = Date.now() } = {}) {
+export async function pollOnce(state, fetchPage, { filter = {}, now = Date.now() } = {}) {
   const continuing = state.chain;
   // Continuing reuses the chain's ORIGINAL base: a cursor is only meaningful
   // against the filter it was issued for, and re-deriving `since` mid-chain
@@ -68,19 +71,33 @@ export async function pollOnce(state, fetchPage, { filter = {}, maxRows = 300, n
   }
   state.chain = exhausted ? null : { cursor, base };
 
+  // One dedupe for every consumer. `since` is inclusive, so every span AT the
+  // watermark returns on the next tick; the paused path used to skip this and
+  // re-buffer a quiet page until it filled.
+  //
+  // `seen` maps key -> start time rather than being a plain set, because
+  // pruning it correctly needs each key's timestamp and the spans themselves
+  // are long gone by the next tick.
+  const added = fresh.filter((span) => !state.seen.has(spanKey(span)));
+  for (const span of added) state.seen.set(spanKey(span), span.start_time_ns);
+
   if (exhausted && fresh.length) {
     state.sinceNs = fresh[fresh.length - 1].start_time_ns;
+    // Retain exactly the keys sitting ON the inclusive watermark; drop the
+    // rest, which `since` can never return again.
+    //
+    // Evicting by SIZE is wrong here in a way that never settles: a burst
+    // sharing one timestamp cannot advance the watermark, so its keys are
+    // needed on every later poll — dropping them made 1,250 spans at one
+    // timestamp replay 1000, 250, 1000, 250… forever. Pruning against only
+    // the CURRENT tick's spans is wrong too, and was the first attempt at
+    // this: the earlier ticks' keys are equally on the watermark, and
+    // forgetting them replays exactly the prefix they covered.
+    for (const [key, startNs] of state.seen) {
+      if (startNs !== state.sinceNs) state.seen.delete(key);
+    }
   } else if (!fresh.length && state.sinceNs == null) {
     state.sinceNs = Math.round(now * 1e6);
-  }
-
-  // One dedupe for every consumer. `since` is inclusive, so the span the
-  // watermark points at returns on the next tick; the paused path used to skip
-  // this and re-buffer a quiet page until it filled.
-  const added = fresh.filter((span) => !state.seen.has(spanKey(span)));
-  for (const span of added) state.seen.add(spanKey(span));
-  if (state.seen.size > maxRows * 4) {
-    state.seen = new Set(added.map(spanKey));
   }
   return added;
 }

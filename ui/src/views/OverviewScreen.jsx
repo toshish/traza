@@ -123,6 +123,27 @@ export function OverviewScreen({ go }) {
     [current.sinceNs, current.untilNs],
     { skip: !current.sinceNs },
   );
+  // p95 comes from a duration histogram PER PERIOD, not from the series.
+  //
+  // `max(bucket.p95)` is not the p95 of a period — it is the worst bucket's
+  // p95, which a single sparse slow bucket drags into seconds while the true
+  // period p95 sits in milliseconds. There is no way to combine per-bucket
+  // percentiles into a period percentile; the distribution has to be folded
+  // over the whole period, which is exactly what /v1/stats/duration does.
+  const durationNow = useRead(
+    (signal) => api.duration({
+      since: Math.round(current.sinceNs), until: Math.round(current.untilNs),
+    }, signal),
+    [current.sinceNs, current.untilNs],
+    { skip: !current.sinceNs },
+  );
+  const durationBefore = useRead(
+    (signal) => api.duration({
+      since: Math.round(previous.sinceNs), until: Math.round(previous.untilNs),
+    }, signal),
+    [previous.sinceNs, previous.untilNs],
+    { skip: !previous.sinceNs },
+  );
   // These two are window-independent, but they are still on a screen labelled
   // live, so they follow the tick like everything else.
   const sessions = useRead((signal) => api.sessions({ limit: 5 }, signal), [tick]);
@@ -138,8 +159,8 @@ export function OverviewScreen({ go }) {
   const errors = sum(now, 'errors');
   const cost = sum(now, 'cost_usd');
   const tokens = sum(now, 'total_tokens');
-  const p95 = Math.max(...now.map((b) => b.p95_ns || 0), 0);
-  const p95Before = Math.max(...before.map((b) => b.p95_ns || 0), 0);
+  const p95 = durationNow.data?.p95_ns ?? 0;
+  const p95Before = durationBefore.data?.p95_ns ?? 0;
 
   const worstFailure = failures.data?.groups?.[0];
   // The server's own count of every matching span, not the sum of the five
@@ -147,7 +168,11 @@ export function OverviewScreen({ go }) {
   // share read as a far larger fraction of failures than it was.
   const totalFailures = failures.data?.total ?? 0;
   const topModel = models.data?.rows?.[0];
-  const modelCost = (models.data?.rows || []).reduce((t, r) => t + r.cost_usd, 0);
+  // Total spend from the SERIES, which covers every model, not the subtotal of
+  // the six rows the limit returned. Summing a truncated list inflates the top
+  // model's share by exactly what was left out — and the more models exist,
+  // the more confident the wrong number looks.
+  const modelCost = cost;
 
   const loading = series.loading || failures.loading;
   const error = series.error || failures.error;

@@ -48,11 +48,14 @@ describe('the live tail drains an equal-timestamp burst completely', () => {
     const state = newTailState();
     state.sinceNs = 0; // watching from before the burst
 
+    // Poll a fixed number of times, deliberately CONTINUING past the drain.
+    // The previous version of this test stopped the moment the corpus was
+    // complete, which is precisely where the replay started: the next poll
+    // returned the first 1,000 all over again.
     const collected = [];
     for (let tick = 0; tick < 12; tick += 1) {
       // eslint-disable-next-line no-await-in-loop
       collected.push(...await pollOnce(state, server.fetchPage, { now: 1_000_000 }));
-      if (!state.chain && collected.length >= corpus.length) break;
     }
 
     expect(collected.length).toBe(1250);
@@ -121,6 +124,60 @@ describe('the live tail drains an equal-timestamp burst completely', () => {
     expect(later.map((s) => s.start_time_ns)).toEqual([9_000]);
   });
 
+  it('never re-delivers a burst it has already drained', async () => {
+    // The failure mode this pins: 1,250 spans at one timestamp cannot advance
+    // the watermark, so evicting their keys by SIZE made the poll return
+    // 1000, 250, 1000, 250… indefinitely.
+    const corpus = Array.from({ length: 1250 }, (_, i) => span(i, 5_000));
+    const server = fakeServer(corpus);
+    const state = newTailState();
+    state.sinceNs = 0;
+
+    let drained = 0;
+    for (let tick = 0; tick < 4; tick += 1) {
+      // eslint-disable-next-line no-await-in-loop
+      drained += (await pollOnce(state, server.fetchPage, { now: 1_000_000 })).length;
+    }
+    expect(drained).toBe(1250);
+
+    // Every later poll must be silent.
+    for (let tick = 0; tick < 6; tick += 1) {
+      // eslint-disable-next-line no-await-in-loop
+      expect(await pollOnce(state, server.fetchPage, { now: 1_000_000 })).toEqual([]);
+    }
+  });
+
+  it('retains exactly the keys on the watermark, and prunes when it moves', async () => {
+    // The set must hold one timestamp's membership: enough to dedupe an
+    // inclusive floor, and no more. Pruning against only the current tick's
+    // spans — the first attempt — forgot the earlier ticks' keys, which are
+    // equally on the watermark, and replayed exactly the prefix they covered.
+    const corpus = Array.from({ length: 600 }, (_, i) => span(i, 5_000));
+    const server = fakeServer(corpus);
+    const state = newTailState();
+    state.sinceNs = 0;
+
+    while (true) {
+      // eslint-disable-next-line no-await-in-loop
+      const batch = await pollOnce(state, server.fetchPage, { now: 1_000_000 });
+      if (!state.chain && batch.length === 0) break;
+    }
+    expect(state.sinceNs).toBe(5_000);
+    expect(state.seen.size).toBe(600); // all of them sit on the watermark
+
+    // A span at a LATER timestamp moves the watermark and the set shrinks to
+    // that timestamp's membership.
+    server.add(span(9001, 9_000));
+    let arrived = [];
+    for (let tick = 0; tick < 4 && !arrived.length; tick += 1) {
+      // eslint-disable-next-line no-await-in-loop
+      arrived = await pollOnce(state, server.fetchPage, { now: 1_000_000 });
+    }
+    expect(arrived.length).toBe(1);
+    expect(state.sinceNs).toBe(9_000);
+    expect(state.seen.size).toBe(1);
+  });
+
   it('bounds the dedupe set instead of growing without limit', async () => {
     const state = newTailState();
     const corpus = Array.from({ length: 2_000 }, (_, i) => span(i, 1_000 + i));
@@ -128,8 +185,9 @@ describe('the live tail drains an equal-timestamp burst completely', () => {
     state.sinceNs = 0;
     for (let tick = 0; tick < 20; tick += 1) {
       // eslint-disable-next-line no-await-in-loop
-      await pollOnce(state, server.fetchPage, { maxRows: 50, now: 1_000_000 });
+      await pollOnce(state, server.fetchPage, { now: 1_000_000 });
     }
-    expect(state.seen.size).toBeLessThanOrEqual(50 * 4 + PAGE * MAX_PAGES_PER_TICK);
+    // Distinct timestamps, so only the last one's membership is retained.
+    expect(state.seen.size).toBeLessThanOrEqual(PAGE * MAX_PAGES_PER_TICK);
   });
 });

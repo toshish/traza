@@ -883,3 +883,80 @@ fn a_series_covers_its_window_for_ordinary_sizes_too() {
     }
     server.kill();
 }
+
+#[test]
+fn a_period_percentile_is_not_the_worst_buckets_percentile() {
+    // The Overview screen derived a period p95 as `max(bucket.p95)` over the
+    // series. That is not a percentile of the period, and this corpus shows
+    // how far apart the two can be: one sparse bucket of slow spans sits
+    // beside many buckets of fast ones, so the worst bucket's p95 is seconds
+    // while the period's p95 is milliseconds.
+    let dir = test_dir("period-p95");
+    let server = Server::spawn(&dir);
+
+    let mut spans: Vec<Value> = Vec::new();
+    // 23 buckets' worth of fast traffic: 100 spans each at 1ms.
+    for bucket in 0..23u64 {
+        for index in 0..100u64 {
+            let start = BASE_NS + bucket * 1_000_000_000 + index;
+            spans.push(json!({
+                "trace_id": format!("fast-{bucket}-{index}"), "span_id": "s",
+                "name": "op", "service": "svc", "status": "ok",
+                "start_time_ns": start, "end_time_ns": start + 1_000_000,
+                "attributes": {},
+            }));
+        }
+    }
+    // One sparse bucket: 3 spans at 10 seconds each.
+    for index in 0..3u64 {
+        let start = BASE_NS + 23 * 1_000_000_000 + index;
+        spans.push(json!({
+            "trace_id": format!("slow-{index}"), "span_id": "s",
+            "name": "op", "service": "svc", "status": "ok",
+            "start_time_ns": start, "end_time_ns": start + 10_000_000_000u64,
+            "attributes": {},
+        }));
+    }
+    let (status, body) = server.request("POST", "/v1/spans", Some(&json!({"spans": spans})));
+    assert_eq!(status, 200, "{body}");
+
+    let until = BASE_NS + 24_000_000_000;
+    let (_, series) = server.request(
+        "GET",
+        &format!("/v1/stats/series?since={BASE_NS}&until={until}&buckets=24"),
+        None,
+    );
+    let worst_bucket_p95 = series["buckets"]
+        .as_array()
+        .expect("buckets")
+        .iter()
+        .map(|bucket| bucket["p95_ns"].as_u64().unwrap_or(0))
+        .max()
+        .unwrap_or(0);
+
+    let (_, duration) = server.request(
+        "GET",
+        &format!("/v1/stats/duration?since={BASE_NS}&until={until}"),
+        None,
+    );
+    let period_p95 = duration["p95_ns"].as_u64().expect("p95_ns");
+
+    // The period's p95: 2,303 spans, 3 of them slow — the 95th percentile is
+    // comfortably inside the fast population.
+    assert!(
+        period_p95 < 100_000_000,
+        "the true period p95 should be milliseconds, got {period_p95}: {duration}"
+    );
+    // The worst bucket's p95 is the slow one, three orders of magnitude away.
+    assert!(
+        worst_bucket_p95 > 5_000_000_000,
+        "the worst bucket should be seconds, got {worst_bucket_p95}: {series}"
+    );
+    assert!(
+        worst_bucket_p95 > period_p95 * 50,
+        "max-of-buckets ({worst_bucket_p95}) must be shown to diverge wildly \
+         from the period p95 ({period_p95}) — that divergence is why the screen \
+         reads the histogram instead"
+    );
+    server.kill();
+}

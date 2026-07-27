@@ -34,12 +34,19 @@ export function TailScreen({ go }) {
   // The polling state machine lives in lib/tail.js so it can be tested without
   // a DOM — which is where its two real bugs were found.
   const tail = React.useRef(newTailState());
+  // Which filter the in-flight poll belongs to. Replacing the state and
+  // clearing the screen does not un-send a request: a poll started under the
+  // old filter still resolves, and appended its rows to a screen now showing a
+  // different one. The generation is checked after the await.
+  const generation = React.useRef(0);
 
   // Reset when the filter changes: a narrower tail should show what is arriving
   // now, not resume a cursor chain belonging to the wider one.
   React.useEffect(() => {
+    generation.current += 1;
     tail.current = newTailState();
     buffer.current = [];
+    inFlight.current = false;
     setRows([]);
     setPending(0);
   }, [service, errorsOnly]);
@@ -50,18 +57,23 @@ export function TailScreen({ go }) {
     // twice.
     if (inFlight.current) return;
     inFlight.current = true;
+    const mine = generation.current;
+    const state = tail.current;
     try {
       const added = await pollOnce(
-        tail.current,
+        state,
         (params) => api.spans(params),
         {
           filter: {
             service: service || undefined,
             status: errorsOnly ? 'error' : undefined,
           },
-          maxRows: MAX_ROWS,
         },
       );
+
+      // The filter changed while this was in flight: these rows describe a
+      // query nobody is looking at any more.
+      if (mine !== generation.current) return;
 
       const now = performance.now();
       if (lastTick.current) {
@@ -86,7 +98,10 @@ export function TailScreen({ go }) {
   }, TICK_MS, true);
 
   const resume = () => {
-    setRows((all) => [...buffer.current.reverse(), ...all].slice(0, MAX_ROWS));
+    // The buffer is already newest-first — each tick prepends its own
+    // newest-first batch — so reversing it here handed back an oldest-first
+    // block on top of a newest-first list.
+    setRows((all) => [...buffer.current, ...all].slice(0, MAX_ROWS));
     buffer.current = [];
     setPending(0);
     setPaused(false);

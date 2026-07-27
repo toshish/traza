@@ -105,11 +105,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path skipped the primary-key check, so a quiet page was re-buffered until it
   filled. Both paths share one dedupe now.
 
+- **A drained equal-timestamp burst replayed forever.** The dedupe set was
+  evicted by size, but a burst sharing one timestamp cannot advance the
+  inclusive watermark, so its keys are needed on every later poll: 1,250 spans
+  at one timestamp cycled 1000, 250, 1000, 250… indefinitely. The set now
+  retains exactly the keys ON the watermark and prunes only when it moves —
+  bounded by one timestamp's membership, which is the minimum that is correct.
+  The previous test stopped the moment the drain completed, which is precisely
+  where the replay began.
+
+- **A filter change could admit rows from the previous filter.** Replacing the
+  tail's state and clearing the screen does not un-send a request; an in-flight
+  poll still resolved and appended its old-filter rows. Responses are checked
+  against a generation token.
+
+- **Overview's period p95 was the worst bucket's p95.** `max(bucket.p95)` is
+  not a percentile of a period, and one sparse slow bucket dragged it into
+  seconds while the true figure sat in milliseconds. Each period now reads a
+  duration histogram folded over the whole period.
+
+- **The top model's spend share used a truncated denominator.**
+  `/v1/stats/llm?limit=6` returns six rows, and their subtotal was the
+  denominator, so the share inflated by whatever the limit left out. The
+  series' total cost is the honest one.
+
+- **Resuming a paused tail reversed its chronology.** The buffer is already
+  newest-first, so reversing it handed back an oldest-first block.
+
 - **Query cost under-reported content pruning.** Both search paths incremented
   the process-wide counter but not the per-query `segments_pruned`, so a
   content-narrowed search understated the work it had avoided.
 
 ### Changed
+
+- **The logo is the revised mark from the design system.** The bars gained a
+  stem, so the mark resolves as a lowercase "t" rather than four unanchored
+  rows. It is a component now (`ui/src/components/Logo.jsx`) rather than SVG
+  inlined per site, defaulting to `currentColor` because the design system is
+  explicit that an img-referenced SVG cannot inherit page color and the
+  reversed lockup depends on it. The wordmark's tracking was a step off the
+  brand card (-0.01em against -0.02em). The favicon now uses the three-bar
+  variant the system specifies for 16px, where the four-bar mark loses its
+  rows.
 
 - **Segment format v4: the attribute index is keyed by digest, not by value
   text.** Through v3 the index held every distinct attribute value resident,
