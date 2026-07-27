@@ -2,7 +2,9 @@ import React from 'react';
 import { api } from '../lib/api.js';
 import { fmtClockNs, fmtDurationNs, fmtNum, fmtRate } from '../lib/format.js';
 import { Card, Chip, LiveDot, Mono } from '../components/primitives/Chrome.jsx';
-import { newTailState, runTail, newGapState, recordGap, gapLabel } from '../lib/tail.js';
+import {
+  newTailState, runTail, newGapState, recordGap, recordDropped, gapLabel, gapDetail,
+} from '../lib/tail.js';
 
 // Spans as they land — over one held connection, not a poll.
 //
@@ -17,6 +19,15 @@ import { newTailState, runTail, newGapState, recordGap, gapLabel } from '../lib/
 // heartbeat every fifteen seconds.
 
 const MAX_ROWS = 300;
+// How long typing has to settle before the filter is applied. Each change
+// tears down the streaming connection and opens another, so a filter bound
+// straight to the input opened one connection per keystroke — eight for
+// "checkout", each a request, a scan and a fresh backlog.
+const FILTER_SETTLE_MS = 250;
+// Arrival timestamps kept for the rate window. The window is a duration, but
+// under load it also has to be a count: one timestamp per span with no cap
+// makes a burst its own memory problem in the tab.
+const MAX_ARRIVAL_SAMPLES = 2_000;
 // Arrival rate is averaged over a sliding window rather than computed per
 // frame. Spans arrive in bursts of whatever the SDK flushed, so a per-frame
 // rate is a number that swings between zero and enormous and reads as noise.
@@ -37,14 +48,29 @@ export function TailScreen({ go }) {
   // bugs — an unknown count folded to zero, and a reset that cleared only half
   // the state — survived because nothing but React could reach it.
   const [gapState, setGapState] = React.useState(newGapState);
+  // `service` is what the input shows; `appliedService` is what the stream is
+  // filtered by, and it trails the input until typing stops.
   const [service, setService] = React.useState('');
+  const [appliedService, setAppliedService] = React.useState('');
   const [errorsOnly, setErrorsOnly] = React.useState(false);
   const buffer = React.useRef([]);
+  // Rows carry a client-assigned id so React can keep them mounted. Their
+  // primary key cannot serve: the same (trace, span) may legitimately be
+  // admitted twice, once per update. The array index cannot either — it shifts
+  // on every prepend, which changed every key and rebuilt all 300 rows per
+  // frame.
+  const nextRowId = React.useRef(0);
   const arrivals = React.useRef([]);
   // `paused` is read inside a long-lived async loop, which closed over the
   // value it had when the stream opened. The ref is what the loop reads.
   const pausedRef = React.useRef(false);
   pausedRef.current = paused;
+
+  React.useEffect(() => {
+    if (service === appliedService) return undefined;
+    const settle = setTimeout(() => setAppliedService(service), FILTER_SETTLE_MS);
+    return () => clearTimeout(settle);
+  }, [service, appliedService]);
 
   React.useEffect(() => {
     // One subscription per filter. Aborting is what ends the previous loop and
@@ -65,7 +91,7 @@ export function TailScreen({ go }) {
     arrivals.current = [];
 
     const filter = {
-      service: service || undefined,
+      service: appliedService || undefined,
       status: errorsOnly ? 'error' : undefined,
     };
 
@@ -87,13 +113,25 @@ export function TailScreen({ go }) {
         const now = Date.now();
         arrivals.current = arrivals.current
           .filter((at) => now - at < RATE_WINDOW_MS)
-          .concat(spans.map(() => now));
+          .concat(spans.map(() => now))
+          .slice(-MAX_ARRIVAL_SAMPLES);
         setRate((arrivals.current.length * 1000) / RATE_WINDOW_MS);
 
         // Newest first, matching the table's order.
-        const newestFirst = spans.slice().reverse();
+        const newestFirst = spans
+          .slice()
+          .reverse()
+          .map((span) => {
+            nextRowId.current += 1;
+            return { span, id: nextRowId.current };
+          });
         if (pausedRef.current) {
-          buffer.current = [...newestFirst, ...buffer.current].slice(0, MAX_ROWS);
+          const combined = [...newestFirst, ...buffer.current];
+          buffer.current = combined.slice(0, MAX_ROWS);
+          // Overflow is discarded on purpose, and said out loud. Silently
+          // dropping spans the reader believes they are queued to see is the
+          // same hole a gap would be.
+          setGapState((state) => recordDropped(state, combined.length - buffer.current.length));
           setPending(buffer.current.length);
         } else {
           setRows((all) => [...newestFirst, ...all].slice(0, MAX_ROWS));
@@ -120,14 +158,19 @@ export function TailScreen({ go }) {
       controller.abort();
       clearInterval(decay);
     };
-  }, [service, errorsOnly]);
+  }, [appliedService, errorsOnly]);
 
   const resume = () => {
-    // The buffer is already newest-first — each tick prepends its own
-    // newest-first batch — so reversing it here handed back an oldest-first
-    // block on top of a newest-first list.
-    setRows((all) => [...buffer.current, ...all].slice(0, MAX_ROWS));
+    // Read the buffer OUT before clearing it. A `setRows` updater runs during
+    // the later render, not at this call, so an updater that reads
+    // `buffer.current` saw the empty array this function had already assigned —
+    // and resuming produced no rows at all.
+    //
+    // The buffer is already newest-first — each batch prepends its own
+    // newest-first block — so it goes straight on top.
+    const held = buffer.current;
     buffer.current = [];
+    setRows((all) => [...held, ...all].slice(0, MAX_ROWS));
     setPending(0);
     setPaused(false);
   };
@@ -153,9 +196,7 @@ export function TailScreen({ go }) {
         setGapState(newGapState());
       }}>Clear</Chip>
       {gapLabel(gapState, fmtNum) ? <Chip
-        title={gapState.uncounted
-          ? 'The stream broke and the view was rebuilt from the live edge. At least one break could not be counted — a server restart renumbers the stream, so the loss across it is not measurable. Anything missing is still in the store; search for it on Traces.'
-          : 'The stream fell further behind than the server retains, so these spans never reached this view. They are still in the store — search for them on Traces.'}
+        title={gapDetail(gapState)}
         style={{ background: 'var(--warn-tint)', borderColor: 'var(--warn)', color: 'var(--warn)' }}>
         {gapLabel(gapState, fmtNum)}
       </Chip> : null}
@@ -185,9 +226,9 @@ export function TailScreen({ go }) {
       {rows.length === 0 ? <div style={{ padding: '18px 14px', fontSize: 13, color: 'var(--ink-muted)' }}>
         Waiting for spans. Anything ingested from now on appears here.
       </div> : null}
-      {rows.map((span, index) => {
+      {rows.map(({ span, id }, index) => {
         const error = span.status === 'error';
-        return <div key={span.trace_id + span.span_id + index}
+        return <div key={id}
           onClick={() => go(['trace', span.trace_id], { span: span.span_id })}
           role="link" tabIndex={0}
           onKeyDown={(e) => { if (e.key === 'Enter') go(['trace', span.trace_id], { span: span.span_id }); }}
