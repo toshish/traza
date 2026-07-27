@@ -787,3 +787,76 @@ fn a_failed_ingest_never_reaches_the_tail() {
         ids(&after)
     );
 }
+
+#[test]
+fn a_gap_honours_an_explicit_request_for_no_backlog() {
+    // `backfill=0` means "I want nothing but what arrives from now". After a
+    // gap the server used to substitute its own default, so a subscriber that
+    // had explicitly asked for no history was handed a screenful of retained
+    // spans it never wanted — and, worse, spans that predate the break it was
+    // just told about.
+    let dir = test_dir("http-gap-zero-backfill");
+    let server = Server::spawn_with(&dir, &["--tail-ring-spans", "4"]);
+
+    server.ingest(json!([{
+        "trace_id": "t1", "span_id": "first", "name": "op", "service": "svc",
+        "start_time_ns": 1_000_u64, "end_time_ns": 2_000_u64, "status": "ok",
+    }]));
+
+    let stale = {
+        let (_head, mut stream) = Stream::open(&server, "?backfill=100");
+        let opening = stream.next_spans();
+        opening["cursor"].as_str().expect("cursor").to_owned()
+    };
+
+    // Turn the ring over so the position is unusable.
+    for index in 0..24 {
+        server.ingest(json!([{
+            "trace_id": "t1", "span_id": format!("x{index}"), "name": "op",
+            "service": "svc", "start_time_ns": 3_000_u64 + index as u64,
+            "end_time_ns": 4_000_u64, "status": "ok",
+        }]));
+    }
+
+    let (_head, mut stream) = Stream::open(&server, &format!("?cursor={stale}&backfill=0"));
+
+    // Consume the gap frame.
+    loop {
+        let frame = stream.frame();
+        if frame.starts_with("event: gap") {
+            break;
+        }
+        assert!(
+            frame.starts_with(':'),
+            "unexpected frame before the gap: {frame}"
+        );
+    }
+
+    // Now a fresh span arrives. It — and nothing before it — must be what the
+    // subscriber receives.
+    server.ingest(json!([{
+        "trace_id": "t1", "span_id": "after-the-gap", "name": "op",
+        "service": "svc", "start_time_ns": 9_000_u64, "end_time_ns": 9_500_u64,
+        "status": "ok",
+    }]));
+
+    // Collect every span the stream delivers until the new one shows up. The
+    // frame immediately after a gap is legitimately empty — it carries the
+    // subscriber's new position — so the property under test is not "the next
+    // frame has one span" but "no retained span is ever delivered".
+    let mut delivered: Vec<String> = Vec::new();
+    for _ in 0..20 {
+        let batch = stream.next_spans();
+        for span in batch["spans"].as_array().expect("spans") {
+            delivered.push(span["span_id"].as_str().expect("id").to_owned());
+        }
+        if delivered.iter().any(|id| id == "after-the-gap") {
+            break;
+        }
+    }
+    assert_eq!(
+        delivered,
+        vec!["after-the-gap".to_owned()],
+        "backfill=0 must stay zero across a gap; got {delivered:?}"
+    );
+}

@@ -411,29 +411,33 @@ fn advanced(read: &TailRead, from: Option<TailCursor>) -> bool {
 /// to the same span: the write-ahead log serializes it in full.
 fn approximate_bytes(span: &Span) -> usize {
     const OVERHEAD: usize = std::mem::size_of::<Span>();
+    /// Charged per map entry and per collection element, matching `value_bytes`.
+    const ENTRY: usize = 48 + std::mem::size_of::<String>() + std::mem::size_of::<Value>();
+
     let mut total = OVERHEAD
-        + span.trace_id.len()
-        + span.span_id.len()
-        + span.name.len()
-        + span.status.len()
-        + span.service.len()
-        + span.parent_span_id.as_ref().map_or(0, String::len);
+        + span.trace_id.capacity()
+        + span.span_id.capacity()
+        + span.name.capacity()
+        + span.status.capacity()
+        + span.service.capacity()
+        + span.parent_span_id.as_ref().map_or(0, String::capacity);
     for (key, value) in &span.attributes {
-        total += key.len() + value_bytes(value);
+        total += ENTRY + key.capacity() + value_bytes(value);
     }
     for (key, value) in &span.extra {
-        total += key.len() + value_bytes(value);
+        total += ENTRY + key.capacity() + value_bytes(value);
     }
     for event in &span.events {
-        total += event.name.len();
+        total += std::mem::size_of::<crate::Event>() + event.name.capacity();
         for (key, value) in &event.attributes {
-            total += key.len() + value_bytes(value);
+            total += ENTRY + key.capacity() + value_bytes(value);
         }
     }
     for link in &span.links {
-        total += link.trace_id.len() + link.span_id.len();
+        total +=
+            std::mem::size_of::<crate::Link>() + link.trace_id.capacity() + link.span_id.capacity();
         for (key, value) in &link.attributes {
-            total += key.len() + value_bytes(value);
+            total += ENTRY + key.capacity() + value_bytes(value);
         }
     }
     total
@@ -441,14 +445,31 @@ fn approximate_bytes(span: &Span) -> usize {
 
 /// Heap held by one JSON value, recursively.
 fn value_bytes(value: &Value) -> usize {
+    // Every element of an array and every entry of a map costs a whole `Value`
+    // slot regardless of what it holds, plus the container's own bookkeeping.
+    //
+    // The first version counted only text: scalars were free and a container
+    // cost eight bytes per element. That made the byte budget bypassable by
+    // shape rather than by size — deeply nested structured JSON with no long
+    // strings in it measured at a small fraction of what it actually held, so
+    // 128 spans could take 150 MB against a 32 MiB ceiling the accounting
+    // believed was barely touched. Anything the ring holds has to be counted,
+    // and where the exact cost is an allocator detail the estimate rounds up.
+    const SLOT: usize = std::mem::size_of::<Value>();
+    const KEY: usize = std::mem::size_of::<String>();
+    /// Per-entry overhead of the map `serde_json` builds. A rounded-up stand-in
+    /// for node and hashing structure that no public API exposes.
+    const ENTRY: usize = 48;
+
     match value {
-        Value::String(text) => text.len(),
-        Value::Array(items) => items.iter().map(value_bytes).sum::<usize>() + 8 * items.len(),
+        Value::String(text) => KEY + text.capacity(),
+        Value::Array(items) => SLOT * items.len() + items.iter().map(value_bytes).sum::<usize>(),
         Value::Object(fields) => fields
             .iter()
-            .map(|(key, nested)| key.len() + value_bytes(nested))
+            .map(|(key, nested)| ENTRY + KEY + key.capacity() + SLOT + value_bytes(nested))
             .sum(),
-        // Null, bool and number are stored inline in the enum.
+        // Null, bool and number live inline in the enum, which the caller has
+        // already charged for as a slot.
         _ => 0,
     }
 }
@@ -741,6 +762,65 @@ mod tests {
             TailRead::Batch { cursor, .. } => assert_eq!(cursor.seq, 6),
             TailRead::Gap { .. } => panic!("the cursor kept pace, so it cannot gap"),
         }
+    }
+
+    /// A span whose weight is STRUCTURE rather than text: nested objects and
+    /// arrays of scalars, no long strings anywhere.
+    fn structured_span(id: &str, width: usize, depth: usize) -> Arc<Span> {
+        fn nest(depth: usize, width: usize) -> Value {
+            if depth == 0 {
+                return Value::Array((0..width).map(|n| Value::from(n as u64)).collect());
+            }
+            let mut object = serde_json::Map::new();
+            for n in 0..width {
+                object.insert(format!("k{n}"), nest(depth - 1, width));
+            }
+            Value::Object(object)
+        }
+        let mut span = span(id, 1);
+        let mutable = Arc::get_mut(&mut span).expect("sole owner");
+        mutable
+            .attributes
+            .insert("payload".into(), nest(depth, width));
+        span
+    }
+
+    #[test]
+    fn structured_json_counts_against_the_byte_budget() {
+        // The budget has to bound MEMORY, not text. Counting only string bytes
+        // — scalars free, containers eight bytes an element — left the ceiling
+        // bypassable by shape: deeply structured JSON with no long strings in
+        // it measured at a fraction of what it held, so the ring kept
+        // accepting spans while the accounting insisted it was nearly empty.
+        let heavy = structured_span("s", 8, 3);
+        let measured = approximate_bytes(&heavy);
+
+        // Every leaf scalar occupies a whole `Value` slot, and every map entry
+        // costs a key plus a slot plus node overhead. 8^3 objects of 8 keys
+        // each, bottoming out in 8-element arrays, cannot honestly measure as
+        // a few hundred bytes.
+        let leaves = 8_usize.pow(4);
+        assert!(
+            measured >= leaves * std::mem::size_of::<Value>(),
+            "structure must be counted: {measured} bytes for {leaves} leaves"
+        );
+
+        // And the ring must actually stop on it. A budget of ten spans' worth
+        // has to evict at roughly ten spans, whatever the spans are made of.
+        let budget = measured * 10;
+        let ring = TailChannel::new(100_000, budget);
+        for n in 0..200 {
+            ring.publish(&[structured_span(&format!("s{n}"), 8, 3)]);
+        }
+        let (spans, bytes, _, _) = ring.usage().expect("usage");
+        assert!(
+            bytes <= budget,
+            "the ring exceeded its byte budget: {bytes} > {budget}"
+        );
+        assert!(
+            spans <= 12,
+            "count should be bounded by BYTES here, not by the 100k cap: {spans}"
+        );
     }
 
     #[test]

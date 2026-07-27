@@ -27,6 +27,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   code. Residency and both bounds are reported at `/v1/metrics.json` under
   `tail_ring`.
 
+  The ring is bounded by **bytes as well as count**, and the byte estimate
+  counts structure, not only text — a `Value` slot per element and per map
+  entry. Counting text alone left the ceiling bypassable by shape: deeply
+  nested JSON with no long strings measured at a fraction of what it held.
+
+  A gap is a **visible** discontinuity even when the server cannot count it. A
+  cursor from before a restart is not comparable to the new numbering, so
+  `missed` is `null` rather than a number, and the client shows the break
+  without inventing a count. `backfill` survives a gap unchanged, including
+  `backfill=0`.
+
   A streamed span has been **acknowledged**: entries reach the ring only after
   the ingest succeeded, past the log's fsync and past the seal `flushed`
   promises. The tail is bounded and may gap, but it never shows a span the store

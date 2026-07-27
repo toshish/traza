@@ -33,7 +33,14 @@ export function TailScreen({ go }) {
   // Admissions the server dropped before this client could read them. Shown
   // rather than swallowed: the view is complete from the break onwards, and
   // saying so is the difference between a gap and a silent hole.
+  // Two separate facts. `missed` is how many admissions were lost where the
+  // server could count them; `gaps` is how many discontinuities happened at
+  // all. They come apart on a server restart: sequence numbers are per-process,
+  // so the count is genuinely unknowable and arrives as null — and treating
+  // null as zero showed no warning while silently clearing the screen, which is
+  // exactly the invisible discontinuity this feature exists to remove.
   const [missed, setMissed] = React.useState(0);
+  const [gaps, setGaps] = React.useState(0);
   const [service, setService] = React.useState('');
   const [errorsOnly, setErrorsOnly] = React.useState(false);
   const buffer = React.useRef([]);
@@ -107,7 +114,8 @@ export function TailScreen({ go }) {
         buffer.current = [];
         setPending(0);
         setRows([]);
-        setMissed((total) => total + (count || 0));
+        setGaps((total) => total + 1);
+        if (typeof count === 'number') setMissed((total) => total + count);
       },
     });
 
@@ -146,11 +154,14 @@ export function TailScreen({ go }) {
         buffer.current = [];
         setPending(0);
         setMissed(0);
+        setGaps(0);
       }}>Clear</Chip>
-      {missed ? <Chip
-        title="The stream fell further behind than the server retains, so these spans never reached this view. They are still in the store — search for them on Traces."
+      {gaps ? <Chip
+        title={missed
+          ? 'The stream fell further behind than the server retains, so these spans never reached this view. They are still in the store — search for them on Traces.'
+          : 'The stream broke and the view was rebuilt from the live edge. The server could not say how many spans were missed — a restart renumbers the stream, so the count is not comparable. Anything missing is still in the store; search for it on Traces.'}
         style={{ background: 'var(--warn-tint)', borderColor: 'var(--warn)', color: 'var(--warn)' }}>
-        {fmtNum(missed)} missed
+        {missed ? `${fmtNum(missed)} missed` : 'spans missed'}
       </Chip> : null}
       <span style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: 'var(--ink-muted)' }}>
         <LiveDot color={paused ? 'var(--ink-faint)'
