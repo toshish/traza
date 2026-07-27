@@ -97,7 +97,9 @@ fn sessions_aggregate_across_buffer_segments_and_reopen() {
             .ingest(plain_span("t4", "s1", "web", 5_000, "ok"))
             .expect("ingests");
 
-        let sessions = store.sessions(None, None, 10).expect("lists");
+        let sessions = store
+            .sessions(None, None, 10, traza::analytics::SessionOrder::Recent)
+            .expect("lists");
         assert_eq!(sessions.len(), 2, "two sessions: {sessions:?}");
         // Most recent activity first: sess-b ends later.
         assert_eq!(sessions[0].session_id, "sess-b");
@@ -116,7 +118,9 @@ fn sessions_aggregate_across_buffer_segments_and_reopen() {
     // segment's two sess-a spans survive (buffered spans are volatile until
     // flush, by design).
     let store = Store::open(&dir, buffered).expect("reopens");
-    let sessions = store.sessions(None, None, 10).expect("lists after reopen");
+    let sessions = store
+        .sessions(None, None, 10, traza::analytics::SessionOrder::Recent)
+        .expect("lists after reopen");
     assert_eq!(
         sessions.len(),
         1,
@@ -154,7 +158,9 @@ fn the_default_mode_recovers_unflushed_sessions_across_reopen() {
             .expect("ingests");
     }
     let store = Store::open(&dir, Config::default()).expect("reopens");
-    let sessions = store.sessions(None, None, 10).expect("lists after reopen");
+    let sessions = store
+        .sessions(None, None, 10, traza::analytics::SessionOrder::Recent)
+        .expect("lists after reopen");
     assert_eq!(sessions.len(), 1, "{sessions:?}");
     let recovered = &sessions[0];
     assert_eq!(recovered.session_id, "sess-a");
@@ -319,7 +325,9 @@ fn numeric_strings_and_explicit_totals_are_honored() {
     }))
     .expect("span");
     store.ingest(span).expect("ingests");
-    let sessions = store.sessions(None, None, 10).expect("lists");
+    let sessions = store
+        .sessions(None, None, 10, traza::analytics::SessionOrder::Recent)
+        .expect("lists");
     assert_eq!(sessions.len(), 1);
     assert_eq!(sessions[0].prompt_tokens, 120);
     assert_eq!(sessions[0].completion_tokens, 30);
@@ -395,7 +403,9 @@ fn rollup_cache_survives_compaction_supersede() {
         after.is_empty(),
         "expired spans must leave the aggregates: {after:?}"
     );
-    let sessions = store.sessions(None, None, 10).expect("lists");
+    let sessions = store
+        .sessions(None, None, 10, traza::analytics::SessionOrder::Recent)
+        .expect("lists");
     assert!(sessions.is_empty(), "expired sessions vanish: {sessions:?}");
 }
 

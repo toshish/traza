@@ -64,6 +64,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a search or a whole-store rollup depending only on the tool named in the
   body; filed under `other` alongside static assets it would describe neither.
 
+### Fixed
+
+- **The MCP endpoint's DNS-rebinding defence trusted a header the attack
+  controls.** `Origin` was accepted whenever its authority equalled the
+  request's `Host` — which is exactly what a rebinding request supplies, since
+  the attacker owns the name and the browser sends theirs in both headers. A
+  page on any domain could drive a loopback Traza and read the whole store.
+  Origins are now checked against loopback plus an operator-supplied
+  `--mcp-allowed-origin` allowlist, and nothing else the request carries is
+  consulted; the `Host` header is no longer read at all, so the comparison
+  cannot be reintroduced by accident.
+
+- **`list_sessions` ranked a page instead of the population.** `order_by=cost`
+  fetched the most recent sessions and re-sorted those, so an expensive session
+  outside the recency window was not lower down — it was absent. Ranking moved
+  into `Store::sessions`, which already materializes every session in the
+  window, so the comparator change costs nothing and the answer is over the
+  whole population.
+
+- **`structuredContent` escaped `--mcp-max-result-bytes`.** Only the text block
+  was clamped, so one long stored identifier produced an 83-byte text block
+  inside a 100 KB result under a 1 KiB ceiling. Text and structured content are
+  now budgeted and trimmed together; the ceiling bounds the tool result, not
+  one field of it.
+
+- **Impossible timestamps became different valid ones.** `2026-02-31` resolved
+  to March 3rd, `2026-07-27T99:99:99Z` to July 31st, and a `+99:99` offset was
+  accepted — each silently substituting a window nobody asked for, over which
+  the answer looks correct. Month lengths, leap years (century rule included),
+  time-of-day and offset ranges are validated before conversion.
+
+- **The dashboard generated a stdio configuration that could not work over
+  TLS.** It interpolated `window.location.origin` into `traza-server mcp
+  --url`, which the bridge refuses for `https://`. On a secure origin it now
+  asks for the plaintext endpoint instead of emitting a copy-ready snippet that
+  fails.
+
 ## [0.20.0] - 2026-07-27
 
 ### Added
@@ -123,8 +160,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   The dashboard's Live tail consumes it over one held connection. An idle tail
   went from roughly forty empty round trips a minute to zero.
-
-### Added
 
 ### Fixed
 

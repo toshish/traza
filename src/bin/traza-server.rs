@@ -503,6 +503,8 @@ default 32MiB)] \
 [--mcp (serve the Model Context Protocol endpoint at /v1/mcp; off by default)] \
 [--mcp-annotations (additionally let MCP callers with an rw token record annotations)] \
 [--mcp-max-result-bytes N (default 32768)] [--mcp-max-payload-bytes N (default 262144)] \
+[--mcp-allowed-origin ORIGIN (repeatable; browser origins allowed to drive /v1/mcp \
+besides loopback)] \
 [--allow-unauthenticated-non-loopback]\n\
        traza-server mcp --url URL [--token TOKEN] \
 (stdio bridge: speaks MCP on stdin/stdout and forwards to a running server)";
@@ -527,12 +529,18 @@ struct Options {
 /// `enabled` defaults to off. A read endpoint that is on by default is a
 /// decision to expose every stored prompt to whatever holds the token, and
 /// that should be something an operator turned on.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct McpOptions {
     /// Off unless `--mcp` was passed.
     enabled: bool,
     annotations: bool,
     limits: traza::mcp::Limits,
+    /// Browser origins permitted to drive the endpoint, beyond loopback.
+    ///
+    /// Operator-supplied, and that is the whole point: the origin cannot be
+    /// validated against anything else the request carries, because a request
+    /// driven by DNS rebinding supplies all of them.
+    allowed_origins: Vec<String>,
 }
 
 /// Parses the command line. `Ok(None)` means `--help` was handled and there is
@@ -676,6 +684,21 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
             "--mcp-max-payload-bytes" => {
                 i += 1;
                 mcp.limits.max_payload_bytes = number(i, "--mcp-max-payload-bytes")? as usize;
+            }
+            "--mcp-allowed-origin" => {
+                i += 1;
+                mcp.enabled = true;
+                let origin = value(i, "--mcp-allowed-origin")?
+                    .trim()
+                    .to_ascii_lowercase();
+                if !origin.contains("://") {
+                    return Err(format!(
+                        "--mcp-allowed-origin must be a whole origin including the scheme, \
+                         like https://traza.example.com (got {origin})"
+                    ));
+                }
+                mcp.allowed_origins
+                    .push(origin.trim_end_matches('/').to_owned());
             }
             "--allow-unauthenticated-non-loopback" => {
                 allow_unauthenticated_non_loopback = true;
@@ -846,6 +869,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // The dashboard is served from disk (ui/ `npm run build` output), never
     // compiled in. A missing build is not fatal: the API runs, and the UI
     // routes explain how to produce it.
+    let mcp = Arc::new(mcp);
     let ui = Arc::new(match ui_dir {
         Some(explicit) => traza::ui::UiRoot::new(explicit),
         None => traza::ui::UiRoot::discover(),
@@ -925,6 +949,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let connection_auth = Arc::clone(&auth);
         let connection_ui = Arc::clone(&ui);
         let connection_metrics = Arc::clone(&metrics);
+        let connection_mcp = Arc::clone(&mcp);
         let spawned = thread::Builder::new()
             .name("traza-http".into())
             .spawn(move || {
@@ -934,7 +959,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     &connection_auth,
                     &connection_ui,
                     &connection_metrics,
-                    &mcp,
+                    &connection_mcp,
                 );
                 connection_metrics
                     .connections_live
@@ -1266,7 +1291,6 @@ fn handle_connection(
             target: head.target,
             content_type: head.content_type,
             origin: head.origin,
-            host: head.host,
             mcp_protocol_version: head.mcp_protocol_version,
             body,
         };
@@ -1525,7 +1549,12 @@ fn serve_request(
                     json!({"error": "group_by is not a /v1/sessions parameter"}),
                 );
             }
-            match engine.sessions(since, until, limit.unwrap_or(100)) {
+            match engine.sessions(
+                since,
+                until,
+                limit.unwrap_or(100),
+                traza::analytics::SessionOrder::Recent,
+            ) {
                 Ok(sessions) => responder.json(
                     200,
                     json!({"sessions": serde_json::to_value(sessions)
@@ -2247,12 +2276,19 @@ fn serve_mcp(
         );
     }
     // DNS rebinding defence. A browser attaches `Origin` and a page on an
-    // attacker's domain cannot forge it, so refusing a cross-origin one stops
-    // a remote site driving a loopback MCP server through the user's browser.
-    // Native MCP clients send no `Origin` at all and are unaffected.
+    // attacker's domain cannot forge it, so refusing an origin the operator
+    // did not name stops a remote site driving this server through the user's
+    // browser. Native MCP clients send no `Origin` at all and are unaffected.
     if let Some(origin) = &request.origin {
-        if !origin_allowed(origin, &request.host) {
-            return responder.json(403, json!({"error": "origin not allowed"}));
+        if !origin_allowed(origin, &options.allowed_origins) {
+            return responder.json(
+                403,
+                json!({
+                    "error": "origin not allowed",
+                    "next": "loopback origins are allowed by default; name any other with \
+                             --mcp-allowed-origin ORIGIN",
+                }),
+            );
         }
     }
     // The specification requires a 400 for a version this server does not
@@ -2311,19 +2347,35 @@ fn serve_mcp(
     }
 }
 
-/// Whether a browser `Origin` may drive this endpoint: same-origin with the
-/// request's own `Host`, or a loopback page (which is the dashboard itself).
-fn origin_allowed(origin: &str, host: &str) -> bool {
-    // "null" is what a sandboxed iframe or a file:// page sends. It is
-    // same-origin with nothing.
-    if origin == "null" || origin.is_empty() {
+/// Whether a browser `Origin` may drive this endpoint.
+///
+/// **The origin is never compared against anything else the request carries.**
+/// An earlier version accepted any `Origin` whose authority equalled the
+/// request's `Host`, which is precisely what a DNS-rebinding request supplies:
+/// the attacker owns the name, so the browser sends *their* host in both
+/// headers and the comparison succeeds. Only two things may permit an origin:
+///
+/// - it is a loopback page, which an attacker's site can never be — the
+///   browser stamps the origin of the page, and a page served from
+///   `evil.example` has that origin however its DNS resolves;
+/// - the operator named it with `--mcp-allowed-origin`.
+fn origin_allowed(origin: &str, allowed: &[String]) -> bool {
+    // "null" is what a sandboxed iframe or a `file://` page sends. It is
+    // same-origin with nothing, and matches no allowlist entry.
+    if origin.is_empty() || origin == "null" {
         return false;
     }
-    let authority = origin.split_once("://").map_or(origin, |(_, rest)| rest);
-    if !host.is_empty() && authority == host {
+    let origin = origin.trim().trim_end_matches('/');
+    if allowed.iter().any(|entry| entry == origin) {
         return true;
     }
-    matches!(authority_host(authority), "localhost" | "127.0.0.1" | "::1")
+    let Some((scheme, authority)) = origin.split_once("://") else {
+        return false;
+    };
+    // A loopback *origin* — not a loopback destination. The scheme is checked
+    // too, so `javascript://localhost` and friends cannot pass as one.
+    matches!(scheme, "http" | "https")
+        && matches!(authority_host(authority), "localhost" | "127.0.0.1" | "::1")
 }
 
 /// The host part of an authority, with an IPv6 literal unwrapped from its
@@ -2339,10 +2391,9 @@ struct Request {
     method: String,
     target: String,
     content_type: String,
-    /// `Origin:`, `Host:` and `MCP-Protocol-Version:` — carried because the
-    /// MCP endpoint has header-level rules the REST routes do not.
+    /// `Origin:` and `MCP-Protocol-Version:` — carried because the MCP
+    /// endpoint has header-level rules the REST routes do not.
     origin: Option<String>,
-    host: String,
     mcp_protocol_version: Option<String>,
     body: Vec<u8>,
 }
@@ -2360,10 +2411,12 @@ struct RequestHead {
     /// Lowercased `Connection:` header value, empty when absent.
     connection: String,
     /// `Origin:` as sent. Needed by the MCP endpoint, which must refuse a
-    /// cross-origin browser request to defeat DNS rebinding.
+    /// browser origin the operator did not name, to defeat DNS rebinding.
+    ///
+    /// Deliberately NOT accompanied by `Host`. Validating one against the
+    /// other is the bug this field exists to avoid: a rebinding request
+    /// supplies both, so they agree exactly when the check matters most.
     origin: Option<String>,
-    /// `Host:` as sent, lowercased, for the same-origin comparison.
-    host: String,
     /// `MCP-Protocol-Version:` as sent. An unsupported value is a `400`.
     mcp_protocol_version: Option<String>,
     content_length: usize,
@@ -2502,7 +2555,6 @@ fn parse_head(bytes: &[u8], header_end: usize) -> io::Result<RequestHead> {
     let mut content_type = String::new();
     let mut connection = String::new();
     let mut origin = None;
-    let mut host = String::new();
     let mut mcp_protocol_version = None;
     let mut header_lines: Vec<&str> = Vec::new();
     for line in lines {
@@ -2518,9 +2570,6 @@ fn parse_head(bytes: &[u8], header_end: usize) -> io::Result<RequestHead> {
             }
             if name.eq_ignore_ascii_case("origin") {
                 origin = Some(value.trim().to_ascii_lowercase());
-            }
-            if name.eq_ignore_ascii_case("host") {
-                host = value.trim().to_ascii_lowercase();
             }
             if name.eq_ignore_ascii_case("mcp-protocol-version") {
                 mcp_protocol_version = Some(value.trim().to_owned());
@@ -2573,7 +2622,6 @@ fn parse_head(bytes: &[u8], header_end: usize) -> io::Result<RequestHead> {
         content_type,
         connection,
         origin,
-        host,
         mcp_protocol_version,
         content_length,
         header_end,

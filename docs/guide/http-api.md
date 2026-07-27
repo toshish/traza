@@ -854,7 +854,7 @@ What belongs here is the transport contract:
 | A JSON-RPC request | `200` with one JSON-RPC response |
 | A JSON-RPC notification or response | `202` with **no body** |
 | `GET` or `DELETE` | `405` — no server-initiated SSE stream, no session to delete |
-| `Origin` present and neither same-origin nor loopback | `403` — the transport's DNS-rebinding defence |
+| `Origin` present, and neither loopback nor named by `--mcp-allowed-origin` | `403` — the transport's DNS-rebinding defence. The origin is never validated against the request's own `Host`, which a rebinding request also controls |
 | `MCP-Protocol-Version` naming an unserved revision | `400`, listing the supported ones |
 | A body that is not JSON | `400` with JSON-RPC `-32700` |
 | A JSON array (a batch) | `400` with JSON-RPC `-32600` — batching was removed from MCP |

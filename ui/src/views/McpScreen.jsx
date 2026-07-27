@@ -64,6 +64,11 @@ export function McpScreen({ go }) {
   }, [enabled], { skip: !enabled });
 
   const origin = typeof window !== 'undefined' ? window.location.origin : 'http://localhost:8080';
+  // The stdio bridge speaks plain HTTP and refuses an https:// URL outright.
+  // Interpolating this page's origin into it behind TLS produced a snippet
+  // that looked copy-ready and could not work, so on https the bridge block
+  // asks for the plaintext endpoint instead of inventing one.
+  const secure = typeof window !== 'undefined' && window.location.protocol === 'https:';
   const token = getToken();
   const writable = (surface.data?.tools || []).some((tool) => tool.name === 'record_annotation');
 
@@ -106,7 +111,9 @@ traza-server --data-dir ./data --mcp --mcp-annotations`} />
       <div style={{ fontSize: 12, color: 'var(--ink-muted)', marginTop: 8, lineHeight: '19px' }}>
         Two more flags bound what one call may return:{' '}
         <Mono color="var(--ink)">--mcp-max-result-bytes</Mono> (32 KiB) and{' '}
-        <Mono color="var(--ink)">--mcp-max-payload-bytes</Mono> (256 KiB). Restart to apply — this
+        <Mono color="var(--ink)">--mcp-max-payload-bytes</Mono> (256 KiB). Served behind a
+        hostname rather than loopback, this page is a browser origin like any other and needs{' '}
+        <Mono color="var(--ink)">--mcp-allowed-origin {origin}</Mono>. Restart to apply — this
         page rechecks on reload.
       </div>
     </Card> : null}
@@ -126,11 +133,17 @@ claude mcp add --transport http traza ${origin}/v1/mcp${token ? ` \\
   "mcpServers": {
     "traza": {
       "command": "traza-server",
-      "args": ["mcp", "--url", "${origin}"]${token ? `,
+      "args": ["mcp", "--url", "${secure ? 'http://TRAZA-HOST:PORT' : origin}"]${token ? `,
       "env": { "TRAZA_TOKEN": "${token}" }` : ''}
     }
   }
 }`} />
+      {secure ? <div style={{ fontSize: 12, color: 'var(--ink-muted)', marginTop: 8, lineHeight: '19px' }}>
+        This page is served over TLS, and the stdio bridge speaks plain HTTP — so the URL above is
+        a placeholder, not this origin. Point it at the server's plaintext address behind your
+        proxy (<Mono color="var(--ink)">http://localhost:8080</Mono> on the host itself), or use
+        the HTTP client form, which handles <Mono color="var(--ink)">https://</Mono> directly.
+      </div> : null}
       {token ? <div style={{ fontSize: 12, color: 'var(--warn)', marginTop: 8, lineHeight: '19px' }}>
         The snippet above contains the bearer token you entered in this browser session. Treat it
         the way you would treat the token itself.
