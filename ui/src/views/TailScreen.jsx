@@ -1,114 +1,173 @@
 import React from 'react';
 import { api } from '../lib/api.js';
-import { usePoll } from '../lib/route.js';
 import { fmtClockNs, fmtDurationNs, fmtNum, fmtRate } from '../lib/format.js';
 import { Card, Chip, LiveDot, Mono } from '../components/primitives/Chrome.jsx';
-import { newTailState, pollOnce } from '../lib/tail.js';
+import {
+  newTailState, runTail, newGapState, recordGap, recordDropped, gapLabel, gapDetail,
+  newRateWindow, recordArrivals, ratePerSecond,
+} from '../lib/tail.js';
 
-// Spans as they land. The old table was a snapshot with a Refresh button,
-// which is the wrong shape for data that arrives continuously.
+// Spans as they land — over one held connection, not a poll.
 //
-// Polling is incremental: each tick asks only for spans newer than the last
-// one seen, so the cost of watching is proportional to what arrived rather
-// than to what is on screen. A paused tail stops asking entirely.
+// The screen used to ask `/v1/spans?since=<watermark>` every 1.5 seconds, and
+// that could not express what this screen claims to show. A span outliving one
+// tick starts before the watermark and arrives after it, so the server dropped
+// it permanently. The server now streams in admission order, which is the order
+// "as they land" actually means.
 //
-// Two invariants make it correct rather than merely incremental. Paging is by
-// cursor, because a watermark cannot separate spans that share a timestamp and
-// an SDK flush routinely produces hundreds that do. And the watermark advances
-// only when a cursor chain is exhausted, because moving it mid-chain re-reads
-// the burst's prefix forever and never reaches its end.
+// The network cost went the same direction: an idle tail was forty round trips
+// a minute returning nothing, and is now zero — one parked connection and a
+// heartbeat every fifteen seconds.
 
 const MAX_ROWS = 300;
-const TICK_MS = 1500;
+// How long typing has to settle before the filter is applied. Each change
+// tears down the streaming connection and opens another, so a filter bound
+// straight to the input opened one connection per keystroke — eight for
+// "checkout", each a request, a scan and a fresh backlog.
+const FILTER_SETTLE_MS = 250;
+// How often the rate window is re-evaluated when nothing is arriving. The
+// window itself lives in lib/tail.js: it holds bucketed COUNTS, so its size is
+// fixed by the window duration rather than by the traffic, and it has no rate
+// ceiling. Averaging matters because spans arrive in bursts of whatever the SDK
+// flushed — a per-frame rate swings between zero and enormous and reads as
+// noise.
+const RATE_TICK_MS = 1_000;
 
 export function TailScreen({ go }) {
   const [rows, setRows] = React.useState([]);
   const [paused, setPaused] = React.useState(false);
   const [pending, setPending] = React.useState(0);
   const [rate, setRate] = React.useState(null);
+  const [status, setStatus] = React.useState('live');
+  // Admissions the server dropped before this client could read them. Shown
+  // rather than swallowed: the view is complete from the break onwards, and
+  // saying so is the difference between a gap and a silent hole.
+  // Gap bookkeeping lives in lib/tail.js, where it can be tested. Both of its
+  // bugs — an unknown count folded to zero, and a reset that cleared only half
+  // the state — survived because nothing but React could reach it.
+  const [gapState, setGapState] = React.useState(newGapState);
+  // `service` is what the input shows; `appliedService` is what the stream is
+  // filtered by, and it trails the input until typing stops.
   const [service, setService] = React.useState('');
+  const [appliedService, setAppliedService] = React.useState('');
   const [errorsOnly, setErrorsOnly] = React.useState(false);
   const buffer = React.useRef([]);
-  const lastTick = React.useRef(null);
-  const inFlight = React.useRef(null);
-  // The polling state machine lives in lib/tail.js so it can be tested without
-  // a DOM — which is where its two real bugs were found.
-  const tail = React.useRef(newTailState());
-  // Which filter the in-flight poll belongs to. Replacing the state and
-  // clearing the screen does not un-send a request: a poll started under the
-  // old filter still resolves, and appended its rows to a screen now showing a
-  // different one. The generation is checked after the await.
-  const generation = React.useRef(0);
+  // Rows carry a client-assigned id so React can keep them mounted. Their
+  // primary key cannot serve: the same (trace, span) may legitimately be
+  // admitted twice, once per update. The array index cannot either — it shifts
+  // on every prepend, which changed every key and rebuilt all 300 rows per
+  // frame.
+  const nextRowId = React.useRef(0);
+  const arrivals = React.useRef(newRateWindow());
+  // `paused` is read inside a long-lived async loop, which closed over the
+  // value it had when the stream opened. The ref is what the loop reads.
+  const pausedRef = React.useRef(false);
+  pausedRef.current = paused;
 
-  // Reset when the filter changes: a narrower tail should show what is arriving
-  // now, not resume a cursor chain belonging to the wider one.
   React.useEffect(() => {
-    generation.current += 1;
-    tail.current = newTailState();
-    buffer.current = [];
-    // NOT cleared here. Releasing the flag while the obsolete request is still
-    // running let a new poll start, and then that obsolete request's `finally`
-    // cleared the flag a second time — admitting a third poll alongside the
-    // second. The flag is a token now: only its owner may release it.
+    if (service === appliedService) return undefined;
+    const settle = setTimeout(() => setAppliedService(service), FILTER_SETTLE_MS);
+    return () => clearTimeout(settle);
+  }, [service, appliedService]);
+
+  React.useEffect(() => {
+    // One subscription per filter. Aborting is what ends the previous loop and
+    // releases its connection — there is no "ignore the late response" case to
+    // handle any more, because there is no response, only a stream that stops.
+    const controller = new AbortController();
+    const state = newTailState();
     setRows([]);
     setPending(0);
-  }, [service, errorsOnly]);
+    // All of it: a warning earned under the previous filter has nothing to do
+    // with this subscription.
+    setGapState(newGapState());
+    // Reset the DISPLAYED rate too, not just its inputs. Clearing the window
+    // while leaving the number on screen left the previous filter's rate
+    // standing over an empty table until something happened to arrive.
+    setRate(null);
+    buffer.current = [];
+    arrivals.current = newRateWindow();
 
-  usePoll(async () => {
-    // Ticks must not overlap. A slow response used to let the next tick start
-    // against the same watermark, so both pages landed and every span appeared
-    // twice.
-    if (inFlight.current) return;
-    const mine = generation.current;
-    // The token identifies the flight, so a late finalizer cannot free a slot
-    // it no longer owns.
-    const token = Symbol('poll');
-    inFlight.current = token;
-    const state = tail.current;
-    try {
-      const added = await pollOnce(
-        state,
-        (params) => api.spans(params),
-        {
-          filter: {
-            service: service || undefined,
-            status: errorsOnly ? 'error' : undefined,
-          },
-        },
-      );
+    const filter = {
+      service: appliedService || undefined,
+      status: errorsOnly ? 'error' : undefined,
+    };
 
-      // The filter changed while this was in flight: these rows describe a
-      // query nobody is looking at any more.
-      if (mine !== generation.current) return;
+    // The rate is a sliding window, so it has to decay on its own. Computing it
+    // only when spans arrive meant a burst that stopped kept showing its peak
+    // rate indefinitely — the one reading that is certainly wrong.
+    const decay = setInterval(() => {
+      const now = Date.now();
+      arrivals.current = recordArrivals(arrivals.current, 0, now);
+      setRate(ratePerSecond(arrivals.current, now));
+    }, RATE_TICK_MS);
 
-      const now = performance.now();
-      if (lastTick.current) {
-        const seconds = Math.max(0.001, (now - lastTick.current) / 1000);
-        setRate(added.length / seconds);
-      }
-      lastTick.current = now;
-      if (!added.length) return;
+    runTail(state, {
+      open: (params) => api.tailChunks(params, controller.signal),
+      filter,
+      signal: controller.signal,
+      onStatus: setStatus,
+      onSpans: (spans) => {
+        const now = Date.now();
+        // One bucket update for the whole batch, not one entry per span: the
+        // cost of measuring the rate must not scale with the rate.
+        arrivals.current = recordArrivals(arrivals.current, spans.length, now);
+        setRate(ratePerSecond(arrivals.current, now));
 
-      const newestFirst = added.slice().reverse();
-      if (paused) {
-        buffer.current = [...newestFirst, ...buffer.current].slice(0, MAX_ROWS);
-        setPending(buffer.current.length);
-      } else {
-        setRows((all) => [...newestFirst, ...all].slice(0, MAX_ROWS));
-      }
-    } catch (e) {
-      /* a dropped tick is the next tick's problem */
-    } finally {
-      if (inFlight.current === token) inFlight.current = null;
-    }
-  }, TICK_MS, true);
+        // Newest first, matching the table's order.
+        const newestFirst = spans
+          .slice()
+          .reverse()
+          .map((span) => {
+            nextRowId.current += 1;
+            return { span, id: nextRowId.current };
+          });
+        if (pausedRef.current) {
+          const combined = [...newestFirst, ...buffer.current];
+          buffer.current = combined.slice(0, MAX_ROWS);
+          // Overflow is discarded on purpose, and said out loud. Silently
+          // dropping spans the reader believes they are queued to see is the
+          // same hole a gap would be.
+          setGapState((state) => recordDropped(state, combined.length - buffer.current.length));
+          setPending(buffer.current.length);
+        } else {
+          setRows((all) => [...newestFirst, ...all].slice(0, MAX_ROWS));
+        }
+      },
+      onGap: (count) => {
+        // The stream fell further behind than the server retains. There is
+        // nothing to fetch: the dropped entries are exactly the ones no longer
+        // addressable, and `/v1/spans` is ordered by event time, so it cannot
+        // name an admission range at all. An earlier version queried it anyway
+        // and prepended the result, which overlapped the entries the stream
+        // then replayed and showed them twice.
+        //
+        // So the view is discarded and the stream rebuilds it from the live
+        // edge. A visible break beats a plausible-looking splice.
+        buffer.current = [];
+        setPending(0);
+        setRows([]);
+        setGapState((state) => recordGap(state, count));
+      },
+    });
+
+    return () => {
+      controller.abort();
+      clearInterval(decay);
+    };
+  }, [appliedService, errorsOnly]);
 
   const resume = () => {
-    // The buffer is already newest-first — each tick prepends its own
-    // newest-first batch — so reversing it here handed back an oldest-first
-    // block on top of a newest-first list.
-    setRows((all) => [...buffer.current, ...all].slice(0, MAX_ROWS));
+    // Read the buffer OUT before clearing it. A `setRows` updater runs during
+    // the later render, not at this call, so an updater that reads
+    // `buffer.current` saw the empty array this function had already assigned —
+    // and resuming produced no rows at all.
+    //
+    // The buffer is already newest-first — each batch prepends its own
+    // newest-first block — so it goes straight on top.
+    const held = buffer.current;
     buffer.current = [];
+    setRows((all) => [...held, ...all].slice(0, MAX_ROWS));
     setPending(0);
     setPaused(false);
   };
@@ -131,10 +190,17 @@ export function TailScreen({ go }) {
         setRows([]);
         buffer.current = [];
         setPending(0);
+        setGapState(newGapState());
       }}>Clear</Chip>
+      {gapLabel(gapState, fmtNum) ? <Chip
+        title={gapDetail(gapState)}
+        style={{ background: 'var(--warn-tint)', borderColor: 'var(--warn)', color: 'var(--warn)' }}>
+        {gapLabel(gapState, fmtNum)}
+      </Chip> : null}
       <span style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: 'var(--ink-muted)' }}>
-        <LiveDot color={paused ? 'var(--ink-faint)' : 'var(--ok)'} />
-        {paused ? 'paused' : 'live'}
+        <LiveDot color={paused ? 'var(--ink-faint)'
+          : status === 'reconnecting' ? 'var(--warn)' : 'var(--ok)'} />
+        {paused ? 'paused' : status}
         <span style={{ color: 'var(--ink-faint)' }}>·</span>
         <Mono color="var(--accent)">{rate == null ? '—' : fmtRate(rate)}</Mono>
         <span style={{ color: 'var(--ink-faint)' }}>·</span>
@@ -147,7 +213,7 @@ export function TailScreen({ go }) {
         display: 'grid', gridTemplateColumns: '104px 132px 1fr 100px 88px 70px',
         background: 'var(--bg-sunken)', borderBottom: '1px solid var(--hairline)',
       }}>
-        {['arrived', 'service', 'name', 'trace', 'duration', 'status'].map((label, i) => (
+        {['started', 'service', 'name', 'trace', 'duration', 'status'].map((label, i) => (
           <div key={label} style={{
             padding: '6px 10px', fontSize: 12, fontWeight: 500, color: 'var(--ink-muted)',
             textAlign: i === 4 ? 'right' : 'left', whiteSpace: 'nowrap',
@@ -157,9 +223,9 @@ export function TailScreen({ go }) {
       {rows.length === 0 ? <div style={{ padding: '18px 14px', fontSize: 13, color: 'var(--ink-muted)' }}>
         Waiting for spans. Anything ingested from now on appears here.
       </div> : null}
-      {rows.map((span, index) => {
+      {rows.map(({ span, id }, index) => {
         const error = span.status === 'error';
-        return <div key={span.trace_id + span.span_id + index}
+        return <div key={id}
           onClick={() => go(['trace', span.trace_id], { span: span.span_id })}
           role="link" tabIndex={0}
           onKeyDown={(e) => { if (e.key === 'Enter') go(['trace', span.trace_id], { span: span.span_id }); }}

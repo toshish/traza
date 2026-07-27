@@ -21,6 +21,7 @@ pub mod payload;
 pub mod seed;
 pub mod segment;
 pub mod semconv;
+pub mod tail;
 pub mod ui;
 mod wal;
 
@@ -619,6 +620,24 @@ pub struct Config {
     /// so that the measurement is possible: with it, the same corpus can be
     /// queried with and without the index and the difference attributed.
     pub content_index: bool,
+    /// Spans retained in the live tail's admission ring (see [`tail`]).
+    ///
+    /// Whichever of this and [`Self::tail_ring_bytes`] binds first decides how
+    /// far behind a subscriber may fall before it is told it gapped. Neither
+    /// bound is a correctness one — falling behind is reported, never silently
+    /// skipped — but a count alone is not a memory bound, which is why there
+    /// are two.
+    pub tail_ring_spans: usize,
+    /// Bytes of span text the live tail's admission ring may hold.
+    ///
+    /// **This is what actually bounds the tail's memory.** The ring becomes the
+    /// sole owner of a span once a seal evicts it from the write buffer, and
+    /// span size varies by orders of magnitude: an LLM span carrying a prompt
+    /// just under [`Self::payload_threshold`] is roughly a thousand times a
+    /// span carrying a status code. Counted only by entries, a default ring of
+    /// such spans reached hundreds of megabytes — the same text residency the
+    /// attribute index was rewritten to remove.
+    pub tail_ring_bytes: usize,
 }
 
 /// The last commit whose reader accepts every superseded segment format.
@@ -640,6 +659,22 @@ pub const LEGACY_SEGMENT_READER: &str = "cf40bea";
 /// small enough that a restart replays it in well under a second.
 pub const DEFAULT_FLUSH_WAL_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Default admission-ring depth, in spans.
+///
+/// Enough to cover minutes of a quiet store or seconds of a loud one —
+/// comfortably longer than a browser tab spends backgrounded between
+/// reconnects. On narrow spans this is the binding bound; on wide ones
+/// [`DEFAULT_TAIL_RING_BYTES`] binds first, which is the point of having both.
+pub const DEFAULT_TAIL_RING_SPANS: usize = 8_192;
+
+/// Default ceiling on the bytes the admission ring holds.
+///
+/// Chosen as a bound an operator does not have to think about: small enough
+/// that a tail cannot meaningfully change a process's footprint, large enough
+/// that ordinary spans reach the count bound first and the byte bound only
+/// engages for the wide-text workloads where it matters.
+pub const DEFAULT_TAIL_RING_BYTES: usize = 32 * 1024 * 1024;
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -651,6 +686,8 @@ impl Default for Config {
             compaction: Some(CompactionConfig::default()),
             wal_commit_window: None,
             content_index: true,
+            tail_ring_spans: DEFAULT_TAIL_RING_SPANS,
+            tail_ring_bytes: DEFAULT_TAIL_RING_BYTES,
         }
     }
 }
@@ -698,6 +735,13 @@ pub enum Error {
     /// so recovering the prefix would silently drop acknowledged batches that
     /// come after the damage. Refusing to open is the only honest answer.
     WalCorrupt(String),
+    /// A filter carried a predicate the surface it was given to cannot honour.
+    ///
+    /// Refused rather than ignored. Dropping a predicate answers a different
+    /// question than the caller asked while looking like it answered theirs,
+    /// which is how a live tail came to silently discard every span that
+    /// started before its window.
+    UnsupportedFilter(&'static str),
 }
 
 impl fmt::Display for Error {
@@ -709,6 +753,7 @@ impl fmt::Display for Error {
             Self::LockPoisoned(name) => write!(f, "storage lock poisoned: {name}"),
             Self::InvalidSpan(reason) => write!(f, "invalid span: {reason}"),
             Self::QueryTooBroad(reason) => write!(f, "query too broad: {reason}"),
+            Self::UnsupportedFilter(reason) => write!(f, "unsupported filter: {reason}"),
             Self::WalCorrupt(detail) => write!(f, "write-ahead log is corrupt: {detail}"),
         }
     }
@@ -723,7 +768,8 @@ impl StdError for Error {
             | Self::LockPoisoned(_)
             | Self::InvalidSpan(_)
             | Self::QueryTooBroad(_)
-            | Self::WalCorrupt(_) => None,
+            | Self::WalCorrupt(_)
+            | Self::UnsupportedFilter(_) => None,
         }
     }
 }
@@ -997,7 +1043,14 @@ struct WriteBuffer {
 }
 
 impl WriteBuffer {
-    fn upsert(&mut self, span: Span) {
+    /// Inserts or replaces `span`, returning the handle now holding it.
+    ///
+    /// The handle is returned so ingest can publish the same allocation to the
+    /// tail ring (see [`crate::tail`]) instead of copying the span a second
+    /// time. It is a `Arc::clone`, so the ring costs one pointer per entry and
+    /// keeps the span alive after a seal evicts it from here — which is exactly
+    /// what a tail wants to keep showing.
+    fn upsert(&mut self, span: Span) -> std::sync::Arc<Span> {
         let key = (span.trace_id.clone(), span.span_id.clone());
         self.upserts += 1;
         // A fresh allocation every time, including for a replacement: the old
@@ -1005,6 +1058,7 @@ impl WriteBuffer {
         // evict by comparing handles. Mutating in place would make the newer
         // version indistinguishable from the sealed one and get it evicted.
         let span = std::sync::Arc::new(span);
+        let handle = std::sync::Arc::clone(&span);
         match self.index.get(&key) {
             Some(&position) => self.spans[position] = span,
             None => {
@@ -1012,6 +1066,7 @@ impl WriteBuffer {
                 self.spans.push(span);
             }
         }
+        handle
     }
 
     fn len(&self) -> usize {
@@ -1278,6 +1333,11 @@ pub struct Store {
     segments: Mutex<Vec<std::sync::Arc<Segment>>>,
     rollups: Mutex<std::collections::HashMap<PathBuf, std::sync::Arc<analytics::SegmentRollup>>>,
     recent_payloads: payload::TouchRegistry,
+    // The live tail's admission ring. It takes NO other lock and is never
+    // taken while another engine lock is held — ingest publishes to it after
+    // releasing the writer lock — so it sits outside the ordering above
+    // entirely rather than at the bottom of it.
+    tail: tail::TailChannel,
     annotations: annotations::AnnotationLog,
     next_segment: AtomicU64,
     /// Present unless durability is [`Durability::Buffered`]. Guards the gap
@@ -1325,7 +1385,14 @@ impl Store {
                 // damaged anywhere but its final append cannot be resumed
                 // without dropping acknowledged batches, and dropping them
                 // quietly is worse than not starting.
-                wal::Wal::recover(&directory, |span| buffer.upsert(span))?;
+                // The handle is discarded rather than published to the tail:
+                // these are spans admitted before the restart, and the tail is
+                // a live surface. Replaying them would show a reconnecting
+                // client the last buffer's worth of history as though it had
+                // just arrived.
+                wal::Wal::recover(&directory, |span| {
+                    buffer.upsert(span);
+                })?;
                 Some(wal::Wal::open(&directory, config.wal_commit_window)?)
             };
             let next_segment = segments
@@ -1333,6 +1400,8 @@ impl Store {
                 .filter_map(|segment| segment_number(&segment.path))
                 .max()
                 .map_or(0, |number| number.saturating_add(1));
+            let tail_ring_spans = config.tail_ring_spans;
+            let tail_ring_bytes = config.tail_ring_bytes;
 
             Ok(Self {
                 annotations: annotations::AnnotationLog::open(&directory)?,
@@ -1344,6 +1413,7 @@ impl Store {
                 segments: Mutex::new(segments),
                 rollups: Mutex::new(std::collections::HashMap::new()),
                 recent_payloads: payload::TouchRegistry::default(),
+                tail: tail::TailChannel::new(tail_ring_spans, tail_ring_bytes),
                 next_segment: AtomicU64::new(next_segment),
                 wal,
                 metrics: metrics::Metrics::default(),
@@ -1392,7 +1462,9 @@ impl Store {
     ///    that disagrees with the log;
     /// 2. release the lock;
     /// 3. fsync, and only then return;
-    /// 4. seal, if the buffer has reached one of its bounds.
+    /// 4. seal, if the buffer has reached one of its bounds;
+    /// 5. publish to the live tail, which is therefore a stream of
+    ///    ACKNOWLEDGED admissions rather than of attempted ones.
     ///
     /// The fsync deliberately happens OUTSIDE the lock: that is what lets
     /// concurrent batches accumulate into one sync instead of serializing an
@@ -1418,6 +1490,7 @@ impl Store {
         let mut pending_commit = None;
         let seal_now;
         let seal_must_wait;
+        let admitted_handles;
         {
             let waited = Instant::now();
             let mut writer = self.lock_writer()?;
@@ -1429,10 +1502,11 @@ impl Store {
                         .time(|| log.append(frame, &self.metrics))?,
                 );
             }
-            self.metrics.buffer_upsert.time(|| {
-                for span in spans {
-                    writer.upsert(span);
-                }
+            admitted_handles = self.metrics.buffer_upsert.time(|| {
+                spans
+                    .into_iter()
+                    .map(|span| writer.upsert(span))
+                    .collect::<Vec<_>>()
             });
             seal_now = self.should_flush(&writer);
             seal_must_wait = self.seal_must_not_be_skipped(&writer);
@@ -1461,6 +1535,26 @@ impl Store {
             };
             self.seal(wait)?;
         }
+
+        // Publish to the tail LAST, once this batch is acknowledged.
+        //
+        // "Admitted" means acknowledged, and the boundary is here: every `?`
+        // above can still fail, and under `Durability::Wal` the fsync that
+        // makes the batch survivable has only just returned. Publishing
+        // earlier — which is what this did — let the tail show a span whose
+        // ingest then returned an error, or which a crash a millisecond later
+        // erased. A live view is allowed to be bounded and to admit gaps; it
+        // is not allowed to show data the store never accepted.
+        //
+        // It stays outside the writer lock, so sequence numbers are assigned
+        // in acknowledgement order rather than in write-buffer order. Under
+        // concurrency those can differ, and acknowledgement order is the more
+        // meaningful of the two: it is what a caller observed, and it is what
+        // a replicated commit position would later refine into a total order.
+        // The cursor only needs the numbers to be monotonic and gapless, which
+        // assigning them at push guarantees however threads interleave.
+        self.tail.publish(&admitted_handles);
+
         self.metrics.spans_admitted.add(admitted);
         self.metrics.batches_admitted.increment();
         Ok(())
@@ -1479,6 +1573,61 @@ impl Store {
     /// Returns the current number of spans buffered in memory.
     pub fn buffered_span_count(&self) -> usize {
         self.writer.lock().map_or(0, |writer| writer.len())
+    }
+
+    /// The newest tail position — where a subscriber wanting only future spans
+    /// begins.
+    pub fn tail_head(&self) -> Option<tail::TailCursor> {
+        self.tail.head()
+    }
+
+    /// The live tail's residency as `(spans, bytes, max_spans, max_bytes)`.
+    ///
+    /// Exposed because the ring is the only structure in the engine that holds
+    /// whole spans for an unbounded time, so an operator needs to be able to
+    /// see it rather than deduce it from RSS.
+    pub fn tail_usage(&self) -> Option<(usize, usize, usize, usize)> {
+        self.tail.usage()
+    }
+
+    /// Waits up to `timeout` for spans admitted after `cursor` that match
+    /// `filter`.
+    ///
+    /// This is the live tail, and it is ordered by ADMISSION rather than event
+    /// time — see [`tail`] for why that distinction is the whole point.
+    ///
+    /// **`since_ns` and `until_ns` are rejected, not ignored.** An event-time
+    /// window cannot be honoured on an admission-ordered stream, and applying
+    /// one anyway is the original bug: a span that started before the window
+    /// but landed inside it is dropped, the cursor advances past it, and it
+    /// never appears. Documenting the field as "ignored" while passing the
+    /// whole filter to `span_matches` reproduced exactly that for every library
+    /// caller, which is why this is a type-checked refusal now rather than a
+    /// sentence in a doc comment.
+    ///
+    /// Takes only the ring's lock, so an idle subscriber parked here blocks
+    /// neither ingest nor any other query.
+    pub fn tail_after(
+        &self,
+        cursor: Option<tail::TailCursor>,
+        backfill: usize,
+        limit: usize,
+        filter: &SpanFilter,
+        timeout: std::time::Duration,
+    ) -> Result<tail::TailRead> {
+        if filter.since_ns.is_some() || filter.until_ns.is_some() {
+            return Err(Error::UnsupportedFilter(
+                "a tail streams in admission order, so since_ns/until_ns cannot \
+                 be honoured; use Store::query for an event-time window",
+            ));
+        }
+        // Content search works on the tail without any index: the ring holds
+        // whole spans, so the query runs against the text in memory rather than
+        // against the postings a segment would have needed at seal time.
+        let content = filter.content.as_deref().map(content::Query::new);
+        Ok(self.tail.wait(cursor, backfill, limit, timeout, &|span| {
+            span_matches(span, filter, content.as_ref())
+        }))
     }
 
     /// Persists every currently buffered span as one sorted segment.

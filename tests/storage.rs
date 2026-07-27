@@ -78,6 +78,8 @@ fn buffer_flush_persists_sorted_batches() {
             compaction: None,
             wal_commit_window: None,
             content_index: true,
+            tail_ring_spans: traza::DEFAULT_TAIL_RING_SPANS,
+            tail_ring_bytes: traza::DEFAULT_TAIL_RING_BYTES,
             flush_wal_bytes: None,
         },
     )
@@ -132,6 +134,8 @@ fn crash_recovery_preserves_flushed_spans() {
                 compaction: None,
                 wal_commit_window: None,
                 content_index: true,
+                tail_ring_spans: traza::DEFAULT_TAIL_RING_SPANS,
+                tail_ring_bytes: traza::DEFAULT_TAIL_RING_BYTES,
                 flush_wal_bytes: None,
             },
         )
@@ -174,6 +178,8 @@ fn crash_recovery_preserves_flushed_spans() {
             compaction: None,
             wal_commit_window: None,
             content_index: true,
+            tail_ring_spans: traza::DEFAULT_TAIL_RING_SPANS,
+            tail_ring_bytes: traza::DEFAULT_TAIL_RING_BYTES,
             flush_wal_bytes: None,
         },
     )
@@ -293,6 +299,8 @@ fn randomized_filters_match_naive_reference() {
             compaction: None,
             wal_commit_window: None,
             content_index: true,
+            tail_ring_spans: traza::DEFAULT_TAIL_RING_SPANS,
+            tail_ring_bytes: traza::DEFAULT_TAIL_RING_BYTES,
             flush_wal_bytes: None,
         },
     )
@@ -386,6 +394,8 @@ fn ttl_compaction_drops_expired_segments() {
             compaction: None,
             wal_commit_window: None,
             content_index: true,
+            tail_ring_spans: traza::DEFAULT_TAIL_RING_SPANS,
+            tail_ring_bytes: traza::DEFAULT_TAIL_RING_BYTES,
             flush_wal_bytes: None,
         },
     )
@@ -494,6 +504,8 @@ fn lock_order_no_deadlock() {
                 compaction: None,
                 wal_commit_window: None,
                 content_index: true,
+                tail_ring_spans: traza::DEFAULT_TAIL_RING_SPANS,
+                tail_ring_bytes: traza::DEFAULT_TAIL_RING_BYTES,
                 flush_wal_bytes: None,
             },
         )
@@ -553,6 +565,8 @@ fn reads_never_miss_committed_spans() {
                 compaction: None,
                 wal_commit_window: None,
                 content_index: true,
+                tail_ring_spans: traza::DEFAULT_TAIL_RING_SPANS,
+                tail_ring_bytes: traza::DEFAULT_TAIL_RING_BYTES,
                 flush_wal_bytes: None,
             },
         )
@@ -626,6 +640,8 @@ fn stale_temp_does_not_wedge_flush() {
             compaction: None,
             wal_commit_window: None,
             content_index: true,
+            tail_ring_spans: traza::DEFAULT_TAIL_RING_SPANS,
+            tail_ring_bytes: traza::DEFAULT_TAIL_RING_BYTES,
             flush_wal_bytes: None,
         },
     )
@@ -684,6 +700,8 @@ fn second_open_is_rejected() {
         compaction: None,
         wal_commit_window: None,
         content_index: true,
+        tail_ring_spans: traza::DEFAULT_TAIL_RING_SPANS,
+        tail_ring_bytes: traza::DEFAULT_TAIL_RING_BYTES,
         flush_wal_bytes: None,
     };
     let first = Store::open(&dir, config.clone()).expect("open first store");

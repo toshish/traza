@@ -109,6 +109,17 @@ impl Latency {
         }
     }
 
+    /// Counts one event without timing it.
+    ///
+    /// For work whose duration is not a latency — a stream lasts as long as
+    /// its consumer stays connected — this keeps the request count honest
+    /// while leaving the percentiles describing only things that finish.
+    /// Recording the duration instead would not merely add an outlier; it
+    /// would move every percentile the panel derives from these buckets.
+    pub fn count_only(&self) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Times `body`, records how long it took, and returns its value.
     pub fn time<T>(&self, body: impl FnOnce() -> T) -> T {
         let started = Instant::now();

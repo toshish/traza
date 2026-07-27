@@ -7,6 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`GET /v1/tail` streams spans as they are admitted**, as server-sent events.
+  This is the only route ordered by admission rather than event time, and that
+  is why it exists: `/v1/spans?since=` answers "what STARTED after T", which is
+  a different question from "what is arriving". A span running longer than a
+  client's polling interval starts before the watermark and arrives after it, so
+  the old polling tail dropped it permanently — not late, never. Admission order
+  comes from a bounded in-memory ring, so it costs no disk, no segment format
+  version, and no branch in the query path. Every `/v1/spans` predicate works,
+  content search included. An event-time bound is refused with `400` rather than
+  ignored, at the HTTP surface and in `Store::tail_after` alike.
+
+  Bounded by `--tail-ring-spans` (count) and `--tail-ring-bytes` (memory),
+  whichever binds first. The byte bound is the one that matters: the ring owns
+  whole spans once a seal drops them from the write buffer, and an LLM span
+  carrying a prompt is orders of magnitude larger than one carrying a status
+  code. Residency and both bounds are reported at `/v1/metrics.json` under
+  `tail_ring`.
+
+  The ring is bounded by **bytes as well as count**, and the byte estimate
+  counts structure and retained capacity, not only text — a `Value` slot per
+  element and per map entry, and `capacity()` rather than `len()` for every
+  collection. Counting text alone left the ceiling bypassable by shape; counting
+  logical length left it bypassable by a `Vec` grown large and truncated, which
+  keeps its whole allocation.
+
+  The screen itself is under test now (`ui/src/views/TailScreen.test.jsx`,
+  jsdom + Testing Library), which found four defects nothing else could reach:
+  **resume produced no rows** — `setRows` was given an updater that read
+  `buffer.current`, and the buffer was cleared before React ran it; **every
+  keystroke in the service filter opened a new stream**, eight connections for
+  "checkout", now settled over 250 ms; **row keys included the array index**, so
+  prepending a batch changed every key and rebuilt all 300 rows per frame, now a
+  client-assigned id; and **a full pause buffer discarded its overflow
+  silently**, now counted and shown. The rate window is bounded by samples as
+  well as by duration.
+
+  A gap is a **visible** discontinuity even when the server cannot count it. A
+  cursor from before a restart is not comparable to the new numbering, so
+  `missed` is `null` rather than a number, and the client shows the break
+  without inventing a count — tracking counted and uncounted breaks separately,
+  so "unknown, then 5" reads as `5+` rather than as an exact 5. `backfill` survives a gap unchanged, including
+  `backfill=0`.
+
+  A streamed span has been **acknowledged**: entries reach the ring only after
+  the ingest succeeded, past the log's fsync and past the seal `flushed`
+  promises. The tail is bounded and may gap, but it never shows a span the store
+  did not accept.
+
+  A subscriber that falls further behind than the ring retains gets a `gap`
+  frame carrying a count and **no position**: the dropped entries are exactly
+  the ones no longer addressable, and no query can name an admission range. The
+  stream restarts at the live edge and the client rebuilds from there.
+
+  The dashboard's Live tail consumes it over one held connection. An idle tail
+  went from roughly forty empty round trips a minute to zero.
+
 ### Fixed
 
 - **Aggregations no longer block ingest.** `fold_spans` held the writer and

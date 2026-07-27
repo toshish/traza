@@ -471,7 +471,10 @@ fn metrics_json_reports_per_route_latency_with_its_error_bound() {
 
     // Route classes exist so "how fast are queries" has an answer: one blended
     // histogram over ingest and search described neither.
-    for class in ["ingest", "lookup", "search", "stats", "other"] {
+    // `stream` included deliberately: the reporting zips this list against a
+    // fixed-size array, so a class added to one and not the other is dropped
+    // from the output without any compile error. That happened.
+    for class in ["ingest", "lookup", "search", "stats", "stream", "other"] {
         assert!(
             body["by_class"][class].is_object(),
             "missing {class}: {body}"

@@ -251,6 +251,37 @@ export const api = {
     }
     return { blob: new Blob(chunks, { type: 'application/x-ndjson' }), rows, bytes };
   },
+  /** The live tail, as an async iterable of decoded text chunks.
+   *
+   *  Not `EventSource`: that cannot set an `Authorization` header, and the only
+   *  alternative it leaves is putting the bearer token in the URL, where it
+   *  lands in proxy logs and browser history. `fetch` carries the header, and
+   *  its reader is abortable, which `EventSource` also is not.
+   *
+   *  Decoding is stateful (`stream: true`): a chunk boundary can fall inside a
+   *  multi-byte character, and decoding each chunk independently would turn
+   *  every such span name into replacement characters. */
+  tailChunks: async (filters, signal) => {
+    const response = await request('/v1/tail' + query(filters), { raw: true, signal });
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    return {
+      async *[Symbol.asyncIterator]() {
+        try {
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            yield decoder.decode(value, { stream: true });
+          }
+        } finally {
+          // Releasing matters on the abort path: without it the response body
+          // stays locked and the connection is held until GC gets to it.
+          try { reader.cancel(); } catch (e) { /* already closed */ }
+        }
+      },
+    };
+  },
+
   exportPath: (filters) => '/v1/export' + query(filters),
   spansPath: (filters) => '/v1/spans' + query(filters),
 };
