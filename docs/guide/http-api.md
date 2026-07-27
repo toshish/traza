@@ -440,6 +440,12 @@ A line beginning `:` is a comment — the heartbeat, sent every 15 seconds on a
 quiet store. It is how an intermediary is kept from reaping the connection and
 how the server discovers a client has gone.
 
+**A streamed span has been acknowledged.** Entries reach the stream only after
+the ingest that carried them succeeded — after the write-ahead log's fsync, and
+after the seal that `--durability flushed` promises. The tail is bounded and may
+gap, but it never shows a span the store did not accept, and never one that a
+crash a moment later would erase.
+
 **Cursors do not survive a restart.** The `epoch` half of the token identifies
 the process; a cursor from a previous one is reported as a gap rather than
 misread as a live position.

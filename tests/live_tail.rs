@@ -718,3 +718,72 @@ fn the_ring_reports_its_residency_and_both_bounds() {
         "residency is measured, not assumed: {ring}"
     );
 }
+
+#[test]
+#[cfg(unix)]
+fn a_failed_ingest_never_reaches_the_tail() {
+    // "Admitted" has to mean acknowledged. The ring used to be published
+    // straight after the write-buffer upsert — before the fsync that makes the
+    // batch survivable, and before the synchronous seal that
+    // `Durability::Flushed` promises — so a tail could show a span whose
+    // ingest then returned an error, or which a crash a millisecond later
+    // erased. A live view may be bounded and may admit gaps; it may not show
+    // data the store never accepted.
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = test_dir("failed-ingest");
+    let engine = Store::open(
+        &dir,
+        Config {
+            // Every batch seals, and the seal has to finish before the
+            // acknowledgement — so making the seal fail fails the ingest.
+            durability: Durability::Flushed,
+            flush_spans: 1,
+            ..Config::default()
+        },
+    )
+    .expect("store opens");
+
+    // A successful ingest first, to prove the tail is working at all.
+    engine
+        .ingest_batch(vec![span("t1", "accepted", 1_000, 2_000)])
+        .expect("ingest");
+    let cursor = cursor_of(
+        &engine
+            .tail_after(None, 100, 100, &SpanFilter::default(), Duration::ZERO)
+            .expect("tail"),
+    );
+
+    let mut locked = std::fs::metadata(&dir).expect("metadata").permissions();
+    locked.set_mode(0o555);
+    std::fs::set_permissions(&dir, locked).expect("lock the directory");
+
+    let refused = engine.ingest_batch(vec![span("t1", "rejected", 3_000, 4_000)]);
+
+    let mut unlocked = std::fs::metadata(&dir).expect("metadata").permissions();
+    unlocked.set_mode(0o755);
+    std::fs::set_permissions(&dir, unlocked).expect("unlock the directory");
+
+    // Running as root ignores the permission bits, so the fault never happens
+    // and the test has nothing to observe. Say so rather than pass silently.
+    assert!(
+        refused.is_err(),
+        "expected the seal to fail on a read-only directory; if this is running \
+         as root the fault cannot be injected and the guard proves nothing"
+    );
+
+    let after = engine
+        .tail_after(
+            Some(cursor),
+            100,
+            100,
+            &SpanFilter::default(),
+            Duration::ZERO,
+        )
+        .expect("tail");
+    assert!(
+        ids(&after).is_empty(),
+        "a span whose ingest failed must never appear in the tail: {:?}",
+        ids(&after)
+    );
+}

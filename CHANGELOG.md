@@ -27,6 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   code. Residency and both bounds are reported at `/v1/metrics.json` under
   `tail_ring`.
 
+  A streamed span has been **acknowledged**: entries reach the ring only after
+  the ingest succeeded, past the log's fsync and past the seal `flushed`
+  promises. The tail is bounded and may gap, but it never shows a span the store
+  did not accept.
+
   A subscriber that falls further behind than the ring retains gets a `gap`
   frame carrying a count and **no position**: the dropped entries are exactly
   the ones no longer addressable, and no query can name an admission range. The
