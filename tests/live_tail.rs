@@ -71,7 +71,8 @@ fn ids(read: &TailRead) -> Vec<String> {
 fn cursor_of(read: &TailRead) -> traza::tail::TailCursor {
     match read {
         TailRead::Batch { cursor, .. } => *cursor,
-        TailRead::Gap { cursor } => *cursor,
+        // A gap carries no position, by design — see `TailRead::Gap`.
+        TailRead::Gap { .. } => panic!("a gap has no position to resume from"),
     }
 }
 
@@ -84,7 +85,9 @@ fn event_time_paging_still_loses_the_span_the_tail_delivers() {
     engine
         .ingest_batch(vec![span("t1", "a", 10_000, 11_000)])
         .expect("ingest a");
-    let first = engine.tail_after(None, 100, 100, &SpanFilter::default(), Duration::ZERO);
+    let first = engine
+        .tail_after(None, 100, 100, &SpanFilter::default(), Duration::ZERO)
+        .expect("tail");
     assert_eq!(ids(&first), ["a"]);
     let cursor = cursor_of(&first);
 
@@ -115,13 +118,15 @@ fn event_time_paging_still_loses_the_span_the_tail_delivers() {
 
     // Admission order delivers it. This is the line that fails against the
     // design this replaced.
-    let second = engine.tail_after(
-        Some(cursor),
-        100,
-        100,
-        &SpanFilter::default(),
-        Duration::ZERO,
-    );
+    let second = engine
+        .tail_after(
+            Some(cursor),
+            100,
+            100,
+            &SpanFilter::default(),
+            Duration::ZERO,
+        )
+        .expect("tail");
     assert_eq!(
         ids(&second),
         ["b"],
@@ -139,20 +144,24 @@ fn a_settled_cursor_never_replays() {
         ])
         .expect("ingest");
 
-    let first = engine.tail_after(None, 100, 100, &SpanFilter::default(), Duration::ZERO);
+    let first = engine
+        .tail_after(None, 100, 100, &SpanFilter::default(), Duration::ZERO)
+        .expect("tail");
     assert_eq!(ids(&first).len(), 2);
     let mut cursor = cursor_of(&first);
 
     // Identical timestamps, which no watermark can separate — the burst that
     // made the previous implementation replay its first page forever.
     for _ in 0..5 {
-        let read = engine.tail_after(
-            Some(cursor),
-            100,
-            100,
-            &SpanFilter::default(),
-            Duration::ZERO,
-        );
+        let read = engine
+            .tail_after(
+                Some(cursor),
+                100,
+                100,
+                &SpanFilter::default(),
+                Duration::ZERO,
+            )
+            .expect("tail");
         assert!(ids(&read).is_empty(), "settled cursor must be silent");
         cursor = cursor_of(&read);
     }
@@ -167,16 +176,18 @@ fn a_filter_applies_to_the_stream() {
         .ingest_batch(vec![span("t1", "good", 1_000, 2_000), failed])
         .expect("ingest");
 
-    let read = engine.tail_after(
-        None,
-        100,
-        100,
-        &SpanFilter {
-            status: Some("error".to_owned()),
-            ..SpanFilter::default()
-        },
-        Duration::ZERO,
-    );
+    let read = engine
+        .tail_after(
+            None,
+            100,
+            100,
+            &SpanFilter {
+                status: Some("error".to_owned()),
+                ..SpanFilter::default()
+            },
+            Duration::ZERO,
+        )
+        .expect("tail");
     assert_eq!(ids(&read), ["bad"]);
 }
 
@@ -196,8 +207,11 @@ fn falling_off_the_ring_reports_a_gap() {
     engine
         .ingest_batch(vec![span("t1", "a", 1_000, 2_000)])
         .expect("ingest");
-    let cursor =
-        cursor_of(&engine.tail_after(None, 100, 100, &SpanFilter::default(), Duration::ZERO));
+    let cursor = cursor_of(
+        &engine
+            .tail_after(None, 100, 100, &SpanFilter::default(), Duration::ZERO)
+            .expect("tail"),
+    );
 
     for index in 0..8 {
         engine
@@ -207,13 +221,15 @@ fn falling_off_the_ring_reports_a_gap() {
 
     // A gap is reported rather than entries being silently skipped: the client
     // can recover from being told, and cannot recover from not being told.
-    let read = engine.tail_after(
-        Some(cursor),
-        100,
-        100,
-        &SpanFilter::default(),
-        Duration::ZERO,
-    );
+    let read = engine
+        .tail_after(
+            Some(cursor),
+            100,
+            100,
+            &SpanFilter::default(),
+            Duration::ZERO,
+        )
+        .expect("tail");
     assert!(
         matches!(read, TailRead::Gap { .. }),
         "a cursor older than the ring must gap, not skip"
@@ -240,13 +256,15 @@ fn a_waiting_subscriber_is_woken_by_an_ingest() {
     // is pushed to the waiting subscriber, not that the deadline eventually
     // expires and it re-reads.
     let started = Instant::now();
-    let read = engine.tail_after(
-        Some(head),
-        0,
-        100,
-        &SpanFilter::default(),
-        Duration::from_secs(5),
-    );
+    let read = engine
+        .tail_after(
+            Some(head),
+            0,
+            100,
+            &SpanFilter::default(),
+            Duration::from_secs(5),
+        )
+        .expect("tail");
     let waited = started.elapsed();
     ingest.join().expect("ingest thread");
 
@@ -268,6 +286,10 @@ struct Server {
 
 impl Server {
     fn spawn(data_dir: &Path) -> Self {
+        Self::spawn_with(data_dir, &[])
+    }
+
+    fn spawn_with(data_dir: &Path, extra: &[&str]) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_traza-server"));
         command
             .arg("--data-dir")
@@ -281,6 +303,9 @@ impl Server {
             .env_remove("TRAZA_TOKENS")
             .env("TRAZA_SOCKET_TIMEOUT_MS", "30000")
             .stderr(Stdio::piped());
+        for argument in extra {
+            command.arg(argument);
+        }
         let mut child = command.spawn().expect("spawns traza-server");
         let stderr = child.stderr.take().expect("stderr piped");
         let mut reader = BufReader::new(stderr);
@@ -548,5 +573,148 @@ fn a_stream_is_counted_but_never_timed() {
         stream_class["max_ns"].as_u64(),
         Some(0),
         "a stream's duration must never enter the latency histogram: {stream_class}"
+    );
+}
+
+#[test]
+fn the_library_refuses_an_event_time_window_rather_than_applying_it() {
+    // The bug this guards: `tail_after` documented `since_ns`/`until_ns` as
+    // ignored while handing the whole filter to `span_matches`, which applies
+    // both. A span starting before the window was dropped AND the cursor
+    // advanced past it, so it could never be delivered — the original
+    // permanent-loss bug, reproduced for every library caller behind a doc
+    // comment saying it could not happen.
+    let (engine, _dir) = store("library-window");
+    engine
+        .ingest_batch(vec![span("t1", "early", 5_000, 30_000)])
+        .expect("ingest");
+
+    for bounded in [
+        SpanFilter {
+            since_ns: Some(10_000),
+            ..SpanFilter::default()
+        },
+        SpanFilter {
+            until_ns: Some(1_000),
+            ..SpanFilter::default()
+        },
+    ] {
+        let refused = engine.tail_after(None, 100, 100, &bounded, Duration::ZERO);
+        assert!(
+            matches!(refused, Err(traza::Error::UnsupportedFilter(_))),
+            "an event-time bound must be refused, not silently applied"
+        );
+    }
+
+    // Without the bound the same span is delivered, which is what makes the
+    // refusal a refusal rather than the store simply having nothing.
+    let allowed = engine
+        .tail_after(None, 100, 100, &SpanFilter::default(), Duration::ZERO)
+        .expect("tail");
+    assert_eq!(ids(&allowed), ["early"]);
+}
+
+#[test]
+fn a_gap_restarts_the_stream_without_replaying_or_duplicating() {
+    // The gap contract, end to end, by the route that actually produces one:
+    // a client disconnects, the ring turns over while it is away, and it
+    // reconnects with a position the server no longer holds.
+    //
+    // The previous design answered that with the ring's FLOOR, replayed every
+    // retained entry from there, and told the client to "backfill what was
+    // dropped" from an event-time query it could not express. The overlap
+    // between the two showed the same span twice.
+    let dir = test_dir("http-gap");
+    let server = Server::spawn_with(&dir, &["--tail-ring-spans", "4"]);
+
+    server.ingest(json!([{
+        "trace_id": "t1", "span_id": "first", "name": "op", "service": "svc",
+        "start_time_ns": 1_000_u64, "end_time_ns": 2_000_u64, "status": "ok",
+    }]));
+
+    let stale = {
+        let (_head, mut stream) = Stream::open(&server, "?backfill=100");
+        let opening = stream.next_spans();
+        assert_eq!(opening["spans"].as_array().expect("spans").len(), 1);
+        opening["cursor"].as_str().expect("cursor").to_owned()
+    };
+
+    // Away long enough that the ring turns over several times.
+    for index in 0..24 {
+        server.ingest(json!([{
+            "trace_id": "t1", "span_id": format!("x{index}"), "name": "op",
+            "service": "svc", "start_time_ns": 3_000_u64 + index as u64,
+            "end_time_ns": 4_000_u64, "status": "ok",
+        }]));
+    }
+
+    let (_head, mut stream) = Stream::open(&server, &format!("?cursor={stale}"));
+
+    // The first frame must be the gap, and it must offer no position.
+    let payload = loop {
+        let frame = stream.frame();
+        if let Some(data) = frame.strip_prefix("event: gap\ndata: ") {
+            break serde_json::from_str::<Value>(data.trim_end()).expect("json");
+        }
+        assert!(
+            frame.starts_with(':'),
+            "nothing but a heartbeat may precede the gap: {frame}"
+        );
+    };
+    assert!(
+        payload.get("cursor").is_none(),
+        "a gap must not offer a position to resume from: {payload}"
+    );
+    assert_eq!(
+        payload["missed"].as_u64(),
+        Some(20),
+        "25 admitted, this subscriber had seen 1, and 4 are still retained — \
+         so 20 passed through the ring while it was away: {payload}"
+    );
+
+    // What follows is one fresh backlog, bounded by what the ring holds — not
+    // a replay from the floor, and with no key repeated.
+    let rebuild = stream.next_spans();
+    let keys: Vec<String> = rebuild["spans"]
+        .as_array()
+        .expect("spans")
+        .iter()
+        .map(|span| format!("{}/{}", span["trace_id"], span["span_id"]))
+        .collect();
+    let distinct: std::collections::HashSet<&String> = keys.iter().collect();
+    assert_eq!(
+        keys.len(),
+        distinct.len(),
+        "the rebuild must not repeat a span: {keys:?}"
+    );
+    assert!(
+        !keys.is_empty() && keys.len() <= 4,
+        "bounded by what the ring retains, not by what was lost: {keys:?}"
+    );
+}
+
+#[test]
+fn the_ring_reports_its_residency_and_both_bounds() {
+    // The tail is the only structure that holds whole spans indefinitely, so
+    // "is this why the process is large" has to be answerable without a
+    // profiler.
+    let dir = test_dir("http-usage");
+    let server = Server::spawn_with(
+        &dir,
+        &["--tail-ring-spans", "16", "--tail-ring-bytes", "4096"],
+    );
+    server.ingest(json!([{
+        "trace_id": "t1", "span_id": "a", "name": "op", "service": "svc",
+        "start_time_ns": 1_000_u64, "end_time_ns": 2_000_u64, "status": "ok",
+    }]));
+
+    let stats = server_metrics(&server);
+    let ring = &stats["tail_ring"];
+    assert_eq!(ring["max_spans"].as_u64(), Some(16));
+    assert_eq!(ring["max_bytes"].as_u64(), Some(4096));
+    assert_eq!(ring["spans"].as_u64(), Some(1));
+    assert!(
+        ring["bytes"].as_u64().unwrap_or(0) > 0,
+        "residency is measured, not assumed: {ring}"
     );
 }

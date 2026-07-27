@@ -38,6 +38,7 @@ fn store_with_corpus(label: &str, options: &SeedOptions) -> (Store, traza::seed:
             wal_commit_window: None,
             content_index: true,
             tail_ring_spans: traza::DEFAULT_TAIL_RING_SPANS,
+            tail_ring_bytes: traza::DEFAULT_TAIL_RING_BYTES,
             flush_wal_bytes: None,
         },
     )

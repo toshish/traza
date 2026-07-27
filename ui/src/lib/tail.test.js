@@ -7,7 +7,7 @@ import {
 /** An SSE frame, as the server writes it. */
 const spansFrame = (spans, cursor) =>
   `event: spans\ndata: ${JSON.stringify({ spans, cursor })}\n\n`;
-const gapFrame = (cursor) => `event: gap\ndata: ${JSON.stringify({ cursor })}\n\n`;
+const gapFrame = (missed) => `event: gap\ndata: ${JSON.stringify({ missed })}\n\n`;
 
 const span = (id, startNs) => ({
   trace_id: `t-${id}`, span_id: id, start_time_ns: startNs,
@@ -184,7 +184,12 @@ describe('the tail client', () => {
     expect(waits[1]).toBe(RECONNECT_MIN_MS);
   });
 
-  it('reports a gap and resumes from the position it was given', async () => {
+  it('drops its position on a gap and rebuilds from what follows', async () => {
+    // A gap is a discontinuity, not a position. The old contract handed back
+    // the ring's floor and told the client to "backfill only what was dropped"
+    // from an event-time query that cannot address an admission range — the
+    // fetch overlapped the entries the stream then replayed, and the same span
+    // appeared twice with nothing to deduplicate it.
     const state = newTailState();
     const gaps = [];
     const delivered = [];
@@ -192,18 +197,50 @@ describe('the tail client', () => {
 
     await runTail(state, {
       open: async () => source([
-        gapFrame('1.400'),
-        spansFrame([span('after', 9)], '1.401'),
+        spansFrame([span('before', 1)], '1.7'),
+        gapFrame(412),
+        spansFrame([span('after', 9)], '1.900'),
       ]),
       signal: controller.signal,
       sleep: async () => controller.abort(),
-      onGap: async (cursor) => { gaps.push(cursor); },
+      onGap: async (missed) => { gaps.push(missed); },
       onSpans: (spans) => delivered.push(...spans.map((s) => s.span_id)),
     });
 
-    expect(gaps).toEqual(['1.400']);
-    expect(delivered).toEqual(['after']);
-    expect(state.cursor).toBe('1.401');
+    // The count is reported so the break is visible rather than silent.
+    expect(gaps).toEqual([412]);
+    expect(delivered).toEqual(['before', 'after']);
+    // And the position that followed the gap is the one now held — never the
+    // dead one from before it.
+    expect(state.cursor).toBe('1.900');
+  });
+
+  it('reconnects from scratch after a gap, not from the dead position', async () => {
+    // If the connection drops during recovery, resuming from the pre-gap
+    // position would gap again immediately, forever.
+    const state = newTailState();
+    const asked = [];
+    const controller = new AbortController();
+    let opened = 0;
+
+    await runTail(state, {
+      open: async (params) => {
+        asked.push(params);
+        opened += 1;
+        if (opened === 1) return source([spansFrame([span('a', 1)], '1.5'), gapFrame(9)]);
+        controller.abort();
+        return source([]);
+      },
+      backfill: 200,
+      signal: controller.signal,
+      sleep: async () => {},
+      onSpans: () => {},
+      onGap: () => {},
+    });
+
+    expect(asked[0]).toEqual({ backfill: 200 });
+    expect(asked[1]).toEqual({ backfill: 200 });
+    expect(asked[1].cursor).toBeUndefined();
   });
 
   it('does not advance past spans whose delivery threw', async () => {

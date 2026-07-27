@@ -80,7 +80,11 @@ export function parseFrame(frame) {
   if (event === 'spans') {
     return { type: 'spans', spans: payload.spans || [], cursor: payload.cursor || null };
   }
-  if (event === 'gap') return { type: 'gap', cursor: payload.cursor || null };
+  // A gap carries no position. It is a discontinuity: everything held before it
+  // is void, and the stream resumes with a fresh backlog from the live edge.
+  if (event === 'gap') {
+    return { type: 'gap', missed: typeof payload.missed === 'number' ? payload.missed : null };
+  }
   return null;
 }
 
@@ -142,8 +146,14 @@ export async function runTail(state, options) {
             if (frame.spans.length && onSpans) onSpans(frame.spans);
             state.cursor = frame.cursor;
           } else if (frame.type === 'gap') {
-            if (onGap) await onGap(frame.cursor);
-            state.cursor = frame.cursor;
+            // Drop the position: it names entries the server no longer has, and
+            // there is no query that can fetch them — `/v1/spans` is ordered by
+            // event time and cannot address an admission range at all. The
+            // server restarts this subscription at the live edge, so the next
+            // `spans` frame is a clean rebuild, and the consumer's job is to
+            // discard what it was holding rather than to try to patch it.
+            state.cursor = null;
+            if (onGap) await onGap(frame.missed);
           }
         }
       }

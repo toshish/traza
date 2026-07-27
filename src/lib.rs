@@ -622,12 +622,22 @@ pub struct Config {
     pub content_index: bool,
     /// Spans retained in the live tail's admission ring (see [`tail`]).
     ///
-    /// This is the tail's entire memory cost and its entire replay window. A
-    /// subscriber that falls further behind than this is told it gapped rather
-    /// than being silently skipped, so the bound is a latency budget, not a
-    /// correctness one: it decides how long a client may be disconnected before
-    /// resuming costs it a backfill query.
+    /// Whichever of this and [`Self::tail_ring_bytes`] binds first decides how
+    /// far behind a subscriber may fall before it is told it gapped. Neither
+    /// bound is a correctness one — falling behind is reported, never silently
+    /// skipped — but a count alone is not a memory bound, which is why there
+    /// are two.
     pub tail_ring_spans: usize,
+    /// Bytes of span text the live tail's admission ring may hold.
+    ///
+    /// **This is what actually bounds the tail's memory.** The ring becomes the
+    /// sole owner of a span once a seal evicts it from the write buffer, and
+    /// span size varies by orders of magnitude: an LLM span carrying a prompt
+    /// just under [`Self::payload_threshold`] is roughly a thousand times a
+    /// span carrying a status code. Counted only by entries, a default ring of
+    /// such spans reached hundreds of megabytes — the same text residency the
+    /// attribute index was rewritten to remove.
+    pub tail_ring_bytes: usize,
 }
 
 /// Default ceiling on log bytes before a flush seals the buffer. Large enough
@@ -635,11 +645,21 @@ pub struct Config {
 /// small enough that a restart replays it in well under a second.
 pub const DEFAULT_FLUSH_WAL_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Default admission-ring depth. At a few hundred bytes per span this is single
-/// -digit megabytes, and it covers minutes of a quiet store or seconds of a
-/// loud one — comfortably longer than a browser tab spends backgrounded
-/// between reconnects.
+/// Default admission-ring depth, in spans.
+///
+/// Enough to cover minutes of a quiet store or seconds of a loud one —
+/// comfortably longer than a browser tab spends backgrounded between
+/// reconnects. On narrow spans this is the binding bound; on wide ones
+/// [`DEFAULT_TAIL_RING_BYTES`] binds first, which is the point of having both.
 pub const DEFAULT_TAIL_RING_SPANS: usize = 8_192;
+
+/// Default ceiling on the bytes the admission ring holds.
+///
+/// Chosen as a bound an operator does not have to think about: small enough
+/// that a tail cannot meaningfully change a process's footprint, large enough
+/// that ordinary spans reach the count bound first and the byte bound only
+/// engages for the wide-text workloads where it matters.
+pub const DEFAULT_TAIL_RING_BYTES: usize = 32 * 1024 * 1024;
 
 impl Default for Config {
     fn default() -> Self {
@@ -653,6 +673,7 @@ impl Default for Config {
             wal_commit_window: None,
             content_index: true,
             tail_ring_spans: DEFAULT_TAIL_RING_SPANS,
+            tail_ring_bytes: DEFAULT_TAIL_RING_BYTES,
         }
     }
 }
@@ -700,6 +721,13 @@ pub enum Error {
     /// so recovering the prefix would silently drop acknowledged batches that
     /// come after the damage. Refusing to open is the only honest answer.
     WalCorrupt(String),
+    /// A filter carried a predicate the surface it was given to cannot honour.
+    ///
+    /// Refused rather than ignored. Dropping a predicate answers a different
+    /// question than the caller asked while looking like it answered theirs,
+    /// which is how a live tail came to silently discard every span that
+    /// started before its window.
+    UnsupportedFilter(&'static str),
 }
 
 impl fmt::Display for Error {
@@ -711,6 +739,7 @@ impl fmt::Display for Error {
             Self::LockPoisoned(name) => write!(f, "storage lock poisoned: {name}"),
             Self::InvalidSpan(reason) => write!(f, "invalid span: {reason}"),
             Self::QueryTooBroad(reason) => write!(f, "query too broad: {reason}"),
+            Self::UnsupportedFilter(reason) => write!(f, "unsupported filter: {reason}"),
             Self::WalCorrupt(detail) => write!(f, "write-ahead log is corrupt: {detail}"),
         }
     }
@@ -725,7 +754,8 @@ impl StdError for Error {
             | Self::LockPoisoned(_)
             | Self::InvalidSpan(_)
             | Self::QueryTooBroad(_)
-            | Self::WalCorrupt(_) => None,
+            | Self::WalCorrupt(_)
+            | Self::UnsupportedFilter(_) => None,
         }
     }
 }
@@ -1357,6 +1387,7 @@ impl Store {
                 .max()
                 .map_or(0, |number| number.saturating_add(1));
             let tail_ring_spans = config.tail_ring_spans;
+            let tail_ring_bytes = config.tail_ring_bytes;
 
             Ok(Self {
                 annotations: annotations::AnnotationLog::open(&directory)?,
@@ -1368,7 +1399,7 @@ impl Store {
                 segments: Mutex::new(segments),
                 rollups: Mutex::new(std::collections::HashMap::new()),
                 recent_payloads: payload::TouchRegistry::default(),
-                tail: tail::TailChannel::new(tail_ring_spans),
+                tail: tail::TailChannel::new(tail_ring_spans, tail_ring_bytes),
                 next_segment: AtomicU64::new(next_segment),
                 wal,
                 metrics: metrics::Metrics::default(),
@@ -1524,14 +1555,29 @@ impl Store {
         self.tail.head()
     }
 
+    /// The live tail's residency as `(spans, bytes, max_spans, max_bytes)`.
+    ///
+    /// Exposed because the ring is the only structure in the engine that holds
+    /// whole spans for an unbounded time, so an operator needs to be able to
+    /// see it rather than deduce it from RSS.
+    pub fn tail_usage(&self) -> Option<(usize, usize, usize, usize)> {
+        self.tail.usage()
+    }
+
     /// Waits up to `timeout` for spans admitted after `cursor` that match
     /// `filter`.
     ///
     /// This is the live tail, and it is ordered by ADMISSION rather than event
-    /// time — see [`tail`] for why that distinction is the whole point. The
-    /// time bounds in `filter` are ignored here for the same reason: a tail
-    /// asks what is arriving, and answering that with `start_time_ns` is what
-    /// made long-running spans invisible.
+    /// time — see [`tail`] for why that distinction is the whole point.
+    ///
+    /// **`since_ns` and `until_ns` are rejected, not ignored.** An event-time
+    /// window cannot be honoured on an admission-ordered stream, and applying
+    /// one anyway is the original bug: a span that started before the window
+    /// but landed inside it is dropped, the cursor advances past it, and it
+    /// never appears. Documenting the field as "ignored" while passing the
+    /// whole filter to `span_matches` reproduced exactly that for every library
+    /// caller, which is why this is a type-checked refusal now rather than a
+    /// sentence in a doc comment.
     ///
     /// Takes only the ring's lock, so an idle subscriber parked here blocks
     /// neither ingest nor any other query.
@@ -1542,14 +1588,20 @@ impl Store {
         limit: usize,
         filter: &SpanFilter,
         timeout: std::time::Duration,
-    ) -> tail::TailRead {
+    ) -> Result<tail::TailRead> {
+        if filter.since_ns.is_some() || filter.until_ns.is_some() {
+            return Err(Error::UnsupportedFilter(
+                "a tail streams in admission order, so since_ns/until_ns cannot \
+                 be honoured; use Store::query for an event-time window",
+            ));
+        }
         // Content search works on the tail without any index: the ring holds
         // whole spans, so the query runs against the text in memory rather than
         // against the postings a segment would have needed at seal time.
         let content = filter.content.as_deref().map(content::Query::new);
-        self.tail.wait(cursor, backfill, limit, timeout, &|span| {
+        Ok(self.tail.wait(cursor, backfill, limit, timeout, &|span| {
             span_matches(span, filter, content.as_ref())
-        })
+        }))
     }
 
     /// Persists every currently buffered span as one sorted segment.

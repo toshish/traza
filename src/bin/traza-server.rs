@@ -417,6 +417,19 @@ impl ServerMetrics {
             // server as `wal` — including a `buffered` one, which promises the
             // opposite. A screen must not be able to invent this.
             "durability": engine.durability().as_str(),
+            // The live tail's residency, and both of its bounds, so which one
+            // is binding is visible rather than inferred. The ring is the only
+            // structure here that holds whole spans indefinitely, so "is the
+            // tail why this process is large" has to be answerable.
+            "tail_ring": match engine.tail_usage() {
+                Some((spans, bytes, max_spans, max_bytes)) => json!({
+                    "spans": spans,
+                    "bytes": bytes,
+                    "max_spans": max_spans,
+                    "max_bytes": max_bytes,
+                }),
+                None => Value::Null,
+            },
             "requests": {
                 "total": self.requests.get(),
                 "rejected": self.rejected.get(),
@@ -475,6 +488,9 @@ default 64MiB)] \
 [--wal-commit-window-us N (delay each fsync so more acks share it; 0 = off)] \
 [--compaction-fanout N (0 disables; default 4)] [--compaction-max-segment-bytes N] \
 [--no-content-index (content search still works, by scanning)] \
+[--tail-ring-spans N (live-tail replay depth; default 8192)] \
+[--tail-ring-bytes N (live-tail memory ceiling, whichever bound binds first; \
+default 32MiB)] \
 [--ui-dir DIR (built dashboard; default: TRAZA_UI_DIR, beside the binary, then ./ui/dist)] \
 [--allow-unauthenticated-non-loopback]";
 
@@ -520,6 +536,7 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
     // exactly the question the resolve below asks.
     let mut flush_spans: Option<usize> = None;
     let mut tail_ring_spans = traza::DEFAULT_TAIL_RING_SPANS;
+    let mut tail_ring_bytes = traza::DEFAULT_TAIL_RING_BYTES;
     let mut wal_commit_window_us: Option<u64> = None;
 
     let value = |i: usize, name: &str| -> Result<&String, String> {
@@ -568,6 +585,10 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
             "--tail-ring-spans" => {
                 i += 1;
                 tail_ring_spans = (number(i, "--tail-ring-spans")? as usize).max(1);
+            }
+            "--tail-ring-bytes" => {
+                i += 1;
+                tail_ring_bytes = (number(i, "--tail-ring-bytes")? as usize).max(1);
             }
             "--max-connections" => {
                 i += 1;
@@ -651,6 +672,7 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
             content_index,
             compaction: compaction_enabled.then_some(compaction),
             tail_ring_spans,
+            tail_ring_bytes,
         },
     }))
 }
@@ -1666,7 +1688,18 @@ fn stream_tail(
     let mut opening_backfill = backfill;
 
     loop {
-        let read = engine.tail_after(cursor, opening_backfill, limit, filter, TAIL_HEARTBEAT);
+        let read = match engine.tail_after(cursor, opening_backfill, limit, filter, TAIL_HEARTBEAT)
+        {
+            Ok(read) => read,
+            // The filter was validated before the status line went out, so
+            // reaching this means a predicate the tail cannot honour got past
+            // the parser. Ending the stream is the only honest response left
+            // once the response has already begun.
+            Err(error) => {
+                eprintln!("tail refused its filter mid-stream: {error}");
+                return stream.flush();
+            }
+        };
         opening_backfill = 0;
         let frame = match read {
             TailRead::Batch {
@@ -1693,11 +1726,19 @@ fn stream_tail(
                     format!("event: spans\ndata: {payload}\n\n")
                 }
             }
-            TailRead::Gap { cursor: floor } => {
-                cursor = Some(floor);
-                // The floor, not the head: the client's backfill only has to
-                // cover what the ring actually dropped.
-                let payload = json!({"cursor": floor.to_token()});
+            TailRead::Gap { missed } => {
+                // A gap is a discontinuity, not a position to resume from. The
+                // subscriber restarts at the live edge with a fresh backlog,
+                // and everything it held before the break is void.
+                //
+                // Resuming from the ring's floor instead — the first design —
+                // replayed every retained entry while the client was fetching
+                // an overlapping window by event time, producing duplicates
+                // with nothing to deduplicate them, and claiming to have
+                // recovered an interval that no query can actually address.
+                cursor = None;
+                opening_backfill = backfill.max(DEFAULT_TAIL_BACKFILL);
+                let payload = json!({"missed": missed});
                 format!("event: gap\ndata: {payload}\n\n")
             }
         };

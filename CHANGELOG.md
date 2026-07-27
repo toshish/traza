@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`GET /v1/tail` streams spans as they are admitted**, as server-sent events.
+  This is the only route ordered by admission rather than event time, and that
+  is why it exists: `/v1/spans?since=` answers "what STARTED after T", which is
+  a different question from "what is arriving". A span running longer than a
+  client's polling interval starts before the watermark and arrives after it, so
+  the old polling tail dropped it permanently — not late, never. Admission order
+  comes from a bounded in-memory ring, so it costs no disk, no segment format
+  version, and no branch in the query path. Every `/v1/spans` predicate works,
+  content search included. An event-time bound is refused with `400` rather than
+  ignored, at the HTTP surface and in `Store::tail_after` alike.
+
+  Bounded by `--tail-ring-spans` (count) and `--tail-ring-bytes` (memory),
+  whichever binds first. The byte bound is the one that matters: the ring owns
+  whole spans once a seal drops them from the write buffer, and an LLM span
+  carrying a prompt is orders of magnitude larger than one carrying a status
+  code. Residency and both bounds are reported at `/v1/metrics.json` under
+  `tail_ring`.
+
+  A subscriber that falls further behind than the ring retains gets a `gap`
+  frame carrying a count and **no position**: the dropped entries are exactly
+  the ones no longer addressable, and no query can name an admission range. The
+  stream restarts at the live edge and the client rebuilds from there.
+
+  The dashboard's Live tail consumes it over one held connection. An idle tail
+  went from roughly forty empty round trips a minute to zero.
+
 ### Fixed
 
 - **Aggregations no longer block ingest.** `fold_spans` held the writer and
