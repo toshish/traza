@@ -90,7 +90,12 @@ export function OverviewScreen({ go }) {
   const previous = React.useMemo(() => {
     if (!current.sinceNs) return { sinceNs: null, untilNs: null };
     const span = current.untilNs - current.sinceNs;
-    return { sinceNs: current.sinceNs - span, untilNs: current.sinceNs };
+    // `since` and `until` are both INCLUSIVE, so ending the previous period at
+    // `current.sinceNs` counts a span landing exactly on the boundary in both
+    // histograms — while the series, which buckets by offset, gives it only to
+    // the current half. One nanosecond earlier makes the two periods disjoint
+    // and the comparison a partition rather than an overlap.
+    return { sinceNs: current.sinceNs - span, untilNs: current.sinceNs - 1 };
   }, [current]);
 
   // Even bucket count so the split is exact: the first half is `previous`,
@@ -174,8 +179,15 @@ export function OverviewScreen({ go }) {
   // the more confident the wrong number looks.
   const modelCost = cost;
 
-  const loading = series.loading || failures.loading;
-  const error = series.error || failures.error;
+  // Every read that feeds a figure on this screen. `durationNow` supplies the
+  // p95 tile and `models` the spend card, and both were outside this: after a
+  // range change the series could finish first and paint new volume beside the
+  // previous range's p95 with no loading bar, and a failed histogram silently
+  // became an em dash.
+  const reads = [series, failures, models, durationNow, durationBefore, sessions, metrics];
+  const loading = reads.some((read) => read.loading);
+  const error = reads.map((read) => read.error).find(Boolean);
+  const reload = () => reads.forEach((read) => read.reload());
 
   return <div style={{ display: 'grid', gap: 16, maxWidth: 1560 }}>
     <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
@@ -191,7 +203,7 @@ export function OverviewScreen({ go }) {
     </div>
 
     <LoadingBar active={loading} />
-    {error ? <ErrorState what={error.what} next={error.next} onRetry={series.reload} /> : null}
+    {error ? <ErrorState what={error.what} next={error.next} onRetry={reload} /> : null}
 
     <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5,1fr)', gap: 12 }}>
       <Tile label="spans" value={fmtCompact(spans)}

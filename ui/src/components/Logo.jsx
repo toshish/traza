@@ -14,12 +14,14 @@ import React from 'react';
 // hard-coding the accent — a mark on an inked chip has to invert with it.
 
 /** Below this the four bars stop resolving as separate rows; the design
-    system's guidance is to use the favicon variant instead. */
+    system's guidance is to use the favicon variant instead.
+    It is also the DEFAULT size — a floor that components have to remember to
+    respect is one the navigation had already broken by rendering at 19. */
 export const MARK_MIN_PX = 20;
 
 /** The mark. `tone` accepts any CSS color; the default inherits, which is what
     makes the reversed lockup work without a second asset. */
-export function Logo({ size = 19, tone = 'currentColor', title, style }) {
+export function Logo({ size = MARK_MIN_PX, tone = 'currentColor', title, style }) {
   return <svg width={size} height={size} viewBox="0 0 48 48" fill={tone}
     role={title ? 'img' : undefined} aria-hidden={title ? undefined : 'true'}
     aria-label={title} style={style}>
@@ -35,7 +37,7 @@ export function Logo({ size = 19, tone = 'currentColor', title, style }) {
 
 /** Mark plus wordmark. Lowercase always, JetBrains Mono 500, tracking -0.02em
     — the three things the brand card pins down about the wordmark. */
-export function Lockup({ size = 19, tone = 'var(--accent)', textTone = 'var(--ink)', gap = 9, style }) {
+export function Lockup({ size = MARK_MIN_PX, tone = 'var(--accent)', textTone = 'var(--ink)', gap = 9, style }) {
   return <span style={{ display: 'inline-flex', alignItems: 'center', gap, ...style }}>
     <Logo size={size} tone={tone} />
     <span style={{

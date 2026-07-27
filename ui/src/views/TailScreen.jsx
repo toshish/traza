@@ -30,7 +30,7 @@ export function TailScreen({ go }) {
   const [errorsOnly, setErrorsOnly] = React.useState(false);
   const buffer = React.useRef([]);
   const lastTick = React.useRef(null);
-  const inFlight = React.useRef(false);
+  const inFlight = React.useRef(null);
   // The polling state machine lives in lib/tail.js so it can be tested without
   // a DOM — which is where its two real bugs were found.
   const tail = React.useRef(newTailState());
@@ -46,7 +46,10 @@ export function TailScreen({ go }) {
     generation.current += 1;
     tail.current = newTailState();
     buffer.current = [];
-    inFlight.current = false;
+    // NOT cleared here. Releasing the flag while the obsolete request is still
+    // running let a new poll start, and then that obsolete request's `finally`
+    // cleared the flag a second time — admitting a third poll alongside the
+    // second. The flag is a token now: only its owner may release it.
     setRows([]);
     setPending(0);
   }, [service, errorsOnly]);
@@ -56,8 +59,11 @@ export function TailScreen({ go }) {
     // against the same watermark, so both pages landed and every span appeared
     // twice.
     if (inFlight.current) return;
-    inFlight.current = true;
     const mine = generation.current;
+    // The token identifies the flight, so a late finalizer cannot free a slot
+    // it no longer owns.
+    const token = Symbol('poll');
+    inFlight.current = token;
     const state = tail.current;
     try {
       const added = await pollOnce(
@@ -93,7 +99,7 @@ export function TailScreen({ go }) {
     } catch (e) {
       /* a dropped tick is the next tick's problem */
     } finally {
-      inFlight.current = false;
+      if (inFlight.current === token) inFlight.current = null;
     }
   }, TICK_MS, true);
 
