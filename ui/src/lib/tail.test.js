@@ -5,6 +5,11 @@ import {
   recordDropped,
   gapLabel,
   gapDetail,
+  newRateWindow,
+  recordArrivals,
+  ratePerSecond,
+  RATE_BUCKET_MS,
+  RATE_WINDOW_MS,
   newTailState, runTail, createFramer, parseFrame, backoffMs,
   RECONNECT_MIN_MS, RECONNECT_MAX_MS,
 } from './tail.js';
@@ -420,5 +425,50 @@ describe('spans dropped by a full pause buffer', () => {
 
   it('says nothing when nothing is missing', () => {
     expect(gapDetail(newGapState())).toBe('');
+  });
+});
+
+describe('the arrival-rate window', () => {
+  it('reports a rate above what a capped sample list could express', () => {
+    // The bug: the window kept one timestamp per span, capped at 2,000, and
+    // divided by five seconds — so it could not report more than 400/s
+    // whatever arrived. A 600/s stream read 400/s and looked stable.
+    let window = newRateWindow();
+    const start = 1_000_000;
+    // 3,000 spans over 5 seconds = 600/s.
+    for (let tick = 0; tick < 20; tick += 1) {
+      window = recordArrivals(window, 150, start + tick * RATE_BUCKET_MS);
+    }
+    const observed = ratePerSecond(window, start + RATE_WINDOW_MS - 1);
+    expect(observed).toBe(600);
+    expect(observed).toBeGreaterThan(400);
+  });
+
+  it('stays bounded however many spans arrive', () => {
+    let window = newRateWindow();
+    const start = 1_000_000;
+    for (let tick = 0; tick < 400; tick += 1) {
+      window = recordArrivals(window, 10_000, start + tick * RATE_BUCKET_MS);
+    }
+    // One bucket per 250ms of a 5s window, whatever the traffic.
+    expect(window.buckets.length).toBeLessThanOrEqual(RATE_WINDOW_MS / RATE_BUCKET_MS);
+  });
+
+  it('decays to zero once the window empties', () => {
+    let window = newRateWindow();
+    const start = 1_000_000;
+    window = recordArrivals(window, 500, start);
+    expect(ratePerSecond(window, start)).toBe(100);
+    expect(ratePerSecond(window, start + RATE_WINDOW_MS + 1)).toBe(0);
+  });
+
+  it('merges arrivals landing in the same bucket', () => {
+    let window = newRateWindow();
+    const start = 1_000_000;
+    window = recordArrivals(window, 5, start);
+    window = recordArrivals(window, 5, start + 10);
+    window = recordArrivals(window, 5, start + 20);
+    expect(window.buckets).toHaveLength(1);
+    expect(window.buckets[0].count).toBe(15);
   });
 });

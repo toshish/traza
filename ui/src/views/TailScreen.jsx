@@ -4,6 +4,7 @@ import { fmtClockNs, fmtDurationNs, fmtNum, fmtRate } from '../lib/format.js';
 import { Card, Chip, LiveDot, Mono } from '../components/primitives/Chrome.jsx';
 import {
   newTailState, runTail, newGapState, recordGap, recordDropped, gapLabel, gapDetail,
+  newRateWindow, recordArrivals, ratePerSecond,
 } from '../lib/tail.js';
 
 // Spans as they land — over one held connection, not a poll.
@@ -24,15 +25,12 @@ const MAX_ROWS = 300;
 // straight to the input opened one connection per keystroke — eight for
 // "checkout", each a request, a scan and a fresh backlog.
 const FILTER_SETTLE_MS = 250;
-// Arrival timestamps kept for the rate window. The window is a duration, but
-// under load it also has to be a count: one timestamp per span with no cap
-// makes a burst its own memory problem in the tab.
-const MAX_ARRIVAL_SAMPLES = 2_000;
-// Arrival rate is averaged over a sliding window rather than computed per
-// frame. Spans arrive in bursts of whatever the SDK flushed, so a per-frame
-// rate is a number that swings between zero and enormous and reads as noise.
-const RATE_WINDOW_MS = 5_000;
-// How often the window is re-evaluated when nothing is arriving.
+// How often the rate window is re-evaluated when nothing is arriving. The
+// window itself lives in lib/tail.js: it holds bucketed COUNTS, so its size is
+// fixed by the window duration rather than by the traffic, and it has no rate
+// ceiling. Averaging matters because spans arrive in bursts of whatever the SDK
+// flushed — a per-frame rate swings between zero and enormous and reads as
+// noise.
 const RATE_TICK_MS = 1_000;
 
 export function TailScreen({ go }) {
@@ -60,7 +58,7 @@ export function TailScreen({ go }) {
   // on every prepend, which changed every key and rebuilt all 300 rows per
   // frame.
   const nextRowId = React.useRef(0);
-  const arrivals = React.useRef([]);
+  const arrivals = React.useRef(newRateWindow());
   // `paused` is read inside a long-lived async loop, which closed over the
   // value it had when the stream opened. The ref is what the loop reads.
   const pausedRef = React.useRef(false);
@@ -88,7 +86,7 @@ export function TailScreen({ go }) {
     // standing over an empty table until something happened to arrive.
     setRate(null);
     buffer.current = [];
-    arrivals.current = [];
+    arrivals.current = newRateWindow();
 
     const filter = {
       service: appliedService || undefined,
@@ -100,8 +98,8 @@ export function TailScreen({ go }) {
     // rate indefinitely — the one reading that is certainly wrong.
     const decay = setInterval(() => {
       const now = Date.now();
-      arrivals.current = arrivals.current.filter((at) => now - at < RATE_WINDOW_MS);
-      setRate(arrivals.current.length ? (arrivals.current.length * 1000) / RATE_WINDOW_MS : 0);
+      arrivals.current = recordArrivals(arrivals.current, 0, now);
+      setRate(ratePerSecond(arrivals.current, now));
     }, RATE_TICK_MS);
 
     runTail(state, {
@@ -111,11 +109,10 @@ export function TailScreen({ go }) {
       onStatus: setStatus,
       onSpans: (spans) => {
         const now = Date.now();
-        arrivals.current = arrivals.current
-          .filter((at) => now - at < RATE_WINDOW_MS)
-          .concat(spans.map(() => now))
-          .slice(-MAX_ARRIVAL_SAMPLES);
-        setRate((arrivals.current.length * 1000) / RATE_WINDOW_MS);
+        // One bucket update for the whole batch, not one entry per span: the
+        // cost of measuring the rate must not scale with the rate.
+        arrivals.current = recordArrivals(arrivals.current, spans.length, now);
+        setRate(ratePerSecond(arrivals.current, now));
 
         // Newest first, matching the table's order.
         const newestFirst = spans

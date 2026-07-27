@@ -293,3 +293,22 @@ describe('the live tail screen', () => {
     expect(rowNodes()).toHaveLength(300);
   });
 });
+
+describe('the arrival rate the screen shows', () => {
+  it('reports a rate a capped sample list could not have expressed', async () => {
+    // End to end: 600 spans/s must read as 600, not as the 400 ceiling the
+    // old per-span sample cap imposed.
+    render(<TailScreen go={() => {}} />);
+    await settle();
+
+    // 3,000 spans across the 5s window, delivered in batches.
+    for (let batch = 0; batch < 10; batch += 1) {
+      const spans = Array.from({ length: 300 }, (_, n) => span(`r${batch}-${n}`));
+      // eslint-disable-next-line no-await-in-loop
+      await deliver(spansFrame(spans, `1.${batch}`));
+    }
+
+    const shown = parseFloat(screen.getByText(/\/s$/).textContent);
+    expect(shown).toBeGreaterThan(400);
+  });
+});
