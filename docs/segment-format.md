@@ -1,4 +1,4 @@
-# Segment Format v5: indexed segments
+# Segment Format: indexed segments
 
 The shipped layout is described first; the original v0.3 design proposal is
 retained below it as history. **The proposal does not describe the format that
@@ -29,7 +29,7 @@ Header fields, little-endian, at fixed byte offsets:
 | Offset | Size | Field |
 |---:|---:|---|
 | 0 | 8 | magic, `TRAZASEG` |
-| 8 | 2 | format version (`5`) |
+| 8 | 2 | format version (`6`) |
 | 10 | 2 | header length (`104`) |
 | 12 | 4 | reserved, zero |
 | 16 | 8 | record count |
@@ -40,14 +40,13 @@ Header fields, little-endian, at fixed byte offsets:
 | 56 | 8 | trace index offset |
 | 64 | 8 | trace index length |
 | 72 | 8 | attribute index offset |
-| 80 | 8 | minimum record timestamp (v3+) |
-| 88 | 8 | maximum record timestamp (v3+) |
-| 96 | 8 | content index offset (v5+) |
+| 80 | 8 | minimum record timestamp |
+| 88 | 8 | maximum record timestamp |
+| 96 | 8 | content index offset |
 
 Neither the attribute index nor the content index stores its own length. The
 attribute index is bounded by where the content index begins; the content
-index runs to EOF. (Before v5 the attribute index itself ran to EOF, which is
-why adding a fifth section needed a header field.) The reader rejects a segment whose
+index runs to EOF. The reader rejects a segment whose
 sections are not contiguous from the end of the header, whose record-offset
 index is not exactly `record_count * 8` bytes, or whose sections exceed the
 file.
@@ -126,38 +125,102 @@ against a span reading `refunds were issued` would be skipped by the filter
 while a substring match would have returned it — a wrong answer, not a slow
 one. See `src/content.rs` for the full argument.
 
-**`block_count = 0` means the index is absent, not empty.** A segment written
-before v5, one whose records carry no indexable text, or one written with
-`--no-content-index` must be SCANNED by a content query. Reading absence as
-"holds nothing" would make content search silently return no rows — the same
-trap as v2's missing timestamp range.
+**`block_count = 0` means the index is absent, not empty.** A segment whose
+records carry no indexable text, or one written with `--no-content-index`, must
+be SCANNED by a content query. Reading absence as "holds nothing" would make
+content search silently return no rows. Note that the section is always
+present: "indexed nothing" is stated inside it rather than by its absence,
+which is what lets the header field bound the attribute index unconditionally.
 
 `Segment::open` reads only the header, the three index sections, and the
 content index's prologue and summary filter into memory; record payloads and
 the bit-sliced block rows stay on disk and are read by exact byte range on
 demand. That is what makes stores larger than RAM serveable.
 
-### Compatibility
+### Versioning
 
-v1 JSONL segments are **not** readable. `Store::open` refuses a directory
-containing a `.jsonl` segment with an error pointing at traza 0.3.x for
-migration — failing loudly beats silently hiding persisted data.
+**There is exactly one readable version.** A file declaring any other is
+refused, including a JSONL segment from 0.3.x, which carries no magic at all.
 
-Versions 2, 3 and 4 are readable and need no migration step:
+It was not always one. The format grew by appending header fields behind
+`if version >= N` gates, and each gate turned a field into an `Option` that
+every reader downstream had to treat as "unknown, therefore assume the worst":
+a segment whose timestamp range could not be read had to be scanned by every
+time-bounded query, and a second attribute-index decoder existed solely to read
+the encoding that predated digests. Those branches were removed and the header
+fields became plain values, so the pruning path no longer carries a case where
+it cannot prune.
 
-- **v2** has an 80-byte header and no timestamp range. A query treats its
-  range as unknown, which means "cannot rule this segment out" — never
-  "empty". Reading it as empty would drop every v2 segment from every
-  time-filtered query, which is data loss that looks like a normal result.
-- **v2 and v3** store attribute value text in the index. Their values are
-  hashed and discarded while the segment is opened, so an existing store gets
-  the v4 steady-state memory cost without being rewritten. Peak memory *during*
-  that open is still the old cost, bounded by one segment.
-- **v2, v3 and v4** carry no content index. A content query scans them rather
-  than skipping them: the same rows come back, at the cost of a scan.
+**Versions 1 through 5 are spent.** 1 was JSONL. 2 was written by v0.16 and
+v0.17, 3 by v0.18 and v0.19. **4 and 5 were never released** — they existed only
+on unreleased `main`, so no tag writes them and no tag reads them. None of the
+five opens now. The README's pre-1.0 terms permit an on-disk break between 0.x
+versions, and this is one: `Store::open` refuses such a segment and names it,
+never advising deletion.
 
-New segments are always written at v5, including those produced by compaction,
-so a store converts as it merges.
+### Migrating between formats
+
+**Take a backup by one of the two procedures in the
+[durability guide](operations/durability.md#backups):** stop the server and copy
+the directory, or take a filesystem snapshot that is atomic across the whole
+directory. Copying a live directory file by file is *not* safe — an in-flight
+flush can change the segment set between files — and that guide is the single
+source of truth for it. Then read the copy with the build that wrote it.
+
+A span export is a reasonable way to move a **dataset**, but it is not a
+migration of the store:
+
+| Part of the store | In `GET /v1/export`? |
+|---|---|
+| Spans | **yes** — every one, as of the instant the export began. It pins a snapshot, and that snapshot copies the write buffer, so spans not yet sealed into a segment are included |
+| Offloaded attribute values | **no** — left as `{"$payload": "sha256/…"}` references; the bytes stay in `payloads/` |
+| Annotations | **no** — a separate surface (`/v1/annotations`) the export does not touch |
+
+The design document gives the underlying reason: a span export "cannot pin
+[annotations and payload bytes] at all" — there is no consistent point across
+the store's independent recovery domains for it to pin
+([generations-design.md](generations-design.md)). Closing that is what the
+generation/checkpoint boundary is for, and it is scheduled before 1.0.
+
+So export-and-reingest is a complete migration only for a store with no
+offloaded payloads and no annotations. Otherwise: back up, and read the backup
+with a build that can read it.
+
+**Which build?** Not "the release that wrote this segment". A store accumulates
+segments in whichever format was current when each was sealed, so one directory
+can hold several formats at once, and a release that reads the oldest of them
+cannot read the newest. Formats 4 and 5 were never tagged at all.
+
+One commit reads every indexed format this project has written — 2 through 5 —
+and that is what the error names: **`cf40bea`** (`MIN_READABLE_VERSION` 2,
+`VERSION` 5), exposed as `traza::LEGACY_SEGMENT_READER`. Build it, point it at
+the backup, and export from there. Format 1 was JSONL; it is refused separately
+and needs 0.3.x.
+
+### The policy from here
+
+This cut is a one-time exception, taken while the store holds no data anyone
+depends on. **"Every layout change makes all prior files unreadable" is not a
+policy** — it treats stored telemetry as disposable, and a datastore does not
+get to do that.
+
+The rule from v6 onward is three planes, kept apart on purpose:
+
+1. **Runtime reads exactly one canonical format.** No `if version >= N`, no
+   `Option` field standing in for "unknown", no compatibility branch in the
+   query path. That is what this change bought, and it is the part to preserve.
+2. **Version numbers stay monotonic.** An identifier written by a release is
+   never reused for a different layout.
+3. **A format bump ships with a migrator** — an explicit, resumable conversion
+   from the previous format into the current one, run offline or at startup,
+   never woven into the read path. Reading an old format is code that has to
+   exist somewhere; the win is that it lives there rather than in every query.
+
+Point 3 is the part this change does not pay for, and that is worth stating
+rather than hiding: a migrator from v2/v3/v5 would mean resurrecting precisely
+the decoders just deleted, to serve stores that do not exist. The debt was
+declined once, on the last occasion it could be declined cheaply. v6 is where
+it starts being paid.
 
 ---
 

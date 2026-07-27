@@ -1768,3 +1768,174 @@ fn expiry_finishes_when_the_segment_file_is_already_gone() {
     drop(store);
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_version_mismatch_advises_migration_and_never_deletion() {
+    // Collapsing the format made segments from earlier releases unreadable.
+    // That is the intended trade, but the failure has to name the file and
+    // point at a path that PRESERVES the data. Telling an operator to remove
+    // the data directory is destructive advice for a store that is intact.
+    let dir = TestDir::new("foreign-segment-version");
+    let segment = sealed_segment(&dir);
+
+    // Stamp a version this build does not write. The magic, the header length
+    // and every section bound stay valid, so nothing but the version word
+    // distinguishes it — which is exactly the case the check exists for.
+    let mut bytes = fs::read(&segment).expect("read segment");
+    let foreign = traza::segment::VERSION - 1;
+    bytes[8..10].copy_from_slice(&foreign.to_le_bytes());
+    fs::write(&segment, &bytes).expect("write segment");
+
+    let message = open_error(&dir);
+    assert!(
+        message.contains(&format!("segment format v{foreign}")),
+        "says which format the file is: {message}"
+    );
+    assert!(
+        message.contains("durability.md#backups"),
+        "links the backup section by its real anchor: {message}"
+    );
+    assert!(
+        message.contains(&segment.display().to_string()),
+        "names the file: {message}"
+    );
+    assert!(
+        message.contains("Back up the directory first"),
+        "the preserving step comes first: {message}"
+    );
+    // A file-by-file copy of a running store is NOT safe, and the durability
+    // guide is explicit about it. Advice that says "copy the directory" without
+    // that qualification is wrong in the case an operator is most likely to be
+    // in: the server is running, which is why they are reading this.
+    assert!(
+        message.contains("stop the server") && message.contains("snapshot"),
+        "names a procedure that is actually safe: {message}"
+    );
+    // An export is NOT a backup, and advice that treats it as one loses the
+    // payload store and every annotation. The message must not offer it as the
+    // migration; it must say what a copy is for.
+    assert!(
+        !message.contains("GET /v1/export") || message.contains("$payload"),
+        "must not prescribe export without naming what it drops: {message}"
+    );
+    assert!(
+        message.contains("annotations are not in it") && message.contains("$payload"),
+        "names both omissions explicitly: {message}"
+    );
+    // And does NOT overstate them. An export pins a snapshot, and the snapshot
+    // copies the write buffer, so buffered spans ARE included — claiming
+    // otherwise sent an operator flushing before a migration for no reason.
+    assert!(
+        message.contains("buffered ones included"),
+        "must not imply unflushed spans are lost: {message}"
+    );
+    assert!(
+        !message.contains("data is intact"),
+        "the version is checked BEFORE the section bounds, so intactness is \
+         not established: {message}"
+    );
+    assert!(
+        !message.to_lowercase().contains("remove the data directory")
+            && !message.to_lowercase().contains("start fresh"),
+        "must never advise deleting the store: {message}"
+    );
+}
+
+#[test]
+fn version_guidance_names_one_reader_that_covers_every_old_format() {
+    // Per-version advice is wrong for a real store. Segments accumulate in
+    // whichever format was current when each was sealed, so one directory can
+    // hold several at once — and "open it with the release that wrote v2"
+    // sends an operator to a build that cannot read the v3 segments sitting
+    // beside it. Formats 4 and 5 were never tagged, so for those there is no
+    // release to name at all.
+    for found in [2_u16, 3, 4, 5] {
+        let dir = TestDir::new(&format!("version-guidance-{found}"));
+        let segment = sealed_segment(&dir);
+        let mut bytes = fs::read(&segment).expect("read segment");
+        bytes[8..10].copy_from_slice(&found.to_le_bytes());
+        fs::write(&segment, &bytes).expect("write segment");
+
+        let message = open_error(&dir);
+        assert!(
+            message.contains(traza::LEGACY_SEGMENT_READER),
+            "format {found} must point at the one reader covering 2-5: {message}"
+        );
+        assert!(
+            message.contains("SEVERAL formats"),
+            "format {found} must warn that the store may be mixed: {message}"
+        );
+        // No version-specific release names, and nothing an operator cannot
+        // actually obtain.
+        for unreachable in ["v0.16", "v0.17", "v0.18", "v0.19", "untagged"] {
+            assert!(
+                !message.contains(unreachable),
+                "format {found} guidance must not name {unreachable}: {message}"
+            );
+        }
+    }
+}
+
+#[test]
+fn corruption_is_not_answered_with_advice_to_delete_the_store() {
+    // The regression this pins. A corrupt magic and a version mismatch both
+    // arrived as `Unsupported`, so one flipped byte in an otherwise healthy
+    // store was answered with instructions to delete it — the single most
+    // destructive thing an operator could do in response to a recoverable
+    // fault.
+    let dir = TestDir::new("corrupt-segment-magic");
+    let segment = sealed_segment(&dir);
+
+    let mut bytes = fs::read(&segment).expect("read segment");
+    bytes[0] = b'X';
+    fs::write(&segment, &bytes).expect("write segment");
+
+    let message = open_error(&dir);
+    assert!(
+        message.contains("bad magic"),
+        "says what is wrong: {message}"
+    );
+    assert!(
+        !message.to_lowercase().contains("remove the data directory")
+            && !message.to_lowercase().contains("start fresh"),
+        "corruption must never be answered with deletion advice: {message}"
+    );
+    assert!(
+        !message.contains("GET /v1/export"),
+        "and it is not a migration either — the cause is unknown: {message}"
+    );
+    assert!(
+        message.contains("inspect the file"),
+        "advises inspection instead: {message}"
+    );
+    // `load_segments` aborts on the first unreadable segment, so claiming an
+    // older build can still serve the rest is false.
+    assert!(
+        !message.contains("readable by an older build"),
+        "no build opens this store until the file is dealt with: {message}"
+    );
+}
+
+/// Seals one span into a store and returns the segment file it wrote.
+fn sealed_segment(dir: &TestDir) -> PathBuf {
+    {
+        let store = Store::open(dir.path(), Config::default()).expect("open");
+        store
+            .ingest(span("trace-a", "span-a".to_owned(), 1_000, 10))
+            .expect("ingest");
+        store.flush().expect("flush");
+    }
+    fs::read_dir(dir.path())
+        .expect("read dir")
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .find(|path| path.extension().is_some_and(|ext| ext == "seg"))
+        .expect("a sealed segment")
+}
+
+/// The error text from reopening a store whose segment has been tampered with.
+fn open_error(dir: &TestDir) -> String {
+    Store::open(dir.path(), Config::default())
+        .err()
+        .expect("a store with an unreadable segment must not open")
+        .to_string()
+}
