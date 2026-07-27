@@ -109,7 +109,7 @@ means seals are back-to-back, which is normal under saturation.
 | `traza_uptime_seconds` | gauge | Seconds since this process began serving |
 | `traza_http_decode_ns_{count,sum,max}` | — | Wire decode. For OTLP protobuf this covers the wire decode **and** the OTLP-to-span mapping, which is the whole cost of accepting a batch on that route |
 | `traza_http_request_ns_{count,sum,max,p50,p95,p99}` | — | End-to-end request handling, every route together |
-| `traza_http_{ingest,lookup,search,stats,other}_ns_{count,sum,p50,p95,p99}` | — | The same, split by route class |
+| `traza_http_{ingest,lookup,search,stats,stream,other}_ns_{count,sum,p50,p95,p99}` | — | The same, split by route class |
 
 **Request latency is also split by route class**, because one blended
 histogram over ingest and search described neither: an ingest batch and a
@@ -118,10 +118,19 @@ trace lookup differ by orders of magnitude. The classes are:
 | Class | Routes |
 |---|---|
 | `ingest` | `POST /v1/spans`, `POST /v1/traces` |
-| `search` | `GET /v1/spans`, `GET /v1/export` |
+| `search` | `GET /v1/spans` |
 | `lookup` | `GET /v1/traces/…`, `/v1/sessions/…`, `/v1/payloads/…`, `/v1/annotations` |
 | `stats` | `GET /v1/stats*`, `GET /v1/sessions` |
+| `stream` | `GET /v1/tail`, `GET /v1/export` |
 | `other` | dashboard assets, `/v1/metrics`, `/v1/flush` |
+
+**`stream` is counted but never timed.** Its `_count` increments; its `_sum`,
+`_p50`, `_p95` and `_p99` stay at zero, by design. A tail lasts as long as a
+browser tab is open and an export as long as its dataset takes to send, so
+those durations measure the consumer, not the server. Recorded, a single
+dashboard left open overnight would set the p95 of every latency panel on the
+page to eight hours. Export moved here from `search` for the same reason — its
+duration always tracked dataset size rather than server speed.
 
 `traza_http_decode` still exposes count, sum and max only. Everything else
 above carries percentiles under the accuracy bound stated at the top of this
