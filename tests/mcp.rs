@@ -933,6 +933,158 @@ fn a_ceiling_smaller_than_the_truncation_notice_is_still_a_ceiling() {
     }
 }
 
+// ------------------------------------------------------- review regressions
+
+#[test]
+fn ranking_sessions_considers_every_session_not_just_the_recent_page() {
+    let dir = test_dir("session-ranking");
+    let store = open_store(&dir);
+    // One old, very expensive session, then ten newer cheap ones. Any
+    // implementation that takes a recency-ordered page and re-sorts it has
+    // already discarded the answer.
+    let mut expensive = span("t-old", "s-old", "svc", "openai.chat", FIXED_NOW);
+    expensive
+        .attributes
+        .insert("gen_ai.conversation.id".to_owned(), json!("expensive-old"));
+    expensive
+        .attributes
+        .insert("llm.cost_usd".to_owned(), json!(10_000.0));
+    expensive
+        .attributes
+        .insert("llm.usage.total_tokens".to_owned(), json!(999_999));
+    expensive.status = "error".to_owned();
+    store.ingest(expensive).expect("ingest");
+    for index in 0..10 {
+        let mut cheap = span(
+            &format!("t-{index}"),
+            &format!("s-{index}"),
+            "svc",
+            "openai.chat",
+            FIXED_NOW + (index + 1) * HOUR,
+        );
+        cheap.attributes.insert(
+            "gen_ai.conversation.id".to_owned(),
+            json!(format!("cheap-{index}")),
+        );
+        cheap
+            .attributes
+            .insert("llm.cost_usd".to_owned(), json!(1.0));
+        cheap
+            .attributes
+            .insert("llm.usage.total_tokens".to_owned(), json!(10));
+        store.ingest(cheap).expect("ingest");
+    }
+
+    for (order, expected) in [
+        ("cost", "expensive-old"),
+        ("tokens", "expensive-old"),
+        ("errors", "expensive-old"),
+        ("recent", "cheap-9"),
+    ] {
+        let result = call(
+            &store,
+            "list_sessions",
+            json!({"order_by": order, "limit": 1}),
+        );
+        assert_eq!(
+            result["structuredContent"]["sessions"][0]["session_id"],
+            json!(expected),
+            "order_by={order} returned the wrong session"
+        );
+    }
+}
+
+#[test]
+fn the_whole_result_respects_the_ceiling_including_structured_content() {
+    let dir = test_dir("structured-budget");
+    let store = open_store(&dir);
+    // A stored identifier far larger than the ceiling. Clamping only the text
+    // block let it through: the text read 83 bytes while the result carried
+    // 100 KB.
+    let huge_id = "A".repeat(100_000);
+    let mut row = span("t-1", "s-1", "svc", "openai.chat", FIXED_NOW);
+    row.attributes
+        .insert("gen_ai.conversation.id".to_owned(), json!(huge_id));
+    row.attributes.insert("llm.cost_usd".to_owned(), json!(1.0));
+    row.attributes
+        .insert("gen_ai.request.model".to_owned(), json!(huge_id.clone()));
+    store.ingest(row).expect("ingest");
+
+    for tool in ["list_sessions", "analyze_cost"] {
+        for ceiling in [1_024_usize, 4_096, 65_536] {
+            let server = McpServer::new(
+                &store,
+                Limits {
+                    max_result_bytes: ceiling,
+                    max_payload_bytes: 4_096,
+                },
+                false,
+            );
+            let response = server
+                .handle(
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/call",
+                        "params": {"name": tool, "arguments": {}},
+                    }),
+                    Context {
+                        access: Access::Read,
+                        now_ns: FIXED_NOW,
+                    },
+                )
+                .expect("answered");
+            let whole = serde_json::to_vec(&response["result"]).expect("serializes");
+            assert!(
+                whole.len() <= ceiling,
+                "{tool} at a {ceiling}-byte ceiling returned {} bytes in total",
+                whole.len()
+            );
+        }
+    }
+}
+
+#[test]
+fn an_impossible_date_is_refused_rather_than_rolled_into_a_different_one() {
+    let dir = test_dir("calendar");
+    let store = open_store(&dir);
+    // Each of these used to become a different, valid instant — a window
+    // nobody asked for, over which the answer looks perfectly correct.
+    for (value, was) in [
+        ("2026-02-31", "2026-03-03"),
+        ("2025-02-29", "2025-03-01"),
+        ("2026-07-27T99:99:99Z", "2026-07-31T04:40:39Z"),
+        ("2026-07-27T00:00:00+99:99", "2026-07-22T19:21:00Z"),
+        ("2026-13-01", "a thirteenth month"),
+        ("2026-04-31", "2026-05-01"),
+        ("2026-07-27T24:00:00Z", "the next day"),
+    ] {
+        let result = call(&store, "search_spans", json!({"since": value}));
+        assert_eq!(
+            result["isError"],
+            json!(true),
+            "{value} was accepted (it used to resolve to {was})"
+        );
+    }
+
+    // The calendar's real edges still work, leap day included.
+    for value in [
+        "2024-02-29",
+        "2000-02-29",
+        "2026-12-31T23:59:59Z",
+        "2026-06-30T23:59:60Z",
+        "2026-07-27T00:00:00-11:30",
+    ] {
+        let result = call(&store, "search_spans", json!({"since": value}));
+        assert_eq!(result["isError"], json!(false), "{value} was refused");
+    }
+    // 1900 is not a leap year; 2000 is. The century rule has to be there.
+    assert_eq!(
+        call(&store, "search_spans", json!({"since": "1900-02-29"}))["isError"],
+        json!(true)
+    );
+}
+
 // ------------------------------------------------------------ trace rendering
 
 #[test]
@@ -1419,18 +1571,29 @@ impl Server {
     }
 
     /// One raw MCP request, with whatever headers the case is about.
+    ///
+    /// A `Host` entry replaces the default rather than adding a second one:
+    /// the rebinding cases are about a request whose `Host` really is the
+    /// attacker's name, and two `Host` headers would be a different bug.
     fn post(&self, body: &str, headers: &[(&str, &str)]) -> (u16, String) {
         let mut stream = connect_with_retry(self.port);
+        let host = headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("host"))
+            .map_or_else(
+                || format!("127.0.0.1:{}", self.port),
+                |(_, v)| (*v).to_owned(),
+            );
         let extra: String = headers
             .iter()
+            .filter(|(name, _)| !name.eq_ignore_ascii_case("host"))
             .map(|(name, value)| format!("{name}: {value}\r\n"))
             .collect();
         write!(
             stream,
-            "POST /v1/mcp HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\n\
+            "POST /v1/mcp HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\n\
              Accept: application/json, text/event-stream\r\n{extra}Content-Length: {}\r\n\
              Connection: close\r\n\r\n",
-            self.port,
             body.len()
         )
         .expect("request writes");
@@ -1546,6 +1709,76 @@ fn the_transport_rules_are_enforced_on_the_real_socket() {
     let (status, body) = server.post("{not json", &[]);
     assert_eq!(status, 400);
     assert!(body.contains("-32700"), "{body}");
+}
+
+#[test]
+fn a_rebinding_origin_is_refused_even_when_it_matches_the_host_it_sent() {
+    let dir = test_dir("rebinding");
+    let server = Server::spawn(&dir, &["--mcp"], None);
+    let list = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+
+    // The attack this check exists for. The attacker owns the name, so the
+    // browser sends *their* host in both headers — an origin validated against
+    // the request's own `Host` therefore passes exactly when it matters most.
+    for (host, origin) in [
+        ("attacker.example:39328", "http://attacker.example:39328"),
+        ("evil.test", "http://evil.test"),
+        ("traza.internal", "https://traza.internal"),
+    ] {
+        let (status, body) = server.post(list, &[("Host", host), ("Origin", origin)]);
+        assert_eq!(status, 403, "{origin} with a matching Host was served");
+        assert!(
+            !body.contains("search_spans"),
+            "the tool list leaked to {origin}"
+        );
+    }
+    // Nor by a scheme that is not a web origin at all.
+    for origin in ["null", "javascript://localhost", "file://", "http://"] {
+        let (status, _) = server.post(list, &[("Origin", origin)]);
+        assert_eq!(status, 403, "{origin} was served");
+    }
+    // A loopback page is safe whatever its port: a page served from an
+    // attacker's domain carries that domain as its origin however its DNS
+    // resolves, so it can never present one of these.
+    for origin in [
+        "http://localhost:5173",
+        "http://127.0.0.1:8080",
+        "https://localhost",
+    ] {
+        let (status, _) = server.post(list, &[("Origin", origin)]);
+        assert_eq!(status, 200, "{origin} was refused");
+    }
+    // And a native client, which sends no Origin at all, is unaffected.
+    let (status, _) = server.post(list, &[]);
+    assert_eq!(status, 200);
+}
+
+#[test]
+fn a_deployed_origin_is_reachable_only_once_the_operator_names_it() {
+    let dir = test_dir("allowed-origin");
+    let server = Server::spawn(
+        &dir,
+        &["--mcp", "--mcp-allowed-origin", "https://traza.example.com"],
+        None,
+    );
+    let ping = PING;
+    for origin in [
+        "https://traza.example.com",
+        "https://traza.example.com/",
+        "HTTPS://Traza.Example.Com",
+    ] {
+        let (status, _) = server.post(ping, &[("Origin", origin)]);
+        assert_eq!(status, 200, "{origin} was refused");
+    }
+    for origin in [
+        "https://evil.example.com",
+        "http://traza.example.com",
+        "https://traza.example.com.evil.test",
+    ] {
+        let (status, body) = server.post(ping, &[("Origin", origin)]);
+        assert_eq!(status, 403, "{origin} was served");
+        assert!(body.contains("--mcp-allowed-origin"), "{body}");
+    }
 }
 
 #[test]

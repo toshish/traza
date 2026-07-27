@@ -203,7 +203,9 @@ fn sessions_aggregate_long_conversations_across_traces_and_dialects() {
             entry.2 += facts.total();
         }
     }
-    let sessions = store.sessions(None, None, 10_000).expect("lists sessions");
+    let sessions = store
+        .sessions(None, None, 10_000, traza::analytics::SessionOrder::Recent)
+        .expect("lists sessions");
     assert_eq!(sessions.len(), expected.len(), "every session is listed");
     for summary in &sessions {
         let (traces, spans, tokens) = expected
@@ -240,7 +242,9 @@ fn the_session_filter_unions_mixed_convention_spans() {
     // gen_ai.conversation.id) and a traceloop association property. Filtering
     // on one literal key would drop spans; the session filter must not.
     let (store, _) = store_with_corpus("session-filter", &SeedOptions::default());
-    let sessions = store.sessions(None, None, 10_000).expect("lists");
+    let sessions = store
+        .sessions(None, None, 10_000, traza::analytics::SessionOrder::Recent)
+        .expect("lists");
     let thread = sessions
         .iter()
         .find(|summary| summary.session_id.starts_with("thread-"))
@@ -581,7 +585,7 @@ fn failures_and_linked_retries_are_queryable() {
 
     // A failed call contributes an error to its session but no phantom tokens.
     let errored_sessions = store
-        .sessions(None, None, 10_000)
+        .sessions(None, None, 10_000, traza::analytics::SessionOrder::Recent)
         .expect("sessions")
         .into_iter()
         .filter(|summary| summary.error_count > 0)
@@ -667,7 +671,10 @@ fn rollups_survive_reopen_and_repeated_ingest() {
     let before = store
         .llm_aggregate(LlmGroupBy::Provider, None, None)
         .expect("rollup");
-    let sessions_before = store.sessions(None, None, 10_000).expect("sessions").len();
+    let sessions_before = store
+        .sessions(None, None, 10_000, traza::analytics::SessionOrder::Recent)
+        .expect("sessions")
+        .len();
 
     store
         .ingest_batch(generated.spans.clone())
@@ -691,7 +698,10 @@ fn rollups_survive_reopen_and_repeated_ingest() {
         assert_eq!(left.total_tokens, right.total_tokens);
     }
     assert_eq!(
-        store.sessions(None, None, 10_000).expect("sessions").len(),
+        store
+            .sessions(None, None, 10_000, traza::analytics::SessionOrder::Recent)
+            .expect("sessions")
+            .len(),
         sessions_before
     );
 }

@@ -54,6 +54,11 @@ That file is `.mcp.json` in a project root for Claude Code, or
 `claude_desktop_config.json` for Claude Desktop; other hosts use the same
 shape. The bridge reads `--token`, or `TRAZA_TOKEN` from the environment.
 
+**The bridge speaks plain HTTP and refuses an `https://` URL.** Behind TLS
+termination, point it at the server's plaintext address on the host itself —
+or use the HTTP client form above, which handles `https://` directly and needs
+no bridge at all.
+
 The dashboard's **MCP** screen generates both snippets against the origin you
 are actually on, and shows the live tool list, so it is correct behind any
 host, port or reverse proxy. See the [trace browser](trace-browser.md).
@@ -118,7 +123,11 @@ confident, wrong windows:
 | Unix nanoseconds | `1785000000000000000` | Itself |
 
 A bare integer too small to be a nanosecond timestamp is **refused with the
-units named** rather than answered from 1970.
+units named** rather than answered from 1970. So is a date that is not on the
+calendar: `2026-02-31`, `2025-02-29`, `2026-07-27T99:99:99Z` and a `+99:99`
+offset are all errors, not silently rolled forward into a different valid
+instant. A window nobody asked for is worse than a refusal, because the answer
+computed over it looks correct. Leap days are honoured, century rule included.
 
 ### Results
 
@@ -131,7 +140,7 @@ unusable answer that also costs money to fail.
 | Span tools default to | `limit=20`, capped at 100 |
 | Prompt/completion content is | omitted unless `include_content: true` |
 | A string attribute renders to at most | 200 characters, then an elision |
-| Any single result is capped at | `--mcp-max-result-bytes` (32 KiB) |
+| Any single result is capped at | `--mcp-max-result-bytes` (32 KiB), **text and `structuredContent` together** |
 | One `get_payload` fetch is capped at | the smaller of `--mcp-max-payload-bytes` (256 KiB) and the result cap |
 | Truncation is | **always stated, with the argument that would narrow it** |
 
@@ -144,6 +153,14 @@ against a declared `outputSchema`, because their rows are small, genuinely
 tabular, and the thing a client is most likely to chart. Everything else is
 text only — for span data the compact rendering is strictly better, and sending
 both doubles the bytes for identical information.
+
+Both halves are budgeted together, and trimmed in lockstep: the ceiling bounds
+the tool result a client receives, not one field of it. `structuredContent`
+carries stored identifiers verbatim so they can be passed straight back to
+`get_session` — control characters are neutralized, but no delimiter travels
+there, because a value wrapped in framing is no longer the value a client is
+meant to use. A host that feeds `structuredContent` to a model is handling
+stored telemetry and should frame it the way the text block already is.
 
 Note one deliberate deviation: the specification suggests a tool returning
 structured content *should* also repeat it as serialized JSON in a text block,
@@ -284,11 +301,27 @@ bounding is what a data source can honestly offer.
   An `MCP-Protocol-Version` header naming an unsupported revision is a `400`.
   Older revisions are refused rather than half-served: `structuredContent`,
   which two tools return, does not exist before `2025-06-18`.
-- **Origin is validated.** A request carrying an `Origin` header that is
-  neither same-origin with the request's `Host` nor a loopback page is refused
-  with `403`. This is the DNS-rebinding defence the transport requires: a
-  browser attaches `Origin` and a page on an attacker's domain cannot forge it.
-  Native MCP clients send no `Origin` and are unaffected.
+- **Origin is validated against an allowlist the operator controls.** A
+  request carrying an `Origin` that is neither a loopback page nor named by
+  `--mcp-allowed-origin` is refused with `403`. Native MCP clients send no
+  `Origin` and are unaffected.
+
+  **The origin is never compared against anything else the request carries.**
+  Validating it against the request's own `Host` looks equivalent and is not:
+  under DNS rebinding the attacker owns the name, so the browser sends *their*
+  host in both headers and the comparison succeeds exactly when it matters
+  most. Only two things permit an origin — that it is a loopback page, which an
+  attacker's site can never present (the browser stamps the origin of the page,
+  and a page served from `evil.example` carries that origin however its DNS
+  resolves), or that an operator named it:
+
+  ```sh
+  traza-server --data-dir ./data --mcp \
+    --mcp-allowed-origin https://traza.example.com
+  ```
+
+  Deploying the dashboard behind a hostname therefore needs that flag, because
+  its own MCP screen is a browser page like any other.
 - **Notifications answer `202` with no body**, as the transport specifies.
 - **No JSON-RPC batching.** It was removed from MCP in `2025-06-18`; an array
   is refused with `-32600`.

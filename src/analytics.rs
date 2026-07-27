@@ -91,6 +91,48 @@ pub struct SessionDetail {
     pub traces: Vec<SessionTrace>,
 }
 
+/// How [`Store::sessions`] ranks the population before truncating it.
+///
+/// This is an engine concern rather than a presentation one. Ranking after
+/// truncation answers a different question from the one asked — "the costliest
+/// of the hundred most recent" is not "the costliest" — and the difference is
+/// invisible in the result, which is what makes it dangerous.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SessionOrder {
+    /// Most recent activity first. The default, and what a listing wants.
+    #[default]
+    Recent,
+    /// Highest summed cost first.
+    Cost,
+    /// Most error spans first.
+    Errors,
+    /// Most tokens first.
+    Tokens,
+}
+
+impl SessionOrder {
+    /// Parses the wire name; `None` for an unrecognized one.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "recent" => Some(Self::Recent),
+            "cost" => Some(Self::Cost),
+            "errors" => Some(Self::Errors),
+            "tokens" => Some(Self::Tokens),
+            _ => None,
+        }
+    }
+
+    /// The wire name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Recent => "recent",
+            Self::Cost => "cost",
+            Self::Errors => "errors",
+            Self::Tokens => "tokens",
+        }
+    }
+}
+
 /// Aggregation dimension for [`Store::llm_aggregate`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LlmGroupBy {
@@ -403,12 +445,22 @@ fn in_window(start_ns: u64, since: Option<u64>, until: Option<u64>) -> bool {
 // -------------------------------------------------------------- store API
 
 impl Store {
-    /// Lists sessions active in the window, most recent activity first.
+    /// Lists sessions active in the window, ranked by `order`, truncated to
+    /// `limit`.
+    ///
+    /// **The ranking happens here, over the complete population, and not in
+    /// the caller.** A caller that asks for the costliest session cannot get a
+    /// correct answer by re-sorting a page this returned: the page was chosen
+    /// by whatever `order` produced it, so an expensive session outside it is
+    /// invisible rather than merely lower down. The fold below already
+    /// materializes every session in the window — ordering by any of these
+    /// keys is a comparator change, not extra work.
     pub fn sessions(
         &self,
         since_ns: Option<u64>,
         until_ns: Option<u64>,
         limit: usize,
+        order: SessionOrder,
     ) -> Result<Vec<SessionSummary>> {
         let mut merged: HashMap<String, SessionCounters> = HashMap::new();
         self.fold_analytics(since_ns, until_ns, |rollup| {
@@ -433,10 +485,19 @@ impl Store {
                 error_count: entry.counters.errors,
             })
             .collect();
+        // The session id breaks every tie, so a page is deterministic even
+        // when a hundred sessions report the same cost.
         sessions.sort_by(|a, b| {
-            b.last_end_ns
-                .cmp(&a.last_end_ns)
-                .then_with(|| a.session_id.cmp(&b.session_id))
+            let ranked = match order {
+                SessionOrder::Recent => b.last_end_ns.cmp(&a.last_end_ns),
+                SessionOrder::Cost => b
+                    .cost_usd
+                    .partial_cmp(&a.cost_usd)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+                SessionOrder::Errors => b.error_count.cmp(&a.error_count),
+                SessionOrder::Tokens => b.total_tokens.cmp(&a.total_tokens),
+            };
+            ranked.then_with(|| a.session_id.cmp(&b.session_id))
         });
         sessions.truncate(limit);
         Ok(sessions)

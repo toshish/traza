@@ -539,7 +539,9 @@ fn replaced_spans_count_once_in_rollups() {
 
     for _ in 0..2 {
         // Twice: the second pass exercises the cached-rollup path.
-        let sessions = store.sessions(None, None, 10).expect("lists");
+        let sessions = store
+            .sessions(None, None, 10, traza::analytics::SessionOrder::Recent)
+            .expect("lists");
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].llm_calls, 1, "one logical span: {sessions:?}");
         assert_eq!(sessions[0].span_count, 1);
@@ -556,7 +558,9 @@ fn replaced_spans_count_once_in_rollups() {
 
     // A third version still in the BUFFER also wins over both segments.
     store.ingest(make(50, 0.50)).expect("ingests v3 buffered");
-    let sessions = store.sessions(None, None, 10).expect("lists");
+    let sessions = store
+        .sessions(None, None, 10, traza::analytics::SessionOrder::Recent)
+        .expect("lists");
     assert_eq!(sessions[0].total_tokens, 50, "buffer supersedes segments");
     assert_eq!(sessions[0].llm_calls, 1);
     let by_day = store

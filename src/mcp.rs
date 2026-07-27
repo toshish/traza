@@ -37,7 +37,7 @@
 
 use serde_json::{json, Map, Value};
 
-use crate::analytics::{LlmAggregateRow, LlmGroupBy};
+use crate::analytics::{LlmAggregateRow, LlmGroupBy, SessionOrder};
 use crate::annotations::Annotation;
 use crate::{semconv, Error, Span, SpanCursor, SpanFilter, SpanSort, Store};
 
@@ -573,7 +573,7 @@ impl<'a> Server<'a> {
         let by_model = self.store.llm_aggregate(LlmGroupBy::Model, None, None)?;
         let by_provider = self.store.llm_aggregate(LlmGroupBy::Provider, None, None)?;
         let by_day = self.store.llm_aggregate(LlmGroupBy::Day, None, None)?;
-        let sessions = self.store.sessions(None, None, 100)?;
+        let sessions = self.store.sessions(None, None, 100, SessionOrder::Recent)?;
 
         let mut head = String::new();
         head.push_str(&format!(
@@ -818,37 +818,21 @@ impl<'a> Server<'a> {
         let limit = optional_usize(arguments, "limit")?
             .unwrap_or(DEFAULT_SPAN_LIMIT)
             .clamp(1, MAX_SPAN_LIMIT);
-        let order = arguments
+        let requested = arguments
             .get("order_by")
             .and_then(Value::as_str)
             .unwrap_or("recent")
             .to_owned();
-        if !["recent", "cost", "errors", "tokens"].contains(&order.as_str()) {
-            return Err(ToolError(format!(
-                "order_by must be one of recent, cost, errors, tokens (got {order:?})."
-            )));
-        }
-        // Ordering by anything but recency has to rank a population, so pull a
-        // wider page from the engine and rank it here rather than reporting the
-        // costliest session out of an arbitrary most-recent window.
-        let fetch = if order == "recent" {
-            limit
-        } else {
-            limit.saturating_mul(10).min(1_000)
-        };
-        let mut sessions = self.store.sessions(since, until, fetch)?;
-        match order.as_str() {
-            "cost" => sessions.sort_by(|left, right| {
-                right
-                    .cost_usd
-                    .partial_cmp(&left.cost_usd)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            }),
-            "errors" => sessions.sort_by_key(|session| std::cmp::Reverse(session.error_count)),
-            "tokens" => sessions.sort_by_key(|session| std::cmp::Reverse(session.total_tokens)),
-            _ => {}
-        }
-        sessions.truncate(limit);
+        // The engine ranks the whole population and then truncates. Fetching a
+        // wide page and re-sorting it here was wrong in a way the result could
+        // not show: the page came back ordered by recency, so the costliest
+        // session in the store was simply absent from it.
+        let order = SessionOrder::parse(&requested).ok_or_else(|| {
+            ToolError(format!(
+                "order_by must be one of recent, cost, errors, tokens (got {requested:?})."
+            ))
+        })?;
+        let sessions = self.store.sessions(since, until, limit, order)?;
         if sessions.is_empty() {
             return Ok(text_result(clamp_report(
                 "No sessions in that window.",
@@ -862,8 +846,9 @@ impl<'a> Server<'a> {
             )));
         }
         let head = format!(
-            "{}, ordered by {order}.",
-            count(sessions.len() as u64, "session")
+            "{}, ordered by {}.",
+            count(sessions.len() as u64, "session"),
+            order.as_str()
         );
         let rows: Vec<String> = sessions
             .iter()
@@ -883,12 +868,12 @@ impl<'a> Server<'a> {
                 )
             })
             .collect();
-        let structured = json!({
-            "sessions": sessions
-                .iter()
-                .map(|session| json!({
-                    "session_id": session.session_id,
-                    "session_attribute": session.session_attribute,
+        let structured_rows: Vec<Value> = sessions
+            .iter()
+            .map(|session| {
+                json!({
+                    "session_id": json_safe(&session.session_id),
+                    "session_attribute": json_safe(&session.session_attribute),
                     "first_start_ns": session.first_start_ns,
                     "last_end_ns": session.last_end_ns,
                     "trace_count": session.trace_count,
@@ -897,13 +882,18 @@ impl<'a> Server<'a> {
                     "total_tokens": session.total_tokens,
                     "cost_usd": session.cost_usd,
                     "error_count": session.error_count,
-                }))
-                .collect::<Vec<Value>>(),
-        });
+                })
+            })
+            .collect();
         let notes = vec!["Open any of these with get_session, then get_trace.".to_owned()];
-        Ok(structured_result(
-            clamp_report(&head, &rows, &notes, self.limits.max_result_bytes),
-            structured,
+        Ok(budgeted_structured_result(
+            &head,
+            &rows,
+            &notes,
+            "sessions",
+            &structured_rows,
+            &[],
+            self.limits.max_result_bytes,
         ))
     }
 
@@ -1124,12 +1114,11 @@ impl<'a> Server<'a> {
             })
             .collect();
         let mut notes = Vec::new();
-        let mut structured = json!({
-            "group_by": group_name,
-            "rows": rows_data
-                .iter()
-                .map(|row| json!({
-                    "key": row.key,
+        let structured_rows: Vec<Value> = rows_data
+            .iter()
+            .map(|row| {
+                json!({
+                    "key": json_safe(&row.key),
                     "spans": row.spans,
                     "llm_calls": row.llm_calls,
                     "prompt_tokens": row.prompt_tokens,
@@ -1137,9 +1126,10 @@ impl<'a> Server<'a> {
                     "total_tokens": row.total_tokens,
                     "cost_usd": row.cost_usd,
                     "error_count": row.error_count,
-                }))
-                .collect::<Vec<Value>>(),
-        });
+                })
+            })
+            .collect();
+        let mut extra: Vec<(&str, Value)> = vec![("group_by", json!(group_name))];
         if over_time {
             match (since, until) {
                 (Some(since_ns), Some(until_ns)) if until_ns > since_ns => {
@@ -1160,9 +1150,7 @@ impl<'a> Server<'a> {
                             })
                         })
                         .collect();
-                    if let Some(object) = structured.as_object_mut() {
-                        object.insert("series".to_owned(), Value::Array(buckets));
-                    }
+                    extra.push(("series", Value::Array(buckets)));
                     notes.push(format!(
                         "Series: {} buckets of {} each.",
                         series.buckets.len(),
@@ -1186,9 +1174,14 @@ impl<'a> Server<'a> {
                 ),
             }
         }
-        Ok(structured_result(
-            clamp_report(&head, &rows, &notes, self.limits.max_result_bytes),
-            structured,
+        Ok(budgeted_structured_result(
+            &head,
+            &rows,
+            &notes,
+            "rows",
+            &structured_rows,
+            &extra,
+            self.limits.max_result_bytes,
         ))
     }
 
@@ -2094,12 +2087,94 @@ fn text_result(text: String) -> Value {
     json!({"content": [{"type": "text", "text": text}], "isError": false})
 }
 
-fn structured_result(text: String, structured: Value) -> Value {
-    json!({
-        "content": [{"type": "text", "text": text}],
-        "structuredContent": structured,
-        "isError": false,
-    })
+/// Assembles a result whose text and structured halves are budgeted *together*.
+///
+/// `rows` and `structured_rows` are parallel — index `i` of each describes the
+/// same session or group — and both are trimmed to the same prefix until the
+/// whole serialized result fits.
+///
+/// Clamping only the text was a hole rather than an oversight in emphasis:
+/// `structuredContent` is part of the tool result the client receives, so a
+/// single stored identifier could carry a hundred kilobytes past a one-kilobyte
+/// ceiling while the text block sat at eighty-three bytes and looked compliant.
+/// The ceiling means the result, or it means nothing.
+fn budgeted_structured_result(
+    head: &str,
+    rows: &[String],
+    notes: &[String],
+    key: &str,
+    structured_rows: &[Value],
+    extra: &[(&str, Value)],
+    max_bytes: usize,
+) -> Value {
+    debug_assert_eq!(rows.len(), structured_rows.len());
+    let assemble = |kept: usize, notes: &[String]| -> Value {
+        let mut structured = Map::new();
+        for (name, value) in extra {
+            structured.insert((*name).to_owned(), value.clone());
+        }
+        structured.insert(
+            key.to_owned(),
+            Value::Array(structured_rows[..kept].to_vec()),
+        );
+        json!({
+            "content": [{
+                "type": "text",
+                "text": clamp_report(head, &rows[..kept], notes, max_bytes),
+            }],
+            "structuredContent": Value::Object(structured),
+            "isError": false,
+        })
+    };
+    let mut kept = rows.len();
+    loop {
+        let mut trimmed = notes.to_vec();
+        if kept < rows.len() {
+            trimmed.push(format!(
+                "Truncated: {} of {} shown, because the whole result — text and structured \
+                 content together — would exceed this server's --mcp-max-result-bytes. \
+                 Narrow with 'since' or a smaller 'limit'.",
+                kept,
+                count(rows.len() as u64, "row")
+            ));
+        }
+        let candidate = assemble(kept, &trimmed);
+        if serde_json::to_vec(&candidate).map_or(usize::MAX, |bytes| bytes.len()) <= max_bytes {
+            return candidate;
+        }
+        if kept == 0 {
+            break;
+        }
+        kept /= 2;
+    }
+    // Even an empty structured payload does not fit. Text only, and say so
+    // rather than returning a result whose structured half silently vanished.
+    let mut final_notes = notes.to_vec();
+    final_notes.push(
+        "Structured content was omitted entirely: it did not fit under this server's \
+         --mcp-max-result-bytes. Raise the ceiling if a client needs it."
+            .to_owned(),
+    );
+    text_result(clamp_report(head, &[], &final_notes, max_bytes))
+}
+
+/// Stored text on its way into `structuredContent`.
+///
+/// The untrusted-telemetry delimiter cannot travel here — a JSON value that
+/// carried framing would no longer be the value a client is meant to chart or
+/// pass back to `get_session`. What does travel is the escaping: control
+/// characters are neutralized so a stored identifier cannot garble whatever
+/// renders it. The size guarantee is [`budgeted_structured_result`]'s.
+fn json_safe(text: &str) -> String {
+    text.chars()
+        .map(|character| {
+            if character.is_control() {
+                '\u{fffd}'
+            } else {
+                character
+            }
+        })
+        .collect()
 }
 
 /// The text of a tool result, for the resource reader that reuses one.
@@ -2851,8 +2926,16 @@ fn parse_iso(text: &str) -> Result<u64, String> {
     let year = four(0, "year")?;
     let month = two(5, "month")?;
     let day = two(8, "day")?;
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
-        return Err(format!("{text:?} has a month or day outside the calendar"));
+    // Month-specific, leap-year aware. A looser check let `2026-02-31` through
+    // to `days_from_civil`, whose arithmetic happily rolls it into March 3rd —
+    // a *different, valid* timestamp, silently substituted for the one that
+    // was asked for. A window nobody requested is worse than a refusal,
+    // because the answer computed over it looks correct.
+    if !(1..=12).contains(&month) || day < 1 || day > days_in_month(year, month) {
+        return Err(format!(
+            "{text:?} is not a date on the calendar: {year:04} has {} day(s) in month {month:02}",
+            days_in_month(year, month)
+        ));
     }
     let mut seconds = days_from_civil(year, month as u32, day as u32) * 86_400;
     let mut nanos = 0_i64;
@@ -2867,10 +2950,23 @@ fn parse_iso(text: &str) -> Result<u64, String> {
             return Err(unreadable("time"));
         }
         let minute = two(at + 3, "minute")?;
+        if hour > 23 || minute > 59 {
+            return Err(format!(
+                "{text:?} is not a time of day: hours run 00-23 and minutes 00-59"
+            ));
+        }
         seconds += hour * 3_600 + minute * 60;
         at += 5;
         if bytes.get(at) == Some(&b':') {
-            seconds += two(at + 1, "second")?;
+            let second = two(at + 1, "second")?;
+            if second > 60 {
+                return Err(format!("{text:?} is not a time of day: seconds run 00-60"));
+            }
+            // RFC 3339 permits :60 for a leap second. POSIX time has no
+            // representation for one, so it lands on the same instant as :59
+            // — which is what every other tool the caller will compare against
+            // does too.
+            seconds += second.min(59);
             at += 3;
         }
         if bytes.get(at) == Some(&b'.') {
@@ -2914,6 +3010,9 @@ fn parse_iso(text: &str) -> Result<u64, String> {
                 if bytes.len() > minute_at + 2 {
                     return Err(unreadable("UTC offset"));
                 }
+                if hours > 23 || minutes > 59 {
+                    return Err(format!("{text:?} has a UTC offset outside ±23:59"));
+                }
                 seconds += sign * (hours * 3_600 + minutes * 60);
             }
             Some(_) => return Err(unreadable("time zone")),
@@ -2927,6 +3026,26 @@ fn parse_iso(text: &str) -> Result<u64, String> {
 }
 
 // -------------------------------------------------------------- formatting
+
+/// Days in a month, Gregorian leap rule included.
+///
+/// The rule is "every fourth year, except centuries, except every fourth
+/// century", and it is written out rather than approximated because 2100 is
+/// inside the range a retention window can reach.
+fn days_in_month(year: i64, month: i64) -> i64 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 0,
+    }
+}
 
 /// Days since the Unix epoch for a civil date (Howard Hinnant's algorithm,
 /// which is exact for the whole proleptic Gregorian calendar and needs no
