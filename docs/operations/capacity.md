@@ -406,7 +406,7 @@ and "1053 MiB". Both were wrong, and understated. The benchmark took **one RSS
 sample after `compact_segments()` returned** — by which point the merge has
 freed its working set — so it measured the trough and published it as a peak.
 RSS is now sampled every 20 ms by a background thread for the duration of the
-merge. From [`INDEX-MEM-BENCHMARK.json`]( ../../INDEX-MEM-BENCHMARK.json),
+merge. From [`INDEX-MEM-BENCHMARK.json`](../../INDEX-MEM-BENCHMARK.json),
 every configuration whose merge completed:
 
 | Steady-state open | **Peak during merge** | Settled after |
