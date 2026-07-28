@@ -175,6 +175,9 @@ traza-server --data-dir ./data --port 8080 --mcp
 claude mcp add --transport http traza http://localhost:8080/v1/mcp
 ```
 
+A scripted version of the whole thing — seed, serve, investigate, clean up —
+is [`examples/mcp-demo/run.sh`](../../examples/mcp-demo/README.md).
+
 Ask it to call `describe_store` first — service and model names differ per
 store, and that call is what stops an agent guessing one and reporting that
 nothing is wrong. The dashboard's **MCP** screen shows the live tool list and

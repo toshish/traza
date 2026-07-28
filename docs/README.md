@@ -11,7 +11,7 @@ to the right document. Start with the row that matches what you are doing.
 | Send traces from my app or an OTel SDK | [Ingest](guide/ingest.md) |
 | Look up an exact route, parameter, or response shape | [HTTP API reference](guide/http-api.md) |
 | Query LLM/agent telemetry — sessions, tokens, cost | [LLM semantics](llm-semantics.md) |
-| Let a coding agent read the store over MCP | [MCP server](guide/mcp.md) |
+| Let a coding agent read the store over MCP | [MCP server](guide/mcp.md) · [demo](../examples/mcp-demo/README.md) |
 | Navigate the trace browser | [Trace browser](guide/trace-browser.md) |
 | Deploy, tune, or operate a server | [Operations](#operators) |
 | Change Traza's code | [Internals](#developers) |

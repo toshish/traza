@@ -63,6 +63,11 @@ The dashboard's **MCP** screen generates both snippets against the origin you
 are actually on, and shows the live tool list, so it is correct behind any
 host, port or reverse proxy. See the [trace browser](trace-browser.md).
 
+To see the whole surface working before wiring anything up, run
+[`examples/mcp-demo/run.sh`](../../examples/mcp-demo/README.md): it seeds a
+throwaway store, starts a server with `--mcp`, and drives a full investigation
+over `curl`.
+
 ## The tools
 
 Ten tools: nine reads and one gated writer. They are shaped like the questions
