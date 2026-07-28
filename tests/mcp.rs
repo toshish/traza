@@ -885,6 +885,184 @@ fn a_payload_cap_is_bytes_and_never_exceeds_the_result_ceiling() {
 }
 
 #[test]
+fn an_empty_answer_still_conforms_to_the_schema_its_tool_advertises() {
+    let dir = test_dir("empty-conformance");
+    let store = open_store(&dir);
+
+    // Nothing ingested at all, and then a window with nothing in it. Both are
+    // the most routine answer a tool gives, and both used to come back as text
+    // with no structured half — which a validating client rejects outright.
+    let schemas: std::collections::HashMap<String, Value> = rpc(&store, "tools/list", json!({}))
+        ["result"]["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .filter_map(|tool| {
+            Some((
+                tool["name"].as_str()?.to_owned(),
+                tool.get("outputSchema")?.clone(),
+            ))
+        })
+        .collect();
+
+    let cases = [
+        ("list_sessions", json!({}), "sessions"),
+        ("list_sessions", json!({"since": "1h"}), "sessions"),
+        ("analyze_cost", json!({}), "rows"),
+        ("analyze_cost", json!({"group_by": "day"}), "rows"),
+    ];
+    for (tool, arguments, key) in cases {
+        let result = call(&store, tool, arguments.clone());
+        assert_eq!(result["isError"], json!(false), "{tool} errored");
+        let structured = result
+            .get("structuredContent")
+            .unwrap_or_else(|| panic!("{tool} {arguments} returned no structuredContent"));
+        assert_eq!(
+            structured[key],
+            json!([]),
+            "{tool} should report an empty {key} array, not omit it"
+        );
+        for required in schemas[tool]["required"].as_array().expect("required") {
+            let field = required.as_str().expect("field");
+            assert!(
+                structured.get(field).is_some(),
+                "{tool} declares {field} required but omitted it on an empty result"
+            );
+        }
+    }
+}
+
+#[test]
+fn every_result_fits_the_ceiling_once_the_envelope_is_counted() {
+    let dir = test_dir("serialized-ceiling");
+    let store = open_store(&dir);
+    // Two shapes, because they trim by different paths. Rows that
+    // `clamp_report` can drop land well under the ceiling; a single long block
+    // — the orientation text over many services — is trimmed by `clamp` to the
+    // ceiling *exactly*, which is where the JSON envelope becomes the
+    // difference between fitting and not.
+    for index in 0..150 {
+        let mut row = span(
+            &format!("t-{index}"),
+            &format!("s-{index}"),
+            &format!("service-number-{index:03}-with-a-long-name"),
+            "openai.chat",
+            FIXED_NOW + index,
+        );
+        row.attributes.insert(
+            "gen_ai.conversation.id".to_owned(),
+            json!(format!("conversation-{index}-{}", "x".repeat(200))),
+        );
+        row.attributes.insert("llm.cost_usd".to_owned(), json!(1.5));
+        row.attributes
+            .insert("gen_ai.request.model".to_owned(), json!("gpt-4o"));
+        store.ingest(row).expect("ingest");
+    }
+
+    // At and above the enforced floor, the SERIALIZED result — envelope,
+    // structured content and JSON escaping included — must fit, and the
+    // structured half must survive.
+    for ceiling in [traza::mcp::MIN_RESULT_BYTES, 1_500, 2_048, 4_096, 32 * 1024] {
+        for tool in [
+            "list_sessions",
+            "analyze_cost",
+            "search_spans",
+            "describe_store",
+        ] {
+            let server = McpServer::new(
+                &store,
+                Limits {
+                    max_result_bytes: ceiling,
+                    max_payload_bytes: 4_096,
+                },
+                false,
+            );
+            let response = server
+                .handle(
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/call",
+                        "params": {"name": tool, "arguments": {}},
+                    }),
+                    Context {
+                        access: Access::Read,
+                        now_ns: FIXED_NOW,
+                    },
+                )
+                .expect("answered");
+            let serialized = serde_json::to_vec(&response["result"]).expect("serializes");
+            assert!(
+                serialized.len() <= ceiling,
+                "{tool} at a {ceiling}-byte ceiling serialized to {} bytes",
+                serialized.len()
+            );
+            if matches!(tool, "list_sessions" | "analyze_cost") {
+                assert!(
+                    response["result"].get("structuredContent").is_some(),
+                    "{tool} dropped structuredContent to fit {ceiling} bytes"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_ceiling_that_cannot_hold_a_conforming_result_refuses_to_start() {
+    let dir = test_dir("ceiling-floor");
+    // Below the floor the server must not come up at all. Answering every
+    // request with something a validating client rejects is the failure this
+    // prevents, and startup is where an operator can see it.
+    for ceiling in ["0", "128", "256", "1023"] {
+        // Spawned rather than `output()`-ed: a server that wrongly accepts the
+        // ceiling runs forever, and a test that waits for it to exit hangs
+        // instead of failing. Bounded wait, then kill and report.
+        let mut child = Command::new(env!("CARGO_BIN_EXE_traza-server"))
+            .arg("--data-dir")
+            .arg(&dir)
+            .arg("--port")
+            .arg("0")
+            .arg("--mcp")
+            .arg("--mcp-max-result-bytes")
+            .arg(ceiling)
+            .env_remove("TRAZA_TOKENS")
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawns");
+        let mut exited = None;
+        for _ in 0..100 {
+            match child.try_wait().expect("waits") {
+                Some(status) => {
+                    exited = Some(status);
+                    break;
+                }
+                None => std::thread::sleep(Duration::from_millis(50)),
+            }
+        }
+        let Some(status) = exited else {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the server started with --mcp-max-result-bytes {ceiling}");
+        };
+        assert!(
+            !status.success(),
+            "the server exited cleanly with --mcp-max-result-bytes {ceiling}"
+        );
+        let mut stderr = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            let _ = pipe.read_to_string(&mut stderr);
+        }
+        assert!(
+            stderr.contains("--mcp-max-result-bytes") && stderr.contains("output schema"),
+            "the refusal must say what is wrong: {stderr}"
+        );
+    }
+    // The floor itself is accepted, and so is a small ceiling when MCP is off.
+    let server = Server::spawn(&dir, &["--mcp", "--mcp-max-result-bytes", "1024"], None);
+    assert_eq!(server.post(PING, &[]).0, 200);
+}
+
+#[test]
 fn a_ceiling_smaller_than_the_truncation_notice_is_still_a_ceiling() {
     let dir = test_dir("tiny-ceiling");
     let store = open_store(&dir);

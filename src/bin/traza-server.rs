@@ -712,6 +712,19 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
         i += 1;
     }
 
+    // A ceiling too small to hold a schema-conforming result is refused here
+    // rather than producing, at every request, an answer a validating client
+    // rejects. Same stance as an invalid TRAZA_TOKENS: fail where the operator
+    // can see it.
+    if mcp.enabled && mcp.limits.max_result_bytes < traza::mcp::MIN_RESULT_BYTES {
+        return Err(format!(
+            "--mcp-max-result-bytes {} is below the {} needed for a result that both fits the \
+             ceiling and conforms to the output schema its tool advertises",
+            mcp.limits.max_result_bytes,
+            traza::mcp::MIN_RESULT_BYTES,
+        ));
+    }
+
     Ok(Some(Options {
         data_dir,
         host,
