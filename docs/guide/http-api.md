@@ -59,6 +59,7 @@ trailers and has no declared length.
 | `GET` | [`/v1/stats`](#get-v1stats) | Store statistics |
 | `GET` | [`/v1/metrics`](#get-v1metrics) | Prometheus text metrics |
 | `GET` | [`/v1/metrics.json`](#get-v1metricsjson) | The same metrics as JSON |
+| `POST` | [`/v1/mcp`](#post-v1mcp) | Model Context Protocol endpoint (off unless `--mcp`) |
 | `GET` | [`/`, `/dashboard`](#get--and-dashboard) | The trace browser |
 
 ---
@@ -836,6 +837,42 @@ every `p*_ns` here is a bucket upper bound, at most that fraction high and
 never low. Counts, sums, means and maxima are exact.
 
 **Errors.** None — the route always renders.
+
+### `POST /v1/mcp`
+
+The [Model Context Protocol](../guide/mcp.md) endpoint: JSON-RPC 2.0 over the
+Streamable HTTP transport, one message per request. **Served only when the
+server was started with `--mcp`**; otherwise every method answers `404` with
+the flag named.
+
+This route is documented in full in **[the MCP guide](mcp.md)** — its ten
+tools, five resources, three templates and four prompts, and what each returns.
+What belongs here is the transport contract:
+
+| Condition | Response |
+|---|---|
+| A JSON-RPC request | `200` with one JSON-RPC response |
+| A JSON-RPC notification or response | `202` with **no body** |
+| `GET` or `DELETE` | `405` — no server-initiated SSE stream, no session to delete |
+| `Origin` present, and neither loopback nor named by `--mcp-allowed-origin` | `403` — the transport's DNS-rebinding defence. The origin is never validated against the request's own `Host`, which a rebinding request also controls |
+| `MCP-Protocol-Version` naming an unserved revision | `400`, listing the supported ones |
+| A body that is not JSON | `400` with JSON-RPC `-32700` |
+| A JSON array (a batch) | `400` with JSON-RPC `-32600` — batching was removed from MCP |
+
+Supported protocol revisions are `2025-11-25` and `2025-06-18`. A revision this
+server serves is echoed back from `initialize` unchanged; anything else is
+answered with `2025-11-25` and the client decides whether to continue.
+
+**Authorization is per tool, not per method.** Unlike every other route here,
+the HTTP method does not describe the operation: MCP tunnels reads and writes
+alike through one `POST`. A `ro` token therefore reaches every read tool, and
+`record_annotation` additionally requires `rw` *and* `--mcp-annotations`.
+
+```sh
+curl -X POST http://localhost:8080/v1/mcp \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+```
 
 ### `GET /` and `/dashboard`
 

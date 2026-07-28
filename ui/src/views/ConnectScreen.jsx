@@ -50,6 +50,7 @@ export function ConnectScreen({ go }) {
       {arrived ? <div style={{ display: 'flex', gap: 6, marginTop: 12 }}>
         <Chip tone="primary" onClick={() => go(['traces'])}>Open Traces</Chip>
         <Chip onClick={() => go(['tail'])}>Watch the live tail</Chip>
+        <Chip onClick={() => go(['mcp'])}>Let an agent read it</Chip>
       </div> : null}
     </Card>
 

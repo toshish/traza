@@ -5,6 +5,116 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **An MCP server, embedded in `traza-server`: `POST /v1/mcp`.** Traza's read
+  path had two consumers — the dashboard and `curl` — and the one its own
+  vision implies was missing: the agent that produced the traces. `--mcp`
+  serves the [Model Context Protocol](docs/guide/mcp.md) from the same binary,
+  same port, same auth gate, with **no new dependency** (JSON-RPC is
+  `serde_json`; the transport is the HTTP server that already exists) and no
+  engine change. Tool handlers call `Store` directly rather than looping back
+  through the socket, which is why `tests/mcp.rs` can drive the whole surface
+  with no listener in the process.
+
+  **Ten tools, shaped like questions rather than routes**: `describe_store`,
+  `search_spans`, `get_trace`, `list_sessions`, `get_session`, `top_failures`,
+  `slowest_spans`, `analyze_cost`, `get_payload`, and `record_annotation`
+  behind two gates. A mechanical translation of the route index would have been
+  nineteen tools a model cannot tell apart. `describe_store` exists because an
+  agent that guesses a service name gets an empty result indistinguishable from
+  "nothing is wrong" and reports that everything is fine.
+
+  **Results are bounded in tokens, not rows.** One LLM span with a prompt and a
+  completion is 20–50 KB, so the REST default of `limit=100` would be an
+  unusable call that also costs money to fail: span tools default to 20, stored
+  content is omitted unless asked for, every result is capped by
+  `--mcp-max-result-bytes`, and **every truncation is stated along with the
+  argument that would have narrowed it** — a silently shortened answer gets
+  reported by a model as a complete one.
+
+  **Stored span text is treated as untrusted.** It is confined to a delimited
+  block with a preamble saying so, control characters are escaped so a newline
+  cannot forge a row, the delimiter is neutralized so a value cannot close the
+  block early, and it never reaches a tool name, description, or error message.
+  The load-bearing mitigation is architectural: the server has no fetcher, no
+  shell, no filesystem write and no outbound network path, so an injected
+  instruction has nothing to actuate.
+
+  Also: five resources and three URI templates (`traza://trace/{trace_id}` and
+  friends, so a trace id in a tool result is something a host can attach), four
+  prompts that each carry the live store overview as an embedded resource, a
+  `traza-server mcp --url` stdio bridge for clients that launch a subprocess,
+  and a dashboard **MCP** screen that reads the live surface from the running
+  server rather than describing what the build believes it to be.
+
+- **Per-tool authorization on the MCP route.** Every other route maps scope to
+  HTTP method, which is right where the method *is* the operation. MCP tunnels
+  reads and writes through one `POST`, so the method rule would either lock
+  every `ro` token out of a read-only surface or hand every caller the write
+  scope. `AuthConfig::scope_for` authenticates without applying it, and the
+  endpoint authorizes per tool: `ro` reaches every read tool, and
+  `record_annotation` needs `rw` *and* `--mcp-annotations`. A tool the token
+  cannot call is never advertised to it — a model shown one calls it, reads the
+  refusal as transient, and retries.
+
+- **A `mcp` route class in `/v1/metrics`.** One `POST /v1/mcp` can be a lookup,
+  a search or a whole-store rollup depending only on the tool named in the
+  body; filed under `other` alongside static assets it would describe neither.
+
+### Fixed
+
+- **The MCP endpoint's DNS-rebinding defence trusted a header the attack
+  controls.** `Origin` was accepted whenever its authority equalled the
+  request's `Host` — which is exactly what a rebinding request supplies, since
+  the attacker owns the name and the browser sends theirs in both headers. A
+  page on any domain could drive a loopback Traza and read the whole store.
+  Origins are now checked against loopback plus an operator-supplied
+  `--mcp-allowed-origin` allowlist, and nothing else the request carries is
+  consulted; the `Host` header is no longer read at all, so the comparison
+  cannot be reintroduced by accident.
+
+- **`list_sessions` ranked a page instead of the population.** `order_by=cost`
+  fetched the most recent sessions and re-sorted those, so an expensive session
+  outside the recency window was not lower down — it was absent. Ranking moved
+  into `Store::sessions`, which already materializes every session in the
+  window, so the comparator change costs nothing and the answer is over the
+  whole population.
+
+- **`structuredContent` escaped `--mcp-max-result-bytes`.** Only the text block
+  was clamped, so one long stored identifier produced an 83-byte text block
+  inside a 100 KB result under a 1 KiB ceiling. Text and structured content are
+  now budgeted and trimmed together; the ceiling bounds the tool result, not
+  one field of it.
+
+- **Impossible timestamps became different valid ones.** `2026-02-31` resolved
+  to March 3rd, `2026-07-27T99:99:99Z` to July 31st, and a `+99:99` offset was
+  accepted — each silently substituting a window nobody asked for, over which
+  the answer looks correct. Month lengths, leap years (century rule included),
+  time-of-day and offset ranges are validated before conversion.
+
+- **Empty results violated the schema their tool advertises.** `list_sessions`
+  and `analyze_cost` returned text-only results for an empty store or window,
+  while both declare required `outputSchema` fields — so a validating client
+  would reject the most routine answer either tool gives. They now return
+  `{"sessions": []}` and `{"group_by": "…", "rows": []}`, and the path that
+  trims rows to fit keeps the structured half rather than dropping it.
+
+- **Small ceilings were exceeded by the JSON envelope.** `--mcp-max-result-bytes`
+  was applied to the text block, then the result was wrapped — so a 256-byte
+  ceiling shipped 286 bytes. The ceiling is now enforced on the whole
+  serialized result at the single point every tool result passes through, and
+  a ceiling below 1,024 bytes is refused at startup, because beneath that no
+  result can both fit and conform.
+
+- **The dashboard generated a stdio configuration that could not work over
+  TLS.** It interpolated `window.location.origin` into `traza-server mcp
+  --url`, which the bridge refuses for `https://`. On a secure origin it now
+  asks for the plaintext endpoint instead of emitting a copy-ready snippet that
+  fails.
+
 ## [0.20.0] - 2026-07-27
 
 ### Added

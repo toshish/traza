@@ -189,6 +189,24 @@ impl AuthConfig {
     /// Authenticates an HTTP Authorization header and enforces method scope.
     /// Checks a request: bearer token match (constant-time) + scope for the method.
     pub fn authorize(&self, authorization: Option<&str>, method: &str) -> Result<(), AuthFailure> {
+        let scope = self.scope_for(authorization)?;
+        if scope.permits(method) {
+            Ok(())
+        } else {
+            Err(AuthFailure::Forbidden)
+        }
+    }
+
+    /// Authenticates a bearer token and returns what it may do, without
+    /// applying the HTTP-method rule.
+    ///
+    /// The method rule is right for the REST surface, where the method *is*
+    /// the operation. It is wrong for a protocol that tunnels every operation
+    /// through one `POST`: applied there it would lock `ro` tokens out of a
+    /// read-only surface entirely, and hand every caller that got in the write
+    /// scope. [`crate::mcp`] authorizes per tool instead, and this is the
+    /// authentication half it builds on.
+    pub fn scope_for(&self, authorization: Option<&str>) -> Result<Scope, AuthFailure> {
         let token = authorization
             .and_then(parse_bearer)
             .ok_or(AuthFailure::Unauthorized)?;
@@ -203,13 +221,7 @@ impl AuthConfig {
                 matched_scope = Some(credential.scope);
             }
         }
-
-        let scope = matched_scope.ok_or(AuthFailure::Unauthorized)?;
-        if scope.permits(method) {
-            Ok(())
-        } else {
-            Err(AuthFailure::Forbidden)
-        }
+        matched_scope.ok_or(AuthFailure::Unauthorized)
     }
 }
 
