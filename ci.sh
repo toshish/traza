@@ -33,6 +33,17 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo build --release
 cargo test
 
+# ---------------------------------------------------------------- examples
+# The MCP demo is documentation people run, so it is a gate rather than a
+# sample: it drives the real binary over the real endpoint, and a change that
+# breaks the surface it shows should not merge green.
+if command -v python3 >/dev/null 2>&1; then
+  TRAZA_DEMO_PORT=${TRAZA_DEMO_PORT:-8123} ./examples/mcp-demo/run.sh >/dev/null
+  echo "ci: mcp demo ran"
+else
+  echo "ci: skipping the MCP demo (python3 not found)"
+fi
+
 # ---------------------------------------------------------------- dashboard
 # Node is required: the dashboard is a first-class part of the product, and a
 # UI that does not build must not merge green. Set TRAZA_SKIP_UI=1 only for a

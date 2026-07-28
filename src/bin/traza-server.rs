@@ -148,6 +148,11 @@ enum RouteClass {
     /// Responses held open for as long as the consumer wants them: the live
     /// tail and export. Counted, never timed — see [`ServerMetrics::observe`].
     Stream,
+    /// The MCP endpoint. Its own class because one `POST /v1/mcp` can be a
+    /// lookup, a search or a whole-store rollup depending only on the tool
+    /// named in the body — blending that into `other` alongside static assets
+    /// would describe neither.
+    Mcp,
     /// Everything else — dashboard assets, metrics, flush.
     Other,
 }
@@ -156,6 +161,7 @@ impl RouteClass {
     /// Classifies a request by method and path.
     fn of(method: &str, path: &str) -> Self {
         match (method, path) {
+            (_, traza::mcp::ENDPOINT) => Self::Mcp,
             ("POST", "/v1/spans" | "/v1/traces") => Self::Ingest,
             ("GET", "/v1/spans") => Self::Search,
             // Long-lived responses, held open by the consumer rather than by
@@ -186,6 +192,7 @@ impl RouteClass {
             Self::Search => "search",
             Self::Stats => "stats",
             Self::Stream => "stream",
+            Self::Mcp => "mcp",
             Self::Other => "other",
         }
     }
@@ -348,12 +355,13 @@ impl ServerMetrics {
     }
 
     /// The route classes, in the order [`Self::by_class`] stores them.
-    const CLASSES: [RouteClass; 6] = [
+    const CLASSES: [RouteClass; 7] = [
         RouteClass::Ingest,
         RouteClass::Lookup,
         RouteClass::Search,
         RouteClass::Stats,
         RouteClass::Stream,
+        RouteClass::Mcp,
         RouteClass::Other,
     ];
 
@@ -492,7 +500,14 @@ default 64MiB)] \
 [--tail-ring-bytes N (live-tail memory ceiling, whichever bound binds first; \
 default 32MiB)] \
 [--ui-dir DIR (built dashboard; default: TRAZA_UI_DIR, beside the binary, then ./ui/dist)] \
-[--allow-unauthenticated-non-loopback]";
+[--mcp (serve the Model Context Protocol endpoint at /v1/mcp; off by default)] \
+[--mcp-annotations (additionally let MCP callers with an rw token record annotations)] \
+[--mcp-max-result-bytes N (default 32768)] [--mcp-max-payload-bytes N (default 262144)] \
+[--mcp-allowed-origin ORIGIN (repeatable; browser origins allowed to drive /v1/mcp \
+besides loopback)] \
+[--allow-unauthenticated-non-loopback]\n\
+       traza-server mcp --url URL [--token TOKEN] \
+(stdio bridge: speaks MCP on stdin/stdout and forwards to a running server)";
 
 /// Everything the command line decides, with the profile already resolved
 /// against the explicit flags.
@@ -505,7 +520,27 @@ struct Options {
     ui_dir: Option<PathBuf>,
     profile: Profile,
     compaction_enabled: bool,
+    mcp: McpOptions,
     config: Config,
+}
+
+/// What the MCP endpoint is allowed to do, resolved from the command line.
+///
+/// `enabled` defaults to off. A read endpoint that is on by default is a
+/// decision to expose every stored prompt to whatever holds the token, and
+/// that should be something an operator turned on.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct McpOptions {
+    /// Off unless `--mcp` was passed.
+    enabled: bool,
+    annotations: bool,
+    limits: traza::mcp::Limits,
+    /// Browser origins permitted to drive the endpoint, beyond loopback.
+    ///
+    /// Operator-supplied, and that is the whole point: the origin cannot be
+    /// validated against anything else the request carries, because a request
+    /// driven by DNS rebinding supplies all of them.
+    allowed_origins: Vec<String>,
 }
 
 /// Parses the command line. `Ok(None)` means `--help` was handled and there is
@@ -532,6 +567,7 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
     let mut content_index = true;
     let mut flush_wal_bytes = traza::DEFAULT_FLUSH_WAL_BYTES;
     let mut profile = Profile::default();
+    let mut mcp = McpOptions::default();
     // Profile-owned: `None` means "not given on the command line", which is
     // exactly the question the resolve below asks.
     let mut flush_spans: Option<usize> = None;
@@ -630,6 +666,40 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
                 i += 1;
                 ui_dir = Some(PathBuf::from(value(i, "--ui-dir")?));
             }
+            "--mcp" => {
+                mcp.enabled = true;
+            }
+            // Implies --mcp: asking for the write tool and getting no endpoint
+            // at all is a silent no-op, and the alternative reading — "enable
+            // annotations on the endpoint I did not enable" — is not one
+            // anybody means.
+            "--mcp-annotations" => {
+                mcp.enabled = true;
+                mcp.annotations = true;
+            }
+            "--mcp-max-result-bytes" => {
+                i += 1;
+                mcp.limits.max_result_bytes = number(i, "--mcp-max-result-bytes")? as usize;
+            }
+            "--mcp-max-payload-bytes" => {
+                i += 1;
+                mcp.limits.max_payload_bytes = number(i, "--mcp-max-payload-bytes")? as usize;
+            }
+            "--mcp-allowed-origin" => {
+                i += 1;
+                mcp.enabled = true;
+                let origin = value(i, "--mcp-allowed-origin")?
+                    .trim()
+                    .to_ascii_lowercase();
+                if !origin.contains("://") {
+                    return Err(format!(
+                        "--mcp-allowed-origin must be a whole origin including the scheme, \
+                         like https://traza.example.com (got {origin})"
+                    ));
+                }
+                mcp.allowed_origins
+                    .push(origin.trim_end_matches('/').to_owned());
+            }
             "--allow-unauthenticated-non-loopback" => {
                 allow_unauthenticated_non_loopback = true;
             }
@@ -642,6 +712,19 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
         i += 1;
     }
 
+    // A ceiling too small to hold a schema-conforming result is refused here
+    // rather than producing, at every request, an answer a validating client
+    // rejects. Same stance as an invalid TRAZA_TOKENS: fail where the operator
+    // can see it.
+    if mcp.enabled && mcp.limits.max_result_bytes < traza::mcp::MIN_RESULT_BYTES {
+        return Err(format!(
+            "--mcp-max-result-bytes {} is below the {} needed for a result that both fits the \
+             ceiling and conforms to the output schema its tool advertises",
+            mcp.limits.max_result_bytes,
+            traza::mcp::MIN_RESULT_BYTES,
+        ));
+    }
+
     Ok(Some(Options {
         data_dir,
         host,
@@ -651,6 +734,7 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
         ui_dir,
         profile,
         compaction_enabled,
+        mcp,
         config: Config {
             // Explicit flag beats profile beats built-in default, in that
             // order and regardless of where each appeared.
@@ -679,6 +763,12 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // `traza-server mcp --url ...` is the stdio bridge, not a server. It opens
+    // no data directory and holds no state — the running server it forwards to
+    // is the only thing that does.
+    if args.first().map(String::as_str) == Some("mcp") {
+        return run_mcp_bridge(&args[1..]);
+    }
     let Some(options) = parse_args(&args)? else {
         return Ok(());
     };
@@ -691,6 +781,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         ui_dir,
         profile,
         compaction_enabled,
+        mcp,
         config,
     } = options;
     let durability = config.durability;
@@ -773,9 +864,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     );
 
+    // What the agent-facing surface will actually do, announced rather than
+    // left to be discovered by a client that gets a 404.
+    if mcp.enabled {
+        eprintln!(
+            "traza-server: MCP endpoint on {} — read tools{}; results capped at {} bytes",
+            traza::mcp::ENDPOINT,
+            if mcp.annotations {
+                " plus record_annotation for rw tokens"
+            } else {
+                " only (no --mcp-annotations)"
+            },
+            mcp.limits.max_result_bytes,
+        );
+    }
+
     // The dashboard is served from disk (ui/ `npm run build` output), never
     // compiled in. A missing build is not fatal: the API runs, and the UI
     // routes explain how to produce it.
+    let mcp = Arc::new(mcp);
     let ui = Arc::new(match ui_dir {
         Some(explicit) => traza::ui::UiRoot::new(explicit),
         None => traza::ui::UiRoot::discover(),
@@ -855,6 +962,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let connection_auth = Arc::clone(&auth);
         let connection_ui = Arc::clone(&ui);
         let connection_metrics = Arc::clone(&metrics);
+        let connection_mcp = Arc::clone(&mcp);
         let spawned = thread::Builder::new()
             .name("traza-http".into())
             .spawn(move || {
@@ -864,6 +972,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     &connection_auth,
                     &connection_ui,
                     &connection_metrics,
+                    &connection_mcp,
                 );
                 connection_metrics
                     .connections_live
@@ -877,6 +986,173 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+/// The stdio bridge: MCP on stdin/stdout, forwarded to a running server.
+///
+/// Many MCP clients still launch their servers as a subprocess and speak over
+/// pipes. This is that subprocess, and it does exactly one thing — translate
+/// framing. No caching, no tool logic, no state of its own. If it ever needs a
+/// second responsibility, that is evidence the split is wrong.
+///
+/// Two rules from the transport are load-bearing here: **stdout carries
+/// nothing but MCP messages** (every diagnostic goes to stderr, or the client's
+/// parser breaks), and a message the server answers with `202` produces no
+/// output at all.
+fn run_mcp_bridge(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    const BRIDGE_USAGE: &str =
+        "Usage: traza-server mcp --url http://HOST:PORT[/v1/mcp] [--token TOKEN]";
+    let mut url = None;
+    let mut token = std::env::var("TRAZA_TOKEN").ok().filter(|t| !t.is_empty());
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--url" => {
+                index += 1;
+                url = Some(args.get(index).ok_or("--url requires a value")?.clone());
+            }
+            "--token" => {
+                index += 1;
+                token = Some(args.get(index).ok_or("--token requires a value")?.clone());
+            }
+            "--help" | "-h" => {
+                println!("{BRIDGE_USAGE}");
+                return Ok(());
+            }
+            other => return Err(format!("unknown argument: {other}\n{BRIDGE_USAGE}").into()),
+        }
+        index += 1;
+    }
+    let url = url.ok_or(BRIDGE_USAGE)?;
+    let (host, port, path) = split_url(&url)?;
+    let path = if path == "/" {
+        traza::mcp::ENDPOINT.to_owned()
+    } else {
+        path
+    };
+    eprintln!("traza-server mcp: bridging stdio to http://{host}:{port}{path}");
+
+    let stdin = io::stdin();
+    let mut stdout = io::stdout();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if stdin.read_line(&mut line)? == 0 {
+            // The client closed our input: the documented way a stdio session
+            // ends.
+            return Ok(());
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match forward(&host, port, &path, token.as_deref(), trimmed.as_bytes()) {
+            Ok(Some(response)) => {
+                stdout.write_all(response.as_bytes())?;
+                stdout.write_all(b"\n")?;
+                stdout.flush()?;
+            }
+            // 202: accepted, nothing to say.
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!("traza-server mcp: {error}");
+                // A transport failure still owes the client a reply, or it
+                // waits for one that will never come. Only a request has an
+                // id to answer; a notification that failed is only a log line.
+                if let Some(id) = serde_json::from_str::<Value>(trimmed)
+                    .ok()
+                    .and_then(|message| message.get("id").cloned())
+                    .filter(|id| !id.is_null())
+                {
+                    let body = traza::mcp::error_response(
+                        id,
+                        -32603,
+                        &format!("traza bridge could not reach the server: {error}"),
+                    );
+                    stdout.write_all(body.to_string().as_bytes())?;
+                    stdout.write_all(b"\n")?;
+                    stdout.flush()?;
+                }
+            }
+        }
+    }
+}
+
+/// One request/response exchange with the server. `Ok(None)` is a `202`.
+fn forward(
+    host: &str,
+    port: u16,
+    path: &str,
+    token: Option<&str>,
+    body: &[u8],
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let mut stream = TcpStream::connect((host, port))?;
+    stream.set_read_timeout(Some(Duration::from_secs(120)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+    let authorization = token.map_or(String::new(), |token| {
+        format!("Authorization: Bearer {token}\r\n")
+    });
+    write!(
+        stream,
+        "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json\r\n\
+         Accept: application/json, text/event-stream\r\nMCP-Protocol-Version: {}\r\n\
+         {authorization}Content-Length: {}\r\nConnection: close\r\n\r\n",
+        traza::mcp::PROTOCOL_VERSION,
+        body.len(),
+    )?;
+    stream.write_all(body)?;
+    stream.flush()?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response)?;
+    let split = find_bytes(&response, b"\r\n\r\n").ok_or("malformed HTTP response")?;
+    let head = String::from_utf8_lossy(&response[..split]);
+    let status: u16 = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .ok_or("malformed HTTP status line")?;
+    let payload = String::from_utf8_lossy(&response[split + 4..])
+        .trim()
+        .to_owned();
+    match status {
+        202 => Ok(None),
+        200 => Ok(Some(payload)),
+        // Everything else is the server refusing: surface its own words rather
+        // than inventing a reason.
+        other => Err(format!("server returned {other}: {payload}").into()),
+    }
+}
+
+/// Splits `scheme://host:port/path` into its parts, defaulting the port by
+/// scheme and the path to `/`.
+fn split_url(url: &str) -> Result<(String, u16, String), Box<dyn std::error::Error>> {
+    let (scheme, rest) = url.split_once("://").unwrap_or(("http", url));
+    if scheme == "https" {
+        return Err(
+            "the bridge speaks plain HTTP; put TLS termination in front of it, and \
+                    point --url at the plaintext side"
+                .into(),
+        );
+    }
+    let (authority, path) = rest
+        .split_once('/')
+        .map_or((rest, String::new()), |(a, p)| (a, format!("/{p}")));
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => (host.to_owned(), port.parse::<u16>()?),
+        None => (authority.to_owned(), 80),
+    };
+    if host.is_empty() {
+        return Err("--url needs a host".into());
+    }
+    Ok((
+        host,
+        port,
+        if path.is_empty() {
+            "/".to_owned()
+        } else {
+            path
+        },
+    ))
 }
 
 fn is_loopback_bind(host: &str) -> bool {
@@ -897,6 +1173,7 @@ fn handle_connection(
     auth: &Option<traza::auth::AuthConfig>,
     ui: &traza::ui::UiRoot,
     metrics: &ServerMetrics,
+    mcp: &McpOptions,
 ) -> io::Result<()> {
     // A silent or dribbling peer must not park this thread forever.
     let timeout = socket_timeout();
@@ -966,26 +1243,53 @@ fn handle_connection(
         // means an unauthenticated client cannot make this server buffer
         // 64 MiB. The connection then closes, precisely because that body was
         // never read.
+        //
+        // The MCP endpoint authenticates the same way and authorizes
+        // differently: it carries reads and writes alike over one POST, so the
+        // method rule would either refuse every `ro` token or grant every
+        // caller the write scope. Its token's scope is resolved here and
+        // enforced per tool.
+        let is_mcp = head
+            .target
+            .split_once('?')
+            .map_or(head.target.as_str(), |(path, _)| path)
+            == traza::mcp::ENDPOINT;
+        let mut access = traza::mcp::Access::ReadWrite;
         if let Some(config) = auth {
-            if let Err(failure) = config.authorize(head.authorization.as_deref(), &head.method) {
-                metrics.rejected.increment();
-                let challenge = failure
-                    .www_authenticate()
-                    .map(|value| format!("WWW-Authenticate: {value}\r\n"))
-                    .unwrap_or_default();
-                let body = failure.body();
-                let reason = if failure.status() == 401 {
-                    "Unauthorized"
-                } else {
-                    "Forbidden"
-                };
-                let mut responder = connection.responder(false);
-                let head = format!(
-                    "HTTP/1.1 {} {reason}\r\n{challenge}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    failure.status(),
-                    body.len(),
-                );
-                return responder.raw(&head, body.as_bytes());
+            let verdict = if is_mcp {
+                config
+                    .scope_for(head.authorization.as_deref())
+                    .map(|scope| match scope {
+                        traza::auth::Scope::ReadOnly => traza::mcp::Access::Read,
+                        traza::auth::Scope::ReadWrite => traza::mcp::Access::ReadWrite,
+                    })
+            } else {
+                config
+                    .authorize(head.authorization.as_deref(), &head.method)
+                    .map(|()| traza::mcp::Access::ReadWrite)
+            };
+            match verdict {
+                Ok(granted) => access = granted,
+                Err(failure) => {
+                    metrics.rejected.increment();
+                    let challenge = failure
+                        .www_authenticate()
+                        .map(|value| format!("WWW-Authenticate: {value}\r\n"))
+                        .unwrap_or_default();
+                    let body = failure.body();
+                    let reason = if failure.status() == 401 {
+                        "Unauthorized"
+                    } else {
+                        "Forbidden"
+                    };
+                    let mut responder = connection.responder(false);
+                    let head = format!(
+                        "HTTP/1.1 {} {reason}\r\n{challenge}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        failure.status(),
+                        body.len(),
+                    );
+                    return responder.raw(&head, body.as_bytes());
+                }
             }
         }
         let body = match connection.read_body(&head) {
@@ -999,6 +1303,8 @@ fn handle_connection(
             method: head.method,
             target: head.target,
             content_type: head.content_type,
+            origin: head.origin,
+            mcp_protocol_version: head.mcp_protocol_version,
             body,
         };
         let mut responder = connection.responder(keep_alive);
@@ -1008,7 +1314,7 @@ fn handle_connection(
                 .split_once('?')
                 .map_or(target.as_str(), |(path, _)| path)
         });
-        let result = serve_request(&mut responder, request, engine, metrics);
+        let result = serve_request(&mut responder, request, engine, metrics, mcp, access);
         let persist = responder.keep_alive;
         let status = responder.status;
         // Observed BEFORE the error is propagated, because a write failure is
@@ -1058,11 +1364,16 @@ fn serve_request(
     request: Request,
     engine: &Store,
     metrics: &ServerMetrics,
+    mcp: &McpOptions,
+    access: traza::mcp::Access,
 ) -> io::Result<()> {
     let (path, query) = request
         .target
         .split_once('?')
         .unwrap_or((&request.target, ""));
+    if path == traza::mcp::ENDPOINT {
+        return serve_mcp(responder, &request, engine, mcp, access);
+    }
     match (request.method.as_str(), path) {
         ("POST", "/v1/spans") => {
             let spans = match metrics.decode.time(|| decode_spans(&request.body)) {
@@ -1251,7 +1562,12 @@ fn serve_request(
                     json!({"error": "group_by is not a /v1/sessions parameter"}),
                 );
             }
-            match engine.sessions(since, until, limit.unwrap_or(100)) {
+            match engine.sessions(
+                since,
+                until,
+                limit.unwrap_or(100),
+                traza::analytics::SessionOrder::Recent,
+            ) {
                 Ok(sessions) => responder.json(
                     200,
                     json!({"sessions": serde_json::to_value(sessions)
@@ -1948,10 +2264,150 @@ fn span_query_from(raw_query: &str) -> Result<(SpanFilter, Option<traza::SpanCur
     Ok((filter, cursor))
 }
 
+/// Serves the MCP endpoint: the Streamable HTTP transport's server half.
+///
+/// Deliberately not an SSE stream. Every tool here is request/response, none
+/// of them needs the server to speak first, and a stream would be state this
+/// surface has decided not to keep. `GET` and `DELETE` therefore answer `405`,
+/// which the specification defines as "this endpoint offers no such stream"
+/// and "sessions cannot be terminated here" respectively.
+fn serve_mcp(
+    responder: &mut Responder<'_>,
+    request: &Request,
+    engine: &Store,
+    options: &McpOptions,
+    access: traza::mcp::Access,
+) -> io::Result<()> {
+    if !options.enabled {
+        return responder.json(
+            404,
+            json!({
+                "error": "the MCP endpoint is not enabled",
+                "next": "restart traza-server with --mcp (add --mcp-annotations to let an \
+                         rw token record annotations)",
+            }),
+        );
+    }
+    // DNS rebinding defence. A browser attaches `Origin` and a page on an
+    // attacker's domain cannot forge it, so refusing an origin the operator
+    // did not name stops a remote site driving this server through the user's
+    // browser. Native MCP clients send no `Origin` at all and are unaffected.
+    if let Some(origin) = &request.origin {
+        if !origin_allowed(origin, &options.allowed_origins) {
+            return responder.json(
+                403,
+                json!({
+                    "error": "origin not allowed",
+                    "next": "loopback origins are allowed by default; name any other with \
+                             --mcp-allowed-origin ORIGIN",
+                }),
+            );
+        }
+    }
+    // The specification requires a 400 for a version this server does not
+    // serve, rather than silently answering in a dialect the client cannot
+    // read.
+    if let Some(version) = &request.mcp_protocol_version {
+        if !traza::mcp::SUPPORTED_VERSIONS.contains(&version.as_str()) {
+            return responder.json(
+                400,
+                json!({
+                    "error": format!("unsupported MCP-Protocol-Version: {version}"),
+                    "supported": traza::mcp::SUPPORTED_VERSIONS,
+                }),
+            );
+        }
+    }
+    if request.method != "POST" {
+        return responder.json(
+            405,
+            json!({
+                "error": "this MCP endpoint accepts POST only",
+                "next": "POST one JSON-RPC message per request; there is no SSE stream and \
+                         no session to delete",
+            }),
+        );
+    }
+    let message: Value = match serde_json::from_slice(&request.body) {
+        Ok(value) => value,
+        Err(error) => {
+            return responder.json(
+                400,
+                traza::mcp::error_response(Value::Null, -32700, &format!("parse error: {error}")),
+            );
+        }
+    };
+    if message.is_array() {
+        return responder.json(
+            400,
+            traza::mcp::error_response(
+                Value::Null,
+                -32600,
+                "JSON-RPC batching was removed from MCP; send one message per request",
+            ),
+        );
+    }
+    let server = traza::mcp::Server::new(engine, options.limits, options.annotations);
+    let context = traza::mcp::Context {
+        access,
+        now_ns: traza::mcp::unix_nanos_now(),
+    };
+    match server.handle(&message, context) {
+        Some(response) => responder.json(200, response),
+        // A notification or a response: accepted, and by the transport's rule
+        // answered with no body at all.
+        None => responder.accepted(),
+    }
+}
+
+/// Whether a browser `Origin` may drive this endpoint.
+///
+/// **The origin is never compared against anything else the request carries.**
+/// An earlier version accepted any `Origin` whose authority equalled the
+/// request's `Host`, which is precisely what a DNS-rebinding request supplies:
+/// the attacker owns the name, so the browser sends *their* host in both
+/// headers and the comparison succeeds. Only two things may permit an origin:
+///
+/// - it is a loopback page, which an attacker's site can never be — the
+///   browser stamps the origin of the page, and a page served from
+///   `evil.example` has that origin however its DNS resolves;
+/// - the operator named it with `--mcp-allowed-origin`.
+fn origin_allowed(origin: &str, allowed: &[String]) -> bool {
+    // "null" is what a sandboxed iframe or a `file://` page sends. It is
+    // same-origin with nothing, and matches no allowlist entry.
+    if origin.is_empty() || origin == "null" {
+        return false;
+    }
+    let origin = origin.trim().trim_end_matches('/');
+    if allowed.iter().any(|entry| entry == origin) {
+        return true;
+    }
+    let Some((scheme, authority)) = origin.split_once("://") else {
+        return false;
+    };
+    // A loopback *origin* — not a loopback destination. The scheme is checked
+    // too, so `javascript://localhost` and friends cannot pass as one.
+    matches!(scheme, "http" | "https")
+        && matches!(authority_host(authority), "localhost" | "127.0.0.1" | "::1")
+}
+
+/// The host part of an authority, with an IPv6 literal unwrapped from its
+/// brackets so `[::1]:8080` compares as `::1`.
+fn authority_host(authority: &str) -> &str {
+    if let Some(rest) = authority.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    authority.split(':').next().unwrap_or(authority)
+}
+
 struct Request {
     method: String,
     target: String,
     content_type: String,
+    /// `Origin:` and `MCP-Protocol-Version:` — carried because the MCP
+    /// endpoint has header-level rules the REST routes do not.
+    origin: Option<String>,
+    mcp_protocol_version: Option<String>,
     body: Vec<u8>,
 }
 
@@ -1967,6 +2423,15 @@ struct RequestHead {
     content_type: String,
     /// Lowercased `Connection:` header value, empty when absent.
     connection: String,
+    /// `Origin:` as sent. Needed by the MCP endpoint, which must refuse a
+    /// browser origin the operator did not name, to defeat DNS rebinding.
+    ///
+    /// Deliberately NOT accompanied by `Host`. Validating one against the
+    /// other is the bug this field exists to avoid: a rebinding request
+    /// supplies both, so they agree exactly when the check matters most.
+    origin: Option<String>,
+    /// `MCP-Protocol-Version:` as sent. An unsupported value is a `400`.
+    mcp_protocol_version: Option<String>,
     content_length: usize,
     header_end: usize,
 }
@@ -2102,6 +2567,8 @@ fn parse_head(bytes: &[u8], header_end: usize) -> io::Result<RequestHead> {
     let mut authorization = None;
     let mut content_type = String::new();
     let mut connection = String::new();
+    let mut origin = None;
+    let mut mcp_protocol_version = None;
     let mut header_lines: Vec<&str> = Vec::new();
     for line in lines {
         if let Some((name, value)) = line.split_once(':') {
@@ -2113,6 +2580,12 @@ fn parse_head(bytes: &[u8], header_end: usize) -> io::Result<RequestHead> {
             }
             if name.eq_ignore_ascii_case("connection") {
                 connection = value.trim().to_ascii_lowercase();
+            }
+            if name.eq_ignore_ascii_case("origin") {
+                origin = Some(value.trim().to_ascii_lowercase());
+            }
+            if name.eq_ignore_ascii_case("mcp-protocol-version") {
+                mcp_protocol_version = Some(value.trim().to_owned());
             }
         }
         header_lines.push(line);
@@ -2161,6 +2634,8 @@ fn parse_head(bytes: &[u8], header_end: usize) -> io::Result<RequestHead> {
         authorization,
         content_type,
         connection,
+        origin,
+        mcp_protocol_version,
         content_length,
         header_end,
     })
@@ -2210,7 +2685,9 @@ impl Responder<'_> {
         let reason = match status {
             200 => "OK",
             400 => "Bad Request",
+            403 => "Forbidden",
             404 => "Not Found",
+            405 => "Method Not Allowed",
             413 => "Payload Too Large",
             429 => "Too Many Requests",
             503 => "Service Unavailable",
@@ -2223,6 +2700,19 @@ impl Responder<'_> {
                 self.connection_header(),
             ),
             &encoded,
+        )
+    }
+
+    /// Acknowledges a request that has no reply — an MCP notification. The
+    /// transport specifies 202 *with no body*, so this is not `json`.
+    fn accepted(&mut self) -> io::Result<()> {
+        self.status = Some(202);
+        self.raw(
+            &format!(
+                "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: {}\r\n\r\n",
+                self.connection_header(),
+            ),
+            &[],
         )
     }
 

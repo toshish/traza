@@ -13,6 +13,7 @@ pub mod content;
 pub mod expiration;
 pub mod hash;
 pub mod insights;
+pub mod mcp;
 mod media;
 pub mod metrics;
 pub mod otlp;

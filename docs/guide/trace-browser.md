@@ -51,7 +51,7 @@ needs.
 | **explore** | Overview `#/overview` · Traces `#/traces` · Sessions `#/sessions` · Live tail `#/tail` |
 | **measure** | Analytics `#/analytics` · Latency `#/latency` · Failures `#/failures` |
 | **evaluate** | Scores `#/scores` · Experiments `#/experiments` · Datasets `#/datasets` |
-| **operate** | Server `#/server` · Store `#/store` · Connect `#/connect` |
+| **operate** | Server `#/server` · Store `#/store` · Connect `#/connect` · MCP `#/mcp` |
 
 Detail screens hang off those: `#/trace/<id>`, `#/sessions/<id>`,
 `#/conversation/traces/<id>`, `#/compare?a=…&b=…`.
@@ -240,6 +240,27 @@ arrived with rather than making you retype it.
 
 `#/connect` — first run. Two environment variables, then watch the first span
 arrive; the page polls and tells you the moment it does.
+
+## MCP
+
+`#/mcp` — connecting an agent to *read* this store, which is the other
+direction from Connect's "send spans in".
+
+Everything on the page is asked of the running server rather than written into
+the build: whether the endpoint is serving, which protocol revision it
+negotiated, and the exact tools, resources, templates and prompts your token
+would be offered. A screen that listed what the build believes the surface to
+be would be wrong the moment the server was started without
+`--mcp-annotations`, and wrong in the direction that costs somebody an
+afternoon.
+
+With the endpoint off, the page says so and gives the flags. With it on, it
+generates both client configurations — the HTTP form and the stdio-bridge form
+— against the origin you are actually on, so they are correct behind any host,
+port or reverse proxy. If a bearer token is set in this browser session it is
+included in those snippets, and the page says so.
+
+Full reference: [the MCP guide](mcp.md).
 
 ## Developing on the dashboard
 

@@ -43,6 +43,7 @@ file-backed reads), primary-key idempotent ingest, OTLP/HTTP protobuf+JSON,
 sessions and token/cost analytics, content-addressed payload offloading,
 append-only annotations, streaming NDJSON export with integrity trailers,
 bearer auth with scopes, safe bind defaults, a standalone trace-browser UI,
+an embedded MCP server (`--mcp`) so an agent can read the store it wrote,
 measured benchmarks (116k spans/s ingest; sub-ms trace lookup at 10M spans).
 
 **Known gap that shapes Phase 1:** `POST /v1/spans` acknowledges after the
@@ -215,6 +216,17 @@ would be a planning failure.
   [the segment format](segment-format.md#the-content-index).
 
 ### 1.4 Operability and release engineering
+
+- **Agent-facing read surface (MCP)** — **shipped**, and deliberately scoped as
+  a facade rather than a differentiator. It is table stakes: the LLM
+  observability field is converging on shipping one, so its absence would be
+  noticed while its presence wins nothing. It cost no engine change and no
+  dependency, and it must not be allowed to grow into the budget that §1.3's
+  eval model and §1.5's generation boundary need. The one part of it that could
+  genuinely lead is the untrusted-content boundary — stored spans carry
+  attacker-written text, and handing that to a tool-holding model is a confused
+  deputy nobody in this category has handled well. See
+  [the MCP guide](guide/mcp.md).
 
 - **HTTP/1.1 keep-alive + gzip.** Per-request TCP handshakes cap the ingest
   path. (gRPC stays out; `http/protobuf` covers OTel SDKs.)
