@@ -3010,8 +3010,8 @@ fn parse_iso(text: &str) -> Result<u64, String> {
     // because the answer computed over it looks correct.
     if !(1..=12).contains(&month) || day < 1 || day > days_in_month(year, month) {
         return Err(format!(
-            "{text:?} is not a date on the calendar: {year:04} has {} day(s) in month {month:02}",
-            days_in_month(year, month)
+            "{text:?} is not a date on the calendar: month {month:02} of {year:04} has {}",
+            count(days_in_month(year, month).max(0) as u64, "day")
         ));
     }
     let mut seconds = days_from_civil(year, month as u32, day as u32) * 86_400;
