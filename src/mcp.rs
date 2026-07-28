@@ -96,6 +96,17 @@ const MAX_ATTRIBUTES_PER_SPAN: usize = 12;
 /// the byte count a tool reports is the one it actually returns.
 const RENDER_OVERHEAD: usize = 512;
 
+/// The smallest `--mcp-max-result-bytes` the server will start with.
+///
+/// Below this there is no way to satisfy both halves of the contract: a result
+/// must fit the ceiling *and* conform to the `outputSchema` its tool
+/// advertises, and the smallest conforming result — envelope, an empty row
+/// array, and a sentence saying nothing matched — is already larger than a few
+/// hundred bytes. Refusing the configuration at startup is the honest place to
+/// fail; the alternative is a server that answers every request with something
+/// a validating client rejects.
+pub const MIN_RESULT_BYTES: usize = 1024;
+
 /// Bare integer timestamps below this are refused as a probable unit mistake:
 /// this is 1970-01-12 in nanoseconds, so anything under it is far likelier to
 /// be seconds or milliseconds than a real query bound.
@@ -553,6 +564,12 @@ impl<'a> Server<'a> {
                 "isError": true,
             }),
         };
+        // The ceiling is enforced here, at the one point every tool result
+        // passes through, rather than in each handler. A handler that clamped
+        // its own text still shipped a result larger than the ceiling once the
+        // JSON envelope and `structuredContent` were counted — and a rule that
+        // ten call sites have to remember is a rule one of them will forget.
+        let result = enforce_ceiling(result, self.limits.max_result_bytes);
         json!({"jsonrpc": "2.0", "id": id, "result": result})
     }
 
@@ -833,8 +850,12 @@ impl<'a> Server<'a> {
             ))
         })?;
         let sessions = self.store.sessions(since, until, limit, order)?;
+        // An empty window is an ordinary answer, not an exception, so it comes
+        // back shaped like every other one. A text-only "nothing found" would
+        // violate the outputSchema this tool advertises, and a client that
+        // validates would reject the most routine response there is.
         if sessions.is_empty() {
-            return Ok(text_result(clamp_report(
+            return Ok(budgeted_structured_result(
                 "No sessions in that window.",
                 &[],
                 &[
@@ -842,8 +863,11 @@ impl<'a> Server<'a> {
                    call describe_store to see whether this store records sessions at all."
                         .to_owned(),
                 ],
+                "sessions",
+                &[],
+                &[],
                 self.limits.max_result_bytes,
-            )));
+            ));
         }
         let head = format!(
             "{}, ordered by {}.",
@@ -1073,7 +1097,7 @@ impl<'a> Server<'a> {
         let total_rows = rows_data.len();
         rows_data.truncate(limit);
         if rows_data.is_empty() {
-            return Ok(text_result(clamp_report(
+            return Ok(budgeted_structured_result(
                 "No LLM usage in that window.",
                 &[],
                 &[
@@ -1081,8 +1105,11 @@ impl<'a> Server<'a> {
                    store of plain request traces has none, and describe_store will say so."
                         .to_owned(),
                 ],
+                "rows",
+                &[],
+                &[("group_by", json!(group_name))],
                 self.limits.max_result_bytes,
-            )));
+            ));
         }
         let head = format!(
             "Tokens and cost by {group_name}, {} of {}, highest cost first. Counts and sums \
@@ -2147,15 +2174,65 @@ fn budgeted_structured_result(
         }
         kept /= 2;
     }
-    // Even an empty structured payload does not fit. Text only, and say so
-    // rather than returning a result whose structured half silently vanished.
+    // Even an empty structured payload does not fit. The structured half still
+    // travels: dropping it would break the outputSchema this tool advertises,
+    // and a validating client rejects that rather than reading it as "nothing
+    // matched". The final trim is `enforce_ceiling`'s, on the text alone.
     let mut final_notes = notes.to_vec();
     final_notes.push(
-        "Structured content was omitted entirely: it did not fit under this server's \
-         --mcp-max-result-bytes. Raise the ceiling if a client needs it."
+        "No rows fit under this server's --mcp-max-result-bytes; only the summary is shown. \
+         Raise the ceiling, or narrow the query."
             .to_owned(),
     );
-    text_result(clamp_report(head, &[], &final_notes, max_bytes))
+    assemble(0, &final_notes)
+}
+
+/// Shrinks a finished result until its **serialized** form fits the ceiling.
+///
+/// Only the text block gives way; `structuredContent` is left alone, because
+/// removing it would break the `outputSchema` the tool advertises and a
+/// validating client would reject the answer outright. The row count that
+/// makes the structured half small enough is chosen upstream, by
+/// [`budgeted_structured_result`]; this is the backstop that accounts for the
+/// envelope and for whatever JSON escaping adds.
+fn enforce_ceiling(mut result: Value, max_bytes: usize) -> Value {
+    loop {
+        let length = serialized_len(&result);
+        if length <= max_bytes {
+            return result;
+        }
+        let Some(text) = result
+            .pointer("/content/0/text")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        else {
+            return result;
+        };
+        if text.is_empty() {
+            // Nothing left to give. Only reachable below MIN_RESULT_BYTES,
+            // which the server refuses to start with.
+            return result;
+        }
+        let target = text.len().saturating_sub((length - max_bytes).max(1));
+        let shorter = truncate_bytes(&text, target);
+        match result.pointer_mut("/content/0/text") {
+            Some(slot) => *slot = Value::String(shorter),
+            None => return result,
+        }
+    }
+}
+
+fn serialized_len(result: &Value) -> usize {
+    serde_json::to_vec(result).map_or(usize::MAX, |bytes| bytes.len())
+}
+
+/// Truncates to at most `max_bytes`, at a character boundary.
+fn truncate_bytes(text: &str, max_bytes: usize) -> String {
+    let mut end = max_bytes.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_owned()
 }
 
 /// Stored text on its way into `structuredContent`.

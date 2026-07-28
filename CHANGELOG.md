@@ -95,6 +95,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the answer looks correct. Month lengths, leap years (century rule included),
   time-of-day and offset ranges are validated before conversion.
 
+- **Empty results violated the schema their tool advertises.** `list_sessions`
+  and `analyze_cost` returned text-only results for an empty store or window,
+  while both declare required `outputSchema` fields — so a validating client
+  would reject the most routine answer either tool gives. They now return
+  `{"sessions": []}` and `{"group_by": "…", "rows": []}`, and the path that
+  trims rows to fit keeps the structured half rather than dropping it.
+
+- **Small ceilings were exceeded by the JSON envelope.** `--mcp-max-result-bytes`
+  was applied to the text block, then the result was wrapped — so a 256-byte
+  ceiling shipped 286 bytes. The ceiling is now enforced on the whole
+  serialized result at the single point every tool result passes through, and
+  a ceiling below 1,024 bytes is refused at startup, because beneath that no
+  result can both fit and conform.
+
 - **The dashboard generated a stdio configuration that could not work over
   TLS.** It interpolated `window.location.origin` into `traza-server mcp
   --url`, which the bridge refuses for `https://`. On a secure origin it now

@@ -140,7 +140,7 @@ unusable answer that also costs money to fail.
 | Span tools default to | `limit=20`, capped at 100 |
 | Prompt/completion content is | omitted unless `include_content: true` |
 | A string attribute renders to at most | 200 characters, then an elision |
-| Any single result is capped at | `--mcp-max-result-bytes` (32 KiB), **text and `structuredContent` together** |
+| Any single result is capped at | `--mcp-max-result-bytes` (32 KiB) — the whole serialized result, envelope included, in UTF-8 bytes |
 | One `get_payload` fetch is capped at | the smaller of `--mcp-max-payload-bytes` (256 KiB) and the result cap |
 | Truncation is | **always stated, with the argument that would narrow it** |
 
@@ -155,7 +155,17 @@ text only — for span data the compact rendering is strictly better, and sendin
 both doubles the bytes for identical information.
 
 Both halves are budgeted together, and trimmed in lockstep: the ceiling bounds
-the tool result a client receives, not one field of it. `structuredContent`
+the tool result a client receives, not one field of it. Rows come off both at
+once, and if none fit, the structured half still travels empty rather than
+disappearing — the schema is part of the contract, so a result that omits it is
+not a smaller answer, it is an invalid one. The server refuses to start with a
+ceiling under 1,024 bytes for the same reason.
+
+**An empty result is an ordinary result.** A window with no sessions, or a
+store with no LLM usage, comes back as `{"sessions": []}` and
+`{"group_by": "model", "rows": []}` — shaped like every other answer, because a
+text-only "nothing found" would violate the schema on the single most routine
+response these tools give. `structuredContent`
 carries stored identifiers verbatim so they can be passed straight back to
 `get_session` — control characters are neutralized, but no delimiter travels
 there, because a value wrapped in framing is no longer the value a client is
