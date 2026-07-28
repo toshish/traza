@@ -8,10 +8,13 @@
 //! estimate tracks it.
 //!
 //! A global allocator affects the whole test binary, which is why this is its
-//! own file rather than a case in another one.
+//! own file rather than a case in another one. The counter it keeps is
+//! process-global for the same reason, which is why reading it goes through
+//! `Measurement` — see there.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use serde_json::{Map, Value};
@@ -49,8 +52,44 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static ALLOCATOR: Counting = Counting;
 
-fn live_bytes() -> usize {
-    LIVE.load(Ordering::Relaxed)
+/// Exclusive right to read `LIVE`, held for the whole of one measurement.
+///
+/// `LIVE` counts the entire process, so a reading only describes the code being
+/// measured while nothing else in the process is allocating. libtest runs the
+/// tests in this file concurrently, as threads of one process, and both of them
+/// build tens of megabytes of the same heavy spans — so a neighbour that lands
+/// inside a measurement window is charged to it. That is not hypothetical: it
+/// is how `approximate_bytes` came to be accused of undercounting 34 MB it had
+/// in fact counted to within 0.02%, on a machine loaded enough for the two
+/// windows to overlap. In isolation they rarely did, which is what made it look
+/// like a flake rather than the measurement bug it was.
+///
+/// Holding this for a whole test serializes them, which is simply what
+/// measuring a process-global number requires. It gates the read rather than
+/// living in each test, so a test added here later cannot forget to take it.
+static MEASURING: Mutex<()> = Mutex::new(());
+
+struct Measurement {
+    /// Held for its `Drop`; the exclusion is the whole value.
+    _exclusive: MutexGuard<'static, ()>,
+}
+
+impl Measurement {
+    /// Waits until this thread is the only one in this process measuring.
+    fn begin() -> Self {
+        Measurement {
+            // A panicking test poisons the lock. The other one should then
+            // report its own verdict rather than a panic about its neighbour.
+            _exclusive: MEASURING
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        }
+    }
+
+    /// Bytes the allocator has handed out and not yet taken back.
+    fn live_bytes(&self) -> usize {
+        LIVE.load(Ordering::Relaxed)
+    }
 }
 
 fn base_span(id: &str) -> Span {
@@ -114,15 +153,19 @@ fn retained_capacity(id: &str, slots: usize) -> Span {
 
 /// Bytes the allocator reports for holding `count` copies of `make`, and what
 /// the engine's estimate said they would cost.
-fn measure(make: impl Fn(usize) -> Span, count: usize) -> (usize, usize) {
+fn measure(
+    measurement: &Measurement,
+    make: impl Fn(usize) -> Span,
+    count: usize,
+) -> (usize, usize) {
     // Warm up: the first span pulls in whatever lazily-initialized machinery
     // the construction path uses, which would otherwise be charged to the
     // measurement.
     drop(make(0));
 
-    let before = live_bytes();
+    let before = measurement.live_bytes();
     let spans: Vec<Span> = (1..=count).map(&make).collect();
-    let held = live_bytes().saturating_sub(before);
+    let held = measurement.live_bytes().saturating_sub(before);
 
     let estimated: usize = spans.iter().map(traza::tail::approximate_bytes).sum();
     drop(spans);
@@ -131,21 +174,27 @@ fn measure(make: impl Fn(usize) -> Span, count: usize) -> (usize, usize) {
 
 #[test]
 fn the_estimate_tracks_what_the_allocator_actually_hands_out() {
+    let measurement = Measurement::begin();
+
     // The estimate must never be far BELOW real allocation — that is the
     // direction that makes the ceiling bypassable — across every shape,
     // including ones whose cost is invisible to a serializer.
     for (label, held, estimated) in [
         (
             "wide text",
-            measure(|n| wide_text(&format!("s{n}"), 64 * 1024), 32),
+            measure(&measurement, |n| wide_text(&format!("s{n}"), 64 * 1024), 32),
         ),
         (
             "deep structure",
-            measure(|n| deep_structure(&format!("s{n}"), 8, 3), 8),
+            measure(&measurement, |n| deep_structure(&format!("s{n}"), 8, 3), 8),
         ),
         (
             "retained capacity",
-            measure(|n| retained_capacity(&format!("s{n}"), 50_000), 16),
+            measure(
+                &measurement,
+                |n| retained_capacity(&format!("s{n}"), 50_000),
+                16,
+            ),
         ),
     ]
     .map(|(label, (held, estimated))| (label, held, estimated))
@@ -167,6 +216,11 @@ fn the_estimate_tracks_what_the_allocator_actually_hands_out() {
 
 #[test]
 fn the_ring_holds_no_more_than_its_byte_budget_says() {
+    // Taken before the first allocation rather than before the first reading:
+    // this test's own ingest loop builds 200 of the same heavy spans, and that
+    // is exactly the noise the other test must not be charged for.
+    let measurement = Measurement::begin();
+
     // End to end, through the real ingest path: the allocator's own count of
     // what the process holds must stay within reach of the configured ceiling,
     // whatever shape the spans are.
@@ -211,7 +265,7 @@ fn the_ring_holds_no_more_than_its_byte_budget_says() {
     // the only thing left holding spans in memory, which is exactly what the
     // budget is supposed to bound.
     store.flush().expect("flush");
-    let settled = live_bytes();
+    let settled = measurement.live_bytes();
 
     let (spans, bytes, _, budget) = store.tail_usage().expect("usage");
     assert!(
@@ -223,7 +277,7 @@ fn the_ring_holds_no_more_than_its_byte_budget_says() {
     // the segment set's indexes. Generous, but the assertion that matters:
     // without capacity counting these 200 spans retained hundreds of megabytes
     // while the ring believed it held a few kilobytes.
-    let after_flush = live_bytes();
+    let after_flush = measurement.live_bytes();
     assert!(
         after_flush <= settled,
         "flush should not grow the heap: {settled} -> {after_flush}"
