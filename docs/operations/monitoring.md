@@ -60,6 +60,8 @@ with a plain `Instant` — see [benchmarking](../internals/benchmarking.md).
 | `traza_batches_admitted_total` | counter | Batches accepted. `spans_admitted / batches_admitted` is the **mean batch size actually reaching the engine** — often more informative than either alone |
 | `traza_wal_commits_total` | counter | Calls to commit, whether or not they performed their own fsync. Divided by `traza_wal_fsync_ns_count` this is the **group-commit ratio**: how many acknowledgements each fsync covered |
 | `traza_segment_seal_spans_total` | counter | Spans written out by seals, for seal cost per span |
+| `traza_expiry_segments_skipped_total` | counter | Segments a TTL sweep ruled out **without decoding them**, from the rollup's end-time range. Skipping is invisible from results — the same spans are removed either way — so this and the next counter are the sweep's only visible cost |
+| `traza_expiry_segments_decoded_total` | counter | Segments a TTL sweep had to read: the ones straddling the cutoff, plus any whose rollup sidecar was absent, stale or damaged. **If this stays near `segment_count` every tick, the sidecars are not being trusted** — check they exist before concluding the sweep is merely busy |
 | `traza_segment_merges_total` | counter | Merges that published their outputs. **Segment count cannot substitute for this**: seals raise it while merges lower it, so under sustained ingest the two hide each other and a store that is merging steadily can look like one that never merges |
 | `traza_segments_merged_away_total` | counter | Segments consumed by merges. Divided by `traza_segment_merges_total` this is the **mean fan-in actually achieved** — whether compaction is keeping up or nibbling |
 
@@ -71,6 +73,8 @@ the noise floor of what it measures.
 | Stage | What it times |
 |---|---|
 | `traza_writer_lock_wait` | Waiting to acquire the writer lock — **the contention signal** |
+| `traza_segments_lock_wait` | Waiting to acquire the **segments** lock, timed at every acquisition. The reader/writer contention signal: a seal takes the writer lock and then this one, so anything holding segments stalls ingest |
+| `traza_analytics_fold` | One `GET /v1/stats/llm` or `GET /v1/sessions` fold, end to end. Pair it with `segments_lock_wait` to tell whether an analytics query is the thing stalling writers |
 | `traza_wal_encode` | Encoding a batch into its log frame. Measured deliberately *outside* the writer lock |
 | `traza_wal_write` | Appending the frame to the log: the log's own lock plus the write (inside the writer lock) |
 | `traza_wal_lock_wait` | The log-lock half of `wal_write` |
@@ -81,6 +85,15 @@ the noise floor of what it measures.
 | `traza_segment_seal_locked` | The part of that seal which holds an engine lock **around the segment write** — draining and publishing. The write itself runs with nothing held |
 | `traza_segment_merge` | A merge end to end: choosing the run, decoding every input, writing the outputs, publishing, unlinking. Runs on the maintenance thread with no engine lock held across the merge itself |
 | `traza_segment_seal_reconcile` | The post-publish reconcile, which holds the writer lock: reclaiming the write-ahead log and evicting sealed spans. **This is an fsync**, and it dominates a seal's lock-hold time |
+
+**Reading `segments_lock_wait` correctly.** It is the *reader against writer*
+signal, and it exists because the stall it measures used to be
+unattributable — a seal's own timers start after its locks are acquired, so a
+reader holding the segments lock showed up as a slow seal. An analytics fold
+pins the segment list and releases the lock before decoding anything, so the
+expected shape is a long `analytics_fold` beside a short `segments_lock_wait`.
+The two rising together means something is holding the lock across its work
+again.
 
 **Reading `writer_lock_wait` correctly.** It is not a cost, it is the **queue**
 for everything else. If it dominates, the fix is to do *less work while holding
