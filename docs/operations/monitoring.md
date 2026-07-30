@@ -60,6 +60,8 @@ with a plain `Instant` — see [benchmarking](../internals/benchmarking.md).
 | `traza_batches_admitted_total` | counter | Batches accepted. `spans_admitted / batches_admitted` is the **mean batch size actually reaching the engine** — often more informative than either alone |
 | `traza_wal_commits_total` | counter | Calls to commit, whether or not they performed their own fsync. Divided by `traza_wal_fsync_ns_count` this is the **group-commit ratio**: how many acknowledgements each fsync covered |
 | `traza_segment_seal_spans_total` | counter | Spans written out by seals, for seal cost per span |
+| `traza_segment_merges_total` | counter | Merges that published their outputs. **Segment count cannot substitute for this**: seals raise it while merges lower it, so under sustained ingest the two hide each other and a store that is merging steadily can look like one that never merges |
+| `traza_segments_merged_away_total` | counter | Segments consumed by merges. Divided by `traza_segment_merges_total` this is the **mean fan-in actually achieved** — whether compaction is keeping up or nibbling |
 
 ### Engine stages
 
@@ -76,19 +78,33 @@ the noise floor of what it measures.
 | `traza_wal_fsync` | The fsync. The one stage that is not CPU |
 | `traza_buffer_upsert` | Upserting a batch into the write buffer (inside the writer lock) |
 | `traza_segment_seal` | Sealing the write buffer into a segment, end to end |
-| `traza_segment_seal_locked` | The part of that seal which holds an engine lock — draining, publishing, reconciling. Everything else runs with nothing held |
+| `traza_segment_seal_locked` | The part of that seal which holds an engine lock **around the segment write** — draining and publishing. The write itself runs with nothing held |
+| `traza_segment_merge` | A merge end to end: choosing the run, decoding every input, writing the outputs, publishing, unlinking. Runs on the maintenance thread with no engine lock held across the merge itself |
+| `traza_segment_seal_reconcile` | The post-publish reconcile, which holds the writer lock: reclaiming the write-ahead log and evicting sealed spans. **This is an fsync**, and it dominates a seal's lock-hold time |
 
 **Reading `writer_lock_wait` correctly.** It is not a cost, it is the **queue**
 for everything else. If it dominates, the fix is to do *less work while holding
 the lock*, not to make that work faster. The work performed under the lock is
-`wal_write + buffer_upsert + segment_seal_locked`; comparing that sum against
-wall clock tells you how saturated the lock is.
+`wal_write + buffer_upsert + segment_seal_locked + segment_seal_reconcile`;
+comparing that sum against wall clock tells you how saturated the lock is.
 
 **`segment_seal` is not in that sum, and that is the point.** A seal does its
 I/O with no lock held, so its wall time is not lock occupancy — use
 `segment_seal_locked` for saturation and `segment_seal` for what a seal costs.
 If `segment_seal_locked / segment_seal` climbs toward 1, something has put the
-segment write back under the lock. Expect it well under 0.25.
+segment write back under the lock. Expect it around 0.0005 — microseconds
+against tens of milliseconds.
+
+**Watch the two lock-hold stages separately; they have different shapes.**
+`segment_seal_locked` is CPU and is measured in microseconds.
+`segment_seal_reconcile` is a *log truncation*, so it is one fsync and lands
+in the milliseconds — typically a few hundred times the other. That is
+expected: the log cannot be reclaimed without the writer lock, because an
+append interleaving with the truncation would be discarded, so ingest really
+does wait on it. What is not expected is for it to grow with the size of the
+buffer: it should track the device, not the corpus. Summed together the two
+answer neither question, which is why they are separate metrics — see
+[testing.md](../internals/testing.md) for what that conflation cost.
 
 `traza_segment_seals_coalesced_total` counts seals that found another already
 running and declined to start a second one; those spans are covered by the
@@ -216,7 +232,8 @@ added acknowledgement latency.
 
 **The writer lock is saturated.** Sum
 `traza_wal_write_ns_sum + traza_buffer_upsert_ns_sum +
-traza_segment_seal_locked_ns_sum` and compare it against wall clock. Sealing
+traza_segment_seal_locked_ns_sum + traza_segment_seal_reconcile_ns_sum` and
+compare it against wall clock. Sealing
 used to be ~74% of that sum and is now a small part of it, so a saturated lock
 today points at `wal_write` — which means the log device, not the engine. The
 decomposition and how it moved are in
