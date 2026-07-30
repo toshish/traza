@@ -36,6 +36,9 @@
 //! record count     u64   |   the BINDING: which segment this describes
 //! min start ns     u64   |
 //! max start ns     u64  /
+//! min end ns       u64      span END range, for TTL expiry
+//! max end ns       u64
+//! prologue cksum   u64       FNV-1a over the 64 bytes above
 //! by_model         counter map
 //! by_provider      counter map
 //! by_service       counter map
@@ -64,7 +67,7 @@ use crate::semconv;
 const MAGIC: [u8; 8] = *b"TRAZAROL";
 
 /// Layout version of this file. Bump when the BYTES change.
-const FORMAT_VERSION: u16 = 1;
+const FORMAT_VERSION: u16 = 2;
 
 /// Version of the analytics semantics the counters were computed under.
 ///
@@ -79,6 +82,32 @@ const SCHEMA_VERSION: u32 = 1;
 
 /// Extension of the sidecar written beside `segment-<id>.seg`.
 const ROLLUP_SUFFIX: &str = "rollup";
+
+/// Bytes of the fixed prologue, including its own checksum.
+///
+/// The prologue is separately checksummed so that [`bounds`] can answer from
+/// one short read. TTL expiry asks that question about every segment on every
+/// tick, and it must be able to trust the answer without reading — let alone
+/// decoding — anything else: an unverified bound would let expiry skip a
+/// segment that should have been swept, or sweep one that should not.
+const PROLOGUE_LEN: usize = 72;
+
+/// Offset of the prologue's own checksum, which covers everything before it.
+const PROLOGUE_CHECKSUM_AT: usize = 64;
+
+/// The timestamp ranges a rollup covers.
+///
+/// Start and end are tracked separately because they answer different
+/// questions and do not bound each other: aggregation windows filter on
+/// `start_time_ns`, TTL expires on `end_time_ns`, and a long span can end well
+/// after the last span in its segment started.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Bounds {
+    pub(crate) min_start_ns: u64,
+    pub(crate) max_start_ns: u64,
+    pub(crate) min_end_ns: u64,
+    pub(crate) max_end_ns: u64,
+}
 
 /// Distinguishes concurrent temp files, as `seal_segment` does for segments.
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -122,6 +151,62 @@ pub(crate) struct Binding {
 pub(crate) fn load(segment_path: &Path, expected: Binding) -> Option<SegmentRollup> {
     let bytes = fs::read(rollup_path(segment_path)).ok()?;
     decode(&bytes, expected)
+}
+
+/// The timestamp ranges of `segment_path`'s rollup, from a single
+/// [`PROLOGUE_LEN`]-byte read.
+///
+/// This is the question TTL expiry asks about every segment on every tick:
+/// *could this segment hold anything expirable?* Answering it by decoding the
+/// segment costs a JSON parse per span and made the sweep re-read the whole
+/// corpus once a minute whether or not anything was expirable. Answering it
+/// from the sidecar's prologue costs one short read.
+///
+/// The prologue carries its own checksum, so this never acts on unverified
+/// bytes — which matters, because the caller deletes data on the strength of
+/// the answer. `None` means "no trustworthy answer", and every caller must
+/// fall back to reading the segment rather than assuming either way.
+pub(crate) fn bounds(segment_path: &Path, expected: Binding) -> Option<Bounds> {
+    use std::io::Read;
+    let mut file = fs::File::open(rollup_path(segment_path)).ok()?;
+    let mut head = [0u8; PROLOGUE_LEN];
+    file.read_exact(&mut head).ok()?;
+    if head[..MAGIC.len()] != MAGIC {
+        return None;
+    }
+    let mut cursor = Cursor {
+        bytes: &head,
+        at: MAGIC.len(),
+    };
+    if cursor.u16()? != FORMAT_VERSION {
+        return None;
+    }
+    cursor.u16()?; // reserved
+    if cursor.u32()? != SCHEMA_VERSION {
+        return None;
+    }
+    let found = Binding {
+        segment_bytes: cursor.u64()?,
+        record_count: cursor.u64()?,
+        min_start_ns: cursor.u64()?,
+        max_start_ns: cursor.u64()?,
+    };
+    let bounds = Bounds {
+        min_start_ns: found.min_start_ns,
+        max_start_ns: found.max_start_ns,
+        min_end_ns: cursor.u64()?,
+        max_end_ns: cursor.u64()?,
+    };
+    if cursor.u64()? != fnv1a(&head[..PROLOGUE_CHECKSUM_AT]) {
+        return None;
+    }
+    // Checked LAST, so a mismatched binding is distinguished from corruption
+    // only by which check failed — both answer `None`, which is the same
+    // instruction to the caller: go and read the segment.
+    if found != expected {
+        return None;
+    }
+    Some(bounds)
 }
 
 /// Writes the sidecar for `segment_path`, atomically.
@@ -192,6 +277,13 @@ fn encode(binding: Binding, rollup: &SegmentRollup) -> Vec<u8> {
     put_u64(&mut out, binding.record_count);
     put_u64(&mut out, binding.min_start_ns);
     put_u64(&mut out, binding.max_start_ns);
+    let bounds = rollup.bounds();
+    put_u64(&mut out, bounds.min_end_ns);
+    put_u64(&mut out, bounds.max_end_ns);
+    debug_assert_eq!(out.len(), PROLOGUE_CHECKSUM_AT);
+    let prologue_checksum = fnv1a(&out);
+    put_u64(&mut out, prologue_checksum);
+    debug_assert_eq!(out.len(), PROLOGUE_LEN);
 
     // Maps are written in SORTED key order so that encoding the same rollup
     // twice produces identical bytes, the same determinism rule the segment
@@ -272,8 +364,20 @@ fn decode(bytes: &[u8], expected: Binding) -> Option<SegmentRollup> {
     if found != expected {
         return None;
     }
+    let bounds = Bounds {
+        min_start_ns: found.min_start_ns,
+        max_start_ns: found.max_start_ns,
+        min_end_ns: cursor.u64()?,
+        max_end_ns: cursor.u64()?,
+    };
+    // The prologue carries its own checksum so `bounds` can be read without
+    // the rest of the file; verified here too, so the two readers cannot
+    // disagree about the same bytes.
+    if cursor.u64()? != fnv1a(&body[..PROLOGUE_CHECKSUM_AT]) {
+        return None;
+    }
 
-    let mut rollup = SegmentRollup::empty(found.min_start_ns, found.max_start_ns);
+    let mut rollup = SegmentRollup::empty(bounds);
     rollup.by_model = cursor.counter_map()?;
     rollup.by_provider = cursor.counter_map()?;
     rollup.by_service = cursor.counter_map()?;
