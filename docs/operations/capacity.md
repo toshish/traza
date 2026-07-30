@@ -562,6 +562,34 @@ Two things follow for sizing:
   under an older analytics schema. Deleting every `.rollup` in a data
   directory is safe; it costs one rebuild per segment.
 
+**Aggregations do not stall ingest.** The fold pins the segment list — a
+pointer copy per segment — and releases the lock before it decodes anything,
+because a pinned `Arc<Segment>` keeps its own file descriptor and stays
+readable even if a merge or expiry unlinks it underneath. Holding that lock
+across the scan meant every analytics request stalled every writer for as long
+as it ran, and the Overview screen starts several at once. Watch
+`traza_segments_lock_wait` against `traza_analytics_fold`: a long fold beside a
+short wait is the intended shape.
+
+**The TTL sweep no longer re-reads the corpus.** It runs once a minute over
+every segment and used to JSON-decode all of them to discover that nothing had
+aged out. The rollup sidecar's prologue carries the segment's span END range
+under its own checksum, so a segment wholly newer than the cutoff is skipped
+and one wholly older is retired without being read; only a segment straddling
+the cutoff is decoded. `traza_expiry_segments_skipped_total` against
+`traza_expiry_segments_decoded_total` is the sweep's real cost — nothing about
+a correct sweep otherwise says whether it read one segment or all of them. A
+missing or damaged sidecar reads as "I do not know" and falls back to decoding,
+so retention is never decided on an unverified byte.
+
+**A maintenance timer does not fill the rollup cache.** The payload sweep asks
+about every segment in the corpus, including ones no aggregation has ever
+touched. It now reads sidecars without caching them, and `compact_expired`
+skips the reference set entirely when the store has no `payloads/` directory —
+which is most stores, and where the whole walk was in service of an empty
+answer. `Store::cached_rollup_count()` is the hook that says what is actually
+resident.
+
 Time-windowed queries are the common dashboard case and they behave
 differently. A segment fully inside the window is answered from its rollup; a
 segment straddling the boundary is decoded, though only across the window's

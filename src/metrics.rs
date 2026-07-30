@@ -206,6 +206,25 @@ pub struct Metrics {
     /// if this dominates, the fix is to do less work while holding it, not to
     /// make the work faster.
     pub writer_lock_wait: Latency,
+    /// Time spent waiting to acquire the SEGMENTS lock — the second engine
+    /// lock, and the one a reader competes for.
+    ///
+    /// It exists because the stall it measures used to be unattributable. A
+    /// seal takes the writer lock and then the segments lock, so a reader
+    /// holding segments stalls ingest — but the seal's own instrumentation
+    /// starts after the writer lock is acquired, which timed the wait as
+    /// though the seal itself were slow. Every acquisition is timed, so this
+    /// covers readers, seals, merges and expiry alike; the holder is
+    /// identified by [`Self::analytics_fold`] and the seal stages.
+    pub segments_lock_wait: Latency,
+    /// One `GET /v1/stats/llm` or `GET /v1/sessions` fold, end to end.
+    ///
+    /// Paired with [`Self::segments_lock_wait`] this says whether a stall is
+    /// an analytics query's fault: the fold pins the segment list and releases
+    /// the lock before decoding anything, so a long fold beside a short
+    /// segments wait is the intended shape, and a long wait alongside it is
+    /// not.
+    pub analytics_fold: Latency,
     /// Encoding a batch into its log frame. Deliberately measured outside the
     /// writer lock — see [`crate::Store::admit`].
     pub wal_encode: Latency,
@@ -294,6 +313,21 @@ pub struct Metrics {
     /// `segments_pruned_by_time` is how much of the store a time filter is
     /// actually eliminating.
     pub segments_examined: Counter,
+    /// Segments TTL expiry ruled out without decoding them, because the
+    /// rollup's end-time range put the whole segment on one side of the
+    /// cutoff.
+    ///
+    /// Exposed for the same reason as `segments_pruned_by_time`: skipping is
+    /// invisible from results. Expiry removes exactly the same spans whether
+    /// it read one segment or all of them, so nothing about a correct sweep
+    /// says whether it re-read the corpus to reach that answer. Against
+    /// [`Self::expiry_segments_decoded`] this is the sweep's real cost.
+    pub expiry_segments_skipped: Counter,
+    /// Segments TTL expiry had to decode: the ones straddling the cutoff, plus
+    /// any whose rollup sidecar was absent, stale or damaged. A number that
+    /// stays near the segment count means the sidecars are not being trusted
+    /// — check that they exist before concluding the sweep is simply busy.
+    pub expiry_segments_decoded: Counter,
     /// Merges that published their outputs.
     ///
     /// Compaction was invisible here until this existed, which made a whole
@@ -324,7 +358,7 @@ impl Metrics {
     pub fn render_prometheus(&self, into: &mut String) {
         use std::fmt::Write as _;
 
-        let counters: [(&str, &Counter); 11] = [
+        let counters: [(&str, &Counter); 13] = [
             ("traza_spans_admitted_total", &self.spans_admitted),
             ("traza_batches_admitted_total", &self.batches_admitted),
             ("traza_wal_commits_total", &self.wal_commits),
@@ -346,6 +380,14 @@ impl Metrics {
                 &self.records_admitted_by_content,
             ),
             ("traza_segments_examined_total", &self.segments_examined),
+            (
+                "traza_expiry_segments_skipped_total",
+                &self.expiry_segments_skipped,
+            ),
+            (
+                "traza_expiry_segments_decoded_total",
+                &self.expiry_segments_decoded,
+            ),
             ("traza_segment_merges_total", &self.segment_merges),
             (
                 "traza_segments_merged_away_total",
@@ -357,8 +399,10 @@ impl Metrics {
             let _ = writeln!(into, "{name} {}", counter.get());
         }
 
-        let stages: [(&str, &Latency); 11] = [
+        let stages: [(&str, &Latency); 13] = [
             ("traza_writer_lock_wait", &self.writer_lock_wait),
+            ("traza_segments_lock_wait", &self.segments_lock_wait),
+            ("traza_analytics_fold", &self.analytics_fold),
             ("traza_wal_encode", &self.wal_encode),
             ("traza_wal_write", &self.wal_write),
             ("traza_wal_lock_wait", &self.wal_lock_wait),

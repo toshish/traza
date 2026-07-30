@@ -237,6 +237,20 @@ fn offload_map(
     Ok(())
 }
 
+/// Drops touch-immunity entries that have aged out.
+///
+/// Split out of [`sweep_expired`] because it is the registry's ONLY pruner,
+/// and the sweep is now skipped entirely for a store with no payload
+/// directory. Leaving it inside would have made "this store has no payloads"
+/// mean "this store's touch registry grows without bound".
+pub(crate) fn prune_touch_registry(registry: &TouchRegistry) -> Result<()> {
+    registry
+        .lock()
+        .map_err(|_| Error::LockPoisoned("payload registry"))?
+        .retain(|_, at| at.elapsed() < TOUCH_IMMUNITY);
+    Ok(())
+}
+
 /// Deletes payload files that are BOTH older than the cutoff and no longer
 /// referenced by any live span. Age alone is not grounds for deletion:
 /// content addressing means a fresh span can re-reference an old file
@@ -251,10 +265,7 @@ pub(crate) fn sweep_expired(
 ) -> Result<usize> {
     // Prune stale immunity entries briefly, then traverse without the
     // registry lock: a large payload directory must not stall every ingest.
-    registry
-        .lock()
-        .map_err(|_| Error::LockPoisoned("payload registry"))?
-        .retain(|_, at| at.elapsed() < TOUCH_IMMUNITY);
+    prune_touch_registry(registry)?;
     let root = directory.join(PAYLOAD_DIR);
     if !root.exists() {
         return Ok(0);
