@@ -845,19 +845,65 @@ impl Segment {
 
     /// Returns records in the inclusive timestamp range in stable timestamp order.
     pub fn query_time_range(&self, start: u64, end: u64) -> Result<Vec<Record>, Error> {
-        self.last_query_used_index.store(false, Ordering::Relaxed);
+        self.last_query_used_index.store(true, Ordering::Relaxed);
         if start > end {
             return Ok(Vec::new());
         }
-        let mut records = Vec::new();
-        for offset in &self.record_offsets {
-            let record = self.decode_at(*offset)?;
-            if record.timestamp >= start && record.timestamp <= end {
-                records.push(record);
-            }
+        let span = self.ordinal_range_for_window(Some(start), Some(end))?;
+        let mut records = Vec::with_capacity(span.len());
+        for ordinal in span {
+            let offset = self.record_offsets[ordinal];
+            records.push(self.decode_at(offset)?);
         }
-        records.sort_by_key(|record| record.timestamp);
         Ok(records)
+    }
+
+    /// The half-open ordinal range `[start, end)` of every record whose
+    /// timestamp falls in the inclusive window, found by binary search.
+    ///
+    /// This is the whole reason `encode_with` sorts: records are stored in
+    /// ascending timestamp order, so a window is a contiguous ordinal range
+    /// and locating it costs `log2(record_count)` eight-byte reads instead of
+    /// decoding the segment. A 1%-wide window over a two-million-span segment
+    /// decodes twenty thousand records, not two million.
+    ///
+    /// `None` means unbounded on that side. The returned range is empty when
+    /// the window selects nothing.
+    pub fn ordinal_range_for_window(
+        &self,
+        since: Option<u64>,
+        until: Option<u64>,
+    ) -> Result<std::ops::Range<usize>, Error> {
+        let count = self.record_offsets.len();
+        // `partition_point`, but each probe can fail: the timestamp is read
+        // from disk for a file-backed segment.
+        let first_at_or_after = |bound: u64| -> Result<usize, Error> {
+            let (mut low, mut high) = (0usize, count);
+            while low < high {
+                let mid = low + (high - low) / 2;
+                if self.timestamp_at(self.record_offsets[mid])? < bound {
+                    low = mid + 1;
+                } else {
+                    high = mid;
+                }
+            }
+            Ok(low)
+        };
+        let start = match since {
+            Some(bound) => first_at_or_after(bound)?,
+            None => 0,
+        };
+        // The window is inclusive at the top, so the end is the first record
+        // strictly after it — `until + 1`, saturating so that `u64::MAX` as an
+        // upper bound selects the tail rather than wrapping to nothing.
+        let end = match until {
+            Some(bound) => match bound.checked_add(1) {
+                Some(exclusive) => first_at_or_after(exclusive)?,
+                None => count,
+            },
+            None => count,
+        };
+        Ok(start..end.max(start))
     }
 
     /// Writes the exact encoded bytes to a file and synchronizes them.
@@ -1071,6 +1117,22 @@ pub fn encode(records: &[RecordInput]) -> Result<Vec<u8>, Error> {
 /// skipped — so this trades query latency for seal-time CPU and about 1-2% of
 /// segment size. See `Config::content_index`.
 pub fn encode_with(records: &[RecordInput], content_index: bool) -> Result<Vec<u8>, Error> {
+    // Ascending timestamp order is a FORMAT INVARIANT, not a hope about what
+    // callers pass. `Segment::ordinal_range_for_window` binary-searches the
+    // record region on it, and a binary search over unordered data does not
+    // fail loudly — it silently answers with the wrong records. The store's
+    // own writers (seal, compaction) already sort, so for them this is a
+    // no-op; enforcing it here means no future caller can quietly break the
+    // search. Sorting rather than rejecting keeps a mis-sorted caller from
+    // turning into a failed seal that strands acknowledged spans in the
+    // buffer. The sort is STABLE and by timestamp alone, so a caller's finer
+    // tie-break (Traza sorts on end time, then trace, then span) survives it
+    // and already-sorted input encodes to byte-identical output.
+    let mut order: Vec<usize> = (0..records.len()).collect();
+    order.sort_by_key(|index| records[*index].timestamp);
+    let records: Vec<&RecordInput> = order.into_iter().map(|index| &records[index]).collect();
+    let records = records.as_slice();
+
     let mut record_region = Vec::new();
     let mut offsets = Vec::with_capacity(records.len());
     let mut trace_index: BTreeMap<(String, String), Vec<u64>> = BTreeMap::new();
@@ -1187,7 +1249,7 @@ fn div_ceil_u64(value: u64, divisor: u64) -> u64 {
 /// A segment whose records carry no content text writes the prologue with zero
 /// blocks, which the reader treats as "no content index" rather than as "no
 /// content": an absent index can never be used to skip anything.
-fn encode_content_index(records: &[RecordInput]) -> Vec<u8> {
+fn encode_content_index(records: &[&RecordInput]) -> Vec<u8> {
     let block_records = CONTENT_BLOCK_RECORDS as usize;
     let block_count = div_ceil(records.len(), block_records);
     let indexable = records.iter().any(|record| !record.content.is_empty());
