@@ -7,12 +7,28 @@
 //! conventions (`gen_ai.*`, `llm.usage.*`, `traceloop.*`) and Traza's native
 //! `llm.*` / `session.id` shorthand (docs/llm-semantics.md).
 //!
-//! Cost model: segments are immutable, so a per-segment rollup is computed at
-//! most once per process and cached by path (superseded segments simply fall
-//! out of the cache). A query window that only partially overlaps a segment
-//! falls back to an exact decode of that one segment — results are always
-//! exact, never bucket-approximated. The write buffer is scanned directly on
-//! every call (it is at most `flush_spans` entries).
+//! Cost model, in the order a query tries things:
+//!
+//! 1. **The in-memory rollup cache**, keyed by segment path. Segments are
+//!    immutable, so a rollup is valid for the segment's whole lifetime;
+//!    superseded segments fall out of the cache with their paths.
+//! 2. **The on-disk rollup sidecar** (`src/rollup_file.rs`), written beside
+//!    the segment at seal time. This is what a RESTART lives on: the
+//!    in-memory cache is empty in a fresh process, so without a persisted
+//!    rollup the first aggregation after every restart decodes the entire
+//!    corpus.
+//! 3. **Decoding the segment**, which also writes the sidecar so the next
+//!    process does not repeat it.
+//!
+//! A query window that only partially overlaps a segment cannot use a rollup
+//! at all — the counters cover spans outside the window — so it decodes that
+//! segment. It decodes only the window's slice: records are stored in
+//! ascending start-time order, so the window is a contiguous ordinal range
+//! that `Segment::ordinal_range_for_window` finds by binary search.
+//!
+//! Results are always exact, never bucket-approximated. The write buffer is
+//! scanned directly on every call (it is at most `flush_spans` entries) and
+//! is the one part with no cache, because it is still changing.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
@@ -189,15 +205,15 @@ pub struct LlmAggregateRow {
 // ------------------------------------------------------------------ counters
 
 #[derive(Clone, Debug, Default)]
-struct Counters {
-    spans: usize,
-    llm_calls: usize,
-    prompt_tokens: u64,
-    completion_tokens: u64,
-    total_tokens: u64,
-    cost_usd: f64,
-    errors: usize,
-    llm_duration_ns: u64,
+pub(crate) struct Counters {
+    pub(crate) spans: usize,
+    pub(crate) llm_calls: usize,
+    pub(crate) prompt_tokens: u64,
+    pub(crate) completion_tokens: u64,
+    pub(crate) total_tokens: u64,
+    pub(crate) cost_usd: f64,
+    pub(crate) errors: usize,
+    pub(crate) llm_duration_ns: u64,
 }
 
 impl Counters {
@@ -251,14 +267,14 @@ fn finite_saturating_add(left: f64, right: f64) -> f64 {
 }
 
 #[derive(Clone, Debug, Default)]
-struct SessionCounters {
-    counters: Counters,
-    first_start_ns: u64,
-    last_end_ns: u64,
-    traces: HashSet<String>,
+pub(crate) struct SessionCounters {
+    pub(crate) counters: Counters,
+    pub(crate) first_start_ns: u64,
+    pub(crate) last_end_ns: u64,
+    pub(crate) traces: HashSet<String>,
     /// The recognized session key that grouped this session; the
     /// highest-precedence key seen wins when spans differ (see [`prefer_key`]).
-    session_key: Option<&'static str>,
+    pub(crate) session_key: Option<&'static str>,
 }
 
 impl SessionCounters {
@@ -312,31 +328,42 @@ fn prefer_key(
 /// for the segment's whole lifetime).
 #[derive(Debug, Default)]
 pub(crate) struct SegmentRollup {
-    min_start_ns: u64,
-    max_start_ns: u64,
-    by_model: HashMap<String, Counters>,
-    by_provider: HashMap<String, Counters>,
-    by_service: HashMap<String, Counters>,
-    by_day: BTreeMap<String, Counters>,
-    by_session_key: HashMap<String, Counters>,
-    sessions: HashMap<String, SessionCounters>,
+    pub(crate) min_start_ns: u64,
+    pub(crate) max_start_ns: u64,
+    pub(crate) by_model: HashMap<String, Counters>,
+    pub(crate) by_provider: HashMap<String, Counters>,
+    pub(crate) by_service: HashMap<String, Counters>,
+    pub(crate) by_day: BTreeMap<String, Counters>,
+    pub(crate) by_session_key: HashMap<String, Counters>,
+    pub(crate) sessions: HashMap<String, SessionCounters>,
     /// FNV-1a hashes of every (trace_id, span_id) in the rollup: the
     /// supersede prefilter. A key replaced in a NEWER source makes this
     /// rollup unusable as-is (its counters include the stale version).
-    key_hashes: HashSet<u64>,
+    pub(crate) key_hashes: HashSet<u64>,
     /// `$payload` references held by any span in the rollup — the live set
     /// that protects payload files from the TTL sweep.
     pub(crate) payload_refs: HashSet<String>,
 }
 
 impl SegmentRollup {
-    fn build(spans: &[Span]) -> Self {
+    /// An empty rollup over a known timestamp range: the starting point the
+    /// sidecar decoder fills in, so that `min`/`max` are never left at the
+    /// `build` sentinel when no span was absorbed.
+    pub(crate) fn empty(min_start_ns: u64, max_start_ns: u64) -> Self {
+        Self {
+            min_start_ns,
+            max_start_ns,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn build<S: std::borrow::Borrow<Span>>(spans: &[S]) -> Self {
         let mut rollup = Self {
             min_start_ns: u64::MAX,
             ..Self::default()
         };
         for span in spans {
-            rollup.absorb(span);
+            rollup.absorb(span.borrow());
         }
         if rollup.min_start_ns == u64::MAX {
             rollup.min_start_ns = 0;
@@ -677,24 +704,41 @@ impl Store {
                 seen_hashes.extend(rollup.key_hashes.iter().copied());
                 continue;
             }
-            // Exact path: decode this segment, dropping out-of-window spans
-            // and spans whose key exists in the buffer or a newer segment.
+            // Exact path: decode the window's slice of this segment, dropping
+            // spans whose key exists in the buffer or a newer segment.
+            //
+            // Only the records the window covers are decoded. Segments store
+            // records in ascending start-time order, so the window is a
+            // contiguous ordinal range; the old full decode read the whole
+            // segment to throw most of it away, which is what made a narrow
+            // dashboard window cost more than a whole-corpus one.
             let mut survivors: Vec<Span> = Vec::new();
-            for span in segment.spans_parsed()? {
-                if !in_window(span.start_time_ns, since_ns, until_ns) {
-                    continue;
-                }
+            for span in segment.spans_parsed_in_window(since_ns, until_ns)? {
                 let key = (span.trace_id.clone(), span.span_id.clone());
                 if buffer_keys.contains(&key) {
                     continue;
                 }
-                let mut superseded = false;
-                for newer in segments.iter().skip(position + 1) {
-                    if newer.contains_key(&span.trace_id, &span.span_id)? {
-                        superseded = true;
-                        break;
-                    }
-                }
+                // `seen_hashes` holds every key in the buffer and in every
+                // NEWER segment (each branch of this loop extends it before
+                // moving on), so a miss here is proof this span was never
+                // replaced — no probe needed. Only a hit, which means a real
+                // supersede or an FNV collision, pays for the exact scan.
+                // Without this prefilter every surviving span probed the trace
+                // index of every newer segment, so the cost was
+                // spans × segments: at eight concurrent ingest clients, where
+                // interleaved time ranges leave no segment fully inside a
+                // window, that quadratic term was the whole query.
+                let superseded = seen_hashes.contains(&key_hash(&span.trace_id, &span.span_id))
+                    && segments
+                        .iter()
+                        .skip(position + 1)
+                        .try_fold(false, |found, newer| {
+                            if found {
+                                Ok(true)
+                            } else {
+                                newer.contains_key(&span.trace_id, &span.span_id)
+                            }
+                        })?;
                 if !superseded {
                     survivors.push(span);
                 }
@@ -730,7 +774,20 @@ impl Store {
         Ok(refs)
     }
 
-    /// The segment's cached rollup, building it on first use.
+    /// The segment's rollup: from the in-memory cache, else from the segment's
+    /// on-disk sidecar, else built by decoding the segment.
+    ///
+    /// The middle step is what a restart lives on. The in-memory cache is
+    /// empty in a fresh process, so without a sidecar the first aggregation
+    /// after every restart decodes the entire corpus — seconds, scaling with
+    /// bytes on disk. The sidecar turns that into a read of a file roughly
+    /// proportional to the segment's DISTINCT keys plus eight bytes per span.
+    ///
+    /// A miss on the sidecar writes one, so a store that predates this code
+    /// (or lost one to a crash) heals on its first query rather than paying
+    /// the decode on every restart forever. The write is best-effort: failing
+    /// a query because a derived cache could not be saved would trade a
+    /// correct slow answer for no answer.
     fn segment_rollup(&self, segment: &crate::Segment) -> Result<Arc<SegmentRollup>> {
         {
             let cache = self
@@ -741,7 +798,15 @@ impl Store {
                 return Ok(Arc::clone(rollup));
             }
         }
-        let rollup = Arc::new(SegmentRollup::build(&segment.spans_parsed()?));
+        let binding = segment.rollup_binding();
+        let rollup = match crate::rollup_file::load(&segment.path, binding) {
+            Some(rollup) => Arc::new(rollup),
+            None => {
+                let rollup = Arc::new(SegmentRollup::build(&segment.spans_parsed()?));
+                let _ = crate::rollup_file::store(&segment.path, binding, &rollup);
+                rollup
+            }
+        };
         self.rollups
             .lock()
             .map_err(|_| crate::Error::LockPoisoned("rollups"))?

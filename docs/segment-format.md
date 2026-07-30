@@ -56,6 +56,24 @@ payload length `u32`, reserved `u32`, then the trace id, then that many
 length-prefixed key/value pairs, then the opaque payload. **Records carry
 attribute value text; the index does not.**
 
+### Record order is an invariant, not a convention
+
+Records are stored in ascending timestamp order, and `encode_with` establishes
+that itself — it stable-sorts by timestamp rather than trusting the caller.
+The sort is by timestamp alone, so a caller's finer tie-break survives it and
+already-ordered input encodes to byte-identical output.
+
+The enforcement is load-bearing because `Segment::ordinal_range_for_window`
+**binary-searches** the record region to turn a time window into a contiguous
+ordinal range, which is what lets a windowed query decode a slice instead of
+the whole segment. A binary search over unordered records does not fail
+loudly; it returns the wrong records. Every writer in the store already sorted
+before encoding, so nothing changed for them — what changed is that a future
+one cannot silently break the search. Pinned by
+`records_are_stored_in_ascending_timestamp_order_whatever_order_they_arrive_in`
+in `tests/segment_format_acceptance.rs`, which encodes a shuffled corpus and
+cross-checks the range search against a brute-force filter at every bound.
+
 ### The attribute index
 
 ```
