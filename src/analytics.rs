@@ -330,6 +330,15 @@ fn prefer_key(
 pub(crate) struct SegmentRollup {
     pub(crate) min_start_ns: u64,
     pub(crate) max_start_ns: u64,
+    /// Inclusive range of span END times.
+    ///
+    /// Separate from the start range because TTL expires on `end_time_ns`,
+    /// and nothing constrains a span's end to fall inside the segment's start
+    /// range — a long span can end well after the last span in its segment
+    /// started. Carrying it lets expiry decide whether a segment holds
+    /// anything expirable without decoding it.
+    pub(crate) min_end_ns: u64,
+    pub(crate) max_end_ns: u64,
     pub(crate) by_model: HashMap<String, Counters>,
     pub(crate) by_provider: HashMap<String, Counters>,
     pub(crate) by_service: HashMap<String, Counters>,
@@ -349,17 +358,30 @@ impl SegmentRollup {
     /// An empty rollup over a known timestamp range: the starting point the
     /// sidecar decoder fills in, so that `min`/`max` are never left at the
     /// `build` sentinel when no span was absorbed.
-    pub(crate) fn empty(min_start_ns: u64, max_start_ns: u64) -> Self {
+    pub(crate) fn empty(bounds: crate::rollup_file::Bounds) -> Self {
         Self {
-            min_start_ns,
-            max_start_ns,
+            min_start_ns: bounds.min_start_ns,
+            max_start_ns: bounds.max_start_ns,
+            min_end_ns: bounds.min_end_ns,
+            max_end_ns: bounds.max_end_ns,
             ..Self::default()
+        }
+    }
+
+    /// The timestamp ranges this rollup covers.
+    pub(crate) fn bounds(&self) -> crate::rollup_file::Bounds {
+        crate::rollup_file::Bounds {
+            min_start_ns: self.min_start_ns,
+            max_start_ns: self.max_start_ns,
+            min_end_ns: self.min_end_ns,
+            max_end_ns: self.max_end_ns,
         }
     }
 
     pub(crate) fn build<S: std::borrow::Borrow<Span>>(spans: &[S]) -> Self {
         let mut rollup = Self {
             min_start_ns: u64::MAX,
+            min_end_ns: u64::MAX,
             ..Self::default()
         };
         for span in spans {
@@ -368,12 +390,17 @@ impl SegmentRollup {
         if rollup.min_start_ns == u64::MAX {
             rollup.min_start_ns = 0;
         }
+        if rollup.min_end_ns == u64::MAX {
+            rollup.min_end_ns = 0;
+        }
         rollup
     }
 
     fn absorb(&mut self, span: &Span) {
         self.min_start_ns = self.min_start_ns.min(span.start_time_ns);
         self.max_start_ns = self.max_start_ns.max(span.start_time_ns);
+        self.min_end_ns = self.min_end_ns.min(span.end_time_ns);
+        self.max_end_ns = self.max_end_ns.max(span.end_time_ns);
         self.key_hashes
             .insert(key_hash(&span.trace_id, &span.span_id));
         collect_payload_refs(span, &mut self.payload_refs);
@@ -662,17 +689,31 @@ impl Store {
         until_ns: Option<u64>,
         mut visit: impl FnMut(&SegmentRollup),
     ) -> Result<()> {
+        let folding = std::time::Instant::now();
         // Lock order: writer before segments (see Store field docs).
+        //
+        // Nothing is deep-copied under the writer lock. The buffer holds
+        // `Arc<Span>` precisely so a reader can take the whole thing away for
+        // the price of a pointer per span, and both the window filter and the
+        // key set are derived AFTER the lock is released. Cloning the spans
+        // and the key index in here — a `String` pair per buffered span —
+        // was the same copy the seal path was restructured to stop paying,
+        // reintroduced on the read side.
         let writer = self.lock_writer()?;
-        let buffered: Vec<Span> = writer
-            .spans
+        let buffer: Vec<Arc<Span>> = writer.spans.clone();
+        drop(writer);
+
+        // ALL buffer keys supersede segment copies, in-window or not, so this
+        // is over the whole buffer rather than the window's slice of it.
+        let buffer_keys: HashSet<(&str, &str)> = buffer
+            .iter()
+            .map(|span| (span.trace_id.as_str(), span.span_id.as_str()))
+            .collect();
+        let buffered: Vec<Arc<Span>> = buffer
             .iter()
             .filter(|span| in_window(span.start_time_ns, since_ns, until_ns))
-            .map(|span| Span::clone(span))
+            .map(Arc::clone)
             .collect();
-        // ALL buffer keys supersede segment copies, in-window or not.
-        let buffer_keys: HashSet<(String, String)> = writer.index.keys().cloned().collect();
-        drop(writer);
         if !buffered.is_empty() {
             visit(&SegmentRollup::build(&buffered));
         }
@@ -681,11 +722,17 @@ impl Store {
             .map(|(trace_id, span_id)| key_hash(trace_id, span_id))
             .collect();
 
-        let segments = self.lock_segments()?;
-        let mut live_paths: HashSet<PathBuf> = HashSet::new();
+        // PINNED, not held. The fold below decodes segments and reads sidecar
+        // files, and doing that under the segments lock made every analytics
+        // request a stall for every writer: a seal takes the writer lock and
+        // then this one, so a fold that held it for its whole duration held
+        // ingest for its whole duration too. An `Arc<Segment>` keeps its own
+        // file descriptor, so a pinned segment stays readable even if a merge
+        // or expiry unlinks it while this runs — which is the same guarantee
+        // `expire_before_locked` already pins on.
+        let segments = self.pin_segments()?;
         // Newest first: paths are zero-padded, so path order is flush order.
         for (position, segment) in segments.iter().enumerate().rev() {
-            live_paths.insert(segment.path.clone());
             let rollup = self.segment_rollup(segment)?;
             let overlaps = since_ns.map_or(true, |bound| rollup.max_start_ns >= bound)
                 && until_ns.map_or(true, |bound| rollup.min_start_ns <= bound);
@@ -714,8 +761,7 @@ impl Store {
             // dashboard window cost more than a whole-corpus one.
             let mut survivors: Vec<Span> = Vec::new();
             for span in segment.spans_parsed_in_window(since_ns, until_ns)? {
-                let key = (span.trace_id.clone(), span.span_id.clone());
-                if buffer_keys.contains(&key) {
+                if buffer_keys.contains(&(span.trace_id.as_str(), span.span_id.as_str())) {
                     continue;
                 }
                 // `seen_hashes` holds every key in the buffer and in every
@@ -749,10 +795,25 @@ impl Store {
             seen_hashes.extend(rollup.key_hashes.iter().copied());
         }
         // Superseded segments drop out of the cache with their paths.
-        self.rollups
-            .lock()
-            .map_err(|_| crate::Error::LockPoisoned("rollups"))?
-            .retain(|path, _| live_paths.contains(path));
+        //
+        // Against a FRESH read of the segment list, not against the pinned
+        // snapshot above: a merge that published while this fold ran installed
+        // its output's rollup as it did so, and retaining against a stale
+        // snapshot would evict exactly that entry and undo the handover. Both
+        // locks are taken here — segments then rollups, the established order
+        // — so the liveness test and the eviction cannot disagree. The work is
+        // proportional to the cache, not to the corpus.
+        {
+            let live = self.lock_segments()?;
+            let live_paths: HashSet<&PathBuf> = live.iter().map(|segment| &segment.path).collect();
+            self.rollups
+                .lock()
+                .map_err(|_| crate::Error::LockPoisoned("rollups"))?
+                .retain(|path, _| live_paths.contains(path));
+        }
+        self.metrics
+            .analytics_fold
+            .record(u64::try_from(folding.elapsed().as_nanos()).unwrap_or(u64::MAX));
         Ok(())
     }
 
@@ -762,14 +823,42 @@ impl Store {
     /// delays deletion, never loses data.
     pub(crate) fn live_payload_refs(&self) -> Result<HashSet<String>> {
         let mut refs = HashSet::new();
-        let writer = self.lock_writer()?;
-        for span in &writer.spans {
+        // Pointer copies under the lock; the scan happens after it is dropped.
+        let buffer: Vec<Arc<Span>> = {
+            let writer = self.lock_writer()?;
+            writer.spans.clone()
+        };
+        for span in &buffer {
             collect_payload_refs(span, &mut refs);
         }
-        drop(writer);
-        let segments = self.lock_segments()?;
-        for segment in segments.iter() {
-            refs.extend(self.segment_rollup(segment)?.payload_refs.iter().cloned());
+        // Pinned, not held: this runs from the maintenance thread once a
+        // minute and reads a file per segment, and holding the segments lock
+        // across that stalled every seal for the duration.
+        for segment in self.pin_segments()? {
+            // Read the sidecar WITHOUT caching it. The payload sweep asks
+            // about every segment in the corpus, including ones no
+            // aggregation has ever touched, so routing it through the cache
+            // made a timer — not a query — the thing that decided how much
+            // memory the rollup cache held. A miss falls back to the caching
+            // path, because at that point the segment has to be decoded
+            // anyway and the result is worth keeping.
+            let binding = segment.rollup_binding();
+            // Warm cache first — bypassing it made every tick re-read and
+            // re-decode sidecars the process already had in memory. Then the
+            // sidecar, read WITHOUT caching: the sweep asks about every
+            // segment in the corpus, including ones no aggregation has ever
+            // touched, and routing that through the cache made a timer rather
+            // than a query decide how much memory the cache held. Only a real
+            // miss falls back to the caching path, because at that point the
+            // segment has to be decoded anyway and the result is worth
+            // keeping.
+            if let Some(rollup) = self.cached_rollup(&segment.path, binding)? {
+                refs.extend(rollup.payload_refs.iter().cloned());
+            } else if let Some(rollup) = crate::rollup_file::load(&segment.path, binding) {
+                refs.extend(rollup.payload_refs);
+            } else {
+                refs.extend(self.segment_rollup(&segment)?.payload_refs.iter().cloned());
+            }
         }
         Ok(refs)
     }
@@ -789,16 +878,10 @@ impl Store {
     /// a query because a derived cache could not be saved would trade a
     /// correct slow answer for no answer.
     fn segment_rollup(&self, segment: &crate::Segment) -> Result<Arc<SegmentRollup>> {
-        {
-            let cache = self
-                .rollups
-                .lock()
-                .map_err(|_| crate::Error::LockPoisoned("rollups"))?;
-            if let Some(rollup) = cache.get(&segment.path) {
-                return Ok(Arc::clone(rollup));
-            }
-        }
         let binding = segment.rollup_binding();
+        if let Some(rollup) = self.cached_rollup(&segment.path, binding)? {
+            return Ok(rollup);
+        }
         let rollup = match crate::rollup_file::load(&segment.path, binding) {
             Some(rollup) => Arc::new(rollup),
             None => {
@@ -807,11 +890,42 @@ impl Store {
                 rollup
             }
         };
+        // Last writer wins, including over an entry for a different
+        // generation of this path. That is safe because reads check the
+        // binding: an entry this overwrote is either the one we would have
+        // written anyway, or a stale one, or a newer one that the next reader
+        // rejects and reloads from its sidecar. Correct either way, and
+        // self-healing; the only cost of losing this race is one extra
+        // sidecar read.
         self.rollups
             .lock()
             .map_err(|_| crate::Error::LockPoisoned("rollups"))?
-            .insert(segment.path.clone(), Arc::clone(&rollup));
+            .insert(segment.path.clone(), (binding, Arc::clone(&rollup)));
         Ok(rollup)
+    }
+
+    /// The cached rollup for `path`, but only if it was built from the segment
+    /// `binding` identifies.
+    ///
+    /// The check is the whole point. A path is not an identity — TTL expiry
+    /// rewrites a segment in place — and a reader pins the segment list rather
+    /// than holding the lock, so the caller may be holding a descriptor to one
+    /// generation of a segment while the cache holds the rollup for another.
+    /// Serving that hit mixes the two, and the fold's supersede prefilter
+    /// turns the mismatch into a double-counted span. A rejected hit costs a
+    /// sidecar read, which is what an empty cache would have cost anyway.
+    fn cached_rollup(
+        &self,
+        path: &PathBuf,
+        binding: crate::rollup_file::Binding,
+    ) -> Result<Option<Arc<SegmentRollup>>> {
+        let cache = self
+            .rollups
+            .lock()
+            .map_err(|_| crate::Error::LockPoisoned("rollups"))?;
+        Ok(cache
+            .get(path)
+            .and_then(|(cached, rollup)| (*cached == binding).then(|| Arc::clone(rollup))))
     }
 }
 
@@ -861,4 +975,112 @@ fn narrow_to_session(candidates: Vec<Span>, session_id: &str) -> Vec<Span> {
         .into_iter()
         .filter(|span| semconv::facts(&span.attributes).session.as_deref() == Some(session_id))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rollup_file::Binding;
+
+    fn temp_dir(label: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "traza-rollup-cache-{label}-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        dir
+    }
+
+    /// A cache entry is keyed by path but ANSWERS FOR AN IDENTITY.
+    ///
+    /// This is the check that makes pinning the segment list safe. A path is
+    /// not an identity — TTL expiry rewrites a segment in place — and a fold
+    /// pins the segment list rather than holding the lock, so it can be
+    /// decoding one generation of a segment through its own descriptor while
+    /// the cache already holds the rollup for the rewritten bytes. Serving
+    /// that hit mixes the two: the survivors come from the old bytes and the
+    /// supersede prefilter from the new rollup, so a key both generations
+    /// still contain slips past the prefilter and is counted twice.
+    ///
+    /// The interleaving that produces it is a genuine race and an unreliable
+    /// thing to reproduce from outside, so the invariant is pinned here
+    /// instead, where it is exact: the same path with a different binding is a
+    /// MISS, and every field of the binding is load-bearing.
+    #[test]
+    fn a_cached_rollup_answers_only_for_the_segment_it_was_built_from() {
+        let dir = temp_dir("identity");
+        let store = Store::open(&dir, crate::Config::default()).expect("opens");
+        let path = dir.join("segment-00000000000000000000.seg");
+        let binding = Binding {
+            segment_bytes: 4_096,
+            record_count: 10,
+            min_start_ns: 1_000,
+            max_start_ns: 9_000,
+        };
+        let rollup = Arc::new(SegmentRollup::default());
+        store
+            .rollups
+            .lock()
+            .expect("rollups")
+            .insert(path.clone(), (binding, Arc::clone(&rollup)));
+
+        assert!(
+            store
+                .cached_rollup(&path, binding)
+                .expect("lookup")
+                .is_some(),
+            "the identical binding must hit"
+        );
+
+        // Every field is part of the identity. A rewritten segment differs in
+        // its byte length and record count; a re-sealed one can differ only in
+        // its timestamp range. None of them may be ignored.
+        for (label, other) in [
+            (
+                "bytes",
+                Binding {
+                    segment_bytes: 4_097,
+                    ..binding
+                },
+            ),
+            (
+                "record count",
+                Binding {
+                    record_count: 9,
+                    ..binding
+                },
+            ),
+            (
+                "min start",
+                Binding {
+                    min_start_ns: 1_001,
+                    ..binding
+                },
+            ),
+            (
+                "max start",
+                Binding {
+                    max_start_ns: 9_001,
+                    ..binding
+                },
+            ),
+        ] {
+            assert!(
+                store.cached_rollup(&path, other).expect("lookup").is_none(),
+                "a rollup built from a segment with a different {label} must \
+                 not be served for this one"
+            );
+        }
+
+        // An unknown path is a miss rather than a panic.
+        assert!(store
+            .cached_rollup(&dir.join("segment-00000000000000000001.seg"), binding)
+            .expect("lookup")
+            .is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

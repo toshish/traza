@@ -1011,3 +1011,312 @@ fn partial_expiry_is_reflected_by_the_aggregates_and_survives_reopen() {
     assert_eq!(reloaded[0].1, 40);
     assert!((reloaded[0].2 - 10.0).abs() < 1e-9);
 }
+
+/// TTL expiry must not re-read the corpus to discover that nothing aged out.
+///
+/// The sweep runs once a minute over every segment. It used to JSON-decode all
+/// of them every time, which on a large store is the most expensive thing the
+/// process does on a timer — and it is pure waste, because a segment whose
+/// spans all end after the cutoff cannot contribute anything. The rollup's
+/// end-time range answers that without a decode, and the counters are the only
+/// way to tell: expiry removes exactly the same spans either way, so a correct
+/// result says nothing about what it cost.
+#[test]
+fn expiry_rules_segments_out_without_decoding_them() {
+    let dir = test_dir("expiry-skip");
+    let now_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos() as u64;
+    let hour = 3_600_000_000_000_u64;
+    let store = Store::open(
+        &dir,
+        Config {
+            flush_spans: 100_000,
+            ttl_seconds: Some(3_600),
+            ..Config::default()
+        },
+    )
+    .expect("opens");
+
+    // Three segments, each sealed separately and each entirely on one side of
+    // the one-hour cutoff: two wholly expired, three wholly live.
+    let seal = |label: &str, start_ns: u64, count: u64| {
+        for index in 0..count {
+            store
+                .ingest(llm_span(
+                    &format!("{label}-{index}"),
+                    &format!("{label}-{index}"),
+                    &format!("sess-{label}"),
+                    "m",
+                    start_ns,
+                    10,
+                    10,
+                    0.5,
+                ))
+                .expect("ingests");
+        }
+        store.flush().expect("seals");
+    };
+    seal("old-a", now_ns - 5 * hour, 10);
+    seal("old-b", now_ns - 4 * hour, 10);
+    seal("live-a", now_ns, 10);
+    seal("live-b", now_ns, 10);
+    seal("live-c", now_ns, 10);
+
+    let removed = store.compact_expired().expect("expires");
+    assert_eq!(removed, 20, "both old segments' spans go");
+
+    let metrics = store.metrics();
+    let skipped = metrics.expiry_segments_skipped.get();
+    let decoded = metrics.expiry_segments_decoded.get();
+    assert_eq!(
+        skipped + decoded,
+        5,
+        "every segment is accounted for exactly once"
+    );
+    assert_eq!(
+        decoded, 0,
+        "no segment straddles the cutoff, so none had to be read: \
+         {skipped} skipped, {decoded} decoded"
+    );
+
+    // And the answer is still exactly right.
+    let rows = store
+        .llm_aggregate(LlmGroupBy::Model, None, None)
+        .expect("aggregates");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].spans, 30, "the three live segments survive whole");
+}
+
+/// A segment straddling the cutoff still gets read — the fast path must not
+/// become a wrong answer for the one case it cannot rule out.
+#[test]
+fn expiry_still_reads_a_segment_that_straddles_the_cutoff() {
+    let dir = test_dir("expiry-straddle");
+    let now_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos() as u64;
+    let hour = 3_600_000_000_000_u64;
+    let store = Store::open(
+        &dir,
+        Config {
+            flush_spans: 100_000,
+            ttl_seconds: Some(3_600),
+            ..Config::default()
+        },
+    )
+    .expect("opens");
+
+    // One segment, half either side of the cutoff.
+    for index in 0..10_u64 {
+        store
+            .ingest(llm_span(
+                &format!("old-{index}"),
+                &format!("old-{index}"),
+                "sess",
+                "m",
+                now_ns - 5 * hour,
+                10,
+                10,
+                1.0,
+            ))
+            .expect("ingests");
+        store
+            .ingest(llm_span(
+                &format!("new-{index}"),
+                &format!("new-{index}"),
+                "sess",
+                "m",
+                now_ns,
+                1,
+                1,
+                0.5,
+            ))
+            .expect("ingests");
+    }
+    store.flush().expect("seals");
+
+    assert_eq!(store.compact_expired().expect("expires"), 10);
+    let metrics = store.metrics();
+    assert_eq!(
+        metrics.expiry_segments_decoded.get(),
+        1,
+        "a straddling segment must be read, not guessed at"
+    );
+    assert_eq!(metrics.expiry_segments_skipped.get(), 0);
+
+    let rows = store
+        .llm_aggregate(LlmGroupBy::Model, None, None)
+        .expect("aggregates");
+    assert_eq!(rows[0].spans, 10, "only the live half remains");
+    assert!((rows[0].cost_usd - 5.0).abs() < 1e-9);
+}
+
+/// A store with no payloads must not even COMPUTE the live reference set.
+///
+/// `sweep_expired` returns immediately when there is no `payloads/` directory,
+/// so the walk that produced its argument was pure waste — and that walk is
+/// over every segment in the corpus.
+#[test]
+fn the_ttl_sweep_does_not_fill_the_rollup_cache() {
+    let dir = test_dir("sweep-cache");
+    let now_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos() as u64;
+    let store = Store::open(
+        &dir,
+        Config {
+            flush_spans: 100_000,
+            ttl_seconds: Some(3_600),
+            ..Config::default()
+        },
+    )
+    .expect("opens");
+    for index in 0..30_u64 {
+        store
+            .ingest(llm_span(
+                &format!("t-{index}"),
+                &format!("s-{index}"),
+                "sess",
+                "m",
+                now_ns,
+                10,
+                10,
+                0.1,
+            ))
+            .expect("ingests");
+        if index % 10 == 9 {
+            store.flush().expect("seals");
+        }
+    }
+    assert_eq!(
+        store.cached_rollup_count().expect("count"),
+        0,
+        "sealing alone must not populate the analytics cache"
+    );
+
+    store.compact_expired().expect("sweeps");
+    assert_eq!(
+        store.cached_rollup_count().expect("count"),
+        0,
+        "a TTL tick must not pull the corpus into the rollup cache"
+    );
+
+    // A real aggregation still populates it — the cache is not broken, it is
+    // just no longer filled by a timer.
+    store
+        .llm_aggregate(LlmGroupBy::Model, None, None)
+        .expect("aggregates");
+    assert!(
+        store.cached_rollup_count().expect("count") > 0,
+        "a query is what warms the cache"
+    );
+}
+
+/// The same guarantee for a store that DOES have payloads, where the sweep
+/// really runs.
+///
+/// The test above proves only that a store without a `payloads/` directory
+/// skips the whole thing — it never reaches `live_payload_refs` at all, so it
+/// cannot say anything about how that function reads rollups. This one
+/// configures a payload threshold low enough that ordinary spans offload,
+/// which makes the sweep genuinely execute, and then asserts the same
+/// property: a timer must not pull the corpus into the cache.
+#[test]
+fn the_payload_sweep_reads_rollups_without_caching_them() {
+    let dir = test_dir("sweep-payloads");
+    let now_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos() as u64;
+    let store = Store::open(
+        &dir,
+        Config {
+            flush_spans: 100_000,
+            ttl_seconds: Some(3_600),
+            // Low enough that the prompt attribute below is offloaded.
+            payload_threshold: Some(64),
+            ..Config::default()
+        },
+    )
+    .expect("opens");
+
+    for index in 0..30_u64 {
+        let mut span = llm_span(
+            &format!("t-{index}"),
+            &format!("s-{index}"),
+            "sess",
+            "m",
+            now_ns,
+            10,
+            10,
+            0.1,
+        );
+        span.attributes
+            // Distinct per span: payload storage is content-addressed, so
+            // thirty identical values dedupe to a single file and the sweep
+            // would have one reference to get wrong instead of thirty.
+            .insert(
+                "gen_ai.prompt".to_owned(),
+                json!(format!("prompt-{index}-{}", "x".repeat(512))),
+            );
+        store.ingest(span).expect("ingests");
+        if index % 10 == 9 {
+            store.flush().expect("seals");
+        }
+    }
+
+    // The sweep only runs if there is something to sweep.
+    assert!(
+        dir.join("payloads").exists(),
+        "the corpus must actually offload payloads for this test to mean anything"
+    );
+    let before = payload_files(&dir);
+    assert!(before >= 30, "expected one payload per span, got {before}");
+    assert_eq!(store.cached_rollup_count().expect("count"), 0);
+
+    store.compact_expired().expect("sweeps");
+    assert_eq!(
+        store.cached_rollup_count().expect("count"),
+        0,
+        "the payload sweep must read sidecars without caching them"
+    );
+
+    // And nothing was wrongly swept. This is the half that matters most:
+    // reading the reference set from a sidecar instead of from a freshly
+    // built rollup must not UNDER-report, because a missed reference is a
+    // payload file deleted while a live span still points at it.
+    assert_eq!(
+        payload_files(&dir),
+        before,
+        "every payload a live span references must survive the sweep"
+    );
+    let rows = store
+        .llm_aggregate(LlmGroupBy::Model, None, None)
+        .expect("aggregates");
+    assert_eq!(rows[0].spans, 30, "nothing expired, so nothing may vanish");
+}
+
+/// Every file under `payloads/`, recursively — the sweep's blast radius.
+fn payload_files(dir: &std::path::Path) -> usize {
+    fn walk(path: &std::path::Path) -> usize {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return 0;
+        };
+        entries
+            .flatten()
+            .map(|entry| {
+                let child = entry.path();
+                if child.is_dir() {
+                    walk(&child)
+                } else {
+                    1
+                }
+            })
+            .sum()
+    }
+    walk(&dir.join("payloads"))
+}

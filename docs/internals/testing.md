@@ -56,6 +56,17 @@ specifically because they passed against broken code:
   different shapes cannot bound either of them.** If an assertion sits close
   to its threshold, suspect the measurement before the tolerance.
 
+- **`tests/fold_concurrency.rs::an_analytics_fold_does_not_hold_the_segments_lock`
+  is the third variation, and the trap is subtler again.** The obvious test for
+  "a reader must not hold the segments lock" is to time a `flush()` racing a
+  fold and compare the two. It flakes, because a seal's wall clock is dominated
+  by its segment write and its write-ahead-log fsync — neither of which has
+  anything to do with that lock — so on a busy machine the comparison measures
+  the storage device and blames the fold. The fix was to assert on
+  `traza_segments_lock_wait`, which times exactly the thing under test and
+  nothing else. **Assert on the quantity itself, not on a proxy that merely
+  contains it.**
+
 The lesson generalizes. When you add a test:
 
 - **Mutate the code it guards**, not the test. Flip a comparison, drop a lock,
