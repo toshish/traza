@@ -54,6 +54,10 @@ Deploying, tuning, and keeping it healthy.
   `GET /v1/stats`, what each metric means, and what is worth alerting on.
 - **[Capacity and performance](operations/capacity.md)** — measured
   characteristics, with every number traced to the file that recorded it.
+- **[Storage comparison](storage-comparison.md)** — bytes stored per byte
+  ingested and what it costs, next to OpenObserve's published Elasticsearch
+  comparison. Traza loses this one on ordinary spans and wins it on
+  long-context agent traffic; both numbers are measured.
 - **[Configuration reference](configuration.md)** — the exhaustive
   flag-by-flag reference plus throughput and latency profiles. Flags are
   documented there and nowhere else, so there is one place to correct.
@@ -70,8 +74,9 @@ Changing Traza's code.
 - **[Testing](internals/testing.md)** — how the suite is organised, what each
   file covers, and the standard that a test must be shown to fail when the
   behaviour it guards is broken.
-- **[Benchmarking](internals/benchmarking.md)** — running `bench` and
-  `ingest-bench`, and the rules for reporting a measurement honestly.
+- **[Benchmarking](internals/benchmarking.md)** — running `bench`,
+  `ingest-bench` and `storage-bench`, and the rules for reporting a
+  measurement honestly.
 - **[Segment format](segment-format.md)** — the on-disk layout, byte by byte.
 - **[Contributing](../CONTRIBUTING.md)** — setup, the `./ci.sh` gate, and pull
   request expectations.
