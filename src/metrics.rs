@@ -230,16 +230,36 @@ pub struct Metrics {
     pub buffer_upsert: Latency,
     /// Sealing the write buffer into a segment, end to end.
     pub segment_seal: Latency,
-    /// The part of a seal that holds an engine lock: draining the buffer,
-    /// publishing the finished segment, and reconciling buffer and log
-    /// afterwards. Everything else — encode, write, fsync, rename, reopen —
-    /// runs with no lock held.
+    /// The part of a seal that holds an engine lock AROUND THE SEGMENT WRITE:
+    /// draining the buffer and publishing the finished segment. Everything
+    /// between them — encode, write, fsync, rename, reopen — runs with no lock
+    /// held.
     ///
     /// **This is the pair that makes "sealing is off the lock" checkable.**
     /// A correctness test cannot see the difference: the same spans come back
     /// either way. The ratio `segment_seal_locked / segment_seal` can, and it
     /// goes to 1 the moment a seal is performed under the writer lock again.
+    ///
+    /// It deliberately EXCLUDES the post-publish reconcile, which is measured
+    /// by [`Self::segment_seal_reconcile`]. Folding the two together made this
+    /// ratio useless for the claim it exists to check: the reconcile's log
+    /// fsync is a thousand times longer than the drain, so the combined figure
+    /// sat at roughly a quarter of the seal whether or not the segment write
+    /// was on the lock, and the test asserting on it flaked at its threshold
+    /// instead of catching regressions.
     pub segment_seal_locked: Latency,
+    /// The post-publish reconcile, which holds the writer lock: reclaiming the
+    /// write-ahead log for the spans now in a segment, and evicting them from
+    /// the buffer.
+    ///
+    /// **This is an fsync, and it dominates a seal's lock-hold time.** The log
+    /// cannot be truncated without the writer lock — an append interleaving
+    /// with the truncation would be discarded — so ingest genuinely waits on
+    /// it. Separated from [`Self::segment_seal_locked`] because the two answer
+    /// different questions: that one asks whether the segment write was moved
+    /// off the lock (it was), this one asks how long ingest stalls for log
+    /// reclamation (about one fsync, on the seals that reclaim).
+    pub segment_seal_reconcile: Latency,
     /// Seals that found another already in flight and declined to start a
     /// second one. The spans are still in the write buffer, so the running
     /// seal covers them; this counts how often that happens rather than
@@ -274,6 +294,23 @@ pub struct Metrics {
     /// `segments_pruned_by_time` is how much of the store a time filter is
     /// actually eliminating.
     pub segments_examined: Counter,
+    /// Merges that published their outputs.
+    ///
+    /// Compaction was invisible here until this existed, which made a whole
+    /// class of question unanswerable from the outside: a merge replaces
+    /// segments, and replacing a segment DISCARDS its cached analytics
+    /// rollup, so a store that is merging serves aggregations that keep
+    /// having to rebuild what compaction just took away. Segment count alone
+    /// cannot show it — seals raise it while merges lower it, so under
+    /// sustained ingest the two hide each other.
+    pub segment_merges: Counter,
+    /// Segments consumed by merges. Against `segment_merges` this is the mean
+    /// fan-in actually achieved, which is what says whether compaction is
+    /// keeping up or nibbling.
+    pub segments_merged_away: Counter,
+    /// A merge end to end: choosing the run, decoding every input, writing
+    /// the outputs, publishing, and unlinking.
+    pub segment_merge: Latency,
 }
 
 impl Metrics {
@@ -287,7 +324,7 @@ impl Metrics {
     pub fn render_prometheus(&self, into: &mut String) {
         use std::fmt::Write as _;
 
-        let counters: [(&str, &Counter); 9] = [
+        let counters: [(&str, &Counter); 11] = [
             ("traza_spans_admitted_total", &self.spans_admitted),
             ("traza_batches_admitted_total", &self.batches_admitted),
             ("traza_wal_commits_total", &self.wal_commits),
@@ -309,13 +346,18 @@ impl Metrics {
                 &self.records_admitted_by_content,
             ),
             ("traza_segments_examined_total", &self.segments_examined),
+            ("traza_segment_merges_total", &self.segment_merges),
+            (
+                "traza_segments_merged_away_total",
+                &self.segments_merged_away,
+            ),
         ];
         for (name, counter) in counters {
             let _ = writeln!(into, "# TYPE {name} counter");
             let _ = writeln!(into, "{name} {}", counter.get());
         }
 
-        let stages: [(&str, &Latency); 9] = [
+        let stages: [(&str, &Latency); 11] = [
             ("traza_writer_lock_wait", &self.writer_lock_wait),
             ("traza_wal_encode", &self.wal_encode),
             ("traza_wal_write", &self.wal_write),
@@ -325,6 +367,8 @@ impl Metrics {
             ("traza_buffer_upsert", &self.buffer_upsert),
             ("traza_segment_seal", &self.segment_seal),
             ("traza_segment_seal_locked", &self.segment_seal_locked),
+            ("traza_segment_seal_reconcile", &self.segment_seal_reconcile),
+            ("traza_segment_merge", &self.segment_merge),
         ];
         for (name, stage) in stages {
             let _ = writeln!(into, "# TYPE {name}_ns_count counter");
