@@ -1316,6 +1316,27 @@ impl Drop for DirectoryLock {
     }
 }
 
+/// A cached rollup, together with the identity of the segment it was built
+/// from.
+///
+/// The binding is not decoration. The cache is keyed by PATH, and a path is
+/// not an identity: TTL expiry rewrites a segment in place, so the same name
+/// can hold different bytes over time — and because a reader PINS the segment
+/// list rather than holding the lock, a fold can be decoding a segment's old
+/// bytes through its own descriptor while the cache already holds the rollup
+/// for the rewritten ones. Serving that hit mixes two generations of the same
+/// segment: the survivors come from the old bytes and the supersede prefilter
+/// from the new rollup, and a span that both segments still physically
+/// contain gets counted twice.
+///
+/// The sidecar path never had this problem — `rollup_file::load` checks the
+/// binding — so the fix is to give the in-memory path the same check rather
+/// than a different one.
+type CachedRollup = (
+    rollup_file::Binding,
+    std::sync::Arc<analytics::SegmentRollup>,
+);
+
 /// A segment just written to disk, plus the analytics rollup that was built
 /// in order to persist its sidecar.
 ///
@@ -1376,7 +1397,7 @@ pub struct Store {
     // segment holds its own open descriptor, so an unlinked-but-pinned segment
     // still serves its records.
     segments: Mutex<Vec<std::sync::Arc<Segment>>>,
-    rollups: Mutex<std::collections::HashMap<PathBuf, std::sync::Arc<analytics::SegmentRollup>>>,
+    rollups: Mutex<std::collections::HashMap<PathBuf, CachedRollup>>,
     recent_payloads: payload::TouchRegistry,
     // The live tail's admission ring. It takes NO other lock and is never
     // taken while another engine lock is held — ingest publishes to it after
@@ -2479,15 +2500,36 @@ impl Store {
         // lingers at most one TTL past its span).
         self.annotations.drop_older_than(cutoff_ns)?;
         let cutoff_time = UNIX_EPOCH + std::time::Duration::from_nanos(cutoff_ns);
-        // Live references computed AFTER span expiry, so payloads referenced
-        // only by just-expired spans become sweepable.
-        let live_refs = self.live_payload_refs()?;
-        payload::sweep_expired(
-            &self.directory,
-            cutoff_time,
-            &live_refs,
-            &self.recent_payloads,
-        )?;
+        // Nothing to protect means nothing to compute.
+        //
+        // `live_payload_refs` walks every segment, and it was run on every
+        // tick even for a store that has never offloaded a single value —
+        // `sweep_expired` would then find no payload directory and return
+        // immediately, so the whole walk was in service of an empty answer.
+        // The directory's existence is the exact test: no directory, no files
+        // to sweep, no reference set needed. It is checked here rather than
+        // only inside the sweep because the cost being avoided is the
+        // caller's, not the sweep's.
+        //
+        // Deliberately NOT gated on `config.payload_threshold`: a store whose
+        // threshold was removed still holds the files written while it was
+        // set, and those must go on aging out.
+        // Unconditionally: the touch registry's only pruner used to live
+        // inside the sweep, so skipping the sweep would have turned "this
+        // store has no payloads" into "this store's touch registry grows
+        // without bound".
+        payload::prune_touch_registry(&self.recent_payloads)?;
+        if self.directory.join(payload::PAYLOAD_DIR).exists() {
+            // Live references computed AFTER span expiry, so payloads
+            // referenced only by just-expired spans become sweepable.
+            let live_refs = self.live_payload_refs()?;
+            payload::sweep_expired(
+                &self.directory,
+                cutoff_time,
+                &live_refs,
+                &self.recent_payloads,
+            )?;
+        }
         Ok(removed)
     }
 
@@ -2698,29 +2740,45 @@ impl Store {
             let mut segments = self.lock_segments()?;
             match run_position(&segments, &inputs) {
                 Some(start) => {
-                    let mut installed: Vec<(PathBuf, std::sync::Arc<analytics::SegmentRollup>)> =
+                    let mut installed: Vec<(PathBuf, CachedRollup)> =
                         Vec::with_capacity(outputs.len());
                     let replacements = std::mem::take(&mut outputs)
                         .into_iter()
                         .map(|sealed| {
-                            installed.push((sealed.segment.path.clone(), sealed.rollup));
+                            installed.push((
+                                sealed.segment.path.clone(),
+                                (sealed.segment.rollup_binding(), sealed.rollup),
+                            ));
                             std::sync::Arc::new(sealed.segment)
                         })
                         .collect::<Vec<_>>();
                     segments.splice(start..start + run, replacements);
                     segments.sort_by(|left, right| left.path.cmp(&right.path));
-                    // Under the SAME guard that published them. The inputs'
-                    // rollups are dead the moment they leave the segment list,
-                    // and the outputs' are already built — the merge had to
-                    // build them to write their sidecars. Handing them over
-                    // here is what keeps a merge from being a latency event
-                    // for the next aggregation: without it, publishing a merge
-                    // discards several warm rollups and leaves the next query
-                    // to re-establish the replacement from disk. Measured on a
-                    // one-million-span store, the worst query during
-                    // compaction was 2.6 s when that rebuild was a full
-                    // decode.
-                    self.replace_cached_rollups(&input_paths, installed);
+                    // Under the SAME guard that published them. The outputs'
+                    // rollups are already built — the merge had to build them
+                    // to write their sidecars — so handing them over here is
+                    // what keeps a merge from being a latency event for the
+                    // next aggregation: without it, publishing a merge leaves
+                    // the next query to re-establish the replacement from
+                    // disk. Measured on a one-million-span store, the worst
+                    // query during compaction was 2.6 s when that rebuild was
+                    // a full decode.
+                    //
+                    // The inputs' rollups are deliberately LEFT IN PLACE, and
+                    // that is not an oversight. A fold pins the segment list
+                    // and releases the lock, so a merge can unlink an input —
+                    // and its sidecar — while a fold that pinned it is still
+                    // working. Evicting the input's rollup at that moment
+                    // takes away the last cheap copy: the fold then rebuilds
+                    // it by decoding a segment whose sidecar no longer exists,
+                    // which measured as a 1.6 s outlier. Keeping the entry
+                    // costs nothing that lasts, because every fold ends by
+                    // retaining the cache against the live segment list and
+                    // will reclaim these paths as soon as no fold needs them.
+                    // The stale entries are also SAFE to serve: segments are
+                    // immutable, so the rollup still describes exactly what
+                    // that segment held.
+                    self.install_cached_rollups(&input_paths, installed);
                     true
                 }
                 None => false,
@@ -2796,6 +2854,34 @@ impl Store {
         self.expire_before_locked(cutoff_ns)
     }
 
+    /// Removes a segment whose every span has expired.
+    ///
+    /// The same sequence the rewrite path uses when nothing survives, factored
+    /// out so the fast path — which reaches this conclusion from the rollup's
+    /// end-time range instead of by decoding — cannot drift from it. Off disk
+    /// first, out of the live list second, cache last: a failed unlink must
+    /// leave the store still reporting a segment that is still there, with
+    /// something for the retry to find.
+    fn retire_expired_segment(&self, segment: &std::sync::Arc<Segment>) -> Result<()> {
+        unlink_segment(&segment.path)?;
+        // An unlink is visible immediately and durable only when the directory
+        // entry it removed is synced. Reporting the deletion before that would
+        // let a crash bring the file — and the spans TTL just removed — back.
+        sync_directory(&self.directory)?;
+        let mut segments = self.lock_segments()?;
+        if let Some(position) = segments
+            .iter()
+            .position(|held| std::sync::Arc::ptr_eq(held, segment))
+        {
+            segments.remove(position);
+        }
+        // Under the same guard as the removal, for the reason spelled out in
+        // `expire_before_locked`: a reader that sees the new segment list
+        // beside the old rollup reports spans TTL has just deleted.
+        self.replace_cached_rollups(std::slice::from_ref(&segment.path), []);
+        Ok(())
+    }
+
     /// [`Self::expire_before`] with the maintenance lock already held.
     fn expire_before_locked(&self, cutoff_ns: u64) -> Result<usize> {
         // A seal in flight drained its spans BEFORE this deletion ran and
@@ -2856,8 +2942,38 @@ impl Store {
         // versions win over segments that legitimately supersede them. The
         // rename is also what makes a supersede marker unnecessary here —
         // there is no window where a replacement exists beside its original.
-        let pinned: Vec<std::sync::Arc<Segment>> = self.lock_segments()?.clone();
+        let pinned: Vec<std::sync::Arc<Segment>> = self.pin_segments()?;
         for segment in &pinned {
+            // Decide whether this segment can hold anything expirable WITHOUT
+            // decoding it.
+            //
+            // The sweep runs once a minute over every segment, and it used to
+            // JSON-decode all of them every time — the entire corpus, to
+            // discover that nothing had aged out. The rollup's end-time range
+            // answers the question outright: entirely newer than the cutoff
+            // means nothing expires, entirely older means everything does.
+            // Only a segment straddling the cutoff has to be read.
+            //
+            // `None` means the sidecar is absent, stale or damaged, and the
+            // only safe reading of that is "I do not know" — so it falls
+            // through to the decode, which is what this did unconditionally
+            // before. Retention is never decided on an unverified byte.
+            let bounds = rollup_file::bounds(&segment.path, segment.rollup_binding());
+            if bounds.is_some_and(|bounds| bounds.min_end_ns >= cutoff_ns) {
+                self.metrics.expiry_segments_skipped.increment();
+                continue;
+            }
+            if bounds.is_some_and(|bounds| bounds.max_end_ns < cutoff_ns) && !segment.seg.is_empty()
+            {
+                // Every span in it is expired, so there is nothing to keep and
+                // nothing to read: the whole segment goes.
+                self.metrics.expiry_segments_skipped.increment();
+                removed += segment.record_count();
+                self.retire_expired_segment(segment)?;
+                continue;
+            }
+
+            self.metrics.expiry_segments_decoded.increment();
             let all = segment.spans_parsed()?;
             let total = all.len();
             let mut kept: Vec<Span> = all
@@ -2892,10 +3008,13 @@ impl Store {
             // list and its rollup into the cache, and neither step needs to
             // reopen the file that was just written.
             let (replacement, rollup) = match replacement {
-                Some(sealed) => (
-                    Some(std::sync::Arc::new(sealed.segment)),
-                    Some(sealed.rollup),
-                ),
+                Some(sealed) => {
+                    let binding = sealed.segment.rollup_binding();
+                    (
+                        Some(std::sync::Arc::new(sealed.segment)),
+                        Some((binding, sealed.rollup)),
+                    )
+                }
                 None => (None, None),
             };
             // Publish this one before rewriting the next, so an I/O failure
@@ -2953,6 +3072,23 @@ impl Store {
             .iter()
             .map(|segment| segment.spans_parsed())
             .collect()
+    }
+
+    /// Number of segment rollups held in the analytics cache.
+    ///
+    /// An inspection hook, and the only view of a structure that is otherwise
+    /// invisible to every resident-memory accessor on this type: a rollup
+    /// costs eight bytes per span for the supersede prefilter plus its
+    /// per-session trace sets, so a cache that fills up behind an operator's
+    /// back is real memory. It exists so tests can assert WHAT fills it —
+    /// notably that a maintenance timer does not, since a sweep touches every
+    /// segment in the corpus including ones no query has ever asked about.
+    pub fn cached_rollup_count(&self) -> Result<usize> {
+        Ok(self
+            .rollups
+            .lock()
+            .map_err(|_| Error::LockPoisoned("rollups"))?
+            .len())
     }
 
     /// Number of fully materialized `Span` structs held for PERSISTED data.
@@ -3051,10 +3187,34 @@ impl Store {
             .map_err(|_| Error::LockPoisoned("writer"))
     }
 
+    /// Acquires the segments lock, timing the wait.
+    ///
+    /// Timed at the acquisition rather than at chosen call sites, because the
+    /// question this answers — "is something holding segments long enough to
+    /// stall everyone else" — is not askable from any one caller. A seal takes
+    /// writer then segments, so a reader holding segments stalls ingest, and
+    /// the seal's own timers start after ITS locks are acquired: the wait
+    /// showed up as a slow seal rather than as contention.
     fn lock_segments(&self) -> Result<MutexGuard<'_, Vec<std::sync::Arc<Segment>>>> {
-        self.segments
+        let waited = Instant::now();
+        let guard = self
+            .segments
             .lock()
-            .map_err(|_| Error::LockPoisoned("segments"))
+            .map_err(|_| Error::LockPoisoned("segments"))?;
+        self.metrics
+            .segments_lock_wait
+            .record(elapsed_nanos(&waited));
+        Ok(guard)
+    }
+
+    /// The segment list as an owned snapshot, with the lock released.
+    ///
+    /// `Arc<Segment>` is a pointer, so this is a cheap copy — and a pinned
+    /// segment keeps its own file descriptor, so it stays readable even if a
+    /// merge or expiry unlinks it underneath. That is what lets a long read
+    /// run without holding the lock every writer needs.
+    fn pin_segments(&self) -> Result<Vec<std::sync::Arc<Segment>>> {
+        Ok(self.lock_segments()?.clone())
     }
 
     fn lock_maintenance(&self) -> Result<MutexGuard<'_, ()>> {
@@ -3339,13 +3499,17 @@ impl Store {
     /// Replaces the cached rollups for `evicted` with `installed`, but ONLY
     /// where something was actually evicted.
     ///
+    /// For callers that must INVALIDATE — expiry rewrites a segment in place,
+    /// so a cached rollup for that path would count spans TTL just deleted.
+    /// A merge wants [`Self::install_cached_rollups`] instead: its inputs stay
+    /// valid for anyone still reading them.
+    ///
     /// The condition is what keeps this from being a memory regression. A
     /// rollup is not small — eight bytes per span for the supersede prefilter,
     /// plus the per-session trace sets — and installing one for every segment
     /// the store ever writes would make a store that never runs an aggregation
     /// pay for an analytics cache it does not use. Replacing only what was
-    /// already resident makes the exchange net-neutral at worst: a merge that
-    /// drops four cached rollups installs one.
+    /// already resident makes the exchange net-neutral at worst.
     ///
     /// **Callers must have published the new segments first.** Installing a
     /// rollup for a path whose OLD segment is still in the live list would
@@ -3353,7 +3517,7 @@ impl Store {
     fn replace_cached_rollups(
         &self,
         evicted: &[PathBuf],
-        installed: impl IntoIterator<Item = (PathBuf, std::sync::Arc<analytics::SegmentRollup>)>,
+        installed: impl IntoIterator<Item = (PathBuf, CachedRollup)>,
     ) {
         let Ok(mut rollups) = self.rollups.lock() else {
             return;
@@ -3363,6 +3527,31 @@ impl Store {
             had_any |= rollups.remove(path).is_some();
         }
         if had_any {
+            rollups.extend(installed);
+        }
+    }
+
+    /// Adds `installed` to the cache if any of `warm` is already cached,
+    /// leaving `warm` in place.
+    ///
+    /// The gate is the same one [`Self::replace_cached_rollups`] applies for
+    /// the same reason: a store that never runs an aggregation must not
+    /// accumulate an analytics cache because it compacted. What differs is
+    /// that nothing is evicted — see the merge's publish block for why taking
+    /// an input's rollup away mid-fold is the expensive mistake, and
+    /// `fold_analytics` for what reclaims them instead.
+    ///
+    /// **Callers must have published the new segments first**, for the same
+    /// reason.
+    fn install_cached_rollups(
+        &self,
+        warm: &[PathBuf],
+        installed: impl IntoIterator<Item = (PathBuf, CachedRollup)>,
+    ) {
+        let Ok(mut rollups) = self.rollups.lock() else {
+            return;
+        };
+        if warm.iter().any(|path| rollups.contains_key(path)) {
             rollups.extend(installed);
         }
     }

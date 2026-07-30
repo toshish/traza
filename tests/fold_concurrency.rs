@@ -182,3 +182,132 @@ fn a_fold_reads_one_coherent_instant() {
         "fold saw {counted}, which is not a state the store passed through"
     );
 }
+
+/// An LLM aggregation must not hold the SEGMENTS lock for its duration.
+///
+/// This is the sibling of `a_fold_does_not_hold_the_writer_lock`, one lock
+/// down. `fold_analytics` walks every segment, decoding the ones a time window
+/// only partly covers and reading a sidecar file for the rest — and it did all
+/// of that with the segments mutex held. A seal takes the writer lock and then
+/// the segments lock, so an aggregation stalled ingest for as long as it ran,
+/// and the Overview screen starts several at once.
+///
+/// Nothing about the aggregate's VALUE can show this: the same rows come back
+/// whether the lock was held for 300 ms or 300 ns. So the test races a real
+/// seal against a real fold and times the seal.
+#[test]
+fn an_analytics_fold_does_not_hold_the_segments_lock() {
+    use traza::analytics::LlmGroupBy;
+
+    let dir = TestDir::new("segments-lock");
+    let store = Arc::new(
+        Store::open(
+            dir.0.clone(),
+            Config {
+                flush_spans: 1_000,
+                ..config()
+            },
+        )
+        .expect("open"),
+    );
+
+    // Every segment must cover the WHOLE time range, so that a partial window
+    // straddles all of them and none can be answered from a cached rollup.
+    // That is also what real concurrent ingest produces, and it is the case
+    // the lock hold actually hurt.
+    const SEGMENTS: u64 = 30;
+    const PER_SEGMENT: u64 = 1_000;
+    let base = 1_700_000_000_000_000_000u64;
+    for segment in 0..SEGMENTS {
+        let batch: Vec<Span> = (0..PER_SEGMENT)
+            .map(|slot| {
+                let mut s = span(segment * PER_SEGMENT + slot);
+                s.start_time_ns = base + slot * 1_000_000;
+                s.end_time_ns = s.start_time_ns + 1_000;
+                s
+            })
+            .collect();
+        store.ingest_batch(batch).expect("seed");
+        store.flush().expect("seal");
+    }
+
+    // A window that covers the middle of every segment, so every segment is
+    // decoded rather than rolled up.
+    let since = base + (PER_SEGMENT / 4) * 1_000_000;
+    let until = base + (PER_SEGMENT * 3 / 4) * 1_000_000;
+    let fold_once = |store: &Store| {
+        store
+            .llm_aggregate(LlmGroupBy::Service, Some(since), Some(until))
+            .expect("aggregate")
+    };
+
+    // Calibrate: how long does one fold take with nothing competing?
+    let solo = Instant::now();
+    let rows = fold_once(&store);
+    let fold_ns = solo.elapsed();
+    assert_eq!(rows.len(), 1, "the corpus has one service");
+    assert!(
+        fold_ns >= Duration::from_millis(20),
+        "the fold must be slow enough to race against, took {fold_ns:?}"
+    );
+
+    // Fold continuously in the background.
+    let folding = Arc::new(AtomicBool::new(true));
+    let folder_store = Arc::clone(&store);
+    let folder_flag = Arc::clone(&folding);
+    let folder = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut folds = 0u32;
+        while Instant::now() < deadline {
+            let _ = folder_store
+                .llm_aggregate(LlmGroupBy::Service, Some(since), Some(until))
+                .expect("aggregate");
+            folds += 1;
+        }
+        folder_flag.store(false, Ordering::SeqCst);
+        folds
+    });
+
+    // Seal repeatedly while the folds run. A seal takes the segments lock at
+    // its drain and again at its publish, so if a fold held that lock these
+    // would each wait a whole fold.
+    let mut seals = 0u32;
+    while folding.load(Ordering::SeqCst) && seals < 40 {
+        store
+            .ingest_batch(vec![span(9_000_000 + u64::from(seals))])
+            .expect("ingest");
+        store.flush().expect("flush during fold");
+        seals += 1;
+    }
+    let folds = folder.join().expect("folder thread");
+
+    assert!(seals >= 5, "need several seals to have raced, got {seals}");
+    assert!(folds >= 2, "need several folds to have raced, got {folds}");
+
+    // Assert on the WAIT, not on how long a seal took.
+    //
+    // The obvious test — time `flush()` and compare it against a fold — does
+    // not work, and failed intermittently when it was written that way. A
+    // seal's wall clock is dominated by its segment write and its
+    // write-ahead-log fsync, neither of which has anything to do with this
+    // lock; on a busy machine an fsync alone can exceed a fold, so the
+    // comparison measured the storage device and blamed the fold.
+    // `segments_lock_wait` times exactly the thing under test — every
+    // acquisition of that one mutex, by any thread — so a fold holding it
+    // across its scan shows up here and nothing else does.
+    let metrics = store.metrics();
+    let waited = Duration::from_nanos(metrics.segments_lock_wait.percentile_ns(99.0));
+    assert!(
+        metrics.segments_lock_wait.count() >= 10,
+        "need several acquisitions to have been timed, got {}",
+        metrics.segments_lock_wait.count()
+    );
+    // Generous on purpose: the point is the order of magnitude. Holding the
+    // lock across the fold puts this at or above one fold; releasing it puts
+    // it three orders of magnitude below.
+    assert!(
+        waited * 4 < fold_ns,
+        "the segments lock was waited on for {waited:?} at p99 while one fold \
+         takes {fold_ns:?} — the fold is holding it across its scan"
+    );
+}
