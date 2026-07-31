@@ -584,6 +584,45 @@ pub struct Config {
     /// seal since the last reclaim. Leaving records in the log is always safe:
     /// replaying a span a segment already holds upserts it to the same value.
     pub flush_wal_bytes: Option<u64>,
+    /// Longest a span may sit in the write buffer before a seal is due on age
+    /// alone, or `None` to bound the buffer only by volume.
+    ///
+    /// The volume thresholds assume traffic: a trickle that never reaches
+    /// [`Self::flush_spans`] leaves acknowledged spans in the buffer — and in
+    /// the log a restart must replay — indefinitely. Worse than replay time,
+    /// a buffered UPSERT of a persisted span disqualifies every segment
+    /// holding that key from answering aggregations out of its rollup, and
+    /// the disqualification lasts exactly as long as the key stays buffered
+    /// (measured on a real deployment: 36 days, because the store wrote ~150
+    /// spans a day against a 10,000-span threshold). Age is the bound volume
+    /// cannot provide.
+    ///
+    /// Enforced on the ingest path opportunistically and by
+    /// [`Store::maintain_buffer`] on whatever cadence the caller schedules —
+    /// like TTL, the engine implements the policy and the embedder owns the
+    /// clock. `traza-server` calls it from its maintenance tick.
+    pub max_buffer_age: Option<std::time::Duration>,
+    /// Whether an aggregation that observes segment-versus-segment key
+    /// shadowing may schedule a bounded deduplicating merge. On by default;
+    /// inert without [`Self::compaction`], which owns all merging.
+    ///
+    /// "Shadowing" is the state where the same `(trace_id, span_id)` exists
+    /// in more than one segment, so last-write-wins has versions to arbitrate
+    /// at read time and no shadowed segment may answer from its rollup. The
+    /// analytics fold detects it for free while deciding exactly that; this
+    /// switch lets the observation latch a flag that
+    /// [`Store::maintain_buffer`] converts into a merge of the shadowed tail
+    /// run — bounded by the compaction size cap, cooled down after success,
+    /// backed off exponentially when nothing mergeable is found. The trigger
+    /// is the observed mechanism, never a latency threshold: it fires exactly
+    /// when a query had to decode instead of using a rollup, and stops firing
+    /// the moment the duplicates are merged away.
+    ///
+    /// Deliberately NOT latched by buffer-caused shadowing — a buffered
+    /// upsert of a persisted key. A merge cannot retire that state (the
+    /// buffer is not mergeable, and a client still updating the key re-forms
+    /// it immediately); [`Self::max_buffer_age`] is what bounds it.
+    pub shadow_seal: bool,
     /// Retention period in seconds; zero disables TTL expiration.
     pub ttl_seconds: Option<u64>,
     /// String attribute values longer than this many bytes are offloaded to
@@ -661,6 +700,52 @@ pub const LEGACY_SEGMENT_READER: &str = "cf40bea";
 /// small enough that a restart replays it in well under a second.
 pub const DEFAULT_FLUSH_WAL_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Default ceiling on how long a buffered span may wait for a seal.
+///
+/// Five minutes: long enough that a store under any real traffic reaches a
+/// volume threshold first and never seals on age at all, short enough that a
+/// trickle deployment's restart replay, durability exposure, and
+/// rollup-disqualifying buffered upserts are all bounded by a coffee break
+/// rather than by the arrival rate. Seals are off the critical path and
+/// coalesce, so the cost of an age seal is one small segment for tier-0
+/// compaction to fold — a few milliseconds — which is why this defaults on
+/// rather than opt-in.
+pub const DEFAULT_MAX_BUFFER_AGE: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Base spacing between shadow passes, and the value futility backoff resets
+/// to after a successful merge.
+const SHADOW_PASS_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Spacing after a shadow pass that merged. A workload that re-poisons the
+/// store after every merge — a client continually re-upserting keys that keep
+/// landing in fresh segments — is thereby bounded to four tail rewrites an
+/// hour instead of one per observation window.
+const SHADOW_MERGE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// Ceiling on futility backoff: a store whose collision cannot be merged
+/// within the byte budget settles at one scan per hour, not one per minute.
+const SHADOW_BACKOFF_CEILING: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// The shadow pass's schedule state; see [`Store::finish_shadow_pass`].
+#[derive(Debug)]
+struct ShadowPassClock {
+    /// Earliest the next pass may run; `None` means immediately, so the first
+    /// observation after open is answered without waiting out an interval.
+    not_before: Option<Instant>,
+    /// The current futility backoff, doubled on each pass that merges nothing
+    /// and reset by one that does.
+    backoff: std::time::Duration,
+}
+
+impl Default for ShadowPassClock {
+    fn default() -> Self {
+        Self {
+            not_before: None,
+            backoff: SHADOW_PASS_MIN_INTERVAL,
+        }
+    }
+}
+
 /// Default admission-ring depth, in spans.
 ///
 /// Enough to cover minutes of a quiet store or seconds of a loud one —
@@ -682,6 +767,8 @@ impl Default for Config {
         Self {
             flush_spans: 10_000,
             flush_wal_bytes: Some(DEFAULT_FLUSH_WAL_BYTES),
+            max_buffer_age: Some(DEFAULT_MAX_BUFFER_AGE),
+            shadow_seal: true,
             ttl_seconds: None,
             payload_threshold: None,
             durability: Durability::Wal,
@@ -713,6 +800,11 @@ pub struct Stats {
     /// Bytes the write-ahead log holds, i.e. the work a restart would replay.
     /// Zero in [`Durability::Buffered`], and immediately after a flush.
     pub wal_bytes: u64,
+    /// Seconds the oldest buffered span has waited for a seal, or `None` when
+    /// the buffer is empty. The number [`Config::max_buffer_age`] bounds;
+    /// watching it climb past that bound means nothing is scheduling
+    /// [`Store::maintain_buffer`].
+    pub buffer_age_seconds: Option<u64>,
 }
 
 /// Errors returned by storage operations.
@@ -1074,6 +1166,14 @@ struct WriteBuffer {
     /// count untouched while still costing a log record, so the flush policy
     /// needs both numbers (see [`Config::flush_spans`]).
     upserts: usize,
+    /// When the buffer last went from empty to holding something — the age
+    /// [`Config::max_buffer_age`] bounds. `None` exactly when the buffer is
+    /// empty. Approximate at the edges by design: replay and seal survivors
+    /// restart the clock at the moment of restore or reconcile, which can only
+    /// understate age by one seal's duration — an error measured in seconds
+    /// against a bound measured in minutes, in the direction of a later, not
+    /// earlier, seal.
+    oldest_at: Option<Instant>,
 }
 
 impl WriteBuffer {
@@ -1087,6 +1187,9 @@ impl WriteBuffer {
     fn upsert(&mut self, span: Span) -> std::sync::Arc<Span> {
         let key = (span.trace_id.clone(), span.span_id.clone());
         self.upserts += 1;
+        if self.spans.is_empty() {
+            self.oldest_at = Some(Instant::now());
+        }
         // A fresh allocation every time, including for a replacement: the old
         // handle may be held by a seal in flight, and the seal decides what to
         // evict by comparing handles. Mutating in place would make the newer
@@ -1123,11 +1226,20 @@ impl WriteBuffer {
     fn restore(&mut self, spans: Vec<std::sync::Arc<Span>>) {
         self.spans = spans;
         self.reindex();
+        // Replayed spans' true arrival times died with the previous process;
+        // the age clock restarts at restore, which can only delay their seal
+        // by one `max_buffer_age`.
+        self.oldest_at = (!self.spans.is_empty()).then(Instant::now);
     }
 
     fn retain(&mut self, keep: impl Fn(&Span) -> bool) {
         self.spans.retain(|span| keep(span));
         self.reindex();
+        // Survivors were already here, so their age stands; only emptiness
+        // resets the clock.
+        if self.spans.is_empty() {
+            self.oldest_at = None;
+        }
     }
 
     /// Drops every span whose handle `sealed` recognizes, and reindexes.
@@ -1140,6 +1252,10 @@ impl WriteBuffer {
         self.spans
             .retain(|span| !sealed.contains(&std::sync::Arc::as_ptr(span)));
         self.reindex();
+        // Survivors arrived while the seal was writing, so "now" overstates
+        // their arrival by at most that write — the age clock may run late by
+        // seconds against a bound of minutes, never early.
+        self.oldest_at = (!self.spans.is_empty()).then(Instant::now);
     }
 
     fn reindex(&mut self) {
@@ -1409,6 +1525,16 @@ pub struct Store {
     /// Present unless durability is [`Durability::Buffered`]. Guards the gap
     /// between acknowledging a write and sealing it into a segment.
     wal: Option<wal::Wal>,
+    /// Set by an analytics fold that had to take the exact path because a
+    /// segment's keys are shadowed by a NEWER SEGMENT, and consumed by
+    /// [`Store::maintain_buffer`]. A latch rather than a count: one shadowed
+    /// key disqualifies a segment's rollup exactly as thoroughly as a
+    /// thousand, and a count over persisted keys would cost the memory the
+    /// digest index rewrite exists to avoid.
+    shadowing_observed: std::sync::atomic::AtomicBool,
+    /// The shadow pass's clock: when the next pass may run, and the current
+    /// futility backoff. See [`Store::finish_shadow_pass`].
+    shadow_pass: Mutex<ShadowPassClock>,
     metrics: metrics::Metrics,
     _directory_lock: DirectoryLock,
 }
@@ -1488,6 +1614,8 @@ impl Store {
                 tail: tail::TailChannel::new(tail_ring_spans, tail_ring_bytes),
                 next_segment: AtomicU64::new(next_segment),
                 wal,
+                shadowing_observed: std::sync::atomic::AtomicBool::new(false),
+                shadow_pass: Mutex::new(ShadowPassClock::default()),
                 metrics: metrics::Metrics::default(),
                 _directory_lock: directory_lock,
             })
@@ -1709,7 +1837,7 @@ impl Store {
     /// WHILE it runs may still be buffered afterwards — they arrived after the
     /// snapshot this call sealed, and the next seal takes them.
     pub fn flush(&self) -> Result<()> {
-        self.seal(SealWait::ForPermit)
+        self.seal(SealWait::ForPermit).map(|_| ())
     }
 
     /// Returns all spans belonging to `trace_id`, ordered by start time.
@@ -2441,6 +2569,7 @@ impl Store {
             disk_bytes,
             durability: self.config.durability,
             wal_bytes: self.wal.as_ref().map_or(0, wal::Wal::size_bytes),
+            buffer_age_seconds: writer.oldest_at.map(|oldest| oldest.elapsed().as_secs()),
         })
     }
 
@@ -2609,10 +2738,176 @@ impl Store {
         Ok(merged_away)
     }
 
+    /// Applies the buffer's non-volume bounds: seals on age, and answers
+    /// observed key shadowing with a seal plus a bounded deduplicating merge.
+    ///
+    /// The engine implements the policy; the caller owns the clock, exactly
+    /// as with TTL. `traza-server` calls this from its maintenance tick;
+    /// an embedding process that wants the bounds enforced while idle should
+    /// call it on a similar cadence (every few seconds is plenty — both
+    /// checks are a lock acquisition and a comparison when nothing is due).
+    ///
+    /// Age also gates on the ingest path, so an actively-written store seals
+    /// on its next batch; this call exists for the store that goes quiet with
+    /// spans still buffered — the case the volume thresholds structurally
+    /// cannot bound, measured in production at 36 days of buffered upserts
+    /// that disqualified every segment's rollup for the whole of it.
+    pub fn maintain_buffer(&self) -> Result<()> {
+        let age_due = {
+            let writer = self.lock_writer()?;
+            match (self.config.max_buffer_age, writer.oldest_at) {
+                (Some(limit), Some(oldest)) => oldest.elapsed() >= limit,
+                _ => false,
+            }
+        };
+        // SkipIfBusy: a seal already in flight covers everything buffered.
+        // The counter records seals that actually published, not attempts —
+        // an expiry pass holding the permit for minutes must not turn every
+        // tick into a phantom age seal.
+        if age_due && self.seal(SealWait::SkipIfBusy)? {
+            self.metrics.segment_seals_age.increment();
+        }
+
+        // The shadow pass merges; it never seals. Sealing here answered
+        // buffer-caused shadowing, but a buffer key a client is still
+        // updating re-shadows the moment it is sealed, so the pass either
+        // churned a rewrite per interval or manufactured unmergeable crumb
+        // segments when it could not merge at all (compaction off, or the
+        // collision out of budget). Buffer-caused shadowing is the age
+        // bound's problem — bounded, transient — and only segment-versus-
+        // segment shadowing, which a merge genuinely retires, latches
+        // (see `fold_analytics`). Without compaction there is nothing this
+        // pass could do, so it does not run.
+        if self.config.shadow_seal && self.config.compaction.is_some() && self.take_shadow_pass()? {
+            let merged = self.compact_shadowed()?;
+            if merged > 0 {
+                self.metrics.shadow_merges.increment();
+            }
+            self.finish_shadow_pass(merged > 0)?;
+        }
+        Ok(())
+    }
+
+    /// Consumes the shadowing latch if the pass clock allows. The clock is
+    /// advanced only by [`Self::finish_shadow_pass`], so a quiet store pays a
+    /// single atomic load per call.
+    fn take_shadow_pass(&self) -> Result<bool> {
+        if !self
+            .shadowing_observed
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Ok(false);
+        }
+        let pass = self
+            .shadow_pass
+            .lock()
+            .map_err(|_| Error::LockPoisoned("shadow_pass"))?;
+        if pass
+            .not_before
+            .is_some_and(|not_before| Instant::now() < not_before)
+        {
+            return Ok(false);
+        }
+        drop(pass);
+        Ok(self
+            .shadowing_observed
+            .swap(false, std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Schedules the next shadow pass. Success cools down for a fixed
+    /// interval — a workload that re-poisons after every merge gets a bounded
+    /// rewrite rate, not a rewrite per observation. Futility backs off
+    /// exponentially: a store whose collision lies beyond the byte budget
+    /// (or whose scan is blocked by a sidecar-less segment) re-latches after
+    /// every aggregation forever, and re-scanning it every interval would buy
+    /// sidecar reads with no merge at the end.
+    fn finish_shadow_pass(&self, merged: bool) -> Result<()> {
+        let mut pass = self
+            .shadow_pass
+            .lock()
+            .map_err(|_| Error::LockPoisoned("shadow_pass"))?;
+        if merged {
+            pass.backoff = SHADOW_PASS_MIN_INTERVAL;
+            pass.not_before = Some(Instant::now() + SHADOW_MERGE_COOLDOWN);
+        } else {
+            pass.backoff = pass.backoff.saturating_mul(2).min(SHADOW_BACKOFF_CEILING);
+            pass.not_before = Some(Instant::now() + pass.backoff);
+        }
+        Ok(())
+    }
+
+    /// Records that an aggregation had to decode instead of using a rollup
+    /// because a segment's keys are shadowed BY A NEWER SEGMENT — the state a
+    /// merge retires. Called by the analytics fold; buffer-caused shadowing
+    /// deliberately does not latch (see `maintain_buffer`).
+    pub(crate) fn note_shadowing(&self) {
+        self.shadowing_observed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Merges the shadowed tail run, if the scan finds one within the size
+    /// cap, restoring every merged segment's rollup eligibility in one
+    /// journaled operation. Returns segments merged away.
+    ///
+    /// The scan runs lock-free against a pinned segment list and reads only
+    /// rollups that already exist in cache or as sidecars — it never decodes
+    /// a segment — so the answer can be stale by the time the merge pins the
+    /// live list. The selector therefore revalidates by path and declines
+    /// rather than merging a run it did not scan. The byte budget is the
+    /// compaction size cap: a run that cannot merge into one bounded output
+    /// is left to tiered compaction, which owns write amplification policy.
+    fn compact_shadowed(&self) -> Result<usize> {
+        let Some(settings) = self.config.compaction else {
+            return Ok(0);
+        };
+        // Zero means uncapped everywhere `max_segment_bytes` is honored
+        // (see `merge_chunks`), so it must not read as a zero budget here.
+        let budget = match settings.max_segment_bytes {
+            0 => u64::MAX,
+            bytes => bytes,
+        };
+        let Some(chosen) = self.shadowed_tail_suffix(budget)? else {
+            return Ok(0);
+        };
+        if chosen.len() < 2 {
+            return Ok(0);
+        }
+        let _maintenance = self.lock_maintenance()?;
+        let watermark = self.next_segment.load(Ordering::Relaxed);
+        self.merge_run(&settings, watermark, &|segments| {
+            if segments.len() < chosen.len() {
+                return None;
+            }
+            let start = segments.len() - chosen.len();
+            segments[start..]
+                .iter()
+                .map(|segment| &segment.path)
+                .eq(chosen.iter())
+                .then_some(chosen.len())
+        })
+    }
+
     /// Merges the tail run, if one qualifies, into as few segments as the size
     /// cap allows. Returns segments removed, or zero if nothing qualified or
     /// the run stopped qualifying before the result could be published.
     fn merge_tail_run(&self, settings: &CompactionConfig, watermark: u64) -> Result<usize> {
+        self.merge_run(settings, watermark, &|segments| {
+            tail_run_to_merge(segments, settings)
+        })
+    }
+
+    /// Merges the tail run `select` chooses, sharing every invariant of tiered
+    /// compaction — the seal-permit pin, contiguous-block id claiming, the
+    /// journal, and rollup handover. `select` sees the live segment list under
+    /// both guards and must answer in microseconds: anything slower belongs
+    /// before the call, with the answer revalidated here (see
+    /// [`Store::compact_shadowed`]).
+    fn merge_run(
+        &self,
+        settings: &CompactionConfig,
+        watermark: u64,
+        select: &dyn Fn(&[std::sync::Arc<Segment>]) -> Option<usize>,
+    ) -> Result<usize> {
         let merging = Instant::now();
         // ---- pin: short critical section -------------------------------
         let (inputs, chunks, first_id, run) = {
@@ -2652,7 +2947,7 @@ impl Store {
                 .lock()
                 .map_err(|_| Error::LockPoisoned("sealing"))?;
             let segments = self.lock_segments()?;
-            let Some(run) = tail_run_to_merge(&segments, settings) else {
+            let Some(run) = select(&segments) else {
                 return Ok(0);
             };
             let start = segments.len() - run;
@@ -3244,6 +3539,14 @@ impl Store {
         {
             return true;
         }
+        // Age is checked here as well as in `maintain_buffer` so an actively
+        // ingesting store seals on the next batch rather than waiting out the
+        // maintenance cadence; the tick exists for the store that goes quiet.
+        if let (Some(limit), Some(oldest)) = (self.config.max_buffer_age, writer.oldest_at) {
+            if oldest.elapsed() >= limit {
+                return true;
+            }
+        }
         match (self.config.flush_wal_bytes, &self.wal) {
             (Some(limit), Some(log)) => limit > 0 && log.size_bytes() >= limit,
             _ => false,
@@ -3302,7 +3605,10 @@ impl Store {
     /// that states the invariant locally, rather than leaving segment ordering
     /// as a consequence of how seals happen to be scheduled.
     /// [`Self::merge_tail_run`] claims its id early for the same reason.
-    fn seal(&self, wait: SealWait) -> Result<()> {
+    /// Returns whether a segment was actually published: `false` when the
+    /// seal coalesced into one already running or found the buffer empty, so
+    /// a caller attributing seals to a trigger counts events, not attempts.
+    fn seal(&self, wait: SealWait) -> Result<bool> {
         let _permit = match wait {
             SealWait::ForPermit => self
                 .sealing
@@ -3314,7 +3620,7 @@ impl Store {
                     // Everything this seal would have drained is still in the
                     // buffer, so the running seal already covers it.
                     self.metrics.segment_seals_coalesced.increment();
-                    return Ok(());
+                    return Ok(false);
                 }
                 Err(std::sync::TryLockError::Poisoned(_)) => {
                     return Err(Error::LockPoisoned("sealing"))
@@ -3325,7 +3631,7 @@ impl Store {
     }
 
     /// [`Self::seal`] with the seal permit already held.
-    fn seal_with_permit(&self) -> Result<()> {
+    fn seal_with_permit(&self) -> Result<bool> {
         let sealing = Instant::now();
 
         // ---- drain: short critical section ------------------------------
@@ -3338,7 +3644,7 @@ impl Store {
             let writer = self.lock_writer()?;
             let locked = Instant::now();
             if writer.is_empty() {
-                return Ok(());
+                return Ok(false);
             }
             // Cloning a `Vec<Arc<Span>>` copies pointers, not spans. This is
             // why the buffer holds handles: the same drain over `Vec<Span>`
@@ -3399,7 +3705,7 @@ impl Store {
         drop(pending);
         self.metrics.segment_seal.record(elapsed_nanos(&sealing));
         self.metrics.segment_seal_spans.add(sealed);
-        Ok(())
+        Ok(true)
     }
 
     /// Drops the published spans from the buffer and reclaims the log.
