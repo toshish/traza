@@ -1,6 +1,6 @@
 # Benchmarking
 
-Three benchmarks, three jobs. All build and drive the **real** release server
+Four benchmarks, four jobs. All build and drive the **real** release server
 over its real HTTP path; none estimates anything.
 
 | Binary | Answers | Writes |
@@ -8,6 +8,7 @@ over its real HTTP path; none estimates anything.
 | `bench` | "Is the canonical corpus still fast?" — ingest rate plus trace-lookup and filtered-query percentiles | [`BENCHMARKS.md`](../../BENCHMARKS.md) |
 | `ingest-bench` | "Where does ingest throughput actually go?" — a matrix over protocol, keep-alive, concurrency, and durability | [`INGEST-BENCHMARK.md`](../../INGEST-BENCHMARK.md) |
 | `storage-bench` | "How many bytes on disk per byte ingested, and what does that cost?" | [`STORAGE-BENCHMARK.md`](../../STORAGE-BENCHMARK.md) |
+| `query-bench` | "What does a dashboard's aggregation cost — cold, and while the store is being written to?" | [`QUERY-BENCHMARK.md`](../../QUERY-BENCHMARK.md) |
 
 None is part of [`./ci.sh`](../../ci.sh). Run them when a change could
 plausibly move performance or on-disk size.
@@ -169,3 +170,46 @@ shows how to use them. Two cautions:
   published as such.** The benchmarks measure end-to-end request latency
   exactly, from the client, with a plain `Instant`. See
   [monitoring](../operations/monitoring.md#how-accurate-the-percentiles-are).
+
+## `query-bench` — aggregation, cold and under load
+
+```sh
+cargo build --release
+cargo run --release --bin query-bench
+```
+
+Measures `GET /v1/stats/llm` and `GET /v1/sessions`: the endpoints a dashboard
+actually calls, and the two things about them the other three benchmarks
+cannot see.
+
+**Cold.** Aggregates are served from a per-segment rollup that is cached in
+process memory, so the first one after a restart is a different query from
+every one after it. The only honest way to produce that is to restart the
+server, which this does before EVERY measured shape — measuring two cold
+queries against one restart would report the second as cold when the first had
+already warmed it.
+
+**Under concurrent ingest.** A segment fully inside a query's time window is
+answered from its rollup; one that straddles the boundary is decoded.
+Concurrent clients interleave their timestamps across segments, so with enough
+of them no segment is fully inside any window and every query takes the slow
+path. `TRAZA_QUERY_BENCH_THREADS` is therefore a first-class axis, not a
+detail: a single-threaded ingest reports the easy case and never sees this.
+
+A separate probe queries continuously for the whole of ingest, flush and
+settle, which is the only window in which compaction has anything to do — a
+settled store cannot show what a merge costs the next aggregation, because by
+then every rollup has been rebuilt once and stays warm.
+
+Every measured shape is checked for a non-empty answer, and the whole-corpus
+shapes for the RIGHT answer: the rows must sum to the corpus size. A benchmark
+that cannot tell a fast query from an empty one is measuring the HTTP stack,
+and a supersede bug would show up here as a sum above the corpus rather than
+as a suspiciously good latency.
+
+| Variable | Effect |
+|---|---|
+| `TRAZA_QUERY_BENCH_SPANS` | Corpus size (default 500,000) |
+| `TRAZA_QUERY_BENCH_THREADS` | Concurrent ingest clients (default 8) — the axis that decides whether any segment is fully inside a window |
+| `TRAZA_QUERY_BENCH_COMPACTION_FANOUT` | Compaction fan-out; `0` disables it. Pinned rather than left to its defaults because it sets the segment count, and an unpinned run can measure a four-segment store against a seventy-segment one without saying so |
+| `TRAZA_QUERY_BENCH_COMPACTION_MAX_SEGMENT_BYTES` | Size ceiling for compacted segments |
