@@ -55,6 +55,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   running. `/v1/stats` now reports `buffer_age_seconds` so a scheduler that
   stopped calling `maintain_buffer` is visible.
 
+- **A storage-cost benchmark (`storage-bench`) and an honest comparison
+  against OpenObserve's published table**
+  ([docs/storage-comparison.md](docs/storage-comparison.md),
+  [STORAGE-BENCHMARK.md](STORAGE-BENCHMARK.md)): the same eight metrics
+  OpenObserve computes against Elasticsearch, measured for Traza's segment
+  format, including the configurations where Traza loses the comparison and
+  why.
+
 - **An MCP server, embedded in `traza-server`: `POST /v1/mcp`.** Traza's read
   path had two consumers — the dashboard and `curl` — and the one its own
   vision implies was missing: the agent that produced the traces. `--mcp`

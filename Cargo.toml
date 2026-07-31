@@ -35,6 +35,10 @@ name = "ingest-bench"
 path = "src/bin/ingest-bench.rs"
 
 [[bin]]
+name = "storage-bench"
+path = "src/bin/storage-bench.rs"
+
+[[bin]]
 name = "index-mem-bench"
 path = "src/bin/index-mem-bench.rs"
 
