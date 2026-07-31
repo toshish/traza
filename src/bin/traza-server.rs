@@ -491,6 +491,10 @@ const USAGE: &str = "Usage: traza-server --data-dir DIR --port PORT [--host ADDR
 NEVER changes durability)] [--ttl-seconds N] [--flush-spans N] \
 [--flush-wal-bytes N (seal when the write-ahead log reaches N bytes; 0 disables; \
 default 64MiB)] \
+[--max-buffer-age-seconds N (seal when the oldest buffered span reaches N seconds; \
+0 disables; default 300)] \
+[--no-shadow-seal (do not answer observed segment-key shadowing with a \
+corrective deduplicating merge)] \
 [--max-connections N (default 1024)] [--payload-threshold-bytes N (0 disables)] \
 [--durability buffered|wal|flushed (default wal)] \
 [--wal-commit-window-us N (delay each fsync so more acks share it; 0 = off)] \
@@ -566,6 +570,8 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
     let mut compaction_enabled = true;
     let mut content_index = true;
     let mut flush_wal_bytes = traza::DEFAULT_FLUSH_WAL_BYTES;
+    let mut max_buffer_age_seconds = traza::DEFAULT_MAX_BUFFER_AGE.as_secs();
+    let mut shadow_seal = true;
     let mut profile = Profile::default();
     let mut mcp = McpOptions::default();
     // Profile-owned: `None` means "not given on the command line", which is
@@ -605,6 +611,13 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
             "--ttl-seconds" => {
                 i += 1;
                 ttl_seconds = Some(number(i, "--ttl-seconds")?);
+            }
+            "--max-buffer-age-seconds" => {
+                i += 1;
+                max_buffer_age_seconds = number(i, "--max-buffer-age-seconds")?;
+            }
+            "--no-shadow-seal" => {
+                shadow_seal = false;
             }
             "--payload-threshold-bytes" => {
                 i += 1;
@@ -748,6 +761,11 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
                 None => profile.wal_commit_window(),
             },
             ttl_seconds,
+            // 0 removes the age bound; the buffer is then bounded by volume
+            // alone, which a trickle workload never reaches.
+            max_buffer_age: (max_buffer_age_seconds > 0)
+                .then(|| Duration::from_secs(max_buffer_age_seconds)),
+            shadow_seal,
             // 0 disables offloading.
             payload_threshold: (payload_threshold_bytes > 0).then_some(payload_threshold_bytes),
             // Never profile-derived: what an acknowledgement guarantees is a
@@ -805,11 +823,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let refusals = Arc::new(AtomicUsize::new(0));
     let engine = Arc::new(Store::open(&data_dir, config.clone())?);
 
-    // TTL enforcement and segment compaction live in the engine; the server
-    // only schedules them. Compaction ticks far more often than TTL: it is
-    // what keeps filtered-search latency flat as segments accumulate, and it
-    // is a no-op when no run qualifies.
-    if ttl_seconds.is_some() || compaction_enabled {
+    // TTL enforcement, segment compaction, and the buffer's non-volume bounds
+    // live in the engine; the server only schedules them. Compaction ticks far
+    // more often than TTL: it is what keeps filtered-search latency flat as
+    // segments accumulate, and it is a no-op when no run qualifies. Buffer
+    // maintenance shares the fast tick because a seal it declines to schedule
+    // costs a comparison, and the age bound's whole promise is that a store
+    // that went quiet still seals within it.
+    let buffer_bounds = config.max_buffer_age.is_some() || config.shadow_seal;
+    if ttl_seconds.is_some() || compaction_enabled || buffer_bounds {
         let maintainer = Arc::clone(&engine);
         let ttl_enabled = ttl_seconds.is_some();
         thread::Builder::new()
@@ -819,6 +841,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 loop {
                     thread::sleep(std::time::Duration::from_secs(5));
                     ticks += 1;
+                    if let Err(error) = maintainer.maintain_buffer() {
+                        eprintln!("buffer maintenance failed: {error}");
+                    }
                     if let Err(error) = maintainer.compact_segments() {
                         eprintln!("segment compaction failed: {error}");
                     }
@@ -1525,6 +1550,7 @@ fn serve_request(
                     "total_records": stats.total_records,
                     "durability": stats.durability.as_str(),
                     "wal_bytes": stats.wal_bytes,
+                    "buffer_age_seconds": stats.buffer_age_seconds,
                 }),
             ),
             Err(error) => responder.json(503, json!({"error": error.to_string()})),

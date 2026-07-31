@@ -371,6 +371,8 @@ fn rollup_cache_survives_compaction_supersede() {
         &dir,
         Config {
             flush_spans: 10_000,
+            max_buffer_age: None,
+            shadow_seal: false,
             ttl_seconds: Some(1),
             payload_threshold: None,
             durability: traza::Durability::Buffered,

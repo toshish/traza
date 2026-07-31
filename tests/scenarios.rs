@@ -29,6 +29,8 @@ fn store_with_corpus(label: &str, options: &SeedOptions) -> (Store, traza::seed:
         &dir,
         Config {
             flush_spans: 10_000,
+            max_buffer_age: None,
+            shadow_seal: false,
             ttl_seconds: None,
             payload_threshold: Some(256 * 1024),
             // Bulk-loading a fixed corpus; the log would only add fsyncs to
