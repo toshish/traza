@@ -188,17 +188,47 @@ fn a_seal_holds_an_engine_lock_for_a_small_fraction_of_its_work() {
     let metrics = store.metrics();
     let total = metrics.segment_seal.total_ns();
     let locked = metrics.segment_seal_locked.total_ns();
+    let reconcile = metrics.segment_seal_reconcile.total_ns();
+    let seals = metrics.segment_seal.count();
     assert!(
-        metrics.segment_seal.count() >= 5,
-        "need several seals to average over, got {}",
-        metrics.segment_seal.count()
+        seals >= 5,
+        "need several seals to average over, got {seals}"
     );
-    // Generous on purpose: the point is the order of magnitude, not a
-    // percentage. Sealing under the writer lock puts this at ~100%.
+
+    // The claim: the segment write happens with no engine lock held. What
+    // brackets it is the drain and the publish, and those are the only things
+    // `segment_seal_locked` measures.
+    //
+    // This assertion used to include the post-publish reconcile too, and that
+    // made it both wrong and flaky. The reconcile truncates the write-ahead
+    // log under the writer lock, so it is an FSYNC — measured here at about
+    // 12 ms against a 4 us drain, a factor of three thousand. It therefore set
+    // the ratio almost single-handedly, parking it at roughly 23% against a
+    // 25% threshold, where it passed or failed on how busy the machine was
+    // and would have passed just the same with the segment write back under
+    // the lock. Measuring the two separately puts the real figure at ~0.05%,
+    // and the 1% threshold below is a twenty-fold margin over that rather
+    // than a five-percent one.
     assert!(
-        locked * 4 < total,
-        "a seal held an engine lock for {locked} ns of {total} ns of work — \
-         the write is supposed to happen with nothing held"
+        locked * 100 < total,
+        "the drain and publish held an engine lock for {locked} ns of {total} ns of seal work — \
+         the segment write is supposed to happen with nothing held"
+    );
+
+    // And the reconcile stays a bounded, fsync-shaped cost rather than
+    // becoming span-proportional work: one log reclamation per seal, not a
+    // re-encode of the buffer. Loose on purpose — this one IS an fsync and so
+    // it tracks the device, not the code — but it still catches the segment
+    // write migrating into the reconcile, which would take it to ~100%.
+    assert_eq!(
+        metrics.segment_seal_reconcile.count(),
+        seals,
+        "every seal reconciles exactly once"
+    );
+    assert!(
+        reconcile * 2 < total,
+        "the post-publish reconcile held the writer lock for {reconcile} ns of {total} ns — \
+         it is supposed to be one log fsync, not the seal"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -75,8 +75,8 @@ Changing Traza's code.
   file covers, and the standard that a test must be shown to fail when the
   behaviour it guards is broken.
 - **[Benchmarking](internals/benchmarking.md)** — running `bench`,
-  `ingest-bench` and `storage-bench`, and the rules for reporting a
-  measurement honestly.
+  `ingest-bench`, `storage-bench` and `query-bench`, and the rules for
+  reporting a measurement honestly.
 - **[Segment format](segment-format.md)** — the on-disk layout, byte by byte.
 - **[Contributing](../CONTRIBUTING.md)** — setup, the `./ci.sh` gate, and pull
   request expectations.
