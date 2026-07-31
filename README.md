@@ -147,6 +147,8 @@ Measured on macOS/aarch64 (10 hardware threads) by the bundled benchmarks over c
 
 Full percentiles, the 10M and 100M scaling runs, the ingest matrix, and an honest list of what is **not** measured: **[capacity](docs/operations/capacity.md)**. The underlying records are [BENCHMARKS.md](BENCHMARKS.md) and [INGEST-BENCHMARK.md](INGEST-BENCHMARK.md), both rewritten by the benchmarks themselves — run them on your hardware rather than trusting ours.
 
+**Where Traza is expensive: disk.** Segments are uncompressed JSON plus indexes, so an ordinary span corpus costs **1.8–2.1x the bytes a client sent** — worse than Elasticsearch, far worse than a Parquet-and-object-storage system. The exception is the workload the payload store was built for: 3.1 GiB of pinned agent context measures **121:1 in Traza's favour**, because a byte-identical context above the offload threshold is stored once. Measured both ways, next to OpenObserve's published Elasticsearch comparison, in **[storage comparison](docs/storage-comparison.md)** and [STORAGE-BENCHMARK.md](STORAGE-BENCHMARK.md).
+
 ## Status and roadmap
 
 Traza is pre-1.0 and honest about it: on-disk formats may change between 0.x versions, and single-node is the current scope. Shipped and load-bearing today: durable segment storage with a write-ahead log and crash recovery, size-tiered compaction, OTLP protobuf/JSON ingest, sessions and cost analytics, payload offloading, annotations, streaming export, bearer auth, Prometheus metrics, and the [`ui/`](ui/) trace browser served from its build output.
