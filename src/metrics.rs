@@ -286,6 +286,16 @@ pub struct Metrics {
     pub segment_seals_coalesced: Counter,
     /// Spans written out by seals, for seal cost per span.
     pub segment_seal_spans: Counter,
+    /// Maintenance-pass seals that published a segment because the buffer's
+    /// oldest span reached `max_buffer_age`. Attempts that coalesced into a
+    /// running seal are not counted, and an age seal taken on the ingest path
+    /// appears as an ordinary seal rather than here. A store under real
+    /// traffic should show zero — volume thresholds fire first — so a
+    /// climbing count identifies a trickle workload living off the age bound.
+    pub segment_seals_age: Counter,
+    /// Shadow-pass merges that deduplicated a tail run and restored its
+    /// segments' rollup eligibility.
+    pub shadow_merges: Counter,
     /// Segments a query skipped entirely because their timestamp range could
     /// not overlap the requested window.
     ///
@@ -358,7 +368,7 @@ impl Metrics {
     pub fn render_prometheus(&self, into: &mut String) {
         use std::fmt::Write as _;
 
-        let counters: [(&str, &Counter); 13] = [
+        let counters: [(&str, &Counter); 15] = [
             ("traza_spans_admitted_total", &self.spans_admitted),
             ("traza_batches_admitted_total", &self.batches_admitted),
             ("traza_wal_commits_total", &self.wal_commits),
@@ -367,6 +377,8 @@ impl Metrics {
                 "traza_segment_seals_coalesced_total",
                 &self.segment_seals_coalesced,
             ),
+            ("traza_segment_seals_age_total", &self.segment_seals_age),
+            ("traza_shadow_merges_total", &self.shadow_merges),
             (
                 "traza_segments_pruned_by_time_total",
                 &self.segments_pruned_by_time,

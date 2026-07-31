@@ -112,6 +112,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 compaction: Some(traza::CompactionConfig::default()),
                 flush_spans: 10_000,
                 flush_wal_bytes: None,
+                // A seeder ingests continuously and flushes explicitly at the
+                // end; the trickle bounds have nothing to add but seals.
+                max_buffer_age: None,
+                shadow_seal: false,
                 ttl_seconds: None,
                 payload_threshold: (payload_threshold > 0).then_some(payload_threshold),
                 wal_commit_window: None,
