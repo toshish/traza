@@ -44,6 +44,8 @@ fn open_store(dir: &Path) -> Store {
         dir,
         Config {
             flush_spans: 100_000,
+            max_buffer_age: None,
+            shadow_seal: false,
             ttl_seconds: None,
             payload_threshold: Some(256 * 1024),
             durability: traza::Durability::Buffered,

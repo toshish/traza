@@ -40,6 +40,8 @@ impl Drop for TestDir {
 fn config() -> Config {
     Config {
         flush_spans: 1_000_000, // keep everything in the buffer; the scan is the point
+        max_buffer_age: None,
+        shadow_seal: false,
         ttl_seconds: None,
         payload_threshold: None,
         durability: traza::Durability::Buffered,

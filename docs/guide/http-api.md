@@ -774,7 +774,7 @@ attribute the reference came from.
 ### `GET /v1/stats`
 
 ```json
-{"buffered_records":1,"bytes_on_disk":0,"durability":"wal","persisted_records":0,"record_count":1,"segment_count":0,"total_records":1,"wal_bytes":261}
+{"buffer_age_seconds":4,"buffered_records":1,"bytes_on_disk":0,"durability":"wal","persisted_records":0,"record_count":1,"segment_count":0,"total_records":1,"wal_bytes":261}
 ```
 
 | Field | Type | Description |
@@ -787,6 +787,7 @@ attribute the reference came from.
 | `bytes_on_disk` | integer | Total size of segment files |
 | `durability` | string | `buffered`, `wal`, or `flushed` |
 | `wal_bytes` | integer | Bytes the write-ahead log holds — the work a restart would replay. Zero in `buffered` mode and immediately after a flush |
+| `buffer_age_seconds` | integer or null | Seconds the oldest buffered span has waited for a seal; `null` when the buffer is empty. Climbing past `--max-buffer-age-seconds` means nothing is scheduling buffer maintenance |
 
 `persisted_records` counts physical records so that the call stays
 O(number of segments) instead of decoding the corpus. It is therefore an upper

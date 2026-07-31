@@ -7,7 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-07-31
+
 ### Added
+
+- **The write buffer now bounds itself in time and self-corrects observed key
+  shadowing, instead of trusting volume thresholds an idle store never
+  reaches.** Found by measuring a real deployment: a trickle workload
+  (~150 spans/day against the 10,000-span flush threshold) had parked upserted
+  keys in the write buffer for **36 days**, which held ~12 MB of log a restart
+  would replay and — far worse — disqualified every segment holding those keys
+  from answering `stats/llm`/`sessions` out of its rollup, for the entire
+  wait. Two new bounds, both mechanism-triggered and both on by default:
+
+  - **`--max-buffer-age-seconds` (default 300, `Config::max_buffer_age`)** —
+    the oldest buffered span's wait is now a seal trigger, checked on the
+    ingest path and by the new `Store::maintain_buffer`, which `traza-server`
+    drives from its maintenance tick. Under real traffic the volume thresholds
+    fire first and this never does; `traza_segment_seals_age_total` says when
+    it did.
+  - **A corrective merge on observed segment-key shadowing
+    (`--no-shadow-seal` to disable, `Config::shadow_seal`)** — the analytics
+    fold already decides, per segment, whether a rollup is safe or the same
+    `(trace_id, span_id)` exists in a newer segment; that decision now
+    latches a flag instead of being discarded. Maintenance converts the latch
+    into a merge of the shadowed tail run, chosen by a scan that reads only
+    cached or sidecar rollups — never a decode — and bounded by
+    `--compaction-max-segment-bytes`. The merge rides the existing journaled
+    machinery: same permit pin, same contiguous id claim, same rollup
+    handover. Three deliberate restraints, each the result of adversarial
+    review: buffer-caused shadowing does not latch (a merge cannot retire a
+    key a client is still updating — the age bound handles it); a successful
+    merge cools the pass down for 15 minutes, so a workload that re-poisons
+    after every merge gets a bounded rewrite rate; and a pass that finds
+    nothing mergeable backs off exponentially to hourly instead of
+    re-scanning every interval. Inert when compaction is disabled, which
+    owns all merging. A latency threshold is deliberately NOT the trigger:
+    the latch fires exactly when a query had to decode instead of using a
+    rollup, and stops the moment the duplicates are merged away. Counter:
+    `traza_shadow_merges_total`.
+
+  Measured end to end on a copy of the deployment that motivated it (32k
+  spans, 46 MB, 3 segments, 1,368 shadowed keys): one seal plus one shadow
+  merge leaves a single deduplicated segment, after which whole-corpus
+  `stats/llm` answers from rollups in **0.55 ms** against ~170 ms before the
+  pass — and against ~20 s on the pre-rollup engine the deployment was
+  running. `/v1/stats` now reports `buffer_age_seconds` so a scheduler that
+  stopped calling `maintain_buffer` is visible.
 
 - **An MCP server, embedded in `traza-server`: `POST /v1/mcp`.** Traza's read
   path had two consumers — the dashboard and `curl` — and the one its own
@@ -1644,7 +1690,8 @@ completion trailers — clients parsing either surface must update.
 
 - This is an initial 0.1 release; consult README.md for the currently documented operational constraints and unsupported use cases.
 
-[Unreleased]: https://github.com/toshish/traza/compare/v0.20.0...HEAD
+[Unreleased]: https://github.com/toshish/traza/compare/v0.21.0...HEAD
+[0.21.0]: https://github.com/toshish/traza/releases/tag/v0.21.0
 [0.20.0]: https://github.com/toshish/traza/releases/tag/v0.20.0
 [0.19.0]: https://github.com/toshish/traza/releases/tag/v0.19.0
 [0.1.0]: https://github.com/toshish/traza/releases/tag/v0.1.0

@@ -717,10 +717,17 @@ impl Store {
         if !buffered.is_empty() {
             visit(&SegmentRollup::build(&buffered));
         }
-        let mut seen_hashes: HashSet<u64> = buffer_keys
+        // Buffer and newer-segment hashes are tracked separately because the
+        // shadow latch must tell them apart: a merge retires segment-versus-
+        // segment shadowing, while buffer-caused shadowing re-forms as long
+        // as a client keeps updating the key, so latching on it would either
+        // churn a rewrite per pass or run passes that cannot help. The gate
+        // and the exact-path prefilter still test the union.
+        let buffer_hashes: HashSet<u64> = buffer_keys
             .iter()
             .map(|(trace_id, span_id)| key_hash(trace_id, span_id))
             .collect();
+        let mut segment_hashes: HashSet<u64> = HashSet::new();
 
         // PINNED, not held. The fold below decodes segments and reads sidecar
         // files, and doing that under the segments lock made every analytics
@@ -737,19 +744,38 @@ impl Store {
             let overlaps = since_ns.map_or(true, |bound| rollup.max_start_ns >= bound)
                 && until_ns.map_or(true, |bound| rollup.min_start_ns <= bound);
             if !overlaps {
-                seen_hashes.extend(rollup.key_hashes.iter().copied());
+                segment_hashes.extend(rollup.key_hashes.iter().copied());
                 continue;
             }
             let fully_inside = in_window(rollup.min_start_ns, since_ns, until_ns)
                 && in_window(rollup.max_start_ns, since_ns, until_ns);
-            let possibly_superseded = rollup
-                .key_hashes
-                .iter()
-                .any(|hash| seen_hashes.contains(hash));
+            // One walk answers both questions: does the gate fail at all, and
+            // is any of it segment-caused? The walk ends as soon as both are
+            // settled — a segment collision settles them together, so the
+            // added cost against plain `.any` is confined to the buffer-only
+            // case, where it is the price of not latching a pass that could
+            // not have helped.
+            let mut shadowed_by_buffer = false;
+            let mut shadowed_by_segment = false;
+            for hash in rollup.key_hashes.iter() {
+                shadowed_by_segment = shadowed_by_segment || segment_hashes.contains(hash);
+                if shadowed_by_segment {
+                    break;
+                }
+                shadowed_by_buffer = shadowed_by_buffer || buffer_hashes.contains(hash);
+            }
+            let possibly_superseded = shadowed_by_buffer || shadowed_by_segment;
             if fully_inside && !possibly_superseded {
                 visit(&rollup);
-                seen_hashes.extend(rollup.key_hashes.iter().copied());
+                segment_hashes.extend(rollup.key_hashes.iter().copied());
                 continue;
+            }
+            // Only what maintenance can fix latches: a merge retires
+            // segment-versus-segment shadowing, while window geometry and
+            // buffer-caused shadowing it cannot touch. The observation is
+            // free — the gate just computed it.
+            if shadowed_by_segment {
+                self.note_shadowing();
             }
             // Exact path: decode the window's slice of this segment, dropping
             // spans whose key exists in the buffer or a newer segment.
@@ -764,17 +790,19 @@ impl Store {
                 if buffer_keys.contains(&(span.trace_id.as_str(), span.span_id.as_str())) {
                     continue;
                 }
-                // `seen_hashes` holds every key in the buffer and in every
-                // NEWER segment (each branch of this loop extends it before
-                // moving on), so a miss here is proof this span was never
-                // replaced — no probe needed. Only a hit, which means a real
-                // supersede or an FNV collision, pays for the exact scan.
-                // Without this prefilter every surviving span probed the trace
-                // index of every newer segment, so the cost was
-                // spans × segments: at eight concurrent ingest clients, where
-                // interleaved time ranges leave no segment fully inside a
-                // window, that quadratic term was the whole query.
-                let superseded = seen_hashes.contains(&key_hash(&span.trace_id, &span.span_id))
+                // The union of buffer and newer-segment hashes holds every
+                // key that could supersede this span (each branch of this
+                // loop extends `segment_hashes` before moving on), so a miss
+                // here is proof this span was never replaced — no probe
+                // needed. Only a hit, which means a real supersede or an FNV
+                // collision, pays for the exact scan. Without this prefilter
+                // every surviving span probed the trace index of every newer
+                // segment, so the cost was spans × segments: at eight
+                // concurrent ingest clients, where interleaved time ranges
+                // leave no segment fully inside a window, that quadratic term
+                // was the whole query.
+                let hash = key_hash(&span.trace_id, &span.span_id);
+                let superseded = (segment_hashes.contains(&hash) || buffer_hashes.contains(&hash))
                     && segments
                         .iter()
                         .skip(position + 1)
@@ -792,7 +820,7 @@ impl Store {
             if !survivors.is_empty() {
                 visit(&SegmentRollup::build(&survivors));
             }
-            seen_hashes.extend(rollup.key_hashes.iter().copied());
+            segment_hashes.extend(rollup.key_hashes.iter().copied());
         }
         // Superseded segments drop out of the cache with their paths.
         //
@@ -902,6 +930,56 @@ impl Store {
             .map_err(|_| crate::Error::LockPoisoned("rollups"))?
             .insert(segment.path.clone(), (binding, Arc::clone(&rollup)));
         Ok(rollup)
+    }
+
+    /// The tail suffix of segments that provably share keys, as paths, or
+    /// `None` when no collision is visible within `budget_bytes` of the tail.
+    ///
+    /// This is [`Store::compact_shadowed`]'s scan. It walks newest-to-oldest
+    /// so "shares keys" means "with a NEWER segment" — the direction
+    /// last-write-wins arbitrates and the fold's gate tests. It reads only
+    /// rollups already in cache or on disk as sidecars: a segment with
+    /// neither ends the scan rather than being decoded, because maintenance
+    /// that decodes segments to decide whether to merge them has already paid
+    /// most of what the merge would. Freshly sealed segments carry sidecars,
+    /// so the segment that ends a scan is a pre-sidecar survivor that the
+    /// first aggregation to touch it will heal, after which the scan sees
+    /// through it.
+    ///
+    /// The byte budget keeps both the walk's transient hash set and any merge
+    /// chosen from it bounded by configuration rather than by corpus size.
+    pub(crate) fn shadowed_tail_suffix(
+        &self,
+        budget_bytes: u64,
+    ) -> crate::Result<Option<Vec<PathBuf>>> {
+        let segments = self.pin_segments()?;
+        let mut seen: HashSet<u64> = HashSet::new();
+        let mut bytes = 0u64;
+        let mut start: Option<usize> = None;
+        for (position, segment) in segments.iter().enumerate().rev() {
+            bytes = bytes.saturating_add(segment.bytes);
+            if bytes > budget_bytes {
+                break;
+            }
+            let binding = segment.rollup_binding();
+            let rollup = match self.cached_rollup(&segment.path, binding)? {
+                Some(rollup) => rollup,
+                None => match crate::rollup_file::load(&segment.path, binding) {
+                    Some(rollup) => Arc::new(rollup),
+                    None => break,
+                },
+            };
+            if rollup.key_hashes.iter().any(|hash| seen.contains(hash)) {
+                start = Some(position);
+            }
+            seen.extend(rollup.key_hashes.iter().copied());
+        }
+        Ok(start.map(|position| {
+            segments[position..]
+                .iter()
+                .map(|segment| segment.path.clone())
+                .collect()
+        }))
     }
 
     /// The cached rollup for `path`, but only if it was built from the segment
