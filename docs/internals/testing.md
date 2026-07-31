@@ -39,9 +39,33 @@ specifically because they passed against broken code:
   identical whether or not the seal holds the writer lock, so no assertion over
   data can distinguish them; the test reads
   `traza_segment_seal_locked` against `traza_segment_seal` instead. Putting the
-  write back under the lock takes that ratio from under 25% to 99.9%. **If you
+  write back under the lock takes that ratio from ~0.05% to ~44%. **If you
   are claiming a performance property, assert it through an observable —
   a metric, a counter, a lock-hold measurement — never through query results.**
+- **The same test is also the cautionary tale about what an observable
+  MEASURES.** `traza_segment_seal_locked` originally covered every critical
+  section of a seal, including the post-publish reconcile — and the reconcile
+  truncates the write-ahead log under the writer lock, so it is an fsync:
+  ~12 ms against a ~4 us drain. It set the ratio almost single-handedly,
+  parking it at roughly 23% against a 25% threshold. The test consequently
+  failed whenever the machine was busy and would have PASSED with the segment
+  write back under the lock, which is the one thing it existed to catch. The
+  fix was not a looser threshold but a truer metric: the reconcile moved to
+  `traza_segment_seal_reconcile`, and the ratio the test asserts on became
+  ~0.05% with a 1% threshold. **A metric that aggregates two costs with
+  different shapes cannot bound either of them.** If an assertion sits close
+  to its threshold, suspect the measurement before the tolerance.
+
+- **`tests/fold_concurrency.rs::an_analytics_fold_does_not_hold_the_segments_lock`
+  is the third variation, and the trap is subtler again.** The obvious test for
+  "a reader must not hold the segments lock" is to time a `flush()` racing a
+  fold and compare the two. It flakes, because a seal's wall clock is dominated
+  by its segment write and its write-ahead-log fsync — neither of which has
+  anything to do with that lock — so on a busy machine the comparison measures
+  the storage device and blames the fold. The fix was to assert on
+  `traza_segments_lock_wait`, which times exactly the thing under test and
+  nothing else. **Assert on the quantity itself, not on a proxy that merely
+  contains it.**
 
 The lesson generalizes. When you add a test:
 

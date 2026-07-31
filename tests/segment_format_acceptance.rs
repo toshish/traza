@@ -1055,3 +1055,114 @@ fn a_segment_without_a_content_index_is_never_skipped_by_a_content_query() {
         ],
     );
 }
+
+/// Ascending record order is a format invariant the reader BINARY-SEARCHES on,
+/// so the encoder has to establish it rather than trust the caller. A binary
+/// search over unordered records does not fail — it returns the wrong ones.
+#[test]
+fn records_are_stored_in_ascending_timestamp_order_whatever_order_they_arrive_in() {
+    let shuffled = vec![
+        RecordInput::new(
+            1_700_000_000_000_000_200,
+            "trace-a",
+            attributes(&[("service", "billing")]),
+            b"third".to_vec(),
+        ),
+        RecordInput::new(
+            1_700_000_000_000_000_000,
+            "trace-a",
+            attributes(&[("service", "checkout")]),
+            b"first".to_vec(),
+        ),
+        RecordInput::new(
+            1_700_000_000_000_000_100,
+            "trace-b",
+            attributes(&[("service", "checkout")]),
+            b"second".to_vec(),
+        ),
+    ];
+    let segment = Segment::from_bytes(segment::encode(&shuffled).expect("encode")).expect("opens");
+
+    let stored: Vec<(u64, Vec<u8>)> = (0..segment.len())
+        .map(|ordinal| {
+            let record = segment
+                .record(ordinal)
+                .expect("ordinal access")
+                .expect("record present");
+            (record.timestamp(), record.payload().to_vec())
+        })
+        .collect();
+    assert_eq!(
+        stored,
+        vec![
+            (1_700_000_000_000_000_000, b"first".to_vec()),
+            (1_700_000_000_000_000_100, b"second".to_vec()),
+            (1_700_000_000_000_000_200, b"third".to_vec()),
+        ],
+        "the encoder sorts, so ordinal order is timestamp order"
+    );
+
+    // And the range search agrees with a brute-force filter at every bound,
+    // including the empty, point, and past-the-end cases.
+    let stamps: Vec<u64> = stored.iter().map(|(timestamp, _)| *timestamp).collect();
+    let probes = [
+        1_699_999_999_999_999_999,
+        1_700_000_000_000_000_000,
+        1_700_000_000_000_000_050,
+        1_700_000_000_000_000_100,
+        1_700_000_000_000_000_200,
+        1_700_000_000_000_000_999,
+    ];
+    for since in probes {
+        for until in probes {
+            let range = segment
+                .ordinal_range_for_window(Some(since), Some(until))
+                .expect("range");
+            let expected: Vec<usize> = stamps
+                .iter()
+                .enumerate()
+                .filter(|(_, stamp)| **stamp >= since && **stamp <= until)
+                .map(|(ordinal, _)| ordinal)
+                .collect();
+            assert_eq!(
+                range.collect::<Vec<usize>>(),
+                expected,
+                "window [{since}, {until}] must select exactly the in-window ordinals"
+            );
+        }
+    }
+
+    // Unbounded on either side, and the saturating top bound.
+    assert_eq!(
+        segment
+            .ordinal_range_for_window(None, None)
+            .expect("range")
+            .collect::<Vec<usize>>(),
+        vec![0, 1, 2],
+        "an unbounded window selects everything"
+    );
+    assert_eq!(
+        segment
+            .ordinal_range_for_window(Some(1_700_000_000_000_000_100), None)
+            .expect("range")
+            .collect::<Vec<usize>>(),
+        vec![1, 2]
+    );
+    assert_eq!(
+        segment
+            .ordinal_range_for_window(None, Some(u64::MAX))
+            .expect("range")
+            .collect::<Vec<usize>>(),
+        vec![0, 1, 2],
+        "u64::MAX as an upper bound must select the tail, not wrap to nothing"
+    );
+
+    evidence(
+        "record_order",
+        &[
+            "encoder_sorts_by_timestamp",
+            "range_search_matches_brute_force",
+            "unbounded_and_saturating_bounds",
+        ],
+    );
+}

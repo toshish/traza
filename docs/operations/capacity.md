@@ -523,6 +523,83 @@ uncompacted column shows 7.72 ms — because a lookup still probes each segment'
 trace index, so it tracks segment count too, just far less steeply than a
 filtered search.
 
+## LLM aggregation, and what a restart costs
+
+`GET /v1/stats/llm` and `GET /v1/sessions` are served from a per-segment
+rollup: the model, provider, service, day and session counters for everything
+that segment holds. Segments are immutable, so a rollup is computed once and
+then reused.
+
+The rollup is held in memory AND persisted beside its segment as
+`segment-<id>.rollup`. The persisted copy is what a restart lives on. Process
+memory is empty after a restart, so with only the in-memory cache the first
+aggregation had to decode the whole corpus — measured at **3.8 s cold against
+127 ms warm** on a one-million-span store, a ratio that scales with bytes on
+disk rather than with what the query asked for. Reading the sidecars instead
+puts the same query at **~290 ms cold**.
+
+Two things follow for sizing:
+
+- **Budget about 3-8% of segment bytes for sidecars.** The dominant term is
+  eight bytes per span for the supersede prefilter, plus the per-session trace
+  sets, so the share rises with session and trace cardinality rather than with
+  span size. Both ends of that range are measured; see `QUERY-BENCHMARK.md`
+  for the store it was measured on.
+- **Compaction no longer costs the aggregations a rebuild.** A merge replaces
+  several segments with one, which kills the inputs' cached rollups and
+  publishes an output that has none — so the next aggregation used to pay to
+  re-establish what the merge had just taken away. Measured while compaction
+  ran under sustained ingest, the worst single query was **2.6 s**. The merge
+  now hands its outputs' rollups straight to the cache, under the same lock
+  that publishes the segments, because it already had to build them to write
+  their sidecars; the worst query is **210 ms** and the median is
+  indistinguishable from a settled store. TTL expiry does the same when it
+  rewrites a partially-expired segment. Watch `traza_segment_merges_total` and
+  `traza_segments_merged_away_total` to see compaction at all — segment count
+  cannot show it, because seals raise it while merges lower it.
+- **A sidecar is derived and disposable.** It is rebuilt on demand whenever it
+  is absent, truncated, corrupt, bound to a different segment, or written
+  under an older analytics schema. Deleting every `.rollup` in a data
+  directory is safe; it costs one rebuild per segment.
+
+**Aggregations do not stall ingest.** The fold pins the segment list — a
+pointer copy per segment — and releases the lock before it decodes anything,
+because a pinned `Arc<Segment>` keeps its own file descriptor and stays
+readable even if a merge or expiry unlinks it underneath. Holding that lock
+across the scan meant every analytics request stalled every writer for as long
+as it ran, and the Overview screen starts several at once. Watch
+`traza_segments_lock_wait` against `traza_analytics_fold`: a long fold beside a
+short wait is the intended shape.
+
+**The TTL sweep no longer re-reads the corpus.** It runs once a minute over
+every segment and used to JSON-decode all of them to discover that nothing had
+aged out. The rollup sidecar's prologue carries the segment's span END range
+under its own checksum, so a segment wholly newer than the cutoff is skipped
+and one wholly older is retired without being read; only a segment straddling
+the cutoff is decoded. `traza_expiry_segments_skipped_total` against
+`traza_expiry_segments_decoded_total` is the sweep's real cost — nothing about
+a correct sweep otherwise says whether it read one segment or all of them. A
+missing or damaged sidecar reads as "I do not know" and falls back to decoding,
+so retention is never decided on an unverified byte.
+
+**A maintenance timer does not fill the rollup cache.** The payload sweep asks
+about every segment in the corpus, including ones no aggregation has ever
+touched. It now reads sidecars without caching them, and `compact_expired`
+skips the reference set entirely when the store has no `payloads/` directory —
+which is most stores, and where the whole walk was in service of an empty
+answer. `Store::cached_rollup_count()` is the hook that says what is actually
+resident.
+
+Time-windowed queries are the common dashboard case and they behave
+differently. A segment fully inside the window is answered from its rollup; a
+segment straddling the boundary is decoded, though only across the window's
+own record range, which the reader locates by binary search over the
+ascending record timestamps. Concurrent ingest is what makes this matter: with
+several clients writing at once, segments interleave in time and no segment is
+fully inside any window, so every one of them takes the decoding path.
+`cargo run --release --bin query-bench` measures exactly that axis —
+`TRAZA_QUERY_BENCH_THREADS` sets the number of concurrent ingest clients.
+
 ## Sizing guidance
 
 There is no single "spans per node" answer, because the binding constraint
@@ -540,7 +617,8 @@ moves with the workload. Work through it in this order:
    ceiling. Batch size is the first lever — the per-batch costs are paid once
    per request regardless of how many spans it carries.
 5. **File descriptors.** One per segment. Fine with compaction on; a real
-   limit with it off.
+   limit with it off. Rollup sidecars do not add to this — they are read once
+   and closed, not held open.
 
 ## What is not measured
 
