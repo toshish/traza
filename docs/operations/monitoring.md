@@ -250,7 +250,7 @@ compare it against wall clock. Sealing
 used to be ~74% of that sum and is now a small part of it, so a saturated lock
 today points at `wal_write` — which means the log device, not the engine. The
 decomposition and how it moved are in
-[`INGEST-BENCHMARK.md`](../../INGEST-BENCHMARK.md#the-limiting-stage).
+[`ingest.md`](../benchmarks/ingest.md#the-limiting-stage).
 
 ### What not to alert on
 

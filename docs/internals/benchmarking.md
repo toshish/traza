@@ -5,10 +5,10 @@ over its real HTTP path; none estimates anything.
 
 | Binary | Answers | Writes |
 |---|---|---|
-| `bench` | "Is the canonical corpus still fast?" — ingest rate plus trace-lookup and filtered-query percentiles | [`BENCHMARKS.md`](../../BENCHMARKS.md) |
-| `ingest-bench` | "Where does ingest throughput actually go?" — a matrix over protocol, keep-alive, concurrency, and durability | [`INGEST-BENCHMARK.md`](../../INGEST-BENCHMARK.md) |
-| `storage-bench` | "How many bytes on disk per byte ingested, and what does that cost?" | [`STORAGE-BENCHMARK.md`](../../STORAGE-BENCHMARK.md) |
-| `query-bench` | "What does a dashboard's aggregation cost — cold, and while the store is being written to?" | [`QUERY-BENCHMARK.md`](../../QUERY-BENCHMARK.md) |
+| `bench` | "Is the canonical corpus still fast?" — ingest rate plus trace-lookup and filtered-query percentiles | [`canonical-corpus.md`](../benchmarks/canonical-corpus.md) |
+| `ingest-bench` | "Where does ingest throughput actually go?" — a matrix over protocol, keep-alive, concurrency, and durability | [`ingest.md`](../benchmarks/ingest.md) |
+| `storage-bench` | "How many bytes on disk per byte ingested, and what does that cost?" | [`storage.md`](../benchmarks/storage.md) |
+| `query-bench` | "What does a dashboard's aggregation cost — cold, and while the store is being written to?" | [`query.md`](../benchmarks/query.md) |
 
 None is part of [`./ci.sh`](../../ci.sh). Run them when a change could
 plausibly move performance or on-disk size.
@@ -23,7 +23,8 @@ cargo run --release --bin bench
 It starts `target/release/traza-server` on a free loopback port with a fresh
 temporary data directory, ingests 1,000,000 spans over `POST /v1/spans` at
 1,000 spans per request, then samples trace lookups and attribute-filtered
-queries. It rewrites `BENCHMARKS.md` from its own measurements and deletes its
+queries. It rewrites `canonical-corpus.md` from its own measurements and
+deletes its
 data directory on exit.
 
 Three gates are reported PASS/FAIL rather than being substituted or estimated:
@@ -38,7 +39,7 @@ makes it a floor on what the server can do, not a ceiling.
 
 | Variable | Effect |
 |---|---|
-| `TRAZA_BENCH_SPANS` | Corpus size. **A non-default value does not rewrite `BENCHMARKS.md`** — it prints `(experimental corpus — BENCHMARKS.md not rewritten)`, so a scaling experiment cannot silently replace the published numbers |
+| `TRAZA_BENCH_SPANS` | Corpus size. **A non-default value does not rewrite `canonical-corpus.md`** — it prints `(experimental corpus — canonical-corpus.md not rewritten)`, so a scaling experiment cannot silently replace the published numbers |
 | `TRAZA_BENCH_COMPACTION_FANOUT` | Passes `--compaction-fanout` to the server it spawns; `0` disables compaction |
 | `TRAZA_BENCH_COMPACTION_MAX_SEGMENT_BYTES` | Passes `--compaction-max-segment-bytes`. Defaults to the real `CompactionConfig::default()` value rather than a literal, so the two cannot drift |
 
@@ -66,7 +67,7 @@ before/after comparison runs through **one** client. Measuring two builds with
 two clients would put the client's own change inside the difference being
 attributed to the server.
 
-It rewrites `INGEST-BENCHMARK.md`.
+It rewrites `ingest.md`.
 
 ### What it refuses to report
 
@@ -126,7 +127,7 @@ not an extrapolation presented as a measurement, not a number carried over from
 an older version. If you are unsure, say so instead of writing a confident
 sentence.
 
-**Never edit `BENCHMARKS.md` or `INGEST-BENCHMARK.md` by hand.** They are
+**Never edit `canonical-corpus.md` or `ingest.md` by hand.** They are
 generated. If your change affects performance, regenerate the relevant one and
 include the run in your PR description.
 
@@ -135,8 +136,8 @@ measurement record rather than copying figures into prose that then goes stale.
 Where a number does appear in prose, it must be traceable to a committed
 measurement file, and it must say what machine and corpus produced it.
 
-**Label extrapolations as extrapolations.** `BENCHMARKS.md` and
-`INGEST-BENCHMARK.md` already do this — for example marking segment counts
+**Label extrapolations as extrapolations.** `canonical-corpus.md` and
+`ingest.md` already do this — for example marking segment counts
 extrapolated from mid-run samples distinctly from counts sampled directly.
 Follow that.
 
@@ -157,7 +158,7 @@ statements travel with the numbers.
 
 ## Reading a stage breakdown
 
-`GET /v1/metrics` gives per-stage engine timings, and `INGEST-BENCHMARK.md`
+`GET /v1/metrics` gives per-stage engine timings, and `ingest.md`
 shows how to use them. Two cautions:
 
 - **Writer-lock wait is not a cost, it is a queue.** It measures contention for
