@@ -53,9 +53,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   word-not-substring, status-is-not-an-attribute, a missing key is kept, and
   the ranking ceiling that sends a caller to `slowest_spans`.
 
-
-## [0.21.0] - 2026-07-31
-
 ### Added
 
 - **An MCP server, embedded in `traza-server`: `POST /v1/mcp`.** Traza's read
