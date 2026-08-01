@@ -95,10 +95,23 @@ Changing Traza's code.
 These are written by the benchmarks themselves, not by hand. Documentation
 cites them rather than restating numbers.
 
-- **[BENCHMARKS.md](../BENCHMARKS.md)** — the canonical corpus run, rewritten
-  by `cargo run --release --bin bench`.
-- **[INGEST-BENCHMARK.md](../INGEST-BENCHMARK.md)** — the ingest matrix over
+They live in [`benchmarks/`](benchmarks/); how to run each one, and the rules
+for reporting a measurement honestly, are in
+[benchmarking](internals/benchmarking.md).
+
+- **[canonical-corpus.md](benchmarks/canonical-corpus.md)** — the canonical
+  corpus run, rewritten by `cargo run --release --bin bench`.
+- **[ingest.md](benchmarks/ingest.md)** — the ingest matrix over
   protocol, keep-alive, concurrency, and durability, from
   `cargo run --release --bin ingest-bench`.
+- **[storage.md](benchmarks/storage.md)** — bytes on disk per byte ingested,
+  from `cargo run --release --bin storage-bench`.
+- **[query.md](benchmarks/query.md)** — LLM aggregation latency, cold and
+  under concurrent ingest, from `cargo run --release --bin query-bench`.
+- **[index-memory.md](benchmarks/index-memory.md)** — resident index memory
+  and the compaction transient, from `index-mem-bench --matrix`. Its raw
+  per-cell results are committed alongside it as
+  [`index-memory.json`](benchmarks/index-memory.json), which
+  `tests/measurement_records.rs` checks the capacity guide against.
 - **[CHANGELOG.md](../CHANGELOG.md)** — what changed, when, and what it
   measured.
