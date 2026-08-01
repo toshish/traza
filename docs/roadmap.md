@@ -302,7 +302,7 @@ alongside results.
   spans/s with `--profile throughput` — the median clears the bar, but NOT
   YET CONFIRMED***: median of 5 rotated rounds at concurrency 16 over a
   1M-span corpus, min 122,768, max 261,215 (`ingest-bench`; see
-  [INGEST-BENCHMARK.md](../INGEST-BENCHMARK.md)). The spread straddles the
+  [ingest.md](benchmarks/ingest.md)). The spread straddles the
   target because the host was shared during measurement (1-minute load average
   6.5 to 47.8, mean 15.4). **Re-measure on an idle machine before calling this
   met.** At the default `balanced` settings the same run measures 197,056, and
@@ -351,7 +351,7 @@ alongside results.
   2x.
 
   Two v0.17 conclusions recorded here were wrong and are corrected in
-  INGEST-BENCHMARK.md: moving the seal off the lock needs **neither** a
+  ingest.md: moving the seal off the lock needs **neither** a
   reader-visible "sealing" tier (the spans simply stay in the write buffer
   until the segment is published, as a merge keeps its inputs live) **nor** a
   rotating WAL (reclamation rides `--flush-wal-bytes` instead of running on

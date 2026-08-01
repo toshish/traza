@@ -179,7 +179,8 @@ way round.
 ### [`src/bin/bench.rs`](../../src/bin/bench.rs)
 
 The canonical end-to-end benchmark. Builds and starts the release server, drives
-it over HTTP, and rewrites `BENCHMARKS.md` from its own measurements.
+it over HTTP, and rewrites `canonical-corpus.md` from its own
+measurements.
 
 ### [`src/bin/ingest-bench.rs`](../../src/bin/ingest-bench.rs)
 

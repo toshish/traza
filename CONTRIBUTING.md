@@ -47,11 +47,11 @@ If you are changing the engine, read [docs/internals/invariants.md](docs/interna
 
 ## Benchmarks
 
-`cargo run --release --bin bench` measures the canonical corpus and rewrites `BENCHMARKS.md`. `cargo run --release --bin ingest-bench` measures the ingest matrix and rewrites `INGEST-BENCHMARK.md`. `cargo run --release --bin query-bench` measures the LLM aggregation endpoints and rewrites `QUERY-BENCHMARK.md`. None is part of `ci.sh`; run the relevant one when a change could plausibly move performance, and include the run in your PR description.
+`cargo run --release --bin bench` measures the canonical corpus and rewrites `docs/benchmarks/canonical-corpus.md`. `cargo run --release --bin ingest-bench` measures the ingest matrix and rewrites `docs/benchmarks/ingest.md`. `cargo run --release --bin query-bench` measures the LLM aggregation endpoints and rewrites `docs/benchmarks/query.md`. None is part of `ci.sh`; run the relevant one when a change could plausibly move performance, and include the run in your PR description.
 
 `query-bench` is the one to run for anything touching aggregation, because it measures two things the others cannot see: **cold** latency, by restarting the server so the in-memory rollup cache is genuinely empty, and **windowed** latency under concurrent ingest, where interleaved segment time ranges stop any segment from being fully inside the window. It flushes the buffer and waits for the segment count to settle before timing, so two runs describe the same store shape; `TRAZA_QUERY_BENCH_SPANS`, `TRAZA_QUERY_BENCH_THREADS` and the `TRAZA_QUERY_BENCH_COMPACTION_*` knobs vary the axes.
 
-**Never edit `BENCHMARKS.md`, `INGEST-BENCHMARK.md` or `QUERY-BENCHMARK.md` by hand.** They are generated. See [docs/internals/benchmarking.md](docs/internals/benchmarking.md) for the flags and the rules on reporting a measurement honestly.
+**Never edit `docs/benchmarks/canonical-corpus.md`, `docs/benchmarks/ingest.md` or `docs/benchmarks/query.md` by hand.** They are generated. See [docs/internals/benchmarking.md](docs/internals/benchmarking.md) for the flags and the rules on reporting a measurement honestly.
 
 ## Documentation
 

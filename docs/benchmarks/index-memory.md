@@ -4,7 +4,7 @@
 
              - Commit: `de046d8`
              - Machine: macos/aarch64, 10 hardware threads, Apple M1 Max
-             - Raw per-cell results: [`INDEX-MEM-BENCHMARK.json`](INDEX-MEM-BENCHMARK.json)
+             - Raw per-cell results: [`index-memory.json`](index-memory.json)
              - RSS is sampled every 20 ms by a background thread for the duration of each              merge; every other RSS figure is a single reading in a freshly spawned child.
              - Load average is recorded per row: this machine was not idle.
 
