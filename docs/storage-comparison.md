@@ -45,7 +45,7 @@ unverified. Only the Traza columns were measured for this document.
 `cargo run --release --bin storage-bench` ingests each corpus through the real
 HTTP path, counting the exact request-body bytes it sends, waits for the flush
 and for compaction to settle, then walks the whole data directory. Full output,
-including exact byte counts, is in [`STORAGE-BENCHMARK.md`](../STORAGE-BENCHMARK.md).
+including exact byte counts, is in [`storage.md`](benchmarks/storage.md).
 
 | Corpus | Spans | Ingested | On disk | Ratio | Bytes/span stored |
 |---|---:|---:|---:|---:|---:|
@@ -188,9 +188,9 @@ Storage cost per ingested byte is one axis, and every number in Traza's favour
 sits on a different one. From the bundled benchmarks on macOS/aarch64:
 
 - **Ingest:** 116,618 spans/s from one client, 208,973 spans/s at 16 concurrent
-  clients, at the default `wal` durability ([`INGEST-BENCHMARK.md`](../INGEST-BENCHMARK.md))
+  clients, at the default `wal` durability ([`ingest.md`](benchmarks/ingest.md))
 - **Query:** trace lookup p95 0.64 ms, attribute-filtered search p95 3.3 ms over
-  1M spans ([`BENCHMARKS.md`](../BENCHMARKS.md))
+  1M spans ([`canonical-corpus.md`](benchmarks/canonical-corpus.md))
 - **Content search:** 1.5 ms versus 1,258 ms scanning, for +0.1% on disk
 - **Footprint:** a 2.0 MiB binary, two direct dependencies, no external
   database, queue or coordinator; a store larger than RAM serves correctly
@@ -209,6 +209,6 @@ cargo run --release --bin storage-bench
 
 Corpus sizes are overridable — `TRAZA_STORAGE_BENCH_GENERIC_SPANS`,
 `TRAZA_STORAGE_BENCH_LLM_SPANS`, `TRAZA_STORAGE_BENCH_PINNED_CONTEXT_SPANS` —
-and the run rewrites [`STORAGE-BENCHMARK.md`](../STORAGE-BENCHMARK.md) with
+and the run rewrites [`storage.md`](benchmarks/storage.md) with
 exact byte counts, so every derived figure in this document can be recomputed
 rather than trusted.

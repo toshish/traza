@@ -151,8 +151,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ];
 
     let report = render(&measurements)?;
-    fs::write("STORAGE-BENCHMARK.md", &report)?;
-    println!("\nWrote STORAGE-BENCHMARK.md");
+    fs::write("docs/benchmarks/storage.md", &report)?;
+    println!("\nWrote docs/benchmarks/storage.md");
     for measurement in &measurements {
         println!(
             "{}: {} spans, {:.0} MiB in -> {:.0} MiB on disk ({:.2}x amplification, {:.0} B/span)",

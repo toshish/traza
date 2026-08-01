@@ -201,20 +201,32 @@ impl Measured {
     }
 }
 
+/// Where the published record lives.
+const RECORD_PATH: &str = "docs/benchmarks/query.md";
+
+/// The fan-out the published record is measured at.
+const DEFAULT_COMPACTION_FANOUT: &str = "4";
+
 /// Compaction fan-out for the benchmarked server; `0` disables compaction.
 fn compaction_fanout() -> String {
-    env::var("TRAZA_QUERY_BENCH_COMPACTION_FANOUT").unwrap_or_else(|_| "4".to_owned())
+    env::var("TRAZA_QUERY_BENCH_COMPACTION_FANOUT")
+        .unwrap_or_else(|_| DEFAULT_COMPACTION_FANOUT.to_owned())
+}
+
+/// The segment ceiling the published record is measured at: the production
+/// default, read from the config rather than repeated as a literal.
+fn default_max_segment_bytes() -> String {
+    traza::CompactionConfig::default()
+        .max_segment_bytes
+        .to_string()
 }
 
 /// Size ceiling for compacted segments — the knob that decides how many
 /// segments the corpus lands in. Defaults to the production default rather
 /// than a literal so the two cannot drift apart.
 fn compaction_max_segment_bytes() -> String {
-    env::var("TRAZA_QUERY_BENCH_COMPACTION_MAX_SEGMENT_BYTES").unwrap_or_else(|_| {
-        traza::CompactionConfig::default()
-            .max_segment_bytes
-            .to_string()
-    })
+    env::var("TRAZA_QUERY_BENCH_COMPACTION_MAX_SEGMENT_BYTES")
+        .unwrap_or_else(|_| default_max_segment_bytes())
 }
 
 fn env_usize(name: &str, default: usize) -> usize {
@@ -430,8 +442,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     println!();
     println!("{report}");
-    fs::write("QUERY-BENCHMARK.md", &report)?;
-    println!("Wrote QUERY-BENCHMARK.md");
+    // Publishing is for the CANONICAL run only, the same rule `bench` holds
+    // itself to. The record is a published document, and every knob this
+    // harness exposes changes what it measures — a 20,000-span smoke test or a
+    // single-client run would otherwise overwrite the committed numbers with
+    // something that answers a different question, silently and in the same
+    // file. An experiment prints its table and leaves the record alone.
+    let canonical = span_count == DEFAULT_SPAN_COUNT
+        && threads == DEFAULT_THREADS
+        && compaction_fanout() == DEFAULT_COMPACTION_FANOUT
+        && compaction_max_segment_bytes() == default_max_segment_bytes();
+    if canonical {
+        fs::write(RECORD_PATH, &report)?;
+        println!("Wrote {RECORD_PATH}");
+    } else {
+        println!("(experimental configuration — {RECORD_PATH} not rewritten)");
+    }
     Ok(())
 }
 
