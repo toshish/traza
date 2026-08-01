@@ -54,6 +54,50 @@ That file is `.mcp.json` in a project root for Claude Code, or
 `claude_desktop_config.json` for Claude Desktop; other hosts use the same
 shape. The bridge reads `--token`, or `TRAZA_TOKEN` from the environment.
 
+### Keeping the token out of the config file
+
+The snippet above puts a credential in a file that gets committed, synced,
+backed up and pasted into issues. Read it from a mode-restricted file at launch
+instead — the config then holds a *path*, and the token itself never appears in
+it:
+
+```sh
+install -m 600 /dev/null ~/.config/traza/ro.token
+printf '%s' "$TRAZA_RO_TOKEN" > ~/.config/traza/ro.token
+```
+
+```toml
+# ~/.codex/config.toml  — Codex CLI
+[mcp_servers.traza]
+command = "/bin/zsh"
+args = [
+  "-c",
+  'export TRAZA_TOKEN="$(< ~/.config/traza/ro.token)"; exec traza-server mcp --url http://127.0.0.1:8080/v1/mcp',
+]
+```
+
+The same shape works anywhere a host launches a subprocess, including Claude
+Desktop:
+
+```json
+{
+  "mcpServers": {
+    "traza": {
+      "command": "/bin/sh",
+      "args": [
+        "-c",
+        "export TRAZA_TOKEN=\"$(cat $HOME/.config/traza/ro.token)\"; exec traza-server mcp --url http://127.0.0.1:8080/v1/mcp"
+      ]
+    }
+  }
+}
+```
+
+**Give it the `ro` token.** MCP authorizes per tool rather than per HTTP
+method, so a read-only credential reaches every read tool — which is the whole
+surface unless you deliberately enabled `record_annotation`. An `rw` token in
+an agent's configuration buys nothing and widens what a mistake can do.
+
 **The bridge speaks plain HTTP and refuses an `https://` URL.** Behind TLS
 termination, point it at the server's plaintext address on the host itself —
 or use the HTTP client form above, which handles `https://` directly and needs
@@ -86,6 +130,27 @@ and one route may serve two.
 | `analyze_cost` | Where did the tokens and the money go? |
 | `get_payload` | Show me the full prompt behind this reference |
 | `record_annotation` | Score this trace (**`rw` token + `--mcp-annotations`**) |
+
+Every tool advertises MCP `ToolAnnotations`, which is what decides whether a
+host asks for approval before each call:
+
+| Tool | `readOnlyHint` | `destructiveHint` | `idempotentHint` | `openWorldHint` |
+|---|---|---|---|---|
+| the nine readers | `true` | — | — | `false` |
+| `record_annotation` | `false` | `false` | `false` | `false` |
+
+**Absent annotations are not neutral.** Every hint defaults to the pessimistic
+answer — not read-only, potentially destructive, open world — so a server that
+omits them advertises nine read tools as though each might delete something and
+call out to the internet. A host that gates on that asks for confirmation on
+every call, and one running non-interactively, with nobody to ask, declines
+them. `destructiveHint` and `idempotentHint` are meaningful only when
+`readOnlyHint` is false, so the readers omit them rather than state values the
+specification tells clients to ignore.
+
+`openWorldHint` is `false` on the writer too: the domain of interaction is one
+store on one disk. This surface has no fetcher, no shell and no outbound
+network path — the same property the untrusted-content boundary rests on.
 
 **`describe_store` is the one to call first, and the reason the other nine
 work.** Service and model names differ per store. An agent that guesses
