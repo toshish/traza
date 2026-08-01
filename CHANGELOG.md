@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Every MCP tool now advertises `ToolAnnotations`.** The catalog carried
+  names, descriptions and schemas but no `readOnlyHint`, `destructiveHint`,
+  `idempotentHint` or `openWorldHint` — and absent hints are not neutral. Each
+  defaults to the pessimistic answer, so nine read-only tools were advertised
+  as potentially destructive and open-world. A host that gates on that asks for
+  approval on every call; one running non-interactively, with nobody to ask,
+  cancels them, which is what a Codex run did. The nine readers now declare
+  `readOnlyHint: true` with `openWorldHint: false`, and `record_annotation`
+  declares an additive, non-idempotent write. Tool nature is a required
+  argument of the builder rather than a step that can be skipped.
+
+- **`describe_store` reports the server version.** `initialize` carried it in
+  `serverInfo`, but a host reads that once and need not pass it to the model,
+  so an agent asked which Traza it was talking to correctly answered that it
+  could not tell. The overview block — and the `traza://store/overview`
+  resource that shares it — now names the version.
+
 ### Changed
 
 - **The measurement records moved out of the repository root into
@@ -25,6 +44,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rule `bench` already held itself to. Now that the record is a published
   document, an experimental corpus or client count would otherwise have
   overwritten the committed numbers with an answer to a different question.
+
+- **The advertised tool catalog is smaller than before the annotations were
+  added**: 14,895 → 14,296 bytes, with 628 bytes of new annotations inside
+  that. The four accepted time formats were restated on ten properties while
+  the `initialize` instructions already spell them out once per session; that
+  repetition and some restated prose are gone. Every semantic warning stays —
+  word-not-substring, status-is-not-an-attribute, a missing key is kept, and
+  the ranking ceiling that sends a caller to `slowest_spans`.
+
+
+## [0.21.0] - 2026-07-31
 
 ### Added
 
