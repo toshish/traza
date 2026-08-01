@@ -1616,8 +1616,8 @@ const GENERATED_END: &str = "<!-- END GENERATED -->";
 
 /// Writes the report, preserving hand-written analysis.
 ///
-/// This used to overwrite `INGEST-BENCHMARK.md` wholesale, which silently
-/// destroyed every paragraph of interpretation in it — the stage decomposition,
+/// This used to overwrite `docs/benchmarks/ingest.md` wholesale, which
+/// silently destroyed every paragraph of interpretation in it — the stage decomposition,
 /// the reasoning about what the numbers mean — each time anyone re-ran the
 /// benchmark. The generated table is an INPUT to that document, not the
 /// document. When the file marks a generated region, only that region is
@@ -1630,7 +1630,7 @@ fn write_report(
     runs: usize,
     spans: usize,
 ) -> Result<(), String> {
-    let path = "INGEST-BENCHMARK.md";
+    let path = "docs/benchmarks/ingest.md";
     // Publication is opt-in, and a PARTIAL run may never publish.
     //
     // Preserving the prose was not enough. The generated table is itself a
@@ -1677,7 +1677,7 @@ fn write_report(
             }
         }
         // A file with no markers is analysis this harness must not clobber.
-        let aside = "INGEST-BENCHMARK.generated.md";
+        let aside = "docs/benchmarks/ingest.generated.md";
         std::fs::write(aside, report).map_err(|e| e.to_string())?;
         println!("{path} carries no {GENERATED_BEGIN} marker, so it was left alone; wrote {aside}");
         return Ok(());

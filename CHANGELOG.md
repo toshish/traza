@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The measurement records moved out of the repository root into
+  [`docs/benchmarks/`](docs/benchmarks/)**, and are named for what they
+  measure rather than shouted: `BENCHMARKS.md` is now
+  `docs/benchmarks/canonical-corpus.md`, and `INGEST-BENCHMARK.md`,
+  `STORAGE-BENCHMARK.md`, `QUERY-BENCHMARK.md` and
+  `INDEX-MEM-BENCHMARK.{md,json}` are `ingest.md`, `storage.md`, `query.md`
+  and `index-memory.{md,json}`. Six SHOUTING files at the root read as project
+  furniture on the level of README and LICENSE; they are generated
+  documentation, and they belong with the documentation that cites them.
+  Every benchmark binary writes to the new path, and `docs/README.md` now
+  indexes all five records rather than two. Entries below this one name the
+  files as they were called at the time.
+- `query-bench` publishes its record only for the canonical configuration, the
+  rule `bench` already held itself to. Now that the record is a published
+  document, an experimental corpus or client count would otherwise have
+  overwritten the committed numbers with an answer to a different question.
+
 ### Added
 
 - **An MCP server, embedded in `traza-server`: `POST /v1/mcp`.** Traza's read
