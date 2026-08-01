@@ -233,6 +233,92 @@ fn the_advertised_tool_list_is_exactly_what_the_caller_may_call() {
 }
 
 #[test]
+fn every_tool_declares_what_it_does_to_the_store() {
+    let dir = test_dir("annotations");
+    let store = open_store(&dir);
+    let tools = rpc_with(&store, "tools/list", json!({}), Access::ReadWrite, true)["result"]
+        ["tools"]
+        .as_array()
+        .expect("tools")
+        .clone();
+
+    // Every hint defaults to the pessimistic answer, so silence is not
+    // neutral: an unannotated read tool is advertised as one that may destroy
+    // things and reach the open internet. A host that gates on that asks for
+    // approval on every call, or — running non-interactively — declines it.
+    for tool in &tools {
+        let name = tool["name"].as_str().expect("name");
+        let annotations = tool
+            .get("annotations")
+            .unwrap_or_else(|| panic!("{name} advertises no annotations"));
+        assert_eq!(
+            annotations["openWorldHint"],
+            json!(false),
+            "{name}: this surface has no fetcher, shell or outbound path, so its world is closed"
+        );
+
+        if name == "record_annotation" {
+            assert_eq!(annotations["readOnlyHint"], json!(false));
+            // Append-only: it records a fact beside the data and can never
+            // modify or remove a span.
+            assert_eq!(annotations["destructiveHint"], json!(false));
+            // Two identical calls record two annotations.
+            assert_eq!(annotations["idempotentHint"], json!(false));
+        } else {
+            assert_eq!(
+                annotations["readOnlyHint"],
+                json!(true),
+                "{name} reads the store and must say so"
+            );
+            // Meaningful only when readOnlyHint is false, so stating them here
+            // would be advertising values the specification tells clients to
+            // ignore.
+            assert!(
+                annotations.get("destructiveHint").is_none()
+                    && annotations.get("idempotentHint").is_none(),
+                "{name} states hints that are meaningless on a read-only tool"
+            );
+        }
+    }
+
+    // Nine readers and one writer, so a tool added without a decision about
+    // its nature fails here rather than shipping as pessimistically annotated.
+    let read_only = tools
+        .iter()
+        .filter(|tool| tool["annotations"]["readOnlyHint"] == json!(true))
+        .count();
+    assert_eq!(
+        read_only, 9,
+        "expected nine read-only tools, found {read_only}"
+    );
+}
+
+#[test]
+fn the_store_reports_its_own_version_where_an_agent_can_read_it() {
+    let dir = test_dir("version");
+    let store = open_store(&dir);
+    // `initialize` carries it too, but a host reads serverInfo once and need
+    // not pass it to the model — so an agent asked which Traza it is talking
+    // to could not answer.
+    let text = text_of(&call(&store, "describe_store", json!({})));
+    assert!(
+        text.contains(env!("CARGO_PKG_VERSION")),
+        "describe_store does not report the version: {}",
+        text.lines().next().unwrap_or_default()
+    );
+    // And the resource that shares the same block reports it as well.
+    let resource = rpc(
+        &store,
+        "resources/read",
+        json!({"uri": "traza://store/overview"}),
+    );
+    assert!(resource["result"]["contents"][0]["text"]
+        .as_str()
+        .expect("text")
+        .contains(env!("CARGO_PKG_VERSION")));
+}
+
+#[test]
 fn the_write_tool_is_refused_by_both_of_its_gates() {
     let dir = test_dir("write-gates");
     let store = open_store(&dir);
