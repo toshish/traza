@@ -200,7 +200,7 @@ function mediaKindOf(type, mime) {
     if (t === 'file') return 'document';
     if (MEDIA_KINDS.includes(t)) return t;
     if (t === 'image_url' || t === 'input_image') return 'image';
-    if (t === 'input_audio') return 'audio';
+    if (t === 'input_audio' || t === 'output_audio') return 'audio';
   }
   if (typeof mime === 'string') {
     if (mime.startsWith('image/')) return 'image';
@@ -219,8 +219,112 @@ function renderableSrc(value) {
   return /^(data:|https?:)/i.test(value) ? value : null;
 }
 
+// Bare base64 payloads (the OTel GenAI `data` field, Anthropic `source.data`,
+// Google `inline_data.data`, tool screenshots…) carry no scheme, so the
+// browser cannot use them as-is; with the MIME type they become a data: URI.
+// The length floor keeps ordinary words ("summary") from looking like bytes.
+export function base64ToDataUri(value, mime) {
+  if (typeof value !== 'string' || value.length < 16) return null;
+  const clean = /\s/.test(value) ? value.replace(/\s+/g, '') : value;
+  if (clean.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(clean)) return null;
+  return 'data:' + (mime || 'application/octet-stream') + ';base64,' + clean;
+}
+
+// A reference worth SHOWING is scheme-shaped and short (a URI or an id) — an
+// opaque blob that fails both the URI and base64 tests must not be poured
+// into the transcript as text, which is how a screenshot once rendered as
+// eight thousand lines of base64.
+function referenceUri(value) {
+  if (typeof value !== 'string' || !value || value.length > 2048) return null;
+  if (/^data:/i.test(value)) return null; // bytes, not a reference
+  return /^[a-z][a-z0-9+.-]*:/i.test(value) ? value : null;
+}
+
+// MIME for the OpenAI input_audio {data, format} shape.
+function audioFormatMime(format) {
+  if (typeof format !== 'string' || !format) return undefined;
+  const f = format.toLowerCase();
+  return f === 'mp3' ? 'audio/mpeg' : 'audio/' + f;
+}
+
+/** Media descriptor for one message part across the shapes emitters actually
+    produce, else null. Recognized, in rough order of the wild population:
+      - OTel GenAI / Traza native: {type, mime_type, data|uri, filename, …}
+      - OpenAI: {type:"image_url", image_url:{url}|url}, {type:"input_audio",
+        input_audio:{data, format}}, {type:"file", file:{file_data|file_id}}
+      - Anthropic: {type, source:{type:"base64"|"url"|"file", data|url|file_id}}
+      - Google GenAI: {inline_data|inlineData:{mime_type, data}},
+        {file_data|fileData:{mime_type, file_uri}} — typeless parts
+    Bytes render (data:/http(s), or bare base64 lifted into a data: URI);
+    object-store locators stay references; offloaded bytes carry their
+    payload ref so the renderer can fetch them on demand. */
+function mediaPartOf(part, type) {
+  const source = typeof part.source === 'object' && part.source !== null ? part.source : undefined;
+  const inline = part.inline_data ?? part.inlineData;
+  const fileRef = part.file_data ?? part.fileData;
+  const audioIn = typeof part.input_audio === 'object' && part.input_audio !== null ? part.input_audio : undefined;
+  const fileBox = typeof part.file === 'object' && part.file !== null ? part.file : undefined;
+
+  const mime = part.mime_type || part.mimeType || part.media_type
+    || (source && source.media_type)
+    || (inline && typeof inline === 'object' ? inline.mime_type || inline.mimeType : undefined)
+    || (fileRef && typeof fileRef === 'object' ? fileRef.mime_type || fileRef.mimeType : undefined)
+    || (fileBox && fileBox.mime_type)
+    || (audioIn && audioFormatMime(audioIn.format));
+
+  // Typeless Google parts are media by virtue of carrying inline or file
+  // data; a document is the honest default when even the MIME is missing.
+  const media = mediaKindOf(type, mime)
+    || ((inline != null || fileRef != null) ? (mediaKindOf(undefined, mime) || 'document') : null)
+    || ((type === undefined && (audioIn || fileBox)) ? (audioIn ? 'audio' : 'document') : null);
+  if (!media) return null;
+
+  // Locator candidates, most specific first. Each may be a string (bytes or
+  // URI), an object with .url (OpenAI image_url), or a payload reference.
+  const candidates = [
+    part.data, source && source.data, inline && typeof inline === 'object' ? inline.data : inline,
+    audioIn && audioIn.data, fileBox && fileBox.file_data,
+    part.uri, part.url, source && source.url,
+    fileRef && typeof fileRef === 'object' ? (fileRef.file_uri ?? fileRef.fileUri) : fileRef,
+    part.image_url, fileBox && fileBox.file_id, source && source.file_id, part.file_id,
+  ];
+
+  let src = null;
+  let uri;
+  let payloadRef;
+  for (const raw of candidates) {
+    if (raw == null) continue;
+    if (isPayloadRef(raw)) {
+      if (!payloadRef) payloadRef = { ref: raw.$payload, bytes: raw.bytes };
+      continue;
+    }
+    const value = typeof raw === 'object' ? raw.url : raw;
+    if (typeof value !== 'string' || !value) continue;
+    src = renderableSrc(value) || base64ToDataUri(value, mime);
+    if (src) break;
+    if (uri === undefined) uri = referenceUri(value) || undefined;
+  }
+
+  const unavailable = part.capture_status === 'unavailable' || part.archive_status === 'unavailable'
+    || part.status === 'unavailable';
+  return {
+    kind: 'media',
+    mediaType: media,
+    mime: mime || undefined,
+    filename: part.filename || part.name || (fileBox && fileBox.filename) || undefined,
+    sizeBytes: typeof part.size_bytes === 'number' ? part.size_bytes : undefined,
+    width: typeof part.width === 'number' ? part.width : undefined,
+    height: typeof part.height === 'number' ? part.height : undefined,
+    src,
+    uri: src ? undefined : uri,
+    payloadRef: src ? undefined : payloadRef,
+    unavailable: unavailable || undefined,
+    unavailableReason: (unavailable && (part.unavailable_reason || part.reason || part.detail)) || undefined,
+  };
+}
+
 // One part of a message, normalized into a shape the renderer can switch on.
-function normalizePart(part) {
+export function normalizePart(part) {
   if (part == null) return { kind: 'text', text: '' };
   if (typeof part !== 'object') return { kind: 'text', text: String(part) };
   if (isPayloadRef(part)) {
@@ -236,24 +340,23 @@ function normalizePart(part) {
   if (type === 'tool_call_response' || type === 'tool_result') {
     return { kind: 'tool_result', id: part.id, result: part.result ?? part.response ?? part.content ?? '' };
   }
-  const mime = part.mime_type || part.mimeType || part.media_type;
-  const media = mediaKindOf(type, mime);
-  if (media) {
-    const raw = part.data ?? part.uri ?? part.url ?? part.image_url;
-    const locator = typeof raw === 'object' && raw !== null ? raw.url : raw;
-    return {
-      kind: 'media',
-      mediaType: media,
-      mime: mime || undefined,
-      filename: part.filename || part.name || undefined,
-      sizeBytes: typeof part.size_bytes === 'number' ? part.size_bytes : undefined,
-      src: renderableSrc(locator),
-      uri: typeof locator === 'string' ? locator : undefined,
-    };
-  }
+  const media = mediaPartOf(part, type);
+  if (media) return media;
   if (typeof part.content === 'string') return { kind: 'text', text: clip(part.content, MAX_TEXT_CHARS) };
   if (typeof part.text === 'string') return { kind: 'text', text: clip(part.text, MAX_TEXT_CHARS) };
   return { kind: 'text', text: clip(JSON.stringify(part, null, 2), MAX_TEXT_CHARS) };
+}
+
+/** Message parts hiding inside a tool result: MCP and computer-use tools
+    answer with a content list whose entries are ordinary parts, screenshots
+    included. Returns normalized parts when `value` holds at least one media
+    part, else null — a plain JSON result is better shown as JSON. */
+export function toolResultParts(value) {
+  const list = Array.isArray(value) ? value
+    : (value && typeof value === 'object' && Array.isArray(value.content)) ? value.content : null;
+  if (!list || !list.length) return null;
+  const parts = list.map(normalizePart);
+  return parts.some((p) => p.kind === 'media') ? parts : null;
 }
 
 // One message -> { role, parts: [...] }. Accepts the OTel GenAI shape
@@ -281,11 +384,13 @@ function normalizeMessage(message, direction) {
 // Parses a gen_ai.{input,output}.messages attribute, which OpenLLMetry emits
 // JSON-encoded (a string) but native ingest may carry as an array. A whole
 // attribute past the offload threshold arrives as a {$payload} reference —
-// surface it instead of silently rendering nothing.
+// surface it instead of silently rendering nothing, and mark it as a whole
+// offloaded CONVERSATION (`offloadedMessages`) so the renderer knows the
+// payload body parses back into messages rather than into prose.
 function parseMessagesAttr(value, direction) {
   if (value == null) return [];
   if (isPayloadRef(value)) {
-    return [{ direction, role: undefined, parts: [normalizePart(value)] }];
+    return [{ direction, role: undefined, offloadedMessages: true, parts: [normalizePart(value)] }];
   }
   let parsed = value;
   if (typeof value === 'string') {
@@ -339,6 +444,21 @@ export function llmMessages(span) {
       parts: [normalizePart({ content: (e.attributes || {}).content })],
     }));
   return [...collectIndexed('prompt'), ...collectIndexed('completion'), ...events];
+}
+
+/** The messages inside a loaded payload body, normalized like any other
+    turn, or null when the text is not a messages array. This is the second
+    half of the `offloadedMessages` contract: an oversized
+    gen_ai.{input,output}.messages attribute round-trips through the payload
+    store as its original JSON, so fetching and re-parsing it yields exactly
+    what would have rendered had it stayed inline — media parts included. */
+export function parseLoadedMessages(text, direction) {
+  if (typeof text !== 'string' || !text.trim()) return null;
+  let parsed;
+  try { parsed = JSON.parse(text); } catch (e) { return null; }
+  const list = Array.isArray(parsed) ? parsed : [parsed];
+  if (!list.length || !list.every((m) => m != null && (typeof m === 'object' || typeof m === 'string'))) return null;
+  return list.map((m) => normalizeMessage(m, direction));
 }
 
 /** Plain-text rendering of a message, for copy-to-clipboard. */
