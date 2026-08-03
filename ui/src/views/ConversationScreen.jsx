@@ -120,8 +120,9 @@ export function ConversationScreen({ kind, id, go }) {
       <LoadingBar active={read.loading} />
       {read.data && !turns.length ? <EmptyState
         message={<>No messages here. Traza reads prompts and completions from{' '}
-          <code>gen_ai.prompt.*</code>, <code>gen_ai.completion.*</code>, OpenLLMetry's{' '}
-          <code>llm.prompts.*</code>, and offloaded payload references.</>} /> : null}
+          <code>gen_ai.input.messages</code> / <code>gen_ai.output.messages</code>, the indexed{' '}
+          <code>gen_ai.prompt.*</code> / <code>gen_ai.completion.*</code>, native{' '}
+          <code>llm.prompt</code> / <code>llm.completion</code> events, and offloaded payload references.</>} /> : null}
 
       {turns.map((turn, index) => {
         const duration = turn.span.end_time_ns - turn.span.start_time_ns;
