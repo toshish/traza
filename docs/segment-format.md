@@ -342,7 +342,7 @@ Advisory (report, do not gate on machine-dependent numbers):
 
 6. `TRAZA_BENCH_SPANS=10000000` run: trace lookup p50 < 1 ms, attribute
    filter p50 < 100 ms, server RSS under 1.5 GB. Record actuals in
-   BENCHMARKS-10M.md style notes (do not overwrite BENCHMARKS.md).
+   BENCHMARKS-10M.md style notes (do not overwrite canonical-corpus.md).
 
 ## Non-goals
 

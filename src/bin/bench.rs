@@ -47,8 +47,8 @@ fn compaction_max_segment_bytes() -> String {
 
 fn span_count() -> usize {
     // TRAZA_BENCH_SPANS overrides the corpus size for scaling experiments.
-    // BENCHMARKS.md is only rewritten for the canonical default corpus, so
-    // experimental runs cannot silently change the published numbers.
+    // The published record is only rewritten for the canonical default
+    // corpus, so experimental runs cannot silently change its numbers.
     std::env::var("TRAZA_BENCH_SPANS")
         .ok()
         .and_then(|value| value.parse().ok())
@@ -257,9 +257,9 @@ The ingest threshold is {}. The trace p95 threshold is {}. The filtered-query p9
     );
     report.push_str("\n## Verification Notes\n\n- Corpus declaration: `1000000` spans (1,000,000 spans).\n- Every reported result is measured by this benchmark run, never estimated.\n- Unsuccessful lookups are reported as misses.\n");
     if SPAN_COUNT == DEFAULT_SPAN_COUNT {
-        fs::write("BENCHMARKS.md", report)?;
+        fs::write("docs/benchmarks/canonical-corpus.md", report)?;
     } else {
-        println!("(experimental corpus — BENCHMARKS.md not rewritten)");
+        println!("(experimental corpus — docs/benchmarks/canonical-corpus.md not rewritten)");
     }
 
     println!(
@@ -279,7 +279,7 @@ The ingest threshold is {}. The trace p95 threshold is {}. The filtered-query p9
         ms(filter_p99)
     );
     if SPAN_COUNT == DEFAULT_SPAN_COUNT {
-        println!("Wrote BENCHMARKS.md");
+        println!("Wrote docs/benchmarks/canonical-corpus.md");
     }
     Ok(())
 }
