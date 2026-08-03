@@ -14,8 +14,8 @@ use std::collections::HashSet;
 use serde_json::Value;
 
 fn record() -> Value {
-    let raw = std::fs::read_to_string("INDEX-MEM-BENCHMARK.json")
-        .expect("INDEX-MEM-BENCHMARK.json is a committed measurement record");
+    let raw = std::fs::read_to_string("docs/benchmarks/index-memory.json")
+        .expect("docs/benchmarks/index-memory.json is a committed measurement record");
     serde_json::from_str(&raw).expect("the record parses")
 }
 

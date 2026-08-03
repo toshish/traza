@@ -319,6 +319,7 @@ impl<'a> Server<'a> {
                  only exist in this store, and guessing them returns empty results that \
                  look exactly like 'nothing is wrong'.",
                 json!({"type": "object", "properties": {}, "additionalProperties": false}),
+                Nature::Read,
             ),
             tool(
                 "search_spans",
@@ -335,6 +336,7 @@ impl<'a> Server<'a> {
                     "properties": search_properties(true),
                     "additionalProperties": false,
                 }),
+                Nature::Read,
             ),
             tool(
                 "get_trace",
@@ -359,6 +361,7 @@ impl<'a> Server<'a> {
                     "required": ["trace_id"],
                     "additionalProperties": false,
                 }),
+                Nature::Read,
             ),
             tool(
                 "list_sessions",
@@ -381,6 +384,7 @@ impl<'a> Server<'a> {
                     },
                     "additionalProperties": false,
                 }),
+                Nature::Read,
             )
             .with_output_schema(sessions_output_schema()),
             tool(
@@ -396,6 +400,7 @@ impl<'a> Server<'a> {
                     "required": ["session_id"],
                     "additionalProperties": false,
                 }),
+                Nature::Read,
             ),
             tool(
                 "top_failures",
@@ -410,6 +415,7 @@ impl<'a> Server<'a> {
                     "properties": search_properties(false),
                     "additionalProperties": false,
                 }),
+                Nature::Read,
             ),
             tool(
                 "slowest_spans",
@@ -424,6 +430,7 @@ impl<'a> Server<'a> {
                     "properties": search_properties(false),
                     "additionalProperties": false,
                 }),
+                Nature::Read,
             ),
             tool(
                 "analyze_cost",
@@ -451,6 +458,7 @@ impl<'a> Server<'a> {
                     },
                     "additionalProperties": false,
                 }),
+                Nature::Read,
             )
             .with_output_schema(cost_output_schema()),
             tool(
@@ -478,6 +486,7 @@ impl<'a> Server<'a> {
                     "required": ["reference"],
                     "additionalProperties": false,
                 }),
+                Nature::Read,
             ),
         ];
         if self.annotation_tool_available(access) {
@@ -508,6 +517,7 @@ impl<'a> Server<'a> {
                     "required": ["trace_id", "name", "value"],
                     "additionalProperties": false,
                 }),
+                Nature::AdditiveWrite,
             ));
         }
         tools.into_iter().map(Tool::into_value).collect()
@@ -593,8 +603,13 @@ impl<'a> Server<'a> {
         let sessions = self.store.sessions(None, None, 100, SessionOrder::Recent)?;
 
         let mut head = String::new();
+        // The version belongs here as well as in `initialize`. A host reads
+        // `serverInfo` once and need not pass it to the model, so an agent
+        // asked which Traza it is talking to had no way to find out and
+        // correctly reported that it could not tell.
         head.push_str(&format!(
-            "Traza store: {} in {} ({}), durability={}\n",
+            "Traza {} — {} in {} ({}), durability={}\n",
+            env!("CARGO_PKG_VERSION"),
             count(stats.total_records as u64, "record"),
             count(stats.segment_count as u64, "segment"),
             bytes_human(stats.disk_bytes),
@@ -1661,24 +1676,73 @@ impl Tool {
     }
 }
 
-fn tool(name: &str, title: &str, description: &str, input_schema: Value) -> Tool {
+/// What a tool does to the store, in the terms MCP's `ToolAnnotations` uses.
+///
+/// A required argument of [`tool`] rather than a builder step that could be
+/// forgotten, because forgetting it is not a neutral omission: every hint
+/// defaults to the pessimistic answer, so an unannotated read tool is
+/// advertised as one that may destroy things and reach the open internet.
+/// A host that gates on those defaults asks for approval on every call — or,
+/// running non-interactively with nobody to ask, declines them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Nature {
+    /// Reads the store and changes nothing in it.
+    Read,
+    /// Appends a record beside the data. Never modifies or removes one.
+    AdditiveWrite,
+}
+
+impl Nature {
+    /// The `ToolAnnotations` object for this nature.
+    ///
+    /// `destructiveHint` and `idempotentHint` are meaningful only when
+    /// `readOnlyHint` is false, so the read case omits them rather than
+    /// stating values a client is told to ignore.
+    fn annotations(self) -> Value {
+        match self {
+            // `openWorldHint: false` on every tool here, read or write: the
+            // domain of interaction is one store on one disk. Nothing in this
+            // surface reaches an external entity — no fetcher, no shell, no
+            // outbound path — which is the same property the untrusted-content
+            // boundary rests on.
+            Self::Read => json!({"readOnlyHint": true, "openWorldHint": false}),
+            Self::AdditiveWrite => json!({
+                "readOnlyHint": false,
+                // Annotations are append-only and cannot touch a span.
+                "destructiveHint": false,
+                // Two identical calls record two annotations, so repeating one
+                // is not free. Stated rather than left to the default, because
+                // this is the tool a host will actually gate on.
+                "idempotentHint": false,
+                "openWorldHint": false,
+            }),
+        }
+    }
+}
+
+fn tool(name: &str, title: &str, description: &str, input_schema: Value, nature: Nature) -> Tool {
     Tool {
         value: json!({
             "name": name,
             "title": title,
             "description": description,
             "inputSchema": input_schema,
+            "annotations": nature.annotations(),
         }),
     }
 }
 
+/// A time bound.
+///
+/// The four accepted forms are spelled out once, in the `initialize`
+/// instructions a host shows the model per session. Repeating them on ten
+/// properties was the largest single line item in the advertised catalog and
+/// taught the model nothing it had not already been told; what is per-property
+/// is only which end of the window this is.
 fn time_property(what: &str) -> Value {
     json!({
         "type": "string",
-        "description": format!(
-            "{what} Accepts a relative age ('2h', '30m', '7d'), an RFC 3339 instant \
-             ('2026-07-27T09:00:00Z'), a plain date ('2026-07-27'), or Unix nanoseconds."
-        ),
+        "description": format!("{what} Relative ('2h', '7d'), RFC 3339, date, or Unix ns."),
     })
 }
 
@@ -1694,9 +1758,8 @@ fn limit_property(default: usize, maximum: usize) -> Value {
 fn include_content_property() -> Value {
     json!({
         "type": "boolean",
-        "description": "Include stored attribute values (prompts, completions, tool \
-                        arguments). Default false — these are large, and one span can fill a \
-                        context window.",
+        "description": "Include stored prompts, completions and tool arguments. Default \
+                        false: one span of these can fill a context window.",
     })
 }
 
@@ -1711,9 +1774,9 @@ fn search_properties(paging: bool) -> Value {
         "name": {"type": "string", "description": "Exact operation name."},
         "status": {
             "type": "string",
-            "description": "The span's own status field, e.g. 'error' or 'ok'. This is not \
-                            an attribute: filtering on attributes.status matches something \
-                            most instrumentation never writes.",
+            "description": "The span's own status field ('error', 'ok'). NOT an attribute: \
+                            attributes.status matches something most instrumentation never \
+                            writes, and returns an empty page.",
         },
         "exclude_status": {
             "type": "array",
@@ -1723,24 +1786,22 @@ fn search_properties(paging: bool) -> Value {
         "content": {
             "type": "string",
             "description": "Words that must all appear in the span's text — attributes, \
-                            event attributes and event names. Whole words only: 'refund' \
-                            does not match 'refunds', and there is no stemming or phrase \
-                            matching.",
+                            event attributes, event names. WHOLE WORDS only: 'refund' does \
+                            not match 'refunds'. No stemming, no phrases.",
         },
         "session": {
             "type": "string",
-            "description": "Every span of one session, unioning all recognized session keys.",
+            "description": "One session's spans, unioning all recognized session keys.",
         },
         "attributes": {
             "type": "object",
-            "description": "Exact attribute matches, e.g. {\"gen_ai.request.model\": \
-                            \"gpt-4o\"}. Scalars match whether the value was stored as a \
-                            number or a string.",
+            "description": "Exact matches, e.g. {\"gen_ai.request.model\": \"gpt-4o\"}. \
+                            Scalars match whether stored as number or string.",
         },
         "exclude_attributes": {
             "type": "object",
-            "description": "Attribute values to exclude. A span that lacks the key entirely \
-                            is KEPT, so this means 'not known to be X'.",
+            "description": "Values to exclude. A span lacking the key entirely is KEPT — \
+                            this means 'not known to be X'.",
         },
         "min_duration_ms": {"type": "number", "description": "Minimum span duration."},
         "max_duration_ms": {"type": "number", "description": "Maximum span duration."},
