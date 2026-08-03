@@ -811,6 +811,61 @@ impl Gen {
             );
             self.push(span);
         }
+
+        // A fifth turn covering the OTHER spellings of "here is media" the
+        // dashboard must render: bare base64 with a MIME type (no data:
+        // prefix), the Google inline_data shape, an MCP-style tool result
+        // carrying a screenshot, and a part whose bytes the emitter declined
+        // to capture — which must present its reason, not an empty frame.
+        // Real bytes as elsewhere in this corpus: a chart small enough to
+        // stay inline under the default offload threshold.
+        let raw_base64 = crate::media::base64_encode(&crate::media::png_chart(160, 90));
+        let trace = self.id("trace-media");
+        let span_id = self.id("span");
+        let start = self.advance_rand(10, 120, SEC);
+        let prompt_tokens = self.rng.range(800, 5000);
+        let mut attributes = self.usage_attributes(vendor, Dialect::Current, prompt_tokens, 120);
+        attributes.insert("gen_ai.conversation.id".into(), json!(session));
+        attributes.insert(
+            "gen_ai.input.messages".into(),
+            messages_json(json!([
+                {"role": "user", "parts": [
+                    {"type": "text", "content": "Compare the two charts; one attachment could not be captured."},
+                    {"type": "image", "mime_type": "image/png", "filename": "chart-raw-b64.png",
+                     "size_bytes": raw_base64.len() * 3 / 4, "data": raw_base64},
+                    {"inline_data": {"mime_type": "image/png", "data": raw_base64}},
+                    {"type": "image", "mime_type": "image/jpeg", "filename": "outside-roots.jpg",
+                     "size_bytes": 38399, "archive_status": "unavailable",
+                     "capture_status": "unavailable", "unavailable_reason": "outside_allowed_roots"}
+                ]}
+            ])),
+        );
+        attributes.insert(
+            "gen_ai.output.messages".into(),
+            messages_json(json!([
+                {"role": "assistant", "parts": [
+                    {"type": "tool_call", "id": "call_shot", "name": "computer.screenshot",
+                     "arguments": "{\"display\": 1}"},
+                    {"type": "tool_call_response", "id": "call_shot", "response": {"content": [
+                        {"type": "text", "text": "Screenshot captured."},
+                        {"type": "image", "mimeType": "image/png", "data": raw_base64}
+                    ]}},
+                    {"type": "text", "content": "The captured charts agree; the missing file was skipped."}
+                ], "finish_reason": "stop"}
+            ])),
+        );
+        let span = make_span(
+            &trace,
+            &span_id,
+            None,
+            &format!("{}.chat", vendor.provider),
+            vendor.service,
+            start,
+            self.rng.range(800, 9000) * MS,
+            "ok",
+            attributes,
+        );
+        self.push(span);
     }
 
     /// A failed call and its linked retry: error status, `error.type`, and a

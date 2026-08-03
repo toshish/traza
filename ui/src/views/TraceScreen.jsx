@@ -17,7 +17,7 @@ import { AttrTree } from '../components/data/AttrTree.jsx';
 import { Modal } from '../components/primitives/Modal.jsx';
 import { Input } from '../components/primitives/Input.jsx';
 import { Button } from '../components/primitives/Button.jsx';
-import { CodeBlock } from '../components/data/CodeBlock.jsx';
+import { PayloadBody } from '../components/trace/MessageList.jsx';
 
 // One trace, on a time axis. The old waterfall positioned bars proportionally
 // with no ruler, no zoom, no collapse and no self time — readable at nine
@@ -465,7 +465,8 @@ function SpanPanel({ span, annotations, traceId, onAnnotate, go, pushToast }) {
     <Chip onClick={onAnnotate}>Annotate this span</Chip>
 
     <Modal open={!!payload} title={payload?.key || ''} width={720} onClose={() => setPayload(null)}>
-      {payload ? <CodeBlock code={payload.text} style={{ maxHeight: '55vh', whiteSpace: 'pre-wrap' }} /> : null}
+      {payload ? <PayloadBody text={payload.text} hintKey={payload.key}
+        onLoadPayload={(ref) => api.payload(ref)} /> : null}
     </Modal>
   </Card>;
 }
