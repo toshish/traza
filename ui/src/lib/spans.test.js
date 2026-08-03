@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest';
-import { llmUsage, sessionIdOf, llmMessages, messageText } from './spans.js';
+import {
+  llmUsage, sessionIdOf, llmMessages, messageText,
+  base64ToDataUri, parseLoadedMessages, toolResultParts,
+} from './spans.js';
 
 const span = (attributes, extra = {}) => ({ attributes, ...extra });
 
@@ -124,11 +127,205 @@ describe('llmMessages', () => {
       'gen_ai.input.messages': { $payload: 'sha256/abc', bytes: 900000, preview: 'start…' },
     }));
     expect(message.parts[0]).toMatchObject({ kind: 'payload', ref: 'sha256/abc', preview: 'start…' });
+    // …and marks it as a whole offloaded conversation, so the renderer knows
+    // the payload body parses back into messages.
+    expect(message.offloadedMessages).toBe(true);
+  });
+
+  // The wild population of media part shapes. Each provider spells "here is
+  // an image" differently; every spelling must land on a renderable source
+  // or an honest reference, never on a JSON dump or a base64 wall.
+  const B64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB';
+
+  it('lifts bare base64 bytes into a data: URI (OTel GenAI shape)', () => {
+    const [message] = llmMessages(span({
+      'gen_ai.input.messages': JSON.stringify([{
+        role: 'user',
+        parts: [{ type: 'image', mime_type: 'image/png', filename: 's.png', data: B64 }],
+      }]),
+    }));
+    expect(message.parts[0]).toMatchObject({
+      kind: 'media', mediaType: 'image', src: 'data:image/png;base64,' + B64, uri: undefined,
+    });
+  });
+
+  it('reads the Anthropic source object, base64 and url alike', () => {
+    const [message] = llmMessages(span({
+      'gen_ai.input.messages': JSON.stringify([{
+        role: 'user',
+        content: [
+          { type: 'image', source: { type: 'base64', media_type: 'image/png', data: B64 } },
+          { type: 'image', source: { type: 'url', url: 'https://cdn.example/frame.jpg' } },
+        ],
+      }]),
+    }));
+    expect(message.parts[0]).toMatchObject({ kind: 'media', mediaType: 'image', mime: 'image/png', src: 'data:image/png;base64,' + B64 });
+    expect(message.parts[1]).toMatchObject({ kind: 'media', mediaType: 'image', src: 'https://cdn.example/frame.jpg' });
+  });
+
+  it('recognizes typeless Google parts by their inline_data and file_data', () => {
+    const [message] = llmMessages(span({
+      'gen_ai.input.messages': JSON.stringify([{
+        role: 'user',
+        parts: [
+          { inline_data: { mime_type: 'image/png', data: B64 } },
+          { fileData: { mimeType: 'video/mp4', fileUri: 'gs://bucket/clip.mp4' } },
+        ],
+      }]),
+    }));
+    expect(message.parts[0]).toMatchObject({ kind: 'media', mediaType: 'image', src: 'data:image/png;base64,' + B64 });
+    expect(message.parts[1]).toMatchObject({ kind: 'media', mediaType: 'video', src: null, uri: 'gs://bucket/clip.mp4' });
+  });
+
+  it('reads OpenAI input_audio, image_url objects, and file parts', () => {
+    const [message] = llmMessages(span({
+      'gen_ai.input.messages': JSON.stringify([{
+        role: 'user',
+        content: [
+          { type: 'input_audio', input_audio: { data: B64, format: 'wav' } },
+          { type: 'image_url', image_url: { url: 'data:image/png;base64,' + B64 } },
+          { type: 'file', file: { filename: 'q3.pdf', file_data: 'data:application/pdf;base64,' + B64 } },
+        ],
+      }]),
+    }));
+    expect(message.parts[0]).toMatchObject({ kind: 'media', mediaType: 'audio', mime: 'audio/wav', src: 'data:audio/wav;base64,' + B64 });
+    expect(message.parts[1]).toMatchObject({ kind: 'media', mediaType: 'image', src: 'data:image/png;base64,' + B64 });
+    expect(message.parts[2]).toMatchObject({ kind: 'media', mediaType: 'document', filename: 'q3.pdf', src: 'data:application/pdf;base64,' + B64 });
+  });
+
+  it('says why bytes are missing when the emitter did not capture them', () => {
+    const [message] = llmMessages(span({
+      'gen_ai.input.messages': JSON.stringify([{
+        role: 'user',
+        parts: [{
+          type: 'image', mime_type: 'image/jpeg', filename: 'probe.jpg', size_bytes: 38399,
+          archive_status: 'unavailable', capture_status: 'unavailable',
+          unavailable_reason: 'outside_allowed_roots',
+        }],
+      }]),
+    }));
+    expect(message.parts[0]).toMatchObject({
+      kind: 'media', mediaType: 'image', src: null, uri: undefined,
+      unavailable: true, unavailableReason: 'outside_allowed_roots',
+    });
+  });
+
+  it('carries dimensions and keeps http archive locators renderable', () => {
+    const [message] = llmMessages(span({
+      'gen_ai.input.messages': JSON.stringify([{
+        role: 'user',
+        parts: [{
+          type: 'image', mime_type: 'image/jpeg', filename: 'sheet.jpg',
+          uri: 'http://127.0.0.1:8000/trace-media/ab/cd.jpg',
+          archive_status: 'archived', width: 960, height: 540,
+        }],
+      }]),
+    }));
+    expect(message.parts[0]).toMatchObject({
+      kind: 'media', src: 'http://127.0.0.1:8000/trace-media/ab/cd.jpg', width: 960, height: 540,
+    });
+  });
+
+  it('never pours an opaque blob into the transcript as a reference', () => {
+    // Not base64 (bad charset), not a URI (no scheme): the one honest answer
+    // is the chrome with no body, NOT thousands of junk characters.
+    const blob = ('&*^%$#@!'.repeat(4000));
+    const [message] = llmMessages(span({
+      'gen_ai.input.messages': JSON.stringify([{
+        role: 'user',
+        parts: [{ type: 'image', mime_type: 'image/png', data: blob }],
+      }]),
+    }));
+    expect(message.parts[0]).toMatchObject({ kind: 'media', src: null, uri: undefined });
+  });
+
+  it('keeps a payload reference when the media bytes were offloaded', () => {
+    // Native ingest can carry the attribute as a real array, not JSON text.
+    const [message] = llmMessages(span({
+      'gen_ai.input.messages': [{
+        role: 'user',
+        parts: [{ type: 'image', mime_type: 'image/png', data: { $payload: 'sha256/def', bytes: 1234 } }],
+      }],
+    }));
+    expect(message.parts[0]).toMatchObject({
+      kind: 'media', mediaType: 'image', src: null,
+      payloadRef: { ref: 'sha256/def', bytes: 1234 },
+    });
   });
 
   it('keeps unparseable content as text rather than dropping it', () => {
     const [message] = llmMessages(span({ 'gen_ai.input.messages': 'not json at all' }));
     expect(message.parts[0]).toEqual({ kind: 'text', text: 'not json at all' });
+  });
+});
+
+describe('base64ToDataUri', () => {
+  it('builds a data: URI from plausible base64 and a MIME type', () => {
+    expect(base64ToDataUri('iVBORw0KGgoAAAANSUhEUg==', 'image/png'))
+      .toBe('data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==');
+  });
+
+  it('tolerates whitespace line-wrapping inside the bytes', () => {
+    expect(base64ToDataUri('iVBORw0KGgo\nAAAANSUhEUg==', 'image/png'))
+      .toBe('data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==');
+  });
+
+  it('refuses words, short strings, and non-base64 blobs', () => {
+    expect(base64ToDataUri('summary', 'audio/wav')).toBeNull();     // too short
+    expect(base64ToDataUri('not base64 at all, clearly!!', 'x')).toBeNull();
+    expect(base64ToDataUri('AAAA'.repeat(4) + 'A', 'x')).toBeNull(); // bad padding
+  });
+
+  it('falls back to octet-stream when the MIME is unknown', () => {
+    expect(base64ToDataUri('AAAA'.repeat(5), undefined))
+      .toBe('data:application/octet-stream;base64,' + 'AAAA'.repeat(5));
+  });
+});
+
+describe('parseLoadedMessages', () => {
+  it('parses a fetched messages payload into renderable turns', () => {
+    const text = JSON.stringify([
+      { role: 'assistant', parts: [
+        { type: 'text', content: 'Here.' },
+        { type: 'audio', mime_type: 'audio/wav', data: 'data:audio/wav;base64,AAAA' },
+      ], finish_reason: 'stop' },
+    ]);
+    const messages = parseLoadedMessages(text, 'completion');
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toMatchObject({ direction: 'completion', role: 'assistant', finishReason: 'stop' });
+    expect(messages[0].parts[1]).toMatchObject({ kind: 'media', mediaType: 'audio', src: 'data:audio/wav;base64,AAAA' });
+  });
+
+  it('returns null for non-JSON, scalars, and empty bodies', () => {
+    expect(parseLoadedMessages('a plain prompt body', 'prompt')).toBeNull();
+    expect(parseLoadedMessages('42', 'prompt')).toBeNull();
+    expect(parseLoadedMessages('[]', 'prompt')).toBeNull();
+    expect(parseLoadedMessages('', 'prompt')).toBeNull();
+    expect(parseLoadedMessages('[1, 2]', 'prompt')).toBeNull();
+  });
+});
+
+describe('toolResultParts', () => {
+  it('unpacks an MCP-style content list that carries media', () => {
+    const parts = toolResultParts({ content: [
+      { type: 'text', text: 'Screenshot captured.' },
+      { type: 'image', mimeType: 'image/png', data: 'iVBORw0KGgoAAAANSUhEUg==' },
+    ] });
+    expect(parts).toHaveLength(2);
+    expect(parts[0]).toEqual({ kind: 'text', text: 'Screenshot captured.' });
+    expect(parts[1]).toMatchObject({ kind: 'media', mediaType: 'image', src: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==' });
+  });
+
+  it('accepts a bare array as well as {content: […]}', () => {
+    expect(toolResultParts([{ type: 'image', mimeType: 'image/png', data: 'iVBORw0KGgoAAAANSUhEUg==' }]))
+      .toHaveLength(1);
+  });
+
+  it('stays null for plain values, so JSON results render as JSON', () => {
+    expect(toolResultParts('done')).toBeNull();
+    expect(toolResultParts({ ok: true })).toBeNull();
+    expect(toolResultParts({ content: [{ type: 'text', text: 'no media here' }] })).toBeNull();
+    expect(toolResultParts([])).toBeNull();
   });
 });
 

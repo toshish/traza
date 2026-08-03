@@ -118,6 +118,37 @@ panel:
 All round-trip verbatim through `/v1/spans` and OTLP ingest. Large content is
 offloaded at ingest (below), so it never bloats the attribute index.
 
+### Media parts
+
+Within a messages array, the dashboard renders media parts across the
+spellings emitters actually produce — images inline, audio and video with
+players, documents and object-store locators as downloadable references:
+
+- **OTel GenAI / Traza native** — `{"type": "image"|"audio"|"video"|
+  "document"|"file", "mime_type": …, "data": <data: URI or bare base64>,
+  "uri"|"url": …, "filename": …, "size_bytes": …, "width"/"height": …}`;
+- **OpenAI** — `{"type": "image_url", "image_url": {"url": …}}`,
+  `{"type": "input_audio", "input_audio": {"data": …, "format": "wav"|"mp3"}}`,
+  and `{"type": "file", "file": {"filename": …, "file_data"|"file_id": …}}`;
+- **Anthropic** — `{"type": "image"|"document", "source": {"type":
+  "base64"|"url"|"file", "media_type": …, "data"|"url"|"file_id": …}}`;
+- **Google GenAI** — typeless parts carrying `inline_data`/`inlineData`
+  (`{"mime_type": …, "data": …}`) or `file_data`/`fileData`
+  (`{"mime_type": …, "file_uri": …}`);
+- **Tool results** — an MCP-style `{"content": [ …parts… ]}` list inside a
+  `tool_call_response`/`tool_result` part renders its parts, screenshots
+  included.
+
+Bare base64 bytes are lifted into `data:` URIs using the declared MIME type;
+`data:`/`http(s):` sources render in place; `s3://`, `gs://` and other
+non-fetchable locators stay references with a copy affordance. A part whose
+bytes the emitter declined to capture (`capture_status`/`archive_status`
+`"unavailable"`) says so, with the emitter's `unavailable_reason`. A whole
+messages attribute past the offload threshold arrives as a payload
+reference; the conversation view fetches small ones back automatically (and
+larger ones on demand) and renders the parsed turns, so offloading never
+demotes media to a JSON dump.
+
 ## Query recipes
 
 All spans for one model (index-served attribute filter):

@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The dashboard now renders trace media wherever the trace actually put
+  it, instead of only the one lucky shape it recognized before.** Found via
+  a production vision-review trace whose image showed as an empty frame: the
+  conversation view understood only `data:`/`http(s):` strings in a part's
+  `data`/`uri`/`url`, which missed most real emitters and — worse — poured
+  every other locator into the transcript as text (a bare-base64 screenshot
+  rendered as eight thousand lines of base64). The messages panel and the
+  trace inspector's payload modal now recognize, with tests: bare-base64
+  `data` lifted into a `data:` URI via the declared MIME type; Anthropic
+  `source.{base64,url,file}` parts; Google GenAI typeless `inline_data` /
+  `file_data` parts; OpenAI `input_audio`, `image_url`-object, and `file`
+  parts; MCP-style tool-result content lists (screenshots included);
+  `width`/`height` metadata; and parts whose bytes were never captured,
+  which now say so with the emitter's `unavailable_reason` instead of
+  presenting an empty frame that reads as a rendering bug.
+- **Offloading no longer demotes media to a JSON dump.** A
+  `gen_ai.{input,output}.messages` attribute past `--payload-threshold-bytes`
+  becomes a payload reference, and the old conversation view could only show
+  it as preview text — "load full" printed the raw JSON, megabytes of base64
+  included. The payload body is the original messages JSON, so the
+  conversation view now fetches it back (automatically up to 4 MiB, when the
+  turn nears the viewport; on demand above that, content-addressed and cached
+  across screens) and renders the parsed turns — an offloaded text-to-speech
+  span plays its audio again. The trace inspector's payload modal gained the
+  same understanding: message payloads render as turns, media payloads as
+  media, anything else as code, with the literal bytes one `raw` toggle away.
+
 ## [0.21.0] - 2026-07-31
 
 ### Added
