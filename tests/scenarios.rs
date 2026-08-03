@@ -368,9 +368,18 @@ fn multimodal_messages_keep_their_media_descriptors() {
                         part.get("mime_type").is_some() && part.get("size_bytes").is_some(),
                         "a media part must describe itself: {part}"
                     );
+                    // Bytes, a locator, or a stated reason for having neither:
+                    // the corpus deliberately carries a part whose bytes the
+                    // emitter never captured, and the dashboard renders that
+                    // absence with its reason. What stays forbidden is a part
+                    // that is silently blank.
+                    let unavailable = part["capture_status"].as_str() == Some("unavailable")
+                        || part["archive_status"].as_str() == Some("unavailable");
                     assert!(
-                        part.get("uri").is_some() || part.get("data").is_some(),
-                        "a media part must carry a locator or inline data: {part}"
+                        part.get("uri").is_some()
+                            || part.get("data").is_some()
+                            || (unavailable && part.get("unavailable_reason").is_some()),
+                        "a media part must carry a locator, inline data, or say why it has neither: {part}"
                     );
                 }
             }
