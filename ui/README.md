@@ -1,9 +1,9 @@
 # Traza dashboard (ui/)
 
-The trace browser: a React + Vite app built to the Traza design system
-(tokens and components imported from the "Traza Design System" project on
-claude.ai/design). It is a single-page app that talks to a `traza-server`
-JSON API.
+The trace browser: a React + Vite app built to the Traza design system —
+the design tokens and component styles live in
+[`src/styles.css`](src/styles.css). It is a single-page app that talks to a
+`traza-server` JSON API.
 
 `npm run build` emits `dist/` — one self-contained `index.html` — and
 `traza-server` **serves that directory** (`--ui-dir`, default `./ui/dist`).

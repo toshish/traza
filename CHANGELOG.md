@@ -132,7 +132,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A storage-cost benchmark (`storage-bench`) and an honest comparison
   against OpenObserve's published table**
   ([docs/storage-comparison.md](docs/storage-comparison.md),
-  [STORAGE-BENCHMARK.md](STORAGE-BENCHMARK.md)): the same eight metrics
+  [STORAGE-BENCHMARK.md](docs/benchmarks/storage.md)): the same eight metrics
   OpenObserve computes against Elasticsearch, measured for Traza's segment
   format, including the configurations where Traza loses the comparison and
   why.
