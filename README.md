@@ -60,7 +60,7 @@ Most tracing backends make you assemble a fleet before the first span: a column 
 - **Scale by adding nodes, not systems.** The engine's foundations — immutable segments, idempotent primary-key ingest, journaled compaction — were chosen to replicate. The [HA design](docs/ha-design.md) (quorum-replicated logical log, validated full-state snapshots for catch-up) is the committed trajectory. Today's scope is single-node; see [Status](#status-and-roadmap).
 - **Built for LLM and agent workloads.** Sessions, token and cost analytics, prompt/completion capture with large-payload offloading, post-hoc evals and feedback, and one-command dataset export — first-class, not bolted on.
 - **OpenTelemetry-compatible, OpenLLMetry-native.** Point any OTel SDK at it with two environment variables. Traza follows the [OpenLLMetry](https://github.com/traceloop/openllmetry) standard (`gen_ai.*` / `traceloop.*`), so instrumented apps get sessions and token/cost analytics with no attribute renaming.
-- **Small enough to trust.** Two direct dependencies; HTTP, threading, and file I/O are the Rust standard library. `#![forbid(unsafe_code)]`. Every performance number is measured by a bundled benchmark, never estimated.
+- **Small enough to trust.** Two direct dependencies; HTTP, threading, and file I/O are the Rust standard library. `#![forbid(unsafe_code)]`. The budget is paid for in the open: the SHA-256 behind content-addressed payloads is implemented in-crate against the FIPS 180-4 test vectors and is never used for authentication or tamper-proofing, and the 128-bit index hash is not a cryptographic commitment — every index probe is re-verified against the stored record. Every performance number is measured by a bundled benchmark, with anything extrapolated marked as such.
 - **Crash-safe by construction.** Immutable segments written by write-temp, fsync, atomic rename; recovery loads only complete segments and heals crash artifacts.
 
 ## What it does
@@ -141,7 +141,7 @@ Deeper: [architecture](docs/internals/architecture.md) · [invariants](docs/inte
 
 Measured on macOS/aarch64 (10 hardware threads) by the bundled benchmarks over corpora ingested through the real HTTP path:
 
-- **Sustained ingest:** 116,618 spans/s single client, 208,973 spans/s at 16 concurrent clients (`wal`)
+- **Sustained ingest:** 208,973 spans/s at 16 concurrent clients in `wal` mode, measured on an idle machine ([ingest.md](docs/benchmarks/ingest.md)); the single-client canonical record predates the 0.20 compaction rework and is queued for re-measurement
 - **Trace lookup:** p95 0.64 ms · **Attribute-filtered search:** p95 3.3 ms (1M-span corpus)
 - **Compaction is worth 16–28x on filtered search at 100M spans**, and the segment-size cap is worth another 3–4x on top — at a real cost in memory and ingest throughput
 
@@ -165,4 +165,4 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). The short version: stable Rust is the on
 
 ## License
 
-Licensed under the [Apache License, Version 2.0](LICENSE). Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be licensed as above, without any additional terms or conditions.
+Copyright © 2026 Toshish Jawale. Licensed under the [Apache License, Version 2.0](LICENSE). Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be licensed as above, without any additional terms or conditions.

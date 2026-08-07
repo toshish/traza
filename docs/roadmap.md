@@ -35,69 +35,30 @@ attribute convention bolted onto a request tracer. The product wins when:
   Features can be added; identity cannot be retrofitted.
 - **Small enough to audit.** Dependencies are budgeted, not vibes-based.
 
-## Where Traza stands (baseline, v0.16)
+## Where Traza stands (baseline, v0.21)
 
 Shipped and load-bearing: durable segment engine (immutable indexed
-segments, crash recovery, journaled TTL compaction, larger-than-RAM
-file-backed reads), primary-key idempotent ingest, OTLP/HTTP protobuf+JSON,
-sessions and token/cost analytics, content-addressed payload offloading,
-append-only annotations, streaming NDJSON export with integrity trailers,
-bearer auth with scopes, safe bind defaults, a standalone trace-browser UI,
-an embedded MCP server (`--mcp`) so an agent can read the store it wrote,
-measured benchmarks (116k spans/s ingest; sub-ms trace lookup at 10M spans).
+segments, crash recovery, journaled TTL compaction, size-tiered compaction,
+larger-than-RAM file-backed reads), a write-ahead log with group commit and
+three explicit durability modes (`wal` the default), primary-key idempotent
+ingest, OTLP/HTTP protobuf+JSON, sessions and token/cost analytics answered
+from persisted rollups, content search, content-addressed payload
+offloading, append-only annotations, streaming NDJSON export with integrity
+trailers, live tail over SSE, bearer auth with scopes, safe bind defaults,
+Prometheus metrics, a standalone trace-browser UI, and an embedded MCP
+server (`--mcp`) so an agent can read the store it wrote.
 
-**Known gap that shapes Phase 1:** `POST /v1/spans` acknowledges after the
-write buffer accepts the batch, and durability begins at segment flush. A
-crash can therefore lose acknowledged writes (bounded by `--flush-spans`).
-This is documented in the README and is *not* a production durability
-contract. Closing it is the first item below.
+**Known gap that shapes Phase 1:** query-visible state lives in several
+independent recovery domains — the write-ahead log and buffer, segments,
+annotations, payload files — and nothing yet names one state they all agree
+on, so backup, export, retention and deletion are four mechanisms rather
+than one. The generation/checkpoint boundary that closes the class is
+designed in [generations-design.md](generations-design.md) and lands in
+§1.5, before 1.0.
 
-Also not yet: replication/HA, query language, columnar analytics at
-billion-span scale, tenancy, RBAC/SSO, targeted deletion, encryption at
-rest, tail sampling, content search, an eval entity model, packaged
-releases.
-
-## What production users expect in 2026 (research summary)
-
-From surveying the current state of the art — general trace backends
-(Grafana Tempo, ClickHouse-based stacks, VictoriaTraces, Jaeger v2) and
-LLM/agent platforms (Langfuse, LangSmith, Braintrust, Arize Phoenix, W&B
-Weave, Opik, AgentOps, Laminar):
-
-- **The market supports the thesis.** ClickHouse
-  [acquired Langfuse](https://clickhouse.com/blog/clickhouse-acquires-langfuse-open-source-llm-observability)
-  (Jan 2026), pairing the leading open-source LLM observability platform
-  with a columnar database vendor. Braintrust built
-  [Brainstore](https://www.braintrust.dev/blog/brainstore-architecture), a
-  purpose-built AI-log database: a single Rust binary whose segments carry
-  a row store, an inverted index, and a column store, with an
-  object-storage WAL and a tiered read merge — but requiring Postgres for
-  metadata and Redis for locks. Both data points say LLM observability at
-  scale is a database problem. Traza's differentiation is being that
-  database with no external control plane.
-- **Eval-first is the workflow bar, not a feature.** The Braintrust loop —
-  datasets of examples, task runs, scorers, experiments diffing score
-  distributions, failing production traces promoted into regression
-  datasets — is what serious AI teams now mean by observability. A trace
-  store that cannot represent experiments, dataset versions, and scores as
-  queryable records is substrate for someone else's product. *This roadmap
-  therefore treats a minimal eval model as a 1.0 requirement, not a later
-  phase.*
-- **Columnar + object storage is a proven scale architecture.** Tempo
-  writes [Parquet blocks to object storage](https://grafana.com/docs/tempo/latest/reference-tempo-architecture/block-format/);
-  ClickHouse stacks query wide events in LSM columnar storage. Row storage
-  wins lookup, columnar projections win analytics, object tiering wins cost.
-- **Agent models are outgrowing "a list of LLM calls."** The 2026
-  differentiators are session/goal-level outcomes, multi-agent step graphs,
-  time-travel replay, loop/runaway detection, and evals wired to production
-  traces.
-- **OTel GenAI conventions are coming but unstable.** `gen_ai.*` semantics
-  remain in [Development status](https://opentelemetry.io/docs/specs/semconv/configuration/version-selection/);
-  attribute names may still change. The durable strategy is dual-dialect:
-  accept and normalize both OTel GenAI and native conventions.
-- **Enterprise table stakes are unchanged:** tenancy, RBAC, SSO, audit
-  logs, PII controls, retention tiers, sampling, export **and deletion** on
-  demand. Their *administration* can ship late; their *identity* cannot.
+Not yet: replication/HA, query language, columnar analytics at billion-span
+scale, tenancy, RBAC/SSO, targeted deletion, encryption at rest, tail
+sampling, an eval entity model, packaged releases.
 
 ---
 
@@ -217,16 +178,16 @@ would be a planning failure.
 
 ### 1.4 Operability and release engineering
 
-- **Agent-facing read surface (MCP)** — **shipped**, and deliberately scoped as
-  a facade rather than a differentiator. It is table stakes: the LLM
-  observability field is converging on shipping one, so its absence would be
-  noticed while its presence wins nothing. It cost no engine change and no
-  dependency, and it must not be allowed to grow into the budget that §1.3's
-  eval model and §1.5's generation boundary need. The one part of it that could
-  genuinely lead is the untrusted-content boundary — stored spans carry
-  attacker-written text, and handing that to a tool-holding model is a confused
-  deputy nobody in this category has handled well. See
-  [the MCP guide](guide/mcp.md).
+- **Agent-facing read surface (MCP)** — **shipped**, and deliberately scoped
+  as a facade over the read path the engine already has. It cost no engine
+  change and no dependency, and it must not be allowed to grow into the
+  budget that §1.3's eval model and §1.5's generation boundary need. The part
+  built with the most care is the untrusted-content boundary: stored spans
+  carry attacker-written text, and handing that text to a tool-holding model
+  is a confused deputy by construction — so span text returns only inside a
+  block marked untrusted, never reaches a tool description or an error
+  message, and the server holds no fetcher, shell, or outbound path for an
+  injected instruction to actuate. See [the MCP guide](guide/mcp.md).
 
 - **HTTP/1.1 keep-alive + gzip.** Per-request TCP handshakes cap the ingest
   path. (gRPC stays out; `http/protobuf` covers OTel SDKs.)
@@ -235,6 +196,10 @@ would be a planning failure.
 - **OTel GenAI dialect normalization.** Ingest-time mapping of `gen_ai.*`
   (agent spans, tool calls, content events, MCP attributes) onto native
   conventions; dual-dialect queries so either vocabulary finds the data.
+  The `gen_ai.*` conventions remain in
+  [Development status](https://opentelemetry.io/docs/specs/semconv/configuration/version-selection/)
+  and attribute names may still change; dual-dialect normalization is the
+  hedge that keeps an upstream rename from stranding stored data.
 - **Prometheus `/metrics`.** Ingest rate, WAL fsync latency, queue depth,
   flush latency, segment counts, query latency histograms, payload store
   size, compaction progress, durability mode.
@@ -568,10 +533,9 @@ these features need was reserved in v1; this phase adds administration.*
   metrics TSDB, no general log storage. (Full-text search over *trace
   content* is in scope; indexing an application log firehose is not.)
 - **No mandatory external control plane.** No metadata database, no lock
-  service, no coordinator required beside the binary — the constraint that
-  distinguishes Traza from otherwise-similar engines that lean on Postgres
-  and Redis. Optional data-plane tiers the operator already owns are a
-  different thing and are explicitly allowed.
+  service, no coordinator required beside the binary. Optional data-plane
+  tiers the operator already owns are a different thing and are explicitly
+  allowed.
 - **Not an eval model host.** Traza orchestrates eval loops and stores
   verdicts; it never runs or embeds judge models.
 - **Not a SQL engine.** The DSL stays small and purpose-built.
