@@ -139,7 +139,7 @@ jobs:
           echo "$body" | grep -q '"accepted":1' || { echo "ingest failed: $body"; exit 1; }
           echo "$got" | grep -q '"span_id":"s1"' || { echo "read-back failed: $got"; exit 1; }
           echo "smoke ok: dashboard 200, span accepted and read back"
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@v3
         with:
           subject-path: "traza-*.tar.gz"
       - uses: actions/upload-artifact@v4
