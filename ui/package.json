@@ -21,7 +21,7 @@
     "jsdom": "^29.1.1",
     "vite": "^7.2.4",
     "vite-plugin-singlefile": "^2.3.0",
-    "vitest": "^3.2.7"
+    "vitest": "^4.1.10"
   },
   "engines": {
     "node": ">=22"
