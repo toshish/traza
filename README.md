@@ -1,8 +1,30 @@
 # Traza
 
+[![CI](https://github.com/toshish/traza/actions/workflows/ci.yml/badge.svg)](https://github.com/toshish/traza/actions/workflows/ci.yml)
+
 **A trace datastore with first-class LLM and agent observability — one binary from laptop to cluster.**
 
 Traza (Spanish for "trace") ingests OpenTelemetry or plain-JSON spans over HTTP, stores them durably, and answers trace lookups, filtered searches, and token/cost analytics in milliseconds — with a trace browser and no infrastructure to stand up. Two dependencies (`serde`, `serde_json`), no external database, and one deployment story at every size: today a single node that starts in milliseconds; the designed trajectory is replicated, highly available clusters of the same binary.
+
+## Install
+
+Grab a [release](https://github.com/toshish/traza/releases) — the server binary with the dashboard already built, no Rust or Node needed. `macos-aarch64` below; `linux-x86_64` and `linux-aarch64` archives are named likewise (musl-static, so any distribution works):
+
+```sh
+curl -LO https://github.com/toshish/traza/releases/download/v0.22.0/traza-0.22.0-macos-aarch64.tar.gz
+tar xzf traza-0.22.0-macos-aarch64.tar.gz && cd traza-0.22.0-macos-aarch64
+./traza-server --data-dir ./data --port 8080
+# open http://localhost:8080
+```
+
+Or the container — `FROM scratch`, nothing in it but the binary and the dashboard. The non-loopback bind refuses to start without a token, so pass one:
+
+```sh
+docker run -p 8080:8080 -v traza-data:/data \
+  -e TRAZA_TOKENS="rw:$(openssl rand -hex 16)" ghcr.io/toshish/traza:v0.22.0
+```
+
+Or from source (`cargo install traza` for the crate, or the full tree with the dashboard):
 
 ```sh
 cargo build --release
@@ -10,6 +32,8 @@ cargo build --release
 ./target/release/traza-server --data-dir ./data --port 8080
 # open http://localhost:8080 — the server serves ui/dist
 ```
+
+Release archives carry `SHA256SUMS` and GitHub build-provenance attestations: `gh attestation verify traza-*.tar.gz --repo toshish/traza`.
 
 ```sh
 curl -X POST http://localhost:8080/v1/spans -H 'Content-Type: application/json' \

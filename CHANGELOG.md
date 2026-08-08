@@ -5,7 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.22.0] - 2026-08-07
+
+### Added
+
+- **An install, not a build.** Tagged releases now ship what the README used
+  to ask you to compile:
+  `traza-<version>-{linux-x86_64,linux-aarch64,macos-aarch64}.tar.gz`, each
+  carrying the `traza-server` binary (musl-static on Linux — no libc to
+  match) with the dashboard already built in `ui/dist`, alongside
+  `SHA256SUMS` and GitHub build-provenance attestations
+  (`gh attestation verify`). The same binaries become the container image,
+  `ghcr.io/toshish/traza`, built `FROM scratch` — an engine with two
+  dependencies does not need a distribution underneath it. A non-loopback
+  bind still refuses to start without `TRAZA_TOKENS`, in the container as
+  anywhere else. The tag also publishes to crates.io when the registry
+  token is present.
+- **The merge bar runs in public.** `./ci.sh` — the same script, no drift —
+  now runs on Linux and macOS for every push and pull request, and the
+  README carries the badge. Until this release the script had only ever
+  gated one platform: the laptop it was written on.
 
 ### Fixed
 
@@ -80,6 +99,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   repetition and some restated prose are gone. Every semantic warning stays —
   word-not-substring, status-is-not-an-attribute, a missing key is kept, and
   the ranking ceiling that sends a caller to `slowest_spans`.
+
+- **The published history was rewritten once, before the repository went
+  public**, to remove an internal live-deployment analysis that had no
+  business in a public tree. Tags `v0.1.0` through `v0.20.0` are
+  bit-identical to the private originals; commits from the `v0.21.0`
+  release onward carry new hashes. Stated here because a lineage that
+  quietly changed under its tags would be worse than one that says so.
 
 ## [0.21.0] - 2026-07-31
 
@@ -1772,7 +1798,7 @@ completion trailers — clients parsing either surface must update.
 
 - This is an initial 0.1 release; consult README.md for the currently documented operational constraints and unsupported use cases.
 
-[Unreleased]: https://github.com/toshish/traza/compare/v0.21.0...HEAD
+[0.22.0]: https://github.com/toshish/traza/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/toshish/traza/releases/tag/v0.21.0
 [0.20.0]: https://github.com/toshish/traza/releases/tag/v0.20.0
 [0.19.0]: https://github.com/toshish/traza/releases/tag/v0.19.0

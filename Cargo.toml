@@ -4,11 +4,12 @@ resolver = "2"
 
 [package]
 name = "traza"
-version = "0.21.0"
+version = "0.22.0"
 edition = "2021"
 rust-version = "1.70"
 description = "Single-binary trace datastore with first-class LLM/agent observability: OTLP ingest, sessions, token/cost analytics, and a built-in dashboard"
 license = "Apache-2.0"
+exclude = ["/ui", "/.github", "/Dockerfile", "/Dockerfile.release"]
 
 repository = "https://github.com/toshish/traza"
 homepage = "https://github.com/toshish/traza"
