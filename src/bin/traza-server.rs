@@ -509,7 +509,7 @@ default 32MiB)] \
 [--mcp-max-result-bytes N (default 32768)] [--mcp-max-payload-bytes N (default 262144)] \
 [--mcp-allowed-origin ORIGIN (repeatable; browser origins allowed to drive /v1/mcp \
 besides loopback)] \
-[--allow-unauthenticated-non-loopback]\n\
+[--allow-unauthenticated-non-loopback] [--version]\n\
        traza-server mcp --url URL [--token TOKEN] \
 (stdio bridge: speaks MCP on stdin/stdout and forwards to a running server)";
 
@@ -718,6 +718,10 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
             }
             "--help" | "-h" => {
                 println!("{USAGE}");
+                return Ok(None);
+            }
+            "--version" | "-V" => {
+                println!("traza-server {}", env!("CARGO_PKG_VERSION"));
                 return Ok(None);
             }
             other => return Err(format!("unknown argument: {other}")),
@@ -2970,6 +2974,16 @@ mod tests {
     fn help_parses_to_nothing_to_run() {
         assert!(parse_args(&["--help".to_owned()])
             .expect("help is not an error")
+            .is_none());
+    }
+
+    #[test]
+    fn version_parses_to_nothing_to_run() {
+        assert!(parse_args(&["--version".to_owned()])
+            .expect("version is not an error")
+            .is_none());
+        assert!(parse_args(&["-V".to_owned()])
+            .expect("version is not an error")
             .is_none());
     }
 }

@@ -5,6 +5,48 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.22.1] - 2026-08-07
+
+### Fixed
+
+- **The release archive's dashboard now sits where the server actually
+  probes.** v0.22.0 packaged the UI at `ui/dist` inside the archive, but
+  the binary-relative search — the packaging convention the source itself
+  documents — looks for `<binary dir>/ui`. Launched from inside the
+  extracted directory, the working-directory fallback hid the bug; launched
+  from anywhere else, `/` was a 404. The archive now places the build at
+  `ui/`, and every release archive is smoke-tested **from an unrelated
+  working directory** — dashboard 200, span accepted and read back —
+  before anything publishes, so this class of bug cannot ship twice.
+- **The README's container quickstart no longer discards the token it
+  mints.** The old one-liner generated `TRAZA_TOKENS` inline, so the server
+  started and the reader had no way into their own dashboard. The token now
+  lands in a shell variable and is echoed before use.
+
+### Added
+
+- **`--version` / `-V`** on `traza-server`, printing the crate version.
+- **Third-party notices ship with the artifacts.** Release archives and
+  container images now carry `THIRD_PARTY_NOTICES.md`: the MIT and OFL
+  material for React, Inter and JetBrains Mono in the dashboard build, and
+  the dual-licensed Rust crates linked into the binary.
+- **The release pipeline fails closed.** A preflight job refuses a tag
+  whose version disagrees with `Cargo.toml`, `ui/package.json`, or this
+  file, and runs the full `./ci.sh` gate on the tagged commit before
+  anything builds; the crates.io job fails loudly when the registry token
+  is absent instead of skipping green. A new CI job checks the crate on
+  Rust 1.70, holding `rust-version` to being true rather than advertised.
+- **`SECURITY.md`** (private vulnerability reporting, supported versions,
+  and the threat model in one paragraph), a code of conduct, issue and PR
+  templates, and Dependabot coverage for Cargo, npm, and GitHub Actions.
+
+### Changed
+
+- **The container runs as uid 65534**, with `/data` shipped owned by that
+  uid so a named volume inherits it — a bind-mounted data directory must be
+  writable by 65534 — and images carry OCI source, version, and license
+  labels.
+
 ## [0.22.0] - 2026-08-07
 
 ### Added
@@ -1798,6 +1840,7 @@ completion trailers — clients parsing either surface must update.
 
 - This is an initial 0.1 release; consult README.md for the currently documented operational constraints and unsupported use cases.
 
+[0.22.1]: https://github.com/toshish/traza/compare/v0.22.0...v0.22.1
 [0.22.0]: https://github.com/toshish/traza/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/toshish/traza/releases/tag/v0.21.0
 [0.20.0]: https://github.com/toshish/traza/releases/tag/v0.20.0

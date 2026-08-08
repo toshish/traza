@@ -1,7 +1,8 @@
 # Benchmarking
 
-Four benchmarks, four jobs. All build and drive the **real** release server
-over its real HTTP path; none estimates anything.
+Six benchmarks, six jobs. All build and drive the **real** release server
+over its real HTTP path (or the engine directly, where the question is about
+the engine); none estimates anything.
 
 | Binary | Answers | Writes |
 |---|---|---|
@@ -9,6 +10,8 @@ over its real HTTP path; none estimates anything.
 | `ingest-bench` | "Where does ingest throughput actually go?" — a matrix over protocol, keep-alive, concurrency, and durability | [`ingest.md`](../benchmarks/ingest.md) |
 | `storage-bench` | "How many bytes on disk per byte ingested, and what does that cost?" | [`storage.md`](../benchmarks/storage.md) |
 | `query-bench` | "What does a dashboard's aggregation cost — cold, and while the store is being written to?" | [`query.md`](../benchmarks/query.md) |
+| `index-mem-bench` | "What does the resident attribute index cost in RAM as values grow?" | [`index-memory.md`](../benchmarks/index-memory.md) and `.json` |
+| `content-bench` | "What does the content index cost on disk and in RAM, and what does a probe save?" | no committed record; its figures are quoted with context in [capacity](../operations/capacity.md) |
 
 None is part of [`./ci.sh`](../../ci.sh). Run them when a change could
 plausibly move performance or on-disk size.

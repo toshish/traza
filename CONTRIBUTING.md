@@ -16,7 +16,7 @@ The dashboard is a separate build artifact, never compiled into the binary — t
 
 ## The CI gate
 
-`./ci.sh` is the whole CI story and the merge bar — there is no GitHub Actions workflow. It runs in order and fails fast:
+`./ci.sh` is the merge bar, and GitHub Actions runs exactly it — the same script on Linux and macOS ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)), so there is nothing CI checks that a laptop cannot. It runs in order and fails fast:
 
 ```sh
 # source hygiene: no tracked source file may contain a literal NUL byte

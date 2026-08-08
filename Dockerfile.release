@@ -3,10 +3,21 @@
 # so the multi-arch image ships the exact bytes the archives ship. Build from
 # source with ./Dockerfile instead.
 
+FROM alpine:3.20 AS prep
+RUN mkdir /data && chown 65534:65534 /data
+
 FROM scratch
 ARG TARGETARCH
+ARG VERSION=dev
+LABEL org.opencontainers.image.source="https://github.com/toshish/traza" \
+      org.opencontainers.image.description="Trace datastore with first-class LLM and agent observability — one binary" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.version="${VERSION}"
 COPY stage/${TARGETARCH}/traza-server /traza-server
 COPY stage/ui-dist /ui/dist
+COPY LICENSE NOTICE THIRD_PARTY_NOTICES.md /
+COPY --from=prep --chown=65534:65534 /data /data
+USER 65534:65534
 VOLUME /data
 EXPOSE 8080
 ENTRYPOINT ["/traza-server", "--data-dir", "/data", "--host", "0.0.0.0", "--ui-dir", "/ui/dist"]

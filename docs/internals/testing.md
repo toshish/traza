@@ -135,8 +135,10 @@ own temporary data directory, because a data directory has exactly one writer.
 
 ## The gate
 
-[`./ci.sh`](../../ci.sh) is the whole CI story — there is no GitHub Actions
-workflow. It must be green before a change is finished. It runs, in order:
+[`./ci.sh`](../../ci.sh) is the gate, and GitHub Actions runs exactly it on
+Linux and macOS ([`ci.yml`](../../.github/workflows/ci.yml)) — the same
+script, no drift. It must be green before a change is finished. It runs, in
+order:
 
 1. **Source hygiene** — no tracked source file may contain a literal NUL byte.
    A NUL makes git treat a file as binary: its diff disappears from review and
