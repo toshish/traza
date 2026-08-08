@@ -4,6 +4,13 @@ name: Release
 # static server binary and the dashboard's build output, a multi-arch
 # container image built from the same binaries, checksums, and build
 # provenance. Linux binaries are musl-static so there is no libc to match.
+#
+# The pipeline fails closed. Preflight refuses a tag whose version disagrees
+# with Cargo.toml, ui/package.json, or the CHANGELOG, and runs the full
+# ./ci.sh gate on the tagged commit. Every archive is smoke-tested from an
+# UNRELATED working directory before anything publishes — v0.22.0 shipped a
+# dashboard 404 that only appeared when launched from elsewhere, and this
+# step exists so that class of bug cannot ship twice.
 
 on:
   push:
@@ -16,8 +23,35 @@ permissions:
   attestations: write
 
 jobs:
+  preflight:
+    name: Version agreement + the full gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: The tag names one version, everywhere
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          cargo_v=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          ui_v=$(python3 -c 'import json; print(json.load(open("ui/package.json"))["version"])')
+          fail=0
+          [ "$version" = "$cargo_v" ] || { echo "tag ${version} != Cargo.toml ${cargo_v}"; fail=1; }
+          [ "$version" = "$ui_v" ] || { echo "tag ${version} != ui/package.json ${ui_v}"; fail=1; }
+          grep -q "^## \[${version}\]" CHANGELOG.md || { echo "CHANGELOG.md has no [${version}] section"; fail=1; }
+          exit $fail
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Run the merge bar on the tagged commit
+        run: ./ci.sh
+
   ui:
     name: Build the dashboard once
+    needs: preflight
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -73,16 +107,38 @@ jobs:
         with:
           name: ui-dist
           path: ui-dist
-      - name: Assemble the archive
+      - name: Assemble the archive (dashboard at ui/, the packaging convention the server probes)
         run: |
           version="${GITHUB_REF_NAME#v}"
           pkg="traza-${version}-${{ matrix.name }}"
-          mkdir -p "stage/${pkg}/ui"
+          mkdir -p "stage/${pkg}"
           cp "target/${{ matrix.target }}/release/traza-server" "stage/${pkg}/"
-          cp -R ui-dist "stage/${pkg}/ui/dist"
-          cp README.md LICENSE NOTICE CHANGELOG.md "stage/${pkg}/"
+          cp -R ui-dist "stage/${pkg}/ui"
+          cp README.md LICENSE NOTICE THIRD_PARTY_NOTICES.md CHANGELOG.md "stage/${pkg}/"
           tar -C stage -czf "${pkg}.tar.gz" "${pkg}"
           shasum -a 256 "${pkg}.tar.gz"
+      - name: Smoke-test the archive from an unrelated directory
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          pkg="traza-${version}-${{ matrix.name }}"
+          mkdir -p "$RUNNER_TEMP/smoke"
+          tar -C "$RUNNER_TEMP/smoke" -xzf "${pkg}.tar.gz"
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/smoke/${pkg}/traza-server" --data-dir "$RUNNER_TEMP/smoke-data" --port 18123 &
+          server=$!
+          for i in $(seq 1 20); do
+            curl -sf -o /dev/null http://127.0.0.1:18123/v1/stats && break
+            sleep 0.5
+          done
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18123/)
+          body=$(curl -s -X POST http://127.0.0.1:18123/v1/spans -H 'Content-Type: application/json' \
+            -d '[{"trace_id":"smoke","span_id":"s1","name":"smoke","service":"smoke","start_time_unix_nano":1,"end_time_unix_nano":2,"status":"ok"}]')
+          got=$(curl -s http://127.0.0.1:18123/v1/traces/smoke)
+          kill $server
+          [ "$code" = "200" ] || { echo "dashboard did not serve from an unrelated cwd: HTTP $code"; exit 1; }
+          echo "$body" | grep -q '"accepted":1' || { echo "ingest failed: $body"; exit 1; }
+          echo "$got" | grep -q '"span_id":"s1"' || { echo "read-back failed: $got"; exit 1; }
+          echo "smoke ok: dashboard 200, span accepted and read back"
       - uses: actions/attest-build-provenance@v2
         with:
           subject-path: "traza-*.tar.gz"
@@ -130,6 +186,8 @@ jobs:
           file: Dockerfile.release
           platforms: linux/amd64,linux/arm64
           push: true
+          build-args: |
+            VERSION=${{ github.ref_name }}
           tags: |
             ghcr.io/${{ github.repository }}:${{ github.ref_name }}
             ghcr.io/${{ github.repository }}:latest
@@ -169,10 +227,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: cargo publish (skips when no token secret is set)
+      - name: cargo publish — fails closed when the token secret is missing
         run: |
           if [ -z "${CARGO_REGISTRY_TOKEN}" ]; then
-            echo "CARGO_REGISTRY_TOKEN is not set; skipping the crates.io publish."
-            exit 0
+            echo "::error::CARGO_REGISTRY_TOKEN is not set. Every expected release channel must publish;"
+            echo "::error::add the secret (repo Settings → Secrets → Actions) or publish manually with cargo publish."
+            exit 1
           fi
           cargo publish --locked

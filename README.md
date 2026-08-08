@@ -11,20 +11,26 @@ Traza (Spanish for "trace") ingests OpenTelemetry or plain-JSON spans over HTTP,
 Grab a [release](https://github.com/toshish/traza/releases) — the server binary with the dashboard already built, no Rust or Node needed. `macos-aarch64` below; `linux-x86_64` and `linux-aarch64` archives are named likewise (musl-static, so any distribution works):
 
 ```sh
-curl -LO https://github.com/toshish/traza/releases/download/v0.22.0/traza-0.22.0-macos-aarch64.tar.gz
-tar xzf traza-0.22.0-macos-aarch64.tar.gz && cd traza-0.22.0-macos-aarch64
+curl -LO https://github.com/toshish/traza/releases/download/v0.22.1/traza-0.22.1-macos-aarch64.tar.gz
+tar xzf traza-0.22.1-macos-aarch64.tar.gz && cd traza-0.22.1-macos-aarch64
 ./traza-server --data-dir ./data --port 8080
 # open http://localhost:8080
 ```
 
-Or the container — `FROM scratch`, nothing in it but the binary and the dashboard. The non-loopback bind refuses to start without a token, so pass one:
+The macOS binary is not yet notarized: a browser download gets quarantined by
+Gatekeeper (`curl` does not set the flag; `xattr -d com.apple.quarantine
+traza-server` clears it if your download method did).
+
+Or the container — `FROM scratch`, nothing in it but the binary and the dashboard, running as uid 65534. The non-loopback bind refuses to start without a token, so mint one you keep:
 
 ```sh
+TOKEN="rw:$(openssl rand -hex 16)"
+echo "$TOKEN"    # the dashboard and API will ask for this
 docker run -p 8080:8080 -v traza-data:/data \
-  -e TRAZA_TOKENS="rw:$(openssl rand -hex 16)" ghcr.io/toshish/traza:v0.22.0
+  -e TRAZA_TOKENS="$TOKEN" ghcr.io/toshish/traza:v0.22.1
 ```
 
-Or from source (`cargo install traza` for the crate, or the full tree with the dashboard):
+Or from crates.io — `cargo add traza` for the library, `cargo install traza --locked --bin traza-server` for the server — or the full tree with the dashboard:
 
 ```sh
 cargo build --release
@@ -33,7 +39,7 @@ cargo build --release
 # open http://localhost:8080 — the server serves ui/dist
 ```
 
-Release archives carry `SHA256SUMS` and GitHub build-provenance attestations: `gh attestation verify traza-*.tar.gz --repo toshish/traza`.
+Release archives carry `SHA256SUMS`, GitHub build-provenance attestations (`gh attestation verify traza-*.tar.gz --repo toshish/traza`), and third-party license material in `THIRD_PARTY_NOTICES.md`.
 
 ```sh
 curl -X POST http://localhost:8080/v1/spans -H 'Content-Type: application/json' \

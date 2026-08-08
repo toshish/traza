@@ -35,7 +35,7 @@ attribute convention bolted onto a request tracer. The product wins when:
   Features can be added; identity cannot be retrofitted.
 - **Small enough to audit.** Dependencies are budgeted, not vibes-based.
 
-## Where Traza stands (baseline, v0.21)
+## Where Traza stands (baseline, v0.22)
 
 Shipped and load-bearing: durable segment engine (immutable indexed
 segments, crash recovery, journaled TTL compaction, size-tiered compaction,
@@ -45,8 +45,10 @@ ingest, OTLP/HTTP protobuf+JSON, sessions and token/cost analytics answered
 from persisted rollups, content search, content-addressed payload
 offloading, append-only annotations, streaming NDJSON export with integrity
 trailers, live tail over SSE, bearer auth with scopes, safe bind defaults,
-Prometheus metrics, a standalone trace-browser UI, and an embedded MCP
-server (`--mcp`) so an agent can read the store it wrote.
+Prometheus metrics, a standalone trace-browser UI, an embedded MCP server
+(`--mcp`) so an agent can read the store it wrote, and packaged releases:
+prebuilt archives for linux-x86_64, linux-aarch64 and macos-aarch64, a
+`FROM scratch` container image, and CI running `./ci.sh` on both platforms.
 
 **Known gap that shapes Phase 1:** query-visible state lives in several
 independent recovery domains — the write-ahead log and buffer, segments,
@@ -58,7 +60,7 @@ designed in [generations-design.md](generations-design.md) and lands in
 
 Not yet: replication/HA, query language, columnar analytics at billion-span
 scale, tenancy, RBAC/SSO, targeted deletion, encryption at rest, tail
-sampling, an eval entity model, packaged releases.
+sampling, an eval entity model.
 
 ---
 

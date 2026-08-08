@@ -15,13 +15,14 @@ cargo build --release
 (cd ui && npm ci && npm run build)   # optional: emits ui/dist
 ```
 
-`cargo build --release` produces three binaries in `target/release/`:
+`cargo build --release` produces `traza-server` and the tooling binaries in
+`target/release/`:
 
 | Binary | Purpose |
 |---|---|
 | `traza-server` | The HTTP server |
 | `seed` | Loads a realistic demo corpus, for trying the UI |
-| `bench` / `ingest-bench` | Benchmarks (see [benchmarking](../internals/benchmarking.md)) |
+| `bench`, `ingest-bench`, `query-bench`, `storage-bench`, `index-mem-bench`, `content-bench` | Benchmarks (see [benchmarking](../internals/benchmarking.md)) |
 
 ## 2. Run the server
 

@@ -182,6 +182,7 @@ better p95/p99 with peak capacity. Do not pick it hoping for a lower median;
 | `--mcp-max-result-bytes N` | `32768` | Ceiling on one MCP tool result or resource read, counting the **whole serialized result** — text block, `structuredContent`, and the JSON envelope around them — in UTF-8 bytes, which is what goes on the wire. **Refused below 1,024**: beneath that there is no result that both fits and conforms to the `outputSchema` its tool advertises, and failing at startup beats answering every request with something a validating client rejects. Past it, rows are dropped and the truncation is stated with the argument that would have narrowed it. Raise for a client with a large context window; lower to make an agent narrow its own queries. |
 | `--mcp-max-payload-bytes N` | `262144` | Ceiling on one `get_payload` fetch, whatever the call asks for. This is what stops a single offloaded prompt filling a context window. The **effective** cap is the smaller of this and `--mcp-max-result-bytes`, so that the byte count the tool reports is the one it returns. |
 | `--allow-unauthenticated-non-loopback` | off | Explicitly permit an unauthenticated non-loopback bind. |
+| `--version`, `-V` | — | Print `traza-server <version>` and exit. |
 
 ### Durability modes
 

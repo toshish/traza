@@ -33,3 +33,16 @@ jobs:
           node-version: 22
       - name: Run the merge bar
         run: ./ci.sh
+
+  msrv:
+    name: MSRV check (rust-version in Cargo.toml)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.70
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+      - name: The advertised floor actually compiles
+        run: cargo check --all-targets --locked
