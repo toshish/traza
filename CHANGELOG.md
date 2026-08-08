@@ -34,8 +34,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whose version disagrees with `Cargo.toml`, `ui/package.json`, or this
   file, and runs the full `./ci.sh` gate on the tagged commit before
   anything builds; the crates.io job fails loudly when the registry token
-  is absent instead of skipping green. A new CI job checks the crate on
-  Rust 1.70, holding `rust-version` to being true rather than advertised.
+  is absent instead of skipping green. A new CI job checks the crate on the
+  advertised MSRV, holding `rust-version` to being true rather than
+  asserted — and its first run proved the asserted 1.70 false: the locked
+  dependency tree requires 1.71, so `rust-version` now says 1.71.
 - **`SECURITY.md`** (private vulnerability reporting, supported versions,
   and the threat model in one paragraph), a code of conduct, issue and PR
   templates, and Dependabot coverage for Cargo, npm, and GitHub Actions.

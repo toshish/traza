@@ -4,7 +4,7 @@ Thanks for helping build Traza. This document covers everything needed to go fro
 
 ## Development setup
 
-You need stable Rust (1.70 or newer, installed via [rustup](https://rustup.rs)) to build the server, and Node 22 or newer (see [`ui/.nvmrc`](ui/.nvmrc)) to build the dashboard. There is no database to run, no container to start, no service to configure:
+You need stable Rust (1.71 or newer, installed via [rustup](https://rustup.rs)) to build the server, and Node 22 or newer (see [`ui/.nvmrc`](ui/.nvmrc)) to build the dashboard. There is no database to run, no container to start, no service to configure:
 
 ```sh
 git clone https://github.com/toshish/traza.git
