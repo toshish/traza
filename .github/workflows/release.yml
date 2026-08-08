@@ -64,7 +64,7 @@ jobs:
           cd ui
           npm ci
           npm run build
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ui-dist
           path: ui/dist
@@ -142,12 +142,12 @@ jobs:
       - uses: actions/attest-build-provenance@v2
         with:
           subject-path: "traza-*.tar.gz"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: archive-${{ matrix.name }}
           path: "traza-*.tar.gz"
           if-no-files-found: error
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: bin-${{ matrix.name }}
           path: target/${{ matrix.target }}/release/traza-server
