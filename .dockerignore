@@ -1,0 +1,10 @@
+target
+data
+ui/node_modules
+ui/dist
+.git
+.github
+docs
+tests
+examples
+*.log

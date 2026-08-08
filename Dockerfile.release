@@ -1,0 +1,12 @@
+# Used by the release workflow only: the same final layer as ./Dockerfile,
+# assembled from the release-built binaries instead of compiling from source,
+# so the multi-arch image ships the exact bytes the archives ship. Build from
+# source with ./Dockerfile instead.
+
+FROM scratch
+ARG TARGETARCH
+COPY stage/${TARGETARCH}/traza-server /traza-server
+COPY stage/ui-dist /ui/dist
+VOLUME /data
+EXPOSE 8080
+ENTRYPOINT ["/traza-server", "--data-dir", "/data", "--host", "0.0.0.0", "--ui-dir", "/ui/dist"]
