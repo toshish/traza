@@ -5,7 +5,7 @@ installed: no database, no queue, no container.
 
 ## 1. Build
 
-Stable Rust (1.70 or newer) builds the server. Node 22 or newer builds the
+Stable Rust (1.71 or newer) builds the server. Node 22 or newer builds the
 dashboard — only if you want the dashboard; the API does not need it.
 
 ```sh
