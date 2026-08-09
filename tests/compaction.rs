@@ -658,7 +658,7 @@ fn a_backlog_compacts_down_to_the_size_cap() {
     // Four ~500 KB outputs for ~1.9 MB of input: the floor the cap implies,
     // not the 46 that stopping the run at the cap used to leave.
     // (d + n - 1) / n rather than div_ceil: the crate's MSRV is 1.70.
-    let floor = ((disk + 499_999) / 500_000) as usize;
+    let floor = disk.div_ceil(500_000) as usize;
     assert!(
         after <= floor + 1,
         "backlog left {after} segments for {disk} bytes at a 500 KB cap \
