@@ -308,7 +308,7 @@ impl SpanCursor {
         raw.extend_from_slice(trace);
         raw.extend_from_slice(span);
         // `div_ceil` is stable only since 1.73; this crate supports 1.70.
-        let mut out = String::with_capacity(((raw.len() + 2) / 3) * 4);
+        let mut out = String::with_capacity(raw.len().div_ceil(3) * 4);
         for chunk in raw.chunks(3) {
             let bits = (u32::from(chunk[0]) << 16)
                 | (u32::from(chunk.get(1).copied().unwrap_or(0)) << 8)
