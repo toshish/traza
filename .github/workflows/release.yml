@@ -5,12 +5,17 @@ name: Release
 # container image built from the same binaries, checksums, and build
 # provenance. Linux binaries are musl-static so there is no libc to match.
 #
-# The pipeline fails closed. Preflight refuses a tag whose version disagrees
-# with Cargo.toml, ui/package.json, or the CHANGELOG, and runs the full
-# ./ci.sh gate on the tagged commit. Every archive is smoke-tested from an
-# UNRELATED working directory before anything publishes — v0.22.0 shipped a
-# dashboard 404 that only appeared when launched from elsewhere, and this
-# step exists so that class of bug cannot ship twice.
+# The pipeline validates every prerequisite before it publishes anywhere.
+# Preflight refuses a tag whose version disagrees with Cargo.toml,
+# ui/package.json, or the CHANGELOG; runs the full ./ci.sh gate on BOTH
+# platforms plus the MSRV check; verifies the crates.io token is present and
+# the crate packages cleanly — all before a single artifact is built. True
+# atomicity across three registries is not a thing, so the ordering makes
+# the GitHub release the LAST act: if a publication step fails, the repo is
+# not left advertising a release that only partially exists. Every archive
+# is smoke-tested from an UNRELATED working directory — v0.22.0 shipped a
+# dashboard 404 only visible when launched from elsewhere, and that class
+# of bug does not get a second chance. Actions are pinned to commit SHAs.
 
 on:
   push:
@@ -24,11 +29,15 @@ permissions:
 
 jobs:
   preflight:
-    name: Version agreement + the full gate
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    name: Full gate (${{ matrix.os }})
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: The tag names one version, everywhere
         run: |
           version="${GITHUB_REF_NAME#v}"
@@ -39,24 +48,62 @@ jobs:
           [ "$version" = "$ui_v" ] || { echo "tag ${version} != ui/package.json ${ui_v}"; fail=1; }
           grep -q "^## \[${version}\]" CHANGELOG.md || { echo "CHANGELOG.md has no [${version}] section"; fail=1; }
           exit $fail
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
+          toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v4
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
       - name: Run the merge bar on the tagged commit
         run: ./ci.sh
 
+  preflight-msrv:
+    name: MSRV holds on the tagged commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: "1.75"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: msrv
+      - run: cargo check --all-targets --locked
+
+  preflight-crates:
+    name: crates.io can publish before anything does
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: The token exists, or nothing gets built
+        run: |
+          if [ -z "${CARGO_REGISTRY_TOKEN}" ]; then
+            echo "::error::CARGO_REGISTRY_TOKEN is not set. Every expected channel must be able to"
+            echo "::error::publish BEFORE any channel does; add the secret (Settings → Secrets →"
+            echo "::error::Actions) and push the tag again."
+            exit 1
+          fi
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: The crate packages and builds as it will publish
+        run: cargo publish --dry-run --locked
+
   ui:
     name: Build the dashboard once
-    needs: preflight
+    needs: [preflight, preflight-msrv, preflight-crates]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
       - name: npm ci && npm run build
@@ -64,7 +111,7 @@ jobs:
           cd ui
           npm ci
           npm run build
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ui-dist
           path: ui/dist
@@ -89,11 +136,12 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: ${{ matrix.target }}
       - name: musl toolchain
@@ -103,7 +151,7 @@ jobs:
           sudo apt-get install -y musl-tools
       - name: Build traza-server
         run: cargo build --release --locked --bin traza-server --target ${{ matrix.target }}
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: ui-dist
           path: ui-dist
@@ -139,15 +187,15 @@ jobs:
           echo "$body" | grep -q '"accepted":1' || { echo "ingest failed: $body"; exit 1; }
           echo "$got" | grep -q '"span_id":"s1"' || { echo "read-back failed: $got"; exit 1; }
           echo "smoke ok: dashboard 200, span accepted and read back"
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-path: "traza-*.tar.gz"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: archive-${{ matrix.name }}
           path: "traza-*.tar.gz"
           if-no-files-found: error
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: bin-${{ matrix.name }}
           path: target/${{ matrix.target }}/release/traza-server
@@ -159,28 +207,28 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: bin-linux-x86_64
           path: stage/amd64
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: bin-linux-aarch64
           path: stage/arm64
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: ui-dist
           path: stage/ui-dist
       - name: Restore the executable bit artifacts drop
         run: chmod +x stage/amd64/traza-server stage/arm64/traza-server
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           file: Dockerfile.release
@@ -192,14 +240,29 @@ jobs:
             ghcr.io/${{ github.repository }}:${{ github.ref_name }}
             ghcr.io/${{ github.repository }}:latest
 
-  release:
-    name: Publish the GitHub release
+  crates:
+    name: Publish to crates.io
     needs: [binaries, container]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: stable
+      - name: cargo publish
+        run: cargo publish --locked
+
+  release:
+    name: Publish the GitHub release, last
+    needs: [binaries, container, crates]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: archive-*
           merge-multiple: true
@@ -216,22 +279,3 @@ jobs:
         run: |
           gh release create "$GITHUB_REF_NAME" traza-*.tar.gz SHA256SUMS \
             --title "$GITHUB_REF_NAME" --notes-file notes.md
-
-  crates:
-    name: Publish to crates.io
-    needs: release
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    env:
-      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: cargo publish — fails closed when the token secret is missing
-        run: |
-          if [ -z "${CARGO_REGISTRY_TOKEN}" ]; then
-            echo "::error::CARGO_REGISTRY_TOKEN is not set. Every expected release channel must publish;"
-            echo "::error::add the secret (repo Settings → Secrets → Actions) or publish manually with cargo publish."
-            exit 1
-          fi
-          cargo publish --locked

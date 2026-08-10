@@ -1,6 +1,8 @@
 # Traza
 
 [![CI](https://github.com/toshish/traza/actions/workflows/ci.yml/badge.svg)](https://github.com/toshish/traza/actions/workflows/ci.yml)
+[![MSRV](https://img.shields.io/badge/MSRV-1.75-blue)](Cargo.toml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
 **A trace datastore with first-class LLM and agent observability — one binary from laptop to cluster.**
 
