@@ -7,7 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The dashboard's rail reports the version that is actually running.** A
+  hardcoded prop default shipped "0.19" on every install regardless of the
+  build; the rail now takes its version from `ui/package.json` at build
+  time.
+
 ### Changed
+
+- **The README leads with the install and a picture instead of a wall of
+  sections.** A real trace-browser screenshot (an agent swarm's waterfall,
+  from the seeded corpus) sits above four install paths — release archive,
+  container, crates.io, source — and the HTTP API table, library example,
+  and design prose moved out to the documentation that owns them. A social
+  preview card in the repo's own design system lives at
+  `docs/assets/social-preview.png`.
 
 - **The release pipeline validates every channel before it publishes to
   any.** v0.22.1 proved the previous shape only failed loudly at the end:

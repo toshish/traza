@@ -3,6 +3,9 @@ import { fmtNum, fmtRate } from '../../lib/format.js';
 import { Kbd, LiveDot } from '../primitives/Chrome.jsx';
 import { Sparkbar } from '../charts/Marks.jsx';
 import { Lockup, MARK_MIN_PX } from '../Logo.jsx';
+// The rail's version comes from the build, not a literal: a hardcoded default
+// once shipped "0.19" on every install regardless of what was running.
+import { version as APP_VERSION } from '../../../package.json';
 
 // The frame every screen sits in. Four top tabs could not hold seventeen
 // screens, so navigation is a left rail grouped by the question you arrived
@@ -86,7 +89,7 @@ function NavItem({ item, active, badge, onGo }) {
     The pulse is at the bottom on purpose. It is the one number that is true
     everywhere — spans are still arriving — and putting it in the frame means
     no screen has to spend space repeating it. */
-export function NavRail({ screen, badges, ingest, onGo, version = '0.19' }) {
+export function NavRail({ screen, badges, ingest, onGo, version = APP_VERSION }) {
   return <aside style={{
     width: 'var(--rail-width)', flex: 'none', background: 'var(--bg-raised)',
     borderRight: '1px solid var(--hairline)', display: 'flex', flexDirection: 'column',

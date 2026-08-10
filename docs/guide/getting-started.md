@@ -1,12 +1,26 @@
 # Getting started
 
-From a clone to a span you can see in the browser. Nothing else needs to be
-installed: no database, no queue, no container.
+From nothing to a span you can see in the browser. Nothing else needs to be
+installed: no database, no queue, no mandatory container.
 
-## 1. Build
+## 1. Install
 
-Stable Rust (1.75 or newer) builds the server. Node 22 or newer builds the
-dashboard — only if you want the dashboard; the API does not need it.
+The fastest path is a [release archive](https://github.com/toshish/traza/releases)
+— the server with the dashboard already built, no toolchains:
+
+```sh
+curl -LO https://github.com/toshish/traza/releases/download/v0.22.1/traza-0.22.1-macos-aarch64.tar.gz
+tar xzf traza-0.22.1-macos-aarch64.tar.gz && cd traza-0.22.1-macos-aarch64
+```
+
+(`linux-x86_64` and `linux-aarch64` likewise; the container image is
+`ghcr.io/toshish/traza`, and `cargo install traza --locked --bin traza-server`
+installs the server API from crates.io — the dashboard comes from an archive
+or a `ui/` build.)
+
+Or build from source: stable Rust (1.75 or newer) builds the server, Node 22
+or newer builds the dashboard — only if you want the dashboard; the API does
+not need it.
 
 ```sh
 git clone https://github.com/toshish/traza.git
