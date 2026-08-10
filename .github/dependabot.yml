@@ -1,17 +1,26 @@
-# Weekly dependency PRs. The dependency budget still applies: an update PR
-# merges on the same terms as any other change — ci.sh green, and a version
-# bump is not a reason by itself.
+# Weekly dependency PRs, grouped so the PR list stays legible. The dependency
+# budget still applies: an update PR merges on the same terms as any other
+# change — ci.sh green, and a version bump is not a reason by itself.
 version: 2
 updates:
   - package-ecosystem: cargo
     directory: /
     schedule:
       interval: weekly
+    groups:
+      cargo-deps:
+        patterns: ["*"]
   - package-ecosystem: npm
     directory: /ui
     schedule:
       interval: weekly
+    groups:
+      npm-deps:
+        patterns: ["*"]
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]

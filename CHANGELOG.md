@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **The release pipeline validates every channel before it publishes to
+  any.** v0.22.1 proved the previous shape only failed loudly at the end:
+  the crates.io token was unset, and the GitHub release and container
+  image had already published by the time the pipeline said so. Preflight
+  now runs the full gate on both platforms plus the MSRV check, verifies
+  the crates.io token exists, and runs `cargo publish --dry-run --locked`
+  — all before a single artifact is built — and the GitHub release moved
+  to the end, behind the crates and container publications it used to
+  precede. Three registries cannot be atomic; prerequisites can be checked
+  before touching any of them.
+- **The grouped-merge crash test's deadline is a failsafe, not an
+  oracle.** Its 30-second query deadline doubled as the duplicate-version
+  check, which turned shared-runner weather into red durability legs. The
+  deterministic assertions after each query — a hot key surviving other
+  than exactly once, a stale version outranking an acknowledged one, a
+  batch coming back short — were the real oracle all along; the deadline
+  is now 300 seconds and its message says what it is.
+- **`ci.sh` audits the shipped dashboard's dependencies.**
+  `npm audit --omit=dev --audit-level=high` gates the merge bar;
+  development-tool advisories print without blocking. The two open
+  advisories (nanoid, postcss — both development-only) are resolved in
+  the lockfile.
+- **Workflow actions are pinned to commit SHAs**, with the tag each pin
+  was resolved from in a comment, and Dependabot groups cargo, npm, and
+  actions updates into one weekly PR per ecosystem. The changelog's
+  footer now carries the full compare-link lineage, every release back
+  to v0.1.0.
+
 ## [0.22.1] - 2026-08-07
 
 ### Fixed
@@ -1844,9 +1876,35 @@ completion trailers — clients parsing either surface must update.
 
 - This is an initial 0.1 release; consult README.md for the currently documented operational constraints and unsupported use cases.
 
+[Unreleased]: https://github.com/toshish/traza/compare/v0.22.1...HEAD
 [0.22.1]: https://github.com/toshish/traza/compare/v0.22.0...v0.22.1
 [0.22.0]: https://github.com/toshish/traza/compare/v0.21.0...v0.22.0
-[0.21.0]: https://github.com/toshish/traza/releases/tag/v0.21.0
-[0.20.0]: https://github.com/toshish/traza/releases/tag/v0.20.0
-[0.19.0]: https://github.com/toshish/traza/releases/tag/v0.19.0
+[0.21.0]: https://github.com/toshish/traza/compare/v0.20.0...v0.21.0
+[0.20.0]: https://github.com/toshish/traza/compare/v0.19.0...v0.20.0
+[0.19.0]: https://github.com/toshish/traza/compare/v0.18.0...v0.19.0
+[0.18.0]: https://github.com/toshish/traza/compare/v0.17.0...v0.18.0
+[0.17.0]: https://github.com/toshish/traza/compare/v0.16.0...v0.17.0
+[0.16.0]: https://github.com/toshish/traza/compare/v0.15.0...v0.16.0
+[0.15.0]: https://github.com/toshish/traza/compare/v0.14.0...v0.15.0
+[0.14.0]: https://github.com/toshish/traza/compare/v0.13.0...v0.14.0
+[0.13.0]: https://github.com/toshish/traza/compare/v0.12.2...v0.13.0
+[0.12.2]: https://github.com/toshish/traza/compare/v0.12.1...v0.12.2
+[0.12.1]: https://github.com/toshish/traza/compare/v0.12.0...v0.12.1
+[0.12.0]: https://github.com/toshish/traza/compare/v0.11.0...v0.12.0
+[0.11.0]: https://github.com/toshish/traza/compare/v0.10.0...v0.11.0
+[0.10.0]: https://github.com/toshish/traza/compare/v0.9.2...v0.10.0
+[0.9.2]: https://github.com/toshish/traza/compare/v0.9.1...v0.9.2
+[0.9.1]: https://github.com/toshish/traza/compare/v0.9.0...v0.9.1
+[0.9.0]: https://github.com/toshish/traza/compare/v0.8.0...v0.9.0
+[0.8.0]: https://github.com/toshish/traza/compare/v0.7.0...v0.8.0
+[0.7.0]: https://github.com/toshish/traza/compare/v0.6.0...v0.7.0
+[0.6.0]: https://github.com/toshish/traza/compare/v0.5.0...v0.6.0
+[0.5.0]: https://github.com/toshish/traza/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/toshish/traza/compare/v0.3.1...v0.4.0
+[0.3.1]: https://github.com/toshish/traza/compare/v0.3.0...v0.3.1
+[0.3.0]: https://github.com/toshish/traza/compare/v0.2.3...v0.3.0
+[0.2.3]: https://github.com/toshish/traza/compare/v0.2.2...v0.2.3
+[0.2.2]: https://github.com/toshish/traza/compare/v0.2.1...v0.2.2
+[0.2.1]: https://github.com/toshish/traza/compare/v0.2.0...v0.2.1
+[0.2.0]: https://github.com/toshish/traza/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/toshish/traza/releases/tag/v0.1.0

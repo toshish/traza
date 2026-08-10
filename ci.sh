@@ -69,6 +69,10 @@ fi
 (
   cd ui
   npm ci
+  # Shipped-dashboard dependencies must be clean; development-tool advisories
+  # are printed for visibility but do not block the gate.
+  npm audit --omit=dev --audit-level=high
+  npm audit --audit-level=high || echo "ci: development-dependency advisories above are non-blocking"
   npm test
   npm run build
 )
