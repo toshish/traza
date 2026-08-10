@@ -452,8 +452,33 @@ fn server_serves_sessions_and_llm_stats() {
         if let Some(bytes) = encoded {
             stream.write_all(&bytes).expect("body");
         }
+        // A close delivered as RST once the response is complete is
+        // tolerated: the server closes the socket as soon as it answers, and
+        // a loaded kernel can turn that into a reset that `read_to_end`
+        // reports AFTER handing over every byte (the lesson of
+        // `tests/auth.rs`). An incomplete response still panics.
         let mut response = Vec::new();
-        stream.read_to_end(&mut response).expect("reads");
+        if let Err(error) = stream.read_to_end(&mut response) {
+            let complete = response
+                .windows(4)
+                .position(|bytes| bytes == b"\r\n\r\n")
+                .and_then(|header_end| {
+                    let head = std::str::from_utf8(&response[..header_end]).ok()?;
+                    let length = head.lines().find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })?;
+                    Some(response.len() >= header_end + 4 + length)
+                })
+                .unwrap_or(false);
+            assert!(
+                complete,
+                "incomplete response after {:?}: {error}",
+                error.kind()
+            );
+        }
         let text = String::from_utf8_lossy(&response);
         let status = text
             .split_whitespace()

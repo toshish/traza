@@ -131,6 +131,55 @@ fn decode_chunked(bytes: &[u8]) -> (Vec<u8>, String) {
     }
 }
 
+/// Reads until the server closes the socket, tolerating a close delivered as
+/// RST once the response is complete — a loaded kernel turns the server's
+/// post-response close into a reset rather than a FIN-drain, and `read_to_end`
+/// then errors AFTER handing over every byte (the lesson of `tests/auth.rs`).
+/// An INCOMPLETE response still panics.
+fn read_until_close(stream: &mut TcpStream) -> Vec<u8> {
+    let mut response = Vec::new();
+    if let Err(error) = stream.read_to_end(&mut response) {
+        assert!(
+            complete_http_response(&response),
+            "incomplete response after {:?}: {error}",
+            error.kind()
+        );
+    }
+    response
+}
+
+/// True once `response` holds a full header block plus a complete body: the
+/// declared `Content-Length` bytes, or for a chunked response the zero-size
+/// last-chunk and the trailer block's final CRLF. The chunked test is a
+/// framing check only — `decode_chunked` and the trailer assertions in the
+/// export tests remain the deterministic completion oracle on top of it.
+fn complete_http_response(response: &[u8]) -> bool {
+    let Some(header_end) = response.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
+        return false;
+    };
+    let Ok(head) = std::str::from_utf8(&response[..header_end]) else {
+        return false;
+    };
+    let body = &response[header_end + 4..];
+    if head
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
+        return (body.starts_with(b"0\r\n")
+            || body.windows(5).any(|window| window == b"\r\n0\r\n"))
+            && response.ends_with(b"\r\n\r\n");
+    }
+    let Some(content_length) = head.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse::<usize>().ok())
+            .flatten()
+    }) else {
+        return false;
+    };
+    body.len() >= content_length
+}
+
 #[test]
 fn annotations_append_query_and_survive_reopen() {
     let dir = test_dir("annotations");
@@ -306,8 +355,7 @@ impl Server {
         if let Some(bytes) = body {
             stream.write_all(bytes).expect("body");
         }
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response).expect("reads");
+        let response = read_until_close(&mut stream);
         let split = response
             .windows(4)
             .position(|window| window == b"\r\n\r\n")
@@ -674,7 +722,7 @@ fn export_streams_with_completion_trailers_and_paginates_exactly() {
 
     // Chunked framing preserves NDJSON while trailers prove completion.
     {
-        use std::io::{Read, Write};
+        use std::io::Write;
         let mut stream =
             std::net::TcpStream::connect(("127.0.0.1", server.port)).expect("connects");
         write!(
@@ -682,8 +730,7 @@ fn export_streams_with_completion_trailers_and_paginates_exactly() {
             "GET /v1/export?service=bulk&limit=5 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
         )
         .expect("writes");
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response).expect("reads");
+        let response = read_until_close(&mut stream);
         let text = String::from_utf8_lossy(&response);
         let head = text
             .split("\r\n\r\n")
@@ -757,8 +804,7 @@ fn export_storage_failure_is_explicit_in_trailers() {
         "GET /v1/export?service=broken HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
     )
     .expect("writes");
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response).expect("reads");
+    let response = read_until_close(&mut stream);
     let split = response
         .windows(4)
         .position(|window| window == b"\r\n\r\n")

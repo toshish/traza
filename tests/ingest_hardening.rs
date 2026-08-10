@@ -90,8 +90,7 @@ impl Server {
         if let Some(bytes) = encoded {
             stream.write_all(&bytes).expect("body");
         }
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response).expect("reads");
+        let response = read_until_close(&mut stream);
         let text = String::from_utf8_lossy(&response);
         let status = text
             .split_whitespace()
@@ -110,6 +109,43 @@ impl Server {
     fn kill(self) {
         drop(self);
     }
+}
+
+/// Reads until the server closes the socket, tolerating a close delivered as
+/// RST once the response is complete — a loaded kernel turns the server's
+/// post-response close into a reset rather than a FIN-drain, and `read_to_end`
+/// then errors AFTER handing over every byte (the lesson of `tests/auth.rs`).
+/// An INCOMPLETE response still panics.
+fn read_until_close(stream: &mut TcpStream) -> Vec<u8> {
+    let mut response = Vec::new();
+    if let Err(error) = stream.read_to_end(&mut response) {
+        assert!(
+            complete_http_response(&response),
+            "incomplete response after {:?}: {error}",
+            error.kind()
+        );
+    }
+    response
+}
+
+/// True once `response` holds a full header block plus the `Content-Length`
+/// bytes it declares.
+fn complete_http_response(response: &[u8]) -> bool {
+    let Some(header_end) = response.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
+        return false;
+    };
+    let Ok(head) = std::str::from_utf8(&response[..header_end]) else {
+        return false;
+    };
+    let Some(content_length) = head.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse::<usize>().ok())
+            .flatten()
+    }) else {
+        return false;
+    };
+    response.len() >= header_end + 4 + content_length
 }
 
 // A panicking test must never leak its server child: cargo waits on the
@@ -267,8 +303,11 @@ fn lying_content_length_gets_a_400_not_a_hang() {
         "POST /v1/spans HTTP/1.1\r\nHost: x\r\nContent-Length: 5000\r\nConnection: close\r\n\r\n[",
     );
     assert!(response.starts_with("HTTP/1.1 400"), "got: {response:.60}");
+    // A tripwire, not the oracle: the 400 above is what proves the server
+    // answered. Sized far above the harness's 500ms socket deadline so a
+    // starved runner cannot trip it.
     assert!(
-        started.elapsed() < Duration::from_secs(10),
+        started.elapsed() < Duration::from_secs(30),
         "lying content-length must not park the connection"
     );
 
@@ -307,13 +346,18 @@ fn silent_connections_are_released() {
     // A peer that connects and never speaks must be dropped by the socket
     // deadline (500ms in this harness), freeing the worker thread.
     let mut idle = server.connect();
+    // The client-side timeout is the failsafe that turns "the server never
+    // releases the connection" into a red assertion instead of a hung suite;
+    // the elapsed bound below is sized so that failsafe firing cannot pass.
+    idle.set_read_timeout(Some(Duration::from_secs(30)))
+        .expect("timeout");
     let started = Instant::now();
     let mut sink = Vec::new();
     // Whether the server answers 400 or just closes, read_to_end must
     // complete once the socket deadline fires.
     let _ = idle.read_to_end(&mut sink);
     assert!(
-        started.elapsed() < Duration::from_secs(10),
+        started.elapsed() < Duration::from_secs(25),
         "silent connection must be released by the socket deadline"
     );
 
@@ -345,8 +389,12 @@ fn unauthenticated_requests_are_refused_before_the_body() {
         text.starts_with("HTTP/1.1 401"),
         "401 must not wait for the body: {text:.60}"
     );
+    // A tripwire, not the oracle: a server that buffered the declared body
+    // first would hit its 500ms socket deadline waiting and answer 400, so
+    // the 401 assertion above is what catches the regression. The bound only
+    // has to sit far below an actual body wait, not race the scheduler.
     assert!(
-        started.elapsed() < Duration::from_millis(2_000),
+        started.elapsed() < Duration::from_secs(10),
         "auth verdict must precede the body read"
     );
     server.kill();

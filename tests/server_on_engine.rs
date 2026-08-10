@@ -64,8 +64,7 @@ impl Server {
         if let Some(bytes) = encoded {
             stream.write_all(&bytes).expect("body writes");
         }
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response).expect("response reads");
+        let response = read_until_close(&mut stream);
         let text = String::from_utf8_lossy(&response);
         let status = text
             .split_whitespace()
@@ -106,6 +105,43 @@ fn connect_with_retry(port: u16) -> TcpStream {
         std::thread::sleep(Duration::from_millis(20));
     }
     panic!("server on port {port} never accepted a connection");
+}
+
+/// Reads until the server closes the socket, tolerating a close delivered as
+/// RST once the response is complete — a loaded kernel turns the server's
+/// post-response close into a reset rather than a FIN-drain, and `read_to_end`
+/// then errors AFTER handing over every byte (the lesson of `tests/auth.rs`).
+/// An INCOMPLETE response still panics.
+fn read_until_close(stream: &mut TcpStream) -> Vec<u8> {
+    let mut response = Vec::new();
+    if let Err(error) = stream.read_to_end(&mut response) {
+        assert!(
+            complete_http_response(&response),
+            "incomplete response after {:?}: {error}",
+            error.kind()
+        );
+    }
+    response
+}
+
+/// True once `response` holds a full header block plus the `Content-Length`
+/// bytes it declares.
+fn complete_http_response(response: &[u8]) -> bool {
+    let Some(header_end) = response.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
+        return false;
+    };
+    let Ok(head) = std::str::from_utf8(&response[..header_end]) else {
+        return false;
+    };
+    let Some(content_length) = head.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse::<usize>().ok())
+            .flatten()
+    }) else {
+        return false;
+    };
+    response.len() >= header_end + 4 + content_length
 }
 
 fn test_dir(label: &str) -> PathBuf {
@@ -275,8 +311,7 @@ fn server_invalid_write_preserves_error_contract() {
         "POST /v1/spans HTTP/1.1\r\nHost: x\r\nContent-Length: 9\r\nConnection: close\r\n\r\nnot-json!"
     )
     .expect("writes");
-    let mut response = String::new();
-    stream.read_to_string(&mut response).expect("reads");
+    let response = String::from_utf8_lossy(&read_until_close(&mut stream)).into_owned();
     assert!(response.starts_with("HTTP/1.1 400"), "got: {response}");
 
     // A structurally valid body that is not a span list is rejected.
