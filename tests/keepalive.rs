@@ -15,7 +15,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
@@ -113,7 +113,11 @@ fn read_response(stream: &mut impl Read) -> (String, String) {
     let mut head = Vec::new();
     let mut byte = [0_u8; 1];
     while !head.ends_with(b"\r\n\r\n") {
-        let read = stream.read(&mut byte).expect("header byte");
+        let read = match stream.read(&mut byte) {
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => panic!("header byte: {error}"),
+        };
         assert_ne!(read, 0, "connection closed mid-header: {head:?}");
         head.push(byte[0]);
     }
@@ -129,6 +133,29 @@ fn read_response(stream: &mut impl Read) -> (String, String) {
     let mut body = vec![0_u8; length];
     stream.read_exact(&mut body).expect("body");
     (head, String::from_utf8_lossy(&body).into_owned())
+}
+
+/// Drains a connection the server has promised to close, returning whatever
+/// arrived after the response already read. A close delivered as RST is still
+/// a close — under load the kernel turns close-with-unread-input into a reset,
+/// which `read_to_end` reports as an error after handing over every byte that
+/// preceded it — so reset-shaped errors are tolerated. Any other error (a
+/// timeout above all) still panics: a server that neither sends nor closes is
+/// exactly the broken announcement these tests exist to catch, and swallowing
+/// the timeout would let it pass.
+fn drain_after_close(stream: &mut TcpStream) -> Vec<u8> {
+    let mut rest = Vec::new();
+    if let Err(error) = stream.read_to_end(&mut rest) {
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+            ),
+            "read after close failed with {:?}: {error}",
+            error.kind()
+        );
+    }
+    rest
 }
 
 fn span_body(id: u32) -> String {
@@ -217,8 +244,7 @@ fn connection_close_is_honoured_and_announced() {
     );
 
     // The server said close, so it must actually close.
-    let mut rest = Vec::new();
-    stream.read_to_end(&mut rest).expect("read to end");
+    let rest = drain_after_close(&mut stream);
     assert!(rest.is_empty(), "trailing bytes after close: {rest:?}");
 }
 
@@ -236,8 +262,7 @@ fn an_http_1_0_client_gets_a_closed_connection_by_default() {
         head.to_ascii_lowercase().contains("connection: close"),
         "HTTP/1.0 defaults to close: {head}"
     );
-    let mut rest = Vec::new();
-    stream.read_to_end(&mut rest).expect("read to end");
+    let rest = drain_after_close(&mut stream);
     assert!(rest.is_empty());
 }
 
@@ -296,8 +321,7 @@ fn a_transfer_encoded_body_is_refused_rather_than_guessed() {
     );
 
     // Crucially: the smuggled GET must NOT have been answered.
-    let mut rest = Vec::new();
-    stream.read_to_end(&mut rest).expect("read to end");
+    let rest = drain_after_close(&mut stream);
     assert!(
         rest.is_empty(),
         "smuggled request was answered: {}",
@@ -370,8 +394,11 @@ fn an_unauthorized_request_with_a_body_closes_instead_of_reusing() {
     let (head, _) = read_response(&mut stream);
     assert!(head.starts_with("HTTP/1.1 401"), "{head}");
 
-    let mut rest = Vec::new();
-    stream.read_to_end(&mut rest).expect("read to end");
+    // The server closes with the refused body still unread in its receive
+    // queue, and THAT close is the one the kernel most reliably turns into
+    // RST — tolerated by the drain, which still surfaces any bytes that
+    // preceded it.
+    let rest = drain_after_close(&mut stream);
     assert!(
         rest.is_empty(),
         "the unread body was served as a request: {}",
@@ -407,25 +434,53 @@ fn the_connection_limit_refuses_rather_than_queues() {
     third
         .write_all(b"GET /v1/stats HTTP/1.1\r\nHost: x\r\n\r\n")
         .expect("write");
-    let mut response = Vec::new();
-    third.read_to_end(&mut response).expect("read");
+    let response = drain_after_close(&mut third);
     let response = String::from_utf8_lossy(&response);
     assert!(
         response.starts_with("HTTP/1.1 503"),
         "over-limit connection must be refused, got: {response:.80}"
     );
 
-    // And the refusal is counted, so an operator can see it happened.
+    // And the refusal is counted, so an operator can see it happened. Counted
+    // is still the assertion, but two asynchronies sit between the 503 above
+    // and the counter being readable: a dropped connection's slot is reaped
+    // only when its handler thread notices the close — a probe that outruns
+    // the reaper is itself refused — and the counter increments on the accept
+    // thread, not in the 503 the client just read. So poll under a failsafe
+    // deadline, counting every 503 the probe itself takes, and the comparison
+    // stays EXACT: a refusal the counter never absorbs times out red, and an
+    // over-counting server dies on the spot.
     drop(held);
-    let mut probe = server.connect();
-    probe
-        .write_all(b"GET /v1/metrics HTTP/1.1\r\nHost: x\r\n\r\n")
-        .expect("write");
-    let (_, body) = read_response(&mut probe);
-    assert!(
-        body.contains("traza_http_connections_refused_total 1"),
-        "refusal not counted: {body}"
-    );
+    let mut expected = 1_u64; // the third connection above
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let mut probe = server.connect();
+        probe
+            .write_all(b"GET /v1/metrics HTTP/1.1\r\nHost: x\r\n\r\n")
+            .expect("write");
+        let (head, body) = read_response(&mut probe);
+        if head.starts_with("HTTP/1.1 503") {
+            expected += 1; // the probe outran the reaper: one more refusal
+        } else {
+            let counted: u64 = body
+                .lines()
+                .find_map(|line| line.strip_prefix("traza_http_connections_refused_total "))
+                .and_then(|value| value.trim().parse().ok())
+                .unwrap_or(0);
+            assert!(
+                counted <= expected,
+                "more refusals counted than happened: {counted} > {expected}\n{body}"
+            );
+            if counted == expected {
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "refusals never fully counted: expected {expected}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 #[test]

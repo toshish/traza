@@ -11,7 +11,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
@@ -68,8 +68,7 @@ impl Server {
         if let Some(bytes) = encoded {
             stream.write_all(&bytes).expect("body");
         }
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response).expect("reads");
+        let response = read_until_close(&mut stream);
         let text = String::from_utf8_lossy(&response);
         let status = text
             .split_whitespace()
@@ -89,6 +88,43 @@ impl Server {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// Reads until the server closes the socket, tolerating a close delivered as
+/// RST once the response is complete — a loaded kernel turns the server's
+/// post-response close into a reset rather than a FIN-drain, and `read_to_end`
+/// then errors AFTER handing over every byte (the lesson of `tests/auth.rs`).
+/// An INCOMPLETE response still panics.
+fn read_until_close(stream: &mut TcpStream) -> Vec<u8> {
+    let mut response = Vec::new();
+    if let Err(error) = stream.read_to_end(&mut response) {
+        assert!(
+            complete_http_response(&response),
+            "incomplete response after {:?}: {error}",
+            error.kind()
+        );
+    }
+    response
+}
+
+/// True once `response` holds a full header block plus the `Content-Length`
+/// bytes it declares.
+fn complete_http_response(response: &[u8]) -> bool {
+    let Some(header_end) = response.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
+        return false;
+    };
+    let Ok(head) = std::str::from_utf8(&response[..header_end]) else {
+        return false;
+    };
+    let Some(content_length) = head.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse::<usize>().ok())
+            .flatten()
+    }) else {
+        return false;
+    };
+    response.len() >= header_end + 4 + content_length
 }
 
 fn test_dir(label: &str) -> PathBuf {
@@ -460,7 +496,21 @@ fn metrics_json_reports_per_route_latency_with_its_error_bound() {
     server.request("GET", "/v1/spans?limit=5", None);
     server.request("GET", "/v1/stats/duration", None);
 
-    let (status, body) = server.request("GET", "/v1/metrics.json", None);
+    // A request is observed AFTER its response is written — deliberately, so
+    // a failed write still counts — which means the counts for the requests
+    // just made can land a beat after their responses did. Poll under a
+    // failsafe deadline for the classes this test asserts on; a class that is
+    // never counted still times out into the assertions below, red.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let (status, body) = loop {
+        let (status, body) = server.request("GET", "/v1/metrics.json", None);
+        let search_counted = body["by_class"]["search"]["count"].as_u64().unwrap_or(0) > 0;
+        let ingest_counted = body["by_class"]["ingest"]["count"].as_u64().unwrap_or(0) > 0;
+        if (search_counted && ingest_counted) || Instant::now() >= deadline {
+            break (status, body);
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
     assert_eq!(status, 200, "{body}");
 
     assert!(body["uptime_ns"].as_u64().is_some(), "{body}");
@@ -513,8 +563,7 @@ fn prometheus_output_carries_the_new_series() {
         "GET /v1/metrics HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
     )
     .expect("write");
-    let mut text = String::new();
-    stream.read_to_string(&mut text).expect("read");
+    let text = String::from_utf8_lossy(&read_until_close(&mut stream)).into_owned();
 
     for metric in [
         "traza_uptime_seconds",

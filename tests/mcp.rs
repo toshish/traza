@@ -1864,8 +1864,7 @@ impl Server {
         )
         .expect("request writes");
         stream.write_all(body.as_bytes()).expect("body writes");
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response).expect("response reads");
+        let response = read_until_close(&mut stream);
         let text = String::from_utf8_lossy(&response).into_owned();
         let status = text
             .split_whitespace()
@@ -1887,14 +1886,55 @@ impl Server {
             self.port
         )
         .expect("request writes");
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response).expect("response reads");
+        let response = read_until_close(&mut stream);
         String::from_utf8_lossy(&response)
             .split_whitespace()
             .nth(1)
             .and_then(|code| code.parse::<u16>().ok())
             .expect("status parses")
     }
+}
+
+/// Reads until the server closes the socket. The server tears a
+/// `Connection: close` socket down as soon as its response is written, and
+/// under load that close can reach the client as RST rather than a FIN-drain
+/// — `read_to_end` then errors AFTER handing over every byte that preceded
+/// it. The invariant is that a COMPLETE response arrived; how the peer tore
+/// the socket down afterwards is OS noise (the lesson of `tests/auth.rs`). An
+/// INCOMPLETE response still panics: a server dying mid-answer must stay a
+/// failure.
+fn read_until_close(stream: &mut TcpStream) -> Vec<u8> {
+    let mut response = Vec::new();
+    if let Err(error) = stream.read_to_end(&mut response) {
+        assert!(
+            complete_http_response(&response),
+            "incomplete response after {:?}: {error}",
+            error.kind()
+        );
+    }
+    response
+}
+
+/// True once `response` holds a full header block plus the `Content-Length`
+/// bytes it declares. Every response this server writes on these paths
+/// declares one — a 202 carries `Content-Length: 0` — so an absent length is
+/// an incomplete response, not a different framing.
+fn complete_http_response(response: &[u8]) -> bool {
+    let Some(header_end) = response.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
+        return false;
+    };
+    let Ok(head) = std::str::from_utf8(&response[..header_end]) else {
+        return false;
+    };
+    let Some(content_length) = head.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse::<usize>().ok())
+            .flatten()
+    }) else {
+        return false;
+    };
+    response.len() >= header_end + 4 + content_length
 }
 
 impl Drop for Server {

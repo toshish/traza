@@ -252,9 +252,12 @@ fn a_waiting_subscriber_is_woken_by_an_ingest() {
             .expect("ingest");
     });
 
-    // A five-second budget that must not be spent: the point is that the span
-    // is pushed to the waiting subscriber, not that the deadline eventually
-    // expires and it re-reads.
+    // A budget that must not be spent: the point is that the span is pushed
+    // to the waiting subscriber, not that the deadline eventually expires and
+    // it re-reads. The stopwatch is unavoidably the discriminator here —
+    // deadline-expiry delivery would return the same span — so the budget is
+    // sized to keep the two outcomes far apart on a starved runner: a push
+    // arrives ~50ms in, an expiry at 30s, and the verdict line sits at 25s.
     let started = Instant::now();
     let read = engine
         .tail_after(
@@ -262,7 +265,7 @@ fn a_waiting_subscriber_is_woken_by_an_ingest() {
             0,
             100,
             &SpanFilter::default(),
-            Duration::from_secs(5),
+            Duration::from_secs(30),
         )
         .expect("tail");
     let waited = started.elapsed();
@@ -270,7 +273,7 @@ fn a_waiting_subscriber_is_woken_by_an_ingest() {
 
     assert_eq!(ids(&read), ["late"]);
     assert!(
-        waited < Duration::from_secs(4),
+        waited < Duration::from_secs(25),
         "delivery must follow the ingest, not the timeout (waited {waited:?})"
     );
 }
@@ -355,13 +358,49 @@ impl Server {
             body.len()
         )
         .expect("write ingest");
-        let mut answer = String::new();
-        stream.read_to_string(&mut answer).expect("read ingest");
+        let answer = String::from_utf8_lossy(&read_until_close(&mut stream)).into_owned();
         assert!(
             answer.starts_with("HTTP/1.1 2"),
             "ingest rejected: {answer}"
         );
     }
+}
+
+/// Reads until the server closes the socket, tolerating a close delivered as
+/// RST once the response is complete — a loaded kernel turns the server's
+/// post-response close into a reset rather than a FIN-drain, and `read_to_end`
+/// then errors AFTER handing over every byte (the lesson of `tests/auth.rs`).
+/// An INCOMPLETE response still panics.
+fn read_until_close(stream: &mut TcpStream) -> Vec<u8> {
+    let mut response = Vec::new();
+    if let Err(error) = stream.read_to_end(&mut response) {
+        assert!(
+            complete_http_response(&response),
+            "incomplete response after {:?}: {error}",
+            error.kind()
+        );
+    }
+    response
+}
+
+/// True once `response` holds a full header block plus the `Content-Length`
+/// bytes it declares.
+fn complete_http_response(response: &[u8]) -> bool {
+    let Some(header_end) = response.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
+        return false;
+    };
+    let Ok(head) = std::str::from_utf8(&response[..header_end]) else {
+        return false;
+    };
+    let Some(content_length) = head.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse::<usize>().ok())
+            .flatten()
+    }) else {
+        return false;
+    };
+    response.len() >= header_end + 4 + content_length
 }
 
 impl Drop for Server {
@@ -519,8 +558,7 @@ fn server_metrics(server: &Server) -> Value {
         "GET /v1/metrics.json HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
     )
     .expect("write");
-    let mut answer = String::new();
-    socket.read_to_string(&mut answer).expect("read");
+    let answer = String::from_utf8_lossy(&read_until_close(&mut socket)).into_owned();
     let body = answer.split("\r\n\r\n").nth(1).unwrap_or_default();
     serde_json::from_str(body).expect("json metrics")
 }

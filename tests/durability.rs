@@ -96,8 +96,7 @@ fn request_to(port: u16, method: &str, target: &str, body: Option<&Value>) -> (u
         if let Some(bytes) = encoded {
             stream.write_all(&bytes).expect("body");
         }
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response).expect("reads");
+        let response = read_until_close(&mut stream);
         let text = String::from_utf8_lossy(&response);
         let status = text
             .split_whitespace()
@@ -112,6 +111,45 @@ fn request_to(port: u16, method: &str, target: &str, body: Option<&Value>) -> (u
             .unwrap_or(Value::Null);
         (status, payload)
     }
+}
+
+/// Reads until the server closes the socket, tolerating a close delivered as
+/// RST once the response is complete: the server closes a
+/// `Connection: close` socket the moment its answer is written, and a loaded
+/// kernel turns that into a reset rather than a FIN-drain — `read_to_end`
+/// then errors AFTER handing over every byte. An INCOMPLETE response still
+/// panics; a server dying mid-answer must stay a failure (the lesson of
+/// `tests/auth.rs`).
+fn read_until_close(stream: &mut TcpStream) -> Vec<u8> {
+    let mut response = Vec::new();
+    if let Err(error) = stream.read_to_end(&mut response) {
+        assert!(
+            complete_http_response(&response),
+            "incomplete response after {:?}: {error}",
+            error.kind()
+        );
+    }
+    response
+}
+
+/// True once `response` holds a full header block plus the `Content-Length`
+/// bytes it declares.
+fn complete_http_response(response: &[u8]) -> bool {
+    let Some(header_end) = response.windows(4).position(|bytes| bytes == b"\r\n\r\n") else {
+        return false;
+    };
+    let Ok(head) = std::str::from_utf8(&response[..header_end]) else {
+        return false;
+    };
+    let Some(content_length) = head.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse::<usize>().ok())
+            .flatten()
+    }) else {
+        return false;
+    };
+    response.len() >= header_end + 4 + content_length
 }
 
 fn test_dir(label: &str) -> PathBuf {
@@ -595,8 +633,7 @@ fn raw_get(port: u16, target: &str) -> String {
         "GET {target} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
     )
     .expect("writes");
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response).expect("reads");
+    let response = read_until_close(&mut stream);
     let text = String::from_utf8_lossy(&response).into_owned();
     text.split_once("\r\n\r\n")
         .map(|(_, body)| body.to_owned())
