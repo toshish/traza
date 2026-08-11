@@ -89,6 +89,12 @@ pub(crate) struct ManifestFile {
     pub path: String,
     pub bytes: u64,
     pub sha256: String,
+    /// Modification time, nanoseconds since the Unix epoch, or 0 where the
+    /// platform would not say. Recorded ONLY so a later checkpoint can prove a
+    /// file is unchanged and carry its digest over — never consulted by
+    /// verification, which re-reads the bytes.
+    #[serde(default)]
+    pub modified_unix_ns: u64,
 }
 
 /// One immutable, self-describing, complete logical state of the store.
@@ -267,21 +273,34 @@ pub(crate) fn digest_engine(engine: &Path, prior: &[ManifestFile]) -> Result<Vec
             if !is_manifested(&relative) {
                 continue;
             }
-            let bytes = entry.metadata()?.len();
-            // A segment carries its digest over unchanged — it is immutable at
-            // this exact length. Payload files are content-addressed and never
-            // rewritten either. The annotation log grows, so a size change
-            // correctly forces a re-hash.
-            let sha256 = match carry.get(relative.as_str()) {
-                Some(prior) if prior.bytes == bytes && relative != "annotations.jsonl" => {
-                    prior.sha256.clone()
-                }
-                _ => payload::sha256_file(&path)?,
+            let metadata = entry.metadata()?;
+            let bytes = metadata.len();
+            let modified_unix_ns = metadata
+                .modified()
+                .ok()
+                .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |since| since.as_nanos().min(u128::from(u64::MAX)) as u64);
+            // A file carries its digest over only when path, length AND
+            // modification time all match. Length alone is nearly enough —
+            // segments are immutable, payload files are content-addressed, and
+            // expiry's in-place rewrite removes spans so it shrinks — but
+            // "nearly" is the wrong standard for the number verification
+            // trusts. Every file this engine publishes arrives by atomic
+            // rename, so a rewritten one carries a new mtime.
+            let unchanged = carry.get(relative.as_str()).filter(|prior| {
+                prior.bytes == bytes
+                    && prior.modified_unix_ns == modified_unix_ns
+                    && prior.modified_unix_ns != 0
+            });
+            let sha256 = match unchanged {
+                Some(prior) => prior.sha256.clone(),
+                None => payload::sha256_file(&path)?,
             };
             files.push(ManifestFile {
                 path: relative,
                 bytes,
                 sha256,
+                modified_unix_ns,
             });
         }
     }
@@ -574,6 +593,40 @@ mod tests {
         let problems = verify_against(&engine, &loaded).expect("verify");
         assert_eq!(problems.len(), 1);
         assert!(problems[0].contains("payloads/ab/abcd.bin"));
+    }
+
+    #[test]
+    fn a_same_length_rewrite_does_not_carry_a_stale_digest() {
+        // The reuse optimization's danger: a checkpoint carries a prior
+        // digest over for an unchanged file, and "unchanged" judged by length
+        // alone would hand verification a digest for bytes that are gone. The
+        // length here is deliberately identical, which is the case length
+        // alone cannot see.
+        let root = temp_root("reuse");
+        let engine = root.clone();
+        let seg = engine.join("segment-00000000000000000001.seg");
+        fs::write(&seg, b"aaaaaaaa").expect("write");
+        let first = digest_engine(&engine, &[]).expect("digest");
+        assert_eq!(first.len(), 1);
+
+        // Rewrite in place, same byte count, different content.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        fs::write(&seg, b"bbbbbbbb").expect("rewrite");
+        let second = digest_engine(&engine, &first).expect("digest");
+        assert_eq!(second[0].bytes, first[0].bytes, "the length is unchanged");
+        assert_ne!(
+            second[0].sha256, first[0].sha256,
+            "a rewritten file must be re-hashed, not carried over on length alone"
+        );
+
+        // And an genuinely untouched file DOES carry over, or the optimization
+        // is not doing its job.
+        let third = digest_engine(&engine, &second).expect("digest");
+        assert_eq!(third[0].sha256, second[0].sha256);
+        assert_eq!(
+            third[0].modified_unix_ns, second[0].modified_unix_ns,
+            "carried over on an unchanged path, length and mtime"
+        );
     }
 
     #[test]
