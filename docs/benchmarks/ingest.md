@@ -33,8 +33,8 @@ lying.
   threads, dominated by one unrelated process pinning a core for the whole
   window. Its **before and after builds were alternated round-robin**, so the
   ratio is sound and the absolute levels are depressed. Read the ratio.
-- Anything reported as a gate against
-  [the roadmap](../roadmap.md) says explicitly whether the host was idle.
+- Anything reported as a gate against a roadmap target says explicitly
+  whether the host was idle.
   A target is not met on a contended machine, however good the median looks.
 
 ## Protocol: what a wire format actually costs

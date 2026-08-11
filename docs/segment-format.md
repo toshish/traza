@@ -196,9 +196,8 @@ migration of the store:
 
 The design document gives the underlying reason: a span export "cannot pin
 [annotations and payload bytes] at all" — there is no consistent point across
-the store's independent recovery domains for it to pin
-([generations-design.md](generations-design.md)). Closing that is what the
-generation/checkpoint boundary is for, and it is scheduled before 1.0.
+the store's independent recovery domains for it to pin. Closing that is what
+the generation/checkpoint boundary is designed for.
 
 So export-and-reingest is a complete migration only for a store with no
 offloaded payloads and no annotations. Otherwise: back up, and read the backup

@@ -51,6 +51,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   actions updates into one weekly PR per ecosystem. The changelog's
   footer now carries the full compare-link lineage, every release back
   to v0.1.0.
+- **Future-facing documentation left the repository.** `docs/roadmap.md`,
+  `docs/ha-design.md`, and `docs/generations-design.md` moved to the
+  private planning workspace and were removed from the repository **and
+  its git history** — the repo documents what Traza does; where it is
+  going is tracked elsewhere. This is the second history rewrite (the
+  first predates going public), and it re-hashed every commit and
+  re-pointed every tag, including the ones the 0.22.0 note below could
+  still call bit-identical when it was written. Stated here for the same
+  reason as last time: a lineage that quietly changed under its tags
+  would be worse than one that says so. Published release artifacts and
+  crates.io packages are immutable and still contain the files as they
+  were at their release.
 
 ## [0.22.1] - 2026-08-07
 
@@ -875,7 +887,7 @@ Alongside it, four defects from an independent review of v0.17, fixed and
 tested. They are symptoms of one gap — Traza has several recovery domains and
 nothing names a state they all agree on — so the class fix is designed too, and
 scheduled before 1.0 rather than as part of HA:
-[docs/generations-design.md](docs/generations-design.md).
+`docs/generations-design.md` (since moved out of the repository).
 
 ### Fixed
 

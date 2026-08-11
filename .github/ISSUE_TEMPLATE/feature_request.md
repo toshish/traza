@@ -7,8 +7,7 @@ labels: enhancement
 **The problem, before the feature**
 
 What are you trying to find out or make happen, against what kind of
-workload? The roadmap ([docs/roadmap.md](../../docs/roadmap.md)) sequences
-by phase — it helps to know whether this blocks you today or shapes where
+workload? It helps to know whether this blocks you today or shapes where
 you are heading.
 
 **What you'd expect**

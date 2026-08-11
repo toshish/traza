@@ -42,8 +42,7 @@ Practical consequences:
   meaningless across hosts.
 - To bulk-load with `seed --data-dir`, stop the server first; or leave it
   running and use `seed --url` to go through the API instead.
-- Scaling today is vertical. Multi-node replication is the designed trajectory,
-  not shipped behaviour — see the [HA design](../ha-design.md).
+- Scaling today is vertical; multi-node replication is not shipped behaviour.
 
 ## What lives on disk
 

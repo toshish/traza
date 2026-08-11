@@ -60,7 +60,7 @@ Any OpenTelemetry SDK exports to Traza with two environment variables (`OTEL_EXP
 
 ## Why Traza
 
-- **One binary whose deployment grows with you.** A single process stores everything under `--data-dir` — laptop, CI job, edge box, or the agent you are debugging right now. The engine's foundations (immutable segments, idempotent primary-key ingest, journaled compaction) were chosen to replicate; the [HA design](docs/ha-design.md) is the committed trajectory, and today's scope is honestly single-node.
+- **One binary whose deployment grows with you.** A single process stores everything under `--data-dir` — laptop, CI job, edge box, or the agent you are debugging right now. The engine's foundations (immutable segments, idempotent primary-key ingest, journaled compaction) were chosen with replication in mind; today's scope is honestly single-node.
 - **Built for LLM and agent workloads.** Sessions, token and cost rollups, prompt/completion capture with content-addressed offloading, post-hoc evals and annotations, content search over prompts, live tail, and one-command NDJSON export — first-class, not bolted on. See [LLM semantics](docs/llm-semantics.md).
 - **Your agent can read its own traces.** `--mcp` serves a [Model Context Protocol](docs/guide/mcp.md) endpoint from the same binary — ten tools shaped like questions (what is failing, what is slow, where did the money go), results bounded in tokens, stored span text confined as untrusted, and no fetcher, shell, or outbound path behind the boundary for an injected instruction to actuate.
 - **Small enough to trust.** Two direct dependencies; HTTP, threading, and file I/O are the Rust standard library. The in-crate SHA-256 (content addressing only, never authentication) and index hash (not a cryptographic commitment — every probe re-verified against the record) are pinned by test vectors. Every performance number is measured by a bundled benchmark, with anything extrapolated marked as such.
@@ -72,7 +72,7 @@ Measured on macOS/aarch64 (10 hardware threads) by the bundled benchmarks over t
 
 ## Status
 
-Pre-1.0 and honest about it: on-disk formats may change between 0.x versions, single-node is the current scope, and the known architectural gap (query-visible state spans several recovery domains; the generation/checkpoint boundary that closes it is [designed](docs/generations-design.md) and scheduled before 1.0) is stated rather than implied. The phased roadmap — durable v1 foundations, replicated HA, columnar analytics at billion-span scale — lives in [docs/roadmap.md](docs/roadmap.md).
+Pre-1.0 and honest about it: on-disk formats may change between 0.x versions, single-node is the current scope, and the known architectural gap — query-visible state spans several recovery domains, so backup, export, retention and deletion are four mechanisms rather than one — is stated rather than implied. The [CHANGELOG](CHANGELOG.md) is the record of what ships.
 
 ## Documentation
 

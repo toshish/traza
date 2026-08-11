@@ -176,8 +176,8 @@ storage-bench`, which leaves each corpus's data directory on disk; the header
 gives the records region at bytes 24 and 32 (see
 [segment format](segment-format.md)).
 
-Two roadmap items attack what compression cannot: [columnar segment projections
-and an object-storage tier](roadmap.md#phase-3--scale-out-and-analytics-v2x).
+Columnar segment projections and an object-storage tier attack what
+compression cannot.
 The object tier is the one that matters most for the cost row, because it is the
 only thing that removes the per-replica multiplier. Neither has shipped, and
 compression itself is not currently a named roadmap item.
