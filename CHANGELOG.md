@@ -73,14 +73,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   restart would redo — and a constant is neither replayed nor reclaimable.
 - **The checkpoint's commit point is proven by SIGKILL**, not only
   deterministically. `tests/durability.rs` kills a real server mid-checkpoint
-  from both sides of the commit — aimed at the manifest directory appearing
-  and at `CURRENT` changing, because the window between them is two fsyncs
-  wide and a stagger alone lands wherever the machine favours — and asserts
-  that recovery answers with exactly one state: every acknowledged span
-  present, the hot key at the newest acknowledged version, the live
-  generation verifying clean over `GET /v1/verify`, and no staged `CURRENT`
-  or manifest left behind. Publishing `CURRENT` before the manifest is
-  durable fails it.
+  at three named on-disk signals — the manifest directory appearing,
+  `.CURRENT.tmp` existing between the staged write and its rename, and
+  `CURRENT` itself changing — because those windows are single fsyncs wide
+  and a stagger alone lands wherever the machine favours. Recovery must then
+  answer with exactly one state: every acknowledged span present, the hot key
+  at the newest acknowledged version, the live generation verifying clean
+  over `GET /v1/verify`, a complete manifest behind whatever `CURRENT` names,
+  and nothing staged surviving the sweep. Publishing `CURRENT` before the
+  manifest is durable fails it.
+
+  The staged-`CURRENT` signal exists because a slower CI runner reached that
+  window when a fast machine never did — and a test that only covers a state
+  when the machine happens to be slow is a test that passes for the wrong
+  reason. Aiming at it beats depending on the weather.
 
   Recorded because the opposite would be a claim rather than evidence: the
   *other* ordering rule — reclaiming folded frames only after `CURRENT` is

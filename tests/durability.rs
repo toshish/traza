@@ -1093,7 +1093,7 @@ fn a_crash_during_a_checkpoint_publishes_all_or_nothing() {
     // load-bearing; it becomes load-bearing the moment segment loading is
     // driven by the manifest, which is what a replicated snapshot install
     // would want. Invariant 12 says the same thing in the same words.
-    const ATTEMPTS: usize = 6;
+    const ATTEMPTS: usize = 9;
     const PER_BATCH: usize = 150;
     const ROUNDS: usize = 8;
 
@@ -1123,32 +1123,44 @@ fn a_crash_during_a_checkpoint_publishes_all_or_nothing() {
         // serving it, and a client that panics on the reset would be noise.
         std::thread::spawn(move || ask_and_forget(port, "POST /v1/checkpoint HTTP/1.1"));
 
-        // Two named signals, not one stopwatch. The manifest directory
-        // appears when the checkpoint starts publishing — the last moment
-        // before the commit sequence — and `CURRENT` changing IS the commit.
-        // Aiming at each in turn is what puts kills on both sides of the
-        // fsync deterministically; the window between them is two fsyncs
-        // wide, so a stagger alone lands on whichever side the machine
-        // happens to favour.
-        let target_committed = attempt % 2 == 1;
+        // Three named signals, not one stopwatch. Each is a real state in the
+        // publish sequence, and aiming at them in turn is what covers the
+        // matrix on every machine rather than on whichever one happens to be
+        // slow enough: the manifest directory appears as publishing begins,
+        // `.CURRENT.tmp` exists between the staged write and the rename, and
+        // `CURRENT` changing IS the commit. A stagger alone lands wherever
+        // the machine favours — the staged-CURRENT window in particular was
+        // never reached locally and was found by a slower CI runner, which is
+        // precisely why it is aimed at here instead of hoped for.
+        let signal = attempt % 3;
         let next = dir.join("generations").join((before + 1).to_string());
+        let staged_current = dir.join(".CURRENT.tmp");
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
         let mut signalled = false;
         while std::time::Instant::now() < deadline {
-            let reached = match target_committed {
-                true => current_generation(&dir) == Some(before + 1),
-                false => next.exists(),
+            let reached = match signal {
+                0 => next.exists(),
+                1 => staged_current.exists(),
+                _ => current_generation(&dir) == Some(before + 1),
             };
             if reached {
                 signalled = true;
                 break;
             }
-            std::thread::sleep(Duration::from_micros(100));
+            // The staged CURRENT exists for one fsync and one rename, so it
+            // is polled tightly. Missing it is not a failure — the kill then
+            // lands a step later, which is another legitimate row of the
+            // matrix — but the tight poll is what makes catching it usual.
+            if signal != 1 {
+                std::thread::sleep(Duration::from_micros(100));
+            }
         }
-        assert!(
-            signalled,
-            "attempt {attempt}: the checkpoint never reached its signal within the failsafe"
-        );
+        if signal != 1 {
+            assert!(
+                signalled,
+                "attempt {attempt}: the checkpoint never reached its signal within the failsafe"
+            );
+        }
         // A little deeper each time, so kills spread through the steps that
         // follow the signal rather than clustering on the first one.
         std::thread::sleep(Duration::from_micros(attempt as u64 * 400));
@@ -1166,14 +1178,14 @@ fn a_crash_during_a_checkpoint_publishes_all_or_nothing() {
             false => caught_after_commit += 1,
         }
 
-        // Nothing half-written survives. A staged manifest or a staged
-        // CURRENT left behind would be a second thing claiming to describe
-        // the store.
-        let staged = matching_files(&dir, |name| name.starts_with(".CURRENT"));
-        assert!(
-            staged.is_empty(),
-            "attempt {attempt}: a staged CURRENT survived the crash: {staged:?}"
-        );
+        // A staged `CURRENT` may well be sitting here: the publish writes
+        // `.CURRENT.tmp`, fsyncs it, and renames, so a kill in between leaves
+        // one behind. That is inert — nothing reads it, exactly like the
+        // orphan segment temps — and the property that matters is that it
+        // never became authoritative and does not survive recovery. Both are
+        // checked below. (Asserting its absence HERE is what a slower runner
+        // caught: it lands in that window where a fast one does not.)
+        //
         // The generation CURRENT names has a COMPLETE manifest. This is the
         // ordering rule stated as a property: the manifest is durable before
         // CURRENT moves, so there is no crash that leaves CURRENT pointing at
@@ -1244,6 +1256,16 @@ fn a_crash_during_a_checkpoint_publishes_all_or_nothing() {
         assert_eq!(verified["generation"], landed);
 
         recovered.kill_hard();
+
+        // Recovery swept whatever the crash staged. A leftover temp is not a
+        // correctness problem on its own, but one per crash accumulating in a
+        // store's root is how a directory fills with things nobody can
+        // explain.
+        let staged = matching_files(&dir, |name| name.starts_with(".CURRENT"));
+        assert!(
+            staged.is_empty(),
+            "attempt {attempt}: a staged CURRENT survived RECOVERY: {staged:?}"
+        );
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
