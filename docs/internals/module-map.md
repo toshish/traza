@@ -42,10 +42,33 @@ opened segment owns its file handle and decoded index maps only — records are
 decoded when a query selects their offsets, and no decoded record vector is
 retained. Byte layout: [segment format](../segment-format.md).
 
+### [`src/generation.rs`](../../src/generation.rs)
+
+Generations: the one state every recovery domain agrees on. Owns the manifest
+(`state-manifest.json` — every load-bearing file with its length and SHA-256,
+plus the log position it folded through), `CURRENT` and its staged-rename
+publication, the digest walk that builds a manifest, verification against one,
+the staged install behind `Store::restore`, and the sweep that retires
+superseded manifests.
+
+The engine's files never move: a generation *references* the working set in
+place, because segment paths are load-bearing (invariants 1 and 5). What
+changes hands is the manifest. A pin is a hard-link farm of one manifest's
+files, which is why a backup copy survives compaction unlinking the originals
+underneath it.
+
+`Store::checkpoint`, `pin_generation`, `verify_generation` and `restore` in
+[`src/lib.rs`](../../src/lib.rs) are the operations built on this; invariant 12
+states the ordering rules they must not break.
+
 ### [`src/wal.rs`](../../src/wal.rs)
 
-The write-ahead log with group commit. Framing is
-`[u32 length][u32 crc32][payload]`, the payload being one batch's JSON.
+The write-ahead log with group commit. The file opens with the 8-byte magic
+`TRZWAL02`; framing is `[u32 length][u32 crc32][u64 epoch][u64 sequence][payload]`,
+the payload being one batch's JSON. The `(epoch, sequence)` stamp names the
+generation a frame was appended under, and recovery replays a frame only when
+that stamp is strictly after the live generation's `folded_through` — see
+[`src/generation.rs`](#srcgenerationrs) and invariant 12.
 Recovery streams frames one at a time and distinguishes a torn tail (bytes the
 frame declared are missing — dropped, and the file truncated back to the last
 good frame) from interior damage (a complete frame that fails its checksum or

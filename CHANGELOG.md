@@ -5,6 +5,78 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **One recovery domain: generations and checkpoints.** Query-visible state
+  lived in several independent recovery domains — the write-ahead log and
+  buffer, segments, `annotations.jsonl`, `payloads/` — each with its own
+  durability rule and its own idea of "now", and nothing named a state they
+  all agreed on. That is why backup, export, retention and deletion were four
+  mechanisms rather than one. A **generation** is that agreed state: a
+  manifest naming every load-bearing file with its SHA-256 digest, plus the
+  log position it folded through. `CURRENT` names the live one, and moving it
+  — a staged rename made durable by a directory fsync — is the single commit
+  point for a checkpoint, a restore, or a published deletion.
+
+  - **Backup runs against a live server**: `POST /v1/backups/{label}`
+    checkpoints, hard-links the manifested files into `pins/{label}`, and
+    verifies every digest before reporting success. Hard links share inodes,
+    so a pin costs almost no disk and holds its bytes even after compaction
+    unlinks the originals — the copy proceeds at its own pace, and
+    `POST /v1/backups/{label}/release` frees it. The pinned set carries
+    **spans, annotations and payload bytes together**, which is what a span
+    export never could.
+  - **Restore is install**: `traza-server --restore DIR` (or `Store::restore`)
+    verifies the backup *before* swapping anything, and commits at one
+    `CURRENT` rename, so a failed or interrupted restore leaves the prior
+    store rather than a blend.
+  - **`GET /v1/verify`** re-digests the live generation and names each
+    discrepancy, so recovery can distinguish damage it may ignore from damage
+    that changes what the store contains by asking rather than inferring it
+    from whether parsing happened to succeed.
+  - **`POST /v1/checkpoint`**, plus a checkpoint every five minutes from the
+    maintenance thread. Cheap by construction: segments are immutable, so a
+    checkpoint carries their digests over from the previous manifest and
+    hashes only what was written since.
+
+- **Log frames carry the generation they belong to.** The framing gains an
+  eight-byte magic and a `(epoch, sequence)` stamp — a 24-byte header, up from
+  8. `CURRENT` and the log are separate filesystem objects, so no rename can
+  make "the new generation is live" and "the frames folded into it are gone"
+  one event; a crash between them meets a log still holding folded frames, and
+  for a checkpoint that published a deletion, replaying them resurrects
+  exactly what was deleted. Recovery now replays a frame only when its stamp
+  is strictly after the live generation's `folded_through`, which demotes log
+  reclamation from correctness to housekeeping. Sequences are monotonic for
+  the life of the store — a rewrite keeps counting rather than restarting —
+  because a stamp landing at or before a recorded fold point would be
+  discarded by the next replay as though it had been folded.
+
+  `tests/generations.rs` proves it against the crash state itself: the log's
+  pre-checkpoint bytes are written back over a committed generation, and the
+  test fails when the stamp rule is removed.
+
+- **Existing data directories are adopted at first open.** Nothing moves —
+  segments stay exactly where they are, because their paths are load-bearing —
+  and generation one is published over the files already there, converting a
+  pre-generation log to stamped framing on the way. One-way, resumable, and
+  committed by the `CURRENT` rename, so a crash mid-adoption leaves a
+  directory the next open finishes.
+
+### Changed
+
+- **`wal_bytes` counts replayable work, not file bytes.** The log's constant
+  preamble is excluded, so a reclaimed log measures zero. Both the
+  `flush_wal_bytes` bound and the statistic mean the same thing — what a
+  restart would redo — and a constant is neither replayed nor reclaimable.
+- **Checkpointing is never a side effect of a primitive.** It seals the write
+  buffer, and expiry must not decide when to seal: `expire_before` deletes
+  from every domain and stops, exactly as before. The deletion is durable when
+  its domains are durable and *published* by the next checkpoint — one
+  maintenance interval away, or immediately when a backup asks.
+
 ## [0.22.2] - 2026-08-12
 
 ### Fixed
@@ -1905,6 +1977,7 @@ completion trailers — clients parsing either surface must update.
 
 - This is an initial 0.1 release; consult README.md for the currently documented operational constraints and unsupported use cases.
 
+[Unreleased]: https://github.com/toshish/traza/compare/v0.22.2...HEAD
 [0.22.2]: https://github.com/toshish/traza/compare/v0.22.1...v0.22.2
 [0.22.1]: https://github.com/toshish/traza/compare/v0.22.0...v0.22.1
 [0.22.0]: https://github.com/toshish/traza/compare/v0.21.0...v0.22.0

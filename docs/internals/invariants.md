@@ -447,6 +447,58 @@ semantics. `tests/server_on_engine.rs` opens the server's data directory with
 
 ---
 
+## 12. `CURRENT` is the commit point, and a frame's stamp decides replay
+
+**The rule.** A generation is published by ONE staged rename of `CURRENT` made
+durable by a directory fsync, and its manifest is durable before that rename.
+Recovery replays a log frame only when its `(epoch, sequence)` stamp is
+strictly after the live generation's `folded_through`.
+
+**Where.** `src/generation.rs` (`publish_current`, `write_manifest`,
+`verify_against`), `Store::checkpoint`, and `Wal::recover` in
+[`src/wal.rs`](../../src/wal.rs).
+
+**Why the stamp, and not just trimming the log.** `CURRENT` and the log are
+separate filesystem objects, so no rename can make "generation N+1 is live" and
+"the frames folded into it are gone" one event. A crash between them meets a
+log still physically holding folded frames — and for a checkpoint that
+published a deletion, replaying them resurrects exactly what was deleted. The
+stamp closes it, which demotes log reclamation from correctness to
+housekeeping: doing it late, or never, costs disk and replay time and cannot
+change what the store contains.
+
+**Ordering, and none of it is negotiable.**
+
+1. The manifest is durable **before** `CURRENT` moves, or a restart points at a
+   generation whose contents are not proven.
+2. `CURRENT` is durable — written, renamed, and the directory fsynced —
+   **before** a single folded frame is reclaimed. A rename is visible
+   immediately but is not crash-durable until its directory is synced, so
+   reclaiming between those two steps risks the one combination that loses
+   data: a durable reclamation against a `CURRENT` that rolls back.
+3. The log is reclaimed only after that, and by rewriting the prefix away
+   rather than truncating — folded frames are a prefix, and `set_len` removes a
+   suffix.
+
+Everything before step 2's fsync is retryable; everything after it is
+bookkeeping.
+
+**Sequences are monotonic for the life of the store.** A rewrite keeps counting
+rather than restarting. A stamp that landed at or before a recorded
+`folded_through` would be discarded by the next replay as though it had been
+folded, which is silent data loss.
+
+**Checkpointing is never a side effect of a primitive.** It seals the write
+buffer, and expiry must not decide when to seal. The maintenance cadence and
+`pin_generation` publish; `expire_before` deletes and stops.
+
+**Proven by** `tests/generations.rs`, whose
+`folded_frames_left_in_the_log_by_a_crash_never_replay` reconstructs the crash
+state byte-for-byte — the log's pre-checkpoint bytes written back over a
+committed generation — and fails when the stamp rule is removed.
+
+---
+
 ## Rules of thumb for changing this code
 
 - **If it is only reachable under concurrency, a single-threaded test will not

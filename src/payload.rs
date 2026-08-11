@@ -62,20 +62,87 @@ const K: [u32; 64] = [
 
 /// SHA-256 of `bytes` as lowercase hex (FIPS 180-4).
 pub fn sha256_hex(bytes: &[u8]) -> String {
-    let mut state: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
-        0x5be0cd19,
-    ];
-    let bit_length = (bytes.len() as u64).wrapping_mul(8);
-    let mut message = bytes.to_vec();
-    message.push(0x80);
-    while message.len() % 64 != 56 {
-        message.push(0);
-    }
-    message.extend_from_slice(&bit_length.to_be_bytes());
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher.finalize_hex()
+}
 
-    let mut schedule = [0_u32; 64];
-    for block in message.chunks_exact(64) {
+/// Incremental SHA-256 (FIPS 180-4), so a digest over a file larger than RAM
+/// never needs the file resident. [`sha256_hex`] is this hasher over one
+/// slice, which is what keeps the standard test vectors pinning both paths.
+///
+/// Buffers at most 63 bytes — the tail of the last incomplete block — and
+/// compresses everything else as it arrives.
+pub(crate) struct Sha256 {
+    state: [u32; 8],
+    /// Tail bytes that have not yet filled a 64-byte block.
+    pending: [u8; 64],
+    pending_len: usize,
+    /// Total message length so far, in bytes.
+    length: u64,
+}
+
+impl Sha256 {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: [
+                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+                0x5be0cd19,
+            ],
+            pending: [0; 64],
+            pending_len: 0,
+            length: 0,
+        }
+    }
+
+    pub(crate) fn update(&mut self, mut bytes: &[u8]) {
+        self.length = self.length.wrapping_add(bytes.len() as u64);
+        if self.pending_len > 0 {
+            let take = (64 - self.pending_len).min(bytes.len());
+            self.pending[self.pending_len..self.pending_len + take].copy_from_slice(&bytes[..take]);
+            self.pending_len += take;
+            bytes = &bytes[take..];
+            if self.pending_len == 64 {
+                let block = self.pending;
+                self.compress(&block);
+                self.pending_len = 0;
+            }
+        }
+        let mut chunks = bytes.chunks_exact(64);
+        for block in &mut chunks {
+            let mut owned = [0u8; 64];
+            owned.copy_from_slice(block);
+            self.compress(&owned);
+        }
+        let rest = chunks.remainder();
+        self.pending[..rest.len()].copy_from_slice(rest);
+        self.pending_len = rest.len();
+    }
+
+    pub(crate) fn finalize_hex(mut self) -> String {
+        let bit_length = self.length.wrapping_mul(8);
+        let mut tail = Vec::with_capacity(72);
+        tail.extend_from_slice(&self.pending[..self.pending_len]);
+        tail.push(0x80);
+        while tail.len() % 64 != 56 {
+            tail.push(0);
+        }
+        tail.extend_from_slice(&bit_length.to_be_bytes());
+        self.pending_len = 0;
+        for block in tail.chunks_exact(64) {
+            let mut owned = [0u8; 64];
+            owned.copy_from_slice(block);
+            self.compress(&owned);
+        }
+        let mut out = String::with_capacity(64);
+        for word in self.state {
+            out.push_str(&format!("{word:08x}"));
+        }
+        out
+    }
+
+    fn compress(&mut self, block: &[u8; 64]) {
+        let mut schedule = [0_u32; 64];
         for (i, word) in schedule.iter_mut().take(16).enumerate() {
             *word = u32::from_be_bytes([
                 block[i * 4],
@@ -96,7 +163,7 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
                 .wrapping_add(schedule[i - 7])
                 .wrapping_add(s1);
         }
-        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = state;
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = self.state;
         for i in 0..64 {
             let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
             let ch = (e & f) ^ (!e & g);
@@ -117,20 +184,30 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
             b = a;
             a = temp1.wrapping_add(temp2);
         }
-        state[0] = state[0].wrapping_add(a);
-        state[1] = state[1].wrapping_add(b);
-        state[2] = state[2].wrapping_add(c);
-        state[3] = state[3].wrapping_add(d);
-        state[4] = state[4].wrapping_add(e);
-        state[5] = state[5].wrapping_add(f);
-        state[6] = state[6].wrapping_add(g);
-        state[7] = state[7].wrapping_add(h);
+        self.state[0] = self.state[0].wrapping_add(a);
+        self.state[1] = self.state[1].wrapping_add(b);
+        self.state[2] = self.state[2].wrapping_add(c);
+        self.state[3] = self.state[3].wrapping_add(d);
+        self.state[4] = self.state[4].wrapping_add(e);
+        self.state[5] = self.state[5].wrapping_add(f);
+        self.state[6] = self.state[6].wrapping_add(g);
+        self.state[7] = self.state[7].wrapping_add(h);
     }
-    let mut out = String::with_capacity(64);
-    for word in state {
-        out.push_str(&format!("{word:08x}"));
+}
+
+/// SHA-256 of a file as lowercase hex, streamed in 64 KiB reads so a
+/// multi-gigabyte segment is digested without ever being resident.
+pub(crate) fn sha256_file(path: &Path) -> std::io::Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut chunk = vec![0u8; 64 * 1024];
+    loop {
+        let read = std::io::Read::read(&mut file, &mut chunk)?;
+        if read == 0 {
+            return Ok(hasher.finalize_hex());
+        }
+        hasher.update(&chunk[..read]);
     }
-    out
 }
 
 // ------------------------------------------------------------ payload store

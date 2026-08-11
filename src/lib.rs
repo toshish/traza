@@ -11,6 +11,7 @@ pub mod annotations;
 pub mod auth;
 pub mod content;
 pub mod expiration;
+mod generation;
 pub mod hash;
 pub mod insights;
 pub mod mcp;
@@ -1288,6 +1289,18 @@ struct Drained {
     /// subtract exactly what this segment accounted for.
     upserts: usize,
     id: u64,
+    /// The log's stamp position at the drain, captured under the writer lock
+    /// so no append can interleave. Everything at or before it is in the
+    /// drained spans — which is exactly what a checkpoint built on this seal
+    /// may record as its `folded_through`.
+    position: Option<generation::FoldedThrough>,
+}
+
+/// What a seal accomplished: whether a segment was published, and — when the
+/// store keeps a log — the fold point a checkpoint may claim for it.
+struct SealOutcome {
+    published: bool,
+    folded: Option<generation::FoldedThrough>,
 }
 
 #[derive(Debug)]
@@ -1466,7 +1479,14 @@ struct Sealed {
 
 /// A durable span store backed by sorted JSON-lines segment files.
 pub struct Store {
+    /// The store directory: segments, the annotation log, and payload files
+    /// live here directly, alongside the lock, the write-ahead log, `CURRENT`,
+    /// and the `generations/` and `pins/` metadata. A generation references
+    /// the engine files in place rather than owning a separate copy of them.
     directory: PathBuf,
+    /// The generation `CURRENT` names. Advanced by [`Store::checkpoint`]
+    /// after its `CURRENT` rename is durable, never before.
+    live_generation: AtomicU64,
     config: Config,
     // Locking discipline: maintenance first, then sealing, then writer, then
     // segments, and retain that order until every guard is dropped. The rollup
@@ -1540,18 +1560,55 @@ pub struct Store {
 }
 
 impl Store {
+    /// Restores a store from a backup directory `staged` into `root`, then
+    /// opens it. `root` must not have a live store against it.
+    ///
+    /// `staged` is a copy of a pin: an engine file set plus its manifest. The
+    /// backup is verified before anything is swapped, and the swap commits at
+    /// one `CURRENT` rename, so a failed or interrupted restore leaves the
+    /// prior store (or nothing) rather than a blend. This is the inverse of
+    /// `pin` + copy.
+    pub fn restore(
+        root: impl AsRef<Path>,
+        staged: impl AsRef<Path>,
+        config: Config,
+    ) -> Result<Self> {
+        let root = root.as_ref().to_path_buf();
+        fs::create_dir_all(&root)?;
+        let lock = DirectoryLock::acquire(root.join(LOCK_FILE_NAME))?;
+        generation::install_staged(&root, staged.as_ref())?;
+        drop(lock);
+        Self::open(root, config)
+    }
+
     /// Opens or creates a store in `path`.
     ///
     /// Only one live `Store` may own a directory. Opening also removes orphaned
     /// temporary segment files left by an interrupted write.
+    ///
+    /// A directory from before the generation layout is migrated at first
+    /// open — engine files move under `engine/`, the log is rewritten in
+    /// stamped framing, and generation one is published — after which
+    /// `CURRENT` names the live generation and every open loads through it.
+    /// The migration is one-way and resumable: it commits by publishing
+    /// `CURRENT`, so a crash anywhere before that leaves a directory the next
+    /// open finishes migrating, and a crash after it leaves a migrated store.
     pub fn open(path: impl AsRef<Path>, config: Config) -> Result<Self> {
-        let directory = path.as_ref().to_path_buf();
-        fs::create_dir_all(&directory)?;
+        let root = path.as_ref().to_path_buf();
+        fs::create_dir_all(&root)?;
 
-        let lock_path = directory.join(LOCK_FILE_NAME);
+        let lock_path = root.join(LOCK_FILE_NAME);
         let directory_lock = DirectoryLock::acquire(lock_path)?;
 
         let opened = (|| {
+            let directory = root;
+            let live_generation = match generation::read_current(&directory)? {
+                Some(live) => live,
+                None => migrate_to_generations(&directory)?,
+            };
+            let manifest =
+                generation::load_manifest(&generation::manifest_path(&directory, live_generation))?;
+
             remove_orphan_temps(&directory)?;
             // Interrupted compaction rewrites are finished from their
             // supersede markers BEFORE loading: recovery follows the journal,
@@ -1571,7 +1628,11 @@ impl Store {
 
             // Replay BEFORE accepting new writes. Records are append-ordered
             // and upserted in that order, so the newest version of a
-            // re-ingested key wins exactly as it did before the crash.
+            // re-ingested key wins exactly as it did before the crash. Frames
+            // at or before the live generation's `folded_through` are already
+            // inside its files and are discarded, trimmed or not — which is
+            // what makes a published deletion durable against a log that was
+            // never rolled over.
             let mut buffer = WriteBuffer::default();
             let wal = if config.durability == Durability::Buffered {
                 // A buffered store makes no durability promise, so it neither
@@ -1588,10 +1649,27 @@ impl Store {
                 // a live surface. Replaying them would show a reconnecting
                 // client the last buffer's worth of history as though it had
                 // just arrived.
-                wal::Wal::recover(&directory, |span| {
+                let recovered = wal::Wal::recover(&directory, manifest.folded_through, |span| {
                     buffer.upsert(span);
                 })?;
-                Some(wal::Wal::open(&directory, config.wal_commit_window)?)
+                // New stamps must land strictly after BOTH everything the log
+                // holds and everything any manifest folded — a stamp that
+                // sorted at or before either would be discarded on the next
+                // replay as if it had been folded, which is data loss. The
+                // epoch likewise resumes at its high-water mark: a checkpoint
+                // whose `CURRENT` rename did not survive leaves frames stamped
+                // under the generation that never went live.
+                let epoch = live_generation.max(recovered.highest.epoch);
+                let resume_after = recovered
+                    .highest
+                    .sequence
+                    .max(manifest.folded_through.sequence);
+                Some(wal::Wal::open(
+                    &directory,
+                    config.wal_commit_window,
+                    epoch,
+                    resume_after,
+                )?)
             };
             let next_segment = segments
                 .iter()
@@ -1604,6 +1682,7 @@ impl Store {
             Ok(Self {
                 annotations: annotations::AnnotationLog::open(&directory)?,
                 directory,
+                live_generation: AtomicU64::new(live_generation),
                 config,
                 maintenance: Mutex::new(()),
                 sealing: Mutex::new(()),
@@ -1681,7 +1760,7 @@ impl Store {
         // lock made every concurrent ingest wait for it — the lock was held
         // for the serialization of every batch in the system, one at a time.
         // Only the file write has to be inside the lock (below).
-        let frame = match &self.wal {
+        let mut frame = match &self.wal {
             Some(_) => Some(self.metrics.wal_encode.time(|| wal::Wal::encode(&spans))?),
             None => None,
         };
@@ -1695,7 +1774,7 @@ impl Store {
             let waited = Instant::now();
             let mut writer = self.lock_writer()?;
             self.metrics.writer_lock_wait.record(elapsed_nanos(&waited));
-            if let (Some(log), Some(frame)) = (&self.wal, &frame) {
+            if let (Some(log), Some(frame)) = (&self.wal, frame.as_mut()) {
                 pending_commit = Some(
                     self.metrics
                         .wal_write
@@ -2659,6 +2738,14 @@ impl Store {
                 &self.recent_payloads,
             )?;
         }
+        // The deletion is already durable in every domain it touched — that is
+        // invariant 10's discipline and it has not moved. What a generation
+        // adds is publication: the next checkpoint stops naming the expired
+        // bytes. That checkpoint is deliberately NOT taken here. It seals the
+        // write buffer, and a primitive that expires must not also decide when
+        // to seal; the maintenance cadence and `pin_generation` both publish
+        // on their own, so the deletion is in a published generation within
+        // one maintenance interval, or immediately if a backup asks.
         Ok(removed)
     }
 
@@ -3222,7 +3309,7 @@ impl Store {
                         .filter(|span| span.end_time_ns >= cutoff_ns)
                         .map(|span| span.as_ref())
                         .collect();
-                    log.rewrite(&survivors)?;
+                    log.rewrite(&survivors, 0)?;
                 }
                 writer.retain(|span| span.end_time_ns >= cutoff_ns);
             }
@@ -3627,11 +3714,11 @@ impl Store {
                 }
             },
         };
-        self.seal_with_permit()
+        Ok(self.seal_with_permit()?.published)
     }
 
     /// [`Self::seal`] with the seal permit already held.
-    fn seal_with_permit(&self) -> Result<bool> {
+    fn seal_with_permit(&self) -> Result<SealOutcome> {
         let sealing = Instant::now();
 
         // ---- drain: short critical section ------------------------------
@@ -3644,8 +3731,18 @@ impl Store {
             let writer = self.lock_writer()?;
             let locked = Instant::now();
             if writer.is_empty() {
-                return Ok(false);
+                return Ok(SealOutcome {
+                    published: false,
+                    folded: None,
+                });
             }
+            // Captured before anything else: with the writer lock held no
+            // append can interleave, so every stamped frame at or before this
+            // position carries a span this drain is about to copy out.
+            let position = match &self.wal {
+                Some(log) => Some(log.position()?),
+                None => None,
+            };
             // Cloning a `Vec<Arc<Span>>` copies pointers, not spans. This is
             // why the buffer holds handles: the same drain over `Vec<Span>`
             // would deep-copy ten thousand spans under the lock and give back
@@ -3663,7 +3760,12 @@ impl Store {
             self.metrics
                 .segment_seal_locked
                 .record(elapsed_nanos(&locked));
-            Drained { spans, upserts, id }
+            Drained {
+                spans,
+                upserts,
+                id,
+                position,
+            }
         };
 
         // ---- write: no engine lock held ---------------------------------
@@ -3705,7 +3807,213 @@ impl Store {
         drop(pending);
         self.metrics.segment_seal.record(elapsed_nanos(&sealing));
         self.metrics.segment_seal_spans.add(sealed);
-        Ok(true)
+        Ok(SealOutcome {
+            published: true,
+            folded: drained.position,
+        })
+    }
+
+    /// Publishes a new generation: one manifest naming every load-bearing
+    /// engine file with its digest, the log position it folded through, and
+    /// one `CURRENT` rename — made durable by a directory fsync — that is the
+    /// single commit point. Returns the new generation id.
+    ///
+    /// The sequence and its crash behaviour follow the checkpoint matrix in
+    /// the design: everything before the `CURRENT` fsync is retryable and
+    /// invisible (the old generation stays live, orphaned manifests are
+    /// overwritten by the retry), and everything after it — advancing the
+    /// stamp epoch, rolling the folded frames out of the log, sweeping old
+    /// manifests — is housekeeping that a crash merely postpones. Recovery
+    /// discards folded frames by stamp, trimmed or not.
+    ///
+    /// Holds the maintenance lock (no compaction or expiry may replace files
+    /// mid-digest) and the seal permit (no segment may appear mid-manifest).
+    /// Ingest keeps flowing throughout: batches admitted after the fold point
+    /// stamp after it and replay against this generation on recovery.
+    /// Annotation appends land past the manifested prefix, which verification
+    /// reads as appends rather than damage.
+    pub fn checkpoint(&self) -> Result<u64> {
+        let _maintenance = self.lock_maintenance()?;
+        let _permit = self
+            .sealing
+            .lock()
+            .map_err(|_| Error::LockPoisoned("sealing"))?;
+
+        // Seal what the buffer holds, capturing the fold point at the drain.
+        // An empty buffer means nothing was drained: capture the position
+        // under a fresh writer lock instead, re-checking emptiness so a batch
+        // that slipped in between is sealed rather than silently folded.
+        let folded = loop {
+            let outcome = self.seal_with_permit()?;
+            if let Some(folded) = outcome.folded {
+                break folded;
+            }
+            match &self.wal {
+                None => break generation::FoldedThrough::NONE,
+                Some(log) => {
+                    let writer = self.lock_writer()?;
+                    if writer.is_empty() {
+                        break log.position()?;
+                    }
+                    // Admitted between the empty drain and this lock: go
+                    // around and seal it.
+                }
+            }
+        };
+
+        let epoch_floor = match &self.wal {
+            Some(log) => log.position()?.epoch,
+            None => 0,
+        };
+        let next = self
+            .live_generation
+            .load(Ordering::SeqCst)
+            .max(epoch_floor)
+            .saturating_add(1);
+
+        let prior = generation::load_manifest(&generation::manifest_path(
+            &self.directory,
+            self.live_generation.load(Ordering::SeqCst),
+        ))
+        .map(|manifest| manifest.files)
+        .unwrap_or_default();
+        let files = generation::digest_engine(&self.directory, &prior)?;
+        let created_unix_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_nanos().min(u128::from(u64::MAX)) as u64);
+        let manifest = generation::Manifest {
+            generation: next,
+            created_unix_ns,
+            folded_through: folded,
+            files,
+        };
+        // The manifest is durable before CURRENT moves, or a restart would
+        // point at a generation whose contents are not proven.
+        generation::write_manifest(&self.directory, &manifest)?;
+        generation::publish_current(&self.directory, next)?;
+        self.live_generation.store(next, Ordering::SeqCst);
+
+        // Everything past the CURRENT fsync is housekeeping: frames at or
+        // before the fold are excluded by stamp whether or not this runs.
+        if let Some(log) = &self.wal {
+            log.advance_epoch(next)?;
+            let writer = self.lock_writer()?;
+            let survivors: Vec<&Span> = writer.spans.iter().map(|span| span.as_ref()).collect();
+            if survivors.is_empty() {
+                log.reset()?;
+            } else {
+                log.rewrite(&survivors, next)?;
+            }
+        }
+        let _ = generation::sweep_generations(&self.directory, next);
+        Ok(next)
+    }
+
+    /// The generation `CURRENT` currently names.
+    pub fn live_generation(&self) -> u64 {
+        self.live_generation.load(Ordering::SeqCst)
+    }
+
+    /// Re-reads a generation's manifest and checks every file's length and
+    /// digest, returning each discrepancy. An empty vector means intact.
+    ///
+    /// This is what lets recovery distinguish "damage I may safely ignore"
+    /// from "damage that changes what the store contains" by asking rather
+    /// than inferring it from whether parsing happened to succeed. Pass the
+    /// generation `CURRENT` names ([`Self::live_generation`]) to verify the
+    /// live store; pass an older id to verify a generation a pin still holds.
+    pub fn verify_generation(&self, generation: u64) -> Result<Vec<String>> {
+        let manifest =
+            generation::load_manifest(&generation::manifest_path(&self.directory, generation))?;
+        // Serialize against the operations that replace files, so a digest is
+        // never read across a rewrite. Reads and ingest continue.
+        let _maintenance = self.lock_maintenance()?;
+        generation::verify_against(&self.directory, &manifest)
+    }
+
+    /// Pins the live generation into `pins/<label>/` as a hard-link farm, so a
+    /// backup can copy it while ingest and compaction carry on underneath.
+    ///
+    /// Checkpoints first, so the pin references an exact, digested manifest
+    /// rather than a store mid-flight. Then, under the maintenance lock and
+    /// seal permit — nothing may replace or add a file across the linking —
+    /// every manifested file is hard-linked into the pin directory and the
+    /// manifest is copied beside them. Hard links share inodes, so the pin
+    /// costs almost no disk and holds its bytes even after compaction unlinks
+    /// the originals from `engine/`; the reader drops them when it removes the
+    /// pin. Returns the pinned generation id.
+    ///
+    /// Backup is then: `pin`, [`verify_pin`](Self::verify_pin), copy the
+    /// directory, [`release_pin`](Self::release_pin) — no server stop.
+    pub fn pin_generation(&self, label: &str) -> Result<u64> {
+        if label.is_empty() || label.contains(['/', '\\']) || label.starts_with('.') {
+            return Err(Error::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a pin label must be a single non-hidden path component",
+            )));
+        }
+        let generation = self.checkpoint()?;
+        let manifest =
+            generation::load_manifest(&generation::manifest_path(&self.directory, generation))?;
+
+        let _maintenance = self.lock_maintenance()?;
+        let _permit = self
+            .sealing
+            .lock()
+            .map_err(|_| Error::LockPoisoned("sealing"))?;
+
+        let pin_dir = self.directory.join(generation::PINS_DIR).join(label);
+        if pin_dir.exists() {
+            return Err(Error::Io(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("a pin named {label:?} already exists"),
+            )));
+        }
+        let staged = pin_dir.with_file_name(format!(".{label}.pinning"));
+        let _ = fs::remove_dir_all(&staged);
+        let build = (|| -> Result<()> {
+            for file in &manifest.files {
+                let relative = file.path.replace('/', std::path::MAIN_SEPARATOR_STR);
+                let source = self.directory.join(&relative);
+                let target = staged.join(&relative);
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::hard_link(&source, &target)?;
+            }
+            generation::write_pin_manifest(&staged, &manifest)?;
+            Ok(())
+        })();
+        if let Err(error) = build {
+            let _ = fs::remove_dir_all(&staged);
+            return Err(error);
+        }
+        fs::create_dir_all(self.directory.join(generation::PINS_DIR))?;
+        fs::rename(&staged, &pin_dir)?;
+        sync_directory(&self.directory.join(generation::PINS_DIR))?;
+        Ok(generation)
+    }
+
+    /// Where a pin's hard-link farm lives — the directory a backup copies.
+    pub fn pin_path(&self, label: &str) -> PathBuf {
+        self.directory.join(generation::PINS_DIR).join(label)
+    }
+
+    /// Verifies a pin's files against the manifest copied into it — the check
+    /// a backup runs before trusting the copy it is about to make.
+    pub fn verify_pin(&self, label: &str) -> Result<Vec<String>> {
+        let pin_dir = self.pin_path(label);
+        let manifest = generation::load_manifest(&pin_dir.join(generation::MANIFEST_NAME))?;
+        generation::verify_against(&pin_dir, &manifest)
+    }
+
+    /// Removes a pin, freeing the disk its unshared bytes were holding. Idempotent.
+    pub fn release_pin(&self, label: &str) -> Result<()> {
+        match fs::remove_dir_all(self.directory.join(generation::PINS_DIR).join(label)) {
+            Ok(()) => sync_directory(&self.directory.join(generation::PINS_DIR)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(Error::Io(error)),
+        }
     }
 
     /// Drops the published spans from the buffer and reclaims the log.
@@ -3753,7 +4061,7 @@ impl Store {
                 // same value. So the log is reclaimed on the bound that
                 // exists to bound it, `flush_wal_bytes`, and the cost
                 // amortizes across every seal since the last reclaim.
-                log.rewrite(&survivors)?;
+                log.rewrite(&survivors, 0)?;
             }
         }
         writer.evict_sealed(&sealed);
@@ -4624,6 +4932,73 @@ fn segment_number(path: &Path) -> Option<u64> {
         .strip_suffix(LEGACY_SEGMENT_SUFFIX)
         .or_else(|| stem.strip_suffix(SEGMENT_SUFFIX))?;
     number.parse().ok()
+}
+
+/// Adopts a directory into the generation layout by publishing generation one
+/// over the files already in it. Returns the live generation id.
+///
+/// The engine files never move — the layout keeps them at the root — so this
+/// only adds metadata: it converts a pre-generation log to stamped framing,
+/// digests the working set, writes generation one's manifest, and publishes
+/// `CURRENT`. One-way and resumable: this runs only while `CURRENT` is absent,
+/// each step is idempotent (the log conversion recognizes a log already
+/// converted), and the commit is the `CURRENT` rename, so a crash before it
+/// leaves a directory the next open re-adopts and a crash after it leaves an
+/// adopted store. A brand-new empty directory takes the same path and gets an
+/// empty generation one.
+///
+/// The pre-generation log's spans are replayed with the old reader and
+/// rewritten as ONE stamped frame under `(epoch 1, sequence 1)`. Replay order
+/// is preserved inside the frame, so last-write-wins resolves exactly as it
+/// did, and generation one's `folded_through` of zero leaves the frame
+/// strictly after it — the spans replay into the buffer on the very open that
+/// adopts them.
+fn migrate_to_generations(root: &Path) -> Result<u64> {
+    // Convert the log, unless a resumed migration already did.
+    let wal_path = root.join("wal.log");
+    let already_v2 = match File::open(&wal_path) {
+        Ok(mut file) => {
+            let mut magic = [0u8; 8];
+            let mut filled = 0;
+            while filled < magic.len() {
+                match io::Read::read(&mut file, &mut magic[filled..]) {
+                    Ok(0) => break,
+                    Ok(read) => filled += read,
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(error) => return Err(Error::Io(error)),
+                }
+            }
+            filled == magic.len() && &magic == b"TRZWAL02"
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(Error::Io(error)),
+    };
+    if !already_v2 {
+        let mut replayed: Vec<Span> = Vec::new();
+        wal::Wal::recover_v1(root, |span| replayed.push(span))?;
+        if !replayed.is_empty() || wal_path.exists() {
+            wal::Wal::write_fresh(root, &replayed, 1)?;
+        }
+    }
+
+    // Generation one: everything the working set holds, nothing folded — the
+    // converted frame replays. The manifest is durable before CURRENT names
+    // it, and CURRENT is the commit.
+    let files = generation::digest_engine(root, &[])?;
+    let created_unix_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos().min(u128::from(u64::MAX)) as u64);
+    generation::write_manifest(
+        root,
+        &generation::Manifest {
+            generation: 1,
+            created_unix_ns,
+            folded_through: generation::FoldedThrough::NONE,
+            files,
+        },
+    )?;
+    generation::publish_current(root, 1)?;
+    Ok(1)
 }
 
 #[cfg(unix)]

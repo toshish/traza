@@ -42,6 +42,10 @@ trailers and has no declared length.
 | `POST` | [`/v1/spans`](#post-v1spans) | Ingest a native JSON span batch |
 | `POST` | [`/v1/traces`](#post-v1traces) | Ingest OTLP/HTTP (protobuf or JSON) |
 | `POST` | [`/v1/flush`](#post-v1flush) | Seal buffered spans into a segment |
+| `POST` | [`/v1/checkpoint`](#post-v1checkpoint) | Publish a generation |
+| `POST` | [`/v1/backups/{label}`](#post-v1backupslabel) | Pin and verify a backup |
+| `POST` | [`/v1/backups/{label}/release`](#post-v1backupslabelrelease) | Release a pin |
+| `GET` | [`/v1/verify`](#get-v1verify) | Verify the live generation |
 | `GET` | [`/v1/spans`](#get-v1spans) | Filtered span search |
 | `GET` | [`/v1/traces/{trace_id}`](#get-v1tracestrace_id) | One trace's spans and annotations |
 | `GET` | [`/v1/sessions`](#get-v1sessions) | Sessions, most recent activity first |
@@ -123,6 +127,58 @@ Seals every currently buffered span into a durable segment.
 ```
 
 Errors: `503` if the seal failed.
+
+### `POST /v1/checkpoint`
+
+Publishes a generation: seals the buffer, writes a manifest naming every
+load-bearing file with its digest, and moves `CURRENT`. The server also does
+this every five minutes. See [backup and restore](../operations/backup.md).
+
+```json
+{"generation":42}
+```
+
+Errors: `503` if the checkpoint failed. Nothing is published unless it
+succeeds — the prior generation stays live.
+
+### `POST /v1/backups/{label}`
+
+Checkpoints, hard-links the manifested files into `pins/{label}`, and verifies
+every digest before reporting success. The server keeps running throughout;
+the pin holds its bytes even after compaction unlinks the originals, so the
+copy can proceed at its own pace.
+
+```json
+{"backup":"nightly","generation":42,
+ "path":"/var/lib/traza/pins/nightly","verified":true}
+```
+
+`path` is a directory to copy — Traza never writes outside its own data
+directory. Copy it, then release the pin.
+
+Errors: `409` if a pin by that label already exists or the label is not a
+single non-hidden path component; `500` with a `problems` array if the pin does
+not verify; `503` if the checkpoint or linking failed.
+
+### `POST /v1/backups/{label}/release`
+
+Removes a pin, freeing the disk its unshared bytes were holding. Idempotent.
+
+```json
+{"released":true,"backup":"nightly"}
+```
+
+### `GET /v1/verify`
+
+Re-reads and re-digests every file in the live generation's manifest.
+
+```json
+{"generation":42,"intact":true,"problems":[]}
+```
+
+`problems` names each discrepancy — `segment-….seg: digest mismatch`,
+`payloads/ab/cd.bin: missing` — because which file is damaged is what decides
+whether to restore. A read, so an `ro` token may ask.
 
 ---
 

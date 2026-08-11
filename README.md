@@ -72,7 +72,7 @@ Measured on macOS/aarch64 (10 hardware threads) by the bundled benchmarks over t
 
 ## Status
 
-Pre-1.0 and honest about it: on-disk formats may change between 0.x versions, single-node is the current scope, and the known architectural gap — query-visible state spans several recovery domains, so backup, export, retention and deletion are four mechanisms rather than one — is stated rather than implied. The [CHANGELOG](CHANGELOG.md) is the record of what ships.
+Pre-1.0 and honest about it: on-disk formats may change between 0.x versions, single-node is the current scope, and what is not yet proven is stated rather than implied. The recovery-domain gap that made backup, export, retention and deletion four mechanisms is closed: one generation boundary now names the state they all agree on, so backup is pin-verify-copy against a live server and a deletion is published by one atomic rename ([backup and restore](docs/operations/backup.md)). The [CHANGELOG](CHANGELOG.md) is the record of what ships.
 
 ## Documentation
 

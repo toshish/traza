@@ -1385,10 +1385,22 @@ fn a_damaged_interior_log_frame_refuses_to_open() {
 
     // Corrupt a payload byte in the SECOND of the three frames. Every byte the
     // frame declared is present, so this cannot be an interrupted append.
+    //
+    // The log opens with an 8-byte magic, and each frame header is 24 bytes —
+    // length, checksum, then the (epoch, sequence) stamp naming the generation
+    // the frame belongs to.
+    const MAGIC: usize = 8;
+    const HEADER: usize = 24;
     let log = dir.join("wal.log");
     let mut bytes = fs::read(&log).expect("read log");
-    let first_frame = 8 + u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
-    let target = first_frame + 10;
+    let first_length = u32::from_le_bytes([
+        bytes[MAGIC],
+        bytes[MAGIC + 1],
+        bytes[MAGIC + 2],
+        bytes[MAGIC + 3],
+    ]) as usize;
+    let second_frame = MAGIC + HEADER + first_length;
+    let target = second_frame + HEADER + 10;
     bytes[target] ^= 0xFF;
     fs::write(&log, &bytes).expect("write log");
 

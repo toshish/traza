@@ -509,7 +509,8 @@ default 32MiB)] \
 [--mcp-max-result-bytes N (default 32768)] [--mcp-max-payload-bytes N (default 262144)] \
 [--mcp-allowed-origin ORIGIN (repeatable; browser origins allowed to drive /v1/mcp \
 besides loopback)] \
-[--allow-unauthenticated-non-loopback] [--version]\n\
+[--allow-unauthenticated-non-loopback] [--version] \
+[--restore BACKUP_DIR (install a backup into --data-dir, then serve it)]\n\
        traza-server mcp --url URL [--token TOKEN] \
 (stdio bridge: speaks MCP on stdin/stdout and forwards to a running server)";
 
@@ -522,6 +523,8 @@ struct Options {
     max_connections: usize,
     allow_unauthenticated_non_loopback: bool,
     ui_dir: Option<PathBuf>,
+    /// A backup directory to install before serving; see `--restore`.
+    restore_from: Option<PathBuf>,
     profile: Profile,
     compaction_enabled: bool,
     mcp: McpOptions,
@@ -565,6 +568,7 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
     let mut max_connections = DEFAULT_MAX_CONNECTIONS;
     let mut allow_unauthenticated_non_loopback = false;
     let mut ui_dir: Option<PathBuf> = None;
+    let mut restore_from: Option<PathBuf> = None;
     let mut durability = Durability::default();
     let mut compaction = CompactionConfig::default();
     let mut compaction_enabled = true;
@@ -679,6 +683,10 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
                 i += 1;
                 ui_dir = Some(PathBuf::from(value(i, "--ui-dir")?));
             }
+            "--restore" => {
+                i += 1;
+                restore_from = Some(PathBuf::from(value(i, "--restore")?));
+            }
             "--mcp" => {
                 mcp.enabled = true;
             }
@@ -749,6 +757,7 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
         max_connections,
         allow_unauthenticated_non_loopback,
         ui_dir,
+        restore_from,
         profile,
         compaction_enabled,
         mcp,
@@ -801,6 +810,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         max_connections,
         allow_unauthenticated_non_loopback,
         ui_dir,
+        restore_from,
         profile,
         compaction_enabled,
         mcp,
@@ -825,7 +835,26 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // In-flight 503 refusals, bounded so a connection flood cannot spawn
     // without limit.
     let refusals = Arc::new(AtomicUsize::new(0));
-    let engine = Arc::new(Store::open(&data_dir, config.clone())?);
+    // Restore installs a backup before the store opens, because it replaces
+    // the working set wholesale — the backup is verified first, and the swap
+    // commits at one `CURRENT` rename, so a failed restore leaves what was
+    // there rather than a blend.
+    let engine = Arc::new(match &restore_from {
+        Some(backup) => {
+            eprintln!(
+                "traza-server: restoring {} into {}",
+                backup.display(),
+                data_dir.display()
+            );
+            let store = Store::restore(&data_dir, backup, config.clone())?;
+            eprintln!(
+                "traza-server: restored generation {}",
+                store.live_generation()
+            );
+            store
+        }
+        None => Store::open(&data_dir, config.clone())?,
+    });
 
     // TTL enforcement, segment compaction, and the buffer's non-volume bounds
     // live in the engine; the server only schedules them. Compaction ticks far
@@ -855,6 +884,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     if ttl_enabled && ticks % 12 == 0 {
                         if let Err(error) = maintainer.compact_expired() {
                             eprintln!("expiry compaction failed: {error}");
+                        }
+                    }
+                    // A checkpoint every five minutes. Nothing depends on the
+                    // cadence for correctness — recovery excludes folded
+                    // frames by stamp whether or not one has run recently —
+                    // but each one moves `folded_through` forward, which is
+                    // what bounds replay on the next restart, and it keeps a
+                    // long-lived store's live generation describing something
+                    // close to what is actually on disk. Cheap by
+                    // construction: immutable segments carry their digests
+                    // over from the previous manifest, so only what was
+                    // written since is hashed.
+                    if ticks % 60 == 0 {
+                        if let Err(error) = maintainer.checkpoint() {
+                            eprintln!("checkpoint failed: {error}");
                         }
                     }
                 }
@@ -1480,6 +1524,65 @@ fn serve_request(
             Ok(()) => responder.json(200, json!({"flushed": true})),
             Err(error) => responder.json(503, json!({"error": error.to_string()})),
         },
+        // Publishing a generation is what makes a deletion, a seal and an
+        // annotation one durable fact rather than four. Operators need it for
+        // backup; the maintenance thread runs it on its own cadence.
+        ("POST", "/v1/checkpoint") => match engine.checkpoint() {
+            Ok(generation) => responder.json(200, json!({"generation": generation})),
+            Err(error) => responder.json(503, json!({"error": error.to_string()})),
+        },
+        // Backup, with the server still running: pin the live generation as a
+        // hard-link farm, verify it, and hand back the path to copy. The copy
+        // is the operator's to make — Traza will not write outside its own
+        // data directory — and `release` frees the pin when they are done.
+        ("GET", "/v1/verify") => {
+            let generation = engine.live_generation();
+            match engine.verify_generation(generation) {
+                Ok(problems) => responder.json(
+                    200,
+                    json!({
+                        "generation": generation,
+                        "intact": problems.is_empty(),
+                        "problems": problems,
+                    }),
+                ),
+                Err(error) => responder.json(503, json!({"error": error.to_string()})),
+            }
+        }
+        ("POST", path) if path.starts_with("/v1/backups/") => {
+            let rest = &path["/v1/backups/".len()..];
+            let (label, release) = match rest.strip_suffix("/release") {
+                Some(label) => (label, true),
+                None => (rest, false),
+            };
+            if release {
+                return match engine.release_pin(label) {
+                    Ok(()) => responder.json(200, json!({"released": true, "backup": label})),
+                    Err(error) => responder.json(503, json!({"error": error.to_string()})),
+                };
+            }
+            match engine.pin_generation(label) {
+                // Verified before it is reported, because a backup nobody
+                // checked is a backup nobody can trust.
+                Ok(generation) => match engine.verify_pin(label) {
+                    Ok(problems) if problems.is_empty() => responder.json(
+                        201,
+                        json!({
+                            "backup": label,
+                            "generation": generation,
+                            "path": engine.pin_path(label).display().to_string(),
+                            "verified": true,
+                        }),
+                    ),
+                    Ok(problems) => responder.json(
+                        500,
+                        json!({"error": "the pinned backup does not verify", "problems": problems}),
+                    ),
+                    Err(error) => responder.json(503, json!({"error": error.to_string()})),
+                },
+                Err(error) => responder.json(409, json!({"error": error.to_string()})),
+            }
+        }
         ("GET", "/v1/spans") => {
             let (filter, cursor) = match span_query_from(query) {
                 Ok(parsed) => parsed,

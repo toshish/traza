@@ -50,6 +50,8 @@ Deploying, tuning, and keeping it healthy.
   that a macOS `fsync` does not flush the drive's write cache.
 - **[Administration](operations/administration.md)** — authentication and
   scopes, retention/TTL, compaction, payload offloading, and backups.
+- **[Backup and restore](operations/backup.md)** — generations, `CURRENT`, and
+  the pin-verify-copy backup that runs without stopping the server.
 - **[Monitoring](operations/monitoring.md)** — `GET /v1/metrics` and
   `GET /v1/stats`, what each metric means, and what is worth alerting on.
 - **[Capacity and performance](operations/capacity.md)** — measured
