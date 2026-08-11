@@ -71,6 +71,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   preamble is excluded, so a reclaimed log measures zero. Both the
   `flush_wal_bytes` bound and the statistic mean the same thing — what a
   restart would redo — and a constant is neither replayed nor reclaimable.
+- **The checkpoint's commit point is proven by SIGKILL**, not only
+  deterministically. `tests/durability.rs` kills a real server mid-checkpoint
+  from both sides of the commit — aimed at the manifest directory appearing
+  and at `CURRENT` changing, because the window between them is two fsyncs
+  wide and a stagger alone lands wherever the machine favours — and asserts
+  that recovery answers with exactly one state: every acknowledged span
+  present, the hot key at the newest acknowledged version, the live
+  generation verifying clean over `GET /v1/verify`, and no staged `CURRENT`
+  or manifest left behind. Publishing `CURRENT` before the manifest is
+  durable fails it.
+
+  Recorded because the opposite would be a claim rather than evidence: the
+  *other* ordering rule — reclaiming folded frames only after `CURRENT` is
+  durable — was mutated too and did **not** fail. A checkpoint seals the
+  buffer first, so the frames it reclaims are already in a durable segment,
+  and recovery loads segments by walking the directory rather than by reading
+  the manifest. That rule is defensive under today's engine and becomes
+  load-bearing the moment segment loading is manifest-driven, which is what a
+  replicated snapshot install wants. Invariant 12 now says so.
+
 - **Checkpointing is never a side effect of a primitive.** It seals the write
   buffer, and expiry must not decide when to seal: `expire_before` deletes
   from every domain and stops, exactly as before. The deletion is durable when

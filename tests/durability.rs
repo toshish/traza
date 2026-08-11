@@ -1009,3 +1009,250 @@ fn a_crash_during_a_grouped_merge_recovers_exactly() {
          nothing about grouped-merge recovery was exercised"
     );
 }
+
+/// The generation `CURRENT` names, or `None` before one is published.
+fn current_generation(dir: &Path) -> Option<u64> {
+    std::fs::read_to_string(dir.join("CURRENT"))
+        .ok()
+        .and_then(|contents| contents.trim().parse().ok())
+}
+
+/// Ingests `count` spans tagged `marker`, each with its own primary key, plus
+/// one hot key carrying `version` as its name. Returns once acknowledged.
+fn acknowledge_batch(server: &Server, marker: &str, count: usize, version: usize) {
+    let mut spans: Vec<Value> = (0..count)
+        .map(|index| {
+            json!({
+                "trace_id": "ckpt", "span_id": format!("{marker}-{index}"),
+                "name": "acknowledged", "service": "ingest",
+                "start_time_ns": 1_000u64, "end_time_ns": 2_000u64,
+                "attributes": {"marker": marker}
+            })
+        })
+        .collect();
+    // The hot key is the version oracle: counting spans cannot catch a stale
+    // copy outranking a newer one, but a name that went BACKWARDS can only
+    // mean a superseded version was resurrected.
+    spans.push(json!({
+        "trace_id": "ckpt", "span_id": "hot",
+        "name": format!("v{version}"), "service": "ingest",
+        "start_time_ns": 1_000u64, "end_time_ns": 2_000u64,
+        "attributes": {"marker": "hot"}
+    }));
+    let (status, body) = server.request("POST", "/v1/spans", Some(&Value::Array(spans)));
+    assert_eq!(status, 200, "ingest acknowledged: {body}");
+}
+
+/// Sends one request and abandons it. The server is about to be killed under
+/// this connection, so every outcome — a reset, a half-written response, no
+/// response — is expected and none of them is this caller's business.
+fn ask_and_forget(port: u16, request_line: &str) {
+    if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) {
+        let _ = write!(
+            stream,
+            "{request_line}\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let mut sink = Vec::new();
+        let _ = stream.read_to_end(&mut sink);
+    }
+}
+
+#[test]
+fn a_crash_during_a_checkpoint_publishes_all_or_nothing() {
+    // A checkpoint publishes a generation in a fixed order, and exactly one
+    // step commits it: the fsync of the data directory after `CURRENT` is
+    // renamed. Everything before that is retryable and invisible — the old
+    // generation stays live and a stray manifest is unreferenced — and
+    // everything after is housekeeping the next open can finish. A crash
+    // must therefore leave the store on ONE side of that fsync, never
+    // between: no half-published generation, no acknowledged span lost to a
+    // log rolled over too early, and no superseded version resurrected by a
+    // folded frame replaying.
+    //
+    // The kill is aimed at an on-disk signal rather than a stopwatch: the
+    // next generation's directory appears when the checkpoint starts writing
+    // its manifest, which is the last moment before the commit sequence. Each
+    // attempt then waits a little longer, so the kills land at different
+    // depths, and each is CLASSIFIED by what it actually caught rather than
+    // assumed — the window between the manifest and the directory fsync is
+    // two fsyncs wide, and pretending to aim inside it precisely would be a
+    // stopwatch by another name.
+    //
+    // Shown to fail by publishing `CURRENT` BEFORE the manifest is durable:
+    // the crash then leaves `CURRENT` naming a generation whose manifest is
+    // still staged, and the assertion below says so by name.
+    //
+    // Also TRIED, and it does NOT fail here — recorded because a comment
+    // claiming otherwise would be a claim, not evidence: moving the log
+    // roll-over ahead of `publish_current`, which invariant 12 names as the
+    // data-losing order. It survives because a checkpoint seals the buffer
+    // FIRST, so every frame it then reclaims is already in a durable segment,
+    // and recovery loads segments by walking the directory rather than by
+    // reading the manifest — so a `CURRENT` that rolls back still finds them.
+    // That ordering rule is therefore defensive under today's engine, not
+    // load-bearing; it becomes load-bearing the moment segment loading is
+    // driven by the manifest, which is what a replicated snapshot install
+    // would want. Invariant 12 says the same thing in the same words.
+    const ATTEMPTS: usize = 6;
+    const PER_BATCH: usize = 150;
+    const ROUNDS: usize = 8;
+
+    let mut caught_before_commit = 0;
+    let mut caught_after_commit = 0;
+    for attempt in 0..ATTEMPTS {
+        let dir = test_dir(&format!("checkpoint-crash-{attempt}"));
+        // Small segments and no compaction: several segments make the
+        // checkpoint's digest walk real work, and compaction is a different
+        // crash matrix with its own test.
+        let mut server = Server::spawn_with(
+            &dir,
+            "wal",
+            &["--flush-spans", "200", "--compaction-fanout", "0"],
+        );
+        let port = server.port;
+
+        for round in 0..ROUNDS {
+            acknowledge_batch(&server, &format!("r{round}"), PER_BATCH, round);
+        }
+        let acknowledged = ROUNDS * PER_BATCH;
+        let newest_version = ROUNDS - 1;
+        let before = current_generation(&dir).expect("a store publishes generation one at open");
+
+        // The checkpoint runs on its own connection, fire-and-forget: it will
+        // never answer, because this process is about to kill the server
+        // serving it, and a client that panics on the reset would be noise.
+        std::thread::spawn(move || ask_and_forget(port, "POST /v1/checkpoint HTTP/1.1"));
+
+        // Two named signals, not one stopwatch. The manifest directory
+        // appears when the checkpoint starts publishing — the last moment
+        // before the commit sequence — and `CURRENT` changing IS the commit.
+        // Aiming at each in turn is what puts kills on both sides of the
+        // fsync deterministically; the window between them is two fsyncs
+        // wide, so a stagger alone lands on whichever side the machine
+        // happens to favour.
+        let target_committed = attempt % 2 == 1;
+        let next = dir.join("generations").join((before + 1).to_string());
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let mut signalled = false;
+        while std::time::Instant::now() < deadline {
+            let reached = match target_committed {
+                true => current_generation(&dir) == Some(before + 1),
+                false => next.exists(),
+            };
+            if reached {
+                signalled = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_micros(100));
+        }
+        assert!(
+            signalled,
+            "attempt {attempt}: the checkpoint never reached its signal within the failsafe"
+        );
+        // A little deeper each time, so kills spread through the steps that
+        // follow the signal rather than clustering on the first one.
+        std::thread::sleep(Duration::from_micros(attempt as u64 * 400));
+        server.kill_hard();
+
+        // ---- what the crash left, and what must be true of it ------------
+        let landed = current_generation(&dir).expect("CURRENT survives a crash");
+        assert!(
+            landed == before || landed == before + 1,
+            "attempt {attempt}: CURRENT names {landed}, which is neither the \
+             generation that was live ({before}) nor the one being published"
+        );
+        match landed == before {
+            true => caught_before_commit += 1,
+            false => caught_after_commit += 1,
+        }
+
+        // Nothing half-written survives. A staged manifest or a staged
+        // CURRENT left behind would be a second thing claiming to describe
+        // the store.
+        let staged = matching_files(&dir, |name| name.starts_with(".CURRENT"));
+        assert!(
+            staged.is_empty(),
+            "attempt {attempt}: a staged CURRENT survived the crash: {staged:?}"
+        );
+        // The generation CURRENT names has a COMPLETE manifest. This is the
+        // ordering rule stated as a property: the manifest is durable before
+        // CURRENT moves, so there is no crash that leaves CURRENT pointing at
+        // a generation whose contents were never proven.
+        let generations = dir.join("generations").join(landed.to_string());
+        assert!(
+            generations.join("state-manifest.json").exists(),
+            "attempt {attempt}: CURRENT names generation {landed}, whose manifest \
+             is not there — a restart would point at contents nothing proved"
+        );
+        let staged = matching_files(&generations, |name| name.starts_with(".state-manifest"));
+        assert!(
+            staged.is_empty(),
+            "attempt {attempt}: a staged manifest survived the crash: {staged:?}"
+        );
+
+        // ---- recovery answers with exactly one state ---------------------
+        let recovered = Server::spawn_with(&dir, "wal", &["--compaction-fanout", "0"]);
+        let mut recovered = recovered;
+
+        // Every acknowledged span, exactly once. A span short is loss; the
+        // primary key makes a literal duplicate impossible, so the count is
+        // the loss oracle and the hot key below is the resurrection oracle.
+        let mut survived = 0;
+        for round in 0..ROUNDS {
+            let body = request_within(
+                recovered.port,
+                &format!("/v1/spans?attr.marker=r{round}&limit=1000"),
+                Duration::from_secs(300),
+            );
+            survived += body["spans"].as_array().map(Vec::len).unwrap_or(0);
+        }
+        assert_eq!(
+            survived, acknowledged,
+            "attempt {attempt} (CURRENT={landed}): {survived} of {acknowledged} \
+             acknowledged spans survived a crash during a checkpoint"
+        );
+
+        let body = request_within(
+            recovered.port,
+            "/v1/spans?attr.marker=hot&limit=1000",
+            Duration::from_secs(300),
+        );
+        let hot = body["spans"].as_array().cloned().unwrap_or_default();
+        assert_eq!(
+            hot.len(),
+            1,
+            "attempt {attempt}: the hot primary key must survive exactly once"
+        );
+        let name = hot[0]["name"].as_str().unwrap_or_default();
+        let version: usize = name
+            .strip_prefix('v')
+            .and_then(|digits| digits.parse().ok())
+            .unwrap_or_else(|| panic!("attempt {attempt}: bad version {name:?}"));
+        assert_eq!(
+            version, newest_version,
+            "attempt {attempt}: the hot key came back at v{version} after \
+             v{newest_version} was acknowledged — a stale copy outranked a newer one"
+        );
+
+        // The generation the store settled on describes what is actually
+        // there. This is the operator's own check, over the shipped surface.
+        let verified = request_within(recovered.port, "/v1/verify", Duration::from_secs(300));
+        assert_eq!(
+            verified["intact"], true,
+            "attempt {attempt}: the live generation does not verify after the crash: {verified}"
+        );
+        assert_eq!(verified["generation"], landed);
+
+        recovered.kill_hard();
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    // The matrix is only exercised if kills landed on BOTH sides of the
+    // commit. Landing only after it would mean the window was never entered
+    // and the test proves nothing about the uncommitted half.
+    assert!(
+        caught_before_commit > 0 && caught_after_commit > 0,
+        "kills landed {caught_before_commit} before and {caught_after_commit} \
+         after the commit across {ATTEMPTS} attempts; the crash matrix needs both"
+    );
+}

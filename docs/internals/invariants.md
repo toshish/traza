@@ -474,8 +474,19 @@ change what the store contains.
 2. `CURRENT` is durable — written, renamed, and the directory fsynced —
    **before** a single folded frame is reclaimed. A rename is visible
    immediately but is not crash-durable until its directory is synced, so
-   reclaiming between those two steps risks the one combination that loses
-   data: a durable reclamation against a `CURRENT` that rolls back.
+   reclaiming between those two steps risks a durable reclamation against a
+   `CURRENT` that rolls back.
+
+   **This rule is currently defensive, not load-bearing, and the difference
+   is worth knowing before someone "simplifies" it away.** A checkpoint seals
+   the buffer first, so every frame it reclaims is already in a durable
+   segment — and recovery loads segments by walking the directory, not by
+   reading the manifest, so a rolled-back `CURRENT` still finds them.
+   Reversing the order was mutation-tested against
+   `a_crash_during_a_checkpoint_publishes_all_or_nothing` and did **not**
+   fail. It becomes load-bearing the moment segment loading is driven by the
+   manifest instead of the directory, which is exactly what a replicated
+   snapshot install wants — so the order stays.
 3. The log is reclaimed only after that, and by rewriting the prefix away
    rather than truncating — folded frames are a prefix, and `set_len` removes a
    suffix.
