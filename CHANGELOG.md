@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.22.2] - 2026-08-12
 
 ### Fixed
 
@@ -60,9 +60,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   re-pointed every tag, including the ones the 0.22.0 note below could
   still call bit-identical when it was written. Stated here for the same
   reason as last time: a lineage that quietly changed under its tags
-  would be worse than one that says so. Published release artifacts and
-  crates.io packages are immutable and still contain the files as they
-  were at their release.
+  would be worse than one that says so. Published GitHub release artifacts
+  still contain the files as they were at their release; the crates.io
+  versions that carried them (0.22.0, 0.22.1) were deleted outright within
+  the registry's deletion window, and this release is the first published
+  from the purged tree.
 
 ## [0.22.1] - 2026-08-07
 
@@ -1903,7 +1905,7 @@ completion trailers — clients parsing either surface must update.
 
 - This is an initial 0.1 release; consult README.md for the currently documented operational constraints and unsupported use cases.
 
-[Unreleased]: https://github.com/toshish/traza/compare/v0.22.1...HEAD
+[0.22.2]: https://github.com/toshish/traza/compare/v0.22.1...v0.22.2
 [0.22.1]: https://github.com/toshish/traza/compare/v0.22.0...v0.22.1
 [0.22.0]: https://github.com/toshish/traza/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/toshish/traza/compare/v0.20.0...v0.21.0

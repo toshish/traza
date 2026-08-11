@@ -17,8 +17,8 @@ Traza (Spanish for "trace") ingests OpenTelemetry or plain-JSON spans over HTTP,
 **Download** — the server with the dashboard already built. No Rust, no Node:
 
 ```sh
-curl -LO https://github.com/toshish/traza/releases/download/v0.22.1/traza-0.22.1-macos-aarch64.tar.gz
-tar xzf traza-0.22.1-macos-aarch64.tar.gz && cd traza-0.22.1-macos-aarch64
+curl -LO https://github.com/toshish/traza/releases/download/v0.22.2/traza-0.22.2-macos-aarch64.tar.gz
+tar xzf traza-0.22.2-macos-aarch64.tar.gz && cd traza-0.22.2-macos-aarch64
 ./traza-server --data-dir ./data --port 8080
 ```
 
@@ -30,7 +30,7 @@ tar xzf traza-0.22.1-macos-aarch64.tar.gz && cd traza-0.22.1-macos-aarch64
 TOKEN="rw:$(openssl rand -hex 16)"
 echo "$TOKEN"    # the dashboard and API will ask for this
 docker run -p 8080:8080 -v traza-data:/data \
-  -e TRAZA_TOKENS="$TOKEN" ghcr.io/toshish/traza:v0.22.1
+  -e TRAZA_TOKENS="$TOKEN" ghcr.io/toshish/traza:v0.22.2
 ```
 
 **crates.io** — `cargo install traza --locked --bin traza-server` for the server (API only; the dashboard ships in the archives or builds from [`ui/`](ui/)), or `cargo add traza` to [embed the engine](docs/guide/ingest.md#using-the-engine-directly) in your own process.

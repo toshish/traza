@@ -1,7 +1,7 @@
 {
   "name": "traza-ui",
   "private": true,
-  "version": "0.22.1",
+  "version": "0.22.2",
   "description": "The Traza dashboard: a standalone React trace browser built to the Traza design system, talking to a traza-server JSON API.",
   "type": "module",
   "scripts": {
