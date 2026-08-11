@@ -1,91 +1,221 @@
-# Traza
+Traza
+=====
+
+Traza is a trace database for LLM and agent workloads. It runs as a single binary with no external database, no queue, and no coordinator.
+
+**Sub-millisecond trace lookup. 3.3 ms filtered search over a million spans. 208,000 spans/s sustained ingest.** One process, one directory.
 
 [![CI](https://github.com/toshish/traza/actions/workflows/ci.yml/badge.svg)](https://github.com/toshish/traza/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/traza)](https://crates.io/crates/traza)
-[![docs.rs](https://img.shields.io/docsrs/traza)](https://docs.rs/traza)
-[![MSRV](https://img.shields.io/badge/MSRV-1.75-blue)](Cargo.toml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
-**A trace datastore with first-class LLM and agent observability — one binary from laptop to cluster.**
-
-Traza (Spanish for "trace") ingests OpenTelemetry or plain-JSON spans over HTTP, stores them durably, and answers trace lookups, filtered search, and token/cost analytics in milliseconds — with a trace browser built in and nothing else to stand up. Two dependencies (`serde`, `serde_json`), no external database, `#![forbid(unsafe_code)]`.
-
-![An agent swarm in the trace browser: a 14-span waterfall with the critical path marked, per-span model and token counts, and the run's duration, tokens, and cost at the top.](docs/assets/trace-waterfall.png)
+![An agent swarm in the trace browser: a 14-span waterfall with the critical path marked, per-span model and token counts, and the run's duration, tokens and cost across the top.](docs/assets/trace-waterfall.png)
 
 ## Install
 
-**Download** — the server with the dashboard already built. No Rust, no Node:
+### Download
+
+The server with the dashboard already built in. No Rust, no Node.
 
 ```sh
-curl -LO https://github.com/toshish/traza/releases/download/v0.22.2/traza-0.22.2-macos-aarch64.tar.gz
-tar xzf traza-0.22.2-macos-aarch64.tar.gz && cd traza-0.22.2-macos-aarch64
-./traza-server --data-dir ./data --port 8080
+VERSION=0.22.2
+PLATFORM=macos-aarch64          # or linux-x86_64, linux-aarch64
+
+curl -LO https://github.com/toshish/traza/releases/download/v$VERSION/traza-$VERSION-$PLATFORM.tar.gz
+tar xzf traza-$VERSION-$PLATFORM.tar.gz
+cd traza-$VERSION-$PLATFORM
 ```
 
-`linux-x86_64` and `linux-aarch64` archives are named likewise, musl-static so any distribution works. Archives carry `SHA256SUMS`, provenance attestations (`gh attestation verify traza-*.tar.gz --repo toshish/traza`), and `THIRD_PARTY_NOTICES.md`. macOS quarantines browser downloads of unsigned binaries — `curl` avoids the flag, and `xattr -d com.apple.quarantine traza-server` clears it otherwise.
-
-**Docker** — `FROM scratch`, runs as uid 65534, refuses a non-loopback bind without a token, so mint one you keep:
+### Docker
 
 ```sh
-TOKEN="rw:$(openssl rand -hex 16)"
-echo "$TOKEN"    # the dashboard and API will ask for this
 docker run -p 8080:8080 -v traza-data:/data \
-  -e TRAZA_TOKENS="$TOKEN" ghcr.io/toshish/traza:v0.22.2
+  -e TRAZA_TOKENS="rw:$(openssl rand -hex 16)" \
+  ghcr.io/toshish/traza:latest
 ```
 
-**crates.io** — `cargo install traza --locked --bin traza-server` for the server (API only; the dashboard ships in the archives or builds from [`ui/`](ui/)), or `cargo add traza` to [embed the engine](docs/guide/ingest.md#using-the-engine-directly) in your own process.
-
-**Source** — stable Rust ≥ 1.75, plus Node ≥ 22 if you want the dashboard:
+### Cargo
 
 ```sh
-cargo build --release && (cd ui && npm ci && npm run build)
-./target/release/traza-server --data-dir ./data --port 8080
+cargo install traza --locked --bin traza-server
 ```
 
-## First trace in thirty seconds
+Installs the server and API. The dashboard ships with the release archives, or build it from [`ui/`](ui/).
+
+To embed the engine directly in your own process instead:
 
 ```sh
-curl -X POST http://localhost:8080/v1/spans -H 'Content-Type: application/json' \
-  -d '[{"trace_id":"trace-1","span_id":"span-1","name":"charge","service":"checkout",
-        "start_time_unix_nano":1700000000000000000,
-        "end_time_unix_nano":1700000000002500000,
-        "status":"ok","attributes":{"region":"us-east"}}]'
-# {"accepted":1,"durability":"wal"}
-
-curl http://localhost:8080/v1/traces/trace-1
-# open http://localhost:8080 for the trace browser
+cargo add traza
 ```
 
-Any OpenTelemetry SDK exports to Traza with two environment variables (`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf`), and apps instrumented with [OpenLLMetry](https://github.com/traceloop/openllmetry) or the OTel GenAI conventions land with sessions and token/cost analytics populated, no renaming. Full walkthrough, including the seeded demo corpus: **[Getting started](docs/guide/getting-started.md)**.
+### From source
 
-## Why Traza
+```sh
+git clone https://github.com/toshish/traza && cd traza
+cargo build --release
+(cd ui && npm ci && npm run build)
+```
 
-- **One binary whose deployment grows with you.** A single process stores everything under `--data-dir` — laptop, CI job, edge box, or the agent you are debugging right now. The engine's foundations (immutable segments, idempotent primary-key ingest, journaled compaction) were chosen with replication in mind; today's scope is honestly single-node.
-- **Built for LLM and agent workloads.** Sessions, token and cost rollups, prompt/completion capture with content-addressed offloading, post-hoc evals and annotations, content search over prompts, live tail, and one-command NDJSON export — first-class, not bolted on. See [LLM semantics](docs/llm-semantics.md).
-- **Your agent can read its own traces.** `--mcp` serves a [Model Context Protocol](docs/guide/mcp.md) endpoint from the same binary — ten tools shaped like questions (what is failing, what is slow, where did the money go), results bounded in tokens, stored span text confined as untrusted, and no fetcher, shell, or outbound path behind the boundary for an injected instruction to actuate.
-- **Small enough to trust.** Two direct dependencies; HTTP, threading, and file I/O are the Rust standard library. The in-crate SHA-256 (content addressing only, never authentication) and index hash (not a cryptographic commitment — every probe re-verified against the record) are pinned by test vectors. Every performance number is measured by a bundled benchmark, with anything extrapolated marked as such.
-- **Crash-safe by construction, durability you choose.** Write-ahead log with group commit; `--durability` is `buffered`, `wal` (default), or `flushed`, every response says which one answered, and a SIGKILL suite holds each mode to its claim. One caveat stated plainly: macOS `fsync` does not flush the drive's own cache. See [durability](docs/operations/durability.md).
+## Run
+
+```sh
+./traza-server
+```
+
+```
+traza-server listening on 127.0.0.1:8080
+traza-server: durability=wal — acknowledged writes are fsynced to the write-ahead log and recovered on restart
+traza-server serving dashboard from ./ui/dist
+```
+
+That is the whole setup. Data lands in `./data`, the dashboard is on <http://localhost:8080>.
+
+### Common options
+
+| Flag | Default | |
+|---|---|---|
+| `--data-dir DIR` | `./data` | All state. One writer process per directory. |
+| `--host ADDR` | `127.0.0.1` | A non-loopback bind requires `TRAZA_TOKENS`. |
+| `--port PORT` | `8080` | `0` binds an ephemeral port and announces it. |
+| `--durability MODE` | `wal` | `buffered`, `wal`, or `flushed`. Every response says which one answered. |
+| `--profile NAME` | `balanced` | `throughput`, `balanced`, or `latency`. Sets the write-path knobs together. |
+| `--ttl-seconds N` | off | Retention window for spans, annotations and payloads. |
+| `--mcp` | off | Serve Model Context Protocol at `/v1/mcp`. |
+| `--ui-dir DIR` | beside the binary | Where the built dashboard lives. |
+| `--restore DIR` | | Install a backup into `--data-dir`, then serve it. |
+| `TRAZA_TOKENS` | unset | Bearer auth, `rw:` and `ro:` scoped. |
+
+`--help` prints all twenty-five. The [configuration reference](docs/configuration.md) explains what each one costs.
+
+### Examples
+
+**Serving a team.** Named paths, an open bind address with auth, thirty days of retention, and the agent endpoint on:
+
+```sh
+export TRAZA_TOKENS="rw:$(openssl rand -hex 16),ro:$(openssl rand -hex 16)"
+
+./traza-server \
+  --data-dir /var/lib/traza \
+  --host 0.0.0.0 \
+  --ttl-seconds 2592000 \
+  --mcp
+```
+
+**Bulk backfill.** The `throughput` profile seals larger segments and lets more acknowledgements share one fsync, which is what you want when nothing is waiting on any single batch:
+
+```sh
+./traza-server --data-dir /var/lib/traza --profile throughput
+```
+
+**A client blocking on the acknowledgement.** The `latency` profile trades peak ingest for a materially better p95:
+
+```sh
+./traza-server --data-dir /var/lib/traza --profile latency
+```
+
+**Tests and CI.** `buffered` is the fastest mode and lossy by design, which is exactly right for a store you are about to throw away. Port `0` picks a free port and prints it, so parallel test runs do not collide:
+
+```sh
+./traza-server --data-dir "$(mktemp -d)" --port 0 --durability buffered
+```
+
+**Debugging an agent from your terminal.** Serve MCP, then point a client at it:
+
+```sh
+./traza-server --mcp
+claude mcp add --transport http traza http://localhost:8080/v1/mcp
+```
+
+**Backing up a running server.** Pin and verify a consistent copy, take it, then release the pin:
+
+```sh
+curl -X POST http://localhost:8080/v1/backups/nightly
+cp -a ./data/pins/nightly /backups/traza-$(date +%F)
+curl -X POST http://localhost:8080/v1/backups/nightly/release
+```
+
+**Restoring one.** Verified before anything is swapped, then served:
+
+```sh
+./traza-server --data-dir /var/lib/traza --restore /backups/traza-2026-08-10
+```
+
+## Send a span
+
+```sh
+curl -X POST http://localhost:8080/v1/spans \
+  -H 'Content-Type: application/json' \
+  -d '[{
+    "trace_id": "trace-1",
+    "span_id": "span-1",
+    "name": "charge",
+    "service": "checkout",
+    "start_time_unix_nano": 1700000000000000000,
+    "end_time_unix_nano": 1700000000002500000,
+    "status": "ok"
+  }]'
+```
+
+```json
+{"accepted":1,"durability":"wal"}
+```
+
+Or point an existing app at it with two environment variables:
+
+```sh
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:8080
+export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+```
+
+Apps instrumented with OpenLLMetry or the OpenTelemetry GenAI conventions arrive with sessions and token/cost analytics already populated. No attribute renaming, no mapping file.
+
+Want a populated store to explore first? `examples/mcp-demo/run.sh` seeds agent tool-calling trees, retry storms and multi-turn sessions, then runs a scripted investigation against them.
+
+## What you get
+
+**Fast reads.** Trace lookup at p95 0.64 ms and filtered search at p95 3.3 ms over a million spans. Full-text search across prompt text returns a selective term in 1.5 ms where scanning takes 1,258 ms.
+
+**One process.** No metadata database, no column store, no lock service, no object store to configure. It starts in milliseconds, and there is no control plane to lose a quorum at 3am.
+
+**A small surface.** Two direct dependencies, twelve packages in the whole lockfile, a 2.2 MB binary. HTTP, threading and file I/O are the standard library, and the crate is `#![forbid(unsafe_code)]`.
+
+**Agent telemetry as the workload.** Sessions, token and cost rollups, prompts and completions with large ones offloaded and deduplicated, evals and human feedback attached after the fact, live tail, and one-command dataset export.
+
+**An endpoint your agent can query.** `--mcp` serves Model Context Protocol from the same binary and port: ten tools shaped like the questions people actually ask, with stored span text confined as untrusted and results bounded in tokens.
+
+**Durability you choose.** Three acknowledgement modes, and every response states which one answered it. The suite proves them by killing the process, not by asserting.
+
+**Backup without stopping.** One call pins and verifies a consistent copy of spans, annotations and payload bytes together. Restore is one flag.
 
 ## Performance
 
-Measured on macOS/aarch64 (10 hardware threads) by the bundled benchmarks over the real HTTP path: **208,973 spans/s** sustained ingest at 16 clients in `wal` mode on an idle machine ([ingest.md](docs/benchmarks/ingest.md)); trace lookup **p95 0.64 ms** and filtered search **p95 3.3 ms** on a 1M-span corpus; compaction worth 16–28x on filtered search at 100M spans. **Where Traza is expensive: disk** — uncompressed segments cost 1.8–2.1x the bytes sent, worse than Elasticsearch; the exception is pinned agent context, measured 121:1 in Traza's favour. Full records, caveats, and an honest list of what is *not* measured: [capacity](docs/operations/capacity.md) and [storage comparison](docs/storage-comparison.md). Run the benchmarks on your hardware rather than trusting ours.
+| | |
+|---|---|
+| Trace lookup, 1M spans | p95 **0.64 ms** |
+| Filtered search, 1M spans | p95 **3.3 ms** |
+| Content search, selective term | **1.5 ms** (1,258 ms scanning) |
+| Sustained ingest, `wal` | **208,973 spans/s** |
+| Binary | **2.2 MB** |
+| Direct dependencies | **2** |
 
-## Status
+Every number is produced by a benchmark bundled in this repo, run over the real HTTP path. The harness writes the records itself and refuses to publish a result it cannot stand behind. Run them yourself with `cargo run --release --bin bench`.
 
-Pre-1.0 and honest about it: on-disk formats may change between 0.x versions, single-node is the current scope, and what is not yet proven is stated rather than implied. The recovery-domain gap that made backup, export, retention and deletion four mechanisms is closed: one generation boundary now names the state they all agree on, so backup is pin-verify-copy against a live server and a deletion is published by one atomic rename ([backup and restore](docs/operations/backup.md)). The [CHANGELOG](CHANGELOG.md) is the record of what ships.
+## When not to use Traza
+
+**Disk cost is your binding constraint.** Segments are uncompressed JSON plus indexes and cost 1.8–2.1× the bytes you send. A columnar engine writing compressed files to object storage will beat that by an order of magnitude. The exception is agent context: a repeated system prompt above the offload threshold is stored once, measured at 121:1 in Traza's favour.
+
+**You need metrics and logs in the same system.** Traza stores traces and their analytics. That is the whole surface, on purpose.
+
+**You need horizontal scale-out today.** Traza is single-node.
 
 ## Documentation
 
-Organised by what you are doing, in **[docs/](docs/README.md)**:
-
-- **Using** — [getting started](docs/guide/getting-started.md) · [data model](docs/guide/data-model.md) · [ingest](docs/guide/ingest.md) · [HTTP API](docs/guide/http-api.md) · [MCP server](docs/guide/mcp.md) · [trace browser](docs/guide/trace-browser.md) · [LLM semantics](docs/llm-semantics.md)
-- **Operating** — [deployment](docs/operations/deployment.md) · [durability](docs/operations/durability.md) · [administration](docs/operations/administration.md) · [monitoring](docs/operations/monitoring.md) · [capacity](docs/operations/capacity.md) · [configuration](docs/configuration.md)
-- **Changing** — [architecture](docs/internals/architecture.md) · [invariants](docs/internals/invariants.md) · [testing](docs/internals/testing.md) · [benchmarking](docs/internals/benchmarking.md) · [segment format](docs/segment-format.md) · [CONTRIBUTING.md](CONTRIBUTING.md)
+Everything is in **[docs/](docs/README.md)** — getting started, the HTTP API, LLM semantics, the MCP server, deployment, durability, backup and restore, capacity, and the engine internals.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). The short version: stable Rust is the only dependency, `./ci.sh` is the merge bar, and new dependencies need a reason.
+See [CONTRIBUTING.md](CONTRIBUTING.md). Stable Rust is the only dependency, `./ci.sh` is the merge bar, and a new dependency needs a written reason.
 
 ## License
 
-Copyright © 2026 Toshish Jawale. Licensed under the [Apache License, Version 2.0](LICENSE). Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be licensed as above, without any additional terms or conditions.
+Copyright © 2026 Toshish Jawale. [Apache-2.0](LICENSE).
