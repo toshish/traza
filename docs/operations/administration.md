@@ -139,6 +139,53 @@ it has to leave.
 Retention runs with reads and ingest fully live. Only one rewriting pass —
 expiry or compaction — runs at a time.
 
+## Erasure (deletion with a receipt)
+
+TTL answers "how long do we keep telemetry"; erasure answers "this specific
+data must go, and prove it". `POST /v1/erasures` erases a **subject** — a
+trace, a span, a session, or an offloaded payload — from every domain, and
+`verify --erasure` (or `GET /v1/erasures/{id}/verify`) produces the receipt:
+every place the subject's bytes could be, checked by name, with the result of
+each. Endpoint shapes are in the
+[HTTP API](../guide/http-api.md#erasure); this section is the operational
+contract.
+
+**What an erasure does.** The intent is fsynced into `tombstones.jsonl`
+before anything is removed — from that moment the subject is invisible to
+every query, and a crash mid-purge leaves a pending erasure the next open
+masks and the maintenance tick finishes. The purge then rewrites the write
+buffer and the write-ahead log to the survivors, rewrites every segment
+holding a match in place (superseded versions of an erased key held the bytes
+too, so they go with it), drops annotations addressed to erased spans, and
+deletes payload files **reference-aware**: content addressing means one file
+can back spans outside the subject, and those bytes are retained and named in
+the receipt rather than destroyed. A checkpoint publishes the deletion —
+durable at the `CURRENT` rename — and the settle record lands.
+
+**What remains, on purpose.** The tombstone log keeps the subject's
+identifiers, the resolved span keys, and the payload content hashes — never
+the erased text. That record is what verification checks the store against,
+and the receipt states its retention rather than hiding it. Erasing the
+record of erasure means deleting the store.
+
+**Pins hold their bytes.** A backup pinned before the erasure still contains
+the subject in its hard-link farm — that is what a pin is for. The receipt
+checks every pin and names the ones to release; a backup already copied
+elsewhere is outside the data directory and outside the receipt's scope, and
+the receipt says exactly that by only ever naming what it checked.
+
+**A tombstone is a barrier, not a ban.** Data ingested under the same
+identifiers after the erasure settles is new data. The receipt tells the two
+apart exactly — an erased key found live again is a **re-delivery** (some
+client replayed erased data; the receipt fails), a fresh key under the same
+trace or session id is **new activity** (reported, never a failure). If a
+client with a retry queue may replay erased batches, drain it before erasing,
+or expect the receipt to name the re-delivery and re-run the erasure.
+
+**The MCP endpoint cannot erase.** Deletion is an HTTP-only verb behind the
+write scope. The agent-facing surface stays read-only by construction, so
+stored adversarial text has no destructive tool to actuate.
+
 ## Compaction
 
 On by default, and you should leave it on.

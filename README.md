@@ -140,6 +140,16 @@ curl -X POST http://localhost:8080/v1/backups/nightly/release
 ./traza-server --data-dir /var/lib/traza --restore /backups/traza-2026-08-10
 ```
 
+**Erasing a session, and proving it.** Deletion by trace, span, session or payload, published at a checkpoint; the receipt re-checks every domain by name:
+
+```sh
+curl -X POST http://localhost:8080/v1/erasures \
+  -H 'Content-Type: application/json' \
+  -d '{"subject": {"kind": "session", "session_id": "sess-42"}}'
+
+curl http://localhost:8080/v1/erasures/1/verify
+```
+
 ## Send a span
 
 ```sh
@@ -186,6 +196,8 @@ Want a populated store to explore first? `examples/mcp-demo/run.sh` seeds agent 
 **Durability you choose.** Three acknowledgement modes, and every response states which one answered it. The suite proves them by killing the process, not by asserting.
 
 **Backup without stopping.** One call pins and verifies a consistent copy of spans, annotations and payload bytes together. Restore is one flag.
+
+**Deletion with a receipt.** Erase a trace, a session, or one offloaded payload from every domain — buffer, log, segments, annotations, payload files — then prove it: `verify --erasure` re-checks each domain by name and reports the result of each, down to the pinned backup that still holds the bytes.
 
 ## Performance
 

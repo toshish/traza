@@ -46,6 +46,9 @@ trailers and has no declared length.
 | `POST` | [`/v1/backups/{label}`](#post-v1backupslabel) | Pin and verify a backup |
 | `POST` | [`/v1/backups/{label}/release`](#post-v1backupslabelrelease) | Release a pin |
 | `GET` | [`/v1/verify`](#get-v1verify) | Verify the live generation |
+| `POST` | [`/v1/erasures`](#post-v1erasures) | Erase a trace, span, session, or payload |
+| `GET` | [`/v1/erasures`](#get-v1erasures) | The tombstone log |
+| `GET` | [`/v1/erasures/{id}/verify`](#get-v1erasuresidverify) | The erasure receipt |
 | `GET` | [`/v1/spans`](#get-v1spans) | Filtered span search |
 | `GET` | [`/v1/traces/{trace_id}`](#get-v1tracestrace_id) | One trace's spans and annotations |
 | `GET` | [`/v1/sessions`](#get-v1sessions) | Sessions, most recent activity first |
@@ -822,6 +825,99 @@ bytes. Traza does not record the original media type; interpret it using the
 attribute the reference came from.
 
 **Errors.** `404 {"error":"payload not found"}`. `503` on store failure.
+
+---
+
+## Erasure
+
+Targeted deletion by **subject**, with a receipt to prove it. TTL removes
+spans by age; erasure removes them because someone is entitled to have them
+gone, and the difference is what must be demonstrable afterwards. The
+operational story — what remains on purpose, pins, re-delivery — is in
+[administration § Erasure](../operations/administration.md#erasure-deletion-with-a-receipt).
+
+There is deliberately **no MCP tool for erasure**: the agent-facing surface
+stays read-only, so stored adversarial text has no deletion verb to actuate.
+
+### `POST /v1/erasures`
+
+Erases one subject and blocks until the erasure settles. The `200` is the
+acknowledgement, and it means the whole sequence ran: the intent is fsynced
+into the tombstone log, the write buffer and write-ahead log are rewritten to
+the survivors, every segment holding a match is rewritten in place (superseded
+versions included), annotations addressed to erased spans are dropped, payload
+files are deleted reference-aware, and a checkpoint published the deletion —
+durable at the `CURRENT` rename.
+
+```sh
+curl -X POST http://localhost:8080/v1/erasures \
+  -H 'Content-Type: application/json' \
+  -d '{"subject": {"kind": "trace", "trace_id": "trace-1"}}'
+```
+
+| Subject | Fields | Erases |
+|---|---|---|
+| `trace` | `trace_id` | Every span of the trace, its annotations, payload bytes no survivor references |
+| `span` | `trace_id`, `span_id` | One span by primary key, all physical versions |
+| `session` | `session_id` | Every span resolving to the session, across all recognized session keys |
+| `payload` | `reference` | The `sha256/<hex>` file, plus a rewrite of every referencing span dropping its inline preview |
+
+**Response `200`.** The erasure record — id, subject, the resolved
+`span_keys` — plus its `settle` block: `spans_removed`, `spans_redacted`,
+`annotations_removed`, `payloads_removed`, `payloads_retained` (each retained
+reference carries its reason — shared content still referenced by live spans
+outside the subject is kept, and the receipt says so), and the `generation`
+that published the deletion.
+
+Reads and ingest continue throughout. From the moment the tombstone is
+recorded the subject is invisible to every query — before the rewrites run —
+and a crash mid-erasure leaves a pending erasure that masks at the next open
+and is finished by the server's maintenance tick. Spans ingested under the
+same identifiers **after** the erasure settles are new data: a tombstone is a
+barrier, not a ban.
+
+**Errors.** `400` on a malformed body or subject. `503` on store failure.
+
+### `GET /v1/erasures`
+
+Every erasure the tombstone log records, oldest first, each with its `settle`
+block or `null` while pending. `GET /v1/erasures/{id}` returns one.
+
+### `GET /v1/erasures/{id}/verify`
+
+The **erasure receipt**: re-checks every domain the subject's bytes could
+inhabit and reports the result of each, by name — write buffer, live tail,
+write-ahead log, segments, annotations, payload files, derived caches, pins,
+generation metadata, and the tombstone log itself (retained by design: the
+record of the erasure is what this receipt verifies against).
+
+```sh
+curl http://localhost:8080/v1/erasures/1/verify
+```
+
+`result` is `erased` or `incomplete`, computed from what the walk found and
+never from what the settle record claims. Matches are classified against the
+erase record's resolved keys: an erased key found live again is a
+**re-delivery** and fails the receipt; a fresh key matching the subject is
+**new activity** and is reported without failing it. A pin created before the
+erasure still holds the subject's bytes in its hard-link farm, and the receipt
+says which pin to release. Byte-level occurrence scans (the log, rollup
+sidecars) are over-approximate on purpose and report as `attention` rather
+than failure — an identifier quoted in unrelated content counts.
+
+The same receipt is available offline, against a directory no live server
+owns:
+
+```sh
+traza-server verify --erasure 1 --data-dir /var/lib/traza
+```
+
+Exits `0` when the receipt says erased, `2` when it does not.
+
+**Errors.** `404` for an id the tombstone log does not record. `400` on a
+non-numeric id. `503` on store failure. The walk probes segment indexes
+rather than decoding the corpus, but it is a real verification, not a cache
+read — expect it to cost more than a query.
 
 ---
 

@@ -8,7 +8,7 @@
 //! index is the honest design. The TTL compactor rewrites the log dropping
 //! entries older than the retention window.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -279,6 +279,71 @@ impl AnnotationLog {
             found.truncate(limit);
         }
         Ok(found)
+    }
+
+    /// Drops annotations addressed to erased spans, rewriting the log
+    /// atomically (temp + rename). Returns how many were removed.
+    ///
+    /// An annotation is dropped when its `(trace_id, span_id)` is one of
+    /// `keys`, or when `whole_trace` names its trace — the trace-subject
+    /// case, which also covers trace-level annotations (`span_id` empty).
+    /// A trace-level annotation on a trace that was only PARTIALLY erased
+    /// (a session cutting across it) is deliberately kept: it is judgment
+    /// about spans that still exist.
+    pub(crate) fn drop_for_keys(
+        &self,
+        keys: &HashSet<(String, String)>,
+        whole_trace: Option<&str>,
+    ) -> Result<usize> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| Error::LockPoisoned("annotations"))?;
+        let doomed = |annotation: &Annotation| {
+            whole_trace.is_some_and(|trace_id| annotation.trace_id == trace_id)
+                || keys.contains(&(annotation.trace_id.clone(), annotation.span_id.clone()))
+        };
+        let mut kept: Vec<Annotation> = Vec::new();
+        let mut removed = 0;
+        for entries in inner.by_trace.values() {
+            for annotation in entries {
+                if doomed(annotation) {
+                    removed += 1;
+                } else {
+                    kept.push(annotation.clone());
+                }
+            }
+        }
+        if removed == 0 {
+            return Ok(0);
+        }
+        // Same publish shape as the TTL rewrite below: staged, fsynced,
+        // renamed, directory synced — a crash leaves the old log or the new
+        // one, never a blend, and the old log only ever errs toward a retry.
+        let temp = self.path.with_extension("jsonl.tmp");
+        {
+            let mut file = File::create(&temp)?;
+            for annotation in &kept {
+                let mut line = serde_json::to_string(annotation)?;
+                line.push('\n');
+                file.write_all(line.as_bytes())?;
+            }
+            file.sync_all()?;
+        }
+        std::fs::rename(&temp, &self.path)?;
+        if let Some(directory) = self.path.parent() {
+            crate::sync_directory(directory)?;
+        }
+        inner.by_trace.clear();
+        inner.count = kept.len();
+        for annotation in kept {
+            inner
+                .by_trace
+                .entry(annotation.trace_id.clone())
+                .or_default()
+                .push(annotation);
+        }
+        Ok(removed)
     }
 
     /// Drops annotations older than `cutoff_ns` by rewriting the log

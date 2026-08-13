@@ -512,7 +512,10 @@ besides loopback)] \
 [--allow-unauthenticated-non-loopback] [--version] \
 [--restore BACKUP_DIR (install a backup into --data-dir, then serve it)]\n\
        traza-server mcp --url URL [--token TOKEN] \
-(stdio bridge: speaks MCP on stdin/stdout and forwards to a running server)";
+(stdio bridge: speaks MCP on stdin/stdout and forwards to a running server)\n\
+       traza-server verify --erasure ID|latest [--data-dir DIR] [--json] \
+(offline erasure receipt: re-checks every domain and prints the result of each; \
+exits 2 when the erasure does not verify)";
 
 /// Everything the command line decides, with the profile already resolved
 /// against the explicit flags.
@@ -792,6 +795,87 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
     }))
 }
 
+/// `traza-server verify --erasure <id|latest>`: the offline erasure receipt.
+///
+/// Opens the store the way serving would — the standard recovery: log
+/// replayed, torn tails healed, pending erasures masked — then re-checks
+/// every domain the subject's bytes could inhabit and prints the result of
+/// each. It never runs the purge itself: a pending erasure verifies as
+/// incomplete, which is the truthful answer until a serving process settles
+/// it. Exits 0 when the receipt says erased, 2 when it does not.
+///
+/// Refuses a directory a live server owns; that server's
+/// `GET /v1/erasures/<id>/verify` is the same receipt without the contention.
+fn run_verify(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut data_dir = PathBuf::from("./data");
+    let mut erasure: Option<String> = None;
+    let mut as_json = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--data-dir" => {
+                i += 1;
+                data_dir =
+                    PathBuf::from(args.get(i).ok_or("--data-dir requires a value")?.as_str());
+            }
+            "--erasure" => {
+                i += 1;
+                erasure = Some(
+                    args.get(i)
+                        .ok_or("--erasure requires an id or 'latest'")?
+                        .clone(),
+                );
+            }
+            "--json" => as_json = true,
+            "--help" | "-h" => {
+                println!("{USAGE}");
+                return Ok(());
+            }
+            other => return Err(format!("unknown argument: {other}").into()),
+        }
+        i += 1;
+    }
+    let Some(erasure) = erasure else {
+        return Err("verify requires --erasure <id|latest>".into());
+    };
+
+    let store = match Store::open(&data_dir, Config::default()) {
+        Ok(store) => store,
+        Err(traza::Error::AlreadyOpen) => {
+            return Err(format!(
+                "{} is owned by a live traza-server; ask that server instead: \
+                 GET /v1/erasures/<id>/verify returns the same receipt",
+                data_dir.display()
+            )
+            .into())
+        }
+        Err(error) => return Err(error.into()),
+    };
+
+    let id = match erasure.as_str() {
+        "latest" => store
+            .erasures()?
+            .last()
+            .map(|status| status.erase.id)
+            .ok_or("the tombstone log records no erasures")?,
+        text => text
+            .parse::<u64>()
+            .map_err(|_| format!("--erasure takes a decimal id or 'latest' (got {text:?})"))?,
+    };
+    let receipt = store.verify_erasure(id)?;
+    match as_json {
+        true => println!(
+            "{}",
+            serde_json::to_string_pretty(&receipt).unwrap_or_else(|_| "{}".to_owned())
+        ),
+        false => print!("{}", receipt.render_text()),
+    }
+    if receipt.result != "erased" {
+        std::process::exit(2);
+    }
+    Ok(())
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // `traza-server mcp --url ...` is the stdio bridge, not a server. It opens
@@ -799,6 +883,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // is the only thing that does.
     if args.first().map(String::as_str) == Some("mcp") {
         return run_mcp_bridge(&args[1..]);
+    }
+    // `traza-server verify --erasure ...` produces the erasure receipt
+    // offline, against a data directory no live server owns.
+    if args.first().map(String::as_str) == Some("verify") {
+        return run_verify(&args[1..]);
     }
     let Some(options) = parse_args(&args)? else {
         return Ok(());
@@ -863,10 +952,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // maintenance shares the fast tick because a seal it declines to schedule
     // costs a comparison, and the age bound's whole promise is that a store
     // that went quiet still seals within it.
-    let buffer_bounds = config.max_buffer_age.is_some() || config.shadow_seal;
-    if ttl_seconds.is_some() || compaction_enabled || buffer_bounds {
+    // The tick always runs now: besides the conditional duties above it is
+    // the erasure-resume loop, and a pending erasure — one a crash
+    // interrupted — must settle even on a store with TTL, compaction and the
+    // buffer bounds all switched off.
+    {
         let maintainer = Arc::clone(&engine);
         let ttl_enabled = ttl_seconds.is_some();
+        let _ = compaction_enabled;
         thread::Builder::new()
             .name("traza-maintenance".into())
             .spawn(move || {
@@ -876,6 +969,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     ticks += 1;
                     if let Err(error) = maintainer.maintain_buffer() {
                         eprintln!("buffer maintenance failed: {error}");
+                    }
+                    // An erasure a crash interrupted is pending in the
+                    // tombstone log: its subject is already masked, and this
+                    // finishes the purge and settles it. A comparison and an
+                    // empty list on every tick that has nothing to do.
+                    match maintainer.resume_erasures() {
+                        Ok(0) => {}
+                        Ok(resumed) => eprintln!(
+                            "traza-server: settled {resumed} erasure(s) interrupted by a restart"
+                        ),
+                        Err(error) => eprintln!("erasure resume failed: {error}"),
                     }
                     if let Err(error) = maintainer.compact_segments() {
                         eprintln!("segment compaction failed: {error}");
@@ -1581,6 +1685,88 @@ fn serve_request(
                     Err(error) => responder.json(503, json!({"error": error.to_string()})),
                 },
                 Err(error) => responder.json(409, json!({"error": error.to_string()})),
+            }
+        }
+        // Targeted deletion, with the receipt to prove it. POST names a
+        // subject and blocks until the erasure settles — resolve, tombstone,
+        // purge every domain, checkpoint — and answers with the settle
+        // summary. GET lists the tombstone log; GET /{id}/verify re-checks
+        // every domain and returns the receipt. Erasure rides the ordinary
+        // method rule (POST needs the write scope), and there is deliberately
+        // NO MCP tool for it: the agent-facing surface stays read-only, so
+        // stored adversarial text has no deletion verb to actuate.
+        ("POST", "/v1/erasures") => {
+            let body: Value = match serde_json::from_slice(&request.body) {
+                Ok(body) => body,
+                Err(error) => return responder.json(400, json!({"error": error.to_string()})),
+            };
+            let Some(subject) = body.get("subject").cloned() else {
+                return responder.json(
+                    400,
+                    json!({"error": "body must be {\"subject\": {\"kind\": \"trace\"|\"span\"|\"session\"|\"payload\", ...}}"}),
+                );
+            };
+            let subject: traza::erasure::Subject = match serde_json::from_value(subject) {
+                Ok(subject) => subject,
+                Err(error) => {
+                    return responder.json(
+                        400,
+                        json!({"error": format!("subject does not parse: {error}")}),
+                    )
+                }
+            };
+            match engine.erase(subject) {
+                Ok(status) => responder.json(
+                    200,
+                    serde_json::to_value(&status).unwrap_or_else(|_| json!({})),
+                ),
+                Err(traza::Error::InvalidSpan(reason)) => {
+                    responder.json(400, json!({"error": reason}))
+                }
+                Err(error) => responder.json(503, json!({"error": error.to_string()})),
+            }
+        }
+        ("GET", "/v1/erasures") => match engine.erasures() {
+            Ok(erasures) => responder.json(
+                200,
+                json!({
+                    "erasures": serde_json::to_value(erasures)
+                        .unwrap_or_else(|_| Value::Array(Vec::new()))
+                }),
+            ),
+            Err(error) => responder.json(503, json!({"error": error.to_string()})),
+        },
+        ("GET", path) if path.starts_with("/v1/erasures/") && path.ends_with("/verify") => {
+            let id = &path["/v1/erasures/".len()..path.len() - "/verify".len()];
+            let Ok(id) = id.parse::<u64>() else {
+                return responder.json(400, json!({"error": "erasure ids are decimal integers"}));
+            };
+            match engine.verify_erasure(id) {
+                Ok(receipt) => responder.json(
+                    200,
+                    serde_json::to_value(&receipt).unwrap_or_else(|_| json!({})),
+                ),
+                Err(traza::Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                    responder.json(404, json!({"error": error.to_string()}))
+                }
+                Err(error) => responder.json(503, json!({"error": error.to_string()})),
+            }
+        }
+        ("GET", path) if path.starts_with("/v1/erasures/") => {
+            let id = &path["/v1/erasures/".len()..];
+            let Ok(id) = id.parse::<u64>() else {
+                return responder.json(400, json!({"error": "erasure ids are decimal integers"}));
+            };
+            match engine.erasure_status(id) {
+                Ok(Some(status)) => responder.json(
+                    200,
+                    serde_json::to_value(&status).unwrap_or_else(|_| json!({})),
+                ),
+                Ok(None) => responder.json(
+                    404,
+                    json!({"error": format!("no erasure {id} is recorded in the tombstone log")}),
+                ),
+                Err(error) => responder.json(503, json!({"error": error.to_string()})),
             }
         }
         ("GET", "/v1/spans") => {

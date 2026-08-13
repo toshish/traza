@@ -65,6 +65,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   committed by the `CURRENT` rename, so a crash mid-adoption leaves a
   directory the next open finishes.
 
+- **Targeted deletion, with a receipt.** `POST /v1/erasures` erases a
+  **subject** — a trace, a span, a session (resolved across every recognized
+  session key), or one offloaded payload — and the new
+  `traza-server verify --erasure` (or `GET /v1/erasures/{id}/verify`) then
+  proves it: every domain the subject's bytes could inhabit, checked by name,
+  with the result of each. TTL removes by age; this removes because someone
+  is entitled to have it gone, and the receipt is the difference.
+
+  - **The tombstone log** (`tombstones.jsonl`) is a new manifested,
+    append-only recovery domain beside the annotation log. The intent record
+    is fsynced *before* anything is removed, so from that moment the subject
+    is invisible to every read path — search, lookups, sessions, analytics,
+    export, the live tail — even before the rewrites run, and a crash
+    mid-purge leaves a pending erasure the next open masks and the
+    maintenance tick finishes. Idempotent to resume: the purge re-verifies
+    rather than re-damages.
+  - **The purge reaches every domain.** Buffer and write-ahead log rewritten
+    to the survivors (the TTL discipline: a deletion a restart undoes is not
+    a deletion); segments rewritten in place, superseded versions of an
+    erased key included — the purge tests every physical record, not the
+    visible one; annotations addressed to erased spans dropped; payload
+    files deleted **reference-aware**, because content addressing means one
+    file can back spans outside the subject — those bytes are retained and
+    the receipt names the reason. A payload subject additionally rewrites
+    every referencing span to drop its inline preview: the preview is
+    content too. Publication is a checkpoint — the deletion is durable when
+    `CURRENT` moves, and `tests/erasure.rs` proves it by killing the server
+    after its 200.
+  - **The receipt is a verification, not a claim.** Its result is computed
+    from the walk, never from the settle record. Matches are classified
+    against the erase record's resolved keys: an erased key found live again
+    is a re-delivery and fails the receipt; a fresh key under the same
+    identifiers is new activity, reported without failing it — an erasure is
+    a barrier, not a ban. Pins are checked and named: a backup pinned before
+    the erasure still holds the bytes in its hard-link farm, and the receipt
+    says which pin to release. What remains afterwards is stated rather than
+    hidden: the tombstone record itself keeps the subject's identifiers and
+    content hashes — never the erased text — as the record the receipt
+    verifies against.
+  - **No MCP tool for any of it, deliberately.** Deletion is an HTTP verb
+    behind the write scope; the agent-facing surface stays read-only, so
+    stored adversarial text has no destructive tool to actuate.
+
 ### Changed
 
 - **`wal_bytes` counts replayable work, not file bytes.** The log's constant

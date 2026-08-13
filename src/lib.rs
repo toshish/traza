@@ -10,6 +10,7 @@ pub mod analytics;
 pub mod annotations;
 pub mod auth;
 pub mod content;
+pub mod erasure;
 pub mod expiration;
 mod generation;
 pub mod hash;
@@ -1477,6 +1478,25 @@ struct Sealed {
     rollup: std::sync::Arc<analytics::SegmentRollup>,
 }
 
+/// An erasure subject at request time: the span keys it covers, and the
+/// payload references those spans carry.
+type ResolvedSubject = (Vec<(String, String)>, Vec<String>);
+
+/// What one erasure's purge removed, counted physically: superseded versions
+/// of an erased key held the bytes too, so they count and they go.
+#[derive(Debug, Default)]
+struct SubjectPurge {
+    /// Physical records removed across buffer, log and segments.
+    removed: usize,
+    /// Records rewritten with a redacted payload reference.
+    redacted: usize,
+    /// Every key a removed or redacted record carried — the tail veil's
+    /// coverage, and the union the annotation drop tests against.
+    keys: std::collections::HashSet<(String, String)>,
+    /// Every payload reference a REMOVED record carried, before redaction.
+    payload_refs: std::collections::HashSet<String>,
+}
+
 /// A durable span store backed by sorted JSON-lines segment files.
 pub struct Store {
     /// The store directory: segments, the annotation log, and payload files
@@ -1541,6 +1561,9 @@ pub struct Store {
     // entirely rather than at the bottom of it.
     tail: tail::TailChannel,
     annotations: annotations::AnnotationLog,
+    /// The tombstone log: every erasure requested and settled, plus the mask
+    /// over the pending ones that every read path consults. See [`erasure`].
+    erasures: erasure::ErasureLog,
     next_segment: AtomicU64,
     /// Present unless durability is [`Durability::Buffered`]. Guards the gap
     /// between acknowledging a write and sealing it into a segment.
@@ -1681,6 +1704,11 @@ impl Store {
 
             Ok(Self {
                 annotations: annotations::AnnotationLog::open(&directory)?,
+                // Replayed before serving: a pending erasure — one whose purge
+                // a crash interrupted — masks its subject from the first query
+                // this store answers, and stays masked until the resumed purge
+                // settles it (see [`Store::resume_erasures`]).
+                erasures: erasure::ErasureLog::open(&directory)?,
                 directory,
                 live_generation: AtomicU64::new(live_generation),
                 config,
@@ -1904,8 +1932,13 @@ impl Store {
         // whole spans, so the query runs against the text in memory rather than
         // against the postings a segment would have needed at seal time.
         let content = filter.content.as_deref().map(content::Query::new);
+        // The ring's veils hide what settled erasures covered; the mask hides
+        // what a PENDING one covers, for the same reason every other read
+        // path consults it.
+        let mask = self.erasure_mask();
         Ok(self.tail.wait(cursor, backfill, limit, timeout, &|span| {
-            span_matches(span, filter, content.as_ref())
+            mask.as_deref().map_or(true, |mask| !mask.covers(span))
+                && span_matches(span, filter, content.as_ref())
         }))
     }
 
@@ -1925,6 +1958,7 @@ impl Store {
     /// combined view, so a concurrent flush cannot move spans between halves
     /// of the snapshot and make them temporarily disappear.
     pub fn get_trace(&self, trace_id: &str) -> Result<Vec<Span>> {
+        let mask = self.erasure_mask();
         let writer = self.lock_writer()?;
         let segments = self.lock_segments()?;
         let mut result = Vec::new();
@@ -1943,7 +1977,11 @@ impl Store {
                 latest.insert(span.span_id.clone(), Span::clone(span));
             }
         }
-        result.extend(latest.into_values());
+        result.extend(
+            latest
+                .into_values()
+                .filter(|span| mask.as_deref().map_or(true, |mask| !mask.covers(span))),
+        );
 
         sort_spans(&mut result);
         Ok(result)
@@ -1977,10 +2015,11 @@ impl Store {
         keys: &[&str],
         values: &[Value],
     ) -> Result<Vec<Span>> {
+        let mask = self.erasure_mask();
         // Lock order: writer before segments (see Store field docs).
         let writer = self.lock_writer()?;
         let segments = self.lock_segments()?;
-        attribute_union_view(&writer, &segments, keys, values)
+        attribute_union_view(&writer, &segments, keys, values, mask.as_deref())
     }
 
     /// Returns spans matching `filter` strictly after `cursor`.
@@ -2004,9 +2043,17 @@ impl Store {
             let spans = self.resolve_session_spans(session_id)?;
             return Ok(narrow_session_spans(spans, filter, cursor));
         }
+        let mask = self.erasure_mask();
         let writer = self.lock_writer()?;
         let segments = self.lock_segments()?;
-        query_view(&writer, &segments, &self.metrics, filter, cursor)
+        query_view(
+            &writer,
+            &segments,
+            &self.metrics,
+            filter,
+            cursor,
+            mask.as_deref(),
+        )
     }
 
     /// [`Self::query_after`], additionally reporting what the query cost.
@@ -2026,9 +2073,18 @@ impl Store {
             let spans = self.resolve_session_spans(session_id)?;
             narrow_session_spans(spans, filter, cursor)
         } else {
+            let mask = self.erasure_mask();
             let writer = self.lock_writer()?;
             let segments = self.lock_segments()?;
-            query_view_costed(&writer, &segments, &self.metrics, filter, cursor, &mut cost)?
+            query_view_costed(
+                &writer,
+                &segments,
+                &self.metrics,
+                filter,
+                cursor,
+                mask.as_deref(),
+                &mut cost,
+            )?
         };
         cost.elapsed_ns = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
         Ok((spans, cost))
@@ -2051,6 +2107,7 @@ impl Store {
     /// the bytes are not reclaimed until it drops, so a view is meant to be
     /// held for one operation, not parked.
     pub fn snapshot(&self) -> Result<SnapshotView<'_>> {
+        let mask = self.erasure_mask();
         // Lock order: writer before segments (see Store field docs).
         let writer = self.lock_writer()?;
         let segments = self.lock_segments()?;
@@ -2059,8 +2116,15 @@ impl Store {
         Ok(SnapshotView {
             buffer,
             segments: segments.clone(),
+            mask,
             metrics: &self.metrics,
         })
+    }
+
+    /// The pending-erasure mask, or `None` when nothing is pending — the
+    /// common case, and one `Arc` clone when not.
+    fn erasure_mask(&self) -> Option<std::sync::Arc<erasure::Mask>> {
+        self.erasures.mask()
     }
 }
 
@@ -2075,6 +2139,10 @@ impl Store {
 pub struct SnapshotView<'a> {
     buffer: WriteBuffer,
     segments: Vec<std::sync::Arc<Segment>>,
+    /// The pending-erasure mask as it stood when the view was taken. A view
+    /// is one instant of the store, and what was invisible at that instant
+    /// stays invisible for the view's whole life.
+    mask: Option<std::sync::Arc<erasure::Mask>>,
     /// Reads through a view are real reads and are counted as such. Borrowing
     /// the store's counters is also what keeps a view from outliving the store
     /// whose files it pins.
@@ -2096,11 +2164,22 @@ impl SnapshotView<'_> {
         cursor: Option<&SpanCursor>,
     ) -> Result<Vec<Span>> {
         if let Some(session_id) = &filter.session {
-            let spans =
-                analytics::resolve_session_spans_in(&self.buffer, &self.segments, session_id)?;
+            let spans = analytics::resolve_session_spans_in(
+                &self.buffer,
+                &self.segments,
+                session_id,
+                self.mask.as_deref(),
+            )?;
             return Ok(narrow_session_spans(spans, filter, cursor));
         }
-        query_view(&self.buffer, &self.segments, self.metrics, filter, cursor)
+        query_view(
+            &self.buffer,
+            &self.segments,
+            self.metrics,
+            filter,
+            cursor,
+            self.mask.as_deref(),
+        )
     }
 
     /// Folds every matching span through `visit`, reporting what it cost.
@@ -2118,6 +2197,7 @@ impl SnapshotView<'_> {
             &self.segments,
             self.metrics,
             filter,
+            self.mask.as_deref(),
             cost,
             visit,
         )
@@ -2157,7 +2237,9 @@ pub(crate) fn attribute_union_view(
     segments: &[std::sync::Arc<Segment>],
     keys: &[&str],
     values: &[Value],
+    mask: Option<&erasure::Mask>,
 ) -> Result<Vec<Span>> {
+    let visible = |span: &Span| mask.map_or(true, |mask| !mask.covers(span));
     let matches = |span: &Span| {
         keys.iter().any(|key| {
             span.attributes
@@ -2170,7 +2252,7 @@ pub(crate) fn attribute_union_view(
     let mut claimed: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
     // The buffer holds the newest version of anything it carries.
     for span in buffer.spans.iter() {
-        if matches(span) {
+        if visible(span) && matches(span) {
             claimed.insert((span.trace_id.clone(), span.span_id.clone()));
             result.push(Span::clone(span));
         }
@@ -2198,7 +2280,7 @@ pub(crate) fn attribute_union_view(
             let record = seg.record_at_offset(offset).map_err(segment_error)?;
             let span = record_to_span(&record)?;
             // An index accelerates a filter, it never changes it.
-            if !matches(&span) {
+            if !visible(&span) || !matches(&span) {
                 continue;
             }
             if claimed.insert((span.trace_id.clone(), span.span_id.clone())) {
@@ -2223,6 +2305,7 @@ pub(crate) fn query_view(
     metrics: &metrics::Metrics,
     filter: &SpanFilter,
     cursor: Option<&SpanCursor>,
+    mask: Option<&erasure::Mask>,
 ) -> Result<Vec<Span>> {
     query_view_costed(
         writer,
@@ -2230,6 +2313,7 @@ pub(crate) fn query_view(
         metrics,
         filter,
         cursor,
+        mask,
         &mut QueryCost::default(),
     )
 }
@@ -2245,8 +2329,13 @@ pub(crate) fn query_view_costed(
     metrics: &metrics::Metrics,
     filter: &SpanFilter,
     cursor: Option<&SpanCursor>,
+    mask: Option<&erasure::Mask>,
     cost: &mut QueryCost,
 ) -> Result<Vec<Span>> {
+    // A pending erasure hides its subject from every read path, and it hides
+    // it HERE — beside the filter, inside the limit accounting — rather than
+    // by post-filtering results, so a limited page is still a full page.
+    let visible = |span: &Span| mask.map_or(true, |mask| !mask.covers(span));
     // A sorted answer cannot be streamed: the record that belongs first may be
     // the last one read, so `limit` cannot stop the scan early. Re-run
     // unlimited, order, then truncate. Refusing past a ceiling rather than
@@ -2258,7 +2347,8 @@ pub(crate) fn query_view_costed(
             sort: None,
             ..filter.clone()
         };
-        let mut spans = query_view_costed(writer, segments, metrics, &unlimited, cursor, cost)?;
+        let mut spans =
+            query_view_costed(writer, segments, metrics, &unlimited, cursor, mask, cost)?;
         if spans.len() > SORT_CANDIDATE_LIMIT {
             return Err(Error::QueryTooBroad(format!(
                 "sorting {} matches exceeds the {SORT_CANDIDATE_LIMIT} candidate limit; \
@@ -2295,7 +2385,8 @@ pub(crate) fn query_view_costed(
                 .spans
                 .iter()
                 .filter(|span| {
-                    span_matches(span, filter, content.as_ref())
+                    visible(span)
+                        && span_matches(span, filter, content.as_ref())
                         && cursor.map_or(true, |position| span_after_cursor(span, position))
                 })
                 .map(|span| Span::clone(span))
@@ -2407,6 +2498,9 @@ pub(crate) fn query_view_costed(
                 let Some(index) = best else { break };
                 let span = heads[index].take().expect("selected head exists");
                 heads[index] = advance(&mut sources[index])?;
+                if !visible(&span) {
+                    continue;
+                }
                 if index != 0
                     && (!span_matches(&span, filter, content.as_ref())
                         || cursor.is_some_and(|position| !span_after_cursor(&span, position)))
@@ -2481,7 +2575,8 @@ pub(crate) fn query_view_costed(
             for offset in offsets.iter() {
                 let record = seg.record_at_offset(*offset).map_err(segment_error)?;
                 let span = record_to_span(&record)?;
-                if !span_matches(&span, filter, content.as_ref())
+                if !visible(&span)
+                    || !span_matches(&span, filter, content.as_ref())
                     || cursor.is_some_and(|bound| !span_after_cursor(&span, bound))
                 {
                     continue;
@@ -2502,7 +2597,8 @@ pub(crate) fn query_view_costed(
             }
         }
         for span in writer.spans.iter() {
-            if span_matches(span, filter, content.as_ref())
+            if visible(span)
+                && span_matches(span, filter, content.as_ref())
                 && cursor.map_or(true, |bound| span_after_cursor(span, bound))
             {
                 result.push(Span::clone(span));
@@ -2531,9 +2627,13 @@ pub(crate) fn fold_view(
     segments: &[std::sync::Arc<Segment>],
     metrics: &metrics::Metrics,
     filter: &SpanFilter,
+    mask: Option<&erasure::Mask>,
     cost: &mut QueryCost,
     visit: &mut impl FnMut(&Span),
 ) -> Result<()> {
+    // Same rule as the query path: a pending erasure's subject never reaches
+    // an aggregation, even before its bytes are rewritten away.
+    let visible = |span: &Span| mask.map_or(true, |mask| !mask.covers(span));
     // Parsed once for the whole fold, exactly as the query path does it: the
     // tokenizer runs per call, and running it per segment would put it on the
     // hot loop of every aggregation.
@@ -2563,7 +2663,7 @@ pub(crate) fn fold_view(
         for offset in offsets.iter() {
             let record = seg.record_at_offset(*offset).map_err(segment_error)?;
             let span = record_to_span(&record)?;
-            if !span_matches(&span, filter, content.as_ref()) {
+            if !visible(&span) || !span_matches(&span, filter, content.as_ref()) {
                 continue;
             }
             if writer.contains_key(&span.trace_id, &span.span_id) {
@@ -2582,7 +2682,7 @@ pub(crate) fn fold_view(
         }
     }
     for span in writer.spans.iter() {
-        if span_matches(span, filter, content.as_ref()) {
+        if visible(span) && span_matches(span, filter, content.as_ref()) {
             visit(span);
         }
     }
@@ -4014,6 +4114,857 @@ impl Store {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(Error::Io(error)),
         }
+    }
+
+    /// Erases a subject — a trace, a span, a session, or an offloaded
+    /// payload — from every domain, and publishes the deletion.
+    ///
+    /// The sequence is the contract:
+    ///
+    /// 1. **Resolve.** The subject becomes the concrete span keys it covers,
+    ///    recorded so the erasure is exact rather than a predicate re-argued
+    ///    later.
+    /// 2. **Tombstone.** The intent is appended to `tombstones.jsonl` and
+    ///    fsynced BEFORE anything is removed. From here the subject is
+    ///    invisible to every query (the pending mask), and a crash anywhere
+    ///    later leaves a pending erasure the next open masks and
+    ///    [`Self::resume_erasures`] finishes — never a half-deletion nothing
+    ///    remembers.
+    /// 3. **Purge.** The write buffer and log are rewritten to the survivors
+    ///    (the same discipline as TTL: a deletion a restart undoes is not a
+    ///    deletion); every segment holding a match is rewritten in place or
+    ///    removed; annotations addressed to erased spans are dropped; payload
+    ///    files are deleted **reference-aware** — content addressing means
+    ///    one file can back spans outside the subject, and those bytes are
+    ///    retained and reported rather than destroyed. Superseded versions
+    ///    of erased spans purge with them: the purge tests every physical
+    ///    record against the subject, not just the visible one.
+    /// 4. **Publish.** A checkpoint moves `CURRENT`; the deletion is durable
+    ///    at that rename, and the generation's manifest names the tombstone
+    ///    log that commands it.
+    /// 5. **Settle.** The outcome is appended and the mask lifts. New spans
+    ///    under the same identifiers are new data from here on — an erasure
+    ///    is a barrier, not a ban.
+    ///
+    /// Reads and ingest continue throughout, exactly as they do across TTL
+    /// expiry. A reader that PINNED the store before the erasure (a running
+    /// export) finishes against its pinned view — POSIX semantics; new reads
+    /// cannot see the subject from step 2 on.
+    ///
+    /// What remains afterwards, on purpose: the tombstone record itself,
+    /// naming the subject and its keys. That record is what
+    /// [`Self::verify_erasure`] checks the store against; erasing the record
+    /// of erasure means deleting the store.
+    pub fn erase(&self, subject: erasure::Subject) -> Result<erasure::ErasureStatus> {
+        subject.validate()?;
+        let (span_keys, payload_refs) = self.resolve_subject(&subject)?;
+        let requested_unix_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since| since.as_nanos().min(u128::from(u64::MAX)) as u64);
+        let record = self
+            .erasures
+            .begin(requested_unix_ns, subject, span_keys, payload_refs)?;
+        let settle = self.complete_erasure(&record)?;
+        Ok(erasure::ErasureStatus {
+            erase: record,
+            settle: Some(settle),
+        })
+    }
+
+    /// Finishes every pending erasure — one whose purge a crash interrupted —
+    /// and returns how many were settled. The purge steps are idempotent, so
+    /// resuming an erasure that was nearly done merely re-verifies each
+    /// domain and publishes. `traza-server` calls this from its maintenance
+    /// tick; an embedding process should call it once after open.
+    pub fn resume_erasures(&self) -> Result<usize> {
+        let pending = self.erasures.pending()?;
+        for record in &pending {
+            self.complete_erasure(record)?;
+        }
+        Ok(pending.len())
+    }
+
+    /// Every erasure the tombstone log records, oldest first.
+    pub fn erasures(&self) -> Result<Vec<erasure::ErasureStatus>> {
+        self.erasures.list()
+    }
+
+    /// One erasure by id, or `None` when the log never recorded it.
+    pub fn erasure_status(&self, id: u64) -> Result<Option<erasure::ErasureStatus>> {
+        self.erasures.get(id)
+    }
+
+    /// The subject resolved to the concrete keys and payload references it
+    /// covers right now, under the store's usual read semantics.
+    fn resolve_subject(&self, subject: &erasure::Subject) -> Result<ResolvedSubject> {
+        let spans: Vec<Span> = match subject {
+            erasure::Subject::Trace { trace_id } => self.get_trace(trace_id)?,
+            erasure::Subject::Span { trace_id, span_id } => self
+                .get_trace(trace_id)?
+                .into_iter()
+                .filter(|span| span.span_id == *span_id)
+                .collect(),
+            erasure::Subject::Session { session_id } => self.resolve_session_spans(session_id)?,
+            erasure::Subject::Payload { reference } => {
+                // No index reaches into reference objects (their hashes are
+                // deliberately not content-indexed), so resolution is a fold.
+                // Payload erasure is an explicit administrative act; one scan
+                // per request is the honest price.
+                let mut matching = Vec::new();
+                let view = self.snapshot()?;
+                view.fold(
+                    &SpanFilter::default(),
+                    &mut QueryCost::default(),
+                    &mut |span| {
+                        if erasure::payload_unredacted(span, reference) {
+                            matching.push(span.clone());
+                        }
+                    },
+                )?;
+                matching
+            }
+        };
+        let mut keys: Vec<(String, String)> = spans
+            .iter()
+            .map(|span| (span.trace_id.clone(), span.span_id.clone()))
+            .collect();
+        keys.sort();
+        keys.dedup();
+        let mut refs: std::collections::HashSet<String> = std::collections::HashSet::new();
+        match subject {
+            erasure::Subject::Payload { reference } => {
+                refs.insert(reference.clone());
+            }
+            _ => {
+                for span in &spans {
+                    erasure::payload_refs_of(span, &mut refs);
+                }
+            }
+        }
+        let mut refs: Vec<String> = refs.into_iter().collect();
+        refs.sort();
+        Ok((keys, refs))
+    }
+
+    /// Runs the purge, publishes, and settles one recorded erasure. Shared by
+    /// [`Self::erase`] and [`Self::resume_erasures`]; every step is
+    /// idempotent, so running it again after a crash re-verifies rather than
+    /// re-damages.
+    fn complete_erasure(&self, record: &erasure::EraseRecord) -> Result<erasure::SettleRecord> {
+        let erasing = Instant::now();
+        let subject = &record.subject;
+
+        let (purge, annotations_removed, payloads_removed, payloads_retained) = {
+            // One rewriter at a time, same as compaction and expiry.
+            let _maintenance = self.lock_maintenance()?;
+            let purge = self.purge_subject_locked(subject)?;
+
+            let annotations_removed = match subject {
+                erasure::Subject::Payload { .. } => 0,
+                erasure::Subject::Trace { trace_id } => self
+                    .annotations
+                    .drop_for_keys(&purge.keys, Some(trace_id))?,
+                _ => self.annotations.drop_for_keys(&purge.keys, None)?,
+            };
+
+            // Payload files, reference-aware. Live references are computed
+            // AFTER the span purge, so a file only the subject referenced is
+            // sweepable and a file shared with surviving spans is not.
+            let mut payloads_removed: Vec<String> = Vec::new();
+            let mut payloads_retained: Vec<erasure::RetainedPayload> = Vec::new();
+            let mut doomed: Vec<String> = record
+                .payload_refs
+                .iter()
+                .cloned()
+                .chain(purge.payload_refs.iter().cloned())
+                .collect();
+            doomed.sort();
+            doomed.dedup();
+            if !doomed.is_empty() {
+                let erased_file = |reference: &str| -> Result<bool> {
+                    let Some(hash) = reference.strip_prefix("sha256/") else {
+                        return Ok(false);
+                    };
+                    match fs::remove_file(payload::payload_path(&self.directory, hash)) {
+                        Ok(()) => Ok(true),
+                        // Already absent is the erased state; resume hits this.
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+                        Err(error) => Err(Error::Io(error)),
+                    }
+                };
+                match subject {
+                    erasure::Subject::Payload { .. } => {
+                        // The content itself is the subject: every reference
+                        // was redacted above, so the file goes regardless of
+                        // who pointed at it.
+                        for reference in doomed {
+                            erased_file(&reference)?;
+                            payloads_removed.push(reference);
+                        }
+                    }
+                    _ => {
+                        // Live references are the ONLY retention ground here,
+                        // and deliberately not the touch registry the TTL
+                        // sweep also consults. The two tools resolve the same
+                        // race in opposite directions, each rightly: retention
+                        // must never destroy a span's data, so TTL yields to
+                        // any recent toucher; an erasure was COMMANDED to
+                        // destroy this data, so it yields only to spans that
+                        // provably still reference the bytes. The residual
+                        // race is one in-flight ingest re-uploading the exact
+                        // content being erased: if it has not yet passed its
+                        // existence check it recreates the file (the standard
+                        // store_payload interlock), and if it has, its span
+                        // keeps the inline preview while the offloaded body
+                        // defers to the erasure — the priority an erasure
+                        // exists to enforce.
+                        let live = self.live_payload_refs()?;
+                        for reference in doomed {
+                            if live.contains(&reference) {
+                                payloads_retained.push(erasure::RetainedPayload {
+                                    reference,
+                                    reason: "still referenced by live spans outside the subject"
+                                        .to_owned(),
+                                });
+                                continue;
+                            }
+                            erased_file(&reference)?;
+                            payloads_removed.push(reference);
+                        }
+                    }
+                }
+                // An unlink is durable only when its directory entry is
+                // synced, and payload files live in SHARD directories — the
+                // parent alone would not carry the removals. Deduplicated,
+                // because many removals share a shard.
+                let mut shards: Vec<PathBuf> = payloads_removed
+                    .iter()
+                    .filter_map(|reference| reference.strip_prefix("sha256/"))
+                    .filter_map(|hash| {
+                        payload::payload_path(&self.directory, hash)
+                            .parent()
+                            .map(Path::to_path_buf)
+                    })
+                    .collect();
+                shards.sort();
+                shards.dedup();
+                for shard in shards {
+                    if shard.exists() {
+                        sync_directory(&shard)?;
+                    }
+                }
+            }
+            (
+                purge,
+                annotations_removed,
+                payloads_removed,
+                payloads_retained,
+            )
+        };
+
+        // The live tail must stop serving what the store no longer holds. A
+        // veil covers exactly the entries admitted before this point; spans
+        // admitted later are new data and flow normally.
+        if !purge.keys.is_empty() {
+            self.tail.veil(std::sync::Arc::new(purge.keys.clone()));
+        }
+
+        // Publication: the deletion is durable when `CURRENT` moves, and the
+        // manifest it moves to names the tombstone log that commands it. The
+        // checkpoint also rewrites the log to the surviving buffer, so the
+        // erased bytes leave `wal.log` here at the latest.
+        let generation = self.checkpoint()?;
+
+        let settle = erasure::SettleRecord {
+            schema: erasure::SettleRecord::schema_now(),
+            id: record.id,
+            settled_unix_ns: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |since| since.as_nanos().min(u128::from(u64::MAX)) as u64),
+            generation,
+            spans_removed: purge.removed,
+            spans_redacted: purge.redacted,
+            annotations_removed,
+            payloads_removed,
+            payloads_retained,
+        };
+        self.erasures.record_settle(settle.clone())?;
+        self.metrics.erasures_settled.increment();
+        self.metrics.erasure_spans_removed.add(purge.removed as u64);
+        self.metrics.erasure.record(elapsed_nanos(&erasing));
+        Ok(settle)
+    }
+
+    /// Removes (or redacts) every physical record the subject covers, across
+    /// the buffer, the log, and every segment. The maintenance lock is held
+    /// by the caller; the seal permit is taken here for exactly the reason
+    /// expiry takes it — a seal that drained before the purge must not
+    /// publish the purged spans back afterwards.
+    fn purge_subject_locked(&self, subject: &erasure::Subject) -> Result<SubjectPurge> {
+        let _permit = self
+            .sealing
+            .lock()
+            .map_err(|_| Error::LockPoisoned("sealing"))?;
+        let mut purge = SubjectPurge::default();
+
+        // ---- buffer and log ---------------------------------------------
+        // Durable state first, memory second, exactly as expiry: the log is
+        // rewritten to the survivors before the buffer drops anything, so a
+        // failed rewrite leaves the store as retryable as it found it.
+        {
+            let mut writer = self.lock_writer()?;
+            let mut next: Vec<std::sync::Arc<Span>> = Vec::with_capacity(writer.spans.len());
+            let mut changed = false;
+            for span in writer.spans.iter() {
+                match subject.action(span) {
+                    erasure::Action::Keep => next.push(std::sync::Arc::clone(span)),
+                    erasure::Action::Drop => {
+                        changed = true;
+                        purge.removed += 1;
+                        purge
+                            .keys
+                            .insert((span.trace_id.clone(), span.span_id.clone()));
+                        erasure::payload_refs_of(span, &mut purge.payload_refs);
+                    }
+                    erasure::Action::Redact => {
+                        changed = true;
+                        purge.redacted += 1;
+                        purge
+                            .keys
+                            .insert((span.trace_id.clone(), span.span_id.clone()));
+                        let mut redacted = Span::clone(span);
+                        if let Some(reference) = subject.payload_reference() {
+                            erasure::redact_payload(&mut redacted, reference);
+                        }
+                        next.push(std::sync::Arc::new(redacted));
+                    }
+                }
+            }
+            if changed {
+                if let Some(log) = &self.wal {
+                    let survivors: Vec<&Span> = next.iter().map(|span| span.as_ref()).collect();
+                    log.rewrite(&survivors, 0)?;
+                }
+                writer.restore(next);
+            }
+        }
+
+        // ---- segments: pinned, rewritten with no engine lock held --------
+        // Same shape as expiry, and for the same reasons: in-place renames
+        // keep path order (which IS recency order), pinned readers keep their
+        // descriptors, and each segment is published before the next is
+        // touched so a failure strands nothing.
+        let pinned: Vec<std::sync::Arc<Segment>> = self.pin_segments()?;
+        for segment in &pinned {
+            if !self.segment_may_hold_subject(segment, subject)? {
+                continue;
+            }
+            self.metrics.expiry_segments_decoded.increment();
+            let all = segment.spans_parsed()?;
+            let total = all.len();
+            let mut kept: Vec<Span> = Vec::with_capacity(total);
+            let mut changed = false;
+            for span in all {
+                match subject.action(&span) {
+                    erasure::Action::Keep => kept.push(span),
+                    erasure::Action::Drop => {
+                        changed = true;
+                        purge.removed += 1;
+                        purge
+                            .keys
+                            .insert((span.trace_id.clone(), span.span_id.clone()));
+                        erasure::payload_refs_of(&span, &mut purge.payload_refs);
+                    }
+                    erasure::Action::Redact => {
+                        changed = true;
+                        purge.redacted += 1;
+                        purge
+                            .keys
+                            .insert((span.trace_id.clone(), span.span_id.clone()));
+                        let mut redacted = span;
+                        if let Some(reference) = subject.payload_reference() {
+                            erasure::redact_payload(&mut redacted, reference);
+                        }
+                        kept.push(redacted);
+                    }
+                }
+            }
+            if !changed {
+                continue;
+            }
+            sort_spans(&mut kept);
+
+            let replacement = match kept.is_empty() {
+                true => None,
+                false => Some(self.rewrite_segment_in_place(&segment.path, &kept)?),
+            };
+            if replacement.is_none() {
+                unlink_segment(&segment.path)?;
+                sync_directory(&self.directory)?;
+            }
+            let (replacement, rollup) = match replacement {
+                Some(sealed) => {
+                    let binding = sealed.segment.rollup_binding();
+                    (
+                        Some(std::sync::Arc::new(sealed.segment)),
+                        Some((binding, sealed.rollup)),
+                    )
+                }
+                None => (None, None),
+            };
+            // Publish under the segments guard, rollup cache inside the same
+            // critical section — the expiry path's rule, for the expiry
+            // path's reason: a reader must never see the new segment beside
+            // the old rollup.
+            {
+                let mut segments = self.lock_segments()?;
+                if let Some(position) = segments
+                    .iter()
+                    .position(|held| std::sync::Arc::ptr_eq(held, segment))
+                {
+                    match &replacement {
+                        Some(replacement) => segments[position] = replacement.clone(),
+                        None => {
+                            segments.remove(position);
+                        }
+                    }
+                }
+                let evicted = [segment.path.clone()];
+                match rollup {
+                    Some(rollup) => {
+                        self.replace_cached_rollups(&evicted, [(segment.path.clone(), rollup)])
+                    }
+                    None => self.replace_cached_rollups(&evicted, []),
+                }
+            }
+        }
+        Ok(purge)
+    }
+
+    /// Whether a segment could hold any record the subject covers, answered
+    /// from indexes and sidecars where possible so an erasure does not decode
+    /// the corpus. `true` means "decode and check", never "matches".
+    fn segment_may_hold_subject(
+        &self,
+        segment: &Segment,
+        subject: &erasure::Subject,
+    ) -> Result<bool> {
+        match subject {
+            erasure::Subject::Trace { trace_id } | erasure::Subject::Span { trace_id, .. } => {
+                Ok(!segment.trace_spans(trace_id)?.is_empty())
+            }
+            erasure::Subject::Session { session_id } => {
+                for key in &semconv::SESSION_KEYS {
+                    for value in analytics::session_values(session_id) {
+                        if !attribute_candidates(&segment.seg, key, &value).is_empty() {
+                            return Ok(true);
+                        }
+                    }
+                }
+                Ok(false)
+            }
+            erasure::Subject::Payload { reference } => {
+                // The sidecar's reference set answers without a decode; a
+                // segment with no usable sidecar cannot be ruled out.
+                match rollup_file::load(&segment.path, segment.rollup_binding()) {
+                    Some(rollup) => Ok(rollup.payload_refs.contains(reference)),
+                    None => Ok(true),
+                }
+            }
+        }
+    }
+
+    /// Every `(trace_id, span_id)` in `seg` the subject covers — the
+    /// verification-side probe, over any segment file (live or pinned).
+    /// For a payload subject a span counts only while it still carries an
+    /// UNREDACTED reference: the redaction marker left behind is the erasure
+    /// working as designed, not a finding.
+    fn subject_keys_in_segment(
+        seg: &segment::Segment,
+        subject: &erasure::Subject,
+    ) -> Result<Vec<(String, String)>> {
+        let mut keys = Vec::new();
+        match subject {
+            erasure::Subject::Trace { trace_id } => {
+                for record in seg.query_trace(trace_id).map_err(segment_error)? {
+                    let span = record_to_span(&record)?;
+                    keys.push((span.trace_id, span.span_id));
+                }
+            }
+            erasure::Subject::Span { trace_id, span_id } => {
+                for record in seg.query_trace(trace_id).map_err(segment_error)? {
+                    let span = record_to_span(&record)?;
+                    if span.span_id == *span_id {
+                        keys.push((span.trace_id, span.span_id));
+                    }
+                }
+            }
+            erasure::Subject::Session { session_id } => {
+                let mut offsets: Vec<u64> = Vec::new();
+                for key in &semconv::SESSION_KEYS {
+                    for value in analytics::session_values(session_id) {
+                        offsets.extend_from_slice(&attribute_candidates(seg, key, &value));
+                    }
+                }
+                offsets.sort_unstable();
+                offsets.dedup();
+                for offset in offsets {
+                    let record = seg.record_at_offset(offset).map_err(segment_error)?;
+                    let span = record_to_span(&record)?;
+                    if semconv::facts(&span.attributes).session.as_deref() == Some(session_id) {
+                        keys.push((span.trace_id, span.span_id));
+                    }
+                }
+            }
+            erasure::Subject::Payload { reference } => {
+                for ordinal in 0..seg.len() {
+                    if let Some(record) = seg.record(ordinal).map_err(segment_error)? {
+                        let span = record_to_span(&record)?;
+                        if erasure::payload_unredacted(&span, reference) {
+                            keys.push((span.trace_id, span.span_id));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(keys)
+    }
+
+    /// Verifies one erasure against every domain the subject's bytes could
+    /// inhabit, and returns the receipt: each domain named, each checked,
+    /// each result stated. This is a VERIFICATION — the result field is
+    /// computed from what the walk found, never from what the settle record
+    /// claims.
+    ///
+    /// Advisory by design: it reads the live store without stopping it, so a
+    /// span ingested mid-walk lands in whichever half of the walk reaches it.
+    /// Matches are classified against the erase record's resolved keys — an
+    /// erased key found live again is a re-delivery and fails the receipt; a
+    /// fresh key matching the subject is new activity and is reported
+    /// without failing it, because an erasure is a barrier, not a ban.
+    pub fn verify_erasure(&self, id: u64) -> Result<erasure::Receipt> {
+        let Some(status) = self.erasures.get(id)? else {
+            return Err(Error::Io(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no erasure {id} is recorded in the tombstone log"),
+            )));
+        };
+        let record = &status.erase;
+        let subject = &record.subject;
+        let erased_keys: std::collections::HashSet<(String, String)> =
+            record.span_keys.iter().cloned().collect();
+        let needles = subject.needles();
+        let mut domains: Vec<erasure::DomainReport> = Vec::new();
+        let mut clean = status.settle.is_some();
+
+        // ---- write buffer -------------------------------------------------
+        {
+            let matches: Vec<(String, String)> = {
+                let writer = self.lock_writer()?;
+                writer
+                    .spans
+                    .iter()
+                    .filter(|span| match subject {
+                        erasure::Subject::Payload { reference } => {
+                            erasure::payload_unredacted(span, reference)
+                        }
+                        _ => subject.action(span) != erasure::Action::Keep,
+                    })
+                    .map(|span| (span.trace_id.clone(), span.span_id.clone()))
+                    .collect()
+            };
+            let held = matches.len();
+            let classes = erasure::classify_matches(&erased_keys, matches);
+            clean &= classes.re_delivered == 0;
+            let mut report = erasure::DomainReport::clear(
+                "write-buffer",
+                match held {
+                    0 => "no buffered span matches the subject".to_owned(),
+                    found => format!("{found} buffered span(s) match the subject"),
+                },
+            );
+            report.re_delivered = classes.re_delivered;
+            report.new_activity = classes.new_activity;
+            if classes.re_delivered > 0 {
+                report.result = "holds-data".to_owned();
+            }
+            domains.push(report);
+        }
+
+        // ---- live tail ------------------------------------------------------
+        {
+            let matches = self.tail.matching_keys(&|span| match subject {
+                erasure::Subject::Payload { reference } => {
+                    erasure::payload_unredacted(span, reference)
+                }
+                _ => subject.action(span) != erasure::Action::Keep,
+            });
+            let held = matches.len();
+            let classes = erasure::classify_matches(&erased_keys, matches);
+            clean &= classes.re_delivered == 0;
+            let mut report = erasure::DomainReport::clear(
+                "live-tail",
+                match held {
+                    0 => "no retained tail entry serves the subject".to_owned(),
+                    found => format!("{found} retained tail entr(ies) match the subject"),
+                },
+            );
+            report.re_delivered = classes.re_delivered;
+            report.new_activity = classes.new_activity;
+            if classes.re_delivered > 0 {
+                report.result = "holds-data".to_owned();
+            }
+            domains.push(report);
+        }
+
+        // ---- write-ahead log, by occurrence scan ---------------------------
+        {
+            let occurrences =
+                erasure::count_occurrences(&self.directory.join("wal.log"), &needles)?;
+            let mut report = erasure::DomainReport::clear(
+                "write-ahead-log",
+                match occurrences {
+                    0 => "no byte-level occurrence of the subject's identifiers".to_owned(),
+                    found => format!(
+                        "{found} raw occurrence(s) of the subject's identifiers; \
+                         over-approximate — an identifier quoted in unrelated \
+                         content counts. A checkpoint rewrites the log; re-run \
+                         after one if these are stale frames"
+                    ),
+                },
+            );
+            report.occurrences = occurrences;
+            if occurrences > 0 {
+                report.result = "attention".to_owned();
+            }
+            domains.push(report);
+        }
+
+        // ---- segments -------------------------------------------------------
+        {
+            let pinned = self.pin_segments()?;
+            let mut all_matches: Vec<(String, String)> = Vec::new();
+            let mut unredacted = 0usize;
+            for segment in &pinned {
+                if !self.segment_may_hold_subject(segment, subject)? {
+                    continue;
+                }
+                let keys = Self::subject_keys_in_segment(&segment.seg, subject)?;
+                unredacted += keys.len();
+                all_matches.extend(keys);
+            }
+            let classes = erasure::classify_matches(&erased_keys, all_matches);
+            let failing = match subject {
+                // Redaction leaves the span; any UNREDACTED reference fails.
+                erasure::Subject::Payload { .. } => unredacted > 0,
+                _ => classes.re_delivered > 0,
+            };
+            clean &= !failing;
+            let mut report = erasure::DomainReport::clear(
+                "segments",
+                format!(
+                    "{} segment(s) checked through their indexes; {}",
+                    pinned.len(),
+                    match unredacted {
+                        0 => "no record matches the subject".to_owned(),
+                        found => format!("{found} record(s) match the subject"),
+                    }
+                ),
+            );
+            report.re_delivered = classes.re_delivered;
+            report.new_activity = classes.new_activity;
+            if failing {
+                report.result = "holds-data".to_owned();
+            }
+            domains.push(report);
+        }
+
+        // ---- annotation log -------------------------------------------------
+        {
+            let all = self
+                .annotations
+                .search(&annotations::AnnotationQuery::default())?;
+            let matching = all
+                .iter()
+                .filter(|annotation| match subject {
+                    erasure::Subject::Trace { trace_id } => annotation.trace_id == *trace_id,
+                    erasure::Subject::Span { trace_id, span_id } => {
+                        annotation.trace_id == *trace_id && annotation.span_id == *span_id
+                    }
+                    erasure::Subject::Session { .. } => erased_keys
+                        .contains(&(annotation.trace_id.clone(), annotation.span_id.clone())),
+                    erasure::Subject::Payload { .. } => false,
+                })
+                .count();
+            clean &= matching == 0;
+            let mut report = erasure::DomainReport::clear(
+                "annotations",
+                match matching {
+                    0 => "no annotation addresses the subject".to_owned(),
+                    found => format!("{found} annotation(s) still address the subject"),
+                },
+            );
+            if matching > 0 {
+                report.result = "holds-data".to_owned();
+            }
+            domains.push(report);
+        }
+
+        // ---- payload files ----------------------------------------------------
+        {
+            let mut items: Vec<String> = Vec::new();
+            let mut failing = false;
+            let live = match record.payload_refs.is_empty() {
+                true => std::collections::HashSet::new(),
+                false => self.live_payload_refs()?,
+            };
+            for reference in &record.payload_refs {
+                let exists = reference
+                    .strip_prefix("sha256/")
+                    .map(|hash| payload::payload_path(&self.directory, hash).exists())
+                    .unwrap_or(false);
+                match (exists, live.contains(reference)) {
+                    (false, _) => items.push(format!("{reference}: erased")),
+                    (true, true) => items.push(format!(
+                        "{reference}: retained — still referenced by live spans \
+                         outside the subject (content addressing shares bytes; \
+                         reference-aware deletion keeps them)"
+                    )),
+                    (true, false) => {
+                        failing = true;
+                        items.push(format!(
+                            "{reference}: present and unreferenced — the sweep did \
+                             not complete; re-run the erasure"
+                        ));
+                    }
+                }
+            }
+            clean &= !failing;
+            let mut report = erasure::DomainReport::clear(
+                "payloads",
+                format!("{} reference(s) accounted for", record.payload_refs.len()),
+            );
+            report.items = items;
+            if failing {
+                report.result = "holds-data".to_owned();
+            }
+            domains.push(report);
+        }
+
+        // ---- derived caches, by occurrence scan ------------------------------
+        {
+            let mut occurrences = 0usize;
+            let pinned = self.pin_segments()?;
+            for segment in &pinned {
+                let mut sidecar = segment.path.clone().into_os_string();
+                sidecar.push(".rollup");
+                occurrences += erasure::count_occurrences(Path::new(&sidecar), &needles)?;
+            }
+            let mut report = erasure::DomainReport::clear(
+                "derived-caches",
+                match occurrences {
+                    0 => "no occurrence of the subject's identifiers in any rollup sidecar"
+                        .to_owned(),
+                    found => format!(
+                        "{found} raw occurrence(s) in rollup sidecars; over-approximate, \
+                         and expected exactly where a payload was retained for live \
+                         references"
+                    ),
+                },
+            );
+            report.occurrences = occurrences;
+            if occurrences > 0 {
+                report.result = "attention".to_owned();
+            }
+            domains.push(report);
+        }
+
+        // ---- pins ----------------------------------------------------------------
+        {
+            let labels = erasure::pin_labels(&self.directory)?;
+            let mut items: Vec<String> = Vec::new();
+            let mut holding = 0usize;
+            for label in &labels {
+                let pin_dir = self.directory.join(generation::PINS_DIR).join(label);
+                // For a payload subject the pinned FILE is the content, and
+                // it holds its bytes whether or not any pinned span still
+                // references them — hard links share inodes, which is the
+                // whole point of a pin and the whole reason to check.
+                let mut holds = subject
+                    .payload_reference()
+                    .and_then(|reference| reference.strip_prefix("sha256/"))
+                    .is_some_and(|hash| payload::payload_path(&pin_dir, hash).exists());
+                if !holds {
+                    for entry in fs::read_dir(&pin_dir)? {
+                        let path = entry?.path();
+                        if !is_segment_file(&path) {
+                            continue;
+                        }
+                        let seg = segment::Segment::open(&path).map_err(segment_error)?;
+                        if !Self::subject_keys_in_segment(&seg, subject)?.is_empty() {
+                            holds = true;
+                            break;
+                        }
+                    }
+                }
+                match holds {
+                    true => {
+                        holding += 1;
+                        items.push(format!(
+                            "pin {label:?} holds the subject — release it (and re-create \
+                             it from the current generation if the backup is still wanted)"
+                        ));
+                    }
+                    false => items.push(format!("pin {label:?}: clear")),
+                }
+            }
+            clean &= holding == 0;
+            let mut report = erasure::DomainReport::clear(
+                "pins",
+                match labels.is_empty() {
+                    true => "no pins exist".to_owned(),
+                    false => format!("{} pin(s) checked", labels.len()),
+                },
+            );
+            report.items = items;
+            if holding > 0 {
+                report.result = "holds-data".to_owned();
+            }
+            domains.push(report);
+        }
+
+        // ---- metadata domains, stated rather than implied ----------------------
+        domains.push(erasure::DomainReport::clear(
+            "generations",
+            "manifests carry file paths and digests only; no span content".to_owned(),
+        ));
+        {
+            let mut report = erasure::DomainReport::clear(
+                "tombstone-log",
+                "retains the subject's identifiers and resolved keys as the record \
+                 of this erasure — that record is what this receipt verifies against; \
+                 erasing the record of erasure means deleting the store"
+                    .to_owned(),
+            );
+            report.result = "retained-by-design".to_owned();
+            domains.push(report);
+        }
+
+        Ok(erasure::Receipt {
+            erasure_id: record.id,
+            subject: subject.clone(),
+            requested_unix_ns: record.requested_unix_ns,
+            verified_unix_ns: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |since| since.as_nanos().min(u128::from(u64::MAX)) as u64),
+            generation: status.settle.as_ref().map(|settle| settle.generation),
+            settled: status.settle.is_some(),
+            domains,
+            result: match clean {
+                true => "erased".to_owned(),
+                false => "incomplete".to_owned(),
+            },
+        })
     }
 
     /// Drops the published spans from the buffer and reclaims the log.

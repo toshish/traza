@@ -25,13 +25,15 @@
 //!   wal.log                    -- v2 frames stamped (epoch, sequence)
 //!   segment-*.seg              -- the working set: segments,
 //!   annotations.jsonl          -- the annotation log,
+//!   tombstones.jsonl           -- the erasure log,
 //!   payloads/                  -- and offloaded payload bytes
 //!   generations/<id>/state-manifest.json
 //!   pins/<label>/              -- hard-link farm of one manifest's files
 //! ```
 //!
 //! The manifest lists what recovery and verification are *about*: segments,
-//! the annotation log, payload files. Rollup sidecars are derived caches
+//! the annotation log, the tombstone log, payload files. Rollup sidecars are
+//! derived caches
 //! rebuilt on any failure, supersede journals are transient recovery state,
 //! and the generation metadata is not itself engine state; none is listed,
 //! and a digest walk skips the reserved subdirectories so a pinned segment is
@@ -203,13 +205,21 @@ pub(crate) fn write_manifest(root: &Path, manifest: &Manifest) -> Result<()> {
     crate::sync_directory(&dir)
 }
 
-/// True for the files a manifest lists: segments, the annotation log, and
-/// payload bytes. Everything else in the engine directory is derived or
-/// transient.
+/// True for the files a manifest lists: segments, the annotation log, the
+/// tombstone log, and payload bytes. Everything else in the engine directory
+/// is derived or transient.
 fn is_manifested(relative: &str) -> bool {
     relative == "annotations.jsonl"
+        || relative == crate::erasure::LOG_NAME
         || (relative.starts_with("segment-") && relative.ends_with(".seg"))
         || relative.starts_with("payloads/")
+}
+
+/// The append-only manifested files: bytes past their recorded length are
+/// appends since the manifest, never damage. Everything else a manifest
+/// names is immutable once published.
+fn is_append_only(relative: &str) -> bool {
+    relative == "annotations.jsonl" || relative == crate::erasure::LOG_NAME
 }
 
 /// Walks the engine directory and digests every load-bearing file, reusing a
@@ -327,7 +337,7 @@ pub(crate) fn verify_against(engine: &Path, manifest: &Manifest) -> Result<Vec<S
             }
             Err(error) => return Err(Error::Io(error)),
         };
-        let append_only = file.path == "annotations.jsonl";
+        let append_only = is_append_only(&file.path);
         if metadata.len() != file.bytes && !(append_only && metadata.len() > file.bytes) {
             problems.push(format!(
                 "{}: {} bytes on disk, {} in the manifest",
@@ -476,7 +486,11 @@ fn remove_working_set(root: &Path) -> Result<()> {
                 }
                 continue;
             }
-            if top && (name == "annotations.jsonl" || (name.starts_with("segment-"))) {
+            if top
+                && (name == "annotations.jsonl"
+                    || name == crate::erasure::LOG_NAME
+                    || name.starts_with("segment-"))
+            {
                 fs::remove_file(entry.path())?;
             }
         }
@@ -561,6 +575,7 @@ mod tests {
         fs::create_dir_all(engine.join("payloads/ab")).expect("dirs");
         fs::write(engine.join("segment-00000000000000000001.seg"), b"segment").expect("seg");
         fs::write(engine.join("annotations.jsonl"), b"{}\n").expect("ann");
+        fs::write(engine.join("tombstones.jsonl"), b"{}\n").expect("tomb");
         fs::write(engine.join("payloads/ab/abcd.bin"), b"payload").expect("pay");
         // Derived and transient files are not manifested.
         fs::write(engine.join("segment-00000000000000000001.seg.rollup"), b"x").expect("roll");
@@ -572,7 +587,8 @@ mod tests {
             [
                 "annotations.jsonl",
                 "payloads/ab/abcd.bin",
-                "segment-00000000000000000001.seg"
+                "segment-00000000000000000001.seg",
+                "tombstones.jsonl"
             ],
             "load-bearing files only, sorted"
         );
