@@ -49,7 +49,8 @@ Deploying, tuning, and keeping it healthy.
   and precisely what a `200` promises in each, including the platform caveat
   that a macOS `fsync` does not flush the drive's write cache.
 - **[Administration](operations/administration.md)** — authentication and
-  scopes, retention/TTL, compaction, payload offloading, and backups.
+  scopes, retention/TTL, targeted erasure and its receipt, compaction,
+  payload offloading, and backups.
 - **[Backup and restore](operations/backup.md)** — generations, `CURRENT`, and
   the pin-verify-copy backup that runs without stopping the server.
 - **[Monitoring](operations/monitoring.md)** — `GET /v1/metrics` and

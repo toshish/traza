@@ -23,6 +23,7 @@ A comma-separated list of `scope:token` entries.
 |---|---|
 | `ro` | `GET` only |
 | `rw` | `GET` and `POST` |
+| `admin` | Everything `rw` permits, **plus erasure** |
 
 Tokens must be non-empty, unique, and free of whitespace and commas. Entries
 may not have surrounding whitespace.
@@ -98,6 +99,10 @@ token in `sessionStorage` only.
 - Give collectors and exporters an `rw` token; give dashboards, alerting, and
   anything read-only a `ro` token. A `ro` token cannot ingest, flush, or
   annotate — and over MCP it reaches the read tools but not the writer.
+- Mint `admin` tokens for operators and compliance tooling only, and never
+  hand one to a telemetry producer. Erasure is the one destructive verb in
+  the API, and it is gated on this scope precisely so that a compromised or
+  overprivileged ingest credential cannot destroy the telemetry it writes.
 - **Two similarly named variables.** `TRAZA_TOKENS` (plural) configures the
   *server's* credential set. `TRAZA_TOKEN` (singular) is the bearer token the
   bundled `seed --url` client sends. They are not interchangeable.
@@ -138,6 +143,89 @@ it has to leave.
 
 Retention runs with reads and ingest fully live. Only one rewriting pass —
 expiry or compaction — runs at a time.
+
+## Erasure (deletion with a receipt)
+
+TTL answers "how long do we keep telemetry"; erasure answers "this specific
+data must go, and prove it". `POST /v1/erasures` erases a **subject** — a
+trace, a span, a session, or an offloaded payload — from every domain, and
+`verify --erasure` (or `GET /v1/erasures/{id}/verify`) produces the receipt:
+every place the subject's bytes could be, checked by name, with the result of
+each. Endpoint shapes are in the
+[HTTP API](../guide/http-api.md#erasure); this section is the operational
+contract.
+
+**Erasure requires the `admin` scope.** When `TRAZA_TOKENS` is configured,
+`POST /v1/erasures` refuses `rw` with a `403`: every collector holds a write
+token, and a credential minted to produce telemetry must not be the
+credential that destroys it. Reading the tombstone log and the receipt stays
+`ro` — identifiers, never content. On a loopback-open server (no tokens),
+erasure is open with everything else.
+
+**What an erasure does.** The intent is fsynced into `tombstones.jsonl`
+before anything is removed — from that moment the subject is invisible to
+every query, **and covered spans are dropped at ingest**: the pending
+erasure is an admission barrier, so a client replaying covered data while
+the erasure runs gets an acknowledgement and no storage (counted in
+`traza_erasure_spans_suppressed_total`). A crash mid-purge leaves a pending
+erasure the next open masks and the maintenance tick finishes. The purge then
+rewrites the write buffer and the write-ahead log to the survivors, rewrites
+every segment holding a match in place (superseded versions of an erased key
+held the bytes too, so they go with it), drops annotations addressed to
+erased spans, and deletes payload files **reference-aware**: content
+addressing means one file can back spans outside the subject, and those
+bytes are retained and named in the receipt rather than destroyed. The
+barrier is total while the erasure is pending: covered spans are dropped
+**before payload offloading** (a suppressed span must not leave orphan
+payload bytes behind), oversized values whose content hash IS the subject
+offload directly to their redacted marker instead of recreating the file,
+and covered annotations are dropped at admission too. Every rewrite —
+including a confirm pass for anything in flight when the barrier went up —
+happens **before** the checkpoint, so the generation the settle record cites
+digests exactly the store the erasure left behind and verifies clean
+afterwards. Then the checkpoint publishes the deletion — durable at the
+`CURRENT` rename — and the settle record lands, lifting the barrier. Nothing
+can be acknowledged before `settled_unix_ns` and survive it.
+
+**What remains, on purpose.** The tombstone log keeps the subject's
+identifiers, the resolved span keys, and the payload content hashes — never
+the erased text. That record is what verification checks the store against,
+and the receipt states its retention rather than hiding it. Erasing the
+record of erasure means deleting the store. One caveat the settle record
+carries in its own docs: its counts are the settling pass's counts — after a
+crash-resume the physical work of the first pass is already done and cannot
+be re-counted, so the audit-grade answer to "is it gone" is always the
+receipt, never the tallies.
+
+**Pins hold their bytes.** A backup pinned before the erasure still contains
+the subject in its hard-link farm — that is what a pin is for. The receipt
+checks every pin and names the ones to release; a backup already copied
+elsewhere is outside the data directory and outside the receipt's scope, and
+the receipt says exactly that by only ever naming what it checked. The
+converse also holds: **an erasure never edits a pin.** The append-only logs
+are *copied* into a pin at their manifested length rather than hard-linked,
+precisely so a later erasure's records cannot leak into a backup that still
+holds the pre-erasure state.
+
+**A tombstone is a barrier, not a ban.** Data ingested under the same
+identifiers after the erasure settles is new data. The receipt tells the two
+apart exactly — an erased key found live again is a **re-delivery** (some
+client replayed erased data; the receipt fails), a fresh key under the same
+trace or session id is **new activity** (reported, never a failure). If a
+client with a retry queue may replay erased batches, drain it before erasing,
+or expect the receipt to name the re-delivery and re-run the erasure.
+
+**`erased` and `conclusive` are separate answers.** The receipt's `result`
+is the semantic verdict; its `conclusive` flag is false whenever an
+over-approximate check — the byte-level occurrence scans over the log and
+the rollup sidecars — found the subject's identifiers without proving them
+benign. The subcommand's exit code carries the distinction: `0` erased and
+conclusive, `3` erased but inconclusive (read the attention domains), `2`
+not erased.
+
+**The MCP endpoint cannot erase.** Deletion is an HTTP-only verb behind the
+`admin` scope. The agent-facing surface stays read-only by construction, so
+stored adversarial text has no destructive tool to actuate.
 
 ## Compaction
 

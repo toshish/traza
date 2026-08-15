@@ -48,7 +48,7 @@
 
 use crate::Span;
 use serde_json::Value;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -140,6 +140,21 @@ struct Entry {
     bytes: usize,
 }
 
+/// One erasure's shadow over the ring: entries admitted before the erasure
+/// (`seq < below`) whose key it covered are withheld from every read.
+///
+/// The ring cannot REMOVE an interior entry — `entries[i]`'s sequence number
+/// is `first_seq + i` by construction, and a removal would renumber every
+/// entry behind it under cursors already handed out. A veil leaves the ring's
+/// arithmetic alone and takes effect at read time instead; it retires by
+/// itself once eviction has carried `first_seq` past everything it covered,
+/// so a veil costs exactly as long as the erased spans would have been
+/// served.
+struct Veil {
+    keys: Arc<HashSet<(String, String)>>,
+    below: u64,
+}
+
 /// A bounded ring of recently admitted spans.
 ///
 /// Bounded two ways, and it needs both. A count alone says nothing about
@@ -161,6 +176,10 @@ pub struct TailRing {
     capacity: usize,
     byte_budget: usize,
     resident_bytes: usize,
+    /// Erasures still shadowing retained entries; see [`Veil`]. Empty in any
+    /// store that has never erased, so the common read path pays one
+    /// `is_empty` check.
+    veils: Vec<Veil>,
 }
 
 impl TailRing {
@@ -175,6 +194,39 @@ impl TailRing {
             capacity,
             byte_budget: byte_budget.max(1),
             resident_bytes: 0,
+            veils: Vec::new(),
+        }
+    }
+
+    /// Withholds every retained entry whose key `keys` names from all future
+    /// reads. Entries admitted AFTER this call are new admissions and are
+    /// served normally — an erasure is a barrier, not a ban.
+    pub fn veil(&mut self, keys: Arc<HashSet<(String, String)>>) {
+        if keys.is_empty() || self.entries.is_empty() {
+            return;
+        }
+        self.veils.push(Veil {
+            keys,
+            below: self.next_seq(),
+        });
+    }
+
+    /// Whether a veil withholds the entry at `seq`.
+    fn veiled(&self, seq: u64, span: &Span) -> bool {
+        if self.veils.is_empty() {
+            return false;
+        }
+        let key = (span.trace_id.clone(), span.span_id.clone());
+        self.veils
+            .iter()
+            .any(|veil| seq < veil.below && veil.keys.contains(&key))
+    }
+
+    /// Drops veils whose covered entries have all been evicted.
+    fn prune_veils(&mut self) {
+        if !self.veils.is_empty() {
+            let floor = self.first_seq;
+            self.veils.retain(|veil| veil.below > floor);
         }
     }
 
@@ -228,6 +280,7 @@ impl TailRing {
             }
             self.first_seq = self.first_seq.saturating_add(1);
         }
+        self.prune_veils();
     }
 
     /// Reads at most `limit` matching spans from `cursor`.
@@ -270,11 +323,17 @@ impl TailRing {
 
         let mut spans = Vec::new();
         let mut consumed = 0_usize;
-        for entry in self.entries.iter().skip(start) {
+        for (index, entry) in self.entries.iter().enumerate().skip(start) {
             if spans.len() == limit {
                 break;
             }
             consumed += 1;
+            // A veiled entry is consumed — the cursor moves past it — and
+            // never delivered: an erased span leaving the store through the
+            // live tail would make the tail the one read path erasure missed.
+            if self.veiled(self.first_seq.saturating_add(index as u64), &entry.span) {
+                continue;
+            }
             if keep(&entry.span) {
                 spans.push(Arc::clone(&entry.span));
             }
@@ -340,6 +399,36 @@ impl TailChannel {
     /// The position a subscriber wanting only future spans starts from.
     pub fn head(&self) -> Option<TailCursor> {
         self.ring.lock().ok().map(|ring| ring.head())
+    }
+
+    /// Withholds retained entries under `keys` from every future read; see
+    /// [`TailRing::veil`]. A poisoned ring is tolerated the same way
+    /// [`Self::publish`] tolerates one — the erasure's authority is the
+    /// store, and the ring's contents die with the process either way.
+    pub fn veil(&self, keys: Arc<HashSet<(String, String)>>) {
+        if let Ok(mut ring) = self.ring.lock() {
+            ring.veil(keys);
+        }
+    }
+
+    /// The keys of every retained, unveiled entry matching `covered` — the
+    /// live tail's contribution to an erasure receipt, returned as keys so
+    /// the verifier can tell a re-delivered erased span from new activity
+    /// under the same identifiers.
+    pub fn matching_keys(&self, covered: &dyn Fn(&Span) -> bool) -> Vec<(String, String)> {
+        let Ok(ring) = self.ring.lock() else {
+            return Vec::new();
+        };
+        let first = ring.first_seq;
+        ring.entries
+            .iter()
+            .enumerate()
+            .filter(|(index, entry)| {
+                !ring.veiled(first.saturating_add(*index as u64), &entry.span)
+                    && covered(&entry.span)
+            })
+            .map(|(_, entry)| (entry.span.trace_id.clone(), entry.span.span_id.clone()))
+            .collect()
     }
 
     /// Waits up to `timeout` for spans after `cursor`.

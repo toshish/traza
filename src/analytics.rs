@@ -458,9 +458,20 @@ fn key_hash(trace_id: &str, span_id: &str) -> u64 {
 }
 
 /// Collects `$payload` references from span and event attributes.
+///
+/// Redaction markers (`"erased": true`) are excluded, and the exclusion is
+/// load-bearing twice over: this set is the TTL sweep's protection set, so a
+/// marker counted as a reference would shield a file whose bytes an erasure
+/// already removed forever — and it is the erasure receipt's liveness
+/// evidence, where the same mistake certified a RE-CREATED file as "safely
+/// retained by live spans". A marker records that content is gone; it is not
+/// a reference to content.
 fn collect_payload_refs(span: &Span, refs: &mut HashSet<String>) {
     let mut scan = |attributes: &Map<String, Value>| {
         for value in attributes.values() {
+            if value.get("erased").and_then(Value::as_bool) == Some(true) {
+                continue;
+            }
             if let Some(reference) = value
                 .get(crate::payload::PAYLOAD_KEY)
                 .and_then(Value::as_str)
@@ -690,6 +701,13 @@ impl Store {
         mut visit: impl FnMut(&SegmentRollup),
     ) -> Result<()> {
         let folding = std::time::Instant::now();
+        // A pending erasure must not be counted, and a rollup cannot subtract:
+        // while one is pending the fast path below is declined outright and
+        // every overlapping segment takes the exact path, where the mask
+        // applies span by span. The window is the seconds inside one erase
+        // call — or, after a crash, until the resumed purge settles — and
+        // slower-but-right is the only acceptable trade for that window.
+        let mask = self.erasure_mask();
         // Lock order: writer before segments (see Store field docs).
         //
         // Nothing is deep-copied under the writer lock. The buffer holds
@@ -711,7 +729,10 @@ impl Store {
             .collect();
         let buffered: Vec<Arc<Span>> = buffer
             .iter()
-            .filter(|span| in_window(span.start_time_ns, since_ns, until_ns))
+            .filter(|span| {
+                in_window(span.start_time_ns, since_ns, until_ns)
+                    && mask.as_deref().map_or(true, |mask| !mask.covers(span))
+            })
             .map(Arc::clone)
             .collect();
         if !buffered.is_empty() {
@@ -765,7 +786,7 @@ impl Store {
                 shadowed_by_buffer = shadowed_by_buffer || buffer_hashes.contains(hash);
             }
             let possibly_superseded = shadowed_by_buffer || shadowed_by_segment;
-            if fully_inside && !possibly_superseded {
+            if fully_inside && !possibly_superseded && mask.is_none() {
                 visit(&rollup);
                 segment_hashes.extend(rollup.key_hashes.iter().copied());
                 continue;
@@ -787,6 +808,9 @@ impl Store {
             // dashboard window cost more than a whole-corpus one.
             let mut survivors: Vec<Span> = Vec::new();
             for span in segment.spans_parsed_in_window(since_ns, until_ns)? {
+                if mask.as_deref().is_some_and(|mask| mask.covers(&span)) {
+                    continue;
+                }
                 if buffer_keys.contains(&(span.trace_id.as_str(), span.span_id.as_str())) {
                     continue;
                 }
@@ -1014,12 +1038,14 @@ pub(crate) fn resolve_session_spans_in(
     buffer: &crate::WriteBuffer,
     segments: &[Arc<crate::Segment>],
     session_id: &str,
+    mask: Option<&crate::erasure::Mask>,
 ) -> Result<Vec<Span>> {
     let candidates = crate::attribute_union_view(
         buffer,
         segments,
         &semconv::SESSION_KEYS,
         &session_values(session_id),
+        mask,
     )?;
     Ok(narrow_to_session(candidates, session_id))
 }
@@ -1030,7 +1056,7 @@ pub(crate) fn resolve_session_spans_in(
 /// sent `"gen_ai.conversation.id": 4711` yields the session id "4711".
 /// Matching only the JSON string would then list that session and refuse to
 /// open it.
-fn session_values(session_id: &str) -> Vec<Value> {
+pub(crate) fn session_values(session_id: &str) -> Vec<Value> {
     let mut values = vec![Value::String(session_id.to_owned())];
     if let Ok(number) = session_id.parse::<u64>() {
         values.push(Value::from(number));

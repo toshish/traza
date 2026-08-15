@@ -355,6 +355,22 @@ pub struct Metrics {
     /// A merge end to end: choosing the run, decoding every input, writing
     /// the outputs, publishing, and unlinking.
     pub segment_merge: Latency,
+    /// Erasures settled: the purge ran, the checkpoint published, the settle
+    /// record landed. Requested-but-unsettled erasures are visible as the
+    /// difference against the erasure list, which is where they belong — a
+    /// pending erasure is a state, not an event.
+    pub erasures_settled: Counter,
+    /// Physical span records removed by erasures, across buffer, log and
+    /// segments. Superseded versions count: they held the bytes too.
+    pub erasure_spans_removed: Counter,
+    /// Spans dropped at admission because a pending erasure covered them —
+    /// the barrier that makes an erasure's cut exact. Nonzero means a client
+    /// kept sending covered spans while an erasure ran; sustained growth
+    /// means a producer is replaying erased data.
+    pub erasure_spans_suppressed: Counter,
+    /// One erasure end to end: resolve, tombstone, purge every domain,
+    /// checkpoint, settle.
+    pub erasure: Latency,
 }
 
 impl Metrics {
@@ -368,7 +384,7 @@ impl Metrics {
     pub fn render_prometheus(&self, into: &mut String) {
         use std::fmt::Write as _;
 
-        let counters: [(&str, &Counter); 15] = [
+        let counters: [(&str, &Counter); 18] = [
             ("traza_spans_admitted_total", &self.spans_admitted),
             ("traza_batches_admitted_total", &self.batches_admitted),
             ("traza_wal_commits_total", &self.wal_commits),
@@ -405,13 +421,22 @@ impl Metrics {
                 "traza_segments_merged_away_total",
                 &self.segments_merged_away,
             ),
+            ("traza_erasures_settled_total", &self.erasures_settled),
+            (
+                "traza_erasure_spans_removed_total",
+                &self.erasure_spans_removed,
+            ),
+            (
+                "traza_erasure_spans_suppressed_total",
+                &self.erasure_spans_suppressed,
+            ),
         ];
         for (name, counter) in counters {
             let _ = writeln!(into, "# TYPE {name} counter");
             let _ = writeln!(into, "{name} {}", counter.get());
         }
 
-        let stages: [(&str, &Latency); 13] = [
+        let stages: [(&str, &Latency); 14] = [
             ("traza_writer_lock_wait", &self.writer_lock_wait),
             ("traza_segments_lock_wait", &self.segments_lock_wait),
             ("traza_analytics_fold", &self.analytics_fold),
@@ -425,6 +450,7 @@ impl Metrics {
             ("traza_segment_seal_locked", &self.segment_seal_locked),
             ("traza_segment_seal_reconcile", &self.segment_seal_reconcile),
             ("traza_segment_merge", &self.segment_merge),
+            ("traza_erasure", &self.erasure),
         ];
         for (name, stage) in stages {
             let _ = writeln!(into, "# TYPE {name}_ns_count counter");

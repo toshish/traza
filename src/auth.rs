@@ -17,12 +17,19 @@ pub const FORBIDDEN_BODY: &str = "{\"error\":\"forbidden\"}";
 pub const WWW_AUTHENTICATE: &str = "Bearer";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// What a credential may do: read-only (GET) or read-write (GET + POST).
+/// What a credential may do: read-only (GET), read-write (GET + POST), or
+/// admin (read-write plus the destructive operations).
 pub enum Scope {
     /// GET only.
     ReadOnly,
     /// GET and POST.
     ReadWrite,
+    /// Everything `rw` permits, plus erasure. Deletion is not ingest: every
+    /// collector and exporter holds an `rw` token, and a credential minted
+    /// to WRITE telemetry must not be able to destroy it. `admin` exists so
+    /// that the erase capability is a token an operator issued on purpose,
+    /// not a side effect of being allowed to POST.
+    Admin,
 }
 
 impl Scope {
@@ -30,6 +37,7 @@ impl Scope {
         match value {
             "ro" => Some(Self::ReadOnly),
             "rw" => Some(Self::ReadWrite),
+            "admin" => Some(Self::Admin),
             _ => None,
         }
     }
@@ -38,10 +46,17 @@ impl Scope {
     pub fn permits(self, method: &str) -> bool {
         match self {
             Self::ReadOnly => method.eq_ignore_ascii_case("GET"),
-            Self::ReadWrite => {
+            Self::ReadWrite | Self::Admin => {
                 method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("POST")
             }
         }
+    }
+
+    /// Whether this scope may erase data. The method rule cannot express
+    /// this — erasure is a POST like any ingest — so the erasure route
+    /// checks the capability explicitly.
+    pub fn permits_erasure(self) -> bool {
+        matches!(self, Self::Admin)
     }
 }
 
@@ -296,9 +311,26 @@ mod tests {
     fn rejects_invalid_configuration() {
         assert!(AuthConfig::parse("").is_err());
         assert!(AuthConfig::parse("rw:").is_err());
-        assert!(AuthConfig::parse("admin:token").is_err());
+        assert!(AuthConfig::parse("root:token").is_err());
         assert!(AuthConfig::parse("rw:token,rw:token").is_err());
         assert!(AuthConfig::parse("rw:token with-space").is_err());
+    }
+
+    #[test]
+    fn erasure_is_an_admin_capability_not_a_method() {
+        let auth = AuthConfig::parse("rw:writer-token,admin:root-token").unwrap();
+        assert_eq!(
+            auth.scope_for(Some("Bearer root-token")),
+            Ok(Scope::Admin),
+            "admin parses and authenticates like any scope"
+        );
+        assert!(Scope::Admin.permits("POST") && Scope::Admin.permits("GET"));
+        assert!(Scope::Admin.permits_erasure());
+        // The write scope every collector holds must NOT erase: a credential
+        // minted to produce telemetry cannot be the credential that destroys
+        // it.
+        assert!(!Scope::ReadWrite.permits_erasure());
+        assert!(!Scope::ReadOnly.permits_erasure());
     }
 
     #[test]
