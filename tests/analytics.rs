@@ -1348,3 +1348,95 @@ fn payload_files(dir: &std::path::Path) -> usize {
     }
     walk(&dir.join("payloads"))
 }
+
+#[test]
+fn a_sparse_rewrite_pays_one_probe_not_a_walk_across_the_segments_between() {
+    // A key rewritten long after its first version — a backfill correcting an
+    // old span is the ordinary way to get one — leaves ten segments between
+    // the two copies. The aggregation fold's exact path must consult each
+    // newer segment's OWN key-hash set and probe only where the key actually
+    // lives: a union prefilter that walks every intervening segment on a hit
+    // spends a probe per segment of version distance, and each probe decodes
+    // the trace's whole slice of the probed segment. Dense-upsert corpora
+    // never see this — their supersede is always in the immediate neighbor —
+    // which is exactly how it stayed hidden.
+    const SEGMENTS: u64 = 12;
+
+    let dir = test_dir("sparse-rewrite-probes");
+    let store = Store::open(
+        &dir,
+        Config {
+            durability: traza::Durability::Buffered,
+            compaction: None,
+            ..Config::default()
+        },
+    )
+    .expect("opens");
+
+    for round in 0..SEGMENTS {
+        let base = 1_000_000 * (round + 1);
+        // Every segment carries the shared trace, so an ungated probe into a
+        // middle segment would find the trace present and decode its slice.
+        for filler in 0..3 {
+            let span_id = format!("filler-{round}-{filler}");
+            store
+                .ingest(llm_span(
+                    "sparse-trace",
+                    &span_id,
+                    "sess-sparse",
+                    "m-fill",
+                    base + filler,
+                    10,
+                    5,
+                    0.001,
+                ))
+                .expect("ingest");
+        }
+        // The sparse key: written in the FIRST segment, rewritten in the
+        // LAST, under a model that changes so a resurrected old version
+        // would surface as its own aggregation row.
+        if round == 0 || round == SEGMENTS - 1 {
+            let model = if round == 0 { "m-old" } else { "m-new" };
+            store
+                .ingest(llm_span(
+                    "sparse-trace",
+                    "hot",
+                    "sess-sparse",
+                    model,
+                    base + 100,
+                    100,
+                    50,
+                    0.01,
+                ))
+                .expect("ingest");
+        }
+        store.flush().expect("flush seals one segment per round");
+    }
+
+    let before = store.metrics().supersede_probes.get();
+    let rows = store
+        .llm_aggregate(LlmGroupBy::Model, None, None)
+        .expect("aggregate");
+    assert_eq!(
+        store.metrics().supersede_probes.get() - before,
+        1,
+        "one superseded version, one confirming probe — the ten segments \
+         between the two copies must be ruled out by their own hash sets, \
+         never probed"
+    );
+
+    let row = |model: &str| rows.iter().find(|row| row.key == model);
+    assert!(
+        row("m-old").is_none(),
+        "the superseded version must not surface: {rows:?}"
+    );
+    let newest = row("m-new").expect("the rewrite's version aggregates");
+    assert_eq!(newest.llm_calls, 1, "the sparse key counts exactly once");
+    let fill = row("m-fill").expect("fillers aggregate");
+    assert_eq!(
+        fill.llm_calls,
+        (SEGMENTS * 3) as usize,
+        "every filler span survives"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}

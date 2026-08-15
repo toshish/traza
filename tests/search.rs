@@ -1228,7 +1228,13 @@ fn a_duplicate_heavy_store_probes_only_keys_a_newer_segment_actually_holds() {
     // Without the prefilter the stable spans alone pay STABLE probes per
     // pair of segments — 2,640 here, forty times this — and every one of
     // them decodes trace records to learn nothing.
-    const CONFIRMING_PROBES: u64 = (HOT * (SEGMENTS - 1)) as u64;
+    // Plus exactly one for the SPARSE key, rewritten eleven segments after
+    // its first version: the gate consults each newer segment's own set, so
+    // only the one segment that actually holds the key is probed. A union
+    // prefilter that walks every intervening segment on a hit would spend
+    // eleven probes here and hide behind the dense keys, whose supersede is
+    // always in the immediate neighbor.
+    const CONFIRMING_PROBES: u64 = (HOT * (SEGMENTS - 1)) as u64 + 1;
 
     let (store, dir) = store("supersede-prefilter");
     for round in 0..SEGMENTS {
@@ -1246,20 +1252,35 @@ fn a_duplicate_heavy_store_probes_only_keys_a_newer_segment_actually_holds() {
                 .ingest(upsert_span(&id, &version, base + (STABLE + key) as u64))
                 .expect("ingest");
         }
+        if round == 0 || round == SEGMENTS - 1 {
+            let version = format!("v{round}");
+            store
+                .ingest(upsert_span(
+                    "hot-sparse",
+                    &version,
+                    base + (STABLE + HOT) as u64,
+                ))
+                .expect("ingest");
+        }
         store.flush().expect("flush seals one segment per round");
     }
 
     let expect_resolved = |spans: &[Span], label: &str| {
         assert_eq!(
             spans.len(),
-            SEGMENTS * STABLE + HOT,
-            "{label}: every stable span, and each hot key exactly once"
+            SEGMENTS * STABLE + HOT + 1,
+            "{label}: every stable span, each hot key exactly once, and the \
+             sparse key exactly once"
         );
         let hot: Vec<&Span> = spans
             .iter()
             .filter(|span| span.span_id.starts_with("hot-"))
             .collect();
-        assert_eq!(hot.len(), HOT, "{label}: one survivor per hot key");
+        assert_eq!(
+            hot.len(),
+            HOT + 1,
+            "{label}: one survivor per hot key, sparse included"
+        );
         for span in hot {
             assert_eq!(
                 span.name,
