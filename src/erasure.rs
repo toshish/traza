@@ -78,8 +78,10 @@ pub enum Subject {
     Trace {
         /// The trace being erased.
         trace_id: String,
-        /// Whose trace; empty is the default tenant.
-        #[serde(default, skip_serializing_if = "String::is_empty")]
+        /// Whose trace; empty is the default tenant. `$tenant` is accepted
+        /// too — an admin who spells it the span's way must not silently erase
+        /// the DEFAULT tenant's trace instead of the one intended.
+        #[serde(alias = "$tenant", default, skip_serializing_if = "String::is_empty")]
         tenant: String,
     },
     /// One span, by primary key.
@@ -88,8 +90,8 @@ pub enum Subject {
         trace_id: String,
         /// Span half of the primary key.
         span_id: String,
-        /// Whose span; empty is the default tenant.
-        #[serde(default, skip_serializing_if = "String::is_empty")]
+        /// Whose span; empty is the default tenant. `$tenant` accepted too.
+        #[serde(alias = "$tenant", default, skip_serializing_if = "String::is_empty")]
         tenant: String,
     },
     /// Every span of one tenant that resolves to one session, across all
@@ -97,8 +99,8 @@ pub enum Subject {
     Session {
         /// The session identifier being erased.
         session_id: String,
-        /// Whose session; empty is the default tenant.
-        #[serde(default, skip_serializing_if = "String::is_empty")]
+        /// Whose session; empty is the default tenant. `$tenant` accepted too.
+        #[serde(alias = "$tenant", default, skip_serializing_if = "String::is_empty")]
         tenant: String,
     },
     /// One offloaded payload by content address (`sha256/<hex>`). The file is
@@ -116,7 +118,9 @@ pub enum Subject {
     /// spans and examples held. The default tenant cannot be named here —
     /// erasing it is erasing the store, and narrower subjects exist.
     Tenant {
-        /// The tenant being erased; must be non-empty.
+        /// The tenant being erased; must be non-empty. `$tenant` accepted too
+        /// (a `$tenant` that arrives empty is rejected like any empty one).
+        #[serde(alias = "$tenant")]
         tenant: String,
     },
 }
@@ -947,6 +951,13 @@ impl ErasureLog {
             entry.0.payload_refs.sort();
             entry.0.payload_refs.dedup();
         }
+        // Fold the freshly-discovered references into the live mask so
+        // `covers_payload_file` withholds them from this moment, not only
+        // after settle rebuilds. Without this the specific bytes a purge is
+        // mid-way through accounting for stay fetchable through the operator
+        // path (a scoped tenant fetch is already closed by `covers_tenant`),
+        // which is the same leak as serving a span an erasure is deleting.
+        inner.rebuild_mask();
         Ok(())
     }
 

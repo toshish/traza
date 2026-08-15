@@ -964,7 +964,7 @@ fn a_bound_promotion_cannot_reach_another_tenants_payload() {
     store
         .ingest(
             serde_json::from_value(json!({
-                "trace_id": "ta", "span_id": "s1", "tenant": "acme",
+                "trace_id": "ta", "span_id": "s1", "$tenant": "acme",
                 "name": "op", "service": "svc",
                 "start_time_ns": 1000u64, "end_time_ns": 2000u64,
                 "attributes": {"prompt": secret},
@@ -1036,7 +1036,7 @@ fn tenant_erasure_reaches_payload_bytes_held_only_by_its_examples() {
     store
         .ingest(
             serde_json::from_value(json!({
-                "trace_id": "ta", "span_id": "s1", "tenant": "acme",
+                "trace_id": "ta", "span_id": "s1", "$tenant": "acme",
                 "name": "op", "service": "svc",
                 "start_time_ns": 1000u64, "end_time_ns": 2000u64,
                 "attributes": {"prompt": content},
@@ -1118,7 +1118,7 @@ fn a_tenant_erasure_records_its_payload_refs_so_resume_can_sweep_them() {
     store
         .ingest(
             serde_json::from_value(json!({
-                "trace_id": "ta", "span_id": "s1", "tenant": "acme",
+                "trace_id": "ta", "span_id": "s1", "$tenant": "acme",
                 "name": "op", "service": "svc",
                 "start_time_ns": 1000u64, "end_time_ns": 2000u64,
                 "attributes": {"prompt": content},
@@ -1163,7 +1163,7 @@ fn a_tenant_erasure_records_its_payload_refs_so_resume_can_sweep_them() {
     store
         .ingest(
             serde_json::from_value(json!({
-                "trace_id": "tb", "span_id": "s1", "tenant": "acme",
+                "trace_id": "tb", "span_id": "s1", "$tenant": "acme",
                 "name": "op", "service": "svc",
                 "start_time_ns": 1000u64, "end_time_ns": 2000u64,
                 "attributes": {"prompt": span_only},

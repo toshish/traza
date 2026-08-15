@@ -110,7 +110,27 @@ pub struct Span {
     /// constrained to `[a-z0-9][a-z0-9._-]{0,63}` at ingest — lowercase only,
     /// because an identity that needs canonicalization is an identity that
     /// will one day be compared uncanonicalized (the payload-hash lesson).
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    ///
+    /// **The wire and storage key is `$tenant`, not `tenant`.** A span's
+    /// top-level namespace is open — [`Self::extra`] preserves any unknown
+    /// field — so a bare `tenant` key is client data and must stay client
+    /// data. Before tenancy that is exactly where it lived, and a store
+    /// written then reads back now without a value silently becoming an
+    /// identity no query selects and no erasure names. The `$` sigil marks a
+    /// reserved identity the way `$payload` marks a reserved reference, so the
+    /// discriminator is the key itself, not a guess about a value's shape.
+    ///
+    /// The narrow honesty: what is new is the *reservation* of `$tenant`, not
+    /// the `$` sigil, which predates tenancy through `$payload`. A store
+    /// written by tenant-unaware code has an empty identity by construction —
+    /// nothing wrote the field — and the only bytes that could carry a literal
+    /// top-level `$tenant` are a *foreign* pre-tenancy store that happened to
+    /// use that exact key for its own data. No store of ours writes such
+    /// bytes, and the pre-1.0 terms do not promise reading foreign ones; a
+    /// pre-tenancy import path would have to fold such a key back into
+    /// [`Self::extra`] itself. A bound credential still stamps this field
+    /// server-side regardless of the body.
+    #[serde(rename = "$tenant", default, skip_serializing_if = "String::is_empty")]
     pub tenant: String,
     /// Identifier of the parent span, if this is not a root span.
     #[serde(default)]
@@ -1137,28 +1157,12 @@ fn span_to_record(span: &Span) -> Result<segment::RecordInput> {
 }
 
 fn record_to_span(record: &segment::Record) -> Result<Span> {
-    let mut span: Span = serde_json::from_slice(record.payload())?;
-    normalize_decoded_tenant(&mut span);
-    Ok(span)
-}
-
-/// Repairs a decoded span whose `tenant` field predates tenancy.
-///
-/// Before the tenant joined the primary key, a client-supplied top-level
-/// `tenant` field round-tripped through [`Span::extra`] like any unknown
-/// field. Those bytes now deserialize into the IDENTITY field — possibly with
-/// a value ingest validation would refuse, which no erasure subject could
-/// ever name and no scoped query could ever select. Decode paths (segment
-/// records, log replay) route such values back where they always lived, so
-/// the identity field only ever holds what validation admits. The empty
-/// check makes this free for every store that never hit the collision.
-pub(crate) fn normalize_decoded_tenant(span: &mut Span) {
-    if span.tenant.is_empty() || valid_tenant(&span.tenant) {
-        return;
-    }
-    let legacy = std::mem::take(&mut span.tenant);
-    span.extra
-        .insert("tenant".to_owned(), Value::String(legacy));
+    // Identity comes off the wire and the disk under the reserved `$tenant`
+    // key (see [`Span::tenant`]). A record written before tenancy carried a
+    // bare `tenant` at most as client data, and it decodes back into
+    // [`Span::extra`] untouched — never into identity — so no repair pass is
+    // needed and none exists to be unsound.
+    Ok(serde_json::from_slice(record.payload())?)
 }
 
 /// Whether `tenant` is admissible as a tenant identity: `[a-z0-9]` first,
@@ -3679,6 +3683,18 @@ impl Store {
             if mask.covers_payload_file(reference) {
                 return Ok(None);
             }
+            // A whole-tenant erasure discovers its span-held references only
+            // as its purge walks them, so `payload_files` is still filling
+            // while the mask already hides the tenant. A scoped fetch must
+            // not race that gap: the tenant is being erased, so nothing of
+            // its is served, whether or not this exact reference has been
+            // enumerated yet. The operator (unscoped) fetch is governed by
+            // `payload_files` alone, as it was — its capability is the hash.
+            if let Some(tenant) = tenant {
+                if mask.covers_tenant(tenant) {
+                    return Ok(None);
+                }
+            }
         }
         if let Some(tenant) = tenant {
             if !self.tenant_holds_reference(tenant, reference)? {
@@ -3757,10 +3773,20 @@ impl Store {
             if !may_hold {
                 continue;
             }
-            let offsets = segment
-                .seg
-                .attribute_candidate_offsets(IDX_TENANT, tenant)
-                .to_vec();
+            // The default (empty) tenant carries no posting — it is never
+            // indexed, so single-tenant stores stay byte-identical — so the
+            // tenant posting cannot answer for it. Scan every record and let
+            // the decoded tenant decide, exactly as `select_probe` falls
+            // through to `record_offsets` for an explicit `Some("")` scope.
+            // A non-empty tenant keeps its narrow posting probe.
+            let offsets: Vec<u64> = if tenant.is_empty() {
+                segment.seg.record_offsets().to_vec()
+            } else {
+                segment
+                    .seg
+                    .attribute_candidate_offsets(IDX_TENANT, tenant)
+                    .to_vec()
+            };
             for offset in offsets {
                 let record = segment
                     .seg
@@ -5881,13 +5907,23 @@ impl Store {
                 // The reserved tenant posting is written for every non-empty
                 // tenant, so an empty candidate list IS proof of absence —
                 // and tenant subjects cannot name the default tenant, whose
-                // spans carry no posting. The one corpus this cannot see is
-                // a segment written BEFORE tenancy whose span JSON already
-                // carried a valid `tenant` value (no posting was written
-                // for it): no store of ours holds such bytes and the
-                // pre-1.0 terms do not promise reading them, so the fast
-                // path stands — revisit if a migration from foreign
-                // pre-M4 data ever ships.
+                // spans carry no posting. A span acquires an identity tenant
+                // only from the reserved `$tenant` key (see [`Span::tenant`]),
+                // which a tenant-aware build always writes alongside this
+                // posting — so for every span THIS build wrote, a set tenant
+                // implies a posting, and the fast path is exact.
+                //
+                // The one corpus it cannot see is a FOREIGN pre-tenancy store
+                // whose span JSON already used a literal top-level `$tenant`
+                // key for its own data: decoded here it becomes an identity
+                // with no posting, which this probe would miss and a whole-
+                // tenant erasure would then skip under a settle receipt. No
+                // store of ours writes such bytes, and the pre-1.0 terms do
+                // not promise reading foreign ones — a pre-tenancy import path
+                // must fold such a key out at decode (see [`Span::tenant`])
+                // before this invariant holds for it. It is a property of the
+                // key for our own corpus, and an assumption about anyone
+                // else's.
                 Ok(!segment
                     .seg
                     .attribute_candidate_offsets(IDX_TENANT, tenant)
