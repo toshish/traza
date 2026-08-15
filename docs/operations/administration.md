@@ -17,7 +17,7 @@ TRAZA_TOKENS="rw:$(openssl rand -hex 16),ro:$(openssl rand -hex 16)" \
 
 ### The token format
 
-A comma-separated list of `scope:token` entries.
+A comma-separated list of `scope[@tenant]:token` entries.
 
 | Scope | Permits |
 |---|---|
@@ -26,13 +26,47 @@ A comma-separated list of `scope:token` entries.
 | `admin` | Everything `rw` permits, **plus erasure** |
 
 Tokens must be non-empty, unique, and free of whitespace and commas. Entries
-may not have surrounding whitespace.
+may not have surrounding whitespace. The first `:` isolates the token — which
+may itself contain `@` or `:` — and only the left side is examined for a
+binding, which is what makes the syntax unambiguous.
+
+**The optional `@tenant` binds the credential to one tenant:**
+
+```sh
+TRAZA_TOKENS="rw@acme:$(openssl rand -hex 16),admin:$(openssl rand -hex 16)"
+```
+
+`rw@acme:…` writes and reads tenant `acme` and nothing else. Operationally, a
+bound credential is the token you hand a customer's collector or dashboard in
+a multi-tenant deployment:
+
+- **Ingest is stamped and checked.** Spans that name no tenant get the
+  binding; a span claiming a different tenant fails its whole batch with
+  `400` — loudly, because silently rewriting it would hide a misconfigured
+  exporter forever.
+- **Every read is scoped.** The binding is applied where queries are
+  constructed — one choke point, so no endpoint can forget it — and naming a
+  foreign tenant in any `tenant=` parameter is a
+  `403 {"error":"this credential is bound to a different tenant"}`.
+- **The store-global operator endpoints refuse bound tokens.** `/v1/stats`,
+  `/v1/metrics`, `/v1/metrics.json`, `/v1/verify`, `/v1/checkpoint`,
+  `/v1/flush`, and `/v1/backups/*` answer bound credentials `403`: they
+  report and move the whole store's data, and even the volumes disclose
+  co-tenants. A bound credential's accounting surface is
+  [`GET /v1/tenants`](#tenant-accounting).
+- **Cross-tenant reads answer `404`, never `403`** — existence is a fact
+  about another tenant, and a distinguishable refusal would leak it.
+- A bound `admin` may erase only its own tenant; see
+  [Erasure](#erasure-deletion-with-a-receipt).
 
 **An invalid `TRAZA_TOKENS` refuses startup.** Not a warning, not a fallback to
 open — the process exits. Silently running open when the operator tried to
 configure authentication would be the worst possible failure mode. The error
-names the defect (`TRAZA_TOKENS contains an invalid scope`) and never echoes
-the offending value.
+names the defect (`TRAZA_TOKENS contains an invalid scope`,
+`TRAZA_TOKENS contains an invalid tenant binding`) and never echoes the
+offending value. Bindings must satisfy the tenant charset ingest enforces —
+lowercase `[a-z0-9][a-z0-9._-]`, at most 64 bytes — so a credential can never
+be bound to a tenant no span could ever carry.
 
 ### Behaviour
 
@@ -128,6 +162,41 @@ A background pass runs **every minute** and removes:
 
 `--ttl-seconds 0` means **disabled**, not "expire everything now".
 
+### Per-tenant retention
+
+`--tenant-ttl TENANT=SECONDS` (repeatable) overrides the window for one
+tenant:
+
+```sh
+traza-server --data-dir /var/lib/traza \
+  --ttl-seconds 604800 \
+  --tenant-ttl acme=2592000 --tenant-ttl trial-co=86400
+```
+
+A tenant's cutoff is resolved in one order: **its override, else
+`--ttl-seconds`, else never.** A tenant with no override on a server with no
+global TTL keeps everything, whatever other tenants are configured with.
+Retention is a per-tenant policy the moment tenants exist — a single window
+forced on every tenant would make one customer's compliance clock another's
+data loss. `--tenant-ttl acme=0` disables `acme`'s window (same rule as the
+global flag: zero is "disabled", never "expire everything now"), and an
+invalid tenant name refuses startup.
+
+Two consequences worth knowing:
+
+- **The retire-whole fast path only runs when a global TTL covers everyone.**
+  Deleting a segment outright because every span in it is expired is sound
+  only against a bound *every* span is subject to; with per-tenant overrides
+  and no `--ttl-seconds`, a tenant with no window has no cutoff at all, and
+  retiring a segment on the other tenants' clocks would delete that tenant's
+  unexpired spans with it. Such segments are decoded and rewritten to their
+  survivors instead — correct, just not free.
+- **Scores are exempt from TTL entirely.** A score — an annotation addressed
+  to an experiment example — lives on eval retention, not trace retention: a
+  rolling window that swept January's scores would silently empty the base of
+  every experiment-over-experiment diff run in March. Other annotations age
+  out on their own tenant's window.
+
 Expiry rewrites the segments it touches with the same
 write-temp-fsync-rename discipline as any other rewrite — onto the same file
 name, so an expired segment keeps its place in recency order — and an
@@ -148,7 +217,8 @@ expiry or compaction — runs at a time.
 
 TTL answers "how long do we keep telemetry"; erasure answers "this specific
 data must go, and prove it". `POST /v1/erasures` erases a **subject** — a
-trace, a span, a session, or an offloaded payload — from every domain, and
+trace, a span, a session, an offloaded payload, or a whole tenant — from
+every domain, and
 `verify --erasure` (or `GET /v1/erasures/{id}/verify`) produces the receipt:
 every place the subject's bytes could be, checked by name, with the result of
 each. Endpoint shapes are in the
@@ -161,6 +231,27 @@ token, and a credential minted to produce telemetry must not be the
 credential that destroys it. Reading the tombstone log and the receipt stays
 `ro` — identifiers, never content. On a loopback-open server (no tokens),
 erasure is open with everything else.
+
+**Subjects are tenant-scoped.** Trace, span, and session subjects carry a
+`tenant` field; empty is the default tenant, never "all tenants" — two
+tenants sharing a trace id are two subjects, and erasing one leaves the other
+untouched. The `tenant` subject kind erases everything one tenant owns —
+spans, annotations and scores, datasets, versions, examples, experiments, and
+reference-aware deletion of the payload bytes they held — and requires a
+non-empty name: the default tenant is every store that never configured
+tenancy, and "erase it whole" is "erase the store", which is not an API.
+Tenant subjects record no span keys (a tenant's key set is unbounded; the
+mask and purge cover by predicate), so for a whole tenant **the settle time
+is the re-delivery line**. While one is pending, eval mutations for that
+tenant answer `409` rather than racing the purge.
+
+**A bound `admin` erases only its own tenant.** Naming a foreign tenant —
+tenant subjects included, or a per-tenant admin could destroy a neighbour
+wholesale — is a `403`. Payload subjects carry no tenant (content addressing
+is store-global), so they are an unbound-operator act by rule: a bound admin
+gets `403 {"error":"payload subjects are store-global; erasing one requires
+an unbound admin credential"}`. Bound credentials also see only their own
+tenant's records in the tombstone-log listings.
 
 **What an erasure does.** The intent is fsynced into `tombstones.jsonl`
 before anything is removed — from that moment the subject is invisible to
@@ -215,17 +306,57 @@ trace or session id is **new activity** (reported, never a failure). If a
 client with a retry queue may replay erased batches, drain it before erasing,
 or expect the receipt to name the re-delivery and re-run the erasure.
 
+**The receipt checks eval records too.** Between the annotations and
+payloads domains sits `eval-records`, a decode-walk scoped to the subject's
+tenant — never a raw byte scan of the shared log, so one tenant's receipt can
+never name another tenant's datasets. What it reports depends on the subject,
+and the two non-clear results mean different things:
+
+- For a **trace/span/session** subject, examples whose provenance or content
+  is traceable to the subject report as **`attention`** and leave the receipt
+  inconclusive: a promotion **copy** survives source erasure by design, and
+  purging it is a deliberate second act (tombstone the dataset version, erase
+  the payload) — the receipt names the copies so the operator can decide,
+  rather than pretending the erasure reached data it was never asked to
+  reach.
+- For a **payload** subject, examples still carrying the reference report as
+  **`retained-by-design`** and the receipt stays conclusive: after the blob's
+  deletion the reference is a dangling **address, not content** — the bytes
+  are gone, the version's digests remain valid, and purging the addresses is
+  a version tombstone plus a future compaction.
+- For a **tenant** subject, the domain re-counts the records the tenant still
+  owns, which must be zero. The settle record carries the purge's tally as
+  `eval_records_removed` (a tenant's scores are annotations and count under
+  `annotations_removed`).
+
 **`erased` and `conclusive` are separate answers.** The receipt's `result`
 is the semantic verdict; its `conclusive` flag is false whenever an
 over-approximate check — the byte-level occurrence scans over the log and
 the rollup sidecars — found the subject's identifiers without proving them
-benign. The subcommand's exit code carries the distinction: `0` erased and
-conclusive, `3` erased but inconclusive (read the attention domains), `2`
-not erased.
+benign, and whenever any domain could only reach `attention`. The
+subcommand's exit code carries the distinction: `0` erased and conclusive,
+`3` erased but inconclusive (read the attention domains), `2` not erased.
 
 **The MCP endpoint cannot erase.** Deletion is an HTTP-only verb behind the
 `admin` scope. The agent-facing surface stays read-only by construction, so
 stored adversarial text has no destructive tool to actuate.
+
+## Tenant accounting
+
+`GET /v1/tenants` answers "what does each tenant hold right now": logical
+spans and distinct traces currently visible, approximate inline bytes,
+approximate offloaded-payload bytes (a blob shared across tenants counts for
+every referencing tenant — for a quota question, each of them is holding the
+store to those bytes), and the activity window. A bound credential gets
+exactly its own row. Shapes are in the
+[HTTP API](../guide/http-api.md#get-v1tenants).
+
+**It is an exact fold and it is O(store).** The route decodes the visible
+spans to count them, on demand, against one pinned snapshot. That is the
+right cost for an accounting question asked occasionally and the wrong one
+for a dashboard polling per minute against a hundred-million-span corpus —
+use `/v1/metrics` for continuous monitoring and this route when the per-tenant
+answer is actually needed.
 
 ## Compaction
 
@@ -305,6 +436,30 @@ The threshold is a size/latency trade rather than a correctness one: lowering
 it moves more content out of segments (smaller, faster decodes; more small
 files) and raising it does the opposite. Payload files are swept on the TTL
 window, so offloading interacts with retention as described above.
+
+### Payload fetch across tenants
+
+Content addressing is **store-global** — identical bytes are one file,
+whoever ingested them — and that has a consequence for `GET /v1/payloads`
+worth stating frankly rather than discovering.
+
+For **unbound** deployments the route is capability-addressed: the full
+SHA-256 is the capability, and knowing it means having read a span that
+disclosed it. That argument is sound within one trust domain and it is also,
+across tenants, a **cross-tenant existence oracle for guessable content**:
+the hash of a suspected document is computable, and a `200` would confirm
+some tenant stored those exact bytes. An unbound token is an operator
+credential, so for it this is accepted.
+
+**Bound credentials close the oracle.** A tenant-bound fetch must also prove
+**reachability** — some span or dataset example of its own tenant carries the
+reference (an example legitimately outlives its source span, so its holder
+keeps fetch access) — and an unreachable payload answers `404` exactly as an
+absent one does, indistinguishably. This is the deliberate M4 stance: the
+boundary that matters is the tenant boundary, bound credentials are the
+untrusted principals, and they are the ones the proof is demanded of. If
+co-tenants must not be able to probe each other, do not hand tenants unbound
+tokens.
 
 ## Backups
 

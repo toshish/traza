@@ -60,10 +60,31 @@ impl Scope {
     }
 }
 
+/// What an authenticated credential is: what it may do, and — when bound —
+/// whose data it may do it to.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Principal {
+    /// The capability tier.
+    pub scope: Scope,
+    /// The tenant this credential is bound to, or `None` for an unbound
+    /// (operator-level) credential. A bound principal reads and writes ONLY
+    /// its tenant's data, on every surface; binding is applied where queries
+    /// are constructed, so no endpoint can forget it.
+    pub tenant: Option<String>,
+}
+
+impl Principal {
+    /// The tenant scope for store reads: `Some(t)` when bound, else `None`.
+    pub fn tenant_scope(&self) -> Option<&str> {
+        self.tenant.as_deref()
+    }
+}
+
 #[derive(Clone)]
 struct Credential {
     token: Vec<u8>,
     scope: Scope,
+    tenant: Option<String>,
 }
 
 #[derive(Clone)]
@@ -155,7 +176,13 @@ impl AuthConfig {
         }
     }
 
-    /// Parses a TRAZA_TOKENS value (`scope:token`, comma-separated).
+    /// Parses a TRAZA_TOKENS value (`scope[@tenant]:token`, comma-separated).
+    ///
+    /// The optional `@tenant` binds the credential: `rw@acme:tok` writes and
+    /// reads tenant `acme` and nothing else. The split order is what makes
+    /// the syntax unambiguous — the first `:` isolates the token (which may
+    /// itself contain `@` or `:`), and only the left side is examined for a
+    /// binding.
     pub fn parse(raw: &str) -> Result<Self, ConfigError> {
         if raw.is_empty() {
             return Err(ConfigError::new("TRAZA_TOKENS must not be empty"));
@@ -170,6 +197,17 @@ impl AuthConfig {
             let (scope, token) = entry
                 .split_once(':')
                 .ok_or_else(|| ConfigError::new("TRAZA_TOKENS entries must use scope:token"))?;
+            let (scope, tenant) = match scope.split_once('@') {
+                None => (scope, None),
+                Some((scope, tenant)) => {
+                    if !crate::valid_tenant(tenant) {
+                        return Err(ConfigError::new(
+                            "TRAZA_TOKENS contains an invalid tenant binding",
+                        ));
+                    }
+                    (scope, Some(tenant.to_owned()))
+                }
+            };
             let scope = Scope::parse(scope)
                 .ok_or_else(|| ConfigError::new("TRAZA_TOKENS contains an invalid scope"))?;
             if token.is_empty() {
@@ -190,6 +228,7 @@ impl AuthConfig {
             credentials.push(Credential {
                 token: token.as_bytes().to_vec(),
                 scope,
+                tenant,
             });
         }
 
@@ -204,8 +243,8 @@ impl AuthConfig {
     /// Authenticates an HTTP Authorization header and enforces method scope.
     /// Checks a request: bearer token match (constant-time) + scope for the method.
     pub fn authorize(&self, authorization: Option<&str>, method: &str) -> Result<(), AuthFailure> {
-        let scope = self.scope_for(authorization)?;
-        if scope.permits(method) {
+        let principal = self.principal_for(authorization)?;
+        if principal.scope.permits(method) {
             Ok(())
         } else {
             Err(AuthFailure::Forbidden)
@@ -214,6 +253,13 @@ impl AuthConfig {
 
     /// Authenticates a bearer token and returns what it may do, without
     /// applying the HTTP-method rule.
+    pub fn scope_for(&self, authorization: Option<&str>) -> Result<Scope, AuthFailure> {
+        self.principal_for(authorization)
+            .map(|principal| principal.scope)
+    }
+
+    /// Authenticates a bearer token and returns the full principal — scope
+    /// AND tenant binding — without applying the HTTP-method rule.
     ///
     /// The method rule is right for the REST surface, where the method *is*
     /// the operation. It is wrong for a protocol that tunnels every operation
@@ -221,22 +267,26 @@ impl AuthConfig {
     /// read-only surface entirely, and hand every caller that got in the write
     /// scope. [`crate::mcp`] authorizes per tool instead, and this is the
     /// authentication half it builds on.
-    pub fn scope_for(&self, authorization: Option<&str>) -> Result<Scope, AuthFailure> {
+    pub fn principal_for(&self, authorization: Option<&str>) -> Result<Principal, AuthFailure> {
         let token = authorization
             .and_then(parse_bearer)
             .ok_or(AuthFailure::Unauthorized)?;
 
         // Check every configured credential even after a match. Besides avoiding
         // an early token-dependent return, this keeps lookup timing independent
-        // of credential ordering.
-        let mut matched_scope = None;
+        // of credential ordering. The tenant is metadata ON the matched
+        // credential, never something compared against the request, so the
+        // constant-time story is untouched.
+        let mut matched: Option<Principal> = None;
         for credential in &self.credentials {
-            let matched = constant_time_eq(&credential.token, token.as_bytes());
-            if matched {
-                matched_scope = Some(credential.scope);
+            if constant_time_eq(&credential.token, token.as_bytes()) {
+                matched = Some(Principal {
+                    scope: credential.scope,
+                    tenant: credential.tenant.clone(),
+                });
             }
         }
-        matched_scope.ok_or(AuthFailure::Unauthorized)
+        matched.ok_or(AuthFailure::Unauthorized)
     }
 }
 
@@ -331,6 +381,43 @@ mod tests {
         // it.
         assert!(!Scope::ReadWrite.permits_erasure());
         assert!(!Scope::ReadOnly.permits_erasure());
+    }
+
+    #[test]
+    fn tenant_bindings_parse_and_reach_the_principal() {
+        let auth = AuthConfig::parse("rw@acme:tok-a,ro:tok-open,admin@big.co:tok-b").unwrap();
+        assert_eq!(
+            auth.principal_for(Some("Bearer tok-a")),
+            Ok(Principal {
+                scope: Scope::ReadWrite,
+                tenant: Some("acme".to_owned())
+            })
+        );
+        assert_eq!(
+            auth.principal_for(Some("Bearer tok-open")),
+            Ok(Principal {
+                scope: Scope::ReadOnly,
+                tenant: None
+            })
+        );
+        assert_eq!(
+            auth.principal_for(Some("Bearer tok-b")),
+            Ok(Principal {
+                scope: Scope::Admin,
+                tenant: Some("big.co".to_owned())
+            })
+        );
+        // A token may contain '@' or ':' — the first colon decides, and the
+        // binding is examined only left of it.
+        let auth = AuthConfig::parse("rw:t@ok:en").unwrap();
+        assert_eq!(
+            auth.principal_for(Some("Bearer t@ok:en")).map(|p| p.tenant),
+            Ok(None)
+        );
+        // Invalid bindings are configuration errors, loudly.
+        assert!(AuthConfig::parse("rw@:tok").is_err());
+        assert!(AuthConfig::parse("rw@Acme:tok").is_err());
+        assert!(AuthConfig::parse("bogus@acme:tok").is_err());
     }
 
     #[test]

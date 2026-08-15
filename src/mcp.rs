@@ -156,10 +156,15 @@ pub enum Access {
 }
 
 /// Per-request context: who is asking, and when.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Context {
     /// What this caller may do.
     pub access: Access,
+    /// The credential's tenant binding, when it has one. A bound principal
+    /// sees exactly what it would see over HTTP: its own tenant's spans,
+    /// sessions, aggregates, annotations — MCP is a different wire, not a
+    /// different authority.
+    pub tenant: Option<String>,
     /// Wall clock at the start of the request, in Unix nanoseconds. Relative
     /// times (`"2h"`) resolve against it, and passing it in rather than
     /// reading the clock per tool keeps one request on one instant.
@@ -171,8 +176,14 @@ impl Context {
     pub fn now() -> Self {
         Self {
             access: Access::Read,
+            tenant: None,
             now_ns: unix_nanos_now(),
         }
+    }
+
+    /// The tenant scope for store reads: `Some(t)` when bound, else `None`.
+    fn scope(&self) -> Option<&str> {
+        self.tenant.as_deref()
     }
 }
 
@@ -259,9 +270,9 @@ impl<'a> Server<'a> {
             "tools/call" => return Some(self.call_tool(id, &params, context)),
             "resources/list" => Ok(json!({ "resources": resource_definitions() })),
             "resources/templates/list" => Ok(json!({ "resourceTemplates": resource_templates() })),
-            "resources/read" => self.read_resource(&params),
+            "resources/read" => self.read_resource(&params, &context),
             "prompts/list" => Ok(json!({ "prompts": prompt_definitions() })),
-            "prompts/get" => self.get_prompt(&params),
+            "prompts/get" => self.get_prompt(&params, &context),
             other => Err(RpcError {
                 code: -32601,
                 message: format!("method not found: {other}"),
@@ -542,15 +553,15 @@ impl<'a> Server<'a> {
             .unwrap_or(&empty);
 
         let outcome = match name {
-            "describe_store" => self.describe_store(),
-            "search_spans" => self.search_spans(arguments, context),
-            "get_trace" => self.get_trace(arguments),
-            "list_sessions" => self.list_sessions(arguments, context),
-            "get_session" => self.get_session(arguments),
-            "top_failures" => self.top_failures(arguments, context),
-            "slowest_spans" => self.slowest_spans(arguments, context),
-            "analyze_cost" => self.analyze_cost(arguments, context),
-            "get_payload" => self.get_payload(arguments),
+            "describe_store" => self.describe_store(&context),
+            "search_spans" => self.search_spans(arguments, context.clone()),
+            "get_trace" => self.get_trace(arguments, &context),
+            "list_sessions" => self.list_sessions(arguments, context.clone()),
+            "get_session" => self.get_session(arguments, &context),
+            "top_failures" => self.top_failures(arguments, context.clone()),
+            "slowest_spans" => self.slowest_spans(arguments, context.clone()),
+            "analyze_cost" => self.analyze_cost(arguments, context.clone()),
+            "get_payload" => self.get_payload(arguments, &context),
             "record_annotation" if self.annotation_tool_available(context.access) => {
                 self.record_annotation(arguments, context)
             }
@@ -585,36 +596,69 @@ impl<'a> Server<'a> {
 
     // ------------------------------------------------------- tool handlers
 
-    fn describe_store(&self) -> ToolResult {
+    fn describe_store(&self, context: &Context) -> ToolResult {
         Ok(text_result(clamp(
-            self.overview_text()?,
+            self.overview_text(context.scope())?,
             self.limits.max_result_bytes,
         )))
     }
 
     /// The orientation block, shared by `describe_store` and the
     /// `traza://store/overview` resource so the two can never disagree.
-    fn overview_text(&self) -> Result<String, ToolError> {
+    fn overview_text(&self, scope: Option<&str>) -> Result<String, ToolError> {
         let stats = self.store.stats()?;
-        let by_service = self.store.llm_aggregate(LlmGroupBy::Service, None, None)?;
-        let by_model = self.store.llm_aggregate(LlmGroupBy::Model, None, None)?;
-        let by_provider = self.store.llm_aggregate(LlmGroupBy::Provider, None, None)?;
-        let by_day = self.store.llm_aggregate(LlmGroupBy::Day, None, None)?;
-        let sessions = self.store.sessions(None, None, 100, SessionOrder::Recent)?;
+        // A bound caller must not see the STORE's totals — the same volumes
+        // the HTTP layer 403s /v1/stats for. Its header comes from its own
+        // usage row instead.
+        let bound_usage = match scope {
+            None => None,
+            Some(_) => Some(
+                self.store
+                    .tenant_usage(scope)?
+                    .into_iter()
+                    .next()
+                    .map(|row| (row.spans, row.bytes_approx))
+                    .unwrap_or((0, 0)),
+            ),
+        };
+        let by_service = self
+            .store
+            .llm_aggregate_in(scope, LlmGroupBy::Service, None, None)?;
+        let by_model = self
+            .store
+            .llm_aggregate_in(scope, LlmGroupBy::Model, None, None)?;
+        let by_provider = self
+            .store
+            .llm_aggregate_in(scope, LlmGroupBy::Provider, None, None)?;
+        let by_day = self
+            .store
+            .llm_aggregate_in(scope, LlmGroupBy::Day, None, None)?;
+        let sessions = self
+            .store
+            .sessions_in(scope, None, None, 100, SessionOrder::Recent)?;
 
         let mut head = String::new();
         // The version belongs here as well as in `initialize`. A host reads
         // `serverInfo` once and need not pass it to the model, so an agent
         // asked which Traza it is talking to had no way to find out and
         // correctly reported that it could not tell.
-        head.push_str(&format!(
-            "Traza {} — {} in {} ({}), durability={}\n",
-            env!("CARGO_PKG_VERSION"),
-            count(stats.total_records as u64, "record"),
-            count(stats.segment_count as u64, "segment"),
-            bytes_human(stats.disk_bytes),
-            stats.durability.as_str(),
-        ));
+        match bound_usage {
+            Some((spans, bytes)) => head.push_str(&format!(
+                "Traza {} — {} of this tenant's data ({}), durability={}\n",
+                env!("CARGO_PKG_VERSION"),
+                count(spans, "span"),
+                bytes_human(bytes),
+                stats.durability.as_str(),
+            )),
+            None => head.push_str(&format!(
+                "Traza {} — {} in {} ({}), durability={}\n",
+                env!("CARGO_PKG_VERSION"),
+                count(stats.total_records as u64, "record"),
+                count(stats.segment_count as u64, "segment"),
+                bytes_human(stats.disk_bytes),
+                stats.durability.as_str(),
+            )),
+        }
         let mut days: Vec<&str> = by_day.iter().map(|row| row.key.as_str()).collect();
         days.sort_unstable();
         match (days.first(), days.last()) {
@@ -753,10 +797,16 @@ impl<'a> Server<'a> {
     /// on a name that does not exist", and a model resolves that ambiguity by
     /// reporting that nothing is wrong. So the miss is diagnosed.
     fn empty_search_result(&self, request: &SearchRequest) -> ToolResult {
+        // Scoped like the search itself: enumerating the STORE's services to
+        // explain a bound tenant's empty result would hand it the cross-
+        // tenant catalog its query was scoped away from.
+        let scope = request.filter.tenant.as_deref();
         let mut head = format!("No spans matched{}.", request.window_note());
         let mut rows = Vec::new();
         if let Some(service) = &request.filter.service {
-            let known = self.store.llm_aggregate(LlmGroupBy::Service, None, None)?;
+            let known = self
+                .store
+                .llm_aggregate_in(scope, LlmGroupBy::Service, None, None)?;
             if !known.iter().any(|row| &row.key == service) {
                 head = "No spans matched, and the requested service does not exist in this \
                         store. Its known services are listed below; re-run with one of them."
@@ -810,13 +860,13 @@ impl<'a> Server<'a> {
         )))
     }
 
-    fn get_trace(&self, arguments: &Map<String, Value>) -> ToolResult {
+    fn get_trace(&self, arguments: &Map<String, Value>, context: &Context) -> ToolResult {
         let trace_id = required_str(arguments, "trace_id")?;
         let include_content = optional_bool(arguments, "include_content")?.unwrap_or(false);
         let max_spans = optional_usize(arguments, "max_spans")?
             .unwrap_or(DEFAULT_TRACE_SPANS)
             .clamp(1, MAX_TRACE_SPANS);
-        let spans = self.store.get_trace(trace_id)?;
+        let spans = self.store.get_trace_in(context.scope(), trace_id)?;
         if spans.is_empty() {
             return Err(ToolError(format!(
                 "No trace with that id is in the store. Trace ids are exact — copy one from a \
@@ -827,7 +877,7 @@ impl<'a> Server<'a> {
         }
         let annotations = self
             .store
-            .annotations(trace_id, None, None)
+            .annotations_in(context.scope(), trace_id, None, None)
             .unwrap_or_default();
         let (head, rows, notes) =
             render_trace(&spans, &annotations, max_spans, include_content, trace_id);
@@ -845,8 +895,8 @@ impl<'a> Server<'a> {
             &["since", "until", "order_by", "limit"],
             "list_sessions",
         )?;
-        let since = optional_time(arguments, "since", context)?;
-        let until = optional_time(arguments, "until", context)?;
+        let since = optional_time(arguments, "since", &context)?;
+        let until = optional_time(arguments, "until", &context)?;
         let limit = optional_usize(arguments, "limit")?
             .unwrap_or(DEFAULT_SPAN_LIMIT)
             .clamp(1, MAX_SPAN_LIMIT);
@@ -864,7 +914,9 @@ impl<'a> Server<'a> {
                 "order_by must be one of recent, cost, errors, tokens (got {requested:?})."
             ))
         })?;
-        let sessions = self.store.sessions(since, until, limit, order)?;
+        let sessions = self
+            .store
+            .sessions_in(context.scope(), since, until, limit, order)?;
         // An empty window is an ordinary answer, not an exception, so it comes
         // back shaped like every other one. A text-only "nothing found" would
         // violate the outputSchema this tool advertises, and a client that
@@ -936,16 +988,19 @@ impl<'a> Server<'a> {
         ))
     }
 
-    fn get_session(&self, arguments: &Map<String, Value>) -> ToolResult {
+    fn get_session(&self, arguments: &Map<String, Value>, context: &Context) -> ToolResult {
         let session_id = required_str(arguments, "session_id")?;
-        let detail = self.store.session(session_id)?.ok_or_else(|| {
-            ToolError(
-                "No session with that id. Session ids are exact — take one from \
+        let detail = self
+            .store
+            .session_in(context.scope(), session_id)?
+            .ok_or_else(|| {
+                ToolError(
+                    "No session with that id. Session ids are exact — take one from \
                  list_sessions. Note that a session is resolved across every recognized \
                  session key, so the id is the value, not the attribute name."
-                    .to_owned(),
-            )
-        })?;
+                        .to_owned(),
+                )
+            })?;
         let summary = &detail.summary;
         let head = format!(
             "Session: {}, {}, {}, {}, ${:.4}, {}, {} to {}.",
@@ -1101,14 +1156,16 @@ impl<'a> Server<'a> {
                  {group_name:?})."
             ))
         })?;
-        let since = optional_time(arguments, "since", context)?;
-        let until = optional_time(arguments, "until", context)?;
+        let since = optional_time(arguments, "since", &context)?;
+        let until = optional_time(arguments, "until", &context)?;
         let limit = optional_usize(arguments, "limit")?
             .unwrap_or(DEFAULT_SPAN_LIMIT)
             .clamp(1, MAX_SPAN_LIMIT);
         let over_time = optional_bool(arguments, "over_time")?.unwrap_or(false);
 
-        let mut rows_data = self.store.llm_aggregate(group_by, since, until)?;
+        let mut rows_data = self
+            .store
+            .llm_aggregate_in(context.scope(), group_by, since, until)?;
         let total_rows = rows_data.len();
         rows_data.truncate(limit);
         if rows_data.is_empty() {
@@ -1175,9 +1232,15 @@ impl<'a> Server<'a> {
         if over_time {
             match (since, until) {
                 (Some(since_ns), Some(until_ns)) if until_ns > since_ns => {
-                    let series =
-                        self.store
-                            .series(&SpanFilter::default(), since_ns, until_ns, 24)?;
+                    let series = self.store.series(
+                        &SpanFilter {
+                            tenant: context.scope().map(str::to_owned),
+                            ..SpanFilter::default()
+                        },
+                        since_ns,
+                        until_ns,
+                        24,
+                    )?;
                     let buckets: Vec<Value> = series
                         .buckets
                         .iter()
@@ -1227,7 +1290,7 @@ impl<'a> Server<'a> {
         ))
     }
 
-    fn get_payload(&self, arguments: &Map<String, Value>) -> ToolResult {
+    fn get_payload(&self, arguments: &Map<String, Value>, context: &Context) -> ToolResult {
         known_keys(arguments, &["reference", "max_bytes"], "get_payload")?;
         let reference = required_str(arguments, "reference")?;
         // Bounded by both ceilings, not just the payload one. The result cap
@@ -1239,13 +1302,16 @@ impl<'a> Server<'a> {
             .min(self.limits.max_payload_bytes)
             .min(self.limits.max_result_bytes.saturating_sub(RENDER_OVERHEAD))
             .max(1);
-        let bytes = self.store.payload(reference)?.ok_or_else(|| {
-            ToolError(
-                "No payload with that reference. The value is the whole '$payload' field \
+        let bytes = self
+            .store
+            .payload_in(context.scope(), reference)?
+            .ok_or_else(|| {
+                ToolError(
+                    "No payload with that reference. The value is the whole '$payload' field \
                  including the 'sha256/' prefix, copied exactly from the span."
-                    .to_owned(),
-            )
-        })?;
+                        .to_owned(),
+                )
+            })?;
         let total = bytes.len();
         match std::str::from_utf8(&bytes) {
             Ok(text) => {
@@ -1338,6 +1404,10 @@ impl<'a> Server<'a> {
         let annotation = Annotation {
             trace_id: trace_id.clone(),
             span_id: span_id.clone(),
+            tenant: context.tenant.clone().unwrap_or_default(),
+            session_id: String::new(),
+            experiment_id: None,
+            example_id: String::new(),
             name: name.clone(),
             value,
             source: AGENT_ANNOTATION_SOURCE.to_owned(),
@@ -1417,25 +1487,25 @@ impl<'a> Server<'a> {
 
     // ------------------------------------------------------------ resources
 
-    fn read_resource(&self, params: &Map<String, Value>) -> RpcResult {
+    fn read_resource(&self, params: &Map<String, Value>, context: &Context) -> RpcResult {
         let uri = params
             .get("uri")
             .and_then(Value::as_str)
             .ok_or_else(|| RpcError::invalid_params("resources/read requires a uri"))?;
-        let contents = self.resource_contents(uri)?;
+        let contents = self.resource_contents(uri, context)?;
         Ok(json!({ "contents": [contents] }))
     }
 
-    fn resource_contents(&self, uri: &str) -> Result<Value, RpcError> {
+    fn resource_contents(&self, uri: &str, context: &Context) -> Result<Value, RpcError> {
         let text = match uri {
             "traza://store/overview" => self
-                .overview_text()
+                .overview_text(context.scope())
                 .map_err(|error| RpcError::internal(error.0))?,
             "traza://store/services" => self
-                .dimension_resource(LlmGroupBy::Service, "Services")
+                .dimension_resource(context, LlmGroupBy::Service, "Services")
                 .map_err(|error| RpcError::internal(error.0))?,
             "traza://store/models" => self
-                .dimension_resource(LlmGroupBy::Model, "Models")
+                .dimension_resource(context, LlmGroupBy::Model, "Models")
                 .map_err(|error| RpcError::internal(error.0))?,
             "traza://guide/query" => QUERY_GUIDE.to_owned(),
             "traza://guide/semantics" => SEMANTICS_GUIDE.to_owned(),
@@ -1444,14 +1514,14 @@ impl<'a> Server<'a> {
                     let trace_id = percent_decode(trace_id);
                     let spans = self
                         .store
-                        .get_trace(&trace_id)
+                        .get_trace_in(context.scope(), &trace_id)
                         .map_err(|error| RpcError::internal(error.to_string()))?;
                     if spans.is_empty() {
                         return Err(RpcError::resource_not_found(other));
                     }
                     let annotations = self
                         .store
-                        .annotations(&trace_id, None, None)
+                        .annotations_in(context.scope(), &trace_id, None, None)
                         .unwrap_or_default();
                     let (head, rows, notes) =
                         render_trace(&spans, &annotations, DEFAULT_TRACE_SPANS, true, &trace_id);
@@ -1461,7 +1531,7 @@ impl<'a> Server<'a> {
                     let mut arguments = Map::new();
                     arguments.insert("session_id".to_owned(), json!(session_id));
                     let result = self
-                        .get_session(&arguments)
+                        .get_session(&arguments, context)
                         .map_err(|_| RpcError::resource_not_found(other))?;
                     result_text(&result)
                 } else if let Some(reference) = other.strip_prefix("traza://payload/") {
@@ -1469,7 +1539,7 @@ impl<'a> Server<'a> {
                     let mut arguments = Map::new();
                     arguments.insert("reference".to_owned(), json!(reference));
                     let result = self
-                        .get_payload(&arguments)
+                        .get_payload(&arguments, context)
                         .map_err(|_| RpcError::resource_not_found(other))?;
                     result_text(&result)
                 } else {
@@ -1484,8 +1554,15 @@ impl<'a> Server<'a> {
         }))
     }
 
-    fn dimension_resource(&self, group_by: LlmGroupBy, title: &str) -> Result<String, ToolError> {
-        let rows_data = self.store.llm_aggregate(group_by, None, None)?;
+    fn dimension_resource(
+        &self,
+        context: &Context,
+        group_by: LlmGroupBy,
+        title: &str,
+    ) -> Result<String, ToolError> {
+        let rows_data = self
+            .store
+            .llm_aggregate_in(context.scope(), group_by, None, None)?;
         let head = format!("{title} present in this store ({}).", rows_data.len());
         let rows: Vec<String> = rows_data
             .iter()
@@ -1505,7 +1582,7 @@ impl<'a> Server<'a> {
 
     // -------------------------------------------------------------- prompts
 
-    fn get_prompt(&self, params: &Map<String, Value>) -> RpcResult {
+    fn get_prompt(&self, params: &Map<String, Value>, context: &Context) -> RpcResult {
         let name = params
             .get("name")
             .and_then(Value::as_str)
@@ -1622,7 +1699,7 @@ impl<'a> Server<'a> {
         // starts with this store's real service and model names instead of
         // spending its first tool call discovering them.
         let overview = self
-            .overview_text()
+            .overview_text(context.scope())
             .unwrap_or_else(|error| format!("(store overview unavailable: {})", error.0));
         Ok(json!({
             "description": description,
@@ -2764,8 +2841,8 @@ impl SearchRequest {
             &SEARCH_ARGUMENTS[..FILTER_ARGUMENTS]
         };
         known_keys(arguments, accepted, tool)?;
-        let since_ns = optional_time(arguments, "since", context)?;
-        let until_ns = optional_time(arguments, "until", context)?;
+        let since_ns = optional_time(arguments, "since", &context)?;
+        let until_ns = optional_time(arguments, "until", &context)?;
         if let (Some(since), Some(until)) = (since_ns, until_ns) {
             if until < since {
                 return Err(ToolError(
@@ -2802,6 +2879,10 @@ impl SearchRequest {
             since_ns,
             until_ns,
             sort,
+            // The credential's binding rides the filter, so every span
+            // surface a tool reaches is scoped the way HTTP is — one choke
+            // point, not per-tool care.
+            tenant: context.tenant.clone(),
             limit: Some(
                 optional_usize(arguments, "limit")?
                     .unwrap_or(default_limit)
@@ -2948,7 +3029,7 @@ fn millis_to_nanos(milliseconds: f64) -> Result<u64, ToolError> {
 fn optional_time(
     arguments: &Map<String, Value>,
     field: &str,
-    context: Context,
+    context: &Context,
 ) -> Result<Option<u64>, ToolError> {
     match arguments.get(field) {
         None | Some(Value::Null) => Ok(None),

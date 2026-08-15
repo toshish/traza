@@ -560,6 +560,10 @@ impl Gen {
             self.out.annotations.push(Annotation {
                 trace_id: trace.clone(),
                 span_id: answer.clone(),
+                tenant: String::new(),
+                session_id: String::new(),
+                experiment_id: None,
+                example_id: String::new(),
                 name: "groundedness".into(),
                 value: json!(score),
                 source: "eval:nightly".into(),
@@ -952,6 +956,10 @@ impl Gen {
         self.out.annotations.push(Annotation {
             trace_id: trace.clone(),
             span_id: String::new(),
+            tenant: String::new(),
+            session_id: String::new(),
+            experiment_id: None,
+            example_id: String::new(),
             name: "incident".into(),
             value: json!(failure.0),
             source: "human:oncall".into(),
@@ -1764,6 +1772,7 @@ fn make_span(
     Span {
         trace_id: trace_id.to_owned(),
         span_id: span_id.to_owned(),
+        tenant: String::new(),
         parent_span_id: parent.map(str::to_owned),
         name: name.to_owned(),
         start_time_ns: start_ns,

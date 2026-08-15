@@ -28,6 +28,7 @@ fn span(index: usize) -> Span {
     Span {
         trace_id: format!("{:032x}", index / 10 + 1),
         span_id: format!("{:016x}", index + 1),
+        tenant: String::new(),
         start_time_ns: 1_700_000_000_000_000_000 + index as u64 * 1_000_000,
         end_time_ns: 1_700_000_000_000_500_000 + index as u64 * 1_000_000,
         name: "operation".to_owned(),

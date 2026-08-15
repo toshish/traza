@@ -39,6 +39,7 @@ impl Drop for TestDir {
 
 fn config() -> Config {
     Config {
+        tenant_ttl_seconds: Default::default(),
         flush_spans: 1_000_000, // keep everything in the buffer; the scan is the point
         max_buffer_age: None,
         shadow_seal: false,
@@ -60,6 +61,7 @@ fn span(index: u64) -> Span {
     Span {
         trace_id: format!("t-{index:07}"),
         span_id: "s".to_owned(),
+        tenant: String::new(),
         parent_span_id: None,
         name: "op".to_owned(),
         service: "svc".to_owned(),

@@ -174,56 +174,70 @@ pub fn spans_from_protobuf(bytes: &[u8]) -> Decoded<Vec<Span>> {
 /// submessages it does not want are skipped, not decoded.
 fn decode_resource_spans(bytes: &[u8], out: &mut Vec<Span>) -> Decoded<()> {
     let mut service = None;
+    let mut tenant = None;
     let mut reader = Reader::new(bytes);
     while !reader.done() {
         let (field, wire_type) = reader.tag()?;
         match (field, wire_type) {
-            (1, 2) => service = decode_resource_service(reader.bytes_field()?)?,
+            (1, 2) => (service, tenant) = decode_resource_identity(reader.bytes_field()?)?,
             _ => reader.skip(wire_type)?,
         }
     }
     let service = service.unwrap_or_else(|| "unknown_service".to_owned());
+    let tenant = tenant.unwrap_or_default();
 
     let mut reader = Reader::new(bytes);
     while !reader.done() {
         let (field, wire_type) = reader.tag()?;
         match (field, wire_type) {
-            (2, 2) => decode_scope_spans(reader.bytes_field()?, &service, out)?,
+            (2, 2) => decode_scope_spans(reader.bytes_field()?, &service, &tenant, out)?,
             _ => reader.skip(wire_type)?,
         }
     }
     Ok(())
 }
 
-/// The first `service.name` resource attribute whose value is a string.
+/// The first `service.name` and first `traza.tenant` resource attributes
+/// whose values are strings.
 ///
-/// Every resource attribute is still decoded in full, not just the one being
+/// Every resource attribute is still decoded in full, not just the ones being
 /// looked for: decoding is what rejects invalid UTF-8 and hostile nesting, and
 /// skipping the others would quietly start accepting malformed resources. The
 /// cost is per-ResourceSpans, not per-span.
-fn decode_resource_service(bytes: &[u8]) -> Decoded<Option<String>> {
+#[allow(clippy::type_complexity)]
+fn decode_resource_identity(bytes: &[u8]) -> Decoded<(Option<String>, Option<String>)> {
     let mut reader = Reader::new(bytes);
     let mut service = None;
+    let mut tenant = None;
     while !reader.done() {
         let (field, wire_type) = reader.tag()?;
         match (field, wire_type) {
             (1, 2) => {
                 let (key, value) = decode_key_value(reader.bytes_field()?, 0)?;
-                if service.is_none() && key == "service.name" {
-                    if let Value::String(name) = value {
+                match (key.as_str(), value) {
+                    ("service.name", Value::String(name)) if service.is_none() => {
                         service = Some(name);
                     }
+                    ("traza.tenant", Value::String(name)) if tenant.is_none() => {
+                        tenant = Some(name);
+                    }
+                    _ => {}
                 }
             }
             _ => reader.skip(wire_type)?,
         }
     }
-    Ok(service)
+    Ok((service, tenant))
 }
 
 /// Same two-sweep reason as [`decode_resource_spans`]: `scope` is field 1 and
 /// supplies attributes that sit beneath every span in field 2.
-fn decode_scope_spans(bytes: &[u8], service: &str, out: &mut Vec<Span>) -> Decoded<()> {
+fn decode_scope_spans(
+    bytes: &[u8],
+    service: &str,
+    tenant: &str,
+    out: &mut Vec<Span>,
+) -> Decoded<()> {
     let mut scope_attributes = Map::new();
     let mut reader = Reader::new(bytes);
     while !reader.done() {
@@ -240,7 +254,7 @@ fn decode_scope_spans(bytes: &[u8], service: &str, out: &mut Vec<Span>) -> Decod
         match (field, wire_type) {
             (2, 2) => {
                 let parts = decode_span(reader.bytes_field()?)?;
-                out.push(parts.finish(service, &scope_attributes)?);
+                out.push(parts.finish(service, tenant, &scope_attributes)?);
             }
             _ => reader.skip(wire_type)?,
         }

@@ -41,6 +41,7 @@ fn span(trace_id: &str, span_id: String, start_time_ns: u64, duration_ns: u64) -
     Span {
         trace_id: trace_id.to_owned(),
         span_id,
+        tenant: String::new(),
         parent_span_id: None,
         name: "operation".to_owned(),
         start_time_ns,
@@ -71,6 +72,7 @@ fn buffer_flush_persists_sorted_batches() {
     let store = Store::open(
         dir.path(),
         Config {
+            tenant_ttl_seconds: Default::default(),
             flush_spans: 8,
             max_buffer_age: None,
             shadow_seal: false,
@@ -129,6 +131,7 @@ fn crash_recovery_preserves_flushed_spans() {
         let store = Store::open(
             dir.path(),
             Config {
+                tenant_ttl_seconds: Default::default(),
                 flush_spans: 32,
                 max_buffer_age: None,
                 shadow_seal: false,
@@ -175,6 +178,7 @@ fn crash_recovery_preserves_flushed_spans() {
     let reopened = Store::open(
         dir.path(),
         Config {
+            tenant_ttl_seconds: Default::default(),
             flush_spans: 32,
             max_buffer_age: None,
             shadow_seal: false,
@@ -298,6 +302,7 @@ fn randomized_filters_match_naive_reference() {
     let store = Store::open(
         dir.path(),
         Config {
+            tenant_ttl_seconds: Default::default(),
             flush_spans: 4_096,
             max_buffer_age: None,
             shadow_seal: false,
@@ -331,6 +336,7 @@ fn randomized_filters_match_naive_reference() {
         spans.push(Span {
             trace_id: format!("trace-{:04}", index / 4),
             span_id: format!("random-{index:04}"),
+            tenant: String::new(),
             parent_span_id: None,
             name,
             start_time_ns,
@@ -395,6 +401,7 @@ fn ttl_compaction_drops_expired_segments() {
     let store = Store::open(
         dir.path(),
         Config {
+            tenant_ttl_seconds: Default::default(),
             flush_spans: 4,
             max_buffer_age: None,
             shadow_seal: false,
@@ -487,6 +494,7 @@ fn correctness_span(batch: u64, item: u64) -> Span {
     Span {
         trace_id: format!("trace-{batch}"),
         span_id: format!("batch-{batch}-span-{item}"),
+        tenant: String::new(),
         parent_span_id: None,
         name: "correctness".to_string(),
         start_time_ns: batch * 1_000 + item,
@@ -507,6 +515,7 @@ fn lock_order_no_deadlock() {
         Store::open(
             &dir,
             Config {
+                tenant_ttl_seconds: Default::default(),
                 flush_spans: 10_000,
                 max_buffer_age: None,
                 shadow_seal: false,
@@ -570,6 +579,7 @@ fn reads_never_miss_committed_spans() {
         Store::open(
             &dir,
             Config {
+                tenant_ttl_seconds: Default::default(),
                 flush_spans: 10_000,
                 max_buffer_age: None,
                 shadow_seal: false,
@@ -647,6 +657,7 @@ fn stale_temp_does_not_wedge_flush() {
     let store = Store::open(
         &dir,
         Config {
+            tenant_ttl_seconds: Default::default(),
             flush_spans: 2,
             max_buffer_age: None,
             shadow_seal: false,
@@ -709,6 +720,7 @@ fn stale_lock_from_dead_process_is_recovered() {
 fn second_open_is_rejected() {
     let dir = correctness_test_dir("single-writer");
     let config = Config {
+        tenant_ttl_seconds: Default::default(),
         flush_spans: 100,
         max_buffer_age: None,
         shadow_seal: false,
