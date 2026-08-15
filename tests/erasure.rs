@@ -100,6 +100,7 @@ fn erasing_a_trace_purges_every_domain_and_the_receipt_verifies() {
 
     let status = store
         .erase(Subject::Trace {
+            tenant: String::new(),
             trace_id: "doomed".into(),
         })
         .expect("erases");
@@ -314,6 +315,7 @@ fn the_settle_names_a_generation_the_erasure_does_not_then_invalidate() {
 
     let status = store
         .erase(Subject::Trace {
+            tenant: String::new(),
             trace_id: "doomed".into(),
         })
         .expect("erases");
@@ -437,6 +439,7 @@ fn the_begin_transition_leaves_no_orphan_bytes_behind() {
         std::thread::sleep(Duration::from_millis(10));
         let status = store
             .erase(Subject::Trace {
+                tenant: String::new(),
                 trace_id: "doomed".into(),
             })
             .expect("erases");
@@ -460,6 +463,7 @@ fn the_begin_transition_leaves_no_orphan_bytes_behind() {
     // disk or off.
     store
         .erase(Subject::Trace {
+            tenant: String::new(),
             trace_id: "doomed".into(),
         })
         .expect("final erase");
@@ -539,6 +543,7 @@ fn no_span_acknowledged_before_settle_survives_a_concurrent_erasure() {
     std::thread::sleep(Duration::from_millis(20));
     let status = store
         .erase(Subject::Trace {
+            tenant: String::new(),
             trace_id: "doomed".into(),
         })
         .expect("erases");
@@ -598,6 +603,7 @@ fn a_pin_taken_before_an_erasure_is_not_edited_by_it() {
     // Erasure #1 creates the tombstone log, so the pin below carries it.
     store
         .erase(Subject::Trace {
+            tenant: String::new(),
             trace_id: "first".into(),
         })
         .expect("erasure one");
@@ -607,6 +613,7 @@ fn a_pin_taken_before_an_erasure_is_not_edited_by_it() {
 
     store
         .erase(Subject::Trace {
+            tenant: String::new(),
             trace_id: "second".into(),
         })
         .expect("erasure two");
@@ -862,6 +869,7 @@ fn a_published_erasure_survives_reopen_without_the_log_resurrecting_it() {
         store.ingest(span("kept", "k1", json!({}))).expect("k1");
         store
             .erase(Subject::Trace {
+                tenant: String::new(),
                 trace_id: "doomed".into(),
             })
             .expect("erases");
@@ -896,6 +904,7 @@ fn superseded_versions_of_an_erased_key_purge_with_it() {
 
     let status = store
         .erase(Subject::Span {
+            tenant: String::new(),
             trace_id: "t".into(),
             span_id: "s".into(),
         })
@@ -927,6 +936,7 @@ fn session_erasure_resolves_across_mixed_conventions() {
 
     let status = store
         .erase(Subject::Session {
+            tenant: String::new(),
             session_id: "sess-9".into(),
         })
         .expect("erases");
@@ -1060,6 +1070,7 @@ fn trace_erasure_is_reference_aware_about_shared_payloads() {
     // Erasing t1 must not destroy bytes t2 still references.
     let first = store
         .erase(Subject::Trace {
+            tenant: String::new(),
             trace_id: "t1".into(),
         })
         .expect("erases t1");
@@ -1088,6 +1099,7 @@ fn trace_erasure_is_reference_aware_about_shared_payloads() {
     // Erasing the second trace removes the last reference, and the bytes.
     let second = store
         .erase(Subject::Trace {
+            tenant: String::new(),
             trace_id: "t2".into(),
         })
         .expect("erases t2");
@@ -1155,6 +1167,7 @@ fn the_live_tail_stops_serving_erased_spans_but_serves_new_ones() {
 
     store
         .erase(Subject::Trace {
+            tenant: String::new(),
             trace_id: "doomed".into(),
         })
         .expect("erases");
@@ -1201,6 +1214,7 @@ fn re_delivered_data_fails_the_receipt_and_new_activity_does_not() {
     store.flush().expect("seals");
     let status = store
         .erase(Subject::Trace {
+            tenant: String::new(),
             trace_id: "t".into(),
         })
         .expect("erases");
@@ -1211,7 +1225,7 @@ fn re_delivered_data_fails_the_receipt_and_new_activity_does_not() {
                 .erase
                 .span_keys
                 .iter()
-                .map(|(trace, id)| span(trace, id, json!({})))
+                .map(|(_tenant, trace, id)| span(trace, id, json!({})))
                 .collect::<Vec<_>>()
         ),
         erased,
@@ -1248,6 +1262,7 @@ fn a_pin_holding_the_subject_flips_the_receipt_until_released() {
 
     let status = store
         .erase(Subject::Trace {
+            tenant: String::new(),
             trace_id: "doomed".into(),
         })
         .expect("erases");

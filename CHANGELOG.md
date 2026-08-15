@@ -9,6 +9,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Tenant identity in the primary key.** Span identity is now
+  `(tenant, trace_id, span_id)` — everywhere: the write buffer's index, WAL
+  replay, segment supersede resolution, compaction's last-write-wins merge,
+  the tail ring's veils, cursors, the analytics key hashes, annotations and
+  erasure. Two tenants sharing a trace id can no longer silently upsert over
+  each other, which is the whole reason this ships now: keys cannot be
+  retrofitted after the format freeze. The default tenant is the empty
+  string and is **never serialized**, so a single-tenant store writes
+  byte-identical WAL frames, segment records and annotation lines to what it
+  wrote before tenancy existed — no segment or WAL format bump, proven by a
+  serialization-guard test. Tenant scoping reaches every surface the roadmap
+  names:
+  - **Credentials**: `TRAZA_TOKENS` entries take an optional binding,
+    `scope@tenant:token`. A bound credential ingests, queries, tails,
+    exports, annotates and erases exactly its own tenant; naming another
+    tenant is a 403, and the store-global operator surfaces (`/v1/stats`,
+    `/v1/metrics`, `/v1/verify`, checkpoint/flush/backups) refuse bound
+    tokens outright. OTLP exporters select a tenant with the `traza.tenant`
+    resource attribute; MCP tools are scoped by the same binding.
+  - **Sessions** are `(tenant, session_id)` — the same `session.id` under
+    two tenants is two sessions, in the rollup sidecar (format v3,
+    self-healing rebuild), the session list, and `group_by=session` rows.
+  - **Retention** takes per-tenant windows: `--tenant-ttl TENANT=SECONDS`,
+    repeatable. A tenant's cutoff is its override, else the global TTL,
+    else never — and the segment retire-whole fast path only runs when a
+    global TTL covers everyone, because a whole-segment decision taken from
+    configured windows alone would delete an unswept tenant's data with the
+    segment.
+  - **Quota accounting**: `GET /v1/tenants` reports per-tenant spans,
+    traces, serialized bytes and offloaded payload bytes from one exact
+    fold. Accounting, deliberately not enforcement.
+  - **Erasure**: trace/span/session subjects carry a tenant (empty = the
+    default tenant, never "all"), and a new `tenant` subject erases
+    everything a tenant owns — spans, annotations, scores, datasets,
+    experiments — with the same barrier, ordering, and receipt discipline
+    as M3. Reference-aware payload deletion now spans tenants: a blob two
+    tenants share survives one tenant's erasure and the receipt names why.
+- **The eval entity model — identity only, no workflow.** The addressing the
+  product thesis requires, and nothing else: **Dataset** (stable id, name,
+  tenant), **DatasetVersion** (immutable, content-addressed manifest of
+  `(example_id, digest)` pairs with a parent version for lineage and the
+  promotion's provenance — re-POSTing identical content IS the same
+  version), **Example** (stable id across versions; input, optional
+  expected output, split label, provenance back to the source span; bodies
+  carry `$payload` references that count as live for the TTL sweep and
+  reference-aware erasure, so a promoted copy is real for offloaded
+  content), **Experiment** (stable id, one dataset version, config
+  metadata), **Run** (the experiment→trace link, appended by the external
+  harness), and **Score** — an annotation whose addressing was generalized
+  to a typed subject (trace / span / session / experiment example), so a
+  score addresses the `(experiment, example, span)` tuple with every
+  existing annotation field preserved. All of it lives in `evals.jsonl`, a
+  new manifested append-only recovery domain with the annotation log's
+  torn-tail healing and pin-by-copy discipline. Deletion semantics were
+  settled up front and are enforced by test: erasing source traces never
+  corrupts a dataset version (the receipt's new `eval-records` domain
+  REPORTS surviving copies and turns inconclusive — purging a curated copy
+  is a deliberate second act); erasing a payload leaves dangling addresses
+  in example bodies, reported retained-by-design without losing
+  conclusiveness; a dataset-version tombstone is logical deletion with
+  defined effects (410 with the tombstone, dependent experiments keep
+  working and say why, new experiments refused); a tenant erasure takes the
+  tenant's eval records inside the barrier, and ids are never reused past
+  the rewrite (a counter record floors the allocators). Score distributions
+  (`/summary`) and experiment-over-experiment diffs (`/diff`) come from
+  ordinary reads with per-`(example, name)` last-write-wins dedup. The
+  whole loop — promote failing traces, run externally, record runs and
+  scores, read distributions and diffs — runs end to end in CI against the
+  built binary, and survives kill -9.
+
 - **One recovery domain: generations and checkpoints.** Query-visible state
   lived in several independent recovery domains — the write-ahead log and
   buffer, segments, `annotations.jsonl`, `payloads/` — each with its own
@@ -168,6 +238,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     stored adversarial text has no destructive tool to actuate.
 
 ### Changed
+
+- **Ingest rejects an inadmissible tenant with 400, on both surfaces.** A
+  tenant is identity: lowercase `[a-z0-9][a-z0-9._-]`, at most 64 bytes, or
+  empty for the default. A misconfigured `traza.tenant` resource attribute
+  fails the whole OTLP export loudly rather than being silently dropped —
+  partialSuccess is for data the server chose to suppress, not for a defect
+  the client must fix.
+- **Cursor tokens carry a version byte.** The ordering key changed shape
+  (tenant joined it), and a pre-tenancy token must parse as *invalid*, never
+  as a plausible wrong position. Live cursors from before an upgrade get a
+  400, which is what a stale cursor always deserved.
+- **A span decoded from pre-tenancy bytes with a client-supplied top-level
+  `tenant` field** (which round-tripped through the unknown-field contract)
+  is normalized at decode: a value that ingest validation would refuse moves
+  back into the span's extra fields instead of becoming an unqueryable,
+  unerasable identity.
 
 - **Append-only files are digested and verified over their recorded prefix,
   exactly.** `digest_engine` recorded an append-only log's length from one

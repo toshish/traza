@@ -11,6 +11,7 @@ pub mod annotations;
 pub mod auth;
 pub mod content;
 pub mod erasure;
+pub mod evals;
 pub mod expiration;
 mod generation;
 pub mod hash;
@@ -58,6 +59,11 @@ const SEGMENT_SUFFIX: &str = ".seg";
 /// over-selects candidates that re-verification drops.
 const IDX_SERVICE: &str = "\u{0}service";
 const IDX_NAME: &str = "\u{0}name";
+/// Reserved index key carrying a record's tenant. Inserted only when the
+/// tenant is non-empty, so a single-tenant store's segments stay byte-for-byte
+/// what they were before tenancy existed — and tenant-scoped queries and
+/// tenant-subject erasures get an index-served prefilter when it matters.
+const IDX_TENANT: &str = "\u{0}tenant";
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// An event attached to a span.
@@ -94,9 +100,18 @@ pub struct Span {
     /// surfaces reject spans with an empty id.
     pub trace_id: String,
     /// Identifier unique to this span within its trace. Must be non-empty
-    /// (the other half of the primary key): distinct spans sharing an empty
-    /// span_id would collide into one upserted key.
+    /// (with the trace id, the within-tenant half of the primary key):
+    /// distinct spans sharing an empty span_id would collide into one
+    /// upserted key.
     pub span_id: String,
+    /// The tenant this span belongs to. Empty is the DEFAULT tenant, and is
+    /// never serialized, so a single-tenant deployment writes byte-identical
+    /// records to what it wrote before tenancy existed. Non-empty values are
+    /// constrained to `[a-z0-9][a-z0-9._-]{0,63}` at ingest — lowercase only,
+    /// because an identity that needs canonicalization is an identity that
+    /// will one day be compared uncanonicalized (the payload-hash lesson).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tenant: String,
     /// Identifier of the parent span, if this is not a root span.
     #[serde(default)]
     pub parent_span_id: Option<String>,
@@ -257,6 +272,14 @@ pub struct SpanFilter {
     /// this unions the recognized keys, so a session whose spans use mixed
     /// conventions is returned whole (see [`crate::semconv`]).
     pub session: Option<String>,
+    /// Match only spans of this tenant. `None` matches every tenant (the
+    /// operator view); `Some("")` matches the default tenant explicitly;
+    /// `Some(t)` matches tenant `t`. This is THE tenant-scoping choke point:
+    /// a credential bound to a tenant has this forced on every query it can
+    /// express, and every span-filter surface — search, export, tail, series,
+    /// duration, failures, slowest — inherits the predicate by building this
+    /// struct rather than by remembering to check.
+    pub tenant: Option<String>,
     /// Maximum number of returned spans.
     pub limit: Option<usize>,
 }
@@ -264,14 +287,16 @@ pub struct SpanFilter {
 /// Exclusive position in Traza's stable span order.
 ///
 /// Passing a cursor to [`Store::query_after`] returns only spans ordered after
-/// `(start_time_ns, end_time_ns, trace_id, span_id)`. This is the bounded
-/// pagination primitive used by dataset export.
+/// `(start_time_ns, end_time_ns, tenant, trace_id, span_id)`. This is the
+/// bounded pagination primitive used by dataset export.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SpanCursor {
     /// Span start timestamp.
     pub start_time_ns: u64,
     /// Span end timestamp.
     pub end_time_ns: u64,
+    /// Tenant; empty for the default tenant.
+    pub tenant: String,
     /// Trace identifier.
     pub trace_id: String,
     /// Span identifier.
@@ -283,6 +308,7 @@ impl From<&Span> for SpanCursor {
         Self {
             start_time_ns: span.start_time_ns,
             end_time_ns: span.end_time_ns,
+            tenant: span.tenant.clone(),
             trace_id: span.trace_id.clone(),
             span_id: span.span_id.clone(),
         }
@@ -297,15 +323,22 @@ impl SpanCursor {
     ///
     /// Opaque on purpose: a client that cannot parse the token cannot come to
     /// depend on its layout, which leaves the ordering key free to change. The
-    /// payload is `start | end | trace_len | trace | span`, so an id
-    /// containing any byte — including the delimiters a text encoding would
-    /// need — round-trips exactly.
+    /// payload is `version | start | end | tenant_len | tenant | trace_len |
+    /// trace | span`, so an id containing any byte — including the delimiters
+    /// a text encoding would need — round-trips exactly. The leading version
+    /// byte exists because the layout HAS changed once (tenancy): without it,
+    /// a pre-tenancy token could parse into a valid wrong cursor — a silently
+    /// wrong page, the exact failure this parser promises to prevent.
     pub fn to_token(&self) -> String {
+        let tenant = self.tenant.as_bytes();
         let trace = self.trace_id.as_bytes();
         let span = self.span_id.as_bytes();
-        let mut raw = Vec::with_capacity(20 + trace.len() + span.len());
+        let mut raw = Vec::with_capacity(25 + tenant.len() + trace.len() + span.len());
+        raw.push(CURSOR_VERSION);
         raw.extend_from_slice(&self.start_time_ns.to_be_bytes());
         raw.extend_from_slice(&self.end_time_ns.to_be_bytes());
+        raw.extend_from_slice(&(tenant.len() as u32).to_be_bytes());
+        raw.extend_from_slice(tenant);
         raw.extend_from_slice(&(trace.len() as u32).to_be_bytes());
         raw.extend_from_slice(trace);
         raw.extend_from_slice(span);
@@ -340,23 +373,33 @@ impl SpanCursor {
                 raw.push((bits >> have) as u8);
             }
         }
-        if raw.len() < 20 {
+        if raw.len() < 25 || raw[0] != CURSOR_VERSION {
             return None;
         }
-        let start_time_ns = u64::from_be_bytes(raw[0..8].try_into().ok()?);
-        let end_time_ns = u64::from_be_bytes(raw[8..16].try_into().ok()?);
-        let trace_len = u32::from_be_bytes(raw[16..20].try_into().ok()?) as usize;
-        let rest = raw.get(20..)?;
+        let start_time_ns = u64::from_be_bytes(raw[1..9].try_into().ok()?);
+        let end_time_ns = u64::from_be_bytes(raw[9..17].try_into().ok()?);
+        let tenant_len = u32::from_be_bytes(raw[17..21].try_into().ok()?) as usize;
+        let rest = raw.get(21..)?;
+        let tenant = rest.get(..tenant_len)?;
+        let rest = rest.get(tenant_len..)?;
+        let trace_len = u32::from_be_bytes(rest.get(..4)?.try_into().ok()?) as usize;
+        let rest = rest.get(4..)?;
         let trace = rest.get(..trace_len)?;
         let span = rest.get(trace_len..)?;
         Some(Self {
             start_time_ns,
             end_time_ns,
+            tenant: String::from_utf8(tenant.to_vec()).ok()?,
             trace_id: String::from_utf8(trace.to_vec()).ok()?,
             span_id: String::from_utf8(span.to_vec()).ok()?,
         })
     }
 }
+
+/// Version byte leading every cursor token. Bumped when the ordering key
+/// changes shape; a token from another version parses to `None`, never to a
+/// plausible wrong position.
+const CURSOR_VERSION: u8 = 1;
 
 /// What one query actually had to do, reported back with its results.
 ///
@@ -627,6 +670,14 @@ pub struct Config {
     pub shadow_seal: bool,
     /// Retention period in seconds; zero disables TTL expiration.
     pub ttl_seconds: Option<u64>,
+    /// Per-tenant retention overrides, in seconds, keyed by tenant name. A
+    /// tenant listed here expires on its own window; a tenant not listed
+    /// falls back to [`Config::ttl_seconds`] — and if that is unset, NEVER
+    /// expires, whatever other tenants are configured with. Retention is a
+    /// per-tenant policy the moment tenants exist; a single window forced on
+    /// every tenant would make one customer's compliance clock another's
+    /// data loss.
+    pub tenant_ttl_seconds: std::collections::HashMap<String, u64>,
     /// String attribute values longer than this many bytes are offloaded to
     /// the content-addressed payload store and replaced by a reference
     /// object (see [`payload`]). `None` disables offloading.
@@ -772,6 +823,7 @@ impl Default for Config {
             max_buffer_age: Some(DEFAULT_MAX_BUFFER_AGE),
             shadow_seal: true,
             ttl_seconds: None,
+            tenant_ttl_seconds: std::collections::HashMap::new(),
             payload_threshold: None,
             durability: Durability::Wal,
             compaction: Some(CompactionConfig::default()),
@@ -855,6 +907,15 @@ pub enum Error {
     /// which is how a live tail came to silently discard every span that
     /// started before its window.
     UnsupportedFilter(&'static str),
+    /// A request named something that does not hold — an unknown dataset, a
+    /// parent version from another dataset, an example outside its
+    /// experiment's manifest. The client's error, with the offender named.
+    Invalid(String),
+    /// A request conflicts with the store's current state rather than being
+    /// malformed: a tenant with an erasure pending, a tombstoned version, a
+    /// payload reference whose bytes are gone. Retryable once the state
+    /// changes, which is exactly what HTTP 409 means.
+    Conflict(String),
 }
 
 impl fmt::Display for Error {
@@ -868,6 +929,8 @@ impl fmt::Display for Error {
             Self::QueryTooBroad(reason) => write!(f, "query too broad: {reason}"),
             Self::UnsupportedFilter(reason) => write!(f, "unsupported filter: {reason}"),
             Self::WalCorrupt(detail) => write!(f, "write-ahead log is corrupt: {detail}"),
+            Self::Invalid(reason) => write!(f, "invalid request: {reason}"),
+            Self::Conflict(reason) => write!(f, "conflict: {reason}"),
         }
     }
 }
@@ -882,7 +945,9 @@ impl StdError for Error {
             | Self::InvalidSpan(_)
             | Self::QueryTooBroad(_)
             | Self::WalCorrupt(_)
-            | Self::UnsupportedFilter(_) => None,
+            | Self::UnsupportedFilter(_)
+            | Self::Invalid(_)
+            | Self::Conflict(_) => None,
         }
     }
 }
@@ -1053,6 +1118,9 @@ fn span_to_record(span: &Span) -> Result<segment::RecordInput> {
     }
     attributes.insert(IDX_SERVICE.to_owned(), span.service.clone());
     attributes.insert(IDX_NAME.to_owned(), span.name.clone());
+    if !span.tenant.is_empty() {
+        attributes.insert(IDX_TENANT.to_owned(), span.tenant.clone());
+    }
     // Content is carried unescaped and separately from `attributes`, whose
     // values are canonical JSON. See `RecordInput::content`.
     let content = content_strs(span)
@@ -1069,7 +1137,47 @@ fn span_to_record(span: &Span) -> Result<segment::RecordInput> {
 }
 
 fn record_to_span(record: &segment::Record) -> Result<Span> {
-    Ok(serde_json::from_slice(record.payload())?)
+    let mut span: Span = serde_json::from_slice(record.payload())?;
+    normalize_decoded_tenant(&mut span);
+    Ok(span)
+}
+
+/// Repairs a decoded span whose `tenant` field predates tenancy.
+///
+/// Before the tenant joined the primary key, a client-supplied top-level
+/// `tenant` field round-tripped through [`Span::extra`] like any unknown
+/// field. Those bytes now deserialize into the IDENTITY field — possibly with
+/// a value ingest validation would refuse, which no erasure subject could
+/// ever name and no scoped query could ever select. Decode paths (segment
+/// records, log replay) route such values back where they always lived, so
+/// the identity field only ever holds what validation admits. The empty
+/// check makes this free for every store that never hit the collision.
+fn normalize_decoded_tenant(span: &mut Span) {
+    if span.tenant.is_empty() || valid_tenant(&span.tenant) {
+        return;
+    }
+    let legacy = std::mem::take(&mut span.tenant);
+    span.extra
+        .insert("tenant".to_owned(), Value::String(legacy));
+}
+
+/// Whether `tenant` is admissible as a tenant identity: `[a-z0-9]` first,
+/// then up to 63 more of `[a-z0-9._-]`. Lowercase-only by fiat — an identity
+/// that needs canonicalizing will one day be compared uncanonicalized.
+pub fn valid_tenant(tenant: &str) -> bool {
+    let bytes = tenant.as_bytes();
+    let Some(first) = bytes.first() else {
+        return false;
+    };
+    if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
+        return false;
+    }
+    if bytes.len() > 64 {
+        return false;
+    }
+    bytes[1..].iter().all(|byte| {
+        byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
+    })
 }
 
 impl Segment {
@@ -1093,9 +1201,12 @@ impl Segment {
         }
     }
 
-    fn contains_key(&self, trace_id: &str, span_id: &str) -> Result<bool> {
+    fn contains_key(&self, tenant: &str, trace_id: &str, span_id: &str) -> Result<bool> {
+        // The trace index is keyed by trace text alone and may hold another
+        // tenant's spans under the same id — it accelerates, the decoded
+        // span decides (invariant 7).
         for span in self.trace_spans(trace_id)? {
-            if span.span_id == span_id {
+            if span.span_id == span_id && span.tenant == tenant {
                 return Ok(true);
             }
         }
@@ -1147,10 +1258,13 @@ fn segment_error(error: segment::Error) -> Error {
 
 /// The in-memory write buffer, keyed by span identity.
 ///
-/// Both halves of the (trace_id, span_id) primary key must be non-empty at
-/// the engine boundary, not just at the HTTP surfaces: distinct spans sharing
-/// an empty id would silently collapse into one upserted key for any library
-/// consumer too.
+/// Both the trace and span halves of the (tenant, trace_id, span_id) primary
+/// key must be non-empty at the engine boundary, not just at the HTTP
+/// surfaces: distinct spans sharing an empty id would silently collapse into
+/// one upserted key for any library consumer too. The tenant half is the one
+/// component that MAY be empty — empty IS the default tenant — but a
+/// non-empty tenant must satisfy [`valid_tenant`], for the same reason both
+/// checks live here at all.
 fn validate_span(span: &Span) -> Result<()> {
     if span.trace_id.is_empty() {
         return Err(Error::InvalidSpan("trace_id is empty"));
@@ -1158,12 +1272,18 @@ fn validate_span(span: &Span) -> Result<()> {
     if span.span_id.is_empty() {
         return Err(Error::InvalidSpan("span_id is empty"));
     }
+    if !span.tenant.is_empty() && !valid_tenant(&span.tenant) {
+        return Err(Error::InvalidSpan(
+            "tenant must be lowercase [a-z0-9][a-z0-9._-], at most 64 bytes",
+        ));
+    }
     Ok(())
 }
 
-/// (trace_id, span_id) is the span's PRIMARY KEY: re-ingesting an existing
-/// key replaces the buffered version in place — retries are idempotent and
-/// never create a second acknowledged copy.
+/// (tenant, trace_id, span_id) is the span's PRIMARY KEY: re-ingesting an
+/// existing key replaces the buffered version in place — retries are
+/// idempotent and never create a second acknowledged copy — and two tenants
+/// sharing a trace id can never upsert over each other.
 ///
 /// **Why the spans are behind an `Arc`.** A seal has to take the buffer's
 /// contents away with it and write them with no lock held, while the buffer
@@ -1179,7 +1299,7 @@ fn validate_span(span: &Span) -> Result<()> {
 #[derive(Debug, Default)]
 struct WriteBuffer {
     spans: Vec<std::sync::Arc<Span>>,
-    index: std::collections::HashMap<(String, String), usize>,
+    index: std::collections::HashMap<(String, String, String), usize>,
     /// Spans upserted since the last seal, counting replacements. `spans.len()`
     /// deliberately does not: an update to a buffered key leaves the record
     /// count untouched while still costing a log record, so the flush policy
@@ -1204,7 +1324,11 @@ impl WriteBuffer {
     /// keeps the span alive after a seal evicts it from here — which is exactly
     /// what a tail wants to keep showing.
     fn upsert(&mut self, span: Span) -> std::sync::Arc<Span> {
-        let key = (span.trace_id.clone(), span.span_id.clone());
+        let key = (
+            span.tenant.clone(),
+            span.trace_id.clone(),
+            span.span_id.clone(),
+        );
         self.upserts += 1;
         if self.spans.is_empty() {
             self.oldest_at = Some(Instant::now());
@@ -1233,9 +1357,9 @@ impl WriteBuffer {
         self.spans.is_empty()
     }
 
-    fn contains_key(&self, trace_id: &str, span_id: &str) -> bool {
+    fn contains_key(&self, tenant: &str, trace_id: &str, span_id: &str) -> bool {
         self.index
-            .contains_key(&(trace_id.to_owned(), span_id.to_owned()))
+            .contains_key(&(tenant.to_owned(), trace_id.to_owned(), span_id.to_owned()))
     }
 
     /// Adopts `spans` as the whole buffer, rebuilding the position index.
@@ -1280,8 +1404,14 @@ impl WriteBuffer {
     fn reindex(&mut self) {
         self.index.clear();
         for (position, span) in self.spans.iter().enumerate() {
-            self.index
-                .insert((span.trace_id.clone(), span.span_id.clone()), position);
+            self.index.insert(
+                (
+                    span.tenant.clone(),
+                    span.trace_id.clone(),
+                    span.span_id.clone(),
+                ),
+                position,
+            );
         }
     }
 }
@@ -1497,7 +1627,7 @@ struct Sealed {
 
 /// An erasure subject at request time: the span keys it covers, and the
 /// payload references those spans carry.
-type ResolvedSubject = (Vec<(String, String)>, Vec<String>);
+type ResolvedSubject = (Vec<(String, String, String)>, Vec<String>);
 
 /// What one erasure's purge removed, counted physically: superseded versions
 /// of an erased key held the bytes too, so they count and they go.
@@ -1509,9 +1639,149 @@ struct SubjectPurge {
     redacted: usize,
     /// Every key a removed or redacted record carried — the tail veil's
     /// coverage, and the union the annotation drop tests against.
-    keys: std::collections::HashSet<(String, String)>,
+    keys: std::collections::HashSet<(String, String, String)>,
     /// Every payload reference a REMOVED record carried, before redaction.
     payload_refs: std::collections::HashSet<String>,
+}
+
+/// One tenant's usage row, from [`Store::tenant_usage`].
+#[derive(Clone, Debug, Serialize)]
+pub struct TenantUsage {
+    /// The tenant; empty is the default tenant.
+    pub tenant: String,
+    /// Logical spans currently visible (LWW-resolved, superseded versions
+    /// excluded — this is what the tenant sees, not what disk holds).
+    pub spans: u64,
+    /// Distinct traces among them.
+    pub traces: u64,
+    /// Serialized size of those spans, approximately — inline content only.
+    pub bytes_approx: u64,
+    /// Bytes of distinct offloaded payloads the tenant's spans reference,
+    /// from the reference objects' recorded sizes. A blob shared across
+    /// tenants counts for EVERY referencing tenant: for a quota question,
+    /// each of them is holding the store to those bytes.
+    pub payload_bytes_approx: u64,
+    /// Earliest span start.
+    pub first_start_ns: u64,
+    /// Latest span end.
+    pub last_end_ns: u64,
+}
+
+/// The recorded byte size of `reference` as `span` carries it — reference
+/// objects record `bytes` at offload time, so accounting never opens files.
+fn payload_ref_bytes(span: &Span, reference: &str) -> u64 {
+    let from = |attributes: &Map<String, Value>| {
+        attributes.values().find_map(|value| {
+            (value.get(payload::PAYLOAD_KEY).and_then(Value::as_str) == Some(reference))
+                .then(|| value.get("bytes").and_then(Value::as_u64))
+                .flatten()
+        })
+    };
+    from(&span.attributes)
+        .or_else(|| span.events.iter().find_map(|event| from(&event.attributes)))
+        .unwrap_or(0)
+}
+
+/// Wall clock in Unix nanoseconds, saturating at zero before the epoch.
+fn unix_now_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos().min(u128::from(u64::MAX)) as u64)
+}
+
+/// The per-tenant expiry policy, resolved to absolute cutoffs.
+///
+/// One number cannot express "tenant A keeps a day, tenant B keeps a month,
+/// tenant C keeps everything" — and the segment fast paths need CONSERVATIVE
+/// bounds over the whole policy, not a bound over whichever tenants happen to
+/// be configured. Getting the retire-whole bound wrong deletes an unswept
+/// tenant's segment outright, which is why the bounds are computed here, once,
+/// instead of at each use site.
+#[derive(Debug)]
+struct ExpiryCutoffs {
+    /// Cutoff for tenants without an override; `None` means such tenants
+    /// never expire.
+    default: Option<u64>,
+    /// Per-tenant cutoff overrides.
+    tenants: std::collections::HashMap<String, u64>,
+}
+
+impl ExpiryCutoffs {
+    /// One cutoff for everyone — [`Store::expire_before`]'s contract.
+    fn single(cutoff_ns: u64) -> Self {
+        Self {
+            default: Some(cutoff_ns),
+            tenants: std::collections::HashMap::new(),
+        }
+    }
+
+    /// The configured policy as absolute cutoffs, or `None` when no window
+    /// is configured anywhere (retention wholly disabled). A zero TTL is
+    /// documented as "disabled", not "expire everything now" — for the
+    /// global window and for each override alike.
+    fn from_config(config: &Config, now_ns: u64) -> Option<Self> {
+        let cutoff = |ttl_seconds: u64| {
+            (ttl_seconds > 0)
+                .then(|| now_ns.saturating_sub(ttl_seconds.saturating_mul(1_000_000_000)))
+        };
+        let default = config.ttl_seconds.and_then(cutoff);
+        let tenants: std::collections::HashMap<String, u64> = config
+            .tenant_ttl_seconds
+            .iter()
+            .filter_map(|(tenant, ttl)| cutoff(*ttl).map(|cut| (tenant.clone(), cut)))
+            .collect();
+        if default.is_none() && tenants.is_empty() {
+            return None;
+        }
+        Some(Self { default, tenants })
+    }
+
+    /// This tenant's cutoff: its override, else the default, else never.
+    fn cutoff_for(&self, tenant: &str) -> Option<u64> {
+        self.tenants.get(tenant).copied().or(self.default)
+    }
+
+    /// The latest instant any configured window reaches — a span ending at
+    /// or after this expires under NO policy, so a segment entirely newer
+    /// is skipped without a decode.
+    fn latest(&self) -> u64 {
+        self.tenants
+            .values()
+            .copied()
+            .chain(self.default)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// The earliest instant every span is bound by, or `None` when no such
+    /// bound exists. It exists only when the DEFAULT window does: a tenant
+    /// with no override and no default has no cutoff at all, and a
+    /// retire-whole decision taken without it would delete that tenant's
+    /// unexpired spans with the segment.
+    fn retire_bound(&self) -> Option<u64> {
+        let default = self.default?;
+        Some(
+            self.tenants
+                .values()
+                .copied()
+                .chain(std::iter::once(default))
+                .min()
+                .expect("at least the default"),
+        )
+    }
+
+    /// The earliest configured cutoff — the payload sweep's mtime gate.
+    /// Liveness and touch immunity carry payload safety; this bound only
+    /// protects brand-new files, so the most conservative instant costs at
+    /// most a lingering orphan.
+    fn earliest(&self) -> u64 {
+        self.tenants
+            .values()
+            .copied()
+            .chain(self.default)
+            .min()
+            .unwrap_or(0)
+    }
 }
 
 /// A durable span store backed by sorted JSON-lines segment files.
@@ -1578,6 +1848,11 @@ pub struct Store {
     // entirely rather than at the bottom of it.
     tail: tail::TailChannel,
     annotations: annotations::AnnotationLog,
+    /// The eval log: datasets, versions, examples, experiments, runs — a
+    /// manifested recovery domain like the annotation log. Its mutex is
+    /// leaf-level; every mutation additionally holds the erasure gate's read
+    /// half, because a tenant erasure rewrites this log inside its barrier.
+    evals: evals::EvalLog,
     /// The tombstone log: every erasure requested and settled, plus the mask
     /// over the pending ones that every read path consults. See [`erasure`].
     erasures: erasure::ErasureLog,
@@ -1731,6 +2006,7 @@ impl Store {
 
             Ok(Self {
                 annotations: annotations::AnnotationLog::open(&directory)?,
+                evals: evals::EvalLog::open(&directory)?,
                 // Replayed before serving: a pending erasure — one whose purge
                 // a crash interrupted — masks its subject from the first query
                 // this store answers, and stays masked until the resumed purge
@@ -2061,23 +2337,43 @@ impl Store {
     /// combined view, so a concurrent flush cannot move spans between halves
     /// of the snapshot and make them temporarily disappear.
     pub fn get_trace(&self, trace_id: &str) -> Result<Vec<Span>> {
+        self.get_trace_in(None, trace_id)
+    }
+
+    /// [`Self::get_trace`] under a tenant scope. `None` is the operator view
+    /// — every tenant's spans under this trace id, in one response — and
+    /// `Some(tenant)` is that tenant's trace alone, which is what a bound
+    /// credential always gets and what erasure subject resolution always
+    /// uses: a subject resolved without the scope could record another
+    /// tenant's newer same-id span and miss its own.
+    pub fn get_trace_in(&self, tenant: Option<&str>, trace_id: &str) -> Result<Vec<Span>> {
         let mask = self.erasure_mask();
         let writer = self.lock_writer()?;
         let segments = self.lock_segments()?;
         let mut result = Vec::new();
 
-        // (trace_id, span_id) is the span's primary key: the newest ingested
-        // version wins. Segments are visited oldest-first so later versions
-        // overwrite, and the write buffer overwrites everything.
-        let mut latest: std::collections::HashMap<String, Span> = std::collections::HashMap::new();
+        let in_scope = |span: &Span| tenant.map_or(true, |tenant| span.tenant.as_str() == tenant);
+        // (tenant, trace_id, span_id) is the span's primary key: the newest
+        // ingested version wins. Segments are visited oldest-first so later
+        // versions overwrite, and the write buffer overwrites everything.
+        // The LWW map is keyed by (tenant, span_id) — trace fixed by the
+        // argument — so two tenants sharing an id never collapse into one
+        // entry even in the operator view.
+        let mut latest: std::collections::HashMap<(String, String), Span> =
+            std::collections::HashMap::new();
         for segment in segments.iter() {
             for span in segment.trace_spans(trace_id)? {
-                latest.insert(span.span_id.clone(), span);
+                if in_scope(&span) {
+                    latest.insert((span.tenant.clone(), span.span_id.clone()), span);
+                }
             }
         }
         for span in writer.spans.iter() {
-            if span.trace_id == trace_id {
-                latest.insert(span.span_id.clone(), Span::clone(span));
+            if span.trace_id == trace_id && in_scope(span) {
+                latest.insert(
+                    (span.tenant.clone(), span.span_id.clone()),
+                    Span::clone(span),
+                );
             }
         }
         result.extend(
@@ -2143,7 +2439,7 @@ impl Store {
         // the single-key attribute index cannot express — resolve it up front,
         // then apply the remaining predicates, order, and limit.
         if let Some(session_id) = &filter.session {
-            let spans = self.resolve_session_spans(session_id)?;
+            let spans = self.resolve_session_spans(filter.tenant.as_deref(), session_id)?;
             return Ok(narrow_session_spans(spans, filter, cursor));
         }
         let mask = self.erasure_mask();
@@ -2173,7 +2469,7 @@ impl Store {
         let started = std::time::Instant::now();
         let mut cost = QueryCost::default();
         let spans = if let Some(session_id) = &filter.session {
-            let spans = self.resolve_session_spans(session_id)?;
+            let spans = self.resolve_session_spans(filter.tenant.as_deref(), session_id)?;
             narrow_session_spans(spans, filter, cursor)
         } else {
             let mask = self.erasure_mask();
@@ -2270,6 +2566,7 @@ impl SnapshotView<'_> {
             let spans = analytics::resolve_session_spans_in(
                 &self.buffer,
                 &self.segments,
+                filter.tenant.as_deref(),
                 session_id,
                 self.mask.as_deref(),
             )?;
@@ -2352,18 +2649,23 @@ pub(crate) fn attribute_union_view(
     };
 
     let mut result: Vec<Span> = Vec::new();
-    let mut claimed: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    let mut claimed: std::collections::HashSet<(String, String, String)> =
+        std::collections::HashSet::new();
     // The buffer holds the newest version of anything it carries.
     for span in buffer.spans.iter() {
         if visible(span) && matches(span) {
-            claimed.insert((span.trace_id.clone(), span.span_id.clone()));
+            claimed.insert((
+                span.tenant.clone(),
+                span.trace_id.clone(),
+                span.span_id.clone(),
+            ));
             result.push(Span::clone(span));
         }
     }
     // Any key present in the buffer supersedes every segment copy, even
     // one the predicate does not select in its buffered version.
-    for (trace_id, span_id) in buffer.index.keys() {
-        claimed.insert((trace_id.clone(), span_id.clone()));
+    for key in buffer.index.keys() {
+        claimed.insert(key.clone());
     }
     // Newest segment first, so the first version claimed for a key wins.
     for segment in segments.iter().rev() {
@@ -2386,7 +2688,11 @@ pub(crate) fn attribute_union_view(
             if !visible(&span) || !matches(&span) {
                 continue;
             }
-            if claimed.insert((span.trace_id.clone(), span.span_id.clone())) {
+            if claimed.insert((
+                span.tenant.clone(),
+                span.trace_id.clone(),
+                span.span_id.clone(),
+            )) {
                 result.push(span);
             }
         }
@@ -2584,7 +2890,7 @@ pub(crate) fn query_view_costed(
             }
 
             let mut result: Vec<Span> = Vec::with_capacity(limit.min(1024));
-            let mut emitted: std::collections::HashSet<(String, String)> =
+            let mut emitted: std::collections::HashSet<(String, String, String)> =
                 std::collections::HashSet::new();
             while result.len() < limit {
                 let mut best: Option<usize> = None;
@@ -2610,7 +2916,11 @@ pub(crate) fn query_view_costed(
                 {
                     continue;
                 }
-                let key = (span.trace_id.clone(), span.span_id.clone());
+                let key = (
+                    span.tenant.clone(),
+                    span.trace_id.clone(),
+                    span.span_id.clone(),
+                );
                 if emitted.contains(&key) {
                     continue;
                 }
@@ -2627,11 +2937,17 @@ pub(crate) fn query_view_costed(
                     Source::Lazy {
                         segment_position, ..
                     } => {
-                        writer.contains_key(&span.trace_id, &span.span_id)
+                        writer.contains_key(&span.tenant, &span.trace_id, &span.span_id)
                             || segments
                                 .iter()
                                 .skip(segment_position + 1)
-                                .map(|segment| segment.contains_key(&span.trace_id, &span.span_id))
+                                .map(|segment| {
+                                    segment.contains_key(
+                                        &span.tenant,
+                                        &span.trace_id,
+                                        &span.span_id,
+                                    )
+                                })
                                 .collect::<Result<Vec<_>>>()?
                                 .into_iter()
                                 .any(|contains| contains)
@@ -2684,12 +3000,12 @@ pub(crate) fn query_view_costed(
                 {
                     continue;
                 }
-                if writer.contains_key(&span.trace_id, &span.span_id) {
+                if writer.contains_key(&span.tenant, &span.trace_id, &span.span_id) {
                     continue; // the buffer holds a newer version
                 }
                 let mut superseded = false;
                 for newer in segments.iter().skip(position + 1) {
-                    if newer.contains_key(&span.trace_id, &span.span_id)? {
+                    if newer.contains_key(&span.tenant, &span.trace_id, &span.span_id)? {
                         superseded = true;
                         break;
                     }
@@ -2769,12 +3085,12 @@ pub(crate) fn fold_view(
             if !visible(&span) || !span_matches(&span, filter, content.as_ref()) {
                 continue;
             }
-            if writer.contains_key(&span.trace_id, &span.span_id) {
+            if writer.contains_key(&span.tenant, &span.trace_id, &span.span_id) {
                 continue; // the buffer holds a newer version
             }
             let mut superseded = false;
             for newer in segments.iter().skip(position + 1) {
-                if newer.contains_key(&span.trace_id, &span.span_id)? {
+                if newer.contains_key(&span.tenant, &span.trace_id, &span.span_id)? {
                     superseded = true;
                     break;
                 }
@@ -2818,7 +3134,7 @@ impl Store {
             // expresses. Its span count is bounded by one conversation, so
             // resolving it up front costs a conversation, not a corpus.
             let content = filter.content.as_deref().map(content::Query::new);
-            for span in self.resolve_session_spans(session_id)? {
+            for span in self.resolve_session_spans(filter.tenant.as_deref(), session_id)? {
                 if span_matches(&span, filter, content.as_ref()) {
                     visit(&span);
                 }
@@ -2879,9 +3195,19 @@ impl Store {
             .read()
             .map_err(|_| Error::LockPoisoned("erasure gate"))?;
         if let Some(mask) = self.erasure_mask() {
-            if mask.covers_annotation(&annotation.trace_id, &annotation.span_id) {
+            if mask.covers_annotation(&annotation) {
                 return Ok(());
             }
+        }
+        // A score's address must hold at write time: its experiment exists,
+        // belongs to the score's tenant, and lists the example. Validated
+        // under the eval log's own mutex, and under the same gate hold as
+        // the append — a tombstone or erasure cannot slide between check
+        // and write.
+        if let Some(experiment_id) = annotation.experiment_id {
+            annotation.validate_subject()?;
+            self.evals
+                .validate_score(&annotation.tenant, experiment_id, &annotation.example_id)?;
         }
         self.annotations.append(annotation)
     }
@@ -2893,15 +3219,25 @@ impl Store {
         span_id: Option<&str>,
         name: Option<&str>,
     ) -> Result<Vec<annotations::Annotation>> {
-        let mut found = self.annotations.query(trace_id, span_id, name)?;
+        self.annotations_in(None, trace_id, span_id, name)
+    }
+
+    /// [`Self::annotations`] under a tenant scope; `None` is the operator
+    /// view, `Some(t)` only tenant `t`'s judgments.
+    pub fn annotations_in(
+        &self,
+        tenant: Option<&str>,
+        trace_id: &str,
+        span_id: Option<&str>,
+        name: Option<&str>,
+    ) -> Result<Vec<annotations::Annotation>> {
+        let mut found = self.annotations.query(tenant, trace_id, span_id, name)?;
         // "Invisible to every query" includes the judgments ABOUT the
         // subject: an annotation addressed to a pending erasure's span is
         // withheld exactly as the span is, and the purge drops it before the
         // mask lifts.
         if let Some(mask) = self.erasure_mask() {
-            found.retain(|annotation| {
-                !mask.covers_annotation(&annotation.trace_id, &annotation.span_id)
-            });
+            found.retain(|annotation| !mask.covers_annotation(annotation));
         }
         Ok(found)
     }
@@ -2915,15 +3251,383 @@ impl Store {
         let mut found = self.annotations.search(narrow)?;
         // Same rule as [`Self::annotations`], for the same reason.
         if let Some(mask) = self.erasure_mask() {
-            found.retain(|annotation| {
-                !mask.covers_annotation(&annotation.trace_id, &annotation.span_id)
-            });
+            found.retain(|annotation| !mask.covers_annotation(annotation));
         }
         Ok(found)
     }
 
+    // ------------------------------------------------------------- evals
+    //
+    // Every eval MUTATION holds the erasure gate's read half across its
+    // whole validate+append, exactly as span and annotation admission do: a
+    // tenant erasure's `begin` takes the write half, so a dataset, version,
+    // experiment, run or tombstone append is wholly before the erasure
+    // (the barrier rewrite removes it) or wholly after (the mask refuses it
+    // with a 409-shaped Conflict) — never astride the transition.
+
+    /// Creates a dataset owned by `tenant` (empty = the default tenant) and
+    /// returns its id.
+    pub fn create_dataset(&self, tenant: &str, name: &str) -> Result<u64> {
+        let _gate = self
+            .erasure_gate
+            .read()
+            .map_err(|_| Error::LockPoisoned("erasure gate"))?;
+        let mask = self.erasure_mask();
+        self.evals
+            .create_dataset(mask.as_deref(), tenant, name, unix_now_ns())
+    }
+
+    /// Creates (or idempotently re-finds) a dataset version. `scope` is a
+    /// bound principal's tenant; a dataset outside the scope reads as
+    /// nonexistent.
+    pub fn create_dataset_version(
+        &self,
+        scope: Option<&str>,
+        dataset_id: u64,
+        parent: Option<String>,
+        provenance: Option<Value>,
+        examples: Vec<evals::NewExample>,
+    ) -> Result<evals::VersionOutcome> {
+        let _gate = self
+            .erasure_gate
+            .read()
+            .map_err(|_| Error::LockPoisoned("erasure gate"))?;
+        let mask = self.erasure_mask();
+        // The payload interlock: touch first, then check existence — the
+        // registry insert is what makes a concurrent TTL sweep's unlink
+        // yield, exactly as `store_payload` does for fresh writes. An
+        // example whose reference is already gone is refused, not recorded
+        // dangling.
+        let verify = |reference: &str| -> Result<bool> {
+            if let Ok(mut touched) = self.recent_payloads.lock() {
+                touched.insert(reference.to_owned(), Instant::now());
+            }
+            let Some(hash) = reference.strip_prefix("sha256/") else {
+                return Ok(false);
+            };
+            Ok(payload::payload_path(&self.directory, hash).exists())
+        };
+        self.evals.create_version(
+            mask.as_deref(),
+            scope,
+            dataset_id,
+            parent,
+            provenance,
+            examples,
+            unix_now_ns(),
+            &verify,
+        )
+    }
+
+    /// Creates an experiment against a dataset version; the experiment
+    /// inherits the dataset's tenant.
+    pub fn create_experiment(
+        &self,
+        scope: Option<&str>,
+        dataset_id: u64,
+        dataset_version: &str,
+        name: &str,
+        config: Option<Value>,
+    ) -> Result<u64> {
+        let _gate = self
+            .erasure_gate
+            .read()
+            .map_err(|_| Error::LockPoisoned("erasure gate"))?;
+        let mask = self.erasure_mask();
+        self.evals.create_experiment(
+            mask.as_deref(),
+            scope,
+            dataset_id,
+            dataset_version,
+            name,
+            config,
+            unix_now_ns(),
+        )
+    }
+
+    /// Records one task run for an experiment's example — the
+    /// experiment→trace link; execution itself stays external.
+    pub fn record_eval_run(
+        &self,
+        scope: Option<&str>,
+        experiment_id: u64,
+        example_id: &str,
+        trace_id: &str,
+        span_id: &str,
+    ) -> Result<()> {
+        let _gate = self
+            .erasure_gate
+            .read()
+            .map_err(|_| Error::LockPoisoned("erasure gate"))?;
+        let mask = self.erasure_mask();
+        self.evals.record_run(
+            mask.as_deref(),
+            scope,
+            experiment_id,
+            example_id,
+            trace_id,
+            span_id,
+            unix_now_ns(),
+        )
+    }
+
+    /// Tombstones a dataset version — logical deletion with defined effects
+    /// (see [`evals::VersionTombstone`]). Idempotent.
+    pub fn tombstone_dataset_version(
+        &self,
+        scope: Option<&str>,
+        dataset_id: u64,
+        version_id: &str,
+        reason: &str,
+    ) -> Result<bool> {
+        let _gate = self
+            .erasure_gate
+            .read()
+            .map_err(|_| Error::LockPoisoned("erasure gate"))?;
+        let mask = self.erasure_mask();
+        self.evals.tombstone_version(
+            mask.as_deref(),
+            scope,
+            dataset_id,
+            version_id,
+            reason,
+            unix_now_ns(),
+        )
+    }
+
+    /// Whether a pending tenant erasure hides this tenant's eval entities
+    /// from reads — the read half of the eval barrier.
+    fn eval_hidden(&self, tenant: &str) -> bool {
+        self.erasure_mask()
+            .is_some_and(|mask| mask.covers_tenant(tenant))
+    }
+
+    /// Datasets visible under `scope`, versions summarized.
+    pub fn datasets(&self, scope: Option<&str>) -> Result<Vec<evals::DatasetView>> {
+        let mut views = self.evals.datasets(scope)?;
+        views.retain(|view| !self.eval_hidden(&view.dataset.tenant));
+        Ok(views)
+    }
+
+    /// One dataset, or `None` (unknown, foreign to the scope, or hidden by
+    /// a pending tenant erasure).
+    pub fn dataset(
+        &self,
+        scope: Option<&str>,
+        dataset_id: u64,
+    ) -> Result<Option<evals::DatasetView>> {
+        Ok(self
+            .evals
+            .dataset(scope, dataset_id)?
+            .filter(|view| !self.eval_hidden(&view.dataset.tenant)))
+    }
+
+    /// One dataset version with bodies, the tombstone hiding it, or `None`.
+    #[allow(clippy::type_complexity)]
+    pub fn dataset_version(
+        &self,
+        scope: Option<&str>,
+        dataset_id: u64,
+        version_id: &str,
+    ) -> Result<Option<std::result::Result<evals::VersionView, evals::VersionTombstone>>> {
+        Ok(self
+            .evals
+            .version(scope, dataset_id, version_id)?
+            .filter(|found| {
+                let tenant = match found {
+                    Ok(view) => &view.version.tenant,
+                    Err(tombstone) => &tombstone.tenant,
+                };
+                !self.eval_hidden(tenant)
+            }))
+    }
+
+    /// Experiments visible under `scope`, optionally narrowed to a dataset.
+    pub fn experiments(
+        &self,
+        scope: Option<&str>,
+        dataset_id: Option<u64>,
+    ) -> Result<Vec<evals::ExperimentView>> {
+        let mut views = self.evals.experiments(scope, dataset_id)?;
+        views.retain(|view| !self.eval_hidden(&view.experiment.tenant));
+        Ok(views)
+    }
+
+    /// One experiment, or `None`.
+    pub fn experiment(
+        &self,
+        scope: Option<&str>,
+        experiment_id: u64,
+    ) -> Result<Option<evals::ExperimentView>> {
+        Ok(self
+            .evals
+            .experiment(scope, experiment_id)?
+            .filter(|view| !self.eval_hidden(&view.experiment.tenant)))
+    }
+
+    /// An experiment's recorded runs, or `None`.
+    pub fn eval_runs(
+        &self,
+        scope: Option<&str>,
+        experiment_id: u64,
+    ) -> Result<Option<Vec<evals::Run>>> {
+        if self.experiment(scope, experiment_id)?.is_none() {
+            return Ok(None);
+        }
+        self.evals.runs(scope, experiment_id)
+    }
+
+    /// An experiment's scores — the annotations addressed to it — newest
+    /// first, or `None` when the experiment is unknown to the scope.
+    pub fn experiment_scores(
+        &self,
+        scope: Option<&str>,
+        experiment_id: u64,
+        limit: Option<usize>,
+    ) -> Result<Option<Vec<annotations::Annotation>>> {
+        if self.experiment(scope, experiment_id)?.is_none() {
+            return Ok(None);
+        }
+        let narrow = annotations::AnnotationQuery {
+            experiment_id: Some(experiment_id),
+            limit,
+            ..annotations::AnnotationQuery::default()
+        };
+        Ok(Some(self.search_annotations(&narrow)?))
+    }
+
+    /// Score distributions for one experiment, or `None`. Scores are
+    /// deduplicated per `(example, name)` by latest timestamp before any
+    /// statistic — a retried scorer moves a number, it never double-counts.
+    pub fn experiment_summary(
+        &self,
+        scope: Option<&str>,
+        experiment_id: u64,
+    ) -> Result<Option<evals::ExperimentSummary>> {
+        if self.experiment(scope, experiment_id)?.is_none() {
+            return Ok(None);
+        }
+        let examples = self
+            .evals
+            .experiment_examples(scope, experiment_id)?
+            .unwrap_or_default();
+        let scores = self
+            .experiment_scores(scope, experiment_id, None)?
+            .unwrap_or_default();
+        Ok(Some(evals::summarize_scores(
+            experiment_id,
+            examples.len(),
+            &scores,
+        )))
+    }
+
+    /// Experiment-over-experiment comparison, joined on `(example, name)`
+    /// after the same dedup as [`Self::experiment_summary`]. Numeric scores
+    /// compare higher-is-better; booleans as 0/1 — a convention, stated,
+    /// not configurable in this milestone. `None` when either experiment is
+    /// unknown to the scope.
+    pub fn experiment_diff(
+        &self,
+        scope: Option<&str>,
+        base: u64,
+        candidate: u64,
+    ) -> Result<Option<evals::ExperimentDiff>> {
+        let (Some(base_scores), Some(candidate_scores)) = (
+            self.experiment_scores(scope, base, None)?,
+            self.experiment_scores(scope, candidate, None)?,
+        ) else {
+            return Ok(None);
+        };
+        Ok(Some(evals::diff_scores(
+            base,
+            candidate,
+            &base_scores,
+            &candidate_scores,
+        )))
+    }
+
+    /// Per-tenant usage accounting: one exact fold over a pinned snapshot.
+    ///
+    /// This is the ACCOUNTING surface tenancy promises — enforcement is a
+    /// later milestone's problem — and it is O(store) by construction, so it
+    /// is an on-demand answer, not something to poll per minute against a
+    /// hundred-million-span corpus. `scope` narrows a bound principal to its
+    /// own row.
+    pub fn tenant_usage(&self, scope: Option<&str>) -> Result<Vec<TenantUsage>> {
+        struct Accumulator {
+            spans: u64,
+            traces: std::collections::HashSet<String>,
+            bytes_approx: u64,
+            payload_refs: std::collections::HashMap<String, u64>,
+            first_start_ns: u64,
+            last_end_ns: u64,
+        }
+        let mut by_tenant: std::collections::HashMap<String, Accumulator> =
+            std::collections::HashMap::new();
+        let filter = SpanFilter {
+            tenant: scope.map(str::to_owned),
+            ..SpanFilter::default()
+        };
+        self.fold_spans(&filter, |span| {
+            let entry = by_tenant
+                .entry(span.tenant.clone())
+                .or_insert_with(|| Accumulator {
+                    spans: 0,
+                    traces: std::collections::HashSet::new(),
+                    bytes_approx: 0,
+                    payload_refs: std::collections::HashMap::new(),
+                    first_start_ns: u64::MAX,
+                    last_end_ns: 0,
+                });
+            entry.spans += 1;
+            entry.traces.insert(span.trace_id.clone());
+            entry.bytes_approx += serde_json::to_vec(span).map_or(0, |bytes| bytes.len() as u64);
+            let mut refs = std::collections::HashSet::new();
+            erasure::payload_refs_of(span, &mut refs);
+            for reference in refs {
+                let bytes = payload_ref_bytes(span, &reference);
+                entry.payload_refs.entry(reference).or_insert(bytes);
+            }
+            entry.first_start_ns = entry.first_start_ns.min(span.start_time_ns);
+            entry.last_end_ns = entry.last_end_ns.max(span.end_time_ns);
+        })?;
+        let mut rows: Vec<TenantUsage> = by_tenant
+            .into_iter()
+            .map(|(tenant, accumulated)| TenantUsage {
+                tenant,
+                spans: accumulated.spans,
+                traces: accumulated.traces.len() as u64,
+                bytes_approx: accumulated.bytes_approx,
+                payload_bytes_approx: accumulated.payload_refs.values().sum(),
+                first_start_ns: match accumulated.first_start_ns {
+                    u64::MAX => 0,
+                    other => other,
+                },
+                last_end_ns: accumulated.last_end_ns,
+            })
+            .collect();
+        rows.sort_by(|left, right| left.tenant.cmp(&right.tenant));
+        Ok(rows)
+    }
+
     /// Reads an offloaded payload by its `sha256/<hex>` reference.
     pub fn payload(&self, reference: &str) -> Result<Option<Vec<u8>>> {
+        self.payload_in(None, reference)
+    }
+
+    /// [`Self::payload`] under a tenant scope.
+    ///
+    /// Content addressing is store-global, and for the OPERATOR the full
+    /// hash is the capability — knowing it means having read a span that
+    /// disclosed it. Across a tenant boundary that argument fails: the hash
+    /// of GUESSABLE content is computable, and a 200 would confirm another
+    /// tenant stored those exact bytes. So a bound scope must also prove
+    /// REACHABILITY — some span or dataset example of that tenant carries
+    /// the reference — and an unreachable payload answers `None`, exactly
+    /// as an absent one does. The cost is a prefiltered probe (sidecar
+    /// reference sets, then the tenant posting), paid only by bound
+    /// callers on a fetch-shaped request.
+    pub fn payload_in(&self, tenant: Option<&str>, reference: &str) -> Result<Option<Vec<u8>>> {
         // A payload a pending erasure is due to account for is withheld
         // while it is pending — the bytes may be seconds from deletion, and
         // serving them from under an erasure in progress is the same failure
@@ -2934,34 +3638,100 @@ impl Store {
                 return Ok(None);
             }
         }
+        if let Some(tenant) = tenant {
+            if !self.tenant_holds_reference(tenant, reference)? {
+                return Ok(None);
+            }
+        }
         payload::load_payload(&self.directory, reference)
     }
 
-    /// Expires spans, annotations, and payload files older than the
-    /// configured TTL (no-op when TTL is unset or zero).
-    pub fn compact_expired(&self) -> Result<usize> {
-        let Some(ttl_seconds) = self.config.ttl_seconds else {
-            return Ok(0);
-        };
-        // Zero is documented as "disabled", not "expire everything now".
-        if ttl_seconds == 0 {
-            return Ok(0);
-        }
+    /// The eval log's payload references, for the liveness union in
+    /// [`Self::live_payload_refs`] (which lives in the analytics module and
+    /// reaches the eval log through this).
+    pub(crate) fn eval_payload_refs(&self) -> Result<std::collections::HashSet<String>> {
+        self.evals.payload_refs()
+    }
 
+    /// Whether any of `tenant`'s spans or dataset examples carries
+    /// `reference` — the reachability proof behind [`Self::payload_in`].
+    fn tenant_holds_reference(&self, tenant: &str, reference: &str) -> Result<bool> {
+        // The write buffer first: cheap, and where the freshest refs live.
+        {
+            let writer = self.lock_writer()?;
+            let mut refs = std::collections::HashSet::new();
+            for span in writer.spans.iter() {
+                if span.tenant == tenant {
+                    erasure::payload_refs_of(span, &mut refs);
+                    if refs.contains(reference) {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        // The tenant's dataset examples: an example legitimately outlives
+        // its source span, and its holder must keep fetch access.
+        if self.evals.tenant_references(tenant, reference)? {
+            return Ok(true);
+        }
+        // Segments, doubly prefiltered: only segments whose sidecar holds
+        // the reference at all, and within them only the tenant's records.
+        for segment in self.pin_segments()? {
+            let may_hold = match rollup_file::load(&segment.path, segment.rollup_binding()) {
+                Some(rollup) => rollup.payload_refs.contains(reference),
+                None => true, // no usable sidecar cannot be ruled out
+            };
+            if !may_hold {
+                continue;
+            }
+            let offsets = segment
+                .seg
+                .attribute_candidate_offsets(IDX_TENANT, tenant)
+                .to_vec();
+            for offset in offsets {
+                let record = segment
+                    .seg
+                    .record_at_offset(offset)
+                    .map_err(segment_error)?;
+                let span = record_to_span(&record)?;
+                if span.tenant != tenant {
+                    continue;
+                }
+                let mut refs = std::collections::HashSet::new();
+                erasure::payload_refs_of(&span, &mut refs);
+                if refs.contains(reference) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Expires spans, annotations, and payload files older than their
+    /// tenant's retention window (no-op when no TTL is configured at all).
+    /// Every tenant expires on its own cutoff: its override if listed in
+    /// [`Config::tenant_ttl_seconds`], else the global TTL, else never.
+    pub fn compact_expired(&self) -> Result<usize> {
         let now_ns = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos()
             .min(u128::from(u64::MAX)) as u64;
-        let ttl_ns = ttl_seconds.saturating_mul(1_000_000_000);
-        let cutoff_ns = now_ns.saturating_sub(ttl_ns);
+        let Some(cutoffs) = ExpiryCutoffs::from_config(&self.config, now_ns) else {
+            return Ok(0);
+        };
         let _maintenance = self.lock_maintenance()?;
-        let removed = self.expire_before_locked(cutoff_ns)?;
-        // Same retention window for the satellite stores: annotations by
-        // their own timestamps, payload files by mtime (an orphan payload
-        // lingers at most one TTL past its span).
-        self.annotations.drop_older_than(cutoff_ns)?;
-        let cutoff_time = UNIX_EPOCH + std::time::Duration::from_nanos(cutoff_ns);
+        let removed = self.expire_by_policy_locked(&cutoffs)?;
+        // The satellite stores age on the same per-tenant windows:
+        // annotations by their own timestamps and their own tenant (scores
+        // are exempt — eval retention, not trace retention), payload files
+        // by mtime against the EARLIEST configured cutoff — the mtime gate
+        // only protects brand-new files, liveness and touch immunity carry
+        // the real safety, so the conservative bound costs at most a
+        // lingering orphan.
+        self.annotations
+            .drop_older_than(&|tenant| cutoffs.cutoff_for(tenant))?;
+        let cutoff_time = UNIX_EPOCH + std::time::Duration::from_nanos(cutoffs.earliest());
         // Nothing to protect means nothing to compute.
         //
         // `live_payload_refs` walks every segment, and it was run on every
@@ -3350,12 +4120,16 @@ impl Store {
                 // overwrites an earlier one — the same last-write-wins rule
                 // reads apply. Across groups the outputs' ids carry that
                 // order instead.
-                let mut latest: std::collections::HashMap<(String, String), Span> =
+                let mut latest: std::collections::HashMap<(String, String, String), Span> =
                     std::collections::HashMap::new();
-                let mut order: Vec<(String, String)> = Vec::new();
+                let mut order: Vec<(String, String, String)> = Vec::new();
                 for segment in group {
                     for span in segment.spans_parsed()? {
-                        let key = (span.trace_id.clone(), span.span_id.clone());
+                        let key = (
+                            span.tenant.clone(),
+                            span.trace_id.clone(),
+                            span.span_id.clone(),
+                        );
                         if latest.insert(key.clone(), span).is_none() {
                             order.push(key);
                         }
@@ -3487,7 +4261,7 @@ impl Store {
     /// engine lock held, and swapped in one at a time.
     pub fn expire_before(&self, cutoff_ns: u64) -> Result<usize> {
         let _maintenance = self.lock_maintenance()?;
-        self.expire_before_locked(cutoff_ns)
+        self.expire_by_policy_locked(&ExpiryCutoffs::single(cutoff_ns))
     }
 
     /// Removes a segment whose every span has expired.
@@ -3518,8 +4292,13 @@ impl Store {
         Ok(())
     }
 
-    /// [`Self::expire_before`] with the maintenance lock already held.
-    fn expire_before_locked(&self, cutoff_ns: u64) -> Result<usize> {
+    /// [`Self::expire_before`] with the maintenance lock already held,
+    /// generalized to per-tenant cutoffs. Every predicate asks the POLICY,
+    /// never a single number: a tenant with no window keeps its spans while
+    /// its neighbours expire, and the segment fast paths use the policy's
+    /// conservative bounds (see [`ExpiryCutoffs`]) so no whole-segment
+    /// decision can ever be wrong for a tenant the bound did not consider.
+    fn expire_by_policy_locked(&self, cutoffs: &ExpiryCutoffs) -> Result<usize> {
         // A seal in flight drained its spans BEFORE this deletion ran and
         // publishes its segment AFTER, so without this permit an expiry could
         // clean the buffer, the log and every segment it knew about, and then
@@ -3545,12 +4324,17 @@ impl Store {
         // buffer, reported that it had removed nothing, and never repaired the
         // log, so the restart resurrected the span. An expiry that returns an
         // error must leave the store exactly as retryable as it found it.
+        let expired_span = |span: &Span| {
+            cutoffs
+                .cutoff_for(&span.tenant)
+                .is_some_and(|cutoff_ns| span.end_time_ns < cutoff_ns)
+        };
         let mut removed = {
             let mut writer = self.lock_writer()?;
             let expired = writer
                 .spans
                 .iter()
-                .filter(|span| span.end_time_ns < cutoff_ns)
+                .filter(|span| expired_span(span))
                 .count();
             if expired > 0 {
                 if let Some(log) = &self.wal {
@@ -3560,12 +4344,12 @@ impl Store {
                     let survivors: Vec<&Span> = writer
                         .spans
                         .iter()
-                        .filter(|span| span.end_time_ns >= cutoff_ns)
+                        .filter(|span| !expired_span(span))
                         .map(|span| span.as_ref())
                         .collect();
                     log.rewrite(&survivors, 0)?;
                 }
-                writer.retain(|span| span.end_time_ns >= cutoff_ns);
+                writer.retain(|span| !expired_span(span));
             }
             expired
         };
@@ -3595,11 +4379,22 @@ impl Store {
             // through to the decode, which is what this did unconditionally
             // before. Retention is never decided on an unverified byte.
             let bounds = rollup_file::bounds(&segment.path, segment.rollup_binding());
-            if bounds.is_some_and(|bounds| bounds.min_end_ns >= cutoff_ns) {
+            // Skip: no span can be older than the LATEST configured cutoff,
+            // so no policy — however short its window — expires anything
+            // here. Always sound; it only ever declines to decode less.
+            if bounds.is_some_and(|bounds| bounds.min_end_ns >= cutoffs.latest()) {
                 self.metrics.expiry_segments_skipped.increment();
                 continue;
             }
-            if bounds.is_some_and(|bounds| bounds.max_end_ns < cutoff_ns) && !segment.seg.is_empty()
+            // Retire-whole: sound ONLY against a bound every span is subject
+            // to. A tenant with no window has no cutoff at all, so this arm
+            // exists only when the global TTL covers everyone
+            // (`retire_bound` is `None` otherwise), and it tests the
+            // EARLIEST cutoff — the longest window any tenant was promised.
+            if cutoffs
+                .retire_bound()
+                .is_some_and(|bound| bounds.is_some_and(|bounds| bounds.max_end_ns < bound))
+                && !segment.seg.is_empty()
             {
                 // Every span in it is expired, so there is nothing to keep and
                 // nothing to read: the whole segment goes.
@@ -3612,10 +4407,7 @@ impl Store {
             self.metrics.expiry_segments_decoded.increment();
             let all = segment.spans_parsed()?;
             let total = all.len();
-            let mut kept: Vec<Span> = all
-                .into_iter()
-                .filter(|span| span.end_time_ns >= cutoff_ns)
-                .collect();
+            let mut kept: Vec<Span> = all.into_iter().filter(|span| !expired_span(span)).collect();
             if kept.len() == total {
                 continue;
             }
@@ -4331,6 +5123,13 @@ impl Store {
         let subject = subject.canonicalized();
         subject.validate()?;
         let (span_keys, payload_refs) = self.resolve_subject(&subject)?;
+        // A tenant subject also records which eval entities it is about to
+        // remove — bounded and small, unlike its span keys — so the receipt
+        // can name them without walking a log that no longer holds them.
+        let (eval_datasets, eval_experiments) = match &subject {
+            erasure::Subject::Tenant { tenant } => self.evals.ids_of_tenant(tenant)?,
+            _ => (Vec::new(), Vec::new()),
+        };
         let requested_unix_ns = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |since| since.as_nanos().min(u128::from(u64::MAX)) as u64);
@@ -4345,8 +5144,14 @@ impl Store {
                 .erasure_gate
                 .write()
                 .map_err(|_| Error::LockPoisoned("erasure gate"))?;
-            self.erasures
-                .begin(requested_unix_ns, subject, span_keys, payload_refs)?
+            self.erasures.begin(
+                requested_unix_ns,
+                subject,
+                span_keys,
+                payload_refs,
+                eval_datasets,
+                eval_experiments,
+            )?
         };
         let settle = self.complete_erasure(&record)?;
         Ok(erasure::ErasureStatus {
@@ -4379,16 +5184,33 @@ impl Store {
     }
 
     /// The subject resolved to the concrete keys and payload references it
-    /// covers right now, under the store's usual read semantics.
+    /// covers right now, under the store's usual read semantics. Trace and
+    /// span subjects resolve UNDER THEIR TENANT'S SCOPE — an unscoped lookup
+    /// would let another tenant's newer same-id span shadow the subject's
+    /// own out of the resolved set, and the receipt's re-delivery check
+    /// would then have nothing to catch a re-delivery against.
     fn resolve_subject(&self, subject: &erasure::Subject) -> Result<ResolvedSubject> {
         let spans: Vec<Span> = match subject {
-            erasure::Subject::Trace { trace_id } => self.get_trace(trace_id)?,
-            erasure::Subject::Span { trace_id, span_id } => self
-                .get_trace(trace_id)?
+            erasure::Subject::Trace { trace_id, tenant } => {
+                self.get_trace_in(Some(tenant), trace_id)?
+            }
+            erasure::Subject::Span {
+                trace_id,
+                span_id,
+                tenant,
+            } => self
+                .get_trace_in(Some(tenant), trace_id)?
                 .into_iter()
                 .filter(|span| span.span_id == *span_id)
                 .collect(),
-            erasure::Subject::Session { session_id } => self.resolve_session_spans(session_id)?,
+            erasure::Subject::Session { session_id, tenant } => {
+                self.resolve_session_spans(Some(tenant), session_id)?
+            }
+            // A tenant's span set is unbounded, and the mask covers it by
+            // predicate. Resolving it into the record would serialize the
+            // store into one tombstone line under the gate's write half —
+            // and the purge collects keys and refs as it walks anyway.
+            erasure::Subject::Tenant { .. } => Vec::new(),
             erasure::Subject::Payload { reference } => {
                 // No index reaches into reference objects (their hashes are
                 // deliberately not content-indexed), so resolution is a fold.
@@ -4408,9 +5230,15 @@ impl Store {
                 matching
             }
         };
-        let mut keys: Vec<(String, String)> = spans
+        let mut keys: Vec<(String, String, String)> = spans
             .iter()
-            .map(|span| (span.trace_id.clone(), span.span_id.clone()))
+            .map(|span| {
+                (
+                    span.tenant.clone(),
+                    span.trace_id.clone(),
+                    span.span_id.clone(),
+                )
+            })
             .collect();
         keys.sort();
         keys.dedup();
@@ -4419,6 +5247,7 @@ impl Store {
             erasure::Subject::Payload { reference } => {
                 refs.insert(reference.clone());
             }
+            erasure::Subject::Tenant { .. } => {}
             _ => {
                 for span in &spans {
                     erasure::payload_refs_of(span, &mut refs);
@@ -4438,17 +5267,19 @@ impl Store {
         let erasing = Instant::now();
         let subject = &record.subject;
 
-        let (purge, annotations_removed, payloads_removed, payloads_retained) = {
+        let (purge, annotations_removed, eval_records_removed, payloads_removed, payloads_retained) = {
             // One rewriter at a time, same as compaction and expiry.
             let _maintenance = self.lock_maintenance()?;
             let purge = self.purge_subject_locked(subject)?;
 
-            let annotations_removed = match subject {
-                erasure::Subject::Payload { .. } => 0,
-                erasure::Subject::Trace { trace_id } => self
-                    .annotations
-                    .drop_for_keys(&purge.keys, Some(trace_id))?,
-                _ => self.annotations.drop_for_keys(&purge.keys, None)?,
+            let annotations_removed = self.drop_annotations_for(subject, &purge.keys)?;
+            // A tenant subject's eval records leave inside the same barrier,
+            // before the checkpoint the settle will cite — the eval log is
+            // manifested, and nothing may rewrite a manifested file past
+            // that checkpoint.
+            let eval_records_removed = match subject {
+                erasure::Subject::Tenant { tenant } => self.evals.purge_tenant(tenant)?,
+                _ => 0,
             };
 
             // Payload files, reference-aware. Live references are computed
@@ -4541,6 +5372,7 @@ impl Store {
             (
                 purge,
                 annotations_removed,
+                eval_records_removed,
                 payloads_removed,
                 payloads_retained,
             )
@@ -4548,10 +5380,9 @@ impl Store {
 
         // The live tail must stop serving what the store no longer holds. A
         // veil covers exactly the entries admitted before this point; spans
-        // admitted later are new data and flow normally.
-        if !purge.keys.is_empty() {
-            self.tail.veil(std::sync::Arc::new(purge.keys.clone()));
-        }
+        // admitted later are new data and flow normally. A tenant subject
+        // resolves no keys — its veil is the tenant predicate itself.
+        self.veil_tail(subject, &purge.keys);
 
         // ---- confirm: everything mutable, BEFORE the checkpoint ----------
         // The admission barrier suppresses covered spans (and the annotate
@@ -4593,20 +5424,19 @@ impl Store {
             confirm
         };
         if !confirm.keys.is_empty() {
-            self.tail.veil(std::sync::Arc::new(confirm.keys.clone()));
+            self.veil_tail(subject, &confirm.keys);
         }
         // Annotations that arrived before the annotate barrier went up get
-        // the same confirm treatment; a no-op rewrite costs nothing
-        // (`drop_for_keys` returns before touching the file when nothing
-        // matches).
-        let annotations_removed = annotations_removed
+        // the same confirm treatment; a no-op rewrite costs nothing (the
+        // rewrite returns before touching the file when nothing matches).
+        // The eval log gets it too, for the same belt-and-braces reason,
+        // and both are idempotent.
+        let annotations_removed =
+            annotations_removed + self.drop_annotations_for(subject, &confirm.keys)?;
+        let eval_records_removed = eval_records_removed
             + match subject {
-                erasure::Subject::Payload { .. } => 0,
-                erasure::Subject::Trace { trace_id } => self
-                    .annotations
-                    .drop_for_keys(&confirm.keys, Some(trace_id))?,
-                _ if confirm.keys.is_empty() => 0,
-                _ => self.annotations.drop_for_keys(&confirm.keys, None)?,
+                erasure::Subject::Tenant { tenant } => self.evals.purge_tenant(tenant)?,
+                _ => 0,
             };
         let spans_removed = purge.removed + confirm.removed;
         let spans_redacted = purge.redacted + confirm.redacted;
@@ -4641,6 +5471,7 @@ impl Store {
             annotations_removed,
             payloads_removed,
             payloads_retained,
+            eval_records_removed,
         };
         {
             let _gate = self
@@ -4653,6 +5484,61 @@ impl Store {
         self.metrics.erasure_spans_removed.add(spans_removed as u64);
         self.metrics.erasure.record(elapsed_nanos(&erasing));
         Ok(settle)
+    }
+
+    /// Veils the live tail for one purge pass: by the pass's keys, and — for
+    /// a tenant subject, whose keys are deliberately unresolved — by the
+    /// tenant predicate, so ring entries admitted before the erasure stop
+    /// being served even though no key list names them.
+    fn veil_tail(
+        &self,
+        subject: &erasure::Subject,
+        keys: &std::collections::HashSet<(String, String, String)>,
+    ) {
+        let tenants: std::collections::HashSet<String> = match subject {
+            erasure::Subject::Tenant { tenant } => std::iter::once(tenant.clone()).collect(),
+            _ => std::collections::HashSet::new(),
+        };
+        if keys.is_empty() && tenants.is_empty() {
+            return;
+        }
+        self.tail.veil(
+            std::sync::Arc::new(keys.clone()),
+            std::sync::Arc::new(tenants),
+        );
+    }
+
+    /// One purge pass's annotation drop, with the subject expressed in the
+    /// annotation log's own typed terms: span keys always; the whole trace
+    /// for a trace subject (trace-level annotations included); the whole
+    /// session for a session subject (session-subject annotations have no
+    /// span address for the keys to catch); the whole tenant for a tenant
+    /// subject (scores included, whatever their shape). Payload subjects
+    /// drop nothing — a redaction is not a deletion of judgment.
+    fn drop_annotations_for(
+        &self,
+        subject: &erasure::Subject,
+        keys: &std::collections::HashSet<(String, String, String)>,
+    ) -> Result<usize> {
+        match subject {
+            erasure::Subject::Payload { .. } => Ok(0),
+            erasure::Subject::Trace { trace_id, tenant } => {
+                self.annotations
+                    .drop_for_subject(keys, Some((tenant, trace_id)), None, None)
+            }
+            erasure::Subject::Session { session_id, tenant } => {
+                self.annotations
+                    .drop_for_subject(keys, None, Some((tenant, session_id)), None)
+            }
+            erasure::Subject::Tenant { tenant } => {
+                self.annotations
+                    .drop_for_subject(keys, None, None, Some(tenant))
+            }
+            erasure::Subject::Span { .. } if keys.is_empty() => Ok(0),
+            erasure::Subject::Span { .. } => {
+                self.annotations.drop_for_subject(keys, None, None, None)
+            }
+        }
     }
 
     /// Removes (or redacts) every physical record the subject covers, across
@@ -4681,17 +5567,21 @@ impl Store {
                     erasure::Action::Drop => {
                         changed = true;
                         purge.removed += 1;
-                        purge
-                            .keys
-                            .insert((span.trace_id.clone(), span.span_id.clone()));
+                        purge.keys.insert((
+                            span.tenant.clone(),
+                            span.trace_id.clone(),
+                            span.span_id.clone(),
+                        ));
                         erasure::payload_refs_of(span, &mut purge.payload_refs);
                     }
                     erasure::Action::Redact => {
                         changed = true;
                         purge.redacted += 1;
-                        purge
-                            .keys
-                            .insert((span.trace_id.clone(), span.span_id.clone()));
+                        purge.keys.insert((
+                            span.tenant.clone(),
+                            span.trace_id.clone(),
+                            span.span_id.clone(),
+                        ));
                         let mut redacted = Span::clone(span);
                         if let Some(reference) = subject.payload_reference() {
                             erasure::redact_payload(&mut redacted, reference);
@@ -4730,17 +5620,21 @@ impl Store {
                     erasure::Action::Drop => {
                         changed = true;
                         purge.removed += 1;
-                        purge
-                            .keys
-                            .insert((span.trace_id.clone(), span.span_id.clone()));
+                        purge.keys.insert((
+                            span.tenant.clone(),
+                            span.trace_id.clone(),
+                            span.span_id.clone(),
+                        ));
                         erasure::payload_refs_of(&span, &mut purge.payload_refs);
                     }
                     erasure::Action::Redact => {
                         changed = true;
                         purge.redacted += 1;
-                        purge
-                            .keys
-                            .insert((span.trace_id.clone(), span.span_id.clone()));
+                        purge.keys.insert((
+                            span.tenant.clone(),
+                            span.trace_id.clone(),
+                            span.span_id.clone(),
+                        ));
                         let mut redacted = span;
                         if let Some(reference) = subject.payload_reference() {
                             erasure::redact_payload(&mut redacted, reference);
@@ -4810,10 +5704,12 @@ impl Store {
         subject: &erasure::Subject,
     ) -> Result<bool> {
         match subject {
-            erasure::Subject::Trace { trace_id } | erasure::Subject::Span { trace_id, .. } => {
+            erasure::Subject::Trace { trace_id, .. } | erasure::Subject::Span { trace_id, .. } => {
+                // The trace index over-approximates across tenants; the
+                // decode-and-check that follows settles it (invariant 7).
                 Ok(!segment.trace_spans(trace_id)?.is_empty())
             }
-            erasure::Subject::Session { session_id } => {
+            erasure::Subject::Session { session_id, .. } => {
                 for key in &semconv::SESSION_KEYS {
                     for value in analytics::session_values(session_id) {
                         if !attribute_candidates(&segment.seg, key, &value).is_empty() {
@@ -4822,6 +5718,16 @@ impl Store {
                     }
                 }
                 Ok(false)
+            }
+            erasure::Subject::Tenant { tenant } => {
+                // The reserved tenant posting is written for every non-empty
+                // tenant, so an empty candidate list IS proof of absence —
+                // and tenant subjects cannot name the default tenant, whose
+                // spans carry no posting.
+                Ok(!segment
+                    .seg
+                    .attribute_candidate_offsets(IDX_TENANT, tenant)
+                    .is_empty())
             }
             erasure::Subject::Payload { reference } => {
                 // The sidecar's reference set answers without a decode; a
@@ -4834,7 +5740,7 @@ impl Store {
         }
     }
 
-    /// Every `(trace_id, span_id)` in `seg` the subject covers — the
+    /// Every `(tenant, trace_id, span_id)` in `seg` the subject covers — the
     /// verification-side probe, over any segment file (live or pinned).
     /// For a payload subject a span counts only while it still carries an
     /// UNREDACTED reference: the redaction marker left behind is the erasure
@@ -4842,24 +5748,31 @@ impl Store {
     fn subject_keys_in_segment(
         seg: &segment::Segment,
         subject: &erasure::Subject,
-    ) -> Result<Vec<(String, String)>> {
+    ) -> Result<Vec<(String, String, String)>> {
         let mut keys = Vec::new();
+        let key_of = |span: Span| (span.tenant, span.trace_id, span.span_id);
         match subject {
-            erasure::Subject::Trace { trace_id } => {
+            erasure::Subject::Trace { trace_id, tenant } => {
                 for record in seg.query_trace(trace_id).map_err(segment_error)? {
                     let span = record_to_span(&record)?;
-                    keys.push((span.trace_id, span.span_id));
-                }
-            }
-            erasure::Subject::Span { trace_id, span_id } => {
-                for record in seg.query_trace(trace_id).map_err(segment_error)? {
-                    let span = record_to_span(&record)?;
-                    if span.span_id == *span_id {
-                        keys.push((span.trace_id, span.span_id));
+                    if span.tenant == *tenant {
+                        keys.push(key_of(span));
                     }
                 }
             }
-            erasure::Subject::Session { session_id } => {
+            erasure::Subject::Span {
+                trace_id,
+                span_id,
+                tenant,
+            } => {
+                for record in seg.query_trace(trace_id).map_err(segment_error)? {
+                    let span = record_to_span(&record)?;
+                    if span.span_id == *span_id && span.tenant == *tenant {
+                        keys.push(key_of(span));
+                    }
+                }
+            }
+            erasure::Subject::Session { session_id, tenant } => {
                 let mut offsets: Vec<u64> = Vec::new();
                 for key in &semconv::SESSION_KEYS {
                     for value in analytics::session_values(session_id) {
@@ -4871,8 +5784,20 @@ impl Store {
                 for offset in offsets {
                     let record = seg.record_at_offset(offset).map_err(segment_error)?;
                     let span = record_to_span(&record)?;
-                    if semconv::facts(&span.attributes).session.as_deref() == Some(session_id) {
-                        keys.push((span.trace_id, span.span_id));
+                    if span.tenant == *tenant
+                        && semconv::facts(&span.attributes).session.as_deref() == Some(session_id)
+                    {
+                        keys.push(key_of(span));
+                    }
+                }
+            }
+            erasure::Subject::Tenant { tenant } => {
+                let offsets = seg.attribute_candidate_offsets(IDX_TENANT, tenant).to_vec();
+                for offset in offsets {
+                    let record = seg.record_at_offset(offset).map_err(segment_error)?;
+                    let span = record_to_span(&record)?;
+                    if span.tenant == *tenant {
+                        keys.push(key_of(span));
                     }
                 }
             }
@@ -4881,7 +5806,7 @@ impl Store {
                     if let Some(record) = seg.record(ordinal).map_err(segment_error)? {
                         let span = record_to_span(&record)?;
                         if erasure::payload_unredacted(&span, reference) {
-                            keys.push((span.trace_id, span.span_id));
+                            keys.push(key_of(span));
                         }
                     }
                 }
@@ -4911,7 +5836,7 @@ impl Store {
         };
         let record = &status.erase;
         let subject = &record.subject;
-        let erased_keys: std::collections::HashSet<(String, String)> =
+        let erased_keys: std::collections::HashSet<(String, String, String)> =
             record.span_keys.iter().cloned().collect();
         let needles = subject.needles();
         let mut domains: Vec<erasure::DomainReport> = Vec::new();
@@ -4919,7 +5844,7 @@ impl Store {
 
         // ---- write buffer -------------------------------------------------
         {
-            let matches: Vec<(String, String)> = {
+            let matches: Vec<(String, String, String)> = {
                 let writer = self.lock_writer()?;
                 writer
                     .spans
@@ -4930,7 +5855,13 @@ impl Store {
                         }
                         _ => subject.action(span) != erasure::Action::Keep,
                     })
-                    .map(|span| (span.trace_id.clone(), span.span_id.clone()))
+                    .map(|span| {
+                        (
+                            span.tenant.clone(),
+                            span.trace_id.clone(),
+                            span.span_id.clone(),
+                        )
+                    })
                     .collect()
             };
             let held = matches.len();
@@ -5003,7 +5934,7 @@ impl Store {
         // ---- segments -------------------------------------------------------
         {
             let pinned = self.pin_segments()?;
-            let mut all_matches: Vec<(String, String)> = Vec::new();
+            let mut all_matches: Vec<(String, String, String)> = Vec::new();
             let mut unredacted = 0usize;
             for segment in &pinned {
                 if !self.segment_may_hold_subject(segment, subject)? {
@@ -5047,15 +5978,34 @@ impl Store {
             let all = self
                 .annotations
                 .search(&annotations::AnnotationQuery::default())?;
+            // Matched against the annotation's own typed subject, tenant
+            // included: a session-subject annotation carries no span address
+            // for the key set to catch, and a tenant subject dooms by
+            // ownership, not by address.
             let matching = all
                 .iter()
                 .filter(|annotation| match subject {
-                    erasure::Subject::Trace { trace_id } => annotation.trace_id == *trace_id,
-                    erasure::Subject::Span { trace_id, span_id } => {
-                        annotation.trace_id == *trace_id && annotation.span_id == *span_id
+                    erasure::Subject::Trace { trace_id, tenant } => {
+                        annotation.tenant == *tenant && annotation.trace_id == *trace_id
                     }
-                    erasure::Subject::Session { .. } => erased_keys
-                        .contains(&(annotation.trace_id.clone(), annotation.span_id.clone())),
+                    erasure::Subject::Span {
+                        trace_id,
+                        span_id,
+                        tenant,
+                    } => {
+                        annotation.tenant == *tenant
+                            && annotation.trace_id == *trace_id
+                            && annotation.span_id == *span_id
+                    }
+                    erasure::Subject::Session { session_id, tenant } => {
+                        (annotation.tenant == *tenant && annotation.session_id == *session_id)
+                            || erased_keys.contains(&(
+                                annotation.tenant.clone(),
+                                annotation.trace_id.clone(),
+                                annotation.span_id.clone(),
+                            ))
+                    }
+                    erasure::Subject::Tenant { tenant } => annotation.tenant == *tenant,
                     erasure::Subject::Payload { .. } => false,
                 })
                 .count();
@@ -5073,15 +6023,116 @@ impl Store {
             domains.push(report);
         }
 
+        // ---- eval records -----------------------------------------------------
+        // A decode-walk, never a raw byte scan of the shared log: the walk is
+        // scoped to the subject's tenant, so one tenant's receipt can never
+        // name another tenant's datasets — and its classifications are exact
+        // where a byte scan could only be over-approximate.
+        {
+            let mut report = match subject {
+                erasure::Subject::Tenant { tenant } => {
+                    let remaining = self.evals.tenant_record_count(tenant)?;
+                    clean &= remaining == 0;
+                    let mut report = erasure::DomainReport::clear(
+                        "eval-records",
+                        match remaining {
+                            0 => format!(
+                                "no eval record remains for the tenant ({} dataset(s) and \
+                                 {} experiment(s) were erased)",
+                                record.eval_datasets.len(),
+                                record.eval_experiments.len()
+                            ),
+                            found => {
+                                format!("{found} eval record(s) still belong to the tenant")
+                            }
+                        },
+                    );
+                    if remaining > 0 {
+                        report.result = "holds-data".to_owned();
+                    }
+                    report
+                }
+                erasure::Subject::Payload { reference } => {
+                    let holders = self.evals.references_to(reference)?;
+                    let mut report = erasure::DomainReport::clear(
+                        "eval-records",
+                        match holders.is_empty() {
+                            true => "no dataset example references the payload".to_owned(),
+                            false => format!(
+                                "{} example(s) still carry the reference — an address, \
+                                 not content; the bytes are gone and the version's \
+                                 digests remain valid. Purging the addresses is a \
+                                 dataset-version tombstone plus a future compaction",
+                                holders.len()
+                            ),
+                        },
+                    );
+                    if !holders.is_empty() {
+                        report.result = "retained-by-design".to_owned();
+                        report.items = holders;
+                    }
+                    report
+                }
+                _ => {
+                    let tenant = subject.tenant().unwrap_or("");
+                    let copies = self.evals.copies_in_tenant(tenant, &needles)?;
+                    let mut report = erasure::DomainReport::clear(
+                        "eval-records",
+                        match copies.is_empty() {
+                            true => {
+                                "no dataset example carries the subject's identifiers".to_owned()
+                            }
+                            false => format!(
+                                "{} example(s) carry copies traceable to the subject — \
+                                 promotion copies survive source erasure BY DESIGN; \
+                                 purging them is a deliberate second act (tombstone the \
+                                 version, erase the payload)",
+                                copies.len()
+                            ),
+                        },
+                    );
+                    if !copies.is_empty() {
+                        report.result = "attention".to_owned();
+                        report.items = copies;
+                    }
+                    report
+                }
+            };
+            // Domain order in the receipt is stable; this one sits between
+            // annotations and payloads, where its findings read in context.
+            if report.detail.is_empty() {
+                report.detail = "checked".to_owned();
+            }
+            domains.push(report);
+        }
+
         // ---- payload files ----------------------------------------------------
         {
             let mut items: Vec<String> = Vec::new();
             let mut failing = false;
-            let live = match record.payload_refs.is_empty() {
+            // The references to account for: what resolution recorded, PLUS
+            // every disposition the settle recorded. The union matters most
+            // for a tenant subject, whose resolve-time list is deliberately
+            // empty (its refs are collected during the purge) — without the
+            // settle's lists this domain would verify nothing and a shared
+            // payload's retention would go unnamed in the receipt.
+            let mut accountable: Vec<String> = record.payload_refs.clone();
+            if let Some(settle) = &status.settle {
+                accountable.extend(settle.payloads_removed.iter().cloned());
+                accountable.extend(
+                    settle
+                        .payloads_retained
+                        .iter()
+                        .map(|retained| retained.reference.clone()),
+                );
+            }
+            accountable.sort();
+            accountable.dedup();
+            let live = match accountable.is_empty() {
                 true => std::collections::HashSet::new(),
                 false => self.live_payload_refs()?,
             };
-            for reference in &record.payload_refs {
+            for reference in &accountable {
                 let exists = reference
                     .strip_prefix("sha256/")
                     .map(|hash| payload::payload_path(&self.directory, hash).exists())
@@ -5089,9 +6140,9 @@ impl Store {
                 match (exists, live.contains(reference)) {
                     (false, _) => items.push(format!("{reference}: erased")),
                     (true, true) => items.push(format!(
-                        "{reference}: retained — still referenced by live spans \
-                         outside the subject (content addressing shares bytes; \
-                         reference-aware deletion keeps them)"
+                        "{reference}: retained — still referenced by live spans or \
+                         dataset examples outside the subject (content addressing \
+                         shares bytes; reference-aware deletion keeps them)"
                     )),
                     (true, false) => {
                         failing = true;
@@ -5105,7 +6156,7 @@ impl Store {
             clean &= !failing;
             let mut report = erasure::DomainReport::clear(
                 "payloads",
-                format!("{} reference(s) accounted for", record.payload_refs.len()),
+                format!("{} reference(s) accounted for", accountable.len()),
             );
             report.items = items;
             if failing {
@@ -5712,10 +6763,15 @@ fn recover_supersede_markers(directory: &Path) -> Result<()> {
     Ok(())
 }
 
+// Traza's stable span order: (start, end, tenant, trace, span). The tenant
+// sits before the ids so the order is total over the full primary key; for a
+// single-tenant store every tenant is "" and the order is exactly what it was
+// before tenancy existed.
 fn compare_spans(left: &Span, right: &Span) -> std::cmp::Ordering {
     left.start_time_ns
         .cmp(&right.start_time_ns)
         .then_with(|| left.end_time_ns.cmp(&right.end_time_ns))
+        .then_with(|| left.tenant.cmp(&right.tenant))
         .then_with(|| left.trace_id.cmp(&right.trace_id))
         .then_with(|| left.span_id.cmp(&right.span_id))
 }
@@ -5724,6 +6780,7 @@ fn compare_span_cursor(span: &Span, cursor: &SpanCursor) -> std::cmp::Ordering {
     span.start_time_ns
         .cmp(&cursor.start_time_ns)
         .then_with(|| span.end_time_ns.cmp(&cursor.end_time_ns))
+        .then_with(|| span.tenant.cmp(&cursor.tenant))
         .then_with(|| span.trace_id.cmp(&cursor.trace_id))
         .then_with(|| span.span_id.cmp(&cursor.span_id))
 }
@@ -5821,6 +6878,19 @@ fn select_probe<'a>(
             false,
         );
     }
+    // A non-empty tenant scope probes the reserved tenant posting. An
+    // explicit default-tenant scope (`Some("")`) cannot: empty tenants are
+    // deliberately never indexed (byte-identity for single-tenant stores),
+    // so that filter falls through to whatever other probe the query has —
+    // the tenant clause in `span_matches_without_content` still decides.
+    if let Some(tenant) = filter.tenant.as_deref() {
+        if !tenant.is_empty() {
+            consider(
+                Cow::Borrowed(seg.attribute_candidate_offsets(IDX_TENANT, tenant)),
+                false,
+            );
+        }
+    }
     for (key, value) in &filter.attributes {
         // Session keys are expanded by the caller into a union and cannot
         // drive a single probe.
@@ -5872,6 +6942,16 @@ fn span_matches(span: &Span, filter: &SpanFilter, content: Option<&content::Quer
 }
 
 fn span_matches_without_content(span: &Span, filter: &SpanFilter) -> bool {
+    // The tenant clause is first because it is the isolation boundary: every
+    // scoped surface relies on this one comparison, and an index probe that
+    // over-selected across tenants is corrected here (invariant 7).
+    if filter
+        .tenant
+        .as_ref()
+        .is_some_and(|tenant| span.tenant != *tenant)
+    {
+        return false;
+    }
     if filter
         .service
         .as_ref()
@@ -6279,7 +7359,7 @@ mod seal_tests {
 
         buffer.evict_sealed(&sealed_set(&drained));
         assert!(buffer.is_empty(), "both sealed keys are gone");
-        assert!(!buffer.contains_key("t", "a"));
+        assert!(!buffer.contains_key("", "t", "a"));
     }
 
     #[test]
@@ -6305,8 +7385,8 @@ mod seal_tests {
         );
         // The index has to follow the eviction, or the next upsert of this key
         // writes over the wrong slot.
-        assert!(buffer.contains_key("t", "a"));
-        assert!(!buffer.contains_key("t", "b"));
+        assert!(buffer.contains_key("", "t", "a"));
+        assert!(!buffer.contains_key("", "t", "b"));
     }
 
     #[test]

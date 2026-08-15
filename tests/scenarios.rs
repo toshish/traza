@@ -28,6 +28,7 @@ fn store_with_corpus(label: &str, options: &SeedOptions) -> (Store, traza::seed:
     let store = Store::open(
         &dir,
         Config {
+            tenant_ttl_seconds: Default::default(),
             flush_spans: 10_000,
             max_buffer_age: None,
             shadow_seal: false,

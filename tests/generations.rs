@@ -282,6 +282,10 @@ fn backup_by_pin_then_restore_round_trips_the_whole_store() {
     store.flush().expect("flush");
     store
         .annotate(traza::annotations::Annotation {
+            tenant: String::new(),
+            session_id: String::new(),
+            experiment_id: None,
+            example_id: String::new(),
             trace_id: "t".into(),
             span_id: "a".into(),
             name: "score".into(),

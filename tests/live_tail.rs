@@ -39,6 +39,7 @@ fn span(trace: &str, id: &str, start_ns: u64, end_ns: u64) -> Span {
     Span {
         trace_id: trace.to_owned(),
         span_id: id.to_owned(),
+        tenant: String::new(),
         parent_span_id: None,
         name: "op".to_owned(),
         start_time_ns: start_ns,

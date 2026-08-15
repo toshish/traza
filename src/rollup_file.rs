@@ -67,7 +67,11 @@ use crate::semconv;
 const MAGIC: [u8; 8] = *b"TRAZAROL";
 
 /// Layout version of this file. Bump when the BYTES change.
-const FORMAT_VERSION: u16 = 2;
+///
+/// v3: session entries and `by_session_key` entries carry a tenant string —
+/// session identity became `(tenant, session_id)` when the tenant joined the
+/// span primary key. v2 sidecars are rejected by this gate and rebuilt.
+const FORMAT_VERSION: u16 = 3;
 
 /// Version of the analytics semantics the counters were computed under.
 ///
@@ -78,7 +82,10 @@ const FORMAT_VERSION: u16 = 2;
 /// a stale rollup looks wrong, it just quietly reports the old model's answer
 /// forever. Forgetting to bump this is the one failure this file cannot
 /// detect for you, which is why it is the first constant in the module.
-const SCHEMA_VERSION: u32 = 1;
+///
+/// v2: `key_hashes` are FNV-1a over `(tenant, trace, span)` — a v1 hash set
+/// computed over the pair would let the supersede prefilter miss.
+const SCHEMA_VERSION: u32 = 2;
 
 /// Extension of the sidecar written beside `segment-<id>.seg`.
 const ROLLUP_SUFFIX: &str = "rollup";
@@ -292,12 +299,26 @@ fn encode(binding: Binding, rollup: &SegmentRollup) -> Vec<u8> {
     put_counter_map(&mut out, &rollup.by_provider);
     put_counter_map(&mut out, &rollup.by_service);
     put_counter_map(&mut out, &rollup.by_day);
-    put_counter_map(&mut out, &rollup.by_session_key);
+    // Tenant and session id are written as two length-prefixed strings, never
+    // one joined key: a joined key cannot distinguish a default-tenant session
+    // named "acme/checkout" from tenant acme's session "checkout".
+    {
+        let mut entries: Vec<(&(String, String), &Counters)> =
+            rollup.by_session_key.iter().collect();
+        entries.sort_by(|left, right| left.0.cmp(right.0));
+        put_u32(&mut out, entries.len() as u32);
+        for ((tenant, session), counters) in entries {
+            put_str(&mut out, tenant);
+            put_str(&mut out, session);
+            put_counters(&mut out, counters);
+        }
+    }
 
-    let mut sessions: Vec<(&String, &SessionCounters)> = rollup.sessions.iter().collect();
+    let mut sessions: Vec<(&(String, String), &SessionCounters)> = rollup.sessions.iter().collect();
     sessions.sort_by(|left, right| left.0.cmp(right.0));
     put_u32(&mut out, sessions.len() as u32);
-    for (id, session) in sessions {
+    for ((tenant, id), session) in sessions {
+        put_str(&mut out, tenant);
         put_str(&mut out, id);
         put_counters(&mut out, &session.counters);
         put_u64(&mut out, session.first_start_ns);
@@ -382,11 +403,21 @@ fn decode(bytes: &[u8], expected: Binding) -> Option<SegmentRollup> {
     rollup.by_provider = cursor.counter_map()?;
     rollup.by_service = cursor.counter_map()?;
     rollup.by_day = cursor.counter_map()?.into_iter().collect();
-    rollup.by_session_key = cursor.counter_map()?;
+    {
+        let entry_count = cursor.u32()? as usize;
+        rollup.by_session_key.reserve(entry_count);
+        for _ in 0..entry_count {
+            let tenant = cursor.string()?;
+            let session = cursor.string()?;
+            let counters = cursor.counters()?;
+            rollup.by_session_key.insert((tenant, session), counters);
+        }
+    }
 
     let session_count = cursor.u32()? as usize;
     rollup.sessions.reserve(session_count);
     for _ in 0..session_count {
+        let tenant = cursor.string()?;
         let id = cursor.string()?;
         let counters = cursor.counters()?;
         let first_start_ns = cursor.u64()?;
@@ -398,7 +429,7 @@ fn decode(bytes: &[u8], expected: Binding) -> Option<SegmentRollup> {
         }
         let session_key = session_key_name(cursor.u32()?)?;
         rollup.sessions.insert(
-            id,
+            (tenant, id),
             SessionCounters {
                 counters,
                 first_start_ns,

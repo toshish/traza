@@ -55,20 +55,32 @@ use crate::{payload, semconv, Error, Result, Span};
 /// appends rather than damage.
 pub(crate) const LOG_NAME: &str = "tombstones.jsonl";
 
-/// Record schema version. M4 extends the subject with tenant scoping; this
-/// field is the hinge that lets a v1 record keep decoding when it does.
-const SCHEMA: u32 = 1;
+/// Record schema version.
+///
+/// v2: tenancy — `span_keys` became `(tenant, trace, span)` triples, the
+/// trace/span/session subjects grew a tenant field, and the tenant subject
+/// kind exists. v1 records replay with the default tenant everywhere; this
+/// field is the hinge that made that a decode rule instead of a guess.
+const SCHEMA: u32 = 2;
 
 /// What an erasure is about. Resolved once, at request time, to the concrete
 /// span keys it covers (see [`EraseRecord::span_keys`]).
+///
+/// The `tenant` on trace/span/session subjects names the ONE tenant the
+/// erasure targets; empty is the default tenant, never "all tenants". Two
+/// tenants sharing a trace id are two subjects — erasing one leaves the
+/// other untouched, which is the primary key doing its job.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Subject {
-    /// Every span of one trace, its annotations, and any payload bytes no
-    /// surviving span still references.
+    /// Every span of one tenant's trace, its annotations, and any payload
+    /// bytes no surviving span still references.
     Trace {
         /// The trace being erased.
         trace_id: String,
+        /// Whose trace; empty is the default tenant.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        tenant: String,
     },
     /// One span, by primary key.
     Span {
@@ -76,30 +88,74 @@ pub enum Subject {
         trace_id: String,
         /// Span half of the primary key.
         span_id: String,
+        /// Whose span; empty is the default tenant.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        tenant: String,
     },
-    /// Every span that resolves to one session, across all recognized
-    /// session keys (see [`crate::semconv`]).
+    /// Every span of one tenant that resolves to one session, across all
+    /// recognized session keys (see [`crate::semconv`]).
     Session {
         /// The session identifier being erased.
         session_id: String,
+        /// Whose session; empty is the default tenant.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        tenant: String,
     },
     /// One offloaded payload by content address (`sha256/<hex>`). The file is
     /// deleted and every referencing span is rewritten with its inline
-    /// preview redacted — the preview is content too.
+    /// preview redacted — the preview is content too. Content addressing is
+    /// store-global, so this subject carries no tenant and is reserved for
+    /// unbound (operator) admin credentials.
     Payload {
         /// The `sha256/<hex>` reference of the payload being erased.
         reference: String,
+    },
+    /// Everything one tenant owns: its spans across every domain, its
+    /// annotations and scores, its datasets, versions, examples and
+    /// experiments, and reference-aware deletion of the payload bytes its
+    /// spans and examples held. The default tenant cannot be named here —
+    /// erasing it is erasing the store, and narrower subjects exist.
+    Tenant {
+        /// The tenant being erased; must be non-empty.
+        tenant: String,
     },
 }
 
 impl Subject {
     /// One line naming the subject, for logs and the receipt.
     pub fn describe(&self) -> String {
+        let scope = |tenant: &str| {
+            if tenant.is_empty() {
+                String::new()
+            } else {
+                format!(" (tenant {tenant})")
+            }
+        };
         match self {
-            Self::Trace { trace_id } => format!("trace {trace_id}"),
-            Self::Span { trace_id, span_id } => format!("span {trace_id}/{span_id}"),
-            Self::Session { session_id } => format!("session {session_id}"),
+            Self::Trace { trace_id, tenant } => format!("trace {trace_id}{}", scope(tenant)),
+            Self::Span {
+                trace_id,
+                span_id,
+                tenant,
+            } => format!("span {trace_id}/{span_id}{}", scope(tenant)),
+            Self::Session { session_id, tenant } => {
+                format!("session {session_id}{}", scope(tenant))
+            }
             Self::Payload { reference } => format!("payload {reference}"),
+            Self::Tenant { tenant } => format!("tenant {tenant}"),
+        }
+    }
+
+    /// The tenant a scoped subject targets: `Some` for trace/span/session/
+    /// tenant subjects (empty = default tenant), `None` for payload subjects,
+    /// which are content-addressed and store-global.
+    pub fn tenant(&self) -> Option<&str> {
+        match self {
+            Self::Trace { tenant, .. }
+            | Self::Span { tenant, .. }
+            | Self::Session { tenant, .. } => Some(tenant),
+            Self::Tenant { tenant } => Some(tenant),
+            Self::Payload { .. } => None,
         }
     }
 
@@ -120,17 +176,27 @@ impl Subject {
     }
 
     /// Whether the subject is well-formed enough to resolve: non-empty
-    /// identifiers, and a payload reference in its canonical form —
-    /// lowercase hex, which [`Self::canonicalized`] produces.
+    /// identifiers, admissible tenants, and a payload reference in its
+    /// canonical form — lowercase hex, which [`Self::canonicalized`]
+    /// produces.
     pub fn validate(&self) -> Result<()> {
+        if let Some(tenant) = self.tenant() {
+            if !tenant.is_empty() && !crate::valid_tenant(tenant) {
+                return Err(Error::InvalidSpan(
+                    "tenant must be lowercase [a-z0-9][a-z0-9._-], at most 64 bytes",
+                ));
+            }
+        }
         let problem = match self {
-            Self::Trace { trace_id } if trace_id.is_empty() => Some("trace_id is empty"),
+            Self::Trace { trace_id, .. } if trace_id.is_empty() => Some("trace_id is empty"),
             Self::Span {
                 trace_id, span_id, ..
             } if trace_id.is_empty() || span_id.is_empty() => {
                 Some("trace_id and span_id must both be non-empty")
             }
-            Self::Session { session_id } if session_id.is_empty() => Some("session_id is empty"),
+            Self::Session { session_id, .. } if session_id.is_empty() => {
+                Some("session_id is empty")
+            }
             Self::Payload { reference }
                 if reference.strip_prefix("sha256/").map_or(true, |hash| {
                     hash.len() != 64
@@ -140,6 +206,12 @@ impl Subject {
                 }) =>
             {
                 Some("a payload reference is sha256/<64 lowercase hex characters>")
+            }
+            // The default tenant is every store that never configured
+            // tenancy; "erase it whole" is "erase the store", which is not
+            // an API. Narrower subjects express every legitimate deletion.
+            Self::Tenant { tenant } if tenant.is_empty() => {
+                Some("a tenant subject names a non-empty tenant")
             }
             _ => None,
         };
@@ -153,22 +225,37 @@ impl Subject {
     /// with the subject payload's inline preview redacted.
     pub(crate) fn action(&self, span: &Span) -> Action {
         match self {
-            Self::Trace { trace_id } => match span.trace_id == *trace_id {
+            Self::Trace { trace_id, tenant } => {
+                match span.trace_id == *trace_id && span.tenant == *tenant {
+                    true => Action::Drop,
+                    false => Action::Keep,
+                }
+            }
+            Self::Span {
+                trace_id,
+                span_id,
+                tenant,
+            } => {
+                match span.trace_id == *trace_id
+                    && span.span_id == *span_id
+                    && span.tenant == *tenant
+                {
+                    true => Action::Drop,
+                    false => Action::Keep,
+                }
+            }
+            Self::Session { session_id, tenant } => {
+                match span.tenant == *tenant
+                    && semconv::facts(&span.attributes).session.as_deref() == Some(session_id)
+                {
+                    true => Action::Drop,
+                    false => Action::Keep,
+                }
+            }
+            Self::Tenant { tenant } => match span.tenant == *tenant {
                 true => Action::Drop,
                 false => Action::Keep,
             },
-            Self::Span { trace_id, span_id } => {
-                match span.trace_id == *trace_id && span.span_id == *span_id {
-                    true => Action::Drop,
-                    false => Action::Keep,
-                }
-            }
-            Self::Session { session_id } => {
-                match semconv::facts(&span.attributes).session.as_deref() == Some(session_id) {
-                    true => Action::Drop,
-                    false => Action::Keep,
-                }
-            }
             // Only an UNREDACTED reference draws a rewrite: the marker a
             // prior pass left behind is the erasure's end state, so acting on
             // it again would make resume rewrite segments it already fixed.
@@ -193,16 +280,23 @@ impl Subject {
     /// its trace id.
     pub(crate) fn needles(&self) -> Vec<String> {
         match self {
-            Self::Trace { trace_id } => vec![trace_id.clone()],
-            Self::Span { trace_id, span_id } => {
+            Self::Trace { trace_id, .. } => vec![trace_id.clone()],
+            Self::Span {
+                trace_id, span_id, ..
+            } => {
                 let mut needles = vec![trace_id.clone()];
                 if span_id.len() >= 8 {
                     needles.push(span_id.clone());
                 }
                 needles
             }
-            Self::Session { session_id } => vec![session_id.clone()],
+            Self::Session { session_id, .. } => vec![session_id.clone()],
             Self::Payload { reference } => vec![reference.clone()],
+            // The tenant name itself. Over-approximate like every needle —
+            // another tenant embedding the same string in content can push
+            // the count above zero, which reads as inconclusive, never as
+            // wrong. Decode-walk domains classify tenant-exactly.
+            Self::Tenant { tenant } => vec![tenant.clone()],
         }
     }
 }
@@ -273,6 +367,28 @@ pub(crate) fn payload_refs_of(span: &Span, into: &mut HashSet<String>) {
 
 // ------------------------------------------------------------- log records
 
+/// One recorded span key: a schema-2 `(tenant, trace, span)` triple, or a
+/// schema-1 `(trace, span)` pair that decodes as the default tenant. The
+/// untagged enum is the whole replay-compatibility mechanism — a two-element
+/// array cannot parse as a three-tuple, so arity decides, never a guess.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+enum RecordedKey {
+    /// Schema 2: `(tenant, trace_id, span_id)`.
+    Triple((String, String, String)),
+    /// Schema 1: `(trace_id, span_id)`, default tenant.
+    Pair((String, String)),
+}
+
+impl RecordedKey {
+    fn into_triple(self) -> (String, String, String) {
+        match self {
+            Self::Triple(triple) => triple,
+            Self::Pair((trace_id, span_id)) => (String::new(), trace_id, span_id),
+        }
+    }
+}
+
 /// The intent record: appended and fsynced BEFORE any byte is removed, so a
 /// crash mid-erasure leaves a pending record the next open resumes rather
 /// than a half-deletion nothing remembers.
@@ -286,16 +402,46 @@ pub struct EraseRecord {
     pub requested_unix_ns: u64,
     /// What is being erased.
     pub subject: Subject,
-    /// The concrete `(trace_id, span_id)` keys the subject resolved to at
-    /// request time. This is the exactness the receipt rests on: a key from
-    /// this list found live later is a re-delivery, a fresh key matching the
-    /// subject is new activity, and no timestamp heuristic has to guess
-    /// which. Bounded by the subject's own size.
-    pub span_keys: Vec<(String, String)>,
+    /// The concrete `(tenant, trace_id, span_id)` keys the subject resolved
+    /// to at request time. This is the exactness the receipt rests on: a key
+    /// from this list found live later is a re-delivery, a fresh key matching
+    /// the subject is new activity, and no timestamp heuristic has to guess
+    /// which. Bounded by the subject's own size — EXCEPT for tenant subjects,
+    /// which deliberately record none: a tenant's key set is unbounded, the
+    /// mask and the purge cover by predicate, and for a whole tenant the
+    /// settle time IS the re-delivery line.
+    #[serde(
+        serialize_with = "serialize_keys",
+        deserialize_with = "deserialize_keys"
+    )]
+    pub span_keys: Vec<(String, String, String)>,
     /// Payload references the covered spans carried (or, for a payload
     /// subject, the reference itself) — the set whose files the purge must
-    /// account for, one disposition each, in the settle record.
+    /// account for, one disposition each, in the settle record. Empty for
+    /// tenant subjects, whose refs the purge collects as it walks.
     pub payload_refs: Vec<String>,
+    /// Dataset ids a tenant subject erased — recorded so the receipt can
+    /// tell an erased dataset resurfacing (impossible: ids are never reused)
+    /// from a new one. Bounded and small; empty for other subjects.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub eval_datasets: Vec<u64>,
+    /// Experiment ids a tenant subject erased; see `eval_datasets`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub eval_experiments: Vec<u64>,
+}
+
+fn serialize_keys<S: serde::Serializer>(
+    keys: &[(String, String, String)],
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    serializer.collect_seq(keys)
+}
+
+fn deserialize_keys<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Vec<(String, String, String)>, D::Error> {
+    let keys = Vec::<RecordedKey>::deserialize(deserializer)?;
+    Ok(keys.into_iter().map(RecordedKey::into_triple).collect())
 }
 
 impl EraseRecord {
@@ -304,8 +450,10 @@ impl EraseRecord {
         id: u64,
         requested_unix_ns: u64,
         subject: Subject,
-        span_keys: Vec<(String, String)>,
+        span_keys: Vec<(String, String, String)>,
         payload_refs: Vec<String>,
+        eval_datasets: Vec<u64>,
+        eval_experiments: Vec<u64>,
     ) -> Self {
         Self {
             schema: SCHEMA,
@@ -314,6 +462,8 @@ impl EraseRecord {
             subject,
             span_keys,
             payload_refs,
+            eval_datasets,
+            eval_experiments,
         }
     }
 }
@@ -362,6 +512,12 @@ pub struct SettleRecord {
     pub payloads_removed: Vec<String>,
     /// Payload files deliberately kept, each with its reason.
     pub payloads_retained: Vec<RetainedPayload>,
+    /// Eval records (datasets, versions, examples, experiments, runs,
+    /// version tombstones) removed from the eval log by the settling pass —
+    /// nonzero only for tenant subjects. A tenant's SCORES are annotations
+    /// and count under `annotations_removed`.
+    #[serde(default)]
+    pub eval_records_removed: usize,
 }
 
 impl SettleRecord {
@@ -403,12 +559,17 @@ pub(crate) struct Mask {
     /// Resolved keys of every pending erasure, PLUS the subject key of every
     /// pending span-subject erasure — the subject is authoritative even when
     /// a hand-written or replayed record carries no resolved keys.
-    keys: HashSet<(String, String)>,
-    /// Pending trace subjects, so spans of the trace that were not yet
-    /// visible at resolve time (mid-flight batches) are covered too.
-    traces: HashSet<String>,
-    /// Pending session subjects, likewise.
-    sessions: HashSet<String>,
+    keys: HashSet<(String, String, String)>,
+    /// Pending trace subjects as `(tenant, trace_id)`, so spans of the trace
+    /// that were not yet visible at resolve time (mid-flight batches) are
+    /// covered too.
+    traces: HashSet<(String, String)>,
+    /// Pending session subjects as `(tenant, session_id)`, likewise.
+    sessions: HashSet<(String, String)>,
+    /// Pending tenant subjects: everything of theirs is covered by
+    /// predicate, spans and annotations and eval records alike — a tenant's
+    /// key set is unbounded, so no key list could do this job.
+    tenants: HashSet<String>,
     /// Pending payload subjects: a span referencing one is masked whole
     /// until the redaction settles — over-hiding for seconds beats serving
     /// the preview of content someone asked to have erased.
@@ -432,21 +593,29 @@ impl Mask {
             mask.payload_files
                 .extend(record.payload_refs.iter().cloned());
             match &record.subject {
-                Subject::Trace { trace_id } => {
-                    mask.traces.insert(trace_id.clone());
+                Subject::Trace { trace_id, tenant } => {
+                    mask.traces.insert((tenant.clone(), trace_id.clone()));
                 }
-                Subject::Session { session_id } => {
-                    mask.sessions.insert(session_id.clone());
+                Subject::Session { session_id, tenant } => {
+                    mask.sessions.insert((tenant.clone(), session_id.clone()));
                 }
                 Subject::Payload { reference } => {
                     mask.payloads.insert(reference.clone());
                     mask.payload_files.insert(reference.clone());
                 }
-                Subject::Span { trace_id, span_id } => {
+                Subject::Span {
+                    trace_id,
+                    span_id,
+                    tenant,
+                } => {
                     // The subject IS the key. Relying on `span_keys` alone
                     // left the exact span visible whenever a record carried
                     // an empty list.
-                    mask.keys.insert((trace_id.clone(), span_id.clone()));
+                    mask.keys
+                        .insert((tenant.clone(), trace_id.clone(), span_id.clone()));
+                }
+                Subject::Tenant { tenant } => {
+                    mask.tenants.insert(tenant.clone());
                 }
             }
         }
@@ -477,18 +646,25 @@ impl Mask {
     /// permanently. Admission redacts the doomed value instead — see
     /// [`Self::payload_subjects`].
     pub(crate) fn covers_for_drop(&self, span: &Span) -> bool {
-        if self.traces.contains(&span.trace_id) {
+        if !self.tenants.is_empty() && self.tenants.contains(&span.tenant) {
             return true;
         }
         if self
-            .keys
-            .contains(&(span.trace_id.clone(), span.span_id.clone()))
+            .traces
+            .contains(&(span.tenant.clone(), span.trace_id.clone()))
         {
+            return true;
+        }
+        if self.keys.contains(&(
+            span.tenant.clone(),
+            span.trace_id.clone(),
+            span.span_id.clone(),
+        )) {
             return true;
         }
         if !self.sessions.is_empty() {
             if let Some(session) = semconv::facts(&span.attributes).session {
-                if self.sessions.contains(&session) {
+                if self.sessions.contains(&(span.tenant.clone(), session)) {
                     return true;
                 }
             }
@@ -502,14 +678,49 @@ impl Mask {
         &self.payloads
     }
 
-    /// Whether a pending erasure covers this annotation address. Trace-level
-    /// annotations (empty `span_id`) are covered by trace subjects; span
-    /// addresses by any covered key.
-    pub(crate) fn covers_annotation(&self, trace_id: &str, span_id: &str) -> bool {
-        self.traces.contains(trace_id)
-            || self
-                .keys
-                .contains(&(trace_id.to_owned(), span_id.to_owned()))
+    /// Whether a pending erasure covers this annotation, judged against the
+    /// annotation's own typed subject: trace-level annotations (empty
+    /// `span_id`) are covered by trace subjects, span addresses by any
+    /// covered key, session-subject annotations by session subjects, and
+    /// everything of a tenant's — scores included, whatever their shape —
+    /// by a tenant subject. This is the annotate barrier's other half: an
+    /// admission the purge could never reach by key must be refused by
+    /// predicate.
+    pub(crate) fn covers_annotation(&self, annotation: &crate::annotations::Annotation) -> bool {
+        if !self.tenants.is_empty() && self.tenants.contains(&annotation.tenant) {
+            return true;
+        }
+        if !annotation.trace_id.is_empty() {
+            if self
+                .traces
+                .contains(&(annotation.tenant.clone(), annotation.trace_id.clone()))
+            {
+                return true;
+            }
+            if self.keys.contains(&(
+                annotation.tenant.clone(),
+                annotation.trace_id.clone(),
+                annotation.span_id.clone(),
+            )) {
+                return true;
+            }
+        }
+        if !annotation.session_id.is_empty()
+            && self
+                .sessions
+                .contains(&(annotation.tenant.clone(), annotation.session_id.clone()))
+        {
+            return true;
+        }
+        false
+    }
+
+    /// Whether a pending TENANT erasure covers this tenant — the eval write
+    /// paths' half of the barrier: a dataset, version, experiment, run or
+    /// tombstone append for a tenant being erased must be refused, not
+    /// raced.
+    pub(crate) fn covers_tenant(&self, tenant: &str) -> bool {
+        self.tenants.contains(tenant)
     }
 
     /// Whether a pending erasure is due to account for this payload's bytes.
@@ -638,8 +849,10 @@ impl ErasureLog {
         &self,
         requested_unix_ns: u64,
         subject: Subject,
-        span_keys: Vec<(String, String)>,
+        span_keys: Vec<(String, String, String)>,
         payload_refs: Vec<String>,
+        eval_datasets: Vec<u64>,
+        eval_experiments: Vec<u64>,
     ) -> Result<EraseRecord> {
         let mut inner = self.lock()?;
         let id = inner
@@ -649,7 +862,15 @@ impl ErasureLog {
             .copied()
             .unwrap_or(0)
             .saturating_add(1);
-        let erase = EraseRecord::new(id, requested_unix_ns, subject, span_keys, payload_refs);
+        let erase = EraseRecord::new(
+            id,
+            requested_unix_ns,
+            subject,
+            span_keys,
+            payload_refs,
+            eval_datasets,
+            eval_experiments,
+        );
         self.append_line(&LogRecord::Erase(erase.clone()))?;
         inner.records.insert(erase.id, (erase.clone(), None));
         inner.rebuild_mask();
@@ -919,14 +1140,14 @@ pub(crate) struct MatchClasses {
 
 /// Splits `matches` against the erase record's resolved keys.
 pub(crate) fn classify_matches(
-    erased_keys: &HashSet<(String, String)>,
-    matches: impl IntoIterator<Item = (String, String)>,
+    erased_keys: &HashSet<(String, String, String)>,
+    matches: impl IntoIterator<Item = (String, String, String)>,
 ) -> MatchClasses {
     let mut classes = MatchClasses {
         re_delivered: 0,
         new_activity: 0,
     };
-    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let mut seen: HashSet<(String, String, String)> = HashSet::new();
     for key in matches {
         if !seen.insert(key.clone()) {
             continue;
@@ -1001,8 +1222,10 @@ mod tests {
             id,
             requested_unix_ns: 1,
             subject,
-            span_keys: vec![("t1".into(), "s1".into())],
+            span_keys: vec![(String::new(), "t1".into(), "s1".into())],
             payload_refs: Vec::new(),
+            eval_datasets: Vec::new(),
+            eval_experiments: Vec::new(),
         }
     }
 
@@ -1015,8 +1238,11 @@ mod tests {
                 1,
                 Subject::Trace {
                     trace_id: "t1".into(),
+                    tenant: String::new(),
                 },
-                vec![("t1".into(), "s1".into())],
+                vec![(String::new(), "t1".into(), "s1".into())],
+                Vec::new(),
+                Vec::new(),
                 Vec::new(),
             )
             .expect("erase");
@@ -1034,6 +1260,7 @@ mod tests {
             annotations_removed: 0,
             payloads_removed: Vec::new(),
             payloads_retained: Vec::new(),
+            eval_records_removed: 0,
         })
         .expect("settle");
         assert!(log.pending().expect("pending").is_empty());
@@ -1049,7 +1276,10 @@ mod tests {
                 2,
                 Subject::Trace {
                     trace_id: "t2".into(),
+                    tenant: String::new(),
                 },
+                Vec::new(),
+                Vec::new(),
                 Vec::new(),
                 Vec::new(),
             )
@@ -1069,6 +1299,7 @@ mod tests {
             1,
             Subject::Trace {
                 trace_id: "t1".into(),
+                tenant: String::new(),
             },
         ))
         .expect("erase");
@@ -1096,13 +1327,15 @@ mod tests {
             Subject::Span {
                 trace_id: "t1".into(),
                 span_id: "s1".into(),
+                tenant: String::new(),
             },
         );
-        by_key.span_keys = vec![("t1".into(), "s1".into())];
+        by_key.span_keys = vec![(String::new(), "t1".into(), "s1".into())];
         let mut by_session = erase_record(
             2,
             Subject::Session {
                 session_id: "sess-9".into(),
+                tenant: String::new(),
             },
         );
         by_session.span_keys = Vec::new();
@@ -1132,6 +1365,7 @@ mod tests {
             Subject::Span {
                 trace_id: "t1".into(),
                 span_id: "s1".into(),
+                tenant: String::new(),
             },
         );
         record.span_keys = Vec::new();
@@ -1150,6 +1384,7 @@ mod tests {
             1,
             Subject::Trace {
                 trace_id: "t1".into(),
+                tenant: String::new(),
             },
         );
         let reference = format!("sha256/{}", "c".repeat(64));
@@ -1158,16 +1393,39 @@ mod tests {
             Subject::Span {
                 trace_id: "t9".into(),
                 span_id: "s9".into(),
+                tenant: String::new(),
             },
         );
-        with_refs.span_keys = vec![("t9".into(), "s9".into())];
+        with_refs.span_keys = vec![(String::new(), "t9".into(), "s9".into())];
         with_refs.payload_refs = vec![reference.clone()];
         let mask = Mask::for_pending(&[trace, with_refs]);
 
-        assert!(mask.covers_annotation("t1", ""), "trace-level annotation");
-        assert!(mask.covers_annotation("t1", "any"), "span under the trace");
-        assert!(mask.covers_annotation("t9", "s9"), "covered key");
-        assert!(!mask.covers_annotation("t9", "other"));
+        let annotation = |trace_id: &str, span_id: &str| crate::annotations::Annotation {
+            trace_id: trace_id.to_owned(),
+            span_id: span_id.to_owned(),
+            tenant: String::new(),
+            session_id: String::new(),
+            experiment_id: None,
+            example_id: String::new(),
+            name: "note".into(),
+            value: Value::Bool(true),
+            source: String::new(),
+            comment: String::new(),
+            timestamp_ns: 0,
+        };
+        assert!(
+            mask.covers_annotation(&annotation("t1", "")),
+            "trace-level annotation"
+        );
+        assert!(
+            mask.covers_annotation(&annotation("t1", "any")),
+            "span under the trace"
+        );
+        assert!(
+            mask.covers_annotation(&annotation("t9", "s9")),
+            "covered key"
+        );
+        assert!(!mask.covers_annotation(&annotation("t9", "other")));
         assert!(
             mask.covers_payload_file(&reference),
             "a payload the erasure must account for is withheld while pending"
@@ -1255,10 +1513,33 @@ mod tests {
     #[test]
     fn subjects_validate_and_classify() {
         assert!(Subject::Trace {
-            trace_id: String::new()
+            trace_id: String::new(),
+            tenant: String::new(),
         }
         .validate()
         .is_err());
+        assert!(
+            Subject::Tenant {
+                tenant: String::new()
+            }
+            .validate()
+            .is_err(),
+            "the default tenant is not erasable whole — that is the store"
+        );
+        assert!(
+            Subject::Trace {
+                trace_id: "t".into(),
+                tenant: "Not-Valid".into(),
+            }
+            .validate()
+            .is_err(),
+            "subject tenants obey the same charset ingest enforces"
+        );
+        assert!(Subject::Tenant {
+            tenant: "acme".into()
+        }
+        .validate()
+        .is_ok());
         assert!(Subject::Payload {
             reference: "sha256/short".into()
         }
@@ -1286,14 +1567,16 @@ mod tests {
             }
         );
 
-        let erased: HashSet<(String, String)> =
-            [("t1".to_owned(), "s1".to_owned())].into_iter().collect();
+        let erased: HashSet<(String, String, String)> =
+            [(String::new(), "t1".to_owned(), "s1".to_owned())]
+                .into_iter()
+                .collect();
         let classes = classify_matches(
             &erased,
             vec![
-                ("t1".to_owned(), "s1".to_owned()),
-                ("t1".to_owned(), "s1".to_owned()),
-                ("t9".to_owned(), "s9".to_owned()),
+                (String::new(), "t1".to_owned(), "s1".to_owned()),
+                (String::new(), "t1".to_owned(), "s1".to_owned()),
+                (String::new(), "t9".to_owned(), "s9".to_owned()),
             ],
         );
         assert_eq!(classes.re_delivered, 1, "duplicates count once");

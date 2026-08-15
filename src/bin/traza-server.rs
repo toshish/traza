@@ -602,6 +602,8 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
     let mut host = String::from("127.0.0.1");
     let mut port = 8080_u16;
     let mut ttl_seconds = None;
+    let mut tenant_ttl_seconds: std::collections::HashMap<String, u64> =
+        std::collections::HashMap::new();
     let mut payload_threshold_bytes = 256 * 1024_usize;
     let mut max_connections = DEFAULT_MAX_CONNECTIONS;
     let mut allow_unauthenticated_non_loopback = false;
@@ -653,6 +655,20 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
             "--ttl-seconds" => {
                 i += 1;
                 ttl_seconds = Some(number(i, "--ttl-seconds")?);
+            }
+            "--tenant-ttl" => {
+                i += 1;
+                let raw = value(i, "--tenant-ttl")?;
+                let (tenant, seconds) = raw
+                    .split_once('=')
+                    .ok_or("--tenant-ttl takes TENANT=SECONDS".to_owned())?;
+                if !traza::valid_tenant(tenant) {
+                    return Err("--tenant-ttl names an invalid tenant".to_owned());
+                }
+                let seconds: u64 = seconds
+                    .parse()
+                    .map_err(|_| "--tenant-ttl seconds must be a number".to_owned())?;
+                tenant_ttl_seconds.insert(tenant.to_owned(), seconds);
             }
             "--max-buffer-age-seconds" => {
                 i += 1;
@@ -812,6 +828,7 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
                 None => profile.wal_commit_window(),
             },
             ttl_seconds,
+            tenant_ttl_seconds,
             // 0 removes the age bound; the buffer is then bounded by volume
             // alone, which a trickle workload never reaches.
             max_buffer_age: (max_buffer_age_seconds > 0)
@@ -1000,7 +1017,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // buffer bounds all switched off.
     {
         let maintainer = Arc::clone(&engine);
-        let ttl_enabled = ttl_seconds.is_some();
+        let ttl_enabled = ttl_seconds.is_some() || !config.tenant_ttl_seconds.is_empty();
         let _ = compaction_enabled;
         thread::Builder::new()
             .name("traza-maintenance".into())
@@ -1481,31 +1498,58 @@ fn handle_connection(
         // loopback-open by prior decision, and erasure is open with it.)
         let is_erasure_write =
             head.method.eq_ignore_ascii_case("POST") && head_path == "/v1/erasures";
+        // Destructive eval operations share erasure's capability rule: a
+        // version tombstone is a deletion an rw collector credential must
+        // not be able to perform.
+        let is_eval_tombstone = head.method.eq_ignore_ascii_case("POST")
+            && head_path.starts_with("/v1/datasets/")
+            && head_path.ends_with("/tombstone");
+        // Store-global operator surfaces. A bound (tenant-scoped) credential
+        // is an untrusted principal in a multi-tenant deployment, and these
+        // answer with the WHOLE store's numbers and controls — volumes that
+        // disclose co-tenants, checkpoints and backups that move everyone's
+        // data. Bound tokens get 403 here; their accounting surface is
+        // /v1/tenants.
+        let is_operator_surface = matches!(
+            head_path,
+            "/v1/stats"
+                | "/v1/metrics"
+                | "/v1/metrics.json"
+                | "/v1/verify"
+                | "/v1/checkpoint"
+                | "/v1/flush"
+        ) || head_path.starts_with("/v1/backups/");
         let mut access = traza::mcp::Access::ReadWrite;
+        let mut principal: Option<traza::auth::Principal> = None;
         if let Some(config) = auth {
-            let verdict = if is_mcp {
-                config
-                    .scope_for(head.authorization.as_deref())
-                    .map(|scope| match scope {
+            let verdict = config
+                .principal_for(head.authorization.as_deref())
+                .and_then(|granted| {
+                    let allowed = if is_mcp {
+                        true
+                    } else if is_erasure_write || is_eval_tombstone {
+                        granted.scope.permits_erasure()
+                    } else {
+                        granted.scope.permits(&head.method)
+                    };
+                    if !allowed {
+                        return Err(traza::auth::AuthFailure::Forbidden);
+                    }
+                    if granted.tenant.is_some() && is_operator_surface {
+                        return Err(traza::auth::AuthFailure::Forbidden);
+                    }
+                    Ok(granted)
+                });
+            match verdict {
+                Ok(granted) => {
+                    access = match granted.scope {
                         traza::auth::Scope::ReadOnly => traza::mcp::Access::Read,
                         traza::auth::Scope::ReadWrite | traza::auth::Scope::Admin => {
                             traza::mcp::Access::ReadWrite
                         }
-                    })
-            } else if is_erasure_write {
-                config
-                    .scope_for(head.authorization.as_deref())
-                    .and_then(|scope| match scope.permits_erasure() {
-                        true => Ok(traza::mcp::Access::ReadWrite),
-                        false => Err(traza::auth::AuthFailure::Forbidden),
-                    })
-            } else {
-                config
-                    .authorize(head.authorization.as_deref(), &head.method)
-                    .map(|()| traza::mcp::Access::ReadWrite)
-            };
-            match verdict {
-                Ok(granted) => access = granted,
+                    };
+                    principal = Some(granted);
+                }
                 Err(failure) => {
                     metrics.rejected.increment();
                     let challenge = failure
@@ -1550,7 +1594,15 @@ fn handle_connection(
                 .split_once('?')
                 .map_or(target.as_str(), |(path, _)| path)
         });
-        let result = serve_request(&mut responder, request, engine, metrics, mcp, access);
+        let result = serve_request(
+            &mut responder,
+            request,
+            engine,
+            metrics,
+            mcp,
+            access,
+            principal.as_ref(),
+        );
         let persist = responder.keep_alive;
         let status = responder.status;
         // Observed BEFORE the error is propagated, because a write failure is
@@ -1595,6 +1647,43 @@ fn decode_spans(body: &[u8]) -> Result<Vec<Span>, String> {
     }
 }
 
+/// A bound credential's tenant applied to a request's own tenant selection:
+/// naming a DIFFERENT tenant is refused (`Err` → 403 — the caller knows what
+/// it asked for), anything else becomes the binding.
+fn bind_tenant(
+    selected: Option<String>,
+    principal: Option<&traza::auth::Principal>,
+) -> Result<Option<String>, ()> {
+    match principal.and_then(|principal| principal.tenant.clone()) {
+        None => Ok(selected),
+        Some(bound) => match selected {
+            Some(named) if named != bound => Err(()),
+            _ => Ok(Some(bound)),
+        },
+    }
+}
+
+/// The uniform mapping from engine errors to responses, for the routes that
+/// have no route-specific cases: named defects are the caller's (400),
+/// conflicts are retryable state (409), the rest is the store's (503).
+fn engine_error(responder: &mut Responder<'_>, error: traza::Error) -> io::Result<()> {
+    match error {
+        traza::Error::InvalidSpan(reason) => responder.json(400, json!({"error": reason})),
+        traza::Error::Invalid(reason) => responder.json(400, json!({"error": reason})),
+        traza::Error::Conflict(reason) => responder.json(409, json!({"error": reason})),
+        other => responder.json(503, json!({"error": other.to_string()})),
+    }
+}
+
+/// The one 403 body every cross-tenant refusal shares.
+fn foreign_tenant(responder: &mut Responder<'_>) -> io::Result<()> {
+    responder.json(
+        403,
+        json!({"error": "this credential is bound to a different tenant"}),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn serve_request(
     responder: &mut Responder<'_>,
     request: Request,
@@ -1602,13 +1691,15 @@ fn serve_request(
     metrics: &ServerMetrics,
     mcp: &McpOptions,
     access: traza::mcp::Access,
+    principal: Option<&traza::auth::Principal>,
 ) -> io::Result<()> {
     let (path, query) = request
         .target
         .split_once('?')
         .unwrap_or((&request.target, ""));
+    let scope: Option<&str> = principal.and_then(|principal| principal.tenant.as_deref());
     if path == traza::mcp::ENDPOINT {
-        return serve_mcp(responder, &request, engine, mcp, access);
+        return serve_mcp(responder, &request, engine, mcp, access, principal);
     }
     match (request.method.as_str(), path) {
         ("POST", "/v1/spans") => {
@@ -1635,6 +1726,25 @@ fn serve_request(
                     );
                 }
             }
+            // A bound credential writes ITS tenant: spans that name no
+            // tenant are stamped, and a span claiming another tenant fails
+            // the batch — loudly, batch-atomic, like an empty id. Silently
+            // rewriting it would hide a misconfigured exporter forever.
+            let mut spans = spans;
+            if let Some(bound) = scope {
+                for (index, span) in spans.iter_mut().enumerate() {
+                    if span.tenant.is_empty() {
+                        span.tenant = bound.to_owned();
+                    } else if span.tenant != bound {
+                        return responder.json(
+                            400,
+                            json!({"error": format!(
+                                "span {index}: tenant does not match the credential's binding"
+                            )}),
+                        );
+                    }
+                }
+            }
             match engine.ingest_batch(spans) {
                 // The client should never have to guess what a 200 promises,
                 // and `accepted` is a durability claim — it counts what the
@@ -1657,6 +1767,13 @@ fn serve_request(
                         "durability": engine.durability().as_str(),
                     }),
                 ),
+                // A span the ENGINE refuses (an inadmissible tenant, an
+                // empty id from a library caller's shape) is the client's
+                // defect: 400 names it, 503 would invite a retry that can
+                // never succeed.
+                Err(traza::Error::InvalidSpan(reason)) => {
+                    responder.json(400, json!({"error": reason}))
+                }
                 Err(error) => responder.json(503, json!({"error": error.to_string()})),
             }
         }
@@ -1684,6 +1801,26 @@ fn serve_request(
                 }
             };
             metrics.decoded_spans.add(spans.len() as u64);
+            // Same binding rule as native ingest. The tenant arrived via the
+            // `traza.tenant` resource attribute; a whole-batch 400 for a
+            // foreign one is the loud answer a misconfigured exporter needs
+            // (OTLP's partialSuccess is for data the SERVER chose to drop,
+            // not for a credential contradiction).
+            let mut spans = spans;
+            if let Some(bound) = scope {
+                for (index, span) in spans.iter_mut().enumerate() {
+                    if span.tenant.is_empty() {
+                        span.tenant = bound.to_owned();
+                    } else if span.tenant != bound {
+                        return responder.json(
+                            400,
+                            json!({"error": format!(
+                                "span {index}: tenant does not match the credential's binding"
+                            )}),
+                        );
+                    }
+                }
+            }
             match engine.ingest_batch(spans) {
                 Ok(admission) if is_protobuf => {
                     // An empty ExportTraceServiceResponse is zero protobuf
@@ -1709,6 +1846,14 @@ fn serve_request(
                     }}),
                 ),
                 Ok(_) => responder.json(200, json!({"partialSuccess": {}})),
+                // Same rule as native ingest: a resource attribute the
+                // engine refuses (an invalid `traza.tenant`) is the
+                // exporter's misconfiguration, answered 400 and loudly —
+                // partialSuccess is for data the server CHOSE to drop, not
+                // for a defect the client must fix.
+                Err(traza::Error::InvalidSpan(reason)) => {
+                    responder.json(400, json!({"error": reason}))
+                }
                 Err(error) => responder.json(503, json!({"error": error.to_string()})),
             }
         }
@@ -1803,6 +1948,24 @@ fn serve_request(
                     )
                 }
             };
+            // A bound admin erases ITS tenant and nothing else — the
+            // tenant-subject arm very much included, or a per-tenant admin
+            // could destroy a neighbour wholesale. Payload subjects have no
+            // tenant to check against (content addressing is store-global),
+            // so they are an unbound-operator act by rule.
+            if let Some(bound) = scope {
+                match subject.tenant() {
+                    None => {
+                        return responder.json(
+                            403,
+                            json!({"error": "payload subjects are store-global; erasing one \
+                                             requires an unbound admin credential"}),
+                        )
+                    }
+                    Some(named) if named != bound => return foreign_tenant(responder),
+                    Some(_) => {}
+                }
+            }
             match engine.erase(subject) {
                 Ok(status) => responder.json(
                     200,
@@ -1815,13 +1978,20 @@ fn serve_request(
             }
         }
         ("GET", "/v1/erasures") => match engine.erasures() {
-            Ok(erasures) => responder.json(
-                200,
-                json!({
-                    "erasures": serde_json::to_value(erasures)
-                        .unwrap_or_else(|_| Value::Array(Vec::new()))
-                }),
-            ),
+            Ok(mut erasures) => {
+                // A bound credential sees its own tenant's erasures; the
+                // operator-level ones (payload subjects) are operator news.
+                if let Some(bound) = scope {
+                    erasures.retain(|status| status.erase.subject.tenant() == Some(bound));
+                }
+                responder.json(
+                    200,
+                    json!({
+                        "erasures": serde_json::to_value(erasures)
+                            .unwrap_or_else(|_| Value::Array(Vec::new()))
+                    }),
+                )
+            }
             Err(error) => responder.json(503, json!({"error": error.to_string()})),
         },
         ("GET", path) if path.starts_with("/v1/erasures/") && path.ends_with("/verify") => {
@@ -1829,6 +1999,18 @@ fn serve_request(
             let Ok(id) = id.parse::<u64>() else {
                 return responder.json(400, json!({"error": "erasure ids are decimal integers"}));
             };
+            if let Some(bound) = scope {
+                let mine = matches!(
+                    engine.erasure_status(id),
+                    Ok(Some(status)) if status.erase.subject.tenant() == Some(bound)
+                );
+                if !mine {
+                    return responder.json(
+                        404,
+                        json!({"error": format!("no erasure {id} is recorded in the tombstone log")}),
+                    );
+                }
+            }
             match engine.verify_erasure(id) {
                 Ok(receipt) => responder.json(
                     200,
@@ -1846,11 +2028,15 @@ fn serve_request(
                 return responder.json(400, json!({"error": "erasure ids are decimal integers"}));
             };
             match engine.erasure_status(id) {
-                Ok(Some(status)) => responder.json(
-                    200,
-                    serde_json::to_value(&status).unwrap_or_else(|_| json!({})),
-                ),
-                Ok(None) => responder.json(
+                Ok(Some(status))
+                    if scope.map_or(true, |bound| status.erase.subject.tenant() == Some(bound)) =>
+                {
+                    responder.json(
+                        200,
+                        serde_json::to_value(&status).unwrap_or_else(|_| json!({})),
+                    )
+                }
+                Ok(_) => responder.json(
                     404,
                     json!({"error": format!("no erasure {id} is recorded in the tombstone log")}),
                 ),
@@ -1858,9 +2044,13 @@ fn serve_request(
             }
         }
         ("GET", "/v1/spans") => {
-            let (filter, cursor) = match span_query_from(query) {
+            let (mut filter, cursor) = match span_query_from(query) {
                 Ok(parsed) => parsed,
                 Err(error) => return responder.json(400, json!({"error": error})),
+            };
+            filter.tenant = match bind_tenant(filter.tenant, principal) {
+                Ok(tenant) => tenant,
+                Err(()) => return foreign_tenant(responder),
             };
             let limit = filter.limit;
             match engine.query_costed(&filter, cursor.as_ref()) {
@@ -1938,12 +2128,22 @@ fn serve_request(
         },
         ("GET", _) if path.starts_with("/v1/traces/") => {
             let id = percent_decode(&path[11..]);
-            match engine.get_trace(&id) {
+            let selected = match tenant_param(query) {
+                Ok(selected) => selected,
+                Err(error) => return responder.json(400, json!({"error": error})),
+            };
+            let effective = match bind_tenant(selected, principal) {
+                Ok(tenant) => tenant,
+                Err(()) => return foreign_tenant(responder),
+            };
+            match engine.get_trace_in(effective.as_deref(), &id) {
                 Ok(spans) if spans.is_empty() => {
                     responder.json(404, json!({"error": "trace not found"}))
                 }
                 Ok(spans) => {
-                    let annotations = engine.annotations(&id, None, None).unwrap_or_default();
+                    let annotations = engine
+                        .annotations_in(effective.as_deref(), &id, None, None)
+                        .unwrap_or_default();
                     responder.json(
                         200,
                         json!({
@@ -1959,7 +2159,7 @@ fn serve_request(
             }
         }
         ("GET", "/v1/sessions") => {
-            let (since, until, limit, group_by) = match analytics_query(query) {
+            let (since, until, limit, group_by, tenant) = match analytics_query(query) {
                 Ok(parsed) => parsed,
                 Err(error) => return responder.json(400, json!({"error": error})),
             };
@@ -1969,7 +2169,12 @@ fn serve_request(
                     json!({"error": "group_by is not a /v1/sessions parameter"}),
                 );
             }
-            match engine.sessions(
+            let effective = match bind_tenant(tenant, principal) {
+                Ok(tenant) => tenant,
+                Err(()) => return foreign_tenant(responder),
+            };
+            match engine.sessions_in(
+                effective.as_deref(),
                 since,
                 until,
                 limit.unwrap_or(100),
@@ -1985,7 +2190,15 @@ fn serve_request(
         }
         ("GET", _) if path.starts_with("/v1/sessions/") => {
             let id = percent_decode(&path[13..]);
-            match engine.session(&id) {
+            let selected = match tenant_param(query) {
+                Ok(selected) => selected,
+                Err(error) => return responder.json(400, json!({"error": error})),
+            };
+            let effective = match bind_tenant(selected, principal) {
+                Ok(tenant) => tenant,
+                Err(()) => return foreign_tenant(responder),
+            };
+            match engine.session_in(effective.as_deref(), &id) {
                 Ok(None) => responder.json(404, json!({"error": "session not found"})),
                 Ok(Some(detail)) => responder.json(
                     200,
@@ -2003,6 +2216,16 @@ fn serve_request(
                     }
                 };
             let mut annotation = annotation;
+            if let Some(bound) = scope {
+                if annotation.tenant.is_empty() {
+                    annotation.tenant = bound.to_owned();
+                } else if annotation.tenant != bound {
+                    return responder.json(
+                        400,
+                        json!({"error": "tenant does not match the credential's binding"}),
+                    );
+                }
+            }
             if annotation.timestamp_ns == 0 {
                 annotation.timestamp_ns = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -2012,15 +2235,16 @@ fn serve_request(
             }
             match engine.annotate(annotation) {
                 Ok(()) => responder.json(200, json!({"recorded": true})),
-                Err(traza::Error::InvalidSpan(reason)) => {
-                    responder.json(400, json!({"error": reason}))
-                }
-                Err(error) => responder.json(503, json!({"error": error.to_string()})),
+                Err(error) => engine_error(responder, error),
             }
         }
         ("GET", "/v1/annotations") => {
             let mut trace_id = None;
             let mut span_id = None;
+            let mut tenant = None;
+            let mut session_id = None;
+            let mut experiment_id = None;
+            let mut example_id = None;
             let mut name = None;
             let mut source_prefix = None;
             let mut since_ns = None;
@@ -2032,6 +2256,15 @@ fn serve_request(
                 match percent_decode(key).as_str() {
                     "trace_id" => trace_id = Some(value),
                     "span_id" => span_id = Some(value),
+                    "tenant" => tenant = Some(value),
+                    "session_id" => session_id = Some(value),
+                    "experiment_id" => match value.parse() {
+                        Ok(parsed) => experiment_id = Some(parsed),
+                        Err(_) => {
+                            return responder.json(400, json!({"error": "invalid experiment_id"}))
+                        }
+                    },
+                    "example_id" => example_id = Some(value),
                     "name" => name = Some(value),
                     "source" => source_prefix = Some(value),
                     "since" | "since_ns" => match value.parse() {
@@ -2057,9 +2290,17 @@ fn serve_request(
             // `trace_id` used to be required, which made an eval run
             // unreadable: its scores exist per trace, but nobody wants them
             // one trace at a time. It is now one narrowing among several.
+            let tenant = match bind_tenant(tenant, principal) {
+                Ok(tenant) => tenant,
+                Err(()) => return foreign_tenant(responder),
+            };
             let narrow = traza::annotations::AnnotationQuery {
                 trace_id: trace_id.as_deref(),
                 span_id: span_id.as_deref(),
+                tenant: tenant.as_deref(),
+                session_id: session_id.as_deref(),
+                experiment_id,
+                example_id: example_id.as_deref(),
                 name: name.as_deref(),
                 source_prefix: source_prefix.as_deref(),
                 since_ns,
@@ -2077,7 +2318,7 @@ fn serve_request(
         }
         ("GET", _) if path.starts_with("/v1/payloads/") => {
             let reference = percent_decode(&path[13..]);
-            match engine.payload(&reference) {
+            match engine.payload_in(scope, &reference) {
                 Ok(Some(bytes)) => {
                     let head = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n",
@@ -2091,7 +2332,7 @@ fn serve_request(
             }
         }
         ("GET", "/v1/export") => {
-            let (filter, user_limit) = match filter_from_query(query) {
+            let (mut filter, user_limit) = match filter_from_query(query) {
                 Ok(mut filter) => {
                     // Exports default to unbounded, unlike interactive search.
                     let explicit = query.split('&').any(|pair| pair.starts_with("limit"));
@@ -2101,6 +2342,10 @@ fn serve_request(
                 }
                 Err(error) => return responder.json(400, json!({"error": error})),
             };
+            filter.tenant = match bind_tenant(filter.tenant, principal) {
+                Ok(tenant) => tenant,
+                Err(()) => return foreign_tenant(responder),
+            };
             // Chunked with trailers, terminated by the close. Keeping this
             // connection alive would need the client to agree to trailers
             // first; closing is correct and costs one connection per export.
@@ -2108,9 +2353,13 @@ fn serve_request(
             stream_export(responder.stream, engine, filter, user_limit)
         }
         ("GET", "/v1/tail") => {
-            let (filter, cursor, backfill) = match tail_query_from(query) {
+            let (mut filter, cursor, backfill) = match tail_query_from(query) {
                 Ok(parsed) => parsed,
                 Err(error) => return responder.json(400, json!({"error": error})),
+            };
+            filter.tenant = match bind_tenant(filter.tenant, principal) {
+                Ok(tenant) => tenant,
+                Err(()) => return foreign_tenant(responder),
             };
             // Server-sent events, terminated by the close. The connection is
             // the subscription: there is nothing to keep alive afterwards.
@@ -2118,9 +2367,13 @@ fn serve_request(
             stream_tail(responder.stream, engine, &filter, cursor, backfill)
         }
         ("GET", "/v1/stats/llm") => {
-            let (since, until, limit, group_by) = match analytics_query(query) {
+            let (since, until, limit, group_by, tenant) = match analytics_query(query) {
                 Ok(parsed) => parsed,
                 Err(error) => return responder.json(400, json!({"error": error})),
+            };
+            let effective = match bind_tenant(tenant, principal) {
+                Ok(tenant) => tenant,
+                Err(()) => return foreign_tenant(responder),
             };
             let group_by =
                 match group_by {
@@ -2133,7 +2386,7 @@ fn serve_request(
                         ),
                     },
                 };
-            match engine.llm_aggregate(group_by, since, until) {
+            match engine.llm_aggregate_in(effective.as_deref(), group_by, since, until) {
                 Ok(mut rows) => {
                     if let Some(limit) = limit {
                         rows.truncate(limit);
@@ -2153,10 +2406,14 @@ fn serve_request(
                 Err(error) => return responder.json(400, json!({"error": error})),
             };
             let SeriesRequest {
-                filter,
+                mut filter,
                 buckets,
                 window,
             } = request;
+            filter.tenant = match bind_tenant(filter.tenant, principal) {
+                Ok(tenant) => tenant,
+                Err(()) => return foreign_tenant(responder),
+            };
             let Some((since_ns, until_ns)) = window else {
                 return responder.json(
                     400,
@@ -2175,9 +2432,13 @@ fn serve_request(
             }
         }
         ("GET", "/v1/stats/duration") => {
-            let (filter, _) = match span_query_from(query) {
+            let (mut filter, _) = match span_query_from(query) {
                 Ok(parsed) => parsed,
                 Err(error) => return responder.json(400, json!({"error": error})),
+            };
+            filter.tenant = match bind_tenant(filter.tenant, principal) {
+                Ok(tenant) => tenant,
+                Err(()) => return foreign_tenant(responder),
             };
             match engine.duration_histogram(&filter) {
                 Ok(histogram) => responder.json(
@@ -2206,9 +2467,13 @@ fn serve_request(
             }
         }
         ("GET", "/v1/stats/failures") => {
-            let (filter, _) = match span_query_from(query) {
+            let (mut filter, _) = match span_query_from(query) {
                 Ok(parsed) => parsed,
                 Err(error) => return responder.json(400, json!({"error": error})),
+            };
+            filter.tenant = match bind_tenant(filter.tenant, principal) {
+                Ok(tenant) => tenant,
+                Err(()) => return foreign_tenant(responder),
             };
             let limit = filter.limit.unwrap_or(100);
             match engine.failures(&filter, limit) {
@@ -2220,9 +2485,13 @@ fn serve_request(
             }
         }
         ("GET", "/v1/stats/slowest") => {
-            let (filter, _) = match span_query_from(query) {
+            let (mut filter, _) = match span_query_from(query) {
                 Ok(parsed) => parsed,
                 Err(error) => return responder.json(400, json!({"error": error})),
+            };
+            filter.tenant = match bind_tenant(filter.tenant, principal) {
+                Ok(tenant) => tenant,
+                Err(()) => return foreign_tenant(responder),
             };
             let limit = filter.limit.unwrap_or(10);
             match engine.slowest_spans(&filter, limit) {
@@ -2230,6 +2499,361 @@ fn serve_request(
                     200,
                     json!({"spans": serde_json::to_value(spans)
                         .unwrap_or_else(|_| Value::Array(Vec::new()))}),
+                ),
+                Err(error) => responder.json(503, json!({"error": error.to_string()})),
+            }
+        }
+        // Per-tenant usage accounting: an exact fold over one snapshot,
+        // on-demand. A bound credential gets exactly its own row.
+        ("GET", "/v1/tenants") => match engine.tenant_usage(scope) {
+            Ok(rows) => responder.json(
+                200,
+                json!({"tenants": serde_json::to_value(rows)
+                    .unwrap_or_else(|_| Value::Array(Vec::new()))}),
+            ),
+            Err(error) => responder.json(503, json!({"error": error.to_string()})),
+        },
+        // ------------------------------------------------------- evals
+        // The eval entity model: datasets → versions (immutable,
+        // content-addressed) → experiments → runs, with scores riding the
+        // annotations surface. Identity and addressing only — no runner, no
+        // scorer, no UI. Task execution stays external by design.
+        ("POST", "/v1/datasets") => {
+            #[derive(serde::Deserialize)]
+            struct NewDataset {
+                name: String,
+                #[serde(default)]
+                tenant: String,
+            }
+            let body: NewDataset = match serde_json::from_slice(&request.body) {
+                Ok(body) => body,
+                Err(error) => return responder.json(400, json!({"error": error.to_string()})),
+            };
+            let tenant = match bind_tenant(
+                (!body.tenant.is_empty()).then(|| body.tenant.clone()),
+                principal,
+            ) {
+                Ok(tenant) => tenant.unwrap_or_default(),
+                Err(()) => return foreign_tenant(responder),
+            };
+            match engine.create_dataset(&tenant, &body.name) {
+                Ok(dataset_id) => responder.json(200, json!({"dataset_id": dataset_id})),
+                Err(error) => engine_error(responder, error),
+            }
+        }
+        ("GET", "/v1/datasets") => {
+            let selected = match tenant_param(query) {
+                Ok(selected) => selected,
+                Err(error) => return responder.json(400, json!({"error": error})),
+            };
+            let effective = match bind_tenant(selected, principal) {
+                Ok(tenant) => tenant,
+                Err(()) => return foreign_tenant(responder),
+            };
+            match engine.datasets(effective.as_deref()) {
+                Ok(datasets) => responder.json(
+                    200,
+                    json!({"datasets": serde_json::to_value(datasets)
+                        .unwrap_or_else(|_| Value::Array(Vec::new()))}),
+                ),
+                Err(error) => responder.json(503, json!({"error": error.to_string()})),
+            }
+        }
+        ("POST", path) if path.starts_with("/v1/datasets/") && path.ends_with("/tombstone") => {
+            let rest = &path["/v1/datasets/".len()..path.len() - "/tombstone".len()];
+            let Some((dataset_id, version_id)) = rest.split_once("/versions/") else {
+                return responder.json(404, json!({"error": "not found"}));
+            };
+            let Ok(dataset_id) = dataset_id.parse::<u64>() else {
+                return responder.json(400, json!({"error": "dataset ids are decimal integers"}));
+            };
+            #[derive(Default, serde::Deserialize)]
+            struct Tombstone {
+                #[serde(default)]
+                reason: String,
+            }
+            let body: Tombstone = match request.body.is_empty() {
+                true => Tombstone::default(),
+                false => match serde_json::from_slice(&request.body) {
+                    Ok(body) => body,
+                    Err(error) => return responder.json(400, json!({"error": error.to_string()})),
+                },
+            };
+            match engine.tombstone_dataset_version(scope, dataset_id, version_id, &body.reason) {
+                Ok(created) => responder.json(
+                    200,
+                    json!({"tombstoned": true, "already": !created, "version_id": version_id}),
+                ),
+                Err(error) => engine_error(responder, error),
+            }
+        }
+        ("POST", path) if path.starts_with("/v1/datasets/") && path.ends_with("/versions") => {
+            let id = &path["/v1/datasets/".len()..path.len() - "/versions".len()];
+            let Ok(dataset_id) = id.parse::<u64>() else {
+                return responder.json(400, json!({"error": "dataset ids are decimal integers"}));
+            };
+            #[derive(serde::Deserialize)]
+            struct NewVersion {
+                #[serde(default)]
+                parent: Option<String>,
+                #[serde(default)]
+                provenance: Option<Value>,
+                examples: Vec<traza::evals::NewExample>,
+            }
+            let body: NewVersion = match serde_json::from_slice(&request.body) {
+                Ok(body) => body,
+                Err(error) => return responder.json(400, json!({"error": error.to_string()})),
+            };
+            match engine.create_dataset_version(
+                scope,
+                dataset_id,
+                body.parent,
+                body.provenance,
+                body.examples,
+            ) {
+                Ok(outcome) => responder.json(
+                    200,
+                    serde_json::to_value(&outcome).unwrap_or_else(|_| json!({})),
+                ),
+                Err(error) => engine_error(responder, error),
+            }
+        }
+        ("GET", path) if path.starts_with("/v1/datasets/") && path.contains("/versions/") => {
+            let rest = &path["/v1/datasets/".len()..];
+            let Some((dataset_id, version_id)) = rest.split_once("/versions/") else {
+                return responder.json(404, json!({"error": "not found"}));
+            };
+            let Ok(dataset_id) = dataset_id.parse::<u64>() else {
+                return responder.json(400, json!({"error": "dataset ids are decimal integers"}));
+            };
+            match engine.dataset_version(scope, dataset_id, version_id) {
+                Ok(None) => responder.json(404, json!({"error": "no such dataset version"})),
+                // A tombstoned version is GONE, and says so: the 410 carries
+                // the tombstone record, which is the defined effect — the
+                // content is withheld, the fact of the deletion is not.
+                Ok(Some(Err(tombstone))) => responder.json(
+                    410,
+                    json!({
+                        "error": "this dataset version is tombstoned",
+                        "tombstone": serde_json::to_value(&tombstone)
+                            .unwrap_or_else(|_| json!({})),
+                    }),
+                ),
+                Ok(Some(Ok(view))) => responder.json(
+                    200,
+                    serde_json::to_value(&view).unwrap_or_else(|_| json!({})),
+                ),
+                Err(error) => responder.json(503, json!({"error": error.to_string()})),
+            }
+        }
+        ("GET", path) if path.starts_with("/v1/datasets/") => {
+            let id = &path["/v1/datasets/".len()..];
+            let Ok(dataset_id) = id.parse::<u64>() else {
+                return responder.json(400, json!({"error": "dataset ids are decimal integers"}));
+            };
+            match engine.dataset(scope, dataset_id) {
+                Ok(None) => responder.json(404, json!({"error": "no such dataset"})),
+                Ok(Some(view)) => responder.json(
+                    200,
+                    serde_json::to_value(&view).unwrap_or_else(|_| json!({})),
+                ),
+                Err(error) => responder.json(503, json!({"error": error.to_string()})),
+            }
+        }
+        ("POST", "/v1/experiments") => {
+            #[derive(serde::Deserialize)]
+            struct NewExperiment {
+                dataset_id: u64,
+                dataset_version: String,
+                #[serde(default)]
+                name: String,
+                #[serde(default)]
+                config: Option<Value>,
+            }
+            let body: NewExperiment = match serde_json::from_slice(&request.body) {
+                Ok(body) => body,
+                Err(error) => return responder.json(400, json!({"error": error.to_string()})),
+            };
+            match engine.create_experiment(
+                scope,
+                body.dataset_id,
+                &body.dataset_version,
+                &body.name,
+                body.config,
+            ) {
+                Ok(experiment_id) => responder.json(200, json!({"experiment_id": experiment_id})),
+                Err(error) => engine_error(responder, error),
+            }
+        }
+        ("GET", "/v1/experiments") => {
+            let mut dataset_id = None;
+            let mut tenant = None;
+            for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+                let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+                let value = percent_decode(value);
+                match percent_decode(key).as_str() {
+                    "dataset_id" => match value.parse() {
+                        Ok(parsed) => dataset_id = Some(parsed),
+                        Err(_) => {
+                            return responder.json(400, json!({"error": "invalid dataset_id"}))
+                        }
+                    },
+                    "tenant" => tenant = Some(value),
+                    other => {
+                        return responder.json(
+                            400,
+                            json!({"error": format!("unknown query parameter: {other}")}),
+                        )
+                    }
+                }
+            }
+            let effective = match bind_tenant(tenant, principal) {
+                Ok(tenant) => tenant,
+                Err(()) => return foreign_tenant(responder),
+            };
+            match engine.experiments(effective.as_deref(), dataset_id) {
+                Ok(experiments) => responder.json(
+                    200,
+                    json!({"experiments": serde_json::to_value(experiments)
+                        .unwrap_or_else(|_| Value::Array(Vec::new()))}),
+                ),
+                Err(error) => responder.json(503, json!({"error": error.to_string()})),
+            }
+        }
+        ("GET", "/v1/experiments/diff") => {
+            let mut base = None;
+            let mut candidate = None;
+            for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+                let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+                let value = percent_decode(value);
+                match percent_decode(key).as_str() {
+                    "base" => base = value.parse::<u64>().ok(),
+                    "candidate" => candidate = value.parse::<u64>().ok(),
+                    other => {
+                        return responder.json(
+                            400,
+                            json!({"error": format!("unknown query parameter: {other}")}),
+                        )
+                    }
+                }
+            }
+            let (Some(base), Some(candidate)) = (base, candidate) else {
+                return responder.json(
+                    400,
+                    json!({"error": "diff needs base= and candidate= experiment ids"}),
+                );
+            };
+            match engine.experiment_diff(scope, base, candidate) {
+                Ok(None) => responder.json(404, json!({"error": "no such experiment"})),
+                Ok(Some(diff)) => responder.json(
+                    200,
+                    serde_json::to_value(&diff).unwrap_or_else(|_| json!({})),
+                ),
+                Err(error) => responder.json(503, json!({"error": error.to_string()})),
+            }
+        }
+        ("POST", path) if path.starts_with("/v1/experiments/") && path.ends_with("/runs") => {
+            let id = &path["/v1/experiments/".len()..path.len() - "/runs".len()];
+            let Ok(experiment_id) = id.parse::<u64>() else {
+                return responder
+                    .json(400, json!({"error": "experiment ids are decimal integers"}));
+            };
+            #[derive(serde::Deserialize)]
+            struct NewRun {
+                example_id: String,
+                trace_id: String,
+                #[serde(default)]
+                span_id: String,
+            }
+            let body: NewRun = match serde_json::from_slice(&request.body) {
+                Ok(body) => body,
+                Err(error) => return responder.json(400, json!({"error": error.to_string()})),
+            };
+            match engine.record_eval_run(
+                scope,
+                experiment_id,
+                &body.example_id,
+                &body.trace_id,
+                &body.span_id,
+            ) {
+                Ok(()) => responder.json(200, json!({"recorded": true})),
+                Err(error) => engine_error(responder, error),
+            }
+        }
+        ("GET", path) if path.starts_with("/v1/experiments/") && path.ends_with("/runs") => {
+            let id = &path["/v1/experiments/".len()..path.len() - "/runs".len()];
+            let Ok(experiment_id) = id.parse::<u64>() else {
+                return responder
+                    .json(400, json!({"error": "experiment ids are decimal integers"}));
+            };
+            match engine.eval_runs(scope, experiment_id) {
+                Ok(None) => responder.json(404, json!({"error": "no such experiment"})),
+                Ok(Some(runs)) => responder.json(
+                    200,
+                    json!({"runs": serde_json::to_value(runs)
+                        .unwrap_or_else(|_| Value::Array(Vec::new()))}),
+                ),
+                Err(error) => responder.json(503, json!({"error": error.to_string()})),
+            }
+        }
+        ("GET", path) if path.starts_with("/v1/experiments/") && path.ends_with("/scores") => {
+            let id = &path["/v1/experiments/".len()..path.len() - "/scores".len()];
+            let Ok(experiment_id) = id.parse::<u64>() else {
+                return responder
+                    .json(400, json!({"error": "experiment ids are decimal integers"}));
+            };
+            let mut limit = None;
+            for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+                let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+                match percent_decode(key).as_str() {
+                    "limit" => match percent_decode(value).parse() {
+                        Ok(parsed) => limit = Some(parsed),
+                        Err(_) => return responder.json(400, json!({"error": "invalid limit"})),
+                    },
+                    other => {
+                        return responder.json(
+                            400,
+                            json!({"error": format!("unknown query parameter: {other}")}),
+                        )
+                    }
+                }
+            }
+            match engine.experiment_scores(scope, experiment_id, limit) {
+                Ok(None) => responder.json(404, json!({"error": "no such experiment"})),
+                Ok(Some(scores)) => responder.json(
+                    200,
+                    json!({"scores": serde_json::to_value(scores)
+                        .unwrap_or_else(|_| Value::Array(Vec::new()))}),
+                ),
+                Err(error) => responder.json(503, json!({"error": error.to_string()})),
+            }
+        }
+        ("GET", path) if path.starts_with("/v1/experiments/") && path.ends_with("/summary") => {
+            let id = &path["/v1/experiments/".len()..path.len() - "/summary".len()];
+            let Ok(experiment_id) = id.parse::<u64>() else {
+                return responder
+                    .json(400, json!({"error": "experiment ids are decimal integers"}));
+            };
+            match engine.experiment_summary(scope, experiment_id) {
+                Ok(None) => responder.json(404, json!({"error": "no such experiment"})),
+                Ok(Some(summary)) => responder.json(
+                    200,
+                    serde_json::to_value(&summary).unwrap_or_else(|_| json!({})),
+                ),
+                Err(error) => responder.json(503, json!({"error": error.to_string()})),
+            }
+        }
+        ("GET", path) if path.starts_with("/v1/experiments/") => {
+            let id = &path["/v1/experiments/".len()..];
+            let Ok(experiment_id) = id.parse::<u64>() else {
+                return responder
+                    .json(400, json!({"error": "experiment ids are decimal integers"}));
+            };
+            match engine.experiment(scope, experiment_id) {
+                Ok(None) => responder.json(404, json!({"error": "no such experiment"})),
+                Ok(Some(view)) => responder.json(
+                    200,
+                    serde_json::to_value(&view).unwrap_or_else(|_| json!({})),
                 ),
                 Err(error) => responder.json(503, json!({"error": error.to_string()})),
             }
@@ -2534,11 +3158,21 @@ fn finish_export(stream: &mut TcpStream, complete: bool, emitted: usize) -> io::
 #[allow(clippy::type_complexity)]
 fn analytics_query(
     raw_query: &str,
-) -> Result<(Option<u64>, Option<u64>, Option<usize>, Option<String>), String> {
+) -> Result<
+    (
+        Option<u64>,
+        Option<u64>,
+        Option<usize>,
+        Option<String>,
+        Option<String>,
+    ),
+    String,
+> {
     let mut since = None;
     let mut until = None;
     let mut limit = None;
     let mut group_by = None;
+    let mut tenant = None;
     for pair in raw_query.split('&').filter(|pair| !pair.is_empty()) {
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
         let key = percent_decode(key);
@@ -2554,10 +3188,27 @@ fn analytics_query(
                 limit = Some(value.parse().map_err(|_| "invalid limit")?);
             }
             "group_by" => group_by = Some(value),
+            // `tenant=` with an empty value names the default tenant
+            // explicitly; omitting the parameter means every tenant.
+            "tenant" => tenant = Some(value),
             other => return Err(format!("unknown query parameter: {other}")),
         }
     }
-    Ok((since, until, limit, group_by))
+    Ok((since, until, limit, group_by, tenant))
+}
+
+/// The lone `tenant=` selector for endpoints whose only query parameter it
+/// is (trace and session detail). Unknown parameters stay rejected.
+fn tenant_param(raw_query: &str) -> Result<Option<String>, String> {
+    let mut tenant = None;
+    for pair in raw_query.split('&').filter(|pair| !pair.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        match percent_decode(key).as_str() {
+            "tenant" => tenant = Some(percent_decode(value)),
+            other => return Err(format!("unknown query parameter: {other}")),
+        }
+    }
+    Ok(tenant)
 }
 
 fn filter_from_query(raw_query: &str) -> Result<SpanFilter, String> {
@@ -2634,6 +3285,10 @@ fn span_query_from(raw_query: &str) -> Result<(SpanFilter, Option<traza::SpanCur
             // session (some spans session.id, some gen_ai.conversation.id)
             // returns whole — unlike attr.session.id, which sees one key.
             "session" => filter.session = Some(value),
+            // `tenant=` with an empty value names the default tenant
+            // explicitly; omitted, every tenant matches (a bound credential
+            // is forced onto this after parsing, at every call site).
+            "tenant" => filter.tenant = Some(value),
             "min_duration_ms" => {
                 let ms: u64 = value.parse().map_err(|_| "invalid min_duration_ms")?;
                 filter.min_duration_ns = Some(ms.saturating_mul(1_000_000));
@@ -2684,6 +3339,7 @@ fn serve_mcp(
     engine: &Store,
     options: &McpOptions,
     access: traza::mcp::Access,
+    principal: Option<&traza::auth::Principal>,
 ) -> io::Result<()> {
     if !options.enabled {
         return responder.json(
@@ -2757,6 +3413,7 @@ fn serve_mcp(
     let server = traza::mcp::Server::new(engine, options.limits, options.annotations);
     let context = traza::mcp::Context {
         access,
+        tenant: principal.and_then(|principal| principal.tenant.clone()),
         now_ns: traza::mcp::unix_nanos_now(),
     };
     match server.handle(&message, context) {

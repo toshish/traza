@@ -151,7 +151,12 @@ struct Entry {
 /// so a veil costs exactly as long as the erased spans would have been
 /// served.
 struct Veil {
-    keys: Arc<HashSet<(String, String)>>,
+    /// Erased `(tenant, trace_id, span_id)` keys, for subjects that resolved
+    /// to keys.
+    keys: Arc<HashSet<(String, String, String)>>,
+    /// Erased tenants, for tenant subjects — whose key set is unbounded and
+    /// deliberately unresolved, so the veil must cover by predicate.
+    tenants: Arc<HashSet<String>>,
     below: u64,
 }
 
@@ -198,15 +203,20 @@ impl TailRing {
         }
     }
 
-    /// Withholds every retained entry whose key `keys` names from all future
-    /// reads. Entries admitted AFTER this call are new admissions and are
-    /// served normally — an erasure is a barrier, not a ban.
-    pub fn veil(&mut self, keys: Arc<HashSet<(String, String)>>) {
-        if keys.is_empty() || self.entries.is_empty() {
+    /// Withholds every retained entry `keys` or `tenants` covers from all
+    /// future reads. Entries admitted AFTER this call are new admissions and
+    /// are served normally — an erasure is a barrier, not a ban.
+    pub fn veil(
+        &mut self,
+        keys: Arc<HashSet<(String, String, String)>>,
+        tenants: Arc<HashSet<String>>,
+    ) {
+        if (keys.is_empty() && tenants.is_empty()) || self.entries.is_empty() {
             return;
         }
         self.veils.push(Veil {
             keys,
+            tenants,
             below: self.next_seq(),
         });
     }
@@ -216,10 +226,14 @@ impl TailRing {
         if self.veils.is_empty() {
             return false;
         }
-        let key = (span.trace_id.clone(), span.span_id.clone());
-        self.veils
-            .iter()
-            .any(|veil| seq < veil.below && veil.keys.contains(&key))
+        let key = (
+            span.tenant.clone(),
+            span.trace_id.clone(),
+            span.span_id.clone(),
+        );
+        self.veils.iter().any(|veil| {
+            seq < veil.below && (veil.keys.contains(&key) || veil.tenants.contains(&span.tenant))
+        })
     }
 
     /// Drops veils whose covered entries have all been evicted.
@@ -405,9 +419,13 @@ impl TailChannel {
     /// [`TailRing::veil`]. A poisoned ring is tolerated the same way
     /// [`Self::publish`] tolerates one — the erasure's authority is the
     /// store, and the ring's contents die with the process either way.
-    pub fn veil(&self, keys: Arc<HashSet<(String, String)>>) {
+    pub fn veil(
+        &self,
+        keys: Arc<HashSet<(String, String, String)>>,
+        tenants: Arc<HashSet<String>>,
+    ) {
         if let Ok(mut ring) = self.ring.lock() {
-            ring.veil(keys);
+            ring.veil(keys, tenants);
         }
     }
 
@@ -415,7 +433,7 @@ impl TailChannel {
     /// live tail's contribution to an erasure receipt, returned as keys so
     /// the verifier can tell a re-delivered erased span from new activity
     /// under the same identifiers.
-    pub fn matching_keys(&self, covered: &dyn Fn(&Span) -> bool) -> Vec<(String, String)> {
+    pub fn matching_keys(&self, covered: &dyn Fn(&Span) -> bool) -> Vec<(String, String, String)> {
         let Ok(ring) = self.ring.lock() else {
             return Vec::new();
         };
@@ -427,7 +445,13 @@ impl TailChannel {
                 !ring.veiled(first.saturating_add(*index as u64), &entry.span)
                     && covered(&entry.span)
             })
-            .map(|(_, entry)| (entry.span.trace_id.clone(), entry.span.span_id.clone()))
+            .map(|(_, entry)| {
+                (
+                    entry.span.tenant.clone(),
+                    entry.span.trace_id.clone(),
+                    entry.span.span_id.clone(),
+                )
+            })
             .collect()
     }
 
@@ -523,6 +547,7 @@ pub fn approximate_bytes(span: &Span) -> usize {
     let Span {
         trace_id,
         span_id,
+        tenant,
         parent_span_id,
         name,
         start_time_ns: _,
@@ -538,6 +563,7 @@ pub fn approximate_bytes(span: &Span) -> usize {
     let mut total = OVERHEAD
         + trace_id.capacity()
         + span_id.capacity()
+        + tenant.capacity()
         + name.capacity()
         + status.capacity()
         + service.capacity()
@@ -636,6 +662,7 @@ mod tests {
         Arc::new(Span {
             trace_id: format!("t-{id}"),
             span_id: id.to_string(),
+            tenant: String::new(),
             parent_span_id: None,
             name: "op".into(),
             start_time_ns: start_ns,
