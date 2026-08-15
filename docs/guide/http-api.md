@@ -132,7 +132,7 @@ deliberately not stored; the response then carries the split explicitly:
 
 `suppressed` appears only when nonzero.
 
-**Tenancy.** A span may carry a top-level `tenant` field: lowercase
+**Tenancy.** A span may carry a top-level `$tenant` field: lowercase
 `[a-z0-9][a-z0-9._-]`, at most 64 bytes. Empty or absent is the **default
 tenant**, and it is never serialized back — a single-tenant deployment writes
 byte-identical records to what it wrote before tenancy existed. The tenant is
@@ -141,6 +141,15 @@ a trace id can never upsert over each other. A tenant-bound credential stamps
 its binding onto spans that name no tenant, and a span claiming a *different*
 tenant fails the **whole batch** with `400` — loudly and batch-atomically,
 because silently rewriting it would hide a misconfigured exporter forever.
+
+The key is `$tenant`, not `tenant`, and the `$` earns its place: a span's
+top-level namespace is open, so a bare `tenant` is client data preserved
+verbatim (it is not, and never becomes, an identity). Reserving `$tenant` as
+`$payload` is reserved means a store written before tenancy reads back
+correctly — its bare `tenant` values stay data — rather than a value being
+promoted to an identity no query selects and no erasure names. The `?tenant=`
+read filter and the erasure subject's `tenant` field are their own closed
+namespaces and keep the plain name.
 
 **Errors.**
 
@@ -851,7 +860,7 @@ one of four shapes must hold:
 |---|---|---|---|
 | `trace_id` | string | by subject | Trace containing the annotated span; on a score, the run's trace |
 | `span_id` | string | no | Annotated span; requires its `trace_id` |
-| `tenant` | string | no | The annotation's tenant; empty is the default tenant. Scoped exactly like span identity — reads filter on it, erasure dooms by it. A bound credential stamps its binding onto an empty value and answers `400` when a different one is named |
+| `tenant` | string | no | The annotation's tenant; empty is the default tenant. Scoped exactly like span identity — reads filter on it, erasure dooms by it. `$tenant` is accepted as an alias so the span's spelling routes correctly. A bound credential stamps its binding onto an empty value and answers `400` when a different one is named |
 | `session_id` | string | by subject | Session-subject address |
 | `experiment_id` | integer | by subject | Experiment half of a score's address |
 | `example_id` | string | with `experiment_id` | Example half of a score's address — the stable example id within the experiment's dataset version |
@@ -1313,7 +1322,9 @@ curl -X POST http://localhost:8080/v1/erasures \
 On trace/span/session subjects `tenant` is optional and **empty means the
 default tenant, never "all tenants"** — two tenants sharing a trace id are
 two subjects, and erasing one leaves the other untouched, which is the
-primary key doing its job. The `tenant` subject requires a non-empty name:
+primary key doing its job. Every subject's `tenant` also accepts `$tenant`,
+so the span's reserved spelling cannot silently aim a deletion at the default
+tenant. The `tenant` subject requires a non-empty name:
 the default tenant is every store that never configured tenancy, and "erase
 it whole" is "erase the store", which is not an API — narrower subjects
 express every legitimate deletion

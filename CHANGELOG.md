@@ -279,11 +279,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (tenant joined it), and a pre-tenancy token must parse as *invalid*, never
   as a plausible wrong position. Live cursors from before an upgrade get a
   400, which is what a stale cursor always deserved.
-- **A span decoded from pre-tenancy bytes with a client-supplied top-level
-  `tenant` field** (which round-tripped through the unknown-field contract)
-  is normalized at decode: a value that ingest validation would refuse moves
-  back into the span's extra fields instead of becoming an unqueryable,
-  unerasable identity.
+- **The span identity key on the wire and on disk is `$tenant`, not
+  `tenant`.** A span's top-level namespace is open — unknown fields survive
+  in the round trip — so a bare `tenant` is client data and must stay client
+  data. The `$` sigil (as in `$payload`) is the format discriminator: bytes
+  written before tenancy cannot carry `$tenant`, so a store read after an
+  upgrade keeps its bare `tenant` values as data rather than promoting one to
+  an identity no query selects and no erasure names. This replaces an earlier
+  decode-time normalization that tried to tell legacy data from identity by a
+  value's shape — which a valid-looking legacy value (`"acme"`) slipped
+  through. The `?tenant=` read filter and the erasure subject's `tenant`
+  field are closed namespaces and keep the plain name — but they, along with
+  an annotation's and a dataset's `tenant`, now also **accept `$tenant` as an
+  alias**, so a client that learned the span's spelling cannot silently
+  misroute a score, a dataset, or — worst of all — an erasure to the default
+  tenant. The span alone rejects a bare `tenant` as identity, because the span
+  alone has the open namespace that makes it data.
 
 - **Append-only files are digested and verified over their recorded prefix,
   exactly.** `digest_engine` recorded an append-only log's length from one
@@ -334,6 +345,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A pending whole-tenant erasure withholds its payload bytes from a scoped
+  fetch.** A tenant erasure discovers its span-held references only as its
+  purge walks them, so the mask's `payload_files` set fills after the mask
+  already hides the tenant. A `GET /v1/payloads` under a bound credential now
+  returns nothing the moment its tenant is masked — whether or not that exact
+  reference has been enumerated — closing a window in which a planted crash
+  state served the bytes an erasure was seconds from deleting. Freshly
+  discovered references are also folded into the live mask as they are noted,
+  so the operator path stops serving them mid-purge too.
+- **The MCP `describe_store` "nothing to search yet" note follows the
+  caller's own usage, not the store total.** For a tenant-bound caller the
+  note was keyed on the store's `total_records`, so it appeared only on a
+  globally empty store and vanished the instant any *other* tenant ingested a
+  span — a co-tenant presence oracle across the isolation boundary the rest
+  of the overview respects. It now reads the bound tenant's own row.
+- **An explicit default-tenant scope reaches its own sealed payload.** The
+  default (empty) tenant carries no attribute-index posting — that is what
+  keeps single-tenant stores byte-identical — so a payload-reachability probe
+  that trusted the posting found nothing for a `Some("")` scope once the span
+  sealed. The probe now scans the records and lets the decoded tenant decide
+  for the default tenant, exactly as `select_probe` already did.
 - **Native ingest accepts an event's timestamp under the OTLP name.** A span's
   timestamps accepted `start_time_unix_nano`; its events accepted only
   `timestamp_ns`, so a client spelling both the way OTLP spells them had its

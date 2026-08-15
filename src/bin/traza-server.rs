@@ -2540,7 +2540,10 @@ fn serve_request(
             #[derive(serde::Deserialize)]
             struct NewDataset {
                 name: String,
-                #[serde(default)]
+                // `$tenant` accepted alongside `tenant`, so the span's
+                // reserved spelling routes a dataset to the right tenant
+                // rather than silently to the default one.
+                #[serde(alias = "$tenant", default)]
                 tenant: String,
             }
             let body: NewDataset = match serde_json::from_slice(&request.body) {

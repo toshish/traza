@@ -705,12 +705,26 @@ impl<'a> Server<'a> {
              relative form ('2h', '7d'), an RFC 3339 instant, or a plain date."
                 .to_owned(),
         ];
-        if stats.total_records == 0 {
-            notes.push(
-                "The store holds no spans yet, so every search will return nothing until \
-                 something is ingested."
+        // "Nothing to search yet" must be decided from what the CALLER can
+        // see, never the store's total. A bound caller reading `total_records`
+        // would learn whether any OTHER tenant has data — the note would
+        // appear on an empty store and vanish the moment a co-tenant ingested
+        // a single span, a presence oracle across the very boundary the header
+        // above is careful to respect. Scoped, the note follows this tenant's
+        // own usage row.
+        let caller_is_empty = match bound_usage {
+            Some((spans, _)) => spans == 0,
+            None => stats.total_records == 0,
+        };
+        if caller_is_empty {
+            notes.push(match bound_usage {
+                Some(_) => "This tenant has no spans yet, so every search will return \
+                     nothing until something is ingested for it."
                     .to_owned(),
-            );
+                None => "The store holds no spans yet, so every search will return nothing \
+                     until something is ingested."
+                    .to_owned(),
+            });
         }
         Ok(report(&head, &rows, &notes))
     }
