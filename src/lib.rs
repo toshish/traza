@@ -1581,6 +1581,16 @@ pub struct Store {
     /// The tombstone log: every erasure requested and settled, plus the mask
     /// over the pending ones that every read path consults. See [`erasure`].
     erasures: erasure::ErasureLog,
+    /// The erasure admission gate. Ingest and annotation admission hold it in
+    /// READ mode from their mask load through their store mutation; `begin`
+    /// and settle hold it in WRITE mode while they move the mask. That
+    /// span-of-time exclusion is what makes a one-shot mask application
+    /// sound at the transition: a batch is wholly before the erasure (the
+    /// purge finds its spans and payload files in the store) or wholly after
+    /// (the mask governs its drops, its offload writes, its upserts) — never
+    /// astride it. Outermost in the lock order: taken before writer,
+    /// erasures, or annotations, and never while holding any of them.
+    erasure_gate: std::sync::RwLock<()>,
     next_segment: AtomicU64,
     /// Present unless durability is [`Durability::Buffered`]. Guards the gap
     /// between acknowledging a write and sealing it into a segment.
@@ -1726,6 +1736,7 @@ impl Store {
                 // this store answers, and stays masked until the resumed purge
                 // settles it (see [`Store::resume_erasures`]).
                 erasures: erasure::ErasureLog::open(&directory)?,
+                erasure_gate: std::sync::RwLock::new(()),
                 directory,
                 live_generation: AtomicU64::new(live_generation),
                 config,
@@ -1772,18 +1783,34 @@ impl Store {
         }
         let sent = spans.len();
         let mut spans = spans;
-        // The admission barrier runs BEFORE payload offloading, or a
-        // suppressed span's oversized values would be written to the payload
-        // store first and suppressed after — orphan bytes of the very
-        // subject being erased, invisible to the erase record and therefore
-        // to the receipt, because the span that carried them never entered
-        // the store. Admit re-checks the mask under the writer lock; this
-        // pass exists so the FILESYSTEM side effect is barred too.
+
+        // ---- the erasure admission barrier -------------------------------
+        // Everything from the mask load to the buffer upsert happens under
+        // one read acquisition of the erasure gate, and `begin`/settle take
+        // it in write mode. That span-of-time exclusion is the barrier's
+        // whole guarantee: a batch either completes wholly BEFORE an erasure
+        // begins (its spans and payload files are in the store, where the
+        // purge finds and accounts for them) or begins wholly AFTER (the
+        // mask governs every step: the drop below, the offload's file
+        // writes, the admission). A one-shot mask check cannot say that — a
+        // mask installed between the check and the offload's file write left
+        // orphan payload bytes of a suppressed span that no record named,
+        // and a mask installed between the check and the upsert was the
+        // original pre-settle leak. The gate closes the transition, not just
+        // the steady pending state.
+        let gate = self
+            .erasure_gate
+            .read()
+            .map_err(|_| Error::LockPoisoned("erasure gate"))?;
         let mask = self.erasure_mask();
         if let Some(mask) = &mask {
+            // Covered spans are dropped BEFORE payload offloading, so a
+            // suppressed span's oversized values never reach the filesystem.
             spans.retain(|span| !mask.covers_for_drop(span));
         }
         if let Some(threshold) = self.config.payload_threshold {
+            // Offloading consults the mask too: content whose hash IS a
+            // pending subject offloads to its redacted marker, never bytes.
             let masked = mask.as_deref().map(erasure::Mask::payload_subjects);
             for span in &mut spans {
                 payload::offload_span(
@@ -1795,8 +1822,26 @@ impl Store {
                 )?;
             }
         }
+        if let Some(mask) = &mask {
+            // A client can also SUPPLY reference objects verbatim — spans
+            // round-tripped through export re-ingest them — so the redaction
+            // of pending payload subjects runs against the post-offload
+            // batch, where both shapes look the same.
+            for reference in mask.payload_subjects() {
+                for span in &mut spans {
+                    erasure::redact_payload(span, reference);
+                }
+            }
+            if spans.is_empty() {
+                self.metrics.erasure_spans_suppressed.add(sent as u64);
+                return Ok(Admission {
+                    accepted: 0,
+                    suppressed: sent,
+                });
+            }
+        }
 
-        self.admit(spans, sent)
+        self.admit(spans, sent, gate)
     }
 
     /// The acknowledgement path shared by both ingest surfaces.
@@ -1820,81 +1865,37 @@ impl Store {
     /// purpose.** Taking the seal permit while holding the writer lock would
     /// invert the lock order (see the `sealing` field) and deadlock against
     /// expiry.
-    fn admit(&self, mut spans: Vec<Span>, sent: usize) -> Result<Admission> {
-        // ---- the erasure admission barrier -------------------------------
-        // A span covered by a PENDING erasure is dropped here, before the
-        // log ever carries it (and a value whose content a pending erasure
-        // names is admitted only as its redacted marker). Masking reads
-        // alone was not a barrier: a span admitted between an erasure's
-        // purge scan and its settle was hidden while pending and then
-        // unveiled at settle — acknowledged before `settled_unix_ns`, alive
-        // after it. Suppression at admission is what makes the erasure's cut
-        // exact: everything acknowledged before settle is erased or was
-        // never stored, and everything after is new data.
-        //
-        // The check-and-recheck shape closes the race with `begin`. The
-        // filter and the (batch-sized) frame encode run outside the writer
-        // lock; under the lock, the mask handle is compared by pointer — a
-        // mask installed since the filter forces one loop around with the
-        // fresh mask. An erasure's own purge takes this same lock after
-        // `begin` installs the mask, so every upsert lands either before the
-        // purge's scan (and is purged) or after the mask is visible (and is
-        // filtered). The common case — no pending erasure, ever — pays two
-        // `Option` loads.
+    fn admit(
+        &self,
+        spans: Vec<Span>,
+        sent: usize,
+        gate: std::sync::RwLockReadGuard<'_, ()>,
+    ) -> Result<Admission> {
+        // The caller holds the erasure gate in read mode and already applied
+        // the mask it loaded under it — drops, masked offloading, redaction.
+        // The gate is what makes that one-shot application sound: `begin`
+        // and settle take it in write mode, so the mask CANNOT move between
+        // the caller's filter and the upserts below. It is held through the
+        // writer-lock section and released before the fsync and any seal —
+        // durability work needs no exclusion against an erasure beginning,
+        // only the decision of what enters the store does.
         let mut pending_commit = None;
         let seal_now;
         let seal_must_wait;
         let admitted;
         let admitted_handles;
-        let mut frame;
-        loop {
-            let mask = self.erasure_mask();
-            if let Some(mask) = &mask {
-                spans.retain(|span| !mask.covers_for_drop(span));
-                // Payload subjects redact rather than drop: the span is not
-                // the subject, its oversized value is. The marker this
-                // leaves is the erasure's settled end-state, so admitting it
-                // is admitting new data minus the content being erased.
-                for reference in mask.payload_subjects() {
-                    for span in &mut spans {
-                        erasure::redact_payload(span, reference);
-                    }
-                }
-                let suppressed = sent.saturating_sub(spans.len());
-                if spans.is_empty() {
-                    self.metrics.erasure_spans_suppressed.add(suppressed as u64);
-                    return Ok(Admission {
-                        accepted: 0,
-                        suppressed,
-                    });
-                }
-            }
-            // Encode the log frame BEFORE taking the writer lock.
-            // Serializing a batch is pure CPU proportional to its size, and
-            // doing it under the lock made every concurrent ingest wait for
-            // it. Only the file write has to be inside the lock (below).
-            frame = match &self.wal {
-                Some(_) => Some(self.metrics.wal_encode.time(|| wal::Wal::encode(&spans))?),
-                None => None,
-            };
-
+        // Encode the log frame BEFORE taking the writer lock. Serializing a
+        // batch is pure CPU proportional to its size, and doing it under the
+        // lock made every concurrent ingest wait for it. Only the file write
+        // has to be inside the lock (below).
+        let mut frame = match &self.wal {
+            Some(_) => Some(self.metrics.wal_encode.time(|| wal::Wal::encode(&spans))?),
+            None => None,
+        };
+        {
             let waited = Instant::now();
             let mut writer = self.lock_writer()?;
             self.metrics.writer_lock_wait.record(elapsed_nanos(&waited));
-            let current = self.erasure_mask();
-            let mask_moved = match (&mask, &current) {
-                (None, None) => false,
-                (Some(held), Some(now)) => !std::sync::Arc::ptr_eq(held, now),
-                _ => true,
-            };
-            if mask_moved {
-                // An erasure began (or settled) since the filter ran; the
-                // frame may carry spans the new mask covers. Refilter and
-                // re-encode with the lock released — erasures are rare, so
-                // the retry is too.
-                drop(writer);
-                continue;
-            }
             if let (Some(log), Some(frame)) = (&self.wal, frame.as_mut()) {
                 pending_commit = Some(
                     self.metrics
@@ -1911,8 +1912,8 @@ impl Store {
             });
             seal_now = self.should_flush(&writer);
             seal_must_wait = self.seal_must_not_be_skipped(&writer);
-            break;
         }
+        drop(gate);
 
         // `flushed` promises the caller a SEALED segment, so its seal must
         // finish before this returns and it must not be skipped because
@@ -2867,6 +2868,16 @@ impl Store {
     /// again (there is nothing there to annotate until new data arrives, but
     /// the barrier is the erasure's, not a permanent ban).
     pub fn annotate(&self, annotation: annotations::Annotation) -> Result<()> {
+        // Check and append under one read acquisition of the erasure gate: a
+        // one-shot check raced `begin`, and an annotation slipping in
+        // between the erasure's annotation drop and its settle would attach
+        // judgment to erased data. Under the gate the append either
+        // completes before `begin` (and the erasure's own drop sweeps it) or
+        // starts after (and the mask refuses it).
+        let _gate = self
+            .erasure_gate
+            .read()
+            .map_err(|_| Error::LockPoisoned("erasure gate"))?;
         if let Some(mask) = self.erasure_mask() {
             if mask.covers_annotation(&annotation.trace_id, &annotation.span_id) {
                 return Ok(());
@@ -4323,9 +4334,20 @@ impl Store {
         let requested_unix_ns = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |since| since.as_nanos().min(u128::from(u64::MAX)) as u64);
-        let record = self
-            .erasures
-            .begin(requested_unix_ns, subject, span_keys, payload_refs)?;
+        // The mask moves only under the write half of the erasure gate:
+        // every in-flight ingest or annotation admission holding the read
+        // half completes first (its data lands pre-mask, where the purge
+        // finds it), and everything arriving after sees the mask at every
+        // step. This is what makes the barrier hold at the BEGIN transition,
+        // not just in the steady pending state.
+        let record = {
+            let _gate = self
+                .erasure_gate
+                .write()
+                .map_err(|_| Error::LockPoisoned("erasure gate"))?;
+            self.erasures
+                .begin(requested_unix_ns, subject, span_keys, payload_refs)?
+        };
         let settle = self.complete_erasure(&record)?;
         Ok(erasure::ErasureStatus {
             erase: record,
@@ -4596,14 +4618,17 @@ impl Store {
         // leave `wal.log` here at the latest.
         let generation = self.checkpoint()?;
 
-        // The settle lifts the mask, and with it the barriers. The cut is
-        // still exact without holding any engine lock here: a covered span
-        // cannot be admitted while the mask is up (admit re-checks the mask
-        // by pointer INSIDE the writer lock, so even a batch in flight when
-        // `begin` ran is refiltered), covered spans admitted before the mask
-        // went up were swept by the purge and confirm passes above, and
-        // anything admitted after this append is post-settle new data whose
-        // acknowledgement follows `settled_unix_ns`.
+        // The settle lifts the mask, and with it the barriers — under the
+        // WRITE half of the erasure gate, so it is ordered against every
+        // in-flight admission exactly as `begin` was. The cut is exact
+        // without holding any engine lock: no covered span can be admitted
+        // while the mask is up (admissions hold the gate's read half across
+        // their whole decision, so none can straddle the transition), the
+        // ones admitted before the mask went up were swept by the purge and
+        // confirm passes above, and anything admitted after this append is
+        // post-settle new data whose acknowledgement follows
+        // `settled_unix_ns` — and is stored, because no admission can be
+        // mid-flight with a stale pending mask when the write half is held.
         let settle = erasure::SettleRecord {
             schema: erasure::SettleRecord::schema_now(),
             id: record.id,
@@ -4617,7 +4642,13 @@ impl Store {
             payloads_removed,
             payloads_retained,
         };
-        self.erasures.record_settle(settle.clone())?;
+        {
+            let _gate = self
+                .erasure_gate
+                .write()
+                .map_err(|_| Error::LockPoisoned("erasure gate"))?;
+            self.erasures.record_settle(settle.clone())?;
+        }
         self.metrics.erasures_settled.increment();
         self.metrics.erasure_spans_removed.add(spans_removed as u64);
         self.metrics.erasure.record(elapsed_nanos(&erasing));

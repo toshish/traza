@@ -382,6 +382,119 @@ fn annotations_addressed_to_a_pending_subject_are_suppressed_at_admission() {
 }
 
 #[test]
+fn the_begin_transition_leaves_no_orphan_bytes_behind() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    // The steady pending state is the easy half; the holes review kept
+    // finding lived at the TRANSITION — a batch or annotation astride
+    // `begin`, its mask loaded before the erasure existed and its side
+    // effects landing after. This test aims writers with unique oversized
+    // payloads and annotators at the subject while erasures fire
+    // repeatedly, then audits the filesystem itself. Before the erasure
+    // gate, the offload-then-suppress race left payload files no record
+    // named — precisely what the final sweep below hunts.
+    let dir = test_dir("begin-transition");
+    let store = Arc::new(
+        Store::open(
+            &dir,
+            Config {
+                payload_threshold: Some(64),
+                ..wal_config()
+            },
+        )
+        .expect("opens"),
+    );
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut workers = Vec::new();
+    for thread in 0..3 {
+        let store = Arc::clone(&store);
+        let stop = Arc::clone(&stop);
+        workers.push(std::thread::spawn(move || {
+            let mut index = 0usize;
+            while !stop.load(Ordering::Relaxed) {
+                let id = format!("w-{thread}-{index}");
+                index += 1;
+                // Unique content per span: no legitimate sharing, so any
+                // file on disk without a referencing span is an orphan.
+                let text = format!("payload {thread} {index} {}", "x".repeat(150));
+                store
+                    .ingest(span("doomed", &id, json!({"prompt": text})))
+                    .expect("ingest never errors");
+                store
+                    .annotate(
+                        serde_json::from_value(json!({
+                            "trace_id": "doomed", "span_id": id, "name": "note", "value": 1,
+                        }))
+                        .expect("annotation"),
+                    )
+                    .expect("annotate never errors");
+            }
+        }));
+    }
+
+    for _ in 0..8 {
+        std::thread::sleep(Duration::from_millis(10));
+        let status = store
+            .erase(Subject::Trace {
+                trace_id: "doomed".into(),
+            })
+            .expect("erases");
+        let settle = status.settle.expect("settled");
+        let problems = store
+            .verify_generation(settle.generation)
+            .expect("verifies");
+        assert!(
+            problems.is_empty(),
+            "every cycle's cited generation verifies, transitions included: {problems:?}"
+        );
+    }
+    stop.store(true, Ordering::Relaxed);
+    for worker in workers {
+        worker.join().expect("worker");
+    }
+
+    // One quiescent erasure closes the run, so everything the concurrent
+    // cycles legitimately admitted after their settles is erased too — and
+    // then the store must hold NOTHING of the subject, in any domain, on
+    // disk or off.
+    store
+        .erase(Subject::Trace {
+            trace_id: "doomed".into(),
+        })
+        .expect("final erase");
+    assert!(store.get_trace("doomed").expect("lookup").is_empty());
+    assert!(store
+        .annotations("doomed", None, None)
+        .expect("ann")
+        .is_empty());
+    assert!(store
+        .search_annotations(&traza::annotations::AnnotationQuery::default())
+        .expect("search")
+        .is_empty());
+
+    // The filesystem audit: every payload was unique to a "doomed" span, so
+    // a single surviving file is an orphan some race left behind.
+    let payloads = dir.join("payloads");
+    let mut leftover: Vec<String> = Vec::new();
+    if payloads.exists() {
+        for shard in std::fs::read_dir(&payloads).expect("payloads dir") {
+            let shard = shard.expect("shard");
+            if !shard.file_type().expect("type").is_dir() {
+                continue;
+            }
+            for file in std::fs::read_dir(shard.path()).expect("shard dir") {
+                leftover.push(file.expect("file").path().display().to_string());
+            }
+        }
+    }
+    assert!(
+        leftover.is_empty(),
+        "orphan payload bytes survived the erasures: {leftover:?}"
+    );
+}
+
+#[test]
 fn no_span_acknowledged_before_settle_survives_a_concurrent_erasure() {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;

@@ -343,6 +343,17 @@ pub(crate) fn digest_engine(engine: &Path, prior: &[ManifestFile]) -> Result<Vec
             });
             let sha256 = match unchanged {
                 Some(prior) => prior.sha256.clone(),
+                // The append-only logs are digested to EXACTLY the length
+                // recorded above, never to whatever the file holds by the
+                // time the hash runs. Appends are the one mutation the
+                // checkpoint's locks deliberately admit mid-walk, and
+                // hashing the live file recorded a length from one instant
+                // with a digest from another — a manifest that failed its
+                // own verification the moment an annotation (or an
+                // erasure's settle) landed between the two. Everything
+                // else a manifest names is immutable in place, so the whole
+                // file IS the recorded length.
+                None if is_append_only(&relative) => sha256_prefix(&path, bytes)?,
                 None => payload::sha256_file(&path)?,
             };
             files.push(ManifestFile {
@@ -386,7 +397,13 @@ pub(crate) fn verify_against(engine: &Path, manifest: &Manifest) -> Result<Vec<S
             ));
             continue;
         }
-        let digest = if append_only && metadata.len() > file.bytes {
+        // Append-only files are ALWAYS verified over their manifested
+        // prefix, even when the lengths matched a moment ago: an append
+        // landing between the metadata read and the hash would otherwise
+        // fold post-manifest bytes into the digest and report damage where
+        // there is only growth. The same rule, for the same reason, governs
+        // how the digest was produced (see `digest_engine`).
+        let digest = if append_only {
             sha256_prefix(&path, file.bytes)?
         } else {
             payload::sha256_file(&path)?

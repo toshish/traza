@@ -92,11 +92,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     receipt alike); an oversized value whose content hash is itself under
     erasure offloads directly to its redacted marker instead of recreating
     the file being deleted; and annotations addressed to a covered subject
-    are dropped at admission the same way. The cut is exact: every span
-    acknowledged before `settled_unix_ns` is erased or was never stored,
-    under concurrent writers hammering the subject (a review probe
-    demonstrated 92 pre-settle survivors before the barrier existed;
-    `tests/erasure.rs` keeps both probes as regression tests). The ingest
+    are dropped at admission the same way. The barrier holds at the BEGIN
+    transition, not just in the steady pending state: admissions hold an
+    **erasure gate** in read mode from their mask load through their store
+    mutation — the offload's file writes included — and `begin`/settle move
+    the mask only under its write mode, so a batch or annotation is wholly
+    before an erasure or wholly after it, never astride it. A one-shot mask
+    check could not say that, and review was right to test the transition.
+    The cut is exact: every span acknowledged before `settled_unix_ns` is
+    erased or was never stored, under concurrent writers hammering the
+    subject (a review probe demonstrated 92 pre-settle survivors before the
+    barrier existed; `tests/erasure.rs` keeps the probes as regression
+    tests, plus a transition stress test that erases in a loop under
+    payload-writing and annotating threads and then audits the payload
+    directory itself for orphans). The ingest
     response tells the truth about it — `accepted` counts what was stored,
     `suppressed` appears when nonzero, and the OTLP surfaces answer with
     `partialSuccess.rejectedSpans` (hand-encoded for the protobuf path,
@@ -160,6 +169,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Append-only files are digested and verified over their recorded prefix,
+  exactly.** `digest_engine` recorded an append-only log's length from one
+  instant and its hash from another (`sha256` over the live file), and
+  `verify_against` hashed the whole file whenever the lengths happened to
+  match — so an annotation or settle record appended mid-walk made a
+  freshly published generation fail its own verification with a digest
+  mismatch that was growth, not damage. Both sides now hash exactly the
+  recorded length, which is what the checkpoint's concurrency story always
+  claimed. Found by the erasure transition stress test; the race predates
+  erasure and was reachable by any annotation landing inside a checkpoint's
+  digest walk.
 - **`wal_bytes` counts replayable work, not file bytes.** The log's constant
   preamble is excluded, so a reclaimed log measures zero. Both the
   `flush_wal_bytes` bound and the statistic mean the same thing — what a
