@@ -252,10 +252,29 @@ Three rules keep it from being mistaken for one:
 - **Both directions must be known.** A span that reported only a total has no
   input/output split, and the two are priced differently, so it stays
   unpriced rather than being split by an assumed ratio.
-- **The estimate is reported separately.** `/v1/stats/llm` and `/v1/sessions`
-  return `cost_derived_usd` beside `cost_usd`; equal means the whole total is
-  an estimate, zero means it is all measurement. The dashboard prefixes any
-  figure containing an estimate with `~` and gives the split on hover.
+- **The provenance is reported, not implied.** Every cost-bearing row —
+  `/v1/stats/llm`, `/v1/sessions`, and each bucket of `/v1/stats/series` —
+  carries `cost_derived_usd` beside `cost_usd`, plus three call counts:
+  `cost_metered_calls`, `cost_derived_calls`, and `cost_unpriced_calls`.
+
+**Judge a total by the counts, never by the dollars.** `cost_derived_usd == 0`
+does not mean the figure was measured: a zero-rate model is priced and adds
+nothing, and a call nothing could price also adds nothing. The three cases are
+only distinguishable by the counts:
+
+| What happened | `cost_usd` | `cost_derived_usd` | The counts |
+|---|---|---|---|
+| Metered by the span | 0.42 | 0 | `metered: 1` |
+| Priced from the table | 0.42 | 0.42 | `derived: 1` |
+| Priced at a zero rate | 0 | 0 | `derived: 1` |
+| Nothing could price it | 0 | 0 | `unpriced: 1` |
+
+`cost_derived_calls > 0` means the total is an **estimate**;
+`cost_unpriced_calls > 0` means it is an **undercount**, because those calls
+contributed nothing to it. The dashboard prefixes an estimate with `~`, shows
+`—` rather than `0.0000` when nothing could be priced, and gives the full
+breakdown on hover. MCP does the same, and its `analyze_cost` no longer claims
+cost is exact when a rate table contributed to it.
 
 ### Changing the rates
 

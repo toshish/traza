@@ -58,12 +58,19 @@ export function AnalyticsScreen({ go }) {
   const totals = rows.reduce((acc, r) => ({
     calls: acc.calls + r.llm_calls,
     tokens: acc.tokens + r.total_tokens,
-    cost: acc.cost + r.cost_usd,
-    costDerived: acc.costDerived + (r.cost_derived_usd || 0),
+    cost_usd: acc.cost_usd + r.cost_usd,
+    cost_derived_usd: acc.cost_derived_usd + (r.cost_derived_usd || 0),
+    cost_metered_calls: acc.cost_metered_calls + (r.cost_metered_calls || 0),
+    cost_derived_calls: acc.cost_derived_calls + (r.cost_derived_calls || 0),
+    cost_unpriced_calls: acc.cost_unpriced_calls + (r.cost_unpriced_calls || 0),
     errors: acc.errors + r.error_count,
     durationNs: acc.durationNs + r.llm_duration_ns,
     spans: acc.spans + r.spans,
-  }), { calls: 0, tokens: 0, cost: 0, costDerived: 0, errors: 0, durationNs: 0, spans: 0 });
+  }), {
+    calls: 0, tokens: 0, cost_usd: 0, cost_derived_usd: 0,
+    cost_metered_calls: 0, cost_derived_calls: 0, cost_unpriced_calls: 0,
+    errors: 0, durationNs: 0, spans: 0,
+  });
 
   const buckets = series.data?.buckets || [];
 
@@ -93,10 +100,11 @@ export function AnalyticsScreen({ go }) {
         {[
           ['calls', fmtCompact(totals.calls)],
           ['tokens', fmtCompact(totals.tokens)],
-          ['cost', fmtCostProvenance(totals.cost, totals.costDerived).text, 'USD'],
+          ['cost', fmtCostProvenance(totals).text, 'USD'],
           ['mean latency', totals.calls ? fmtDurationNs(totals.durationNs / totals.calls) : '—'],
           ['cost / call', totals.calls
-            ? (totals.costDerived > 0 ? '~' : '') + (totals.cost / totals.calls).toFixed(6)
+            ? (fmtCostProvenance(totals).estimated ? '~' : '')
+              + (totals.cost_usd / totals.calls).toFixed(6)
             : '—', 'USD'],
           ['error rate', totals.spans ? fmtPercent(totals.errors, totals.spans) : '0%'],
         ].map(([label, value, unit]) => <Card key={label} pad="12px 14px">
@@ -174,7 +182,7 @@ function Num({ children, muted, accent, tone }) {
 
 /** A cost cell that marks a figure the pricing table worked out. */
 function CostCell({ row }) {
-  const cost = fmtCostProvenance(row.cost_usd, row.cost_derived_usd);
+  const cost = fmtCostProvenance(row);
   return <div title={cost.title} style={{
     padding: 'var(--row-py) 10px', fontFamily: 'var(--font-mono)', fontSize: 12,
     fontVariantNumeric: 'tabular-nums', textAlign: 'right',

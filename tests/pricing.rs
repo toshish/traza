@@ -68,6 +68,20 @@ fn span(span_id: &str, model: &str, prompt: u64, completion: u64, metered: Optio
     .expect("span")
 }
 
+/// `(metered, derived, unpriced)` call counts summed over every model row.
+fn provenance(store: &Store) -> (usize, usize, usize) {
+    let rows = store
+        .llm_aggregate(LlmGroupBy::Model, None, None)
+        .expect("aggregate");
+    rows.iter().fold((0, 0, 0), |(m, d, u), row| {
+        (
+            m + row.cost_metered_calls,
+            d + row.cost_derived_calls,
+            u + row.cost_unpriced_calls,
+        )
+    })
+}
+
 /// `(cost_usd, cost_derived_usd)` for the one model row.
 fn model_cost(store: &Store) -> (f64, f64) {
     let rows = store
@@ -241,4 +255,161 @@ fn sessions_report_derived_cost_too() {
         session.cost_usd
     );
     assert!((session.cost_derived_usd - 11.0).abs() < 1e-9);
+}
+
+#[test]
+fn an_unpriced_call_is_not_reported_as_a_metered_zero() {
+    // $0.00 with nothing derived is exactly what a metered-at-zero total looks
+    // like on the dollars alone, so provenance has to be counted. Reading it
+    // off the money told every reader these calls had been measured.
+    let dir = test_dir("unpriced-provenance");
+    let store = Store::open(&dir, config(None)).expect("opens");
+    store
+        .ingest_batch(vec![span("a", "gpt-5.6-sol", 1_000_000, 1_000_000, None)])
+        .expect("append");
+
+    assert_eq!(model_cost(&store), (0.0, 0.0));
+    assert_eq!(
+        provenance(&store),
+        (0, 0, 1),
+        "one call, priced by nobody: not metered, not derived"
+    );
+}
+
+#[test]
+fn a_zero_rate_model_is_derived_rather_than_metered() {
+    // A rate of 0.0 is legal and is how a self-hosted model gets priced. It
+    // contributes exactly $0.00, which is indistinguishable from unpriced on
+    // the money — and from metered-at-zero. The counts are what tell them
+    // apart.
+    let dir = test_dir("zero-rate");
+    let free = r#"{"models": {
+        "gpt-5.6-sol": {"input_per_mtok": 0.0, "output_per_mtok": 0.0}
+    }}"#;
+    let store = Store::open(&dir, config(Some(free))).expect("opens");
+    store
+        .ingest_batch(vec![span("a", "gpt-5.6-sol", 1_000_000, 1_000_000, None)])
+        .expect("append");
+
+    assert_eq!(model_cost(&store), (0.0, 0.0), "zero rates cost zero");
+    assert_eq!(
+        provenance(&store),
+        (0, 1, 0),
+        "the call WAS priced, and a reader must be able to tell"
+    );
+}
+
+#[test]
+fn provenance_counts_separate_the_three_kinds_of_call() {
+    let dir = test_dir("provenance-mix");
+    let store = Store::open(&dir, config(Some(TABLE))).expect("opens");
+    store
+        .ingest_batch(vec![
+            span("a", "gpt-5.6-sol", 1_000_000, 1_000_000, Some(0.42)),
+            span("b", "gpt-5.6-sol", 1_000_000, 1_000_000, None),
+            span("c", "some-private-model", 1_000_000, 1_000_000, None),
+        ])
+        .expect("append");
+
+    assert_eq!(provenance(&store), (1, 1, 1));
+}
+
+#[test]
+fn provenance_counts_survive_a_seal_and_reopen() {
+    // The counts live in the rollup sidecar, so they have the same staleness
+    // exposure the dollars do.
+    let dir = test_dir("provenance-sealed");
+    {
+        let store = Store::open(&dir, config(Some(TABLE))).expect("opens");
+        store
+            .ingest_batch(vec![
+                span("a", "gpt-5.6-sol", 1_000_000, 1_000_000, Some(0.42)),
+                span("b", "gpt-5.6-sol", 1_000_000, 1_000_000, None),
+                span("c", "some-private-model", 1_000_000, 1_000_000, None),
+            ])
+            .expect("append");
+        store.flush().expect("flush");
+        assert_eq!(provenance(&store), (1, 1, 1));
+    }
+    {
+        let store = Store::open(&dir, config(Some(TABLE))).expect("reopens");
+        assert_eq!(provenance(&store), (1, 1, 1), "read back from the sidecar");
+    }
+    {
+        // Drop the table: the derived call becomes an unpriced one, and the
+        // rollup must be rebuilt rather than reporting the old provenance.
+        let store = Store::open(&dir, config(None)).expect("reopens");
+        assert_eq!(provenance(&store), (1, 0, 2));
+    }
+}
+
+#[test]
+fn a_span_with_no_llm_facts_is_not_counted_as_an_unpriced_call() {
+    // Ordinary service traffic has no cost because it is not a model call,
+    // which is a different statement from "we could not price it".
+    let dir = test_dir("non-llm");
+    let store = Store::open(&dir, config(Some(TABLE))).expect("opens");
+    let plain: Span = serde_json::from_value(json!({
+        "trace_id": "t1", "span_id": "p1", "name": "GET /health", "service": "api",
+        "start_time_ns": 1_700_000_000_000_000_000u64,
+        "end_time_ns": 1_700_000_000_001_000_000u64,
+        "attributes": {"http.method": "GET"},
+    }))
+    .expect("span");
+    store.ingest_batch(vec![plain]).expect("append");
+
+    let rows = store
+        .llm_aggregate(LlmGroupBy::Service, None, None)
+        .expect("aggregate");
+    let row = rows.first().expect("one service row");
+    assert_eq!(
+        (
+            row.cost_metered_calls,
+            row.cost_derived_calls,
+            row.cost_unpriced_calls
+        ),
+        (0, 0, 0)
+    );
+}
+
+#[test]
+fn the_series_carries_provenance_alongside_the_money() {
+    // The Overview spend tile and its deltas are built from these buckets. A
+    // bucket that reports only `cost_usd` presents an estimate as measured
+    // spend, and the tile is the most-read number in the product.
+    let dir = test_dir("series");
+    let store = Store::open(&dir, config(Some(TABLE))).expect("opens");
+    store
+        .ingest_batch(vec![
+            span("a", "gpt-5.6-sol", 1_000_000, 1_000_000, None),
+            span("b", "gpt-5.6-sol", 1_000_000, 1_000_000, Some(0.42)),
+            span("c", "some-private-model", 1_000_000, 1_000_000, None),
+        ])
+        .expect("append");
+
+    let series = store
+        .series(
+            &Default::default(),
+            1_700_000_000_000_000_000,
+            1_700_000_000_010_000_000,
+            4,
+        )
+        .expect("series");
+
+    let cost: f64 = series.buckets.iter().map(|b| b.cost_usd).sum();
+    let derived: f64 = series.buckets.iter().map(|b| b.cost_derived_usd).sum();
+    let metered_calls: u64 = series.buckets.iter().map(|b| b.cost_metered_calls).sum();
+    let derived_calls: u64 = series.buckets.iter().map(|b| b.cost_derived_calls).sum();
+    let unpriced_calls: u64 = series.buckets.iter().map(|b| b.cost_unpriced_calls).sum();
+
+    assert!(
+        (cost - 11.42).abs() < 1e-9,
+        "0.42 metered + 11 derived: {cost}"
+    );
+    assert!((derived - 11.0).abs() < 1e-9, "derived share: {derived}");
+    assert_eq!(
+        (metered_calls, derived_calls, unpriced_calls),
+        (1, 1, 1),
+        "a bucket must say where its money came from, and what it is missing"
+    );
 }

@@ -248,10 +248,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **A metered `llm.cost_usd` always wins**, and a span reporting only a
     total token count stays unpriced rather than being split by an assumed
     input/output ratio.
-  - **Estimates are reported as estimates.** `/v1/stats/llm` and
-    `/v1/sessions` return `cost_derived_usd` beside `cost_usd`, so a total's
-    provenance is always answerable; the dashboard prefixes any figure
-    containing an estimate with `~` and gives the split on hover.
+  - **Estimates are reported as estimates, by count rather than by amount.**
+    Every cost-bearing row — `/v1/stats/llm`, `/v1/sessions`, and each bucket
+    of `/v1/stats/series` — carries `cost_derived_usd` beside `cost_usd` plus
+    `cost_metered_calls`, `cost_derived_calls` and `cost_unpriced_calls`. The
+    dollars cannot carry provenance on their own: a zero-rate model is priced
+    and adds nothing, a call nothing could price also adds nothing, and
+    neither is distinguishable from a genuine measurement of zero.
+    `cost_derived_calls > 0` means the total is an estimate;
+    `cost_unpriced_calls > 0` means it is an undercount. The dashboard and MCP
+    both mark an estimate `~`, show `—` rather than `0.0000` when nothing
+    could be priced, and state the breakdown — and `analyze_cost` no longer
+    claims cost is exact when a rate table contributed to it.
   - **Rollup sidecars record the fingerprint of the table they were folded
     under** (format v4), so editing the rates invalidates exactly the cached
     counters that would now be wrong instead of reporting last month's prices

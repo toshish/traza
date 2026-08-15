@@ -62,7 +62,7 @@ export function SessionsScreen({ go }) {
           }}>{label}</div>)}
       </div>
       {rows.map((session) => {
-        const cost = fmtCostProvenance(session.cost_usd, session.cost_derived_usd);
+        const cost = fmtCostProvenance(session);
         return <div key={session.session_id}
         onClick={() => go(['sessions', session.session_id])} role="link" tabIndex={0}
         onKeyDown={(e) => { if (e.key === 'Enter') go(['sessions', session.session_id]); }}
@@ -134,9 +134,9 @@ export function SessionScreen({ sessionId, go }) {
         ['spans', fmtNum(data.span_count)],
         ['LLM calls', fmtNum(data.llm_calls)],
         ['tokens', fmtNum(data.total_tokens)],
-        ['cost USD', fmtCostProvenance(data.cost_usd, data.cost_derived_usd).text],
+        ['cost USD', fmtCostProvenance(data).text],
         ['cost / turn', data.trace_count
-          ? (data.cost_derived_usd > 0 ? '~' : '') + (data.cost_usd / data.trace_count).toFixed(5)
+          ? (fmtCostProvenance(data).estimated ? '~' : '') + (data.cost_usd / data.trace_count).toFixed(5)
           : '—'],
         ['errors', fmtNum(data.error_count)],
       ].map(([label, value]) => <Card key={label} pad="12px 14px">
@@ -161,7 +161,7 @@ export function SessionScreen({ sessionId, go }) {
           }}>{label}</div>
         ))}
       </div>
-      {traces.map((trace) => { const cost = fmtCostProvenance(trace.cost_usd, trace.cost_derived_usd);
+      {traces.map((trace) => { const cost = fmtCostProvenance(trace);
         return <div key={trace.trace_id}
         onClick={() => go(['trace', trace.trace_id])} role="link" tabIndex={0}
         onKeyDown={(e) => { if (e.key === 'Enter') go(['trace', trace.trace_id]); }}

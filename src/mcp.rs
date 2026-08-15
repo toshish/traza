@@ -447,9 +447,13 @@ impl<'a> Server<'a> {
                 "analyze_cost",
                 "Analyze tokens and cost",
                 "Where the tokens and the money went, grouped by model, provider, service, \
-                 session or UTC day. Counts and sums are exact. Set over_time for a bucketed \
-                 series over the same window when you need to see when a spike happened \
-                 rather than what it was.",
+                 session or UTC day. Counts and token sums are exact. COST MAY NOT BE: \
+                 a value shown as ~$X is estimated from the server's configured model \
+                 rates rather than metered by the span, and calls with neither a cost nor \
+                 a rate contribute nothing, making the total an undercount. Per row, \
+                 cost_derived_calls and cost_unpriced_calls say which applies. Set \
+                 over_time for a bucketed series over the same window when you need to \
+                 see when a spike happened rather than what it was.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -952,14 +956,18 @@ impl<'a> Server<'a> {
             .enumerate()
             .map(|(index, session)| {
                 format!(
-                    "{:>3}  {}  {} · {} · {} · {} tok · ${:.4} · {} · [{}]",
+                    "{:>3}  {}  {} · {} · {} · {} tok · {} · {} · [{}]",
                     index + 1,
                     sanitize(&session.session_id),
                     count(session.trace_count as u64, "trace"),
                     count(session.span_count as u64, "span"),
                     count(session.llm_calls as u64, "LLM call"),
                     thousands(session.total_tokens),
-                    session.cost_usd,
+                    money(
+                        session.cost_usd,
+                        session.cost_derived_calls as u64,
+                        (session.cost_metered_calls + session.cost_derived_calls) as u64,
+                    ),
                     count(session.error_count as u64, "error"),
                     sanitize(&session.session_attribute),
                 )
@@ -978,6 +986,10 @@ impl<'a> Server<'a> {
                     "llm_calls": session.llm_calls,
                     "total_tokens": session.total_tokens,
                     "cost_usd": session.cost_usd,
+                    "cost_derived_usd": session.cost_derived_usd,
+                    "cost_metered_calls": session.cost_metered_calls,
+                    "cost_derived_calls": session.cost_derived_calls,
+                    "cost_unpriced_calls": session.cost_unpriced_calls,
                     "error_count": session.error_count,
                 })
             })
@@ -1009,12 +1021,16 @@ impl<'a> Server<'a> {
             })?;
         let summary = &detail.summary;
         let head = format!(
-            "Session: {}, {}, {}, {}, ${:.4}, {}, {} to {}.",
+            "Session: {}, {}, {}, {}, {}, {}, {} to {}.",
             count(summary.trace_count as u64, "trace"),
             count(summary.span_count as u64, "span"),
             count(summary.llm_calls as u64, "LLM call"),
             count(summary.total_tokens, "token"),
-            summary.cost_usd,
+            money(
+                summary.cost_usd,
+                summary.cost_derived_calls as u64,
+                (summary.cost_metered_calls + summary.cost_derived_calls) as u64,
+            ),
             count(summary.error_count as u64, "error"),
             rfc3339(summary.first_start_ns),
             rfc3339(summary.last_end_ns),
@@ -1026,17 +1042,25 @@ impl<'a> Server<'a> {
         )];
         for trace in &detail.traces {
             rows.push(format!(
-                "  {}  {}  {} · {} tok · ${:.4} · {}  trace={}",
+                "  {}  {}  {} · {} tok · {} · {}  trace={}",
                 clock(trace.first_start_ns),
                 sanitize(&trace.root_name),
                 count(trace.span_count as u64, "span"),
                 thousands(trace.total_tokens),
-                trace.cost_usd,
+                money(
+                    trace.cost_usd,
+                    trace.cost_derived_calls as u64,
+                    (trace.cost_metered_calls + trace.cost_derived_calls) as u64,
+                ),
                 count(trace.error_count as u64, "error"),
                 sanitize(&trace.trace_id),
             ));
         }
-        let notes = vec!["Open any trace above with get_trace.".to_owned()];
+        let mut notes = vec!["Open any trace above with get_trace.".to_owned()];
+        notes.extend(cost_provenance_note(
+            summary.cost_derived_calls as u64,
+            summary.cost_unpriced_calls as u64,
+        ));
         Ok(text_result(clamp_report(
             &head,
             &rows,
@@ -1189,11 +1213,29 @@ impl<'a> Server<'a> {
                 self.limits.max_result_bytes,
             ));
         }
+        // "Counts and sums are exact" was true of every number this tool
+        // reported until cost could be derived. Token sums still are, so the
+        // claim is narrowed rather than dropped — and the cost half of it is
+        // made only when this particular answer earns it.
+        let cost_note = cost_provenance_note(
+            rows_data
+                .iter()
+                .map(|row| row.cost_derived_calls as u64)
+                .sum(),
+            rows_data
+                .iter()
+                .map(|row| row.cost_unpriced_calls as u64)
+                .sum(),
+        );
         let head = format!(
-            "Tokens and cost by {group_name}, {} of {}, highest cost first. Counts and sums \
-             are exact.",
+            "Tokens and cost by {group_name}, {} of {}, highest cost first. Counts and token \
+             sums are exact{}.",
             thousands(rows_data.len() as u64),
             count(total_rows as u64, "group"),
+            match cost_note.is_some() {
+                true => ", and so is cost where it is not marked ~ (see the note below)",
+                false => ", as is cost: every call here metered its own",
+            },
         );
         let rows: Vec<String> = rows_data
             .iter()
@@ -1205,10 +1247,14 @@ impl<'a> Server<'a> {
                     row.llm_duration_ns / row.llm_calls as u64
                 };
                 format!(
-                    "{:>3}  {}  ${:.4}  {} tok (in {} / out {})  {}  {}  mean {}",
+                    "{:>3}  {}  {}  {} tok (in {} / out {})  {}  {}  mean {}",
                     index + 1,
                     sanitize(&row.key),
-                    row.cost_usd,
+                    money(
+                        row.cost_usd,
+                        row.cost_derived_calls as u64,
+                        (row.cost_metered_calls + row.cost_derived_calls) as u64,
+                    ),
                     thousands(row.total_tokens),
                     thousands(row.prompt_tokens),
                     thousands(row.completion_tokens),
@@ -1219,6 +1265,7 @@ impl<'a> Server<'a> {
             })
             .collect();
         let mut notes = Vec::new();
+        notes.extend(cost_note);
         let structured_rows: Vec<Value> = rows_data
             .iter()
             .map(|row| {
@@ -1230,6 +1277,10 @@ impl<'a> Server<'a> {
                     "completion_tokens": row.completion_tokens,
                     "total_tokens": row.total_tokens,
                     "cost_usd": row.cost_usd,
+                    "cost_derived_usd": row.cost_derived_usd,
+                    "cost_metered_calls": row.cost_metered_calls,
+                    "cost_derived_calls": row.cost_derived_calls,
+                    "cost_unpriced_calls": row.cost_unpriced_calls,
                     "error_count": row.error_count,
                 })
             })
@@ -1258,6 +1309,10 @@ impl<'a> Server<'a> {
                                 "llm_calls": bucket.llm_calls,
                                 "total_tokens": bucket.total_tokens,
                                 "cost_usd": bucket.cost_usd,
+                                "cost_derived_usd": bucket.cost_derived_usd,
+                                "cost_metered_calls": bucket.cost_metered_calls,
+                                "cost_derived_calls": bucket.cost_derived_calls,
+                                "cost_unpriced_calls": bucket.cost_unpriced_calls,
                             })
                         })
                         .collect();
@@ -1269,12 +1324,16 @@ impl<'a> Server<'a> {
                     ));
                     for bucket in &series.buckets {
                         notes.push(format!(
-                            "  {}  {} · {} · {} tok · ${:.4}",
+                            "  {}  {} · {} · {} tok · {}",
                             rfc3339(bucket.start_ns),
                             count(bucket.spans, "span"),
                             count(bucket.errors, "error"),
                             thousands(bucket.total_tokens),
-                            bucket.cost_usd,
+                            money(
+                                bucket.cost_usd,
+                                bucket.cost_derived_calls,
+                                bucket.cost_metered_calls + bucket.cost_derived_calls,
+                            ),
                         ));
                     }
                 }
@@ -1463,7 +1522,10 @@ impl<'a> Server<'a> {
             line.push_str(&format!("  {} tok", thousands(facts.total())));
         }
         if let Some(cost) = facts.cost_usd {
-            line.push_str(&format!("  ${cost:.4}"));
+            line.push_str(&format!(
+                "  {}",
+                money(cost, u64::from(facts.cost_derived), 1)
+            ));
         }
         let mut lines = vec![line];
         if include_content {
@@ -1580,12 +1642,16 @@ impl<'a> Server<'a> {
             .iter()
             .map(|row| {
                 format!(
-                    "  {}  {} · {} · {} tok · ${:.4}",
+                    "  {}  {} · {} · {} tok · {}",
                     sanitize(&row.key),
                     count(row.spans as u64, "span"),
                     count(row.llm_calls as u64, "call"),
                     thousands(row.total_tokens),
-                    row.cost_usd,
+                    money(
+                        row.cost_usd,
+                        row.cost_derived_calls as u64,
+                        (row.cost_metered_calls + row.cost_derived_calls) as u64,
+                    ),
                 )
             })
             .collect();
@@ -1941,6 +2007,25 @@ fn sessions_output_schema() -> Value {
                         "llm_calls": {"type": "integer"},
                         "total_tokens": {"type": "integer"},
                         "cost_usd": {"type": "number"},
+                        "cost_derived_usd": {
+                            "type": "number",
+                            "description": "Part of cost_usd priced from the server's \
+                                            configured model rates rather than metered by a \
+                                            span. Non-zero means cost_usd is an estimate.",
+                        },
+                        "cost_metered_calls": {"type": "integer"},
+                        "cost_derived_calls": {
+                            "type": "integer",
+                            "description": "LLM calls priced from configured rates. Use this, \
+                                            not cost_derived_usd, to decide whether a total is \
+                                            estimated: a zero-rate model adds no dollars.",
+                        },
+                        "cost_unpriced_calls": {
+                            "type": "integer",
+                            "description": "LLM calls with no cost and no configured rate. \
+                                            They contribute nothing, so a non-zero value means \
+                                            cost_usd is an undercount.",
+                        },
                         "error_count": {"type": "integer"},
                     },
                     "required": ["session_id", "span_count", "cost_usd"],
@@ -1968,6 +2053,25 @@ fn cost_output_schema() -> Value {
                         "completion_tokens": {"type": "integer"},
                         "total_tokens": {"type": "integer"},
                         "cost_usd": {"type": "number"},
+                        "cost_derived_usd": {
+                            "type": "number",
+                            "description": "Part of cost_usd priced from the server's \
+                                            configured model rates rather than metered by a \
+                                            span. Non-zero means cost_usd is an estimate.",
+                        },
+                        "cost_metered_calls": {"type": "integer"},
+                        "cost_derived_calls": {
+                            "type": "integer",
+                            "description": "LLM calls priced from configured rates. Use this, \
+                                            not cost_derived_usd, to decide whether a total is \
+                                            estimated: a zero-rate model adds no dollars.",
+                        },
+                        "cost_unpriced_calls": {
+                            "type": "integer",
+                            "description": "LLM calls with no cost and no configured rate. \
+                                            They contribute nothing, so a non-zero value means \
+                                            cost_usd is an undercount.",
+                        },
                         "error_count": {"type": "integer"},
                     },
                     "required": ["key", "total_tokens", "cost_usd"],
@@ -1984,6 +2088,25 @@ fn cost_output_schema() -> Value {
                         "llm_calls": {"type": "integer"},
                         "total_tokens": {"type": "integer"},
                         "cost_usd": {"type": "number"},
+                        "cost_derived_usd": {
+                            "type": "number",
+                            "description": "Part of cost_usd priced from the server's \
+                                            configured model rates rather than metered by a \
+                                            span. Non-zero means cost_usd is an estimate.",
+                        },
+                        "cost_metered_calls": {"type": "integer"},
+                        "cost_derived_calls": {
+                            "type": "integer",
+                            "description": "LLM calls priced from configured rates. Use this, \
+                                            not cost_derived_usd, to decide whether a total is \
+                                            estimated: a zero-rate model adds no dollars.",
+                        },
+                        "cost_unpriced_calls": {
+                            "type": "integer",
+                            "description": "LLM calls with no cost and no configured rate. \
+                                            They contribute nothing, so a non-zero value means \
+                                            cost_usd is an undercount.",
+                        },
                     },
                     "required": ["start_ns", "spans"],
                 },
@@ -2192,8 +2315,18 @@ attribute renaming.
 | Session | `session.id` → `gen_ai.conversation.id` → `traceloop.association.properties.session_id` → `traceloop.association.properties.chat_id` |
 
 Cost is not an OpenTelemetry attribute. `llm.cost_usd` is a Traza extension
-populated when a pipeline meters cost; a store whose instrumentation does not
-emit it reports zero cost and real token counts.
+populated when a pipeline meters cost. A server may also be configured with
+per-model rates, and will then derive a cost for calls that metered none — a
+metered value always wins, and a call reporting only a total token count is
+never priced, because input and output cost different amounts.
+
+**So a cost you read here may be an estimate, and you must not quote one as
+spend.** A rendered value carries `~` when any of it was derived. In
+structured results, `cost_derived_calls > 0` means the total is estimated and
+`cost_unpriced_calls > 0` means it is an undercount — calls that could not be
+priced contribute nothing. Judge by those counts, never by
+`cost_derived_usd`: a zero-rate model is priced and adds no dollars, which is
+indistinguishable from an unpriced one on the money alone.
 
 A session usually spans many traces. The `session` filter unions every key
 above, so a session whose spans use mixed conventions still returns whole —
@@ -2663,6 +2796,11 @@ fn render_trace(
         .collect();
     let errors = spans.iter().filter(|span| span.status == "error").count();
     let cost: f64 = facts.iter().filter_map(|fact| fact.cost_usd).sum();
+    let derived_calls = facts.iter().filter(|fact| fact.cost_derived).count() as u64;
+    let unpriced_calls = facts
+        .iter()
+        .filter(|fact| fact.is_llm && fact.cost_usd.is_none())
+        .count() as u64;
     let tokens: u64 = facts.iter().map(semconv::LlmFacts::total).sum();
     let start = spans
         .iter()
@@ -2673,18 +2811,23 @@ fn render_trace(
     let session = facts.iter().find_map(|fact| fact.session.clone());
 
     let head = format!(
-        "Trace {}: {}, {}, {}, {}, ${:.4}{}. Starts {}.",
+        "Trace {}: {}, {}, {}, {}, {}{}. Starts {}.",
         sanitize(trace_id),
         count(spans.len() as u64, "span"),
         duration_human(end.saturating_sub(start)),
         count(errors as u64, "error"),
         count(tokens, "token"),
-        cost,
+        money(
+            cost,
+            derived_calls,
+            facts.iter().filter(|fact| fact.cost_usd.is_some()).count() as u64,
+        ),
         session.map_or(String::new(), |id| format!(", session {}", sanitize(id))),
         rfc3339(start),
     );
 
     let mut notes = Vec::new();
+    notes.extend(cost_provenance_note(derived_calls, unpriced_calls));
     let (mut ordered, cycles) = depth_first_order(spans);
     if cycles > 0 {
         notes.push(format!(
@@ -2740,7 +2883,10 @@ fn render_trace(
             row.push_str(&format!("  {} tok", thousands(fact.total())));
         }
         if let Some(value) = fact.cost_usd {
-            row.push_str(&format!("  ${value:.4}"));
+            row.push_str(&format!(
+                "  {}",
+                money(value, u64::from(fact.cost_derived), 1)
+            ));
         }
         row.push_str(&format!("  span={}", sanitize(&span.span_id)));
         rows.push(row);
@@ -3378,6 +3524,59 @@ fn count(value: u64, noun: &str) -> String {
         format!("1 {noun}")
     } else {
         format!("{} {noun}s", thousands(value))
+    }
+}
+
+/// A cost, marked when any of it was worked out rather than measured.
+///
+/// `~` is the whole point. An agent reading `$4.1200` will quote it as spend;
+/// reading `~$4.1200` it has to say "about", which is the only claim the
+/// number supports once a pricing table contributed to it. The marker keys off
+/// the DERIVED CALL COUNT, never the derived dollars: a zero-rate model is
+/// priced and adds nothing, and a total of `$0.00` is equally what an unpriced
+/// call leaves behind.
+fn money(cost_usd: f64, derived_calls: u64, priced_calls: u64) -> String {
+    // Nothing here could be priced, so there is no figure to give. `$0.0000`
+    // would be the same lie the `~` exists to prevent, one row further down:
+    // it reads as "this was free" when it means "nobody could say".
+    if priced_calls == 0 {
+        return "—".to_owned();
+    }
+    if derived_calls > 0 {
+        format!("~${cost_usd:.4}")
+    } else {
+        format!("${cost_usd:.4}")
+    }
+}
+
+/// The sentence a cost total needs when it is not a plain measurement, or
+/// `None` when it is.
+///
+/// Two different caveats, and they stack: some of the total was estimated, and
+/// some calls contributed nothing at all because nothing could price them. The
+/// second is the one that turns a total into an undercount, so it is stated as
+/// a count rather than left for the reader to infer from a suspiciously round
+/// figure.
+fn cost_provenance_note(derived_calls: u64, unpriced_calls: u64) -> Option<String> {
+    match (derived_calls > 0, unpriced_calls > 0) {
+        (false, false) => None,
+        (true, false) => Some(format!(
+            "Cost marked ~ is an estimate: {} priced from the server's configured \
+             model rates rather than metered by the span.",
+            count(derived_calls, "call")
+        )),
+        (false, true) => Some(format!(
+            "Cost is an UNDERCOUNT: {} carried no cost and no configured rate, \
+             so they contribute nothing to the total.",
+            count(unpriced_calls, "call")
+        )),
+        (true, true) => Some(format!(
+            "Cost marked ~ is an estimate ({} priced from the server's configured \
+             model rates) and an UNDERCOUNT ({} carried no cost and no rate, so \
+             they contribute nothing).",
+            count(derived_calls, "call"),
+            count(unpriced_calls, "call")
+        )),
     }
 }
 

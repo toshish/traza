@@ -56,11 +56,16 @@ traza-server --data-dir ./data --port 8080 --pricing ./pricing.json
 ```
 
 A metered `llm.cost_usd` always wins — the table only fills blanks, and only
-when the span reported both an input and an output token count. Derived cost
-is summed separately from metered cost and reported as `cost_derived_usd`
-beside `cost_usd` on `/v1/stats/llm` and `/v1/sessions`, so a total's
-provenance is always answerable; the dashboard prefixes any figure containing
-an estimate with `~`.
+when the span reported both an input and an output token count.
+
+Every cost-bearing row (`/v1/stats/llm`, `/v1/sessions`, and each bucket of
+`/v1/stats/series`) reports `cost_derived_usd` beside `cost_usd` and three
+call counts — `cost_metered_calls`, `cost_derived_calls`,
+`cost_unpriced_calls` — so a total's provenance is always answerable.
+**Read the counts, not the dollars:** a zero-rate model and a call nothing
+could price both contribute `0`, so the money alone cannot tell them apart, or
+tell either from a genuine measurement. See
+[Model pricing](configuration.md#model-pricing).
 
 Attributes are indexed like any other, so exact-match filters on them are
 index-served.
