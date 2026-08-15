@@ -103,8 +103,25 @@ impl Subject {
         }
     }
 
+    /// The subject in its canonical form. Payload hashes are lowercased:
+    /// stored references are lowercase hex and every comparison downstream is
+    /// case-sensitive, so an uppercase request would match nothing in any
+    /// span — and then read as a clean receipt over content that is still
+    /// there. (On a case-insensitive filesystem the raw unlink WOULD have hit
+    /// the real file, which is the worst of both: bytes gone, previews
+    /// intact, receipt green. Canonicalizing at the boundary closes both.)
+    pub fn canonicalized(self) -> Self {
+        match self {
+            Self::Payload { reference } => Self::Payload {
+                reference: reference.to_ascii_lowercase(),
+            },
+            other => other,
+        }
+    }
+
     /// Whether the subject is well-formed enough to resolve: non-empty
-    /// identifiers, and a payload reference in its canonical form.
+    /// identifiers, and a payload reference in its canonical form —
+    /// lowercase hex, which [`Self::canonicalized`] produces.
     pub fn validate(&self) -> Result<()> {
         let problem = match self {
             Self::Trace { trace_id } if trace_id.is_empty() => Some("trace_id is empty"),
@@ -116,10 +133,13 @@ impl Subject {
             Self::Session { session_id } if session_id.is_empty() => Some("session_id is empty"),
             Self::Payload { reference }
                 if reference.strip_prefix("sha256/").map_or(true, |hash| {
-                    hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    hash.len() != 64
+                        || !hash
+                            .bytes()
+                            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
                 }) =>
             {
-                Some("a payload reference is sha256/<64 hex characters>")
+                Some("a payload reference is sha256/<64 lowercase hex characters>")
             }
             _ => None,
         };
@@ -230,10 +250,16 @@ pub(crate) fn redact_payload(span: &mut Span, reference: &str) -> bool {
     changed
 }
 
-/// Every `sha256/<hex>` payload reference a span carries.
+/// Every `sha256/<hex>` payload reference a span carries — excluding
+/// redaction markers, whose bytes a prior erasure already removed. A marker
+/// is the RECORD that content is gone; counting it as a reference would put
+/// the erased bytes back under protection.
 pub(crate) fn payload_refs_of(span: &Span, into: &mut HashSet<String>) {
     let mut collect = |attributes: &Map<String, Value>| {
         for value in attributes.values() {
+            if value.get("erased").and_then(Value::as_bool) == Some(true) {
+                continue;
+            }
             if let Some(reference) = value.get(payload::PAYLOAD_KEY).and_then(Value::as_str) {
                 into.insert(reference.to_owned());
             }
@@ -305,6 +331,13 @@ pub struct RetainedPayload {
 
 /// The outcome record: appended after the purge ran and the checkpoint
 /// published. An erase record with no settle record is a pending erasure.
+///
+/// **The counts are the settling pass's counts, not lifetime totals.** A
+/// crash between the physical purge and the settle append loses the first
+/// pass's tallies with the process; the resumed pass finds the work already
+/// done and settles with what IT removed — possibly zero. The receipt, not
+/// this record, is the authority on absence: verification re-checks the
+/// domains, never these numbers.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SettleRecord {
     /// Record schema version; see [`SCHEMA`].
@@ -315,14 +348,17 @@ pub struct SettleRecord {
     pub settled_unix_ns: u64,
     /// The generation whose `CURRENT` rename published the deletion.
     pub generation: u64,
-    /// Spans removed across buffer, log, and segments (physical records,
-    /// superseded versions included).
+    /// Spans removed by the settling pass across buffer, log, and segments
+    /// (physical records, superseded versions included). See the type docs
+    /// for what a crash-resumed settle reports.
     pub spans_removed: usize,
-    /// Spans rewritten with a redacted payload reference (payload subjects).
+    /// Spans rewritten with a redacted payload reference (payload subjects),
+    /// by the settling pass.
     pub spans_redacted: usize,
-    /// Annotations removed from the annotation log.
+    /// Annotations removed from the annotation log by the settling pass.
     pub annotations_removed: usize,
-    /// Payload files whose bytes were deleted.
+    /// Payload files whose bytes were deleted (or already absent, on a
+    /// resumed pass — absence is the erased state either way).
     pub payloads_removed: Vec<String>,
     /// Payload files deliberately kept, each with its reason.
     pub payloads_retained: Vec<RetainedPayload>,
@@ -364,7 +400,9 @@ pub struct ErasureStatus {
 /// invisible, and one ingested after it settles is new data.
 #[derive(Debug, Default)]
 pub(crate) struct Mask {
-    /// Resolved keys of every pending erasure.
+    /// Resolved keys of every pending erasure, PLUS the subject key of every
+    /// pending span-subject erasure — the subject is authoritative even when
+    /// a hand-written or replayed record carries no resolved keys.
     keys: HashSet<(String, String)>,
     /// Pending trace subjects, so spans of the trace that were not yet
     /// visible at resolve time (mid-flight batches) are covered too.
@@ -375,6 +413,14 @@ pub(crate) struct Mask {
     /// until the redaction settles — over-hiding for seconds beats serving
     /// the preview of content someone asked to have erased.
     payloads: HashSet<String>,
+    /// Every payload reference any pending erasure is due to account for —
+    /// the subject reference plus the refs its spans carried. `GET
+    /// /v1/payloads` withholds these bytes while the erasure is pending;
+    /// a shared reference resurfaces at settle if live spans kept it.
+    /// Deliberately NOT consulted by [`Self::covers`]: a popular shared
+    /// payload (a system prompt) must not blank every span that carries it
+    /// while an unrelated trace is being erased.
+    payload_files: HashSet<String>,
 }
 
 impl Mask {
@@ -383,6 +429,8 @@ impl Mask {
         let mut mask = Self::default();
         for record in pending {
             mask.keys.extend(record.span_keys.iter().cloned());
+            mask.payload_files
+                .extend(record.payload_refs.iter().cloned());
             match &record.subject {
                 Subject::Trace { trace_id } => {
                     mask.traces.insert(trace_id.clone());
@@ -392,8 +440,14 @@ impl Mask {
                 }
                 Subject::Payload { reference } => {
                     mask.payloads.insert(reference.clone());
+                    mask.payload_files.insert(reference.clone());
                 }
-                Subject::Span { .. } => {}
+                Subject::Span { trace_id, span_id } => {
+                    // The subject IS the key. Relying on `span_keys` alone
+                    // left the exact span visible whenever a record carried
+                    // an empty list.
+                    mask.keys.insert((trace_id.clone(), span_id.clone()));
+                }
             }
         }
         mask
@@ -425,6 +479,21 @@ impl Mask {
             }
         }
         false
+    }
+
+    /// Whether a pending erasure covers this annotation address. Trace-level
+    /// annotations (empty `span_id`) are covered by trace subjects; span
+    /// addresses by any covered key.
+    pub(crate) fn covers_annotation(&self, trace_id: &str, span_id: &str) -> bool {
+        self.traces.contains(trace_id)
+            || self
+                .keys
+                .contains(&(trace_id.to_owned(), span_id.to_owned()))
+    }
+
+    /// Whether a pending erasure is due to account for this payload's bytes.
+    pub(crate) fn covers_payload_file(&self, reference: &str) -> bool {
+        self.payload_files.contains(reference)
     }
 }
 
@@ -695,10 +764,19 @@ pub struct Receipt {
     pub settled: bool,
     /// Per-domain results, in a stable order.
     pub domains: Vec<DomainReport>,
-    /// `erased` when every domain is clear or retained for a stated reason;
-    /// `incomplete` otherwise. The receipt is a verification, not a claim:
-    /// this field is computed from the domain results and nothing else.
+    /// `erased` when every SEMANTIC check is clear or retained for a stated
+    /// reason; `incomplete` otherwise. The receipt is a verification, not a
+    /// claim: this field is computed from the domain results and nothing
+    /// else.
     pub result: String,
+    /// Whether the verification is also free of unexplained over-approximate
+    /// signals: `false` whenever a byte-level occurrence scan found the
+    /// subject's identifiers, whose matches CAN be benign (an identifier
+    /// quoted in unrelated content) but were not proven so. `erased` answers
+    /// what the semantic walk found; this answers whether anything at all
+    /// was left ambiguous. A receipt offered as proof should carry both, and
+    /// the subcommand's exit code distinguishes them.
+    pub conclusive: bool,
 }
 
 impl Receipt {
@@ -729,7 +807,16 @@ impl Receipt {
                 out.push_str(&format!("  {:<24} {:<20}   - {item}\n", "", ""));
             }
         }
-        out.push_str(&format!("\nresult: {}\n", self.result));
+        out.push_str(&format!(
+            "\nresult: {}{}\n",
+            self.result,
+            match (self.result.as_str(), self.conclusive) {
+                ("erased", false) =>
+                    " (INCONCLUSIVE: occurrence scans found the subject's \
+                     identifiers; see the attention domains above)",
+                _ => "",
+            }
+        ));
         out
     }
 }
@@ -1015,6 +1102,81 @@ mod tests {
     }
 
     #[test]
+    fn a_span_subject_masks_from_its_subject_even_with_no_resolved_keys() {
+        // A replayed or hand-written record may carry an empty key list; the
+        // subject itself must still mask, or the exact span someone asked to
+        // erase stays visible for the whole pending window.
+        let mut record = erase_record(
+            1,
+            Subject::Span {
+                trace_id: "t1".into(),
+                span_id: "s1".into(),
+            },
+        );
+        record.span_keys = Vec::new();
+        let mask = Mask::for_pending(&[record]);
+        let span: Span = serde_json::from_value(serde_json::json!({
+            "trace_id": "t1", "span_id": "s1", "name": "n", "service": "svc",
+            "start_time_ns": 1u64, "end_time_ns": 2u64,
+        }))
+        .expect("span");
+        assert!(mask.covers(&span));
+    }
+
+    #[test]
+    fn the_mask_covers_annotations_and_payload_files() {
+        let trace = erase_record(
+            1,
+            Subject::Trace {
+                trace_id: "t1".into(),
+            },
+        );
+        let reference = format!("sha256/{}", "c".repeat(64));
+        let mut with_refs = erase_record(
+            2,
+            Subject::Span {
+                trace_id: "t9".into(),
+                span_id: "s9".into(),
+            },
+        );
+        with_refs.span_keys = vec![("t9".into(), "s9".into())];
+        with_refs.payload_refs = vec![reference.clone()];
+        let mask = Mask::for_pending(&[trace, with_refs]);
+
+        assert!(mask.covers_annotation("t1", ""), "trace-level annotation");
+        assert!(mask.covers_annotation("t1", "any"), "span under the trace");
+        assert!(mask.covers_annotation("t9", "s9"), "covered key");
+        assert!(!mask.covers_annotation("t9", "other"));
+        assert!(
+            mask.covers_payload_file(&reference),
+            "a payload the erasure must account for is withheld while pending"
+        );
+        assert!(!mask.covers_payload_file("sha256/absent"));
+    }
+
+    #[test]
+    fn payload_ref_collection_skips_redaction_markers() {
+        let reference = format!("sha256/{}", "d".repeat(64));
+        let span: Span = serde_json::from_value(serde_json::json!({
+            "trace_id": "t", "span_id": "s", "name": "n", "service": "svc",
+            "start_time_ns": 1u64, "end_time_ns": 2u64,
+            "attributes": {
+                "gone": {"$payload": reference, "bytes": 9, "erased": true},
+                "held": {"$payload": format!("sha256/{}", "e".repeat(64)), "bytes": 9,
+                         "preview": "still here"},
+            },
+        }))
+        .expect("span");
+        let mut refs = HashSet::new();
+        payload_refs_of(&span, &mut refs);
+        assert!(
+            !refs.contains(&reference),
+            "a marker records that content is gone; it is not a reference"
+        );
+        assert_eq!(refs.len(), 1);
+    }
+
+    #[test]
     fn redaction_drops_the_preview_and_marks_the_value() {
         let reference = format!("sha256/{}", "a".repeat(64));
         let mut span: Span = serde_json::from_value(serde_json::json!({
@@ -1086,6 +1248,22 @@ mod tests {
         }
         .validate()
         .is_ok());
+        // Uppercase hex is not the canonical form: stored references are
+        // lowercase and every comparison is case-sensitive, so accepting it
+        // produced a green receipt over untouched content (and, on a
+        // case-insensitive filesystem, an unlink of the REAL file besides).
+        let uppercase = Subject::Payload {
+            reference: format!("sha256/{}", "B".repeat(64)),
+        };
+        assert!(uppercase.validate().is_err());
+        let canonical = uppercase.canonicalized();
+        assert!(canonical.validate().is_ok());
+        assert_eq!(
+            canonical,
+            Subject::Payload {
+                reference: format!("sha256/{}", "b".repeat(64))
+            }
+        );
 
         let erased: HashSet<(String, String)> =
             [("t1".to_owned(), "s1".to_owned())].into_iter().collect();

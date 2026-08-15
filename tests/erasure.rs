@@ -134,11 +134,398 @@ fn erasing_a_trace_purges_every_domain_and_the_receipt_verifies() {
         receipt.render_text()
     );
     assert!(receipt.settled);
+    assert!(
+        receipt.conclusive,
+        "no occurrence scan has anything to point at:\n{}",
+        receipt.render_text()
+    );
     assert_eq!(
         domain(&receipt, "tombstone-log").result,
         "retained-by-design",
         "the record of the erasure is named, not hidden"
     );
+}
+
+#[test]
+fn spans_covered_by_a_pending_erasure_are_suppressed_at_admission() {
+    let dir = test_dir("suppression");
+    {
+        let store = Store::open(&dir, wal_config()).expect("opens");
+        store.ingest(span("txp", "s1", json!({}))).expect("s1");
+        store.flush().expect("seals");
+    }
+    // The crash state: intent recorded, purge never ran.
+    let line = json!({
+        "op": "erase", "schema": 1, "id": 1, "requested_unix_ns": 123,
+        "subject": {"kind": "trace", "trace_id": "txp"},
+        "span_keys": [["txp", "s1"]], "payload_refs": [],
+    });
+    std::fs::write(dir.join("tombstones.jsonl"), format!("{line}\n")).expect("plants");
+
+    let store = Store::open(&dir, wal_config()).expect("reopens");
+    // Admission is the barrier: a covered span sent while the erasure is
+    // pending is dropped BEFORE the log carries it, not stored-and-hidden.
+    store.ingest(span("txp", "s2", json!({}))).expect("acked");
+    store.ingest(span("other", "o1", json!({}))).expect("other");
+    assert_eq!(store.resume_erasures().expect("settles"), 1);
+    assert!(
+        store.get_trace("txp").expect("lookup").is_empty(),
+        "neither the original span nor the suppressed one survives the settle"
+    );
+    assert_eq!(store.get_trace("other").expect("lookup").len(), 1);
+    // After settle the barrier lifts: the same identifiers are new data.
+    store
+        .ingest(span("txp", "s2", json!({})))
+        .expect("new data");
+    assert_eq!(store.get_trace("txp").expect("lookup").len(), 1);
+}
+
+#[test]
+fn no_span_acknowledged_before_settle_survives_a_concurrent_erasure() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    // The reviewer's probe, kept as a regression test: writers hammer the
+    // doomed trace while the erasure runs. The erasure's contract is a cut
+    // at settle time — every span acknowledged before `settled_unix_ns` is
+    // erased or was never stored, and every survivor was acknowledged after.
+    let dir = test_dir("concurrent");
+    let store = Arc::new(Store::open(&dir, wal_config()).expect("opens"));
+    for index in 0..20 {
+        store
+            .ingest(span("doomed", &format!("pre-{index}"), json!({})))
+            .expect("pre");
+    }
+    store.flush().expect("seals");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut writers = Vec::new();
+    for thread in 0..4 {
+        let store = Arc::clone(&store);
+        let stop = Arc::clone(&stop);
+        writers.push(std::thread::spawn(move || {
+            let mut acked: Vec<(String, u64)> = Vec::new();
+            let mut index = 0;
+            while !stop.load(Ordering::Relaxed) {
+                let id = format!("w-{thread}-{index}");
+                index += 1;
+                store
+                    .ingest(span("doomed", &id, json!({})))
+                    .expect("ingest never errors");
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as u64;
+                acked.push((id, now));
+            }
+            acked
+        }));
+    }
+
+    std::thread::sleep(Duration::from_millis(20));
+    let status = store
+        .erase(Subject::Trace {
+            trace_id: "doomed".into(),
+        })
+        .expect("erases");
+    let settled_unix_ns = status.settle.expect("settled").settled_unix_ns;
+    std::thread::sleep(Duration::from_millis(20));
+    stop.store(true, Ordering::Relaxed);
+    let mut acked: Vec<(String, u64)> = Vec::new();
+    for writer in writers {
+        acked.extend(writer.join().expect("writer"));
+    }
+
+    let survivors: HashSet<String> = store
+        .get_trace("doomed")
+        .expect("lookup")
+        .into_iter()
+        .map(|span| span.span_id)
+        .collect();
+    assert!(
+        !survivors.iter().any(|id| id.starts_with("pre-")),
+        "nothing from before the erasure survives"
+    );
+    for (id, acked_ns) in &acked {
+        if survivors.contains(id) {
+            assert!(
+                acked_ns >= &settled_unix_ns,
+                "span {id} was acknowledged {acked_ns} — before settle at \
+                 {settled_unix_ns} — and survived; the cut leaked"
+            );
+        }
+    }
+    let receipt = store.verify_erasure(status.erase.id).expect("receipt");
+    assert_eq!(
+        receipt.result,
+        "erased",
+        "survivors are post-settle new activity, never re-deliveries:\n{}",
+        receipt.render_text()
+    );
+}
+
+#[test]
+fn a_pin_taken_before_an_erasure_is_not_edited_by_it() {
+    let dir = test_dir("pin-immutable");
+    let store = Store::open(&dir, wal_config()).expect("opens");
+    store.ingest(span("first", "a", json!({}))).expect("first");
+    store
+        .ingest(span("second", "b", json!({})))
+        .expect("second");
+    store.flush().expect("seals");
+    // Erasure #1 creates the tombstone log, so the pin below carries it.
+    store
+        .erase(Subject::Trace {
+            trace_id: "first".into(),
+        })
+        .expect("erasure one");
+    store.pin_generation("before-two").expect("pins");
+    let pinned_log = store.pin_path("before-two").join("tombstones.jsonl");
+    let pinned_len = std::fs::metadata(&pinned_log).expect("pinned log").len();
+
+    store
+        .erase(Subject::Trace {
+            trace_id: "second".into(),
+        })
+        .expect("erasure two");
+
+    // The live log grew; the pinned copy did not — no shared inode, no
+    // retroactive edits to a backup.
+    assert_eq!(
+        std::fs::metadata(&pinned_log).expect("pinned log").len(),
+        pinned_len,
+        "an erasure after the pin must not append through the pinned file"
+    );
+    let pinned_bytes = std::fs::read(&pinned_log).expect("read");
+    assert!(
+        !String::from_utf8_lossy(&pinned_bytes).contains("\"id\":2"),
+        "erasure #2 must not appear in a pin taken before it"
+    );
+    assert!(
+        store.verify_pin("before-two").expect("verify").is_empty(),
+        "the prefix copy verifies against the pin's manifest"
+    );
+
+    // Restoring that pin yields the consistent point-in-time state: the
+    // second trace present, and NO record claiming it was erased.
+    let restored_dir = test_dir("pin-immutable-restored");
+    let restored = Store::restore(&restored_dir, store.pin_path("before-two"), wal_config())
+        .expect("restores");
+    assert_eq!(
+        restored.get_trace("second").expect("lookup").len(),
+        1,
+        "the pinned state predates erasure #2"
+    );
+    let erasures = restored.erasures().expect("list");
+    assert_eq!(erasures.len(), 1, "only erasure #1 exists in the pin");
+    assert!(erasures[0].settle.is_some());
+}
+
+#[test]
+fn a_pending_erasure_masks_annotations_and_payload_bytes_too() {
+    let dir = test_dir("mask-satellites");
+    let secret = format!("withheld {}", "z".repeat(200));
+    let reference = format!("sha256/{}", traza::payload::sha256_hex(secret.as_bytes()));
+    {
+        let store = Store::open(
+            &dir,
+            Config {
+                payload_threshold: Some(64),
+                ..wal_config()
+            },
+        )
+        .expect("opens");
+        store
+            .ingest(span("txp", "s1", json!({"prompt": secret})))
+            .expect("s1");
+        store
+            .annotate(
+                serde_json::from_value(json!({
+                    "trace_id": "txp", "span_id": "s1", "name": "quality", "value": 1,
+                }))
+                .expect("annotation"),
+            )
+            .expect("annotates");
+        store.flush().expect("seals");
+    }
+    let line = json!({
+        "op": "erase", "schema": 1, "id": 1, "requested_unix_ns": 123,
+        "subject": {"kind": "trace", "trace_id": "txp"},
+        "span_keys": [["txp", "s1"]], "payload_refs": [reference],
+    });
+    std::fs::write(dir.join("tombstones.jsonl"), format!("{line}\n")).expect("plants");
+
+    let store = Store::open(
+        &dir,
+        Config {
+            payload_threshold: Some(64),
+            ..wal_config()
+        },
+    )
+    .expect("reopens");
+    assert!(
+        store
+            .annotations("txp", None, None)
+            .expect("ann")
+            .is_empty(),
+        "annotations about a pending subject are withheld"
+    );
+    assert!(
+        store
+            .search_annotations(&traza::annotations::AnnotationQuery::default())
+            .expect("search")
+            .is_empty(),
+        "the cross-trace search withholds them too"
+    );
+    assert!(
+        store.payload(&reference).expect("load").is_none(),
+        "payload bytes a pending erasure must account for are withheld"
+    );
+}
+
+#[test]
+fn an_uppercase_payload_reference_is_canonicalized_not_mismatched() {
+    let dir = test_dir("uppercase");
+    let store = Store::open(
+        &dir,
+        Config {
+            payload_threshold: Some(64),
+            ..wal_config()
+        },
+    )
+    .expect("opens");
+    let secret = format!("cased {}", "q".repeat(200));
+    let reference = format!("sha256/{}", traza::payload::sha256_hex(secret.as_bytes()));
+    store
+        .ingest(span("t1", "a", json!({"prompt": secret})))
+        .expect("ingests");
+    store.flush().expect("seals");
+
+    let uppercase = reference.replace("sha256/", "").to_ascii_uppercase();
+    let status = store
+        .erase(Subject::Payload {
+            reference: format!("sha256/{uppercase}"),
+        })
+        .expect("erases");
+    assert_eq!(
+        status.erase.subject,
+        Subject::Payload {
+            reference: reference.clone()
+        },
+        "the recorded subject is the canonical lowercase form"
+    );
+    assert_eq!(status.settle.expect("settled").spans_redacted, 1);
+    assert!(store.payload(&reference).expect("load").is_none());
+    let spans = store.get_trace("t1").expect("lookup");
+    assert!(
+        spans[0].attributes["prompt"].get("preview").is_none(),
+        "the preview was redacted — an uppercase request must not miss it"
+    );
+    assert_eq!(
+        store
+            .verify_erasure(status.erase.id)
+            .expect("receipt")
+            .result,
+        "erased"
+    );
+}
+
+#[test]
+fn a_recreated_payload_file_fails_the_receipt_instead_of_reading_as_retained() {
+    let dir = test_dir("recreated");
+    let store = Store::open(
+        &dir,
+        Config {
+            payload_threshold: Some(64),
+            ..wal_config()
+        },
+    )
+    .expect("opens");
+    let secret = format!("returning {}", "r".repeat(200));
+    let reference = format!("sha256/{}", traza::payload::sha256_hex(secret.as_bytes()));
+    store
+        .ingest(span("t1", "a", json!({"prompt": secret})))
+        .expect("ingests");
+    store.flush().expect("seals");
+    let status = store
+        .erase(Subject::Payload {
+            reference: reference.clone(),
+        })
+        .expect("erases");
+    assert_eq!(
+        store
+            .verify_erasure(status.erase.id)
+            .expect("receipt")
+            .result,
+        "erased"
+    );
+
+    // Put the bytes back by hand — a re-delivery outside any span. The only
+    // things pointing at this content are redaction markers, and a marker is
+    // the record that content is GONE; it must not read as a live reference
+    // that certifies the file as safely retained.
+    let hash = reference.strip_prefix("sha256/").expect("hash");
+    let path = dir
+        .join("payloads")
+        .join(&hash[..2])
+        .join(format!("{hash}.bin"));
+    std::fs::create_dir_all(path.parent().expect("shard")).expect("dirs");
+    std::fs::write(&path, secret.as_bytes()).expect("recreates");
+
+    let receipt = store.verify_erasure(status.erase.id).expect("receipt");
+    assert_eq!(
+        receipt.result,
+        "incomplete",
+        "recreated bytes with no live referent must fail:\n{}",
+        receipt.render_text()
+    );
+    assert!(domain(&receipt, "payloads")
+        .items
+        .iter()
+        .any(|item| item.contains("present and unreferenced")));
+}
+
+#[test]
+fn post_settle_payload_activity_is_new_activity_in_buffer_and_segments_alike() {
+    let dir = test_dir("payload-new-activity");
+    let store = Store::open(
+        &dir,
+        Config {
+            payload_threshold: Some(64),
+            ..wal_config()
+        },
+    )
+    .expect("opens");
+    let secret = format!("reuploaded {}", "u".repeat(200));
+    let reference = format!("sha256/{}", traza::payload::sha256_hex(secret.as_bytes()));
+    store
+        .ingest(span("t1", "a", json!({"prompt": secret})))
+        .expect("ingests");
+    store.flush().expect("seals");
+    let status = store
+        .erase(Subject::Payload {
+            reference: reference.clone(),
+        })
+        .expect("erases");
+
+    // Legitimate post-settle re-upload of the same content, under a NEW key.
+    store
+        .ingest(span("t2", "b", json!({"prompt": secret})))
+        .expect("new data");
+    let buffered = store.verify_erasure(status.erase.id).expect("receipt");
+    assert_eq!(buffered.result, "erased");
+    assert_eq!(domain(&buffered, "write-buffer").new_activity, 1);
+
+    store.flush().expect("seals the new span");
+    let sealed = store.verify_erasure(status.erase.id).expect("receipt");
+    assert_eq!(
+        sealed.result,
+        "erased",
+        "the verdict must not flip because a seal moved the same span from \
+         buffer to segment:\n{}",
+        sealed.render_text()
+    );
+    assert_eq!(domain(&sealed, "segments").new_activity, 1);
 }
 
 #[test]
@@ -580,8 +967,12 @@ impl Drop for Server {
 
 impl Server {
     fn spawn(data_dir: &Path) -> Self {
+        Self::spawn_with_tokens(data_dir, None)
+    }
+
+    fn spawn_with_tokens(data_dir: &Path, tokens: Option<&str>) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_traza-server"));
-        let mut child = command
+        command
             .arg("--data-dir")
             .arg(data_dir)
             .arg("--host")
@@ -592,8 +983,12 @@ impl Server {
             .arg("wal")
             // The point is what survives WITHOUT a segment flush.
             .arg("--flush-spans")
-            .arg("1000000")
-            .env_remove("TRAZA_TOKENS")
+            .arg("1000000");
+        match tokens {
+            Some(tokens) => command.env("TRAZA_TOKENS", tokens),
+            None => command.env_remove("TRAZA_TOKENS"),
+        };
+        let mut child = command
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawns traza-server");
@@ -617,6 +1012,16 @@ impl Server {
     }
 
     fn request(&self, method: &str, target: &str, body: Option<&Value>) -> (u16, Value) {
+        self.request_as(None, method, target, body)
+    }
+
+    fn request_as(
+        &self,
+        token: Option<&str>,
+        method: &str,
+        target: &str,
+        body: Option<&Value>,
+    ) -> (u16, Value) {
         let encoded = body.map(|value| serde_json::to_vec(value).expect("encodes"));
         let mut stream = {
             let mut attempt = 0;
@@ -632,10 +1037,13 @@ impl Server {
             }
         };
         let length = encoded.as_ref().map_or(0, Vec::len);
+        let authorization = token.map_or(String::new(), |token| {
+            format!("Authorization: Bearer {token}\r\n")
+        });
         write!(
             stream,
             "{method} {target} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n\
-             Content-Length: {length}\r\nConnection: close\r\n\r\n"
+             {authorization}Content-Length: {length}\r\nConnection: close\r\n\r\n"
         )
         .expect("writes");
         if let Some(bytes) = encoded {
@@ -657,6 +1065,64 @@ impl Server {
             .unwrap_or(Value::Null);
         (status, payload)
     }
+}
+
+#[test]
+fn erasure_requires_the_admin_scope_not_merely_the_write_scope() {
+    let dir = test_dir("admin-scope");
+    let server = Server::spawn_with_tokens(
+        &dir,
+        Some("rw:writer-token,ro:reader-token,admin:root-token"),
+    );
+
+    let (status, _) = server.request_as(
+        Some("writer-token"),
+        "POST",
+        "/v1/spans",
+        Some(
+            &json!([{ "trace_id": "t", "span_id": "s", "name": "n", "service": "svc",
+            "start_time_unix_nano": 1_000u64, "end_time_unix_nano": 2_000u64 }]),
+        ),
+    );
+    assert_eq!(status, 200, "the write scope still ingests");
+
+    let erase_body = json!({"subject": {"kind": "trace", "trace_id": "t"}});
+    // Every collector holds an rw token; a credential minted to write
+    // telemetry must not be able to destroy it.
+    let (status, _) = server.request_as(
+        Some("writer-token"),
+        "POST",
+        "/v1/erasures",
+        Some(&erase_body),
+    );
+    assert_eq!(status, 403, "rw must not erase");
+    let (status, _) = server.request_as(
+        Some("reader-token"),
+        "POST",
+        "/v1/erasures",
+        Some(&erase_body),
+    );
+    assert_eq!(status, 403, "ro must not erase");
+    let (status, _) = server.request_as(None, "POST", "/v1/erasures", Some(&erase_body));
+    assert_eq!(status, 401, "no token is no token");
+
+    let (status, settled) = server.request_as(
+        Some("root-token"),
+        "POST",
+        "/v1/erasures",
+        Some(&erase_body),
+    );
+    assert_eq!(status, 200, "admin erases: {settled}");
+    assert_eq!(settled["settle"]["spans_removed"], json!(1));
+
+    // Reading the tombstone log and the receipt is not destructive; the
+    // read scope keeps it.
+    let (status, _) = server.request_as(Some("reader-token"), "GET", "/v1/erasures", None);
+    assert_eq!(status, 200);
+    let (status, receipt) =
+        server.request_as(Some("reader-token"), "GET", "/v1/erasures/1/verify", None);
+    assert_eq!(status, 200);
+    assert_eq!(receipt["result"], json!("erased"));
 }
 
 #[test]

@@ -515,7 +515,7 @@ besides loopback)] \
 (stdio bridge: speaks MCP on stdin/stdout and forwards to a running server)\n\
        traza-server verify --erasure ID|latest [--data-dir DIR] [--json] \
 (offline erasure receipt: re-checks every domain and prints the result of each; \
-exits 2 when the erasure does not verify)";
+exits 0 erased-and-conclusive, 3 erased-but-inconclusive, 2 not erased)";
 
 /// Everything the command line decides, with the profile already resolved
 /// against the explicit flags.
@@ -870,8 +870,15 @@ fn run_verify(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         ),
         false => print!("{}", receipt.render_text()),
     }
+    // For a script, "erased" and "erased, but a byte scan saw the subject's
+    // identifiers somewhere" must be distinguishable without parsing JSON:
+    // 0 is the receipt a compliance workflow may file, 3 says a human should
+    // look at the attention domains first, 2 says the erasure did not hold.
     if receipt.result != "erased" {
         std::process::exit(2);
+    }
+    if !receipt.conclusive {
+        std::process::exit(3);
     }
     Ok(())
 }
@@ -1426,11 +1433,19 @@ fn handle_connection(
         // method rule would either refuse every `ro` token or grant every
         // caller the write scope. Its token's scope is resolved here and
         // enforced per tool.
-        let is_mcp = head
+        let head_path = head
             .target
             .split_once('?')
-            .map_or(head.target.as_str(), |(path, _)| path)
-            == traza::mcp::ENDPOINT;
+            .map_or(head.target.as_str(), |(path, _)| path);
+        let is_mcp = head_path == traza::mcp::ENDPOINT;
+        // Erasure is a POST like any ingest, so the method rule cannot
+        // distinguish it — and it must be distinguished: every collector
+        // holds an `rw` token, and a credential minted to write telemetry
+        // must not be able to destroy it. The route requires the `admin`
+        // scope explicitly. (With no TRAZA_TOKENS configured the server is
+        // loopback-open by prior decision, and erasure is open with it.)
+        let is_erasure_write =
+            head.method.eq_ignore_ascii_case("POST") && head_path == "/v1/erasures";
         let mut access = traza::mcp::Access::ReadWrite;
         if let Some(config) = auth {
             let verdict = if is_mcp {
@@ -1438,7 +1453,16 @@ fn handle_connection(
                     .scope_for(head.authorization.as_deref())
                     .map(|scope| match scope {
                         traza::auth::Scope::ReadOnly => traza::mcp::Access::Read,
-                        traza::auth::Scope::ReadWrite => traza::mcp::Access::ReadWrite,
+                        traza::auth::Scope::ReadWrite | traza::auth::Scope::Admin => {
+                            traza::mcp::Access::ReadWrite
+                        }
+                    })
+            } else if is_erasure_write {
+                config
+                    .scope_for(head.authorization.as_deref())
+                    .and_then(|scope| match scope.permits_erasure() {
+                        true => Ok(traza::mcp::Access::ReadWrite),
+                        false => Err(traza::auth::AuthFailure::Forbidden),
                     })
             } else {
                 config

@@ -458,9 +458,20 @@ fn key_hash(trace_id: &str, span_id: &str) -> u64 {
 }
 
 /// Collects `$payload` references from span and event attributes.
+///
+/// Redaction markers (`"erased": true`) are excluded, and the exclusion is
+/// load-bearing twice over: this set is the TTL sweep's protection set, so a
+/// marker counted as a reference would shield a file whose bytes an erasure
+/// already removed forever — and it is the erasure receipt's liveness
+/// evidence, where the same mistake certified a RE-CREATED file as "safely
+/// retained by live spans". A marker records that content is gone; it is not
+/// a reference to content.
 fn collect_payload_refs(span: &Span, refs: &mut HashSet<String>) {
     let mut scan = |attributes: &Map<String, Value>| {
         for value in attributes.values() {
+            if value.get("erased").and_then(Value::as_bool) == Some(true) {
+                continue;
+            }
             if let Some(reference) = value
                 .get(crate::payload::PAYLOAD_KEY)
                 .and_then(Value::as_str)

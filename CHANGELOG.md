@@ -77,10 +77,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     append-only recovery domain beside the annotation log. The intent record
     is fsynced *before* anything is removed, so from that moment the subject
     is invisible to every read path — search, lookups, sessions, analytics,
-    export, the live tail — even before the rewrites run, and a crash
-    mid-purge leaves a pending erasure the next open masks and the
-    maintenance tick finishes. Idempotent to resume: the purge re-verifies
-    rather than re-damages.
+    annotations, payload fetches, export, the live tail — even before the
+    rewrites run, and a crash mid-purge leaves a pending erasure the next
+    open masks and the maintenance tick finishes. Idempotent to resume: the
+    purge re-verifies rather than re-damages. (The settle record's counts
+    are therefore the settling pass's counts; the receipt, not the tallies,
+    is the authority on absence.)
+  - **A pending erasure is an admission barrier, not just a veil.** Covered
+    spans are dropped at ingest — acknowledged, never stored, counted in
+    `traza_erasure_spans_suppressed_total` — and the settle record is
+    appended inside the same critical section as a final buffer sweep, so
+    the cut is exact: every span acknowledged before `settled_unix_ns` is
+    erased or was never stored, under concurrent writers hammering the
+    subject (a review probe demonstrated 92 pre-settle survivors before this
+    barrier existed; `tests/erasure.rs` keeps that probe as a regression
+    test).
   - **The purge reaches every domain.** Buffer and write-ahead log rewritten
     to the survivors (the TTL discipline: a deletion a restart undoes is not
     a deletion); segments rewritten in place, superseded versions of an
@@ -95,17 +106,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     after its 200.
   - **The receipt is a verification, not a claim.** Its result is computed
     from the walk, never from the settle record. Matches are classified
-    against the erase record's resolved keys: an erased key found live again
-    is a re-delivery and fails the receipt; a fresh key under the same
-    identifiers is new activity, reported without failing it — an erasure is
-    a barrier, not a ban. Pins are checked and named: a backup pinned before
-    the erasure still holds the bytes in its hard-link farm, and the receipt
-    says which pin to release. What remains afterwards is stated rather than
-    hidden: the tombstone record itself keeps the subject's identifiers and
-    content hashes — never the erased text — as the record the receipt
-    verifies against.
+    against the erase record's resolved keys under one rule for every
+    domain: an erased key found live again is a re-delivery and fails the
+    receipt; a fresh key under the same identifiers is new activity,
+    reported without failing it — an erasure is a barrier, not a ban. Pins
+    are checked and named: a backup pinned before the erasure still holds
+    the bytes in its hard-link farm, and the receipt says which pin to
+    release. What remains afterwards is stated rather than hidden: the
+    tombstone record itself keeps the subject's identifiers and content
+    hashes — never the erased text — as the record the receipt verifies
+    against. Where a check is over-approximate by construction (the
+    byte-level occurrence scans), its findings never blend into the
+    verdict: the receipt carries a separate `conclusive` flag, and the
+    subcommand exits `0` erased-and-conclusive, `3` erased-but-inconclusive,
+    `2` not erased.
+  - **Pins no longer share the append-only logs' inodes.** A pin hard-links
+    the immutable files and *copies* `annotations.jsonl` and
+    `tombstones.jsonl` at their manifested length. Hard-linking them let
+    every later append edit the "backup" in place — a pin taken before an
+    erasure inherited the erasure's settle record through the shared inode,
+    so restoring it produced a store that recorded a deletion it did not
+    contain.
+  - **Erasure requires a new `admin` token scope.** `TRAZA_TOKENS` grows
+    `admin:` alongside `rw:`/`ro:`; `POST /v1/erasures` refuses plain `rw`
+    with a 403. Every collector holds a write token, and a credential minted
+    to produce telemetry must not be the credential that destroys it.
+    Payload subjects are canonicalized to lowercase hex before anything is
+    resolved or recorded — an uppercase hash previously matched no stored
+    reference and produced a green receipt over untouched content. Redaction
+    markers are no longer counted as live payload references anywhere
+    (protection sets, receipts): a marker records that content is gone.
   - **No MCP tool for any of it, deliberately.** Deletion is an HTTP verb
-    behind the write scope; the agent-facing surface stays read-only, so
+    behind the `admin` scope; the agent-facing surface stays read-only, so
     stored adversarial text has no destructive tool to actuate.
 
 ### Changed

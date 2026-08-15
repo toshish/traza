@@ -1782,26 +1782,71 @@ impl Store {
     /// purpose.** Taking the seal permit while holding the writer lock would
     /// invert the lock order (see the `sealing` field) and deadlock against
     /// expiry.
-    fn admit(&self, spans: Vec<Span>) -> Result<()> {
-        // Encode the log frame BEFORE taking the writer lock. Serializing a
-        // batch is pure CPU proportional to its size, and doing it under the
-        // lock made every concurrent ingest wait for it — the lock was held
-        // for the serialization of every batch in the system, one at a time.
-        // Only the file write has to be inside the lock (below).
-        let mut frame = match &self.wal {
-            Some(_) => Some(self.metrics.wal_encode.time(|| wal::Wal::encode(&spans))?),
-            None => None,
-        };
-        let admitted = spans.len() as u64;
-
+    fn admit(&self, mut spans: Vec<Span>) -> Result<()> {
+        // ---- the erasure admission barrier -------------------------------
+        // A span covered by a PENDING erasure is dropped here, before the
+        // log ever carries it. Masking reads alone was not a barrier: a span
+        // admitted between an erasure's purge scan and its settle was hidden
+        // while pending and then unveiled at settle — acknowledged before
+        // `settled_unix_ns`, alive after it. Suppression at admission is
+        // what makes the erasure's cut exact: everything acknowledged before
+        // settle is erased or was never stored, and everything after is new
+        // data.
+        //
+        // The check-and-recheck shape closes the race with `begin`. The
+        // filter and the (batch-sized) frame encode run outside the writer
+        // lock; under the lock, the mask handle is compared by pointer — a
+        // mask installed since the filter forces one loop around with the
+        // fresh mask. An erasure's own purge takes this same lock after
+        // `begin` installs the mask, so every upsert lands either before the
+        // purge's scan (and is purged) or after the mask is visible (and is
+        // filtered). The common case — no pending erasure, ever — pays two
+        // `Option` loads.
         let mut pending_commit = None;
         let seal_now;
         let seal_must_wait;
+        let admitted;
         let admitted_handles;
-        {
+        let mut frame;
+        loop {
+            let mask = self.erasure_mask();
+            if let Some(mask) = &mask {
+                let before = spans.len();
+                spans.retain(|span| !mask.covers(span));
+                let suppressed = (before - spans.len()) as u64;
+                if suppressed > 0 {
+                    self.metrics.erasure_spans_suppressed.add(suppressed);
+                }
+                if spans.is_empty() {
+                    return Ok(());
+                }
+            }
+            // Encode the log frame BEFORE taking the writer lock.
+            // Serializing a batch is pure CPU proportional to its size, and
+            // doing it under the lock made every concurrent ingest wait for
+            // it. Only the file write has to be inside the lock (below).
+            frame = match &self.wal {
+                Some(_) => Some(self.metrics.wal_encode.time(|| wal::Wal::encode(&spans))?),
+                None => None,
+            };
+
             let waited = Instant::now();
             let mut writer = self.lock_writer()?;
             self.metrics.writer_lock_wait.record(elapsed_nanos(&waited));
+            let current = self.erasure_mask();
+            let mask_moved = match (&mask, &current) {
+                (None, None) => false,
+                (Some(held), Some(now)) => !std::sync::Arc::ptr_eq(held, now),
+                _ => true,
+            };
+            if mask_moved {
+                // An erasure began (or settled) since the filter ran; the
+                // frame may carry spans the new mask covers. Refilter and
+                // re-encode with the lock released — erasures are rare, so
+                // the retry is too.
+                drop(writer);
+                continue;
+            }
             if let (Some(log), Some(frame)) = (&self.wal, frame.as_mut()) {
                 pending_commit = Some(
                     self.metrics
@@ -1809,6 +1854,7 @@ impl Store {
                         .time(|| log.append(frame, &self.metrics))?,
                 );
             }
+            admitted = spans.len() as u64;
             admitted_handles = self.metrics.buffer_upsert.time(|| {
                 spans
                     .into_iter()
@@ -1817,6 +1863,7 @@ impl Store {
             });
             seal_now = self.should_flush(&writer);
             seal_must_wait = self.seal_must_not_be_skipped(&writer);
+            break;
         }
 
         // `flushed` promises the caller a SEALED segment, so its seal must
@@ -2766,7 +2813,17 @@ impl Store {
         span_id: Option<&str>,
         name: Option<&str>,
     ) -> Result<Vec<annotations::Annotation>> {
-        self.annotations.query(trace_id, span_id, name)
+        let mut found = self.annotations.query(trace_id, span_id, name)?;
+        // "Invisible to every query" includes the judgments ABOUT the
+        // subject: an annotation addressed to a pending erasure's span is
+        // withheld exactly as the span is, and the purge drops it before the
+        // mask lifts.
+        if let Some(mask) = self.erasure_mask() {
+            found.retain(|annotation| {
+                !mask.covers_annotation(&annotation.trace_id, &annotation.span_id)
+            });
+        }
+        Ok(found)
     }
 
     /// Annotations matching `narrow`, newest first, across every trace unless
@@ -2775,11 +2832,28 @@ impl Store {
         &self,
         narrow: &annotations::AnnotationQuery<'_>,
     ) -> Result<Vec<annotations::Annotation>> {
-        self.annotations.search(narrow)
+        let mut found = self.annotations.search(narrow)?;
+        // Same rule as [`Self::annotations`], for the same reason.
+        if let Some(mask) = self.erasure_mask() {
+            found.retain(|annotation| {
+                !mask.covers_annotation(&annotation.trace_id, &annotation.span_id)
+            });
+        }
+        Ok(found)
     }
 
     /// Reads an offloaded payload by its `sha256/<hex>` reference.
     pub fn payload(&self, reference: &str) -> Result<Option<Vec<u8>>> {
+        // A payload a pending erasure is due to account for is withheld
+        // while it is pending — the bytes may be seconds from deletion, and
+        // serving them from under an erasure in progress is the same failure
+        // as serving the span. A shared reference that survives (retained
+        // for live spans outside the subject) resurfaces at settle.
+        if let Some(mask) = self.erasure_mask() {
+            if mask.covers_payload_file(reference) {
+                return Ok(None);
+            }
+        }
         payload::load_payload(&self.directory, reference)
     }
 
@@ -4037,11 +4111,13 @@ impl Store {
     /// Checkpoints first, so the pin references an exact, digested manifest
     /// rather than a store mid-flight. Then, under the maintenance lock and
     /// seal permit — nothing may replace or add a file across the linking —
-    /// every manifested file is hard-linked into the pin directory and the
-    /// manifest is copied beside them. Hard links share inodes, so the pin
-    /// costs almost no disk and holds its bytes even after compaction unlinks
-    /// the originals from `engine/`; the reader drops them when it removes the
-    /// pin. Returns the pinned generation id.
+    /// every IMMUTABLE manifested file is hard-linked into the pin directory,
+    /// the append-only logs are copied to their manifested prefix (a shared
+    /// inode would let every later append edit the "backup" in place), and
+    /// the manifest is copied beside them. Hard links share inodes, so the
+    /// pin costs almost no disk and holds its bytes even after compaction
+    /// unlinks the originals; the reader drops them when it removes the pin.
+    /// Returns the pinned generation id.
     ///
     /// Backup is then: `pin`, [`verify_pin`](Self::verify_pin), copy the
     /// directory, [`release_pin`](Self::release_pin) — no server stop.
@@ -4079,7 +4155,18 @@ impl Store {
                 if let Some(parent) = target.parent() {
                     fs::create_dir_all(parent)?;
                 }
-                fs::hard_link(&source, &target)?;
+                // Immutable files share their inode with the pin — that is
+                // what makes a pin nearly free. The append-only logs must
+                // NOT: a hard-linked log lets every append after the pin
+                // mutate the backup in place, and a later erasure's records
+                // then leak into a pin that still holds the erased spans —
+                // a restored store claiming a deletion it does not contain.
+                // Those two files are copied, bounded to the manifested
+                // prefix, which is exactly what the pin's manifest digests.
+                match generation::is_append_only(&file.path) {
+                    true => generation::copy_prefix(&source, &target, file.bytes)?,
+                    false => fs::hard_link(&source, &target)?,
+                }
             }
             generation::write_pin_manifest(&staged, &manifest)?;
             Ok(())
@@ -4156,6 +4243,12 @@ impl Store {
     /// [`Self::verify_erasure`] checks the store against; erasing the record
     /// of erasure means deleting the store.
     pub fn erase(&self, subject: erasure::Subject) -> Result<erasure::ErasureStatus> {
+        // Canonicalize BEFORE validating or resolving: an uppercase payload
+        // hash would pass a lenient validator, match no stored reference —
+        // every downstream comparison is case-sensitive — and produce a
+        // green receipt over content still fully present. The recorded
+        // subject is always the canonical form.
+        let subject = subject.canonicalized();
         subject.validate()?;
         let (span_keys, payload_refs) = self.resolve_subject(&subject)?;
         let requested_unix_ns = SystemTime::now()
@@ -4375,22 +4468,104 @@ impl Store {
         // erased bytes leave `wal.log` here at the latest.
         let generation = self.checkpoint()?;
 
-        let settle = erasure::SettleRecord {
-            schema: erasure::SettleRecord::schema_now(),
-            id: record.id,
-            settled_unix_ns: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |since| since.as_nanos().min(u128::from(u64::MAX)) as u64),
-            generation,
-            spans_removed: purge.removed,
-            spans_redacted: purge.redacted,
-            annotations_removed,
-            payloads_removed,
-            payloads_retained,
+        // ---- confirm, then settle with nothing able to slip between ------
+        // The admission barrier suppresses covered spans from the moment the
+        // intent record installed the mask, so nothing covered can have been
+        // ADMITTED since. This pass sweeps what the barrier structurally
+        // cannot: batches already inside the writer lock when the mask
+        // landed, and any segment a concurrent seal published from them. It
+        // is a full purge, and on the overwhelmingly common path it finds
+        // nothing and costs index probes.
+        let confirm = {
+            let _maintenance = self.lock_maintenance()?;
+            self.purge_subject_locked(subject)?
         };
-        self.erasures.record_settle(settle.clone())?;
+        if !confirm.keys.is_empty() {
+            self.tail.veil(std::sync::Arc::new(confirm.keys.clone()));
+        }
+        // Annotations that arrived during the window get the same confirm
+        // treatment; a no-op rewrite costs nothing (`drop_for_keys` returns
+        // before touching the file when nothing matches).
+        let annotations_removed = annotations_removed
+            + match subject {
+                erasure::Subject::Payload { .. } => 0,
+                erasure::Subject::Trace { trace_id } => self
+                    .annotations
+                    .drop_for_keys(&confirm.keys, Some(trace_id))?,
+                _ if confirm.keys.is_empty() => 0,
+                _ => self.annotations.drop_for_keys(&confirm.keys, None)?,
+            };
+        let mut spans_removed = purge.removed + confirm.removed;
+        let mut spans_redacted = purge.redacted + confirm.redacted;
+
+        // The settle append happens INSIDE the seal permit and writer lock:
+        // an upsert can then only land before this final scan (and be
+        // removed by it) or after the mask lifts (and be new data by
+        // definition). Without this, a span could be acknowledged before
+        // `settled_unix_ns` and alive after it — the exact hole the
+        // concurrent-writer probe demonstrated. The cost is one fsync'd
+        // append under the writer lock, once per erasure.
+        let (settle, swept_keys) = {
+            let _permit = self
+                .sealing
+                .lock()
+                .map_err(|_| Error::LockPoisoned("sealing"))?;
+            let mut writer = self.lock_writer()?;
+            let mut survivors: Vec<std::sync::Arc<Span>> = Vec::with_capacity(writer.spans.len());
+            let mut swept_keys: std::collections::HashSet<(String, String)> =
+                std::collections::HashSet::new();
+            let mut changed = false;
+            for span in writer.spans.iter() {
+                match subject.action(span) {
+                    erasure::Action::Keep => survivors.push(std::sync::Arc::clone(span)),
+                    erasure::Action::Drop => {
+                        changed = true;
+                        spans_removed += 1;
+                        swept_keys.insert((span.trace_id.clone(), span.span_id.clone()));
+                    }
+                    erasure::Action::Redact => {
+                        changed = true;
+                        spans_redacted += 1;
+                        swept_keys.insert((span.trace_id.clone(), span.span_id.clone()));
+                        let mut redacted = Span::clone(span);
+                        if let Some(reference) = subject.payload_reference() {
+                            erasure::redact_payload(&mut redacted, reference);
+                        }
+                        survivors.push(std::sync::Arc::new(redacted));
+                    }
+                }
+            }
+            if changed {
+                if let Some(log) = &self.wal {
+                    let frames: Vec<&Span> = survivors.iter().map(|span| span.as_ref()).collect();
+                    log.rewrite(&frames, 0)?;
+                }
+                writer.restore(survivors);
+            }
+            let settle = erasure::SettleRecord {
+                schema: erasure::SettleRecord::schema_now(),
+                id: record.id,
+                settled_unix_ns: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0, |since| since.as_nanos().min(u128::from(u64::MAX)) as u64),
+                generation,
+                spans_removed,
+                spans_redacted,
+                annotations_removed,
+                payloads_removed,
+                payloads_retained,
+            };
+            self.erasures.record_settle(settle.clone())?;
+            (settle, swept_keys)
+        };
+        // Spans the final sweep removed were published to the tail at their
+        // admission (they were in flight before the mask landed); the ring
+        // must stop serving them like everything else the erasure covered.
+        if !swept_keys.is_empty() {
+            self.tail.veil(std::sync::Arc::new(swept_keys));
+        }
         self.metrics.erasures_settled.increment();
-        self.metrics.erasure_spans_removed.add(purge.removed as u64);
+        self.metrics.erasure_spans_removed.add(spans_removed as u64);
         self.metrics.erasure.record(elapsed_nanos(&erasing));
         Ok(settle)
     }
@@ -4754,11 +4929,14 @@ impl Store {
                 all_matches.extend(keys);
             }
             let classes = erasure::classify_matches(&erased_keys, all_matches);
-            let failing = match subject {
-                // Redaction leaves the span; any UNREDACTED reference fails.
-                erasure::Subject::Payload { .. } => unredacted > 0,
-                _ => classes.re_delivered > 0,
-            };
+            // One classification rule for every domain: a key the erasure
+            // covered, found matching again, is a re-delivery and fails; a
+            // fresh key is new activity and is reported. A payload subject
+            // is no exception — a NEW span referencing re-uploaded content
+            // is post-settle data, and it must not read as `erased` while
+            // buffered and `incomplete` the moment a seal moves it into a
+            // segment. The buffer above already applies exactly this rule.
+            let failing = classes.re_delivered > 0;
             clean &= !failing;
             let mut report = erasure::DomainReport::clear(
                 "segments",
@@ -4950,6 +5128,15 @@ impl Store {
             domains.push(report);
         }
 
+        // Conclusiveness is computed from the domain reports, never asserted:
+        // any over-approximate signal left unexplained — an occurrence scan
+        // that found the subject's identifiers, a domain that could only
+        // reach "attention" — makes the receipt inconclusive even where the
+        // semantic walk is clean. `result` says what the walk found;
+        // `conclusive` says whether anything at all was left ambiguous.
+        let conclusive = domains
+            .iter()
+            .all(|domain| domain.occurrences == 0 && domain.result != "attention");
         Ok(erasure::Receipt {
             erasure_id: record.id,
             subject: subject.clone(),
@@ -4964,6 +5151,7 @@ impl Store {
                 true => "erased".to_owned(),
                 false => "incomplete".to_owned(),
             },
+            conclusive,
         })
     }
 

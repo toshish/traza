@@ -841,13 +841,23 @@ stays read-only, so stored adversarial text has no deletion verb to actuate.
 
 ### `POST /v1/erasures`
 
+**Requires the `admin` scope** when `TRAZA_TOKENS` is configured — an `rw`
+token gets `403 {"error":"forbidden"}`. Erasure is a POST like any ingest, so
+the method rule cannot distinguish it, and it must be distinguished: a
+credential minted to write telemetry must not be able to destroy it. See
+[administration § Authentication](../operations/administration.md#authentication).
+
 Erases one subject and blocks until the erasure settles. The `200` is the
 acknowledgement, and it means the whole sequence ran: the intent is fsynced
 into the tombstone log, the write buffer and write-ahead log are rewritten to
 the survivors, every segment holding a match is rewritten in place (superseded
 versions included), annotations addressed to erased spans are dropped, payload
 files are deleted reference-aware, and a checkpoint published the deletion —
-durable at the `CURRENT` rename.
+durable at the `CURRENT` rename. A final sweep runs inside the settle's own
+critical section, so the cut is exact: **every span acknowledged before
+`settled_unix_ns` is erased or was never stored.** While the erasure is
+pending, covered spans are dropped at admission (acknowledged, not stored;
+counted in `traza_erasure_spans_suppressed_total`).
 
 ```sh
 curl -X POST http://localhost:8080/v1/erasures \
@@ -862,12 +872,15 @@ curl -X POST http://localhost:8080/v1/erasures \
 | `session` | `session_id` | Every span resolving to the session, across all recognized session keys |
 | `payload` | `reference` | The `sha256/<hex>` file, plus a rewrite of every referencing span dropping its inline preview |
 
-**Response `200`.** The erasure record — id, subject, the resolved
-`span_keys` — plus its `settle` block: `spans_removed`, `spans_redacted`,
+**Response `200`.** The erasure record — id, subject (payload hashes are
+canonicalized to lowercase before anything is resolved or recorded) — plus
+its `settle` block: `spans_removed`, `spans_redacted`,
 `annotations_removed`, `payloads_removed`, `payloads_retained` (each retained
 reference carries its reason — shared content still referenced by live spans
 outside the subject is kept, and the receipt says so), and the `generation`
-that published the deletion.
+that published the deletion. The counts are the settling pass's counts: after
+a crash-resume the first pass's work is already done and cannot be
+re-counted, so the authority on absence is always the receipt.
 
 Reads and ingest continue throughout. From the moment the tombstone is
 recorded the subject is invisible to every query — before the rewrites run —
@@ -897,13 +910,20 @@ curl http://localhost:8080/v1/erasures/1/verify
 
 `result` is `erased` or `incomplete`, computed from what the walk found and
 never from what the settle record claims. Matches are classified against the
-erase record's resolved keys: an erased key found live again is a
-**re-delivery** and fails the receipt; a fresh key matching the subject is
-**new activity** and is reported without failing it. A pin created before the
-erasure still holds the subject's bytes in its hard-link farm, and the receipt
-says which pin to release. Byte-level occurrence scans (the log, rollup
-sidecars) are over-approximate on purpose and report as `attention` rather
-than failure — an identifier quoted in unrelated content counts.
+erase record's resolved keys under one rule for every domain: an erased key
+found live again is a **re-delivery** and fails the receipt; a fresh key
+matching the subject is **new activity** and is reported without failing it.
+A pin created before the erasure still holds the subject's bytes in its
+hard-link farm, and the receipt says which pin to release.
+
+The byte-level occurrence scans (the log, rollup sidecars) are
+over-approximate on purpose — an identifier quoted in unrelated content
+counts — so their findings report as `attention` and are carried in a
+separate top-level field: **`conclusive`** is `false` whenever any
+over-approximate signal was found and not proven benign. `result` answers
+what the semantic walk found; `conclusive` answers whether anything at all
+was left ambiguous. A receipt offered as proof should be `erased` **and**
+`conclusive`.
 
 The same receipt is available offline, against a directory no live server
 owns:
@@ -912,7 +932,8 @@ owns:
 traza-server verify --erasure 1 --data-dir /var/lib/traza
 ```
 
-Exits `0` when the receipt says erased, `2` when it does not.
+Exits `0` when the receipt is erased and conclusive, `3` when it is erased
+but inconclusive, `2` when the erasure did not hold.
 
 **Errors.** `404` for an id the tombstone log does not record. `400` on a
 non-numeric id. `503` on store failure. The walk probes segment indexes

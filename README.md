@@ -83,7 +83,7 @@ That is the whole setup. Data lands in `./data`, the dashboard is on <http://loc
 | `--mcp` | off | Serve Model Context Protocol at `/v1/mcp`. |
 | `--ui-dir DIR` | beside the binary | Where the built dashboard lives. |
 | `--restore DIR` | | Install a backup into `--data-dir`, then serve it. |
-| `TRAZA_TOKENS` | unset | Bearer auth, `rw:` and `ro:` scoped. |
+| `TRAZA_TOKENS` | unset | Bearer auth: `rw:` and `ro:` scoped, plus `admin:` for erasure. |
 
 `--help` prints all twenty-five. The [configuration reference](docs/configuration.md) explains what each one costs.
 

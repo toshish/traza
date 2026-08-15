@@ -218,8 +218,47 @@ fn is_manifested(relative: &str) -> bool {
 /// The append-only manifested files: bytes past their recorded length are
 /// appends since the manifest, never damage. Everything else a manifest
 /// names is immutable once published.
-fn is_append_only(relative: &str) -> bool {
+pub(crate) fn is_append_only(relative: &str) -> bool {
     relative == "annotations.jsonl" || relative == crate::erasure::LOG_NAME
+}
+
+/// Copies exactly the first `length` bytes of `source` to `target`, staged
+/// through the target's own name (the caller stages the whole directory), and
+/// fsynced.
+///
+/// This is how the append-only logs enter a pin. A hard link would share the
+/// inode with the LIVE log, and every append after the pin — an annotation, a
+/// tombstone — would mutate the "backup" in place. The failure that found
+/// this was not subtle: a pin taken before an erasure inherited the erasure's
+/// settle record through the shared inode, so restoring it produced a store
+/// that RECORDED the erasure as settled while still holding every erased
+/// span. A backup that later operations can edit is not a backup. The copy is
+/// bounded to the manifested prefix because these logs are human/eval scale,
+/// and the prefix — not whatever the file has grown to since the manifest —
+/// is what the pin's manifest digests.
+pub(crate) fn copy_prefix(source: &Path, target: &Path, length: u64) -> Result<()> {
+    use std::io::Read;
+    let mut reader = std::io::BufReader::new(File::open(source)?);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(target)?;
+    let mut remaining = length;
+    let mut chunk = vec![0u8; 64 * 1024];
+    while remaining > 0 {
+        let want = chunk.len().min(remaining as usize);
+        let read = reader.read(&mut chunk[..want])?;
+        if read == 0 {
+            return Err(Error::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("{} ended before its manifested length", source.display()),
+            )));
+        }
+        file.write_all(&chunk[..read])?;
+        remaining -= read as u64;
+    }
+    file.sync_all()?;
+    Ok(())
 }
 
 /// Walks the engine directory and digests every load-bearing file, reusing a

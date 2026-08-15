@@ -363,6 +363,11 @@ pub struct Metrics {
     /// Physical span records removed by erasures, across buffer, log and
     /// segments. Superseded versions count: they held the bytes too.
     pub erasure_spans_removed: Counter,
+    /// Spans dropped at admission because a pending erasure covered them —
+    /// the barrier that makes an erasure's cut exact. Nonzero means a client
+    /// kept sending covered spans while an erasure ran; sustained growth
+    /// means a producer is replaying erased data.
+    pub erasure_spans_suppressed: Counter,
     /// One erasure end to end: resolve, tombstone, purge every domain,
     /// checkpoint, settle.
     pub erasure: Latency,
@@ -379,7 +384,7 @@ impl Metrics {
     pub fn render_prometheus(&self, into: &mut String) {
         use std::fmt::Write as _;
 
-        let counters: [(&str, &Counter); 17] = [
+        let counters: [(&str, &Counter); 18] = [
             ("traza_spans_admitted_total", &self.spans_admitted),
             ("traza_batches_admitted_total", &self.batches_admitted),
             ("traza_wal_commits_total", &self.wal_commits),
@@ -420,6 +425,10 @@ impl Metrics {
             (
                 "traza_erasure_spans_removed_total",
                 &self.erasure_spans_removed,
+            ),
+            (
+                "traza_erasure_spans_suppressed_total",
+                &self.erasure_spans_suppressed,
             ),
         ];
         for (name, counter) in counters {
