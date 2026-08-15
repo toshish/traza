@@ -75,32 +75,92 @@ describe('fmtUptime', () => {
 describe('fmtCostProvenance', () => {
   // A cost that was measured and a cost that was worked out from list price
   // are different claims, and the screens show them in the same column.
+  // Provenance comes from the CALL COUNTS: the dollars cannot carry it.
+
+  const row = (over) => ({
+    cost_usd: 0, cost_derived_usd: 0,
+    cost_metered_calls: 0, cost_derived_calls: 0, cost_unpriced_calls: 0,
+    ...over,
+  });
 
   it('states a fully metered cost plainly', () => {
-    const cost = fmtCostProvenance(0.42, 0);
+    const cost = fmtCostProvenance(row({ cost_usd: 0.42, cost_metered_calls: 1 }));
     expect(cost.text).toBe('0.4200');
     expect(cost.estimated).toBe(false);
+    expect(cost.incomplete).toBe(false);
+    expect(cost.title).toContain('Metered');
   });
 
   it('marks a fully derived cost as an estimate', () => {
-    const cost = fmtCostProvenance(11, 11);
+    const cost = fmtCostProvenance(row({
+      cost_usd: 11, cost_derived_usd: 11, cost_derived_calls: 2,
+    }));
     expect(cost.text).toBe('~11.0000');
     expect(cost.estimated).toBe(true);
-    expect(cost.title).toContain('model pricing');
+    expect(cost.title).toContain('configured model rates');
   });
 
   it('marks a mixed total as an estimate and reports the split', () => {
-    // The whole figure is an estimate once any of it is, and the title has to
-    // say how much — otherwise "~" is a warning with no way to act on it.
-    const cost = fmtCostProvenance(11.42, 11);
+    const cost = fmtCostProvenance(row({
+      cost_usd: 11.42, cost_derived_usd: 11,
+      cost_metered_calls: 1, cost_derived_calls: 1,
+    }));
     expect(cost.text).toBe('~11.4200');
     expect(cost.estimated).toBe(true);
-    expect(cost.title).toContain('0.4200 metered');
-    expect(cost.title).toContain('11.0000 derived');
+    expect(cost.title).toContain('1 metered');
+    expect(cost.title).toContain('11.0000');
   });
 
-  it('treats a missing derived share as metered', () => {
-    // Older servers, and every response before pricing existed, omit it.
-    expect(fmtCostProvenance(0.42, undefined).estimated).toBe(false);
+  it('does not call an unpriced total metered', () => {
+    // No pricing configured and no metered cost: every call contributed
+    // nothing. Reading `cost_derived_usd === 0` as proof of measurement said
+    // "metered by the spans themselves" about spans that reported no cost
+    // at all.
+    const cost = fmtCostProvenance(row({ cost_usd: 0, cost_unpriced_calls: 3 }));
+    expect(cost.estimated).toBe(false);
+    expect(cost.incomplete).toBe(true);
+    expect(cost.text).toBe('—');
+    expect(cost.title).not.toContain('Metered by the spans');
+    expect(cost.title).toContain('undercount');
+    expect(cost.title).toContain('3 with no cost');
+  });
+
+  it('marks a zero-rate model as an estimate despite costing nothing', () => {
+    // A rate of 0.0 is legal and explicitly supported — it is how a
+    // self-hosted model is priced. It derives a cost of exactly $0.00, which
+    // on the dollars alone is indistinguishable from never having been
+    // priced, and from having been metered at zero.
+    const cost = fmtCostProvenance(row({
+      cost_usd: 0, cost_derived_usd: 0, cost_derived_calls: 4,
+    }));
+    expect(cost.estimated).toBe(true);
+    expect(cost.text).toBe('~0.0000');
+    expect(cost.title).toContain('4 priced from the configured model rates');
+  });
+
+  it('reports an estimate that is also an undercount as both', () => {
+    const cost = fmtCostProvenance(row({
+      cost_usd: 5, cost_derived_usd: 5, cost_derived_calls: 1, cost_unpriced_calls: 2,
+    }));
+    expect(cost.estimated).toBe(true);
+    expect(cost.incomplete).toBe(true);
+    expect(cost.title).toContain('Estimated and an undercount');
+  });
+
+  it('says so when there were no LLM calls at all', () => {
+    expect(fmtCostProvenance(row({})).title).toBe('No LLM calls here.');
+    expect(fmtCostProvenance(row({})).text).toBe('—');
+  });
+
+  it('still shows a metered zero as a zero', () => {
+    // A free tier really did charge nothing, and the span measured that.
+    const cost = fmtCostProvenance(row({ cost_usd: 0, cost_metered_calls: 2 }));
+    expect(cost.text).toBe('0.0000');
+    expect(cost.estimated).toBe(false);
+  });
+
+  it('survives a row from a server that predates the counts', () => {
+    expect(fmtCostProvenance({ cost_usd: 0.42 }).estimated).toBe(false);
+    expect(fmtCostProvenance(undefined).text).toBe('—');
   });
 });

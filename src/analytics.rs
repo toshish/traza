@@ -78,10 +78,17 @@ pub struct SessionSummary {
     /// Summed cost in USD, metered and derived together.
     pub cost_usd: f64,
     /// The part of `cost_usd` derived from the configured pricing table
-    /// rather than reported by a span. Zero when nothing was derived, which
-    /// is the whole total's provenance answered in one number: equal to
-    /// `cost_usd` means all estimate, zero means all measurement.
+    /// rather than reported by a span.
     pub cost_derived_usd: f64,
+    /// LLM calls whose cost the span itself reported.
+    pub cost_metered_calls: usize,
+    /// LLM calls priced from the configured table.
+    pub cost_derived_calls: usize,
+    /// LLM calls with no cost from either source — an unpriced model, or a
+    /// call that reported only a total token count. **These contribute
+    /// nothing to `cost_usd`, so a total with a non-zero count here is an
+    /// undercount rather than a complete answer.**
+    pub cost_unpriced_calls: usize,
     /// Spans with status `error`.
     pub error_count: usize,
 }
@@ -104,10 +111,17 @@ pub struct SessionTrace {
     /// Summed cost in USD, metered and derived together.
     pub cost_usd: f64,
     /// The part of `cost_usd` derived from the configured pricing table
-    /// rather than reported by a span. Zero when nothing was derived, which
-    /// is the whole total's provenance answered in one number: equal to
-    /// `cost_usd` means all estimate, zero means all measurement.
+    /// rather than reported by a span.
     pub cost_derived_usd: f64,
+    /// LLM calls whose cost the span itself reported.
+    pub cost_metered_calls: usize,
+    /// LLM calls priced from the configured table.
+    pub cost_derived_calls: usize,
+    /// LLM calls with no cost from either source — an unpriced model, or a
+    /// call that reported only a total token count. **These contribute
+    /// nothing to `cost_usd`, so a total with a non-zero count here is an
+    /// undercount rather than a complete answer.**
+    pub cost_unpriced_calls: usize,
     /// Spans with status `error`.
     pub error_count: usize,
 }
@@ -212,10 +226,17 @@ pub struct LlmAggregateRow {
     /// Summed cost in USD, metered and derived together.
     pub cost_usd: f64,
     /// The part of `cost_usd` derived from the configured pricing table
-    /// rather than reported by a span. Zero when nothing was derived, which
-    /// is the whole total's provenance answered in one number: equal to
-    /// `cost_usd` means all estimate, zero means all measurement.
+    /// rather than reported by a span.
     pub cost_derived_usd: f64,
+    /// LLM calls whose cost the span itself reported.
+    pub cost_metered_calls: usize,
+    /// LLM calls priced from the configured table.
+    pub cost_derived_calls: usize,
+    /// LLM calls with no cost from either source — an unpriced model, or a
+    /// call that reported only a total token count. **These contribute
+    /// nothing to `cost_usd`, so a total with a non-zero count here is an
+    /// undercount rather than a complete answer.**
+    pub cost_unpriced_calls: usize,
     /// Spans with status `error`.
     pub error_count: usize,
     /// Summed duration of LLM calls, for average latency (`/ llm_calls`).
@@ -236,6 +257,13 @@ pub(crate) struct Counters {
     /// a span. Summed separately because a total that mixes measurement with
     /// estimate is not interpretable without knowing the mix.
     pub(crate) cost_derived_usd: f64,
+    /// LLM calls whose cost the span itself reported.
+    pub(crate) cost_metered_calls: usize,
+    /// LLM calls whose cost came from the pricing table.
+    pub(crate) cost_derived_calls: usize,
+    /// LLM calls with no cost from either source — an unpriced model, or a
+    /// call that reported only a total token count.
+    pub(crate) cost_unpriced_calls: usize,
     pub(crate) errors: usize,
     pub(crate) llm_duration_ns: u64,
 }
@@ -263,9 +291,22 @@ impl Counters {
             .saturating_add(facts.completion_tokens.unwrap_or(0));
         self.total_tokens = self.total_tokens.saturating_add(facts.total());
         self.cost_usd = finite_saturating_add(self.cost_usd, facts.cost_usd.unwrap_or(0.0));
-        if facts.cost_derived {
-            self.cost_derived_usd =
-                finite_saturating_add(self.cost_derived_usd, facts.cost_usd.unwrap_or(0.0));
+        // Provenance is counted, never inferred from the dollars. A zero-rate
+        // model is priced and contributes nothing; an unpriced call also
+        // contributes nothing — and reading `cost_derived_usd == 0` as
+        // "measured" would call both of them metered, which is false twice.
+        match (facts.cost_usd, facts.cost_derived) {
+            (Some(cost), true) => {
+                self.cost_derived_usd = finite_saturating_add(self.cost_derived_usd, cost);
+                self.cost_derived_calls = self.cost_derived_calls.saturating_add(1);
+            }
+            (Some(_), false) => self.cost_metered_calls = self.cost_metered_calls.saturating_add(1),
+            // Only LLM calls can be *un*priced. A span carrying no model, no
+            // tokens and no cost is not a call that failed to get a price.
+            (None, _) if facts.is_llm => {
+                self.cost_unpriced_calls = self.cost_unpriced_calls.saturating_add(1);
+            }
+            (None, _) => {}
         }
     }
 
@@ -280,6 +321,15 @@ impl Counters {
         self.cost_usd = finite_saturating_add(self.cost_usd, other.cost_usd);
         self.cost_derived_usd =
             finite_saturating_add(self.cost_derived_usd, other.cost_derived_usd);
+        self.cost_metered_calls = self
+            .cost_metered_calls
+            .saturating_add(other.cost_metered_calls);
+        self.cost_derived_calls = self
+            .cost_derived_calls
+            .saturating_add(other.cost_derived_calls);
+        self.cost_unpriced_calls = self
+            .cost_unpriced_calls
+            .saturating_add(other.cost_unpriced_calls);
         self.errors = self.errors.saturating_add(other.errors);
         self.llm_duration_ns = self.llm_duration_ns.saturating_add(other.llm_duration_ns);
     }
@@ -620,6 +670,9 @@ impl Store {
                 total_tokens: entry.counters.total_tokens,
                 cost_usd: entry.counters.cost_usd,
                 cost_derived_usd: entry.counters.cost_derived_usd,
+                cost_metered_calls: entry.counters.cost_metered_calls,
+                cost_derived_calls: entry.counters.cost_derived_calls,
+                cost_unpriced_calls: entry.counters.cost_unpriced_calls,
                 error_count: entry.counters.errors,
             })
             .collect();
@@ -723,6 +776,9 @@ impl Store {
                     total_tokens: counters.total_tokens,
                     cost_usd: counters.cost_usd,
                     cost_derived_usd: counters.cost_derived_usd,
+                    cost_metered_calls: counters.cost_metered_calls,
+                    cost_derived_calls: counters.cost_derived_calls,
+                    cost_unpriced_calls: counters.cost_unpriced_calls,
                     error_count: counters.errors,
                 }
             })
@@ -743,6 +799,9 @@ impl Store {
                 total_tokens: session.counters.total_tokens,
                 cost_usd: session.counters.cost_usd,
                 cost_derived_usd: session.counters.cost_derived_usd,
+                cost_metered_calls: session.counters.cost_metered_calls,
+                cost_derived_calls: session.counters.cost_derived_calls,
+                cost_unpriced_calls: session.counters.cost_unpriced_calls,
                 error_count: session.counters.errors,
             },
             traces: trace_rows,
@@ -827,6 +886,9 @@ impl Store {
                 total_tokens: counters.total_tokens,
                 cost_usd: counters.cost_usd,
                 cost_derived_usd: counters.cost_derived_usd,
+                cost_metered_calls: counters.cost_metered_calls,
+                cost_derived_calls: counters.cost_derived_calls,
+                cost_unpriced_calls: counters.cost_unpriced_calls,
                 error_count: counters.errors,
                 llm_duration_ns: counters.llm_duration_ns,
             })

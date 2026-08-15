@@ -35,10 +35,11 @@
 //! segment bytes    u64  \
 //! record count     u64   |   the BINDING: which segment this describes
 //! min start ns     u64   |
-//! max start ns     u64  /
+//! max start ns     u64   |
+//! pricing fp       u64  /    which rate table the counters were folded under
 //! min end ns       u64      span END range, for TTL expiry
 //! max end ns       u64
-//! prologue cksum   u64       FNV-1a over the 64 bytes above
+//! prologue cksum   u64       FNV-1a over the 72 bytes above
 //! by_model         counter map
 //! by_provider      counter map
 //! by_service       counter map
@@ -51,9 +52,11 @@
 //! ```
 //!
 //! A counter map is a `u32` entry count followed by a length-prefixed key and
-//! eight fixed-width counter fields. A session entry adds the first/last
-//! timestamps, the trace-id set, and an index into
-//! [`crate::semconv::SESSION_KEYS`] (`u32::MAX` for none).
+//! eleven fixed-width counter fields — the last four being the derived cost
+//! share and the metered/derived/unpriced call counts that say where a total
+//! came from. A session entry adds the first/last timestamps, the trace-id
+//! set, and an index into [`crate::semconv::SESSION_KEYS`] (`u32::MAX` for
+//! none).
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -74,7 +77,12 @@ const MAGIC: [u8; 8] = *b"TRAZAROL";
 ///
 /// v4: the prologue carries the pricing fingerprint its counters were folded
 /// under, and every counter block carries the derived share of its cost.
-const FORMAT_VERSION: u16 = 4;
+///
+/// v5: counter blocks carry metered/derived/unpriced call counts. The derived
+/// *dollars* alone cannot answer where a cost came from — a zero-rate model
+/// and an unpriced one both contribute nothing — so provenance is stored
+/// rather than reconstructed.
+const FORMAT_VERSION: u16 = 5;
 
 /// Version of the analytics semantics the counters were computed under.
 ///
@@ -526,6 +534,9 @@ fn put_counters(out: &mut Vec<u8>, counters: &Counters) {
     // would have returned.
     put_u64(out, counters.cost_usd.to_bits());
     put_u64(out, counters.cost_derived_usd.to_bits());
+    put_u64(out, counters.cost_metered_calls as u64);
+    put_u64(out, counters.cost_derived_calls as u64);
+    put_u64(out, counters.cost_unpriced_calls as u64);
     put_u64(out, counters.errors as u64);
     put_u64(out, counters.llm_duration_ns);
 }
@@ -582,6 +593,9 @@ impl<'a> Cursor<'a> {
             total_tokens: self.u64()?,
             cost_usd: f64::from_bits(self.u64()?),
             cost_derived_usd: f64::from_bits(self.u64()?),
+            cost_metered_calls: usize::try_from(self.u64()?).ok()?,
+            cost_derived_calls: usize::try_from(self.u64()?).ok()?,
+            cost_unpriced_calls: usize::try_from(self.u64()?).ok()?,
             errors: usize::try_from(self.u64()?).ok()?,
             llm_duration_ns: self.u64()?,
         })

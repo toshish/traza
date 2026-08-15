@@ -29,26 +29,63 @@ export function fmtCost(value) {
   return typeof value === 'number' ? value.toFixed(4) : String(value ?? '');
 }
 
-/** A cost that says whether it was measured or worked out.
+/** A cost that says where it came from.
  *
- *  Any derived share prefixes a `~`, because a total that mixes a metered
+ *  Takes the row itself — every cost-bearing API row carries `cost_usd`,
+ *  `cost_derived_usd` and the metered/derived/unpriced call counts — and reads
+ *  provenance off the COUNTS. The dollars cannot carry it: a zero-rate model
+ *  is priced and adds nothing, an unpriced call also adds nothing, and a row
+ *  with no LLM calls at all adds nothing. Judging by `cost_derived_usd > 0`
+ *  called all three of those "metered", which was false in two of them.
+ *
+ *  Any derived call prefixes a `~`, because a total that mixes a metered
  *  charge with list-price arithmetic is an estimate as a whole — rounding that
- *  distinction away is how an estimate gets quoted back as a bill. The title
- *  carries the split for anyone who needs the exact provenance.
+ *  distinction away is how an estimate gets quoted back as a bill. Unpriced
+ *  calls are a separate and worse caveat: they contribute nothing, so the
+ *  total is not merely uncertain but low.
  *
- *  Returns `{ text, title, estimated }`. */
-export function fmtCostProvenance(costUsd, derivedUsd) {
-  const cost = typeof costUsd === 'number' ? costUsd : 0;
-  const derived = typeof derivedUsd === 'number' ? derivedUsd : 0;
-  if (derived <= 0) {
-    return { text: fmtCost(cost), title: 'Metered by the spans themselves.', estimated: false };
+ *  Returns `{ text, title, estimated, incomplete, priced }`, where `priced`
+ *  is the number of calls that got a cost from either source — zero means
+ *  there is no figure to show at any precision. */
+export function fmtCostProvenance(row) {
+  const num = (value) => (typeof value === 'number' && Number.isFinite(value) ? value : 0);
+  const cost = num(row?.cost_usd);
+  const derivedUsd = num(row?.cost_derived_usd);
+  const metered = num(row?.cost_metered_calls);
+  const derived = num(row?.cost_derived_calls);
+  const unpriced = num(row?.cost_unpriced_calls);
+
+  const estimated = derived > 0;
+  const incomplete = unpriced > 0;
+  const parts = [];
+  if (metered > 0) parts.push(`${fmtNum(metered)} metered by the spans`);
+  if (derived > 0) {
+    parts.push(`${fmtNum(derived)} priced from the configured model rates`
+      + ` (${fmtCost(derivedUsd)})`);
   }
-  const metered = Math.max(0, cost - derived);
-  const title = metered > 0
-    ? `Estimated. ${fmtCost(metered)} metered by the spans, ${fmtCost(derived)} derived `
-      + 'from the configured model pricing.'
-    : 'Estimated: derived from the configured model pricing, not metered by the spans.';
-  return { text: '~' + fmtCost(cost), title, estimated: true };
+  if (unpriced > 0) {
+    parts.push(`${fmtNum(unpriced)} with no cost and no rate, contributing nothing`);
+  }
+
+  let title;
+  if (!parts.length) title = 'No LLM calls here.';
+  else if (!estimated && !incomplete) title = 'Metered by the spans themselves.';
+  else {
+    title = (estimated ? 'Estimated' : 'Complete only in part')
+      + (incomplete ? ' and an undercount. ' : '. ')
+      + parts.join('; ') + '.';
+  }
+  // Nothing was priced, so there is no figure to show. `0.0000` would read as
+  // "this was free" when it means "nobody could say" — the same confusion the
+  // `~` exists to prevent, and the reason provenance is counted at all.
+  const priced = metered + derived;
+  return {
+    text: priced === 0 ? '—' : (estimated ? '~' : '') + fmtCost(cost),
+    title,
+    estimated,
+    incomplete,
+    priced,
+  };
 }
 
 export function fmtBytes(bytes) {
