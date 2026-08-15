@@ -43,6 +43,7 @@ fn open_store(dir: &Path) -> Store {
     Store::open(
         dir,
         Config {
+            pricing: Default::default(),
             tenant_ttl_seconds: Default::default(),
             flush_spans: 100_000,
             max_buffer_age: None,

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { durabilityMeans, fmtWindowLabel, fmtDelta, fmtUptime } from './format.js';
+import { durabilityMeans, fmtWindowLabel, fmtDelta, fmtUptime, fmtCostProvenance } from './format.js';
 
 describe('durabilityMeans', () => {
   // Both screens used to print the `wal` sentence unconditionally, so a
@@ -69,5 +69,38 @@ describe('fmtUptime', () => {
 
   it('drops the day when there is none', () => {
     expect(fmtUptime(((4 * 3600 + 11 * 60) * 1e9))).toBe('04:11');
+  });
+});
+
+describe('fmtCostProvenance', () => {
+  // A cost that was measured and a cost that was worked out from list price
+  // are different claims, and the screens show them in the same column.
+
+  it('states a fully metered cost plainly', () => {
+    const cost = fmtCostProvenance(0.42, 0);
+    expect(cost.text).toBe('0.4200');
+    expect(cost.estimated).toBe(false);
+  });
+
+  it('marks a fully derived cost as an estimate', () => {
+    const cost = fmtCostProvenance(11, 11);
+    expect(cost.text).toBe('~11.0000');
+    expect(cost.estimated).toBe(true);
+    expect(cost.title).toContain('model pricing');
+  });
+
+  it('marks a mixed total as an estimate and reports the split', () => {
+    // The whole figure is an estimate once any of it is, and the title has to
+    // say how much — otherwise "~" is a warning with no way to act on it.
+    const cost = fmtCostProvenance(11.42, 11);
+    expect(cost.text).toBe('~11.4200');
+    expect(cost.estimated).toBe(true);
+    expect(cost.title).toContain('0.4200 metered');
+    expect(cost.title).toContain('11.0000 derived');
+  });
+
+  it('treats a missing derived share as metered', () => {
+    // Older servers, and every response before pricing existed, omit it.
+    expect(fmtCostProvenance(0.42, undefined).estimated).toBe(false);
   });
 });

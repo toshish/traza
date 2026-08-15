@@ -879,8 +879,14 @@ impl<'a> Server<'a> {
             .store
             .annotations_in(context.scope(), trace_id, None, None)
             .unwrap_or_default();
-        let (head, rows, notes) =
-            render_trace(&spans, &annotations, max_spans, include_content, trace_id);
+        let (head, rows, notes) = render_trace(
+            &spans,
+            &annotations,
+            max_spans,
+            include_content,
+            trace_id,
+            self.store.pricing(),
+        );
         Ok(text_result(clamp_report(
             &head,
             &rows,
@@ -1435,7 +1441,7 @@ impl<'a> Server<'a> {
     /// One span as a compact line, plus its attributes when content is asked
     /// for. Every fragment of stored text goes through [`sanitize`].
     fn render_span(&self, index: usize, span: &Span, include_content: bool) -> Vec<String> {
-        let facts = semconv::facts(&span.attributes);
+        let facts = self.store.facts(span);
         let mut line = format!(
             "{index:>3}  {}  {:<5}  {}  {}  {}  trace={} span={}",
             clock(span.start_time_ns),
@@ -1523,8 +1529,14 @@ impl<'a> Server<'a> {
                         .store
                         .annotations_in(context.scope(), &trace_id, None, None)
                         .unwrap_or_default();
-                    let (head, rows, notes) =
-                        render_trace(&spans, &annotations, DEFAULT_TRACE_SPANS, true, &trace_id);
+                    let (head, rows, notes) = render_trace(
+                        &spans,
+                        &annotations,
+                        DEFAULT_TRACE_SPANS,
+                        true,
+                        &trace_id,
+                        self.store.pricing(),
+                    );
                     clamp_report(&head, &rows, &notes, self.limits.max_result_bytes)
                 } else if let Some(session_id) = other.strip_prefix("traza://session/") {
                     let session_id = percent_decode(session_id);
@@ -2643,10 +2655,11 @@ fn render_trace(
     max_spans: usize,
     include_content: bool,
     trace_id: &str,
+    pricing: &crate::pricing::Pricing,
 ) -> (String, Vec<String>, Vec<String>) {
     let facts: Vec<_> = spans
         .iter()
-        .map(|span| semconv::facts(&span.attributes))
+        .map(|span| semconv::facts(&span.attributes).priced(pricing))
         .collect();
     let errors = spans.iter().filter(|span| span.status == "error").count();
     let cost: f64 = facts.iter().filter_map(|fact| fact.cost_usd).sum();

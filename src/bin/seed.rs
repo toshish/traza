@@ -106,6 +106,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Some(directory) => Some(Store::open(
             directory,
             Config {
+                pricing: Default::default(),
                 tenant_ttl_seconds: Default::default(),
                 // Seeding is a bulk load into a fresh store; the log would be
                 // pure overhead for data that is flushed at the end anyway.

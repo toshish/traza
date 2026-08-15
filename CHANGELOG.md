@@ -237,6 +237,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     behind the `admin` scope; the agent-facing surface stays read-only, so
     stored adversarial text has no destructive tool to actuate.
 
+- **Derived LLM cost from a configured pricing table**, `--pricing FILE`.
+  OpenTelemetry defines no cost attribute, so a span carries one only if its
+  pipeline metered it — and most do not, which left stores that knew the model
+  and both token counts reporting `$0.00` on every cost surface. Rates are USD
+  per million tokens, keyed by exact model name or a `prefix*` pattern
+  (longest match wins; an exact name beats every pattern; a bare `"*"` is a
+  default). There is no built-in table and will not be one: prices move on the
+  vendor's schedule, and self-hosted models have no public rate.
+  - **A metered `llm.cost_usd` always wins**, and a span reporting only a
+    total token count stays unpriced rather than being split by an assumed
+    input/output ratio.
+  - **Estimates are reported as estimates.** `/v1/stats/llm` and
+    `/v1/sessions` return `cost_derived_usd` beside `cost_usd`, so a total's
+    provenance is always answerable; the dashboard prefixes any figure
+    containing an estimate with `~` and gives the split on hover.
+  - **Rollup sidecars record the fingerprint of the table they were folded
+    under** (format v4), so editing the rates invalidates exactly the cached
+    counters that would now be wrong instead of reporting last month's prices
+    from a sealed segment forever. An empty table fingerprints to zero, so a
+    store that prices nothing binds its sidecars exactly as before. A
+    malformed pricing file refuses startup rather than being ignored.
+
 ### Changed
 
 - **Ingest rejects an inadmissible tenant with 400, on both surfaces.** A
@@ -301,6 +323,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from every domain and stops, exactly as before. The deletion is durable when
   its domains are durable and *published* by the next checkpoint — one
   maintenance interval away, or immediately when a backup asks.
+
+### Fixed
+
+- **Native ingest accepts an event's timestamp under the OTLP name.** A span's
+  timestamps accepted `start_time_unix_nano`; its events accepted only
+  `timestamp_ns`, so a client spelling both the way OTLP spells them had its
+  **entire batch** rejected with a 400 naming a field it had supplied. Events
+  now take `time_unix_nano`, `timestamp_unix_nano`, `time_ns` and `time` as
+  aliases, and `attributes` defaults, so a named instant no longer needs an
+  empty map to be legal. The failure mode this closes is quiet rather than
+  loud: telemetry clients are conventionally fail-open, so the spans simply
+  never arrived.
+- **The span search's token column reads the current OpenTelemetry names.**
+  It carried its own third copy of the semantic-convention precedence, which
+  had drifted from `src/semconv.rs`: it resolved only the deprecated
+  `gen_ai.usage.{prompt,completion}_tokens` and a `llm.usage.prompt_tokens`
+  key Traza has never recognized. A span using the current `input`/`output`
+  names — resolved correctly by the server and by the trace detail — showed a
+  blank cell. It now uses the shared `llmUsage` helper, as everything else
+  does.
+- **Two toolbar actions on the span search worked in name only.** A local
+  named `window` shadowed the global for the whole component, so
+  `window.prompt` and `window.location` read `undefined` through the optional
+  chains guarding them: saving a view never asked for a name and silently
+  numbered every one `view N`, and "Copy as curl" emitted a hostless URL that
+  curl refuses.
 
 ## [0.22.2] - 2026-08-12
 

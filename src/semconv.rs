@@ -87,8 +87,13 @@ pub struct LlmFacts {
     pub completion_tokens: Option<u64>,
     /// Explicit total token count, if reported (see [`LlmFacts::total`]).
     pub total_tokens: Option<u64>,
-    /// Metered cost in USD, if reported.
+    /// Cost in USD: metered from the span, or derived by [`Self::priced`].
+    /// [`Self::cost_derived`] says which.
     pub cost_usd: Option<f64>,
+    /// Whether [`Self::cost_usd`] was computed from a pricing table rather
+    /// than reported by the span. Always false as extracted; only
+    /// [`Self::priced`] sets it.
+    pub cost_derived: bool,
 }
 
 impl LlmFacts {
@@ -100,6 +105,25 @@ impl LlmFacts {
                 .unwrap_or(0)
                 .saturating_add(self.completion_tokens.unwrap_or(0))
         })
+    }
+
+    /// Fills in a cost from `pricing` when the span did not meter one.
+    ///
+    /// A metered cost is never overwritten. The span's own number is a
+    /// measurement of what was actually charged; the table's is arithmetic at
+    /// list price, and preferring the second would be replacing evidence with
+    /// an estimate. See [`crate::pricing`].
+    pub fn priced(mut self, pricing: &crate::pricing::Pricing) -> Self {
+        if self.cost_usd.is_some() || pricing.is_empty() {
+            return self;
+        }
+        if let Some(model) = self.model.as_deref() {
+            if let Some(cost) = pricing.cost(model, self.prompt_tokens, self.completion_tokens) {
+                self.cost_usd = Some(cost);
+                self.cost_derived = true;
+            }
+        }
+        self
     }
 }
 
@@ -157,6 +181,9 @@ pub fn facts(attributes: &Map<String, Value>) -> LlmFacts {
         completion_tokens,
         total_tokens,
         cost_usd,
+        // Extraction reports only what the span said. Pricing is applied by
+        // `LlmFacts::priced`, at the sites that hold the store's table.
+        cost_derived: false,
     }
 }
 

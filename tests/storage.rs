@@ -72,6 +72,7 @@ fn buffer_flush_persists_sorted_batches() {
     let store = Store::open(
         dir.path(),
         Config {
+            pricing: Default::default(),
             tenant_ttl_seconds: Default::default(),
             flush_spans: 8,
             max_buffer_age: None,
@@ -131,6 +132,7 @@ fn crash_recovery_preserves_flushed_spans() {
         let store = Store::open(
             dir.path(),
             Config {
+                pricing: Default::default(),
                 tenant_ttl_seconds: Default::default(),
                 flush_spans: 32,
                 max_buffer_age: None,
@@ -178,6 +180,7 @@ fn crash_recovery_preserves_flushed_spans() {
     let reopened = Store::open(
         dir.path(),
         Config {
+            pricing: Default::default(),
             tenant_ttl_seconds: Default::default(),
             flush_spans: 32,
             max_buffer_age: None,
@@ -302,6 +305,7 @@ fn randomized_filters_match_naive_reference() {
     let store = Store::open(
         dir.path(),
         Config {
+            pricing: Default::default(),
             tenant_ttl_seconds: Default::default(),
             flush_spans: 4_096,
             max_buffer_age: None,
@@ -401,6 +405,7 @@ fn ttl_compaction_drops_expired_segments() {
     let store = Store::open(
         dir.path(),
         Config {
+            pricing: Default::default(),
             tenant_ttl_seconds: Default::default(),
             flush_spans: 4,
             max_buffer_age: None,
@@ -515,6 +520,7 @@ fn lock_order_no_deadlock() {
         Store::open(
             &dir,
             Config {
+                pricing: Default::default(),
                 tenant_ttl_seconds: Default::default(),
                 flush_spans: 10_000,
                 max_buffer_age: None,
@@ -579,6 +585,7 @@ fn reads_never_miss_committed_spans() {
         Store::open(
             &dir,
             Config {
+                pricing: Default::default(),
                 tenant_ttl_seconds: Default::default(),
                 flush_spans: 10_000,
                 max_buffer_age: None,
@@ -657,6 +664,7 @@ fn stale_temp_does_not_wedge_flush() {
     let store = Store::open(
         &dir,
         Config {
+            pricing: Default::default(),
             tenant_ttl_seconds: Default::default(),
             flush_spans: 2,
             max_buffer_age: None,
@@ -720,6 +728,7 @@ fn stale_lock_from_dead_process_is_recovered() {
 fn second_open_is_rejected() {
     let dir = correctness_test_dir("single-writer");
     let config = Config {
+        pricing: Default::default(),
         tenant_ttl_seconds: Default::default(),
         flush_spans: 100,
         max_buffer_age: None,
