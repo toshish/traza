@@ -950,3 +950,156 @@ fn a_torn_eval_append_heals_and_the_version_survives_kill() {
         "the torn bytes were truncated away, not left as interior damage"
     );
 }
+
+#[test]
+fn a_bound_promotion_cannot_reach_another_tenants_payload() {
+    // Review round 1, P1: `create_version` verified only that the payload
+    // FILE existed, so a bound tenant could assert any hash, mint
+    // reachability, and then fetch another tenant's bytes — with the
+    // success/409 split doubling as an existence oracle. The interlock now
+    // demands the dataset's tenant already hold the reference.
+    let dir = test_dir("cross-tenant-promotion");
+    let store = Store::open(&dir, wal_config()).expect("opens");
+    let secret = "acme's confidential document body ".repeat(8);
+    store
+        .ingest(
+            serde_json::from_value(json!({
+                "trace_id": "ta", "span_id": "s1", "tenant": "acme",
+                "name": "op", "service": "svc",
+                "start_time_ns": 1000u64, "end_time_ns": 2000u64,
+                "attributes": {"prompt": secret},
+            }))
+            .expect("span"),
+        )
+        .expect("ingests");
+    store.flush().expect("seals");
+    let reference = store.get_trace_in(Some("acme"), "ta").expect("trace")[0].attributes["prompt"]
+        ["$payload"]
+        .as_str()
+        .expect("offloaded")
+        .to_owned();
+
+    let evil_dataset = store.create_dataset("evil", "exfil").expect("dataset");
+    let theft = store.create_dataset_version(
+        Some("evil"),
+        evil_dataset,
+        None,
+        None,
+        vec![serde_json::from_value(json!({
+            "example_id": "e1",
+            "input": {"stolen": {"$payload": reference, "bytes": 9}},
+        }))
+        .expect("example")],
+    );
+    match theft {
+        Err(traza::Error::Conflict(message)) => assert!(
+            message.contains("not reachable"),
+            "one refusal for absent AND foreign — no oracle: {message}"
+        ),
+        other => panic!("a foreign reference must be refused, got {other:?}"),
+    }
+    assert!(
+        store
+            .payload_in(Some("evil"), &reference)
+            .expect("fetch")
+            .is_none(),
+        "and the fetch stays unreachable too"
+    );
+
+    // The same promotion by the tenant that HOLDS the content is fine.
+    let acme_dataset = store.create_dataset("acme", "curated").expect("dataset");
+    let legitimate = store
+        .create_dataset_version(
+            Some("acme"),
+            acme_dataset,
+            None,
+            None,
+            vec![serde_json::from_value(json!({
+                "example_id": "e1",
+                "input": {"prompt": {"$payload": reference, "bytes": 9}},
+            }))
+            .expect("example")],
+        )
+        .expect("acme promotes its own content");
+    assert!(legitimate.created);
+}
+
+#[test]
+fn tenant_erasure_reaches_payload_bytes_held_only_by_its_examples() {
+    // Review round 1, P1: a payload whose only holder was the erased
+    // tenant's EXAMPLES (source span already erased) was never unlinked
+    // and never entered the receipt. The eval purge now surrenders the
+    // dropped bodies' references into the doomed set.
+    let dir = test_dir("example-only-payload");
+    let store = Store::open(&dir, wal_config()).expect("opens");
+    let content = "content that must not outlive its tenant ".repeat(8);
+    store
+        .ingest(
+            serde_json::from_value(json!({
+                "trace_id": "ta", "span_id": "s1", "tenant": "acme",
+                "name": "op", "service": "svc",
+                "start_time_ns": 1000u64, "end_time_ns": 2000u64,
+                "attributes": {"prompt": content},
+            }))
+            .expect("span"),
+        )
+        .expect("ingests");
+    store.flush().expect("seals");
+    let reference = store.get_trace_in(Some("acme"), "ta").expect("trace")[0].attributes["prompt"]
+        ["$payload"]
+        .as_str()
+        .expect("offloaded")
+        .to_owned();
+    let dataset = store.create_dataset("acme", "curated").expect("dataset");
+    store
+        .create_dataset_version(
+            Some("acme"),
+            dataset,
+            None,
+            None,
+            vec![serde_json::from_value(json!({
+                "example_id": "e1",
+                "input": {"prompt": {"$payload": reference, "bytes": 9}},
+            }))
+            .expect("example")],
+        )
+        .expect("promotes");
+
+    // Erase the source trace: the blob survives BECAUSE the example holds it.
+    let trace_erasure = store
+        .erase(traza::erasure::Subject::Trace {
+            trace_id: "ta".into(),
+            tenant: "acme".into(),
+        })
+        .expect("erases trace");
+    assert_eq!(
+        trace_erasure
+            .settle
+            .expect("settles")
+            .payloads_retained
+            .len(),
+        1
+    );
+    assert!(store.payload(&reference).expect("fetch").is_some());
+
+    // Erase the tenant: the example goes, and with it the LAST holder — the
+    // bytes must go too, and the settle must say so.
+    let tenant_erasure = store
+        .erase(traza::erasure::Subject::Tenant {
+            tenant: "acme".into(),
+        })
+        .expect("erases tenant");
+    let settle = tenant_erasure.settle.expect("settles");
+    assert!(
+        settle.payloads_removed.contains(&reference),
+        "the example-held bytes leave with the tenant: {settle:?}"
+    );
+    assert!(
+        store.payload(&reference).expect("fetch").is_none(),
+        "no holder remains, no bytes remain"
+    );
+    let receipt = store
+        .verify_erasure(tenant_erasure.erase.id)
+        .expect("receipt");
+    assert_eq!(receipt.result, "erased", "{}", receipt.render_text());
+}

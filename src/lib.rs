@@ -1702,8 +1702,12 @@ struct ExpiryCutoffs {
     /// Cutoff for tenants without an override; `None` means such tenants
     /// never expire.
     default: Option<u64>,
-    /// Per-tenant cutoff overrides.
-    tenants: std::collections::HashMap<String, u64>,
+    /// Per-tenant overrides. `None` is an EXPLICIT exemption — a tenant
+    /// configured with `--tenant-ttl acme=0` keeps everything even when a
+    /// global window exists. Dropping the zero entry instead let the
+    /// tenant fall through to the global cutoff, which deleted exactly the
+    /// data the operator had just exempted.
+    tenants: std::collections::HashMap<String, Option<u64>>,
 }
 
 impl ExpiryCutoffs {
@@ -1716,29 +1720,33 @@ impl ExpiryCutoffs {
     }
 
     /// The configured policy as absolute cutoffs, or `None` when no window
-    /// is configured anywhere (retention wholly disabled). A zero TTL is
-    /// documented as "disabled", not "expire everything now" — for the
-    /// global window and for each override alike.
+    /// is configured anywhere (retention wholly disabled). A zero GLOBAL
+    /// TTL is documented as "disabled"; a zero PER-TENANT TTL is that
+    /// tenant's exemption from the global window.
     fn from_config(config: &Config, now_ns: u64) -> Option<Self> {
         let cutoff = |ttl_seconds: u64| {
             (ttl_seconds > 0)
                 .then(|| now_ns.saturating_sub(ttl_seconds.saturating_mul(1_000_000_000)))
         };
         let default = config.ttl_seconds.and_then(cutoff);
-        let tenants: std::collections::HashMap<String, u64> = config
+        let tenants: std::collections::HashMap<String, Option<u64>> = config
             .tenant_ttl_seconds
             .iter()
-            .filter_map(|(tenant, ttl)| cutoff(*ttl).map(|cut| (tenant.clone(), cut)))
+            .map(|(tenant, ttl)| (tenant.clone(), cutoff(*ttl)))
             .collect();
-        if default.is_none() && tenants.is_empty() {
+        if default.is_none() && tenants.values().all(Option::is_none) {
             return None;
         }
         Some(Self { default, tenants })
     }
 
-    /// This tenant's cutoff: its override, else the default, else never.
+    /// This tenant's cutoff: its override (where `0` means NEVER), else
+    /// the default, else never.
     fn cutoff_for(&self, tenant: &str) -> Option<u64> {
-        self.tenants.get(tenant).copied().or(self.default)
+        match self.tenants.get(tenant) {
+            Some(exempt_or_cutoff) => *exempt_or_cutoff,
+            None => self.default,
+        }
     }
 
     /// The latest instant any configured window reaches — a span ending at
@@ -1747,22 +1755,27 @@ impl ExpiryCutoffs {
     fn latest(&self) -> u64 {
         self.tenants
             .values()
+            .flatten()
             .copied()
             .chain(self.default)
             .max()
             .unwrap_or(0)
     }
 
-    /// The earliest instant every span is bound by, or `None` when no such
-    /// bound exists. It exists only when the DEFAULT window does: a tenant
-    /// with no override and no default has no cutoff at all, and a
-    /// retire-whole decision taken without it would delete that tenant's
-    /// unexpired spans with the segment.
+    /// The earliest instant EVERY span is bound by, or `None` when no such
+    /// bound exists. It requires the default window AND no exempt tenant:
+    /// a tenant with no cutoff at all — unlisted with no default, or
+    /// explicitly exempted with `0` — makes any whole-segment deletion
+    /// unsound, because the segment may hold that tenant's spans.
     fn retire_bound(&self) -> Option<u64> {
         let default = self.default?;
+        if self.tenants.values().any(Option::is_none) {
+            return None;
+        }
         Some(
             self.tenants
                 .values()
+                .flatten()
                 .copied()
                 .chain(std::iter::once(default))
                 .min()
@@ -1777,6 +1790,7 @@ impl ExpiryCutoffs {
     fn earliest(&self) -> u64 {
         self.tenants
             .values()
+            .flatten()
             .copied()
             .chain(self.default)
             .min()
@@ -3307,6 +3321,33 @@ impl Store {
             };
             Ok(payload::payload_path(&self.directory, hash).exists())
         };
+        // For a BOUND caller, precompute which of the bodies' references the
+        // tenant's own SPANS hold (the eval-side half is checked inside the
+        // log's mutex, where its state is consistent). Computed out here
+        // because it reads the buffer and pinned segments, and the eval
+        // mutex is a leaf that must not reach into engine locks.
+        let spans_hold = match scope {
+            None => None,
+            Some(tenant) => {
+                let mut wanted: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                for example in &examples {
+                    for value in [Some(&example.input), example.expected.as_ref()]
+                        .into_iter()
+                        .flatten()
+                    {
+                        evals::collect_payload_refs_from(value, &mut wanted);
+                    }
+                }
+                let mut held: std::collections::HashSet<String> = std::collections::HashSet::new();
+                for reference in wanted {
+                    if self.tenant_spans_hold_reference(tenant, &reference)? {
+                        held.insert(reference);
+                    }
+                }
+                Some(held)
+            }
+        };
         self.evals.create_version(
             mask.as_deref(),
             scope,
@@ -3316,6 +3357,7 @@ impl Store {
             examples,
             unix_now_ns(),
             &verify,
+            spans_hold.as_ref(),
         )
     }
 
@@ -3656,6 +3698,18 @@ impl Store {
     /// Whether any of `tenant`'s spans or dataset examples carries
     /// `reference` — the reachability proof behind [`Self::payload_in`].
     fn tenant_holds_reference(&self, tenant: &str, reference: &str) -> Result<bool> {
+        if self.tenant_spans_hold_reference(tenant, reference)? {
+            return Ok(true);
+        }
+        // The tenant's dataset examples: an example legitimately outlives
+        // its source span, and its holder must keep fetch access.
+        self.evals.tenant_references(tenant, reference)
+    }
+
+    /// The span-side half of [`Self::tenant_holds_reference`]: buffer and
+    /// segments only, no eval-log locks — callable while building inputs
+    /// for an eval mutation that will hold the eval mutex itself.
+    fn tenant_spans_hold_reference(&self, tenant: &str, reference: &str) -> Result<bool> {
         // The write buffer first: cheap, and where the freshest refs live.
         {
             let writer = self.lock_writer()?;
@@ -3668,11 +3722,6 @@ impl Store {
                     }
                 }
             }
-        }
-        // The tenant's dataset examples: an example legitimately outlives
-        // its source span, and its holder must keep fetch access.
-        if self.evals.tenant_references(tenant, reference)? {
-            return Ok(true);
         }
         // Segments, doubly prefiltered: only segments whose sidecar holds
         // the reference at all, and within them only the tenant's records.
@@ -5122,13 +5171,14 @@ impl Store {
         // subject is always the canonical form.
         let subject = subject.canonicalized();
         subject.validate()?;
-        let (span_keys, payload_refs) = self.resolve_subject(&subject)?;
-        // A tenant subject also records which eval entities it is about to
-        // remove — bounded and small, unlike its span keys — so the receipt
-        // can name them without walking a log that no longer holds them.
-        let (eval_datasets, eval_experiments) = match &subject {
-            erasure::Subject::Tenant { tenant } => self.evals.ids_of_tenant(tenant)?,
-            _ => (Vec::new(), Vec::new()),
+        // Payload subjects resolve BEFORE the gate: their resolution is a
+        // fold over the whole store, and stalling every admission for a
+        // corpus scan is not a price `begin` may charge. Their recorded
+        // refs cannot diverge from the purge's — the subject reference IS
+        // the ref list.
+        let pre_resolved = match &subject {
+            erasure::Subject::Payload { .. } => Some(self.resolve_subject(&subject)?),
+            _ => None,
         };
         let requested_unix_ns = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -5139,11 +5189,29 @@ impl Store {
         // finds it), and everything arriving after sees the mask at every
         // step. This is what makes the barrier hold at the BEGIN transition,
         // not just in the steady pending state.
+        //
+        // Trace, span, session and tenant subjects RESOLVE in here too —
+        // bounded lookups, unlike a payload fold. Resolving outside the
+        // write half left a window where a span (and its payload refs)
+        // joined the subject between resolution and `begin`: the purge
+        // would then delete a reference the mask never accounted for, and
+        // a promotion racing the sweep could commit an example pointing at
+        // bytes the erasure was about to unlink. Under the write half no
+        // admission is in flight and none can start, so what resolution
+        // records is exactly what the purge will find.
         let record = {
             let _gate = self
                 .erasure_gate
                 .write()
                 .map_err(|_| Error::LockPoisoned("erasure gate"))?;
+            let (span_keys, payload_refs) = match pre_resolved {
+                Some(resolved) => resolved,
+                None => self.resolve_subject(&subject)?,
+            };
+            let (eval_datasets, eval_experiments) = match &subject {
+                erasure::Subject::Tenant { tenant } => self.evals.ids_of_tenant(tenant)?,
+                _ => (Vec::new(), Vec::new()),
+            };
             self.erasures.begin(
                 requested_unix_ns,
                 subject,
@@ -5276,10 +5344,13 @@ impl Store {
             // A tenant subject's eval records leave inside the same barrier,
             // before the checkpoint the settle will cite — the eval log is
             // manifested, and nothing may rewrite a manifested file past
-            // that checkpoint.
-            let eval_records_removed = match subject {
+            // that checkpoint. The refs its dropped bodies held join the
+            // doomed set below: content whose ONLY holder was the erased
+            // tenant's examples must lose its bytes too, not linger under a
+            // receipt with nothing to check.
+            let (eval_records_removed, eval_dropped_refs) = match subject {
                 erasure::Subject::Tenant { tenant } => self.evals.purge_tenant(tenant)?,
-                _ => 0,
+                _ => (0, std::collections::HashSet::new()),
             };
 
             // Payload files, reference-aware. Live references are computed
@@ -5292,6 +5363,7 @@ impl Store {
                 .iter()
                 .cloned()
                 .chain(purge.payload_refs.iter().cloned())
+                .chain(eval_dropped_refs.iter().cloned())
                 .collect();
             doomed.sort();
             doomed.dedup();
@@ -5435,7 +5507,7 @@ impl Store {
             annotations_removed + self.drop_annotations_for(subject, &confirm.keys)?;
         let eval_records_removed = eval_records_removed
             + match subject {
-                erasure::Subject::Tenant { tenant } => self.evals.purge_tenant(tenant)?,
+                erasure::Subject::Tenant { tenant } => self.evals.purge_tenant(tenant)?.0,
                 _ => 0,
             };
         let spans_removed = purge.removed + confirm.removed;
@@ -5723,7 +5795,13 @@ impl Store {
                 // The reserved tenant posting is written for every non-empty
                 // tenant, so an empty candidate list IS proof of absence —
                 // and tenant subjects cannot name the default tenant, whose
-                // spans carry no posting.
+                // spans carry no posting. The one corpus this cannot see is
+                // a segment written BEFORE tenancy whose span JSON already
+                // carried a valid `tenant` value (no posting was written
+                // for it): no store of ours holds such bytes and the
+                // pre-1.0 terms do not promise reading them, so the fast
+                // path stands — revisit if a migration from foreign
+                // pre-M4 data ever ships.
                 Ok(!segment
                     .seg
                     .attribute_candidate_offsets(IDX_TENANT, tenant)
@@ -6009,15 +6087,40 @@ impl Store {
                     erasure::Subject::Payload { .. } => false,
                 })
                 .count();
-            clean &= matching == 0;
+            // A tenant subject records no annotation identities, and the
+            // tenant may return post-settle. Classify by the erasure's own
+            // request time: an annotation stamped before it can only be a
+            // survivor (fails); one stamped after is new activity. The
+            // timestamp is client-suppliable, so the split is advisory in
+            // the failing-safe direction — a forged OLD stamp fails a
+            // receipt it should pass, never the reverse.
+            let (failing, fresh) = match subject {
+                erasure::Subject::Tenant { .. } => {
+                    let survivors = all
+                        .iter()
+                        .filter(|annotation| {
+                            matches!(subject, erasure::Subject::Tenant { tenant }
+                                if annotation.tenant == *tenant)
+                                && annotation.timestamp_ns < record.requested_unix_ns
+                        })
+                        .count();
+                    (survivors, matching - survivors)
+                }
+                _ => (matching, 0),
+            };
+            clean &= failing == 0;
             let mut report = erasure::DomainReport::clear(
                 "annotations",
-                match matching {
-                    0 => "no annotation addresses the subject".to_owned(),
-                    found => format!("{found} annotation(s) still address the subject"),
+                match (failing, fresh) {
+                    (0, 0) => "no annotation addresses the subject".to_owned(),
+                    (0, fresh) => {
+                        format!("{fresh} post-settle annotation(s) under the tenant — new activity")
+                    }
+                    (found, _) => format!("{found} annotation(s) still address the subject"),
                 },
             );
-            if matching > 0 {
+            report.new_activity = fresh;
+            if failing > 0 {
                 report.result = "holds-data".to_owned();
             }
             domains.push(report);
@@ -6031,23 +6134,34 @@ impl Store {
         {
             let mut report = match subject {
                 erasure::Subject::Tenant { tenant } => {
-                    let remaining = self.evals.tenant_record_count(tenant)?;
-                    clean &= remaining == 0;
+                    let (re_delivered, new_activity) = self.evals.tenant_record_report(
+                        tenant,
+                        &record.eval_datasets,
+                        &record.eval_experiments,
+                    )?;
+                    clean &= re_delivered == 0;
                     let mut report = erasure::DomainReport::clear(
                         "eval-records",
-                        match remaining {
-                            0 => format!(
+                        match (re_delivered, new_activity) {
+                            (0, 0) => format!(
                                 "no eval record remains for the tenant ({} dataset(s) and \
                                  {} experiment(s) were erased)",
                                 record.eval_datasets.len(),
                                 record.eval_experiments.len()
                             ),
-                            found => {
-                                format!("{found} eval record(s) still belong to the tenant")
-                            }
+                            (0, fresh) => format!(
+                                "{fresh} eval record(s) under ids allocated after the \
+                                 erasure — post-settle new activity; a barrier, not a ban"
+                            ),
+                            (survivors, _) => format!(
+                                "{survivors} eval record(s) still carry ERASED ids — \
+                                 the purge did not complete; re-run the erasure"
+                            ),
                         },
                     );
-                    if remaining > 0 {
+                    report.re_delivered = re_delivered;
+                    report.new_activity = new_activity;
+                    if re_delivered > 0 {
                         report.result = "holds-data".to_owned();
                     }
                     report
@@ -6220,6 +6334,51 @@ impl Store {
                             break;
                         }
                     }
+                }
+                // A pin copies the manifested prefix of the append-only
+                // logs, so a backup taken before the erasure holds the
+                // subject's annotations and eval records even when no
+                // pinned SEGMENT does — a restore would resurrect them.
+                // Both logs are read without healing: a pin is a backup,
+                // and verification must never write into one.
+                if !holds {
+                    let pinned_annotations = pin_dir.join("annotations.jsonl");
+                    if pinned_annotations.exists() {
+                        let contents = fs::read(&pinned_annotations)?;
+                        holds = contents
+                            .split(|byte| *byte == b'\n')
+                            .filter_map(|line| {
+                                serde_json::from_slice::<annotations::Annotation>(line).ok()
+                            })
+                            .any(|annotation| match subject {
+                                erasure::Subject::Trace { trace_id, tenant } => {
+                                    annotation.tenant == *tenant && annotation.trace_id == *trace_id
+                                }
+                                erasure::Subject::Span {
+                                    trace_id,
+                                    span_id,
+                                    tenant,
+                                } => {
+                                    annotation.tenant == *tenant
+                                        && annotation.trace_id == *trace_id
+                                        && annotation.span_id == *span_id
+                                }
+                                erasure::Subject::Session { session_id, tenant } => {
+                                    annotation.tenant == *tenant
+                                        && annotation.session_id == *session_id
+                                }
+                                erasure::Subject::Tenant { tenant } => annotation.tenant == *tenant,
+                                erasure::Subject::Payload { .. } => false,
+                            });
+                    }
+                }
+                if !holds {
+                    holds = !evals::pinned_log_findings(
+                        &pin_dir.join(evals::LOG_NAME),
+                        subject,
+                        &needles,
+                    )?
+                    .is_empty();
                 }
                 match holds {
                     true => {

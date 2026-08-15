@@ -811,3 +811,43 @@ fn mcp_tools_are_scoped_by_the_credential_binding() {
         "never sees the neighbour: {text}"
     );
 }
+
+#[test]
+fn a_zero_tenant_ttl_is_an_exemption_not_a_fallthrough() {
+    // Review round 1, P1: `--tenant-ttl acme=0` dropped the entry, so acme
+    // fell through to the GLOBAL window and expired — the exact data the
+    // operator had just exempted. Zero now means never, and an exempt
+    // tenant also disables the whole-segment retirement fast path.
+    let config = Config {
+        flush_spans: 1_000_000,
+        durability: Durability::Wal,
+        ttl_seconds: Some(60),
+        tenant_ttl_seconds: [("acme".to_owned(), 0)].into_iter().collect(),
+        ..Config::default()
+    };
+    let dir = test_dir("ttl-exempt");
+    let store = Store::open(&dir, config.clone()).expect("opens");
+    let now_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let old = now_ns - 3_600 * 1_000_000_000;
+    for (tenant, trace) in [("acme", "ta"), ("", "td")] {
+        let mut span = tenant_span(tenant, trace, "s1", "old", json!({}));
+        span.start_time_ns = old;
+        span.end_time_ns = old + 1;
+        store.ingest(span).expect("ingests");
+    }
+    store.flush().expect("seals");
+    let removed = store.compact_expired().expect("sweeps");
+    assert_eq!(removed, 1, "only the default tenant's old span expires");
+    assert_eq!(
+        store.get_trace_in(Some("acme"), "ta").expect("acme").len(),
+        1,
+        "an exempted tenant keeps everything, global window or not"
+    );
+    assert!(store
+        .get_trace_in(Some(""), "td")
+        .expect("default")
+        .is_empty());
+}

@@ -523,6 +523,12 @@ impl State {
     }
 }
 
+/// [`collect_refs`], callable from the store layer when it prepares the
+/// reachability inputs for a version POST.
+pub(crate) fn collect_payload_refs_from(value: &Value, refs: &mut HashSet<String>) {
+    collect_refs(value, refs);
+}
+
 /// Collects `$payload` references from anywhere inside a JSON value —
 /// example bodies nest them wherever the promoted span had them. Redaction
 /// markers (`"erased": true`) are not references, same rule as span
@@ -677,6 +683,15 @@ impl EvalLog {
     /// closes the race against a concurrent TTL sweep. A reference that is
     /// pending erasure or absent refuses the POST: an example born dangling
     /// would make "examples carry their own copies" a lie at birth.
+    ///
+    /// `spans_hold` is the OTHER half of the interlock, for bound callers:
+    /// the references the dataset's tenant provably holds through its own
+    /// spans, computed by the store before this call. A bound tenant's body
+    /// reference must be in that set or reachable from the tenant's own
+    /// existing versions (checked here, under this lock) — bare file
+    /// existence would let any tenant mint reachability to any other
+    /// tenant's content by asserting the hash, and the success/409 split
+    /// would be a cross-tenant existence oracle besides.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn create_version(
         &self,
@@ -688,11 +703,18 @@ impl EvalLog {
         examples: Vec<NewExample>,
         created_unix_ns: u64,
         verify_ref: &dyn Fn(&str) -> Result<bool>,
+        spans_hold: Option<&HashSet<String>>,
     ) -> Result<VersionOutcome> {
         if examples.is_empty() {
             return Err(Error::InvalidSpan("a version needs at least one example"));
         }
-        let state = self.lock()?;
+        // ONE hold across validation, the append and the in-memory apply.
+        // Releasing between validation and mutation opened a real window: a
+        // concurrent tenant purge rewrote the log between a body-dedup
+        // decision ("digest already stored") and the version append, and
+        // the committed version then referenced a body the rewrite had
+        // dropped — permanently, across restarts.
+        let mut state = self.lock()?;
         let Some(dataset) = state.dataset_in_scope(scope, dataset_id) else {
             return Err(Error::Invalid(format!("no dataset {dataset_id}")));
         };
@@ -748,11 +770,42 @@ impl EvalLog {
                 &mut refs,
             );
         }
+        let dataset_tenant = state
+            .datasets
+            .get(&dataset_id)
+            .map(|dataset| dataset.tenant.clone())
+            .unwrap_or_default();
         for reference in &refs {
             if mask.is_some_and(|mask| mask.covers_payload_file(reference)) {
                 return Err(Error::Conflict(format!(
                     "payload {reference} is pending erasure; the promotion conflicts with it"
                 )));
+            }
+            if let Some(spans_hold) = spans_hold {
+                // Bound caller: the reference must already be the tenant's —
+                // held by its spans, or listed by its own existing versions.
+                // The refusal message is ONE message for "absent" and
+                // "someone else's", deliberately: distinguishing them would
+                // confirm what another tenant stores.
+                let held_by_spans = spans_hold.contains(reference);
+                let held_by_examples = state.versions.values().any(|version| {
+                    version.tenant == dataset_tenant
+                        && version.examples.iter().any(|(_, digest)| {
+                            state.examples.get(digest).is_some_and(|example| {
+                                let mut body_refs = HashSet::new();
+                                collect_refs(
+                                    &serde_json::to_value(&example.body).expect("body serializes"),
+                                    &mut body_refs,
+                                );
+                                body_refs.contains(reference)
+                            })
+                        })
+                });
+                if !held_by_spans && !held_by_examples {
+                    return Err(Error::Conflict(format!(
+                        "payload {reference} is not reachable from this dataset's tenant"
+                    )));
+                }
             }
             if !verify_ref(reference)? {
                 return Err(Error::Conflict(format!(
@@ -805,19 +858,6 @@ impl EvalLog {
             examples: manifest_pairs.clone(),
             created_unix_ns,
         }));
-        drop(state);
-        // Re-acquire for the mutation: the append and the in-memory apply
-        // happen under one hold; the validation above held the same mutex,
-        // and the only writer between the two holds is... nobody — `self`
-        // methods all lock this mutex, so a re-check is about discipline.
-        let mut state = self.lock()?;
-        if state.versions.contains_key(&version_id) {
-            return Ok(VersionOutcome {
-                version_id,
-                examples: manifest_pairs.len(),
-                created: false,
-            });
-        }
         self.append_lines(&records)?;
         for record in records {
             state.apply(record);
@@ -1212,11 +1252,16 @@ impl EvalLog {
 
     /// Removes every record a tenant owns, rewriting the log atomically —
     /// the erasure-barrier rewrite, and the ONLY path that ever rewrites
-    /// this log. Returns how many records were dropped. Example bodies
+    /// this log. Returns how many records were dropped AND the `$payload`
+    /// references of the bodies that left with them: those references were
+    /// live only through the erased tenant's examples, and the purge must
+    /// get the chance to unlink their bytes — a tenant whose source spans
+    /// already aged out would otherwise leave its promoted content on disk
+    /// forever, under a receipt with nothing to check. Example bodies
     /// survive when a surviving version still lists their digest (bodies
     /// are content-addressed and tenant-free); a counters record preserves
     /// id monotonicity past the rewrite.
-    pub(crate) fn purge_tenant(&self, tenant: &str) -> Result<usize> {
+    pub(crate) fn purge_tenant(&self, tenant: &str) -> Result<(usize, HashSet<String>)> {
         let mut state = self.lock()?;
         let doomed_datasets: HashSet<u64> = state
             .datasets
@@ -1260,7 +1305,18 @@ impl EvalLog {
             + doomed_runs
             + doomed_bodies;
         if removed == 0 {
-            return Ok(0);
+            return Ok((0, HashSet::new()));
+        }
+        // The dropped bodies' references, for the caller's reference-aware
+        // payload sweep.
+        let mut dropped_refs: HashSet<String> = HashSet::new();
+        for (digest, example) in &state.examples {
+            if !surviving_digests.contains(digest) {
+                collect_refs(
+                    &serde_json::to_value(&example.body).expect("body serializes"),
+                    &mut dropped_refs,
+                );
+            }
         }
 
         // Monotonicity floors OVER the pre-purge allocators: whatever ids
@@ -1331,35 +1387,47 @@ impl EvalLog {
             survivors.apply(record);
         }
         *state = survivors;
-        Ok(removed)
+        Ok((removed, dropped_refs))
     }
 
-    /// How many records a tenant still owns — the receipt's eval domain for
-    /// a tenant subject re-checks this after the purge.
-    pub(crate) fn tenant_record_count(&self, tenant: &str) -> Result<usize> {
+    /// The tenant's surviving eval records, CLASSIFIED the way the span
+    /// domains classify: a record whose dataset or experiment id the erase
+    /// record enumerated is a re-delivery (ids are never reused, so it can
+    /// only be a purge that failed) and fails the receipt; a record under a
+    /// fresh id is post-settle new activity — a barrier, not a ban — and is
+    /// reported without failing. A blunt count read "incomplete" forever
+    /// the moment a re-onboarded tenant created its first dataset.
+    pub(crate) fn tenant_record_report(
+        &self,
+        tenant: &str,
+        erased_datasets: &[u64],
+        erased_experiments: &[u64],
+    ) -> Result<(usize, usize)> {
         let state = self.lock()?;
-        let datasets = state
-            .datasets
-            .values()
-            .filter(|dataset| dataset.tenant == tenant)
-            .count();
-        let versions = state
-            .versions
-            .values()
-            .filter(|version| version.tenant == tenant)
-            .count();
-        let experiments = state
-            .experiments
-            .values()
-            .filter(|experiment| experiment.tenant == tenant)
-            .count();
-        let runs = state.runs.iter().filter(|run| run.tenant == tenant).count();
-        let tombstones = state
-            .tombstones
-            .values()
-            .filter(|tombstone| tombstone.tenant == tenant)
-            .count();
-        Ok(datasets + versions + experiments + runs + tombstones)
+        let old_dataset = |id: &u64| erased_datasets.contains(id);
+        let old_experiment = |id: &u64| erased_experiments.contains(id);
+        let mut re_delivered = 0usize;
+        let mut new_activity = 0usize;
+        let mut classify = |is_old: bool| match is_old {
+            true => re_delivered += 1,
+            false => new_activity += 1,
+        };
+        for dataset in state.datasets.values().filter(|d| d.tenant == tenant) {
+            classify(old_dataset(&dataset.dataset_id));
+        }
+        for version in state.versions.values().filter(|v| v.tenant == tenant) {
+            classify(old_dataset(&version.dataset_id));
+        }
+        for experiment in state.experiments.values().filter(|e| e.tenant == tenant) {
+            classify(old_experiment(&experiment.experiment_id));
+        }
+        for run in state.runs.iter().filter(|r| r.tenant == tenant) {
+            classify(old_experiment(&run.experiment_id));
+        }
+        for tombstone in state.tombstones.values().filter(|t| t.tenant == tenant) {
+            classify(old_dataset(&tombstone.dataset_id));
+        }
+        Ok((re_delivered, new_activity))
     }
 
     /// The copies a trace/span/session subject may have left in ONE tenant's
@@ -1450,6 +1518,71 @@ impl EvalLog {
     }
 }
 
+/// Read-only scan of a PINNED eval log for content an erasure subject
+/// covers, returning one item string per finding. Pins are backups: this
+/// must never mutate the file, so it is a plain lenient line walk (a pin
+/// holds a manifested prefix and can have no torn tail) rather than
+/// [`EvalLog::open`], whose healing writes.
+pub(crate) fn pinned_log_findings(
+    path: &Path,
+    subject: &crate::erasure::Subject,
+    needles: &[String],
+) -> Result<Vec<String>> {
+    let mut findings = Vec::new();
+    let contents = match fs::read(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(findings),
+        Err(error) => return Err(error.into()),
+    };
+    for line in contents.split(|byte| *byte == b'\n') {
+        if line.iter().all(|byte| byte.is_ascii_whitespace()) {
+            continue;
+        }
+        let Ok(record) = serde_json::from_slice::<LogRecord>(line) else {
+            continue;
+        };
+        let hit = match (&record, subject) {
+            (LogRecord::Dataset(dataset), crate::erasure::Subject::Tenant { tenant }) => {
+                (dataset.tenant == *tenant).then(|| format!("dataset {}", dataset.dataset_id))
+            }
+            (LogRecord::DatasetVersion(version), crate::erasure::Subject::Tenant { tenant }) => {
+                (version.tenant == *tenant).then(|| format!("version {}", version.version_id))
+            }
+            (LogRecord::Experiment(experiment), crate::erasure::Subject::Tenant { tenant }) => {
+                (experiment.tenant == *tenant)
+                    .then(|| format!("experiment {}", experiment.experiment_id))
+            }
+            (LogRecord::Run(run), crate::erasure::Subject::Tenant { tenant }) => {
+                (run.tenant == *tenant).then(|| format!("run of experiment {}", run.experiment_id))
+            }
+            (LogRecord::Example(example), crate::erasure::Subject::Payload { reference }) => {
+                let mut refs = HashSet::new();
+                collect_refs(
+                    &serde_json::to_value(&example.body).expect("body serializes"),
+                    &mut refs,
+                );
+                refs.contains(reference)
+                    .then(|| format!("example body {}", example.digest))
+            }
+            (LogRecord::Example(example), _) => {
+                let rendered =
+                    canonical_json(&serde_json::to_value(&example.body).expect("body serializes"));
+                needles
+                    .iter()
+                    .any(|needle| rendered.contains(needle))
+                    .then(|| format!("example body {}", example.digest))
+            }
+            _ => None,
+        };
+        if let Some(finding) = hit {
+            findings.push(finding);
+        }
+    }
+    findings.sort();
+    findings.dedup();
+    Ok(findings)
+}
+
 // ----------------------------------------------------- score aggregation
 
 /// Distribution of one score name across an experiment's examples.
@@ -1513,6 +1646,11 @@ pub struct DiffStat {
     pub regressed: Vec<String>,
     /// Examples scored in both with an unchanged value.
     pub unchanged: usize,
+    /// Examples whose value changed without a numeric direction — a
+    /// classifier verdict flipping `"harmful"` to `"safe"`, a type change.
+    /// A directionless change is still a change; folding it into
+    /// `unchanged` defeated the diff for label-style evals.
+    pub changed: Vec<String>,
     /// Examples with this score only in the base experiment.
     pub only_base: Vec<String>,
     /// Examples with this score only in the candidate.
@@ -1667,8 +1805,15 @@ pub(crate) fn diff_scores(
             let mut improved = Vec::new();
             let mut regressed = Vec::new();
             let mut unchanged = 0usize;
+            let mut changed = Vec::new();
             let mut only_base = Vec::new();
             let mut only_candidate = Vec::new();
+            let raw = |latest: &HashMap<(String, String), &crate::annotations::Annotation>,
+                       example: &str| {
+                latest
+                    .get(&(example.to_owned(), name.clone()))
+                    .map(|score| score.value.clone())
+            };
             for (example, base_value) in &base_values {
                 match candidate_values.get(example) {
                     None => only_base.push(example.clone()),
@@ -1679,7 +1824,13 @@ pub(crate) fn diff_scores(
                         (Some(before), Some(after)) if after < before => {
                             regressed.push(example.clone())
                         }
-                        _ => unchanged += 1,
+                        (Some(_), Some(_)) => unchanged += 1,
+                        // No numeric direction on at least one side: compare
+                        // the raw values for identity.
+                        _ => match raw(&base_latest, example) == raw(&candidate_latest, example) {
+                            true => unchanged += 1,
+                            false => changed.push(example.clone()),
+                        },
                     },
                 }
             }
@@ -1699,6 +1850,7 @@ pub(crate) fn diff_scores(
                 improved,
                 regressed,
                 unchanged,
+                changed,
                 only_base,
                 only_candidate,
             }

@@ -607,6 +607,20 @@ impl<'a> Server<'a> {
     /// `traza://store/overview` resource so the two can never disagree.
     fn overview_text(&self, scope: Option<&str>) -> Result<String, ToolError> {
         let stats = self.store.stats()?;
+        // A bound caller must not see the STORE's totals — the same volumes
+        // the HTTP layer 403s /v1/stats for. Its header comes from its own
+        // usage row instead.
+        let bound_usage = match scope {
+            None => None,
+            Some(_) => Some(
+                self.store
+                    .tenant_usage(scope)?
+                    .into_iter()
+                    .next()
+                    .map(|row| (row.spans, row.bytes_approx))
+                    .unwrap_or((0, 0)),
+            ),
+        };
         let by_service = self
             .store
             .llm_aggregate_in(scope, LlmGroupBy::Service, None, None)?;
@@ -628,14 +642,23 @@ impl<'a> Server<'a> {
         // `serverInfo` once and need not pass it to the model, so an agent
         // asked which Traza it is talking to had no way to find out and
         // correctly reported that it could not tell.
-        head.push_str(&format!(
-            "Traza {} — {} in {} ({}), durability={}\n",
-            env!("CARGO_PKG_VERSION"),
-            count(stats.total_records as u64, "record"),
-            count(stats.segment_count as u64, "segment"),
-            bytes_human(stats.disk_bytes),
-            stats.durability.as_str(),
-        ));
+        match bound_usage {
+            Some((spans, bytes)) => head.push_str(&format!(
+                "Traza {} — {} of this tenant's data ({}), durability={}\n",
+                env!("CARGO_PKG_VERSION"),
+                count(spans, "span"),
+                bytes_human(bytes),
+                stats.durability.as_str(),
+            )),
+            None => head.push_str(&format!(
+                "Traza {} — {} in {} ({}), durability={}\n",
+                env!("CARGO_PKG_VERSION"),
+                count(stats.total_records as u64, "record"),
+                count(stats.segment_count as u64, "segment"),
+                bytes_human(stats.disk_bytes),
+                stats.durability.as_str(),
+            )),
+        }
         let mut days: Vec<&str> = by_day.iter().map(|row| row.key.as_str()).collect();
         days.sort_unstable();
         match (days.first(), days.last()) {
@@ -774,10 +797,16 @@ impl<'a> Server<'a> {
     /// on a name that does not exist", and a model resolves that ambiguity by
     /// reporting that nothing is wrong. So the miss is diagnosed.
     fn empty_search_result(&self, request: &SearchRequest) -> ToolResult {
+        // Scoped like the search itself: enumerating the STORE's services to
+        // explain a bound tenant's empty result would hand it the cross-
+        // tenant catalog its query was scoped away from.
+        let scope = request.filter.tenant.as_deref();
         let mut head = format!("No spans matched{}.", request.window_note());
         let mut rows = Vec::new();
         if let Some(service) = &request.filter.service {
-            let known = self.store.llm_aggregate(LlmGroupBy::Service, None, None)?;
+            let known = self
+                .store
+                .llm_aggregate_in(scope, LlmGroupBy::Service, None, None)?;
             if !known.iter().any(|row| &row.key == service) {
                 head = "No spans matched, and the requested service does not exist in this \
                         store. Its known services are listed below; re-run with one of them."
@@ -1203,9 +1232,15 @@ impl<'a> Server<'a> {
         if over_time {
             match (since, until) {
                 (Some(since_ns), Some(until_ns)) if until_ns > since_ns => {
-                    let series =
-                        self.store
-                            .series(&SpanFilter::default(), since_ns, until_ns, 24)?;
+                    let series = self.store.series(
+                        &SpanFilter {
+                            tenant: context.scope().map(str::to_owned),
+                            ..SpanFilter::default()
+                        },
+                        since_ns,
+                        until_ns,
+                        24,
+                    )?;
                     let buckets: Vec<Value> = series
                         .buckets
                         .iter()
