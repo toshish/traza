@@ -523,7 +523,9 @@ fn otlp_partial_success_protobuf(rejected: usize) -> Vec<u8> {
 
 const USAGE: &str = "Usage: traza-server --data-dir DIR --port PORT [--host ADDR] \
 [--profile throughput|balanced|latency (default balanced; sets flush-spans and wal-commit-window; \
-NEVER changes durability)] [--ttl-seconds N] [--flush-spans N] \
+NEVER changes durability)] [--ttl-seconds N] \
+[--tenant-ttl TENANT=SECONDS (retention override for one tenant; repeatable)] \
+[--flush-spans N] \
 [--flush-wal-bytes N (seal when the write-ahead log reaches N bytes; 0 disables; \
 default 64MiB)] \
 [--max-buffer-age-seconds N (seal when the oldest buffered span reaches N seconds; \
@@ -1936,7 +1938,7 @@ fn serve_request(
             let Some(subject) = body.get("subject").cloned() else {
                 return responder.json(
                     400,
-                    json!({"error": "body must be {\"subject\": {\"kind\": \"trace\"|\"span\"|\"session\"|\"payload\", ...}}"}),
+                    json!({"error": "body must be {\"subject\": {\"kind\": \"trace\"|\"span\"|\"session\"|\"tenant\"|\"payload\", ...}}"}),
                 );
             };
             let subject: traza::erasure::Subject = match serde_json::from_value(subject) {
