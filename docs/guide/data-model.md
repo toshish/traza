@@ -62,6 +62,12 @@ this.
 {"name": "llm.prompt", "timestamp_ns": 1700000000001000000, "attributes": {"content": "…"}}
 ```
 
+`timestamp_ns` accepts the aliases `time_unix_nano` — OTLP's spelling, and the
+one most clients build events with — plus `timestamp_unix_nano`, `time_ns`,
+and `time`. `attributes` may be omitted for an event that is just a named
+instant; it reads back as `{}`. Only `name` and a timestamp are required.
+Responses always use the canonical `timestamp_ns`.
+
 **Links** point at other spans, possibly in other traces:
 
 ```json

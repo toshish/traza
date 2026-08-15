@@ -302,6 +302,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its domains are durable and *published* by the next checkpoint — one
   maintenance interval away, or immediately when a backup asks.
 
+### Fixed
+
+- **Native ingest accepts an event's timestamp under the OTLP name.** A span's
+  timestamps accepted `start_time_unix_nano`; its events accepted only
+  `timestamp_ns`, so a client spelling both the way OTLP spells them had its
+  **entire batch** rejected with a 400 naming a field it had supplied. Events
+  now take `time_unix_nano`, `timestamp_unix_nano`, `time_ns` and `time` as
+  aliases, and `attributes` defaults, so a named instant no longer needs an
+  empty map to be legal. The failure mode this closes is quiet rather than
+  loud: telemetry clients are conventionally fail-open, so the spans simply
+  never arrived.
+- **The span search's token column reads the current OpenTelemetry names.**
+  It carried its own third copy of the semantic-convention precedence, which
+  had drifted from `src/semconv.rs`: it resolved only the deprecated
+  `gen_ai.usage.{prompt,completion}_tokens` and a `llm.usage.prompt_tokens`
+  key Traza has never recognized. A span using the current `input`/`output`
+  names — resolved correctly by the server and by the trace detail — showed a
+  blank cell. It now uses the shared `llmUsage` helper, as everything else
+  does.
+- **Two toolbar actions on the span search worked in name only.** A local
+  named `window` shadowed the global for the whole component, so
+  `window.prompt` and `window.location` read `undefined` through the optional
+  chains guarding them: saving a view never asked for a name and silently
+  numbered every one `view N`, and "Copy as curl" emitted a hostless URL that
+  curl refuses.
+
 ## [0.22.2] - 2026-08-12
 
 ### Fixed

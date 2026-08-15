@@ -446,6 +446,54 @@ fn server_accepts_the_documented_wire_contract() {
 }
 
 #[test]
+fn server_accepts_events_under_the_otlp_timestamp_name() {
+    // A span's timestamps accept `*_time_unix_nano`; its events used to accept
+    // only `timestamp_ns`, so a client that spelled both the way OTLP spells
+    // them had its whole batch rejected on the event field alone. Worse, the
+    // failure lands on the ingest response, which fail-open clients discard —
+    // the spans simply never arrive.
+    let dir = test_dir("event-aliases");
+    let server = Server::spawn(&dir);
+
+    let (status, body) = server.request(
+        "POST",
+        "/v1/spans",
+        Some(&json!([{
+            "trace_id": "trace-1",
+            "span_id": "span-1",
+            "name": "chat",
+            "service": "agent",
+            "start_time_unix_nano": 1_700_000_000_000_000_000u64,
+            "end_time_unix_nano": 1_700_000_000_002_500_000u64,
+            "events": [
+                // OTLP's spelling, and the one an event is most often built with.
+                {"name": "llm.prompt", "time_unix_nano": 1_700_000_000_000_500_000u64,
+                 "attributes": {"content": "hello"}},
+                // A named instant: no attributes is a complete event.
+                {"name": "first.token", "time_unix_nano": 1_700_000_000_001_000_000u64}
+            ]
+        }])),
+    );
+    assert_eq!(status, 200, "OTLP-spelled events must be accepted: {body}");
+    assert_eq!(body["accepted"], 1);
+
+    let (status, body) = server.request("GET", "/v1/traces/trace-1", None);
+    assert_eq!(status, 200);
+    let events = body["spans"][0]["events"].as_array().expect("events");
+    assert_eq!(events.len(), 2, "both events must survive: {body}");
+    // Responses speak the canonical name, as they do for span timestamps.
+    assert_eq!(events[0]["timestamp_ns"], 1_700_000_000_000_500_000u64);
+    assert_eq!(events[0]["attributes"]["content"], "hello");
+    assert_eq!(events[1]["timestamp_ns"], 1_700_000_000_001_000_000u64);
+    assert_eq!(
+        events[1]["attributes"],
+        json!({}),
+        "an omitted attributes map must read back as empty, not absent: {body}"
+    );
+    server.kill();
+}
+
+#[test]
 fn server_supports_the_documented_filters() {
     let dir = test_dir("filters");
     let server = Server::spawn(&dir);

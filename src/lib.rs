@@ -71,9 +71,24 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub struct Event {
     /// Event name.
     pub name: String,
-    /// Event timestamp in nanoseconds since the Unix epoch.
+    /// Event timestamp in nanoseconds since the Unix epoch. Deserialization
+    /// accepts the documented wire aliases, `time_unix_nano` among them: an
+    /// event carries the OTLP spelling far more often than the canonical one,
+    /// because clients build events from the same shape they send over OTLP.
+    /// A span whose timestamps were accepted under an alias and whose events
+    /// were not is the worst of both — the batch 400s on a field the caller
+    /// spelled the way the rest of the ecosystem spells it.
+    #[serde(
+        alias = "time_unix_nano",
+        alias = "timestamp_unix_nano",
+        alias = "time_ns",
+        alias = "time"
+    )]
     pub timestamp_ns: u64,
-    /// Arbitrary event attributes.
+    /// Arbitrary event attributes. Defaulted, like the span's own: an event is
+    /// frequently just a named instant, and requiring `{}` to say so rejected
+    /// the whole batch over a field with an obvious empty value.
+    #[serde(default)]
     pub attributes: Map<String, Value>,
 }
 
