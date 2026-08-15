@@ -164,9 +164,16 @@ fn spans_covered_by_a_pending_erasure_are_suppressed_at_admission() {
 
     let store = Store::open(&dir, wal_config()).expect("reopens");
     // Admission is the barrier: a covered span sent while the erasure is
-    // pending is dropped BEFORE the log carries it, not stored-and-hidden.
-    store.ingest(span("txp", "s2", json!({}))).expect("acked");
-    store.ingest(span("other", "o1", json!({}))).expect("other");
+    // pending is dropped BEFORE the log carries it, not stored-and-hidden —
+    // and the admission says so rather than counting it as stored.
+    let admission = store.ingest(span("txp", "s2", json!({}))).expect("acked");
+    assert_eq!(
+        (admission.accepted, admission.suppressed),
+        (0, 1),
+        "a suppressed span is never reported as accepted"
+    );
+    let admission = store.ingest(span("other", "o1", json!({}))).expect("other");
+    assert_eq!((admission.accepted, admission.suppressed), (1, 0));
     assert_eq!(store.resume_erasures().expect("settles"), 1);
     assert!(
         store.get_trace("txp").expect("lookup").is_empty(),
@@ -178,6 +185,200 @@ fn spans_covered_by_a_pending_erasure_are_suppressed_at_admission() {
         .ingest(span("txp", "s2", json!({})))
         .expect("new data");
     assert_eq!(store.get_trace("txp").expect("lookup").len(), 1);
+}
+
+#[test]
+fn a_suppressed_span_leaves_no_payload_bytes_behind() {
+    let dir = test_dir("suppressed-payload");
+    let secret = format!("orphan {}", "o".repeat(200));
+    let reference = format!("sha256/{}", traza::payload::sha256_hex(secret.as_bytes()));
+    {
+        let store = Store::open(
+            &dir,
+            Config {
+                payload_threshold: Some(64),
+                ..wal_config()
+            },
+        )
+        .expect("opens");
+        store.ingest(span("txp", "s1", json!({}))).expect("s1");
+        store.flush().expect("seals");
+    }
+    let line = json!({
+        "op": "erase", "schema": 1, "id": 1, "requested_unix_ns": 123,
+        "subject": {"kind": "trace", "trace_id": "txp"},
+        "span_keys": [["txp", "s1"]], "payload_refs": [],
+    });
+    std::fs::write(dir.join("tombstones.jsonl"), format!("{line}\n")).expect("plants");
+
+    let store = Store::open(
+        &dir,
+        Config {
+            payload_threshold: Some(64),
+            ..wal_config()
+        },
+    )
+    .expect("reopens");
+    // The covered span carries an oversized value. Suppression must bar the
+    // OFFLOAD too: a span dropped after its payload was written would leave
+    // orphan bytes of the erased subject that no record names — invisible to
+    // the purge, the receipt, and `payload_refs`, because the span that
+    // carried them never entered the store.
+    let admission = store
+        .ingest(span("txp", "s2", json!({"prompt": secret})))
+        .expect("acked");
+    assert_eq!((admission.accepted, admission.suppressed), (0, 1));
+    assert!(
+        store.payload(&reference).expect("load").is_none(),
+        "no payload bytes while pending"
+    );
+    let hash = reference.strip_prefix("sha256/").expect("hash");
+    let path = dir
+        .join("payloads")
+        .join(&hash[..2])
+        .join(format!("{hash}.bin"));
+    assert!(
+        !path.exists(),
+        "the suppressed span's payload must never reach the filesystem"
+    );
+
+    assert_eq!(store.resume_erasures().expect("settles"), 1);
+    assert!(!path.exists(), "and it is not resurrected by the settle");
+    assert!(store.payload(&reference).expect("load").is_none());
+    let receipt = store.verify_erasure(1).expect("receipt");
+    assert_eq!(receipt.result, "erased", "{}", receipt.render_text());
+}
+
+#[test]
+fn offloading_content_under_a_pending_payload_erasure_writes_a_marker_not_bytes() {
+    let dir = test_dir("offload-masked");
+    let config = Config {
+        payload_threshold: Some(64),
+        ..wal_config()
+    };
+    let secret = format!("masked {}", "m".repeat(200));
+    let reference = format!("sha256/{}", traza::payload::sha256_hex(secret.as_bytes()));
+    {
+        let store = Store::open(&dir, config.clone()).expect("opens");
+        store
+            .ingest(span("t1", "a", json!({"prompt": secret})))
+            .expect("ingests");
+        store.flush().expect("seals");
+    }
+    // A pending PAYLOAD erasure, as a crash would leave it.
+    let line = json!({
+        "op": "erase", "schema": 1, "id": 1, "requested_unix_ns": 123,
+        "subject": {"kind": "payload", "reference": reference},
+        "span_keys": [["t1", "a"]], "payload_refs": [reference],
+    });
+    std::fs::write(dir.join("tombstones.jsonl"), format!("{line}\n")).expect("plants");
+
+    let store = Store::open(&dir, config).expect("reopens");
+    // A NEW span carrying the doomed content is new data — the span is
+    // admitted — but its oversized value must not recreate the file the
+    // erasure is deleting: it offloads directly to the redacted marker.
+    let admission = store
+        .ingest(span("t2", "b", json!({"prompt": secret})))
+        .expect("acked");
+    assert_eq!((admission.accepted, admission.suppressed), (1, 0));
+
+    assert_eq!(store.resume_erasures().expect("settles"), 1);
+    assert!(
+        store.payload(&reference).expect("load").is_none(),
+        "the file is gone and was not recreated by the mid-erasure ingest"
+    );
+    let spans = store.get_trace("t2").expect("lookup");
+    assert_eq!(spans.len(), 1, "the new span survives the erasure");
+    let value = &spans[0].attributes["prompt"];
+    assert_eq!(value.get("erased"), Some(&Value::Bool(true)));
+    assert!(value.get("preview").is_none());
+    let receipt = store.verify_erasure(1).expect("receipt");
+    assert_eq!(receipt.result, "erased", "{}", receipt.render_text());
+}
+
+#[test]
+fn the_settle_names_a_generation_the_erasure_does_not_then_invalidate() {
+    let dir = test_dir("generation-integrity");
+    let store = Store::open(&dir, wal_config()).expect("opens");
+    store.ingest(span("doomed", "s1", json!({}))).expect("s1");
+    store.ingest(span("kept", "k1", json!({}))).expect("k1");
+    store
+        .annotate(
+            serde_json::from_value(json!({
+                "trace_id": "doomed", "span_id": "s1", "name": "quality", "value": 1,
+            }))
+            .expect("annotation"),
+        )
+        .expect("annotates");
+    store.flush().expect("seals");
+
+    let status = store
+        .erase(Subject::Trace {
+            trace_id: "doomed".into(),
+        })
+        .expect("erases");
+    let generation = status.settle.expect("settled").generation;
+    // Every rewrite the erasure performs — segments, the annotation log —
+    // happens BEFORE the checkpoint the settle record cites, so the cited
+    // generation must verify clean. (The settle append itself rides the
+    // append-only allowance the manifest grants the tombstone log.)
+    assert!(
+        store
+            .verify_generation(generation)
+            .expect("verifies")
+            .is_empty(),
+        "the settle's generation digests the store the erasure left behind"
+    );
+}
+
+#[test]
+fn annotations_addressed_to_a_pending_subject_are_suppressed_at_admission() {
+    let dir = test_dir("annotation-barrier");
+    {
+        let store = Store::open(&dir, wal_config()).expect("opens");
+        store.ingest(span("txp", "s1", json!({}))).expect("s1");
+        store.flush().expect("seals");
+    }
+    let line = json!({
+        "op": "erase", "schema": 1, "id": 1, "requested_unix_ns": 123,
+        "subject": {"kind": "trace", "trace_id": "txp"},
+        "span_keys": [["txp", "s1"]], "payload_refs": [],
+    });
+    std::fs::write(dir.join("tombstones.jsonl"), format!("{line}\n")).expect("plants");
+
+    let store = Store::open(&dir, wal_config()).expect("reopens");
+    // An annotation landing between the erasure's annotation drop and its
+    // settle would attach judgment to erased data; the barrier drops it
+    // exactly as it drops the subject's spans.
+    store
+        .annotate(
+            serde_json::from_value(json!({
+                "trace_id": "txp", "span_id": "s1", "name": "late", "value": 1,
+            }))
+            .expect("annotation"),
+        )
+        .expect("acknowledged");
+    store
+        .annotate(
+            serde_json::from_value(json!({
+                "trace_id": "other", "span_id": "o1", "name": "kept", "value": 2,
+            }))
+            .expect("annotation"),
+        )
+        .expect("stored");
+    assert_eq!(store.resume_erasures().expect("settles"), 1);
+    assert!(
+        store
+            .annotations("txp", None, None)
+            .expect("ann")
+            .is_empty(),
+        "the covered annotation was never stored"
+    );
+    assert_eq!(
+        store.annotations("other", None, None).expect("ann").len(),
+        1,
+        "an uncovered annotation flows normally through the barrier"
+    );
 }
 
 #[test]
@@ -228,7 +429,8 @@ fn no_span_acknowledged_before_settle_survives_a_concurrent_erasure() {
             trace_id: "doomed".into(),
         })
         .expect("erases");
-    let settled_unix_ns = status.settle.expect("settled").settled_unix_ns;
+    let settle = status.settle.expect("settled");
+    let settled_unix_ns = settle.settled_unix_ns;
     std::thread::sleep(Duration::from_millis(20));
     stop.store(true, Ordering::Relaxed);
     let mut acked: Vec<(String, u64)> = Vec::new();
@@ -261,6 +463,13 @@ fn no_span_acknowledged_before_settle_survives_a_concurrent_erasure() {
         "erased",
         "survivors are post-settle new activity, never re-deliveries:\n{}",
         receipt.render_text()
+    );
+    assert!(
+        store
+            .verify_generation(settle.generation)
+            .expect("verifies")
+            .is_empty(),
+        "the cited generation stays intact even under concurrent writers"
     );
 }
 
@@ -1065,6 +1274,62 @@ impl Server {
             .unwrap_or(Value::Null);
         (status, payload)
     }
+}
+
+#[test]
+fn http_never_reports_a_suppressed_span_as_accepted() {
+    let dir = test_dir("http-suppressed");
+    {
+        let store = Store::open(&dir, wal_config()).expect("opens");
+        store.ingest(span("txp", "s1", json!({}))).expect("s1");
+        store.flush().expect("seals");
+    }
+    let line = json!({
+        "op": "erase", "schema": 1, "id": 1, "requested_unix_ns": 123,
+        "subject": {"kind": "trace", "trace_id": "txp"},
+        "span_keys": [["txp", "s1"]], "payload_refs": [],
+    });
+    std::fs::write(dir.join("tombstones.jsonl"), format!("{line}\n")).expect("plants");
+
+    // The maintenance tick settles the pending erasure at its first firing
+    // (five seconds in); these requests land well inside the window.
+    let server = Server::spawn(&dir);
+    let (status, body) = server.request(
+        "POST",
+        "/v1/spans",
+        Some(&json!([
+            {"trace_id": "txp", "span_id": "s2", "name": "n", "service": "svc",
+             "start_time_unix_nano": 1_000u64, "end_time_unix_nano": 2_000u64},
+            {"trace_id": "kept", "span_id": "k1", "name": "n", "service": "svc",
+             "start_time_unix_nano": 1_000u64, "end_time_unix_nano": 2_000u64},
+        ])),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(
+        body["accepted"],
+        json!(1),
+        "accepted counts what was stored, nothing else: {body}"
+    );
+    assert_eq!(body["suppressed"], json!(1), "{body}");
+
+    // The OTLP JSON surface tells the same truth in its own vocabulary.
+    let (status, body) = server.request(
+        "POST",
+        "/v1/traces",
+        Some(&json!({"resourceSpans": [{
+            "resource": {"attributes": [{"key": "service.name",
+                "value": {"stringValue": "svc"}}]},
+            "scopeSpans": [{"spans": [{
+                "traceId": "747870747870747870747870747870ff",
+                "spanId": "73330000000000ff",
+                "name": "n", "startTimeUnixNano": "1000", "endTimeUnixNano": "2000"
+            }]}]
+        }]})),
+    );
+    assert_eq!(status, 200);
+    // This OTLP span's trace id is not the covered one, so it flows —
+    // the point here is the response SHAPE stays plain full success.
+    assert_eq!(body["partialSuccess"], json!({}), "{body}");
 }
 
 #[test]

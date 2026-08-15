@@ -174,10 +174,18 @@ every segment holding a match in place (superseded versions of an erased key
 held the bytes too, so they go with it), drops annotations addressed to
 erased spans, and deletes payload files **reference-aware**: content
 addressing means one file can back spans outside the subject, and those
-bytes are retained and named in the receipt rather than destroyed. A
-checkpoint publishes the deletion — durable at the `CURRENT` rename — and
-the settle record lands, with a final sweep inside the same critical section
-so nothing can be acknowledged before `settled_unix_ns` and survive it.
+bytes are retained and named in the receipt rather than destroyed. The
+barrier is total while the erasure is pending: covered spans are dropped
+**before payload offloading** (a suppressed span must not leave orphan
+payload bytes behind), oversized values whose content hash IS the subject
+offload directly to their redacted marker instead of recreating the file,
+and covered annotations are dropped at admission too. Every rewrite —
+including a confirm pass for anything in flight when the barrier went up —
+happens **before** the checkpoint, so the generation the settle record cites
+digests exactly the store the erasure left behind and verifies clean
+afterwards. Then the checkpoint publishes the deletion — durable at the
+`CURRENT` rename — and the settle record lands, lifting the barrier. Nothing
+can be acknowledged before `settled_unix_ns` and survive it.
 
 **What remains, on purpose.** The tombstone log keeps the subject's
 identifiers, the resolved span keys, and the payload content hashes — never

@@ -86,8 +86,17 @@ are in the [data model](data-model.md#the-span).
 {"accepted":1,"durability":"wal"}
 ```
 
-`accepted` is the number of spans in the batch. `durability` is `buffered`,
-`wal`, or `flushed` and states what the acknowledgement guarantees.
+`accepted` is the number of spans **stored** — it is a durability claim, and
+it counts nothing else. `durability` is `buffered`, `wal`, or `flushed` and
+states what the acknowledgement guarantees. While an
+[erasure](#erasure) is pending, spans it covers are acknowledged and
+deliberately not stored; the response then carries the split explicitly:
+
+```json
+{"accepted":1,"suppressed":1,"durability":"wal"}
+```
+
+`suppressed` appears only when nonzero.
 
 **Errors.**
 
@@ -112,8 +121,15 @@ decoder; anything else is parsed as OTLP/HTTP JSON.
 {"partialSuccess":{}}
 ```
 
+Spans a pending [erasure](#erasure) suppressed were acknowledged and not
+stored, and the response says so in OTLP's own vocabulary:
+`{"partialSuccess":{"rejectedSpans":N,"errorMessage":"…"}}`.
+
 **Response `200` (protobuf request).** `Content-Type: application/x-protobuf`
 with a zero-length body — the encoding of an empty `ExportTraceServiceResponse`.
+With suppressions, the body encodes
+`partial_success { rejected_spans, error_message }` instead, for the same
+reason: an empty response is a claim of full success, and it would be false.
 
 **Errors.** `400` with the decode failure for malformed protobuf or JSON, a
 non-hex id, or a timestamp that is not a `u64`. `503` if the store rejected the
@@ -765,6 +781,11 @@ curl -X POST http://localhost:8080/v1/annotations \
 {"recorded":true}
 ```
 
+While an [erasure](#erasure) covering the addressed trace or span is
+pending, the annotation is acknowledged and deliberately not stored — the
+same admission barrier spans get, so no judgment can attach itself to data
+mid-erasure and surface after the settle.
+
 **Errors.** `400` with the parse error for a malformed body; `400` when the
 engine rejects the annotation as invalid; `503` on store failure.
 
@@ -848,16 +869,20 @@ credential minted to write telemetry must not be able to destroy it. See
 [administration § Authentication](../operations/administration.md#authentication).
 
 Erases one subject and blocks until the erasure settles. The `200` is the
-acknowledgement, and it means the whole sequence ran: the intent is fsynced
-into the tombstone log, the write buffer and write-ahead log are rewritten to
-the survivors, every segment holding a match is rewritten in place (superseded
-versions included), annotations addressed to erased spans are dropped, payload
-files are deleted reference-aware, and a checkpoint published the deletion —
-durable at the `CURRENT` rename. A final sweep runs inside the settle's own
-critical section, so the cut is exact: **every span acknowledged before
-`settled_unix_ns` is erased or was never stored.** While the erasure is
-pending, covered spans are dropped at admission (acknowledged, not stored;
-counted in `traza_erasure_spans_suppressed_total`).
+acknowledgement, and it means the whole sequence ran, in an order chosen so
+each artifact stays true: barrier → purge → confirm → checkpoint → settle.
+The intent is fsynced into the tombstone log; from that moment covered spans
+are dropped at admission **before payload offloading** (acknowledged, not
+stored, no bytes written; counted in
+`traza_erasure_spans_suppressed_total` and reported in the ingest response),
+and covered annotations are dropped at [`POST /v1/annotations`](#post-v1annotations)
+the same way. The purge and a confirm pass then rewrite the buffer,
+write-ahead log, segments (superseded versions included) and annotation log,
+and delete payload files reference-aware. Only after every rewrite does the
+checkpoint publish — durable at the `CURRENT` rename — so the generation the
+settle record cites digests exactly the store the erasure left behind, and
+`GET /v1/verify` holds against it. The cut is exact: **every span
+acknowledged before `settled_unix_ns` is erased or was never stored.**
 
 ```sh
 curl -X POST http://localhost:8080/v1/erasures \

@@ -453,8 +453,30 @@ impl Mask {
         mask
     }
 
-    /// Whether a pending erasure covers this span.
+    /// Whether a pending erasure covers this span, for the READ paths: the
+    /// drop set plus payload subjects, whose referencing spans are withheld
+    /// whole until the redaction settles.
     pub(crate) fn covers(&self, span: &Span) -> bool {
+        if self.covers_for_drop(span) {
+            return true;
+        }
+        if !self.payloads.is_empty() {
+            for reference in &self.payloads {
+                if payload_unredacted(span, reference) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Whether the ADMISSION barrier drops this span outright: keys, traces
+    /// and sessions, but not payload subjects. A read may over-hide a span
+    /// that references a pending payload for the seconds the erasure runs;
+    /// dropping it at admission would destroy the span's unrelated data
+    /// permanently. Admission redacts the doomed value instead — see
+    /// [`Self::payload_subjects`].
+    pub(crate) fn covers_for_drop(&self, span: &Span) -> bool {
         if self.traces.contains(&span.trace_id) {
             return true;
         }
@@ -471,14 +493,13 @@ impl Mask {
                 }
             }
         }
-        if !self.payloads.is_empty() {
-            for reference in &self.payloads {
-                if payload_unredacted(span, reference) {
-                    return true;
-                }
-            }
-        }
         false
+    }
+
+    /// The payload references currently under erasure as SUBJECTS — the set
+    /// admission redacts and offloading refuses to write bytes for.
+    pub(crate) fn payload_subjects(&self) -> &HashSet<String> {
+        &self.payloads
     }
 
     /// Whether a pending erasure covers this annotation address. Trace-level

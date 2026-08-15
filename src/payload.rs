@@ -285,15 +285,29 @@ pub(crate) fn load_payload(directory: &Path, reference: &str) -> Result<Option<V
 
 /// Replaces every string attribute value longer than `threshold` bytes
 /// (span attributes and event attributes) with a payload reference.
+///
+/// `masked` names content hashes currently under a pending erasure as its
+/// SUBJECT. A value whose content resolves to one is not written to disk at
+/// all — the write would recreate the very file the erasure is deleting —
+/// and the span receives the redacted marker directly, which is the state
+/// the erasure would have left it in anyway. Without this, offloading raced
+/// the purge's unlink, and whichever lost, the receipt lost with it.
 pub(crate) fn offload_span(
     directory: &Path,
     span: &mut Span,
     threshold: usize,
     registry: &TouchRegistry,
+    masked: Option<&HashSet<String>>,
 ) -> Result<()> {
-    offload_map(directory, &mut span.attributes, threshold, registry)?;
+    offload_map(directory, &mut span.attributes, threshold, registry, masked)?;
     for event in &mut span.events {
-        offload_map(directory, &mut event.attributes, threshold, registry)?;
+        offload_map(
+            directory,
+            &mut event.attributes,
+            threshold,
+            registry,
+            masked,
+        )?;
     }
     Ok(())
 }
@@ -303,10 +317,22 @@ fn offload_map(
     attributes: &mut Map<String, Value>,
     threshold: usize,
     registry: &TouchRegistry,
+    masked: Option<&HashSet<String>>,
 ) -> Result<()> {
     for value in attributes.values_mut() {
         if let Value::String(text) = value {
             if text.len() > threshold {
+                if let Some(masked) = masked {
+                    let reference = format!("sha256/{}", sha256_hex(text.as_bytes()));
+                    if masked.contains(&reference) {
+                        let mut redacted = Map::new();
+                        redacted.insert(PAYLOAD_KEY.into(), Value::String(reference));
+                        redacted.insert("bytes".into(), Value::from(text.len()));
+                        redacted.insert("erased".into(), Value::Bool(true));
+                        *value = Value::Object(redacted);
+                        continue;
+                    }
+                }
                 *value = store_payload(directory, text, registry)?;
             }
         }

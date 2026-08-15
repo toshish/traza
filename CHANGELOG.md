@@ -85,13 +85,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     is the authority on absence.)
   - **A pending erasure is an admission barrier, not just a veil.** Covered
     spans are dropped at ingest — acknowledged, never stored, counted in
-    `traza_erasure_spans_suppressed_total` — and the settle record is
-    appended inside the same critical section as a final buffer sweep, so
-    the cut is exact: every span acknowledged before `settled_unix_ns` is
-    erased or was never stored, under concurrent writers hammering the
-    subject (a review probe demonstrated 92 pre-settle survivors before this
-    barrier existed; `tests/erasure.rs` keeps that probe as a regression
-    test).
+    `traza_erasure_spans_suppressed_total` — and the barrier is total: it
+    runs BEFORE payload offloading, so a suppressed span leaves no orphan
+    payload bytes behind (a review probe planted exactly that orphan — the
+    file of a span that never entered the store, invisible to record and
+    receipt alike); an oversized value whose content hash is itself under
+    erasure offloads directly to its redacted marker instead of recreating
+    the file being deleted; and annotations addressed to a covered subject
+    are dropped at admission the same way. The cut is exact: every span
+    acknowledged before `settled_unix_ns` is erased or was never stored,
+    under concurrent writers hammering the subject (a review probe
+    demonstrated 92 pre-settle survivors before the barrier existed;
+    `tests/erasure.rs` keeps both probes as regression tests). The ingest
+    response tells the truth about it — `accepted` counts what was stored,
+    `suppressed` appears when nonzero, and the OTLP surfaces answer with
+    `partialSuccess.rejectedSpans` (hand-encoded for the protobuf path,
+    because an empty response is a claim of full success).
+  - **Nothing rewrites a manifested file after the checkpoint the settle
+    cites.** The confirm purge and annotation drops moved BEFORE the
+    checkpoint; the settle append itself rides the append-only allowance
+    every manifest grants the tombstone log. A review probe caught the old
+    order making the settle's own generation fail verification
+    (`annotations.jsonl: digest mismatch`) the moment a concurrent
+    annotation landed; the ordering is now barrier → purge → confirm →
+    checkpoint → settle → lift, and the suite asserts the cited generation
+    verifies clean, including under concurrent writers.
   - **The purge reaches every domain.** Buffer and write-ahead log rewritten
     to the survivors (the TTL discipline: a deletion a restart undoes is not
     a deletion); segments rewritten in place, superseded versions of an

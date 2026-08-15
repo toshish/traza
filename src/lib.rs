@@ -809,6 +809,23 @@ pub struct Stats {
     pub buffer_age_seconds: Option<u64>,
 }
 
+/// What one ingest call actually did.
+///
+/// `accepted` spans are stored under the configured [`Durability`].
+/// `suppressed` spans were acknowledged and deliberately NOT stored, because
+/// a pending erasure covered them — the admission barrier that makes an
+/// erasure's cut exact. The split exists so an ingest surface never reports
+/// a suppressed span as durable: a `200` whose body says `accepted: 1` about
+/// a span that never reached memory or the log would be a durability claim
+/// with nothing behind it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Admission {
+    /// Spans stored under the configured durability mode.
+    pub accepted: usize,
+    /// Spans dropped by the erasure admission barrier.
+    pub suppressed: usize,
+}
+
 /// Errors returned by storage operations.
 #[derive(Debug)]
 pub enum Error {
@@ -1733,32 +1750,53 @@ impl Store {
 
     /// Adds one span, automatically flushing when the configured threshold is
     /// reached.
-    pub fn ingest(&self, mut span: Span) -> Result<()> {
-        validate_span(&span)?;
-        if let Some(threshold) = self.config.payload_threshold {
-            payload::offload_span(&self.directory, &mut span, threshold, &self.recent_payloads)?;
-        }
-        self.admit(vec![span])
+    pub fn ingest(&self, span: Span) -> Result<Admission> {
+        self.ingest_batch(vec![span])
     }
 
     /// Adds a batch of spans, automatically flushing when the configured
     /// threshold is reached. The batch is atomic with respect to validation:
     /// if any span is invalid, nothing from the batch is stored.
-    pub fn ingest_batch(&self, spans: Vec<Span>) -> Result<()> {
+    ///
+    /// The returned [`Admission`] says what actually happened: how many
+    /// spans were stored, and how many a pending erasure suppressed. A
+    /// suppressed span was acknowledged and deliberately not stored, and a
+    /// caller reporting durability to ITS caller must not count it as
+    /// durable.
+    pub fn ingest_batch(&self, spans: Vec<Span>) -> Result<Admission> {
         if spans.is_empty() {
-            return Ok(());
+            return Ok(Admission::default());
         }
         for span in &spans {
             validate_span(span)?;
         }
+        let sent = spans.len();
         let mut spans = spans;
+        // The admission barrier runs BEFORE payload offloading, or a
+        // suppressed span's oversized values would be written to the payload
+        // store first and suppressed after — orphan bytes of the very
+        // subject being erased, invisible to the erase record and therefore
+        // to the receipt, because the span that carried them never entered
+        // the store. Admit re-checks the mask under the writer lock; this
+        // pass exists so the FILESYSTEM side effect is barred too.
+        let mask = self.erasure_mask();
+        if let Some(mask) = &mask {
+            spans.retain(|span| !mask.covers_for_drop(span));
+        }
         if let Some(threshold) = self.config.payload_threshold {
+            let masked = mask.as_deref().map(erasure::Mask::payload_subjects);
             for span in &mut spans {
-                payload::offload_span(&self.directory, span, threshold, &self.recent_payloads)?;
+                payload::offload_span(
+                    &self.directory,
+                    span,
+                    threshold,
+                    &self.recent_payloads,
+                    masked,
+                )?;
             }
         }
 
-        self.admit(spans)
+        self.admit(spans, sent)
     }
 
     /// The acknowledgement path shared by both ingest surfaces.
@@ -1782,16 +1820,17 @@ impl Store {
     /// purpose.** Taking the seal permit while holding the writer lock would
     /// invert the lock order (see the `sealing` field) and deadlock against
     /// expiry.
-    fn admit(&self, mut spans: Vec<Span>) -> Result<()> {
+    fn admit(&self, mut spans: Vec<Span>, sent: usize) -> Result<Admission> {
         // ---- the erasure admission barrier -------------------------------
         // A span covered by a PENDING erasure is dropped here, before the
-        // log ever carries it. Masking reads alone was not a barrier: a span
-        // admitted between an erasure's purge scan and its settle was hidden
-        // while pending and then unveiled at settle — acknowledged before
-        // `settled_unix_ns`, alive after it. Suppression at admission is
-        // what makes the erasure's cut exact: everything acknowledged before
-        // settle is erased or was never stored, and everything after is new
-        // data.
+        // log ever carries it (and a value whose content a pending erasure
+        // names is admitted only as its redacted marker). Masking reads
+        // alone was not a barrier: a span admitted between an erasure's
+        // purge scan and its settle was hidden while pending and then
+        // unveiled at settle — acknowledged before `settled_unix_ns`, alive
+        // after it. Suppression at admission is what makes the erasure's cut
+        // exact: everything acknowledged before settle is erased or was
+        // never stored, and everything after is new data.
         //
         // The check-and-recheck shape closes the race with `begin`. The
         // filter and the (batch-sized) frame encode run outside the writer
@@ -1811,14 +1850,23 @@ impl Store {
         loop {
             let mask = self.erasure_mask();
             if let Some(mask) = &mask {
-                let before = spans.len();
-                spans.retain(|span| !mask.covers(span));
-                let suppressed = (before - spans.len()) as u64;
-                if suppressed > 0 {
-                    self.metrics.erasure_spans_suppressed.add(suppressed);
+                spans.retain(|span| !mask.covers_for_drop(span));
+                // Payload subjects redact rather than drop: the span is not
+                // the subject, its oversized value is. The marker this
+                // leaves is the erasure's settled end-state, so admitting it
+                // is admitting new data minus the content being erased.
+                for reference in mask.payload_subjects() {
+                    for span in &mut spans {
+                        erasure::redact_payload(span, reference);
+                    }
                 }
+                let suppressed = sent.saturating_sub(spans.len());
                 if spans.is_empty() {
-                    return Ok(());
+                    self.metrics.erasure_spans_suppressed.add(suppressed as u64);
+                    return Ok(Admission {
+                        accepted: 0,
+                        suppressed,
+                    });
                 }
             }
             // Encode the log frame BEFORE taking the writer lock.
@@ -1911,7 +1959,14 @@ impl Store {
 
         self.metrics.spans_admitted.add(admitted);
         self.metrics.batches_admitted.increment();
-        Ok(())
+        let suppressed = sent.saturating_sub(admitted as usize);
+        if suppressed > 0 {
+            self.metrics.erasure_spans_suppressed.add(suppressed as u64);
+        }
+        Ok(Admission {
+            accepted: admitted as usize,
+            suppressed,
+        })
     }
 
     /// Per-stage ingest instrumentation. See [`metrics::Metrics`].
@@ -2802,7 +2857,21 @@ impl Store {
     /// Removes spans older than the configured TTL and returns the number
     /// removed. A zero TTL disables expiration.
     /// Records one annotation durably (see [`annotations::Annotation`]).
+    ///
+    /// An annotation addressed to a subject a PENDING erasure covers is
+    /// acknowledged and deliberately not stored — the same admission barrier
+    /// spans get, for the same reason: without it, an annotation landing
+    /// between the erasure's annotation drop and its settle would attach
+    /// judgment to data that no longer exists, invisibly until the mask
+    /// lifted. After the erasure settles, the same address is annotatable
+    /// again (there is nothing there to annotate until new data arrives, but
+    /// the barrier is the erasure's, not a permanent ban).
     pub fn annotate(&self, annotation: annotations::Annotation) -> Result<()> {
+        if let Some(mask) = self.erasure_mask() {
+            if mask.covers_annotation(&annotation.trace_id, &annotation.span_id) {
+                return Ok(());
+            }
+        }
         self.annotations.append(annotation)
     }
 
@@ -4462,30 +4531,52 @@ impl Store {
             self.tail.veil(std::sync::Arc::new(purge.keys.clone()));
         }
 
-        // Publication: the deletion is durable when `CURRENT` moves, and the
-        // manifest it moves to names the tombstone log that commands it. The
-        // checkpoint also rewrites the log to the surviving buffer, so the
-        // erased bytes leave `wal.log` here at the latest.
-        let generation = self.checkpoint()?;
-
-        // ---- confirm, then settle with nothing able to slip between ------
-        // The admission barrier suppresses covered spans from the moment the
-        // intent record installed the mask, so nothing covered can have been
-        // ADMITTED since. This pass sweeps what the barrier structurally
-        // cannot: batches already inside the writer lock when the mask
-        // landed, and any segment a concurrent seal published from them. It
-        // is a full purge, and on the overwhelmingly common path it finds
-        // nothing and costs index probes.
+        // ---- confirm: everything mutable, BEFORE the checkpoint ----------
+        // The admission barrier suppresses covered spans (and the annotate
+        // barrier covered annotations) from the moment the intent record
+        // installed the mask, so nothing covered can have been ADMITTED
+        // since. This pass sweeps what the barriers structurally cannot:
+        // batches already inside the writer lock when the mask landed, any
+        // segment a concurrent seal published from them, and — for a payload
+        // subject — a file an offload racing `begin` may have recreated. On
+        // the common path it finds nothing and costs index probes.
+        //
+        // It runs BEFORE the checkpoint because the settle record names that
+        // checkpoint's generation, and a generation is a set of digests:
+        // rewriting the annotation log or a segment AFTER publishing it
+        // would make the very generation the receipt cites fail its own
+        // verification. Order is barrier → purge → confirm → checkpoint →
+        // settle → the mask lifts; nothing rewrites a manifested file past
+        // the checkpoint, and the settle append itself rides the append-only
+        // allowance every manifest already grants the tombstone log.
         let confirm = {
             let _maintenance = self.lock_maintenance()?;
-            self.purge_subject_locked(subject)?
+            let confirm = self.purge_subject_locked(subject)?;
+            if let Some(reference) = subject.payload_reference() {
+                if let Some(hash) = reference.strip_prefix("sha256/") {
+                    // Idempotent re-delete: closes the window where an
+                    // offload that loaded the mask just before `begin` wrote
+                    // the subject's bytes back mid-purge.
+                    match fs::remove_file(payload::payload_path(&self.directory, hash)) {
+                        Ok(()) => sync_directory(
+                            payload::payload_path(&self.directory, hash)
+                                .parent()
+                                .unwrap_or(&self.directory),
+                        )?,
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(Error::Io(error)),
+                    }
+                }
+            }
+            confirm
         };
         if !confirm.keys.is_empty() {
             self.tail.veil(std::sync::Arc::new(confirm.keys.clone()));
         }
-        // Annotations that arrived during the window get the same confirm
-        // treatment; a no-op rewrite costs nothing (`drop_for_keys` returns
-        // before touching the file when nothing matches).
+        // Annotations that arrived before the annotate barrier went up get
+        // the same confirm treatment; a no-op rewrite costs nothing
+        // (`drop_for_keys` returns before touching the file when nothing
+        // matches).
         let annotations_removed = annotations_removed
             + match subject {
                 erasure::Subject::Payload { .. } => 0,
@@ -4495,75 +4586,38 @@ impl Store {
                 _ if confirm.keys.is_empty() => 0,
                 _ => self.annotations.drop_for_keys(&confirm.keys, None)?,
             };
-        let mut spans_removed = purge.removed + confirm.removed;
-        let mut spans_redacted = purge.redacted + confirm.redacted;
+        let spans_removed = purge.removed + confirm.removed;
+        let spans_redacted = purge.redacted + confirm.redacted;
 
-        // The settle append happens INSIDE the seal permit and writer lock:
-        // an upsert can then only land before this final scan (and be
-        // removed by it) or after the mask lifts (and be new data by
-        // definition). Without this, a span could be acknowledged before
-        // `settled_unix_ns` and alive after it — the exact hole the
-        // concurrent-writer probe demonstrated. The cost is one fsync'd
-        // append under the writer lock, once per erasure.
-        let (settle, swept_keys) = {
-            let _permit = self
-                .sealing
-                .lock()
-                .map_err(|_| Error::LockPoisoned("sealing"))?;
-            let mut writer = self.lock_writer()?;
-            let mut survivors: Vec<std::sync::Arc<Span>> = Vec::with_capacity(writer.spans.len());
-            let mut swept_keys: std::collections::HashSet<(String, String)> =
-                std::collections::HashSet::new();
-            let mut changed = false;
-            for span in writer.spans.iter() {
-                match subject.action(span) {
-                    erasure::Action::Keep => survivors.push(std::sync::Arc::clone(span)),
-                    erasure::Action::Drop => {
-                        changed = true;
-                        spans_removed += 1;
-                        swept_keys.insert((span.trace_id.clone(), span.span_id.clone()));
-                    }
-                    erasure::Action::Redact => {
-                        changed = true;
-                        spans_redacted += 1;
-                        swept_keys.insert((span.trace_id.clone(), span.span_id.clone()));
-                        let mut redacted = Span::clone(span);
-                        if let Some(reference) = subject.payload_reference() {
-                            erasure::redact_payload(&mut redacted, reference);
-                        }
-                        survivors.push(std::sync::Arc::new(redacted));
-                    }
-                }
-            }
-            if changed {
-                if let Some(log) = &self.wal {
-                    let frames: Vec<&Span> = survivors.iter().map(|span| span.as_ref()).collect();
-                    log.rewrite(&frames, 0)?;
-                }
-                writer.restore(survivors);
-            }
-            let settle = erasure::SettleRecord {
-                schema: erasure::SettleRecord::schema_now(),
-                id: record.id,
-                settled_unix_ns: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map_or(0, |since| since.as_nanos().min(u128::from(u64::MAX)) as u64),
-                generation,
-                spans_removed,
-                spans_redacted,
-                annotations_removed,
-                payloads_removed,
-                payloads_retained,
-            };
-            self.erasures.record_settle(settle.clone())?;
-            (settle, swept_keys)
+        // Publication: the deletion is durable when `CURRENT` moves, and the
+        // manifest it moves to names the tombstone log that commands it and
+        // digests every file the purge left behind. The checkpoint also
+        // rewrites the log to the surviving buffer, so the erased bytes
+        // leave `wal.log` here at the latest.
+        let generation = self.checkpoint()?;
+
+        // The settle lifts the mask, and with it the barriers. The cut is
+        // still exact without holding any engine lock here: a covered span
+        // cannot be admitted while the mask is up (admit re-checks the mask
+        // by pointer INSIDE the writer lock, so even a batch in flight when
+        // `begin` ran is refiltered), covered spans admitted before the mask
+        // went up were swept by the purge and confirm passes above, and
+        // anything admitted after this append is post-settle new data whose
+        // acknowledgement follows `settled_unix_ns`.
+        let settle = erasure::SettleRecord {
+            schema: erasure::SettleRecord::schema_now(),
+            id: record.id,
+            settled_unix_ns: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |since| since.as_nanos().min(u128::from(u64::MAX)) as u64),
+            generation,
+            spans_removed,
+            spans_redacted,
+            annotations_removed,
+            payloads_removed,
+            payloads_retained,
         };
-        // Spans the final sweep removed were published to the tail at their
-        // admission (they were in flight before the mask landed); the ring
-        // must stop serving them like everything else the erasure covered.
-        if !swept_keys.is_empty() {
-            self.tail.veil(std::sync::Arc::new(swept_keys));
-        }
+        self.erasures.record_settle(settle.clone())?;
         self.metrics.erasures_settled.increment();
         self.metrics.erasure_spans_removed.add(spans_removed as u64);
         self.metrics.erasure.record(elapsed_nanos(&erasing));

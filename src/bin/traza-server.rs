@@ -486,6 +486,41 @@ fn main() {
     }
 }
 
+/// A hand-encoded OTLP `ExportTraceServiceResponse`. Empty bytes mean full
+/// success; with `rejected > 0` it carries
+/// `partial_success { rejected_spans, error_message }` so a protobuf client
+/// is told the truth about suppression without this crate growing a protobuf
+/// writer. Field numbers from the OTLP proto: `partial_success` = 1
+/// (message), `rejected_spans` = 1 (int64), `error_message` = 2 (string).
+fn otlp_partial_success_protobuf(rejected: usize) -> Vec<u8> {
+    fn varint(mut value: u64, into: &mut Vec<u8>) {
+        loop {
+            let byte = (value & 0x7F) as u8;
+            value >>= 7;
+            if value == 0 {
+                into.push(byte);
+                return;
+            }
+            into.push(byte | 0x80);
+        }
+    }
+    if rejected == 0 {
+        return Vec::new();
+    }
+    let message = b"suppressed by a pending erasure covering these spans";
+    let mut partial = Vec::new();
+    partial.push(0x08); // field 1, varint
+    varint(rejected as u64, &mut partial);
+    partial.push(0x12); // field 2, length-delimited
+    varint(message.len() as u64, &mut partial);
+    partial.extend_from_slice(message);
+    let mut response = Vec::new();
+    response.push(0x0A); // field 1, length-delimited
+    varint(partial.len() as u64, &mut response);
+    response.extend_from_slice(&partial);
+    response
+}
+
 const USAGE: &str = "Usage: traza-server --data-dir DIR --port PORT [--host ADDR] \
 [--profile throughput|balanced|latency (default balanced; sets flush-spans and wal-commit-window; \
 NEVER changes durability)] [--ttl-seconds N] [--flush-spans N] \
@@ -1600,12 +1635,27 @@ fn serve_request(
                     );
                 }
             }
-            let accepted = spans.len();
             match engine.ingest_batch(spans) {
-                Ok(()) => responder.json(
+                // The client should never have to guess what a 200 promises,
+                // and `accepted` is a durability claim — it counts what the
+                // engine actually stored. Spans a pending erasure suppressed
+                // were acknowledged and deliberately not stored, and saying
+                // "accepted" about them would promise a durability nothing
+                // is backing.
+                Ok(admission) if admission.suppressed > 0 => responder.json(
                     200,
-                    // The client should never have to guess what a 200 promises.
-                    json!({"accepted": accepted, "durability": engine.durability().as_str()}),
+                    json!({
+                        "accepted": admission.accepted,
+                        "suppressed": admission.suppressed,
+                        "durability": engine.durability().as_str(),
+                    }),
+                ),
+                Ok(admission) => responder.json(
+                    200,
+                    json!({
+                        "accepted": admission.accepted,
+                        "durability": engine.durability().as_str(),
+                    }),
                 ),
                 Err(error) => responder.json(503, json!({"error": error.to_string()})),
             }
@@ -1635,16 +1685,30 @@ fn serve_request(
             };
             metrics.decoded_spans.add(spans.len() as u64);
             match engine.ingest_batch(spans) {
-                Ok(()) if is_protobuf => {
+                Ok(admission) if is_protobuf => {
                     // An empty ExportTraceServiceResponse is zero protobuf
-                    // bytes; protobuf clients expect the matching media type.
+                    // bytes and means full success; spans suppressed by a
+                    // pending erasure were NOT stored, and OTLP's word for
+                    // that is partialSuccess.rejected_spans. Encoded by hand
+                    // — two fields — because the honest answer must not wait
+                    // on a protobuf writer dependency.
+                    let body = otlp_partial_success_protobuf(admission.suppressed);
                     let head = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/x-protobuf\r\nContent-Length: 0\r\nConnection: {}\r\n\r\n",
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/x-protobuf\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n",
+                        body.len(),
                         responder.connection_header()
                     );
-                    responder.raw(&head, b"")
+                    responder.raw(&head, &body)
                 }
-                Ok(()) => responder.json(200, json!({"partialSuccess": {}})),
+                Ok(admission) if admission.suppressed > 0 => responder.json(
+                    200,
+                    json!({"partialSuccess": {
+                        "rejectedSpans": admission.suppressed,
+                        "errorMessage":
+                            "suppressed by a pending erasure covering these spans",
+                    }}),
+                ),
+                Ok(_) => responder.json(200, json!({"partialSuccess": {}})),
                 Err(error) => responder.json(503, json!({"error": error.to_string()})),
             }
         }
