@@ -10,6 +10,7 @@ it.
 
 - [Profiles](#profiles)
 - [Server flags](#server-flags)
+- [Model pricing](#model-pricing)
 - [Environment variables](#environment-variables)
 - [Library `Config`](#library-config)
 - [The throughput/latency tradeoff, measured](#the-throughputlatency-tradeoff-measured)
@@ -182,6 +183,7 @@ better p95/p99 with peak capacity. Do not pick it hoping for a lower median;
 | `--mcp-allowed-origin ORIGIN` | none | A browser origin permitted to drive `/v1/mcp`, including the scheme (`https://traza.example.com`). Repeatable, and implies `--mcp`. Loopback origins are always allowed; every other one needs naming here. This is the DNS-rebinding defence, and it is operator-supplied because nothing in the request can validate an origin — a rebinding request controls the `Host` header too. Needed when the dashboard is served behind a hostname, since its MCP screen is a browser page. |
 | `--mcp-max-result-bytes N` | `32768` | Ceiling on one MCP tool result or resource read, counting the **whole serialized result** — text block, `structuredContent`, and the JSON envelope around them — in UTF-8 bytes, which is what goes on the wire. **Refused below 1,024**: beneath that there is no result that both fits and conforms to the `outputSchema` its tool advertises, and failing at startup beats answering every request with something a validating client rejects. Past it, rows are dropped and the truncation is stated with the argument that would have narrowed it. Raise for a client with a large context window; lower to make an agent narrow its own queries. |
 | `--mcp-max-payload-bytes N` | `262144` | Ceiling on one `get_payload` fetch, whatever the call asks for. This is what stops a single offloaded prompt filling a context window. The **effective** cap is the smaller of this and `--mcp-max-result-bytes`, so that the byte count the tool reports is the one it returns. |
+| `--pricing FILE` | none | Per-model rates used to derive a cost for LLM spans that did not meter one. Nothing is derived without it, which is the behaviour every store had before it existed. A malformed file refuses startup rather than being ignored — silently reporting `$0.00` is the symptom the file was supplied to fix. Changing the rates invalidates rollups folded under the old ones, which costs a rebuild of the affected sidecars. See [Model pricing](#model-pricing). |
 | `--allow-unauthenticated-non-loopback` | off | Explicitly permit an unauthenticated non-loopback bind. |
 | `--version`, `-V` | — | Print `traza-server <version>` and exit. |
 | `--restore DIR` | — | Install a backup from `DIR` into `--data-dir`, then serve it. The backup is verified before anything is swapped and the swap commits at one `CURRENT` rename, so a failed restore leaves the prior store. See [backup and restore](operations/backup.md). |
@@ -208,6 +210,61 @@ own write cache**. A macOS host losing power can still lose an acknowledged
 write; a `kill -9`, a panic, or an OS crash cannot. On Linux `fsync` carries
 the usual guarantee. See the README's durability section for the full
 discussion.
+
+## Model pricing
+
+OpenTelemetry defines no cost attribute, so a span carries one only if the
+pipeline that produced it metered it — and most do not. Without rates, a store
+that knows the model and both token counts still reports `$0.00` on every cost
+surface, which reads as *this was free* rather than *nobody told me the rates*.
+
+`--pricing FILE` supplies them:
+
+```json
+{
+  "models": {
+    "gpt-5.6-sol":   {"input_per_mtok": 1.25, "output_per_mtok": 10.00},
+    "gpt-4o-mini*":  {"input_per_mtok": 0.15, "output_per_mtok": 0.60},
+    "gpt-4o*":       {"input_per_mtok": 2.50, "output_per_mtok": 10.00}
+  }
+}
+```
+
+Rates are **USD per million tokens**, the unit vendors quote, so the file can
+be checked against a price page without arithmetic. A key ending in `*` is a
+prefix pattern; the longest match wins regardless of the order the file lists
+them in, and an exact name beats every pattern. A bare `"*"` is a default rate
+for everything unnamed.
+
+There is no built-in table, and there will not be one: prices change on the
+vendor's schedule rather than Traza's, and self-hosted models have no public
+rate at all.
+
+**What derived cost is.** Arithmetic over the tokens the span reported, at the
+rates you configured. It is not a bill — it knows nothing about cached-prompt
+discounts, batch tiers, reasoning tokens billed at a third rate, or negotiated
+pricing.
+
+Three rules keep it from being mistaken for one:
+
+- **A metered cost always wins.** If the span carries `llm.cost_usd`, that is
+  the number and the table is not consulted.
+- **Both directions must be known.** A span that reported only a total has no
+  input/output split, and the two are priced differently, so it stays
+  unpriced rather than being split by an assumed ratio.
+- **The estimate is reported separately.** `/v1/stats/llm` and `/v1/sessions`
+  return `cost_derived_usd` beside `cost_usd`; equal means the whole total is
+  an estimate, zero means it is all measurement. The dashboard prefixes any
+  figure containing an estimate with `~` and gives the split on hover.
+
+### Changing the rates
+
+A rollup sidecar records the fingerprint of the table its counters were folded
+under, so editing the file invalidates exactly the cached counters that would
+now be wrong, and they are rebuilt on next read. Without that, a sealed
+segment would keep reporting last month's prices forever — nothing about a
+stale rollup looks wrong. Removing `--pricing` likewise returns the store to
+metered-cost-only rather than leaving derived figures behind.
 
 ## Environment variables
 
@@ -241,6 +298,7 @@ same values a `--profile` would give the server.
 | `content_index` | `bool` | `true` | As `--no-content-index` inverted. `false` omits the content index from sealed segments; `SpanFilter::content` still returns the same rows, by scanning. |
 | `tail_ring_spans` | `usize` | `8_192` | As `--tail-ring-spans`: the live tail's replay depth, as a count. Not a memory bound. |
 | `tail_ring_bytes` | `usize` | `33_554_432` (32 MiB) | As `--tail-ring-bytes`: what actually bounds the tail's memory. Whichever of the two binds first evicts. `Store::tail_usage` reports current residency against both. |
+| `pricing` | `Arc<Pricing>` | empty | As `--pricing`, already parsed. Empty derives nothing. `Pricing::parse` reads the documented JSON; see [Model pricing](#model-pricing). |
 
 `CompactionConfig`:
 

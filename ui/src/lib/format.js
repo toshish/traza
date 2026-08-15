@@ -29,6 +29,28 @@ export function fmtCost(value) {
   return typeof value === 'number' ? value.toFixed(4) : String(value ?? '');
 }
 
+/** A cost that says whether it was measured or worked out.
+ *
+ *  Any derived share prefixes a `~`, because a total that mixes a metered
+ *  charge with list-price arithmetic is an estimate as a whole — rounding that
+ *  distinction away is how an estimate gets quoted back as a bill. The title
+ *  carries the split for anyone who needs the exact provenance.
+ *
+ *  Returns `{ text, title, estimated }`. */
+export function fmtCostProvenance(costUsd, derivedUsd) {
+  const cost = typeof costUsd === 'number' ? costUsd : 0;
+  const derived = typeof derivedUsd === 'number' ? derivedUsd : 0;
+  if (derived <= 0) {
+    return { text: fmtCost(cost), title: 'Metered by the spans themselves.', estimated: false };
+  }
+  const metered = Math.max(0, cost - derived);
+  const title = metered > 0
+    ? `Estimated. ${fmtCost(metered)} metered by the spans, ${fmtCost(derived)} derived `
+      + 'from the configured model pricing.'
+    : 'Estimated: derived from the configured model pricing, not metered by the spans.';
+  return { text: '~' + fmtCost(cost), title, estimated: true };
+}
+
 export function fmtBytes(bytes) {
   if (typeof bytes !== 'number') return String(bytes ?? '');
   if (bytes >= 1 << 30) return (bytes / (1 << 30)).toFixed(2) + ' GiB';

@@ -277,7 +277,7 @@ impl Store {
                 errors[index] += 1;
             }
             durations[index].record(span.end_time_ns.saturating_sub(span.start_time_ns));
-            let usage = crate::semconv::facts(&span.attributes);
+            let usage = self.facts(span);
             if usage.is_llm {
                 llm_calls[index] += 1;
             }

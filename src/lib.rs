@@ -22,6 +22,7 @@ pub mod metrics;
 pub mod otlp;
 pub mod otlp_pb;
 pub mod payload;
+pub mod pricing;
 mod rollup_file;
 pub mod seed;
 pub mod segment;
@@ -612,7 +613,10 @@ impl Profile {
 }
 
 /// Storage configuration.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// `PartialEq` but not `Eq`: pricing carries per-million-token rates, and a
+/// float has no total equality to offer.
+#[derive(Clone, Debug, PartialEq)]
 pub struct Config {
     /// Automatic flush threshold, counted BOTH ways: unique buffered records,
     /// and upserts admitted since the last flush.
@@ -747,6 +751,16 @@ pub struct Config {
     /// such spans reached hundreds of megabytes — the same text residency the
     /// attribute index was rewritten to remove.
     pub tail_ring_bytes: usize,
+    /// Per-model rates used to derive a cost for LLM spans that did not meter
+    /// one. Empty by default, which derives nothing and is exactly the
+    /// behaviour every store had before this existed.
+    ///
+    /// A metered `llm.cost_usd` always wins; this only fills blanks. The
+    /// table's [fingerprint](crate::pricing::Pricing::fingerprint) is part of
+    /// a rollup sidecar's binding, so changing rates invalidates the cached
+    /// counters computed under the old ones rather than silently reporting
+    /// them forever. See [`crate::pricing`].
+    pub pricing: std::sync::Arc<crate::pricing::Pricing>,
 }
 
 /// The last commit whose reader accepts every superseded segment format.
@@ -846,6 +860,7 @@ impl Default for Config {
             content_index: true,
             tail_ring_spans: DEFAULT_TAIL_RING_SPANS,
             tail_ring_bytes: DEFAULT_TAIL_RING_BYTES,
+            pricing: std::sync::Arc::new(crate::pricing::Pricing::default()),
         }
     }
 }
@@ -1206,13 +1221,17 @@ impl Segment {
     /// numbers cannot drift under a valid sidecar. What they defend against
     /// is a sidecar left behind by a different file that later took the same
     /// name, and a sidecar half-written by an older build.
-    fn rollup_binding(&self) -> rollup_file::Binding {
+    /// `pricing_fingerprint` is the store's, not the segment's: the segment
+    /// file says nothing about rates, and it is the counters in the sidecar —
+    /// not the spans — that were computed under a particular table.
+    fn rollup_binding(&self, pricing_fingerprint: u64) -> rollup_file::Binding {
         let (min_start_ns, max_start_ns) = self.seg.timestamp_range();
         rollup_file::Binding {
             segment_bytes: self.bytes,
             record_count: self.seg.len() as u64,
             min_start_ns,
             max_start_ns,
+            pricing_fingerprint,
         }
     }
 
@@ -2283,6 +2302,28 @@ impl Store {
     /// What an acknowledged ingest currently guarantees.
     pub fn durability(&self) -> Durability {
         self.config.durability
+    }
+
+    /// A span's normalized LLM facts, with this store's pricing applied.
+    ///
+    /// **Every surface that reports a cost must extract facts through here**,
+    /// not through [`semconv::facts`] directly, or it reports metered cost
+    /// only and disagrees with the surfaces that do. Extraction stays a pure
+    /// function of the attributes; this is the one place the store's
+    /// configuration joins it. Callers that only want the session id can use
+    /// `semconv::facts` — pricing cannot change that answer.
+    pub(crate) fn facts(&self, span: &Span) -> semconv::LlmFacts {
+        semconv::facts(&span.attributes).priced(&self.config.pricing)
+    }
+
+    /// The per-model rates this store derives unmetered costs at.
+    pub(crate) fn pricing(&self) -> &crate::pricing::Pricing {
+        &self.config.pricing
+    }
+
+    /// The pricing table's digest, which a rollup sidecar must agree with.
+    pub(crate) fn pricing_fingerprint(&self) -> u64 {
+        self.config.pricing.fingerprint()
     }
 
     /// Returns the current number of spans buffered in memory.
@@ -3765,7 +3806,10 @@ impl Store {
         // Segments, doubly prefiltered: only segments whose sidecar holds
         // the reference at all, and within them only the tenant's records.
         for segment in self.pin_segments()? {
-            let may_hold = match rollup_file::load(&segment.path, segment.rollup_binding()) {
+            let may_hold = match rollup_file::load(
+                &segment.path,
+                segment.rollup_binding(self.pricing_fingerprint()),
+            ) {
                 Some(rollup) => rollup.payload_refs.contains(reference),
                 None => true, // no usable sidecar cannot be ruled out
             };
@@ -4245,7 +4289,10 @@ impl Store {
                         .map(|sealed| {
                             installed.push((
                                 sealed.segment.path.clone(),
-                                (sealed.segment.rollup_binding(), sealed.rollup),
+                                (
+                                    sealed.segment.rollup_binding(self.pricing_fingerprint()),
+                                    sealed.rollup,
+                                ),
                             ));
                             std::sync::Arc::new(sealed.segment)
                         })
@@ -4466,7 +4513,10 @@ impl Store {
             // only safe reading of that is "I do not know" — so it falls
             // through to the decode, which is what this did unconditionally
             // before. Retention is never decided on an unverified byte.
-            let bounds = rollup_file::bounds(&segment.path, segment.rollup_binding());
+            let bounds = rollup_file::bounds(
+                &segment.path,
+                segment.rollup_binding(self.pricing_fingerprint()),
+            );
             // Skip: no span can be older than the LATEST configured cutoff,
             // so no policy — however short its window — expires anything
             // here. Always sound; it only ever declines to decode less.
@@ -4525,7 +4575,7 @@ impl Store {
             // reopen the file that was just written.
             let (replacement, rollup) = match replacement {
                 Some(sealed) => {
-                    let binding = sealed.segment.rollup_binding();
+                    let binding = sealed.segment.rollup_binding(self.pricing_fingerprint());
                     (
                         Some(std::sync::Arc::new(sealed.segment)),
                         Some((binding, sealed.rollup)),
@@ -5831,7 +5881,7 @@ impl Store {
             }
             let (replacement, rollup) = match replacement {
                 Some(sealed) => {
-                    let binding = sealed.segment.rollup_binding();
+                    let binding = sealed.segment.rollup_binding(self.pricing_fingerprint());
                     (
                         Some(std::sync::Arc::new(sealed.segment)),
                         Some((binding, sealed.rollup)),
@@ -5911,7 +5961,10 @@ impl Store {
             erasure::Subject::Payload { reference } => {
                 // The sidecar's reference set answers without a decode; a
                 // segment with no usable sidecar cannot be ruled out.
-                match rollup_file::load(&segment.path, segment.rollup_binding()) {
+                match rollup_file::load(
+                    &segment.path,
+                    segment.rollup_binding(self.pricing_fingerprint()),
+                ) {
                     Some(rollup) => Ok(rollup.payload_refs.contains(reference)),
                     None => Ok(true),
                 }
@@ -6772,8 +6825,13 @@ impl Store {
             // failed because a cache could not be saved would put durability
             // at the mercy of a disposable file. A missing sidecar is simply
             // rebuilt on demand.
-            let rollup = std::sync::Arc::new(analytics::SegmentRollup::build(spans));
-            let _ = rollup_file::store(final_path, written.rollup_binding(), &rollup);
+            let rollup =
+                std::sync::Arc::new(analytics::SegmentRollup::build(spans, self.pricing()));
+            let _ = rollup_file::store(
+                final_path,
+                written.rollup_binding(self.pricing_fingerprint()),
+                &rollup,
+            );
             // Handed back rather than dropped: the caller may be replacing a
             // segment whose rollup was cached, and rebuilding what it is about
             // to throw away — from a file that was just written from the very

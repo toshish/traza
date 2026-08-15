@@ -71,7 +71,10 @@ const MAGIC: [u8; 8] = *b"TRAZAROL";
 /// v3: session entries and `by_session_key` entries carry a tenant string —
 /// session identity became `(tenant, session_id)` when the tenant joined the
 /// span primary key. v2 sidecars are rejected by this gate and rebuilt.
-const FORMAT_VERSION: u16 = 3;
+///
+/// v4: the prologue carries the pricing fingerprint its counters were folded
+/// under, and every counter block carries the derived share of its cost.
+const FORMAT_VERSION: u16 = 4;
 
 /// Version of the analytics semantics the counters were computed under.
 ///
@@ -97,10 +100,10 @@ const ROLLUP_SUFFIX: &str = "rollup";
 /// tick, and it must be able to trust the answer without reading — let alone
 /// decoding — anything else: an unverified bound would let expiry skip a
 /// segment that should have been swept, or sweep one that should not.
-const PROLOGUE_LEN: usize = 72;
+const PROLOGUE_LEN: usize = 80;
 
 /// Offset of the prologue's own checksum, which covers everything before it.
-const PROLOGUE_CHECKSUM_AT: usize = 64;
+const PROLOGUE_CHECKSUM_AT: usize = 72;
 
 /// The timestamp ranges a rollup covers.
 ///
@@ -139,13 +142,23 @@ pub(crate) fn remove(segment_path: &Path) -> std::io::Result<()> {
 }
 
 /// What a sidecar must agree with to be believed: identity of the segment it
-/// claims to describe.
+/// claims to describe, and the pricing its counters were folded under.
+///
+/// Pricing belongs here rather than in [`SCHEMA_VERSION`] because it arrives
+/// as configuration, and a compile-time constant cannot notice a file the
+/// operator edited. Without it a sealed segment would keep reporting last
+/// month's rates forever, which is precisely the silent staleness the schema
+/// version exists to prevent — just reached by a different road.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Binding {
     pub(crate) segment_bytes: u64,
     pub(crate) record_count: u64,
     pub(crate) min_start_ns: u64,
     pub(crate) max_start_ns: u64,
+    /// [`crate::pricing::Pricing::fingerprint`] of the table in force. Zero
+    /// when nothing is priced, so a store that derives no cost binds exactly
+    /// as it did before pricing existed.
+    pub(crate) pricing_fingerprint: u64,
 }
 
 /// Reads the sidecar for `segment_path`, or `None` if there is nothing
@@ -197,6 +210,7 @@ pub(crate) fn bounds(segment_path: &Path, expected: Binding) -> Option<Bounds> {
         record_count: cursor.u64()?,
         min_start_ns: cursor.u64()?,
         max_start_ns: cursor.u64()?,
+        pricing_fingerprint: cursor.u64()?,
     };
     let bounds = Bounds {
         min_start_ns: found.min_start_ns,
@@ -284,6 +298,7 @@ fn encode(binding: Binding, rollup: &SegmentRollup) -> Vec<u8> {
     put_u64(&mut out, binding.record_count);
     put_u64(&mut out, binding.min_start_ns);
     put_u64(&mut out, binding.max_start_ns);
+    put_u64(&mut out, binding.pricing_fingerprint);
     let bounds = rollup.bounds();
     put_u64(&mut out, bounds.min_end_ns);
     put_u64(&mut out, bounds.max_end_ns);
@@ -380,6 +395,7 @@ fn decode(bytes: &[u8], expected: Binding) -> Option<SegmentRollup> {
         record_count: cursor.u64()?,
         min_start_ns: cursor.u64()?,
         max_start_ns: cursor.u64()?,
+        pricing_fingerprint: cursor.u64()?,
     };
     // The sidecar describes some segment; this proves it describes THIS one.
     if found != expected {
@@ -509,6 +525,7 @@ fn put_counters(out: &mut Vec<u8>, counters: &Counters) {
     // same value, and this file exists to return exactly what a rebuild
     // would have returned.
     put_u64(out, counters.cost_usd.to_bits());
+    put_u64(out, counters.cost_derived_usd.to_bits());
     put_u64(out, counters.errors as u64);
     put_u64(out, counters.llm_duration_ns);
 }
@@ -564,6 +581,7 @@ impl<'a> Cursor<'a> {
             completion_tokens: self.u64()?,
             total_tokens: self.u64()?,
             cost_usd: f64::from_bits(self.u64()?),
+            cost_derived_usd: f64::from_bits(self.u64()?),
             errors: usize::try_from(self.u64()?).ok()?,
             llm_duration_ns: self.u64()?,
         })

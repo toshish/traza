@@ -75,8 +75,13 @@ pub struct SessionSummary {
     pub completion_tokens: u64,
     /// Summed total tokens (explicit `llm.total_tokens`, else prompt+completion).
     pub total_tokens: u64,
-    /// Summed cost in USD.
+    /// Summed cost in USD, metered and derived together.
     pub cost_usd: f64,
+    /// The part of `cost_usd` derived from the configured pricing table
+    /// rather than reported by a span. Zero when nothing was derived, which
+    /// is the whole total's provenance answered in one number: equal to
+    /// `cost_usd` means all estimate, zero means all measurement.
+    pub cost_derived_usd: f64,
     /// Spans with status `error`.
     pub error_count: usize,
 }
@@ -96,8 +101,13 @@ pub struct SessionTrace {
     pub span_count: usize,
     /// Summed total tokens.
     pub total_tokens: u64,
-    /// Summed cost in USD.
+    /// Summed cost in USD, metered and derived together.
     pub cost_usd: f64,
+    /// The part of `cost_usd` derived from the configured pricing table
+    /// rather than reported by a span. Zero when nothing was derived, which
+    /// is the whole total's provenance answered in one number: equal to
+    /// `cost_usd` means all estimate, zero means all measurement.
+    pub cost_derived_usd: f64,
     /// Spans with status `error`.
     pub error_count: usize,
 }
@@ -199,8 +209,13 @@ pub struct LlmAggregateRow {
     pub completion_tokens: u64,
     /// Summed total tokens.
     pub total_tokens: u64,
-    /// Summed cost in USD.
+    /// Summed cost in USD, metered and derived together.
     pub cost_usd: f64,
+    /// The part of `cost_usd` derived from the configured pricing table
+    /// rather than reported by a span. Zero when nothing was derived, which
+    /// is the whole total's provenance answered in one number: equal to
+    /// `cost_usd` means all estimate, zero means all measurement.
+    pub cost_derived_usd: f64,
     /// Spans with status `error`.
     pub error_count: usize,
     /// Summed duration of LLM calls, for average latency (`/ llm_calls`).
@@ -217,6 +232,10 @@ pub(crate) struct Counters {
     pub(crate) completion_tokens: u64,
     pub(crate) total_tokens: u64,
     pub(crate) cost_usd: f64,
+    /// The part of `cost_usd` that came from a pricing table rather than from
+    /// a span. Summed separately because a total that mixes measurement with
+    /// estimate is not interpretable without knowing the mix.
+    pub(crate) cost_derived_usd: f64,
     pub(crate) errors: usize,
     pub(crate) llm_duration_ns: u64,
 }
@@ -244,6 +263,10 @@ impl Counters {
             .saturating_add(facts.completion_tokens.unwrap_or(0));
         self.total_tokens = self.total_tokens.saturating_add(facts.total());
         self.cost_usd = finite_saturating_add(self.cost_usd, facts.cost_usd.unwrap_or(0.0));
+        if facts.cost_derived {
+            self.cost_derived_usd =
+                finite_saturating_add(self.cost_derived_usd, facts.cost_usd.unwrap_or(0.0));
+        }
     }
 
     fn merge(&mut self, other: &Counters) {
@@ -255,6 +278,8 @@ impl Counters {
             .saturating_add(other.completion_tokens);
         self.total_tokens = self.total_tokens.saturating_add(other.total_tokens);
         self.cost_usd = finite_saturating_add(self.cost_usd, other.cost_usd);
+        self.cost_derived_usd =
+            finite_saturating_add(self.cost_derived_usd, other.cost_derived_usd);
         self.errors = self.errors.saturating_add(other.errors);
         self.llm_duration_ns = self.llm_duration_ns.saturating_add(other.llm_duration_ns);
     }
@@ -389,14 +414,23 @@ impl SegmentRollup {
         }
     }
 
-    pub(crate) fn build<S: std::borrow::Borrow<Span>>(spans: &[S]) -> Self {
+    /// Folds `spans` into a rollup, deriving cost at `pricing` for the calls
+    /// that did not meter one.
+    ///
+    /// The table is an input to the values this produces, which is why the
+    /// sidecar records its fingerprint: a rollup built under one table must
+    /// not be believed by a store running another.
+    pub(crate) fn build<S: std::borrow::Borrow<Span>>(
+        spans: &[S],
+        pricing: &crate::pricing::Pricing,
+    ) -> Self {
         let mut rollup = Self {
             min_start_ns: u64::MAX,
             min_end_ns: u64::MAX,
             ..Self::default()
         };
         for span in spans {
-            rollup.absorb(span.borrow());
+            rollup.absorb(span.borrow(), pricing);
         }
         if rollup.min_start_ns == u64::MAX {
             rollup.min_start_ns = 0;
@@ -407,7 +441,7 @@ impl SegmentRollup {
         rollup
     }
 
-    fn absorb(&mut self, span: &Span) {
+    fn absorb(&mut self, span: &Span, pricing: &crate::pricing::Pricing) {
         self.min_start_ns = self.min_start_ns.min(span.start_time_ns);
         self.max_start_ns = self.max_start_ns.max(span.start_time_ns);
         self.min_end_ns = self.min_end_ns.min(span.end_time_ns);
@@ -416,7 +450,7 @@ impl SegmentRollup {
             .insert(key_hash(&span.tenant, &span.trace_id, &span.span_id));
         collect_payload_refs(span, &mut self.payload_refs);
         // One semconv scan, shared across every group this span joins.
-        let facts = semconv::facts(&span.attributes);
+        let facts = semconv::facts(&span.attributes).priced(pricing);
         if let Some(model) = &facts.model {
             self.by_model
                 .entry(model.clone())
@@ -585,6 +619,7 @@ impl Store {
                 completion_tokens: entry.counters.completion_tokens,
                 total_tokens: entry.counters.total_tokens,
                 cost_usd: entry.counters.cost_usd,
+                cost_derived_usd: entry.counters.cost_derived_usd,
                 error_count: entry.counters.errors,
             })
             .collect();
@@ -662,7 +697,7 @@ impl Store {
         let mut session = SessionCounters::default();
         let mut traces: BTreeMap<String, (Vec<&Span>, Counters)> = BTreeMap::new();
         for span in &spans {
-            let facts = semconv::facts(&span.attributes);
+            let facts = self.facts(span);
             session.absorb(span, &facts);
             let entry = traces.entry(span.trace_id.clone()).or_default();
             entry.0.push(span);
@@ -687,6 +722,7 @@ impl Store {
                     span_count: counters.spans,
                     total_tokens: counters.total_tokens,
                     cost_usd: counters.cost_usd,
+                    cost_derived_usd: counters.cost_derived_usd,
                     error_count: counters.errors,
                 }
             })
@@ -706,6 +742,7 @@ impl Store {
                 completion_tokens: session.counters.completion_tokens,
                 total_tokens: session.counters.total_tokens,
                 cost_usd: session.counters.cost_usd,
+                cost_derived_usd: session.counters.cost_derived_usd,
                 error_count: session.counters.errors,
             },
             traces: trace_rows,
@@ -789,6 +826,7 @@ impl Store {
                 completion_tokens: counters.completion_tokens,
                 total_tokens: counters.total_tokens,
                 cost_usd: counters.cost_usd,
+                cost_derived_usd: counters.cost_derived_usd,
                 error_count: counters.errors,
                 llm_duration_ns: counters.llm_duration_ns,
             })
@@ -865,7 +903,7 @@ impl Store {
             .map(Arc::clone)
             .collect();
         if !buffered.is_empty() {
-            visit(&SegmentRollup::build(&buffered));
+            visit(&SegmentRollup::build(&buffered, self.pricing()));
         }
         // Buffer and newer-segment hashes are tracked separately because the
         // shadow latch must tell them apart: a merge retires segment-versus-
@@ -978,7 +1016,7 @@ impl Store {
                 }
             }
             if !survivors.is_empty() {
-                visit(&SegmentRollup::build(&survivors));
+                visit(&SegmentRollup::build(&survivors, self.pricing()));
             }
             segment_hashes.extend(rollup.key_hashes.iter().copied());
         }
@@ -1036,7 +1074,7 @@ impl Store {
             // memory the rollup cache held. A miss falls back to the caching
             // path, because at that point the segment has to be decoded
             // anyway and the result is worth keeping.
-            let binding = segment.rollup_binding();
+            let binding = segment.rollup_binding(self.pricing_fingerprint());
             // Warm cache first — bypassing it made every tick re-read and
             // re-decode sidecars the process already had in memory. Then the
             // sidecar, read WITHOUT caching: the sweep asks about every
@@ -1072,14 +1110,17 @@ impl Store {
     /// a query because a derived cache could not be saved would trade a
     /// correct slow answer for no answer.
     fn segment_rollup(&self, segment: &crate::Segment) -> Result<Arc<SegmentRollup>> {
-        let binding = segment.rollup_binding();
+        let binding = segment.rollup_binding(self.pricing_fingerprint());
         if let Some(rollup) = self.cached_rollup(&segment.path, binding)? {
             return Ok(rollup);
         }
         let rollup = match crate::rollup_file::load(&segment.path, binding) {
             Some(rollup) => Arc::new(rollup),
             None => {
-                let rollup = Arc::new(SegmentRollup::build(&segment.spans_parsed()?));
+                let rollup = Arc::new(SegmentRollup::build(
+                    &segment.spans_parsed()?,
+                    self.pricing(),
+                ));
                 let _ = crate::rollup_file::store(&segment.path, binding, &rollup);
                 rollup
             }
@@ -1127,7 +1168,7 @@ impl Store {
             if bytes > budget_bytes {
                 break;
             }
-            let binding = segment.rollup_binding();
+            let binding = segment.rollup_binding(self.pricing_fingerprint());
             let rollup = match self.cached_rollup(&segment.path, binding)? {
                 Some(rollup) => rollup,
                 None => match crate::rollup_file::load(&segment.path, binding) {
@@ -1271,6 +1312,7 @@ mod tests {
             record_count: 10,
             min_start_ns: 1_000,
             max_start_ns: 9_000,
+            pricing_fingerprint: 0,
         };
         let rollup = Arc::new(SegmentRollup::default());
         store
@@ -1316,6 +1358,17 @@ mod tests {
                 "max start",
                 Binding {
                     max_start_ns: 9_001,
+                    ..binding
+                },
+            ),
+            (
+                // Counters folded at one set of rates are not the counters
+                // another set would have produced, and the segment they came
+                // from is byte-identical either way — so nothing else in the
+                // binding can catch this.
+                "pricing",
+                Binding {
+                    pricing_fingerprint: 0xdead_beef,
                     ..binding
                 },
             ),

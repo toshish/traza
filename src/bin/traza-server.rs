@@ -541,6 +541,8 @@ corrective deduplicating merge)] \
 [--tail-ring-bytes N (live-tail memory ceiling, whichever bound binds first; \
 default 32MiB)] \
 [--ui-dir DIR (built dashboard; default: TRAZA_UI_DIR, beside the binary, then ./ui/dist)] \
+[--pricing FILE (per-model rates, to derive a cost for LLM spans that did not meter one; \
+a metered llm.cost_usd always wins)] \
 [--mcp (serve the Model Context Protocol endpoint at /v1/mcp; off by default)] \
 [--mcp-annotations (additionally let MCP callers with an rw token record annotations)] \
 [--mcp-max-result-bytes N (default 32768)] [--mcp-max-payload-bytes N (default 262144)] \
@@ -610,6 +612,7 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
     let mut max_connections = DEFAULT_MAX_CONNECTIONS;
     let mut allow_unauthenticated_non_loopback = false;
     let mut ui_dir: Option<PathBuf> = None;
+    let mut pricing = traza::pricing::Pricing::default();
     let mut restore_from: Option<PathBuf> = None;
     let mut durability = Durability::default();
     let mut compaction = CompactionConfig::default();
@@ -743,6 +746,18 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
                 i += 1;
                 restore_from = Some(PathBuf::from(value(i, "--restore")?));
             }
+            // Refused at startup rather than tolerated: a pricing file that
+            // does not parse would otherwise mean silently reporting $0.00
+            // across every cost surface — the exact symptom the operator
+            // supplied the file to fix, and one nothing else would explain.
+            "--pricing" => {
+                i += 1;
+                let path = value(i, "--pricing")?;
+                let text = std::fs::read_to_string(path)
+                    .map_err(|error| format!("--pricing {path}: {error}"))?;
+                pricing = traza::pricing::Pricing::parse(&text)
+                    .map_err(|error| format!("--pricing {path}: {error}"))?;
+            }
             "--mcp" => {
                 mcp.enabled = true;
             }
@@ -845,6 +860,7 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
             compaction: compaction_enabled.then_some(compaction),
             tail_ring_spans,
             tail_ring_bytes,
+            pricing: std::sync::Arc::new(pricing),
         },
     }))
 }
