@@ -6,16 +6,16 @@ These values were measured by `cargo run --release --bin bench`; they are not es
 
 | Metric | Measured | Target | Result |
 |---|---:|---:|---|
-| Sustained batched HTTP ingest | 116618 spans/s | >= 50,000 spans/s | PASS |
-| Trace-by-id p95 | 0.642 ms | < 50 ms | PASS |
-| Attribute-filtered query p95 | 3.344 ms | < 300 ms | PASS |
+| Sustained batched HTTP ingest (durability=wal, compaction fanout=4, max segment bytes=268435456) | 52569 spans/s | >= 50,000 spans/s | PASS |
+| Trace-by-id p95 | 0.926 ms | < 50 ms | PASS |
+| Attribute-filtered query p95 | 2.873 ms | < 300 ms | PASS |
 
 Additional percentiles:
 
 | Query | p50 | p95 | p99 | samples |
 |---|---:|---:|---:|---:|
-| Trace by ID | 0.314 ms | 0.642 ms | 1.270 ms | 200 |
-| Attribute filter | 1.762 ms | 3.344 ms | 7.242 ms | 100 |
+| Trace by ID | 0.393 ms | 0.926 ms | 1.553 ms | 200 |
+| Attribute filter | 1.695 ms | 2.873 ms | 5.521 ms | 100 |
 
 ## Methodology
 
@@ -24,9 +24,9 @@ Additional percentiles:
 - Trace sampling: 200 deterministic trace IDs spread through the corpus; each response is parsed and checked for 10 spans.
 - Filter sampling: 100 deterministic `attr.benchmark.group` queries with `limit=100`; each response body is parsed as JSON.
 - Percentiles: nearest-rank selection over complete request wall-clock durations measured with `std::time::Instant`; no warm-up samples are discarded.
-- Build: Cargo release profile. Timestamp: Unix 1784800070.
+- Build: Cargo release profile. Timestamp: Unix 1786832119.
 - Machine context: macos/aarch64, 10 available hardware threads.
-- Final server stats: `{"buffered_records":0,"bytes_on_disk":583182107,"persisted_records":1000000,"record_count":1000000,"segment_count":100,"total_records":1000000}`.
+- Final server stats: `{"buffer_age_seconds":null,"buffered_records":0,"bytes_on_disk":583863347,"durability":"wal","persisted_records":1000000,"record_count":1000000,"segment_count":36,"total_records":1000000,"wal_bytes":0}`.
 
 The ingest threshold is PASS. The trace p95 threshold is PASS. The filtered-query p95 threshold is PASS. Any miss remains visible in the table rather than being substituted or estimated.
 

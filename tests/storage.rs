@@ -2008,3 +2008,66 @@ fn open_error(dir: &TestDir) -> String {
         .expect("a store with an unreadable segment must not open")
         .to_string()
 }
+
+#[test]
+fn a_store_written_before_the_reserved_tenant_key_still_resolves_its_newest_version() {
+    // tests/fixtures/pr50-tenant-identity was sealed by the build at commit
+    // 34c34fb — M4 as merged, whose identity key on the wire and on disk was
+    // a bare `tenant`. It holds two sealed versions of the key
+    // (acme, "t", "s"), `old` then `new`, plus one `keeper` span. Reserving
+    // `$tenant` reclassified that bare field as client data, so every record
+    // here decodes as the DEFAULT tenant now — while the v2 sidecars beside
+    // them carry key hashes computed under the old decoding.
+    //
+    // Those hashes are honest numbers in a domain this process no longer
+    // speaks: the binding still matches, the checksums still verify, and a
+    // membership miss is no longer proof of anything. A prefilter that
+    // trusted them would skip the exact probe and resurrect the superseded
+    // `old` — silently, with `traza_supersede_probes_total` reading zero.
+    // The rollup SCHEMA_VERSION bump is what forces these sidecars to be
+    // rebuilt under the current decoding, and this fixture is the corpus
+    // that fails if a future decoding change forgets to bump it again.
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pr50-tenant-identity");
+    // Copied, never opened in place: opening writes (heals sidecars, takes
+    // the lock), and the committed fixture must stay the old build's bytes.
+    let dir = correctness_test_dir("pr50-tenant-upgrade");
+    for entry in fs::read_dir(&fixture).expect("fixture dir") {
+        let entry = entry.expect("fixture entry");
+        fs::copy(entry.path(), dir.join(entry.file_name())).expect("copy fixture file");
+    }
+
+    let store = Store::open(
+        &dir,
+        Config {
+            durability: traza::Durability::Buffered,
+            compaction: None,
+            ..Config::default()
+        },
+    )
+    .expect("a pre-`$tenant` store opens");
+
+    let spans = store.query(&SpanFilter::default()).expect("query");
+    let versions: Vec<&str> = spans
+        .iter()
+        .filter(|span| span.span_id == "s")
+        .map(|span| span.name.as_str())
+        .collect();
+    assert_eq!(
+        versions,
+        ["new"],
+        "the newest version of a pre-`$tenant` key survives the upgrade, \
+         exactly once: {spans:?}"
+    );
+    assert!(
+        spans
+            .iter()
+            .any(|span| span.span_id == "keeper" && span.name == "kept"),
+        "data that was never superseded survives untouched"
+    );
+    assert!(
+        spans.iter().all(|span| span.tenant.is_empty()),
+        "a bare `tenant` field is client data now, so these records live in \
+         the default tenant"
+    );
+    let _ = fs::remove_dir_all(dir);
+}

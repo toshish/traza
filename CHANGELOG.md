@@ -366,6 +366,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that trusted the posting found nothing for a `Some("")` scope once the span
   sealed. The probe now scans the records and lets the decoded tenant decide
   for the default tenant, exactly as `select_probe` already did.
+- **Resolving last-write-wins no longer re-reads the store to prove keys were
+  never replaced.** Every query-side supersede probe — the limited merge, the
+  unlimited scan, and the fold behind the aggregation routes — now consults
+  each newer segment's own key-hash set before paying an exact probe, the
+  prefilter the analytics fold's exact path already ran; that fold now gates
+  per segment too, so a key rewritten eleven segments later costs one probe
+  rather than a walk across the ten between. On a store carrying superseded
+  versions — a crash-recovered store before its first compaction is the
+  canonical case — queries cost matches × segments × trace-width decodes,
+  which is how a recovery query blew a 30-second deadline in CI. The new
+  `traza_supersede_probes_total` counter is the observable: roughly one probe
+  per superseded version actually held.
+- **A pre-`$tenant` rollup sidecar is rebuilt, never believed.** Reserving
+  `$tenant` changed what a bare `tenant` field decodes to, and a sidecar's
+  key hashes are evidence only under the decoding they were computed with —
+  trusting one across that boundary treated a stale membership miss as proof
+  of absence and resurrected a superseded span. The rollup `SCHEMA_VERSION`
+  is bumped, so the first read after upgrading rebuilds each segment's
+  sidecar once; `tests/fixtures/pr50-tenant-identity`, sealed by the
+  pre-reservation build, is the corpus that fails if a future decoding change
+  forgets the bump.
 - **Native ingest accepts an event's timestamp under the OTLP name.** A span's
   timestamps accepted `start_time_unix_nano`; its events accepted only
   `timestamp_ns`, so a client spelling both the way OTLP spells them had its

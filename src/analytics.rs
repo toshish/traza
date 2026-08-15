@@ -543,7 +543,7 @@ impl SegmentRollup {
 /// of the hash depend on the value being hashed. Persisted key-hash sets are
 /// invalidated by the rollup sidecar's SCHEMA_VERSION, which was bumped for
 /// exactly this change.
-fn key_hash(tenant: &str, trace_id: &str, span_id: &str) -> u64 {
+pub(crate) fn key_hash(tenant: &str, trace_id: &str, span_id: &str) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in tenant
         .as_bytes()
@@ -1050,30 +1050,27 @@ impl Store {
                 )) {
                     continue;
                 }
-                // The union of buffer and newer-segment hashes holds every
-                // key that could supersede this span (each branch of this
-                // loop extends `segment_hashes` before moving on), so a miss
-                // here is proof this span was never replaced — no probe
-                // needed. Only a hit, which means a real supersede or an FNV
-                // collision, pays for the exact scan. Without this prefilter
-                // every surviving span probed the trace index of every newer
+                // Gated per newer segment on that segment's OWN hash set —
+                // [`crate::superseded_by_newer`], the same test the query
+                // paths run. A miss in every set is proof this span was never
+                // replaced, and only the specific segments whose set holds
+                // the hash — a real supersede or an FNV collision — pay an
+                // exact probe, so a key rewritten eleven segments later costs
+                // one probe, not a walk across the ten in between. The union
+                // in `segment_hashes` stays what it is: the per-ROLLUP gate
+                // above, not the per-span one. Without any prefilter every
+                // surviving span probed the trace index of every newer
                 // segment, so the cost was spans × segments: at eight
                 // concurrent ingest clients, where interleaved time ranges
                 // leave no segment fully inside a window, that quadratic term
                 // was the whole query.
-                let hash = key_hash(&span.tenant, &span.trace_id, &span.span_id);
-                let superseded = (segment_hashes.contains(&hash) || buffer_hashes.contains(&hash))
-                    && segments
-                        .iter()
-                        .skip(position + 1)
-                        .try_fold(false, |found, newer| {
-                            if found {
-                                Ok(true)
-                            } else {
-                                newer.contains_key(&span.tenant, &span.trace_id, &span.span_id)
-                            }
-                        })?;
-                if !superseded {
+                if !crate::superseded_by_newer(
+                    &segments,
+                    position,
+                    &span,
+                    &self.metrics,
+                    self.pricing(),
+                )? {
                     survivors.push(span);
                 }
             }
