@@ -1155,9 +1155,32 @@ fn a_tenant_erasure_records_its_payload_refs_so_resume_can_sweep_them() {
         .expect("erases trace");
     assert!(store.payload(&reference).expect("fetch").is_some());
 
-    // Now the tenant erasure. The DURABLE erase record must carry the
-    // example-only reference — that, not the transient purge output, is
-    // what a resumed erasure would sweep from.
+    // A SECOND payload, held ONLY by a live span (no example) — round 3
+    // found this is the case the round-2 fix missed: the masked snapshot
+    // fold saw none of the tenant's own spans, so a span-held payload was
+    // never noted and a crash would orphan it. It must be recorded too.
+    let span_only = "span-held content the fold must not miss ".repeat(8);
+    store
+        .ingest(
+            serde_json::from_value(json!({
+                "trace_id": "tb", "span_id": "s1", "tenant": "acme",
+                "name": "op", "service": "svc",
+                "start_time_ns": 1000u64, "end_time_ns": 2000u64,
+                "attributes": {"prompt": span_only},
+            }))
+            .expect("span"),
+        )
+        .expect("ingests");
+    store.flush().expect("seals");
+    let span_ref = store.get_trace_in(Some("acme"), "tb").expect("trace")[0].attributes["prompt"]
+        ["$payload"]
+        .as_str()
+        .expect("offloaded")
+        .to_owned();
+
+    // Now the tenant erasure. The DURABLE erase record must carry BOTH the
+    // example-only AND the span-only reference — that, not the transient
+    // purge output, is what a resumed erasure sweeps from.
     let status = store
         .erase(traza::erasure::Subject::Tenant {
             tenant: "acme".into(),
@@ -1168,6 +1191,12 @@ fn a_tenant_erasure_records_its_payload_refs_so_resume_can_sweep_them() {
         "the tenant erasure records the example-held reference: {:?}",
         status.erase.payload_refs
     );
+    assert!(
+        status.erase.payload_refs.contains(&span_ref),
+        "AND the span-held reference — the fold must be mask-free: {:?}",
+        status.erase.payload_refs
+    );
+    assert!(store.payload(&span_ref).expect("fetch").is_none());
     assert!(
         store.payload(&reference).expect("fetch").is_none(),
         "and the live path swept it"
