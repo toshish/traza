@@ -46,7 +46,7 @@ fn tenant_span(tenant: &str, trace: &str, id: &str, name: &str, attributes: Valu
         "attributes": attributes,
     });
     if !tenant.is_empty() {
-        value["tenant"] = json!(tenant);
+        value["$tenant"] = json!(tenant);
     }
     serde_json::from_value(value).expect("span")
 }
@@ -593,7 +593,7 @@ fn bound_credentials_are_isolated_on_every_read_and_write_surface() {
         "POST",
         "/v1/spans",
         Some(&json!([{
-            "trace_id": "t1", "span_id": "s1", "tenant": "bigco",
+            "trace_id": "t1", "span_id": "s1", "$tenant": "bigco",
             "name": "bigco-op", "service": "svc",
             "start_time_ns": 1000u64, "end_time_ns": 2000u64,
         }])),
@@ -604,7 +604,7 @@ fn bound_credentials_are_isolated_on_every_read_and_write_surface() {
         "POST",
         "/v1/spans",
         Some(&json!([{
-            "trace_id": "tx", "span_id": "s1", "tenant": "bigco",
+            "trace_id": "tx", "span_id": "s1", "$tenant": "bigco",
             "name": "forged", "service": "svc",
             "start_time_ns": 1000u64, "end_time_ns": 2000u64,
         }])),
@@ -726,7 +726,7 @@ fn bound_credentials_are_isolated_on_every_read_and_write_surface() {
     let server = Server::spawn_with(&dir, Some(TOKENS), &[]);
     let (status, body) = server.request_as(Some("bigco-rw"), "GET", "/v1/traces/t1", None);
     assert_eq!(status, 200, "{body}");
-    assert_eq!(body["spans"][0]["tenant"], json!("bigco"));
+    assert_eq!(body["spans"][0]["$tenant"], json!("bigco"));
 }
 
 #[test]
@@ -756,7 +756,7 @@ fn otlp_ingest_reads_the_tenant_resource_attribute() {
     assert_eq!(status, 200);
     let spans = found["spans"].as_array().expect("spans");
     assert_eq!(spans.len(), 1);
-    assert_eq!(spans[0]["tenant"], json!("acme"));
+    assert_eq!(spans[0]["$tenant"], json!("acme"));
 
     // An INVALID tenant value refuses the export loudly — a misconfigured
     // exporter must hear it, not lose telemetry to a silent drop.
@@ -850,4 +850,251 @@ fn a_zero_tenant_ttl_is_an_exemption_not_a_fallthrough() {
         .get_trace_in(Some(""), "td")
         .expect("default")
         .is_empty());
+}
+
+// --------------------------------------------------------------- review round
+// Four findings against the merged milestone, each converted to a guard that
+// fails without its fix.
+
+#[test]
+fn a_legacy_top_level_tenant_field_is_client_data_not_identity() {
+    // Before tenancy, a top-level `tenant` was an unknown field that
+    // round-tripped through `Span::extra`. Reclassifying it as identity on an
+    // in-place upgrade made the record vanish from the default scope, miss
+    // tenant-indexed queries, and survive a whole-tenant erasure under a
+    // receipt that still said "erased". The reserved `$tenant` key is the
+    // discriminator the reviewer asked for: bytes predating it cannot carry
+    // it, so a bare `tenant` stays the client data it always was.
+    let dir = test_dir("legacy-tenant");
+    let store = Store::open(&dir, wal_config()).expect("opens");
+    let span: Span = serde_json::from_value(json!({
+        "trace_id": "t", "span_id": "s", "tenant": "acme",
+        "name": "op", "service": "svc",
+        "start_time_ns": 1u64, "end_time_ns": 2u64,
+    }))
+    .expect("span");
+    assert_eq!(span.tenant, "", "a bare `tenant` is not identity");
+    assert_eq!(
+        span.extra.get("tenant"),
+        Some(&json!("acme")),
+        "it survives as the client data it always was"
+    );
+    store.ingest(span).expect("ingests");
+    store.flush().expect("seals");
+    assert_eq!(
+        store.get_trace_in(Some(""), "t").expect("default").len(),
+        1,
+        "the span lives in the default scope, where its identity is"
+    );
+    assert!(
+        store
+            .get_trace_in(Some("acme"), "t")
+            .expect("acme")
+            .is_empty(),
+        "and never joins tenant `acme` on the strength of a value's shape"
+    );
+    // A whole-tenant `acme` erasure leaves it untouched — it was never
+    // acme's — and the receipt is honest because nothing of acme's existed.
+    let receipt = store
+        .erase(Subject::Tenant {
+            tenant: "acme".into(),
+        })
+        .expect("erases");
+    assert!(receipt.settle.is_some(), "the erasure settled");
+    let survivors = store.get_trace_in(Some(""), "t").expect("default");
+    assert_eq!(survivors.len(), 1, "the default-tenant span survives");
+    assert_eq!(
+        survivors[0].extra.get("tenant"),
+        Some(&json!("acme")),
+        "still carrying its client data verbatim"
+    );
+}
+
+#[test]
+fn a_pending_tenant_erasure_withholds_its_scoped_payload_bytes() {
+    // A whole-tenant erasure discovers its span-held references only as its
+    // purge walks them, so `payload_files` is still empty while the mask
+    // already hides the tenant. A scoped fetch must not race that gap: found
+    // a planted crash state served `payload_in(Some("acme"), ref)` the secret.
+    let dir = test_dir("pending-tenant-payload");
+    let config = Config {
+        payload_threshold: Some(64),
+        ..wal_config()
+    };
+    let secret = "acme confidential prompt body that offloads ".repeat(4);
+    let reference = {
+        let store = Store::open(&dir, config.clone()).expect("opens");
+        store
+            .ingest(tenant_span(
+                "acme",
+                "ta",
+                "s1",
+                "op",
+                json!({"prompt": secret}),
+            ))
+            .expect("ingests");
+        store.flush().expect("seals");
+        let reference = store.get_trace_in(Some("acme"), "ta").expect("trace")[0].attributes
+            ["prompt"]["$payload"]
+            .as_str()
+            .expect("offloaded")
+            .to_owned();
+        // With nothing pending, the tenant reaches its own bytes.
+        assert!(store
+            .payload_in(Some("acme"), &reference)
+            .expect("fetch")
+            .is_some());
+        reference
+    };
+    // Plant a PENDING acme tenant erasure — no settle, `payload_refs` not yet
+    // discovered — exactly as a crash before the purge leaves it.
+    let planted = json!({
+        "op": "erase", "schema": 2, "id": 1, "requested_unix_ns": 1,
+        "subject": {"kind": "tenant", "tenant": "acme"},
+        "span_keys": [], "payload_refs": [],
+    });
+    std::fs::write(dir.join("tombstones.jsonl"), format!("{planted}\n")).expect("plants");
+
+    let store = Store::open(&dir, config).expect("reopens");
+    assert!(
+        store
+            .payload_in(Some("acme"), &reference)
+            .expect("fetch")
+            .is_none(),
+        "a scoped fetch under a pending tenant erasure is withheld, \
+         whether or not the exact reference is enumerated yet"
+    );
+    // Settle: the purge accounts for the bytes and removes them.
+    assert_eq!(store.resume_erasures().expect("settles"), 1);
+    assert!(
+        store.payload(&reference).expect("fetch").is_none(),
+        "and the bytes are gone once it settles"
+    );
+}
+
+#[test]
+fn a_bound_tenants_empty_note_is_not_a_co_tenant_oracle() {
+    // The MCP overview's "nothing to search yet" note must follow THIS
+    // tenant's usage, never the store total. Keyed on `total_records` it
+    // appeared only on a globally empty store and vanished the moment any
+    // co-tenant ingested a span — a presence oracle across the very boundary
+    // the header above it is careful to respect.
+    let dir = test_dir("mcp-empty-note");
+    let store = Store::open(&dir, wal_config()).expect("opens");
+    // A co-tenant holds data; the bound acme caller holds none.
+    store
+        .ingest(tenant_span("bigco", "t", "s", "op", json!({})))
+        .expect("bigco");
+    let overview = |store: &Store| {
+        let server = traza::mcp::Server::new(store, traza::mcp::Limits::default(), false);
+        let acme = traza::mcp::Context {
+            access: traza::mcp::Access::Read,
+            tenant: Some("acme".to_owned()),
+            now_ns: traza::mcp::unix_nanos_now(),
+        };
+        let message = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "describe_store", "arguments": {}}
+        });
+        server.handle(&message, acme).expect("responds")["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text")
+            .to_owned()
+    };
+    assert!(
+        overview(&store).contains("no spans yet"),
+        "an empty bound tenant still sees the note though a co-tenant has data"
+    );
+    // Once acme has a span of its own, the note clears — and it never turned
+    // on whether bigco existed.
+    store
+        .ingest(tenant_span("acme", "ta", "sa", "op", json!({})))
+        .expect("acme");
+    assert!(
+        !overview(&store).contains("no spans yet"),
+        "and clears on the tenant's own first span"
+    );
+}
+
+#[test]
+fn a_default_tenant_scope_reaches_its_own_sealed_payload() {
+    // `span_to_record` writes no tenant posting for the default tenant (that
+    // is what keeps single-tenant stores byte-identical), so a probe that
+    // trusts the posting finds nothing for `Some("")`. A default-tenant
+    // payload was reachable while buffered and vanished the instant it sealed.
+    let dir = test_dir("default-tenant-payload");
+    let config = Config {
+        payload_threshold: Some(64),
+        ..wal_config()
+    };
+    let store = Store::open(&dir, config).expect("opens");
+    let body = "default tenant payload body that offloads ".repeat(4);
+    store
+        .ingest(tenant_span("", "t", "s", "op", json!({"prompt": body})))
+        .expect("ingests");
+    let reference = store.get_trace_in(Some(""), "t").expect("trace")[0].attributes["prompt"]
+        ["$payload"]
+        .as_str()
+        .expect("offloaded")
+        .to_owned();
+    assert!(
+        store
+            .payload_in(Some(""), &reference)
+            .expect("buffered")
+            .is_some(),
+        "reachable while buffered"
+    );
+    store.flush().expect("seals");
+    assert!(
+        store
+            .payload_in(Some(""), &reference)
+            .expect("sealed")
+            .is_some(),
+        "and still reachable after the seal — the probe scans, it does not \
+         trust an index the default tenant never writes"
+    );
+}
+
+#[test]
+fn the_reserved_tenant_key_is_forgiven_on_closed_schemas() {
+    // A span needs `$tenant` because its top-level namespace is open. The
+    // closed schemas — annotation, erasure subject, dataset body — key the
+    // tenant as plain `tenant`, but must also accept `$tenant`, or a client
+    // that learned the span's spelling silently misroutes to the default
+    // tenant: a score invisible to its owner, or worse, an erasure aimed at
+    // the wrong tenant. Both spellings route to the same identity.
+    let annotation: traza::annotations::Annotation = serde_json::from_value(json!({
+        "trace_id": "t", "span_id": "s", "$tenant": "acme",
+        "name": "quality", "value": 1,
+    }))
+    .expect("annotation");
+    assert_eq!(
+        annotation.tenant, "acme",
+        "an annotation's $tenant is identity"
+    );
+
+    match serde_json::from_value::<Subject>(json!({
+        "kind": "trace", "trace_id": "t", "$tenant": "acme",
+    }))
+    .expect("subject")
+    {
+        Subject::Trace { tenant, .. } => assert_eq!(tenant, "acme"),
+        other => panic!("wrong subject: {other:?}"),
+    }
+    assert!(
+        matches!(
+            serde_json::from_value::<Subject>(json!({"kind": "tenant", "$tenant": "acme"}))
+                .expect("tenant subject"),
+            Subject::Tenant { tenant } if tenant == "acme"
+        ),
+        "a whole-tenant erasure spelled $tenant erases that tenant, not the default"
+    );
+    // The alias adds a spelling, it never removes the plain one.
+    assert!(matches!(
+        serde_json::from_value::<Subject>(json!({
+            "kind": "session", "session_id": "sess", "tenant": "bigco",
+        }))
+        .expect("plain"),
+        Subject::Session { tenant, .. } if tenant == "bigco"
+    ));
 }

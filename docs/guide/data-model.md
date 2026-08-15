@@ -25,12 +25,21 @@ token rollups, waterfalls — is derived from spans at read time.
 have no defaults — omitting one is a `400` naming the missing field. The rest
 default as shown.
 
-A span may also carry a top-level `tenant` — lowercase
+A span may also carry a top-level `$tenant` — lowercase
 `[a-z0-9][a-z0-9._-]`, at most 64 bytes. Omitted or empty means the DEFAULT
 tenant, and an empty tenant is never serialized back, so a store that never
 uses tenants writes files with no tenant bytes in them at all. A credential
 bound to a tenant (see [administration](../operations/administration.md))
 stamps it for you and refuses a contradiction.
+
+The `$` sigil is load-bearing, not decoration. A span's top-level namespace is
+open — any unknown field survives in the round trip (see below) — so a bare
+`tenant` key is *your* data and stays your data, exactly as it was before the
+identity existed. Reserving `$tenant`, the way payload references reserve
+`$payload`, is what lets a store written before tenancy be read after it
+without a value ever being mistaken for an identity. A bare `tenant` you send
+is preserved verbatim and is never an identity; put a value you mean as
+identity under `$tenant`, or let a bound credential supply it.
 
 ### Timestamps
 
@@ -183,9 +192,15 @@ are set (exactly one shape must hold):
   **score**: it addresses the `(experiment, example, span)` tuple the eval
   model needs (see below).
 
-Every annotation also carries a `tenant` like a span does. They are returned
-alongside a trace by `GET /v1/traces/{trace_id}` and queried directly at
-`GET /v1/annotations`. See the [API reference](http-api.md#post-v1annotations).
+Every annotation is tenant-scoped like a span, but its identity key is plain
+`tenant`, not `$tenant`: an annotation is a closed record with no open
+namespace to protect, so there is nothing for the sigil to disambiguate.
+`$tenant` is accepted here too, so a client that learned the span's spelling
+routes correctly rather than silently landing in the default tenant. The same
+holds for the erasure subject's `tenant` and a dataset's `tenant`. Annotations
+are returned alongside a trace by `GET /v1/traces/{trace_id}` and queried
+directly at `GET /v1/annotations`. See the
+[API reference](http-api.md#post-v1annotations).
 
 ## Eval entities
 

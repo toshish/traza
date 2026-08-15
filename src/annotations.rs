@@ -45,8 +45,11 @@ pub struct Annotation {
     pub span_id: String,
     /// The tenant this annotation belongs to; empty is the default tenant.
     /// Scoped exactly like span identity — reads filter on it, erasure dooms
-    /// by it.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    /// by it. Accepts `$tenant` too, so a client that learned the span's
+    /// reserved key cannot silently misroute a score to the default tenant by
+    /// spelling it that way here; a closed schema has no ambiguity to protect
+    /// against, only a keystroke to forgive.
+    #[serde(alias = "$tenant", default, skip_serializing_if = "String::is_empty")]
     pub tenant: String,
     /// Session-subject address: the recognized session id being judged as a
     /// whole. Mutually exclusive with the other subject shapes.
