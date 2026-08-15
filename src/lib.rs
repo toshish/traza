@@ -994,6 +994,18 @@ struct Segment {
     path: PathBuf,
     bytes: u64,
     seg: Box<segment::Segment>,
+    /// FNV-1a hashes of every primary key in this segment, computed on first
+    /// use and kept for the segment's lifetime — the supersede prefilter (see
+    /// [`superseded_by_newer`]).
+    ///
+    /// Per-instance rather than in the store-level rollup cache because an
+    /// instance IS one immutable generation of the file: a pinned reader can
+    /// outlive a TTL rewrite of its path, and a set bound to the instance
+    /// cannot be served for the wrong generation. Index-scale on purpose —
+    /// eight bytes per distinct key, the same size story as the sidecar it is
+    /// loaded from — where the full rollup this duplicates a corner of is
+    /// counter-heavy and stays in the evictable cache.
+    key_hashes: std::sync::OnceLock<std::collections::HashSet<u64>>,
 }
 
 fn canonical_value(value: &Value) -> String {
@@ -1215,6 +1227,37 @@ impl Segment {
             }
         }
         Ok(false)
+    }
+
+    /// The hash of every primary key this segment holds, built once per
+    /// segment lifetime: the prefilter in front of [`Self::contains_key`].
+    ///
+    /// Loaded from the rollup sidecar when one matches this generation of the
+    /// file; a segment without one — a pre-sidecar store, a sidecar lost to a
+    /// crash — is decoded once and heals its sidecar in passing, exactly as
+    /// `Store::segment_rollup` does. The decode's spans are dropped: what is
+    /// retained is eight bytes per distinct key, never payloads.
+    ///
+    /// The contract callers lean on: a key present in this segment is
+    /// GUARANTEED to have its hash here, because both sources fold the hash of
+    /// every stored span. A membership miss is therefore proof of absence; a
+    /// hit proves nothing and must be confirmed against the records.
+    fn key_hashes(&self) -> Result<&std::collections::HashSet<u64>> {
+        if let Some(hashes) = self.key_hashes.get() {
+            return Ok(hashes);
+        }
+        let binding = self.rollup_binding();
+        let rollup = match rollup_file::load(&self.path, binding) {
+            Some(rollup) => rollup,
+            None => {
+                let rollup = analytics::SegmentRollup::build(&self.spans_parsed()?);
+                let _ = rollup_file::store(&self.path, binding, &rollup);
+                rollup
+            }
+        };
+        // Two readers may race the build; first `set` wins and both answers
+        // are identical, so the loser's work is discarded, not wrong.
+        Ok(self.key_hashes.get_or_init(|| rollup.key_hashes))
     }
 
     /// Full parse — the rewrite/inspection path, never the query path.
@@ -2719,6 +2762,40 @@ pub(crate) fn attribute_union_view(
     Ok(result)
 }
 
+/// Whether any segment after `position` holds `span`'s primary key — the
+/// last-write-wins test every read path applies to a segment candidate.
+///
+/// Prefiltered through each newer segment's key-hash set, ported from the
+/// analytics fold's exact path: a set miss is proof the key was never written
+/// there, so only a hit — a real supersede or an FNV collision — pays the
+/// exact probe. Without the prefilter every emitted span probed the trace
+/// index of every newer segment, and `contains_key` decodes the candidate's
+/// whole trace in each one, so a store carrying many superseded versions (a
+/// crash-recovered store before its first compaction is the canonical case)
+/// answered in matches × segments × trace-width decodes.
+///
+/// The probe on a hit is not optional (see invariant 7, "an index accelerates
+/// a filter; it never changes it"): dropping a span on hash membership alone
+/// would let a collision delete a live row.
+fn superseded_by_newer(
+    segments: &[std::sync::Arc<Segment>],
+    position: usize,
+    span: &Span,
+    metrics: &metrics::Metrics,
+) -> Result<bool> {
+    let hash = analytics::key_hash(&span.tenant, &span.trace_id, &span.span_id);
+    for newer in segments.iter().skip(position + 1) {
+        if !newer.key_hashes()?.contains(&hash) {
+            continue;
+        }
+        metrics.supersede_probes.increment();
+        if newer.contains_key(&span.tenant, &span.trace_id, &span.span_id)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Resolves `filter` (and an optional `cursor`) over one buffer and segment
 /// set, under Traza's primary-key precedence: the buffer wins, then the newest
 /// segment.
@@ -2956,19 +3033,7 @@ pub(crate) fn query_view_costed(
                         segment_position, ..
                     } => {
                         writer.contains_key(&span.tenant, &span.trace_id, &span.span_id)
-                            || segments
-                                .iter()
-                                .skip(segment_position + 1)
-                                .map(|segment| {
-                                    segment.contains_key(
-                                        &span.tenant,
-                                        &span.trace_id,
-                                        &span.span_id,
-                                    )
-                                })
-                                .collect::<Result<Vec<_>>>()?
-                                .into_iter()
-                                .any(|contains| contains)
+                            || superseded_by_newer(segments, *segment_position, &span, metrics)?
                     }
                 };
                 if !superseded {
@@ -3021,14 +3086,7 @@ pub(crate) fn query_view_costed(
                 if writer.contains_key(&span.tenant, &span.trace_id, &span.span_id) {
                     continue; // the buffer holds a newer version
                 }
-                let mut superseded = false;
-                for newer in segments.iter().skip(position + 1) {
-                    if newer.contains_key(&span.tenant, &span.trace_id, &span.span_id)? {
-                        superseded = true;
-                        break;
-                    }
-                }
-                if !superseded {
+                if !superseded_by_newer(segments, position, &span, metrics)? {
                     result.push(span);
                 }
             }
@@ -3106,14 +3164,7 @@ pub(crate) fn fold_view(
             if writer.contains_key(&span.tenant, &span.trace_id, &span.span_id) {
                 continue; // the buffer holds a newer version
             }
-            let mut superseded = false;
-            for newer in segments.iter().skip(position + 1) {
-                if newer.contains_key(&span.tenant, &span.trace_id, &span.span_id)? {
-                    superseded = true;
-                    break;
-                }
-            }
-            if !superseded {
+            if !superseded_by_newer(segments, position, &span, metrics)? {
                 visit(&span);
             }
         }
@@ -6779,6 +6830,7 @@ impl Store {
                 path: final_path.to_path_buf(),
                 bytes,
                 seg,
+                key_hashes: std::sync::OnceLock::new(),
             };
             // Write the rollup sidecar now, while the spans are still in hand.
             //
@@ -7443,6 +7495,7 @@ fn load_segments(directory: &Path) -> Result<Vec<std::sync::Arc<Segment>>> {
             path,
             bytes: bytes_meta,
             seg,
+            key_hashes: std::sync::OnceLock::new(),
         }));
     }
     Ok(segments)

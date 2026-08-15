@@ -1187,3 +1187,171 @@ fn a_genuinely_offloaded_value_still_indexes_only_its_preview() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// A version of one primary key under the one trace every version shares —
+/// the upsert corpus below is a single long trace being rewritten, which is
+/// what makes an unprefiltered supersede probe expensive: probing a key
+/// decodes its trace's whole slice of the probed segment.
+fn upsert_span(span_id: &str, name: &str, start_ns: u64) -> Span {
+    serde_json::from_value(json!({
+        "trace_id": "upsert-trace",
+        "span_id": span_id,
+        "name": name,
+        "service": "svc",
+        "start_time_ns": start_ns,
+        "end_time_ns": start_ns + 10,
+        "attributes": {},
+    }))
+    .expect("span")
+}
+
+#[test]
+fn a_duplicate_heavy_store_probes_only_keys_a_newer_segment_actually_holds() {
+    // The shape a crash leaves behind: until compaction runs, a recovered
+    // store carries every superseded version of its hot keys. Resolving
+    // last-write-wins used to probe every newer segment for every candidate,
+    // so exactly the store that most needs its first queries to be cheap paid
+    // matches × segments × trace-width decodes for them. The key-hash
+    // prefilter bounds that: a candidate pays an exact probe only where a
+    // newer segment provably holds its key.
+    //
+    // Results alone cannot prove the bound — with or without the prefilter a
+    // query returns the same rows — so each path is held to the probe
+    // counter, the same way the pruning tests hold segment skipping to
+    // theirs.
+    const SEGMENTS: usize = 12;
+    const STABLE: usize = 40;
+    const HOT: usize = 6;
+    // One exact probe per superseded version actually present: each old hot
+    // version is confirmed dead by the first newer segment holding its key,
+    // and the stable spans no later segment ever rewrote cost nothing.
+    // Without the prefilter the stable spans alone pay STABLE probes per
+    // pair of segments — 2,640 here, forty times this — and every one of
+    // them decodes trace records to learn nothing.
+    const CONFIRMING_PROBES: u64 = (HOT * (SEGMENTS - 1)) as u64;
+
+    let (store, dir) = store("supersede-prefilter");
+    for round in 0..SEGMENTS {
+        let base = 1_000_000 * (round as u64 + 1);
+        for item in 0..STABLE {
+            let id = format!("stable-{round}-{item}");
+            store
+                .ingest(upsert_span(&id, "settled", base + item as u64))
+                .expect("ingest");
+        }
+        for key in 0..HOT {
+            let id = format!("hot-{key}");
+            let version = format!("v{round}");
+            store
+                .ingest(upsert_span(&id, &version, base + (STABLE + key) as u64))
+                .expect("ingest");
+        }
+        store.flush().expect("flush seals one segment per round");
+    }
+
+    let expect_resolved = |spans: &[Span], label: &str| {
+        assert_eq!(
+            spans.len(),
+            SEGMENTS * STABLE + HOT,
+            "{label}: every stable span, and each hot key exactly once"
+        );
+        let hot: Vec<&Span> = spans
+            .iter()
+            .filter(|span| span.span_id.starts_with("hot-"))
+            .collect();
+        assert_eq!(hot.len(), HOT, "{label}: one survivor per hot key");
+        for span in hot {
+            assert_eq!(
+                span.name,
+                format!("v{}", SEGMENTS - 1),
+                "{label}: {} must resolve to its newest version",
+                span.span_id
+            );
+        }
+    };
+
+    // The unlimited search path.
+    let before = store.metrics().supersede_probes.get();
+    let all = store.query(&SpanFilter::default()).expect("query");
+    expect_resolved(&all, "unlimited");
+    assert_eq!(
+        store.metrics().supersede_probes.get() - before,
+        CONFIRMING_PROBES,
+        "an unlimited query probes once per superseded version, not per \
+         candidate × segment"
+    );
+
+    // The limited path: same rows, same bound.
+    let before = store.metrics().supersede_probes.get();
+    let paged = store
+        .query(&SpanFilter {
+            limit: Some(10_000),
+            ..SpanFilter::default()
+        })
+        .expect("query");
+    expect_resolved(&paged, "limited");
+    assert_eq!(
+        store.metrics().supersede_probes.get() - before,
+        CONFIRMING_PROBES,
+        "the limited path is held to the same probe bound"
+    );
+
+    // The fold behind every aggregation route.
+    let before = store.metrics().supersede_probes.get();
+    let mut folded: Vec<Span> = Vec::new();
+    store
+        .fold_spans(&SpanFilter::default(), |span| folded.push(span.clone()))
+        .expect("fold");
+    expect_resolved(&folded, "fold");
+    assert_eq!(
+        store.metrics().supersede_probes.get() - before,
+        CONFIRMING_PROBES,
+        "the fold is held to the same probe bound"
+    );
+
+    // A store that lost its rollup sidecars — the other thing a crash can
+    // take — answers identically: the prefilter rebuilds from the segments
+    // themselves and heals the sidecars in passing for the next reader.
+    drop(store);
+    let mut removed = 0;
+    for entry in std::fs::read_dir(&dir).expect("read dir") {
+        let path = entry.expect("entry").path();
+        if path.extension().and_then(|extension| extension.to_str()) == Some("rollup") {
+            std::fs::remove_file(&path).expect("remove sidecar");
+            removed += 1;
+        }
+    }
+    assert_eq!(removed, SEGMENTS, "every seal left a sidecar to lose");
+
+    let store = Store::open(
+        &dir,
+        Config {
+            durability: traza::Durability::Buffered,
+            compaction: None,
+            ..Config::default()
+        },
+    )
+    .expect("reopens");
+    let before = store.metrics().supersede_probes.get();
+    let all = store.query(&SpanFilter::default()).expect("query");
+    expect_resolved(&all, "after sidecar loss");
+    assert_eq!(
+        store.metrics().supersede_probes.get() - before,
+        CONFIRMING_PROBES,
+        "a sidecar-less store pays a one-time rebuild, never extra probes"
+    );
+    let healed = std::fs::read_dir(&dir)
+        .expect("read dir")
+        .filter(|entry| {
+            entry.as_ref().is_ok_and(|entry| {
+                entry.path().extension().and_then(|e| e.to_str()) == Some("rollup")
+            })
+        })
+        .count();
+    // Every segment the queries consulted healed its sidecar. The OLDEST
+    // segment is the one exception, and deliberately: candidates are only
+    // ever probed against NEWER segments, nothing is older than the oldest,
+    // so the lazy build never pays for a set no probe can ask about.
+    assert_eq!(healed, SEGMENTS - 1, "the rebuild healed what it consulted");
+    let _ = std::fs::remove_dir_all(dir);
+}

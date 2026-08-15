@@ -459,7 +459,7 @@ impl SegmentRollup {
 /// of the hash depend on the value being hashed. Persisted key-hash sets are
 /// invalidated by the rollup sidecar's SCHEMA_VERSION, which was bumped for
 /// exactly this change.
-fn key_hash(tenant: &str, trace_id: &str, span_id: &str) -> u64 {
+pub(crate) fn key_hash(tenant: &str, trace_id: &str, span_id: &str) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in tenant
         .as_bytes()
@@ -970,6 +970,7 @@ impl Store {
                             if found {
                                 Ok(true)
                             } else {
+                                self.metrics.supersede_probes.increment();
                                 newer.contains_key(&span.tenant, &span.trace_id, &span.span_id)
                             }
                         })?;

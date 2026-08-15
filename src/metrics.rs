@@ -323,6 +323,16 @@ pub struct Metrics {
     /// `segments_pruned_by_time` is how much of the store a time filter is
     /// actually eliminating.
     pub segments_examined: Counter,
+    /// Exact primary-key probes into a newer segment while resolving
+    /// last-write-wins — the reads the key-hash prefilter could not rule out.
+    ///
+    /// Exposed because the prefilter is invisible from results alone: with it
+    /// or without it a query returns the same rows, only the second decodes
+    /// candidate traces in every newer segment to do so. A healthy store pays
+    /// roughly one probe per superseded version it actually holds; a number
+    /// near matches × segments means the prefilter has stopped working and
+    /// every query is re-reading the store to prove keys were never replaced.
+    pub supersede_probes: Counter,
     /// Segments TTL expiry ruled out without decoding them, because the
     /// rollup's end-time range put the whole segment on one side of the
     /// cutoff.
@@ -384,7 +394,7 @@ impl Metrics {
     pub fn render_prometheus(&self, into: &mut String) {
         use std::fmt::Write as _;
 
-        let counters: [(&str, &Counter); 18] = [
+        let counters: [(&str, &Counter); 19] = [
             ("traza_spans_admitted_total", &self.spans_admitted),
             ("traza_batches_admitted_total", &self.batches_admitted),
             ("traza_wal_commits_total", &self.wal_commits),
@@ -408,6 +418,7 @@ impl Metrics {
                 &self.records_admitted_by_content,
             ),
             ("traza_segments_examined_total", &self.segments_examined),
+            ("traza_supersede_probes_total", &self.supersede_probes),
             (
                 "traza_expiry_segments_skipped_total",
                 &self.expiry_segments_skipped,
