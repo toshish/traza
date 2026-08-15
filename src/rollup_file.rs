@@ -85,7 +85,17 @@ const FORMAT_VERSION: u16 = 3;
 ///
 /// v2: `key_hashes` are FNV-1a over `(tenant, trace, span)` — a v1 hash set
 /// computed over the pair would let the supersede prefilter miss.
-const SCHEMA_VERSION: u32 = 2;
+///
+/// v3: same hash, different DOMAIN. Reserving `$tenant` made a bare `tenant`
+/// field client data, so a record that carried its identity there decodes as
+/// the default tenant now — and a v2 sidecar written before that change
+/// hashed the old decoding. The hashes are the dangerous half of such a
+/// sidecar: the supersede prefilter treats a membership miss as proof of
+/// absence, so a set hashed under the wrong domain does not slow a query
+/// down, it resurrects a superseded span. A hash set is only evidence under
+/// the decoding it was computed with; when the decoding moves, this number
+/// moves with it.
+const SCHEMA_VERSION: u32 = 3;
 
 /// Extension of the sidecar written beside `segment-<id>.seg`.
 const ROLLUP_SUFFIX: &str = "rollup";
