@@ -1152,7 +1152,7 @@ fn record_to_span(record: &segment::Record) -> Result<Span> {
 /// records, log replay) route such values back where they always lived, so
 /// the identity field only ever holds what validation admits. The empty
 /// check makes this free for every store that never hit the collision.
-fn normalize_decoded_tenant(span: &mut Span) {
+pub(crate) fn normalize_decoded_tenant(span: &mut Span) {
     if span.tenant.is_empty() || valid_tenant(&span.tenant) {
         return;
     }
@@ -5222,8 +5222,17 @@ impl Store {
             )?
         };
         let settle = self.complete_erasure(&record)?;
+        // Re-read so the caller sees the record as the log now holds it —
+        // a tenant subject's payload refs were NOTED during the purge, not
+        // recorded at begin, and the receipt (and any caller) should see
+        // the complete accounting.
+        let erase = self
+            .erasures
+            .get(record.id)?
+            .map(|status| status.erase)
+            .unwrap_or(record);
         Ok(erasure::ErasureStatus {
-            erase: record,
+            erase,
             settle: Some(settle),
         })
     }
@@ -5315,6 +5324,14 @@ impl Store {
             erasure::Subject::Payload { reference } => {
                 refs.insert(reference.clone());
             }
+            // A tenant subject records NO payload refs at begin: enumerating
+            // them is a corpus fold, and a fold under the gate's write half
+            // would stall every tenant's ingest for its duration. They are
+            // resolved instead in `complete_erasure`, under the maintenance
+            // lock with the gate released — where the mask has already
+            // frozen the tenant's spans, so the set is complete and stable —
+            // and durably NOTED so a resumed erasure can still reconstruct
+            // the payload sweep after a crash.
             erasure::Subject::Tenant { .. } => {}
             _ => {
                 for span in &spans {
@@ -5338,6 +5355,40 @@ impl Store {
         let (purge, annotations_removed, eval_records_removed, payloads_removed, payloads_retained) = {
             // One rewriter at a time, same as compaction and expiry.
             let _maintenance = self.lock_maintenance()?;
+
+            // A tenant subject's payload refs are resolved HERE, not at
+            // begin: the mask (installed at begin) has already frozen the
+            // tenant's spans, so a fold now sees a complete, stable set, and
+            // the gate is released so no other tenant's ingest is blocked by
+            // it. The refs are noted durably BEFORE the purge removes the
+            // spans and bodies that carry them — that is what lets a resume
+            // after a crash mid-purge still reconstruct which bytes to
+            // unlink, from the intent record alone.
+            if let erasure::Subject::Tenant { tenant } = subject {
+                let mut refs: std::collections::HashSet<String> =
+                    record.payload_refs.iter().cloned().collect();
+                let view = self.snapshot()?;
+                let scoped = SpanFilter {
+                    tenant: Some(tenant.clone()),
+                    ..SpanFilter::default()
+                };
+                view.fold(&scoped, &mut QueryCost::default(), &mut |span| {
+                    erasure::payload_refs_of(span, &mut refs);
+                })?;
+                refs.extend(self.evals.tenant_payload_refs(tenant)?);
+                let mut refs: Vec<String> = refs.into_iter().collect();
+                refs.sort();
+                self.erasures.note_payload_refs(record.id, refs)?;
+            }
+            // Re-read the record so the notes just written (and any from a
+            // prior interrupted pass) are in `record.payload_refs` — the
+            // durable source the doomed set derives from.
+            let record = self
+                .erasures
+                .get(record.id)?
+                .map(|status| status.erase)
+                .unwrap_or_else(|| record.clone());
+            let record = &record;
             let purge = self.purge_subject_locked(subject)?;
 
             let annotations_removed = self.drop_annotations_for(subject, &purge.keys)?;
@@ -5606,9 +5657,22 @@ impl Store {
                 self.annotations
                     .drop_for_subject(keys, None, None, Some(tenant))
             }
-            erasure::Subject::Span { .. } if keys.is_empty() => Ok(0),
-            erasure::Subject::Span { .. } => {
-                self.annotations.drop_for_subject(keys, None, None, None)
+            // The span's OWN key, always — not only the keys the purge
+            // resolved. A span-addressed score (a run's judgment) survives
+            // its span's TTL expiry, so by the time the span is erased it
+            // may be absent from the corpus and resolve to no keys; dropping
+            // only resolved keys then left the score forever, and the
+            // receipt read `holds-data` with no way to clear it.
+            erasure::Subject::Span {
+                trace_id,
+                span_id,
+                tenant,
+            } => {
+                let mut with_subject: std::collections::HashSet<(String, String, String)> =
+                    keys.clone();
+                with_subject.insert((tenant.clone(), trace_id.clone(), span_id.clone()));
+                self.annotations
+                    .drop_for_subject(&with_subject, None, None, None)
             }
         }
     }
@@ -5920,11 +5984,25 @@ impl Store {
         let mut domains: Vec<erasure::DomainReport> = Vec::new();
         let mut clean = status.settle.is_some();
 
+        // A tenant subject records no span keys (its coverage is a
+        // predicate, not a list), so `classify_matches` against an empty
+        // erased-key set would call every resident tenant span new activity
+        // and the span domains could never fail. The erasure's request time
+        // is the discriminator instead: a matching span that STARTED before
+        // the erasure was requested is a survivor the purge should have
+        // removed — a failure — while one that started after is post-settle
+        // new activity, a barrier not a ban. `None` for every other subject,
+        // which keys on the recorded set as before.
+        let tenant_cut = match subject {
+            erasure::Subject::Tenant { .. } => Some(record.requested_unix_ns),
+            _ => None,
+        };
+
         // ---- write buffer -------------------------------------------------
         {
-            let matches: Vec<(String, String, String)> = {
+            let (matches, tenant_survivors): (Vec<(String, String, String)>, usize) = {
                 let writer = self.lock_writer()?;
-                writer
+                let matching: Vec<&std::sync::Arc<Span>> = writer
                     .spans
                     .iter()
                     .filter(|span| match subject {
@@ -5933,18 +6011,30 @@ impl Store {
                         }
                         _ => subject.action(span) != erasure::Action::Keep,
                     })
-                    .map(|span| {
-                        (
-                            span.tenant.clone(),
-                            span.trace_id.clone(),
-                            span.span_id.clone(),
-                        )
-                    })
-                    .collect()
+                    .collect();
+                let survivors = tenant_cut.map_or(0, |cut| {
+                    matching
+                        .iter()
+                        .filter(|span| span.start_time_ns < cut)
+                        .count()
+                });
+                (
+                    matching
+                        .iter()
+                        .map(|span| {
+                            (
+                                span.tenant.clone(),
+                                span.trace_id.clone(),
+                                span.span_id.clone(),
+                            )
+                        })
+                        .collect(),
+                    survivors,
+                )
             };
             let held = matches.len();
             let classes = erasure::classify_matches(&erased_keys, matches);
-            clean &= classes.re_delivered == 0;
+            clean &= classes.re_delivered == 0 && tenant_survivors == 0;
             let mut report = erasure::DomainReport::clear(
                 "write-buffer",
                 match held {
@@ -5952,9 +6042,9 @@ impl Store {
                     found => format!("{found} buffered span(s) match the subject"),
                 },
             );
-            report.re_delivered = classes.re_delivered;
+            report.re_delivered = classes.re_delivered + tenant_survivors;
             report.new_activity = classes.new_activity;
-            if classes.re_delivered > 0 {
+            if classes.re_delivered > 0 || tenant_survivors > 0 {
                 report.result = "holds-data".to_owned();
             }
             domains.push(report);
@@ -6014,12 +6104,33 @@ impl Store {
             let pinned = self.pin_segments()?;
             let mut all_matches: Vec<(String, String, String)> = Vec::new();
             let mut unredacted = 0usize;
+            let mut tenant_survivors = 0usize;
             for segment in &pinned {
                 if !self.segment_may_hold_subject(segment, subject)? {
                     continue;
                 }
                 let keys = Self::subject_keys_in_segment(&segment.seg, subject)?;
                 unredacted += keys.len();
+                // The same request-time survivor check the buffer applies —
+                // a tenant subject has no recorded keys to classify against.
+                if let Some(cut) = tenant_cut {
+                    for offset in segment
+                        .seg
+                        .attribute_candidate_offsets(IDX_TENANT, subject.tenant().unwrap_or(""))
+                        .to_vec()
+                    {
+                        let record = segment
+                            .seg
+                            .record_at_offset(offset)
+                            .map_err(segment_error)?;
+                        let span = record_to_span(&record)?;
+                        if Some(span.tenant.as_str()) == subject.tenant()
+                            && span.start_time_ns < cut
+                        {
+                            tenant_survivors += 1;
+                        }
+                    }
+                }
                 all_matches.extend(keys);
             }
             let classes = erasure::classify_matches(&erased_keys, all_matches);
@@ -6030,7 +6141,7 @@ impl Store {
             // is post-settle data, and it must not read as `erased` while
             // buffered and `incomplete` the moment a seal moves it into a
             // segment. The buffer above already applies exactly this rule.
-            let failing = classes.re_delivered > 0;
+            let failing = classes.re_delivered > 0 || tenant_survivors > 0;
             clean &= !failing;
             let mut report = erasure::DomainReport::clear(
                 "segments",
@@ -6043,7 +6154,7 @@ impl Store {
                     }
                 ),
             );
-            report.re_delivered = classes.re_delivered;
+            report.re_delivered = classes.re_delivered + tenant_survivors;
             report.new_activity = classes.new_activity;
             if failing {
                 report.result = "holds-data".to_owned();
@@ -6224,11 +6335,10 @@ impl Store {
         {
             let mut items: Vec<String> = Vec::new();
             let mut failing = false;
-            // The references to account for: what resolution recorded, PLUS
-            // every disposition the settle recorded. The union matters most
-            // for a tenant subject, whose resolve-time list is deliberately
-            // empty (its refs are collected during the purge) — without the
-            // settle's lists this domain would verify nothing and a shared
+            // The references to account for: what the intent record holds
+            // (a tenant subject's are noted into it during the purge, so by
+            // verify time they are present), PLUS every disposition the
+            // settle recorded — without the settle's lists a shared
             // payload's retention would go unnamed in the receipt.
             let mut accountable: Vec<String> = record.payload_refs.clone();
             if let Some(settle) = &status.settle {

@@ -417,8 +417,10 @@ pub struct EraseRecord {
     pub span_keys: Vec<(String, String, String)>,
     /// Payload references the covered spans carried (or, for a payload
     /// subject, the reference itself) — the set whose files the purge must
-    /// account for, one disposition each, in the settle record. Empty for
-    /// tenant subjects, whose refs the purge collects as it walks.
+    /// account for, one disposition each, in the settle record. A tenant
+    /// subject's refs are NOTED into this list during the purge rather than
+    /// resolved at begin (a corpus fold under the gate would stall ingest),
+    /// so a resumed erasure can still reconstruct the sweep.
     pub payload_refs: Vec<String>,
     /// Dataset ids a tenant subject erased — recorded so the receipt can
     /// tell an erased dataset resurfacing (impossible: ids are never reused)
@@ -527,6 +529,23 @@ impl SettleRecord {
     }
 }
 
+/// Additional payload references a pending erasure must account for,
+/// discovered AFTER its intent record but before its purge — the tenant
+/// subject's case, whose refs are resolved once the barrier has frozen the
+/// tenant (not at begin, which cannot afford a corpus fold under the gate).
+/// Recorded durably so a crash between the purge's span removal and the
+/// payload unlink leaves a resume that can still reconstruct which bytes to
+/// remove.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NoteRecord {
+    /// Record schema version.
+    pub schema: u32,
+    /// The erasure these references belong to.
+    pub id: u64,
+    /// The references to fold into that erasure's payload accounting.
+    pub payload_refs: Vec<String>,
+}
+
 /// One line of the tombstone log.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -535,6 +554,8 @@ enum LogRecord {
     Erase(EraseRecord),
     /// See [`SettleRecord`].
     Settle(SettleRecord),
+    /// See [`NoteRecord`].
+    Note(NoteRecord),
 }
 
 /// One erasure as the log currently knows it.
@@ -794,6 +815,14 @@ impl ErasureLog {
                         // be produced by a log manually spliced together, and
                         // dropping it is safer than inventing an intent.
                     }
+                    Ok(LogRecord::Note(note)) => {
+                        valid_len = valid_len.saturating_add(line.len() as u64);
+                        if let Some(entry) = inner.records.get_mut(&note.id) {
+                            entry.0.payload_refs.extend(note.payload_refs);
+                            entry.0.payload_refs.sort();
+                            entry.0.payload_refs.dedup();
+                        }
+                    }
                     Err(_) if lines.peek().is_none() && !terminated => {
                         let file = OpenOptions::new().write(true).open(&path)?;
                         file.set_len(valid_len)?;
@@ -896,6 +925,28 @@ impl ErasureLog {
             entry.1 = Some(settle);
         }
         inner.rebuild_mask();
+        Ok(())
+    }
+
+    /// Durably adds payload references to a pending erasure's accounting,
+    /// merging them into its intent record so a later `pending()` — after a
+    /// crash and resume — carries them. Idempotent: re-noting the same refs
+    /// re-appends a line the merge dedups.
+    pub(crate) fn note_payload_refs(&self, id: u64, payload_refs: Vec<String>) -> Result<()> {
+        if payload_refs.is_empty() {
+            return Ok(());
+        }
+        let mut inner = self.lock()?;
+        self.append_line(&LogRecord::Note(NoteRecord {
+            schema: SCHEMA,
+            id,
+            payload_refs: payload_refs.clone(),
+        }))?;
+        if let Some(entry) = inner.records.get_mut(&id) {
+            entry.0.payload_refs.extend(payload_refs);
+            entry.0.payload_refs.sort();
+            entry.0.payload_refs.dedup();
+        }
         Ok(())
     }
 

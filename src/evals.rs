@@ -1200,6 +1200,29 @@ impl EvalLog {
         Ok(self.lock()?.payload_refs.clone())
     }
 
+    /// Every `$payload` reference carried by any example a tenant's dataset
+    /// versions list — recorded into a tenant erasure so its payload sweep
+    /// is reconstructible on resume. Bounded by the tenant's distinct
+    /// promoted content.
+    pub(crate) fn tenant_payload_refs(&self, tenant: &str) -> Result<HashSet<String>> {
+        let state = self.lock()?;
+        let mut refs = HashSet::new();
+        for version in state.versions.values() {
+            if version.tenant != tenant {
+                continue;
+            }
+            for (_, digest) in &version.examples {
+                if let Some(example) = state.examples.get(digest) {
+                    collect_refs(
+                        &serde_json::to_value(&example.body).expect("body serializes"),
+                        &mut refs,
+                    );
+                }
+            }
+        }
+        Ok(refs)
+    }
+
     /// Whether any of `tenant`'s dataset versions lists an example whose
     /// body carries `reference` — the eval half of a bound principal's
     /// payload-fetch reachability proof.

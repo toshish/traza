@@ -313,7 +313,8 @@ impl Wal {
             if stamp > folded_through {
                 let batch = serde_json::from_slice::<Vec<Span>>(&payload)
                     .map_err(|error| corrupt(intact, &format!("does not decode: {error}")))?;
-                for span in batch {
+                for mut span in batch {
+                    crate::normalize_decoded_tenant(&mut span);
                     sink(span);
                 }
             }
@@ -379,7 +380,8 @@ impl Wal {
             }
             let batch = serde_json::from_slice::<Vec<Span>>(&payload)
                 .map_err(|error| corrupt(intact, &format!("does not decode: {error}")))?;
-            for span in batch {
+            for mut span in batch {
+                crate::normalize_decoded_tenant(&mut span);
                 sink(span);
             }
             intact += V1_HEADER_BYTES as u64 + u64::from(length);

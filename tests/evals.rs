@@ -1103,3 +1103,154 @@ fn tenant_erasure_reaches_payload_bytes_held_only_by_its_examples() {
         .expect("receipt");
     assert_eq!(receipt.result, "erased", "{}", receipt.render_text());
 }
+
+#[test]
+fn a_tenant_erasure_records_its_payload_refs_so_resume_can_sweep_them() {
+    // Review round 2, P1 (a defect the round-1 fix introduced): the doomed
+    // set for a tenant's example-held payloads came from purge_tenant's
+    // TRANSIENT return, so a crash after the eval-log rewrite (bodies gone)
+    // left resume_erasures unable to rediscover the orphan. The tenant's
+    // payload refs are now RECORDED at begin, so the doomed set is derivable
+    // from durable state alone — which is exactly what resume reads.
+    let dir = test_dir("record-tenant-payload");
+    let store = Store::open(&dir, wal_config()).expect("opens");
+    let content = "content held only through an example ".repeat(8);
+    store
+        .ingest(
+            serde_json::from_value(json!({
+                "trace_id": "ta", "span_id": "s1", "tenant": "acme",
+                "name": "op", "service": "svc",
+                "start_time_ns": 1000u64, "end_time_ns": 2000u64,
+                "attributes": {"prompt": content},
+            }))
+            .expect("span"),
+        )
+        .expect("ingests");
+    store.flush().expect("seals");
+    let reference = store.get_trace_in(Some("acme"), "ta").expect("trace")[0].attributes["prompt"]
+        ["$payload"]
+        .as_str()
+        .expect("offloaded")
+        .to_owned();
+    let dataset = store.create_dataset("acme", "curated").expect("dataset");
+    store
+        .create_dataset_version(
+            Some("acme"),
+            dataset,
+            None,
+            None,
+            vec![serde_json::from_value(json!({
+                "example_id": "e1",
+                "input": {"prompt": {"$payload": reference, "bytes": 9}},
+            }))
+            .expect("example")],
+        )
+        .expect("promotes");
+    // Erase the source trace so the payload's ONLY holder is the example.
+    store
+        .erase(traza::erasure::Subject::Trace {
+            trace_id: "ta".into(),
+            tenant: "acme".into(),
+        })
+        .expect("erases trace");
+    assert!(store.payload(&reference).expect("fetch").is_some());
+
+    // Now the tenant erasure. The DURABLE erase record must carry the
+    // example-only reference — that, not the transient purge output, is
+    // what a resumed erasure would sweep from.
+    let status = store
+        .erase(traza::erasure::Subject::Tenant {
+            tenant: "acme".into(),
+        })
+        .expect("erases tenant");
+    assert!(
+        status.erase.payload_refs.contains(&reference),
+        "the tenant erasure records the example-held reference: {:?}",
+        status.erase.payload_refs
+    );
+    assert!(
+        store.payload(&reference).expect("fetch").is_none(),
+        "and the live path swept it"
+    );
+
+    // And a resume of the settled erasure is a clean no-op (idempotent).
+    assert_eq!(store.resume_erasures().expect("resume"), 0);
+}
+
+#[test]
+fn erasing_a_span_drops_its_score_even_after_the_span_expired() {
+    // Review round 2, P2: a span-addressed score survives its span's TTL
+    // expiry (scores are TTL-exempt), so by erasure time the span resolves
+    // to no keys — and dropping only resolved keys left the score forever,
+    // with the receipt stuck at holds-data. The span's OWN key is always
+    // included now.
+    let dir = test_dir("span-score-after-expiry");
+    let store = Store::open(&dir, wal_config()).expect("opens");
+    let dataset = store.create_dataset("", "d").expect("dataset");
+    let outcome = store
+        .create_dataset_version(
+            None,
+            dataset,
+            None,
+            None,
+            vec![
+                serde_json::from_value(json!({"example_id": "e1", "input": "x"})).expect("example"),
+            ],
+        )
+        .expect("version");
+    let experiment = store
+        .create_experiment(None, dataset, &outcome.version_id, "exp", None)
+        .expect("experiment");
+    // A score addressed to a run span that never existed in the corpus
+    // (the run's trace already gone) — the exact shape of a score whose
+    // span the erasure will not resolve.
+    store
+        .annotate(
+            serde_json::from_value(json!({
+                "experiment_id": experiment, "example_id": "e1",
+                "trace_id": "run-1", "span_id": "sp-1",
+                "name": "accuracy", "value": 0.5,
+            }))
+            .expect("score"),
+        )
+        .expect("scores");
+    assert_eq!(
+        store
+            .experiment_scores(None, experiment, None)
+            .expect("scores")
+            .expect("present")
+            .len(),
+        1
+    );
+
+    // Erase the run's span. It resolves to no live span, but its score
+    // must still go, and the receipt must verify clean.
+    let status = store
+        .erase(traza::erasure::Subject::Span {
+            trace_id: "run-1".into(),
+            span_id: "sp-1".into(),
+            tenant: String::new(),
+        })
+        .expect("erases");
+    assert_eq!(status.settle.expect("settles").annotations_removed, 1);
+    assert!(
+        store
+            .experiment_scores(None, experiment, None)
+            .expect("scores")
+            .expect("present")
+            .is_empty(),
+        "the score is gone with its span"
+    );
+    let receipt = store.verify_erasure(status.erase.id).expect("receipt");
+    let annotations = receipt
+        .domains
+        .iter()
+        .find(|domain| domain.domain == "annotations")
+        .expect("annotations domain");
+    assert_eq!(
+        annotations.result,
+        "clear",
+        "no annotation addresses the erased span: {}",
+        receipt.render_text()
+    );
+}
