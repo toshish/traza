@@ -60,7 +60,7 @@ fn the_seeded_corpus_produces_no_phantom_runaways() {
     for (session, members) in &sessions {
         let diagnosis = diagnose(members, now, IDLE_NS, false);
         for finding in &diagnosis.findings {
-            if finding.shape.is_fault() {
+            if finding.shape.is_fault() && !session.starts_with("runaway-") {
                 faults.push(format!(
                     "session {session}: {:?} on {}/{} count={} errors={} trend={:?} depth={}",
                     finding.shape,
@@ -75,13 +75,14 @@ fn the_seeded_corpus_produces_no_phantom_runaways() {
         }
     }
 
-    // Every fault must be one the corpus deliberately models. The corpus has
-    // no runaway and no retry storm — its one retry is a single failure
-    // followed by one success, which is a retry, not a storm.
+    // Exactly one scenario in the corpus is a genuine fault, and it is the one
+    // built to be one. Everything else is ordinary agent traffic and the
+    // analysis must have nothing to say about it — the false-positive failure
+    // mode is the one that matters, because it spends the reader's belief in
+    // the finding that is real.
     assert!(
         faults.is_empty(),
-        "the analysis found faults in a corpus of healthy workloads, which is \
-         the false-positive failure mode that matters:\n{}",
+        "the analysis found faults in healthy workloads:\n{}",
         faults.join("\n")
     );
 }
@@ -154,4 +155,66 @@ fn every_session_reports_an_outcome_and_never_invents_a_success() {
         );
         assert_ne!(diagnosis.outcome.outcome, Outcome::Unknown);
     }
+}
+
+#[test]
+fn the_seeded_runaway_is_found_and_its_failing_step_named() {
+    // The scenario carries no marker saying it is the runaway: no declared
+    // outcome, no retry link, nothing but ordinary OpenLLMetry attributes.
+    // Everything asserted here has to be derived from that.
+    let spans = corpus();
+    let now = after(&spans);
+    let sessions = by_session(&spans);
+    let (session, members) = sessions
+        .iter()
+        .find(|(session, _)| session.starts_with("runaway-"))
+        .expect("the corpus seeds a runaway");
+    let diagnosis = diagnose(members, now, IDLE_NS, false);
+
+    assert_eq!(
+        diagnosis.outcome.outcome,
+        Outcome::Failure,
+        "session {session} ends on a failure"
+    );
+
+    // The reflection loop is found by context growth, which needs no content
+    // capture — only the token counts every pipeline reports.
+    let runaway = diagnosis
+        .findings
+        .iter()
+        .find(|finding| finding.shape == Shape::ContextRunaway)
+        .unwrap_or_else(|| panic!("a context runaway: {:#?}", diagnosis.findings));
+    assert_eq!(runaway.name, "agent.reflect");
+    assert!(runaway.count >= 5, "{runaway:?}");
+    assert!(
+        runaway.context_last.unwrap_or(0) > runaway.context_first.unwrap_or(0) * 2,
+        "the context more than doubled across the loop: {runaway:?}"
+    );
+
+    // The failing tool is found by failure density on the same trace.
+    let storm = diagnosis
+        .findings
+        .iter()
+        .find(|finding| finding.shape == Shape::RetryStorm)
+        .unwrap_or_else(|| panic!("a retry storm: {:#?}", diagnosis.findings));
+    assert_eq!(storm.name, "tool.web_search");
+
+    // The cause is the first search that failed — not the workflow root that
+    // merely inherited its failure, and not the last one.
+    let cause = diagnosis.cause.as_ref().expect("a cause");
+    assert_eq!(cause.name, "tool.web_search", "{cause:?}");
+    let expected = members
+        .iter()
+        .filter(|span| span.status == "error" && span.name == "tool.web_search")
+        .min_by_key(|span| span.start_time_ns)
+        .expect("a failing search");
+    assert_eq!(
+        cause.span.span_id, expected.span_id,
+        "the earliest failing leaf is the cause"
+    );
+    assert!(
+        cause.because.contains("without a failing child"),
+        "and it says why: {}",
+        cause.because
+    );
 }
