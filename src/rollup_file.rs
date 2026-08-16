@@ -106,7 +106,13 @@ const FORMAT_VERSION: u16 = 5;
 /// down, it resurrects a superseded span. A hash set is only evidence under
 /// the decoding it was computed with; when the decoding moves, this number
 /// moves with it.
-const SCHEMA_VERSION: u32 = 3;
+///
+/// v4: `payload_refs` now includes references carried on a span's LINKS. The
+/// set is the TTL sweep's protection set, so a v3 sidecar written before that
+/// walk existed omits any link-borne reference and the sweep would delete a
+/// blob a live span still points at — precisely the "quietly reports the old
+/// model's answer forever" failure this constant exists to stop.
+const SCHEMA_VERSION: u32 = 4;
 
 /// Extension of the sidecar written beside `segment-<id>.seg`.
 const ROLLUP_SUFFIX: &str = "rollup";

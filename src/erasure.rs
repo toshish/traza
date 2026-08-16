@@ -323,7 +323,7 @@ pub(crate) enum Action {
 /// makes a resumed erasure a no-op over work a prior pass finished.
 pub(crate) fn redact_payload(span: &mut Span, reference: &str) -> bool {
     let mut changed = false;
-    let mut redact_map = |attributes: &mut Map<String, Value>| {
+    for attributes in span.payload_maps_mut() {
         for value in attributes.values_mut() {
             let matches = value
                 .get(payload::PAYLOAD_KEY)
@@ -340,10 +340,6 @@ pub(crate) fn redact_payload(span: &mut Span, reference: &str) -> bool {
                 changed = true;
             }
         }
-    };
-    redact_map(&mut span.attributes);
-    for event in &mut span.events {
-        redact_map(&mut event.attributes);
     }
     changed
 }
@@ -353,7 +349,7 @@ pub(crate) fn redact_payload(span: &mut Span, reference: &str) -> bool {
 /// is the RECORD that content is gone; counting it as a reference would put
 /// the erased bytes back under protection.
 pub(crate) fn payload_refs_of(span: &Span, into: &mut HashSet<String>) {
-    let mut collect = |attributes: &Map<String, Value>| {
+    for attributes in span.payload_maps() {
         for value in attributes.values() {
             if value.get("erased").and_then(Value::as_bool) == Some(true) {
                 continue;
@@ -362,10 +358,6 @@ pub(crate) fn payload_refs_of(span: &Span, into: &mut HashSet<String>) {
                 into.insert(reference.to_owned());
             }
         }
-    };
-    collect(&span.attributes);
-    for event in &span.events {
-        collect(&event.attributes);
     }
 }
 
@@ -1233,11 +1225,8 @@ pub(crate) fn payload_unredacted(span: &Span, reference: &str) -> bool {
             .is_some_and(|held| held == reference)
             && value.get("erased").and_then(Value::as_bool) != Some(true)
     };
-    span.attributes.values().any(unredacted)
-        || span
-            .events
-            .iter()
-            .any(|event| event.attributes.values().any(unredacted))
+    span.payload_maps()
+        .any(|attributes| attributes.values().any(unredacted))
 }
 
 /// The pins directory's labels, for the receipt's pin walk.

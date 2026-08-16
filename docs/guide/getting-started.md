@@ -138,14 +138,15 @@ corpus over the API:
 ```
 
 ```
-seed: 393 spans (3/3 scale units)
-seed: posted 393 spans and 9 annotations to http://localhost:8080
+seed: 580 spans (3/3 scale units)
+seed: posted 580 spans and 9 annotations to http://localhost:8080
 ```
 
 The corpus is deliberately messy in the ways production is messy: three
 attribute dialects, tool-calling agent trees, multi-turn sessions, multimodal
-and oversized payloads, failures with linked retries, and ordinary non-LLM
-traffic. Raise `--scale` for more. `seed --data-dir DIR` writes through the
+and oversized payloads, failures with linked retries, a runaway agent that
+cannot make progress, a large healthy fan-out that must not be mistaken for
+one, and ordinary non-LLM traffic. Raise `--scale` for more. `seed --data-dir DIR` writes through the
 engine directly instead, which is faster but requires that no server is running
 against that directory — a data directory has exactly one writer.
 

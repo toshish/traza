@@ -35,7 +35,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::Serialize;
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 use crate::semconv::{self, LlmFacts};
 use crate::{Result, Span, Store};
@@ -498,7 +498,7 @@ impl SegmentRollup {
         self.max_end_ns = self.max_end_ns.max(span.end_time_ns);
         self.key_hashes
             .insert(key_hash(&span.tenant, &span.trace_id, &span.span_id));
-        collect_payload_refs(span, &mut self.payload_refs);
+        crate::erasure::payload_refs_of(span, &mut self.payload_refs);
         // One semconv scan, shared across every group this span joins.
         let facts = semconv::facts(&span.attributes).priced(pricing);
         if let Some(model) = &facts.model {
@@ -557,35 +557,6 @@ pub(crate) fn key_hash(tenant: &str, trace_id: &str, span_id: &str) -> u64 {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     hash
-}
-
-/// Collects `$payload` references from span and event attributes.
-///
-/// Redaction markers (`"erased": true`) are excluded, and the exclusion is
-/// load-bearing twice over: this set is the TTL sweep's protection set, so a
-/// marker counted as a reference would shield a file whose bytes an erasure
-/// already removed forever — and it is the erasure receipt's liveness
-/// evidence, where the same mistake certified a RE-CREATED file as "safely
-/// retained by live spans". A marker records that content is gone; it is not
-/// a reference to content.
-fn collect_payload_refs(span: &Span, refs: &mut HashSet<String>) {
-    let mut scan = |attributes: &Map<String, Value>| {
-        for value in attributes.values() {
-            if value.get("erased").and_then(Value::as_bool) == Some(true) {
-                continue;
-            }
-            if let Some(reference) = value
-                .get(crate::payload::PAYLOAD_KEY)
-                .and_then(Value::as_str)
-            {
-                refs.insert(reference.to_owned());
-            }
-        }
-    };
-    scan(&span.attributes);
-    for event in &span.events {
-        scan(&event.attributes);
-    }
 }
 
 /// UTC calendar day (YYYY-MM-DD) of a nanosecond timestamp, dependency-free
@@ -806,6 +777,124 @@ impl Store {
             },
             traces: trace_rows,
         }))
+    }
+
+    /// Diagnoses one session: how it ended, which step is to blame, and the
+    /// repeated shapes behind that.
+    ///
+    /// The entire answer is computed from ONE resolution of the session's
+    /// spans. That is not an optimization, it is what makes the document
+    /// internally consistent: asking the store separately for an outcome, a
+    /// repetition report and a failure aggregate lets a seal land between the
+    /// calls and produces an answer whose own paragraphs disagree about how
+    /// many times a step ran. Invariant 6 states the general form of this —
+    /// anything that reads in more than one step has to pin its view.
+    ///
+    /// `max_spans` bounds the analysis. When it binds, the spans kept are the
+    /// EARLIEST by start time, because attribution names the first step that
+    /// failed and a suffix would systematically discard the answer.
+    pub fn diagnose_session(
+        &self,
+        tenant: Option<&str>,
+        session_id: &str,
+        now_ns: u64,
+        idle_ns: u64,
+        max_spans: usize,
+    ) -> Result<Option<crate::attribution::Diagnosis>> {
+        let mut spans = self.resolve_session_spans(tenant, session_id)?;
+        if spans.is_empty() {
+            return Ok(None);
+        }
+        spans.sort_by(|left, right| {
+            left.start_time_ns
+                .cmp(&right.start_time_ns)
+                .then_with(|| left.trace_id.cmp(&right.trace_id))
+                .then_with(|| left.span_id.cmp(&right.span_id))
+        });
+        Ok(Some(crate::attribution::diagnose(
+            &spans, now_ns, idle_ns, max_spans,
+        )))
+    }
+
+    /// The failing steps of a session, as dataset examples.
+    ///
+    /// The selection is made HERE, from the server's own diagnosis, and not
+    /// from a list of span ids a caller supplied. That is a security property
+    /// rather than a convenience: the diagnosis is rendered to a model inside
+    /// a block of attacker-controlled telemetry, and a model that reads span
+    /// ids out of that block and hands them back would let injected text
+    /// choose what gets copied into a durable dataset — one that a later span
+    /// or trace erasure does not remove and whose payload references pin
+    /// those bytes past retention. Naming the SESSION and re-deriving the
+    /// steps makes the promoted set a pure function of the run the operator
+    /// named.
+    ///
+    /// Each example carries its own copy of the failing span's input, so
+    /// erasing the source trace afterwards cannot corrupt the dataset, and its
+    /// id is derived from the span's address so re-promoting the same session
+    /// produces the identical version rather than a second one.
+    pub fn promotable_examples(
+        &self,
+        tenant: Option<&str>,
+        session_id: &str,
+        diagnosis: &crate::attribution::Diagnosis,
+        limit: usize,
+    ) -> Result<Vec<crate::evals::NewExample>> {
+        // Every span the diagnosis is willing to stand behind: the attributed
+        // cause, then the evidence of each finding it called a fault.
+        let mut wanted: Vec<(&str, &str)> = Vec::new();
+        if let Some(cause) = &diagnosis.cause {
+            wanted.push((&cause.span.trace_id, &cause.span.span_id));
+        }
+        for finding in diagnosis.findings.iter().filter(|f| f.shape.is_fault()) {
+            for span in &finding.spans {
+                wanted.push((&span.trace_id, &span.span_id));
+            }
+        }
+        wanted.dedup();
+        if wanted.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let spans = self.resolve_session_spans(tenant, session_id)?;
+        let mut examples = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for (trace_id, span_id) in wanted {
+            if examples.len() >= limit {
+                break;
+            }
+            if !seen.insert((trace_id.to_owned(), span_id.to_owned())) {
+                continue;
+            }
+            let Some(span) = spans
+                .iter()
+                .find(|span| span.trace_id == trace_id && span.span_id == span_id)
+            else {
+                continue;
+            };
+            examples.push(crate::evals::NewExample {
+                // Stable across promotions of the same step, so a repeated
+                // promote is idempotent at the version's content address.
+                example_id: format!(
+                    "span-{}",
+                    &crate::payload::sha256_hex(format!("{trace_id}/{span_id}").as_bytes())[..16]
+                ),
+                input: serde_json::json!({
+                    "name": span.name,
+                    "service": span.service,
+                    "status": span.status,
+                    "attributes": span.attributes,
+                }),
+                expected: None,
+                split: "regression".to_owned(),
+                provenance: Some(crate::evals::Provenance {
+                    tenant: span.tenant.clone(),
+                    trace_id: span.trace_id.clone(),
+                    span_id: span.span_id.clone(),
+                }),
+            });
+        }
+        Ok(examples)
     }
 
     /// Aggregates LLM usage over the window, grouped by `group_by`, sorted by
@@ -1114,7 +1203,7 @@ impl Store {
             writer.spans.clone()
         };
         for span in &buffer {
-            collect_payload_refs(span, &mut refs);
+            crate::erasure::payload_refs_of(span, &mut refs);
         }
         // Dataset examples are live references too: an example deliberately
         // outlives the trace it was promoted from, and "deleting source

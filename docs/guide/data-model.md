@@ -86,7 +86,14 @@ Responses always use the canonical `timestamp_ns`.
 Links exist because agentic traces are not trees: parallel tool calls fan out
 and rejoin, retries reference earlier attempts, and one agent's span may cause
 work in another agent's trace. A `relation` attribute by convention keeps the
-semantics queryable. `links` is omitted from responses when empty.
+semantics legible. `links` is omitted from responses when empty.
+
+**Links are stored and returned, not indexed.** No search filter reaches a
+link's attributes — `attr.`, `not_attr.` and content search all read the span's
+own attributes — so a `relation` value is not something you can query for.
+What reads links today is [`diagnose_session`](mcp.md), which traverses them
+within the run it is already analyzing. An earlier version of this page said
+link semantics were "queryable"; they were not, and are not.
 
 ### Unknown fields survive
 

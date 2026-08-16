@@ -97,8 +97,22 @@ scope.
 
 The token is authenticated identically — same constant-time comparison, same
 401 — and then authorized per tool: a `ro` token reaches every read tool, and
-the single writing tool additionally requires `rw` **and** `--mcp-annotations`.
-A tool the presented token cannot call is not advertised to it.
+each writing tool additionally requires `rw` **and** its own switch. A tool the
+presented token cannot call is not advertised to it.
+
+| Tool | Needs |
+|---|---|
+| `record_annotation` | `rw` + `--mcp-annotations` |
+| `promote_failures_to_dataset` | `rw` + `--mcp-promote` |
+
+**The two switches are separate on purpose, and `--mcp-promote` is the larger
+grant.** An annotation is a fact recorded beside a span, and the erasure that
+removes the span removes it. A promoted example is a *copy* that deliberately
+outlives its source — that is what makes a dataset useful as a regression
+suite — so erasing the source trace afterwards does not remove it, and the
+payload references it carries keep those bytes alive past their retention
+window. Deleting it means tombstoning the dataset version, or erasing the whole
+tenant. Grant it to an agent you would let keep a copy.
 
 ### The non-loopback refusal
 

@@ -48,6 +48,15 @@ const TRACELOOP_CHAT_ID: &str = "traceloop.association.properties.chat_id";
 const LLM_COST_USD: &str = "llm.cost_usd";
 const GEN_AI_USAGE_COST: &str = "gen_ai.usage.cost";
 
+// Prompt-caching counters. OpenLLMetry records these verbatim for providers
+// that report them. They matter to attribution because they decide what
+// "prompt tokens" MEANS: Anthropic's `input_tokens` counts only the uncached
+// remainder, so a conversation whose context is growing reports a prompt
+// count that FALLS as the cache warms. Reading growth off the wrong field
+// inverts the signal on the configuration long-running agents actually use.
+const GEN_AI_CACHE_READ_TOKENS: &str = "gen_ai.usage.cache_read_input_tokens";
+const GEN_AI_CACHE_CREATION_TOKENS: &str = "gen_ai.usage.cache_creation_input_tokens";
+
 // -- Native Traza shorthand ------------------------------------------------
 const LLM_MODEL: &str = "llm.model";
 const LLM_PROMPT_TOKENS: &str = "llm.prompt_tokens";
@@ -94,6 +103,10 @@ pub struct LlmFacts {
     /// than reported by the span. Always false as extracted; only
     /// [`Self::priced`] sets it.
     pub cost_derived: bool,
+    /// Prompt tokens served from a provider's cache, if reported.
+    pub cache_read_tokens: Option<u64>,
+    /// Prompt tokens written into a provider's cache, if reported.
+    pub cache_creation_tokens: Option<u64>,
 }
 
 impl LlmFacts {
@@ -124,6 +137,62 @@ impl LlmFacts {
             }
         }
         self
+    }
+
+    /// How much context this call actually carried, for the calls where that
+    /// can be said honestly — `None` when it cannot.
+    ///
+    /// This is the measure a runaway is read from, and it is deliberately not
+    /// [`Self::prompt_tokens`], because the two providers disagree about what
+    /// that field counts once prompt caching is on:
+    ///
+    /// - **Anthropic** reports `input_tokens` as the UNCACHED remainder, with
+    ///   the cached part in `cache_read_input_tokens` /
+    ///   `cache_creation_input_tokens`. The context is the sum, and reading
+    ///   `input_tokens` alone shows a growing conversation SHRINKING as its
+    ///   cache warms.
+    /// - **OpenAI** reports `prompt_tokens` inclusive of its cached subset, so
+    ///   adding the cache counters double-counts.
+    ///
+    /// So the sum is taken only when the provider is known to report the
+    /// exclusive form. When cache counters are present under a provider whose
+    /// convention is not known, this returns `None` — the honest answer, which
+    /// a caller must render as "cannot tell" rather than as a number. Without
+    /// cache counters the question does not arise and prompt tokens stand.
+    pub fn context_tokens(&self) -> Option<u64> {
+        let cached = self
+            .cache_read_tokens
+            .unwrap_or(0)
+            .saturating_add(self.cache_creation_tokens.unwrap_or(0));
+        let prompt = self.prompt_tokens?;
+        if cached == 0 {
+            return Some(prompt);
+        }
+        match self.provider.as_deref() {
+            // The providers whose `input_tokens` excludes the cached part.
+            Some("anthropic") | Some("aws.bedrock") | Some("gcp.vertex_ai") => {
+                Some(prompt.saturating_add(cached))
+            }
+            // Inclusive, so the prompt count already IS the context.
+            Some("openai") | Some("azure.ai.openai") => Some(prompt),
+            _ => None,
+        }
+    }
+
+    /// Whether this call reports cache counters under a provider whose
+    /// arithmetic is not known, so [`Self::context_tokens`] declines to answer.
+    ///
+    /// The distinction matters to any caller reading a TREND: a span that
+    /// reported nothing is a gap in the series, while a span that reported
+    /// something uninterpretable is a reason to distrust the series. Both come
+    /// back from `context_tokens` as `None`, so the two are told apart here
+    /// rather than by guessing which `None` is which.
+    pub fn context_is_ambiguous(&self) -> bool {
+        let cached = self
+            .cache_read_tokens
+            .unwrap_or(0)
+            .saturating_add(self.cache_creation_tokens.unwrap_or(0));
+        self.prompt_tokens.is_some() && cached > 0 && self.context_tokens().is_none()
     }
 }
 
@@ -159,6 +228,8 @@ pub fn facts(attributes: &Map<String, Value>) -> LlmFacts {
         ],
     );
     let cost_usd = first_f64(attributes, &[LLM_COST_USD, GEN_AI_USAGE_COST]);
+    let cache_read_tokens = first_u64(attributes, &[GEN_AI_CACHE_READ_TOKENS]);
+    let cache_creation_tokens = first_u64(attributes, &[GEN_AI_CACHE_CREATION_TOKENS]);
     let (session, session_key) = SESSION_KEYS
         .iter()
         .find_map(|key| attr_str(attributes, key).map(|value| (value, *key)))
@@ -184,7 +255,37 @@ pub fn facts(attributes: &Map<String, Value>) -> LlmFacts {
         // Extraction reports only what the span said. Pricing is applied by
         // `LlmFacts::priced`, at the sites that hold the store's table.
         cost_derived: false,
+        cache_read_tokens,
+        cache_creation_tokens,
     }
+}
+
+/// Attribute keys declaring how a session ENDED, in precedence order.
+///
+/// Nothing in OpenTelemetry GenAI defines a session outcome — the conventions
+/// describe individual model calls, not the agent run around them — so this is
+/// a Traza extension and is labelled one, exactly as `llm.cost_usd` is. That
+/// has a consequence worth stating where the constant lives: **no existing
+/// pipeline emits these keys**, so a declared outcome is a bonus and never a
+/// precondition. Everything that asks "did this run succeed" has to answer
+/// from ordinary telemetry when no one declared anything (see
+/// [`crate::attribution`]).
+pub(crate) const OUTCOME_KEYS: [&str; 2] = [
+    "session.outcome",
+    "traceloop.association.properties.outcome",
+];
+
+/// Attribute keys carrying the goal a session was pursuing.
+pub(crate) const GOAL_KEYS: [&str; 2] = ["session.goal", "traceloop.association.properties.goal"];
+
+/// The declared outcome of a span, if it carries one.
+pub(crate) fn outcome(attributes: &Map<String, Value>) -> Option<String> {
+    first_str(attributes, &OUTCOME_KEYS)
+}
+
+/// The declared goal of a span, if it carries one.
+pub(crate) fn goal(attributes: &Map<String, Value>) -> Option<String> {
+    first_str(attributes, &GOAL_KEYS)
 }
 
 fn first_str(attributes: &Map<String, Value>, keys: &[&str]) -> Option<String> {

@@ -273,6 +273,12 @@ pub fn corpus(options: &SeedOptions) -> Corpus {
         gen.parallel_fanout(index);
     }
     for index in 0..scale {
+        gen.runaway_research_agent(index);
+    }
+    for index in 0..scale {
+        gen.bulk_enrichment_fanout(index);
+    }
+    for index in 0..scale {
         gen.oversized_payloads(index);
     }
     for index in 0..(2 * scale) {
@@ -1062,6 +1068,186 @@ impl Gen {
             });
         }
         self.push(span);
+    }
+
+    /// An agent that cannot make progress and does not stop: the shape
+    /// attribution exists to name.
+    ///
+    /// A research agent reflects, searches, and reflects again on what it
+    /// found. Its search tool starts failing on the fourth turn and never
+    /// recovers, so every later reflection appends the failure to its context
+    /// and asks again. Nothing here is a Traza convention: no
+    /// `session.outcome`, no `relation: "retry-of"` link, no marker of any
+    /// kind saying "this one is the runaway". The session identifies itself
+    /// with `gen_ai.conversation.id` and reports usage the way OpenLLMetry
+    /// does, which is all a real pipeline emits and therefore all the
+    /// analysis is allowed to need.
+    ///
+    /// Two details are deliberate. The steps are SIBLINGS under one agent
+    /// root rather than a parent chain, because that is what LangGraph, the
+    /// OpenAI Agents SDK and this file's own `crewai_session` produce — a
+    /// detector that only sees nesting would miss every real framework. And
+    /// the reflection's context grows every turn while the tool's arguments
+    /// barely change, so the two halves of the run are found by two different
+    /// signals: growth on one, failure density on the other.
+    fn runaway_research_agent(&mut self, index: usize) {
+        let vendor = &VENDORS[1];
+        let session = format!("runaway-{:04}", 900 + index);
+        let trace = self.id("trace-runaway");
+        let root = self.id("span");
+        let start = self.advance_rand(60, 300, SEC);
+        let turns = 9_u64;
+
+        let mut attributes = Map::new();
+        attributes.insert("traceloop.span.kind".into(), json!("workflow"));
+        attributes.insert("traceloop.workflow.name".into(), json!("research"));
+        attributes.insert("gen_ai.conversation.id".into(), json!(session));
+        let root_span = make_span(
+            &trace,
+            &root,
+            None,
+            "research.workflow",
+            vendor.service,
+            start,
+            turns * 12 * SEC,
+            "error",
+            attributes,
+        );
+        self.push(root_span);
+
+        let mut at = start;
+        for turn in 0..turns {
+            // The reflection: context grows every turn because the last
+            // failure is appended to it, which is the runaway's signature and
+            // is readable from token counts alone.
+            let prompt_tokens = 1_200 + turn * 900;
+            let completion_tokens = self.rng.range(80, 260);
+            let mut attributes =
+                self.usage_attributes(vendor, Dialect::Current, prompt_tokens, completion_tokens);
+            attributes.insert("traceloop.span.kind".into(), json!("llm"));
+            attributes.insert("gen_ai.conversation.id".into(), json!(session));
+            let reflect = self.id("span");
+            let think_ns = self.rng.range(900, 2_600) * MS;
+            self.push(make_span(
+                &trace,
+                &reflect,
+                Some(&root),
+                "agent.reflect",
+                vendor.service,
+                at,
+                think_ns,
+                "ok",
+                attributes,
+            ));
+            at += think_ns;
+
+            // The search, which starts failing on turn 3 and stays failed.
+            let failing = turn >= 3;
+            let mut attributes = Map::new();
+            attributes.insert("traceloop.span.kind".into(), json!("tool"));
+            attributes.insert("traceloop.entity.name".into(), json!("web_search"));
+            attributes.insert("gen_ai.tool.name".into(), json!("web_search"));
+            attributes.insert("gen_ai.conversation.id".into(), json!(session));
+            attributes.insert(
+                "traceloop.entity.input".into(),
+                json!(r#"{"query":"quarterly filings 2026"}"#),
+            );
+            if failing {
+                attributes.insert("error.type".into(), json!("SearchBackendUnavailable"));
+                attributes.insert("http.response.status_code".into(), json!(503));
+            }
+            let search = self.id("span");
+            let search_ns = self.rng.range(400, 1_500) * MS;
+            self.push(make_span(
+                &trace,
+                &search,
+                Some(&root),
+                "tool.web_search",
+                vendor.service,
+                at,
+                search_ns,
+                if failing { "error" } else { "ok" },
+                attributes,
+            ));
+            at += search_ns;
+        }
+    }
+
+    /// A large, healthy fan-out: the shape a loop detector must not fire on.
+    ///
+    /// Forty enrichment calls under one root, in one trace, all with the same
+    /// `(service, name)` — which is exactly the input that reaches the
+    /// repetition classifier, and exactly what a naive "many identical spans
+    /// means a loop" rule reports as a runaway. Everything about it says
+    /// ordinary work: the calls overlap in time because they were issued
+    /// concurrently, each one carries a different item, the token counts do
+    /// not climb, and almost nothing fails.
+    ///
+    /// It exists so the corpus can prove a negative. Without a healthy
+    /// workload that actually reaches the classifier, "the analysis finds no
+    /// fault in the seed corpus" is a claim about code that never ran.
+    fn bulk_enrichment_fanout(&mut self, index: usize) {
+        let vendor = &VENDORS[3 % VENDORS.len()];
+        let session = format!("bulk-enrich-{:04}", 700 + index);
+        let trace = self.id("trace-enrich");
+        let root = self.id("span");
+        let start = self.advance_rand(30, 180, SEC);
+        let items = 40_u64;
+
+        let mut attributes = Map::new();
+        attributes.insert("traceloop.span.kind".into(), json!("workflow"));
+        attributes.insert("traceloop.workflow.name".into(), json!("enrich_batch"));
+        attributes.insert("session.id".into(), json!(session));
+        self.push(make_span(
+            &trace,
+            &root,
+            None,
+            "enrich_batch.workflow",
+            vendor.service,
+            start,
+            22 * SEC,
+            "ok",
+            attributes,
+        ));
+
+        for item in 0..items {
+            // Concurrent: every call starts within the same short window, so
+            // the group overlaps rather than running one after another.
+            let began = start + self.rng.range(10, 900) * MS;
+            let prompt_tokens = self.rng.range(420, 460);
+            let completion_tokens = self.rng.range(30, 60);
+            let mut attributes =
+                self.usage_attributes(vendor, Dialect::Current, prompt_tokens, completion_tokens);
+            attributes.insert("traceloop.span.kind".into(), json!("llm"));
+            attributes.insert("session.id".into(), json!(session));
+            // A different item each time — this is iteration, not repetition.
+            attributes.insert(
+                "gen_ai.input.messages".into(),
+                messages_json(json!([{
+                    "role": "user",
+                    "parts": [{"type": "text", "content": format!("Enrich record {item}")}]
+                }])),
+            );
+            // Two of forty fail, which is ordinary flakiness rather than a
+            // failing dependency.
+            let failed = item % 20 == 7;
+            if failed {
+                attributes.insert("error.type".into(), json!("UpstreamTimeout"));
+            }
+            let span_id = self.id("span");
+            let duration = self.rng.range(300, 1_800) * MS;
+            self.push(make_span(
+                &trace,
+                &span_id,
+                Some(&root),
+                "tool.enrich_record",
+                vendor.service,
+                began,
+                duration,
+                if failed { "error" } else { "ok" },
+                attributes,
+            ));
+        }
     }
 
     /// Prompts and completions far past the offload threshold, both as message

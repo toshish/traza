@@ -67,6 +67,42 @@ could price both contribute `0`, so the money alone cannot tell them apart, or
 tell either from a genuine measurement. See
 [Model pricing](configuration.md#model-pricing).
 
+### Prompt caching, and what "prompt tokens" means
+
+`gen_ai.usage.cache_read_input_tokens` and
+`gen_ai.usage.cache_creation_input_tokens` are recognized, because with
+caching on, providers disagree about what the prompt count *counts*:
+
+| Provider | `input_tokens` / `prompt_tokens` | Context is |
+|---|---|---|
+| Anthropic, Bedrock, Vertex | the **uncached remainder** | prompt + cache read + cache creation |
+| OpenAI, Azure OpenAI | **inclusive** of its cached subset | the prompt count itself |
+
+This matters wherever a growing conversation is being watched: read the
+uncached remainder alone and a context that is growing appears to *shrink* as
+its cache warms. [`diagnose_session`](guide/mcp.md) reads the resolved figure,
+and where cache counters appear under a provider whose convention Traza does
+not know, it reports the trend as unreadable rather than guessing.
+
+### Session outcome and goal — Traza extensions
+
+| Fact | Keys (first present wins) |
+|---|---|
+| Session outcome | `session.outcome` → `traceloop.association.properties.outcome` |
+| Session goal | `session.goal` → `traceloop.association.properties.goal` |
+
+Recognized values for outcome are `success`/`succeeded`/`ok`/`resolved`,
+`failure`/`failed`/`error`, and `abandoned`/`cancelled`/`timeout`; anything
+else is kept verbatim and reported as undetermined.
+
+**Nothing in OpenTelemetry GenAI defines these** — the conventions describe
+individual model calls, not the agent run around them — so, like cost, they
+are Traza extensions and no existing pipeline emits them. That is why nothing
+requires them: a session's outcome is **derived** from its own spans when
+undeclared (the last step to finish decides, and a run still in flight is
+reported as unknown rather than as a success). Declaring one replaces the
+derivation with your own statement; it does not unlock the feature.
+
 Attributes are indexed like any other, so exact-match filters on them are
 index-served.
 
@@ -214,7 +250,12 @@ retries reference earlier attempts, and one agent's span may cause work in
 another agent's trace. Spans carry a `links` array (`trace_id`, `span_id`,
 `attributes`) on both ingest surfaces; OTLP links map 1:1 with hex ids
 lowercased. A conventional `relation` link attribute (for example
-`retry-of`, `spawned`, `joins`) keeps link semantics queryable.
+`retry-of`, `spawned`, `joins`) keeps link semantics legible, and
+`diagnose_session` reads `retry-of` as corroboration when it is present.
+
+Links are **stored and returned, not indexed**: no search filter reaches a
+link's attributes, so a `relation` value cannot be queried for. It is read
+inside a diagnosis of a run, not across the store.
 
 ## OTLP mapping
 
