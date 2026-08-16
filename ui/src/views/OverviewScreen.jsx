@@ -3,8 +3,8 @@ import { api } from '../lib/api.js';
 import { useRead, usePoll } from '../lib/route.js';
 import { RANGES, windowOf } from '../lib/query.js';
 import {
-  durabilityMeans, fmtCompact, fmtCost, fmtDelta, fmtDurationNs, fmtNum, fmtPercent, fmtAgo,
-  fmtClockNs, fmtWindowLabel,
+  durabilityMeans, fmtCompact, fmtCost, fmtCostProvenance, fmtDelta, fmtDurationNs, fmtNum,
+  fmtPercent, fmtAgo, fmtClockNs, fmtWindowLabel,
 } from '../lib/format.js';
 import { Card, Chip, Eyebrow, ErrorState, LiveDot, LoadingBar, Skeleton } from '../components/primitives/Chrome.jsx';
 import { Sparkbar, StackedSparkbar } from '../components/charts/Marks.jsx';
@@ -13,8 +13,8 @@ import { Sparkbar, StackedSparkbar } from '../components/charts/Marks.jsx';
 // to look at. Everything on it is a link into the screen that explains it —
 // a number nobody can click is a number nobody can act on.
 
-function Tile({ label, value, unit, delta, deltaTone, spark, highlight }) {
-  return <Card pad="12px 14px 10px">
+function Tile({ label, value, unit, delta, deltaTone, spark, highlight, title }) {
+  return <Card pad="12px 14px 10px" title={title}>
     <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginBottom: 5 }}>
       <span style={{ fontSize: 12, color: 'var(--ink-muted)' }}>{label}</span>
       <span style={{
@@ -163,6 +163,15 @@ export function OverviewScreen({ go }) {
   const spans = sum(now, 'spans');
   const errors = sum(now, 'errors');
   const cost = sum(now, 'cost_usd');
+  // Provenance is summed the same way the money is, so the spend tile states
+  // what its number actually is rather than implying it was metered.
+  const costNow = fmtCostProvenance({
+    cost_usd: cost,
+    cost_derived_usd: sum(now, 'cost_derived_usd'),
+    cost_metered_calls: sum(now, 'cost_metered_calls'),
+    cost_derived_calls: sum(now, 'cost_derived_calls'),
+    cost_unpriced_calls: sum(now, 'cost_unpriced_calls'),
+  });
   const tokens = sum(now, 'total_tokens');
   const p95 = durationNow.data?.p95_ns ?? 0;
   const p95Before = durationBefore.data?.p95_ns ?? 0;
@@ -217,7 +226,9 @@ export function OverviewScreen({ go }) {
         delta={fmtDelta(p95, p95Before)}
         deltaTone={p95 > p95Before * 1.2 ? 'warn' : undefined}
         spark={now.map((b) => b.p95_ns)} />
-      <Tile label="spend" value={cost.toFixed(2)} unit="USD"
+      <Tile label="spend" title={costNow.title}
+        value={costNow.priced === 0 ? '—' : (costNow.estimated ? '~' : '') + cost.toFixed(2)}
+        unit={costNow.priced === 0 ? undefined : 'USD'}
         delta={fmtDelta(cost, sum(before, 'cost_usd'))}
         spark={now.map((b) => b.cost_usd)} />
       <Tile label="tokens" value={fmtCompact(tokens)}

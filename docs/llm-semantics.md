@@ -44,8 +44,28 @@ wins over the prompt+completion sum.
 **Cost is a Traza extension, not an OpenLLMetry attribute.** OpenTelemetry
 GenAI defines no cost attribute — providers meter cost out of band. Traza
 reads cost from `llm.cost_usd` (and accepts `gen_ai.usage.cost` as a courtesy
-for pipelines that compute it), so cost analytics populate only when your
-ingest supplies one of those; it is not part of OpenLLMetry conformance.
+for pipelines that compute it); it is not part of OpenLLMetry conformance.
+
+Most instrumentation does not meter cost, which used to mean a store that knew
+the model and both token counts still reported `$0.00` everywhere. Give the
+server a [pricing table](configuration.md#model-pricing) and it derives a cost
+for those calls instead:
+
+```sh
+traza-server --data-dir ./data --port 8080 --pricing ./pricing.json
+```
+
+A metered `llm.cost_usd` always wins — the table only fills blanks, and only
+when the span reported both an input and an output token count.
+
+Every cost-bearing row (`/v1/stats/llm`, `/v1/sessions`, and each bucket of
+`/v1/stats/series`) reports `cost_derived_usd` beside `cost_usd` and three
+call counts — `cost_metered_calls`, `cost_derived_calls`,
+`cost_unpriced_calls` — so a total's provenance is always answerable.
+**Read the counts, not the dollars:** a zero-rate model and a call nothing
+could price both contribute `0`, so the money alone cannot tell them apart, or
+tell either from a genuine measurement. See
+[Model pricing](configuration.md#model-pricing).
 
 Attributes are indexed like any other, so exact-match filters on them are
 index-served.

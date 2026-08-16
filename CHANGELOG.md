@@ -9,6 +9,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Tenant identity in the primary key.** Span identity is now
+  `(tenant, trace_id, span_id)` — everywhere: the write buffer's index, WAL
+  replay, segment supersede resolution, compaction's last-write-wins merge,
+  the tail ring's veils, cursors, the analytics key hashes, annotations and
+  erasure. Two tenants sharing a trace id can no longer silently upsert over
+  each other, which is the whole reason this ships now: keys cannot be
+  retrofitted after the format freeze. The default tenant is the empty
+  string and is **never serialized**, so a single-tenant store writes
+  byte-identical WAL frames, segment records and annotation lines to what it
+  wrote before tenancy existed — no segment or WAL format bump, proven by a
+  serialization-guard test. Tenant scoping reaches every surface the roadmap
+  names:
+  - **Credentials**: `TRAZA_TOKENS` entries take an optional binding,
+    `scope@tenant:token`. A bound credential ingests, queries, tails,
+    exports, annotates and erases exactly its own tenant; naming another
+    tenant is a 403, and the store-global operator surfaces (`/v1/stats`,
+    `/v1/metrics`, `/v1/verify`, checkpoint/flush/backups) refuse bound
+    tokens outright. OTLP exporters select a tenant with the `traza.tenant`
+    resource attribute; MCP tools are scoped by the same binding.
+  - **Sessions** are `(tenant, session_id)` — the same `session.id` under
+    two tenants is two sessions, in the rollup sidecar (format v3,
+    self-healing rebuild), the session list, and `group_by=session` rows.
+  - **Retention** takes per-tenant windows: `--tenant-ttl TENANT=SECONDS`,
+    repeatable. A tenant's cutoff is its override, else the global TTL,
+    else never — and the segment retire-whole fast path only runs when a
+    global TTL covers everyone, because a whole-segment decision taken from
+    configured windows alone would delete an unswept tenant's data with the
+    segment.
+  - **Quota accounting**: `GET /v1/tenants` reports per-tenant spans,
+    traces, serialized bytes and offloaded payload bytes from one exact
+    fold. Accounting, deliberately not enforcement.
+  - **Erasure**: trace/span/session subjects carry a tenant (empty = the
+    default tenant, never "all"), and a new `tenant` subject erases
+    everything a tenant owns — spans, annotations, scores, datasets,
+    experiments — with the same barrier, ordering, and receipt discipline
+    as M3. Reference-aware payload deletion now spans tenants: a blob two
+    tenants share survives one tenant's erasure and the receipt names why.
+- **The eval entity model — identity only, no workflow.** The addressing the
+  product thesis requires, and nothing else: **Dataset** (stable id, name,
+  tenant), **DatasetVersion** (immutable, content-addressed manifest of
+  `(example_id, digest)` pairs with a parent version for lineage and the
+  promotion's provenance — re-POSTing identical content IS the same
+  version), **Example** (stable id across versions; input, optional
+  expected output, split label, provenance back to the source span; bodies
+  carry `$payload` references that count as live for the TTL sweep and
+  reference-aware erasure, so a promoted copy is real for offloaded
+  content), **Experiment** (stable id, one dataset version, config
+  metadata), **Run** (the experiment→trace link, appended by the external
+  harness), and **Score** — an annotation whose addressing was generalized
+  to a typed subject (trace / span / session / experiment example), so a
+  score addresses the `(experiment, example, span)` tuple with every
+  existing annotation field preserved. All of it lives in `evals.jsonl`, a
+  new manifested append-only recovery domain with the annotation log's
+  torn-tail healing and pin-by-copy discipline. Deletion semantics were
+  settled up front and are enforced by test: erasing source traces never
+  corrupts a dataset version (the receipt's new `eval-records` domain
+  REPORTS surviving copies and turns inconclusive — purging a curated copy
+  is a deliberate second act); erasing a payload leaves dangling addresses
+  in example bodies, reported retained-by-design without losing
+  conclusiveness; a dataset-version tombstone is logical deletion with
+  defined effects (410 with the tombstone, dependent experiments keep
+  working and say why, new experiments refused); a tenant erasure takes the
+  tenant's eval records inside the barrier, and ids are never reused past
+  the rewrite (a counter record floors the allocators). Score distributions
+  (`/summary`) and experiment-over-experiment diffs (`/diff`) come from
+  ordinary reads with per-`(example, name)` last-write-wins dedup. The
+  whole loop — promote failing traces, run externally, record runs and
+  scores, read distributions and diffs — runs end to end in CI against the
+  built binary, and survives kill -9.
+
 - **One recovery domain: generations and checkpoints.** Query-visible state
   lived in several independent recovery domains — the write-ahead log and
   buffer, segments, `annotations.jsonl`, `payloads/` — each with its own
@@ -167,7 +237,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     behind the `admin` scope; the agent-facing surface stays read-only, so
     stored adversarial text has no destructive tool to actuate.
 
+- **Derived LLM cost from a configured pricing table**, `--pricing FILE`.
+  OpenTelemetry defines no cost attribute, so a span carries one only if its
+  pipeline metered it — and most do not, which left stores that knew the model
+  and both token counts reporting `$0.00` on every cost surface. Rates are USD
+  per million tokens, keyed by exact model name or a `prefix*` pattern
+  (longest match wins; an exact name beats every pattern; a bare `"*"` is a
+  default). There is no built-in table and will not be one: prices move on the
+  vendor's schedule, and self-hosted models have no public rate.
+  - **A metered `llm.cost_usd` always wins**, and a span reporting only a
+    total token count stays unpriced rather than being split by an assumed
+    input/output ratio.
+  - **Estimates are reported as estimates, by count rather than by amount.**
+    Every cost-bearing row — `/v1/stats/llm`, `/v1/sessions`, and each bucket
+    of `/v1/stats/series` — carries `cost_derived_usd` beside `cost_usd` plus
+    `cost_metered_calls`, `cost_derived_calls` and `cost_unpriced_calls`. The
+    dollars cannot carry provenance on their own: a zero-rate model is priced
+    and adds nothing, a call nothing could price also adds nothing, and
+    neither is distinguishable from a genuine measurement of zero.
+    `cost_derived_calls > 0` means the total is an estimate;
+    `cost_unpriced_calls > 0` means it is an undercount. The dashboard and MCP
+    both mark an estimate `~`, show `—` rather than `0.0000` when nothing
+    could be priced, and state the breakdown — and `analyze_cost` no longer
+    claims cost is exact when a rate table contributed to it.
+  - **Rollup sidecars record the fingerprint of the table they were folded
+    under** (format v4), so editing the rates invalidates exactly the cached
+    counters that would now be wrong instead of reporting last month's prices
+    from a sealed segment forever. An empty table fingerprints to zero, so a
+    store that prices nothing binds its sidecars exactly as before. A
+    malformed pricing file refuses startup rather than being ignored.
+
 ### Changed
+
+- **Ingest rejects an inadmissible tenant with 400, on both surfaces.** A
+  tenant is identity: lowercase `[a-z0-9][a-z0-9._-]`, at most 64 bytes, or
+  empty for the default. A misconfigured `traza.tenant` resource attribute
+  fails the whole OTLP export loudly rather than being silently dropped —
+  partialSuccess is for data the server chose to suppress, not for a defect
+  the client must fix.
+- **Cursor tokens carry a version byte.** The ordering key changed shape
+  (tenant joined it), and a pre-tenancy token must parse as *invalid*, never
+  as a plausible wrong position. Live cursors from before an upgrade get a
+  400, which is what a stale cursor always deserved.
+- **The span identity key on the wire and on disk is `$tenant`, not
+  `tenant`.** A span's top-level namespace is open — unknown fields survive
+  in the round trip — so a bare `tenant` is client data and must stay client
+  data. The `$` sigil (as in `$payload`) is the format discriminator: bytes
+  written before tenancy cannot carry `$tenant`, so a store read after an
+  upgrade keeps its bare `tenant` values as data rather than promoting one to
+  an identity no query selects and no erasure names. This replaces an earlier
+  decode-time normalization that tried to tell legacy data from identity by a
+  value's shape — which a valid-looking legacy value (`"acme"`) slipped
+  through. The `?tenant=` read filter and the erasure subject's `tenant`
+  field are closed namespaces and keep the plain name — but they, along with
+  an annotation's and a dataset's `tenant`, now also **accept `$tenant` as an
+  alias**, so a client that learned the span's spelling cannot silently
+  misroute a score, a dataset, or — worst of all — an erasure to the default
+  tenant. The span alone rejects a bare `tenant` as identity, because the span
+  alone has the open namespace that makes it data.
 
 - **Append-only files are digested and verified over their recorded prefix,
   exactly.** `digest_engine` recorded an append-only log's length from one
@@ -215,6 +342,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from every domain and stops, exactly as before. The deletion is durable when
   its domains are durable and *published* by the next checkpoint — one
   maintenance interval away, or immediately when a backup asks.
+
+### Fixed
+
+- **A pending whole-tenant erasure withholds its payload bytes from a scoped
+  fetch.** A tenant erasure discovers its span-held references only as its
+  purge walks them, so the mask's `payload_files` set fills after the mask
+  already hides the tenant. A `GET /v1/payloads` under a bound credential now
+  returns nothing the moment its tenant is masked — whether or not that exact
+  reference has been enumerated — closing a window in which a planted crash
+  state served the bytes an erasure was seconds from deleting. Freshly
+  discovered references are also folded into the live mask as they are noted,
+  so the operator path stops serving them mid-purge too.
+- **The MCP `describe_store` "nothing to search yet" note follows the
+  caller's own usage, not the store total.** For a tenant-bound caller the
+  note was keyed on the store's `total_records`, so it appeared only on a
+  globally empty store and vanished the instant any *other* tenant ingested a
+  span — a co-tenant presence oracle across the isolation boundary the rest
+  of the overview respects. It now reads the bound tenant's own row.
+- **An explicit default-tenant scope reaches its own sealed payload.** The
+  default (empty) tenant carries no attribute-index posting — that is what
+  keeps single-tenant stores byte-identical — so a payload-reachability probe
+  that trusted the posting found nothing for a `Some("")` scope once the span
+  sealed. The probe now scans the records and lets the decoded tenant decide
+  for the default tenant, exactly as `select_probe` already did.
+- **Resolving last-write-wins no longer re-reads the store to prove keys were
+  never replaced.** Every query-side supersede probe — the limited merge, the
+  unlimited scan, and the fold behind the aggregation routes — now consults
+  each newer segment's own key-hash set before paying an exact probe, the
+  prefilter the analytics fold's exact path already ran; that fold now gates
+  per segment too, so a key rewritten eleven segments later costs one probe
+  rather than a walk across the ten between. On a store carrying superseded
+  versions — a crash-recovered store before its first compaction is the
+  canonical case — queries cost matches × segments × trace-width decodes,
+  which is how a recovery query blew a 30-second deadline in CI. The new
+  `traza_supersede_probes_total` counter is the observable: roughly one probe
+  per superseded version actually held.
+- **A pre-`$tenant` rollup sidecar is rebuilt, never believed.** Reserving
+  `$tenant` changed what a bare `tenant` field decodes to, and a sidecar's
+  key hashes are evidence only under the decoding they were computed with —
+  trusting one across that boundary treated a stale membership miss as proof
+  of absence and resurrected a superseded span. The rollup `SCHEMA_VERSION`
+  is bumped, so the first read after upgrading rebuilds each segment's
+  sidecar once; `tests/fixtures/pr50-tenant-identity`, sealed by the
+  pre-reservation build, is the corpus that fails if a future decoding change
+  forgets the bump.
+- **Native ingest accepts an event's timestamp under the OTLP name.** A span's
+  timestamps accepted `start_time_unix_nano`; its events accepted only
+  `timestamp_ns`, so a client spelling both the way OTLP spells them had its
+  **entire batch** rejected with a 400 naming a field it had supplied. Events
+  now take `time_unix_nano`, `timestamp_unix_nano`, `time_ns` and `time` as
+  aliases, and `attributes` defaults, so a named instant no longer needs an
+  empty map to be legal. The failure mode this closes is quiet rather than
+  loud: telemetry clients are conventionally fail-open, so the spans simply
+  never arrived.
+- **The span search's token column reads the current OpenTelemetry names.**
+  It carried its own third copy of the semantic-convention precedence, which
+  had drifted from `src/semconv.rs`: it resolved only the deprecated
+  `gen_ai.usage.{prompt,completion}_tokens` and a `llm.usage.prompt_tokens`
+  key Traza has never recognized. A span using the current `input`/`output`
+  names — resolved correctly by the server and by the trace detail — showed a
+  blank cell. It now uses the shared `llmUsage` helper, as everything else
+  does.
+- **Two toolbar actions on the span search worked in name only.** A local
+  named `window` shadowed the global for the whole component, so
+  `window.prompt` and `window.location` read `undefined` through the optional
+  chains guarding them: saving a view never asked for a name and silently
+  numbered every one `view N`, and "Copy as curl" emitted a hostless URL that
+  curl refuses.
 
 ## [0.22.2] - 2026-08-12
 

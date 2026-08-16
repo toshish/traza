@@ -149,8 +149,17 @@ pub struct SeriesBucket {
     pub llm_calls: u64,
     /// Summed prompt + completion tokens.
     pub total_tokens: u64,
-    /// Summed cost, when ingest supplied one.
+    /// Summed cost, metered and derived together.
     pub cost_usd: f64,
+    /// The part of `cost_usd` derived from the configured pricing table.
+    pub cost_derived_usd: f64,
+    /// LLM calls whose cost the span itself reported.
+    pub cost_metered_calls: u64,
+    /// LLM calls priced from the configured table.
+    pub cost_derived_calls: u64,
+    /// LLM calls with no cost from either source. These contribute nothing to
+    /// `cost_usd`, so a bucket with a non-zero count here is an undercount.
+    pub cost_unpriced_calls: u64,
     /// Median span duration in the bucket.
     pub p50_ns: u64,
     /// 95th-percentile span duration in the bucket.
@@ -258,6 +267,10 @@ impl Store {
         let mut llm_calls = vec![0u64; bucket_count];
         let mut tokens = vec![0u64; bucket_count];
         let mut cost = vec![0f64; bucket_count];
+        let mut cost_derived = vec![0f64; bucket_count];
+        let mut metered_calls = vec![0u64; bucket_count];
+        let mut derived_calls = vec![0u64; bucket_count];
+        let mut unpriced_calls = vec![0u64; bucket_count];
         let mut durations: Vec<DurationHistogram> = (0..bucket_count)
             .map(|_| DurationHistogram::default())
             .collect();
@@ -277,18 +290,33 @@ impl Store {
                 errors[index] += 1;
             }
             durations[index].record(span.end_time_ns.saturating_sub(span.start_time_ns));
-            let usage = crate::semconv::facts(&span.attributes);
+            let usage = self.facts(span);
             if usage.is_llm {
                 llm_calls[index] += 1;
             }
             tokens[index] = tokens[index].saturating_add(usage.total());
-            if let Some(spent) = usage.cost_usd {
+            // Provenance is counted alongside the dollars, because the
+            // dollars cannot carry it: a zero-rate model and an unpriced one
+            // both add nothing, and the spend tile would call the first of
+            // them measured.
+            match usage.cost_usd {
                 // Non-finite cost is ignored rather than propagated: one NaN
                 // from bad instrumentation would turn the whole series into
-                // NaN and take the chart with it.
-                if spent.is_finite() {
+                // NaN and take the chart with it. It is still not a metered
+                // call, so it counts as unpriced rather than silently
+                // vanishing from every total.
+                Some(spent) if spent.is_finite() => {
                     cost[index] += spent;
+                    if usage.cost_derived {
+                        cost_derived[index] += spent;
+                        derived_calls[index] += 1;
+                    } else {
+                        metered_calls[index] += 1;
+                    }
                 }
+                Some(_) => unpriced_calls[index] += 1,
+                None if usage.is_llm => unpriced_calls[index] += 1,
+                None => {}
             }
         })?;
 
@@ -306,6 +334,10 @@ impl Store {
                 llm_calls: llm_calls[index],
                 total_tokens: tokens[index],
                 cost_usd: cost[index],
+                cost_derived_usd: cost_derived[index],
+                cost_metered_calls: metered_calls[index],
+                cost_derived_calls: derived_calls[index],
+                cost_unpriced_calls: unpriced_calls[index],
                 p50_ns: durations[index].percentile_ns(50.0),
                 p95_ns: durations[index].percentile_ns(95.0),
             })

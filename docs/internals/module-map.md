@@ -94,6 +94,22 @@ Post-hoc annotations: an append-only JSONL log fsynced per append with an
 in-memory index by trace. A torn trailing line is ignored, matching the segment
 layer's crash-consistency stance.
 
+### [`src/evals.rs`](../../src/evals.rs)
+
+The eval entity model: datasets, versions, examples, experiments, runs —
+identity and addressing only, deliberately without a runner, a scorer library,
+or a UI. One append-only JSONL log (`evals.jsonl` at the store root), fsynced
+per mutation with the annotation log's torn-tail healing, wholly resident in
+memory (datasets are curated artifacts, not span-scale), and rewritten only
+inside the erasure barrier when a tenant subject purges everything a tenant
+owns — id floors survive the rewrite so erased dataset and experiment ids are
+never reissued. Example bodies and version manifests are content-addressed by
+SHA-256 over the module's own `canonical_json`, whose byte form is pinned by
+test: these digests are persisted identity and must not depend on a
+dependency's map-ordering feature flag. Also home to the score aggregation
+(`summarize_scores`, `diff_scores`) behind the experiment summary and diff
+endpoints.
+
 ### [`src/analytics.rs`](../../src/analytics.rs)
 
 Sessions and LLM token/cost aggregation — derived views over ordinary spans, no

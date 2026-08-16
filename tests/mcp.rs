@@ -43,6 +43,8 @@ fn open_store(dir: &Path) -> Store {
     Store::open(
         dir,
         Config {
+            pricing: Default::default(),
+            tenant_ttl_seconds: Default::default(),
             flush_spans: 100_000,
             max_buffer_age: None,
             shadow_seal: false,
@@ -64,6 +66,7 @@ fn span(trace: &str, id: &str, service: &str, name: &str, start_ns: u64) -> Span
     Span {
         trace_id: trace.to_owned(),
         span_id: id.to_owned(),
+        tenant: String::new(),
         parent_span_id: None,
         name: name.to_owned(),
         start_time_ns: start_ns,
@@ -99,6 +102,7 @@ fn call_with(
                 "params": {"name": name, "arguments": arguments},
             }),
             Context {
+                tenant: None,
                 access,
                 now_ns: FIXED_NOW,
             },
@@ -134,6 +138,7 @@ fn rpc_with(
         .handle(
             &json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}),
             Context {
+                tenant: None,
                 access,
                 now_ns: FIXED_NOW,
             },
@@ -431,6 +436,7 @@ fn no_result_exceeds_the_configured_ceiling_even_for_one_enormous_span() {
                     },
                 }),
                 Context {
+                    tenant: None,
                     access: Access::Read,
                     now_ns: FIXED_NOW,
                 },
@@ -481,6 +487,7 @@ fn a_truncated_result_says_so_and_names_the_argument_that_would_narrow_it() {
                 },
             }),
             Context {
+                tenant: None,
                 access: Access::Read,
                 now_ns: FIXED_NOW,
             },
@@ -914,6 +921,7 @@ fn a_text_payload_comes_back_within_the_requested_and_configured_bounds() {
                 },
             }),
             Context {
+                tenant: None,
                 access: Access::Read,
                 now_ns: FIXED_NOW,
             },
@@ -956,6 +964,7 @@ fn a_payload_cap_is_bytes_and_never_exceeds_the_result_ceiling() {
                 },
             }),
             Context {
+                tenant: None,
                 access: Access::Read,
                 now_ns: FIXED_NOW,
             },
@@ -1074,6 +1083,7 @@ fn every_result_fits_the_ceiling_once_the_envelope_is_counted() {
                         "params": {"name": tool, "arguments": {}},
                     }),
                     Context {
+                        tenant: None,
                         access: Access::Read,
                         now_ns: FIXED_NOW,
                     },
@@ -1185,6 +1195,7 @@ fn a_ceiling_smaller_than_the_truncation_notice_is_still_a_ceiling() {
                     "params": {"name": "search_spans", "arguments": {}},
                 }),
                 Context {
+                    tenant: None,
                     access: Access::Read,
                     now_ns: FIXED_NOW,
                 },
@@ -1295,6 +1306,7 @@ fn the_whole_result_respects_the_ceiling_including_structured_content() {
                         "params": {"name": tool, "arguments": {}},
                     }),
                     Context {
+                        tenant: None,
                         access: Access::Read,
                         now_ns: FIXED_NOW,
                     },
@@ -1565,6 +1577,7 @@ fn a_resource_read_is_bounded_like_a_tool_result() {
                 "params": {"uri": "traza://trace/t"},
             }),
             Context {
+                tenant: None,
                 access: Access::Read,
                 now_ns: FIXED_NOW,
             },
@@ -1643,6 +1656,7 @@ fn notifications_are_accepted_silently_and_junk_is_refused() {
     let store = open_store(&dir);
     let server = McpServer::new(&store, Limits::default(), false);
     let context = Context {
+        tenant: None,
         access: Access::Read,
         now_ns: FIXED_NOW,
     };
@@ -1651,14 +1665,17 @@ fn notifications_are_accepted_silently_and_junk_is_refused() {
         server
             .handle(
                 &json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
-                context
+                context.clone()
             )
             .is_none(),
         "a notification has no reply, by JSON-RPC's own rule"
     );
     assert!(
         server
-            .handle(&json!({"jsonrpc": "2.0", "id": 9, "result": {}}), context)
+            .handle(
+                &json!({"jsonrpc": "2.0", "id": 9, "result": {}}),
+                context.clone()
+            )
             .is_none(),
         "a response to a request this server never sent is ignored"
     );
@@ -1666,7 +1683,7 @@ fn notifications_are_accepted_silently_and_junk_is_refused() {
     let refused = server
         .handle(
             &json!([{"jsonrpc": "2.0", "id": 1, "method": "ping"}]),
-            context,
+            context.clone(),
         )
         .expect("answered");
     assert_eq!(refused["error"]["code"], json!(-32600));
@@ -1674,7 +1691,7 @@ fn notifications_are_accepted_silently_and_junk_is_refused() {
     let wrong_version = server
         .handle(
             &json!({"jsonrpc": "1.0", "id": 1, "method": "ping"}),
-            context,
+            context.clone(),
         )
         .expect("answered");
     assert_eq!(wrong_version["error"]["code"], json!(-32600));
@@ -1682,7 +1699,7 @@ fn notifications_are_accepted_silently_and_junk_is_refused() {
     let unknown = server
         .handle(
             &json!({"jsonrpc": "2.0", "id": 1, "method": "no/such/method"}),
-            context,
+            context.clone(),
         )
         .expect("answered");
     assert_eq!(unknown["error"]["code"], json!(-32601));

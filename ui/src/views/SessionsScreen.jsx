@@ -2,7 +2,7 @@ import React from 'react';
 import { api } from '../lib/api.js';
 import { useRead } from '../lib/route.js';
 import { RANGES, windowOf } from '../lib/query.js';
-import { fmtAgo, fmtCost, fmtDurationNs, fmtNum, fmtWindow } from '../lib/format.js';
+import { fmtAgo, fmtCostProvenance, fmtDurationNs, fmtNum, fmtWindow } from '../lib/format.js';
 import { Card, Chip, ErrorState, EmptyState, LoadingBar, Mono } from '../components/primitives/Chrome.jsx';
 
 // Sessions gained the time window the API always had, a sort, an efficiency
@@ -61,7 +61,9 @@ export function SessionsScreen({ go }) {
             textAlign: i === 0 ? 'left' : 'right', whiteSpace: 'nowrap',
           }}>{label}</div>)}
       </div>
-      {rows.map((session) => <div key={session.session_id}
+      {rows.map((session) => {
+        const cost = fmtCostProvenance(session);
+        return <div key={session.session_id}
         onClick={() => go(['sessions', session.session_id])} role="link" tabIndex={0}
         onKeyDown={(e) => { if (e.key === 'Enter') go(['sessions', session.session_id]); }}
         style={{
@@ -82,11 +84,14 @@ export function SessionsScreen({ go }) {
         <Num muted>{fmtNum(session.span_count)}</Num>
         <Num muted>{fmtNum(session.llm_calls)}</Num>
         <Num>{fmtNum(session.total_tokens)}</Num>
-        <Num accent>{fmtCost(session.cost_usd)}</Num>
-        <Num muted>{session.trace_count ? (session.cost_usd / session.trace_count).toFixed(5) : '—'}</Num>
+        <Num accent={!cost.estimated} muted={cost.estimated} title={cost.title}>{cost.text}</Num>
+        <Num muted>{session.trace_count
+          ? (cost.estimated ? '~' : '') + (session.cost_usd / session.trace_count).toFixed(5)
+          : '—'}</Num>
         <Num tone={session.error_count ? 'var(--error)' : 'var(--ink-faint)'}>{session.error_count}</Num>
         <Num muted>{fmtAgo(session.last_end_ns)}</Num>
-      </div>)}
+      </div>;
+      })}
       {rows.length >= limit ? <div style={{ padding: '10px 12px' }}>
         <Chip onClick={() => setLimit((n) => n + 100)}>Load more</Chip>
       </div> : null}
@@ -129,8 +134,10 @@ export function SessionScreen({ sessionId, go }) {
         ['spans', fmtNum(data.span_count)],
         ['LLM calls', fmtNum(data.llm_calls)],
         ['tokens', fmtNum(data.total_tokens)],
-        ['cost USD', fmtCost(data.cost_usd)],
-        ['cost / turn', data.trace_count ? (data.cost_usd / data.trace_count).toFixed(5) : '—'],
+        ['cost USD', fmtCostProvenance(data).text],
+        ['cost / turn', data.trace_count
+          ? (fmtCostProvenance(data).estimated ? '~' : '') + (data.cost_usd / data.trace_count).toFixed(5)
+          : '—'],
         ['errors', fmtNum(data.error_count)],
       ].map(([label, value]) => <Card key={label} pad="12px 14px">
         <div style={{ fontSize: 12, color: 'var(--ink-muted)', marginBottom: 5 }}>{label}</div>
@@ -154,7 +161,8 @@ export function SessionScreen({ sessionId, go }) {
           }}>{label}</div>
         ))}
       </div>
-      {traces.map((trace) => <div key={trace.trace_id}
+      {traces.map((trace) => { const cost = fmtCostProvenance(trace);
+        return <div key={trace.trace_id}
         onClick={() => go(['trace', trace.trace_id])} role="link" tabIndex={0}
         onKeyDown={(e) => { if (e.key === 'Enter') go(['trace', trace.trace_id]); }}
         style={{
@@ -182,15 +190,16 @@ export function SessionScreen({ sessionId, go }) {
         <Num muted>{fmtDurationNs(trace.last_end_ns - trace.first_start_ns)}</Num>
         <Num muted>{fmtNum(trace.span_count)}</Num>
         <Num>{fmtNum(trace.total_tokens)}</Num>
-        <Num accent>{fmtCost(trace.cost_usd)}</Num>
+        <Num accent={!cost.estimated} muted={cost.estimated} title={cost.title}>{cost.text}</Num>
         <Num tone={trace.error_count ? 'var(--error)' : 'var(--ink-faint)'}>{trace.error_count}</Num>
-      </div>)}
+      </div>;
+      })}
     </Card>
   </div>;
 }
 
-function Num({ children, muted, accent, tone }) {
-  return <div style={{
+function Num({ children, muted, accent, tone, title }) {
+  return <div title={title} style={{
     padding: 'var(--row-py) 10px', fontFamily: 'var(--font-mono)', fontSize: 12,
     fontVariantNumeric: 'tabular-nums', textAlign: 'right', whiteSpace: 'nowrap',
     color: tone || (accent ? 'var(--accent)' : muted ? 'var(--ink-muted)' : 'var(--ink)'),

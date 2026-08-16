@@ -25,6 +25,7 @@
 //!   wal.log                    -- v2 frames stamped (epoch, sequence)
 //!   segment-*.seg              -- the working set: segments,
 //!   annotations.jsonl          -- the annotation log,
+//!   evals.jsonl                -- the eval log (datasets, experiments),
 //!   tombstones.jsonl           -- the erasure log,
 //!   payloads/                  -- and offloaded payload bytes
 //!   generations/<id>/state-manifest.json
@@ -211,6 +212,7 @@ pub(crate) fn write_manifest(root: &Path, manifest: &Manifest) -> Result<()> {
 fn is_manifested(relative: &str) -> bool {
     relative == "annotations.jsonl"
         || relative == crate::erasure::LOG_NAME
+        || relative == crate::evals::LOG_NAME
         || (relative.starts_with("segment-") && relative.ends_with(".seg"))
         || relative.starts_with("payloads/")
 }
@@ -219,7 +221,9 @@ fn is_manifested(relative: &str) -> bool {
 /// appends since the manifest, never damage. Everything else a manifest
 /// names is immutable once published.
 pub(crate) fn is_append_only(relative: &str) -> bool {
-    relative == "annotations.jsonl" || relative == crate::erasure::LOG_NAME
+    relative == "annotations.jsonl"
+        || relative == crate::erasure::LOG_NAME
+        || relative == crate::evals::LOG_NAME
 }
 
 /// Copies exactly the first `length` bytes of `source` to `target`, staged
@@ -545,6 +549,7 @@ fn remove_working_set(root: &Path) -> Result<()> {
             if top
                 && (name == "annotations.jsonl"
                     || name == crate::erasure::LOG_NAME
+                    || name == crate::evals::LOG_NAME
                     || name.starts_with("segment-"))
             {
                 fs::remove_file(entry.path())?;

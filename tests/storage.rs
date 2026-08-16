@@ -41,6 +41,7 @@ fn span(trace_id: &str, span_id: String, start_time_ns: u64, duration_ns: u64) -
     Span {
         trace_id: trace_id.to_owned(),
         span_id,
+        tenant: String::new(),
         parent_span_id: None,
         name: "operation".to_owned(),
         start_time_ns,
@@ -71,6 +72,8 @@ fn buffer_flush_persists_sorted_batches() {
     let store = Store::open(
         dir.path(),
         Config {
+            pricing: Default::default(),
+            tenant_ttl_seconds: Default::default(),
             flush_spans: 8,
             max_buffer_age: None,
             shadow_seal: false,
@@ -129,6 +132,8 @@ fn crash_recovery_preserves_flushed_spans() {
         let store = Store::open(
             dir.path(),
             Config {
+                pricing: Default::default(),
+                tenant_ttl_seconds: Default::default(),
                 flush_spans: 32,
                 max_buffer_age: None,
                 shadow_seal: false,
@@ -175,6 +180,8 @@ fn crash_recovery_preserves_flushed_spans() {
     let reopened = Store::open(
         dir.path(),
         Config {
+            pricing: Default::default(),
+            tenant_ttl_seconds: Default::default(),
             flush_spans: 32,
             max_buffer_age: None,
             shadow_seal: false,
@@ -298,6 +305,8 @@ fn randomized_filters_match_naive_reference() {
     let store = Store::open(
         dir.path(),
         Config {
+            pricing: Default::default(),
+            tenant_ttl_seconds: Default::default(),
             flush_spans: 4_096,
             max_buffer_age: None,
             shadow_seal: false,
@@ -331,6 +340,7 @@ fn randomized_filters_match_naive_reference() {
         spans.push(Span {
             trace_id: format!("trace-{:04}", index / 4),
             span_id: format!("random-{index:04}"),
+            tenant: String::new(),
             parent_span_id: None,
             name,
             start_time_ns,
@@ -395,6 +405,8 @@ fn ttl_compaction_drops_expired_segments() {
     let store = Store::open(
         dir.path(),
         Config {
+            pricing: Default::default(),
+            tenant_ttl_seconds: Default::default(),
             flush_spans: 4,
             max_buffer_age: None,
             shadow_seal: false,
@@ -487,6 +499,7 @@ fn correctness_span(batch: u64, item: u64) -> Span {
     Span {
         trace_id: format!("trace-{batch}"),
         span_id: format!("batch-{batch}-span-{item}"),
+        tenant: String::new(),
         parent_span_id: None,
         name: "correctness".to_string(),
         start_time_ns: batch * 1_000 + item,
@@ -507,6 +520,8 @@ fn lock_order_no_deadlock() {
         Store::open(
             &dir,
             Config {
+                pricing: Default::default(),
+                tenant_ttl_seconds: Default::default(),
                 flush_spans: 10_000,
                 max_buffer_age: None,
                 shadow_seal: false,
@@ -570,6 +585,8 @@ fn reads_never_miss_committed_spans() {
         Store::open(
             &dir,
             Config {
+                pricing: Default::default(),
+                tenant_ttl_seconds: Default::default(),
                 flush_spans: 10_000,
                 max_buffer_age: None,
                 shadow_seal: false,
@@ -647,6 +664,8 @@ fn stale_temp_does_not_wedge_flush() {
     let store = Store::open(
         &dir,
         Config {
+            pricing: Default::default(),
+            tenant_ttl_seconds: Default::default(),
             flush_spans: 2,
             max_buffer_age: None,
             shadow_seal: false,
@@ -709,6 +728,8 @@ fn stale_lock_from_dead_process_is_recovered() {
 fn second_open_is_rejected() {
     let dir = correctness_test_dir("single-writer");
     let config = Config {
+        pricing: Default::default(),
+        tenant_ttl_seconds: Default::default(),
         flush_spans: 100,
         max_buffer_age: None,
         shadow_seal: false,
@@ -1986,4 +2007,67 @@ fn open_error(dir: &TestDir) -> String {
         .err()
         .expect("a store with an unreadable segment must not open")
         .to_string()
+}
+
+#[test]
+fn a_store_written_before_the_reserved_tenant_key_still_resolves_its_newest_version() {
+    // tests/fixtures/pr50-tenant-identity was sealed by the build at commit
+    // 34c34fb — M4 as merged, whose identity key on the wire and on disk was
+    // a bare `tenant`. It holds two sealed versions of the key
+    // (acme, "t", "s"), `old` then `new`, plus one `keeper` span. Reserving
+    // `$tenant` reclassified that bare field as client data, so every record
+    // here decodes as the DEFAULT tenant now — while the v2 sidecars beside
+    // them carry key hashes computed under the old decoding.
+    //
+    // Those hashes are honest numbers in a domain this process no longer
+    // speaks: the binding still matches, the checksums still verify, and a
+    // membership miss is no longer proof of anything. A prefilter that
+    // trusted them would skip the exact probe and resurrect the superseded
+    // `old` — silently, with `traza_supersede_probes_total` reading zero.
+    // The rollup SCHEMA_VERSION bump is what forces these sidecars to be
+    // rebuilt under the current decoding, and this fixture is the corpus
+    // that fails if a future decoding change forgets to bump it again.
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pr50-tenant-identity");
+    // Copied, never opened in place: opening writes (heals sidecars, takes
+    // the lock), and the committed fixture must stay the old build's bytes.
+    let dir = correctness_test_dir("pr50-tenant-upgrade");
+    for entry in fs::read_dir(&fixture).expect("fixture dir") {
+        let entry = entry.expect("fixture entry");
+        fs::copy(entry.path(), dir.join(entry.file_name())).expect("copy fixture file");
+    }
+
+    let store = Store::open(
+        &dir,
+        Config {
+            durability: traza::Durability::Buffered,
+            compaction: None,
+            ..Config::default()
+        },
+    )
+    .expect("a pre-`$tenant` store opens");
+
+    let spans = store.query(&SpanFilter::default()).expect("query");
+    let versions: Vec<&str> = spans
+        .iter()
+        .filter(|span| span.span_id == "s")
+        .map(|span| span.name.as_str())
+        .collect();
+    assert_eq!(
+        versions,
+        ["new"],
+        "the newest version of a pre-`$tenant` key survives the upgrade, \
+         exactly once: {spans:?}"
+    );
+    assert!(
+        spans
+            .iter()
+            .any(|span| span.span_id == "keeper" && span.name == "kept"),
+        "data that was never superseded survives untouched"
+    );
+    assert!(
+        spans.iter().all(|span| span.tenant.is_empty()),
+        "a bare `tenant` field is client data now, so these records live in \
+         the default tenant"
+    );
+    let _ = fs::remove_dir_all(dir);
 }

@@ -19,15 +19,49 @@ use serde_json::Value;
 
 use crate::{Error, Result};
 
-/// One annotation attached to a span (or to a whole trace when `span_id`
-/// is empty).
+/// One annotation, addressed to a TYPED SUBJECT: a trace, a span within it,
+/// a session, or an experiment example (a **score**).
+///
+/// The subject is expressed by which address fields are set, and exactly one
+/// shape must hold:
+///
+/// - **trace** — `trace_id` alone (`span_id` empty);
+/// - **span** — `trace_id` + `span_id`;
+/// - **session** — `session_id` alone;
+/// - **experiment example** — `experiment_id` + `example_id`, optionally
+///   carrying `trace_id`/`span_id` naming the task run's span, which is what
+///   makes a score address the `(experiment, example, span)` tuple.
+///
+/// The flat fields are the original wire shape, preserved: every pre-existing
+/// record is a trace or span subject and decodes unchanged.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Annotation {
-    /// Trace containing the annotated span.
+    /// Trace containing the annotated span. Required for trace/span subjects;
+    /// optional on a score, where it names the run's trace.
+    #[serde(default)]
     pub trace_id: String,
-    /// Annotated span; empty string annotates the trace as a whole.
+    /// Annotated span; empty annotates the trace as a whole.
     #[serde(default)]
     pub span_id: String,
+    /// The tenant this annotation belongs to; empty is the default tenant.
+    /// Scoped exactly like span identity — reads filter on it, erasure dooms
+    /// by it. Accepts `$tenant` too, so a client that learned the span's
+    /// reserved key cannot silently misroute a score to the default tenant by
+    /// spelling it that way here; a closed schema has no ambiguity to protect
+    /// against, only a keystroke to forgive.
+    #[serde(alias = "$tenant", default, skip_serializing_if = "String::is_empty")]
+    pub tenant: String,
+    /// Session-subject address: the recognized session id being judged as a
+    /// whole. Mutually exclusive with the other subject shapes.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub session_id: String,
+    /// Experiment half of a score's address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub experiment_id: Option<u64>,
+    /// Example half of a score's address — the stable example id within the
+    /// experiment's dataset version.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub example_id: String,
     /// Annotation name (for example `quality`, `thumbs`, `groundedness`).
     pub name: String,
     /// Annotation value: number, string, bool — any JSON.
@@ -43,6 +77,54 @@ pub struct Annotation {
     pub timestamp_ns: u64,
 }
 
+impl Annotation {
+    /// Whether this annotation is a score — addressed to an experiment
+    /// example. Scores are exempt from the TTL sweep: they live on eval
+    /// retention, not trace retention, or an experiment-over-experiment diff
+    /// would silently lose its base to a rolling window.
+    pub fn is_score(&self) -> bool {
+        self.experiment_id.is_some()
+    }
+
+    /// Validates the typed-subject shape; `Err` names the defect.
+    pub(crate) fn validate_subject(&self) -> Result<()> {
+        if self.name.is_empty() {
+            return Err(Error::InvalidSpan("annotation name is empty"));
+        }
+        if !self.tenant.is_empty() && !crate::valid_tenant(&self.tenant) {
+            return Err(Error::InvalidSpan(
+                "annotation tenant must be lowercase [a-z0-9][a-z0-9._-], at most 64 bytes",
+            ));
+        }
+        let has_trace = !self.trace_id.is_empty();
+        let has_span = !self.span_id.is_empty();
+        let has_session = !self.session_id.is_empty();
+        let has_experiment = self.experiment_id.is_some();
+        let has_example = !self.example_id.is_empty();
+        if has_span && !has_trace {
+            return Err(Error::InvalidSpan(
+                "annotation span_id requires its trace_id",
+            ));
+        }
+        if has_experiment != has_example {
+            return Err(Error::InvalidSpan(
+                "a score names both experiment_id and example_id",
+            ));
+        }
+        if has_session && (has_trace || has_experiment) {
+            return Err(Error::InvalidSpan(
+                "a session annotation names only its session_id",
+            ));
+        }
+        if !has_trace && !has_session && !has_experiment {
+            return Err(Error::InvalidSpan(
+                "annotation must address a trace, a span, a session, or an experiment example",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Narrowings for an annotation search. Every supplied field must match; an
 /// empty query returns everything, newest first.
 #[derive(Clone, Debug, Default)]
@@ -51,6 +133,15 @@ pub struct AnnotationQuery<'a> {
     pub trace_id: Option<&'a str>,
     /// Restrict to one span within the trace.
     pub span_id: Option<&'a str>,
+    /// Restrict to one tenant. `None` is every tenant; `Some("")` the
+    /// default tenant. A bound credential has this forced.
+    pub tenant: Option<&'a str>,
+    /// Restrict to session-subject annotations for this session id.
+    pub session_id: Option<&'a str>,
+    /// Restrict to scores of this experiment.
+    pub experiment_id: Option<u64>,
+    /// Restrict to scores of this example.
+    pub example_id: Option<&'a str>,
     /// Restrict to one annotation name, for example `groundedness`.
     pub name: Option<&'a str>,
     /// Restrict to sources starting with this, so `human:` and `eval:`
@@ -69,6 +160,30 @@ impl AnnotationQuery<'_> {
         if self
             .span_id
             .is_some_and(|span_id| annotation.span_id != span_id)
+        {
+            return false;
+        }
+        if self
+            .tenant
+            .is_some_and(|tenant| annotation.tenant != tenant)
+        {
+            return false;
+        }
+        if self
+            .session_id
+            .is_some_and(|session| annotation.session_id != session)
+        {
+            return false;
+        }
+        if self
+            .experiment_id
+            .is_some_and(|experiment| annotation.experiment_id != Some(experiment))
+        {
+            return false;
+        }
+        if self
+            .example_id
+            .is_some_and(|example| annotation.example_id != example)
         {
             return false;
         }
@@ -108,8 +223,45 @@ pub(crate) struct AnnotationLog {
 
 #[derive(Debug, Default)]
 struct Inner {
-    by_trace: HashMap<String, Vec<Annotation>>,
-    count: usize,
+    /// Every annotation, in log order — the single owner; the indexes below
+    /// hold positions, not copies, so a corpus of machine-written scores is
+    /// resident once.
+    entries: Vec<Annotation>,
+    /// Positions by trace id. Session- and experiment-subject annotations
+    /// with no run trace live under the empty key.
+    by_trace: HashMap<String, Vec<usize>>,
+    /// Positions of scores, by experiment — the eval read path's index.
+    by_experiment: HashMap<u64, Vec<usize>>,
+}
+
+impl Inner {
+    fn adopt(&mut self, entries: Vec<Annotation>) {
+        self.entries = entries;
+        self.by_trace.clear();
+        self.by_experiment.clear();
+        for position in 0..self.entries.len() {
+            self.index(position);
+        }
+    }
+
+    fn index(&mut self, position: usize) {
+        let annotation = &self.entries[position];
+        self.by_trace
+            .entry(annotation.trace_id.clone())
+            .or_default()
+            .push(position);
+        if let Some(experiment) = annotation.experiment_id {
+            self.by_experiment
+                .entry(experiment)
+                .or_default()
+                .push(position);
+        }
+    }
+
+    fn push(&mut self, annotation: Annotation) {
+        self.entries.push(annotation);
+        self.index(self.entries.len() - 1);
+    }
 }
 
 impl AnnotationLog {
@@ -133,12 +285,7 @@ impl AnnotationLog {
                 match serde_json::from_slice::<Annotation>(line) {
                     Ok(annotation) => {
                         valid_len = valid_len.saturating_add(line.len() as u64);
-                        inner.count += 1;
-                        inner
-                            .by_trace
-                            .entry(annotation.trace_id.clone())
-                            .or_default()
-                            .push(annotation);
+                        inner.push(annotation);
                     }
                     // A crash can leave only the final append unterminated.
                     // A malformed newline-terminated record, or any malformed
@@ -172,14 +319,10 @@ impl AnnotationLog {
         })
     }
 
-    /// Appends one annotation durably (fsync) and indexes it.
+    /// Appends one annotation durably (fsync) and indexes it. The subject
+    /// shape is validated here, at the engine boundary, not only over HTTP.
     pub(crate) fn append(&self, annotation: Annotation) -> Result<()> {
-        if annotation.trace_id.is_empty() {
-            return Err(Error::InvalidSpan("annotation trace_id is empty"));
-        }
-        if annotation.name.is_empty() {
-            return Err(Error::InvalidSpan("annotation name is empty"));
-        }
+        annotation.validate_subject()?;
         let mut inner = self
             .inner
             .lock()
@@ -198,18 +341,15 @@ impl AnnotationLog {
                 crate::sync_directory(directory)?;
             }
         }
-        inner.count += 1;
-        inner
-            .by_trace
-            .entry(annotation.trace_id.clone())
-            .or_default()
-            .push(annotation);
+        inner.push(annotation);
         Ok(())
     }
 
-    /// All annotations for a trace, optionally narrowed to one span or name.
+    /// All annotations for a trace, optionally narrowed to one span or name,
+    /// scoped to `tenant` when given.
     pub(crate) fn query(
         &self,
+        tenant: Option<&str>,
         trace_id: &str,
         span_id: Option<&str>,
         name: Option<&str>,
@@ -221,9 +361,11 @@ impl AnnotationLog {
         Ok(inner
             .by_trace
             .get(trace_id)
-            .map(|entries| {
-                entries
+            .map(|positions| {
+                positions
                     .iter()
+                    .map(|position| &inner.entries[*position])
+                    .filter(|a| tenant.is_none() || tenant == Some(a.tenant.as_str()))
                     .filter(|a| span_id.is_none() || span_id == Some(a.span_id.as_str()))
                     .filter(|a| name.is_none() || name == Some(a.name.as_str()))
                     .cloned()
@@ -246,23 +388,25 @@ impl AnnotationLog {
             .lock()
             .map_err(|_| Error::LockPoisoned("annotations"))?;
         let mut found: Vec<Annotation> = Vec::new();
-        let consider = |entries: &Vec<Annotation>, found: &mut Vec<Annotation>| {
-            for annotation in entries {
-                if narrow.matches(annotation) {
-                    found.push(annotation.clone());
-                }
+        let mut consider = |annotation: &Annotation| {
+            if narrow.matches(annotation) {
+                found.push(annotation.clone());
             }
         };
-        match narrow.trace_id {
-            Some(trace_id) => {
-                if let Some(entries) = inner.by_trace.get(trace_id) {
-                    consider(entries, &mut found);
-                }
+        // Most selective index first: an experiment narrows to one run's
+        // scores, a trace to one trace's judgments; only a fully open search
+        // walks the population.
+        if let Some(experiment) = narrow.experiment_id {
+            for position in inner.by_experiment.get(&experiment).into_iter().flatten() {
+                consider(&inner.entries[*position]);
             }
-            None => {
-                for entries in inner.by_trace.values() {
-                    consider(entries, &mut found);
-                }
+        } else if let Some(trace_id) = narrow.trace_id {
+            for position in inner.by_trace.get(trace_id).into_iter().flatten() {
+                consider(&inner.entries[*position]);
+            }
+        } else {
+            for annotation in &inner.entries {
+                consider(annotation);
             }
         }
         // Newest first, then a stable tiebreak so equal timestamps — which
@@ -271,8 +415,10 @@ impl AnnotationLog {
             right
                 .timestamp_ns
                 .cmp(&left.timestamp_ns)
+                .then_with(|| left.tenant.cmp(&right.tenant))
                 .then_with(|| left.trace_id.cmp(&right.trace_id))
                 .then_with(|| left.span_id.cmp(&right.span_id))
+                .then_with(|| left.example_id.cmp(&right.example_id))
                 .then_with(|| left.name.cmp(&right.name))
         });
         if let Some(limit) = narrow.limit {
@@ -281,87 +427,82 @@ impl AnnotationLog {
         Ok(found)
     }
 
-    /// Drops annotations addressed to erased spans, rewriting the log
+    /// Drops annotations addressed to an erased subject, rewriting the log
     /// atomically (temp + rename). Returns how many were removed.
     ///
-    /// An annotation is dropped when its `(trace_id, span_id)` is one of
-    /// `keys`, or when `whole_trace` names its trace — the trace-subject
-    /// case, which also covers trace-level annotations (`span_id` empty).
-    /// A trace-level annotation on a trace that was only PARTIALLY erased
-    /// (a session cutting across it) is deliberately kept: it is judgment
-    /// about spans that still exist.
-    pub(crate) fn drop_for_keys(
+    /// The doom predicate mirrors the typed subject an annotation can carry:
+    ///
+    /// - `keys` — span-addressed annotations (scores' run addresses
+    ///   included) whose `(tenant, trace_id, span_id)` was erased;
+    /// - `whole_trace` — a trace subject, which also sweeps that trace's
+    ///   trace-level annotations (`span_id` empty). A trace-level annotation
+    ///   on a trace that was only PARTIALLY erased (a session cutting across
+    ///   it) is deliberately kept: it is judgment about spans that still
+    ///   exist;
+    /// - `whole_session` — a session subject, which is what reaches
+    ///   session-addressed annotations that carry no span address at all;
+    /// - `whole_tenant` — a tenant subject: everything of the tenant's,
+    ///   scores included, whatever its subject shape.
+    pub(crate) fn drop_for_subject(
         &self,
-        keys: &HashSet<(String, String)>,
-        whole_trace: Option<&str>,
+        keys: &HashSet<(String, String, String)>,
+        whole_trace: Option<(&str, &str)>,
+        whole_session: Option<(&str, &str)>,
+        whole_tenant: Option<&str>,
     ) -> Result<usize> {
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|_| Error::LockPoisoned("annotations"))?;
         let doomed = |annotation: &Annotation| {
-            whole_trace.is_some_and(|trace_id| annotation.trace_id == trace_id)
-                || keys.contains(&(annotation.trace_id.clone(), annotation.span_id.clone()))
+            whole_tenant.is_some_and(|tenant| annotation.tenant == tenant)
+                || whole_trace.is_some_and(|(tenant, trace_id)| {
+                    annotation.tenant == tenant && annotation.trace_id == trace_id
+                })
+                || whole_session.is_some_and(|(tenant, session_id)| {
+                    annotation.tenant == tenant && annotation.session_id == session_id
+                })
+                || (!annotation.trace_id.is_empty()
+                    && keys.contains(&(
+                        annotation.tenant.clone(),
+                        annotation.trace_id.clone(),
+                        annotation.span_id.clone(),
+                    )))
         };
-        let mut kept: Vec<Annotation> = Vec::new();
-        let mut removed = 0;
-        for entries in inner.by_trace.values() {
-            for annotation in entries {
-                if doomed(annotation) {
-                    removed += 1;
-                } else {
-                    kept.push(annotation.clone());
-                }
-            }
-        }
-        if removed == 0 {
-            return Ok(0);
-        }
-        // Same publish shape as the TTL rewrite below: staged, fsynced,
-        // renamed, directory synced — a crash leaves the old log or the new
-        // one, never a blend, and the old log only ever errs toward a retry.
-        let temp = self.path.with_extension("jsonl.tmp");
-        {
-            let mut file = File::create(&temp)?;
-            for annotation in &kept {
-                let mut line = serde_json::to_string(annotation)?;
-                line.push('\n');
-                file.write_all(line.as_bytes())?;
-            }
-            file.sync_all()?;
-        }
-        std::fs::rename(&temp, &self.path)?;
-        if let Some(directory) = self.path.parent() {
-            crate::sync_directory(directory)?;
-        }
-        inner.by_trace.clear();
-        inner.count = kept.len();
-        for annotation in kept {
-            inner
-                .by_trace
-                .entry(annotation.trace_id.clone())
-                .or_default()
-                .push(annotation);
-        }
-        Ok(removed)
+        self.rewrite_keeping(|annotation| !doomed(annotation))
     }
 
-    /// Drops annotations older than `cutoff_ns` by rewriting the log
-    /// atomically (temp + rename). Returns how many were removed.
-    pub(crate) fn drop_older_than(&self, cutoff_ns: u64) -> Result<usize> {
+    /// Drops annotations older than their tenant's cutoff by rewriting the
+    /// log atomically (temp + rename). Returns how many were removed.
+    ///
+    /// `cutoff_for` maps a tenant to its cutoff; `None` means that tenant
+    /// never expires. **Scores are exempt regardless**: they live on eval
+    /// retention, not trace retention — a rolling window that swept January's
+    /// scores would silently empty the base of every
+    /// experiment-over-experiment diff run in March.
+    pub(crate) fn drop_older_than(
+        &self,
+        cutoff_for: &dyn Fn(&str) -> Option<u64>,
+    ) -> Result<usize> {
+        self.rewrite_keeping(|annotation| {
+            annotation.is_score()
+                || cutoff_for(&annotation.tenant)
+                    .map_or(true, |cutoff_ns| annotation.timestamp_ns >= cutoff_ns)
+        })
+    }
+
+    /// Rewrites the log to the annotations `keep` admits — staged, fsynced,
+    /// renamed, directory synced — so a crash leaves the old log or the new
+    /// one, never a blend, and the old log only ever errs toward a retry.
+    /// Returns how many were dropped; a no-op never touches the file.
+    fn rewrite_keeping(&self, keep: impl Fn(&Annotation) -> bool) -> Result<usize> {
         let mut inner = self
             .inner
             .lock()
             .map_err(|_| Error::LockPoisoned("annotations"))?;
         let mut kept: Vec<Annotation> = Vec::new();
         let mut removed = 0;
-        for entries in inner.by_trace.values() {
-            for annotation in entries {
-                if annotation.timestamp_ns >= cutoff_ns {
-                    kept.push(annotation.clone());
-                } else {
-                    removed += 1;
-                }
+        for annotation in &inner.entries {
+            if keep(annotation) {
+                kept.push(annotation.clone());
+            } else {
+                removed += 1;
             }
         }
         if removed == 0 {
@@ -381,15 +522,7 @@ impl AnnotationLog {
         if let Some(directory) = self.path.parent() {
             crate::sync_directory(directory)?;
         }
-        inner.by_trace.clear();
-        inner.count = kept.len();
-        for annotation in kept {
-            inner
-                .by_trace
-                .entry(annotation.trace_id.clone())
-                .or_default()
-                .push(annotation);
-        }
+        inner.adopt(kept);
         Ok(removed)
     }
 }

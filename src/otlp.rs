@@ -71,6 +71,7 @@ impl SpanParts {
     pub(crate) fn finish(
         self,
         service: &str,
+        tenant: &str,
         scope_attributes: &Map<String, Value>,
     ) -> Result<Span, OtlpError> {
         if self.trace_id.is_empty() || self.span_id.is_empty() {
@@ -92,6 +93,7 @@ impl SpanParts {
         Ok(Span {
             trace_id: self.trace_id,
             span_id: self.span_id,
+            tenant: tenant.to_owned(),
             parent_span_id: (!self.parent_span_id.is_empty()).then_some(self.parent_span_id),
             name: self.name,
             start_time_ns: self.start_time_ns,
@@ -252,10 +254,12 @@ pub fn spans_from_json(body: &[u8]) -> Result<Vec<Span>, OtlpError> {
         serde_json::from_slice(body).map_err(|error| OtlpError(error.to_string()))?;
     let mut spans = Vec::new();
     for resource_entry in request.resource_spans {
-        let service = resource_entry
+        let (service, tenant) = resource_entry
             .resource
-            .and_then(|resource| resource.service_name())
-            .unwrap_or_else(|| "unknown_service".to_owned());
+            .map(JsonResource::identity)
+            .unwrap_or_default();
+        let service = service.unwrap_or_else(|| "unknown_service".to_owned());
+        let tenant = tenant.unwrap_or_default();
         for scope_entry in resource_entry.scope_spans {
             let scope_attributes = scope_entry.scope.map(|scope| scope.attributes.0);
             let scope_attributes = scope_attributes.unwrap_or_default();
@@ -263,7 +267,7 @@ pub fn spans_from_json(body: &[u8]) -> Result<Vec<Span>, OtlpError> {
                 spans.push(
                     json_span
                         .into_parts()?
-                        .finish(&service, &scope_attributes)?,
+                        .finish(&service, &tenant, &scope_attributes)?,
                 );
             }
         }
@@ -298,17 +302,27 @@ struct JsonResource {
 }
 
 impl JsonResource {
-    /// The FIRST `service.name` attribute whose value is a string. A
-    /// non-string one does not stop the scan, exactly as the DOM walk's
-    /// `find_map` did not.
-    fn service_name(self) -> Option<String> {
-        self.attributes
-            .0
-            .into_iter()
-            .find_map(|(key, value)| match (key.as_str(), value) {
-                ("service.name", Value::String(name)) => Some(name),
-                _ => None,
-            })
+    /// The FIRST `service.name` and FIRST `traza.tenant` attributes whose
+    /// values are strings, from one scan. A non-string one does not stop the
+    /// scan, exactly as the DOM walk's `find_map` did not. `traza.tenant` is
+    /// the one resource attribute besides the service that flows onto spans:
+    /// it becomes span identity, and the engine validates it like any
+    /// client-supplied tenant.
+    fn identity(self) -> (Option<String>, Option<String>) {
+        let mut service = None;
+        let mut tenant = None;
+        for (key, value) in self.attributes.0 {
+            match (key.as_str(), value) {
+                ("service.name", Value::String(name)) if service.is_none() => {
+                    service = Some(name);
+                }
+                ("traza.tenant", Value::String(name)) if tenant.is_none() => {
+                    tenant = Some(name);
+                }
+                _ => {}
+            }
+        }
+        (service, tenant)
     }
 }
 

@@ -25,6 +25,22 @@ token rollups, waterfalls — is derived from spans at read time.
 have no defaults — omitting one is a `400` naming the missing field. The rest
 default as shown.
 
+A span may also carry a top-level `$tenant` — lowercase
+`[a-z0-9][a-z0-9._-]`, at most 64 bytes. Omitted or empty means the DEFAULT
+tenant, and an empty tenant is never serialized back, so a store that never
+uses tenants writes files with no tenant bytes in them at all. A credential
+bound to a tenant (see [administration](../operations/administration.md))
+stamps it for you and refuses a contradiction.
+
+The `$` sigil is load-bearing, not decoration. A span's top-level namespace is
+open — any unknown field survives in the round trip (see below) — so a bare
+`tenant` key is *your* data and stays your data, exactly as it was before the
+identity existed. Reserving `$tenant`, the way payload references reserve
+`$payload`, is what lets a store written before tenancy be read after it
+without a value ever being mistaken for an identity. A bare `tenant` you send
+is preserved verbatim and is never an identity; put a value you mean as
+identity under `$tenant`, or let a bound credential supply it.
+
 ### Timestamps
 
 Integer Unix nanoseconds, both fields. On ingest, `start_time_ns` also accepts
@@ -55,6 +71,12 @@ this.
 {"name": "llm.prompt", "timestamp_ns": 1700000000001000000, "attributes": {"content": "…"}}
 ```
 
+`timestamp_ns` accepts the aliases `time_unix_nano` — OTLP's spelling, and the
+one most clients build events with — plus `timestamp_unix_nano`, `time_ns`,
+and `time`. `attributes` may be omitted for an event that is just a named
+instant; it reads back as `{}`. Only `name` and a timestamp are required.
+Responses always use the canonical `timestamp_ns`.
+
 **Links** point at other spans, possibly in other traces:
 
 ```json
@@ -81,14 +103,18 @@ accident: a client may carry its own fields through Traza without them being
 silently dropped. Unknown top-level fields are *not* indexed — put anything you
 want to filter on in `attributes`.
 
-## `(trace_id, span_id)` is the primary key
+## `(tenant, trace_id, span_id)` is the primary key
 
 This is the single most important thing to understand about ingesting into
 Traza.
 
-A span is uniquely named by the pair `(trace_id, span_id)`. Ingesting a span
-whose pair already exists **replaces** the stored version. The newest ingest
-wins — last-write-wins — and no second copy is created.
+A span is uniquely named by the triple `(tenant, trace_id, span_id)` — for a
+single-tenant store, where every tenant is the default, that is exactly the
+familiar `(trace_id, span_id)` pair. Ingesting a span whose key already
+exists **replaces** the stored version. The newest ingest wins —
+last-write-wins — and no second copy is created. Two tenants using the same
+trace id hold two different keys, so they can never upsert over each other:
+that is what the tenant is IN the key for.
 
 ```sh
 curl -X POST http://localhost:8080/v1/spans -H 'Content-Type: application/json' \
@@ -143,6 +169,9 @@ any order, from any number of processes.
 
 ## Sessions
 
+A session is identified by `(tenant, session_id)`: the same `session.id`
+value under two tenants is two sessions, never one merged row.
+
 A session groups traces into one unit of agent work — a conversation that spans
 many requests. A span joins a session by carrying a recognized session key;
 Traza resolves the first present of `session.id`, `gen_ai.conversation.id`,
@@ -158,10 +187,56 @@ spans use mixed conventions, the latter sees one key. Full detail in
 
 Spans are immutable once ingested, but judgment about them arrives later — an
 eval score, a human thumbs-down, a triage label. Annotations are a separate
-record type attached to a `(trace_id, span_id)` (or to a whole trace when
-`span_id` is empty) without mutating the span. They are returned alongside a
-trace by `GET /v1/traces/{trace_id}` and queried directly at
-`GET /v1/annotations`. See the [API reference](http-api.md#post-v1annotations).
+record type addressed to a TYPED SUBJECT, expressed by which address fields
+are set (exactly one shape must hold):
+
+- **a trace** — `trace_id` alone;
+- **a span** — `trace_id` + `span_id`;
+- **a session** — `session_id` alone, judging the conversation as a whole;
+- **an experiment example** — `experiment_id` + `example_id`, optionally
+  with `trace_id`/`span_id` naming the task run's span. This shape is a
+  **score**: it addresses the `(experiment, example, span)` tuple the eval
+  model needs (see below).
+
+Every annotation is tenant-scoped like a span, but its identity key is plain
+`tenant`, not `$tenant`: an annotation is a closed record with no open
+namespace to protect, so there is nothing for the sigil to disambiguate.
+`$tenant` is accepted here too, so a client that learned the span's spelling
+routes correctly rather than silently landing in the default tenant. The same
+holds for the erasure subject's `tenant` and a dataset's `tenant`. Annotations
+are returned alongside a trace by `GET /v1/traces/{trace_id}` and queried
+directly at `GET /v1/annotations`. See the
+[API reference](http-api.md#post-v1annotations).
+
+## Eval entities
+
+Five entities make the eval loop representable — addressing only, no
+workflow; task execution stays outside Traza:
+
+- **Dataset** — a stable numeric id, a name, a tenant.
+- **DatasetVersion** — an immutable, content-addressed manifest of
+  `(example_id, digest)` pairs. Its id is the SHA-256 of the manifest, so
+  identical content IS the identical version and re-promoting is
+  idempotent. It records its `parent` version for lineage and the
+  `provenance` of the promotion that produced it.
+- **Example** — a stable, client-chosen id that persists across versions,
+  with `input`, optional `expected`, a `split` label, and provenance back
+  to the source span. **Examples carry their own copies**: large values
+  arrive as `$payload` references, and those references count as live for
+  retention and erasure — deleting the source trace cannot corrupt the
+  version.
+- **Experiment** — a stable numeric id binding one dataset version to a
+  set of task runs, with free-form config metadata. Runs are recorded by
+  the external harness (`POST /v1/experiments/{id}/runs`).
+- **Score** — an annotation with the experiment-example subject, above.
+  Distributions and experiment-over-experiment diffs are served by
+  `/summary` and `/diff`, with per-`(example, name)` last-write-wins dedup
+  so a retried scorer moves a number instead of double-counting it.
+
+Deleting a dataset version is itself a tombstone with defined effects, and
+erasure never silently destroys curated copies — the receipt names them.
+See [the API reference](http-api.md) and
+[administration](../operations/administration.md).
 
 ## Payload references
 

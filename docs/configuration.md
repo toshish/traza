@@ -10,6 +10,7 @@ it.
 
 - [Profiles](#profiles)
 - [Server flags](#server-flags)
+- [Model pricing](#model-pricing)
 - [Environment variables](#environment-variables)
 - [Library `Config`](#library-config)
 - [The throughput/latency tradeoff, measured](#the-throughputlatency-tradeoff-measured)
@@ -168,6 +169,7 @@ better p95/p99 with peak capacity. Do not pick it hoping for a lower median;
 | `--no-shadow-seal` | off (corrective pass is on) | Stops the store answering **observed segment-key shadowing** with a bounded deduplicating merge. Left on, an aggregation that had to decode instead of using a rollup — because the same `(trace_id, span_id)` exists in two segments — latches a flag; the maintenance tick converts it into a merge of the shadowed tail run, bounded by `--compaction-max-segment-bytes`, cooled down for 15 minutes after a successful merge, and backed off exponentially (to hourly) when nothing mergeable is in reach. `traza_shadow_merges_total` counts the merges. The trigger is the observed mechanism, never a latency threshold, and it stops firing the moment the duplicates are merged away. Buffer-caused shadowing — a buffered upsert of a persisted key — deliberately does not latch: a merge cannot retire it, and `--max-buffer-age-seconds` is what bounds it. Inert when compaction is disabled, which owns all merging. |
 | `--wal-commit-window-us N` | `0` (off) | Delays each fsync by up to this long so more batches join it. Costs every acknowledgement in the window up to that delay. Buys nothing on an idle store and a lot on a busy one with small batches. Never weakens the guarantee: the ack still follows the fsync. |
 | `--ttl-seconds N` | off | Rolling retention window. A background pass compacts expired spans every minute; annotations and payload files age out on the same window. Costs a periodic compaction pass. |
+| `--tenant-ttl TENANT=SECONDS` | off | Per-tenant retention override, repeatable. A tenant's cutoff is its override, else `--ttl-seconds`, else **never** — an unlisted tenant on a server with no global TTL keeps everything. `0` disables that tenant's window; an invalid tenant name refuses startup. Scores (experiment-example annotations) are exempt from TTL regardless. See [administration § Per-tenant retention](operations/administration.md#per-tenant-retention). |
 | `--max-connections N` | `1024` | Concurrent connections served; past it clients get `503` rather than being queued. Costs one thread per live connection. |
 | `--payload-threshold-bytes N` | `262144` | String attribute values longer than this are offloaded to the content-addressed payload store and replaced by a reference. `0` disables. Costs an extra file write per offloaded value; saves segment size and buffer memory. **Also bounds content search**: offloading happens at ingest, before anything indexes the span, so an offloaded value is searchable only within its 256-character preview. Since segment v4 this stopped being a lever on *index* memory, so set it on record width and disk alone — and raise it, not lower it, if `?content=` matters. It does still cap how wide a single span can be, which is what `--tail-ring-bytes` is measured against. |
 | `--no-content-index` | off (index is built) | Stops writing the per-segment word filters that make `?content=` fast. **Content search still works** — a segment without the index is scanned rather than skipped, so the same rows come back at the cost of a scan. Saves seal-time tokenization and ~0.1% of segment size. Exposed mainly so the index's value can be measured rather than assumed; see [capacity](operations/capacity.md#content-search). |
@@ -181,6 +183,7 @@ better p95/p99 with peak capacity. Do not pick it hoping for a lower median;
 | `--mcp-allowed-origin ORIGIN` | none | A browser origin permitted to drive `/v1/mcp`, including the scheme (`https://traza.example.com`). Repeatable, and implies `--mcp`. Loopback origins are always allowed; every other one needs naming here. This is the DNS-rebinding defence, and it is operator-supplied because nothing in the request can validate an origin — a rebinding request controls the `Host` header too. Needed when the dashboard is served behind a hostname, since its MCP screen is a browser page. |
 | `--mcp-max-result-bytes N` | `32768` | Ceiling on one MCP tool result or resource read, counting the **whole serialized result** — text block, `structuredContent`, and the JSON envelope around them — in UTF-8 bytes, which is what goes on the wire. **Refused below 1,024**: beneath that there is no result that both fits and conforms to the `outputSchema` its tool advertises, and failing at startup beats answering every request with something a validating client rejects. Past it, rows are dropped and the truncation is stated with the argument that would have narrowed it. Raise for a client with a large context window; lower to make an agent narrow its own queries. |
 | `--mcp-max-payload-bytes N` | `262144` | Ceiling on one `get_payload` fetch, whatever the call asks for. This is what stops a single offloaded prompt filling a context window. The **effective** cap is the smaller of this and `--mcp-max-result-bytes`, so that the byte count the tool reports is the one it returns. |
+| `--pricing FILE` | none | Per-model rates used to derive a cost for LLM spans that did not meter one. Nothing is derived without it, which is the behaviour every store had before it existed. A malformed file refuses startup rather than being ignored — silently reporting `$0.00` is the symptom the file was supplied to fix. Changing the rates invalidates rollups folded under the old ones, which costs a rebuild of the affected sidecars. See [Model pricing](#model-pricing). |
 | `--allow-unauthenticated-non-loopback` | off | Explicitly permit an unauthenticated non-loopback bind. |
 | `--version`, `-V` | — | Print `traza-server <version>` and exit. |
 | `--restore DIR` | — | Install a backup from `DIR` into `--data-dir`, then serve it. The backup is verified before anything is swapped and the swap commits at one `CURRENT` rename, so a failed restore leaves the prior store. See [backup and restore](operations/backup.md). |
@@ -208,11 +211,85 @@ write; a `kill -9`, a panic, or an OS crash cannot. On Linux `fsync` carries
 the usual guarantee. See the README's durability section for the full
 discussion.
 
+## Model pricing
+
+OpenTelemetry defines no cost attribute, so a span carries one only if the
+pipeline that produced it metered it — and most do not. Without rates, a store
+that knows the model and both token counts still reports `$0.00` on every cost
+surface, which reads as *this was free* rather than *nobody told me the rates*.
+
+`--pricing FILE` supplies them:
+
+```json
+{
+  "models": {
+    "gpt-5.6-sol":   {"input_per_mtok": 1.25, "output_per_mtok": 10.00},
+    "gpt-4o-mini*":  {"input_per_mtok": 0.15, "output_per_mtok": 0.60},
+    "gpt-4o*":       {"input_per_mtok": 2.50, "output_per_mtok": 10.00}
+  }
+}
+```
+
+Rates are **USD per million tokens**, the unit vendors quote, so the file can
+be checked against a price page without arithmetic. A key ending in `*` is a
+prefix pattern; the longest match wins regardless of the order the file lists
+them in, and an exact name beats every pattern. A bare `"*"` is a default rate
+for everything unnamed.
+
+There is no built-in table, and there will not be one: prices change on the
+vendor's schedule rather than Traza's, and self-hosted models have no public
+rate at all.
+
+**What derived cost is.** Arithmetic over the tokens the span reported, at the
+rates you configured. It is not a bill — it knows nothing about cached-prompt
+discounts, batch tiers, reasoning tokens billed at a third rate, or negotiated
+pricing.
+
+Three rules keep it from being mistaken for one:
+
+- **A metered cost always wins.** If the span carries `llm.cost_usd`, that is
+  the number and the table is not consulted.
+- **Both directions must be known.** A span that reported only a total has no
+  input/output split, and the two are priced differently, so it stays
+  unpriced rather than being split by an assumed ratio.
+- **The provenance is reported, not implied.** Every cost-bearing row —
+  `/v1/stats/llm`, `/v1/sessions`, and each bucket of `/v1/stats/series` —
+  carries `cost_derived_usd` beside `cost_usd`, plus three call counts:
+  `cost_metered_calls`, `cost_derived_calls`, and `cost_unpriced_calls`.
+
+**Judge a total by the counts, never by the dollars.** `cost_derived_usd == 0`
+does not mean the figure was measured: a zero-rate model is priced and adds
+nothing, and a call nothing could price also adds nothing. The three cases are
+only distinguishable by the counts:
+
+| What happened | `cost_usd` | `cost_derived_usd` | The counts |
+|---|---|---|---|
+| Metered by the span | 0.42 | 0 | `metered: 1` |
+| Priced from the table | 0.42 | 0.42 | `derived: 1` |
+| Priced at a zero rate | 0 | 0 | `derived: 1` |
+| Nothing could price it | 0 | 0 | `unpriced: 1` |
+
+`cost_derived_calls > 0` means the total is an **estimate**;
+`cost_unpriced_calls > 0` means it is an **undercount**, because those calls
+contributed nothing to it. The dashboard prefixes an estimate with `~`, shows
+`—` rather than `0.0000` when nothing could be priced, and gives the full
+breakdown on hover. MCP does the same, and its `analyze_cost` no longer claims
+cost is exact when a rate table contributed to it.
+
+### Changing the rates
+
+A rollup sidecar records the fingerprint of the table its counters were folded
+under, so editing the file invalidates exactly the cached counters that would
+now be wrong, and they are rebuilt on next read. Without that, a sealed
+segment would keep reporting last month's prices forever — nothing about a
+stale rollup looks wrong. Removing `--pricing` likewise returns the store to
+metered-cost-only rather than leaving derived figures behind.
+
 ## Environment variables
 
 | Variable | Used by | Effect |
 |---|---|---|
-| `TRAZA_TOKENS` | `traza-server` | Bearer auth, `rw:` and `ro:` scoped. Set-but-invalid refuses startup rather than running open. Required for a non-loopback bind unless explicitly overridden. |
+| `TRAZA_TOKENS` | `traza-server` | Bearer auth: comma-separated `scope[@tenant]:token` entries with `ro`, `rw`, and `admin` scopes. The optional `@tenant` binds the credential to one tenant — it then reads and writes only that tenant's data, on every surface. Set-but-invalid (including an invalid binding) refuses startup rather than running open. Required for a non-loopback bind unless explicitly overridden. |
 | `TRAZA_UI_DIR` | `traza-server` | First place searched for the built dashboard when `--ui-dir` is unset. |
 | `TRAZA_SOCKET_TIMEOUT_MS` | `traza-server` | Per-read/write socket deadline; default 30,000. Primarily for tests. |
 | `TRAZA_TOKEN` | `seed` | Bearer token the seeder presents. |
@@ -232,6 +309,7 @@ same values a `--profile` would give the server.
 | `max_buffer_age` | `Option<Duration>` | `Some(300 s)` | As `--max-buffer-age-seconds`. Enforced opportunistically on the ingest path and by `Store::maintain_buffer`, whose scheduling — like TTL's — is the embedder's job; `traza-server` calls it from its maintenance tick. |
 | `shadow_seal` | `bool` | `true` | As `--no-shadow-seal` inverted. The corrective merge runs inside `Store::maintain_buffer`, so it too needs the caller to own a clock; inert when `compaction` is `None`. |
 | `ttl_seconds` | `Option<u64>` | `None` | As `--ttl-seconds`. The engine implements it; scheduling the pass is the caller's job. |
+| `tenant_ttl_seconds` | `HashMap<String, u64>` | empty | As `--tenant-ttl`, keyed by tenant name. A listed tenant expires on its own window; an unlisted one falls back to `ttl_seconds` — and if that is `None`, never expires, whatever other tenants are configured with. |
 | `payload_threshold` | `Option<usize>` | `None` | As `--payload-threshold-bytes`. **The library default differs from the server's**: the library offloads nothing unless asked, while `traza-server` defaults to 262,144 bytes. |
 | `durability` | `Durability` | `Wal` | As `--durability`. |
 | `compaction` | `Option<CompactionConfig>` | `Some(default)` | `None` disables compaction. |
@@ -239,6 +317,7 @@ same values a `--profile` would give the server.
 | `content_index` | `bool` | `true` | As `--no-content-index` inverted. `false` omits the content index from sealed segments; `SpanFilter::content` still returns the same rows, by scanning. |
 | `tail_ring_spans` | `usize` | `8_192` | As `--tail-ring-spans`: the live tail's replay depth, as a count. Not a memory bound. |
 | `tail_ring_bytes` | `usize` | `33_554_432` (32 MiB) | As `--tail-ring-bytes`: what actually bounds the tail's memory. Whichever of the two binds first evicts. `Store::tail_usage` reports current residency against both. |
+| `pricing` | `Arc<Pricing>` | empty | As `--pricing`, already parsed. Empty derives nothing. `Pricing::parse` reads the documented JSON; see [Model pricing](#model-pricing). |
 
 `CompactionConfig`:
 

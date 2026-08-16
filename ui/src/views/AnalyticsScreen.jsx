@@ -2,7 +2,7 @@ import React from 'react';
 import { api } from '../lib/api.js';
 import { useRead } from '../lib/route.js';
 import { RANGES, windowOf } from '../lib/query.js';
-import { fmtCompact, fmtCost, fmtDurationNs, fmtNum, fmtPercent } from '../lib/format.js';
+import { fmtCompact, fmtCost, fmtCostProvenance, fmtDurationNs, fmtNum, fmtPercent } from '../lib/format.js';
 import { Card, Chip, Eyebrow, ErrorState, EmptyState, LoadingBar } from '../components/primitives/Chrome.jsx';
 import { CategoryBars, Sparkbar, TimeAxis } from '../components/charts/Marks.jsx';
 
@@ -58,11 +58,19 @@ export function AnalyticsScreen({ go }) {
   const totals = rows.reduce((acc, r) => ({
     calls: acc.calls + r.llm_calls,
     tokens: acc.tokens + r.total_tokens,
-    cost: acc.cost + r.cost_usd,
+    cost_usd: acc.cost_usd + r.cost_usd,
+    cost_derived_usd: acc.cost_derived_usd + (r.cost_derived_usd || 0),
+    cost_metered_calls: acc.cost_metered_calls + (r.cost_metered_calls || 0),
+    cost_derived_calls: acc.cost_derived_calls + (r.cost_derived_calls || 0),
+    cost_unpriced_calls: acc.cost_unpriced_calls + (r.cost_unpriced_calls || 0),
     errors: acc.errors + r.error_count,
     durationNs: acc.durationNs + r.llm_duration_ns,
     spans: acc.spans + r.spans,
-  }), { calls: 0, tokens: 0, cost: 0, errors: 0, durationNs: 0, spans: 0 });
+  }), {
+    calls: 0, tokens: 0, cost_usd: 0, cost_derived_usd: 0,
+    cost_metered_calls: 0, cost_derived_calls: 0, cost_unpriced_calls: 0,
+    errors: 0, durationNs: 0, spans: 0,
+  });
 
   const buckets = series.data?.buckets || [];
 
@@ -92,9 +100,12 @@ export function AnalyticsScreen({ go }) {
         {[
           ['calls', fmtCompact(totals.calls)],
           ['tokens', fmtCompact(totals.tokens)],
-          ['cost', fmtCost(totals.cost), 'USD'],
+          ['cost', fmtCostProvenance(totals).text, 'USD'],
           ['mean latency', totals.calls ? fmtDurationNs(totals.durationNs / totals.calls) : '—'],
-          ['cost / call', totals.calls ? (totals.cost / totals.calls).toFixed(6) : '—', 'USD'],
+          ['cost / call', totals.calls
+            ? (fmtCostProvenance(totals).estimated ? '~' : '')
+              + (totals.cost_usd / totals.calls).toFixed(6)
+            : '—', 'USD'],
           ['error rate', totals.spans ? fmtPercent(totals.errors, totals.spans) : '0%'],
         ].map(([label, value, unit]) => <Card key={label} pad="12px 14px">
           <div style={{ fontSize: 12, color: 'var(--ink-muted)', marginBottom: 5 }}>{label}</div>
@@ -152,7 +163,7 @@ export function AnalyticsScreen({ go }) {
           <Num muted>{fmtNum(row.prompt_tokens)}</Num>
           <Num muted>{fmtNum(row.completion_tokens)}</Num>
           <Num>{fmtNum(row.total_tokens)}</Num>
-          <Num accent>{fmtCost(row.cost_usd)}</Num>
+          <CostCell row={row} />
           <Num muted>{row.llm_calls ? fmtDurationNs(row.llm_duration_ns / row.llm_calls) : '—'}</Num>
           <Num tone={row.error_count ? 'var(--error)' : 'var(--ink-faint)'}>{row.error_count}</Num>
         </div>)}
@@ -167,4 +178,14 @@ function Num({ children, muted, accent, tone }) {
     fontVariantNumeric: 'tabular-nums', textAlign: 'right', whiteSpace: 'nowrap',
     color: tone || (accent ? 'var(--accent)' : muted ? 'var(--ink-muted)' : 'var(--ink)'),
   }}>{children}</div>;
+}
+
+/** A cost cell that marks a figure the pricing table worked out. */
+function CostCell({ row }) {
+  const cost = fmtCostProvenance(row);
+  return <div title={cost.title} style={{
+    padding: 'var(--row-py) 10px', fontFamily: 'var(--font-mono)', fontSize: 12,
+    fontVariantNumeric: 'tabular-nums', textAlign: 'right',
+    color: cost.estimated ? 'var(--ink-muted)' : 'var(--accent)',
+  }}>{cost.text}</div>;
 }

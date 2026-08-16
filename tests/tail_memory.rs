@@ -96,6 +96,7 @@ fn base_span(id: &str) -> Span {
     Span {
         trace_id: format!("trace-{id}"),
         span_id: id.to_owned(),
+        tenant: String::new(),
         parent_span_id: None,
         name: "op".into(),
         start_time_ns: 1_000,
