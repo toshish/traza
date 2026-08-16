@@ -393,25 +393,54 @@ pub fn session_outcome(spans: &[Span], now_ns: u64, idle_ns: u64) -> SessionOutc
     }
 }
 
-/// How a group's context size moved, or why that cannot be said.
-fn token_trend(contexts: &[Option<u64>]) -> (TokenTrend, Option<u64>, Option<u64>) {
-    // A single unreadable member poisons the trend rather than being skipped:
-    // a caching convention we cannot do arithmetic on is not a gap in the
-    // data, it is a reason to distrust the arithmetic.
-    if contexts.iter().any(Option::is_none) && contexts.iter().flatten().count() > 0 {
-        let reported: Vec<u64> = contexts.iter().flatten().copied().collect();
-        if reported.len() < MIN_TREND_SAMPLES {
-            return (TokenTrend::Absent, None, None);
-        }
+/// What one span could say about the context it carried.
+///
+/// Three cases, not two, because `Option<u64>` conflates the two that must be
+/// told apart: a span that reported nothing is a GAP in the series, while a
+/// span reporting cache counters under an unrecognized provider is a reason to
+/// distrust the series. Averaging over the first is fine; ignoring the second
+/// is how a trend gets read off arithmetic that does not hold.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ContextReading {
+    Known(u64),
+    Ambiguous,
+    Absent,
+}
+
+fn context_reading(span: &Span) -> ContextReading {
+    let facts = semconv::facts(&span.attributes);
+    match facts.context_tokens() {
+        Some(tokens) => ContextReading::Known(tokens),
+        None if facts.context_is_ambiguous() => ContextReading::Ambiguous,
+        None => ContextReading::Absent,
     }
-    let reported: Vec<u64> = contexts.iter().flatten().copied().collect();
+}
+
+/// How a group's context size moved, or why that cannot be said.
+fn token_trend(contexts: &[ContextReading]) -> (TokenTrend, Option<u64>, Option<u64>) {
+    // One unreadable member poisons the trend rather than being skipped. A
+    // caching convention whose arithmetic is unknown is not a hole to step
+    // over — the numbers around it may be measuring a different thing.
+    if contexts.contains(&ContextReading::Ambiguous) {
+        return (TokenTrend::Unknown, None, None);
+    }
+    let reported: Vec<u64> = contexts
+        .iter()
+        .filter_map(|reading| match reading {
+            ContextReading::Known(tokens) => Some(*tokens),
+            _ => None,
+        })
+        .collect();
     if reported.len() < MIN_TREND_SAMPLES {
         return (TokenTrend::Absent, None, None);
     }
     let first = reported[0];
     let last = reported[reported.len() - 1];
     let monotonic = reported.windows(2).all(|pair| pair[1] >= pair[0]);
-    let grown = last >= first.saturating_mul(GROWTH_FACTOR)
+    // The ratio needs a base to be a ratio: from a first reading of zero,
+    // `last >= first * 2` is true of every value including one, and a series
+    // rising 0 → 10 is not a runaway. Absolute growth still speaks for itself.
+    let grown = (first > 0 && last >= first.saturating_mul(GROWTH_FACTOR))
         || last.saturating_sub(first) >= GROWTH_ABSOLUTE;
     if monotonic && grown {
         return (TokenTrend::Growing, Some(first), Some(last));
@@ -528,11 +557,11 @@ fn classify(members: &[&Span], max_self_depth: usize) -> Finding {
         serial as f64 / pairs as f64
     };
 
-    let contexts: Vec<Option<u64>> = ordered
+    let contexts: Vec<ContextReading> = ordered.iter().map(|span| context_reading(span)).collect();
+    let reported = contexts
         .iter()
-        .map(|span| semconv::facts(&span.attributes).context_tokens())
-        .collect();
-    let reported = contexts.iter().flatten().count();
+        .filter(|reading| matches!(reading, ContextReading::Known(_)))
+        .count();
     let (trend, context_first, context_last) = token_trend(&contexts);
     let declared = declared_retry(members);
 
@@ -848,6 +877,69 @@ mod tests {
             .collect();
         let members: Vec<&Span> = flat.iter().collect();
         assert_eq!(classify(&members, 0).shape, Shape::Iteration);
+    }
+
+    #[test]
+    fn an_unreadable_cache_convention_poisons_the_trend_rather_than_being_skipped() {
+        // Cache counters under a provider whose arithmetic is not known. The
+        // numbers present cannot be compared with the ones absent, so the
+        // series is unreadable — NOT flat, and not silently averaged over.
+        let spans: Vec<Span> = (0..8_u64)
+            .map(|turn| {
+                let mut span = with_tokens(
+                    span(
+                        "t",
+                        &format!("s{turn}"),
+                        Some("root"),
+                        "step",
+                        turn * 100,
+                        turn * 100 + 50,
+                    ),
+                    1_000,
+                );
+                span.attributes
+                    .insert("gen_ai.provider.name".into(), json!("some-new-vendor"));
+                span.attributes
+                    .insert("gen_ai.usage.cache_read_input_tokens".into(), json!(5_000));
+                span
+            })
+            .collect();
+        let members: Vec<&Span> = spans.iter().collect();
+        let finding = classify(&members, 0);
+        assert_eq!(finding.token_trend, TokenTrend::Unknown);
+        assert_eq!(
+            finding.shape,
+            Shape::Inconclusive,
+            "an unreadable series can neither convict nor acquit"
+        );
+    }
+
+    #[test]
+    fn growth_from_a_zero_reading_is_not_a_runaway_on_the_ratio_alone() {
+        // `last >= first * 2` is true of everything when first is zero, so a
+        // series rising 0 -> 10 would classify as a runaway on the ratio.
+        let spans: Vec<Span> = (0..8_u64)
+            .map(|turn| {
+                with_tokens(
+                    span(
+                        "t",
+                        &format!("s{turn}"),
+                        Some("root"),
+                        "step",
+                        turn * 100,
+                        turn * 100 + 50,
+                    ),
+                    turn,
+                )
+            })
+            .collect();
+        let members: Vec<&Span> = spans.iter().collect();
+        let finding = classify(&members, 0);
+        assert_ne!(
+            finding.token_trend,
+            TokenTrend::Growing,
+            "seven tokens of growth is not a runaway"
+        );
     }
 
     #[test]

@@ -178,6 +178,22 @@ impl LlmFacts {
             _ => None,
         }
     }
+
+    /// Whether this call reports cache counters under a provider whose
+    /// arithmetic is not known, so [`Self::context_tokens`] declines to answer.
+    ///
+    /// The distinction matters to any caller reading a TREND: a span that
+    /// reported nothing is a gap in the series, while a span that reported
+    /// something uninterpretable is a reason to distrust the series. Both come
+    /// back from `context_tokens` as `None`, so the two are told apart here
+    /// rather than by guessing which `None` is which.
+    pub fn context_is_ambiguous(&self) -> bool {
+        let cached = self
+            .cache_read_tokens
+            .unwrap_or(0)
+            .saturating_add(self.cache_creation_tokens.unwrap_or(0));
+        self.prompt_tokens.is_some() && cached > 0 && self.context_tokens().is_none()
+    }
 }
 
 /// Extracts [`LlmFacts`] from a span's attribute map.
