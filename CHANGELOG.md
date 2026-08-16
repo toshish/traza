@@ -9,6 +9,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Attribution: the server names the failing step, instead of the reader
+  doing it.** A new `diagnose_session` MCP tool answers *why did this run
+  fail* — the outcome, the step the failure is attributed to, and the
+  repetition behind it — with the evidence for each claim travelling beside
+  it. It replaces the two prompts that used to teach a model to read a trace
+  and judge its shape by eye (*"repeated sibling names are a retry storm,
+  deep chains are a loop"*), on the surface's own rule that a prompt wanting
+  a branch is a tool.
+  - **Every rule fires on telemetry that already exists.** An earlier design
+    rested on a `session.outcome` attribute and a `relation: "retry-of"` link
+    — both conventions Traza invented and nothing else emits — which would
+    have been a closed loop: seed the convention, detect it, pass CI, and
+    answer `cause: null` on every real store. A declared convention now
+    raises confidence and is never a precondition. The discriminators are
+    error density, serial fraction, self-similar depth and context growth.
+  - **Context growth is read from `context_tokens`, not prompt tokens.**
+    `gen_ai.usage.cache_read_input_tokens` and `cache_creation_input_tokens`
+    are recognized, because Anthropic reports `input_tokens` as the *uncached
+    remainder*: a growing conversation reports a prompt count that falls as
+    its cache warms, so reading the wrong field inverts the signal on the
+    configuration long-running agents actually use. Where the arithmetic is
+    unknown the trend is reported as unreadable rather than guessed.
+  - **It refuses to say more than the data supports.** A shape is classified
+    only when a discriminator agrees; otherwise it is reported as
+    inconclusive with the missing signal named. Ordinary iteration is
+    reported *as* ordinary so a reader can see it was examined and set aside.
+    Absent token data can never satisfy a healthy classification. The
+    strongest test is silence: the analysis finds no fault anywhere in the
+    bundled corpus of healthy workloads.
+  - **Session outcome** is first-class and provenance-tagged: `declared` when
+    a span said so (`session.outcome`, `session.goal` — Traza extensions,
+    labelled as honestly as `llm.cost_usd`), `derived` from the run's own
+    spans otherwise, and `unknown` — never rendered as success — for a run
+    still in flight. A run that failed a call and recovered is a success that
+    reports its errors, not a failure.
+- **`promote_failures_to_dataset`** closes the loop into the M4 eval
+  entities: a session's attributed failures become a regression dataset
+  version, each example carrying its own copy plus provenance back to the
+  span. Re-promoting is idempotent. Gated by an `rw` token **and** a new
+  `--mcp-promote` switch, separate from `--mcp-annotations` because an
+  annotation dies with its span while a promoted example deliberately
+  outlives its source. **The caller names a session, never a span**: the
+  promoted set is re-derived server-side from the diagnosis, so text injected
+  into the telemetry can change whether a promotion happens but never what it
+  copies — proven by a test that plants exactly that instruction.
+- A **runaway agent scenario** in the seed corpus: an agent whose search tool
+  fails from the fourth turn on, so every later reflection appends the failure
+  to its context and asks again. Its steps are siblings under one root, the
+  shape real frameworks emit, and it carries no declared outcome and no retry
+  link — so finding it proves the analysis works on what a real pipeline
+  sends.
+
+### Fixed
+
+- **Link attributes were outside every payload walker.** A `$payload`
+  reference copied into a span's `links[].attributes` — an ordinary thing for
+  an SDK to do, since the wire contract stores what a client sends — was
+  counted by no reference sweep, redacted by no erasure, and invisible to the
+  verify predicate. So a blob a surviving span still referenced could be
+  deleted, and `verify --erasure` could report **erased and conclusive over
+  content still on disk and still readable**. All five walkers now share one
+  iterator naming every attribute map a span carries; the duplicate collector
+  that made the gap exist twice is gone. Links are also bounded at ingest for
+  the first time. Both guards are mutation-proven.
+- `top_failures` and `slowest_spans` advertised a row limit of 100 and applied
+  50, so a caller obeying the schema was silently given half of what it asked
+  for.
+- The claim in the data-model and LLM-semantics guides that a link's
+  `relation` attribute "keeps link semantics queryable" was false — no query
+  path reaches link attributes. The docs now say what is true: links are
+  traversed inside a diagnosis, and are not filterable.
+
+### Added
+
 - **Tenant identity in the primary key.** Span identity is now
   `(tenant, trace_id, span_id)` — everywhere: the write buffer's index, WAL
   replay, segment supersede resolution, compaction's last-write-wins merge,
