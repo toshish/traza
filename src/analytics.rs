@@ -35,7 +35,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::Serialize;
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 use crate::semconv::{self, LlmFacts};
 use crate::{Result, Span, Store};
@@ -498,7 +498,7 @@ impl SegmentRollup {
         self.max_end_ns = self.max_end_ns.max(span.end_time_ns);
         self.key_hashes
             .insert(key_hash(&span.tenant, &span.trace_id, &span.span_id));
-        collect_payload_refs(span, &mut self.payload_refs);
+        crate::erasure::payload_refs_of(span, &mut self.payload_refs);
         // One semconv scan, shared across every group this span joins.
         let facts = semconv::facts(&span.attributes).priced(pricing);
         if let Some(model) = &facts.model {
@@ -557,35 +557,6 @@ pub(crate) fn key_hash(tenant: &str, trace_id: &str, span_id: &str) -> u64 {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     hash
-}
-
-/// Collects `$payload` references from span and event attributes.
-///
-/// Redaction markers (`"erased": true`) are excluded, and the exclusion is
-/// load-bearing twice over: this set is the TTL sweep's protection set, so a
-/// marker counted as a reference would shield a file whose bytes an erasure
-/// already removed forever — and it is the erasure receipt's liveness
-/// evidence, where the same mistake certified a RE-CREATED file as "safely
-/// retained by live spans". A marker records that content is gone; it is not
-/// a reference to content.
-fn collect_payload_refs(span: &Span, refs: &mut HashSet<String>) {
-    let mut scan = |attributes: &Map<String, Value>| {
-        for value in attributes.values() {
-            if value.get("erased").and_then(Value::as_bool) == Some(true) {
-                continue;
-            }
-            if let Some(reference) = value
-                .get(crate::payload::PAYLOAD_KEY)
-                .and_then(Value::as_str)
-            {
-                refs.insert(reference.to_owned());
-            }
-        }
-    };
-    scan(&span.attributes);
-    for event in &span.events {
-        scan(&event.attributes);
-    }
 }
 
 /// UTC calendar day (YYYY-MM-DD) of a nanosecond timestamp, dependency-free
@@ -1114,7 +1085,7 @@ impl Store {
             writer.spans.clone()
         };
         for span in &buffer {
-            collect_payload_refs(span, &mut refs);
+            crate::erasure::payload_refs_of(span, &mut refs);
         }
         // Dataset examples are live references too: an example deliberately
         // outlives the trace it was promoted from, and "deleting source

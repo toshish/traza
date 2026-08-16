@@ -191,6 +191,33 @@ pub struct Span {
     pub extra: Map<String, Value>,
 }
 
+impl Span {
+    /// Every attribute map on this span that may carry a `$payload`
+    /// reference: the span's own, each event's, and **each link's**.
+    ///
+    /// This exists so the question "where can a payload reference live?" has
+    /// exactly one answer. It used to have several, written out by hand at
+    /// each walker, and the hand-written ones all agreed on attributes and
+    /// events and all forgot links — so a reference a client copied into a
+    /// link attribute was counted by no reference sweep, redacted by no
+    /// erasure, and seen by no receipt: `verify --erasure` reported *erased*
+    /// and *conclusive* over a preview that was still on disk. A walker that
+    /// iterates this cannot make that mistake, and a new place a reference can
+    /// hide is added here once rather than in five places.
+    pub(crate) fn payload_maps(&self) -> impl Iterator<Item = &Map<String, Value>> {
+        std::iter::once(&self.attributes)
+            .chain(self.events.iter().map(|event| &event.attributes))
+            .chain(self.links.iter().map(|link| &link.attributes))
+    }
+
+    /// [`Self::payload_maps`], for the walkers that rewrite.
+    pub(crate) fn payload_maps_mut(&mut self) -> impl Iterator<Item = &mut Map<String, Value>> {
+        std::iter::once(&mut self.attributes)
+            .chain(self.events.iter_mut().map(|event| &mut event.attributes))
+            .chain(self.links.iter_mut().map(|link| &mut link.attributes))
+    }
+}
+
 /// How many matches a sorted query will rank before refusing.
 ///
 /// Sorting has to see every match, so an unbounded sorted query over a
@@ -1367,8 +1394,21 @@ fn validate_span(span: &Span) -> Result<()> {
             "tenant must be lowercase [a-z0-9][a-z0-9._-], at most 64 bytes",
         ));
     }
+    if span.links.len() > MAX_LINKS {
+        return Err(Error::InvalidSpan("too many links"));
+    }
     Ok(())
 }
+
+/// Links one span may carry.
+///
+/// Links were unbounded until they became load-bearing. Nothing read them, so
+/// their only cost was bytes; now a diagnosis walks them and each one is an
+/// attribute map the payload walkers visit, so an unbounded array is an
+/// unbounded per-span cost in a path an operator did not choose. A thousand
+/// links on one span is not a trace shape, it is a client bug or an attack,
+/// and both are better answered at ingest than at read.
+const MAX_LINKS: usize = 256;
 
 /// (tenant, trace_id, span_id) is the span's PRIMARY KEY: re-ingesting an
 /// existing key replaces the buffered version in place — retries are

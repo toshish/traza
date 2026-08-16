@@ -283,8 +283,15 @@ pub(crate) fn load_payload(directory: &Path, reference: &str) -> Result<Option<V
     }
 }
 
-/// Replaces every string attribute value longer than `threshold` bytes
-/// (span attributes and event attributes) with a payload reference.
+/// Replaces every string attribute value longer than `threshold` bytes with a
+/// payload reference, everywhere a span can hold one — its own attributes,
+/// each event's, and each link's ([`Span::payload_maps_mut`]).
+///
+/// Links are offloaded for the same reason they are swept and redacted: a
+/// reference is wherever a client put one, and every walker has to agree on
+/// where that can be. Offloading them too keeps the store the only writer of
+/// its own references, so a large value in a link attribute becomes a counted
+/// reference rather than inline bytes no reference sweep knows about.
 ///
 /// `masked` names content hashes currently under a pending erasure as its
 /// SUBJECT. A value whose content resolves to one is not written to disk at
@@ -299,15 +306,8 @@ pub(crate) fn offload_span(
     registry: &TouchRegistry,
     masked: Option<&HashSet<String>>,
 ) -> Result<()> {
-    offload_map(directory, &mut span.attributes, threshold, registry, masked)?;
-    for event in &mut span.events {
-        offload_map(
-            directory,
-            &mut event.attributes,
-            threshold,
-            registry,
-            masked,
-        )?;
+    for attributes in span.payload_maps_mut() {
+        offload_map(directory, attributes, threshold, registry, masked)?;
     }
     Ok(())
 }

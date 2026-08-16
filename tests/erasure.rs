@@ -1565,3 +1565,156 @@ fn an_acknowledged_erasure_survives_kill_dash_nine() {
         "the receipt verifies after the restart: {receipt}"
     );
 }
+
+/// A span's LINK attributes are a place a payload reference can live, and for
+/// three shipped releases they were a place no payload walker looked.
+///
+/// The store never wrote one there itself — offload walked attributes and
+/// events — but the wire contract stores what a client sends, and copying a
+/// linked span's attributes onto the link is an ordinary thing for an SDK to
+/// do. The result was a reference that no sweep counted, no erasure redacted,
+/// and no receipt saw: `verify --erasure` answered *erased* and *conclusive*
+/// over content still on disk and still readable through the span. This holds
+/// both halves of the fix at once — the value is offloaded from the link like
+/// any other, and the erasure reaches it.
+#[test]
+fn a_payload_carried_on_a_link_is_offloaded_redacted_and_seen_by_the_receipt() {
+    let dir = test_dir("link-payload");
+    let store = Store::open(
+        &dir,
+        Config {
+            payload_threshold: Some(64),
+            ..wal_config()
+        },
+    )
+    .expect("opens");
+    let secret = format!("linked {}", "z".repeat(300));
+    let reference = format!("sha256/{}", traza::payload::sha256_hex(secret.as_bytes()));
+
+    // The subject lives on an ordinary attribute of one span, and is copied
+    // onto a LINK of another — the shape an SDK produces when it annotates a
+    // link with the context of the span it points at.
+    store
+        .ingest(span("t1", "a", json!({"prompt": secret.clone()})))
+        .expect("ingests");
+    let linked: Span = serde_json::from_value(json!({
+        "trace_id": "t1", "span_id": "b", "name": "op-b", "service": "svc",
+        "start_time_ns": 1_000u64, "end_time_ns": 2_000u64,
+        "attributes": {},
+        "links": [{
+            "trace_id": "t1", "span_id": "a",
+            "attributes": {"relation": "retry-of", "prompt": secret.clone()}
+        }],
+    }))
+    .expect("span");
+    store.ingest(linked).expect("ingests");
+    store.flush().expect("seals");
+
+    // Half one: the link's oversized value was offloaded like any other, so
+    // the store holds one content-addressed copy rather than inline bytes no
+    // reference sweep knows about.
+    let stored = store.get_trace("t1").expect("lookup");
+    let link_value = stored
+        .iter()
+        .find(|span| span.span_id == "b")
+        .map(|span| span.links[0].attributes["prompt"].clone())
+        .expect("the linked span");
+    assert_eq!(
+        link_value.get("$payload").and_then(Value::as_str),
+        Some(reference.as_str()),
+        "a link attribute over the threshold is offloaded, not left inline: {link_value}"
+    );
+
+    let status = store
+        .erase(Subject::Payload {
+            reference: reference.clone(),
+        })
+        .expect("erases");
+
+    // Half two: the erasure reached the link copy. Before the fix the marker
+    // landed on the span attribute alone and the link kept its preview.
+    let after = store.get_trace("t1").expect("lookup");
+    let link_after = after
+        .iter()
+        .find(|span| span.span_id == "b")
+        .map(|span| span.links[0].attributes["prompt"].clone())
+        .expect("the linked span");
+    assert_eq!(
+        link_after.get("erased").and_then(Value::as_bool),
+        Some(true),
+        "the link's copy is redacted: {link_after}"
+    );
+    assert!(
+        link_after.get("preview").is_none(),
+        "the preview is content, and it is gone from the link too: {link_after}"
+    );
+    assert!(
+        store.payload(&reference).expect("load").is_none(),
+        "the bytes are gone"
+    );
+
+    let receipt = store.verify_erasure(status.erase.id).expect("receipt");
+    assert_eq!(receipt.result, "erased");
+    assert!(
+        receipt.conclusive,
+        "and the receipt may only say so because it looked where the reference was"
+    );
+}
+
+/// Reference-aware deletion has to count a reference wherever one can be, or
+/// it deletes bytes another span is still using.
+///
+/// Erasing the trace that holds the only ATTRIBUTE reference must not remove
+/// a payload a surviving span still points at from a LINK. Before the fix the
+/// link's reference was invisible to `payload_refs_of`, so the blob was swept
+/// and the survivor was left pointing at nothing.
+#[test]
+fn a_reference_held_only_by_a_link_keeps_its_payload_alive() {
+    let dir = test_dir("link-liveness");
+    let store = Store::open(
+        &dir,
+        Config {
+            payload_threshold: Some(64),
+            ..wal_config()
+        },
+    )
+    .expect("opens");
+    let shared = format!("shared {}", "y".repeat(300));
+    let reference = format!("sha256/{}", traza::payload::sha256_hex(shared.as_bytes()));
+
+    store
+        .ingest(span("doomed", "a", json!({"prompt": shared.clone()})))
+        .expect("ingests");
+    let survivor: Span = serde_json::from_value(json!({
+        "trace_id": "keeps", "span_id": "b", "name": "op-b", "service": "svc",
+        "start_time_ns": 1_000u64, "end_time_ns": 2_000u64,
+        "attributes": {},
+        "links": [{
+            "trace_id": "doomed", "span_id": "a",
+            "attributes": {"prompt": shared.clone()}
+        }],
+    }))
+    .expect("span");
+    store.ingest(survivor).expect("ingests");
+    store.flush().expect("seals");
+
+    store
+        .erase(Subject::Trace {
+            trace_id: "doomed".into(),
+            tenant: String::new(),
+        })
+        .expect("erases");
+
+    assert!(
+        store.payload(&reference).expect("load").is_some(),
+        "a live reference on a link is a live reference: the payload stays"
+    );
+    let kept = store.get_trace("keeps").expect("lookup");
+    assert_eq!(
+        kept[0].links[0].attributes["prompt"]
+            .get("$payload")
+            .and_then(Value::as_str),
+        Some(reference.as_str()),
+        "and the survivor still points at bytes that are there"
+    );
+}
