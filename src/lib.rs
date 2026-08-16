@@ -8,6 +8,7 @@
 
 pub mod analytics;
 pub mod annotations;
+pub mod attribution;
 pub mod auth;
 pub mod content;
 pub mod erasure;
