@@ -264,12 +264,15 @@ fn every_tool_declares_what_it_does_to_the_store() {
             "{name}: this surface has no fetcher, shell or outbound path, so its world is closed"
         );
 
-        if name == "record_annotation" {
+        if name == "record_annotation" || name == "promote_failures_to_dataset" {
             assert_eq!(annotations["readOnlyHint"], json!(false));
             // Append-only: it records a fact beside the data and can never
             // modify or remove a span.
             assert_eq!(annotations["destructiveHint"], json!(false));
-            // Two identical calls record two annotations.
+            // Two identical calls record two annotations. (Promotion is in
+            // fact idempotent at the version's content address, but it is
+            // annotated conservatively: a host that gates on the hint should
+            // ask, and a promise of idempotence is one a caller may act on.)
             assert_eq!(annotations["idempotentHint"], json!(false));
         } else {
             assert_eq!(
@@ -288,15 +291,17 @@ fn every_tool_declares_what_it_does_to_the_store() {
         }
     }
 
-    // Nine readers and one writer, so a tool added without a decision about
+    // Ten readers and one writer, so a tool added without a decision about
     // its nature fails here rather than shipping as pessimistically annotated.
+    // (The second writer, promote_failures_to_dataset, needs --mcp-promote and
+    // so is absent from this listing; its own gating test covers it.)
     let read_only = tools
         .iter()
         .filter(|tool| tool["annotations"]["readOnlyHint"] == json!(true))
         .count();
     assert_eq!(
-        read_only, 9,
-        "expected nine read-only tools, found {read_only}"
+        read_only, 10,
+        "expected ten read-only tools, found {read_only}"
     );
 }
 

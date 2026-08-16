@@ -545,6 +545,7 @@ default 32MiB)] \
 a metered llm.cost_usd always wins)] \
 [--mcp (serve the Model Context Protocol endpoint at /v1/mcp; off by default)] \
 [--mcp-annotations (additionally let MCP callers with an rw token record annotations)] \
+[--mcp-promote (additionally let them promote a session's failures into a dataset)] \
 [--mcp-max-result-bytes N (default 32768)] [--mcp-max-payload-bytes N (default 262144)] \
 [--mcp-allowed-origin ORIGIN (repeatable; browser origins allowed to drive /v1/mcp \
 besides loopback)] \
@@ -583,6 +584,7 @@ struct McpOptions {
     /// Off unless `--mcp` was passed.
     enabled: bool,
     annotations: bool,
+    promote: bool,
     limits: traza::mcp::Limits,
     /// Browser origins permitted to drive the endpoint, beyond loopback.
     ///
@@ -768,6 +770,15 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
             "--mcp-annotations" => {
                 mcp.enabled = true;
                 mcp.annotations = true;
+            }
+            // Separate from --mcp-annotations, and deliberately not implied by
+            // it. An annotation is removed by the erasure that removes its
+            // span; a promoted example is a COPY that outlives its source and
+            // pins that source's payload bytes past retention. Those are
+            // different things to consent to.
+            "--mcp-promote" => {
+                mcp.enabled = true;
+                mcp.promote = true;
             }
             "--mcp-max-result-bytes" => {
                 i += 1;
@@ -3431,7 +3442,8 @@ fn serve_mcp(
             ),
         );
     }
-    let server = traza::mcp::Server::new(engine, options.limits, options.annotations);
+    let server = traza::mcp::Server::new(engine, options.limits, options.annotations)
+        .with_promotion(options.promote);
     let context = traza::mcp::Context {
         access,
         tenant: principal.and_then(|principal| principal.tenant.clone()),
