@@ -208,6 +208,15 @@ between 1 and 50 distinct values each, 8.4 GiB on disk across 977 segments —
 10,000,000 × 8 bytes of postings and nothing else. Span size never entered
 into it, and under v4 it still does not.
 
+**The supersede prefilter adds one more per-segment term.** Resolving
+last-write-wins consults a per-segment set holding the FNV-1a hash of every
+primary key the segment stores — eight bytes of payload per distinct key,
+roughly sixteen of RSS with hash-table slack. It is built lazily from the
+rollup sidecar the first time a query asks whether that segment could
+supersede a candidate, so an idle store pays nothing, and a queried store
+converges on every segment but the oldest holding its set for the segment's
+lifetime.
+
 ### What this cost, measured
 
 One indexed text attribute, `--flush-spans 10000`, 256 MiB of attribute text

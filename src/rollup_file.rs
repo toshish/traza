@@ -35,10 +35,11 @@
 //! segment bytes    u64  \
 //! record count     u64   |   the BINDING: which segment this describes
 //! min start ns     u64   |
-//! max start ns     u64  /
+//! max start ns     u64   |
+//! pricing fp       u64  /    which rate table the counters were folded under
 //! min end ns       u64      span END range, for TTL expiry
 //! max end ns       u64
-//! prologue cksum   u64       FNV-1a over the 64 bytes above
+//! prologue cksum   u64       FNV-1a over the 72 bytes above
 //! by_model         counter map
 //! by_provider      counter map
 //! by_service       counter map
@@ -51,9 +52,11 @@
 //! ```
 //!
 //! A counter map is a `u32` entry count followed by a length-prefixed key and
-//! eight fixed-width counter fields. A session entry adds the first/last
-//! timestamps, the trace-id set, and an index into
-//! [`crate::semconv::SESSION_KEYS`] (`u32::MAX` for none).
+//! eleven fixed-width counter fields — the last four being the derived cost
+//! share and the metered/derived/unpriced call counts that say where a total
+//! came from. A session entry adds the first/last timestamps, the trace-id
+//! set, and an index into [`crate::semconv::SESSION_KEYS`] (`u32::MAX` for
+//! none).
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -67,7 +70,19 @@ use crate::semconv;
 const MAGIC: [u8; 8] = *b"TRAZAROL";
 
 /// Layout version of this file. Bump when the BYTES change.
-const FORMAT_VERSION: u16 = 2;
+///
+/// v3: session entries and `by_session_key` entries carry a tenant string —
+/// session identity became `(tenant, session_id)` when the tenant joined the
+/// span primary key. v2 sidecars are rejected by this gate and rebuilt.
+///
+/// v4: the prologue carries the pricing fingerprint its counters were folded
+/// under, and every counter block carries the derived share of its cost.
+///
+/// v5: counter blocks carry metered/derived/unpriced call counts. The derived
+/// *dollars* alone cannot answer where a cost came from — a zero-rate model
+/// and an unpriced one both contribute nothing — so provenance is stored
+/// rather than reconstructed.
+const FORMAT_VERSION: u16 = 5;
 
 /// Version of the analytics semantics the counters were computed under.
 ///
@@ -78,7 +93,20 @@ const FORMAT_VERSION: u16 = 2;
 /// a stale rollup looks wrong, it just quietly reports the old model's answer
 /// forever. Forgetting to bump this is the one failure this file cannot
 /// detect for you, which is why it is the first constant in the module.
-const SCHEMA_VERSION: u32 = 1;
+///
+/// v2: `key_hashes` are FNV-1a over `(tenant, trace, span)` — a v1 hash set
+/// computed over the pair would let the supersede prefilter miss.
+///
+/// v3: same hash, different DOMAIN. Reserving `$tenant` made a bare `tenant`
+/// field client data, so a record that carried its identity there decodes as
+/// the default tenant now — and a v2 sidecar written before that change
+/// hashed the old decoding. The hashes are the dangerous half of such a
+/// sidecar: the supersede prefilter treats a membership miss as proof of
+/// absence, so a set hashed under the wrong domain does not slow a query
+/// down, it resurrects a superseded span. A hash set is only evidence under
+/// the decoding it was computed with; when the decoding moves, this number
+/// moves with it.
+const SCHEMA_VERSION: u32 = 3;
 
 /// Extension of the sidecar written beside `segment-<id>.seg`.
 const ROLLUP_SUFFIX: &str = "rollup";
@@ -90,10 +118,10 @@ const ROLLUP_SUFFIX: &str = "rollup";
 /// tick, and it must be able to trust the answer without reading — let alone
 /// decoding — anything else: an unverified bound would let expiry skip a
 /// segment that should have been swept, or sweep one that should not.
-const PROLOGUE_LEN: usize = 72;
+const PROLOGUE_LEN: usize = 80;
 
 /// Offset of the prologue's own checksum, which covers everything before it.
-const PROLOGUE_CHECKSUM_AT: usize = 64;
+const PROLOGUE_CHECKSUM_AT: usize = 72;
 
 /// The timestamp ranges a rollup covers.
 ///
@@ -132,13 +160,23 @@ pub(crate) fn remove(segment_path: &Path) -> std::io::Result<()> {
 }
 
 /// What a sidecar must agree with to be believed: identity of the segment it
-/// claims to describe.
+/// claims to describe, and the pricing its counters were folded under.
+///
+/// Pricing belongs here rather than in [`SCHEMA_VERSION`] because it arrives
+/// as configuration, and a compile-time constant cannot notice a file the
+/// operator edited. Without it a sealed segment would keep reporting last
+/// month's rates forever, which is precisely the silent staleness the schema
+/// version exists to prevent — just reached by a different road.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Binding {
     pub(crate) segment_bytes: u64,
     pub(crate) record_count: u64,
     pub(crate) min_start_ns: u64,
     pub(crate) max_start_ns: u64,
+    /// [`crate::pricing::Pricing::fingerprint`] of the table in force. Zero
+    /// when nothing is priced, so a store that derives no cost binds exactly
+    /// as it did before pricing existed.
+    pub(crate) pricing_fingerprint: u64,
 }
 
 /// Reads the sidecar for `segment_path`, or `None` if there is nothing
@@ -190,6 +228,7 @@ pub(crate) fn bounds(segment_path: &Path, expected: Binding) -> Option<Bounds> {
         record_count: cursor.u64()?,
         min_start_ns: cursor.u64()?,
         max_start_ns: cursor.u64()?,
+        pricing_fingerprint: cursor.u64()?,
     };
     let bounds = Bounds {
         min_start_ns: found.min_start_ns,
@@ -277,6 +316,7 @@ fn encode(binding: Binding, rollup: &SegmentRollup) -> Vec<u8> {
     put_u64(&mut out, binding.record_count);
     put_u64(&mut out, binding.min_start_ns);
     put_u64(&mut out, binding.max_start_ns);
+    put_u64(&mut out, binding.pricing_fingerprint);
     let bounds = rollup.bounds();
     put_u64(&mut out, bounds.min_end_ns);
     put_u64(&mut out, bounds.max_end_ns);
@@ -292,12 +332,26 @@ fn encode(binding: Binding, rollup: &SegmentRollup) -> Vec<u8> {
     put_counter_map(&mut out, &rollup.by_provider);
     put_counter_map(&mut out, &rollup.by_service);
     put_counter_map(&mut out, &rollup.by_day);
-    put_counter_map(&mut out, &rollup.by_session_key);
+    // Tenant and session id are written as two length-prefixed strings, never
+    // one joined key: a joined key cannot distinguish a default-tenant session
+    // named "acme/checkout" from tenant acme's session "checkout".
+    {
+        let mut entries: Vec<(&(String, String), &Counters)> =
+            rollup.by_session_key.iter().collect();
+        entries.sort_by(|left, right| left.0.cmp(right.0));
+        put_u32(&mut out, entries.len() as u32);
+        for ((tenant, session), counters) in entries {
+            put_str(&mut out, tenant);
+            put_str(&mut out, session);
+            put_counters(&mut out, counters);
+        }
+    }
 
-    let mut sessions: Vec<(&String, &SessionCounters)> = rollup.sessions.iter().collect();
+    let mut sessions: Vec<(&(String, String), &SessionCounters)> = rollup.sessions.iter().collect();
     sessions.sort_by(|left, right| left.0.cmp(right.0));
     put_u32(&mut out, sessions.len() as u32);
-    for (id, session) in sessions {
+    for ((tenant, id), session) in sessions {
+        put_str(&mut out, tenant);
         put_str(&mut out, id);
         put_counters(&mut out, &session.counters);
         put_u64(&mut out, session.first_start_ns);
@@ -359,6 +413,7 @@ fn decode(bytes: &[u8], expected: Binding) -> Option<SegmentRollup> {
         record_count: cursor.u64()?,
         min_start_ns: cursor.u64()?,
         max_start_ns: cursor.u64()?,
+        pricing_fingerprint: cursor.u64()?,
     };
     // The sidecar describes some segment; this proves it describes THIS one.
     if found != expected {
@@ -382,11 +437,21 @@ fn decode(bytes: &[u8], expected: Binding) -> Option<SegmentRollup> {
     rollup.by_provider = cursor.counter_map()?;
     rollup.by_service = cursor.counter_map()?;
     rollup.by_day = cursor.counter_map()?.into_iter().collect();
-    rollup.by_session_key = cursor.counter_map()?;
+    {
+        let entry_count = cursor.u32()? as usize;
+        rollup.by_session_key.reserve(entry_count);
+        for _ in 0..entry_count {
+            let tenant = cursor.string()?;
+            let session = cursor.string()?;
+            let counters = cursor.counters()?;
+            rollup.by_session_key.insert((tenant, session), counters);
+        }
+    }
 
     let session_count = cursor.u32()? as usize;
     rollup.sessions.reserve(session_count);
     for _ in 0..session_count {
+        let tenant = cursor.string()?;
         let id = cursor.string()?;
         let counters = cursor.counters()?;
         let first_start_ns = cursor.u64()?;
@@ -398,7 +463,7 @@ fn decode(bytes: &[u8], expected: Binding) -> Option<SegmentRollup> {
         }
         let session_key = session_key_name(cursor.u32()?)?;
         rollup.sessions.insert(
-            id,
+            (tenant, id),
             SessionCounters {
                 counters,
                 first_start_ns,
@@ -478,6 +543,10 @@ fn put_counters(out: &mut Vec<u8>, counters: &Counters) {
     // same value, and this file exists to return exactly what a rebuild
     // would have returned.
     put_u64(out, counters.cost_usd.to_bits());
+    put_u64(out, counters.cost_derived_usd.to_bits());
+    put_u64(out, counters.cost_metered_calls as u64);
+    put_u64(out, counters.cost_derived_calls as u64);
+    put_u64(out, counters.cost_unpriced_calls as u64);
     put_u64(out, counters.errors as u64);
     put_u64(out, counters.llm_duration_ns);
 }
@@ -533,6 +602,10 @@ impl<'a> Cursor<'a> {
             completion_tokens: self.u64()?,
             total_tokens: self.u64()?,
             cost_usd: f64::from_bits(self.u64()?),
+            cost_derived_usd: f64::from_bits(self.u64()?),
+            cost_metered_calls: usize::try_from(self.u64()?).ok()?,
+            cost_derived_calls: usize::try_from(self.u64()?).ok()?,
+            cost_unpriced_calls: usize::try_from(self.u64()?).ok()?,
             errors: usize::try_from(self.u64()?).ok()?,
             llm_duration_ns: self.u64()?,
         })

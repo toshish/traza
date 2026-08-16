@@ -156,10 +156,15 @@ pub enum Access {
 }
 
 /// Per-request context: who is asking, and when.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Context {
     /// What this caller may do.
     pub access: Access,
+    /// The credential's tenant binding, when it has one. A bound principal
+    /// sees exactly what it would see over HTTP: its own tenant's spans,
+    /// sessions, aggregates, annotations — MCP is a different wire, not a
+    /// different authority.
+    pub tenant: Option<String>,
     /// Wall clock at the start of the request, in Unix nanoseconds. Relative
     /// times (`"2h"`) resolve against it, and passing it in rather than
     /// reading the clock per tool keeps one request on one instant.
@@ -171,8 +176,14 @@ impl Context {
     pub fn now() -> Self {
         Self {
             access: Access::Read,
+            tenant: None,
             now_ns: unix_nanos_now(),
         }
+    }
+
+    /// The tenant scope for store reads: `Some(t)` when bound, else `None`.
+    fn scope(&self) -> Option<&str> {
+        self.tenant.as_deref()
     }
 }
 
@@ -259,9 +270,9 @@ impl<'a> Server<'a> {
             "tools/call" => return Some(self.call_tool(id, &params, context)),
             "resources/list" => Ok(json!({ "resources": resource_definitions() })),
             "resources/templates/list" => Ok(json!({ "resourceTemplates": resource_templates() })),
-            "resources/read" => self.read_resource(&params),
+            "resources/read" => self.read_resource(&params, &context),
             "prompts/list" => Ok(json!({ "prompts": prompt_definitions() })),
-            "prompts/get" => self.get_prompt(&params),
+            "prompts/get" => self.get_prompt(&params, &context),
             other => Err(RpcError {
                 code: -32601,
                 message: format!("method not found: {other}"),
@@ -436,9 +447,13 @@ impl<'a> Server<'a> {
                 "analyze_cost",
                 "Analyze tokens and cost",
                 "Where the tokens and the money went, grouped by model, provider, service, \
-                 session or UTC day. Counts and sums are exact. Set over_time for a bucketed \
-                 series over the same window when you need to see when a spike happened \
-                 rather than what it was.",
+                 session or UTC day. Counts and token sums are exact. COST MAY NOT BE: \
+                 a value shown as ~$X is estimated from the server's configured model \
+                 rates rather than metered by the span, and calls with neither a cost nor \
+                 a rate contribute nothing, making the total an undercount. Per row, \
+                 cost_derived_calls and cost_unpriced_calls say which applies. Set \
+                 over_time for a bucketed series over the same window when you need to \
+                 see when a spike happened rather than what it was.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -542,15 +557,15 @@ impl<'a> Server<'a> {
             .unwrap_or(&empty);
 
         let outcome = match name {
-            "describe_store" => self.describe_store(),
-            "search_spans" => self.search_spans(arguments, context),
-            "get_trace" => self.get_trace(arguments),
-            "list_sessions" => self.list_sessions(arguments, context),
-            "get_session" => self.get_session(arguments),
-            "top_failures" => self.top_failures(arguments, context),
-            "slowest_spans" => self.slowest_spans(arguments, context),
-            "analyze_cost" => self.analyze_cost(arguments, context),
-            "get_payload" => self.get_payload(arguments),
+            "describe_store" => self.describe_store(&context),
+            "search_spans" => self.search_spans(arguments, context.clone()),
+            "get_trace" => self.get_trace(arguments, &context),
+            "list_sessions" => self.list_sessions(arguments, context.clone()),
+            "get_session" => self.get_session(arguments, &context),
+            "top_failures" => self.top_failures(arguments, context.clone()),
+            "slowest_spans" => self.slowest_spans(arguments, context.clone()),
+            "analyze_cost" => self.analyze_cost(arguments, context.clone()),
+            "get_payload" => self.get_payload(arguments, &context),
             "record_annotation" if self.annotation_tool_available(context.access) => {
                 self.record_annotation(arguments, context)
             }
@@ -585,36 +600,69 @@ impl<'a> Server<'a> {
 
     // ------------------------------------------------------- tool handlers
 
-    fn describe_store(&self) -> ToolResult {
+    fn describe_store(&self, context: &Context) -> ToolResult {
         Ok(text_result(clamp(
-            self.overview_text()?,
+            self.overview_text(context.scope())?,
             self.limits.max_result_bytes,
         )))
     }
 
     /// The orientation block, shared by `describe_store` and the
     /// `traza://store/overview` resource so the two can never disagree.
-    fn overview_text(&self) -> Result<String, ToolError> {
+    fn overview_text(&self, scope: Option<&str>) -> Result<String, ToolError> {
         let stats = self.store.stats()?;
-        let by_service = self.store.llm_aggregate(LlmGroupBy::Service, None, None)?;
-        let by_model = self.store.llm_aggregate(LlmGroupBy::Model, None, None)?;
-        let by_provider = self.store.llm_aggregate(LlmGroupBy::Provider, None, None)?;
-        let by_day = self.store.llm_aggregate(LlmGroupBy::Day, None, None)?;
-        let sessions = self.store.sessions(None, None, 100, SessionOrder::Recent)?;
+        // A bound caller must not see the STORE's totals — the same volumes
+        // the HTTP layer 403s /v1/stats for. Its header comes from its own
+        // usage row instead.
+        let bound_usage = match scope {
+            None => None,
+            Some(_) => Some(
+                self.store
+                    .tenant_usage(scope)?
+                    .into_iter()
+                    .next()
+                    .map(|row| (row.spans, row.bytes_approx))
+                    .unwrap_or((0, 0)),
+            ),
+        };
+        let by_service = self
+            .store
+            .llm_aggregate_in(scope, LlmGroupBy::Service, None, None)?;
+        let by_model = self
+            .store
+            .llm_aggregate_in(scope, LlmGroupBy::Model, None, None)?;
+        let by_provider = self
+            .store
+            .llm_aggregate_in(scope, LlmGroupBy::Provider, None, None)?;
+        let by_day = self
+            .store
+            .llm_aggregate_in(scope, LlmGroupBy::Day, None, None)?;
+        let sessions = self
+            .store
+            .sessions_in(scope, None, None, 100, SessionOrder::Recent)?;
 
         let mut head = String::new();
         // The version belongs here as well as in `initialize`. A host reads
         // `serverInfo` once and need not pass it to the model, so an agent
         // asked which Traza it is talking to had no way to find out and
         // correctly reported that it could not tell.
-        head.push_str(&format!(
-            "Traza {} — {} in {} ({}), durability={}\n",
-            env!("CARGO_PKG_VERSION"),
-            count(stats.total_records as u64, "record"),
-            count(stats.segment_count as u64, "segment"),
-            bytes_human(stats.disk_bytes),
-            stats.durability.as_str(),
-        ));
+        match bound_usage {
+            Some((spans, bytes)) => head.push_str(&format!(
+                "Traza {} — {} of this tenant's data ({}), durability={}\n",
+                env!("CARGO_PKG_VERSION"),
+                count(spans, "span"),
+                bytes_human(bytes),
+                stats.durability.as_str(),
+            )),
+            None => head.push_str(&format!(
+                "Traza {} — {} in {} ({}), durability={}\n",
+                env!("CARGO_PKG_VERSION"),
+                count(stats.total_records as u64, "record"),
+                count(stats.segment_count as u64, "segment"),
+                bytes_human(stats.disk_bytes),
+                stats.durability.as_str(),
+            )),
+        }
         let mut days: Vec<&str> = by_day.iter().map(|row| row.key.as_str()).collect();
         days.sort_unstable();
         match (days.first(), days.last()) {
@@ -657,12 +705,26 @@ impl<'a> Server<'a> {
              relative form ('2h', '7d'), an RFC 3339 instant, or a plain date."
                 .to_owned(),
         ];
-        if stats.total_records == 0 {
-            notes.push(
-                "The store holds no spans yet, so every search will return nothing until \
-                 something is ingested."
+        // "Nothing to search yet" must be decided from what the CALLER can
+        // see, never the store's total. A bound caller reading `total_records`
+        // would learn whether any OTHER tenant has data — the note would
+        // appear on an empty store and vanish the moment a co-tenant ingested
+        // a single span, a presence oracle across the very boundary the header
+        // above is careful to respect. Scoped, the note follows this tenant's
+        // own usage row.
+        let caller_is_empty = match bound_usage {
+            Some((spans, _)) => spans == 0,
+            None => stats.total_records == 0,
+        };
+        if caller_is_empty {
+            notes.push(match bound_usage {
+                Some(_) => "This tenant has no spans yet, so every search will return \
+                     nothing until something is ingested for it."
                     .to_owned(),
-            );
+                None => "The store holds no spans yet, so every search will return nothing \
+                     until something is ingested."
+                    .to_owned(),
+            });
         }
         Ok(report(&head, &rows, &notes))
     }
@@ -753,10 +815,16 @@ impl<'a> Server<'a> {
     /// on a name that does not exist", and a model resolves that ambiguity by
     /// reporting that nothing is wrong. So the miss is diagnosed.
     fn empty_search_result(&self, request: &SearchRequest) -> ToolResult {
+        // Scoped like the search itself: enumerating the STORE's services to
+        // explain a bound tenant's empty result would hand it the cross-
+        // tenant catalog its query was scoped away from.
+        let scope = request.filter.tenant.as_deref();
         let mut head = format!("No spans matched{}.", request.window_note());
         let mut rows = Vec::new();
         if let Some(service) = &request.filter.service {
-            let known = self.store.llm_aggregate(LlmGroupBy::Service, None, None)?;
+            let known = self
+                .store
+                .llm_aggregate_in(scope, LlmGroupBy::Service, None, None)?;
             if !known.iter().any(|row| &row.key == service) {
                 head = "No spans matched, and the requested service does not exist in this \
                         store. Its known services are listed below; re-run with one of them."
@@ -810,13 +878,13 @@ impl<'a> Server<'a> {
         )))
     }
 
-    fn get_trace(&self, arguments: &Map<String, Value>) -> ToolResult {
+    fn get_trace(&self, arguments: &Map<String, Value>, context: &Context) -> ToolResult {
         let trace_id = required_str(arguments, "trace_id")?;
         let include_content = optional_bool(arguments, "include_content")?.unwrap_or(false);
         let max_spans = optional_usize(arguments, "max_spans")?
             .unwrap_or(DEFAULT_TRACE_SPANS)
             .clamp(1, MAX_TRACE_SPANS);
-        let spans = self.store.get_trace(trace_id)?;
+        let spans = self.store.get_trace_in(context.scope(), trace_id)?;
         if spans.is_empty() {
             return Err(ToolError(format!(
                 "No trace with that id is in the store. Trace ids are exact — copy one from a \
@@ -827,10 +895,16 @@ impl<'a> Server<'a> {
         }
         let annotations = self
             .store
-            .annotations(trace_id, None, None)
+            .annotations_in(context.scope(), trace_id, None, None)
             .unwrap_or_default();
-        let (head, rows, notes) =
-            render_trace(&spans, &annotations, max_spans, include_content, trace_id);
+        let (head, rows, notes) = render_trace(
+            &spans,
+            &annotations,
+            max_spans,
+            include_content,
+            trace_id,
+            self.store.pricing(),
+        );
         Ok(text_result(clamp_report(
             &head,
             &rows,
@@ -845,8 +919,8 @@ impl<'a> Server<'a> {
             &["since", "until", "order_by", "limit"],
             "list_sessions",
         )?;
-        let since = optional_time(arguments, "since", context)?;
-        let until = optional_time(arguments, "until", context)?;
+        let since = optional_time(arguments, "since", &context)?;
+        let until = optional_time(arguments, "until", &context)?;
         let limit = optional_usize(arguments, "limit")?
             .unwrap_or(DEFAULT_SPAN_LIMIT)
             .clamp(1, MAX_SPAN_LIMIT);
@@ -864,7 +938,9 @@ impl<'a> Server<'a> {
                 "order_by must be one of recent, cost, errors, tokens (got {requested:?})."
             ))
         })?;
-        let sessions = self.store.sessions(since, until, limit, order)?;
+        let sessions = self
+            .store
+            .sessions_in(context.scope(), since, until, limit, order)?;
         // An empty window is an ordinary answer, not an exception, so it comes
         // back shaped like every other one. A text-only "nothing found" would
         // violate the outputSchema this tool advertises, and a client that
@@ -894,14 +970,18 @@ impl<'a> Server<'a> {
             .enumerate()
             .map(|(index, session)| {
                 format!(
-                    "{:>3}  {}  {} · {} · {} · {} tok · ${:.4} · {} · [{}]",
+                    "{:>3}  {}  {} · {} · {} · {} tok · {} · {} · [{}]",
                     index + 1,
                     sanitize(&session.session_id),
                     count(session.trace_count as u64, "trace"),
                     count(session.span_count as u64, "span"),
                     count(session.llm_calls as u64, "LLM call"),
                     thousands(session.total_tokens),
-                    session.cost_usd,
+                    money(
+                        session.cost_usd,
+                        session.cost_derived_calls as u64,
+                        (session.cost_metered_calls + session.cost_derived_calls) as u64,
+                    ),
                     count(session.error_count as u64, "error"),
                     sanitize(&session.session_attribute),
                 )
@@ -920,6 +1000,10 @@ impl<'a> Server<'a> {
                     "llm_calls": session.llm_calls,
                     "total_tokens": session.total_tokens,
                     "cost_usd": session.cost_usd,
+                    "cost_derived_usd": session.cost_derived_usd,
+                    "cost_metered_calls": session.cost_metered_calls,
+                    "cost_derived_calls": session.cost_derived_calls,
+                    "cost_unpriced_calls": session.cost_unpriced_calls,
                     "error_count": session.error_count,
                 })
             })
@@ -936,24 +1020,31 @@ impl<'a> Server<'a> {
         ))
     }
 
-    fn get_session(&self, arguments: &Map<String, Value>) -> ToolResult {
+    fn get_session(&self, arguments: &Map<String, Value>, context: &Context) -> ToolResult {
         let session_id = required_str(arguments, "session_id")?;
-        let detail = self.store.session(session_id)?.ok_or_else(|| {
-            ToolError(
-                "No session with that id. Session ids are exact — take one from \
+        let detail = self
+            .store
+            .session_in(context.scope(), session_id)?
+            .ok_or_else(|| {
+                ToolError(
+                    "No session with that id. Session ids are exact — take one from \
                  list_sessions. Note that a session is resolved across every recognized \
                  session key, so the id is the value, not the attribute name."
-                    .to_owned(),
-            )
-        })?;
+                        .to_owned(),
+                )
+            })?;
         let summary = &detail.summary;
         let head = format!(
-            "Session: {}, {}, {}, {}, ${:.4}, {}, {} to {}.",
+            "Session: {}, {}, {}, {}, {}, {}, {} to {}.",
             count(summary.trace_count as u64, "trace"),
             count(summary.span_count as u64, "span"),
             count(summary.llm_calls as u64, "LLM call"),
             count(summary.total_tokens, "token"),
-            summary.cost_usd,
+            money(
+                summary.cost_usd,
+                summary.cost_derived_calls as u64,
+                (summary.cost_metered_calls + summary.cost_derived_calls) as u64,
+            ),
             count(summary.error_count as u64, "error"),
             rfc3339(summary.first_start_ns),
             rfc3339(summary.last_end_ns),
@@ -965,17 +1056,25 @@ impl<'a> Server<'a> {
         )];
         for trace in &detail.traces {
             rows.push(format!(
-                "  {}  {}  {} · {} tok · ${:.4} · {}  trace={}",
+                "  {}  {}  {} · {} tok · {} · {}  trace={}",
                 clock(trace.first_start_ns),
                 sanitize(&trace.root_name),
                 count(trace.span_count as u64, "span"),
                 thousands(trace.total_tokens),
-                trace.cost_usd,
+                money(
+                    trace.cost_usd,
+                    trace.cost_derived_calls as u64,
+                    (trace.cost_metered_calls + trace.cost_derived_calls) as u64,
+                ),
                 count(trace.error_count as u64, "error"),
                 sanitize(&trace.trace_id),
             ));
         }
-        let notes = vec!["Open any trace above with get_trace.".to_owned()];
+        let mut notes = vec!["Open any trace above with get_trace.".to_owned()];
+        notes.extend(cost_provenance_note(
+            summary.cost_derived_calls as u64,
+            summary.cost_unpriced_calls as u64,
+        ));
         Ok(text_result(clamp_report(
             &head,
             &rows,
@@ -1101,14 +1200,16 @@ impl<'a> Server<'a> {
                  {group_name:?})."
             ))
         })?;
-        let since = optional_time(arguments, "since", context)?;
-        let until = optional_time(arguments, "until", context)?;
+        let since = optional_time(arguments, "since", &context)?;
+        let until = optional_time(arguments, "until", &context)?;
         let limit = optional_usize(arguments, "limit")?
             .unwrap_or(DEFAULT_SPAN_LIMIT)
             .clamp(1, MAX_SPAN_LIMIT);
         let over_time = optional_bool(arguments, "over_time")?.unwrap_or(false);
 
-        let mut rows_data = self.store.llm_aggregate(group_by, since, until)?;
+        let mut rows_data = self
+            .store
+            .llm_aggregate_in(context.scope(), group_by, since, until)?;
         let total_rows = rows_data.len();
         rows_data.truncate(limit);
         if rows_data.is_empty() {
@@ -1126,11 +1227,29 @@ impl<'a> Server<'a> {
                 self.limits.max_result_bytes,
             ));
         }
+        // "Counts and sums are exact" was true of every number this tool
+        // reported until cost could be derived. Token sums still are, so the
+        // claim is narrowed rather than dropped — and the cost half of it is
+        // made only when this particular answer earns it.
+        let cost_note = cost_provenance_note(
+            rows_data
+                .iter()
+                .map(|row| row.cost_derived_calls as u64)
+                .sum(),
+            rows_data
+                .iter()
+                .map(|row| row.cost_unpriced_calls as u64)
+                .sum(),
+        );
         let head = format!(
-            "Tokens and cost by {group_name}, {} of {}, highest cost first. Counts and sums \
-             are exact.",
+            "Tokens and cost by {group_name}, {} of {}, highest cost first. Counts and token \
+             sums are exact{}.",
             thousands(rows_data.len() as u64),
             count(total_rows as u64, "group"),
+            match cost_note.is_some() {
+                true => ", and so is cost where it is not marked ~ (see the note below)",
+                false => ", as is cost: every call here metered its own",
+            },
         );
         let rows: Vec<String> = rows_data
             .iter()
@@ -1142,10 +1261,14 @@ impl<'a> Server<'a> {
                     row.llm_duration_ns / row.llm_calls as u64
                 };
                 format!(
-                    "{:>3}  {}  ${:.4}  {} tok (in {} / out {})  {}  {}  mean {}",
+                    "{:>3}  {}  {}  {} tok (in {} / out {})  {}  {}  mean {}",
                     index + 1,
                     sanitize(&row.key),
-                    row.cost_usd,
+                    money(
+                        row.cost_usd,
+                        row.cost_derived_calls as u64,
+                        (row.cost_metered_calls + row.cost_derived_calls) as u64,
+                    ),
                     thousands(row.total_tokens),
                     thousands(row.prompt_tokens),
                     thousands(row.completion_tokens),
@@ -1156,6 +1279,7 @@ impl<'a> Server<'a> {
             })
             .collect();
         let mut notes = Vec::new();
+        notes.extend(cost_note);
         let structured_rows: Vec<Value> = rows_data
             .iter()
             .map(|row| {
@@ -1167,6 +1291,10 @@ impl<'a> Server<'a> {
                     "completion_tokens": row.completion_tokens,
                     "total_tokens": row.total_tokens,
                     "cost_usd": row.cost_usd,
+                    "cost_derived_usd": row.cost_derived_usd,
+                    "cost_metered_calls": row.cost_metered_calls,
+                    "cost_derived_calls": row.cost_derived_calls,
+                    "cost_unpriced_calls": row.cost_unpriced_calls,
                     "error_count": row.error_count,
                 })
             })
@@ -1175,9 +1303,15 @@ impl<'a> Server<'a> {
         if over_time {
             match (since, until) {
                 (Some(since_ns), Some(until_ns)) if until_ns > since_ns => {
-                    let series =
-                        self.store
-                            .series(&SpanFilter::default(), since_ns, until_ns, 24)?;
+                    let series = self.store.series(
+                        &SpanFilter {
+                            tenant: context.scope().map(str::to_owned),
+                            ..SpanFilter::default()
+                        },
+                        since_ns,
+                        until_ns,
+                        24,
+                    )?;
                     let buckets: Vec<Value> = series
                         .buckets
                         .iter()
@@ -1189,6 +1323,10 @@ impl<'a> Server<'a> {
                                 "llm_calls": bucket.llm_calls,
                                 "total_tokens": bucket.total_tokens,
                                 "cost_usd": bucket.cost_usd,
+                                "cost_derived_usd": bucket.cost_derived_usd,
+                                "cost_metered_calls": bucket.cost_metered_calls,
+                                "cost_derived_calls": bucket.cost_derived_calls,
+                                "cost_unpriced_calls": bucket.cost_unpriced_calls,
                             })
                         })
                         .collect();
@@ -1200,12 +1338,16 @@ impl<'a> Server<'a> {
                     ));
                     for bucket in &series.buckets {
                         notes.push(format!(
-                            "  {}  {} · {} · {} tok · ${:.4}",
+                            "  {}  {} · {} · {} tok · {}",
                             rfc3339(bucket.start_ns),
                             count(bucket.spans, "span"),
                             count(bucket.errors, "error"),
                             thousands(bucket.total_tokens),
-                            bucket.cost_usd,
+                            money(
+                                bucket.cost_usd,
+                                bucket.cost_derived_calls,
+                                bucket.cost_metered_calls + bucket.cost_derived_calls,
+                            ),
                         ));
                     }
                 }
@@ -1227,7 +1369,7 @@ impl<'a> Server<'a> {
         ))
     }
 
-    fn get_payload(&self, arguments: &Map<String, Value>) -> ToolResult {
+    fn get_payload(&self, arguments: &Map<String, Value>, context: &Context) -> ToolResult {
         known_keys(arguments, &["reference", "max_bytes"], "get_payload")?;
         let reference = required_str(arguments, "reference")?;
         // Bounded by both ceilings, not just the payload one. The result cap
@@ -1239,13 +1381,16 @@ impl<'a> Server<'a> {
             .min(self.limits.max_payload_bytes)
             .min(self.limits.max_result_bytes.saturating_sub(RENDER_OVERHEAD))
             .max(1);
-        let bytes = self.store.payload(reference)?.ok_or_else(|| {
-            ToolError(
-                "No payload with that reference. The value is the whole '$payload' field \
+        let bytes = self
+            .store
+            .payload_in(context.scope(), reference)?
+            .ok_or_else(|| {
+                ToolError(
+                    "No payload with that reference. The value is the whole '$payload' field \
                  including the 'sha256/' prefix, copied exactly from the span."
-                    .to_owned(),
-            )
-        })?;
+                        .to_owned(),
+                )
+            })?;
         let total = bytes.len();
         match std::str::from_utf8(&bytes) {
             Ok(text) => {
@@ -1338,6 +1483,10 @@ impl<'a> Server<'a> {
         let annotation = Annotation {
             trace_id: trace_id.clone(),
             span_id: span_id.clone(),
+            tenant: context.tenant.clone().unwrap_or_default(),
+            session_id: String::new(),
+            experiment_id: None,
+            example_id: String::new(),
             name: name.clone(),
             value,
             source: AGENT_ANNOTATION_SOURCE.to_owned(),
@@ -1365,7 +1514,7 @@ impl<'a> Server<'a> {
     /// One span as a compact line, plus its attributes when content is asked
     /// for. Every fragment of stored text goes through [`sanitize`].
     fn render_span(&self, index: usize, span: &Span, include_content: bool) -> Vec<String> {
-        let facts = semconv::facts(&span.attributes);
+        let facts = self.store.facts(span);
         let mut line = format!(
             "{index:>3}  {}  {:<5}  {}  {}  {}  trace={} span={}",
             clock(span.start_time_ns),
@@ -1387,7 +1536,10 @@ impl<'a> Server<'a> {
             line.push_str(&format!("  {} tok", thousands(facts.total())));
         }
         if let Some(cost) = facts.cost_usd {
-            line.push_str(&format!("  ${cost:.4}"));
+            line.push_str(&format!(
+                "  {}",
+                money(cost, u64::from(facts.cost_derived), 1)
+            ));
         }
         let mut lines = vec![line];
         if include_content {
@@ -1417,25 +1569,25 @@ impl<'a> Server<'a> {
 
     // ------------------------------------------------------------ resources
 
-    fn read_resource(&self, params: &Map<String, Value>) -> RpcResult {
+    fn read_resource(&self, params: &Map<String, Value>, context: &Context) -> RpcResult {
         let uri = params
             .get("uri")
             .and_then(Value::as_str)
             .ok_or_else(|| RpcError::invalid_params("resources/read requires a uri"))?;
-        let contents = self.resource_contents(uri)?;
+        let contents = self.resource_contents(uri, context)?;
         Ok(json!({ "contents": [contents] }))
     }
 
-    fn resource_contents(&self, uri: &str) -> Result<Value, RpcError> {
+    fn resource_contents(&self, uri: &str, context: &Context) -> Result<Value, RpcError> {
         let text = match uri {
             "traza://store/overview" => self
-                .overview_text()
+                .overview_text(context.scope())
                 .map_err(|error| RpcError::internal(error.0))?,
             "traza://store/services" => self
-                .dimension_resource(LlmGroupBy::Service, "Services")
+                .dimension_resource(context, LlmGroupBy::Service, "Services")
                 .map_err(|error| RpcError::internal(error.0))?,
             "traza://store/models" => self
-                .dimension_resource(LlmGroupBy::Model, "Models")
+                .dimension_resource(context, LlmGroupBy::Model, "Models")
                 .map_err(|error| RpcError::internal(error.0))?,
             "traza://guide/query" => QUERY_GUIDE.to_owned(),
             "traza://guide/semantics" => SEMANTICS_GUIDE.to_owned(),
@@ -1444,24 +1596,30 @@ impl<'a> Server<'a> {
                     let trace_id = percent_decode(trace_id);
                     let spans = self
                         .store
-                        .get_trace(&trace_id)
+                        .get_trace_in(context.scope(), &trace_id)
                         .map_err(|error| RpcError::internal(error.to_string()))?;
                     if spans.is_empty() {
                         return Err(RpcError::resource_not_found(other));
                     }
                     let annotations = self
                         .store
-                        .annotations(&trace_id, None, None)
+                        .annotations_in(context.scope(), &trace_id, None, None)
                         .unwrap_or_default();
-                    let (head, rows, notes) =
-                        render_trace(&spans, &annotations, DEFAULT_TRACE_SPANS, true, &trace_id);
+                    let (head, rows, notes) = render_trace(
+                        &spans,
+                        &annotations,
+                        DEFAULT_TRACE_SPANS,
+                        true,
+                        &trace_id,
+                        self.store.pricing(),
+                    );
                     clamp_report(&head, &rows, &notes, self.limits.max_result_bytes)
                 } else if let Some(session_id) = other.strip_prefix("traza://session/") {
                     let session_id = percent_decode(session_id);
                     let mut arguments = Map::new();
                     arguments.insert("session_id".to_owned(), json!(session_id));
                     let result = self
-                        .get_session(&arguments)
+                        .get_session(&arguments, context)
                         .map_err(|_| RpcError::resource_not_found(other))?;
                     result_text(&result)
                 } else if let Some(reference) = other.strip_prefix("traza://payload/") {
@@ -1469,7 +1627,7 @@ impl<'a> Server<'a> {
                     let mut arguments = Map::new();
                     arguments.insert("reference".to_owned(), json!(reference));
                     let result = self
-                        .get_payload(&arguments)
+                        .get_payload(&arguments, context)
                         .map_err(|_| RpcError::resource_not_found(other))?;
                     result_text(&result)
                 } else {
@@ -1484,19 +1642,30 @@ impl<'a> Server<'a> {
         }))
     }
 
-    fn dimension_resource(&self, group_by: LlmGroupBy, title: &str) -> Result<String, ToolError> {
-        let rows_data = self.store.llm_aggregate(group_by, None, None)?;
+    fn dimension_resource(
+        &self,
+        context: &Context,
+        group_by: LlmGroupBy,
+        title: &str,
+    ) -> Result<String, ToolError> {
+        let rows_data = self
+            .store
+            .llm_aggregate_in(context.scope(), group_by, None, None)?;
         let head = format!("{title} present in this store ({}).", rows_data.len());
         let rows: Vec<String> = rows_data
             .iter()
             .map(|row| {
                 format!(
-                    "  {}  {} · {} · {} tok · ${:.4}",
+                    "  {}  {} · {} · {} tok · {}",
                     sanitize(&row.key),
                     count(row.spans as u64, "span"),
                     count(row.llm_calls as u64, "call"),
                     thousands(row.total_tokens),
-                    row.cost_usd,
+                    money(
+                        row.cost_usd,
+                        row.cost_derived_calls as u64,
+                        (row.cost_metered_calls + row.cost_derived_calls) as u64,
+                    ),
                 )
             })
             .collect();
@@ -1505,7 +1674,7 @@ impl<'a> Server<'a> {
 
     // -------------------------------------------------------------- prompts
 
-    fn get_prompt(&self, params: &Map<String, Value>) -> RpcResult {
+    fn get_prompt(&self, params: &Map<String, Value>, context: &Context) -> RpcResult {
         let name = params
             .get("name")
             .and_then(Value::as_str)
@@ -1622,7 +1791,7 @@ impl<'a> Server<'a> {
         // starts with this store's real service and model names instead of
         // spending its first tool call discovering them.
         let overview = self
-            .overview_text()
+            .overview_text(context.scope())
             .unwrap_or_else(|error| format!("(store overview unavailable: {})", error.0));
         Ok(json!({
             "description": description,
@@ -1852,6 +2021,25 @@ fn sessions_output_schema() -> Value {
                         "llm_calls": {"type": "integer"},
                         "total_tokens": {"type": "integer"},
                         "cost_usd": {"type": "number"},
+                        "cost_derived_usd": {
+                            "type": "number",
+                            "description": "Part of cost_usd priced from the server's \
+                                            configured model rates rather than metered by a \
+                                            span. Non-zero means cost_usd is an estimate.",
+                        },
+                        "cost_metered_calls": {"type": "integer"},
+                        "cost_derived_calls": {
+                            "type": "integer",
+                            "description": "LLM calls priced from configured rates. Use this, \
+                                            not cost_derived_usd, to decide whether a total is \
+                                            estimated: a zero-rate model adds no dollars.",
+                        },
+                        "cost_unpriced_calls": {
+                            "type": "integer",
+                            "description": "LLM calls with no cost and no configured rate. \
+                                            They contribute nothing, so a non-zero value means \
+                                            cost_usd is an undercount.",
+                        },
                         "error_count": {"type": "integer"},
                     },
                     "required": ["session_id", "span_count", "cost_usd"],
@@ -1879,6 +2067,25 @@ fn cost_output_schema() -> Value {
                         "completion_tokens": {"type": "integer"},
                         "total_tokens": {"type": "integer"},
                         "cost_usd": {"type": "number"},
+                        "cost_derived_usd": {
+                            "type": "number",
+                            "description": "Part of cost_usd priced from the server's \
+                                            configured model rates rather than metered by a \
+                                            span. Non-zero means cost_usd is an estimate.",
+                        },
+                        "cost_metered_calls": {"type": "integer"},
+                        "cost_derived_calls": {
+                            "type": "integer",
+                            "description": "LLM calls priced from configured rates. Use this, \
+                                            not cost_derived_usd, to decide whether a total is \
+                                            estimated: a zero-rate model adds no dollars.",
+                        },
+                        "cost_unpriced_calls": {
+                            "type": "integer",
+                            "description": "LLM calls with no cost and no configured rate. \
+                                            They contribute nothing, so a non-zero value means \
+                                            cost_usd is an undercount.",
+                        },
                         "error_count": {"type": "integer"},
                     },
                     "required": ["key", "total_tokens", "cost_usd"],
@@ -1895,6 +2102,25 @@ fn cost_output_schema() -> Value {
                         "llm_calls": {"type": "integer"},
                         "total_tokens": {"type": "integer"},
                         "cost_usd": {"type": "number"},
+                        "cost_derived_usd": {
+                            "type": "number",
+                            "description": "Part of cost_usd priced from the server's \
+                                            configured model rates rather than metered by a \
+                                            span. Non-zero means cost_usd is an estimate.",
+                        },
+                        "cost_metered_calls": {"type": "integer"},
+                        "cost_derived_calls": {
+                            "type": "integer",
+                            "description": "LLM calls priced from configured rates. Use this, \
+                                            not cost_derived_usd, to decide whether a total is \
+                                            estimated: a zero-rate model adds no dollars.",
+                        },
+                        "cost_unpriced_calls": {
+                            "type": "integer",
+                            "description": "LLM calls with no cost and no configured rate. \
+                                            They contribute nothing, so a non-zero value means \
+                                            cost_usd is an undercount.",
+                        },
                     },
                     "required": ["start_ns", "spans"],
                 },
@@ -2103,8 +2329,18 @@ attribute renaming.
 | Session | `session.id` → `gen_ai.conversation.id` → `traceloop.association.properties.session_id` → `traceloop.association.properties.chat_id` |
 
 Cost is not an OpenTelemetry attribute. `llm.cost_usd` is a Traza extension
-populated when a pipeline meters cost; a store whose instrumentation does not
-emit it reports zero cost and real token counts.
+populated when a pipeline meters cost. A server may also be configured with
+per-model rates, and will then derive a cost for calls that metered none — a
+metered value always wins, and a call reporting only a total token count is
+never priced, because input and output cost different amounts.
+
+**So a cost you read here may be an estimate, and you must not quote one as
+spend.** A rendered value carries `~` when any of it was derived. In
+structured results, `cost_derived_calls > 0` means the total is estimated and
+`cost_unpriced_calls > 0` means it is an undercount — calls that could not be
+priced contribute nothing. Judge by those counts, never by
+`cost_derived_usd`: a zero-rate model is priced and adds no dollars, which is
+indistinguishable from an unpriced one on the money alone.
 
 A session usually spans many traces. The `session` filter unions every key
 above, so a session whose spans use mixed conventions still returns whole —
@@ -2566,13 +2802,19 @@ fn render_trace(
     max_spans: usize,
     include_content: bool,
     trace_id: &str,
+    pricing: &crate::pricing::Pricing,
 ) -> (String, Vec<String>, Vec<String>) {
     let facts: Vec<_> = spans
         .iter()
-        .map(|span| semconv::facts(&span.attributes))
+        .map(|span| semconv::facts(&span.attributes).priced(pricing))
         .collect();
     let errors = spans.iter().filter(|span| span.status == "error").count();
     let cost: f64 = facts.iter().filter_map(|fact| fact.cost_usd).sum();
+    let derived_calls = facts.iter().filter(|fact| fact.cost_derived).count() as u64;
+    let unpriced_calls = facts
+        .iter()
+        .filter(|fact| fact.is_llm && fact.cost_usd.is_none())
+        .count() as u64;
     let tokens: u64 = facts.iter().map(semconv::LlmFacts::total).sum();
     let start = spans
         .iter()
@@ -2583,18 +2825,23 @@ fn render_trace(
     let session = facts.iter().find_map(|fact| fact.session.clone());
 
     let head = format!(
-        "Trace {}: {}, {}, {}, {}, ${:.4}{}. Starts {}.",
+        "Trace {}: {}, {}, {}, {}, {}{}. Starts {}.",
         sanitize(trace_id),
         count(spans.len() as u64, "span"),
         duration_human(end.saturating_sub(start)),
         count(errors as u64, "error"),
         count(tokens, "token"),
-        cost,
+        money(
+            cost,
+            derived_calls,
+            facts.iter().filter(|fact| fact.cost_usd.is_some()).count() as u64,
+        ),
         session.map_or(String::new(), |id| format!(", session {}", sanitize(id))),
         rfc3339(start),
     );
 
     let mut notes = Vec::new();
+    notes.extend(cost_provenance_note(derived_calls, unpriced_calls));
     let (mut ordered, cycles) = depth_first_order(spans);
     if cycles > 0 {
         notes.push(format!(
@@ -2650,7 +2897,10 @@ fn render_trace(
             row.push_str(&format!("  {} tok", thousands(fact.total())));
         }
         if let Some(value) = fact.cost_usd {
-            row.push_str(&format!("  ${value:.4}"));
+            row.push_str(&format!(
+                "  {}",
+                money(value, u64::from(fact.cost_derived), 1)
+            ));
         }
         row.push_str(&format!("  span={}", sanitize(&span.span_id)));
         rows.push(row);
@@ -2764,8 +3014,8 @@ impl SearchRequest {
             &SEARCH_ARGUMENTS[..FILTER_ARGUMENTS]
         };
         known_keys(arguments, accepted, tool)?;
-        let since_ns = optional_time(arguments, "since", context)?;
-        let until_ns = optional_time(arguments, "until", context)?;
+        let since_ns = optional_time(arguments, "since", &context)?;
+        let until_ns = optional_time(arguments, "until", &context)?;
         if let (Some(since), Some(until)) = (since_ns, until_ns) {
             if until < since {
                 return Err(ToolError(
@@ -2802,6 +3052,10 @@ impl SearchRequest {
             since_ns,
             until_ns,
             sort,
+            // The credential's binding rides the filter, so every span
+            // surface a tool reaches is scoped the way HTTP is — one choke
+            // point, not per-tool care.
+            tenant: context.tenant.clone(),
             limit: Some(
                 optional_usize(arguments, "limit")?
                     .unwrap_or(default_limit)
@@ -2948,7 +3202,7 @@ fn millis_to_nanos(milliseconds: f64) -> Result<u64, ToolError> {
 fn optional_time(
     arguments: &Map<String, Value>,
     field: &str,
-    context: Context,
+    context: &Context,
 ) -> Result<Option<u64>, ToolError> {
     match arguments.get(field) {
         None | Some(Value::Null) => Ok(None),
@@ -3284,6 +3538,59 @@ fn count(value: u64, noun: &str) -> String {
         format!("1 {noun}")
     } else {
         format!("{} {noun}s", thousands(value))
+    }
+}
+
+/// A cost, marked when any of it was worked out rather than measured.
+///
+/// `~` is the whole point. An agent reading `$4.1200` will quote it as spend;
+/// reading `~$4.1200` it has to say "about", which is the only claim the
+/// number supports once a pricing table contributed to it. The marker keys off
+/// the DERIVED CALL COUNT, never the derived dollars: a zero-rate model is
+/// priced and adds nothing, and a total of `$0.00` is equally what an unpriced
+/// call leaves behind.
+fn money(cost_usd: f64, derived_calls: u64, priced_calls: u64) -> String {
+    // Nothing here could be priced, so there is no figure to give. `$0.0000`
+    // would be the same lie the `~` exists to prevent, one row further down:
+    // it reads as "this was free" when it means "nobody could say".
+    if priced_calls == 0 {
+        return "—".to_owned();
+    }
+    if derived_calls > 0 {
+        format!("~${cost_usd:.4}")
+    } else {
+        format!("${cost_usd:.4}")
+    }
+}
+
+/// The sentence a cost total needs when it is not a plain measurement, or
+/// `None` when it is.
+///
+/// Two different caveats, and they stack: some of the total was estimated, and
+/// some calls contributed nothing at all because nothing could price them. The
+/// second is the one that turns a total into an undercount, so it is stated as
+/// a count rather than left for the reader to infer from a suspiciously round
+/// figure.
+fn cost_provenance_note(derived_calls: u64, unpriced_calls: u64) -> Option<String> {
+    match (derived_calls > 0, unpriced_calls > 0) {
+        (false, false) => None,
+        (true, false) => Some(format!(
+            "Cost marked ~ is an estimate: {} priced from the server's configured \
+             model rates rather than metered by the span.",
+            count(derived_calls, "call")
+        )),
+        (false, true) => Some(format!(
+            "Cost is an UNDERCOUNT: {} carried no cost and no configured rate, \
+             so they contribute nothing to the total.",
+            count(unpriced_calls, "call")
+        )),
+        (true, true) => Some(format!(
+            "Cost marked ~ is an estimate ({} priced from the server's configured \
+             model rates) and an UNDERCOUNT ({} carried no cost and no rate, so \
+             they contribute nothing).",
+            count(derived_calls, "call"),
+            count(unpriced_calls, "call")
+        )),
     }
 }
 

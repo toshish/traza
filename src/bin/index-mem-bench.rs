@@ -209,6 +209,7 @@ fn make_span(index: usize, cell: &Cell) -> Span {
     }
     let start = 1_700_000_000_000_000_000 + index as u64 * 1_000_000;
     Span {
+        tenant: String::new(),
         trace_id: format!("trace-{:012}", index / 8),
         span_id: format!("span-{index:012}"),
         parent_span_id: None,

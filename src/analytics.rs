@@ -50,6 +50,11 @@ pub const SESSION_ATTRIBUTE: &str = "session.id";
 pub struct SessionSummary {
     /// The session identifier shared by the session's spans.
     pub session_id: String,
+    /// The tenant whose spans formed this session; omitted for the default
+    /// tenant. Session identity is `(tenant, session_id)` — two tenants
+    /// reusing an id are two sessions, never one merged row.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub tenant: String,
     /// The attribute key that grouped this session (`session.id`,
     /// `gen_ai.conversation.id`, a `traceloop.association.properties.*` key,
     /// …). Drill-downs filter spans on this key.
@@ -70,8 +75,20 @@ pub struct SessionSummary {
     pub completion_tokens: u64,
     /// Summed total tokens (explicit `llm.total_tokens`, else prompt+completion).
     pub total_tokens: u64,
-    /// Summed cost in USD.
+    /// Summed cost in USD, metered and derived together.
     pub cost_usd: f64,
+    /// The part of `cost_usd` derived from the configured pricing table
+    /// rather than reported by a span.
+    pub cost_derived_usd: f64,
+    /// LLM calls whose cost the span itself reported.
+    pub cost_metered_calls: usize,
+    /// LLM calls priced from the configured table.
+    pub cost_derived_calls: usize,
+    /// LLM calls with no cost from either source — an unpriced model, or a
+    /// call that reported only a total token count. **These contribute
+    /// nothing to `cost_usd`, so a total with a non-zero count here is an
+    /// undercount rather than a complete answer.**
+    pub cost_unpriced_calls: usize,
     /// Spans with status `error`.
     pub error_count: usize,
 }
@@ -91,8 +108,20 @@ pub struct SessionTrace {
     pub span_count: usize,
     /// Summed total tokens.
     pub total_tokens: u64,
-    /// Summed cost in USD.
+    /// Summed cost in USD, metered and derived together.
     pub cost_usd: f64,
+    /// The part of `cost_usd` derived from the configured pricing table
+    /// rather than reported by a span.
+    pub cost_derived_usd: f64,
+    /// LLM calls whose cost the span itself reported.
+    pub cost_metered_calls: usize,
+    /// LLM calls priced from the configured table.
+    pub cost_derived_calls: usize,
+    /// LLM calls with no cost from either source — an unpriced model, or a
+    /// call that reported only a total token count. **These contribute
+    /// nothing to `cost_usd`, so a total with a non-zero count here is an
+    /// undercount rather than a complete answer.**
+    pub cost_unpriced_calls: usize,
     /// Spans with status `error`.
     pub error_count: usize,
 }
@@ -194,8 +223,20 @@ pub struct LlmAggregateRow {
     pub completion_tokens: u64,
     /// Summed total tokens.
     pub total_tokens: u64,
-    /// Summed cost in USD.
+    /// Summed cost in USD, metered and derived together.
     pub cost_usd: f64,
+    /// The part of `cost_usd` derived from the configured pricing table
+    /// rather than reported by a span.
+    pub cost_derived_usd: f64,
+    /// LLM calls whose cost the span itself reported.
+    pub cost_metered_calls: usize,
+    /// LLM calls priced from the configured table.
+    pub cost_derived_calls: usize,
+    /// LLM calls with no cost from either source — an unpriced model, or a
+    /// call that reported only a total token count. **These contribute
+    /// nothing to `cost_usd`, so a total with a non-zero count here is an
+    /// undercount rather than a complete answer.**
+    pub cost_unpriced_calls: usize,
     /// Spans with status `error`.
     pub error_count: usize,
     /// Summed duration of LLM calls, for average latency (`/ llm_calls`).
@@ -212,6 +253,17 @@ pub(crate) struct Counters {
     pub(crate) completion_tokens: u64,
     pub(crate) total_tokens: u64,
     pub(crate) cost_usd: f64,
+    /// The part of `cost_usd` that came from a pricing table rather than from
+    /// a span. Summed separately because a total that mixes measurement with
+    /// estimate is not interpretable without knowing the mix.
+    pub(crate) cost_derived_usd: f64,
+    /// LLM calls whose cost the span itself reported.
+    pub(crate) cost_metered_calls: usize,
+    /// LLM calls whose cost came from the pricing table.
+    pub(crate) cost_derived_calls: usize,
+    /// LLM calls with no cost from either source — an unpriced model, or a
+    /// call that reported only a total token count.
+    pub(crate) cost_unpriced_calls: usize,
     pub(crate) errors: usize,
     pub(crate) llm_duration_ns: u64,
 }
@@ -239,6 +291,23 @@ impl Counters {
             .saturating_add(facts.completion_tokens.unwrap_or(0));
         self.total_tokens = self.total_tokens.saturating_add(facts.total());
         self.cost_usd = finite_saturating_add(self.cost_usd, facts.cost_usd.unwrap_or(0.0));
+        // Provenance is counted, never inferred from the dollars. A zero-rate
+        // model is priced and contributes nothing; an unpriced call also
+        // contributes nothing — and reading `cost_derived_usd == 0` as
+        // "measured" would call both of them metered, which is false twice.
+        match (facts.cost_usd, facts.cost_derived) {
+            (Some(cost), true) => {
+                self.cost_derived_usd = finite_saturating_add(self.cost_derived_usd, cost);
+                self.cost_derived_calls = self.cost_derived_calls.saturating_add(1);
+            }
+            (Some(_), false) => self.cost_metered_calls = self.cost_metered_calls.saturating_add(1),
+            // Only LLM calls can be *un*priced. A span carrying no model, no
+            // tokens and no cost is not a call that failed to get a price.
+            (None, _) if facts.is_llm => {
+                self.cost_unpriced_calls = self.cost_unpriced_calls.saturating_add(1);
+            }
+            (None, _) => {}
+        }
     }
 
     fn merge(&mut self, other: &Counters) {
@@ -250,6 +319,17 @@ impl Counters {
             .saturating_add(other.completion_tokens);
         self.total_tokens = self.total_tokens.saturating_add(other.total_tokens);
         self.cost_usd = finite_saturating_add(self.cost_usd, other.cost_usd);
+        self.cost_derived_usd =
+            finite_saturating_add(self.cost_derived_usd, other.cost_derived_usd);
+        self.cost_metered_calls = self
+            .cost_metered_calls
+            .saturating_add(other.cost_metered_calls);
+        self.cost_derived_calls = self
+            .cost_derived_calls
+            .saturating_add(other.cost_derived_calls);
+        self.cost_unpriced_calls = self
+            .cost_unpriced_calls
+            .saturating_add(other.cost_unpriced_calls);
         self.errors = self.errors.saturating_add(other.errors);
         self.llm_duration_ns = self.llm_duration_ns.saturating_add(other.llm_duration_ns);
     }
@@ -343,8 +423,14 @@ pub(crate) struct SegmentRollup {
     pub(crate) by_provider: HashMap<String, Counters>,
     pub(crate) by_service: HashMap<String, Counters>,
     pub(crate) by_day: BTreeMap<String, Counters>,
-    pub(crate) by_session_key: HashMap<String, Counters>,
-    pub(crate) sessions: HashMap<String, SessionCounters>,
+    /// Keyed `(tenant, session_id)` — STRUCTURALLY, not as a joined display
+    /// string. A joined key would collide: a default-tenant session literally
+    /// named `acme/checkout` is not tenant `acme`'s session `checkout`, and a
+    /// map that cannot tell them apart silently merges two tenants' counters
+    /// in a persisted sidecar.
+    pub(crate) by_session_key: HashMap<(String, String), Counters>,
+    /// Keyed `(tenant, session_id)`, same rule as `by_session_key`.
+    pub(crate) sessions: HashMap<(String, String), SessionCounters>,
     /// FNV-1a hashes of every (trace_id, span_id) in the rollup: the
     /// supersede prefilter. A key replaced in a NEWER source makes this
     /// rollup unusable as-is (its counters include the stale version).
@@ -378,14 +464,23 @@ impl SegmentRollup {
         }
     }
 
-    pub(crate) fn build<S: std::borrow::Borrow<Span>>(spans: &[S]) -> Self {
+    /// Folds `spans` into a rollup, deriving cost at `pricing` for the calls
+    /// that did not meter one.
+    ///
+    /// The table is an input to the values this produces, which is why the
+    /// sidecar records its fingerprint: a rollup built under one table must
+    /// not be believed by a store running another.
+    pub(crate) fn build<S: std::borrow::Borrow<Span>>(
+        spans: &[S],
+        pricing: &crate::pricing::Pricing,
+    ) -> Self {
         let mut rollup = Self {
             min_start_ns: u64::MAX,
             min_end_ns: u64::MAX,
             ..Self::default()
         };
         for span in spans {
-            rollup.absorb(span.borrow());
+            rollup.absorb(span.borrow(), pricing);
         }
         if rollup.min_start_ns == u64::MAX {
             rollup.min_start_ns = 0;
@@ -396,16 +491,16 @@ impl SegmentRollup {
         rollup
     }
 
-    fn absorb(&mut self, span: &Span) {
+    fn absorb(&mut self, span: &Span, pricing: &crate::pricing::Pricing) {
         self.min_start_ns = self.min_start_ns.min(span.start_time_ns);
         self.max_start_ns = self.max_start_ns.max(span.start_time_ns);
         self.min_end_ns = self.min_end_ns.min(span.end_time_ns);
         self.max_end_ns = self.max_end_ns.max(span.end_time_ns);
         self.key_hashes
-            .insert(key_hash(&span.trace_id, &span.span_id));
+            .insert(key_hash(&span.tenant, &span.trace_id, &span.span_id));
         collect_payload_refs(span, &mut self.payload_refs);
         // One semconv scan, shared across every group this span joins.
-        let facts = semconv::facts(&span.attributes);
+        let facts = semconv::facts(&span.attributes).priced(pricing);
         if let Some(model) = &facts.model {
             self.by_model
                 .entry(model.clone())
@@ -428,11 +523,11 @@ impl SegmentRollup {
             .absorb(span, &facts);
         if let Some(session) = &facts.session {
             self.by_session_key
-                .entry(session.clone())
+                .entry((span.tenant.clone(), session.clone()))
                 .or_default()
                 .absorb(span, &facts);
             self.sessions
-                .entry(session.clone())
+                .entry((span.tenant.clone(), session.clone()))
                 .or_default()
                 .absorb(span, &facts);
         }
@@ -441,13 +536,20 @@ impl SegmentRollup {
 
 // ------------------------------------------------------------ span helpers
 
-/// FNV-1a over the primary key. Used only as a PREFILTER: a hash collision
-/// can force an unnecessary exact re-scan, never a wrong count.
-fn key_hash(trace_id: &str, span_id: &str) -> u64 {
+/// FNV-1a over the primary key — tenant, trace, span, NUL-separated. Used
+/// only as a PREFILTER: a hash collision can force an unnecessary exact
+/// re-scan, never a wrong count. The tenant is always hashed, empty included:
+/// special-casing the default tenant would save nothing and make the domain
+/// of the hash depend on the value being hashed. Persisted key-hash sets are
+/// invalidated by the rollup sidecar's SCHEMA_VERSION, which was bumped for
+/// exactly this change.
+pub(crate) fn key_hash(tenant: &str, trace_id: &str, span_id: &str) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in trace_id
+    for byte in tenant
         .as_bytes()
         .iter()
+        .chain([0_u8].iter())
+        .chain(trace_id.as_bytes())
         .chain([0_u8].iter())
         .chain(span_id.as_bytes())
     {
@@ -527,16 +629,36 @@ impl Store {
         limit: usize,
         order: SessionOrder,
     ) -> Result<Vec<SessionSummary>> {
-        let mut merged: HashMap<String, SessionCounters> = HashMap::new();
-        self.fold_analytics(since_ns, until_ns, |rollup| {
-            for (id, counters) in &rollup.sessions {
-                merged.entry(id.clone()).or_default().merge(counters);
+        self.sessions_in(None, since_ns, until_ns, limit, order)
+    }
+
+    /// [`Self::sessions`] under a tenant scope: `None` lists every tenant's
+    /// sessions (the operator view, each row carrying its tenant), `Some(t)`
+    /// only tenant `t`'s. Sessions stay on the rollup fast path either way —
+    /// the session maps are keyed by `(tenant, session_id)`, so scoping is a
+    /// post-filter on structurally separate rows, never a subtraction.
+    pub fn sessions_in(
+        &self,
+        tenant: Option<&str>,
+        since_ns: Option<u64>,
+        until_ns: Option<u64>,
+        limit: usize,
+        order: SessionOrder,
+    ) -> Result<Vec<SessionSummary>> {
+        let mut merged: HashMap<(String, String), SessionCounters> = HashMap::new();
+        self.fold_analytics(since_ns, until_ns, None, |rollup| {
+            for (key, counters) in &rollup.sessions {
+                if tenant.is_some_and(|tenant| key.0 != tenant) {
+                    continue;
+                }
+                merged.entry(key.clone()).or_default().merge(counters);
             }
         })?;
         let mut sessions: Vec<SessionSummary> = merged
             .into_iter()
-            .map(|(session_id, entry)| SessionSummary {
+            .map(|((tenant, session_id), entry)| SessionSummary {
                 session_id,
+                tenant,
                 session_attribute: entry.attribute(),
                 first_start_ns: entry.first_start_ns,
                 last_end_ns: entry.last_end_ns,
@@ -547,11 +669,15 @@ impl Store {
                 completion_tokens: entry.counters.completion_tokens,
                 total_tokens: entry.counters.total_tokens,
                 cost_usd: entry.counters.cost_usd,
+                cost_derived_usd: entry.counters.cost_derived_usd,
+                cost_metered_calls: entry.counters.cost_metered_calls,
+                cost_derived_calls: entry.counters.cost_derived_calls,
+                cost_unpriced_calls: entry.counters.cost_unpriced_calls,
                 error_count: entry.counters.errors,
             })
             .collect();
-        // The session id breaks every tie, so a page is deterministic even
-        // when a hundred sessions report the same cost.
+        // The (tenant, session id) pair breaks every tie, so a page is
+        // deterministic even when a hundred sessions report the same cost.
         sessions.sort_by(|a, b| {
             let ranked = match order {
                 SessionOrder::Recent => b.last_end_ns.cmp(&a.last_end_ns),
@@ -562,7 +688,9 @@ impl Store {
                 SessionOrder::Errors => b.error_count.cmp(&a.error_count),
                 SessionOrder::Tokens => b.total_tokens.cmp(&a.total_tokens),
             };
-            ranked.then_with(|| a.session_id.cmp(&b.session_id))
+            ranked
+                .then_with(|| a.tenant.cmp(&b.tenant))
+                .then_with(|| a.session_id.cmp(&b.session_id))
         });
         sessions.truncate(limit);
         Ok(sessions)
@@ -576,23 +704,53 @@ impl Store {
     /// carries both a native `session.id` and a matching
     /// `gen_ai.conversation.id`) lands in exactly one session. This is what
     /// makes a mixed-convention session queryable as a whole.
-    pub(crate) fn resolve_session_spans(&self, session_id: &str) -> Result<Vec<Span>> {
+    pub(crate) fn resolve_session_spans(
+        &self,
+        tenant: Option<&str>,
+        session_id: &str,
+    ) -> Result<Vec<Span>> {
         let candidates =
             self.query_attribute_union(&semconv::SESSION_KEYS, &session_values(session_id))?;
-        Ok(narrow_to_session(candidates, session_id))
+        Ok(narrow_to_session(candidates, tenant, session_id))
     }
 
     /// One session with its per-trace breakdown, or `None` when no span
     /// carries the id.
     pub fn session(&self, session_id: &str) -> Result<Option<SessionDetail>> {
-        let spans = self.resolve_session_spans(session_id)?;
+        self.session_in(None, session_id)
+    }
+
+    /// [`Self::session`] under a tenant scope. `None` resolves the id across
+    /// every tenant — unchanged for a single-tenant store, and an operator
+    /// drilling into a multi-tenant store should name the tenant, because a
+    /// union across tenants that reuse an id is a merged view, reported with
+    /// an empty tenant field when the members disagree.
+    pub fn session_in(
+        &self,
+        tenant: Option<&str>,
+        session_id: &str,
+    ) -> Result<Option<SessionDetail>> {
+        let spans = self.resolve_session_spans(tenant, session_id)?;
         if spans.is_empty() {
             return Ok(None);
         }
+        // The tenant reported back: the scope when one was given, else the
+        // members' unanimous tenant, else empty (a disagreeing union).
+        let reported_tenant = match tenant {
+            Some(tenant) => tenant.to_owned(),
+            None => {
+                let first = spans[0].tenant.as_str();
+                if spans.iter().all(|span| span.tenant == first) {
+                    first.to_owned()
+                } else {
+                    String::new()
+                }
+            }
+        };
         let mut session = SessionCounters::default();
         let mut traces: BTreeMap<String, (Vec<&Span>, Counters)> = BTreeMap::new();
         for span in &spans {
-            let facts = semconv::facts(&span.attributes);
+            let facts = self.facts(span);
             session.absorb(span, &facts);
             let entry = traces.entry(span.trace_id.clone()).or_default();
             entry.0.push(span);
@@ -617,6 +775,10 @@ impl Store {
                     span_count: counters.spans,
                     total_tokens: counters.total_tokens,
                     cost_usd: counters.cost_usd,
+                    cost_derived_usd: counters.cost_derived_usd,
+                    cost_metered_calls: counters.cost_metered_calls,
+                    cost_derived_calls: counters.cost_derived_calls,
+                    cost_unpriced_calls: counters.cost_unpriced_calls,
                     error_count: counters.errors,
                 }
             })
@@ -625,6 +787,7 @@ impl Store {
         Ok(Some(SessionDetail {
             summary: SessionSummary {
                 session_id: session_id.to_owned(),
+                tenant: reported_tenant,
                 session_attribute: session.attribute(),
                 first_start_ns: session.first_start_ns,
                 last_end_ns: session.last_end_ns,
@@ -635,6 +798,10 @@ impl Store {
                 completion_tokens: session.counters.completion_tokens,
                 total_tokens: session.counters.total_tokens,
                 cost_usd: session.counters.cost_usd,
+                cost_derived_usd: session.counters.cost_derived_usd,
+                cost_metered_calls: session.counters.cost_metered_calls,
+                cost_derived_calls: session.counters.cost_derived_calls,
+                cost_unpriced_calls: session.counters.cost_unpriced_calls,
                 error_count: session.counters.errors,
             },
             traces: trace_rows,
@@ -649,29 +816,79 @@ impl Store {
         since_ns: Option<u64>,
         until_ns: Option<u64>,
     ) -> Result<Vec<LlmAggregateRow>> {
-        let mut merged: HashMap<String, Counters> = HashMap::new();
-        self.fold_analytics(since_ns, until_ns, |rollup| {
-            let groups: Box<dyn Iterator<Item = (&String, &Counters)>> = match group_by {
-                LlmGroupBy::Model => Box::new(rollup.by_model.iter()),
-                LlmGroupBy::Provider => Box::new(rollup.by_provider.iter()),
-                LlmGroupBy::Service => Box::new(rollup.by_service.iter()),
-                LlmGroupBy::Session => Box::new(rollup.by_session_key.iter()),
-                LlmGroupBy::Day => Box::new(rollup.by_day.iter()),
-            };
-            for (key, counters) in groups {
-                merged.entry(key.clone()).or_default().merge(counters);
+        self.llm_aggregate_in(None, group_by, since_ns, until_ns)
+    }
+
+    /// [`Self::llm_aggregate`] under a tenant scope.
+    ///
+    /// An unscoped call keeps the rollup fast path. A scoped one cannot for
+    /// the model/provider/service/day dimensions — those rollup maps are
+    /// store-global and a rollup cannot be subtracted from — so it takes the
+    /// exact fold with the tenant predicate applied span by span, the same
+    /// slower-but-right trade the pending-erasure mask already makes.
+    /// Session rows ARE tenant-keyed, so the session dimension stays on the
+    /// fast path and post-filters.
+    pub fn llm_aggregate_in(
+        &self,
+        tenant: Option<&str>,
+        group_by: LlmGroupBy,
+        since_ns: Option<u64>,
+        until_ns: Option<u64>,
+    ) -> Result<Vec<LlmAggregateRow>> {
+        let fold_scope = match group_by {
+            LlmGroupBy::Session => None,
+            _ => tenant,
+        };
+        // Session rows merge STRUCTURALLY by (tenant, session) and only then
+        // render a display key. Merging by the rendered string would fuse a
+        // default-tenant session literally named "acme/chat" with tenant
+        // acme's session "chat" — the exact collision the sidecar's
+        // two-string encoding exists to prevent. Two rows may still RENDER
+        // alike; equal text on distinct rows is honest, merged counters are
+        // not.
+        let mut merged: HashMap<(String, String), Counters> = HashMap::new();
+        self.fold_analytics(since_ns, until_ns, fold_scope, |rollup| match group_by {
+            LlmGroupBy::Session => {
+                for (key, counters) in &rollup.by_session_key {
+                    if tenant.is_some_and(|tenant| key.0 != tenant) {
+                        continue;
+                    }
+                    merged.entry(key.clone()).or_default().merge(counters);
+                }
+            }
+            _ => {
+                let groups: Box<dyn Iterator<Item = (&String, &Counters)>> = match group_by {
+                    LlmGroupBy::Model => Box::new(rollup.by_model.iter()),
+                    LlmGroupBy::Provider => Box::new(rollup.by_provider.iter()),
+                    LlmGroupBy::Service => Box::new(rollup.by_service.iter()),
+                    LlmGroupBy::Day => Box::new(rollup.by_day.iter()),
+                    LlmGroupBy::Session => unreachable!("handled above"),
+                };
+                for (key, counters) in groups {
+                    merged
+                        .entry((String::new(), key.clone()))
+                        .or_default()
+                        .merge(counters);
+                }
             }
         })?;
         let mut rows: Vec<LlmAggregateRow> = merged
             .into_iter()
-            .map(|(key, counters)| LlmAggregateRow {
-                key,
+            .map(|((row_tenant, key), counters)| LlmAggregateRow {
+                key: match row_tenant.is_empty() {
+                    true => key,
+                    false => format!("{row_tenant}/{key}"),
+                },
                 spans: counters.spans,
                 llm_calls: counters.llm_calls,
                 prompt_tokens: counters.prompt_tokens,
                 completion_tokens: counters.completion_tokens,
                 total_tokens: counters.total_tokens,
                 cost_usd: counters.cost_usd,
+                cost_derived_usd: counters.cost_derived_usd,
+                cost_metered_calls: counters.cost_metered_calls,
+                cost_derived_calls: counters.cost_derived_calls,
+                cost_unpriced_calls: counters.cost_unpriced_calls,
                 error_count: counters.errors,
                 llm_duration_ns: counters.llm_duration_ns,
             })
@@ -694,10 +911,15 @@ impl Store {
     /// forces an exact re-scan). Found live: a replaced span kept both
     /// versions in the aggregates — 2 calls, 30 tokens, $0.30 where the
     /// truth was 1 call, 20 tokens, $0.20.
+    /// `tenant` scopes the fold to one tenant's spans. Like a pending
+    /// erasure's mask, a tenant scope declines the rollup fast path outright
+    /// — a rollup's global dimensions cannot be subtracted from — and applies
+    /// the predicate span by span on the exact path.
     fn fold_analytics(
         &self,
         since_ns: Option<u64>,
         until_ns: Option<u64>,
+        tenant: Option<&str>,
         mut visit: impl FnMut(&SegmentRollup),
     ) -> Result<()> {
         let folding = std::time::Instant::now();
@@ -723,20 +945,27 @@ impl Store {
 
         // ALL buffer keys supersede segment copies, in-window or not, so this
         // is over the whole buffer rather than the window's slice of it.
-        let buffer_keys: HashSet<(&str, &str)> = buffer
+        let buffer_keys: HashSet<(&str, &str, &str)> = buffer
             .iter()
-            .map(|span| (span.trace_id.as_str(), span.span_id.as_str()))
+            .map(|span| {
+                (
+                    span.tenant.as_str(),
+                    span.trace_id.as_str(),
+                    span.span_id.as_str(),
+                )
+            })
             .collect();
         let buffered: Vec<Arc<Span>> = buffer
             .iter()
             .filter(|span| {
                 in_window(span.start_time_ns, since_ns, until_ns)
                     && mask.as_deref().map_or(true, |mask| !mask.covers(span))
+                    && tenant.map_or(true, |tenant| span.tenant == tenant)
             })
             .map(Arc::clone)
             .collect();
         if !buffered.is_empty() {
-            visit(&SegmentRollup::build(&buffered));
+            visit(&SegmentRollup::build(&buffered, self.pricing()));
         }
         // Buffer and newer-segment hashes are tracked separately because the
         // shadow latch must tell them apart: a merge retires segment-versus-
@@ -746,7 +975,7 @@ impl Store {
         // and the exact-path prefilter still test the union.
         let buffer_hashes: HashSet<u64> = buffer_keys
             .iter()
-            .map(|(trace_id, span_id)| key_hash(trace_id, span_id))
+            .map(|(tenant, trace_id, span_id)| key_hash(tenant, trace_id, span_id))
             .collect();
         let mut segment_hashes: HashSet<u64> = HashSet::new();
 
@@ -786,7 +1015,7 @@ impl Store {
                 shadowed_by_buffer = shadowed_by_buffer || buffer_hashes.contains(hash);
             }
             let possibly_superseded = shadowed_by_buffer || shadowed_by_segment;
-            if fully_inside && !possibly_superseded && mask.is_none() {
+            if fully_inside && !possibly_superseded && mask.is_none() && tenant.is_none() {
                 visit(&rollup);
                 segment_hashes.extend(rollup.key_hashes.iter().copied());
                 continue;
@@ -811,38 +1040,42 @@ impl Store {
                 if mask.as_deref().is_some_and(|mask| mask.covers(&span)) {
                     continue;
                 }
-                if buffer_keys.contains(&(span.trace_id.as_str(), span.span_id.as_str())) {
+                if tenant.is_some_and(|tenant| span.tenant != tenant) {
                     continue;
                 }
-                // The union of buffer and newer-segment hashes holds every
-                // key that could supersede this span (each branch of this
-                // loop extends `segment_hashes` before moving on), so a miss
-                // here is proof this span was never replaced — no probe
-                // needed. Only a hit, which means a real supersede or an FNV
-                // collision, pays for the exact scan. Without this prefilter
-                // every surviving span probed the trace index of every newer
+                if buffer_keys.contains(&(
+                    span.tenant.as_str(),
+                    span.trace_id.as_str(),
+                    span.span_id.as_str(),
+                )) {
+                    continue;
+                }
+                // Gated per newer segment on that segment's OWN hash set —
+                // [`crate::superseded_by_newer`], the same test the query
+                // paths run. A miss in every set is proof this span was never
+                // replaced, and only the specific segments whose set holds
+                // the hash — a real supersede or an FNV collision — pay an
+                // exact probe, so a key rewritten eleven segments later costs
+                // one probe, not a walk across the ten in between. The union
+                // in `segment_hashes` stays what it is: the per-ROLLUP gate
+                // above, not the per-span one. Without any prefilter every
+                // surviving span probed the trace index of every newer
                 // segment, so the cost was spans × segments: at eight
                 // concurrent ingest clients, where interleaved time ranges
                 // leave no segment fully inside a window, that quadratic term
                 // was the whole query.
-                let hash = key_hash(&span.trace_id, &span.span_id);
-                let superseded = (segment_hashes.contains(&hash) || buffer_hashes.contains(&hash))
-                    && segments
-                        .iter()
-                        .skip(position + 1)
-                        .try_fold(false, |found, newer| {
-                            if found {
-                                Ok(true)
-                            } else {
-                                newer.contains_key(&span.trace_id, &span.span_id)
-                            }
-                        })?;
-                if !superseded {
+                if !crate::superseded_by_newer(
+                    &segments,
+                    position,
+                    &span,
+                    &self.metrics,
+                    self.pricing(),
+                )? {
                     survivors.push(span);
                 }
             }
             if !survivors.is_empty() {
-                visit(&SegmentRollup::build(&survivors));
+                visit(&SegmentRollup::build(&survivors, self.pricing()));
             }
             segment_hashes.extend(rollup.key_hashes.iter().copied());
         }
@@ -883,6 +1116,12 @@ impl Store {
         for span in &buffer {
             collect_payload_refs(span, &mut refs);
         }
+        // Dataset examples are live references too: an example deliberately
+        // outlives the trace it was promoted from, and "deleting source
+        // traces must not corrupt dataset versions" is only true for
+        // offloaded content if this union says so — to the TTL sweep and to
+        // reference-aware erasure alike.
+        refs.extend(self.eval_payload_refs()?);
         // Pinned, not held: this runs from the maintenance thread once a
         // minute and reads a file per segment, and holding the segments lock
         // across that stalled every seal for the duration.
@@ -894,7 +1133,7 @@ impl Store {
             // memory the rollup cache held. A miss falls back to the caching
             // path, because at that point the segment has to be decoded
             // anyway and the result is worth keeping.
-            let binding = segment.rollup_binding();
+            let binding = segment.rollup_binding(self.pricing_fingerprint());
             // Warm cache first — bypassing it made every tick re-read and
             // re-decode sidecars the process already had in memory. Then the
             // sidecar, read WITHOUT caching: the sweep asks about every
@@ -930,14 +1169,17 @@ impl Store {
     /// a query because a derived cache could not be saved would trade a
     /// correct slow answer for no answer.
     fn segment_rollup(&self, segment: &crate::Segment) -> Result<Arc<SegmentRollup>> {
-        let binding = segment.rollup_binding();
+        let binding = segment.rollup_binding(self.pricing_fingerprint());
         if let Some(rollup) = self.cached_rollup(&segment.path, binding)? {
             return Ok(rollup);
         }
         let rollup = match crate::rollup_file::load(&segment.path, binding) {
             Some(rollup) => Arc::new(rollup),
             None => {
-                let rollup = Arc::new(SegmentRollup::build(&segment.spans_parsed()?));
+                let rollup = Arc::new(SegmentRollup::build(
+                    &segment.spans_parsed()?,
+                    self.pricing(),
+                ));
                 let _ = crate::rollup_file::store(&segment.path, binding, &rollup);
                 rollup
             }
@@ -985,7 +1227,7 @@ impl Store {
             if bytes > budget_bytes {
                 break;
             }
-            let binding = segment.rollup_binding();
+            let binding = segment.rollup_binding(self.pricing_fingerprint());
             let rollup = match self.cached_rollup(&segment.path, binding)? {
                 Some(rollup) => rollup,
                 None => match crate::rollup_file::load(&segment.path, binding) {
@@ -1037,6 +1279,7 @@ impl Store {
 pub(crate) fn resolve_session_spans_in(
     buffer: &crate::WriteBuffer,
     segments: &[Arc<crate::Segment>],
+    tenant: Option<&str>,
     session_id: &str,
     mask: Option<&crate::erasure::Mask>,
 ) -> Result<Vec<Span>> {
@@ -1047,7 +1290,7 @@ pub(crate) fn resolve_session_spans_in(
         &session_values(session_id),
         mask,
     )?;
-    Ok(narrow_to_session(candidates, session_id))
+    Ok(narrow_to_session(candidates, tenant, session_id))
 }
 
 /// Every JSON encoding that normalizes to the session id `session_id`.
@@ -1072,11 +1315,15 @@ pub(crate) fn session_values(session_id: &str) -> Vec<Value> {
     values
 }
 
-/// The attribute union over-selects: a span may carry a matching value under a
-/// LOWER-precedence key while its resolved session is something else.
-fn narrow_to_session(candidates: Vec<Span>, session_id: &str) -> Vec<Span> {
+/// The attribute union over-selects two ways: a span may carry a matching
+/// value under a LOWER-precedence key while its resolved session is something
+/// else, and the value index is tenant-blind, so another tenant's span under
+/// the same session id is a candidate too. Both are settled here, against the
+/// decoded span.
+fn narrow_to_session(candidates: Vec<Span>, tenant: Option<&str>, session_id: &str) -> Vec<Span> {
     candidates
         .into_iter()
+        .filter(|span| tenant.map_or(true, |tenant| span.tenant == tenant))
         .filter(|span| semconv::facts(&span.attributes).session.as_deref() == Some(session_id))
         .collect()
 }
@@ -1124,6 +1371,7 @@ mod tests {
             record_count: 10,
             min_start_ns: 1_000,
             max_start_ns: 9_000,
+            pricing_fingerprint: 0,
         };
         let rollup = Arc::new(SegmentRollup::default());
         store
@@ -1169,6 +1417,17 @@ mod tests {
                 "max start",
                 Binding {
                     max_start_ns: 9_001,
+                    ..binding
+                },
+            ),
+            (
+                // Counters folded at one set of rates are not the counters
+                // another set would have produced, and the segment they came
+                // from is byte-identical either way — so nothing else in the
+                // binding can catch this.
+                "pricing",
+                Binding {
+                    pricing_fingerprint: 0xdead_beef,
                     ..binding
                 },
             ),

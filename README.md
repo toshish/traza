@@ -18,7 +18,7 @@ Traza is a trace database for LLM and agent workloads. It runs as a single binar
 The server with the dashboard already built in. No Rust, no Node.
 
 ```sh
-VERSION=0.22.2
+VERSION=0.22.1
 PLATFORM=macos-aarch64          # or linux-x86_64, linux-aarch64
 
 curl -LO https://github.com/toshish/traza/releases/download/v$VERSION/traza-$VERSION-$PLATFORM.tar.gz
@@ -83,7 +83,7 @@ That is the whole setup. Data lands in `./data`, the dashboard is on <http://loc
 | `--mcp` | off | Serve Model Context Protocol at `/v1/mcp`. |
 | `--ui-dir DIR` | beside the binary | Where the built dashboard lives. |
 | `--restore DIR` | | Install a backup into `--data-dir`, then serve it. |
-| `TRAZA_TOKENS` | unset | Bearer auth: `rw:` and `ro:` scoped, plus `admin:` for erasure. |
+| `TRAZA_TOKENS` | unset | Bearer auth: `rw:` and `ro:` scoped, plus `admin:` for erasure. Bind a credential to one tenant with `rw@acme:token`. |
 
 `--help` prints all twenty-five. The [configuration reference](docs/configuration.md) explains what each one costs.
 
@@ -140,7 +140,7 @@ curl -X POST http://localhost:8080/v1/backups/nightly/release
 ./traza-server --data-dir /var/lib/traza --restore /backups/traza-2026-08-10
 ```
 
-**Erasing a session, and proving it.** Deletion by trace, span, session or payload, published at a checkpoint; the receipt re-checks every domain by name:
+**Erasing a session, and proving it.** Deletion by trace, span, session, tenant or payload, published at a checkpoint; the receipt re-checks every domain by name:
 
 ```sh
 curl -X POST http://localhost:8080/v1/erasures \
@@ -197,7 +197,11 @@ Want a populated store to explore first? `examples/mcp-demo/run.sh` seeds agent 
 
 **Backup without stopping.** One call pins and verifies a consistent copy of spans, annotations and payload bytes together. Restore is one flag.
 
-**Deletion with a receipt.** Erase a trace, a session, or one offloaded payload from every domain — buffer, log, segments, annotations, payload files — then prove it: `verify --erasure` re-checks each domain by name and reports the result of each, down to the pinned backup that still holds the bytes.
+**Deletion with a receipt.** Erase a trace, a session, a whole tenant, or one offloaded payload from every domain — buffer, log, segments, annotations, payload files, datasets — then prove it: `verify --erasure` re-checks each domain by name and reports the result of each, down to the pinned backup that still holds the bytes and the dataset example that carries a promoted copy.
+
+**Tenants in the key, not bolted on.** Span identity is `(tenant, trace_id, span_id)`, so two customers sharing a trace id can never overwrite each other. A token bound with `rw@acme:token` writes and reads exactly one tenant on every surface; retention takes per-tenant windows; `GET /v1/tenants` accounts usage per tenant. Single-tenant stores write byte-identical files and notice nothing.
+
+**The eval loop is representable.** Promote failing production traces into an immutable, content-addressed dataset version — examples keep their own copies, so deleting the source trace cannot corrupt them — run the experiment with your own harness, record runs and scores against `(experiment, example, span)`, and read score distributions and experiment-over-experiment diffs back out. Identity and addressing only: no runner, no scorer library, and your workflow stays yours.
 
 ## Performance
 

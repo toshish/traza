@@ -11,6 +11,7 @@ import {
   opsFor,
   windowOf,
 } from '../lib/query.js';
+import { llmUsage } from '../lib/spans.js';
 import { fmtClockNs, fmtCost, fmtDurationNs, fmtNum, fmtPercent, fmtWindowLabel } from '../lib/format.js';
 import { Card, Chip, Eyebrow, ErrorState, EmptyState, Kbd, LoadingBar } from '../components/primitives/Chrome.jsx';
 import { VolumeBrush, ShareBar } from '../components/charts/Marks.jsx';
@@ -128,22 +129,27 @@ export function TracesScreen({ go, params }) {
   // chart's total and the table's cost disagree about which spans were in
   // scope, and a disagreement nobody can explain is worse than one nobody can
   // see.
-  const window = React.useMemo(() => windowOf(applied.range), [applied]);
+  //
+  // Named `timeWindow`, not `window`: the obvious name shadows the global for
+  // the whole component, and the two places that reached for `window.prompt`
+  // and `window.location` got `undefined` from the memo instead — silently,
+  // because both were written defensively with `?.`.
+  const timeWindow = React.useMemo(() => windowOf(applied.range), [applied]);
   const apiParams = React.useMemo(
     () => toParams(applied, {
       includeWindow: false,
-      extra: window.sinceNs
-        ? { since: Math.round(window.sinceNs), until: Math.round(window.untilNs) }
+      extra: timeWindow.sinceNs
+        ? { since: Math.round(timeWindow.sinceNs), until: Math.round(timeWindow.untilNs) }
         : {},
     }),
-    [applied, window],
+    [applied, timeWindow],
   );
 
   const search = useRead((signal) => api.spans(apiParams, signal), [JSON.stringify(apiParams)]);
   const series = useRead(
     (signal) => api.series({ ...apiParams, limit: undefined, sort: undefined, buckets: 72 }, signal),
     [JSON.stringify(apiParams)],
-    { skip: !window.sinceNs },
+    { skip: !timeWindow.sinceNs },
   );
 
   // A fresh search resets paging; "load more" appends one cursor page, so the
@@ -205,7 +211,10 @@ export function TracesScreen({ go, params }) {
         {view.name}
       </Chip>)}
       <Chip dashed onClick={() => {
-        const name = window.prompt?.('Name this view') || `view ${views.length + 1}`;
+        // `globalThis`, not `window`: this reads the browser global, and saying
+        // so makes it impossible for a later local named `window` to silently
+        // turn it into `undefined` again.
+        const name = globalThis.prompt?.('Name this view') || `view ${views.length + 1}`;
         setViews([...views, { name, query: applied }]);
       }}>+ save current</Chip>
     </div>
@@ -218,7 +227,7 @@ export function TracesScreen({ go, params }) {
           keeps spans that never recorded the key
         </span>
         <span style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
-          <Chip onClick={() => navigator.clipboard?.writeText(toCurl(applied, window.location?.origin || ''))}>
+          <Chip onClick={() => navigator.clipboard?.writeText(toCurl(applied, globalThis.location?.origin || ''))}>
             Copy as curl
           </Chip>
           <Chip tone="primary" onClick={() => apply(query)}>Search</Chip>
@@ -272,7 +281,7 @@ export function TracesScreen({ go, params }) {
         }}>volume</span>
         <span style={{ fontSize: 12, color: 'var(--ink-muted)' }}>
           drag to set the window — <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--ink)' }}>
-            {fmtWindowLabel(window.sinceNs, window.untilNs)}
+            {fmtWindowLabel(timeWindow.sinceNs, timeWindow.untilNs)}
           </span> selected
         </span>
         <span style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
@@ -329,6 +338,13 @@ export function TracesScreen({ go, params }) {
       {rows.map((span, index) => {
         const duration = span.end_time_ns - span.start_time_ns;
         const error = span.status === 'error';
+        // `llmUsage` is the shared mirror of src/semconv.rs. This screen used
+        // to carry its own third copy of the precedence, which had drifted:
+        // it read only the deprecated `gen_ai.usage.{prompt,completion}_tokens`
+        // and a `llm.usage.prompt_tokens` key Traza never recognized, so a
+        // span using the current OTel `input`/`output` names — the ones the
+        // server and the trace detail both resolve — showed a blank cell here.
+        const usage = llmUsage(span);
         return <div key={span.trace_id + span.span_id} role="row" tabIndex={0}
           onClick={() => openRow(span)} onFocus={() => setSelected(index)}
           onKeyDown={(e) => { if (e.key === 'Enter') openRow(span); }}
@@ -351,8 +367,10 @@ export function TracesScreen({ go, params }) {
             </div>
           </div>
           <Cell mono align="right">{fmtDurationNs(duration)}</Cell>
-          <Cell mono muted align="right">{tokensOf(span)}</Cell>
-          <Cell mono align="right" color="var(--accent)">{costOf(span)}</Cell>
+          <Cell mono muted align="right">{usage?.totalTokens ? fmtNum(usage.totalTokens) : ''}</Cell>
+          <Cell mono align="right" color="var(--accent)">
+            {usage?.costUsd != null ? fmtCost(usage.costUsd) : ''}
+          </Cell>
           <Cell color={error ? 'var(--error)' : 'var(--ink-muted)'}>{span.status || '—'}</Cell>
         </div>;
       })}
@@ -382,17 +400,3 @@ function Cell({ children, mono, muted, align, color }) {
   }}>{children}</div>;
 }
 
-/** Token and cost read straight off the span, under either convention. */
-function tokensOf(span) {
-  const attributes = span.attributes || {};
-  const total = attributes['llm.usage.total_tokens'] ?? attributes['gen_ai.usage.total_tokens']
-    ?? ((Number(attributes['gen_ai.usage.prompt_tokens'] ?? attributes['llm.usage.prompt_tokens'] ?? 0)
-      + Number(attributes['gen_ai.usage.completion_tokens'] ?? attributes['llm.usage.completion_tokens'] ?? 0)) || null);
-  return total ? fmtNum(Number(total)) : '';
-}
-
-function costOf(span) {
-  const attributes = span.attributes || {};
-  const cost = attributes['llm.cost_usd'] ?? attributes['gen_ai.usage.cost'];
-  return cost == null ? '' : fmtCost(Number(cost));
-}

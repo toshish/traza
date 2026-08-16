@@ -187,6 +187,10 @@ fn annotations_append_query_and_survive_reopen() {
         let store = Store::open(&dir, Config::default()).expect("opens");
         store
             .annotate(Annotation {
+                tenant: String::new(),
+                session_id: String::new(),
+                experiment_id: None,
+                example_id: String::new(),
                 trace_id: "t1".into(),
                 span_id: "s1".into(),
                 name: "quality".into(),
@@ -198,6 +202,10 @@ fn annotations_append_query_and_survive_reopen() {
             .expect("annotates");
         store
             .annotate(Annotation {
+                tenant: String::new(),
+                session_id: String::new(),
+                experiment_id: None,
+                example_id: String::new(),
                 trace_id: "t1".into(),
                 span_id: String::new(),
                 name: "thumbs".into(),
@@ -211,6 +219,10 @@ fn annotations_append_query_and_survive_reopen() {
         // Empty trace_id / name are invalid.
         assert!(store
             .annotate(Annotation {
+                tenant: String::new(),
+                session_id: String::new(),
+                experiment_id: None,
+                example_id: String::new(),
                 trace_id: String::new(),
                 span_id: String::new(),
                 name: "x".into(),
@@ -240,6 +252,10 @@ fn annotations_append_query_and_survive_reopen() {
 #[test]
 fn annotation_replay_rejects_corrupt_middle_records_but_tolerates_a_torn_tail() {
     let valid = Annotation {
+        tenant: String::new(),
+        session_id: String::new(),
+        experiment_id: None,
+        example_id: String::new(),
         trace_id: "trace".into(),
         span_id: "span".into(),
         name: "quality".into(),
