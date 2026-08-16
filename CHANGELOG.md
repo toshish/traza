@@ -63,6 +63,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A promotion could read across a tenant boundary.** `promote_failures_to_dataset`
+  pinned the tenant it wrote but not the tenants it read: an unbound credential
+  resolves a session across every tenant, so naming one tenant's session copied
+  its span attributes and provenance into a default-tenant dataset — and a
+  promoted example deliberately outlives its source, so erasing that tenant
+  afterwards left the copy standing, permanently outside the reach of the
+  erasure that should own it. Every read the tool makes is now scoped to the
+  tenant being written (`Some("")` being the default tenant *named*, not the
+  absence of a scope). Diagnosis is unchanged: an operator may still read any
+  session, and simply cannot copy one out of its tenant.
+- **Prompt-cache counters were recognized under one spelling.** OpenLLMetry
+  moved them to dotted segment names (`gen_ai.usage.cache_read.input_tokens`,
+  `gen_ai.usage.cache_creation.input_tokens`) to match OTel GenAI, and only the
+  older underscore forms were read — so on a cached Anthropic agent, the exact
+  configuration this field exists for, the detector fell back to the uncached
+  remainder and reported a growing context as ordinary iteration. Both
+  spellings are accepted now, dotted first.
+
 - **Link attributes were outside every payload walker.** A `$payload`
   reference copied into a span's `links[].attributes` — an ordinary thing for
   an SDK to do, since the wire contract stores what a client sends — was
