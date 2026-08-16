@@ -306,7 +306,9 @@ fn is_error(span: &Span) -> bool {
 pub fn session_outcome(spans: &[Span], now_ns: u64, idle_ns: u64) -> SessionOutcome {
     let error_count = spans.iter().filter(|span| is_error(span)).count();
     let span_count = spans.len();
-    let goal = spans.iter().find_map(|span| semconv::goal(&span.attributes));
+    let goal = spans
+        .iter()
+        .find_map(|span| semconv::goal(&span.attributes));
 
     let Some(last) = spans.iter().max_by_key(|span| {
         (

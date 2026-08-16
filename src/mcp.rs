@@ -1222,7 +1222,10 @@ impl<'a> Server<'a> {
                 },
             ));
             if !finding.missing.is_empty() {
-                rows.push(format!("  undecided because: {}", finding.missing.join("; ")));
+                rows.push(format!(
+                    "  undecided because: {}",
+                    finding.missing.join("; ")
+                ));
             }
         }
 
@@ -1247,7 +1250,11 @@ impl<'a> Server<'a> {
     }
 
     fn promote_failures(&self, arguments: &Map<String, Value>, context: &Context) -> ToolResult {
-        known_keys(arguments, &["session_id", "dataset"], "promote_failures_to_dataset")?;
+        known_keys(
+            arguments,
+            &["session_id", "dataset"],
+            "promote_failures_to_dataset",
+        )?;
         let dataset_name = required_str(arguments, "dataset")?.to_owned();
         let mut narrowed = arguments.clone();
         narrowed.remove("dataset");

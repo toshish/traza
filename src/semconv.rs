@@ -260,10 +260,7 @@ pub(crate) const OUTCOME_KEYS: [&str; 2] = [
 ];
 
 /// Attribute keys carrying the goal a session was pursuing.
-pub(crate) const GOAL_KEYS: [&str; 2] = [
-    "session.goal",
-    "traceloop.association.properties.goal",
-];
+pub(crate) const GOAL_KEYS: [&str; 2] = ["session.goal", "traceloop.association.properties.goal"];
 
 /// The declared outcome of a span, if it carries one.
 pub(crate) fn outcome(attributes: &Map<String, Value>) -> Option<String> {

@@ -303,9 +303,7 @@ fn an_agent_finds_the_failing_step_and_promotes_it_through_mcp_alone() {
     // recomputed from the corpus rather than read back from the tool.
     let members: Vec<_> = spans
         .iter()
-        .filter(|span| {
-            semconv::facts(&span.attributes).session.as_deref() == Some(worst)
-        })
+        .filter(|span| semconv::facts(&span.attributes).session.as_deref() == Some(worst))
         .collect();
     let errored_parents: std::collections::HashSet<(&str, &str)> = members
         .iter()
@@ -319,10 +317,14 @@ fn an_agent_finds_the_failing_step_and_promotes_it_through_mcp_alone() {
     let expected = members
         .iter()
         .filter(|span| span.status == "error")
-        .filter(|span| {
-            !errored_parents.contains(&(span.trace_id.as_str(), span.span_id.as_str()))
+        .filter(|span| !errored_parents.contains(&(span.trace_id.as_str(), span.span_id.as_str())))
+        .min_by_key(|span| {
+            (
+                span.start_time_ns,
+                span.trace_id.clone(),
+                span.span_id.clone(),
+            )
         })
-        .min_by_key(|span| (span.start_time_ns, span.trace_id.clone(), span.span_id.clone()))
         .expect("a failing leaf");
     assert_eq!(
         structured["cause"]["span"]["span_id"].as_str(),
