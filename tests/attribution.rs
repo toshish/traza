@@ -684,3 +684,143 @@ fn a_large_healthy_fanout_is_examined_and_called_ordinary() {
     );
     assert!(!fanout.shape.is_fault());
 }
+
+/// A promotion may only read what it may also own.
+///
+/// The write tenant was pinned before this test existed, but the READS were
+/// not: an unbound credential resolves a session across every tenant, so
+/// naming one tenant's session copied that tenant's span attributes and its
+/// provenance into a default-tenant dataset. That copy then outlived the
+/// tenant it came from — a dataset deliberately survives its source, so data
+/// that crossed the boundary on the way in sat permanently outside the reach
+/// of the erasure that should have owned it.
+///
+/// The session id is deliberately identical in both tenants, because that is
+/// the case where a scoped resolution and an unscoped one differ silently
+/// rather than loudly.
+#[test]
+fn an_unbound_promotion_cannot_copy_another_tenants_session() {
+    use serde_json::json;
+    use traza::erasure::Subject;
+    use traza::mcp::{Access, Context, Limits, Server as McpServer};
+    use traza::{Config, Store};
+
+    let dir = std::env::temp_dir().join(format!(
+        "traza-m5-xtenant-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("test dir");
+    let store = Store::open(&dir, Config::default()).expect("opens");
+
+    // The same session id under two tenants. Only `victim` holds the secret.
+    let shared_session = "shared-session-id";
+    let mut planted = Vec::new();
+    for (tenant, marker) in [
+        ("victim", "victim-only-secret"),
+        ("", "default-tenant-work"),
+    ] {
+        planted.push(
+            serde_json::from_value::<Span>(json!({
+                "$tenant": tenant,
+                "trace_id": format!("t-{}", if tenant.is_empty() { "default" } else { tenant }),
+                "span_id": "root", "name": "workflow", "service": "svc",
+                "start_time_ns": 1_000u64, "end_time_ns": 9_000u64, "status": "error",
+                "attributes": {"session.id": shared_session, "marker": marker},
+            }))
+            .expect("span"),
+        );
+        for attempt in 0..6_u64 {
+            planted.push(
+                serde_json::from_value::<Span>(json!({
+                    "$tenant": tenant,
+                    "trace_id": format!("t-{}", if tenant.is_empty() { "default" } else { tenant }),
+                    "span_id": format!("s{attempt}"), "parent_span_id": "root",
+                    "name": "tool.call", "service": "svc",
+                    "start_time_ns": 2_000 + attempt * 100,
+                    "end_time_ns": 2_050 + attempt * 100,
+                    "status": "error",
+                    "attributes": {"session.id": shared_session, "marker": marker},
+                }))
+                .expect("span"),
+            );
+        }
+    }
+    for span in &planted {
+        store.ingest(span.clone()).expect("ingests");
+    }
+    store.flush().expect("seals");
+
+    // An unbound (operator) caller: Context::tenant is None, which is the
+    // default deployment and the one that reads across every tenant.
+    let server = McpServer::new(&store, Limits::default(), true).with_promotion(true);
+    let response = server
+        .handle(
+            &json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "promote_failures_to_dataset",
+                           "arguments": {"session_id": shared_session,
+                                         "dataset": "regressions"}},
+            }),
+            Context {
+                access: Access::ReadWrite,
+                tenant: None,
+                now_ns: 10_000_000_000_000_000_000,
+            },
+        )
+        .expect("a response");
+    let result = &response["result"];
+    assert_ne!(result["isError"], json!(true), "the promote ran: {result}");
+
+    let dataset_id = result["structuredContent"]["dataset_id"]
+        .as_u64()
+        .expect("a dataset id");
+    let version_id = result["structuredContent"]["version_id"]
+        .as_str()
+        .expect("a version id");
+    let stored = store
+        .dataset_version(None, dataset_id, version_id)
+        .expect("reads")
+        .expect("exists")
+        .expect("not tombstoned");
+
+    // Nothing from `victim` may be in a default-tenant dataset.
+    for body in &stored.bodies {
+        let text = serde_json::to_string(&body.body).expect("serializes");
+        assert!(
+            !text.contains("victim-only-secret"),
+            "an unbound promotion copied another tenant's span content: {text}"
+        );
+        let provenance = body.body.provenance.as_ref().expect("provenance");
+        assert_ne!(
+            provenance.tenant, "victim",
+            "and it must not claim provenance into a tenant it cannot own"
+        );
+    }
+
+    // The erasure oracle: taking the whole tenant away must leave nothing of
+    // it behind. Anything copied out earlier would survive this.
+    store
+        .erase(Subject::Tenant {
+            tenant: "victim".into(),
+        })
+        .expect("erases the tenant");
+
+    let after = store
+        .dataset_version(None, dataset_id, version_id)
+        .expect("reads")
+        .expect("exists")
+        .expect("not tombstoned");
+    for body in &after.bodies {
+        let text = serde_json::to_string(&body.body).expect("serializes");
+        assert!(
+            !text.contains("victim-only-secret"),
+            "erasing the tenant left its content in a dataset outside its reach: {text}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

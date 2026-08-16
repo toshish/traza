@@ -48,14 +48,22 @@ const TRACELOOP_CHAT_ID: &str = "traceloop.association.properties.chat_id";
 const LLM_COST_USD: &str = "llm.cost_usd";
 const GEN_AI_USAGE_COST: &str = "gen_ai.usage.cost";
 
-// Prompt-caching counters. OpenLLMetry records these verbatim for providers
-// that report them. They matter to attribution because they decide what
-// "prompt tokens" MEANS: Anthropic's `input_tokens` counts only the uncached
-// remainder, so a conversation whose context is growing reports a prompt
-// count that FALLS as the cache warms. Reading growth off the wrong field
-// inverts the signal on the configuration long-running agents actually use.
-const GEN_AI_CACHE_READ_TOKENS: &str = "gen_ai.usage.cache_read_input_tokens";
-const GEN_AI_CACHE_CREATION_TOKENS: &str = "gen_ai.usage.cache_creation_input_tokens";
+// Prompt-caching counters. They matter to attribution because they decide
+// what "prompt tokens" MEANS: Anthropic's `input_tokens` counts only the
+// uncached remainder, so a conversation whose context is growing reports a
+// prompt count that FALLS as the cache warms. Reading growth off the wrong
+// field inverts the signal on the configuration long-running agents use.
+//
+// Both spellings are recognized, dotted first. OpenLLMetry moved these to
+// dotted segment names to match OTel GenAI, and the underscore forms are what
+// it emitted before that — so a store fed by a mixed fleet, or by anything
+// pinned to an older exporter, holds both. Recognizing only one is not a
+// cosmetic miss here: it silently returns the detector to reading the
+// uncached remainder, which is the exact failure the field exists to avoid.
+const GEN_AI_CACHE_READ_TOKENS: &str = "gen_ai.usage.cache_read.input_tokens";
+const GEN_AI_CACHE_READ_TOKENS_LEGACY: &str = "gen_ai.usage.cache_read_input_tokens";
+const GEN_AI_CACHE_CREATION_TOKENS: &str = "gen_ai.usage.cache_creation.input_tokens";
+const GEN_AI_CACHE_CREATION_TOKENS_LEGACY: &str = "gen_ai.usage.cache_creation_input_tokens";
 
 // -- Native Traza shorthand ------------------------------------------------
 const LLM_MODEL: &str = "llm.model";
@@ -147,8 +155,9 @@ impl LlmFacts {
     /// that field counts once prompt caching is on:
     ///
     /// - **Anthropic** reports `input_tokens` as the UNCACHED remainder, with
-    ///   the cached part in `cache_read_input_tokens` /
-    ///   `cache_creation_input_tokens`. The context is the sum, and reading
+    ///   the cached part in `cache_read.input_tokens` /
+    ///   `cache_creation.input_tokens` (the underscore spellings are accepted
+    ///   as legacy aliases). The context is the sum, and reading
     ///   `input_tokens` alone shows a growing conversation SHRINKING as its
     ///   cache warms.
     /// - **OpenAI** reports `prompt_tokens` inclusive of its cached subset, so
@@ -228,8 +237,17 @@ pub fn facts(attributes: &Map<String, Value>) -> LlmFacts {
         ],
     );
     let cost_usd = first_f64(attributes, &[LLM_COST_USD, GEN_AI_USAGE_COST]);
-    let cache_read_tokens = first_u64(attributes, &[GEN_AI_CACHE_READ_TOKENS]);
-    let cache_creation_tokens = first_u64(attributes, &[GEN_AI_CACHE_CREATION_TOKENS]);
+    let cache_read_tokens = first_u64(
+        attributes,
+        &[GEN_AI_CACHE_READ_TOKENS, GEN_AI_CACHE_READ_TOKENS_LEGACY],
+    );
+    let cache_creation_tokens = first_u64(
+        attributes,
+        &[
+            GEN_AI_CACHE_CREATION_TOKENS,
+            GEN_AI_CACHE_CREATION_TOKENS_LEGACY,
+        ],
+    );
     let (session, session_key) = SESSION_KEYS
         .iter()
         .find_map(|key| attr_str(attributes, key).map(|value| (value, *key)))

@@ -484,11 +484,14 @@ fn framework_shaped_traces_are_represented() {
         "an OpenAI-shaped tool call should carry stringified arguments"
     );
 
-    // Anthropic's prompt-cache counters ride along.
+    // Anthropic's prompt-cache counters ride along, in the dotted spelling
+    // current OpenLLMetry emits. The underscore form older exporters send is
+    // still recognized — `semconv` accepts both — but the corpus models what a
+    // current pipeline actually sends.
     assert!(
         stored.iter().any(|span| span
             .attributes
-            .contains_key("gen_ai.usage.cache_read_input_tokens")),
+            .contains_key("gen_ai.usage.cache_read.input_tokens")),
         "an Anthropic-shaped span should carry cache token counters"
     );
 }
