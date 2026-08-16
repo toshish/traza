@@ -1808,9 +1808,7 @@ fn payload_ref_bytes(span: &Span, reference: &str) -> u64 {
                 .flatten()
         })
     };
-    from(&span.attributes)
-        .or_else(|| span.events.iter().find_map(|event| from(&event.attributes)))
-        .unwrap_or(0)
+    span.payload_maps().find_map(from).unwrap_or(0)
 }
 
 /// Wall clock in Unix nanoseconds, saturating at zero before the epoch.

@@ -58,7 +58,7 @@ fn the_seeded_corpus_produces_no_phantom_runaways() {
 
     let mut faults: Vec<String> = Vec::new();
     for (session, members) in &sessions {
-        let diagnosis = diagnose(members, now, IDLE_NS, false);
+        let diagnosis = diagnose(members, now, IDLE_NS, usize::MAX);
         for finding in &diagnosis.findings {
             if finding.shape.is_fault() && !session.starts_with("runaway-") {
                 faults.push(format!(
@@ -105,7 +105,7 @@ fn a_multi_turn_conversation_is_never_a_context_runaway() {
     );
 
     for (session, members) in threads {
-        let diagnosis = diagnose(members, now, IDLE_NS, false);
+        let diagnosis = diagnose(members, now, IDLE_NS, usize::MAX);
         let growing: Vec<_> = diagnosis
             .findings
             .iter()
@@ -127,7 +127,7 @@ fn the_seeded_retry_reads_as_a_recovered_run_not_a_failed_one() {
     let now = after(&spans);
     let mut recovered = 0;
     for members in by_session(&spans).values() {
-        let diagnosis = diagnose(members, now, IDLE_NS, false);
+        let diagnosis = diagnose(members, now, IDLE_NS, usize::MAX);
         if diagnosis.outcome.error_count > 0 && diagnosis.outcome.outcome == Outcome::Success {
             recovered += 1;
             assert_eq!(diagnosis.outcome.reason, "last_span_succeeded");
@@ -144,7 +144,7 @@ fn every_session_reports_an_outcome_and_never_invents_a_success() {
     let spans = corpus();
     let now = after(&spans);
     for (session, members) in by_session(&spans) {
-        let diagnosis = diagnose(&members, now, IDLE_NS, false);
+        let diagnosis = diagnose(&members, now, IDLE_NS, usize::MAX);
         // No pipeline emits Traza's outcome key, so the whole corpus must be
         // answerable without one. This is the property that keeps the feature
         // from being a closed loop over a convention Traza invented.
@@ -169,7 +169,7 @@ fn the_seeded_runaway_is_found_and_its_failing_step_named() {
         .iter()
         .find(|(session, _)| session.starts_with("runaway-"))
         .expect("the corpus seeds a runaway");
-    let diagnosis = diagnose(members, now, IDLE_NS, false);
+    let diagnosis = diagnose(members, now, IDLE_NS, usize::MAX);
 
     assert_eq!(
         diagnosis.outcome.outcome,
@@ -477,10 +477,22 @@ fn injected_instructions_in_span_text_cannot_choose_what_is_promoted() {
     // standing contract.
     let diagnosis = call("diagnose_session", json!({"session_id": runaway}));
     let rendered = diagnosis["content"][0]["text"].as_str().unwrap_or_default();
-    assert!(
-        rendered.contains("untrusted=\"true\"") || !rendered.contains("ignore the previous"),
-        "stored text is only ever rendered inside the untrusted block"
-    );
+    let open = rendered
+        .find("<traza:telemetry")
+        .expect("the telemetry block is opened");
+    let close = rendered.find("</traza:telemetry>").expect("and closed");
+    // Not "the block exists" — that is true of every result. The assertion is
+    // that the producer's own strings live INSIDE it, so a reader that honours
+    // the delimiter never sees them as the server speaking.
+    for producer_text in ["tool.web_search", "agent.reflect"] {
+        let at = rendered
+            .find(producer_text)
+            .unwrap_or_else(|| panic!("{producer_text} is reported at all"));
+        assert!(
+            at > open && at < close,
+            "{producer_text} is rendered inside the untrusted block, not beside it"
+        );
+    }
 
     // Now the actuation test. Even a model that fully believes the injection
     // can only pass a session id, and the promoted set is re-derived here.

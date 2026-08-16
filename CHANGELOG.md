@@ -72,10 +72,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   content still on disk and still readable**. All five walkers now share one
   iterator naming every attribute map a span carries; the duplicate collector
   that made the gap exist twice is gone. Links are also bounded at ingest for
-  the first time. Both guards are mutation-proven.
-- `top_failures` and `slowest_spans` advertised a row limit of 100 and applied
-  50, so a caller obeying the schema was silently given half of what it asked
-  for.
+  the first time, with its own test. The two erasure guards are
+  mutation-proven: with the link arm removed from the iterator, one test finds
+  the whole secret sitting inline in the link and the other finds the payload
+  deleted while a live reference remained.
+- `top_failures` and `slowest_spans` advertised a row limit whose maximum
+  (100) and default (20) were both wrong — they apply 50 and 10 — so a caller
+  obeying the schema was silently given a fraction of what it asked for.
 - The claim in the data-model and LLM-semantics guides that a link's
   `relation` attribute "keeps link semantics queryable" was false — no query
   path reaches link attributes. The docs now say what is true: links are

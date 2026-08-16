@@ -81,6 +81,10 @@ const MAX_SPAN_LIMIT: usize = 100;
 
 /// Ceiling on `limit` for the ranking and grouping tools.
 const MAX_RANK_LIMIT: usize = 50;
+/// Rows a ranking tool returns when the caller does not say. Distinct from
+/// [`DEFAULT_SPAN_LIMIT`] because a ranked digest wants fewer rows than a span
+/// listing, and the schema has to advertise the number actually applied.
+const RANK_DEFAULT: usize = 10;
 
 /// Default and maximum span counts for one rendered trace.
 const DEFAULT_TRACE_SPANS: usize = 200;
@@ -1230,8 +1234,9 @@ impl<'a> Server<'a> {
         }
 
         let mut notes = vec![
-            "Open any trace above with get_trace, or take the cause span straight to \
-             promote_failures_to_dataset."
+            "Open any trace above with get_trace. To turn this run's failures into a \
+             regression dataset, pass this SESSION id to promote_failures_to_dataset — \
+             it re-derives the steps itself and takes no span argument."
                 .to_owned(),
         ];
         if outcome.source == crate::attribution::OutcomeSource::Derived {
@@ -1241,12 +1246,14 @@ impl<'a> Server<'a> {
                     .to_owned(),
             );
         }
-        Ok(json!({
-            "content": [{"type": "text", "text": clamp_report(
-                &head, &rows, &notes, self.limits.max_result_bytes)}],
-            "structuredContent": diagnosis_structured(&session_id, &diagnosis),
-            "isError": false,
-        }))
+        Ok(budgeted_diagnosis(
+            &head,
+            &rows,
+            &notes,
+            &session_id,
+            &diagnosis,
+            self.limits.max_result_bytes,
+        ))
     }
 
     fn promote_failures(&self, arguments: &Map<String, Value>, context: &Context) -> ToolResult {
@@ -1276,8 +1283,8 @@ impl<'a> Server<'a> {
         )?;
         if examples.is_empty() {
             return Err(ToolError(
-                "Nothing to promote: this session has no failing step the diagnosis could \
-                 attribute. Run diagnose_session to see what it lacked."
+                "Nothing to promote: the diagnosis attributed no step in this session. \
+                 Run diagnose_session to see what it lacked."
                     .to_owned(),
             ));
         }
@@ -1287,11 +1294,19 @@ impl<'a> Server<'a> {
         // times, and two datasets sharing a name would silently split the
         // regression suite in half — and defeat the version-level idempotency
         // below, since a fresh dataset cannot re-find an existing version.
+        //
+        // The lookup is filtered to the tenant being WRITTEN, not to the
+        // caller's scope. For an unbound credential those differ: the scope is
+        // `None`, which reads every tenant, so matching a name across it would
+        // let an operator promoting into "regressions" adopt some tenant's
+        // dataset of that name and write another tenant's span content into
+        // it — outside both tenants' erasure reach. The write tenant is fixed
+        // before anything is read, and the dataset has to belong to it.
         let dataset_id = match self
             .store
             .datasets(context.scope())?
             .into_iter()
-            .find(|view| view.dataset.name == dataset_name)
+            .find(|view| view.dataset.name == dataset_name && view.dataset.tenant == tenant)
         {
             Some(view) => view.dataset.dataset_id,
             None => self.store.create_dataset(&tenant, &dataset_name)?,
@@ -1307,8 +1322,11 @@ impl<'a> Server<'a> {
             examples,
         )?;
         let head = format!(
-            "Promoted {} from session {} into dataset {} ({}).",
-            count(promoted as u64, "failing step"),
+            "Promoted {} from session {} into dataset {} ({}). A step is promoted \
+             because the diagnosis implicated it, which includes steps that did not \
+             themselves fail — the reflection loop around a failing tool is part of \
+             the regression.",
+            count(promoted as u64, "implicated step"),
             sanitize(&session_id),
             sanitize(&dataset_name),
             if outcome.created {
@@ -1393,7 +1411,13 @@ impl<'a> Server<'a> {
     }
 
     fn top_failures(&self, arguments: &Map<String, Value>, context: Context) -> ToolResult {
-        let request = SearchRequest::parse(arguments, context, 10, MAX_RANK_LIMIT, "top_failures")?;
+        let request = SearchRequest::parse(
+            arguments,
+            context,
+            RANK_DEFAULT,
+            MAX_RANK_LIMIT,
+            "top_failures",
+        )?;
         let limit = request.filter.limit.unwrap_or(10);
         let report_data = self.store.failures(&request.filter, limit)?;
         if report_data.groups.is_empty() {
@@ -1467,8 +1491,13 @@ impl<'a> Server<'a> {
     }
 
     fn slowest_spans(&self, arguments: &Map<String, Value>, context: Context) -> ToolResult {
-        let request =
-            SearchRequest::parse(arguments, context, 10, MAX_RANK_LIMIT, "slowest_spans")?;
+        let request = SearchRequest::parse(
+            arguments,
+            context,
+            RANK_DEFAULT,
+            MAX_RANK_LIMIT,
+            "slowest_spans",
+        )?;
         let limit = request.filter.limit.unwrap_or(10);
         let spans = self.store.slowest_spans(&request.filter, limit)?;
         if spans.is_empty() {
@@ -2255,25 +2284,6 @@ fn include_content_property() -> Value {
 /// `paging` adds the arguments that only mean something when a page of spans
 /// is being returned, so the ranking and grouping tools do not advertise a
 /// cursor they would ignore.
-/// [`search_properties`] with the row cap the RANKING tools actually apply.
-///
-/// `top_failures` and `slowest_spans` rank a whole population and return a
-/// digest of it, so they clamp to [`MAX_RANK_LIMIT`] where the span-listing
-/// tools clamp to [`MAX_SPAN_LIMIT`]. They used to advertise the larger
-/// number and silently apply the smaller one, so a caller that obeyed the
-/// schema was quietly given half of what it asked for and had no way to tell.
-/// A schema is a promise about the arguments a tool accepts.
-fn ranked_properties() -> Value {
-    let mut properties = search_properties(false);
-    if let Some(object) = properties.as_object_mut() {
-        object.insert(
-            "limit".to_owned(),
-            limit_property(DEFAULT_SPAN_LIMIT, MAX_RANK_LIMIT),
-        );
-    }
-    properties
-}
-
 fn search_properties(paging: bool) -> Value {
     let mut properties = json!({
         "service": {"type": "string", "description": "Exact service name."},
@@ -2341,6 +2351,25 @@ fn search_properties(paging: bool) -> Value {
 }
 
 /// The word for an outcome, with its grounds, never bare.
+/// [`search_properties`] with the row cap the RANKING tools actually apply.
+///
+/// `top_failures` and `slowest_spans` rank a whole population and return a
+/// digest of it, so they clamp to [`MAX_RANK_LIMIT`] where the span-listing
+/// tools clamp to [`MAX_SPAN_LIMIT`]. They used to advertise the larger
+/// number and silently apply the smaller one, so a caller that obeyed the
+/// schema was quietly given half of what it asked for and had no way to tell.
+/// A schema is a promise about the arguments a tool accepts.
+fn ranked_properties() -> Value {
+    let mut properties = search_properties(false);
+    if let Some(object) = properties.as_object_mut() {
+        object.insert(
+            "limit".to_owned(),
+            limit_property(RANK_DEFAULT, MAX_RANK_LIMIT),
+        );
+    }
+    properties
+}
+
 fn outcome_phrase(outcome: &crate::attribution::SessionOutcome) -> String {
     use crate::attribution::Outcome;
     let word = match outcome.outcome {
@@ -2383,21 +2412,124 @@ fn trend_word(trend: crate::attribution::TokenTrend) -> &'static str {
     }
 }
 
-/// The diagnosis as structured content.
+/// A diagnosis assembled inside the result ceiling.
 ///
-/// Producer text — a declared outcome, a goal — rides through `json_safe`
-/// like every other stored string: control characters out, no delimiter
-/// framing, because a JSON value has to remain the value.
-fn diagnosis_structured(session_id: &str, diagnosis: &crate::attribution::Diagnosis) -> Value {
-    let mut value = serde_json::to_value(diagnosis).unwrap_or_else(|_| json!({}));
+/// The generic assembler pairs one text row with one structured row, and a
+/// diagnosis is not that shape: the cause is one object beside a list of
+/// findings, and the text carries two lines for some findings and one for
+/// others. So the budget is applied here instead of approximated there.
+///
+/// What gives way is findings, from the tail — they are already sorted faults
+/// first, so the ones dropped are the least informative — and when any are
+/// dropped the result says so. `enforce_ceiling` downstream can only shrink
+/// the text block, so a structured half left unbudgeted would ship over the
+/// limit with its text starved to nothing.
+fn budgeted_diagnosis(
+    head: &str,
+    rows: &[String],
+    notes: &[String],
+    session_id: &str,
+    diagnosis: &crate::attribution::Diagnosis,
+    max_bytes: usize,
+) -> Value {
+    let assemble = |kept: usize, rows: &[String], notes: &[String]| -> Value {
+        let findings: Vec<Value> = diagnosis
+            .findings
+            .iter()
+            .take(kept)
+            .map(finding_structured)
+            .collect();
+        json!({
+            "content": [{"type": "text", "text": clamp_report(head, rows, notes, max_bytes)}],
+            "structuredContent": {
+                "session_id": json_safe(session_id),
+                "outcome": outcome_structured(&diagnosis.outcome),
+                "cause": cause_structured(diagnosis.cause.as_ref()),
+                "findings": findings,
+                "findings_reported": findings.len(),
+                "findings_found": diagnosis.findings.len(),
+                "examined": diagnosis.examined,
+                "truncated": diagnosis.truncated,
+            },
+            "isError": false,
+        })
+    };
+    let total = diagnosis.findings.len();
+    let mut kept = total;
+    loop {
+        // The text rows for the findings beyond `kept` go too, so the two
+        // halves always describe the same set.
+        let text_rows: Vec<String> = if kept == total {
+            rows.to_vec()
+        } else {
+            let keep_prefix = rows.len().min(cause_row_count(diagnosis) + kept);
+            rows[..keep_prefix].to_vec()
+        };
+        let mut trimmed = notes.to_vec();
+        if kept < total {
+            trimmed.push(format!(
+                "Truncated: {kept} of {total} findings shown, because the whole result —                  text and structured content together — would exceed this server's                  --mcp-max-result-bytes."
+            ));
+        }
+        let candidate = assemble(kept, &text_rows, &trimmed);
+        if serde_json::to_vec(&candidate).map_or(usize::MAX, |bytes| bytes.len()) <= max_bytes
+            || kept == 0
+        {
+            return candidate;
+        }
+        kept -= 1;
+    }
+}
+
+/// Text rows the cause occupies before the per-finding rows begin.
+fn cause_row_count(diagnosis: &crate::attribution::Diagnosis) -> usize {
+    if diagnosis.cause.is_some() {
+        2
+    } else {
+        1
+    }
+}
+
+/// The outcome as structured content, with producer text made JSON-safe.
+fn outcome_structured(outcome: &crate::attribution::SessionOutcome) -> Value {
+    let mut value = serde_json::to_value(outcome).unwrap_or_else(|_| json!({}));
     if let Some(object) = value.as_object_mut() {
-        object.insert("session_id".into(), json!(json_safe(session_id)));
-        if let Some(outcome) = object.get_mut("outcome").and_then(Value::as_object_mut) {
-            for key in ["declared", "goal"] {
-                if let Some(Value::String(text)) = outcome.get(key) {
-                    let safe = json_safe(&render_value(&Value::String(text.clone()), VALUE_CHARS));
-                    outcome.insert(key.to_owned(), json!(safe));
-                }
+        for key in ["declared", "goal"] {
+            if let Some(Value::String(text)) = object.get(key) {
+                let safe = json_safe(&render_value(&Value::String(text.clone()), VALUE_CHARS));
+                object.insert(key.to_owned(), json!(safe));
+            }
+        }
+    }
+    value
+}
+
+/// The cause as structured content. Its `name`, `service` and `status` are
+/// producer text and are made JSON-safe like every other stored string.
+fn cause_structured(cause: Option<&crate::attribution::Cause>) -> Value {
+    let Some(cause) = cause else {
+        return Value::Null;
+    };
+    let mut value = serde_json::to_value(cause).unwrap_or_else(|_| json!({}));
+    if let Some(object) = value.as_object_mut() {
+        for key in ["name", "service", "status"] {
+            if let Some(Value::String(text)) = object.get(key) {
+                let safe = json_safe(&render_value(&Value::String(text.clone()), VALUE_CHARS));
+                object.insert(key.to_owned(), json!(safe));
+            }
+        }
+    }
+    value
+}
+
+/// One finding as structured content, with its producer text made JSON-safe.
+fn finding_structured(finding: &crate::attribution::Finding) -> Value {
+    let mut value = serde_json::to_value(finding).unwrap_or_else(|_| json!({}));
+    if let Some(object) = value.as_object_mut() {
+        for key in ["name", "service"] {
+            if let Some(Value::String(text)) = object.get(key) {
+                let safe = json_safe(&render_value(&Value::String(text.clone()), VALUE_CHARS));
+                object.insert(key.to_owned(), json!(safe));
             }
         }
     }

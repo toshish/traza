@@ -811,10 +811,8 @@ impl Store {
                 .then_with(|| left.trace_id.cmp(&right.trace_id))
                 .then_with(|| left.span_id.cmp(&right.span_id))
         });
-        let truncated = spans.len() > max_spans;
-        spans.truncate(max_spans);
         Ok(Some(crate::attribution::diagnose(
-            &spans, now_ns, idle_ns, truncated,
+            &spans, now_ns, idle_ns, max_spans,
         )))
     }
 

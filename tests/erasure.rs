@@ -1718,3 +1718,40 @@ fn a_reference_held_only_by_a_link_keeps_its_payload_alive() {
         "and the survivor still points at bytes that are there"
     );
 }
+
+/// Links are bounded at ingest.
+///
+/// They were unbounded while nothing read them — their only cost was bytes.
+/// Now every one is an attribute map the payload walkers visit and a
+/// diagnosis traverses, so an unbounded array is an unbounded per-span cost
+/// in a path the operator did not choose.
+#[test]
+fn a_span_carrying_absurdly_many_links_is_refused() {
+    let dir = test_dir("link-cap");
+    let store = Store::open(&dir, wal_config()).expect("opens");
+
+    let links: Vec<Value> = (0..257)
+        .map(|index| json!({"trace_id": "t1", "span_id": format!("s{index}")}))
+        .collect();
+    let overloaded: Span = serde_json::from_value(json!({
+        "trace_id": "t1", "span_id": "many", "name": "op", "service": "svc",
+        "start_time_ns": 1_000u64, "end_time_ns": 2_000u64,
+        "attributes": {}, "links": links,
+    }))
+    .expect("span");
+    assert!(
+        store.ingest(overloaded).is_err(),
+        "a span with more links than the cap is refused at the engine boundary"
+    );
+
+    let links: Vec<Value> = (0..256)
+        .map(|index| json!({"trace_id": "t1", "span_id": format!("s{index}")}))
+        .collect();
+    let at_cap: Span = serde_json::from_value(json!({
+        "trace_id": "t1", "span_id": "cap", "name": "op", "service": "svc",
+        "start_time_ns": 1_000u64, "end_time_ns": 2_000u64,
+        "attributes": {}, "links": links,
+    }))
+    .expect("span");
+    store.ingest(at_cap).expect("the cap itself is admitted");
+}

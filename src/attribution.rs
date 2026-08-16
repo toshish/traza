@@ -578,12 +578,22 @@ fn classify(members: &[&Span], max_self_depth: usize) -> Finding {
     {
         Shape::RetryStorm
     } else if count >= MIN_REPEATS
+        && error_fraction < ERROR_FRACTION
         && (serial_fraction < SERIAL_FRACTION
             || (error_fraction < 0.1 && matches!(trend, TokenTrend::Flat | TokenTrend::Varying)))
     {
-        // Ordinary work. Note the trend clause admits only POSITIVE evidence
-        // of health: `Absent` and `Unknown` fall through to inconclusive,
-        // because "we could not tell" must never be spendable as "it is fine".
+        // Ordinary work. Two things here are load-bearing.
+        //
+        // The error gate sits OUTSIDE the disjunction. Overlapping in time
+        // says a group ran concurrently and says nothing about whether it
+        // worked, so without this a fan-out of fifty calls that ALL failed
+        // read as ordinary iteration purely for having been issued in
+        // parallel — and iteration is never eligible to be a cause, so the
+        // one shape that most needed reporting was the one silently excused.
+        //
+        // And the trend clause admits only POSITIVE evidence of health:
+        // `Absent` and `Unknown` fall through to inconclusive, because "we
+        // could not tell" must never be spendable as "it is fine".
         Shape::Iteration
     } else {
         if reported < MIN_TREND_SAMPLES {
@@ -594,6 +604,16 @@ fn classify(members: &[&Span], max_self_depth: usize) -> Finding {
         }
         if error_count == 0 {
             missing.push("no attempt failed");
+        }
+        if serial_fraction < SERIAL_FRACTION && error_fraction >= ERROR_FRACTION {
+            missing.push("the attempts overlapped, so they are not retries of each other");
+        }
+        // Never silent. An undecided finding with an empty `missing` explains
+        // nothing, and both the tool description and the prompt promise the
+        // opposite — that when the analysis cannot decide, it says what it
+        // lacked.
+        if missing.is_empty() {
+            missing.push("no discriminator separated this from ordinary repetition");
         }
         Shape::Inconclusive
     };
@@ -654,8 +674,17 @@ fn leaf_error_cause(spans: &[Span]) -> Option<&Span> {
 /// result describes the same instant. Reaching back into the store for a
 /// second aggregate would let a seal land between the two and produce a
 /// document whose own paragraphs disagree.
-pub fn diagnose(spans: &[Span], now_ns: u64, idle_ns: u64, truncated: bool) -> Diagnosis {
+pub fn diagnose(spans: &[Span], now_ns: u64, idle_ns: u64, max_spans: usize) -> Diagnosis {
+    // The outcome is read from the WHOLE run, before any budget applies.
+    // Deriving it from an analyzed prefix would be the worst kind of wrong:
+    // the prefix of a failing session usually ends on a span that succeeded,
+    // so a truncated diagnosis would report `success` — with `error_count: 0`
+    // — about a run that failed. Scanning every span for a max and a count is
+    // two passes over data already in hand; the budget exists to bound the
+    // grouping and ancestry work below, which is where the cost is.
     let outcome = session_outcome(spans, now_ns, idle_ns);
+    let truncated = spans.len() > max_spans;
+    let spans = &spans[..spans.len().min(max_spans)];
     let depths = self_depths(spans);
 
     // Repetition is counted WITHIN a trace. Across a session it is the
@@ -689,9 +718,19 @@ pub fn diagnose(spans: &[Span], now_ns: u64, idle_ns: u64, truncated: bool) -> D
     });
 
     let cause = leaf_error_cause(spans).map(|span| {
-        let fault = findings
-            .iter()
-            .find(|finding| finding.shape.is_fault() && finding.trace_id == span.trace_id);
+        // The finding for THIS step, not merely one in the same trace. A
+        // runaway trace holds several faults at once — the reflection loop and
+        // the tool it keeps calling — and matching on the trace alone let the
+        // sentence "its operation repeats N times" quote a different
+        // operation's counts beside the span it was describing. In the seeded
+        // runaway both findings have the same count, so the name tie-break
+        // decided which one's numbers got attributed to the other.
+        let fault = findings.iter().find(|finding| {
+            finding.shape.is_fault()
+                && finding.trace_id == span.trace_id
+                && finding.service == span.service
+                && finding.name == span.name
+        });
         let (rule, confidence, because) = match fault {
             Some(finding) => (
                 "repeated_fault",
@@ -943,6 +982,103 @@ mod tests {
     }
 
     #[test]
+    fn a_truncated_diagnosis_still_reads_the_outcome_from_the_whole_run() {
+        // The prefix of a failing run usually ends on a span that succeeded,
+        // so an outcome derived from the analyzed slice would report success —
+        // with no errors — about a session that failed.
+        let mut spans: Vec<Span> = (0..50_u64)
+            .map(|turn| {
+                span(
+                    "t",
+                    &format!("s{turn}"),
+                    None,
+                    "step",
+                    turn * 10,
+                    turn * 10 + 5,
+                )
+            })
+            .collect();
+        spans.push(erroring(span("t", "last", None, "step", 1_000, 2_000)));
+        let diagnosis = diagnose(&spans, NOW, IDLE, 5);
+        assert!(diagnosis.truncated, "the budget bound");
+        assert_eq!(diagnosis.examined, 5);
+        assert_eq!(
+            diagnosis.outcome.outcome,
+            Outcome::Failure,
+            "the run failed, whatever the analysis had budget to examine"
+        );
+        assert_eq!(diagnosis.outcome.error_count, 1);
+        assert_eq!(diagnosis.outcome.span_count, 51);
+    }
+
+    #[test]
+    fn a_wholly_failing_parallel_burst_is_not_excused_as_iteration() {
+        // Overlapping in time says a group ran concurrently; it says nothing
+        // about whether it worked. Eight concurrent calls that all failed must
+        // not be filed as ordinary work, which is the one bucket that can
+        // never be named as a cause.
+        let spans: Vec<Span> = (0..8_u64)
+            .map(|turn| {
+                erroring(span(
+                    "t",
+                    &format!("s{turn}"),
+                    Some("root"),
+                    "tool.call",
+                    100,
+                    900,
+                ))
+            })
+            .collect();
+        let members: Vec<&Span> = spans.iter().collect();
+        let finding = classify(&members, 0);
+        assert!(finding.serial_fraction < SERIAL_FRACTION, "they overlap");
+        assert_ne!(finding.shape, Shape::Iteration, "all eight failed");
+        assert!(
+            !finding.missing.is_empty(),
+            "and an undecided finding always says what it lacked"
+        );
+    }
+
+    #[test]
+    fn the_cause_quotes_its_own_operations_counts_not_a_neighbours() {
+        // One trace, two repeating steps: a growing reflection loop and a
+        // failing tool. The cause is the tool, so the sentence explaining it
+        // must carry the TOOL's counts.
+        let mut spans: Vec<Span> = Vec::new();
+        spans.push(span("t", "root", None, "workflow", 0, 10_000));
+        for turn in 0..9_u64 {
+            spans.push(with_tokens(
+                span(
+                    "t",
+                    &format!("reflect{turn}"),
+                    Some("root"),
+                    "agent.reflect",
+                    turn * 200,
+                    turn * 200 + 50,
+                ),
+                1_000 + turn * 3_000,
+            ));
+            spans.push(erroring(span(
+                "t",
+                &format!("call{turn}"),
+                Some("root"),
+                "tool.call",
+                turn * 200 + 60,
+                turn * 200 + 100,
+            )));
+        }
+        let diagnosis = diagnose(&spans, NOW, IDLE, usize::MAX);
+        let cause = diagnosis.cause.expect("a cause");
+        assert_eq!(cause.name, "tool.call");
+        assert!(
+            cause.because.contains("9 times") && cause.because.contains("(9 of them failing)"),
+            "the sentence describes tool.call, whose nine attempts all failed — \
+             not the reflection loop beside it: {}",
+            cause.because
+        );
+    }
+
+    #[test]
     fn the_cause_is_the_earliest_leaf_error_not_the_parent_that_propagated_it() {
         let spans = vec![
             erroring(span("t", "root", None, "workflow", 0, 100)),
@@ -976,7 +1112,7 @@ mod tests {
                 )
             })
             .collect();
-        let diagnosis = diagnose(&spans, NOW, IDLE, false);
+        let diagnosis = diagnose(&spans, NOW, IDLE, usize::MAX);
         assert!(
             diagnosis.findings.is_empty(),
             "a healthy conversation produces no finding: {:?}",
