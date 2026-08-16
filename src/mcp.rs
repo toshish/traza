@@ -1335,6 +1335,15 @@ impl<'a> Server<'a> {
                 "identical to the existing version, nothing appended"
             },
         );
+        let head = format!(
+            "{head}{}",
+            if diagnosis.truncated {
+                " NOTE: the session was larger than the diagnosis budget, so this dataset \
+                 is built from its earliest spans only."
+            } else {
+                ""
+            },
+        );
         Ok(json!({
             "content": [{"type": "text", "text": head}],
             "structuredContent": json!({

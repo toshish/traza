@@ -57,10 +57,15 @@ fn the_seeded_corpus_produces_no_phantom_runaways() {
     );
 
     let mut faults: Vec<String> = Vec::new();
+    let mut healthy_groups_examined = 0_usize;
     for (session, members) in &sessions {
         let diagnosis = diagnose(members, now, IDLE_NS, usize::MAX);
         for finding in &diagnosis.findings {
-            if finding.shape.is_fault() && !session.starts_with("runaway-") {
+            if session.starts_with("runaway-") {
+                continue;
+            }
+            healthy_groups_examined += 1;
+            if finding.shape.is_fault() {
                 faults.push(format!(
                     "session {session}: {:?} on {}/{} count={} errors={} trend={:?} depth={}",
                     finding.shape,
@@ -75,11 +80,20 @@ fn the_seeded_corpus_produces_no_phantom_runaways() {
         }
     }
 
+    // Silence only means something if the classifier was asked. Without this,
+    // the test below passes on a corpus whose every group falls under
+    // MIN_REPEATS — it would then be asserting that code which never ran found
+    // nothing, and would keep passing through any change to the rules.
+    assert!(
+        healthy_groups_examined > 0,
+        "healthy sessions must actually reach the classifier for its silence to be evidence"
+    );
+
     // Exactly one scenario in the corpus is a genuine fault, and it is the one
-    // built to be one. Everything else is ordinary agent traffic and the
-    // analysis must have nothing to say about it — the false-positive failure
-    // mode is the one that matters, because it spends the reader's belief in
-    // the finding that is real.
+    // built to be one. Everything else is ordinary agent traffic that the
+    // analysis looked at and had nothing to say about — the false-positive
+    // failure mode is the one that matters, because it spends the reader's
+    // belief in the finding that is real.
     assert!(
         faults.is_empty(),
         "the analysis found faults in healthy workloads:\n{}",
@@ -625,4 +639,48 @@ fn promotion_is_gated_twice_like_every_other_write() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The decoy earns its place: a large healthy fan-out reaches the classifier
+/// and is classified as ordinary work rather than passed over.
+///
+/// This is the assertion that makes the corpus test's silence mean something.
+/// A detector that never sees a big repeating group cannot be shown not to
+/// fire on one.
+#[test]
+fn a_large_healthy_fanout_is_examined_and_called_ordinary() {
+    let spans = corpus();
+    let now = after(&spans);
+    let sessions = by_session(&spans);
+    let (session, members) = sessions
+        .iter()
+        .find(|(session, _)| session.starts_with("bulk-enrich-"))
+        .expect("the corpus seeds a healthy fan-out");
+    let diagnosis = diagnose(members, now, IDLE_NS, usize::MAX);
+
+    let fanout = diagnosis
+        .findings
+        .iter()
+        .find(|finding| finding.name == "tool.enrich_record")
+        .unwrap_or_else(|| {
+            panic!(
+                "the fan-out reaches the classifier: {:#?}",
+                diagnosis.findings
+            )
+        });
+    assert!(
+        fanout.count >= 5,
+        "it is well past the repeat threshold: {fanout:?}"
+    );
+    assert!(
+        fanout.serial_fraction < 0.8,
+        "the calls overlap, because they were issued concurrently: {fanout:?}"
+    );
+    assert_eq!(
+        fanout.shape,
+        Shape::Iteration,
+        "forty concurrent enrichments of forty different records are ordinary \
+         work, and session {session} must be reported as such"
+    );
+    assert!(!fanout.shape.is_fault());
 }

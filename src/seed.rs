@@ -276,6 +276,9 @@ pub fn corpus(options: &SeedOptions) -> Corpus {
         gen.runaway_research_agent(index);
     }
     for index in 0..scale {
+        gen.bulk_enrichment_fanout(index);
+    }
+    for index in 0..scale {
         gen.oversized_payloads(index);
     }
     for index in 0..(2 * scale) {
@@ -1167,6 +1170,83 @@ impl Gen {
                 attributes,
             ));
             at += search_ns;
+        }
+    }
+
+    /// A large, healthy fan-out: the shape a loop detector must not fire on.
+    ///
+    /// Forty enrichment calls under one root, in one trace, all with the same
+    /// `(service, name)` — which is exactly the input that reaches the
+    /// repetition classifier, and exactly what a naive "many identical spans
+    /// means a loop" rule reports as a runaway. Everything about it says
+    /// ordinary work: the calls overlap in time because they were issued
+    /// concurrently, each one carries a different item, the token counts do
+    /// not climb, and almost nothing fails.
+    ///
+    /// It exists so the corpus can prove a negative. Without a healthy
+    /// workload that actually reaches the classifier, "the analysis finds no
+    /// fault in the seed corpus" is a claim about code that never ran.
+    fn bulk_enrichment_fanout(&mut self, index: usize) {
+        let vendor = &VENDORS[3 % VENDORS.len()];
+        let session = format!("bulk-enrich-{:04}", 700 + index);
+        let trace = self.id("trace-enrich");
+        let root = self.id("span");
+        let start = self.advance_rand(30, 180, SEC);
+        let items = 40_u64;
+
+        let mut attributes = Map::new();
+        attributes.insert("traceloop.span.kind".into(), json!("workflow"));
+        attributes.insert("traceloop.workflow.name".into(), json!("enrich_batch"));
+        attributes.insert("session.id".into(), json!(session));
+        self.push(make_span(
+            &trace,
+            &root,
+            None,
+            "enrich_batch.workflow",
+            vendor.service,
+            start,
+            22 * SEC,
+            "ok",
+            attributes,
+        ));
+
+        for item in 0..items {
+            // Concurrent: every call starts within the same short window, so
+            // the group overlaps rather than running one after another.
+            let began = start + self.rng.range(10, 900) * MS;
+            let prompt_tokens = self.rng.range(420, 460);
+            let completion_tokens = self.rng.range(30, 60);
+            let mut attributes =
+                self.usage_attributes(vendor, Dialect::Current, prompt_tokens, completion_tokens);
+            attributes.insert("traceloop.span.kind".into(), json!("llm"));
+            attributes.insert("session.id".into(), json!(session));
+            // A different item each time — this is iteration, not repetition.
+            attributes.insert(
+                "gen_ai.input.messages".into(),
+                messages_json(json!([{
+                    "role": "user",
+                    "parts": [{"type": "text", "content": format!("Enrich record {item}")}]
+                }])),
+            );
+            // Two of forty fail, which is ordinary flakiness rather than a
+            // failing dependency.
+            let failed = item % 20 == 7;
+            if failed {
+                attributes.insert("error.type".into(), json!("UpstreamTimeout"));
+            }
+            let span_id = self.id("span");
+            let duration = self.rng.range(300, 1_800) * MS;
+            self.push(make_span(
+                &trace,
+                &span_id,
+                Some(&root),
+                "tool.enrich_record",
+                vendor.service,
+                began,
+                duration,
+                if failed { "error" } else { "ok" },
+                attributes,
+            ));
         }
     }
 

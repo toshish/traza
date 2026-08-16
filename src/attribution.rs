@@ -232,7 +232,10 @@ pub struct Finding {
     pub serial_fraction: f64,
     /// How the context moved.
     pub token_trend: TokenTrend,
-    /// Context tokens on the first and last attempt, when known.
+    /// Context tokens on the first and last attempt THAT REPORTED ANY, in
+    /// start order. When some attempts report and others do not, these are not
+    /// the group's first and last spans, so a reader comparing them against
+    /// [`Self::spans`] is comparing different things.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_first: Option<u64>,
     /// See [`Self::context_first`].
@@ -566,12 +569,19 @@ fn classify(members: &[&Span], max_self_depth: usize) -> Finding {
     let declared = declared_retry(members);
 
     let mut missing = Vec::new();
-    let shape = if declared && count >= MIN_REPEATS {
-        Shape::DeclaredRetry
-    } else if max_self_depth >= MIN_SELF_DEPTH {
+    // Computed shapes are tested BEFORE the declared one. The module's rule is
+    // that a declaration may raise confidence and never be a precondition, and
+    // testing it first quietly broke the other half of that: a `retry-of` link
+    // — an attribute any producer writes and anything that can write telemetry
+    // controls — downgraded a measured runaway to "the producer says these are
+    // retries", which is a weaker statement about a worse problem. A
+    // declaration now names a shape only where nothing was measured.
+    let shape = if max_self_depth >= MIN_SELF_DEPTH {
         Shape::SelfSimilarChain
     } else if count >= MIN_REPEATS && trend == TokenTrend::Growing {
         Shape::ContextRunaway
+    } else if declared && count >= MIN_REPEATS {
+        Shape::DeclaredRetry
     } else if count >= MIN_REPEATS
         && serial_fraction >= SERIAL_FRACTION
         && error_fraction >= ERROR_FRACTION
