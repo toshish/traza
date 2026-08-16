@@ -1515,13 +1515,16 @@ impl Gen {
         let mut attributes =
             self.usage_attributes(vendor, Dialect::Current, prompt_tokens, completion_tokens);
         attributes.insert("gen_ai.conversation.id".into(), json!(session));
-        // Anthropic's cache counters, which OpenLLMetry records verbatim.
+        // Anthropic's cache counters, in the dotted spelling current
+        // OpenLLMetry emits. The underscore forms an older exporter sends are
+        // recognized too (see `crate::semconv`); the corpus models what a
+        // current pipeline actually sends.
         attributes.insert(
-            "gen_ai.usage.cache_creation_input_tokens".into(),
+            "gen_ai.usage.cache_creation.input_tokens".into(),
             json!(self.rng.range(0, 3000)),
         );
         attributes.insert(
-            "gen_ai.usage.cache_read_input_tokens".into(),
+            "gen_ai.usage.cache_read.input_tokens".into(),
             json!(self.rng.range(0, 12000)),
         );
         attributes.insert("gen_ai.response.stop_reason".into(), json!("end_turn"));

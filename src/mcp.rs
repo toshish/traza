@@ -1146,6 +1146,7 @@ impl<'a> Server<'a> {
         &self,
         arguments: &Map<String, Value>,
         context: &Context,
+        scope: Option<&str>,
         tool: &str,
     ) -> Result<(String, crate::attribution::Diagnosis), ToolError> {
         known_keys(arguments, &["session_id", "max_spans"], tool)?;
@@ -1156,7 +1157,7 @@ impl<'a> Server<'a> {
         let diagnosis = self
             .store
             .diagnose_session(
-                context.scope(),
+                scope,
                 &session_id,
                 context.now_ns,
                 SESSION_IDLE_NS,
@@ -1173,7 +1174,8 @@ impl<'a> Server<'a> {
     }
 
     fn diagnose_session(&self, arguments: &Map<String, Value>, context: &Context) -> ToolResult {
-        let (session_id, diagnosis) = self.diagnosis_for(arguments, context, "diagnose_session")?;
+        let (session_id, diagnosis) =
+            self.diagnosis_for(arguments, context, context.scope(), "diagnose_session")?;
         let outcome = &diagnosis.outcome;
         let head = format!(
             "Session {}: {}. {} examined, {} failed.{}",
@@ -1265,18 +1267,33 @@ impl<'a> Server<'a> {
         let dataset_name = required_str(arguments, "dataset")?.to_owned();
         let mut narrowed = arguments.clone();
         narrowed.remove("dataset");
-        let (session_id, diagnosis) =
-            self.diagnosis_for(&narrowed, context, "promote_failures_to_dataset")?;
 
-        // The write tenant is fixed BEFORE anything is read, and never taken
-        // from the spans the read returned. An unbound credential resolves the
-        // default tenant explicitly rather than every tenant, so the promoted
-        // copy can only ever land where the caller already was — deriving it
-        // from the resolved spans would let an argument choose the tenant.
+        // The write tenant is fixed BEFORE anything is read, and every read
+        // this tool makes is scoped to it — the diagnosis, the examples, the
+        // dataset lookup and the version append alike.
+        //
+        // Scoping only the WRITE was not enough, and the difference is the
+        // whole bug this closes. An unbound credential's `Context::scope()` is
+        // `None`, which resolves a session across every tenant, so naming one
+        // tenant's session id copied that tenant's span attributes and its
+        // provenance into a default-tenant dataset. Erasing the source tenant
+        // afterwards left the copy standing: a dataset deliberately outlives
+        // its source, so data that crossed a tenant boundary on the way in is
+        // permanently outside the reach of the erasure that should own it.
+        //
+        // `Some("")` is the default tenant NAMED, not the absence of a scope.
+        // A single-tenant store is unaffected, because that is where all of
+        // its data already is; a multi-tenant operator can still DIAGNOSE any
+        // session, and simply cannot copy one out of its tenant. A write may
+        // only read what it may also own.
         let tenant = context.tenant.clone().unwrap_or_default();
+        let scope = Some(tenant.as_str());
+
+        let (session_id, diagnosis) =
+            self.diagnosis_for(&narrowed, context, scope, "promote_failures_to_dataset")?;
 
         let examples = self.store.promotable_examples(
-            context.scope(),
+            scope,
             &session_id,
             &diagnosis,
             MAX_PROMOTED_EXAMPLES,
@@ -1295,16 +1312,12 @@ impl<'a> Server<'a> {
         // regression suite in half — and defeat the version-level idempotency
         // below, since a fresh dataset cannot re-find an existing version.
         //
-        // The lookup is filtered to the tenant being WRITTEN, not to the
-        // caller's scope. For an unbound credential those differ: the scope is
-        // `None`, which reads every tenant, so matching a name across it would
-        // let an operator promoting into "regressions" adopt some tenant's
-        // dataset of that name and write another tenant's span content into
-        // it — outside both tenants' erasure reach. The write tenant is fixed
-        // before anything is read, and the dataset has to belong to it.
+        // Filtered to the tenant being written, like every other read here:
+        // a name matched across tenants would let a promotion adopt somebody
+        // else's dataset.
         let dataset_id = match self
             .store
-            .datasets(context.scope())?
+            .datasets(scope)?
             .into_iter()
             .find(|view| view.dataset.name == dataset_name && view.dataset.tenant == tenant)
         {
@@ -1312,7 +1325,7 @@ impl<'a> Server<'a> {
             None => self.store.create_dataset(&tenant, &dataset_name)?,
         };
         let outcome = self.store.create_dataset_version(
-            context.scope(),
+            scope,
             dataset_id,
             None,
             Some(json!({

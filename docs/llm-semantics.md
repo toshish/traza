@@ -69,8 +69,11 @@ tell either from a genuine measurement. See
 
 ### Prompt caching, and what "prompt tokens" means
 
-`gen_ai.usage.cache_read_input_tokens` and
-`gen_ai.usage.cache_creation_input_tokens` are recognized, because with
+`gen_ai.usage.cache_read.input_tokens` and
+`gen_ai.usage.cache_creation.input_tokens` are recognized — with the older
+underscore spellings (`cache_read_input_tokens`,
+`cache_creation_input_tokens`) accepted as aliases, so a fleet running mixed
+exporter versions is read correctly either way. They matter because with
 caching on, providers disagree about what the prompt count *counts*:
 
 | Provider | `input_tokens` / `prompt_tokens` | Context is |

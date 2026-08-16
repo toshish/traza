@@ -929,6 +929,64 @@ mod tests {
     }
 
     #[test]
+    fn a_cached_anthropic_agent_is_a_runaway_even_though_its_prompt_count_falls() {
+        // The configuration this whole field exists for, in the spelling
+        // current OpenLLMetry emits. `input_tokens` FALLS 1000 -> 600 as the
+        // cache warms while the real context grows 1000 -> 5000. Reading the
+        // uncached remainder alone gives a Varying downward series and files
+        // the run as ordinary iteration.
+        let series = [
+            (1_000_u64, 0_u64),
+            (900, 1_400),
+            (800, 2_600),
+            (700, 3_600),
+            (600, 4_400),
+        ];
+        let build = |key_read: &str| -> Vec<Span> {
+            series
+                .iter()
+                .enumerate()
+                .map(|(turn, (input, cached))| {
+                    let turn = turn as u64;
+                    let mut span = span(
+                        "t",
+                        &format!("s{turn}"),
+                        Some("root"),
+                        "agent.step",
+                        turn * 1_000,
+                        turn * 1_000 + 500,
+                    );
+                    span.attributes
+                        .insert("gen_ai.provider.name".into(), json!("anthropic"));
+                    span.attributes
+                        .insert("gen_ai.request.model".into(), json!("claude-sonnet"));
+                    span.attributes
+                        .insert("gen_ai.usage.input_tokens".into(), json!(input));
+                    span.attributes.insert(key_read.into(), json!(cached));
+                    span
+                })
+                .collect()
+        };
+
+        for key_read in [
+            "gen_ai.usage.cache_read.input_tokens",
+            "gen_ai.usage.cache_read_input_tokens",
+        ] {
+            let spans = build(key_read);
+            let members: Vec<&Span> = spans.iter().collect();
+            let finding = classify(&members, 0);
+            assert_eq!(
+                finding.token_trend,
+                TokenTrend::Growing,
+                "{key_read}: the context grew even as the prompt count fell: {finding:?}"
+            );
+            assert_eq!(finding.shape, Shape::ContextRunaway, "{key_read}");
+            assert_eq!(finding.context_first, Some(1_000));
+            assert_eq!(finding.context_last, Some(5_000));
+        }
+    }
+
+    #[test]
     fn an_unreadable_cache_convention_poisons_the_trend_rather_than_being_skipped() {
         // Cache counters under a provider whose arithmetic is not known. The
         // numbers present cannot be compared with the ones absent, so the
