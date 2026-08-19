@@ -63,6 +63,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Two documentation claims that were not true of the code.** The OTLP mapping
+  table said "other resource and scope attributes" were merged beneath span
+  attributes. Scope attributes are; **resource attributes are discarded** —
+  only `service.name` and `traza.tenant` are read — so
+  `deployment.environment`, `service.version`, `host.name` and `k8s.*` never
+  reach the store and cannot be filtered on. The table now says so, names the
+  workaround (copy them onto spans in an SDK processor or a Collector
+  `transform`), and an OTLP conformance assertion pins the behaviour so the
+  page cannot drift from it again. Separately, the MCP tool table billed
+  `record_annotation` as "Score this trace"; it writes a trace/span annotation
+  and cannot address an `(experiment, example)` pair, which is what a score is.
+  The MCP guide now states that and that the eval entities are HTTP-only.
+
 - **A promotion could read across a tenant boundary.** `promote_failures_to_dataset`
   pinned the tenant it wrote but not the tenants it read: an unbound credential
   resolves a session across every tenant, so naming one tenant's session copied
