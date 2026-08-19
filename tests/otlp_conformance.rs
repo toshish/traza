@@ -237,6 +237,18 @@ fn otlp_request_maps_onto_the_span_model() {
         charge["attributes"]["scope.tag"], "span-wins",
         "span attributes win over scope attributes"
     );
+    // Resource attributes are NOT merged, and the asymmetry with scope
+    // attributes above is the whole point of asserting it. Only `service.name`
+    // and `traza.tenant` are read off the resource; the fixture's `deployment`
+    // is dropped. The mapping table in docs/guide/ingest.md claimed the
+    // opposite for three releases because nothing here checked.
+    // The same resource carries `service.name` (asserted above, so the resource
+    // was certainly parsed) and `deployment` — one is read, the other is gone.
+    assert!(
+        charge["attributes"].get("deployment").is_none(),
+        "resource attributes do not reach the span: {}",
+        charge["attributes"]
+    );
     assert_eq!(charge["events"][0]["name"], "authorized");
     let receipt = &spans[1];
     assert_eq!(receipt["parent_span_id"], "b7ad6b7169203331");

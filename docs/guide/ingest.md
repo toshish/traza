@@ -148,7 +148,9 @@ with `{"partialSuccess":{}}`.
 | `traceId` / `spanId` / `parentSpanId` | Lowercased hex string. Non-hex is a `400` |
 | `startTimeUnixNano` / `endTimeUnixNano` | `start_time_ns` / `end_time_ns`. Accepted as a JSON string (OTLP JSON's u64 encoding) or a number |
 | Resource attribute `service.name` | `service` |
-| Other resource and scope attributes | Merged beneath span attributes, which take precedence |
+| Resource attribute `traza.tenant` | The span's tenant, validated like any client-supplied one |
+| **Every other resource attribute** | **Dropped** — see below |
+| Scope attributes | Merged beneath span attributes, which take precedence on a collision |
 | `attributes` (`AnyValue`) | Flattened to plain JSON: `intValue` becomes a number, `doubleValue` a double, `stringValue` a string |
 | `status.code` `STATUS_CODE_OK` / `1` | `status: "ok"` |
 | `status.code` `STATUS_CODE_ERROR` / `2` | `status: "error"` |
@@ -158,6 +160,22 @@ with `{"partialSuccess":{}}`.
 
 A link whose id pair is empty is dropped rather than treated as fatal — a link
 to nothing is meaningless, and rejecting a whole batch for it would be worse.
+
+#### Resource attributes do not reach the span
+
+Two are read — `service.name` and `traza.tenant` — and **the rest are
+discarded**. `deployment.environment`, `service.version`,
+`service.instance.id`, `host.name`, `k8s.*` and `telemetry.sdk.*` are not
+stored and cannot be filtered on. Scope attributes are different: those *are*
+merged beneath the span's own.
+
+If you need a resource attribute to be queryable, copy it onto spans — an SDK
+span processor, or an OpenTelemetry Collector `transform` processor moving
+`resource.attributes[...]` to `attributes[...]`. Span attributes round-trip
+faithfully and are indexed like any other.
+
+This page previously said other resource attributes were "merged beneath span
+attributes". They never were.
 
 `span.kind` has no dedicated Traza field. If you need it queryable, carry it as
 an attribute.

@@ -131,7 +131,7 @@ store; `diagnose_session` is the one that answers a question about it.
 | `slowest_spans` | What is slow? |
 | `analyze_cost` | Where did the tokens and the money go? |
 | `get_payload` | Show me the full prompt behind this reference |
-| `record_annotation` | Score this trace (**`rw` token + `--mcp-annotations`**) |
+| `record_annotation` | Attach a note or rating to a trace or span (**`rw` token + `--mcp-annotations`**) |
 | `promote_failures_to_dataset` | Turn this run's failures into a regression dataset (**`rw` token + `--mcp-promote`**) |
 
 Every tool advertises MCP `ToolAnnotations`, which is what decides whether a
@@ -187,6 +187,19 @@ Four tools are worth knowing the reasoning behind:
 - **`get_payload` is separate from the search tools on purpose.** Pulling a
   large third-party document into a context window should be a decision, not a
   side effect of a search matching a span.
+
+**The eval entities are not on this surface.** Datasets, versions, examples,
+experiments, runs and scores are served over HTTP only — no tool reads them,
+and no resource exposes them. `promote_failures_to_dataset` is the one
+exception and it only writes: an agent that creates a dataset version cannot
+read it back from here.
+
+`record_annotation` is a trace/span annotation, not a score. A *score* is an
+annotation addressed to an `(experiment, example)` pair, and this tool writes
+neither field — it takes `trace_id`, `span_id`, `name`, `value` and `comment`,
+and refuses anything else. Scoring an experiment means
+`POST /v1/annotations` with `experiment_id` and `example_id` set. The bundled
+dashboard has the same limit.
 
 ### Arguments
 
