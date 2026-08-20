@@ -804,7 +804,7 @@ fn a_recreated_payload_file_fails_the_receipt_instead_of_reading_as_retained() {
     let receipt = store.verify_erasure(status.erase.id).expect("receipt");
     assert_eq!(
         receipt.result,
-        "incomplete",
+        "not-erased",
         "recreated bytes with no live referent must fail:\n{}",
         receipt.render_text()
     );
@@ -1148,7 +1148,7 @@ fn a_pending_tombstone_masks_at_open_and_resume_settles_it() {
     // the receipt says so rather than taking the mask's word for it.
     assert_eq!(
         store.verify_erasure(1).expect("receipt").result,
-        "incomplete",
+        "not-erased",
         "an unsettled erasure never verifies as erased"
     );
 
@@ -1248,7 +1248,7 @@ fn re_delivered_data_fails_the_receipt_and_new_activity_does_not() {
         .ingest(span("t", "old", json!({})))
         .expect("re-delivery");
     let receipt = store.verify_erasure(status.erase.id).expect("receipt");
-    assert_eq!(receipt.result, "incomplete");
+    assert_eq!(receipt.result, "not-erased");
     assert_eq!(domain(&receipt, "write-buffer").re_delivered, 1);
 }
 
@@ -1268,7 +1268,7 @@ fn a_pin_holding_the_subject_flips_the_receipt_until_released() {
         .expect("erases");
     let receipt = store.verify_erasure(status.erase.id).expect("receipt");
     assert_eq!(
-        receipt.result, "incomplete",
+        receipt.result, "not-erased",
         "a hard-linked copy of the subject is not erased, and the receipt says so"
     );
     assert!(domain(&receipt, "pins").result == "holds-data");

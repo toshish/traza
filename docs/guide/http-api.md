@@ -1419,7 +1419,7 @@ unnamed.
 curl http://localhost:8080/v1/erasures/1/verify
 ```
 
-`result` is `erased` or `incomplete`, computed from what the walk found and
+`result` is `erased` or `not-erased`, computed from what the walk found and
 never from what the settle record claims. Matches are classified against the
 erase record's resolved keys under one rule for every domain: an erased key
 found live again is a **re-delivery** and fails the receipt; a fresh key
@@ -1433,8 +1433,12 @@ counts — so their findings report as `attention` and are carried in a
 separate top-level field: **`conclusive`** is `false` whenever any
 over-approximate signal was found and not proven benign. `result` answers
 what the semantic walk found; `conclusive` answers whether anything at all
-was left ambiguous. A receipt offered as proof should be `erased` **and**
-`conclusive`.
+was left ambiguous. The axes disagree in both directions: `erased` but not
+`conclusive` says the walk is clean but a scan saw the identifiers
+somewhere, while `not-erased` with `conclusive: true` says the walk
+definitively found retained bytes — a pinned backup, a re-delivery — with
+nothing ambiguous about the finding. A receipt offered as proof should be
+`erased` **and** `conclusive`.
 
 The same receipt is available offline, against a directory no live server
 owns:

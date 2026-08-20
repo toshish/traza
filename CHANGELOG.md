@@ -377,6 +377,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The erasure receipt's failing verdict is `not-erased`, not `incomplete`.**
+  A receipt over a pinned backup reported `result: "incomplete"` beside
+  `conclusive: true` — semantically right (the walk conclusively found the
+  pin holding the bytes) but reading as a contradiction, because
+  "incomplete" invites attaching to the verification when it describes the
+  erasure. The value now names its subject: conclusively `not-erased` and
+  erased-but-inconclusive both read as the claims they are, the wire value
+  matches the prose the docs and the `verify` usage text already used
+  (`2 not erased`), and the exit codes are unchanged.
 - **Ingest rejects an inadmissible tenant with 400, on both surfaces.** A
   tenant is identity: lowercase `[a-z0-9][a-z0-9._-]`, at most 64 bytes, or
   empty for the default. A misconfigured `traza.tenant` resource attribute
