@@ -179,7 +179,7 @@ export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
 
 Apps instrumented with OpenLLMetry or the OpenTelemetry GenAI conventions arrive with sessions and token/cost analytics already populated. No attribute renaming, no mapping file.
 
-Want a populated store to explore first? `examples/mcp-demo/run.sh` seeds agent tool-calling trees, retry storms and multi-turn sessions, then runs a scripted investigation against them.
+Want it proven rather than described? [`examples/`](examples/README.md) is a six-demo tour: a live agent cockpit, a `kill -9` crash test, a million-span needle hunt, an MCP incident investigation that ends in an experiment diff, an erasure receipt that catches the backup still holding the bytes, and the full MCP tool surface. Every number each demo prints is measured while you watch, and CI runs them all.
 
 ## What you get
 

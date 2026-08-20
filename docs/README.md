@@ -12,6 +12,7 @@ to the right document. Start with the row that matches what you are doing.
 | Look up an exact route, parameter, or response shape | [HTTP API reference](guide/http-api.md) |
 | Query LLM/agent telemetry — sessions, tokens, cost | [LLM semantics](llm-semantics.md) |
 | Let a coding agent read the store over MCP | [MCP server](guide/mcp.md) · [demo](../examples/mcp-demo/README.md) |
+| Watch the claims proven live before reading further | [The demo tour](../examples/README.md) |
 | Navigate the trace browser | [Trace browser](guide/trace-browser.md) |
 | Deploy, tune, or operate a server | [Operations](#operators) |
 | Change Traza's code | [Internals](#developers) |

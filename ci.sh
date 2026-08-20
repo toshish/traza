@@ -34,14 +34,26 @@ cargo build --release
 cargo test
 
 # ---------------------------------------------------------------- examples
-# The MCP demo is documentation people run, so it is a gate rather than a
-# sample: it drives the real binary over the real endpoint, and a change that
-# breaks the surface it shows should not merge green.
+# The demos are documentation people run, so each is a gate rather than a
+# sample: they drive the real binary over the real endpoints and assert their
+# own claims, and a change that breaks a surface they show should not merge
+# green. Each runs at its documented smoke setting; the whole tour stays
+# under a minute.
 if command -v python3 >/dev/null 2>&1; then
   TRAZA_DEMO_PORT=${TRAZA_DEMO_PORT:-8123} ./examples/mcp-demo/run.sh >/dev/null
   echo "ci: mcp demo ran"
+  TRAZA_SWARM_SECONDS=8 ./examples/swarm/run.sh >/dev/null
+  echo "ci: swarm demo ran"
+  TRAZA_CRASH_SPANS=8000 ./examples/crash/run.sh >/dev/null
+  echo "ci: crash demo ran"
+  TRAZA_NEEDLE_SPANS=60000 ./examples/needle/run.sh >/dev/null
+  echo "ci: needle demo ran"
+  TRAZA_INCIDENT_SCALE=2 ./examples/incident/run.sh >/dev/null
+  echo "ci: incident demo ran"
+  TRAZA_VANISH_SCALE=1 ./examples/vanish/run.sh >/dev/null
+  echo "ci: vanish demo ran"
 else
-  echo "ci: skipping the MCP demo (python3 not found)"
+  echo "ci: skipping the demos (python3 not found)"
 fi
 
 # ---------------------------------------------------------------- dashboard
