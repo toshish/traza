@@ -48,7 +48,7 @@ responses:
 | 4 · the request | `POST /v1/erasures` for the session, scoped to `tenant: acme`. The `200` returns only after the purge settles; the settle block's counts are printed — `spans_removed` counts physical versions, so it can exceed the session's visible span count. |
 | 5 · tenant precision | The same session id: intact for zenith (span count unchanged, asserted), `404` and zero spans for acme. |
 | 6 · replay-proof | The re-POST captured during beat 4's pending window: `{"accepted":0,…,"suppressed":1}`, `traza_erasure_spans_suppressed_total` incremented to match, and the span not readable afterwards. |
-| 7 · the receipt | Domain-by-domain verification. First pass: `pins holds-data`, naming the `pre-erasure` pin, and `result: incomplete` — the receipt will not say "gone" while a pinned backup holds the bytes. After the release: `result: erased · conclusive: true`. |
+| 7 · the receipt | Domain-by-domain verification. First pass: `pins holds-data`, naming the `pre-erasure` pin, and `result: not-erased · conclusive: true` — conclusively so: the walk definitively found the pinned backup holding the bytes, and the receipt will not say "gone". After the release: `result: erased · conclusive: true`. |
 | 8 · epilogue | The server is stopped and the same receipt runs offline against the bare data directory. Exit code `0` = erased and conclusive. |
 
 ## Knobs
@@ -85,7 +85,7 @@ responses:
   compliance clock, deleting — not hiding — from segments, log, and payload
   files alike. This demo covers the "this specific data must go, and prove
   it" half; the TTL half needs no subject and no receipt.
-- The receipt's `incomplete` verdict while the pin is held, and the `0/3/2`
+- The receipt's `not-erased` verdict while the pin is held, and the `0/3/2`
   exit codes offline, come from the store's own verification walk; the demo
   prints them verbatim and asserts on them, it does not compute them.
 
