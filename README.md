@@ -9,7 +9,19 @@ Traza is a trace database for LLM and agent workloads. It runs as a single binar
 [![crates.io](https://img.shields.io/crates/v/traza)](https://crates.io/crates/traza)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
-![An agent swarm in the trace browser: a 14-span waterfall with the critical path marked, per-span model and token counts, and the run's duration, tokens and cost across the top.](docs/assets/trace-waterfall.png)
+![Three of the six demos, replayed: a million spans ingested in 6.1 seconds and answered in microseconds to milliseconds; a kill -9 with all 33,000 acknowledged spans recovered; an agent diagnosing a runaway session over MCP and proving the fix with an experiment diff.](docs/assets/demo-reel.svg)
+
+*Replayed from real runs of the [demo tour](examples/README.md) — six scripted proofs, one
+command each. Every number a demo prints is measured on your machine while you watch, each
+script asserts its own claims, and CI runs all six. Clone, then pick one:*
+
+```sh
+./examples/swarm/run.sh      # a live agent cockpit in the dashboard, until Ctrl-C
+./examples/crash/run.sh      # kill -9 mid-ingest; every acknowledged span survives
+./examples/needle/run.sh     # a million spans in, one sentence found in milliseconds
+./examples/incident/run.sh   # an agent diagnoses a runaway over MCP, promotes, diffs
+./examples/vanish/run.sh     # tenant-precise erasure, and a receipt that names the backup
+```
 
 ## Install
 
@@ -179,9 +191,9 @@ export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
 
 Apps instrumented with OpenLLMetry or the OpenTelemetry GenAI conventions arrive with sessions and token/cost analytics already populated. No attribute renaming, no mapping file.
 
-Want a populated store to explore first? `examples/mcp-demo/run.sh` seeds agent tool-calling trees, retry storms and multi-turn sessions, then runs a scripted investigation against them.
-
 ## What you get
+
+![An agent swarm in the trace browser: a 14-span waterfall with the critical path marked, per-span model and token counts, and the run's duration, tokens and cost across the top.](docs/assets/trace-waterfall.png)
 
 **Fast reads.** Trace lookup at p95 0.64 ms and filtered search at p95 3.3 ms over a million spans. Full-text search across prompt text returns a selective term in 1.5 ms where scanning takes 1,258 ms.
 

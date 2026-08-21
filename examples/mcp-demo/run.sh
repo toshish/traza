@@ -33,6 +33,10 @@ command -v python3 >/dev/null 2>&1 || {
   echo "this demo uses python3 only to pretty-print the JSON-RPC replies" >&2
   exit 1
 }
+command -v curl >/dev/null 2>&1 || {
+  echo "this demo drives the server with curl" >&2
+  exit 1
+}
 
 bold() { printf '\n\033[1m%s\033[0m\n' "$*"; }
 dim() { printf '\033[2m%s\033[0m\n' "$*"; }
@@ -65,18 +69,30 @@ fi
 echo "seeding a throwaway store in $data"
 "$seed" --data-dir "$data" --scale 3 >/dev/null 2>&1
 
-"$server" --data-dir "$data" --port "$port" --mcp >/dev/null 2>&1 &
+"$server" --data-dir "$data" --port "$port" --mcp >"$data/server.log" 2>&1 &
 pid=$!
+# A curl probe alone can answer from a server that was already squatting on
+# the port while our child dies on the bind — and then every request below
+# lands in a stranger's store. Readiness is therefore the child's own
+# startup line, which it can only print after the bind succeeded.
 ready=""
 for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-  if curl -sS -o /dev/null "http://127.0.0.1:$port/v1/stats" 2>/dev/null; then
+  if grep -q "listening on" "$data/server.log" 2>/dev/null; then
     ready=yes
+    break
+  fi
+  if ! kill -0 "$pid" 2>/dev/null; then
     break
   fi
   sleep 0.25
 done
 [ -n "$ready" ] || {
-  echo "the server did not come up on port $port (set TRAZA_DEMO_PORT)" >&2
+  if grep -qi "address\|bind\|in use" "$data/server.log" 2>/dev/null; then
+    echo "another server is already on port $port (set TRAZA_DEMO_PORT)" >&2
+  else
+    echo "the server did not come up on port $port (set TRAZA_DEMO_PORT):" >&2
+    tail -3 "$data/server.log" >&2 2>/dev/null || true
+  fi
   exit 1
 }
 

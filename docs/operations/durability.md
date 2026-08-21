@@ -99,9 +99,10 @@ The consequence, precisely:
 
 - **A macOS machine losing power can still lose an acknowledged write**, in
   `wal` and in `flushed`, even though the fsync returned successfully.
-- **A `kill -9`, a panic, or an OS crash cannot** — on either platform. The
-  data has left the process and reached the kernel, which is what those
-  failures do not disturb.
+- **A `kill -9`, a panic, or an OS crash cannot** — on either platform. For
+  process death the data has already reached the kernel, which outlives the
+  process; for a kernel crash the completed fsync has already pushed it to
+  the drive, whose cache the kernel takes nothing from when it dies.
 - **On Linux, `fsync` carries the usual guarantee** and there is no such gap.
 
 This is documented at source in [`src/wal.rs`](../../src/wal.rs). If you are

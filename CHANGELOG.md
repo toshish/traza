@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A demo tour in `examples/` — six scripted proofs, one claim each.** Five
+  new demos join `mcp-demo`, and [`examples/README.md`](examples/README.md)
+  indexes the tour: `swarm` streams a simulated agent platform into a live
+  dashboard in real time; `crash` SIGKILLs the server mid-ingest and proves
+  every acknowledged span survived, then corrupts a byte, watches
+  `/v1/verify` name the file, and restores from a hot backup; `needle`
+  ingests a million spans over real HTTP and times the answers; `incident`
+  investigates a runaway session over MCP — `diagnose_session`, a defused
+  prompt injection, `promote_failures_to_dataset`, and an experiment diff
+  proving a fix; `vanish` erases one tenant's session next to an identical
+  twin tenant and walks the receipt, including the backup pin it refuses to
+  ignore. Every number each demo prints is measured during the run — a timed
+  request, a counter, a field from a live response — and each script asserts
+  its own claims and exits non-zero when one fails, which is why `ci.sh` now
+  runs all six at their smoke settings as merge gates.
+  - Demos refuse to run against a port another server already holds:
+    readiness is the child's own startup line, not a probe that a squatter
+    can answer. This guard also landed in `mcp-demo`.
+
 - **Attribution: the server names the failing step, instead of the reader
   doing it.** A new `diagnose_session` MCP tool answers *why did this run
   fail* — the outcome, the step the failure is attributed to, and the

@@ -1,0 +1,82 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 840 320" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" role="img" aria-label="Three of Traza's six demos, replayed: a million-span ingest answered in microseconds to milliseconds; a kill -9 with every acknowledged span recovered; an agent diagnosing a runaway session over MCP.">
+  <style>
+    .bg { fill: #1B1712; }
+    .bar { fill: #241F18; }
+    .dot { fill: #3A332B; }
+    .title { fill: #9A8F82; font-size: 12px; }
+    .cmd { fill: #EDE7DE; font-size: 13.5px; }
+    .out { fill: #B4A897; font-size: 13.5px; }
+    .num { fill: #D9744F; }
+    .dim { fill: #7A6F61; }
+    .foot { fill: #9A8F82; font-size: 12.5px; }
+    .l { opacity: 0; }
+    /* 18s master loop, three 6s acts. Each line fades in at its cue and its
+       act fades out together at the act boundary. */
+    .a1-1 { animation: k-a1-1 18s linear infinite; }
+    .a1-2 { animation: k-a1-2 18s linear infinite; }
+    .a1-3 { animation: k-a1-3 18s linear infinite; }
+    .a1-4 { animation: k-a1-4 18s linear infinite; }
+    .a1-5 { animation: k-a1-5 18s linear infinite; }
+    .a2-1 { animation: k-a2-1 18s linear infinite; }
+    .a2-2 { animation: k-a2-2 18s linear infinite; }
+    .a2-3 { animation: k-a2-3 18s linear infinite; }
+    .a2-4 { animation: k-a2-4 18s linear infinite; }
+    .a2-5 { animation: k-a2-5 18s linear infinite; }
+    .a3-1 { animation: k-a3-1 18s linear infinite; }
+    .a3-2 { animation: k-a3-2 18s linear infinite; }
+    .a3-3 { animation: k-a3-3 18s linear infinite; }
+    .a3-4 { animation: k-a3-4 18s linear infinite; }
+    .a3-5 { animation: k-a3-5 18s linear infinite; }
+    @keyframes k-a1-1 { 0%,1% {opacity:0} 3%,31% {opacity:1} 33%,100% {opacity:0} }
+    @keyframes k-a1-2 { 0%,7% {opacity:0} 9%,31% {opacity:1} 33%,100% {opacity:0} }
+    @keyframes k-a1-3 { 0%,13% {opacity:0} 15%,31% {opacity:1} 33%,100% {opacity:0} }
+    @keyframes k-a1-4 { 0%,19% {opacity:0} 21%,31% {opacity:1} 33%,100% {opacity:0} }
+    @keyframes k-a1-5 { 0%,25% {opacity:0} 27%,31% {opacity:1} 33%,100% {opacity:0} }
+    @keyframes k-a2-1 { 0%,34% {opacity:0} 36%,64% {opacity:1} 66%,100% {opacity:0} }
+    @keyframes k-a2-2 { 0%,40% {opacity:0} 42%,64% {opacity:1} 66%,100% {opacity:0} }
+    @keyframes k-a2-3 { 0%,46% {opacity:0} 48%,64% {opacity:1} 66%,100% {opacity:0} }
+    @keyframes k-a2-4 { 0%,52% {opacity:0} 54%,64% {opacity:1} 66%,100% {opacity:0} }
+    @keyframes k-a2-5 { 0%,58% {opacity:0} 60%,64% {opacity:1} 66%,100% {opacity:0} }
+    @keyframes k-a3-1 { 0%,67% {opacity:0} 69%,97% {opacity:1} 99%,100% {opacity:0} }
+    @keyframes k-a3-2 { 0%,73% {opacity:0} 75%,97% {opacity:1} 99%,100% {opacity:0} }
+    @keyframes k-a3-3 { 0%,79% {opacity:0} 81%,97% {opacity:1} 99%,100% {opacity:0} }
+    @keyframes k-a3-4 { 0%,85% {opacity:0} 87%,97% {opacity:1} 99%,100% {opacity:0} }
+    @keyframes k-a3-5 { 0%,91% {opacity:0} 93%,97% {opacity:1} 99%,100% {opacity:0} }
+    @media (prefers-reduced-motion: reduce) {
+      .l { animation: none !important; opacity: 0; }
+      .a1-1, .a1-2, .a1-3, .a1-4, .a1-5 { opacity: 1; }
+    }
+  </style>
+
+  <rect class="bg" x="0" y="0" width="840" height="320" rx="9"/>
+  <rect class="bar" x="0" y="0" width="840" height="36" rx="9"/>
+  <rect class="bar" x="0" y="18" width="840" height="18"/>
+  <circle class="dot" cx="22" cy="18" r="5.5"/>
+  <circle class="dot" cx="42" cy="18" r="5.5"/>
+  <circle class="dot" cx="62" cy="18" r="5.5"/>
+  <text class="title" x="420" y="22.5" text-anchor="middle">traza — examples/, replayed from real runs</text>
+
+  <!-- act 1: needle -->
+  <text class="l a1-1 cmd" x="28" y="76"><tspan class="dim">$ </tspan>./examples/needle/run.sh</text>
+  <text class="l a1-2 out" x="28" y="106"><tspan class="num">1,000,000</tspan> spans acknowledged (wal) in <tspan class="num">6.1s</tspan> — <tspan class="num">163,013 spans/s</tspan></text>
+  <text class="l a1-3 out" x="28" y="132">GET /v1/spans?q=aubergine%20midnight — exactly 1 hit, engine <tspan class="num">0.36 ms</tspan></text>
+  <text class="l a1-4 out" x="28" y="158">a word the store has never seen — 0 hits in <tspan class="num">17 µs</tspan></text>
+  <text class="l a1-5 out" x="28" y="184"><tspan class="dim">456 MiB on disk · one process · trace lookup p50 </tspan><tspan class="num">0.14 ms</tspan></text>
+
+  <!-- act 2: crash -->
+  <text class="l a2-1 cmd" x="28" y="76"><tspan class="dim">$ </tspan>./examples/crash/run.sh</text>
+  <text class="l a2-2 out" x="28" y="106">the kill fired after the client reported <tspan class="num">33000</tspan> spans acknowledged</text>
+  <text class="l a2-3 out" x="28" y="132"><tspan class="dim">kill -9 · restart on the same directory · the WAL replays</tspan></text>
+  <text class="l a2-4 out" x="28" y="158">acknowledged before the kill: <tspan class="num">33000</tspan>. present after recovery: <tspan class="num">33000</tspan>.</text>
+  <text class="l a2-5 out" x="28" y="184">one flipped byte — <tspan class="dim">segment-…0001.seg: digest mismatch</tspan> — restored, intact: true</text>
+
+  <!-- act 3: incident -->
+  <text class="l a3-1 cmd" x="28" y="76"><tspan class="dim">$ </tspan>./examples/incident/run.sh</text>
+  <text class="l a3-2 out" x="28" y="106">runaway loop: agent.reflect x9 — context growing (<tspan class="num">1200 to 8400</tspan> tokens)</text>
+  <text class="l a3-3 out" x="28" y="132">an injected instruction arrives quoted inside <tspan class="dim">&lt;traza:telemetry untrusted="true"&gt;</tspan></text>
+  <text class="l a3-4 out" x="28" y="158">promoted <tspan class="num">10</tspan> failing steps into dataset "regressions" — re-run: created:false</text>
+  <text class="l a3-5 out" x="28" y="184">pass <tspan class="num">0.00 -&gt; 0.90</tspan> — 9 of 10 examples flipped fail -&gt; pass</text>
+
+  <line x1="28" y1="252" x2="812" y2="252" stroke="#2E2820" stroke-width="1"/>
+  <text class="foot" x="28" y="284">six demos · every number measured while you watch · <tspan class="num">./examples/</tspan></text>
+</svg>
