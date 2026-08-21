@@ -138,8 +138,16 @@ $ingest stream "http://127.0.0.1:$port" "$total" "$batch" "$tmp/progress" "$tmp/
 client=$!
 # Because fd 3 holds the FIFO open, the client's death alone never delivers
 # EOF — a watchdog posts a sentinel the moment it exits, however it exits.
+# kill -0 cannot be that watchdog: while this shell is blocked in read it has
+# not reaped the client, kill -0 succeeds on the zombie, and under a shell
+# that only reaps at wait points (dash — Linux /bin/sh) that deadlocks the
+# loop forever. Process state tells the truth: gone or Z is exited.
 (
-  while kill -0 "$client" 2>/dev/null; do sleep 0.1; done
+  while :; do
+    state=$(ps -o stat= -p "$client" 2>/dev/null || :)
+    case $(printf '%s' "$state" | tr -d ' ') in ''|Z*) break ;; esac
+    sleep 0.1
+  done
   echo client-exited >&3
 ) &
 watchdog=$!
