@@ -6779,7 +6779,7 @@ impl Store {
             domains,
             result: match clean {
                 true => "erased".to_owned(),
-                false => "incomplete".to_owned(),
+                false => "not-erased".to_owned(),
             },
             conclusive,
         })

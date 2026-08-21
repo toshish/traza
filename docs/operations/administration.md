@@ -344,12 +344,16 @@ and the two non-clear results mean different things:
   `annotations_removed`).
 
 **`erased` and `conclusive` are separate answers.** The receipt's `result`
-is the semantic verdict; its `conclusive` flag is false whenever an
+(`erased` or `not-erased`) is the semantic verdict on the erasure; its
+`conclusive` flag describes the verification, and is false whenever an
 over-approximate check — the byte-level occurrence scans over the log and
 the rollup sidecars — found the subject's identifiers without proving them
-benign, and whenever any domain could only reach `attention`. The
-subcommand's exit code carries the distinction: `0` erased and conclusive,
-`3` erased but inconclusive (read the attention domains), `2` not erased.
+benign, and whenever any domain could only reach `attention`. They disagree
+in both directions: a receipt can be erased but inconclusive, and it can be
+conclusively `not-erased` — a pinned backup definitively holds the bytes,
+nothing ambiguous about it. The subcommand's exit code carries the
+distinction: `0` erased and conclusive, `3` erased but inconclusive (read
+the attention domains), `2` not erased.
 
 **The MCP endpoint cannot erase.** Deletion is an HTTP-only verb behind the
 `admin` scope. The agent-facing surface stays read-only by construction, so

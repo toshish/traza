@@ -1418,7 +1418,7 @@ impl EvalLog {
     /// record enumerated is a re-delivery (ids are never reused, so it can
     /// only be a purge that failed) and fails the receipt; a record under a
     /// fresh id is post-settle new activity — a barrier, not a ban — and is
-    /// reported without failing. A blunt count read "incomplete" forever
+    /// reported without failing. A blunt count read "not-erased" forever
     /// the moment a re-onboarded tenant created its first dataset.
     pub(crate) fn tenant_record_report(
         &self,

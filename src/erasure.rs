@@ -1061,17 +1061,22 @@ pub struct Receipt {
     /// Per-domain results, in a stable order.
     pub domains: Vec<DomainReport>,
     /// `erased` when every SEMANTIC check is clear or retained for a stated
-    /// reason; `incomplete` otherwise. The receipt is a verification, not a
-    /// claim: this field is computed from the domain results and nothing
-    /// else.
+    /// reason; `not-erased` otherwise. This is the verdict on the ERASURE —
+    /// [`conclusive`](Self::conclusive) describes the verification — and the
+    /// value names its subject so the pair cannot read as one contradiction.
+    /// The receipt is a verification, not a claim: this field is computed
+    /// from the domain results and nothing else.
     pub result: String,
     /// Whether the verification is also free of unexplained over-approximate
     /// signals: `false` whenever a byte-level occurrence scan found the
     /// subject's identifiers, whose matches CAN be benign (an identifier
     /// quoted in unrelated content) but were not proven so. `erased` answers
     /// what the semantic walk found; this answers whether anything at all
-    /// was left ambiguous. A receipt offered as proof should carry both, and
-    /// the subcommand's exit code distinguishes them.
+    /// was left ambiguous. The axes disagree in both directions: a receipt
+    /// can be `erased` but inconclusive (a scan saw the identifiers
+    /// somewhere), and conclusively `not-erased` (a pin definitively holds
+    /// the bytes). A receipt offered as proof should carry both, and the
+    /// subcommand's exit code distinguishes them.
     pub conclusive: bool,
 }
 
