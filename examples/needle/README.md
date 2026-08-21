@@ -50,7 +50,7 @@ it found.
 |---|---|---|
 | `TRAZA_DEMO_PORT` | `8126` | Server port |
 | `TRAZA_NEEDLE_SPANS` | `1000000` | Spans to flood (CI smoke uses `60000`) |
-| `TRAZA_NEEDLE_HOLD` | unset | `1` pauses before cleanup so the dashboard link works — build the dashboard first (above) |
+| `TRAZA_NEEDLE_HOLD` | unset | `1` pauses before cleanup so the dashboard link works, and also pauses 6 s before the flood so you can open `#/overview` and watch the ingest sparkline take it — build the dashboard first (above) |
 
 ## Honest caveats
 

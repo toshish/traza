@@ -2,9 +2,10 @@
 # A live agent cockpit in under a minute.
 #
 # Starts a Traza server on a throwaway store, then streams a simulated
-# agent platform into it in real time — three services, wall-clock
-# timestamps — so the dashboard's live tail, waterfalls, sessions and
-# cost analytics are all breathing while you watch.
+# agent platform into it in real time — three services, a few dozen
+# spans a second with bursts and a periodic retry storm, wall-clock
+# timestamps — so the dashboard's live tail, waterfalls, sessions,
+# failures and cost analytics are all breathing while you watch.
 #
 #   examples/swarm/run.sh
 #
@@ -97,10 +98,14 @@ cat <<BANNER
 
     live tail:  http://127.0.0.1:$port/#/tail
     overview:   http://127.0.0.1:$port/#/overview
+    failures:   http://127.0.0.1:$port/#/failures
     analytics:  http://127.0.0.1:$port/#/analytics
 
-  A trace deep link prints below each time a research fan-out lands,
-  and a conversation link prints at the verification gate.
+  Every half-minute or so one service falls into a short retry storm
+  and recovers — watch it land on the failures screen, or flip the
+  live tail to errors only. A trace deep link prints below each time
+  a research fan-out lands, and a conversation link prints at the
+  verification gate.
 BANNER
 
 if [ -z "$dash" ]; then

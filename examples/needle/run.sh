@@ -107,6 +107,11 @@ bold "▸ flood — $spans spans over real HTTP"
 dim "  POST /v1/spans from 8 processes in batches of 1,000: six services, timestamps"
 dim "  spread across the last 30 days, one needle inserted mid-flood. The rate below"
 dim "  measures this python client as much as the server — see the README."
+if [ "${TRAZA_NEEDLE_HOLD:-0}" = 1 ] && [ -n "$ui_ok" ]; then
+  dim "  TRAZA_NEEDLE_HOLD=1 — open http://127.0.0.1:$port/#/overview now to watch"
+  dim "  the ingest sparkline take the flood; starting in 6 seconds."
+  sleep 6
+fi
 python3 "$here/flood.py" --port "$port" --spans "$spans"
 
 bold "▸ flush"

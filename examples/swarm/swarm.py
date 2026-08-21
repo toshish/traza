@@ -6,18 +6,22 @@ stdlib only. Every span carries wall-clock nanosecond timestamps and is
 POSTed in the batch tick after its end time passes, so the live tail and
 the 15-minute overview window behave exactly as they would under a real
 platform: planners land before their workers, workers before the reduce.
+The pace is deliberately busy — a few dozen spans a second, with bursts
+when a fan-out lands and a short retry storm every half-minute or so —
+and TRAZA_SWARM_TEMPO scales it up or down.
 
 Two kinds of numbers print, and each is labeled as what it is. The
 server-read figures — ack counts summed from /v1/spans responses, costs
 from /v1/stats/llm, sessions from /v1/sessions, everything in the
 verification gate — are read back from the live server, never echoed
 from what was sent. The generator's own tallies (sessions started,
-fan-outs, error spans emitted, spans still in flight) are its emission
-counters: honest bookkeeping, not server measurements.
+fan-outs, incidents, error spans emitted, spans still in flight) are its
+emission counters: honest bookkeeping, not server measurements.
 """
 
 import heapq
 import json
+import math
 import os
 import random
 import signal
@@ -30,6 +34,15 @@ NS = 1_000_000_000
 BOLD, DIM, RESET = "\033[1m", "\033[2m", "\033[0m"
 
 rng = random.Random()
+
+# Positive multiplier on the emission rate (TRAZA_SWARM_TEMPO). It scales
+# the gaps *between* turns, traces, fan-outs and storms; span durations
+# stay in their plausible ranges regardless.
+TEMPO = 1.0
+
+
+def paced(lo, hi):
+    return rng.uniform(lo, hi) / TEMPO
 
 
 def bold(s):
@@ -200,13 +213,40 @@ SCRIPTS = [
          "The two seats added most recently are deactivated, not deleted. "
          "Reactivating them later restores their history."),
     ],
+    [
+        ("We keep hitting 429s on the export API around midnight UTC.",
+         "Your nightly job and our metering rollover land in the same "
+         "minute. Your plan allows 600 requests/min; the job burst-peaks "
+         "at 900. Either stagger the job by five minutes or request a "
+         "burst allowance."),
+        ("Can you set the burst allowance up for us?",
+         "Done — burst limit raised to 1200/min for api key ak-prod-114, "
+         "effective immediately. The base rate is unchanged."),
+        ("Will that show up on our invoice?",
+         "No. Burst allowance is included in the Team plan; the invoice "
+         "line items do not change."),
+    ],
+    [
+        ("How do I connect our Okta SSO to your dashboard?",
+         "Create a SAML app in Okta with the ACS URL from Settings → SSO, "
+         "then paste the metadata URL back into that page. Provisioning "
+         "is SCIM if you want automatic deactivation."),
+        ("The metadata URL gives me a 403 from Okta's side.",
+         "That 403 is Okta refusing anonymous metadata reads. Toggle "
+         "'public metadata' in the Okta app's Sign On tab, or upload the "
+         "metadata XML file instead — both work here."),
+        ("Uploading the XML worked. Anything else to enable?",
+         "Turn on 'require SSO' once you've confirmed a successful login, "
+         "so password logins stop being accepted for your domain."),
+    ],
 ]
 
 
 class Chats:
     """A pool of concurrent multi-turn support conversations. Each turn is
-    one trace: agent.turn root, an optional kb.search tool call, then the
-    model call carrying the conversation content."""
+    one trace: an agent.turn root, a short tool-choice model call, one to
+    three tool calls (kb.search, memory.recall, crm.lookup), then the
+    answering model call carrying the conversation content."""
 
     def __init__(self, sched, n):
         self.sched = sched
@@ -215,7 +255,7 @@ class Chats:
         self.next_no = 1041
         now = time.time()
         for i in range(n):
-            self.spawn(now + 0.2 + 0.45 * i)
+            self.spawn(now + 0.2 + 0.2 * i)
 
     def spawn(self, at):
         self.active.append({
@@ -237,37 +277,72 @@ class Chats:
             chat["turn"] += 1
             if chat["turn"] >= len(chat["script"]):
                 self.active.remove(chat)
-                self.spawn(end + rng.uniform(0.5, 2.0))
+                self.spawn(end + paced(0.3, 1.2))
             else:
-                chat["next_at"] = end + rng.uniform(1.5, 4.0)
+                chat["next_at"] = end + paced(0.25, 0.7)
+
+    def llm_attrs(self, session, model, tin, tout, step):
+        return {
+            "session.id": session,
+            "agent.step": step,
+            "gen_ai.operation.name": "chat",
+            "gen_ai.provider.name": model[1],
+            "gen_ai.request.model": model[0],
+            "gen_ai.response.model": model[0],
+            "gen_ai.usage.input_tokens": tin,
+            "gen_ai.usage.output_tokens": tout,
+            "llm.cost_usd": usd(model, tin, tout),
+        }
 
     def emit_turn(self, chat, t0):
         user, asst = chat["script"][chat["turn"]]
         session = chat["session"]
+        model = chat["model"]
         trace = new_trace_id("support")
         root = span(trace, None, "agent.turn", "support-agent", t0, t0,
                     attrs={"session.id": session, "agent.turn": chat["turn"] + 1})
         cursor = t0 + 0.04
 
-        if rng.random() < 0.75:
-            dur = rng.uniform(0.12, 0.5)
-            failed = rng.random() < 0.02
-            attrs = {
-                "session.id": session,
-                "tool.name": "kb.search",
-                "kb.query": " ".join(user.split()[:6]).lower().strip(".,?"),
-                "kb.hits": 0 if failed else rng.randrange(1, 9),
-            }
+        # the agent decides what to look up before it answers
+        dur = rng.uniform(0.2, 0.45)
+        attrs = self.llm_attrs(session, model, rng.randrange(200, 500),
+                               rng.randrange(15, 60), "tool-choice")
+        self.sched.put(cursor + dur, span(
+            trace, root["span_id"], f"{model[1]}.chat", "support-agent",
+            cursor, cursor + dur, "ok", attrs))
+        cursor += dur + 0.03
+
+        tools = []
+        if rng.random() < 0.9:
+            tools.append(("kb.search", rng.uniform(0.08, 0.3), 0.04,
+                          {"kb.query": " ".join(user.split()[:6])
+                           .lower().strip(".,?"),
+                           "kb.hits": rng.randrange(1, 9)},
+                          "kb index shard timed out after 450ms"))
+        if rng.random() < 0.7:
+            tools.append(("memory.recall", rng.uniform(0.04, 0.15), 0.01,
+                          {"memory.hits": rng.randrange(0, 5)},
+                          "memory store read timed out after 250ms"))
+        if rng.random() < 0.6:
+            tools.append(("crm.lookup", rng.uniform(0.1, 0.25), 0.02,
+                          {"crm.record": rng.choice(
+                              ["account", "order", "invoice"])},
+                          "crm api returned 502"))
+        for name, dur, p_fail, extra, err_msg in tools:
+            failed = rng.random() < p_fail
+            attrs = {"session.id": session, "tool.name": name}
+            attrs.update(extra)
             if failed:
-                attrs["error.message"] = "kb index shard timed out after 450ms"
-            tool = span(trace, root["span_id"], "kb.search", "support-agent",
-                        cursor, cursor + dur, "error" if failed else "ok", attrs)
-            self.sched.put(cursor + dur, tool)
-            cursor += dur + 0.05
+                attrs["error.message"] = err_msg
+                attrs.pop("kb.hits", None)
+                attrs.pop("memory.hits", None)
+            self.sched.put(cursor + dur, span(
+                trace, root["span_id"], name, "support-agent",
+                cursor, cursor + dur, "error" if failed else "ok", attrs))
+            cursor += dur + rng.uniform(0.02, 0.06)
 
         streaming = rng.random() < 0.3
-        dur = rng.uniform(0.7, 1.6) * (1.5 if streaming else 1.0)
-        model = chat["model"]
+        dur = rng.uniform(0.4, 0.95) * (1.4 if streaming else 1.0)
         input_msgs = [text_msg("system", SYSTEM_PROMPT)]
         for u, a in chat["history"]:
             input_msgs.append(text_msg("user", u))
@@ -277,21 +352,13 @@ class Chats:
                + sum(toks(u) + toks(a) for u, a in chat["history"])
                + toks(user) + rng.randrange(10, 40))
         tout = toks(asst) + rng.randrange(5, 25)
-        attrs = {
-            "session.id": session,
-            "gen_ai.operation.name": "chat",
-            "gen_ai.provider.name": model[1],
-            "gen_ai.request.model": model[0],
-            "gen_ai.response.model": model[0],
-            "gen_ai.usage.input_tokens": tin,
-            "gen_ai.usage.output_tokens": tout,
-            "llm.cost_usd": usd(model, tin, tout),
-            "gen_ai.input.messages": json.dumps(input_msgs),
-            "gen_ai.output.messages": json.dumps([text_msg("assistant", asst)]),
-        }
+        attrs = self.llm_attrs(session, model, tin, tout, "respond")
+        attrs["gen_ai.input.messages"] = json.dumps(input_msgs)
+        attrs["gen_ai.output.messages"] = json.dumps(
+            [text_msg("assistant", asst)])
         if streaming:
             attrs["llm.is_streaming"] = True
-        failed = rng.random() < 0.01
+        failed = rng.random() < 0.02
         if failed:
             attrs["error.message"] = "upstream timed out mid-stream"
         llm = span(trace, root["span_id"], f"{model[1]}.chat", "support-agent",
@@ -318,9 +385,11 @@ DOMAINS = ["docs.example.dev", "arxiv.example.org", "news.example.com",
 
 
 class Research:
-    """Every 15-20 s, one fan-out trace: a planner model call, then 4-8
-    genuinely concurrent workers doing web.fetch calls (with the odd 503
-    and retry), then a reduce model call. The waterfall showpiece."""
+    """Every 6-9 s (scaled by tempo), one fan-out trace: a planner model
+    call, then 5-10 genuinely concurrent workers doing web.fetch calls
+    (with the odd 503 and retry) and a per-worker summarize call, then a
+    reduce model call. The waterfall showpiece, and the burst in the
+    span rate."""
 
     def __init__(self, sched, base_url, start):
         self.sched = sched
@@ -333,7 +402,7 @@ class Research:
     def step(self, now):
         if now >= self.next_at:
             self.build(now)
-            self.next_at = now + rng.uniform(15, 20)
+            self.next_at = now + paced(6, 9)
         while self.notices and self.notices[0][0] <= now:
             _, trace, nw, nsp = self.notices.pop(0)
             say(f"  research fan-out landed: {nw} concurrent workers, {nsp} spans")
@@ -351,7 +420,7 @@ class Research:
         plan_dur = rng.uniform(0.7, 1.1)
         model = MODELS[1]
         tin, tout = rng.randrange(400, 900), rng.randrange(150, 350)
-        nw = rng.randrange(4, 9)
+        nw = rng.randrange(5, 11)
         planner = span(
             trace, root["span_id"], "anthropic.chat", "research-swarm",
             t0 + 0.02, t0 + 0.02 + plan_dur, "ok", {
@@ -377,7 +446,7 @@ class Research:
         worker_ends = []
         for i in range(nw):
             w0 = fan_start + rng.uniform(0.02, 0.25)
-            w1 = w0 + rng.uniform(1.0, 2.4)
+            w1 = w0 + rng.uniform(1.2, 2.6)
             worker_ends.append(w1)
             worker = span(trace, root["span_id"], "swarm.worker",
                           "research-swarm", w0, w1, "ok",
@@ -385,10 +454,11 @@ class Research:
                            "research.topic": topic})
             spans.append(worker)
 
-            fail_first = rng.random() < 0.12
-            n_fetch = rng.randrange(1, 3) + (1 if fail_first else 0)
+            fail_first = rng.random() < 0.18
+            n_fetch = rng.randrange(3, 6) + (1 if fail_first else 0)
+            fetch_hi = w0 + (w1 - w0) * 0.62
             cur = w0 + 0.05
-            seg = (w1 - 0.05 - cur) / n_fetch
+            seg = (fetch_hi - cur) / n_fetch
             for f in range(n_fetch):
                 f1 = cur + seg * rng.uniform(0.6, 0.95)
                 err = fail_first and f == 0
@@ -406,6 +476,25 @@ class Research:
                                   "research-swarm", cur, f1,
                                   "error" if err else "ok", attrs))
                 cur += seg
+
+            # each worker condenses its fetches with a small, cheap model
+            model_s = MODELS[0]
+            tin_s = rng.randrange(500, 1500)
+            tout_s = rng.randrange(80, 200)
+            spans.append(span(
+                trace, worker["span_id"], "openai.chat", "research-swarm",
+                fetch_hi + 0.04, w1 - 0.03, "ok", {
+                    "swarm.role": "worker",
+                    "swarm.worker": i,
+                    "agent.step": "summarize",
+                    "gen_ai.operation.name": "chat",
+                    "gen_ai.provider.name": model_s[1],
+                    "gen_ai.request.model": model_s[0],
+                    "gen_ai.response.model": model_s[0],
+                    "gen_ai.usage.input_tokens": tin_s,
+                    "gen_ai.usage.output_tokens": tout_s,
+                    "llm.cost_usd": usd(model_s, tin_s, tout_s),
+                }))
 
         r0 = max(worker_ends) + 0.05
         r1 = r0 + rng.uniform(0.6, 1.0)
@@ -456,18 +545,19 @@ FILES = ["src/ingest.rs", "src/wal.rs", "src/segment.rs", "tests/http_api.rs",
 
 
 class Coder:
-    """Tool-heavy traces every 4-7 s: file reads, a model call, a test run
-    that sometimes fails, a diff. Longer durations than the chat turns."""
+    """Tool-heavy traces every second or two: file reads, a model call, a
+    patch, a test run that sometimes fails, a diff. Longer durations than
+    the chat turns, so several code tasks are usually in flight at once."""
 
     def __init__(self, sched, start):
         self.sched = sched
-        self.next_at = start + 1.3
+        self.next_at = start + 0.9
         self.count = 0
 
     def step(self, now):
         if now >= self.next_at:
             self.build(now)
-            self.next_at = now + rng.uniform(4, 7)
+            self.next_at = now + paced(0.5, 0.9)
 
     def build(self, t0):
         trace = new_trace_id("code")
@@ -477,7 +567,7 @@ class Coder:
                     attrs={"task.description": task})
         cur = t0 + 0.03
 
-        for _ in range(rng.randrange(2, 5)):
+        for _ in range(rng.randrange(3, 7)):
             d = rng.uniform(0.01, 0.08)
             self.sched.put(cur + d, span(
                 trace, root["span_id"], "fs.read", "code-agent", cur, cur + d,
@@ -485,7 +575,7 @@ class Coder:
             cur += d + rng.uniform(0.01, 0.05)
 
         model = MODELS[self.count % 2]  # alternates gpt-4o-mini / claude
-        d = rng.uniform(1.2, 3.0)
+        d = rng.uniform(1.0, 2.4)
         tin, tout = rng.randrange(1500, 6000), rng.randrange(200, 900)
         self.sched.put(cur + d, span(
             trace, root["span_id"], f"{model[1]}.chat", "code-agent",
@@ -501,9 +591,18 @@ class Coder:
             }))
         cur += d + 0.05
 
-        d = rng.uniform(1.0, 3.5)
+        if rng.random() < 0.7:
+            d = rng.uniform(0.08, 0.25)
+            self.sched.put(cur + d, span(
+                trace, root["span_id"], "patch.apply", "code-agent",
+                cur, cur + d, "ok",
+                {"tool.name": "patch.apply",
+                 "patch.hunks": rng.randrange(1, 7)}))
+            cur += d + 0.03
+
+        d = rng.uniform(0.8, 2.8)
         total = rng.randrange(40, 220)
-        failed = rng.random() < 0.10
+        failed = rng.random() < 0.14
         nfail = rng.randrange(1, 4) if failed else 0
         attrs = {"tool.name": "tests.run", "tests.total": total,
                  "tests.failed": nfail}
@@ -525,8 +624,122 @@ class Coder:
         self.sched.put(cur + 0.04, root)
 
 
+# ---------------------------------------------------------------- incident
+class Incident:
+    """Every 30-45 s (scaled by tempo), one service falls into a short
+    retry storm: a single tool erroring 5-8 times in one trace with
+    visible backoff, then recovering. It lights up the failures screen
+    and the tail's errors-only filter without moving the overall error
+    share much; services take turns."""
+
+    def __init__(self, sched, chats, base_url, start):
+        self.sched = sched
+        self.chats = chats
+        self.base_url = base_url
+        self.next_at = start + paced(14, 20)
+        self.notices = []
+        self.count = 0
+
+    def step(self, now):
+        if now >= self.next_at:
+            self.build(now)
+            self.next_at = now + paced(30, 45)
+        while self.notices and self.notices[0][0] <= now:
+            _, service, tool, n = self.notices.pop(0)
+            say(f"  incident: {tool} on {service} errored {n} times, "
+                "then recovered")
+            say(f"    {self.base_url}/#/failures  "
+                "(or filter the live tail to errors)")
+
+    def build(self, t0):
+        kind = self.count % 3
+        self.count += 1
+        n = rng.randrange(5, 9)
+
+        if kind == 0:
+            service, tool = "support-agent", "kb.search"
+            trace = new_trace_id("support")
+            session = rng.choice(self.chats.active)["session"]
+            root = span(trace, None, "agent.turn", service, t0, t0,
+                        attrs={"session.id": session})
+            common = {"session.id": session, "tool.name": tool,
+                      "kb.query": "invoice history"}
+
+            def err_attrs(i):
+                a = dict(common, **{
+                    "retry.attempt": i,
+                    "error.message":
+                        f"kb shard 3 returned 503; retry {i}/{n}"})
+                return a
+
+            ok_attrs = dict(common, **{"retry.attempt": n + 1,
+                                       "kb.hits": rng.randrange(1, 6)})
+            parent = root
+        elif kind == 1:
+            service, tool = "research-swarm", "web.fetch"
+            trace = new_trace_id("research")
+            root = span(trace, None, "research.run", service, t0, t0,
+                        attrs={"research.topic": "source mirror health"})
+            parent = span(trace, root["span_id"], "swarm.worker", service,
+                          t0 + 0.02, t0 + 0.02, "ok",
+                          {"swarm.role": "worker", "swarm.worker": 0})
+            url = f"https://news.example.com/wire/{rng.getrandbits(24):06x}"
+
+            def err_attrs(i):
+                return {"tool.name": tool, "url.full": url,
+                        "http.response.status_code": 503,
+                        "http.request.resend_count": i - 1,
+                        "error.message":
+                            f"503 service unavailable; retry {i}/{n}"}
+
+            ok_attrs = {"tool.name": tool, "url.full": url,
+                        "http.response.status_code": 200,
+                        "http.request.resend_count": n}
+        else:
+            service, tool = "code-agent", "git.fetch"
+            trace = new_trace_id("code")
+            root = span(trace, None, "code.task", service, t0, t0,
+                        attrs={"task.description":
+                               "refresh vendored dependencies"})
+
+            def err_attrs(i):
+                return {"tool.name": tool, "git.remote": "origin",
+                        "retry.attempt": i,
+                        "error.message":
+                            f"remote hung up unexpectedly; retry {i}/{n}"}
+
+            ok_attrs = {"tool.name": tool, "git.remote": "origin",
+                        "retry.attempt": n + 1}
+            parent = root
+
+        cur = t0 + 0.05
+        backoff = 0.08
+        for i in range(1, n + 1):
+            d = rng.uniform(0.2, 0.5)
+            self.sched.put(cur + d, span(
+                trace, parent["span_id"], tool, service, cur, cur + d,
+                "error", err_attrs(i)))
+            cur += d + backoff
+            backoff = min(backoff * 1.7, 0.6)
+
+        d = rng.uniform(0.2, 0.4)
+        self.sched.put(cur + d, span(
+            trace, parent["span_id"], tool, service, cur, cur + d,
+            "ok", ok_attrs))
+        cur += d
+
+        if parent is not root:
+            parent["end_time_ns"] = int((cur + 0.02) * NS)
+            self.sched.put(cur + 0.02, parent)
+            cur += 0.02
+        root_end = cur + 0.03
+        root["end_time_ns"] = int(root_end * NS)
+        self.sched.put(root_end, root)
+        self.notices.append((root_end, service, tool, n))
+
+
 # ------------------------------------------------------------ verification
-def run_verification(api, base, research_trace):
+def run_verification(api, base, research_trace, n_chats):
     bold("verify — every number below was read back from the server")
     results = []
 
@@ -535,16 +748,17 @@ def run_verification(api, base, research_trace):
         say(f"  {label:<36} {str(value):<10} need {need:<7} "
             f"{'ok' if passed else 'FAIL'}")
 
+    need_sessions = min(5, n_chats)
     sessions = api.get("/v1/sessions")["sessions"]
-    check("sessions listed by /v1/sessions", len(sessions), ">= 3",
-          len(sessions) >= 3)
+    check("sessions listed by /v1/sessions", len(sessions),
+          f">= {need_sessions}", len(sessions) >= need_sessions)
 
     rows = api.get("/v1/stats/llm")["rows"]
     costed = [r for r in rows if (r.get("cost_usd") or 0) > 0]
-    check("models with cost_usd > 0", len(costed), ">= 1", len(costed) >= 1)
+    check("models with cost_usd > 0", len(costed), ">= 3", len(costed) >= 3)
 
     spans = api.get("/v1/traces/" + research_trace)["spans"]
-    check("spans in the research trace", len(spans), ">= 6", len(spans) >= 6)
+    check("spans in the research trace", len(spans), ">= 20", len(spans) >= 20)
 
     workers = [s for s in spans if s["name"] == "swarm.worker"]
     edges = sorted([(s["start_time_ns"], 1) for s in workers]
@@ -554,8 +768,8 @@ def run_verification(api, base, research_trace):
     for _, d in edges:
         cur += d
         peak = max(peak, cur)
-    check("workers running concurrently", f"{peak}/{len(workers)}", ">= 2",
-          peak >= 2)
+    check("workers running concurrently", f"{peak}/{len(workers)}", ">= 4",
+          peak >= 4)
 
     # The conversation view parses gen_ai.input/output.messages as JSON
     # arrays of {role, parts:[{type,content}]} (ui/src/lib/spans.js). Read
@@ -598,17 +812,28 @@ def llm_cost_total(api):
 
 # -------------------------------------------------------------------- main
 def main():
+    global TEMPO
     port = sys.argv[1] if len(sys.argv) > 1 else os.environ.get(
         "TRAZA_DEMO_PORT", "8124")
     base = f"http://127.0.0.1:{port}"
     api = Api(base)
+
+    raw_tempo = os.environ.get("TRAZA_SWARM_TEMPO", "") or "1.0"
+    try:
+        TEMPO = float(raw_tempo)
+    except ValueError:
+        TEMPO = float("nan")
+    if not (TEMPO > 0 and math.isfinite(TEMPO)):
+        say(f"TRAZA_SWARM_TEMPO must be a positive number, "
+            f"not {raw_tempo!r}")
+        sys.exit(2)
 
     duration = float(os.environ.get("TRAZA_SWARM_SECONDS", "0") or 0)
     if 0 < duration < 8:
         dim(f"  TRAZA_SWARM_SECONDS={duration:g} is below the 8 s "
             "verification window; running 8 s")
         duration = 8.0
-    n_chats = max(3, int(os.environ.get("TRAZA_SWARM_CHATS", "4")))
+    n_chats = max(3, int(os.environ.get("TRAZA_SWARM_CHATS", "12")))
 
     def on_term(signum, frame):
         raise KeyboardInterrupt
@@ -620,13 +845,17 @@ def main():
     chats = Chats(sched, n_chats)
     research = Research(sched, base, start)
     coder = Coder(sched, start)
+    incident = Incident(sched, chats, base, start)
 
-    dim(f"  streaming three services: support-agent ({n_chats} concurrent "
-        "chats), research-swarm (fan-out every 15-20 s), code-agent "
-        "(tool-heavy). Ctrl-C for the summary."
+    pace_note = "" if TEMPO == 1.0 else f" at tempo x{TEMPO:g}"
+    dim(f"  streaming three services{pace_note}: support-agent ({n_chats} "
+        "concurrent chats), research-swarm (periodic fan-outs), code-agent "
+        "(tool-heavy), plus a retry storm every half-minute or so. Ctrl-C "
+        "for the summary."
         if duration == 0 else
-        f"  streaming three services for {duration:g} s: support-agent "
-        f"({n_chats} concurrent chats), research-swarm, code-agent.")
+        f"  streaming three services for {duration:g} s{pace_note}: "
+        f"support-agent ({n_chats} concurrent chats), research-swarm, "
+        "code-agent, plus a periodic retry storm.")
 
     acked = 0
     verified = False
@@ -640,6 +869,7 @@ def main():
             chats.step(now)
             research.step(now)
             coder.step(now)
+            incident.step(now)
 
             batch = sched.due(now)
             if batch:
@@ -661,7 +891,8 @@ def main():
             if (not verified and now - start >= 6.0 and research.first_done
                     and now >= research.first_done[1] + 0.5):
                 verified = True
-                verify_ok = run_verification(api, base, research.first_done[0])
+                verify_ok = run_verification(api, base,
+                                             research.first_done[0], n_chats)
                 if not verify_ok:
                     break
 
@@ -701,7 +932,7 @@ def main():
         dim(f"    could not read /v1/stats/llm: {e}")
     say("  generator's own tallies, emission-side:")
     say(f"    ran {elapsed:.1f}s   sessions started {chats.started}   "
-        f"research fan-outs {research.count}")
+        f"research fan-outs {research.count}   retry storms {incident.count}")
     say(f"    error spans emitted {sched.errors}   still in flight at exit "
         f"{len(sched.q)}")
     if interrupted and not verified:
