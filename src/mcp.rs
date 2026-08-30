@@ -239,8 +239,23 @@ struct ToolError(String);
 type ToolResult = Result<Value, ToolError>;
 
 impl From<Error> for ToolError {
+    /// The one conversion every tool's `?` passes through, which makes it
+    /// the chokepoint for guidance that must not depend on which tool hit
+    /// the condition: an exhausted compute budget reads the same from
+    /// `list_sessions` as from `search_spans`, because the remedy — narrow,
+    /// don't retry — is the same. Tool-specific curation (`search_spans`'
+    /// sort ceiling) stays at its tool.
     fn from(error: Error) -> Self {
-        Self(error.to_string())
+        match error {
+            Error::DeadlineExceeded(_) => Self(
+                "This search exhausted the server's compute budget before finishing, \
+                 and a partial answer is refused because it would look complete. \
+                 Narrow the window with 'since', add a 'service' or an attribute \
+                 filter, or lower 'limit', then retry."
+                    .to_owned(),
+            ),
+            other => Self(other.to_string()),
+        }
     }
 }
 
@@ -884,7 +899,9 @@ impl<'a> Server<'a> {
                      match set with no such ceiling."
                         .to_owned(),
                 ),
-                other => ToolError(other.to_string()),
+                // Through the shared conversion, so an exhausted budget gets
+                // the same narrowing guidance every tool gives.
+                other => ToolError::from(other),
             })?;
 
         if spans.is_empty() {

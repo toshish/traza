@@ -134,6 +134,8 @@ means seals are back-to-back, which is normal under saturation.
 | `traza_http_connections_accepted_total` | counter | Connections accepted |
 | `traza_http_connections_refused_total` | counter | Connections refused at `--max-connections` with a `503` |
 | `traza_http_connections_live` | gauge | Connections currently open |
+| `traza_query_deadline_exceeded_total` | counter | HTTP queries refused with a `400` for exhausting `--query-deadline-ms`; an MCP tool's refusal surfaces in its tool result and is not counted here |
+| `traza_http_handler_panics_total` | counter | Handler threads that panicked; each one still released its connection slot |
 | `traza_http_decoded_spans_total` | counter | Spans decoded from request bodies |
 | `traza_http_responses_{2xx,4xx,5xx}_total` | counter | Responses by status class |
 | `traza_uptime_seconds` | gauge | Seconds since this process began serving |
@@ -218,6 +220,12 @@ indicator.
 **Authentication is failing.** A jump in `traza_http_rejected_total` is either
 a misconfigured client or someone probing. It does not distinguish 401 from
 403.
+
+**A handler panicked.** Any nonzero `traza_http_handler_panics_total` is a bug
+report waiting to be filed. The slot guard means a panic no longer costs a
+`--max-connections` slot — the server keeps serving — but a panic is never
+load or client error; it is a defect in this codebase, and the stderr log
+around the increment holds the panic message that names it.
 
 **Disk growth.** `bytes_on_disk` against the volume's capacity. Remember that
 superseded versions persist until compaction, and that a merge needs room for

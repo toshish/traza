@@ -382,6 +382,21 @@ with a time range, `service`, or an attribute and retry. Returning the "ten
 slowest" out of an arbitrary first page would be a wrong answer that looks
 like a right one.
 
+**Compute is budgeted.** Every span query and aggregation — this route,
+[`GET /v1/traces/{id}`](#get-v1tracestrace_id), the `/v1/stats/*` family,
+sessions, `/v1/tenants`, and the reachability probe behind a tenant-bound
+[`GET /v1/payloads/{ref}`](#get-v1payloadsreference) — runs under the
+server's [`--query-deadline-ms`](../configuration.md#server-flags) budget
+(default 30 s). A request still computing past it answers
+`400 {"error":"query deadline exceeded: ..."}` with **no rows**, naming the
+elapsed time and the narrowing that would help. Like the sort ceiling it is
+a `400`, not a `503`: retrying an over-budget query without narrowing cannot
+help, so "retry with backoff" would be a lie. The streams are exempt —
+[`GET /v1/export`](#get-v1export) and [`GET /v1/tail`](#get-v1tail) are
+documented unbounded, and the socket timeout bounds their abandonment — and
+so is every erasure read, because a partial receipt is worse than a slow
+one. `traza_query_deadline_exceeded_total` counts these refusals.
+
 **Time ranges skip a segment's records.** `since` / `until` are compared
 against each segment's stored timestamp range, so a segment that cannot
 contain a
@@ -469,7 +484,9 @@ curl http://localhost:8080/v1/traces/trace-1
 | `annotations` | array | Annotations on the trace or any of its spans |
 
 **Errors.** `404 {"error":"trace not found"}` when no span carries the id.
-`503` on store failure.
+`400 {"error":"query deadline exceeded: ..."}` when the lookup exhausts
+[`--query-deadline-ms`](../configuration.md#server-flags). `503` on store
+failure.
 
 ### `GET /v1/export`
 
@@ -478,7 +495,11 @@ memory. An export larger than RAM is fine.
 
 **Parameters.** Identical to [`GET /v1/spans`](#get-v1spans), with one
 difference: **exports are unbounded by default.** Passing `limit` explicitly
-caps the stream.
+caps the stream. Unbounded includes the compute budget: an export is exempt
+from `--query-deadline-ms`, because a stream that already said `200` must
+not be truncated by a budget mid-flight — completeness stays whatever the
+trailers say, and the socket write timeout is what bounds an abandoned
+consumer.
 
 **Response `200`.**
 
@@ -1230,7 +1251,11 @@ dataset example of its own tenant carries the reference. An unreachable
 payload answers `404` exactly as an absent one does. See
 [administration § Payload fetch across tenants](../operations/administration.md#payload-fetch-across-tenants).
 
-**Errors.** `404 {"error":"payload not found"}`. `503` on store failure.
+**Errors.** `404 {"error":"payload not found"}`.
+`400 {"error":"query deadline exceeded: ..."}` when a bound fetch's
+reachability probe exhausts
+[`--query-deadline-ms`](../configuration.md#server-flags). `503` on store
+failure.
 
 ---
 
