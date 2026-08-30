@@ -246,6 +246,16 @@ That last row is the one that matters. A silently truncated result is worse
 than a refusal: a model treats a partial answer as complete and reports it as
 fact.
 
+Compute is bounded the same way bytes are. Every tool that queries or
+aggregates spans inherits the server's
+[`--query-deadline-ms`](../configuration.md#server-flags) budget (default
+30 s), and a call that exhausts it comes back as a tool error telling the
+model to narrow with `since`, a `service`, or an attribute — never as a
+partial answer, for exactly the reason truncation is always stated. One
+honest caveat: the budget anchors per engine operation, not per tool call,
+so a tool composed of several folds — `describe_store` runs half a dozen —
+can spend several budgets end to end.
+
 `analyze_cost` and `list_sessions` additionally return `structuredContent`
 against a declared `outputSchema`, because their rows are small, genuinely
 tabular, and the thing a client is most likely to chart. Everything else is

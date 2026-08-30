@@ -50,6 +50,7 @@ fn config() -> Config {
         compaction: None,
         wal_commit_window: None,
         content_index: true,
+        query_deadline: None,
         tail_ring_spans: traza::DEFAULT_TAIL_RING_SPANS,
         tail_ring_bytes: traza::DEFAULT_TAIL_RING_BYTES,
         flush_wal_bytes: None,

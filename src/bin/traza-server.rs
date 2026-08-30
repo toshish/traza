@@ -231,8 +231,23 @@ struct ServerMetrics {
     connections_refused: traza::metrics::Counter,
     /// Connections accepted.
     connections_accepted: traza::metrics::Counter,
-    /// Connections currently being served.
-    connections_live: AtomicUsize,
+    /// Connections currently being served. In an `Arc` of its own so each
+    /// handler's [`SlotGuard`] can hold the counter it must release without
+    /// borrowing the whole metrics struct into the guard's identity.
+    connections_live: Arc<AtomicUsize>,
+    /// HTTP queries refused because they exhausted the compute budget
+    /// (`--query-deadline-ms`). Nonzero means something is issuing scans the
+    /// budget will not finish; the fix is narrower filters, not retries.
+    /// MCP tool refusals surface in the tool result and are not counted.
+    query_deadline_exceeded: traza::metrics::Counter,
+    /// Handler threads that unwound. Every panic still releases its
+    /// connection slot via [`SlotGuard`], so the server survives it — but a
+    /// panic is a bug, and any nonzero value here is a bug report waiting to
+    /// be filed. In an `Arc` like `connections_live`, and for the same
+    /// reason: the connection-slot guard holds it, and ONLY that guard —
+    /// counting the refusal thread's guard here too would make the metric
+    /// lie about the word "handler" in its name.
+    handler_panics: Arc<traza::metrics::Counter>,
 }
 
 // `Instant` has no `Default`, and the right value is "when this was built" —
@@ -252,7 +267,9 @@ impl Default for ServerMetrics {
             decoded_spans: traza::metrics::Counter::default(),
             connections_refused: traza::metrics::Counter::default(),
             connections_accepted: traza::metrics::Counter::default(),
-            connections_live: AtomicUsize::new(0),
+            connections_live: Arc::new(AtomicUsize::new(0)),
+            query_deadline_exceeded: traza::metrics::Counter::default(),
+            handler_panics: Arc::new(traza::metrics::Counter::default()),
         }
     }
 }
@@ -287,6 +304,18 @@ impl ServerMetrics {
             into,
             "traza_http_connections_live {}",
             self.connections_live.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(into, "# TYPE traza_query_deadline_exceeded_total counter");
+        let _ = writeln!(
+            into,
+            "traza_query_deadline_exceeded_total {}",
+            self.query_deadline_exceeded.get()
+        );
+        let _ = writeln!(into, "# TYPE traza_http_handler_panics_total counter");
+        let _ = writeln!(
+            into,
+            "traza_http_handler_panics_total {}",
+            self.handler_panics.get()
         );
         let _ = writeln!(into, "# TYPE traza_http_decoded_spans_total counter");
         let _ = writeln!(
@@ -449,12 +478,14 @@ impl ServerMetrics {
                 "p50_ns": self.request_latency.percentile_ns(50.0),
                 "p95_ns": self.request_latency.percentile_ns(95.0),
                 "p99_ns": self.request_latency.percentile_ns(99.0),
+                "deadline_exceeded": self.query_deadline_exceeded.get(),
             },
             "by_class": classes,
             "connections": {
                 "accepted": self.connections_accepted.get(),
                 "refused": self.connections_refused.get(),
                 "live": self.connections_live.load(Ordering::Relaxed),
+                "handler_panics": self.handler_panics.get(),
             },
             "decode": {
                 "spans": self.decoded_spans.get(),
@@ -478,6 +509,62 @@ impl ServerMetrics {
         })
     }
 }
+
+/// One claimed slot in a bounded counter, released exactly once on [`Drop`].
+///
+/// The claim happens in the constructor and the release in `Drop`, so every
+/// exit releases identically: a handler that returns, a handler that panics
+/// (the unwind runs `Drop`), and a spawn that fails (the closure holding the
+/// guard is dropped un-run). The manual pair this replaced ran its
+/// `fetch_sub` only on the return path, so each handler panic consumed a
+/// `--max-connections` slot permanently — enough of them walked the server
+/// to a permanent 503 with nothing in the logs but old panics.
+///
+/// The contract is exactly "always decrement once". Admission stays the
+/// load-then-claim it was; the guard does not close that pre-existing race,
+/// it only makes the release unconditional.
+struct SlotGuard {
+    slots: Arc<AtomicUsize>,
+    /// The counter an unwinding drop reports into, or `None` for a guard
+    /// whose panics are not handler panics. Per-site on purpose: the
+    /// connection-slot claim passes `traza_http_handler_panics_total`, the
+    /// refusal-thread claim passes `None` — a refusal thread runs no
+    /// handler, and counting its unwind under that name would falsify the
+    /// metric's documented meaning.
+    panics: Option<Arc<traza::metrics::Counter>>,
+}
+
+impl SlotGuard {
+    /// Claims one slot immediately.
+    fn claim(slots: Arc<AtomicUsize>, panics: Option<Arc<traza::metrics::Counter>>) -> Self {
+        slots.fetch_add(1, Ordering::Relaxed);
+        Self { slots, panics }
+    }
+}
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        // Counted here because this is the one line every panicking handler
+        // is guaranteed to run.
+        if std::thread::panicking() {
+            if let Some(panics) = &self.panics {
+                panics.increment();
+            }
+        }
+        self.slots.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Whether `GET /v1/test-panic` exists — the deliberate panic the slot-guard
+/// tests need, since a reachable panic cannot otherwise be arranged from
+/// outside the process. Latched from `TRAZA_TEST_PANIC` ONCE at startup,
+/// before the first connection is accepted: a live per-request environment
+/// read would make route existence a runtime control surface, and a request
+/// header must never be one. Unset, empty, or `0` — every production
+/// process, following the same "`0` disables" convention as every other
+/// knob — the guarded arm is inert and the path 404s exactly as it always
+/// has. Primarily for tests.
+static TEST_PANIC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
 fn main() {
     if let Err(error) = run() {
@@ -532,7 +619,10 @@ default 64MiB)] \
 0 disables; default 300)] \
 [--no-shadow-seal (do not answer observed segment-key shadowing with a \
 corrective deduplicating merge)] \
-[--max-connections N (default 1024)] [--payload-threshold-bytes N (0 disables)] \
+[--max-connections N (default 1024)] \
+[--query-deadline-ms N (refuse a query still computing after N ms; 0 disables; \
+default 30000; streams and erasure work are exempt)] \
+[--payload-threshold-bytes N (0 disables)] \
 [--durability buffered|wal|flushed (default wal)] \
 [--wal-commit-window-us N (delay each fsync so more acks share it; 0 = off)] \
 [--compaction-fanout N (0 disables; default 4)] [--compaction-max-segment-bytes N] \
@@ -612,6 +702,10 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
         std::collections::HashMap::new();
     let mut payload_threshold_bytes = 256 * 1024_usize;
     let mut max_connections = DEFAULT_MAX_CONNECTIONS;
+    // The worst measured legitimate query in this repo — a whole-corpus
+    // /v1/stats/duration over 1M spans (examples/needle) — takes ~3 s, so
+    // 30 s bounds a runaway scan without ever touching measured use.
+    let mut query_deadline_ms: u64 = 30_000;
     let mut allow_unauthenticated_non_loopback = false;
     let mut ui_dir: Option<PathBuf> = None;
     let mut pricing = traza::pricing::Pricing::default();
@@ -707,6 +801,10 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
             "--max-connections" => {
                 i += 1;
                 max_connections = (number(i, "--max-connections")? as usize).max(1);
+            }
+            "--query-deadline-ms" => {
+                i += 1;
+                query_deadline_ms = number(i, "--query-deadline-ms")?;
             }
             "--compaction-fanout" => {
                 i += 1;
@@ -868,6 +966,9 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
             // contract with clients, not a performance setting.
             durability,
             content_index,
+            // 0 removes the budget; queries then run as long as they take.
+            query_deadline: (query_deadline_ms > 0)
+                .then(|| Duration::from_millis(query_deadline_ms)),
             compaction: compaction_enabled.then_some(compaction),
             tail_ring_spans,
             tail_ring_bytes,
@@ -1009,6 +1110,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let auth = Arc::new(auth_config);
     let metrics = Arc::new(ServerMetrics::default());
+    // Latched before the first connection is accepted; see [`TEST_PANIC`].
+    // Unset, empty, and "0" all disable — `TRAZA_TEST_PANIC=0` must not
+    // ENABLE a panic route when 0 disables every other knob.
+    let _ = TEST_PANIC.set(
+        std::env::var_os("TRAZA_TEST_PANIC").is_some_and(|value| !value.is_empty() && value != "0"),
+    );
     // In-flight 503 refusals, bounded so a connection flood cannot spawn
     // without limit.
     let refusals = Arc::new(AtomicUsize::new(0));
@@ -1207,21 +1314,28 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             // Refusal threads are themselves bounded; past that, dropping the
             // connection outright is the correct degradation under a flood.
             if refusals.load(Ordering::Relaxed) < MAX_REFUSAL_THREADS {
-                refusals.fetch_add(1, Ordering::Relaxed);
-                let counter = Arc::clone(&refusals);
+                let slot = SlotGuard::claim(Arc::clone(&refusals), None);
                 let spawned = thread::Builder::new()
                     .name("traza-refuse".into())
                     .spawn(move || {
+                        // The guard rides the closure, so a panicking
+                        // refusal and a failed spawn (which drops the
+                        // closure un-run) release the same way a completed
+                        // one does.
+                        let _slot = slot;
                         refuse_connection(stream);
-                        counter.fetch_sub(1, Ordering::Relaxed);
                     });
-                if spawned.is_err() {
-                    refusals.fetch_sub(1, Ordering::Relaxed);
-                }
+                let _ = spawned;
             }
             continue;
         }
-        metrics.connections_live.fetch_add(1, Ordering::Relaxed);
+        // Claimed before the spawn and released only by the guard's Drop, so
+        // a handler that returns, a handler that panics, and a spawn that
+        // fails all give the slot back exactly once.
+        let slot = SlotGuard::claim(
+            Arc::clone(&metrics.connections_live),
+            Some(Arc::clone(&metrics.handler_panics)),
+        );
         metrics.connections_accepted.increment();
         let connection_engine = Arc::clone(&engine);
         let connection_auth = Arc::clone(&auth);
@@ -1231,6 +1345,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let spawned = thread::Builder::new()
             .name("traza-http".into())
             .spawn(move || {
+                let _slot = slot;
                 let _ = handle_connection(
                     stream,
                     &connection_engine,
@@ -1239,13 +1354,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     &connection_metrics,
                     &connection_mcp,
                 );
-                connection_metrics
-                    .connections_live
-                    .fetch_sub(1, Ordering::Relaxed);
             });
         if spawned.is_err() {
-            // Out of threads: undo the reservation so the count stays honest.
-            metrics.connections_live.fetch_sub(1, Ordering::Relaxed);
+            // The failed spawn dropped its closure — and the guard inside it
+            // — so only the refusal is left to record here.
             metrics.connections_refused.increment();
             eprintln!("failed to spawn a connection handler");
         }
@@ -1695,11 +1807,25 @@ fn bind_tenant(
 /// The uniform mapping from engine errors to responses, for the routes that
 /// have no route-specific cases: named defects are the caller's (400),
 /// conflicts are retryable state (409), the rest is the store's (503).
-fn engine_error(responder: &mut Responder<'_>, error: traza::Error) -> io::Result<()> {
+fn engine_error(
+    responder: &mut Responder<'_>,
+    metrics: &ServerMetrics,
+    error: traza::Error,
+) -> io::Result<()> {
     match error {
         traza::Error::InvalidSpan(reason) => responder.json(400, json!({"error": reason})),
         traza::Error::Invalid(reason) => responder.json(400, json!({"error": reason})),
         traza::Error::Conflict(reason) => responder.json(409, json!({"error": reason})),
+        // An exhausted compute budget is the caller's to narrow, the same
+        // rule as a too-broad sort: 503 would tell the client to retry with
+        // backoff, and retrying an over-budget query without narrowing
+        // cannot help. Counted here — the one chokepoint every deadline 400
+        // passes through — so the metric covers every route that inherits
+        // this mapping.
+        error @ traza::Error::DeadlineExceeded(_) => {
+            metrics.query_deadline_exceeded.increment();
+            responder.json(400, json!({"error": error.to_string()}))
+        }
         other => responder.json(503, json!({"error": other.to_string()})),
     }
 }
@@ -2115,7 +2241,7 @@ fn serve_request(
                 Err(error @ traza::Error::QueryTooBroad(_)) => {
                     responder.json(400, json!({"error": error.to_string()}))
                 }
-                Err(error) => responder.json(503, json!({"error": error.to_string()})),
+                Err(error) => engine_error(responder, metrics, error),
             }
         }
         // The same numbers as /v1/metrics, shaped for a browser. Prometheus
@@ -2184,7 +2310,7 @@ fn serve_request(
                         }),
                     )
                 }
-                Err(error) => responder.json(503, json!({"error": error.to_string()})),
+                Err(error) => engine_error(responder, metrics, error),
             }
         }
         ("GET", "/v1/sessions") => {
@@ -2214,7 +2340,7 @@ fn serve_request(
                     json!({"sessions": serde_json::to_value(sessions)
                         .unwrap_or_else(|_| Value::Array(Vec::new()))}),
                 ),
-                Err(error) => responder.json(503, json!({"error": error.to_string()})),
+                Err(error) => engine_error(responder, metrics, error),
             }
         }
         ("GET", _) if path.starts_with("/v1/sessions/") => {
@@ -2233,7 +2359,7 @@ fn serve_request(
                     200,
                     serde_json::to_value(detail).unwrap_or_else(|_| json!({})),
                 ),
-                Err(error) => responder.json(503, json!({"error": error.to_string()})),
+                Err(error) => engine_error(responder, metrics, error),
             }
         }
         ("POST", "/v1/annotations") => {
@@ -2264,7 +2390,7 @@ fn serve_request(
             }
             match engine.annotate(annotation) {
                 Ok(()) => responder.json(200, json!({"recorded": true})),
-                Err(error) => engine_error(responder, error),
+                Err(error) => engine_error(responder, metrics, error),
             }
         }
         ("GET", "/v1/annotations") => {
@@ -2357,7 +2483,9 @@ fn serve_request(
                     responder.raw(&head, &bytes)
                 }
                 Ok(None) => responder.json(404, json!({"error": "payload not found"})),
-                Err(error) => responder.json(503, json!({"error": error.to_string()})),
+                // Through engine_error for the deadline case: a bound
+                // fetch's reachability probe runs under the compute budget.
+                Err(error) => engine_error(responder, metrics, error),
             }
         }
         ("GET", "/v1/export") => {
@@ -2426,7 +2554,7 @@ fn serve_request(
                             .unwrap_or_else(|_| Value::Array(Vec::new()))}),
                     )
                 }
-                Err(error) => responder.json(503, json!({"error": error.to_string()})),
+                Err(error) => engine_error(responder, metrics, error),
             }
         }
         ("GET", "/v1/stats/series") => {
@@ -2457,7 +2585,7 @@ fn serve_request(
                     200,
                     serde_json::to_value(series).unwrap_or_else(|_| json!({})),
                 ),
-                Err(error) => responder.json(503, json!({"error": error.to_string()})),
+                Err(error) => engine_error(responder, metrics, error),
             }
         }
         ("GET", "/v1/stats/duration") => {
@@ -2492,7 +2620,7 @@ fn serve_request(
                             .collect::<Vec<_>>(),
                     }),
                 ),
-                Err(error) => responder.json(503, json!({"error": error.to_string()})),
+                Err(error) => engine_error(responder, metrics, error),
             }
         }
         ("GET", "/v1/stats/failures") => {
@@ -2510,7 +2638,7 @@ fn serve_request(
                     200,
                     serde_json::to_value(report).unwrap_or_else(|_| json!({})),
                 ),
-                Err(error) => responder.json(503, json!({"error": error.to_string()})),
+                Err(error) => engine_error(responder, metrics, error),
             }
         }
         ("GET", "/v1/stats/slowest") => {
@@ -2529,7 +2657,7 @@ fn serve_request(
                     json!({"spans": serde_json::to_value(spans)
                         .unwrap_or_else(|_| Value::Array(Vec::new()))}),
                 ),
-                Err(error) => responder.json(503, json!({"error": error.to_string()})),
+                Err(error) => engine_error(responder, metrics, error),
             }
         }
         // Per-tenant usage accounting: an exact fold over one snapshot,
@@ -2540,7 +2668,7 @@ fn serve_request(
                 json!({"tenants": serde_json::to_value(rows)
                     .unwrap_or_else(|_| Value::Array(Vec::new()))}),
             ),
-            Err(error) => responder.json(503, json!({"error": error.to_string()})),
+            Err(error) => engine_error(responder, metrics, error),
         },
         // ------------------------------------------------------- evals
         // The eval entity model: datasets → versions (immutable,
@@ -2570,7 +2698,7 @@ fn serve_request(
             };
             match engine.create_dataset(&tenant, &body.name) {
                 Ok(dataset_id) => responder.json(200, json!({"dataset_id": dataset_id})),
-                Err(error) => engine_error(responder, error),
+                Err(error) => engine_error(responder, metrics, error),
             }
         }
         ("GET", "/v1/datasets") => {
@@ -2616,7 +2744,7 @@ fn serve_request(
                     200,
                     json!({"tombstoned": true, "already": !created, "version_id": version_id}),
                 ),
-                Err(error) => engine_error(responder, error),
+                Err(error) => engine_error(responder, metrics, error),
             }
         }
         ("POST", path) if path.starts_with("/v1/datasets/") && path.ends_with("/versions") => {
@@ -2647,7 +2775,7 @@ fn serve_request(
                     200,
                     serde_json::to_value(&outcome).unwrap_or_else(|_| json!({})),
                 ),
-                Err(error) => engine_error(responder, error),
+                Err(error) => engine_error(responder, metrics, error),
             }
         }
         ("GET", path) if path.starts_with("/v1/datasets/") && path.contains("/versions/") => {
@@ -2714,7 +2842,7 @@ fn serve_request(
                 body.config,
             ) {
                 Ok(experiment_id) => responder.json(200, json!({"experiment_id": experiment_id})),
-                Err(error) => engine_error(responder, error),
+                Err(error) => engine_error(responder, metrics, error),
             }
         }
         ("GET", "/v1/experiments") => {
@@ -2809,7 +2937,7 @@ fn serve_request(
                 &body.span_id,
             ) {
                 Ok(()) => responder.json(200, json!({"recorded": true})),
-                Err(error) => engine_error(responder, error),
+                Err(error) => engine_error(responder, metrics, error),
             }
         }
         ("GET", path) if path.starts_with("/v1/experiments/") && path.ends_with("/runs") => {
@@ -2889,6 +3017,14 @@ fn serve_request(
                 ),
                 Err(error) => responder.json(503, json!({"error": error.to_string()})),
             }
+        }
+        // A deliberate, externally reachable panic, for proving the slot
+        // guard releases on unwind. The guard is the startup latch and only
+        // the startup latch — never anything the request carries — so a
+        // production process (the latch unset) 404s here byte-identically
+        // to before the route existed.
+        ("GET", "/v1/test-panic") if TEST_PANIC.get().copied().unwrap_or(false) => {
+            panic!("deliberate panic: TRAZA_TEST_PANIC route exercised")
         }
         _ => responder.json(404, json!({"error": "not found"})),
     }

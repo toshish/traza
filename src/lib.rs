@@ -482,6 +482,57 @@ pub struct QueryCost {
     pub elapsed_ns: u64,
 }
 
+/// Decoded records between deadline checks on the per-offset loops.
+///
+/// Small enough that the budget overshoots by at most a few thousand decodes
+/// — single-digit milliseconds — large enough that the clock read disappears
+/// into the decode cost it is amortized over.
+pub(crate) const DEADLINE_CHECK_INTERVAL: usize = 4096;
+
+/// One request's compute budget: [`Config::query_deadline`] anchored at the
+/// instant the request entered the engine.
+///
+/// Threaded as an explicit parameter, per the same doctrine as the free query
+/// functions' other arguments — a budget hidden in a context struct would not
+/// show which paths are bounded and which are exempt. It carries its anchor
+/// alongside the deadline because the refusal must say how long the request
+/// actually ran, which the deadline instant alone cannot.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Deadline {
+    /// When the request entered the engine.
+    started: Instant,
+    /// The instant past which the request refuses to keep working.
+    at: Instant,
+}
+
+impl Deadline {
+    /// `budget` anchored at `started`, or `None` when no budget is
+    /// configured — the no-op every check site tests for first.
+    fn starting(started: Instant, budget: Option<std::time::Duration>) -> Option<Self> {
+        budget.map(|budget| Self {
+            started,
+            at: started + budget,
+        })
+    }
+
+    /// Errs once the deadline has passed; a `None` deadline never does.
+    /// `segments_examined` is whatever the caller has counted so far —
+    /// reporting for the refusal's message, not accounting.
+    pub(crate) fn check(deadline: Option<Self>, segments_examined: u32) -> Result<()> {
+        let Some(deadline) = deadline else {
+            return Ok(());
+        };
+        if Instant::now() < deadline.at {
+            return Ok(());
+        }
+        Err(Error::DeadlineExceeded(format!(
+            "{} ms elapsed, {segments_examined} segments examined; narrow the filter — \
+             a time range, a service, or an attribute — or raise --query-deadline-ms",
+            deadline.started.elapsed().as_millis(),
+        )))
+    }
+}
+
 /// What an acknowledged write guarantees.
 ///
 /// The mode is the store's contract with its clients, so it is chosen per
@@ -781,6 +832,20 @@ pub struct Config {
     /// so that the measurement is possible: with it, the same corpus can be
     /// queried with and without the index and the difference attributed.
     pub content_index: bool,
+    /// Wall-clock budget one query or aggregation may spend inside the
+    /// engine, or `None` (the default) for the unbounded behaviour every
+    /// embedder had before this existed.
+    ///
+    /// Checked at segment boundaries and every few thousand decoded records,
+    /// so enforcement costs a clock read amortized over real work. A request
+    /// that exhausts the budget gets [`Error::DeadlineExceeded`] and no rows
+    /// — never a partial aggregate, which would be a wrong answer that looks
+    /// like a right one, the same refusal [`Error::QueryTooBroad`] makes.
+    /// Ingest, the live tail (ring-bounded), snapshot exports (documented
+    /// unbounded; the socket write timeout bounds abandonment), and erasure
+    /// work (a partial receipt is worse than a slow one) are deliberately
+    /// outside it.
+    pub query_deadline: Option<std::time::Duration>,
     /// Spans retained in the live tail's admission ring (see [`tail`]).
     ///
     /// Whichever of this and [`Self::tail_ring_bytes`] binds first decides how
@@ -906,6 +971,7 @@ impl Default for Config {
             compaction: Some(CompactionConfig::default()),
             wal_commit_window: None,
             content_index: true,
+            query_deadline: None,
             tail_ring_spans: DEFAULT_TAIL_RING_SPANS,
             tail_ring_bytes: DEFAULT_TAIL_RING_BYTES,
             pricing: std::sync::Arc::new(crate::pricing::Pricing::default()),
@@ -974,6 +1040,12 @@ pub enum Error {
     /// than answered approximately: a truncated ranking is a wrong answer
     /// that looks like a right one.
     QueryTooBroad(String),
+    /// A query spent more wall-clock time inside the engine than
+    /// [`Config::query_deadline`] allows. Refused whole rather than answered
+    /// partially: an aggregate over whatever spans the budget happened to
+    /// reach would be a wrong answer that looks like a right one, so `Err`
+    /// is the only exhaustion signal there is.
+    DeadlineExceeded(String),
     /// The write-ahead log is damaged somewhere other than its final append,
     /// so recovering the prefix would silently drop acknowledged batches that
     /// come after the damage. Refusing to open is the only honest answer.
@@ -1005,6 +1077,7 @@ impl fmt::Display for Error {
             Self::LockPoisoned(name) => write!(f, "storage lock poisoned: {name}"),
             Self::InvalidSpan(reason) => write!(f, "invalid span: {reason}"),
             Self::QueryTooBroad(reason) => write!(f, "query too broad: {reason}"),
+            Self::DeadlineExceeded(detail) => write!(f, "query deadline exceeded: {detail}"),
             Self::UnsupportedFilter(reason) => write!(f, "unsupported filter: {reason}"),
             Self::WalCorrupt(detail) => write!(f, "write-ahead log is corrupt: {detail}"),
             Self::Invalid(reason) => write!(f, "invalid request: {reason}"),
@@ -1022,6 +1095,7 @@ impl StdError for Error {
             | Self::LockPoisoned(_)
             | Self::InvalidSpan(_)
             | Self::QueryTooBroad(_)
+            | Self::DeadlineExceeded(_)
             | Self::WalCorrupt(_)
             | Self::UnsupportedFilter(_)
             | Self::Invalid(_)
@@ -2512,6 +2586,25 @@ impl Store {
     /// uses: a subject resolved without the scope could record another
     /// tenant's newer same-id span and miss its own.
     pub fn get_trace_in(&self, tenant: Option<&str>, trace_id: &str) -> Result<Vec<Span>> {
+        // Anchored here, at the public entry, like every other budgeted
+        // path; the erasure resolver reaches the worker below directly with
+        // no budget at all.
+        let deadline = self.query_deadline(Instant::now());
+        self.trace_spans_in(tenant, trace_id, deadline)
+    }
+
+    /// [`Self::get_trace_in`] under an explicit budget. One trace is usually
+    /// one conversation, but the id is caller-controlled and the walk holds
+    /// BOTH engine locks while decoding every posting in every segment, so
+    /// the lookup is budgeted like any other query. Erasure subject
+    /// resolution passes `None`: a receipt that fails on a compute budget is
+    /// an erasure that did not happen, which is worse than a slow one.
+    fn trace_spans_in(
+        &self,
+        tenant: Option<&str>,
+        trace_id: &str,
+        deadline: Option<Deadline>,
+    ) -> Result<Vec<Span>> {
         let mask = self.erasure_mask();
         let writer = self.lock_writer()?;
         let segments = self.lock_segments()?;
@@ -2526,8 +2619,22 @@ impl Store {
         // entry even in the operator view.
         let mut latest: std::collections::HashMap<(String, String), Span> =
             std::collections::HashMap::new();
+        let mut segments_examined: u32 = 0;
+        let mut decoded_since_check: usize = 0;
         for segment in segments.iter() {
+            Deadline::check(deadline, segments_examined)?;
+            segments_examined += 1;
+            // `trace_spans` decodes one segment's whole posting before the
+            // per-record counter sees it, so the un-checked stretch is one
+            // segment's posting — the same granularity as the supersede
+            // walk — and the per-4096 check below bounds a single giant
+            // trace spread across the accumulation loop.
             for span in segment.trace_spans(trace_id)? {
+                decoded_since_check += 1;
+                if decoded_since_check >= DEADLINE_CHECK_INTERVAL {
+                    decoded_since_check = 0;
+                    Deadline::check(deadline, segments_examined)?;
+                }
                 if in_scope(&span) {
                     latest.insert((span.tenant.clone(), span.span_id.clone()), span);
                 }
@@ -2578,12 +2685,21 @@ impl Store {
         &self,
         keys: &[&str],
         values: &[Value],
+        deadline: Option<Deadline>,
     ) -> Result<Vec<Span>> {
         let mask = self.erasure_mask();
         // Lock order: writer before segments (see Store field docs).
         let writer = self.lock_writer()?;
         let segments = self.lock_segments()?;
-        attribute_union_view(&writer, &segments, keys, values, mask.as_deref())
+        attribute_union_view(&writer, &segments, keys, values, mask.as_deref(), deadline)
+    }
+
+    /// The configured compute budget anchored at `started`, or `None` when
+    /// [`Config::query_deadline`] is unset. Computed once at each public
+    /// query entry, so one budget covers the whole request — the sort path's
+    /// unlimited re-run and the session union included.
+    fn query_deadline(&self, started: Instant) -> Option<Deadline> {
+        Deadline::starting(started, self.config.query_deadline)
     }
 
     /// Returns spans matching `filter` strictly after `cursor`.
@@ -2600,11 +2716,13 @@ impl Store {
         filter: &SpanFilter,
         cursor: Option<&SpanCursor>,
     ) -> Result<Vec<Span>> {
+        let deadline = self.query_deadline(Instant::now());
         // A session predicate unions candidates across recognized keys, which
         // the single-key attribute index cannot express — resolve it up front,
         // then apply the remaining predicates, order, and limit.
         if let Some(session_id) = &filter.session {
-            let spans = self.resolve_session_spans(filter.tenant.as_deref(), session_id)?;
+            let spans =
+                self.resolve_session_spans(filter.tenant.as_deref(), session_id, deadline)?;
             return Ok(narrow_session_spans(spans, filter, cursor));
         }
         let mask = self.erasure_mask();
@@ -2618,6 +2736,7 @@ impl Store {
             filter,
             cursor,
             mask.as_deref(),
+            deadline,
         )
     }
 
@@ -2633,9 +2752,11 @@ impl Store {
         cursor: Option<&SpanCursor>,
     ) -> Result<(Vec<Span>, QueryCost)> {
         let started = std::time::Instant::now();
+        let deadline = self.query_deadline(started);
         let mut cost = QueryCost::default();
         let spans = if let Some(session_id) = &filter.session {
-            let spans = self.resolve_session_spans(filter.tenant.as_deref(), session_id)?;
+            let spans =
+                self.resolve_session_spans(filter.tenant.as_deref(), session_id, deadline)?;
             narrow_session_spans(spans, filter, cursor)
         } else {
             let mask = self.erasure_mask();
@@ -2649,6 +2770,7 @@ impl Store {
                 filter,
                 cursor,
                 mask.as_deref(),
+                deadline,
                 &mut cost,
             )?
         };
@@ -2729,6 +2851,12 @@ impl SnapshotView<'_> {
     /// Spans matching `filter` strictly after `cursor`, in Traza's stable span
     /// order. Paging through a view with this is what makes a multi-page read
     /// one coherent dataset.
+    ///
+    /// Never deadline-bounded, whatever [`Config::query_deadline`] says: the
+    /// callers that page a view are the documented-unbounded streams (export
+    /// most of all), where abandonment is bounded by the socket write timeout
+    /// and a mid-stream refusal would truncate a dataset that already said
+    /// `200`.
     pub fn query_after(
         &self,
         filter: &SpanFilter,
@@ -2752,6 +2880,7 @@ impl SnapshotView<'_> {
             filter,
             cursor,
             self.mask.as_deref(),
+            None,
         )
     }
 
@@ -2759,9 +2888,14 @@ impl SnapshotView<'_> {
     ///
     /// A view holds no engine lock, so a scan of the whole corpus runs
     /// alongside ingest instead of blocking it. See [`Store::fold_spans`].
+    ///
+    /// `deadline` is the caller's budget: [`Store::fold_spans`] passes its
+    /// own, the erasure paths pass `None` — a partial receipt is worse than
+    /// a slow one.
     pub(crate) fn fold(
         &self,
         filter: &SpanFilter,
+        deadline: Option<Deadline>,
         cost: &mut QueryCost,
         visit: &mut impl FnMut(&Span),
     ) -> Result<()> {
@@ -2772,6 +2906,7 @@ impl SnapshotView<'_> {
             &self.pricing,
             filter,
             self.mask.as_deref(),
+            deadline,
             cost,
             visit,
         )
@@ -2812,6 +2947,7 @@ pub(crate) fn attribute_union_view(
     keys: &[&str],
     values: &[Value],
     mask: Option<&erasure::Mask>,
+    deadline: Option<Deadline>,
 ) -> Result<Vec<Span>> {
     let visible = |span: &Span| mask.map_or(true, |mask| !mask.covers(span));
     let matches = |span: &Span| {
@@ -2842,7 +2978,11 @@ pub(crate) fn attribute_union_view(
         claimed.insert(key.clone());
     }
     // Newest segment first, so the first version claimed for a key wins.
+    let mut segments_examined: u32 = 0;
+    let mut decoded_since_check: usize = 0;
     for segment in segments.iter().rev() {
+        Deadline::check(deadline, segments_examined)?;
+        segments_examined += 1;
         let seg = &segment.seg;
         let mut offsets: Vec<u64> = Vec::new();
         for key in keys {
@@ -2856,6 +2996,11 @@ pub(crate) fn attribute_union_view(
         offsets.sort_unstable();
         offsets.dedup();
         for offset in offsets {
+            decoded_since_check += 1;
+            if decoded_since_check >= DEADLINE_CHECK_INTERVAL {
+                decoded_since_check = 0;
+                Deadline::check(deadline, segments_examined)?;
+            }
             let record = seg.record_at_offset(offset).map_err(segment_error)?;
             let span = record_to_span(&record)?;
             // An index accelerates a filter, it never changes it.
@@ -2890,15 +3035,26 @@ pub(crate) fn attribute_union_view(
 /// The probe on a hit is not optional (see invariant 7, "an index accelerates
 /// a filter; it never changes it"): dropping a span on hash membership alone
 /// would let a collision delete a live row.
+///
+/// `deadline` is the calling request's budget, checked once per newer
+/// segment: `key_hashes` on a sidecar miss fully parses that segment, so
+/// without the check here the un-checked stretch between two of the caller's
+/// own check sites was every newer segment's parse — O(corpus). With it the
+/// stretch is one segment's parse, the same granularity as everywhere else.
+/// `segments_examined` is the caller's running count, passed through for the
+/// refusal's message only.
 fn superseded_by_newer(
     segments: &[std::sync::Arc<Segment>],
     position: usize,
     span: &Span,
     metrics: &metrics::Metrics,
     pricing: &crate::pricing::Pricing,
+    deadline: Option<Deadline>,
+    segments_examined: u32,
 ) -> Result<bool> {
     let hash = analytics::key_hash(&span.tenant, &span.trace_id, &span.span_id);
     for newer in segments.iter().skip(position + 1) {
+        Deadline::check(deadline, segments_examined)?;
         if !newer.key_hashes(pricing)?.contains(&hash) {
             continue;
         }
@@ -2917,6 +3073,8 @@ fn superseded_by_newer(
 /// The caller decides what "one set" means — the live store holds both locks
 /// across the call, a [`SnapshotView`] owns its copy — but it must be still
 /// for the duration either way. See invariant 6 in docs/internals/invariants.md.
+// Eight, for the same reason `query_view_costed` gives for its nine.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn query_view(
     writer: &WriteBuffer,
     segments: &[std::sync::Arc<Segment>],
@@ -2925,6 +3083,7 @@ pub(crate) fn query_view(
     filter: &SpanFilter,
     cursor: Option<&SpanCursor>,
     mask: Option<&erasure::Mask>,
+    deadline: Option<Deadline>,
 ) -> Result<Vec<Span>> {
     query_view_costed(
         writer,
@@ -2934,6 +3093,7 @@ pub(crate) fn query_view(
         filter,
         cursor,
         mask,
+        deadline,
         &mut QueryCost::default(),
     )
 }
@@ -2943,11 +3103,12 @@ pub(crate) fn query_view(
 /// The process-wide counters cannot answer this: several readers share them,
 /// so a before/after difference attributes another thread's work to this query.
 /// The cost is accumulated on the stack instead, which is free.
-// Eight, because these are the store's dependencies passed explicitly rather
+// Nine, because these are the store's dependencies passed explicitly rather
 // than a `&Store` these free functions deliberately do not take — the write
-// buffer, the segments, the metrics, and now the rate table the rollups they
-// build must bind to. Bundling them into a context struct would hide which of
-// them each path actually touches, which is the property this shape has.
+// buffer, the segments, the metrics, the rate table the rollups they build
+// must bind to, and now the request's compute budget. Bundling them into a
+// context struct would hide which of them each path actually touches, which
+// is the property this shape has.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn query_view_costed(
     writer: &WriteBuffer,
@@ -2957,6 +3118,7 @@ pub(crate) fn query_view_costed(
     filter: &SpanFilter,
     cursor: Option<&SpanCursor>,
     mask: Option<&erasure::Mask>,
+    deadline: Option<Deadline>,
     cost: &mut QueryCost,
 ) -> Result<Vec<Span>> {
     // A pending erasure hides its subject from every read path, and it hides
@@ -2974,8 +3136,10 @@ pub(crate) fn query_view_costed(
             sort: None,
             ..filter.clone()
         };
+        // The re-run inherits the SAME deadline, so one budget covers the
+        // whole request rather than restarting at the recursion.
         let mut spans = query_view_costed(
-            writer, segments, metrics, pricing, &unlimited, cursor, mask, cost,
+            writer, segments, metrics, pricing, &unlimited, cursor, mask, deadline, cost,
         )?;
         if spans.len() > SORT_CANDIDATE_LIMIT {
             return Err(Error::QueryTooBroad(format!(
@@ -3045,6 +3209,7 @@ pub(crate) fn query_view_costed(
             }
             let mut sources: Vec<(Source<'_>, usize)> = vec![(Source::Parsed(buffered), 0)];
             for (segment_position, segment) in segments.iter().enumerate() {
+                Deadline::check(deadline, cost.segments_examined)?;
                 let seg = &segment.seg;
                 // Skip whole segments that cannot hold a matching timestamp.
                 // This is the only filter that eliminates a segment without
@@ -3112,6 +3277,11 @@ pub(crate) fn query_view_costed(
             let mut emitted: std::collections::HashSet<(String, String, String)> =
                 std::collections::HashSet::new();
             while result.len() < limit {
+                // Checked per head, not per segment: when every head fails
+                // `span_matches` this loop runs unbounded past `limit` — it
+                // is the dominant loop for a selective filter, and a check
+                // only at the sources would never see it.
+                Deadline::check(deadline, cost.segments_examined)?;
                 let mut best: Option<usize> = None;
                 for (index, head) in heads.iter().enumerate() {
                     if let Some(head) = head {
@@ -3163,6 +3333,8 @@ pub(crate) fn query_view_costed(
                                 &span,
                                 metrics,
                                 pricing,
+                                deadline,
+                                cost.segments_examined,
                             )?
                     }
                 };
@@ -3186,7 +3358,9 @@ pub(crate) fn query_view_costed(
         // that check is safe — a superseded older version is dropped either
         // way, and the version that currently holds the key is never
         // superseded by definition.
+        let mut decoded_since_check: usize = 0;
         for (position, segment) in segments.iter().enumerate() {
+            Deadline::check(deadline, cost.segments_examined)?;
             let seg = &segment.seg;
             metrics.segments_examined.increment();
             cost.segments_examined += 1;
@@ -3205,6 +3379,11 @@ pub(crate) fn query_view_costed(
             }
             let offsets = select_probe(seg, filter, content.as_ref(), metrics)?;
             for offset in offsets.iter() {
+                decoded_since_check += 1;
+                if decoded_since_check >= DEADLINE_CHECK_INTERVAL {
+                    decoded_since_check = 0;
+                    Deadline::check(deadline, cost.segments_examined)?;
+                }
                 let record = seg.record_at_offset(*offset).map_err(segment_error)?;
                 let span = record_to_span(&record)?;
                 if !visible(&span)
@@ -3216,7 +3395,15 @@ pub(crate) fn query_view_costed(
                 if writer.contains_key(&span.tenant, &span.trace_id, &span.span_id) {
                     continue; // the buffer holds a newer version
                 }
-                if !superseded_by_newer(segments, position, &span, metrics, pricing)? {
+                if !superseded_by_newer(
+                    segments,
+                    position,
+                    &span,
+                    metrics,
+                    pricing,
+                    deadline,
+                    cost.segments_examined,
+                )? {
                     result.push(span);
                 }
             }
@@ -3247,11 +3434,12 @@ pub(crate) fn query_view_costed(
 ///
 /// Primary-key precedence matches the query path exactly: a candidate is
 /// dropped if the write buffer or any newer segment also holds its key.
-// Eight, because these are the store's dependencies passed explicitly rather
+// Nine, because these are the store's dependencies passed explicitly rather
 // than a `&Store` these free functions deliberately do not take — the write
-// buffer, the segments, the metrics, and now the rate table the rollups they
-// build must bind to. Bundling them into a context struct would hide which of
-// them each path actually touches, which is the property this shape has.
+// buffer, the segments, the metrics, the rate table the rollups they build
+// must bind to, and now the request's compute budget. Bundling them into a
+// context struct would hide which of them each path actually touches, which
+// is the property this shape has.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn fold_view(
     writer: &WriteBuffer,
@@ -3260,6 +3448,7 @@ pub(crate) fn fold_view(
     pricing: &crate::pricing::Pricing,
     filter: &SpanFilter,
     mask: Option<&erasure::Mask>,
+    deadline: Option<Deadline>,
     cost: &mut QueryCost,
     visit: &mut impl FnMut(&Span),
 ) -> Result<()> {
@@ -3270,7 +3459,9 @@ pub(crate) fn fold_view(
     // tokenizer runs per call, and running it per segment would put it on the
     // hot loop of every aggregation.
     let content = filter.content.as_deref().map(content::Query::new);
+    let mut decoded_since_check: usize = 0;
     for (position, segment) in segments.iter().enumerate() {
+        Deadline::check(deadline, cost.segments_examined)?;
         let seg = &segment.seg;
         metrics.segments_examined.increment();
         cost.segments_examined += 1;
@@ -3293,6 +3484,11 @@ pub(crate) fn fold_view(
         }
         let offsets = select_probe(seg, filter, content.as_ref(), metrics)?;
         for offset in offsets.iter() {
+            decoded_since_check += 1;
+            if decoded_since_check >= DEADLINE_CHECK_INTERVAL {
+                decoded_since_check = 0;
+                Deadline::check(deadline, cost.segments_examined)?;
+            }
             let record = seg.record_at_offset(*offset).map_err(segment_error)?;
             let span = record_to_span(&record)?;
             if !visible(&span) || !span_matches(&span, filter, content.as_ref()) {
@@ -3301,7 +3497,15 @@ pub(crate) fn fold_view(
             if writer.contains_key(&span.tenant, &span.trace_id, &span.span_id) {
                 continue; // the buffer holds a newer version
             }
-            if !superseded_by_newer(segments, position, &span, metrics, pricing)? {
+            if !superseded_by_newer(
+                segments,
+                position,
+                &span,
+                metrics,
+                pricing,
+                deadline,
+                cost.segments_examined,
+            )? {
                 visit(&span);
             }
         }
@@ -3334,20 +3538,23 @@ impl Store {
         mut visit: impl FnMut(&Span),
     ) -> Result<QueryCost> {
         let started = std::time::Instant::now();
+        let deadline = self.query_deadline(started);
         let mut cost = QueryCost::default();
         if let Some(session_id) = &filter.session {
             // A session unions several attribute keys, which no single index
             // expresses. Its span count is bounded by one conversation, so
             // resolving it up front costs a conversation, not a corpus.
             let content = filter.content.as_deref().map(content::Query::new);
-            for span in self.resolve_session_spans(filter.tenant.as_deref(), session_id)? {
+            for span in
+                self.resolve_session_spans(filter.tenant.as_deref(), session_id, deadline)?
+            {
                 if span_matches(&span, filter, content.as_ref()) {
                     visit(&span);
                 }
             }
         } else {
             let view = self.snapshot()?; // takes both locks, then releases them
-            view.fold(filter, &mut cost, &mut visit)?;
+            view.fold(filter, deadline, &mut cost, &mut visit)?;
         }
         cost.elapsed_ns = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
         Ok(cost)
@@ -3517,10 +3724,15 @@ impl Store {
         // tenant's own SPANS hold (the eval-side half is checked inside the
         // log's mutex, where its state is consistent). Computed out here
         // because it reads the buffer and pinned segments, and the eval
-        // mutex is a leaf that must not reach into engine locks.
+        // mutex is a leaf that must not reach into engine locks. Being a
+        // precompute is also what makes the budget below safe: a refused
+        // probe returns before `create_version` runs, so no write lands.
         let spans_hold = match scope {
             None => None,
             Some(tenant) => {
+                // One budget across every probe this request performs,
+                // anchored where the probing starts.
+                let deadline = self.query_deadline(Instant::now());
                 let mut wanted: std::collections::HashSet<String> =
                     std::collections::HashSet::new();
                 for example in &examples {
@@ -3533,7 +3745,7 @@ impl Store {
                 }
                 let mut held: std::collections::HashSet<String> = std::collections::HashSet::new();
                 for reference in wanted {
-                    if self.tenant_spans_hold_reference(tenant, &reference)? {
+                    if self.tenant_spans_hold_reference(tenant, &reference, deadline)? {
                         held.insert(reference);
                     }
                 }
@@ -3885,7 +4097,13 @@ impl Store {
             }
         }
         if let Some(tenant) = tenant {
-            if !self.tenant_holds_reference(tenant, reference)? {
+            // The reachability probe can decode a tenant's every record in a
+            // sidecar-less segment, per request, so it runs under the same
+            // budget as any other query — anchored here, at the public
+            // entry. Erasure work never reaches this probe: its accounting
+            // reads mask-free through `tenant_span_payload_refs`.
+            let deadline = self.query_deadline(Instant::now());
+            if !self.tenant_holds_reference(tenant, reference, deadline)? {
                 return Ok(None);
             }
         }
@@ -3925,8 +4143,16 @@ impl Store {
 
     /// Whether any of `tenant`'s spans or dataset examples carries
     /// `reference` — the reachability proof behind [`Self::payload_in`].
-    fn tenant_holds_reference(&self, tenant: &str, reference: &str) -> Result<bool> {
-        if self.tenant_spans_hold_reference(tenant, reference)? {
+    ///
+    /// `deadline` is the calling request's budget; it bounds the span-side
+    /// scan, not the eval-log lookup, whose size is one tenant's datasets.
+    fn tenant_holds_reference(
+        &self,
+        tenant: &str,
+        reference: &str,
+        deadline: Option<Deadline>,
+    ) -> Result<bool> {
+        if self.tenant_spans_hold_reference(tenant, reference, deadline)? {
             return Ok(true);
         }
         // The tenant's dataset examples: an example legitimately outlives
@@ -3937,7 +4163,17 @@ impl Store {
     /// The span-side half of [`Self::tenant_holds_reference`]: buffer and
     /// segments only, no eval-log locks — callable while building inputs
     /// for an eval mutation that will hold the eval mutex itself.
-    fn tenant_spans_hold_reference(&self, tenant: &str, reference: &str) -> Result<bool> {
+    ///
+    /// A segment without a usable sidecar cannot be prefiltered, so this can
+    /// decode a tenant's every record in it — which is why the walk runs
+    /// under the caller's `deadline`, checked per segment and every few
+    /// thousand decoded records like every other budgeted path.
+    fn tenant_spans_hold_reference(
+        &self,
+        tenant: &str,
+        reference: &str,
+        deadline: Option<Deadline>,
+    ) -> Result<bool> {
         // The write buffer first: cheap, and where the freshest refs live.
         {
             let writer = self.lock_writer()?;
@@ -3953,7 +4189,11 @@ impl Store {
         }
         // Segments, doubly prefiltered: only segments whose sidecar holds
         // the reference at all, and within them only the tenant's records.
+        let mut segments_examined: u32 = 0;
+        let mut decoded_since_check: usize = 0;
         for segment in self.pin_segments()? {
+            Deadline::check(deadline, segments_examined)?;
+            segments_examined += 1;
             let may_hold = match rollup_file::load(
                 &segment.path,
                 segment.rollup_binding(self.pricing_fingerprint()),
@@ -3979,6 +4219,11 @@ impl Store {
                     .to_vec()
             };
             for offset in offsets {
+                decoded_since_check += 1;
+                if decoded_since_check >= DEADLINE_CHECK_INTERVAL {
+                    decoded_since_check = 0;
+                    Deadline::check(deadline, segments_examined)?;
+                }
                 let record = segment
                     .seg
                     .record_at_offset(offset)
@@ -5515,20 +5760,23 @@ impl Store {
     /// would then have nothing to catch a re-delivery against.
     fn resolve_subject(&self, subject: &erasure::Subject) -> Result<ResolvedSubject> {
         let spans: Vec<Span> = match subject {
+            // No deadline on any arm here: an erasure that fails on a
+            // compute budget is an erasure that did not happen, which is
+            // worse than a slow one.
             erasure::Subject::Trace { trace_id, tenant } => {
-                self.get_trace_in(Some(tenant), trace_id)?
+                self.trace_spans_in(Some(tenant), trace_id, None)?
             }
             erasure::Subject::Span {
                 trace_id,
                 span_id,
                 tenant,
             } => self
-                .get_trace_in(Some(tenant), trace_id)?
+                .trace_spans_in(Some(tenant), trace_id, None)?
                 .into_iter()
                 .filter(|span| span.span_id == *span_id)
                 .collect(),
             erasure::Subject::Session { session_id, tenant } => {
-                self.resolve_session_spans(Some(tenant), session_id)?
+                self.resolve_session_spans(Some(tenant), session_id, None)?
             }
             // A tenant's span set is unbounded, and the mask covers it by
             // predicate. Resolving it into the record would serialize the
@@ -5544,6 +5792,7 @@ impl Store {
                 let view = self.snapshot()?;
                 view.fold(
                     &SpanFilter::default(),
+                    None, // erasure work is never deadline-bounded
                     &mut QueryCost::default(),
                     &mut |span| {
                         if erasure::payload_unredacted(span, reference) {

@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`--query-deadline-ms`** (default 30000, `0` disables): a wall-clock budget
+  one query or aggregation may spend inside the engine, checked at segment
+  boundaries and every few thousand decoded records. Past it the request
+  answers `400 {"error":"query deadline exceeded: ..."}` with no rows — the
+  refusal that stops one runaway scan (an unindexable content search, a
+  whole-corpus fold) from holding a handler thread for minutes, and never a
+  partial aggregate, because a partial answer would look complete. **A `200`
+  still means what it meant** — every answer served is still the whole answer
+  — and durability is untouched: ingest, the tail, exports (bounded by the
+  socket timeout), and erasure work are all exempt. The worst measured
+  legitimate query in this repo is ~3 s, so the default never touches
+  measured use. `traza_query_deadline_exceeded_total` counts the HTTP
+  refusals; an MCP tool that exhausts the budget surfaces the refusal in its
+  tool result instead, uncounted.
+  - Library surface: **`Config::query_deadline`** is a new field (`None` —
+    the unbounded behaviour every embedder had — by default; a `Config`
+    built by struct literal must add it, `..Config::default()` need not),
+    and **`Error::DeadlineExceeded`** is a new variant of the exhaustive
+    `Error` enum, so a downstream exhaustive `match` must add an arm.
+
 - **A demo tour in `examples/` — six scripted proofs, one claim each.** Five
   new demos join `mcp-demo`, and [`examples/README.md`](examples/README.md)
   indexes the tour: `swarm` streams a simulated agent platform into a live
@@ -79,62 +99,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shape real frameworks emit, and it carries no declared outcome and no retry
   link — so finding it proves the analysis works on what a real pipeline
   sends.
-
-### Fixed
-
-- **Two documentation claims that were not true of the code.** The OTLP mapping
-  table said "other resource and scope attributes" were merged beneath span
-  attributes. Scope attributes are; **resource attributes are discarded** —
-  only `service.name` and `traza.tenant` are read — so
-  `deployment.environment`, `service.version`, `host.name` and `k8s.*` never
-  reach the store and cannot be filtered on. The table now says so, names the
-  workaround (copy them onto spans in an SDK processor or a Collector
-  `transform`), and an OTLP conformance assertion pins the behaviour so the
-  page cannot drift from it again. Separately, the MCP tool table billed
-  `record_annotation` as "Score this trace"; it writes a trace/span annotation
-  and cannot address an `(experiment, example)` pair, which is what a score is.
-  The MCP guide now states that and that the eval entities are HTTP-only.
-
-- **A promotion could read across a tenant boundary.** `promote_failures_to_dataset`
-  pinned the tenant it wrote but not the tenants it read: an unbound credential
-  resolves a session across every tenant, so naming one tenant's session copied
-  its span attributes and provenance into a default-tenant dataset — and a
-  promoted example deliberately outlives its source, so erasing that tenant
-  afterwards left the copy standing, permanently outside the reach of the
-  erasure that should own it. Every read the tool makes is now scoped to the
-  tenant being written (`Some("")` being the default tenant *named*, not the
-  absence of a scope). Diagnosis is unchanged: an operator may still read any
-  session, and simply cannot copy one out of its tenant.
-- **Prompt-cache counters were recognized under one spelling.** OpenLLMetry
-  moved them to dotted segment names (`gen_ai.usage.cache_read.input_tokens`,
-  `gen_ai.usage.cache_creation.input_tokens`) to match OTel GenAI, and only the
-  older underscore forms were read — so on a cached Anthropic agent, the exact
-  configuration this field exists for, the detector fell back to the uncached
-  remainder and reported a growing context as ordinary iteration. Both
-  spellings are accepted now, dotted first.
-
-- **Link attributes were outside every payload walker.** A `$payload`
-  reference copied into a span's `links[].attributes` — an ordinary thing for
-  an SDK to do, since the wire contract stores what a client sends — was
-  counted by no reference sweep, redacted by no erasure, and invisible to the
-  verify predicate. So a blob a surviving span still referenced could be
-  deleted, and `verify --erasure` could report **erased and conclusive over
-  content still on disk and still readable**. All five walkers now share one
-  iterator naming every attribute map a span carries; the duplicate collector
-  that made the gap exist twice is gone. Links are also bounded at ingest for
-  the first time, with its own test. The two erasure guards are
-  mutation-proven: with the link arm removed from the iterator, one test finds
-  the whole secret sitting inline in the link and the other finds the payload
-  deleted while a live reference remained.
-- `top_failures` and `slowest_spans` advertised a row limit whose maximum
-  (100) and default (20) were both wrong — they apply 50 and 10 — so a caller
-  obeying the schema was silently given a fraction of what it asked for.
-- The claim in the data-model and LLM-semantics guides that a link's
-  `relation` attribute "keeps link semantics queryable" was false — no query
-  path reaches link attributes. The docs now say what is true: links are
-  traversed inside a diagnosis, and are not filterable.
-
-### Added
 
 - **Tenant identity in the primary key.** Span identity is now
   `(tenant, trace_id, span_id)` — everywhere: the write buffer's index, WAL
@@ -480,6 +444,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   maintenance interval away, or immediately when a backup asks.
 
 ### Fixed
+
+- **A panicking handler permanently consumed a `--max-connections` slot.**
+  The live-connection count was decremented at the end of the handler
+  closure — a line a panic never reaches — so each handler panic leaked one
+  slot, and enough of them walked the server to a permanent `503` with
+  nothing left in the logs but old panics. The slot is now claimed by an RAII
+  guard whose `Drop` releases it on return, unwind, and spawn failure alike,
+  and each unwind is counted in the new `traza_http_handler_panics_total`
+  (any nonzero value is a bug report waiting to be filed).
+
+- **Two documentation claims that were not true of the code.** The OTLP mapping
+  table said "other resource and scope attributes" were merged beneath span
+  attributes. Scope attributes are; **resource attributes are discarded** —
+  only `service.name` and `traza.tenant` are read — so
+  `deployment.environment`, `service.version`, `host.name` and `k8s.*` never
+  reach the store and cannot be filtered on. The table now says so, names the
+  workaround (copy them onto spans in an SDK processor or a Collector
+  `transform`), and an OTLP conformance assertion pins the behaviour so the
+  page cannot drift from it again. Separately, the MCP tool table billed
+  `record_annotation` as "Score this trace"; it writes a trace/span annotation
+  and cannot address an `(experiment, example)` pair, which is what a score is.
+  The MCP guide now states that and that the eval entities are HTTP-only.
+
+- **A promotion could read across a tenant boundary.** `promote_failures_to_dataset`
+  pinned the tenant it wrote but not the tenants it read: an unbound credential
+  resolves a session across every tenant, so naming one tenant's session copied
+  its span attributes and provenance into a default-tenant dataset — and a
+  promoted example deliberately outlives its source, so erasing that tenant
+  afterwards left the copy standing, permanently outside the reach of the
+  erasure that should own it. Every read the tool makes is now scoped to the
+  tenant being written (`Some("")` being the default tenant *named*, not the
+  absence of a scope). Diagnosis is unchanged: an operator may still read any
+  session, and simply cannot copy one out of its tenant.
+- **Prompt-cache counters were recognized under one spelling.** OpenLLMetry
+  moved them to dotted segment names (`gen_ai.usage.cache_read.input_tokens`,
+  `gen_ai.usage.cache_creation.input_tokens`) to match OTel GenAI, and only the
+  older underscore forms were read — so on a cached Anthropic agent, the exact
+  configuration this field exists for, the detector fell back to the uncached
+  remainder and reported a growing context as ordinary iteration. Both
+  spellings are accepted now, dotted first.
+
+- **Link attributes were outside every payload walker.** A `$payload`
+  reference copied into a span's `links[].attributes` — an ordinary thing for
+  an SDK to do, since the wire contract stores what a client sends — was
+  counted by no reference sweep, redacted by no erasure, and invisible to the
+  verify predicate. So a blob a surviving span still referenced could be
+  deleted, and `verify --erasure` could report **erased and conclusive over
+  content still on disk and still readable**. All five walkers now share one
+  iterator naming every attribute map a span carries; the duplicate collector
+  that made the gap exist twice is gone. Links are also bounded at ingest for
+  the first time, with its own test. The two erasure guards are
+  mutation-proven: with the link arm removed from the iterator, one test finds
+  the whole secret sitting inline in the link and the other finds the payload
+  deleted while a live reference remained.
+- `top_failures` and `slowest_spans` advertised a row limit whose maximum
+  (100) and default (20) were both wrong — they apply 50 and 10 — so a caller
+  obeying the schema was silently given a fraction of what it asked for.
+- The claim in the data-model and LLM-semantics guides that a link's
+  `relation` attribute "keeps link semantics queryable" was false — no query
+  path reaches link attributes. The docs now say what is true: links are
+  traversed inside a diagnosis, and are not filterable.
 
 - **A pending whole-tenant erasure withholds its payload bytes from a scoped
   fetch.** A tenant erasure discovers its span-held references only as its

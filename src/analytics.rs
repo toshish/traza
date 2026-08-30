@@ -616,8 +616,9 @@ impl Store {
         limit: usize,
         order: SessionOrder,
     ) -> Result<Vec<SessionSummary>> {
+        let deadline = self.query_deadline(std::time::Instant::now());
         let mut merged: HashMap<(String, String), SessionCounters> = HashMap::new();
-        self.fold_analytics(since_ns, until_ns, None, |rollup| {
+        self.fold_analytics(since_ns, until_ns, None, deadline, |rollup| {
             for (key, counters) in &rollup.sessions {
                 if tenant.is_some_and(|tenant| key.0 != tenant) {
                     continue;
@@ -679,9 +680,13 @@ impl Store {
         &self,
         tenant: Option<&str>,
         session_id: &str,
+        deadline: Option<crate::Deadline>,
     ) -> Result<Vec<Span>> {
-        let candidates =
-            self.query_attribute_union(&semconv::SESSION_KEYS, &session_values(session_id))?;
+        let candidates = self.query_attribute_union(
+            &semconv::SESSION_KEYS,
+            &session_values(session_id),
+            deadline,
+        )?;
         Ok(narrow_to_session(candidates, tenant, session_id))
     }
 
@@ -701,7 +706,8 @@ impl Store {
         tenant: Option<&str>,
         session_id: &str,
     ) -> Result<Option<SessionDetail>> {
-        let spans = self.resolve_session_spans(tenant, session_id)?;
+        let deadline = self.query_deadline(std::time::Instant::now());
+        let spans = self.resolve_session_spans(tenant, session_id, deadline)?;
         if spans.is_empty() {
             return Ok(None);
         }
@@ -801,7 +807,8 @@ impl Store {
         idle_ns: u64,
         max_spans: usize,
     ) -> Result<Option<crate::attribution::Diagnosis>> {
-        let mut spans = self.resolve_session_spans(tenant, session_id)?;
+        let deadline = self.query_deadline(std::time::Instant::now());
+        let mut spans = self.resolve_session_spans(tenant, session_id, deadline)?;
         if spans.is_empty() {
             return Ok(None);
         }
@@ -856,7 +863,8 @@ impl Store {
             return Ok(Vec::new());
         }
 
-        let spans = self.resolve_session_spans(tenant, session_id)?;
+        let deadline = self.query_deadline(std::time::Instant::now());
+        let spans = self.resolve_session_spans(tenant, session_id, deadline)?;
         let mut examples = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for (trace_id, span_id) in wanted {
@@ -935,32 +943,39 @@ impl Store {
         // two-string encoding exists to prevent. Two rows may still RENDER
         // alike; equal text on distinct rows is honest, merged counters are
         // not.
+        let deadline = self.query_deadline(std::time::Instant::now());
         let mut merged: HashMap<(String, String), Counters> = HashMap::new();
-        self.fold_analytics(since_ns, until_ns, fold_scope, |rollup| match group_by {
-            LlmGroupBy::Session => {
-                for (key, counters) in &rollup.by_session_key {
-                    if tenant.is_some_and(|tenant| key.0 != tenant) {
-                        continue;
+        self.fold_analytics(
+            since_ns,
+            until_ns,
+            fold_scope,
+            deadline,
+            |rollup| match group_by {
+                LlmGroupBy::Session => {
+                    for (key, counters) in &rollup.by_session_key {
+                        if tenant.is_some_and(|tenant| key.0 != tenant) {
+                            continue;
+                        }
+                        merged.entry(key.clone()).or_default().merge(counters);
                     }
-                    merged.entry(key.clone()).or_default().merge(counters);
                 }
-            }
-            _ => {
-                let groups: Box<dyn Iterator<Item = (&String, &Counters)>> = match group_by {
-                    LlmGroupBy::Model => Box::new(rollup.by_model.iter()),
-                    LlmGroupBy::Provider => Box::new(rollup.by_provider.iter()),
-                    LlmGroupBy::Service => Box::new(rollup.by_service.iter()),
-                    LlmGroupBy::Day => Box::new(rollup.by_day.iter()),
-                    LlmGroupBy::Session => unreachable!("handled above"),
-                };
-                for (key, counters) in groups {
-                    merged
-                        .entry((String::new(), key.clone()))
-                        .or_default()
-                        .merge(counters);
+                _ => {
+                    let groups: Box<dyn Iterator<Item = (&String, &Counters)>> = match group_by {
+                        LlmGroupBy::Model => Box::new(rollup.by_model.iter()),
+                        LlmGroupBy::Provider => Box::new(rollup.by_provider.iter()),
+                        LlmGroupBy::Service => Box::new(rollup.by_service.iter()),
+                        LlmGroupBy::Day => Box::new(rollup.by_day.iter()),
+                        LlmGroupBy::Session => unreachable!("handled above"),
+                    };
+                    for (key, counters) in groups {
+                        merged
+                            .entry((String::new(), key.clone()))
+                            .or_default()
+                            .merge(counters);
+                    }
                 }
-            }
-        })?;
+            },
+        )?;
         let mut rows: Vec<LlmAggregateRow> = merged
             .into_iter()
             .map(|((row_tenant, key), counters)| LlmAggregateRow {
@@ -1004,11 +1019,15 @@ impl Store {
     /// erasure's mask, a tenant scope declines the rollup fast path outright
     /// — a rollup's global dimensions cannot be subtracted from — and applies
     /// the predicate span by span on the exact path.
+    /// `deadline` is the calling request's compute budget, checked once per
+    /// segment and every few thousand decoded records on the exact path — the
+    /// rollup fast path is a map merge and needs no check of its own.
     fn fold_analytics(
         &self,
         since_ns: Option<u64>,
         until_ns: Option<u64>,
         tenant: Option<&str>,
+        deadline: Option<crate::Deadline>,
         mut visit: impl FnMut(&SegmentRollup),
     ) -> Result<()> {
         let folding = std::time::Instant::now();
@@ -1077,8 +1096,12 @@ impl Store {
         // or expiry unlinks it while this runs — which is the same guarantee
         // `expire_before_locked` already pins on.
         let segments = self.pin_segments()?;
+        let mut segments_examined: u32 = 0;
+        let mut decoded_since_check: usize = 0;
         // Newest first: paths are zero-padded, so path order is flush order.
         for (position, segment) in segments.iter().enumerate().rev() {
+            crate::Deadline::check(deadline, segments_examined)?;
+            segments_examined += 1;
             let rollup = self.segment_rollup(segment)?;
             let overlaps = since_ns.map_or(true, |bound| rollup.max_start_ns >= bound)
                 && until_ns.map_or(true, |bound| rollup.min_start_ns <= bound);
@@ -1126,6 +1149,11 @@ impl Store {
             // dashboard window cost more than a whole-corpus one.
             let mut survivors: Vec<Span> = Vec::new();
             for span in segment.spans_parsed_in_window(since_ns, until_ns)? {
+                decoded_since_check += 1;
+                if decoded_since_check >= crate::DEADLINE_CHECK_INTERVAL {
+                    decoded_since_check = 0;
+                    crate::Deadline::check(deadline, segments_examined)?;
+                }
                 if mask.as_deref().is_some_and(|mask| mask.covers(&span)) {
                     continue;
                 }
@@ -1159,6 +1187,8 @@ impl Store {
                     &span,
                     &self.metrics,
                     self.pricing(),
+                    deadline,
+                    segments_examined,
                 )? {
                     survivors.push(span);
                 }
@@ -1378,6 +1408,9 @@ pub(crate) fn resolve_session_spans_in(
         &semconv::SESSION_KEYS,
         &session_values(session_id),
         mask,
+        // A snapshot's callers are the documented-unbounded streams; see
+        // [`crate::SnapshotView::query_after`].
+        None,
     )?;
     Ok(narrow_to_session(candidates, tenant, session_id))
 }
