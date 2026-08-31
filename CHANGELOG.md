@@ -445,6 +445,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The bound-token payload probe now heals the sidecar it rebuilds.** The
+  reachability check behind scoped `GET /v1/payloads/{ref}`, MCP
+  `get_payload`, and dataset-version promotion read rollup sidecars directly,
+  so a segment missing one — a crash, a copied data directory, a pricing
+  change invalidating every binding — was decoded again on every probe,
+  forever. The probe now reads rollups through the same
+  cache-then-sidecar-then-rebuild path every aggregation uses: the decode is
+  paid once, the sidecar is written back, and the new
+  `traza_rollup_builds_total` counter says whether heals are landing.
 - **A panicking handler permanently consumed a `--max-connections` slot.**
   The live-connection count was decremented at the end of the handler
   closure — a line a panic never reaches — so each handler panic leaked one

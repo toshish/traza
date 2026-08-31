@@ -4164,10 +4164,14 @@ impl Store {
     /// segments only, no eval-log locks — callable while building inputs
     /// for an eval mutation that will hold the eval mutex itself.
     ///
-    /// A segment without a usable sidecar cannot be prefiltered, so this can
-    /// decode a tenant's every record in it — which is why the walk runs
-    /// under the caller's `deadline`, checked per segment and every few
-    /// thousand decoded records like every other budgeted path.
+    /// The prefilter reads each segment's rollup through the same
+    /// cache-then-sidecar-then-rebuild path every aggregation uses, so a
+    /// segment without a usable sidecar is decoded once, healed on disk, and
+    /// prefiltered from then on — never decoded on every probe. Past the
+    /// prefilter this can still decode a tenant's every record in an admitted
+    /// segment, which is why the walk runs under the caller's `deadline`,
+    /// checked per segment and every few thousand decoded records like every
+    /// other budgeted path.
     fn tenant_spans_hold_reference(
         &self,
         tenant: &str,
@@ -4187,21 +4191,21 @@ impl Store {
                 }
             }
         }
-        // Segments, doubly prefiltered: only segments whose sidecar holds
+        // Segments, doubly prefiltered: only segments whose rollup holds
         // the reference at all, and within them only the tenant's records.
+        // The rollup comes through `segment_rollup` — cache, then sidecar,
+        // then a rebuild that writes the sidecar back — so a missing sidecar
+        // costs one decode ever, not one per probe.
         let mut segments_examined: u32 = 0;
         let mut decoded_since_check: usize = 0;
         for segment in self.pin_segments()? {
             Deadline::check(deadline, segments_examined)?;
             segments_examined += 1;
-            let may_hold = match rollup_file::load(
-                &segment.path,
-                segment.rollup_binding(self.pricing_fingerprint()),
-            ) {
-                Some(rollup) => rollup.payload_refs.contains(reference),
-                None => true, // no usable sidecar cannot be ruled out
-            };
-            if !may_hold {
+            if !self
+                .segment_rollup(&segment)?
+                .payload_refs
+                .contains(reference)
+            {
                 continue;
             }
             // The default (empty) tenant carries no posting — it is never
