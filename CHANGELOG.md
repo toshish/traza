@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.24.1] - 2026-08-31
+
+### Fixed
+
+- **The compaction keeps-up test's tick deadline is sized for v7 merges.**
+  The bound that proves a tick merges the backlog it found and returns —
+  rather than merging what arrives for as long as the writes do — was
+  twenty seconds, sized before v7 made every merge re-encode lz4 blocks.
+  The v0.24.0 tag run watched a starved shared runner push one legitimate
+  tick past it and fail release preflight, so the v0.24.0 tag exists but
+  published no artifacts on any channel; this release is the v7 line's
+  first shipped artifact. The tripwire is two minutes now, and the
+  comment says which failure the clock is for.
+
 ## [0.24.0] - 2026-08-31
 
 The storage release: segment format v7. The same store, at less than half
@@ -2576,6 +2590,7 @@ completion trailers — clients parsing either surface must update.
 
 - This is an initial 0.1 release; consult README.md for the currently documented operational constraints and unsupported use cases.
 
+[0.24.1]: https://github.com/toshish/traza/compare/v0.24.0...v0.24.1
 [0.24.0]: https://github.com/toshish/traza/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/toshish/traza/compare/v0.22.2...v0.23.0
 [0.22.2]: https://github.com/toshish/traza/compare/v0.22.1...v0.22.2
