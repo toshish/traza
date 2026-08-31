@@ -1,10 +1,14 @@
 # Segment Format: indexed segments
 
-The shipped layout is described first; the original v0.3 design proposal is
-retained below it as history. **The proposal does not describe the format that
-shipped** — it predates the implementation and differs in the layout, the
-section list, and the compatibility story. Read the first section for the
-format; read the second only for the reasoning.
+This document has three parts. The shipped v6 layout is described first and is
+authoritative for what is on disk today. The [Format v7
+specification](#format-v7-specification--ships-in-v0240) follows it: a design
+spec, clearly marked as unimplemented, that the v0.24.0 implementation will be
+held to. The original v0.3 design proposal is retained at the bottom as
+history. **The proposal does not describe the format that shipped** — it
+predates the implementation and differs in the layout, the section list, and
+the compatibility story. Read the first section for the current format, the
+second for where it is going, and the third only for the reasoning.
 
 ## Shipped layout
 
@@ -238,6 +242,502 @@ rather than hiding: a migrator from v2/v3/v5 would mean resurrecting precisely
 the decoders just deleted, to serve stores that do not exist. The debt was
 declined once, on the last occasion it could be declined cheaply. v6 is where
 it starts being paid.
+
+---
+
+# Format v7 (specification — ships in v0.24.0)
+
+**Status: design specification, not a description of disk.** The shipped
+format is v6; everything above this line stays authoritative until the
+v0.24.0 implementation lands. This section is the contract that
+implementation will be held to — the format acceptance tests for v0.24.0 are
+written against these tables, and a divergence between spec and code is
+resolved by deliberately amending one of them, never by letting them drift.
+
+v7 is the first bump made under [the policy above](#the-policy-from-here),
+and it pays point 3 in full: it ships with an automatic, resumable migrator,
+and the v6 decoder moves into that migrator rather than surviving in the
+query path. At v0.24.0 the one readable version becomes 7; a v6 file is
+something the store converts at open, not something a query ever sees.
+
+Three things change — the records region, the payload store, and the header
+that describes them. **The four index sections and the record encoding's
+framing keep their v6 byte layout**, and the WAL, the annotation/eval/
+tombstone logs, and the rollup sidecar formats are untouched.
+
+The motivation is measured, at `65652a2` on the `storage-bench` corpora —
+the run recorded in [benchmarks/storage.md](benchmarks/storage.md), whose
+region-measurement footnote carries the figures cited here:
+
+- **The records region is where the bytes are**: 89.6% of segment bytes on
+  `generic`, 95.3% on `llm`, 91.9% on `pinned-context`, corpus-wide, and no
+  individual segment file above 95.3%. Measured from the kept corpora of
+  that run (`TRAZA_STORAGE_BENCH_KEEP=1` leaves the data directories on
+  disk; each file's header gives its records region at bytes 24 and 32).
+- **A third of the LLM corpus's record bytes are a structural
+  double-store**: every indexed attribute value is held once inside the
+  span's JSON payload and again, verbatim, in the record's own key/value
+  list. Counting the value text alone — key names and length prefixes
+  excluded — the duplicated text is 36.1% of `llm`'s records region, 25.6%
+  of `pinned-context`'s, and 7.4% of `generic`'s. The double-store grows
+  with exactly the workload this store exists for.
+- **Compressing the records region is worth a multiple, not a percentage.**
+  The [projection in storage-comparison](storage-comparison.md#what-compression-would-buy)
+  — labeled a projection there and here — puts block-wise `zstd -3` at a
+  6.30x/11.59x/9.27x segment shrink across the three corpora. v7 uses LZ4,
+  which trades ratio for speed and safety of implementation, and cuts
+  blocks at 128 KiB where the projection was computed at 64 KiB — so those
+  numbers are an optimistic reference measured under different knobs, not a
+  forecast of v7's. The [acceptance gates](#acceptance-gates) below, not
+  the projection, are what the implementation must meet.
+
+## v7 records: digests instead of value text
+
+A v7 record is:
+
+| Field | Size |
+|---|---|
+| timestamp | u64 |
+| trace-id length | u32 |
+| attribute count | u32 |
+| payload length | u32 |
+| reserved, zero | u32 |
+| trace id | trace-id length bytes |
+| attribute pairs | attribute count × (key id `u32` + value digest 16 bytes) |
+| payload | payload length bytes |
+
+The framing is v6's; what changes is the attribute list. v6 stored each pair
+as two length-prefixed strings — `4 + key + 4 + value` bytes, with the value
+in its canonical JSON form. v7 stores a fixed 20 bytes per pair: the key id
+indexes the attribute-index section's key dictionary, and the digest is the
+same 128-bit `(key, value)` digest the attribute index posts under
+(`src/hash.rs`). Pairs are written in ascending key-id order, which is the
+order v6's `BTreeMap` iteration already produced, so encoding stays
+deterministic.
+
+**The value text is not lost; it was never only here.** The payload is the
+store's own serialization of the span, and the v6 key/value list was derived
+from that same span at seal time (`span_to_record` in `src/lib.rs`): user
+attributes minus NUL-prefixed keys, their values canonicalized to JSON text,
+plus the reserved `service`/`name`/tenant entries carrying their raw text —
+only user attributes are JSON-canonicalized, and the derivation, that
+asymmetry included, is the definition. That derivation becomes a
+**format invariant**: for every v7 record, applying it to the parsed payload
+must reproduce the stored `(key id, digest)` list exactly. An acceptance test
+pins it by re-deriving the pairs from every payload in a randomized corpus —
+it is what makes the digest list droppable text rather than lost data.
+
+**Candidate verification re-checks against the parsed span payload.** In v6,
+`query_attribute` confirmed a digest-probe candidate against the record's own
+value text. That text is gone, so confirmation now parses the payload,
+applies the same derivation to the queried key, and compares the result with
+the queried value. "The same derivation" is doing work there: the value to
+compare is exactly what `span_to_record` produces for that key — canonical
+JSON for a user attribute, raw text for the reserved `service`/`name`/tenant
+keys — which is already the form the probe side builds its needles in (the
+reserved-key probes in `src/lib.rs` pass the filter's raw text, not a JSON
+encoding of it). The semantics do not move: an index still only narrows a
+filter, and the forged-collision acceptance test — the one that proves the
+re-check is load-bearing — carries over with its oracle pointed at the
+payload-derived value. The cost moves from a memcmp to a JSON parse per candidate; the parse
+was already paid by every true match (results are returned as spans), so the
+new cost falls only on false candidates, which digest probing makes rare.
+
+The pairs stay in the record rather than vanishing entirely for three
+reasons. A full scan can reject a record against an attribute predicate on a
+20-byte compare before parsing its payload — false positives possible,
+false negatives not, so the payload parse remains the authority. A segment
+rewrite can rebuild the attribute index from records without parsing every
+payload. And the record remains self-describing against its index entries,
+which is what erasure's segment verification walks.
+
+## The records region: record-aligned compressed blocks
+
+The records region is carved into **blocks**. Not the content index's blocks
+— those are 128 *records*; to keep the two apart this section always says
+**compression block**. A compression block:
+
+- targets **128 KiB of uncompressed record bytes**: the writer appends whole
+  records until adding the next record would cross 128 KiB, then cuts the
+  block. A block always holds at least one record, so a single record larger
+  than 128 KiB becomes a block by itself. **No record ever spans two
+  blocks**; a reader may treat a record that would as corrupt.
+- is **independently compressed** with the codec the header names — LZ4
+  block format (not the LZ4 frame format), as `lz4_flex`'s block API
+  produces it, with no length prefix of its own: the directory carries the
+  lengths.
+- carries a **raw-passthrough flag** for incompressible blocks: if the
+  compressed output is not strictly smaller than the input, the block is
+  stored as its raw bytes and flagged. This bounds the worst case at
+  raw size plus the directory, and it is why already-compressed payload text
+  cannot make v7 larger than v6's records were.
+
+The stored region is the concatenation of the blocks' stored bytes —
+compressed or raw — with no per-block framing inside the region; the block
+directory is the only framing. A segment whose header declares codec 0 (raw)
+is carved and directed identically, with every block stored raw; logical and
+physical offsets then coincide, and what the segment keeps is the per-block
+CRC and the directory's timestamp fence. That uniformity is deliberate:
+there is one reader shape, and an operator's choice to write uncompressed
+segments (the flag belongs to [configuration](configuration.md), which
+names flags so this document does not have to) is a codec choice, not a
+format variant.
+
+One derived constraint: the raw flag lives in the directory's stored-length
+word (below), so **one record's encoding must be smaller than 2^31 bytes**.
+That is a new bound, not a restatement of an old one: v6 caps individual
+fields at `u32` — trace id, payload, attribute count (`encode_record` in
+`src/segment.rs`) — and nothing in it bounds the record as a whole, so a v6
+record assembled from several large fields can legally exceed 2^31. (The
+server's 64 MiB request cap keeps ingest far below it, but that is a server
+limit, not a store one.) The v7 encoder rejects an oversized record with the
+`TooLarge` error class, naming the record, and the migrator inherits the
+rule: a v6 record whose v7 encoding reaches the bound fails migration as a
+named `Store::open` error — `TooLarge`, naming the segment and the record —
+never a silent skip. No plausible span comes near 2 GiB in one record; the
+point is that if one ever does, the failure is loud and actionable rather
+than a record quietly missing from the migrated store.
+
+## The block directory
+
+A new section, **uncompressed**, holding one 32-byte entry per compression
+block, in block order:
+
+| Field | Size | Meaning |
+|---|---|---|
+| logical start | u64 | offset of the block's first byte in the *uncompressed* records region |
+| stored offset | u64 | offset of the block's first stored byte, relative to the records section start |
+| stored length | u32 | bytes as stored; **bit 31 set = raw passthrough**, remaining 31 bits are the length |
+| crc32 | u32 | CRC-32 (the IEEE/gzip polynomial) over the stored bytes exactly as they appear in the file |
+| min timestamp | u64 | timestamp of the block's first record |
+
+Validation at open, all of it mandatory: logical starts strictly increasing
+from 0; stored offsets strictly increasing from 0; the masked stored lengths
+sum to the header's records length; the last block's logical extent ends at
+the header's records *logical* length; entry count × 32 equals the section
+length. The CRC is checked on every block read, before decode — it is why
+the field exists, and a mismatch is `Corrupt` naming the block. A block's
+decoded size must equal its logical extent; anything else is `Corrupt` too.
+
+**Posting lists keep their u64 currency as LOGICAL offsets** into the
+uncompressed records region — the record-offset index, the trace index, and
+the attribute index are byte-for-byte v6 encodings whose values simply mean
+"offset before compression". The translation lives entirely in the reader:
+binary-search the directory's logical starts for the containing block, read
+its stored bytes, verify, decode, and index into the decoded buffer at
+`logical − logical start`. A record's byte length is still the gap to the
+next entry in the record-offset index — the last record ending at the
+records logical length — which is v6's consecutive-offsets rule restated in
+logical bytes. Whether a reader caches decoded blocks is an implementation
+choice the format does not constrain; the format guarantees only that one
+block decode suffices for any record.
+
+CRC-32 over the gzip polynomial is already in the crate: the WAL frames
+every record under exactly this polynomial (`crc32` in `src/wal.rs`). The
+directory shares that implementation — hoisted to where both call sites can
+reach it, not written a second time — and it costs no dependency.
+
+Because records are timestamp-sorted (the v6 invariant, unchanged), a
+block's first record carries its minimum timestamp, and the directory's
+min-timestamp column is a sorted array. A window disjoint from the segment
+never gets this far in either version: the header's timestamp range answers
+it (`may_contain_timestamps` in `src/segment.rs`), exactly as in v6. For a
+window that does overlap, `ordinal_range_for_window`'s binary search paid
+log2(n) 8-byte reads into the v6 record region; the v7 probe narrows to a
+block through the resident directory — no read, no decode — and pays at most
+a boundary-block decode to place the exact bound.
+
+The directory is read at open and held resident: 32 bytes per 128 KiB of
+uncompressed records, so a segment with 256 MiB of uncompressed record bytes
+carries a 64 KiB directory — arithmetic from the constants, not a
+measurement. That is the resident price of random access into compressed
+records, and it is the whole price; nothing else new is held in memory.
+
+## The v7 header
+
+Little-endian, fixed offsets, `header length = 128`:
+
+| Offset | Size | Field |
+|---:|---:|---|
+| 0 | 8 | magic, `TRAZASEG` |
+| 8 | 2 | format version (`7`) |
+| 10 | 2 | header length (`128`) |
+| 12 | 4 | **codec id: 0 = raw, 1 = LZ4 block format** |
+| 16 | 8 | record count |
+| 24 | 8 | records offset |
+| 32 | 8 | records length, **as stored** (compressed) |
+| 40 | 8 | record-offset index offset |
+| 48 | 8 | record-offset index length |
+| 56 | 8 | trace index offset |
+| 64 | 8 | trace index length |
+| 72 | 8 | attribute index offset |
+| 80 | 8 | minimum record timestamp |
+| 88 | 8 | maximum record timestamp |
+| 96 | 8 | content index offset |
+| 104 | 8 | block directory offset |
+| 112 | 8 | block directory length |
+| 120 | 8 | records **logical** length (uncompressed) |
+
+Offsets 16 through 103 are v6's fields at v6's positions; the codec id takes
+the u32 that v6 reserved as zero, and three u64s are appended. The records
+*logical* length exists because the directory entry has no room for the last
+block's uncompressed size and because record-offset validation needs the
+logical bound (`offset < logical length`, exactly as v6 checked against
+`records_len`).
+
+Section order in the file: header, records (stored), **block directory**,
+record-offset index, trace index, attribute index, content index to EOF. The
+v6 contiguity rule extends to the new section: every section starts where
+the previous ends, the attribute index is still bounded by the content
+offset, the content index still runs to EOF, and trailing bytes are still
+refused. An empty segment has empty records, an empty directory, logical
+length zero, and otherwise encodes as v6-empty did.
+
+**The codec id is parameterization, not a version.** A reader refuses an
+unknown codec id with an error that names it — the same shape as the version
+refusal, and for the same reason: decoding bytes under the wrong codec
+produces garbage, not errors. Adding a codec (the evidence-gated zstd cold
+tier, if it ever clears its gate — see
+[dependencies](internals/dependencies.md)) is configuration plus a new id,
+not a format bump: v7 readers built after it read both, and the cost is
+confined to stores that opt in.
+
+## What stays raw, and why
+
+The header and all four index sections — record offsets, trace, attribute,
+content — are stored uncompressed. The reader parses them at open and probes
+them per query: posting lists are probed by digest and intersected, content
+rows are read by exact byte range, the offset table is the scan path.
+Compressing them would put a decode in front of every probe, and it would
+buy little: [storage-comparison](storage-comparison.md#what-compression-would-buy)
+already makes the argument — compressing the index sections "would flatter
+the number and break the design". After v7 the indexes become the majority
+of segment bytes (the projection's tables show 55–75% post-compression, by
+corpus); shrinking *them* is future index-format work, not a codec knob.
+
+The WAL and the rollup sidecars also stay raw, deliberately: erasure
+verification runs byte-level occurrence scans over both (see
+[administration](operations/administration.md#erasure-deletion-with-a-receipt)),
+and those scans work precisely because the bytes on disk are the literal
+bytes. The same goes for `annotations.jsonl`, `evals.jsonl`, and
+`tombstones.jsonl`. Compression is confined to the two places the
+measurement says the bytes are: segment records and payload blobs.
+
+## Payload blobs
+
+A v7 blob in `payloads/<aa>/<sha256>.bin` is a 24-byte header followed by
+the stored body:
+
+| Offset | Size | Field |
+|---:|---:|---|
+| 0 | 8 | magic, `TRZBLOB1` |
+| 8 | 4 | codec id: 0 = raw, 1 = LZ4 block format |
+| 12 | 8 | uncompressed length |
+| 20 | 4 | crc32 over the stored body bytes |
+| 24 | — | body |
+
+The writer compresses each blob independently and falls back to codec 0 when
+compression does not strictly shrink it. There is **no random access inside
+a blob**: blobs are consumed whole — `GET /v1/payloads/…` streams the
+decoded bytes, dedup compares nothing but names — so one codec unit per file
+is the right shape and block carving would be waste.
+
+**The content address does not move: it is the SHA-256 of the UNCOMPRESSED
+bytes.** Dedup therefore behaves exactly as v6's — an identical pinned
+context still collapses to one file under the same name — and erasure's
+literal reference needles (`sha256/<hex>` strings in spans, logs, and eval
+records) are unchanged bytes matching unchanged names. What does change:
+the file's bytes no longer hash to its name, so any check that verified a
+blob by hashing the file (`sha256_file`) must decode first; blob
+verification in v7 is header parse, CRC check, decode, then SHA-256 of the
+decoded bytes against the name.
+
+## Migration: v6 → v7
+
+The contract, per [the policy](#the-policy-from-here): **automatic at first
+open, resumable, and never woven into the read path.** `Store::open` on a
+v0.24.0 build converts a v6 store before serving anything; the v6 decoder
+exists only inside the migrator module.
+
+- **Same path, temp + fsync + rename.** Each v6 segment is decoded, its
+  records re-derived through the same span → record derivation ingest uses
+  (parse payload, derive attributes and content text — both are recoverable
+  from the payload, which is what makes this a re-encode and not a lossy
+  copy), and re-encoded as v7 **onto the same file name**. Name preservation
+  is not hygiene; [segment path order IS recency
+  order](internals/invariants.md), and a migrator that assigned fresh ids
+  would reorder last-write-wins. The content index is rebuilt under the
+  store's current content-index configuration, exactly as compaction already
+  behaves.
+- **Rollup sidecars are rebound in the same step.** The sidecar's binding
+  includes the segment's byte length, which the rewrite changes, so every
+  existing sidecar becomes self-invalidating — correct, but a rebuild storm
+  at first query. The migrator instead computes the rollup from the records
+  it already has decoded and writes a freshly bound sidecar beside each
+  migrated segment. The write order of sidecar against segment rename is
+  deliberately unspecified, so a crash in that window can leave a sidecar
+  bound to a segment that no longer matches it; resume does not repair this,
+  because it does not need to — a stale-bound sidecar self-invalidates and
+  rebuilds on first use, a performance cost, never a wrong answer.
+- **Blobs are rewritten in the same pass**, onto the same names, by the same
+  temp + fsync + rename discipline, so that the reader accepts exactly one
+  format of each — no header-sniffing in the serving path, ever. The blob
+  pass classifies each file by a three-way rule, never by its magic alone.
+  A file that passes full v7 validation — magic, CRC, decode, SHA-256 of the
+  decoded bytes against the name — is already migrated and is left alone. A
+  file that fails that, but whose **raw** bytes SHA-256 to the file name, is
+  a v6 blob and is migrated; a v6 blob whose content merely happens to begin
+  with the magic bytes lands here, which is why magic alone was never the
+  test. A file that fails both is `Corrupt`, named per file, and the
+  migrator **refuses to rewrite it** — rewriting would launder bytes that
+  match neither format into a validly framed v7 blob.
+- **Pinned backups are migrated the same way.** A pin is a hard-link farm
+  that keeps pre-rewrite inodes alive, so after the live pass every pin
+  still holds v6 bytes — bytes a v0.24.0 restore could not read. The
+  migrator runs the same two passes inside each `pins/<label>` and then
+  rewrites the pin's `state-manifest.json` digests to match, because restore
+  verifies a pin against those digests before installing it. One crash
+  window needs its own rule: between a pin's file pass and its manifest
+  rewrite, every file in the pin already reads as v7, so the version-word
+  trigger below sees nothing left to do — and a pin whose manifest still
+  carries v6 digests fails every restore. Resume therefore does not trust
+  the trigger for pins: every migration resume re-validates each pin's
+  files against that pin's manifest digests, and where the files validate
+  as v7 but the digests disagree, it redoes the manifest rewrite. The
+  rewrite is idempotent, so re-validating a finished pin costs a hash pass
+  and changes nothing. A pin already copied off-host is outside the data
+  directory and outside this contract: it restores only under a build that
+  reads its format, which the [backup guide](operations/backup.md) already
+  says of every backup.
+- **Completion is recorded in the manifest, by a checkpoint that re-hashes
+  everything.** The migration's final act is a checkpoint whose manifest
+  declares the store format; every later checkpoint carries the declaration
+  forward. This checkpoint is exempt from the incremental rule ordinary
+  checkpoints live by — the [backup guide](operations/backup.md) lets a
+  checkpoint carry segment digests over from the previous manifest *because
+  segments are immutable*, and migration has just violated that premise
+  wholesale: every segment and blob was rewritten onto its same name. A
+  carried-over digest is therefore a digest of bytes that no longer exist,
+  and a completion checkpoint that carried one forward would publish a
+  generation that fails verification everywhere — verify-at-pin fails, and
+  restore is impossible. **The completion checkpoint is a full re-hash and
+  is forbidden from carrying any digest forward.** For the same reason, the
+  live generation's manifest is expectedly stale from migration start until
+  that checkpoint: it describes the pre-migration bytes, and nothing during
+  migration consults it. The checkpoint publishes `folded_through`
+  unchanged from the prior generation — it folds nothing, because the
+  migrator does not replay the WAL — and frames after `folded_through`
+  replay normally against the migrated store afterward. The trigger rule at
+  open: any segment (live or pinned) declaring v6 starts a full migration;
+  all segments v7 but no manifest declaration re-runs the idempotent blob
+  pass, re-validates every pin as above, and then checkpoints. Both passes
+  are resumable by construction — every file conversion is atomic, a v7
+  segment is recognized by its version word, a v7 blob by validation — so a
+  crash at any point re-runs from where it stopped, converting only what
+  remains.
+- Migration runs before WAL replay and before any maintenance; the WAL is
+  format-independent of the segments — binary-framed JSON batches under its
+  own `TRZWAL02` magic (`src/wal.rs`) — and is neither read nor rewritten
+  by the migrator. A pending erasure resumes after migration, against the
+  migrated store.
+
+**Costs, stated:** migration duration is proportional to store size — every
+record and every blob is decoded and re-encoded once, plus once more per
+pin. There is a single writer and there are **no reads during migration**;
+the store serves nothing until it holds one format. Pins also cost disk,
+permanently: rewriting a pinned file allocates a new inode, and the migrator
+**does not re-link identical outputs** across pins or against the live store
+— detecting that two independently produced rewrites are byte-identical and
+re-linking them is machinery this design declines to build, so after
+migration every pre-existing pin is a full independent copy of its
+generation. Two consequences an operator plans around: migration requires
+free space for the live store's rewrite plus one full copy per pre-existing
+pin (checked up front, refused with a named error if absent, never
+discovered at 90%), and the cheap-pin promise — the backup guide's "a pin
+costs almost no disk" — stops holding for pins that pre-date the migration.
+That sentence in [backup.md](operations/backup.md) is v6-era text this spec
+does not edit; the implementing PR amends it. The cheap way out is
+procedural: release pins before migrating and re-take them after, when the
+disk cannot afford the copies — a fresh pin of the migrated store hard-links
+v7 files and costs almost nothing again. Un-pinned historical generations
+stop being verifiable once their files are rewritten, exactly as they do
+after any compaction; the post-migration checkpoint is the first generation
+that describes the v7 store. An operator who wants a fallback takes a backup
+first, by one of the two procedures in the
+[durability guide](operations/durability.md#backups) — the same sentence
+every migration section in this file has ever said.
+
+## Erasure and verification under v7
+
+Erasure's segment domain was never a byte scan, and v7 does not make it one.
+v6 verifies segments **through their indexes**: an index-driven walk selects
+candidate records and decodes exactly those (`subject_keys_in_segment` in
+`src/lib.rs`); the byte-level occurrence scan (`count_occurrences`) runs
+over the WAL and the rollup sidecars only. v7 keeps that shape — the walk
+now reads each selected record through its block's decode, and the
+semantics do not move. What compression changes is only how emphatically
+the rationale holds: a raw byte scan of a segment file proved nothing
+against v6's binary encoding, and against LZ4 output "I hex-grepped the
+file and found nothing" is not even a scan of the record bytes — which is
+why the receipt names the domain as index-verified rather than scanned.
+The WAL and rollup-sidecar byte scans are unchanged because those file
+*formats* are unchanged: the migrator rewrites every sidecar's contents,
+but the rewritten bytes are the same raw format the scan reads; only the
+WAL file itself is untouched. Blob checks decode before hashing, as above.
+A settle receipt taken before migration cites generations whose digests
+stop verifying when migration rewrites their files — the loss every
+un-pinned historical generation takes, and no worse: the finding is
+re-derivable by re-running verification against the migrated store, and a
+pin taken at settle time preserves the cited generation if an audit needs
+the original bytes. The in-place segment rewrite that a purge performs
+writes v7 through the ordinary encoder; nothing about the erasure
+contract's ordering, its receipt semantics, or the tombstone log moves.
+
+## Determinism: compressor output is format bytes
+
+The v6 rule that encoding the same records twice yields identical bytes is
+kept, and it now covers the compressor: **the codec's output bytes are
+format bytes under the acceptance tests.** Reproducible merges and the
+byte-comparing format tests depend on it. Therefore the codec crate is
+**pinned to an exact version** (`=` in `Cargo.toml`), and upgrading it is a
+deliberate re-baseline: a commit that bumps the pin, regenerates the golden
+bytes, and says so — never a routine dependency bump. The pin is about
+encoder stability only; any correct LZ4 decoder reads any valid stream, so
+readability never depends on the pinned version. The dependency itself is
+argued in [internals/dependencies.md](internals/dependencies.md).
+
+## Acceptance gates
+
+The implementation is held to these, each with an executable oracle:
+
+1. **Round trip**: encode/decode equality on randomized corpora, including
+   blocks that trip the raw-passthrough flag and records larger than one
+   block.
+2. **Derivation invariant**: for every record in a randomized corpus, the
+   `(key id, digest)` list re-derived from the parsed payload equals the
+   stored list byte for byte.
+3. **Collision safety**: the forged-collision test carries over — a fabricated
+   digest collision must cost a wasted decode, never a wrong row.
+4. **Migration**: a v6 store (segments, blobs, sidecars, pins, non-empty WAL)
+   opened by v0.24.0 serves query-identical results, preserves segment
+   names, and survives `kill -9` at arbitrary points mid-migration with a
+   clean resume — the crash-point harness the durability tests already use.
+   The migrated store must also prove its manifest: the post-migration
+   generation verifies clean (`/v1/verify` reports `intact: true`) and a
+   pin taken immediately after migration passes its verify-at-pin. That
+   half of the gate is what catches a completion checkpoint publishing
+   digests of bytes the migration replaced.
+5. **Storage**: settled amplification **at or below 1.0x** on the `generic`
+   and `llm` corpora, measured by `storage-bench` and recorded in
+   [benchmarks/storage.md](benchmarks/storage.md). This is a gate on a
+   future measurement, not a number that exists yet.
+6. **Latency**: trace-lookup and attribute-filter p95 within **10%** of the
+   v6 numbers on the canonical corpus, measured by `bench` on the same
+   machine in the same session as the v6 baseline it is compared against.
+
+Gates 5 and 6 are what stand between the projection cited at the top and a
+claim; until they are measured, every ratio in this section remains a
+projection.
 
 ---
 
