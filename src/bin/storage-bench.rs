@@ -238,7 +238,7 @@ fn measure(
     }
     // Compaction runs in the background; measuring before it settles reports a
     // store mid-rewrite, which holds both the inputs and the output.
-    let stats = wait_for_quiescence(port)?;
+    let stats = wait_for_quiescence(port, &server.data_dir)?;
 
     // The data directory is flat: `segment-*.seg`, `wal.log`, a `payloads/`
     // directory once anything is offloaded, plus small bookkeeping files.
@@ -604,9 +604,22 @@ fn directory_bytes(path: &Path) -> std::io::Result<u64> {
     Ok(total)
 }
 
-/// Poll until neither the segment count nor the reported disk usage has moved
-/// across three consecutive samples.
-fn wait_for_quiescence(port: u16) -> Result<Value, Box<dyn std::error::Error>> {
+/// Poll until the store has genuinely settled: the reported segment count and
+/// disk usage stop moving for a sustained window, and the number of
+/// `segment-*.seg` files on disk equals the count the store reports.
+///
+/// The file-count condition is the load-bearing one. `/v1/stats` describes
+/// the live set; the walk that follows measures the directory. Between a
+/// merge publishing its output and the reaper unlinking its inputs, stats can
+/// hold still while the directory carries inputs and output together — a
+/// three-sample window once caught the generic corpus in exactly that state
+/// and reported 2.62x amplification across 72 segments where the settled
+/// store measures 1.81x across 3. A store mid-reap is not a store at rest,
+/// and a published number must describe a store at rest.
+fn wait_for_quiescence(
+    port: u16,
+    data_dir: &std::path::Path,
+) -> Result<Value, Box<dyn std::error::Error>> {
     let deadline = Instant::now() + Duration::from_secs(600);
     let mut previous = String::new();
     let mut stable = 0;
@@ -614,14 +627,20 @@ fn wait_for_quiescence(port: u16) -> Result<Value, Box<dyn std::error::Error>> {
         let (status, body) = request(port, "GET", "/v1/stats", None)?;
         let value: Value = serde_json::from_slice(&body)?;
         if status == 200 {
+            let reported = value
+                .get("segment_count")
+                .and_then(Value::as_u64)
+                .unwrap_or(u64::MAX);
+            let on_disk = segment_files_on_disk(data_dir)?;
             let signature = format!(
-                "{}:{}",
-                value.get("segment_count").unwrap_or(&Value::Null),
-                value.get("bytes_on_disk").unwrap_or(&Value::Null)
+                "{}:{}:{}",
+                reported,
+                value.get("bytes_on_disk").unwrap_or(&Value::Null),
+                on_disk
             );
-            if signature == previous {
+            if reported == on_disk && signature == previous {
                 stable += 1;
-                if stable >= 3 {
+                if stable >= 30 {
                     return Ok(value);
                 }
             } else {
@@ -634,6 +653,18 @@ fn wait_for_quiescence(port: u16) -> Result<Value, Box<dyn std::error::Error>> {
         }
         thread::sleep(Duration::from_millis(500));
     }
+}
+
+/// The number of `segment-*.seg` files actually present in the data directory.
+fn segment_files_on_disk(data_dir: &std::path::Path) -> Result<u64, Box<dyn std::error::Error>> {
+    let mut count = 0;
+    for entry in fs::read_dir(data_dir)? {
+        let name = entry?.file_name().to_string_lossy().into_owned();
+        if name.starts_with("segment-") && name.ends_with(".seg") {
+            count += 1;
+        }
+    }
+    Ok(count)
 }
 
 fn ensure_release_server() -> Result<(), Box<dyn std::error::Error>> {
