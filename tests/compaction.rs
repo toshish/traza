@@ -689,11 +689,30 @@ fn a_grouped_merge_resolves_the_primary_key_across_its_outputs() {
     let store = Store::open(&dir, tiered(120_000)).expect("opens");
 
     // One key rewritten in every segment, plus bulk to force several groups.
+    // The bulk spans carry an incompressible attribute so their on-disk size
+    // stays comfortably above what the cap can absorb in one output — v7
+    // compresses the records region, and templated spans alone now shrink so
+    // far that twelve segments WOULD become one.
+    const NOISE_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let mut noise_state = 0x5eed_u64;
+    let mut noise = || {
+        (0..192)
+            .map(|_| {
+                noise_state = noise_state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                char::from(NOISE_ALPHABET[(noise_state >> 33) as usize % NOISE_ALPHABET.len()])
+            })
+            .collect::<String>()
+    };
     for round in 0..12u64 {
         let mut spans = vec![span("t", "s", &format!("v{round}"), 1_000)];
         spans.extend((0..100u64).map(|i| {
             let n = round * 1_000 + i;
-            span(&format!("bulk{n}"), "s1", "op", 2_000 + n)
+            let mut bulk = span(&format!("bulk{n}"), "s1", "op", 2_000 + n);
+            bulk.attributes
+                .insert("noise".to_owned(), serde_json::Value::String(noise()));
+            bulk
         }));
         seal(&store, spans);
     }

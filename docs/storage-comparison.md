@@ -120,12 +120,15 @@ the first two columns.
 
 ## What compression would buy
 
-**Traza has no compressor.** Two dependencies, no `zstd`, no `--compress` flag,
-and the [ingest guide](guide/ingest.md) asks OTel exporters for
-`OTEL_EXPORTER_OTLP_COMPRESSION=none` because the server cannot decode a
+**Traza had no compressor when these numbers were taken.** Three dependencies
+(`lz4_flex` is the one [format v7](segment-format.md) added), no `zstd`, no
+`--compress` flag, and the [ingest guide](guide/ingest.md) asks OTel exporters
+for `OTEL_EXPORTER_OTLP_COMPRESSION=none` because the server cannot decode a
 compressed body either. Everything in this section is therefore a **projection
-of an absent feature** and belongs in a different mental column from every other
-number in this document.
+measured before v7 existed** — computed with `zstd -3` at 64 KiB blocks where
+v7 ships LZ4 at 128 KiB — and belongs in a different mental column from every
+other number in this document; v7's own acceptance gates, not these tables,
+are what its implementation is held to.
 
 It is projected from the segment files `storage-bench` actually produced, not
 from a re-creation of them. Only the **records region** is compressed: the
@@ -168,8 +171,12 @@ Three costs this projection excludes, all of them real:
 - **Decompression on the read path is not measured.** A 64 KiB block costs tens
   of microseconds at `zstd -3` speeds, which is not a rounding error against a
   0.37 ms trace lookup or a 2.1 ms filtered search.
-- **It would be a third dependency**, in a project whose policy is that new
-  dependencies need a reason. Hand-rolling a compressor is a serious lift.
+- **`zstd` would be a fourth dependency**, in a project whose policy is that
+  new dependencies need a reason. v7 spent its dependency on `lz4_flex`
+  instead — the argument is in
+  [internals/dependencies.md](internals/dependencies.md) — so these `zstd`
+  ratios remain an upper reference, not what shipped. Hand-rolling a
+  compressor is a serious lift.
 
 Reproduce the inputs with `TRAZA_STORAGE_BENCH_KEEP=1 cargo run --release --bin
 storage-bench`, which leaves each corpus's data directory on disk; the header
@@ -181,7 +188,7 @@ compression cannot.
 The object tier is the one that matters most for the cost row, because it is the
 only thing that removes the per-replica multiplier. Neither has shipped.
 Compression is now specified — the
-[v7 format](segment-format.md#format-v7-specification--ships-in-v0240),
+[v7 format](segment-format.md#format-v7),
 targeted at v0.24.0 — but remains unimplemented, and every number in this
 section stays a projection until it ships and is measured.
 
@@ -195,7 +202,7 @@ sits on a different one. From the bundled benchmarks on macOS/aarch64:
 - **Query:** trace lookup p95 0.64 ms, attribute-filtered search p95 3.3 ms over
   1M spans ([`canonical-corpus.md`](benchmarks/canonical-corpus.md))
 - **Content search:** 1.5 ms versus 1,258 ms scanning, for +0.1% on disk
-- **Footprint:** a 2.0 MiB binary, two direct dependencies, no external
+- **Footprint:** a 3.3 MiB binary, three direct dependencies, no external
   database, queue or coordinator; a store larger than RAM serves correctly
 - **LLM/agent semantics:** sessions, token and cost analytics, annotations and
   MCP are first-class rather than dashboards built over generic logs

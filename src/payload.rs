@@ -16,6 +16,17 @@
 //! retention window (an orphan from an unflushed span lingers at most one
 //! TTL). SHA-256 is implemented here (FIPS 180-4), dependency-free, and
 //! verified against the standard test vectors in the module tests.
+//!
+//! On disk a blob is a 24-byte `TRZBLOB1` header — magic, codec id,
+//! uncompressed length, CRC-32 of the stored body — followed by the body,
+//! LZ4-compressed unless compression does not strictly shrink it (codec 0,
+//! raw). One codec unit per file, because blobs are consumed whole; there is
+//! no random access inside one. **The content address is the SHA-256 of the
+//! UNCOMPRESSED bytes**, so dedup is unchanged by compression and erasure's
+//! literal `sha256/<hex>` needles keep matching. The corollary: the file's
+//! bytes no longer hash to its name, so verifying a blob means header parse,
+//! CRC check, decode, then SHA-256 of the decoded bytes — never
+//! [`sha256_file`] against the name.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -214,6 +225,93 @@ pub(crate) fn sha256_file(path: &Path) -> std::io::Result<String> {
 
 /// Directory name under the data dir.
 pub(crate) const PAYLOAD_DIR: &str = "payloads";
+/// Magic opening every payload blob file.
+const BLOB_MAGIC: &[u8; 8] = b"TRZBLOB1";
+/// Fixed blob header: magic, codec id (u32), uncompressed length (u64),
+/// CRC-32 of the stored body (u32).
+const BLOB_HEADER_LEN: usize = 24;
+
+/// Frames `content` as a blob file: header plus body, compressed when
+/// compression strictly shrinks it and raw (codec 0) otherwise. `pub(crate)`
+/// for exactly one caller outside this module: the v6 → v7 migrator, which
+/// rewrites raw v6 blobs through the same framing the live writer uses.
+pub(crate) fn encode_blob(content: &[u8]) -> Vec<u8> {
+    let compressed = lz4_flex::block::compress(content);
+    let (codec, body): (u32, &[u8]) = if compressed.len() < content.len() {
+        (1, &compressed)
+    } else {
+        (0, content)
+    };
+    let mut bytes = Vec::with_capacity(BLOB_HEADER_LEN + body.len());
+    bytes.extend_from_slice(BLOB_MAGIC);
+    bytes.extend_from_slice(&codec.to_le_bytes());
+    bytes.extend_from_slice(&(content.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(&crate::crc::crc32(body).to_le_bytes());
+    bytes.extend_from_slice(body);
+    bytes
+}
+
+/// Validates a blob file's framing and returns the decoded bytes. `name`
+/// labels errors with the reference so an operator knows which file. The
+/// SHA-256-against-the-name check is the caller's, and only verification
+/// paths pay it — a read needs the CRC and the decode. `pub(crate)` for the
+/// v6 → v7 migrator's blob classification, which pairs it with that hash
+/// check to recognize an already-migrated blob.
+pub(crate) fn decode_blob(bytes: &[u8], name: &str) -> Result<Vec<u8>> {
+    let corrupt = |what: &str| {
+        Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("payload {name}: {what}"),
+        ))
+    };
+    if bytes.len() < BLOB_HEADER_LEN {
+        return Err(corrupt("shorter than the blob header"));
+    }
+    if &bytes[..8] != BLOB_MAGIC {
+        return Err(corrupt("bad blob magic"));
+    }
+    let codec = u32::from_le_bytes(bytes[8..12].try_into().expect("u32"));
+    let uncompressed = u64::from_le_bytes(bytes[12..20].try_into().expect("u64"));
+    let declared_crc = u32::from_le_bytes(bytes[20..24].try_into().expect("u32"));
+    let uncompressed = usize::try_from(uncompressed)
+        .map_err(|_| corrupt("uncompressed length does not fit memory"))?;
+    let body = &bytes[BLOB_HEADER_LEN..];
+    if crate::crc::crc32(body) != declared_crc {
+        return Err(corrupt("body crc32 mismatch"));
+    }
+    let decoded = match codec {
+        0 => body.to_vec(),
+        1 => {
+            // The header's uncompressed-length word is covered by NOTHING —
+            // the crc32 above spans the stored body only — so this bound is
+            // all that stands between one flipped header byte and an
+            // allocation sized by garbage: the decoder allocates the declared
+            // length up front, and an allocation it cannot satisfy aborts the
+            // process instead of erroring. LZ4's block format cannot expand a
+            // body beyond ~255x, so any declared length past that ceiling
+            // describes bytes no encoder produced and is corrupt, not big.
+            if uncompressed as u64 > body.len() as u64 * 256 + 64 {
+                return Err(corrupt(
+                    "uncompressed length exceeds what lz4 can decode from the body",
+                ));
+            }
+            lz4_flex::block::decompress(body, uncompressed)
+                .map_err(|_| corrupt("body does not decompress"))?
+        }
+        other => {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "payload {name}: codec id {other}, but this build reads 0 (raw) and 1 (lz4)"
+                ),
+            )))
+        }
+    };
+    if decoded.len() != uncompressed {
+        return Err(corrupt("body decodes to the wrong length"));
+    }
+    Ok(decoded)
+}
 
 pub(crate) fn payload_path(directory: &Path, hash: &str) -> PathBuf {
     let shard = hash.get(0..2).unwrap_or("00");
@@ -254,7 +352,7 @@ pub(crate) fn store_payload(
         ));
         {
             let mut file = fs::File::create(&temp)?;
-            file.write_all(content.as_bytes())?;
+            file.write_all(&encode_blob(content.as_bytes()))?;
             file.sync_all()?;
         }
         fs::rename(&temp, &path)?;
@@ -267,7 +365,11 @@ pub(crate) fn store_payload(
     Ok(Value::Object(reference))
 }
 
-/// Reads a payload by its `sha256/<hex>` reference. `None` when absent.
+/// Reads a payload by its `sha256/<hex>` reference, validating the blob's
+/// framing and CRC and returning the DECODED bytes. `None` when absent.
+/// Exactly one blob format is accepted: an unframed file is corrupt, never
+/// a fallback — header sniffing in the serving path is what the migration
+/// design exists to avoid.
 pub(crate) fn load_payload(directory: &Path, reference: &str) -> Result<Option<Vec<u8>>> {
     let Some(hash) = reference.strip_prefix("sha256/") else {
         return Ok(None);
@@ -277,7 +379,7 @@ pub(crate) fn load_payload(directory: &Path, reference: &str) -> Result<Option<V
     }
     // The hash is validated hex, so the path cannot traverse.
     match fs::read(payload_path(directory, hash)) {
-        Ok(bytes) => Ok(Some(bytes)),
+        Ok(bytes) => decode_blob(&bytes, reference).map(Some),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
     }
@@ -410,9 +512,57 @@ pub(crate) fn sweep_expired(
 
 #[cfg(test)]
 mod tests {
-    use super::{sha256_hex, store_payload, sweep_expired, TouchRegistry};
+    use super::{
+        decode_blob, encode_blob, sha256_hex, store_payload, sweep_expired, TouchRegistry,
+    };
     use std::collections::HashSet;
     use std::time::{Duration, Instant, SystemTime};
+
+    #[test]
+    fn a_forged_blob_uncompressed_length_is_refused_not_allocated() {
+        // The header's length word sits outside the CRC (which covers the
+        // stored body only), so a single flipped header byte used to reach
+        // the decoder as an allocation request — 2^62 bytes here — and
+        // allocation failure aborts the process. The bound must turn that
+        // into a corrupt-blob error naming the file, before any allocation.
+        let content = "the quick brown fox jumps over the lazy dog ".repeat(200);
+        let honest = encode_blob(content.as_bytes());
+        assert_eq!(
+            u32::from_le_bytes(honest[8..12].try_into().expect("codec")),
+            1,
+            "the fixture must compress, or the bound under test is not reached"
+        );
+
+        // Bit-flip the high byte of the u64 length at bytes 12..20.
+        let mut forged = honest.clone();
+        forged[19] ^= 0x40;
+        let error = decode_blob(&forged, "sha256/deadbeef")
+            .expect_err("a forged length must refuse, not allocate")
+            .to_string();
+        assert!(
+            error.contains("sha256/deadbeef"),
+            "the refusal names the blob: {error}"
+        );
+        assert!(
+            error.contains("uncompressed length exceeds"),
+            "the refusal names the bound: {error}"
+        );
+
+        // A plausible-but-wrong length inside the bound still refuses,
+        // through the decode-length check.
+        let mut nudged = honest.clone();
+        nudged[12] ^= 0x01;
+        assert!(
+            decode_blob(&nudged, "sha256/deadbeef").is_err(),
+            "an off-by-one length is corrupt too"
+        );
+
+        // And the honest blob still round-trips.
+        assert_eq!(
+            decode_blob(&honest, "sha256/deadbeef").expect("honest blob decodes"),
+            content.as_bytes()
+        );
+    }
 
     #[test]
     fn recently_touched_payloads_are_immune_from_the_sweep() {

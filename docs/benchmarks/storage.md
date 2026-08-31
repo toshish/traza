@@ -60,7 +60,7 @@ For reference, the same stored volume on object storage at $0.023/GiB-month woul
 
 ## Records-region measurements
 
-Measured from the kept corpora of the run above (`TRAZA_STORAGE_BENCH_KEEP=1` leaves each data directory on disk), by parsing every segment's header — records offset and length at bytes 24 and 32, per [the format document](../segment-format.md) — and decoding every record in the records region. "Value text" sums the value bytes of every record's key/value pairs; key names and length prefixes are excluded. These are the figures the [v7 format specification](../segment-format.md#format-v7-specification--ships-in-v0240) cites as its motivation.
+Measured from the kept corpora of the run above (`TRAZA_STORAGE_BENCH_KEEP=1` leaves each data directory on disk), by parsing every segment's header — records offset and length at bytes 24 and 32, per [the format document](../segment-format.md) — and decoding every record in the records region. "Value text" sums the value bytes of every record's key/value pairs; key names and length prefixes are excluded. These are the figures the [v7 format specification](../segment-format.md#format-v7) cites as its motivation.
 
 | Corpus | Segment bytes | Records region | Share | Largest per-file share | Value text | Share of records region |
 |---|---:|---:|---:|---:|---:|---:|
@@ -69,3 +69,5 @@ Measured from the kept corpora of the run above (`TRAZA_STORAGE_BENCH_KEEP=1` le
 | `pinned-context` | 26914752 | 24745600 | 91.9% | 91.9% | 6337800 | 25.6% |
 
 This section is a hand-measured addendum: `storage-bench` regenerates everything above it, so a rerun that overwrites this file re-measures these columns from its own kept corpora or removes the section rather than letting it describe a different run.
+
+**The recipe above is v6-specific and will not reproduce on a v7 store.** This whole file records a run taken while v6 was the shipped format; on a v7 store, byte 32 is the records region's STORED (compressed) length (the logical length moved to byte 120), the region is LZ4 blocks addressed through a block directory, and v7 records carry no attribute value text at all — so both the region decode and the "value text" column are v6-era semantics. The gate-5 rerun of `storage-bench` on the v7 format (the gates PR for [segment-format.md](../segment-format.md#acceptance-gates)) rewrites this file, its recipe included.

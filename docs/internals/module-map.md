@@ -5,9 +5,10 @@ given change.
 
 ## Crate rules
 
-Two direct dependencies, `serde` and `serde_json`. HTTP, threading, hashing,
-protobuf decoding, SHA-256, and file I/O are all standard library or
-hand-written. The crate is `#![forbid(unsafe_code)]` and `missing_docs` is
+Three direct dependencies: `serde`, `serde_json`, and `lz4_flex` (pinned to an
+exact version, because compressor output bytes are format bytes — argued in
+[dependencies](dependencies.md)). HTTP, threading, hashing, protobuf decoding,
+SHA-256, and file I/O are all standard library or hand-written. The crate is `#![forbid(unsafe_code)]` and `missing_docs` is
 denied, so every public item carries a doc comment and clippy enforces it.
 
 ## The engine
@@ -38,9 +39,11 @@ live. Most engine changes start here.
 ### [`src/segment.rs`](../../src/segment.rs)
 
 The on-disk segment format: encoding, parsing, and file-backed reading. An
-opened segment owns its file handle and decoded index maps only — records are
-decoded when a query selects their offsets, and no decoded record vector is
-retained. Byte layout: [segment format](../segment-format.md).
+opened segment owns its file handle, decoded index maps, and a bounded
+decoded-block cache (four compression blocks, counted by the residency
+accounting) — records are decoded when a query selects their offsets, and no
+decoded record vector is retained. Byte layout:
+[segment format](../segment-format.md).
 
 ### [`src/generation.rs`](../../src/generation.rs)
 
@@ -60,6 +63,19 @@ underneath it.
 `Store::checkpoint`, `pin_generation`, `verify_generation` and `restore` in
 [`src/lib.rs`](../../src/lib.rs) are the operations built on this; invariant 12
 states the ordering rules they must not break.
+
+### [`src/migration.rs`](../../src/migration.rs)
+
+The v6 → v7 migrator: automatic at first open, resumable, never in the read
+path. Owns the FROZEN v6 decoder (records only, copied from `src/segment.rs`
+at `5f23172`) — the one place the superseded layout is still understood — the
+three-way payload-blob classification, the per-pin file passes and manifest
+rewrite, and the completion checkpoint (a full re-hash that declares the
+store format in the manifest). `Store::open` calls it after crash recovery
+and before the WAL is replayed; a store whose manifest already declares the
+format pays a ten-byte version-word read per segment — live and pinned —
+plus one read of the live manifest inside the trigger.
+Contract: the Migration section of [segment format](../segment-format.md).
 
 ### [`src/wal.rs`](../../src/wal.rs)
 

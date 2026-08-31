@@ -21,8 +21,9 @@
 //!
 //! It is built around three ways the measurement could quietly lie:
 //!
-//! - **`Store::resident_payload_bytes()` reports zero by design.** It counts
-//!   the payload encoding and deliberately excludes indexes, so measuring
+//! - **`Store::resident_payload_bytes()` reports zero at open by design.**
+//!   It counts the payload encoding (plus, after queries, the decoded-block
+//!   cache) and deliberately excludes indexes, so measuring
 //!   with it "proves" there is no problem. The numbers here are process RSS
 //!   read from the OS, alongside the approximate `resident_index_bytes()`
 //!   diagnostic and the segment headers' own `attribute_index_len`.

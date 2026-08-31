@@ -315,7 +315,7 @@ fn string_attribute(key: &str, value: &str) -> Vec<u8> {
 /// An `ExportTraceServiceRequest` carrying `[start, end)`.
 ///
 /// Encoded here rather than by a library because the point of the protobuf
-/// path is that Traza has two dependencies; a benchmark that pulled in a
+/// path is that Traza has three dependencies; a benchmark that pulled in a
 /// codegen stack to test it would be measuring a program nobody ships.
 fn protobuf_batch(start: usize, end: usize) -> Vec<u8> {
     let mut request = Vec::with_capacity(256 * (end - start));
@@ -1470,7 +1470,7 @@ behind.\n"
         // each scenario occupies a different slot each round.
         //
         // Rotation rather than a shuffle: it is deterministic, needs no RNG
-        // (this crate has two dependencies and neither is one), and spreads
+        // (this crate has three dependencies and none is one), and spreads
         // positions evenly instead of merely randomly.
         let offset = (round - 1) % selected.len().max(1);
         for step in 0..selected.len() {

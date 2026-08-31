@@ -64,7 +64,7 @@ Documentation lives in [`docs/`](docs/README.md), organised by audience: `guide/
 ## Pull request expectations
 
 - **`./ci.sh` is green.** Every gate, no exceptions.
-- **No new dependencies without justification.** Traza deliberately has two direct dependencies (`serde`, `serde_json`); everything else uses the standard library. A PR that adds a dependency must explain why the standard library cannot reasonably do the job, and what the dependency's own footprint is. The written justifications live in [docs/internals/dependencies.md](docs/internals/dependencies.md), one section per decision — that is where a new one goes.
+- **No new dependencies without justification.** Traza deliberately has three direct dependencies (`serde`, `serde_json`, `lz4_flex`); everything else uses the standard library. A PR that adds a dependency must explain why the standard library cannot reasonably do the job, and what the dependency's own footprint is. The written justifications live in [docs/internals/dependencies.md](docs/internals/dependencies.md), one section per decision — that is where a new one goes.
 - **Public items are documented.** The crate denies `missing_docs`; clippy will hold you to it. `#![forbid(unsafe_code)]` is not negotiable.
 - **Focused diffs.** One logical change per PR; imperative mood in commit subjects ("Add X", "Fix Y").
 - **Honest claims.** Performance and durability statements in docs must be backed by a benchmark run or a test.

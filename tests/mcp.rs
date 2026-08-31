@@ -39,6 +39,37 @@ fn test_dir(label: &str) -> PathBuf {
     dir
 }
 
+/// Plants one payload blob under the store directory, framed the way the v7
+/// payload store writes them (`TRZBLOB1`, codec 0/raw, uncompressed length,
+/// CRC-32 of the body) — the reader accepts exactly one blob format, so a
+/// bare-bytes file would read as corrupt, not as a payload. The name stays
+/// the SHA-256 of the UNCOMPRESSED bytes. Returns the `sha256/<hex>`
+/// reference.
+fn plant_payload(dir: &Path, bytes: &[u8]) -> String {
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFF_u32;
+        for byte in bytes {
+            crc ^= u32::from(*byte);
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+            }
+        }
+        !crc
+    }
+    let hash = traza::payload::sha256_hex(bytes);
+    let shard = dir.join("payloads").join(&hash[0..2]);
+    std::fs::create_dir_all(&shard).expect("shard");
+    let mut framed = Vec::with_capacity(24 + bytes.len());
+    framed.extend_from_slice(b"TRZBLOB1");
+    framed.extend_from_slice(&0u32.to_le_bytes());
+    framed.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    framed.extend_from_slice(&crc32(bytes).to_le_bytes());
+    framed.extend_from_slice(bytes);
+    std::fs::write(shard.join(format!("{hash}.bin")), &framed).expect("payload writes");
+    format!("sha256/{hash}")
+}
+
 fn open_store(dir: &Path) -> Store {
     Store::open(
         dir,
@@ -861,16 +892,9 @@ fn a_binary_payload_is_described_rather_than_base64_encoded() {
     let store = open_store(&dir);
     // PNG magic followed by bytes that are not valid UTF-8.
     let bytes: Vec<u8> = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0xff, 0xfe];
-    let hash = traza::payload::sha256_hex(&bytes);
-    let shard = dir.join("payloads").join(&hash[0..2]);
-    std::fs::create_dir_all(&shard).expect("shard");
-    std::fs::write(shard.join(format!("{hash}.bin")), &bytes).expect("payload writes");
+    let reference = plant_payload(&dir, &bytes);
 
-    let result = call(
-        &store,
-        "get_payload",
-        json!({"reference": format!("sha256/{hash}")}),
-    );
+    let result = call(&store, "get_payload", json!({"reference": reference}));
     let text = text_of(&result);
     assert!(text.contains("binary data"), "{text}");
     assert!(
@@ -898,10 +922,7 @@ fn a_text_payload_comes_back_within_the_requested_and_configured_bounds() {
     let dir = test_dir("text-payload");
     let store = open_store(&dir);
     let body = "prompt line\n".repeat(500);
-    let hash = traza::payload::sha256_hex(body.as_bytes());
-    let shard = dir.join("payloads").join(&hash[0..2]);
-    std::fs::create_dir_all(&shard).expect("shard");
-    std::fs::write(shard.join(format!("{hash}.bin")), &body).expect("payload writes");
+    let reference = plant_payload(&dir, body.as_bytes());
 
     let server = McpServer::new(
         &store,
@@ -920,7 +941,7 @@ fn a_text_payload_comes_back_within_the_requested_and_configured_bounds() {
                 "params": {
                     "name": "get_payload",
                     "arguments": {
-                        "reference": format!("sha256/{hash}"),
+                        "reference": reference,
                         // Larger than the server's ceiling: the ceiling wins.
                         "max_bytes": 100_000,
                     },
@@ -945,10 +966,7 @@ fn a_payload_cap_is_bytes_and_never_exceeds_the_result_ceiling() {
     // Four-byte characters: a cap applied to chars rather than bytes returns
     // four times what it promised.
     let body = "🙂".repeat(4_000);
-    let hash = traza::payload::sha256_hex(body.as_bytes());
-    let shard = dir.join("payloads").join(&hash[0..2]);
-    std::fs::create_dir_all(&shard).expect("shard");
-    std::fs::write(shard.join(format!("{hash}.bin")), &body).expect("payload writes");
+    let reference = plant_payload(&dir, body.as_bytes());
 
     let server = McpServer::new(
         &store,
@@ -966,7 +984,7 @@ fn a_payload_cap_is_bytes_and_never_exceeds_the_result_ceiling() {
                 "method": "tools/call",
                 "params": {
                     "name": "get_payload",
-                    "arguments": {"reference": format!("sha256/{hash}"), "max_bytes": 1_000},
+                    "arguments": {"reference": reference, "max_bytes": 1_000},
                 },
             }),
             Context {

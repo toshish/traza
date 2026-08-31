@@ -1856,11 +1856,13 @@ fn a_version_mismatch_advises_migration_and_never_deletion() {
     let dir = TestDir::new("foreign-segment-version");
     let segment = sealed_segment(&dir);
 
-    // Stamp a version this build does not write. The magic, the header length
-    // and every section bound stay valid, so nothing but the version word
-    // distinguishes it — which is exactly the case the check exists for.
+    // Stamp a version this build neither writes NOR migrates. `VERSION - 1`
+    // is v6, which the migrator now converts (or refuses as corrupt when the
+    // body is not really v6) — so the version-mismatch advice is observed on
+    // the formats that still have no decoder in this build: 2 through 5, and
+    // anything from the future (covered by its own test below).
     let mut bytes = fs::read(&segment).expect("read segment");
-    let foreign = traza::segment::VERSION - 1;
+    let foreign = traza::segment::VERSION - 2;
     bytes[8..10].copy_from_slice(&foreign.to_le_bytes());
     fs::write(&segment, &bytes).expect("write segment");
 
@@ -2036,6 +2038,13 @@ fn a_store_written_before_the_reserved_tenant_key_still_resolves_its_newest_vers
     // The rollup SCHEMA_VERSION bump is what forces these sidecars to be
     // rebuilt under the current decoding, and this fixture is the corpus
     // that fails if a future decoding change forgets to bump it again.
+    //
+    // Since format v7 the fixture ALSO exercises the v6 → v7 migrator: these
+    // are v6 segments, so this open converts them (and replaces the stale
+    // sidecars with freshly bound ones) before the first query runs. The
+    // assertions are unchanged from the v6 era — migration re-derives every
+    // record from its payload, so the upgrade semantics this test pinned must
+    // hold across the rewrite too.
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pr50-tenant-identity");
     // Copied, never opened in place: opening writes (heals sidecars, takes
     // the lock), and the committed fixture must stay the old build's bytes.
@@ -2077,6 +2086,64 @@ fn a_store_written_before_the_reserved_tenant_key_still_resolves_its_newest_vers
         spans.iter().all(|span| span.tenant.is_empty()),
         "a bare `tenant` field is client data now, so these records live in \
          the default tenant"
+    );
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn a_future_format_is_refused_with_the_version_error_not_migrated_or_misread() {
+    // This test's previous life proved a v6 store was refused through the
+    // named version error while the migrator did not exist. The migrator
+    // exists now and v6 converts at open, so a v6 fixture can no longer
+    // observe the refusal — but the refusal path itself is preserved, and
+    // what still needs it is the FUTURE: a store carrying a segment from a
+    // format this build does not read must fail through the same named-file
+    // version error, never be "migrated" (there is no decoder to migrate it
+    // with) and never misparsed. A v8 header is fabricated by flipping the
+    // version word of a real, current-build segment.
+    let dir = correctness_test_dir("future-format-refused");
+    {
+        let store = Store::open(&dir, Config::default()).expect("open");
+        store
+            .ingest(span("trace-a", "span-a".to_owned(), 1_000, 10))
+            .expect("ingest");
+        store.flush().expect("flush");
+    }
+    let segment = fs::read_dir(&dir)
+        .expect("read dir")
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .find(|path| path.extension().is_some_and(|ext| ext == "seg"))
+        .expect("a sealed segment");
+    let mut bytes = fs::read(&segment).expect("segment bytes");
+    bytes[8] = 8; // version word: 7 -> 8, little-endian low byte
+    fs::write(&segment, &bytes).expect("tamper");
+
+    let message = Store::open(&dir, Config::default())
+        .err()
+        .expect("a future-format store must not open")
+        .to_string();
+    assert!(
+        message.contains("segment format v8"),
+        "the refusal names the format it found: {message}"
+    );
+    assert!(
+        message.contains("segment-"),
+        "the refusal names the file: {message}"
+    );
+    assert!(
+        message.contains("Back up the directory first"),
+        "the preserving step comes first: {message}"
+    );
+    // The advice must be honest for the version FOUND: a v8 store needs a
+    // newer build, and pointing it at the 2-through-5 legacy reader (which
+    // cannot read it) was affirmatively wrong guidance.
+    assert!(
+        message.contains("A newer build"),
+        "a future format is directed at a newer build: {message}"
+    );
+    assert!(
+        !message.contains("formats 2 through 5"),
+        "no legacy-reader advice for a format it cannot read: {message}"
     );
     let _ = fs::remove_dir_all(dir);
 }

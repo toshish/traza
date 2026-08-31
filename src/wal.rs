@@ -43,7 +43,7 @@
 //! carries the usual guarantee; on **macOS it does not flush the drive's own
 //! write cache** — that needs `F_FULLFSYNC`, which std does not expose and
 //! which this crate will not reach for while it forbids unsafe code and
-//! carries two dependencies. So on macOS a power cut can still lose an
+//! carries three dependencies. So on macOS a power cut can still lose an
 //! acknowledged write. A kill -9, a panic, or an OS crash cannot, on either
 //! platform, which is what tests/durability.rs proves.
 //!
@@ -60,6 +60,7 @@ use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Condvar, Mutex};
 
+use crate::crc::crc32;
 use crate::generation::FoldedThrough;
 use crate::{Error, Result, Span};
 
@@ -87,18 +88,6 @@ const V1_HEADER_BYTES: usize = 8;
 /// A record larger than this is refused rather than trusted — a corrupt length
 /// field must not make replay allocate gigabytes.
 const MAX_RECORD_BYTES: u32 = 256 * 1024 * 1024;
-
-fn crc32(bytes: &[u8]) -> u32 {
-    let mut crc = 0xFFFF_FFFF_u32;
-    for byte in bytes {
-        crc ^= u32::from(*byte);
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-        }
-    }
-    !crc
-}
 
 #[derive(Debug)]
 struct WalState {

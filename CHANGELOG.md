@@ -5,6 +5,68 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Segment format v7: the records region is compressed, and attribute value
+  text stops being stored twice.** A v6 store is migrated **automatically at
+  first open** — no command, no flag; back up first, open, done. The
+  migration is resumable by construction (every file conversion is atomic
+  onto its own name), survives `kill -9` at arbitrary points, converts
+  pinned backups and rewrites their manifests, and completes with a
+  full-re-hash checkpoint that declares the format. What the format buys:
+  records carry a fixed 20-byte `(key id, value digest)` pair instead of
+  each attribute's key and value text (the text lives once, in the payload,
+  from which the pair list is provably re-derivable), the records region is
+  carved into 128 KiB record-aligned LZ4 blocks with per-block CRC-32 and a
+  resident block directory, and payload blobs gain a `TRZBLOB1` header with
+  the same codec-or-raw rule while keeping their uncompressed-bytes content
+  address, so dedup and erasure needles are unchanged. On this branch's
+  development run of `storage-bench`, settled amplification measured
+  **0.41x** on `generic` and **0.23x** on `llm` (v6 shipped at 1.81x and
+  2.07x) — cited here as an unpublished development measurement: the
+  recorded claims, [benchmarks/storage.md](docs/benchmarks/storage.md) and
+  acceptance gates 5 and 6 of
+  [segment-format.md](docs/segment-format.md#acceptance-gates), land with
+  the gates PR. Adversarial-review hardening shipped inside the same
+  change: every header- or directory-declared length is bounded before it
+  can size an allocation (a flipped high bit used to abort the process at
+  open instead of erroring), the block directory's min-timestamp fences are
+  verified against the records they describe (a sorted-but-corrupt fence
+  used to shift time windows silently), and a digest-moved pinned segment
+  is re-accepted on migration resume only after a full validation of every
+  block. The shared CRC-32 (`src/crc.rs`) is computed slice-by-16 from
+  compile-time tables: it now fronts every block read, and read-path
+  profiling showed the earlier byte-at-a-time fold as the single largest
+  term in trace-lookup and attribute-filter latency — the sliced form keeps
+  the checksum a rounding error beside the LZ4 inflate it precedes, with
+  bit-identical output.
+  - Library surface: `segment::Codec` and `segment::encode_with_codec` are
+    new (the raw codec is format-supported; store-written segments are
+    fixed at LZ4 in this release), `segment::Error::TooLarge` carries a
+    `String` naming the offending field or record instead of a `&'static
+    str`, `Segment::resident_bytes` / `Store::resident_payload_bytes` now
+    count the decoded-block cache (zero at open and flush, bounded by four
+    blocks per open segment afterwards), `segment::BlockWalk` (via
+    `Segment::walk`) is the request-scoped decoded-block memo every
+    in-order decode loop reads through — it bounds a walk's inflations to
+    one per block even when a concurrent scan thrashes the shared cache —
+    and `Store::open` may perform the v6 → v7 migration before returning.
+
+### Added
+
+- **`lz4_flex` `=0.14.0`** — the third direct dependency, and the first
+  since `serde`/`serde_json`. LZ4 block compression for segment records and
+  payload blobs; pinned to an exact version because compressor output bytes
+  are format bytes under the acceptance tests (upgrading the pin is a
+  deliberate re-baseline, never a routine bump). Built with
+  `default-features = false` and the safe encode/decode features only, so
+  the crate-wide `#![forbid(unsafe_code)]` posture keeps its meaning. The
+  written justification lives in
+  [docs/internals/dependencies.md](docs/internals/dependencies.md); the
+  lockfile grows from twelve packages to thirteen.
+
 ## [0.23.0] - 2026-08-26
 
 The release where the production obligations land, and the first artifact to
