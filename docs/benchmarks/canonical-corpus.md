@@ -6,16 +6,16 @@ These values were measured by `cargo run --release --bin bench`; they are not es
 
 | Metric | Measured | Target | Result |
 |---|---:|---:|---|
-| Sustained batched HTTP ingest (durability=wal, compaction fanout=4, max segment bytes=268435456) | 69059 spans/s | >= 50,000 spans/s | PASS |
-| Trace-by-id p95 | 3.110 ms | < 50 ms | PASS |
-| Attribute-filtered query p95 | 13.043 ms | < 300 ms | PASS |
+| Sustained batched HTTP ingest (durability=wal, compaction fanout=4, max segment bytes=268435456) | 69980 spans/s | >= 50,000 spans/s | PASS |
+| Trace-by-id p95 | 0.862 ms | < 50 ms | PASS |
+| Attribute-filtered query p95 | 4.392 ms | < 300 ms | PASS |
 
 Additional percentiles:
 
 | Query | p50 | p95 | p99 | samples |
 |---|---:|---:|---:|---:|
-| Trace by ID | 0.513 ms | 3.110 ms | 5.647 ms | 200 |
-| Attribute filter | 5.167 ms | 13.043 ms | 20.854 ms | 100 |
+| Trace by ID | 0.425 ms | 0.862 ms | 1.245 ms | 200 |
+| Attribute filter | 2.974 ms | 4.392 ms | 8.928 ms | 100 |
 
 ## Methodology
 
@@ -24,8 +24,9 @@ Additional percentiles:
 - Trace sampling: 200 deterministic trace IDs spread through the corpus; each response is parsed and checked for 10 spans.
 - Filter sampling: 100 deterministic `attr.benchmark.group` queries with `limit=100`; each response body is parsed as JSON.
 - Percentiles: nearest-rank selection over complete request wall-clock durations measured with `std::time::Instant`; no warm-up samples are discarded.
-- Build: Cargo release profile. Timestamp: Unix 1788175838.
+- Build: Cargo release profile. Timestamp: Unix 1788180718.
 - Machine context: macos/aarch64, 10 available hardware threads.
+- Load conditions: 1-minute load average 8.19 at the end of the run — ambient desktop load, not an idle host (the house rule is [ingest.md's](ingest.md#load-conditions)). An idle rerun will likely improve the tails; the gate tripwires, not these point estimates, are the contract.
 - Final server stats: `{"buffer_age_seconds":null,"buffered_records":0,"bytes_on_disk":124947455,"durability":"wal","persisted_records":1000000,"record_count":1000000,"segment_count":65,"total_records":1000000,"wal_bytes":0}`.
 
 The ingest threshold is PASS. The trace p95 threshold is PASS. The filtered-query p95 threshold is PASS. Any miss remains visible in the table rather than being substituted or estimated.
@@ -35,3 +36,4 @@ The ingest threshold is PASS. The trace p95 threshold is PASS. The filtered-quer
 - Corpus declaration: `1000000` spans (1,000,000 spans).
 - Every reported result is measured by this benchmark run, never estimated.
 - Unsuccessful lookups are reported as misses.
+- **This file exists only because the run passed acceptance gate 6's tripwires** ([segment format](../segment-format.md#acceptance-gates), as amended to absolute bounds): trace-lookup p50 <= 0.75 ms and attribute-filter p50 <= 6 ms on this canonical corpus. The benchmark asserts them after measuring and before writing; a run that misses either exits non-zero and writes nothing.

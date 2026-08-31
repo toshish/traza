@@ -6,6 +6,22 @@
 //! quiesce and walks the data directory. The ratio of the two is the number
 //! every storage-cost comparison is built from, so it is measured on both
 //! sides rather than read off a stats endpoint that only counts segments.
+//!
+//! **This run gates itself.** Acceptance gate 5 of the segment format
+//! (`docs/segment-format.md`, "Acceptance gates") requires settled
+//! amplification **at or below 1.0x** on the `generic` and `llm` corpora. The
+//! gate is asserted here, after measurement and before anything is written: a
+//! run that misses it exits non-zero and leaves `docs/benchmarks/storage.md`
+//! untouched, because the harness does not publish a number the format's own
+//! contract says is a failure.
+//!
+//! **Only the canonical corpora gate and publish** — the same rule `bench`
+//! and `query-bench` hold themselves to. A `TRAZA_STORAGE_BENCH_*_SPANS`
+//! override prints its table and leaves the record alone: the gate is defined
+//! at the default corpus sizes (a small smoke corpus amplifies on fixed
+//! WAL and bookkeeping overhead alone, at a size the spec never gated), and
+//! the record is a published document that an experiment must not silently
+//! rewrite.
 
 use serde_json::{json, Value};
 use std::env;
@@ -33,6 +49,12 @@ const OBJECT_STORAGE_USD_PER_GIB_MONTH: f64 = 0.023;
 /// Replica count priced in the HA row. Traza has no shared-storage tier, so an
 /// HA cluster of N nodes keeps N copies and pays N times.
 const HA_REPLICAS: f64 = 3.0;
+
+/// Acceptance gate 5 (`docs/segment-format.md`, "Acceptance gates"): settled
+/// amplification at or below this value on the corpora named in
+/// [`GATED_PROFILES`]. A miss exits non-zero and writes nothing.
+const GATE_MAX_AMPLIFICATION: f64 = 1.0;
+const GATED_PROFILES: [&str; 2] = ["generic", "llm"];
 
 struct ServerGuard {
     child: Child,
@@ -73,6 +95,13 @@ struct Measurement {
     other_bytes: u64,
     total_bytes: u64,
     segment_count: u64,
+    /// Stored (compressed) records-region bytes, summed over every segment's
+    /// v7 header.
+    records_stored_bytes: u64,
+    /// Logical (uncompressed) records-region bytes, summed the same way.
+    records_logical_bytes: u64,
+    /// The largest single segment's stored-records share of its file.
+    largest_records_share: f64,
     stats: Value,
 }
 
@@ -150,9 +179,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?,
     ];
 
-    let report = render(&measurements)?;
-    fs::write("docs/benchmarks/storage.md", &report)?;
-    println!("\nWrote docs/benchmarks/storage.md");
+    // The gate and the record are defined on the canonical corpora only, and
+    // the two share one predicate so they cannot drift apart: an overridden
+    // corpus size neither asserts gate 5 (the spec does not define it there,
+    // and a small smoke corpus would fail it spuriously on fixed overhead)
+    // nor rewrites the published record.
+    let canonical = spans_for("generic", DEFAULT_GENERIC_SPANS) == DEFAULT_GENERIC_SPANS
+        && spans_for("llm", DEFAULT_LLM_SPANS) == DEFAULT_LLM_SPANS
+        && spans_for("pinned_context", DEFAULT_PINNED_SPANS) == DEFAULT_PINNED_SPANS;
+
+    if canonical {
+        // Acceptance gate 5, asserted before anything is written: a run that
+        // misses it must not leave a record that reads like a result.
+        let mut gate_misses = Vec::new();
+        for m in &measurements {
+            if GATED_PROFILES.contains(&m.profile) && m.amplification() > GATE_MAX_AMPLIFICATION {
+                gate_misses.push(format!(
+                    "`{}` measured {:.2}x amplification, gate is <= {:.2}x",
+                    m.profile,
+                    m.amplification(),
+                    GATE_MAX_AMPLIFICATION,
+                ));
+            }
+        }
+        if !gate_misses.is_empty() {
+            for miss in &gate_misses {
+                eprintln!("GATE FAILED: {miss}");
+            }
+            return Err(format!(
+                "acceptance gate 5 (docs/segment-format.md) failed on {} corpus/corpora; \
+                 docs/benchmarks/storage.md was not written",
+                gate_misses.len()
+            )
+            .into());
+        }
+
+        let report = render(&measurements, true)?;
+        fs::write("docs/benchmarks/storage.md", &report)?;
+        println!("\nWrote docs/benchmarks/storage.md");
+    } else {
+        println!("\n{}", render(&measurements, false)?);
+        println!(
+            "(experimental configuration — docs/benchmarks/storage.md not rewritten, \
+             gate 5 not asserted: the gate and the record are defined at the default \
+             corpus sizes only)"
+        );
+    }
     for measurement in &measurements {
         println!(
             "{}: {} spans, {:.0} MiB in -> {:.0} MiB on disk ({:.2}x amplification, {:.0} B/span)",
@@ -247,6 +319,9 @@ fn measure(
     let mut wal_bytes = 0;
     let mut payload_bytes = 0;
     let mut other_bytes = 0;
+    let mut records_stored_bytes = 0;
+    let mut records_logical_bytes = 0;
+    let mut largest_records_share = 0.0f64;
     for entry in fs::read_dir(&root)? {
         let path = entry?.path();
         let bytes = directory_bytes(&path)?;
@@ -256,6 +331,12 @@ fn measure(
             .unwrap_or_default();
         if name.starts_with("segment-") && name.ends_with(".seg") {
             segment_bytes += bytes;
+            let (stored, logical) = records_region(&path)?;
+            records_stored_bytes += stored;
+            records_logical_bytes += logical;
+            if bytes > 0 {
+                largest_records_share = largest_records_share.max(stored as f64 / bytes as f64);
+            }
         } else if name.starts_with("wal") {
             wal_bytes += bytes;
         } else if name == "payloads" {
@@ -293,8 +374,37 @@ fn measure(
         other_bytes,
         total_bytes,
         segment_count,
+        records_stored_bytes,
+        records_logical_bytes,
+        largest_records_share,
         stats,
     })
+}
+
+/// The records region's stored and logical lengths, read from a v7 segment
+/// header: 128 bytes, magic `TRAZASEG`, stored (compressed) records length at
+/// byte 32, logical (uncompressed) records length at byte 120 — see the
+/// header table in `docs/segment-format.md`. The bench refuses a file it does
+/// not recognize rather than measuring it as zero.
+fn records_region(path: &Path) -> Result<(u64, u64), Box<dyn std::error::Error>> {
+    let mut header = [0u8; 128];
+    let mut file = fs::File::open(path)?;
+    file.read_exact(&mut header)?;
+    if &header[0..8] != b"TRAZASEG" {
+        return Err(format!("{}: not a Traza segment", path.display()).into());
+    }
+    let version = u16::from_le_bytes([header[8], header[9]]);
+    let header_len = u16::from_le_bytes([header[10], header[11]]);
+    if version != 7 || header_len != 128 {
+        return Err(format!(
+            "{}: segment declares version {version} with a {header_len}-byte header; \
+             this bench measures the v7 layout only",
+            path.display()
+        )
+        .into());
+    }
+    let word = |offset: usize| u64::from_le_bytes(header[offset..offset + 8].try_into().unwrap());
+    Ok((word(32), word(120)))
 }
 
 /// The service-trace corpus, span-for-span the shape `bench.rs` ingests.
@@ -458,7 +568,11 @@ fn pinned_context_span(i: usize) -> Value {
     })
 }
 
-fn render(measurements: &[Measurement]) -> Result<String, Box<dyn std::error::Error>> {
+/// Renders the report. `gated` says whether this run asserted acceptance
+/// gate 5 (true only for the canonical corpora, whose report becomes the
+/// published record); an experimental run's printout must not claim a gate
+/// that was never asserted.
+fn render(measurements: &[Measurement], gated: bool) -> Result<String, Box<dyn std::error::Error>> {
     let measured_at = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let mut report = String::from(
         "# Traza Storage Benchmark\n\n\
@@ -561,9 +675,24 @@ threshold at its default. No setting was tuned for this measurement.\n\
         "\n## Verification Notes\n\n\
 - Every reported byte count is measured by this run, never estimated.\n\
 - The benchmark fails rather than reports if the store does not hold exactly the corpus it \
-ingested.\n\
-- Traza stores span payloads as JSON and does not compress them. A ratio below 1:1 is \
-amplification, and is reported as measured rather than inverted into a flattering number.\n\
+ingested.\n",
+    );
+    if gated {
+        report.push_str(&format!(
+            "- **This file exists only because the run passed acceptance gate 5** of \
+[the segment format](../segment-format.md#acceptance-gates): settled amplification at or below \
+{GATE_MAX_AMPLIFICATION:.1}x on `generic` and `llm`. The benchmark asserts the gate after \
+measuring and before writing; a run that misses it exits non-zero and writes nothing.\n",
+        ));
+    } else {
+        report.push_str(
+            "- **Experimental configuration: acceptance gate 5 was NOT asserted** — the gate is \
+defined at the default corpus sizes only — and the published record was not rewritten.\n",
+        );
+    }
+    report.push_str(
+        "- Segment records and payload blobs are LZ4-compressed (format v7). A ratio below 1:1 would be \
+amplification and would be reported as measured rather than inverted into a flattering number.\n\
 - Exact byte counts, so anything derived from this table can be recomputed rather than \
 re-rounded:\n",
     );
@@ -581,7 +710,50 @@ re-rounded:\n",
             m.other_bytes,
         ));
     }
+
+    report.push_str(
+        "\n## Records-region measurements\n\n\
+Measured by this same run, from the v7 header of every segment file the settled store holds: \
+the header is 128 bytes, the records region's STORED (compressed) length is the u64 at byte 32, \
+and its LOGICAL (uncompressed) length is the u64 at byte 120 — the header table in \
+[the format document](../segment-format.md#the-v7-header) is the reference. The records region \
+is LZ4-compressed and addressed through the block directory, so the logical column is the byte \
+count the directory's blocks decode to, not anything present contiguously in the file.\n\n\
+| Corpus | Segment bytes | Records stored | Stored share | Largest per-file share | Records logical | Stored/logical |\n\
+|---|---:|---:|---:|---:|---:|---:|\n",
+    );
+    for m in measurements {
+        report.push_str(&format!(
+            "| `{}` | {} | {} | {:.1}% | {:.1}% | {} | {:.2} |\n",
+            m.profile,
+            m.segment_bytes,
+            m.records_stored_bytes,
+            percent(m.records_stored_bytes, m.segment_bytes),
+            m.largest_records_share * 100.0,
+            m.records_logical_bytes,
+            m.records_stored_bytes as f64 / m.records_logical_bytes.max(1) as f64,
+        ));
+    }
+    report.push_str(
+        "\nThe v6-era edition of this section also measured a \"value text\" column: the share \
+of the records region that was attribute value text stored twice, once in the payload and once \
+in the record's own key/value list. v7 removed that double-store — records carry fixed-width \
+`(key id, digest)` pairs, and the value text lives only in the payload — so the column no \
+longer measures anything. The v6-era numbers (36.1% of `llm`'s records region, 25.6% of \
+`pinned-context`'s, 7.4% of `generic`'s, at `65652a2`) remain quoted in \
+[the format document's motivation](../segment-format.md#format-v7) as the measurement that \
+justified the change, and in this file's git history.\n",
+    );
     Ok(report)
+}
+
+/// `part` as a percentage of `whole`, zero-safe.
+fn percent(part: u64, whole: u64) -> f64 {
+    if whole == 0 {
+        0.0
+    } else {
+        part as f64 / whole as f64 * 100.0
+    }
 }
 
 fn mib(bytes: u64) -> f64 {

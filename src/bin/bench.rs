@@ -1,4 +1,19 @@
 //! Benchmark driver for Traza storage operations.
+//!
+//! **This run gates itself.** Acceptance gate 6 of the segment format
+//! (`docs/segment-format.md`, "Acceptance gates" — the deliberately amended,
+//! absolute form) sets tripwires on the canonical 1M-span corpus:
+//! **trace-lookup p50 at or below 0.75 ms** and **attribute-filter p50 at or
+//! below 6 ms**. They are asserted here after measurement and before
+//! `docs/benchmarks/canonical-corpus.md` is written: a canonical run that
+//! misses either exits non-zero and writes nothing, because the harness does
+//! not publish a number the format's own contract says is a failure.
+//! Non-canonical configurations — an overridden corpus size
+//! (`TRAZA_BENCH_SPANS`) or compaction knob (`TRAZA_BENCH_COMPACTION_FANOUT`,
+//! `TRAZA_BENCH_COMPACTION_MAX_SEGMENT_BYTES`) — never write the doc and are
+//! not gated: the tripwires are defined on the canonical corpus under the
+//! default configuration only, and an experiment prints its numbers and
+//! leaves the record alone.
 
 use serde_json::{json, Value};
 use std::env;
@@ -11,9 +26,17 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_SPAN_COUNT: usize = 1_000_000;
+/// The compaction fan-out the published record is measured at.
+const DEFAULT_COMPACTION_FANOUT: &str = "4";
 const BATCH_SIZE: usize = 1_000;
 const TRACE_SAMPLES: usize = 200;
 const FILTER_SAMPLES: usize = 100;
+
+/// Acceptance gate 6 (`docs/segment-format.md`, "Acceptance gates", as
+/// amended to absolute tripwires): median tripwires on the canonical corpus.
+/// A canonical run past either exits non-zero and writes nothing.
+const GATE_TRACE_P50: Duration = Duration::from_micros(750);
+const GATE_FILTER_P50: Duration = Duration::from_millis(6);
 
 struct ServerGuard {
     child: Child,
@@ -30,7 +53,16 @@ impl Drop for ServerGuard {
 
 /// Compaction fan-out for the benchmarked server; `0` disables compaction.
 fn compaction_fanout() -> String {
-    std::env::var("TRAZA_BENCH_COMPACTION_FANOUT").unwrap_or_else(|_| "4".to_owned())
+    std::env::var("TRAZA_BENCH_COMPACTION_FANOUT")
+        .unwrap_or_else(|_| DEFAULT_COMPACTION_FANOUT.to_owned())
+}
+
+/// The segment ceiling the published record is measured at: the production
+/// default, read from the config rather than repeated as a literal.
+fn default_max_segment_bytes() -> String {
+    traza::CompactionConfig::default()
+        .max_segment_bytes
+        .to_string()
 }
 
 /// Size ceiling for compacted segments. This bounds the segment count from
@@ -38,21 +70,36 @@ fn compaction_fanout() -> String {
 /// it is the knob scaling experiments need to vary. Defaults to the real
 /// production default rather than a literal, so the two cannot drift apart.
 fn compaction_max_segment_bytes() -> String {
-    std::env::var("TRAZA_BENCH_COMPACTION_MAX_SEGMENT_BYTES").unwrap_or_else(|_| {
-        traza::CompactionConfig::default()
-            .max_segment_bytes
-            .to_string()
-    })
+    std::env::var("TRAZA_BENCH_COMPACTION_MAX_SEGMENT_BYTES")
+        .unwrap_or_else(|_| default_max_segment_bytes())
 }
 
-fn span_count() -> usize {
+fn span_count() -> Result<usize, Box<dyn std::error::Error>> {
     // TRAZA_BENCH_SPANS overrides the corpus size for scaling experiments.
-    // The published record is only rewritten for the canonical default
-    // corpus, so experimental runs cannot silently change its numbers.
-    std::env::var("TRAZA_BENCH_SPANS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(DEFAULT_SPAN_COUNT)
+    // The published record is only rewritten for the canonical configuration,
+    // so experimental runs cannot silently change its numbers. A set-but-
+    // unparseable value is an error, not a silent fall-through: falling back
+    // would run the full canonical corpus — and rewrite the record — under a
+    // configuration the operator explicitly asked to change.
+    match std::env::var("TRAZA_BENCH_SPANS") {
+        Ok(value) => value.parse().map_err(|_| {
+            format!("TRAZA_BENCH_SPANS is set to {value:?}, which is not a span count").into()
+        }),
+        Err(_) => Ok(DEFAULT_SPAN_COUNT),
+    }
+}
+
+/// True only for the configuration the published record is defined on: the
+/// canonical corpus at the default compaction knobs. Gate 6 and the rewrite of
+/// `docs/benchmarks/canonical-corpus.md` both key on this — an uncompacted-
+/// baseline experiment (`TRAZA_BENCH_COMPACTION_FANOUT=0`) runs the same
+/// corpus through hundreds of segments, so gating it against tripwires the
+/// spec defines for the default configuration would fail it spuriously, and
+/// writing its numbers over the record would be worse.
+fn canonical_configuration(span_count: usize) -> bool {
+    span_count == DEFAULT_SPAN_COUNT
+        && compaction_fanout() == DEFAULT_COMPACTION_FANOUT
+        && compaction_max_segment_bytes() == default_max_segment_bytes()
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -95,7 +142,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     wait_for_server(port, &mut server.child)?;
 
     #[allow(non_snake_case)]
-    let SPAN_COUNT = span_count();
+    let SPAN_COUNT = span_count()?;
     println!("Loading {SPAN_COUNT} spans in batches of {BATCH_SIZE}...");
     let ingest_started = Instant::now();
     let mut body = Vec::with_capacity(512 * BATCH_SIZE);
@@ -209,6 +256,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let filter_p95 = percentile(&filter_latencies, 95.0);
     let filter_p99 = percentile(&filter_latencies, 99.0);
 
+    // Acceptance gate 6's tripwires, asserted before the record is written.
+    // Only the canonical configuration — default corpus, default compaction
+    // knobs — defines the gate, and only the canonical configuration writes
+    // the doc; the two share one predicate so they cannot drift apart.
+    let canonical = canonical_configuration(SPAN_COUNT);
+    if canonical {
+        let mut gate_misses = Vec::new();
+        if trace_p50 > GATE_TRACE_P50 {
+            gate_misses.push(format!(
+                "trace-lookup p50 measured {:.3} ms, tripwire is <= {:.3} ms",
+                ms(trace_p50),
+                ms(GATE_TRACE_P50),
+            ));
+        }
+        if filter_p50 > GATE_FILTER_P50 {
+            gate_misses.push(format!(
+                "attribute-filter p50 measured {:.3} ms, tripwire is <= {:.3} ms",
+                ms(filter_p50),
+                ms(GATE_FILTER_P50),
+            ));
+        }
+        if !gate_misses.is_empty() {
+            for miss in &gate_misses {
+                eprintln!("GATE FAILED: {miss}");
+            }
+            return Err("acceptance gate 6 (docs/segment-format.md) failed; \
+                 docs/benchmarks/canonical-corpus.md was not written"
+                .into());
+        }
+    }
+
     let context = machine_context();
     let measured_at = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let mut report = format!(
@@ -233,6 +311,7 @@ Additional percentiles:\n\n\
 - Percentiles: nearest-rank selection over complete request wall-clock durations measured with `std::time::Instant`; no warm-up samples are discarded.\n\
 - Build: Cargo release profile. Timestamp: Unix {measured_at}.\n\
 - Machine context: {context}.\n\
+- Load conditions: 1-minute load average {loadavg} at the end of the run — ambient desktop load, not an idle host (the house rule is [ingest.md's](ingest.md#load-conditions)). An idle rerun will likely improve the tails; the gate tripwires, not these point estimates, are the contract.\n\
 - Final server stats: `{}`.\n\n\
 The ingest threshold is {}. The trace p95 threshold is {}. The filtered-query p95 threshold is {}. Any miss remains visible in the table rather than being substituted or estimated.\n",
         pass(ingest_rate >= 50_000.0),
@@ -254,12 +333,29 @@ The ingest threshold is {}. The trace p95 threshold is {}. The filtered-query p9
         pass(filter_p95 < Duration::from_millis(300)),
         fanout = compaction_fanout(),
         max_segment_bytes = compaction_max_segment_bytes(),
+        loadavg = load_average_1m(),
     );
-    report.push_str("\n## Verification Notes\n\n- Corpus declaration: `1000000` spans (1,000,000 spans).\n- Every reported result is measured by this benchmark run, never estimated.\n- Unsuccessful lookups are reported as misses.\n");
-    if SPAN_COUNT == DEFAULT_SPAN_COUNT {
+    report.push_str(&format!(
+        "\n## Verification Notes\n\n\
+- Corpus declaration: `1000000` spans (1,000,000 spans).\n\
+- Every reported result is measured by this benchmark run, never estimated.\n\
+- Unsuccessful lookups are reported as misses.\n\
+- **This file exists only because the run passed acceptance gate 6's tripwires** \
+([segment format](../segment-format.md#acceptance-gates), as amended to absolute bounds): \
+trace-lookup p50 <= {:.2} ms and attribute-filter p50 <= {:.0} ms on this canonical corpus. \
+The benchmark asserts them after measuring and before writing; a run that misses either exits \
+non-zero and writes nothing.\n",
+        ms(GATE_TRACE_P50),
+        ms(GATE_FILTER_P50),
+    ));
+    if canonical {
         fs::write("docs/benchmarks/canonical-corpus.md", report)?;
     } else {
-        println!("(experimental corpus — docs/benchmarks/canonical-corpus.md not rewritten)");
+        println!(
+            "(experimental configuration — docs/benchmarks/canonical-corpus.md not rewritten, \
+             gate 6 not asserted: the tripwires are defined on the canonical corpus at the \
+             default compaction configuration only)"
+        );
     }
 
     println!(
@@ -278,7 +374,7 @@ The ingest threshold is {}. The trace p95 threshold is {}. The filtered-query p9
         ms(filter_p95),
         ms(filter_p99)
     );
-    if SPAN_COUNT == DEFAULT_SPAN_COUNT {
+    if canonical {
         println!("Wrote docs/benchmarks/canonical-corpus.md");
     }
     Ok(())
@@ -409,4 +505,28 @@ fn machine_context() -> String {
     let arch = env::consts::ARCH;
     let parallelism = thread::available_parallelism().map_or(1, usize::from);
     format!("{os}/{arch}, {parallelism} available hardware threads")
+}
+
+/// The 1-minute load average, measured rather than asserted, for the
+/// load-conditions line of the record. Reads `/proc/loadavg` where it exists
+/// and falls back to `sysctl -n vm.loadavg` (macOS); anything else reports
+/// "unavailable" instead of a guess.
+fn load_average_1m() -> String {
+    if let Ok(contents) = fs::read_to_string("/proc/loadavg") {
+        if let Some(first) = contents.split_whitespace().next() {
+            return first.to_owned();
+        }
+    }
+    if let Ok(output) = Command::new("sysctl").args(["-n", "vm.loadavg"]).output() {
+        if output.status.success() {
+            let text = String::from_utf8_lossy(&output.stdout);
+            if let Some(first) = text
+                .split_whitespace()
+                .find(|token| token.starts_with(|c: char| c.is_ascii_digit()))
+            {
+                return first.to_owned();
+            }
+        }
+    }
+    "unavailable".to_owned()
 }

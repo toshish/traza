@@ -144,8 +144,8 @@ dim "  GET /v1/stats/duration with no filter — every span's duration folded in
 probe aggregate --expect-spans "$spans"
 
 bold "▸ the store it did that against"
-dim "  from GET /v1/stats — segments are uncompressed JSON plus indexes, the honest"
-dim "  trade behind the latencies above (docs/storage-comparison.md)."
+dim "  from GET /v1/stats — segment records are LZ4-compressed, indexes stored raw"
+dim "  beside them; what that costs and buys is in docs/storage-comparison.md."
 probe store --expect-spans "$spans"
 
 bold "▸ the same needle, in the dashboard"

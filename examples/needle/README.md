@@ -54,16 +54,18 @@ it found.
 
 ## Honest caveats
 
-- **Segments are uncompressed JSON plus indexes** — the trade that buys the
-  latencies above, spelled out in
+- **Segment records are LZ4-compressed; the indexes beside them are stored
+  raw** — the trade behind the latencies above, spelled out in
   [storage-comparison](../../docs/storage-comparison.md). Measured on this
-  corpus: ~456 MiB on disk for 1,000,000 lean spans (~27 MiB at the 60,000
-  smoke scale). Budget ~0.5 GiB free disk for a full run; fatter spans cost
-  proportionally more.
+  corpus: ~123 MiB on disk for 1,000,000 lean spans (~7 MiB at the 60,000
+  smoke scale). Budget ~0.5 GiB free disk for a full run — the store passes
+  through more than its settled size while compaction is still merging — and
+  fatter spans cost proportionally more.
 - **The ingest rate is client-bound.** A python3/`http.client` flood from the
-  same laptop measured ~200,000 spans/s here; the server's own benchmark rig
-  has measured 250,453 spans/s (`docs/benchmarks/ingest.md`). The demo prints
-  whatever it measured, never a quoted number.
+  same laptop measured ~194,000 spans/s here; the server's own benchmark rig
+  has measured 250,453 spans/s, on a pre-v7 build at v0.16
+  (`docs/benchmarks/ingest.md`). The demo prints whatever it measured, never
+  a quoted number.
 - **`wal` durability on macOS survives `kill -9`, not power loss** — macOS
   `fsync` does not reach the platter without `F_FULLFSYNC`
   ([durability](../../docs/operations/durability.md)).

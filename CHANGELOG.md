@@ -22,14 +22,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   carved into 128 KiB record-aligned LZ4 blocks with per-block CRC-32 and a
   resident block directory, and payload blobs gain a `TRZBLOB1` header with
   the same codec-or-raw rule while keeping their uncompressed-bytes content
-  address, so dedup and erasure needles are unchanged. On this branch's
-  development run of `storage-bench`, settled amplification measured
-  **0.41x** on `generic` and **0.23x** on `llm` (v6 shipped at 1.81x and
-  2.07x) — cited here as an unpublished development measurement: the
-  recorded claims, [benchmarks/storage.md](docs/benchmarks/storage.md) and
-  acceptance gates 5 and 6 of
-  [segment-format.md](docs/segment-format.md#acceptance-gates), land with
-  the gates PR. Adversarial-review hardening shipped inside the same
+  address, so dedup and erasure needles are unchanged. The claims are
+  published: settled amplification measured **0.41x** on `generic` and
+  **0.23x** on `llm` (v6 shipped at 1.81x and 2.07x), recorded in
+  [benchmarks/storage.md](docs/benchmarks/storage.md) by a run that asserts
+  acceptance gate 5 — amplification at or below 1.0x on both corpora —
+  before it will write, and the canonical latency benchmark asserts gate 6's
+  tripwires the same way — trace-lookup p50 at or below 0.75 ms and
+  attribute-filter p50 at or below 6 ms (measured 0.425 ms and 2.974 ms) —
+  before writing
+  [benchmarks/canonical-corpus.md](docs/benchmarks/canonical-corpus.md);
+  both gates are defined in
+  [segment-format.md](docs/segment-format.md#acceptance-gates), and a run
+  that misses one exits non-zero with nothing written.
+  Adversarial-review hardening shipped inside the same
   change: every header- or directory-declared length is bounded before it
   can size an allocation (a flipped high bit used to abort the process at
   open instead of erroring), the block directory's min-timestamp fences are

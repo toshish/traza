@@ -41,9 +41,11 @@ remain normative for v7, carried over unchanged. The WAL, the
 annotation/eval/tombstone logs, and the rollup sidecar formats are
 untouched.
 
-The motivation is measured, at `65652a2` on the `storage-bench` corpora —
-the run recorded in [benchmarks/storage.md](benchmarks/storage.md), whose
-region-measurement footnote carries the figures cited here:
+The motivation is measured, at `65652a2` on the `storage-bench` corpora — a
+v6-era run whose figures are cited here.
+[benchmarks/storage.md](benchmarks/storage.md) now records the v7 run that
+superseded it (its records-region section restates these numbers as the
+retired motivation); the full v6-era record lives in that file's git history:
 
 - **The records region is where the bytes are**: 89.6% of segment bytes on
   `generic`, 95.3% on `llm`, 91.9% on `pinned-context`, corpus-wide, and no
@@ -58,7 +60,7 @@ region-measurement footnote carries the figures cited here:
   of `pinned-context`'s, and 7.4% of `generic`'s. The double-store grows
   with exactly the workload this store exists for.
 - **Compressing the records region is worth a multiple, not a percentage.**
-  The [projection in storage-comparison](storage-comparison.md#what-compression-would-buy)
+  The [projection in storage-comparison](storage-comparison.md#what-compression-bought-next-to-the-projection-that-motivated-it)
   — labeled a projection there and here — puts block-wise `zstd -3` at a
   6.30x/11.59x/9.27x segment shrink across the three corpora. v7 uses LZ4,
   which trades ratio for speed and safety of implementation, and cuts
@@ -344,11 +346,14 @@ content — are stored uncompressed. The reader parses them at open and probes
 them per query: posting lists are probed by digest and intersected, content
 rows are read by exact byte range, the offset table is the scan path.
 Compressing them would put a decode in front of every probe, and it would
-buy little: [storage-comparison](storage-comparison.md#what-compression-would-buy)
-already makes the argument — compressing the index sections "would flatter
-the number and break the design". After v7 the indexes become the majority
-of segment bytes (the projection's tables show 55–75% post-compression, by
-corpus); shrinking *them* is future index-format work, not a codec knob.
+buy little — the argument
+[storage-comparison](storage-comparison.md#what-compression-bought-next-to-the-projection-that-motivated-it)
+makes: past compressed records, the work is in the indexes, not the payload.
+After v7 the indexes are roughly half of segment bytes — measured at 43–55%
+by corpus, the complement of the records shares in
+[storage.md's records-region table](benchmarks/storage.md#records-region-measurements);
+the projection's tables had put them at 55–75%, an overestimate — and
+shrinking *them* is future index-format work, not a codec knob.
 
 The WAL and the rollup sidecars also stay raw, deliberately: erasure
 verification runs byte-level occurrence scans over both (see
@@ -629,15 +634,36 @@ The implementation is held to these, each with an executable oracle:
    baseline** (measured +22%: compression writes fewer bytes), and the
    measured medians of both sides published beside each other in
    [benchmarks](benchmarks/) with the block-decode cost stated plainly.
+   *(Deliberate amendment #4, to the publication clause only: the files
+   under [benchmarks](benchmarks/) are harness-written records of canonical
+   runs, and no harness on this branch can produce a v6-side run — the v6
+   writer is gone, and the only v6 code left is the migrator's frozen
+   decoder — so a benchmarks/ file for the interleaved medians would be
+   hand-written prose wearing a harness record's clothes. The record of the
+   interleaved v6/v7 medians is amendment #3 above — 49 µs vs 38 µs on
+   trace lookup, ~1.23 ms vs 0.64 ms on the limit-100 attribute filter,
+   with the block-decode cost stated there — and this amendment names that
+   text as the publication the clause requires.)*
 
-Gates 1 through 4 are enforced by the test suite on this branch. Gates 5
-and 6 are measurement gates: their runs, and the rewrite of
-[benchmarks/storage.md](benchmarks/storage.md) that records them (that
-file's tables and region-measurement recipe still describe the v6-era run
-this section cites as motivation), land with the gates PR. Until those
-recorded numbers land, every ratio in this section remains a projection —
-including the development-run figures the changelog cites as unpublished
-measurements.
+Gates 1 through 4 are enforced by the test suite. Gates 5 and 6 are
+measurement gates, and they landed. `storage-bench` asserts gate 5 after
+measuring and before writing, and refuses to write
+[benchmarks/storage.md](benchmarks/storage.md) on a miss; `bench` asserts
+gate 6's two latency tripwires the same way against
+[benchmarks/canonical-corpus.md](benchmarks/canonical-corpus.md). Both
+gate and publish on canonical runs only — default corpora, default
+configuration; an experimental knob prints its table and leaves the record
+alone, un-gated, because the gates are defined on the canonical
+configuration. Gate 6's other two clauses are recorded rather than
+harness-asserted: the ingest clause rests on the interleaved A/B's measured
++22% above, and the publication clause is satisfied by amendment #3, per
+amendment #4. The recorded runs are published: settled amplification
+**0.41x** on `generic` and **0.23x** on `llm` (gate 5's bound is 1.0x), and
+trace-lookup p50 **0.425 ms** with attribute-filter p50 **2.974 ms** on the
+canonical corpus (gate 6's tripwires are 0.75 ms and 6 ms). Nothing in this
+section is a projection any more except what a sentence explicitly labels
+as one — the zstd reference numbers; the recorded runs in
+[benchmarks/](benchmarks/) are the published claims.
 
 ---
 

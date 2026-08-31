@@ -33,7 +33,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const DEFAULT_SPAN_COUNT: usize = 500_000;
+/// The canonical corpus is 1M spans — the size every published edition of the
+/// record has measured, and the size `bench`'s canonical corpus uses — so the
+/// record stays comparable edition over edition. (It was briefly 500,000,
+/// which halved the store, collapsed it to one segment, and made the
+/// latency-over-latency diffs conflate the engine with the corpus.) Smaller
+/// experiments are one env var away and never touch the record.
+const DEFAULT_SPAN_COUNT: usize = 1_000_000;
 const DEFAULT_THREADS: usize = 8;
 const BATCH_SIZE: usize = 1_000;
 /// Warm samples per query shape. The cold sample is the single first request

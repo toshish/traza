@@ -41,19 +41,26 @@ spans over the real HTTP path, on macOS/aarch64 with 10 hardware threads.
 
 | Metric | Measured | Project target | Result |
 |---|---:|---:|---|
-| Sustained batched HTTP ingest | 116,618 spans/s | ≥ 50,000 spans/s | PASS |
-| Trace-by-id p95 | 0.642 ms | < 50 ms | PASS |
-| Attribute-filtered query p95 | 3.344 ms | < 300 ms | PASS |
+| Sustained batched HTTP ingest | 69,980 spans/s | ≥ 50,000 spans/s | PASS |
+| Trace-by-id p95 | 0.862 ms | < 50 ms | PASS |
+| Attribute-filtered query p95 | 4.392 ms | < 300 ms | PASS |
 
 | Query | p50 | p95 | p99 | samples |
 |---|---:|---:|---:|---:|
-| Trace by ID | 0.314 ms | 0.642 ms | 1.270 ms | 200 |
-| Attribute filter | 1.762 ms | 3.344 ms | 7.242 ms | 100 |
+| Trace by ID | 0.425 ms | 0.862 ms | 1.245 ms | 200 |
+| Attribute filter | 2.974 ms | 4.392 ms | 8.928 ms | 100 |
 
-That corpus occupied 583,182,107 bytes on disk across 100 segments — roughly
-583 bytes per span *for this benchmark's span shape*. Your bytes-per-span
-depends entirely on your attribute volume, so treat it as a method rather than
-a constant: ingest a representative sample and read `bytes_on_disk` from
+The ingest row measures the bench's compacting configuration (fan-out 4), so
+compaction runs concurrently with the flood.
+[`ingest.md`](../benchmarks/ingest.md)'s 82,805 spans/s single-client
+engine-limit row is the same span shape without that contention — quiet
+machine, compaction off, and a server rate whose client JSON encoding sits
+outside the timed loop, where this row's sits inside it — so the two rates
+are not like-for-like beyond that. That corpus occupied 124,947,455 bytes on
+disk across 65 segments at measurement time — roughly 125 bytes per span
+*for this benchmark's span shape*, on the v7 compressed format. Your bytes-per-span depends entirely on
+your attribute volume, so treat it as a method rather than a constant: ingest
+a representative sample and read `bytes_on_disk` from
 [`GET /v1/stats`](../guide/http-api.md#get-v1stats).
 
 Note that JSON generation sits **inside** the timed ingest loop, so the ingest
@@ -551,11 +558,16 @@ puts the same query at **~290 ms cold**.
 
 Two things follow for sizing:
 
-- **Budget about 3-8% of segment bytes for sidecars.** The dominant term is
-  eight bytes per span for the supersede prefilter, plus the per-session trace
-  sets, so the share rises with session and trace cardinality rather than with
-  span size. Both ends of that range are measured; see `query.md`
-  for the store it was measured on.
+- **Budget the sidecars in absolute bytes — roughly 30 MB per million spans
+  on the query-bench corpus — not as a stable share of the store.** The
+  dominant term is eight bytes per span for the supersede prefilter, plus the
+  per-session trace sets, so sidecar bytes scale with span count and
+  session/trace cardinality rather than with span size. Their *share* moved
+  with format v7: segments compressed to under a third of their v6 size while
+  sidecars stay raw (erasure's byte scans need them literal), so the same
+  1M-span corpus that measured 4.1% sidecar overhead on the v6 store measures
+  **12.5%** on the v7 store — 29.9 MB against 0.27 GB; see
+  [`query.md`](../benchmarks/query.md) for the store it was measured on.
 - **Compaction no longer costs the aggregations a rebuild.** A merge replaces
   several segments with one, which kills the inputs' cached rollups and
   publishes an output that has none — so the next aggregation used to pay to
