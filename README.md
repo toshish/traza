@@ -199,7 +199,7 @@ Apps instrumented with OpenLLMetry or the OpenTelemetry GenAI conventions arrive
 
 **One process.** No metadata database, no column store, no lock service, no object store to configure. It starts in milliseconds, and there is no control plane to lose a quorum at 3am.
 
-**A small surface.** Two direct dependencies, twelve packages in the whole lockfile, a 2.2 MB binary. HTTP, threading and file I/O are the standard library, and the crate is `#![forbid(unsafe_code)]`.
+**A small surface.** Three direct dependencies, thirteen packages in the whole lockfile, a 3.4 MB binary. HTTP, threading and file I/O are the standard library, and the crate is `#![forbid(unsafe_code)]`.
 
 **Agent telemetry as the workload.** Sessions, token and cost rollups, prompts and completions with large ones offloaded and deduplicated, evals and human feedback attached after the fact, live tail, and one-command dataset export.
 
@@ -223,14 +223,14 @@ Apps instrumented with OpenLLMetry or the OpenTelemetry GenAI conventions arrive
 | Filtered search, 1M spans | p95 **3.3 ms** |
 | Content search, selective term | **1.5 ms** (1,258 ms scanning) |
 | Sustained ingest, `wal` | **208,973 spans/s** |
-| Binary | **2.2 MB** |
-| Direct dependencies | **2** |
+| Binary | **3.4 MB** |
+| Direct dependencies | **3** |
 
 Every number is produced by a benchmark bundled in this repo, run over the real HTTP path. The harness writes the records itself and refuses to publish a result it cannot stand behind. Run them yourself with `cargo run --release --bin bench`.
 
 ## When not to use Traza
 
-**Disk cost is your binding constraint.** Segments are uncompressed JSON plus indexes and cost 1.8–2.1× the bytes you send. A columnar engine writing compressed files to object storage will beat that by an order of magnitude. The exception is agent context: a repeated system prompt above the offload threshold is stored once, measured at 120:1 in Traza's favour.
+**Disk cost is your binding constraint.** The recorded measurement — taken on the v6 format, where segments were uncompressed JSON plus indexes — is 1.8–2.1× the bytes you send; format v7 compresses the records region, and its recorded numbers land with the acceptance-gate rerun of `storage-bench`. A columnar engine writing compressed files to object storage will still beat a local block-storage store on raw disk price. The exception is agent context: a repeated system prompt above the offload threshold is stored once, measured at 120:1 in Traza's favour.
 
 **You need metrics and logs in the same system.** Traza stores traces and their analytics. That is the whole surface, on purpose.
 

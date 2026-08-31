@@ -18,7 +18,7 @@ tar xzf traza-0.23.0-macos-aarch64.tar.gz && cd traza-0.23.0-macos-aarch64
 installs the server API from crates.io — the dashboard comes from an archive
 or a `ui/` build.)
 
-Or build from source: stable Rust (1.75 or newer) builds the server, Node 22
+Or build from source: stable Rust (1.81 or newer) builds the server, Node 22
 or newer builds the dashboard — only if you want the dashboard; the API does
 not need it.
 

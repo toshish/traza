@@ -18,12 +18,36 @@
 //! The version word stays. It is two bytes per file and it is the difference
 //! between refusing to open a future format and misparsing its header into
 //! plausible-looking garbage offsets — which is not a cost worth saving on the
-//! one occasion it matters.
+//! one occasion it matters. It is also what triggers the one migration this
+//! build performs: a file declaring v6 is converted by `Store::open` before
+//! anything is served (`src/migration.rs`, where the frozen v6 decoder lives
+//! and this module's refusal is never consulted). This module still reads
+//! exactly one version.
 //!
-//! An opened file-backed segment owns only its file handle and decoded index
-//! maps. In-memory segments built for encoding may own their bytes. Records are
-//! decoded only when a query selects their offsets; no decoded record vector
-//! is retained by [`Segment`].
+//! An opened file-backed segment owns its file handle, its decoded index
+//! maps, and a small decoded-block cache ([`BLOCK_CACHE_SLOTS`], whose doc
+//! states the bound and the worst case). In-memory segments built for
+//! encoding may own their bytes. Records are decoded only when a query
+//! selects their offsets; no decoded record vector is retained by
+//! [`Segment`], and the block cache is counted by
+//! [`Segment::resident_bytes`] rather than hidden. Loops that decode many
+//! records in ascending order additionally pin their current block through a
+//! request-scoped [`BlockWalk`], so their per-block decode cost never depends
+//! on what concurrent readers do to the shared cache.
+//!
+//! # The v7 records region
+//!
+//! Since format 7 the records region is carved into record-aligned
+//! compression blocks ([`COMPRESSION_BLOCK_BYTES`] of uncompressed bytes
+//! each), stored under the codec the header names — LZ4, with raw
+//! passthrough for blocks compression does not strictly shrink — and
+//! addressed through a resident block directory. Records carry `(key id,
+//! value digest)` pairs instead of value text; the text lives only in the
+//! payload, from which the pair list is derivable (`span_to_record` in the
+//! crate root is the definition). Posting lists keep their u64 currency as
+//! LOGICAL offsets into the uncompressed region: the logical-to-physical
+//! translation is confined to this module, and callers never see a stored
+//! offset. The layout contract is docs/segment-format.md.
 //!
 //! # Why the attribute index is hashed
 //!
@@ -50,8 +74,10 @@ use std::fs;
 use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::content;
+use crate::crc::crc32;
 use crate::hash::{hash_attribute, Hash128};
 
 /// Eight-byte marker at the beginning of every segment file. The version
@@ -67,17 +93,49 @@ pub const MAGIC: [u8; 8] = *b"TRAZASEG";
 /// header would be parsed under this one's field layout and yield offsets that
 /// pass every bounds check while pointing at the wrong bytes.
 ///
-/// **The numbering never restarts.** Versions 1 through 5 were all written by
-/// real builds: 1 was JSONL, 2 shipped in 0.16/0.17 and 3 in 0.18/0.19, while
-/// 4 and 5 existed only on unreleased `main`. Collapsing the reader to one
-/// format does not free those identifiers — reusing 2 for a different layout
-/// would mean a header declaring "2" is ambiguous between two incompatible
-/// files, which is the precise failure this field exists to prevent. Removing
-/// compatibility CODE and reusing compatibility IDENTIFIERS are different acts,
-/// and only the first is safe.
-pub const VERSION: u16 = 6;
+/// **The numbering never restarts.** Versions 1 through 6 were all written by
+/// real builds: 1 was JSONL, 2 shipped in 0.16/0.17 and 3 in 0.18/0.19, 4 and
+/// 5 existed only on unreleased `main`, and 6 was written by every release
+/// before v0.24.0. Collapsing the reader to one format does not free those
+/// identifiers — reusing 2 for a different layout would mean a header
+/// declaring "2" is ambiguous between two incompatible files, which is the
+/// precise failure this field exists to prevent. Removing compatibility CODE
+/// and reusing compatibility IDENTIFIERS are different acts, and only the
+/// first is safe.
+pub const VERSION: u16 = 7;
 /// Fixed header size written by this module.
-pub const HEADER_LEN: usize = 104;
+pub const HEADER_LEN: usize = 128;
+/// Uncompressed record bytes one compression block targets. The writer cuts
+/// the block before a record whose end would cross this bound, so a block
+/// always holds whole records and at least one of them; a single record
+/// larger than the bound becomes a block by itself. No record ever spans two
+/// blocks — a reader treats one that would as corrupt.
+pub const COMPRESSION_BLOCK_BYTES: usize = 128 * 1024;
+/// Bytes of one block-directory entry.
+pub const DIRECTORY_ENTRY_LEN: usize = 32;
+/// Raw-passthrough flag in a directory entry's stored-length word: bit 31 set
+/// means the block's stored bytes ARE its uncompressed bytes. The flag exists
+/// so an incompressible block costs its raw size plus a directory entry and
+/// never more; its position is why one record's encoding must stay below 2^31
+/// bytes.
+const STORED_RAW_FLAG: u32 = 1 << 31;
+/// Decoded blocks kept resident per open segment, most recently used first.
+/// Four covers a window search's boundary probes and a posting walk's
+/// locality while bounding the cache at four blocks' uncompressed bytes.
+///
+/// The retained bytes are real residency and are counted by
+/// [`Segment::resident_bytes`]: nominally 4 × [`COMPRESSION_BLOCK_BYTES`]
+/// (512 KiB) per open segment once queries have touched it, retained for the
+/// segment's life. The worst case is larger, because a block is bounded by
+/// its largest RECORD, not by the carving target — a single oversized record
+/// becomes a block by itself, capped only by the 2^31 record bound — so a
+/// segment holding multi-megabyte spans can retain four such blocks. There is
+/// no store-wide budget across segments, deliberately: the per-segment bound
+/// times the open-segment count is the whole story, it is visible through
+/// `Store::resident_payload_bytes`, and a shared eviction pool would couple
+/// every reader through one lock for a cost ceiling the compaction size cap
+/// already keeps small.
+const BLOCK_CACHE_SLOTS: usize = 4;
 
 /// Records covered by one content-index block.
 ///
@@ -101,6 +159,54 @@ const CONTENT_SUMMARY_MAX_BYTES: usize = 32 * 1024;
 const CONTENT_PROLOGUE_LEN: usize = 32;
 
 const RECORD_FIXED_LEN: usize = 8 + 4 + 4 + 4 + 4;
+/// Bytes one encoded attribute pair occupies: key id plus value digest.
+const ATTRIBUTE_PAIR_LEN: usize = 4 + 16;
+
+/// Codec applied to the records region's compression blocks, named by the
+/// header at offset 12.
+///
+/// **Parameterization, not a version.** An unknown id is refused with an
+/// error that names it — the same shape as the version refusal, and for the
+/// same reason: decoding bytes under the wrong codec produces garbage, not
+/// errors. Adding a codec is a new id plus configuration, never a format
+/// bump.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Codec {
+    /// Blocks are stored as their raw bytes. Still carved, directed, and
+    /// CRC-checked identically — writing uncompressed segments is a codec
+    /// choice, not a format variant, so there is exactly one reader shape.
+    Raw,
+    /// LZ4 block format (not the frame format), as `lz4_flex`'s block API
+    /// produces it, with no length prefix of its own: the directory carries
+    /// the lengths.
+    Lz4,
+}
+
+impl Codec {
+    /// The id this codec writes at header offset 12.
+    pub fn id(self) -> u32 {
+        match self {
+            Self::Raw => 0,
+            Self::Lz4 => 1,
+        }
+    }
+
+    /// The codec's short name, for errors and verification receipts.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Raw => "raw",
+            Self::Lz4 => "lz4",
+        }
+    }
+
+    fn from_id(id: u32) -> Result<Self, Error> {
+        match id {
+            0 => Ok(Self::Raw),
+            1 => Ok(Self::Lz4),
+            other => Err(Error::UnsupportedCodec { found: other }),
+        }
+    }
+}
 
 /// Fixed file header.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -109,11 +215,14 @@ pub struct Header {
     pub version: u16,
     /// Header length in bytes.
     pub header_len: u16,
+    /// Codec the records region's blocks are stored under.
+    pub codec: Codec,
     /// Number of encoded records.
     pub record_count: u64,
     /// Byte offset of the record region.
     pub records_offset: u64,
-    /// Length of the record region.
+    /// Length of the record region AS STORED — compressed bytes, not logical
+    /// ones. [`Self::records_logical_len`] carries the uncompressed length.
     pub records_len: u64,
     /// Byte offset of the record-offset index.
     pub offsets_offset: u64,
@@ -139,6 +248,16 @@ pub struct Header {
     /// carries the section: it holds a prologue declaring zero blocks, so
     /// "indexed nothing" is stated in the section rather than by its absence.
     pub content: (u64, u64),
+    /// Byte offset of the block directory.
+    pub directory_offset: u64,
+    /// Length of the block directory: [`DIRECTORY_ENTRY_LEN`] bytes per
+    /// compression block.
+    pub directory_len: u64,
+    /// LOGICAL length of the record region — the uncompressed byte count the
+    /// posting offsets address. Carried in the header because the directory
+    /// entry has no room for the last block's uncompressed size, and because
+    /// record-offset validation needs the logical bound.
+    pub records_logical_len: u64,
 }
 
 impl Header {
@@ -173,6 +292,10 @@ impl Header {
         if usize::from(header_len) != HEADER_LEN {
             return Err(Error::Corrupt("header length does not match the version"));
         }
+        // The codec refusal follows the version refusal and shares its shape:
+        // both name what the file declares, because both failures mean "the
+        // wrong decoder", not "damaged bytes".
+        let codec = Codec::from_id(read_u32(bytes, 12)?)?;
         let attribute_index_offset = read_u64(bytes, 72)?;
         // The content index follows the attribute index, so its offset is what
         // bounds the attribute section.
@@ -180,6 +303,7 @@ impl Header {
         let header = Self {
             version,
             header_len,
+            codec,
             record_count: read_u64(bytes, 16)?,
             records_offset: read_u64(bytes, 24)?,
             records_len: read_u64(bytes, 32)?,
@@ -198,6 +322,9 @@ impl Header {
                     .checked_sub(content_offset)
                     .ok_or(Error::Corrupt("content index offset beyond file"))?,
             ),
+            directory_offset: read_u64(bytes, 104)?,
+            directory_len: read_u64(bytes, 112)?,
+            records_logical_len: read_u64(bytes, 120)?,
         };
         header.validate_total(total)?;
         Ok(header)
@@ -206,6 +333,7 @@ impl Header {
     fn validate_total(&self, file_len: u64) -> Result<(), Error> {
         let sections = [
             (self.records_offset, self.records_len),
+            (self.directory_offset, self.directory_len),
             (self.offsets_offset, self.offsets_len),
             (self.trace_index_offset, self.trace_index_len),
             (self.attribute_index_offset, self.attribute_index_len),
@@ -232,6 +360,19 @@ impl Header {
             .ok_or(Error::Corrupt("record-offset index length overflow"))?;
         if self.offsets_len != expected_offsets {
             return Err(Error::Corrupt("record-offset index has invalid length"));
+        }
+        if self.directory_len % DIRECTORY_ENTRY_LEN as u64 != 0 {
+            return Err(Error::Corrupt("block directory has a partial entry"));
+        }
+        // Emptiness is all-or-nothing: a segment holds records exactly when it
+        // holds stored bytes, logical bytes, and directory entries. Any mixed
+        // state describes bytes that cannot be addressed.
+        let empty = self.record_count == 0;
+        if (self.records_len == 0) != empty
+            || (self.records_logical_len == 0) != empty
+            || (self.directory_len == 0) != empty
+        {
+            return Err(Error::Corrupt("record region and directory disagree"));
         }
         Ok(())
     }
@@ -290,7 +431,10 @@ impl RecordInput {
 pub struct Record {
     timestamp: u64,
     trace_id: String,
-    attributes: BTreeMap<String, String>,
+    /// `(key id, value digest)` pairs in ascending key-id order. The value
+    /// TEXT is not here — it lives in the payload, from which the pair list
+    /// is derivable (the format's derivation invariant).
+    pairs: Vec<(u32, Hash128)>,
     payload: Vec<u8>,
 }
 
@@ -305,9 +449,21 @@ impl Record {
         &self.trace_id
     }
 
-    /// Returns the decoded attributes.
-    pub fn attributes(&self) -> &BTreeMap<String, String> {
-        &self.attributes
+    /// The record's `(key id, value digest)` attribute pairs, ascending by
+    /// key id. Key ids index the segment's attribute-key dictionary; value
+    /// text is recoverable only from the payload.
+    pub fn attribute_pairs(&self) -> &[(u32, Hash128)] {
+        &self.pairs
+    }
+
+    /// Whether this record carries exactly `(key_id, digest)`. A 20-byte
+    /// compare: false positives are possible under a true digest collision,
+    /// false negatives are not, so the payload parse remains the authority.
+    fn carries(&self, key_id: u32, digest: Hash128) -> bool {
+        self.pairs
+            .binary_search_by(|(id, _)| id.cmp(&key_id))
+            .map(|position| self.pairs[position].1 == digest)
+            .unwrap_or(false)
     }
 
     /// Returns the opaque payload.
@@ -341,13 +497,23 @@ pub enum Error {
         /// The version this build reads.
         expected: u16,
     },
+    /// The file declares a records-region codec id this build does not
+    /// decode. Same shape as the version refusal, for the same reason:
+    /// decoding under the wrong codec produces garbage, not errors.
+    UnsupportedCodec {
+        /// The codec id the file declares.
+        found: u32,
+    },
     /// The file is not something this module can interpret at all — a foreign
     /// or corrupt magic, or an index built with incompatible parameters.
     Unsupported(&'static str),
     /// A string field is not valid UTF-8.
     Utf8(std::str::Utf8Error),
-    /// A value cannot be represented by the format's fixed-width length.
-    TooLarge(&'static str),
+    /// A value cannot be represented by the format's fixed-width length. The
+    /// string names the field, and — for the whole-record bound, the one
+    /// refusal an operator may have to act on — the record itself, by trace
+    /// id and timestamp.
+    TooLarge(String),
 }
 
 impl fmt::Display for Error {
@@ -358,6 +524,10 @@ impl fmt::Display for Error {
             Self::UnsupportedVersion { found, expected } => write!(
                 f,
                 "segment format v{found}, but this build reads v{expected}"
+            ),
+            Self::UnsupportedCodec { found } => write!(
+                f,
+                "segment codec id {found}, but this build reads 0 (raw) and 1 (lz4)"
             ),
             Self::Unsupported(message) => write!(f, "unsupported segment: {message}"),
             Self::Utf8(error) => write!(f, "invalid segment UTF-8: {error}"),
@@ -508,6 +678,143 @@ impl ContentIndex {
     }
 }
 
+/// One block-directory entry, held resident for the life of the segment:
+/// 32 bytes per 128 KiB of uncompressed records, which is the whole resident
+/// price of random access into compressed ones.
+#[derive(Clone, Copy, Debug)]
+struct BlockEntry {
+    /// Offset of the block's first byte in the UNCOMPRESSED records region.
+    logical_start: u64,
+    /// Offset of the block's first stored byte, relative to the records
+    /// section start.
+    stored_offset: u64,
+    /// Stored length with the raw flag masked off.
+    stored_len: u32,
+    /// Bit 31 of the stored-length word: the block is stored as its raw
+    /// bytes.
+    raw: bool,
+    /// CRC-32 over the stored bytes exactly as they appear in the file,
+    /// checked on every block read before decode.
+    crc32: u32,
+    /// Timestamp of the block's first record. Records are timestamp-sorted,
+    /// so this column is a sorted array a window probe can binary-search.
+    min_timestamp: u64,
+}
+
+impl BlockEntry {
+    /// The stored-length word as written: masked length plus the raw flag.
+    fn stored_len_word(&self) -> u32 {
+        if self.raw {
+            self.stored_len | STORED_RAW_FLAG
+        } else {
+            self.stored_len
+        }
+    }
+}
+
+/// Most-recently-used decoded blocks, newest first. Shared `Arc`s so a hit
+/// costs a pointer clone and eviction never invalidates a reader mid-decode.
+struct BlockCache {
+    slots: Mutex<Vec<(usize, Arc<Vec<u8>>)>>,
+}
+
+impl BlockCache {
+    fn new() -> Self {
+        Self {
+            slots: Mutex::new(Vec::with_capacity(BLOCK_CACHE_SLOTS)),
+        }
+    }
+
+    fn get(&self, block: usize) -> Option<Arc<Vec<u8>>> {
+        let mut slots = self.slots.lock().ok()?;
+        let position = slots.iter().position(|(held, _)| *held == block)?;
+        let hit = slots.remove(position);
+        let bytes = hit.1.clone();
+        slots.insert(0, hit);
+        Some(bytes)
+    }
+
+    fn insert(&self, block: usize, bytes: Arc<Vec<u8>>) {
+        let Ok(mut slots) = self.slots.lock() else {
+            return;
+        };
+        slots.retain(|(held, _)| *held != block);
+        slots.insert(0, (block, bytes));
+        slots.truncate(BLOCK_CACHE_SLOTS);
+    }
+
+    /// Decoded bytes the cache currently retains — real residency, counted
+    /// by [`Segment::resident_bytes`] so the accounting surfaces cannot
+    /// report a busy store's block cache as zero.
+    fn resident_bytes(&self) -> usize {
+        self.slots
+            .lock()
+            .map(|slots| slots.iter().map(|(_, bytes)| bytes.len()).sum())
+            .unwrap_or(0)
+    }
+}
+
+impl fmt::Debug for BlockCache {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let held = self.slots.lock().map(|slots| slots.len()).unwrap_or(0);
+        write!(f, "BlockCache({held} blocks)")
+    }
+}
+
+/// A request-scoped memo over one segment's decoded-block cache: the last
+/// block this caller decoded, pinned by its `Arc` for the walk's own reuse.
+/// Created by [`Segment::walk`], and bound to that segment by borrow, so a
+/// walk can never serve one segment's bytes for another's offsets.
+///
+/// A query walks its candidate offsets in ascending order, so consecutive
+/// records overwhelmingly share a block. Without the memo every record went
+/// back through the shared cache, and the shared cache is exactly that —
+/// shared: a concurrent sequential scan (compaction parsing a segment it is
+/// merging is the live case) can evict a block between two of a walk's
+/// records, at which point the walk re-reads, re-checks, and re-inflates the
+/// same block once per record. The memo bounds that to once per block PER
+/// WALK, whatever the cache does; under the canonical bench it is the
+/// difference between a trace lookup inflating one block and inflating up to
+/// one per record.
+///
+/// Correctness never depends on the memo: the decoded bytes are the same
+/// `Arc`-shared, CRC-checked block the cache holds. The held block is
+/// transient per-request residency, exactly like a reader mid-decode, and is
+/// therefore not part of [`Segment::resident_bytes`] — the shared cache
+/// remains the only retained copy.
+#[derive(Debug)]
+pub struct BlockWalk<'a> {
+    segment: &'a Segment,
+    /// `(block index, decoded bytes)`.
+    held: Option<(usize, Arc<Vec<u8>>)>,
+}
+
+impl BlockWalk<'_> {
+    /// [`Segment::record_at_offset`] through this walk's memo, for loops
+    /// that decode many offsets in ascending order: consecutive records in
+    /// one block reuse the walk's decoded block instead of going back
+    /// through the shared cache per record.
+    pub fn record_at_offset(&mut self, relative_offset: u64) -> Result<Record, Error> {
+        self.segment
+            .decode_at_walked(&mut self.held, relative_offset)
+    }
+
+    /// [`Segment::record`] through this walk's memo, for sequential ordinal
+    /// scans (a window parse, a rewrite pass).
+    pub fn record(&mut self, ordinal: usize) -> Result<Option<Record>, Error> {
+        self.segment
+            .last_query_used_index
+            .store(true, Ordering::Relaxed);
+        match self.segment.record_offsets.get(ordinal) {
+            Some(offset) => self
+                .segment
+                .decode_at_walked(&mut self.held, *offset)
+                .map(Some),
+            None => Ok(None),
+        }
+    }
+}
+
 /// An opened segment backed by either a file or encoded memory.
 ///
 /// File-backed segments retain only offsets and persisted index postings.
@@ -517,6 +824,15 @@ pub struct Segment {
     backing: Backing,
     header: Header,
     record_offsets: Vec<u64>,
+    /// The resident block directory, in block order.
+    directory: Vec<BlockEntry>,
+    /// Ordinal of each block's first record — derived at open by locating
+    /// every block's logical start in the offset table, which doubles as the
+    /// proof that no record spans a block boundary.
+    block_start_ordinals: Vec<usize>,
+    /// Decoded-block cache; the logical-to-physical translation's whole cost
+    /// beyond the directory itself.
+    cache: BlockCache,
     trace_index: HashMap<String, Vec<u64>>,
     attribute_index: AttributeIndex,
     /// `None` when the segment holds no indexable text, or was written with
@@ -593,11 +909,19 @@ impl Backing {
 }
 
 impl Segment {
-    /// Opens and validates an encoded segment from owned bytes.
+    /// Opens and validates an encoded segment from owned bytes. Validation is
+    /// EAGER here: every block is read, CRC-checked, and decoded, and every
+    /// record decoded from it — the byte-resident counterpart of the lazy
+    /// file-backed open.
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, Error> {
         let header = Header::parse(&bytes)?;
         let record_offsets = decode_offsets(&bytes, &header)?;
-        validate_record_offsets(&bytes, &header, &record_offsets)?;
+        validate_record_offsets_lengths(&header, &record_offsets)?;
+        let directory = decode_directory(
+            section(&bytes, header.directory_offset, header.directory_len)?,
+            &header,
+        )?;
+        let block_start_ordinals = block_start_ordinals(&header, &record_offsets, &directory)?;
         let trace_index = decode_string_index(
             section(&bytes, header.trace_index_offset, header.trace_index_len)?,
             false,
@@ -621,15 +945,23 @@ impl Segment {
             content_len,
             header.record_count,
         )?;
-        Ok(Self {
+        let segment = Self {
             backing: Backing::Resident(bytes),
             header,
             record_offsets,
+            directory,
+            block_start_ordinals,
+            cache: BlockCache::new(),
             trace_index,
             attribute_index,
             content,
             last_query_used_index: AtomicBool::new(false),
-        })
+        };
+        let mut held = None;
+        for offset in &segment.record_offsets {
+            segment.decode_at_walked(&mut held, *offset)?;
+        }
+        Ok(segment)
     }
 
     /// Opens a segment FILE-BACKED: only the header and index sections are
@@ -669,6 +1001,9 @@ impl Segment {
         let offsets_bytes = read_section(header.offsets_offset, header.offsets_len)?;
         let record_offsets = decode_offsets_from(&offsets_bytes, &header)?;
         validate_record_offsets_lengths(&header, &record_offsets)?;
+        let directory_bytes = read_section(header.directory_offset, header.directory_len)?;
+        let directory = decode_directory(&directory_bytes, &header)?;
+        let block_start_ordinals = block_start_ordinals(&header, &record_offsets, &directory)?;
         let trace_bytes = read_section(header.trace_index_offset, header.trace_index_len)?;
         let trace_index = decode_string_index(&trace_bytes, false, header.record_count)?
             .into_iter()
@@ -694,11 +1029,14 @@ impl Segment {
         };
         Ok(Self {
             backing: Backing::File {
-                file: std::sync::Mutex::new(file),
+                file: Mutex::new(file),
                 len: total,
             },
             header,
             record_offsets,
+            directory,
+            block_start_ordinals,
+            cache: BlockCache::new(),
             trace_index,
             attribute_index,
             content,
@@ -706,10 +1044,15 @@ impl Segment {
         })
     }
 
-    /// Bytes of the payload encoding currently resident in memory: the whole
-    /// file for `from_bytes` segments, zero for file-backed ones.
+    /// Bytes of record/payload content currently resident in memory: the
+    /// whole file for `from_bytes` segments, zero for freshly opened
+    /// file-backed ones — plus whatever decoded blocks the block cache
+    /// retains once queries have touched the segment (at most
+    /// [`BLOCK_CACHE_SLOTS`] blocks, see that constant for the bound). The
+    /// larger-than-RAM rule is stated against this number: zero at open and
+    /// at flush, cache-bounded afterwards.
     pub fn resident_bytes(&self) -> usize {
-        self.backing.resident_len()
+        self.backing.resident_len() + self.cache.resident_bytes()
     }
 
     /// **Approximate** bytes held resident by this segment's decoded indexes.
@@ -730,6 +1073,8 @@ impl Segment {
     /// floor.** Process RSS runs above it.
     pub fn approx_index_bytes(&self) -> usize {
         let offsets = self.record_offsets.capacity() * std::mem::size_of::<u64>();
+        let directory = self.directory.capacity() * std::mem::size_of::<BlockEntry>()
+            + self.block_start_ordinals.capacity() * std::mem::size_of::<usize>();
         let traces = hash_table_bytes::<String, Vec<u64>>(self.trace_index.capacity())
             + self
                 .trace_index
@@ -738,7 +1083,7 @@ impl Segment {
                     key.capacity() + postings.capacity() * std::mem::size_of::<u64>()
                 })
                 .sum::<usize>();
-        offsets + traces + self.attribute_index.approx_bytes()
+        offsets + directory + traces + self.attribute_index.approx_bytes()
     }
 
     /// Distinct `(key, value)` pairs in the resident attribute index — the
@@ -811,10 +1156,15 @@ impl Segment {
 
     /// Decodes one record by ordinal through the persisted offset table.
     pub fn record(&self, ordinal: usize) -> Result<Option<Record>, Error> {
-        self.last_query_used_index.store(true, Ordering::Relaxed);
-        match self.record_offsets.get(ordinal) {
-            Some(offset) => self.decode_at(*offset).map(Some),
-            None => Ok(None),
+        self.walk().record(ordinal)
+    }
+
+    /// A fresh [`BlockWalk`] over this segment — the entry point for any
+    /// loop that decodes offsets or ordinals in ascending order.
+    pub fn walk(&self) -> BlockWalk<'_> {
+        BlockWalk {
+            segment: self,
+            held: None,
         }
     }
 
@@ -827,20 +1177,45 @@ impl Segment {
     /// Looks up records for an exact attribute key/value pair.
     ///
     /// The index is probed by digest, so it answers with candidates; each one
-    /// is then checked against the value actually stored in the record. A
-    /// digest collision therefore costs a wasted decode and cannot produce a
-    /// wrong row.
+    /// is then checked against the `(key id, digest)` pair the RECORD itself
+    /// carries, which is what keeps a forged index posting from decoding into
+    /// a wrong row: the wasted work is one block decode, never a false match
+    /// from the index alone.
+    ///
+    /// The check is a digest compare, not a value compare — v7 records carry
+    /// no value text, and the payload is opaque at this layer. A true 128-bit
+    /// collision (two distinct values, one digest) therefore passes here by
+    /// construction, exactly as it passes the index probe; the store's
+    /// verification against the parsed payload (`span_matches` and its
+    /// relatives in `lib.rs`) remains the authority on every result it
+    /// returns. An index narrows a filter; it never answers one.
     pub fn query_attribute(&self, key: &str, value: &str) -> Result<Vec<Record>, Error> {
         self.last_query_used_index.store(true, Ordering::Relaxed);
         let mut records = Vec::new();
+        let Some(key_id) = self.attribute_index.key_id(key) else {
+            return Ok(records);
+        };
+        let digest = hash_attribute(key, value);
+        let mut held = None;
         for offset in self.attribute_index.candidates(key, value) {
-            let record = self.decode_at(*offset)?;
-            if record.attributes.get(key).map(String::as_str) == Some(value) {
+            let record = self.decode_at_walked(&mut held, *offset)?;
+            if record.carries(key_id, digest) {
                 records.push(record);
             }
         }
         records.sort_by_key(|record| record.timestamp);
         Ok(records)
+    }
+
+    /// Whether `record` carries the digest pair for `(key, value)` — the
+    /// cheap prefilter a caller runs before parsing the record's payload, so
+    /// the parse is paid only on digest matches. False positives are possible
+    /// under a true digest collision, false negatives are not; the caller's
+    /// payload-derived comparison stays the authority.
+    pub fn record_carries_attribute(&self, record: &Record, key: &str, value: &str) -> bool {
+        self.attribute_index
+            .key_id(key)
+            .is_some_and(|key_id| record.carries(key_id, hash_attribute(key, value)))
     }
 
     /// Returns records in the inclusive timestamp range in stable timestamp order.
@@ -851,9 +1226,10 @@ impl Segment {
         }
         let span = self.ordinal_range_for_window(Some(start), Some(end))?;
         let mut records = Vec::with_capacity(span.len());
+        let mut held = None;
         for ordinal in span {
             let offset = self.record_offsets[ordinal];
-            records.push(self.decode_at(offset)?);
+            records.push(self.decode_at_walked(&mut held, offset)?);
         }
         Ok(records)
     }
@@ -863,9 +1239,13 @@ impl Segment {
     ///
     /// This is the whole reason `encode_with` sorts: records are stored in
     /// ascending timestamp order, so a window is a contiguous ordinal range
-    /// and locating it costs `log2(record_count)` eight-byte reads instead of
-    /// decoding the segment. A 1%-wide window over a two-million-span segment
-    /// decodes twenty thousand records, not two million.
+    /// and locating it never decodes the segment. The directory's sorted
+    /// min-timestamp column narrows each bound to ONE candidate block with no
+    /// I/O at all, and the per-record search then runs inside that block —
+    /// at most a boundary-block decode per bound, cached across its probes.
+    /// Each landed bound is then VERIFIED against the records on both sides,
+    /// because the fence column is derived metadata no checksum covers: a
+    /// corrupt-but-sorted fence answers `Corrupt`, never a shifted window.
     ///
     /// `None` means unbounded on that side. The returned range is empty when
     /// the window selects nothing.
@@ -875,17 +1255,58 @@ impl Segment {
         until: Option<u64>,
     ) -> Result<std::ops::Range<usize>, Error> {
         let count = self.record_offsets.len();
-        // `partition_point`, but each probe can fail: the timestamp is read
-        // from disk for a file-backed segment.
         let first_at_or_after = |bound: u64| -> Result<usize, Error> {
-            let (mut low, mut high) = (0usize, count);
-            while low < high {
-                let mid = low + (high - low) / 2;
-                if self.timestamp_at(self.record_offsets[mid])? < bound {
-                    low = mid + 1;
-                } else {
-                    high = mid;
+            // The first block whose min timestamp reaches the bound: every
+            // record before the PREVIOUS block's end is below the bound, and
+            // every record from this block on is at or above it, so only that
+            // previous block needs its records examined.
+            let next = self
+                .directory
+                .partition_point(|entry| entry.min_timestamp < bound);
+            let low = match next.checked_sub(1) {
+                Some(candidate) => {
+                    let (mut low, mut high) = (
+                        self.block_start_ordinals[candidate],
+                        self.block_start_ordinals
+                            .get(candidate + 1)
+                            .copied()
+                            .unwrap_or(count),
+                    );
+                    // `partition_point`, but each probe can fail: the
+                    // timestamp is read through the block decode for a
+                    // file-backed segment.
+                    while low < high {
+                        let mid = low + (high - low) / 2;
+                        if self.timestamp_at(self.record_offsets[mid])? < bound {
+                            low = mid + 1;
+                        } else {
+                            high = mid;
+                        }
+                    }
+                    low
                 }
+                None => 0,
+            };
+            // The fence steered the search; the RECORDS confirm the answer.
+            // The min-timestamp column is derived metadata no checksum
+            // covers, and a corrupt-but-still-sorted fence would otherwise
+            // shift a window bound silently — returning out-of-window rows
+            // or dropping in-window ones without ever decoding the forged
+            // block. Verifying the boundary against the records themselves
+            // costs at most two timestamp reads (usually in the block the
+            // search just decoded) and turns every such forgery into
+            // `Corrupt`, on an honest segment it can never fire. The
+            // matching per-block check lives in `decoded_block`, which
+            // compares each decoded block's first record with its fence.
+            if low < count && self.timestamp_at(self.record_offsets[low])? < bound {
+                return Err(Error::Corrupt(
+                    "block min timestamps disagree with the records",
+                ));
+            }
+            if low > 0 && self.timestamp_at(self.record_offsets[low - 1])? >= bound {
+                return Err(Error::Corrupt(
+                    "block min timestamps disagree with the records",
+                ));
             }
             Ok(low)
         };
@@ -1046,21 +1467,23 @@ impl Segment {
             .map_or(0, |index| index.summary.as_bytes().len())
     }
 
-    /// Timestamp of the record at a posting offset without decoding it: the
-    /// timestamp is the record's first fixed field.
+    /// Timestamp of the record at a posting offset without decoding the
+    /// record: the timestamp is its first fixed field, read out of the
+    /// containing block's decoded bytes (one block decode, usually cached).
     pub fn timestamp_at(&self, relative_offset: u64) -> Result<u64, Error> {
-        if relative_offset >= self.header.records_len {
+        if relative_offset >= self.header.records_logical_len {
             return Err(Error::Corrupt("record offset is outside record region"));
         }
-        let absolute = self
-            .header
-            .records_offset
-            .checked_add(relative_offset)
+        let block = self.block_containing(relative_offset)?;
+        let entry = self.directory[block];
+        let end = relative_offset
+            .checked_add(8)
             .ok_or(Error::Corrupt("record offset overflow"))?;
-        let bytes = self.backing.read_range(absolute, 8)?;
-        Ok(u64::from_le_bytes(
-            bytes.as_slice().try_into().expect("8 bytes"),
-        ))
+        if end > self.block_logical_end(block) {
+            return Err(Error::Corrupt("record timestamp crosses block bounds"));
+        }
+        let bytes = self.decoded_block(block)?;
+        read_u64(&bytes, (relative_offset - entry.logical_start) as usize)
     }
 
     /// Decodes exactly one record at a posting offset.
@@ -1071,25 +1494,123 @@ impl Segment {
     fn decode_postings(&self, postings: Option<&Vec<u64>>) -> Result<Vec<Record>, Error> {
         let mut records = Vec::new();
         if let Some(postings) = postings {
+            let mut walk = self.walk();
             for offset in postings {
-                records.push(self.decode_at(*offset)?);
+                records.push(walk.record_at_offset(*offset)?);
             }
         }
         records.sort_by_key(|record| record.timestamp);
         Ok(records)
     }
 
-    fn decode_at(&self, relative_offset: u64) -> Result<Record, Error> {
-        if relative_offset >= self.header.records_len {
-            return Err(Error::Corrupt("record offset is outside record region"));
+    /// Index of the block containing logical offset `logical`, by binary
+    /// search over the resident directory. The translation from posting
+    /// offsets to stored bytes lives entirely here and in
+    /// [`Self::decoded_block`]; every caller above deals in logical offsets.
+    fn block_containing(&self, logical: u64) -> Result<usize, Error> {
+        self.directory
+            .partition_point(|entry| entry.logical_start <= logical)
+            .checked_sub(1)
+            .ok_or(Error::Corrupt("offset precedes the first block"))
+    }
+
+    /// The logical end of `block`: the next block's start, or the region's
+    /// logical length for the last block.
+    fn block_logical_end(&self, block: usize) -> u64 {
+        self.directory
+            .get(block + 1)
+            .map_or(self.header.records_logical_len, |entry| entry.logical_start)
+    }
+
+    /// [`Self::decoded_block`] through a walk's memo. The memo answers
+    /// first; on a miss the shared cache and the decode path answer exactly
+    /// as before, and the memo pins what they returned.
+    fn decoded_block_walked(
+        &self,
+        held: &mut Option<(usize, Arc<Vec<u8>>)>,
+        block: usize,
+    ) -> Result<Arc<Vec<u8>>, Error> {
+        if let Some((held_block, bytes)) = held {
+            if *held_block == block {
+                return Ok(bytes.clone());
+            }
         }
+        let bytes = self.decoded_block(block)?;
+        *held = Some((block, bytes.clone()));
+        Ok(bytes)
+    }
+
+    /// The decoded bytes of one block. The stored bytes are read under the
+    /// backing's lock (inside `read_range`); the CRC check and the inflation
+    /// run OUTSIDE it, so a slow decode never blocks other readers' I/O.
+    fn decoded_block(&self, block: usize) -> Result<Arc<Vec<u8>>, Error> {
+        if let Some(bytes) = self.cache.get(block) {
+            return Ok(bytes);
+        }
+        let entry = *self
+            .directory
+            .get(block)
+            .ok_or(Error::Corrupt("block index out of range"))?;
         let absolute = self
             .header
             .records_offset
-            .checked_add(relative_offset)
-            .ok_or(Error::Corrupt("record offset overflow"))?;
-        // Exact record length from the consecutive-offsets invariant: read
-        // precisely one record's bytes, resident or from disk.
+            .checked_add(entry.stored_offset)
+            .ok_or(Error::Corrupt("block offset overflow"))?;
+        let stored = self
+            .backing
+            .read_range(absolute, u64::from(entry.stored_len))?;
+        // Checked before decode, always: a flipped stored byte must surface
+        // as this error and never as a decoder failure or garbage records.
+        if crc32(&stored) != entry.crc32 {
+            return Err(Error::Corrupt("block crc32 mismatch"));
+        }
+        let logical_len = (self.block_logical_end(block) - entry.logical_start) as usize;
+        let decoded = if entry.raw {
+            stored
+        } else {
+            match self.header.codec {
+                Codec::Raw => stored,
+                Codec::Lz4 => lz4_flex::block::decompress(&stored, logical_len)
+                    .map_err(|_| Error::Corrupt("block does not decompress"))?,
+            }
+        };
+        if decoded.len() != logical_len {
+            return Err(Error::Corrupt("block decodes to the wrong length"));
+        }
+        // The directory's min-timestamp fence, verified against the block's
+        // own first record (the block starts at a record boundary, and a
+        // record's first field is its timestamp). The fence steers
+        // `ordinal_range_for_window` without any decode, so a forged fence
+        // that stays sorted would otherwise move a window bound silently —
+        // and a misplaced bound either selects this block as the search
+        // candidate or puts the first wrongly included record inside it, so
+        // every path that could serve a wrong row decodes this block and
+        // trips this check first. `from_bytes` decodes every block eagerly,
+        // making the check an open-time one for byte-resident segments.
+        if read_u64(&decoded, 0)? != entry.min_timestamp {
+            return Err(Error::Corrupt(
+                "block min timestamp does not match its first record",
+            ));
+        }
+        let decoded = Arc::new(decoded);
+        self.cache.insert(block, decoded.clone());
+        Ok(decoded)
+    }
+
+    fn decode_at(&self, relative_offset: u64) -> Result<Record, Error> {
+        self.decode_at_walked(&mut None, relative_offset)
+    }
+
+    fn decode_at_walked(
+        &self,
+        held: &mut Option<(usize, Arc<Vec<u8>>)>,
+        relative_offset: u64,
+    ) -> Result<Record, Error> {
+        if relative_offset >= self.header.records_logical_len {
+            return Err(Error::Corrupt("record offset is outside record region"));
+        }
+        // Exact record length from the consecutive-offsets invariant, stated
+        // in logical bytes exactly as v6 stated it in stored ones.
         let position = self
             .record_offsets
             .binary_search(&relative_offset)
@@ -1098,11 +1619,22 @@ impl Segment {
             .record_offsets
             .get(position + 1)
             .copied()
-            .unwrap_or(self.header.records_len)
+            .unwrap_or(self.header.records_logical_len)
             .checked_sub(relative_offset)
             .ok_or(Error::Corrupt("record length underflow"))?;
-        let buffer = self.backing.read_range(absolute, record_len)?;
-        decode_record(&buffer, 0, buffer.len() as u64)
+        let block = self.block_containing(relative_offset)?;
+        let entry = self.directory[block];
+        let end = relative_offset
+            .checked_add(record_len)
+            .ok_or(Error::Corrupt("record length overflow"))?;
+        // One block decode suffices for any record, by construction of the
+        // writer; a record that would span two blocks is corrupt.
+        if end > self.block_logical_end(block) {
+            return Err(Error::Corrupt("record spans compression blocks"));
+        }
+        let bytes = self.decoded_block_walked(held, block)?;
+        let start = (relative_offset - entry.logical_start) as usize;
+        decode_record(&bytes, start, start as u64 + record_len)
     }
 }
 
@@ -1111,12 +1643,24 @@ pub fn encode(records: &[RecordInput]) -> Result<Vec<u8>, Error> {
     encode_with(records, true)
 }
 
-/// Encodes records, optionally omitting the content index.
+/// Encodes records, optionally omitting the content index, under the default
+/// codec (LZ4).
 ///
 /// A segment without one is still searchable — it is scanned rather than
 /// skipped — so this trades query latency for seal-time CPU and about 1-2% of
 /// segment size. See `Config::content_index`.
 pub fn encode_with(records: &[RecordInput], content_index: bool) -> Result<Vec<u8>, Error> {
+    encode_with_codec(records, content_index, Codec::Lz4)
+}
+
+/// Encodes records under an explicit codec. Codec choice changes only how
+/// blocks are stored: the logical record bytes, the carving, the directory,
+/// and every index section are byte-identical across codecs.
+pub fn encode_with_codec(
+    records: &[RecordInput],
+    content_index: bool,
+    codec: Codec,
+) -> Result<Vec<u8>, Error> {
     // Ascending timestamp order is a FORMAT INVARIANT, not a hope about what
     // callers pass. `Segment::ordinal_range_for_window` binary-searches the
     // record region on it, and a binary search over unordered data does not
@@ -1156,21 +1700,46 @@ pub fn encode_with(records: &[RecordInput], content_index: bool) -> Result<Vec<u
     for record in records {
         let offset = record_region.len() as u64;
         offsets.push(offset);
-        encode_record(&mut record_region, record)?;
+        // Ascending key-id order falls out of the BTreeMap's sorted-key
+        // iteration meeting a dictionary assigned from the same sort.
+        let pairs: Vec<(u32, Hash128)> = record
+            .attributes
+            .iter()
+            .map(|(key, value)| {
+                (
+                    *key_ids
+                        .get(key.as_str())
+                        .expect("every attribute key is in the dictionary"),
+                    hash_attribute(key, value),
+                )
+            })
+            .collect();
+        encode_record(&mut record_region, record, &pairs)?;
+        // The raw-passthrough flag lives in the directory's stored-length
+        // word, so a block — and therefore any single record — must encode
+        // below 2^31 bytes. Nothing plausible comes near it; the point is
+        // that an implausible record fails loudly instead of wrapping — and
+        // names itself, because the spec requires the refusal to identify
+        // the record, and trace id plus timestamp are in hand right here.
+        if record_region.len() as u64 - offset >= u64::from(STORED_RAW_FLAG) {
+            return Err(Error::TooLarge(format!(
+                "record encoding (trace {:?}, timestamp {})",
+                record.trace_id, record.timestamp
+            )));
+        }
         trace_index
             .entry((record.trace_id.clone(), String::new()))
             .or_default()
             .push(offset);
-        for (key, value) in &record.attributes {
-            let id = *key_ids
-                .get(key.as_str())
-                .expect("every attribute key is in the dictionary");
+        for (id, digest) in &pairs {
             attribute_index
-                .entry((id, hash_attribute(key, value)))
+                .entry((*id, *digest))
                 .or_default()
                 .push(offset);
         }
     }
+
+    let (stored_region, directory_region) = carve_blocks(&record_region, &offsets, records, codec);
 
     let mut offset_region = Vec::with_capacity(offsets.len() * 8);
     for offset in &offsets {
@@ -1185,14 +1754,16 @@ pub fn encode_with(records: &[RecordInput], content_index: bool) -> Result<Vec<u
     };
 
     let records_offset = HEADER_LEN as u64;
-    let offsets_offset = records_offset + record_region.len() as u64;
+    let directory_offset = records_offset + stored_region.len() as u64;
+    let offsets_offset = directory_offset + directory_region.len() as u64;
     let trace_index_offset = offsets_offset + offset_region.len() as u64;
     let attribute_index_offset = trace_index_offset + trace_region.len() as u64;
     let content_index_offset = attribute_index_offset + attribute_region.len() as u64;
 
     let mut bytes = Vec::with_capacity(
         HEADER_LEN
-            + record_region.len()
+            + stored_region.len()
+            + directory_region.len()
             + offset_region.len()
             + trace_region.len()
             + attribute_region.len()
@@ -1201,10 +1772,10 @@ pub fn encode_with(records: &[RecordInput], content_index: bool) -> Result<Vec<u
     bytes.extend_from_slice(&MAGIC);
     put_u16(&mut bytes, VERSION);
     put_u16(&mut bytes, HEADER_LEN as u16);
-    put_u32(&mut bytes, 0);
+    put_u32(&mut bytes, codec.id());
     put_u64(&mut bytes, records.len() as u64);
     put_u64(&mut bytes, records_offset);
-    put_u64(&mut bytes, record_region.len() as u64);
+    put_u64(&mut bytes, stored_region.len() as u64);
     put_u64(&mut bytes, offsets_offset);
     put_u64(&mut bytes, offset_region.len() as u64);
     put_u64(&mut bytes, trace_index_offset);
@@ -1219,8 +1790,12 @@ pub fn encode_with(records: &[RecordInput], content_index: bool) -> Result<Vec<u
     put_u64(&mut bytes, min_ts);
     put_u64(&mut bytes, max_ts);
     put_u64(&mut bytes, content_index_offset);
+    put_u64(&mut bytes, directory_offset);
+    put_u64(&mut bytes, directory_region.len() as u64);
+    put_u64(&mut bytes, record_region.len() as u64);
     debug_assert_eq!(bytes.len(), HEADER_LEN);
-    bytes.extend_from_slice(&record_region);
+    bytes.extend_from_slice(&stored_region);
+    bytes.extend_from_slice(&directory_region);
     bytes.extend_from_slice(&offset_region);
     bytes.extend_from_slice(&trace_region);
     bytes.extend_from_slice(&attribute_region);
@@ -1228,14 +1803,70 @@ pub fn encode_with(records: &[RecordInput], content_index: bool) -> Result<Vec<u
     Ok(bytes)
 }
 
-/// Ceiling division. `usize::div_ceil` is newer than this crate's MSRV.
-fn div_ceil(value: usize, divisor: usize) -> usize {
-    value / divisor + usize::from(value % divisor != 0)
-}
-
-/// Ceiling division for `u64`, for the same reason.
-fn div_ceil_u64(value: u64, divisor: u64) -> u64 {
-    value / divisor + u64::from(value % divisor != 0)
+/// Carves the logical record region into compression blocks and returns the
+/// stored region plus its directory, both ready to write.
+///
+/// A block is cut before the record whose end would cross
+/// [`COMPRESSION_BLOCK_BYTES`] from the block's start, so blocks hold whole
+/// records and at least one each; a single oversized record becomes a block
+/// by itself. Compressed output that is not strictly smaller than its input
+/// is stored raw and flagged, which bounds the worst case at raw size plus
+/// the directory. Under [`Codec::Raw`] every block takes that path.
+fn carve_blocks(
+    record_region: &[u8],
+    offsets: &[u64],
+    records: &[&RecordInput],
+    codec: Codec,
+) -> (Vec<u8>, Vec<u8>) {
+    let mut stored_region = Vec::new();
+    let mut directory = Vec::new();
+    let record_end = |index: usize| -> u64 {
+        offsets
+            .get(index + 1)
+            .copied()
+            .unwrap_or(record_region.len() as u64)
+    };
+    let mut start = 0usize;
+    while start < offsets.len() {
+        let logical_start = offsets[start];
+        let mut end = start + 1;
+        while end < offsets.len()
+            && record_end(end) - logical_start <= COMPRESSION_BLOCK_BYTES as u64
+        {
+            end += 1;
+        }
+        let raw_bytes = &record_region[logical_start as usize..record_end(end - 1) as usize];
+        let (stored, raw) = match codec {
+            Codec::Raw => (raw_bytes.to_vec(), true),
+            Codec::Lz4 => {
+                let compressed = lz4_flex::block::compress(raw_bytes);
+                if compressed.len() < raw_bytes.len() {
+                    (compressed, false)
+                } else {
+                    (raw_bytes.to_vec(), true)
+                }
+            }
+        };
+        let entry = BlockEntry {
+            logical_start,
+            stored_offset: stored_region.len() as u64,
+            // Below 2^31 by the per-record bound: a multi-record block is at
+            // most COMPRESSION_BLOCK_BYTES, and a single-record block was
+            // checked at encode.
+            stored_len: stored.len() as u32,
+            raw,
+            crc32: crc32(&stored),
+            min_timestamp: records[start].timestamp,
+        };
+        put_u64(&mut directory, entry.logical_start);
+        put_u64(&mut directory, entry.stored_offset);
+        put_u32(&mut directory, entry.stored_len_word());
+        put_u32(&mut directory, entry.crc32);
+        put_u64(&mut directory, entry.min_timestamp);
+        stored_region.extend_from_slice(&stored);
+        start = end;
+    }
+    (stored_region, directory)
 }
 
 /// Builds the content index over `records`.
@@ -1251,7 +1882,7 @@ fn div_ceil_u64(value: u64, divisor: u64) -> u64 {
 /// content": an absent index can never be used to skip anything.
 fn encode_content_index(records: &[&RecordInput]) -> Vec<u8> {
     let block_records = CONTENT_BLOCK_RECORDS as usize;
-    let block_count = div_ceil(records.len(), block_records);
+    let block_count = records.len().div_ceil(block_records);
     let indexable = records.iter().any(|record| !record.content.is_empty());
     if block_count == 0 || !indexable {
         let mut out = Vec::with_capacity(CONTENT_PROLOGUE_LEN);
@@ -1286,7 +1917,7 @@ fn encode_content_index(records: &[&RecordInput]) -> Vec<u8> {
     // that a row is a fixed stride and needs no offset table.
     let widest = block_tokens.iter().map(HashSet::len).max().unwrap_or(0);
     let block_bits = content::size_bits(widest, CONTENT_BLOCK_MIN_BYTES, CONTENT_BLOCK_MAX_BYTES);
-    let row_bytes = div_ceil(block_count, 8);
+    let row_bytes = block_count.div_ceil(8);
 
     let mut summary = content::Bloom::new(content::size_bits(
         all_tokens.len(),
@@ -1357,14 +1988,14 @@ fn decode_content_head(
     if block_records == 0 {
         return Err(Error::Corrupt("content index has a zero block size"));
     }
-    let expected_blocks = div_ceil_u64(record_count, u64::from(block_records));
+    let expected_blocks = record_count.div_ceil(u64::from(block_records));
     if u64::from(block_count) != expected_blocks {
         return Err(Error::Corrupt("content index block count does not match"));
     }
     if !summary_bits.is_power_of_two() || !block_bits.is_power_of_two() {
         return Err(Error::Corrupt("content filter size is not a power of two"));
     }
-    let row_bytes = div_ceil_u64(u64::from(block_count), 8);
+    let row_bytes = u64::from(block_count).div_ceil(8);
     let summary_bytes = summary_bits / 8;
     let expected_len = CONTENT_PROLOGUE_LEN as u64 + summary_bytes + block_bits * row_bytes;
     if section_len != expected_len {
@@ -1404,22 +2035,26 @@ pub fn write(path: impl AsRef<Path>, records: &[RecordInput]) -> Result<(), Erro
     Ok(())
 }
 
-fn encode_record(output: &mut Vec<u8>, record: &RecordInput) -> Result<(), Error> {
+fn encode_record(
+    output: &mut Vec<u8>,
+    record: &RecordInput,
+    pairs: &[(u32, Hash128)],
+) -> Result<(), Error> {
     let trace_len =
-        u32::try_from(record.trace_id.len()).map_err(|_| Error::TooLarge("trace id"))?;
+        u32::try_from(record.trace_id.len()).map_err(|_| Error::TooLarge("trace id".to_owned()))?;
     let attribute_count =
-        u32::try_from(record.attributes.len()).map_err(|_| Error::TooLarge("attribute count"))?;
+        u32::try_from(pairs.len()).map_err(|_| Error::TooLarge("attribute count".to_owned()))?;
     let payload_len =
-        u32::try_from(record.payload.len()).map_err(|_| Error::TooLarge("payload"))?;
+        u32::try_from(record.payload.len()).map_err(|_| Error::TooLarge("payload".to_owned()))?;
     put_u64(output, record.timestamp);
     put_u32(output, trace_len);
     put_u32(output, attribute_count);
     put_u32(output, payload_len);
     put_u32(output, 0);
     output.extend_from_slice(record.trace_id.as_bytes());
-    for (key, value) in &record.attributes {
-        put_len_bytes(output, key.as_bytes(), "attribute key")?;
-        put_len_bytes(output, value.as_bytes(), "attribute value")?;
+    for (id, digest) in pairs {
+        put_u32(output, *id);
+        output.extend_from_slice(digest.as_bytes());
     }
     output.extend_from_slice(&record.payload);
     Ok(())
@@ -1442,41 +2077,166 @@ fn decode_record(bytes: &[u8], start: usize, region_end: u64) -> Result<Record, 
     let mut cursor = start + RECORD_FIXED_LEN;
     let trace = take(bytes, &mut cursor, trace_len, region_end)?;
     let trace_id = std::str::from_utf8(trace)?.to_owned();
-    let mut attributes = BTreeMap::new();
+    // The declared count is bounded against the bytes that remain before it
+    // sizes an allocation — a corrupt count must fail, not reserve gigabytes.
+    if attribute_count
+        .checked_mul(ATTRIBUTE_PAIR_LEN)
+        .filter(|needed| {
+            cursor
+                .checked_add(*needed)
+                .is_some_and(|end| end <= region_end)
+        })
+        .is_none()
+    {
+        return Err(Error::Corrupt("truncated record attribute pairs"));
+    }
+    let mut pairs: Vec<(u32, Hash128)> = Vec::with_capacity(attribute_count);
     for _ in 0..attribute_count {
-        let key = take_len_bytes(bytes, &mut cursor, region_end)?;
-        let value = take_len_bytes(bytes, &mut cursor, region_end)?;
-        attributes.insert(
-            std::str::from_utf8(key)?.to_owned(),
-            std::str::from_utf8(value)?.to_owned(),
-        );
+        let id = take_u32_bounded(bytes, &mut cursor, region_end)?;
+        let digest = take(bytes, &mut cursor, 16, region_end)?;
+        let mut raw = [0u8; 16];
+        raw.copy_from_slice(digest);
+        // Ascending key-id order is part of the encoding, and the candidate
+        // prefilter binary-searches on it.
+        if pairs.last().is_some_and(|(previous, _)| *previous >= id) {
+            return Err(Error::Corrupt("record attribute pairs are unordered"));
+        }
+        pairs.push((id, Hash128::from_bytes(raw)));
     }
     let payload = take(bytes, &mut cursor, payload_len, region_end)?.to_vec();
     Ok(Record {
         timestamp,
         trace_id,
-        attributes,
+        pairs,
         payload,
     })
 }
 
-fn validate_record_offsets(bytes: &[u8], header: &Header, offsets: &[u64]) -> Result<(), Error> {
-    let mut previous = None;
-    for offset in offsets {
-        if *offset >= header.records_len || previous.is_some_and(|value| *offset <= value) {
-            return Err(Error::Corrupt("record offsets are invalid or unordered"));
+/// Decodes and validates the block directory. Every check is mandatory: a
+/// directory failing any of them cannot address the bytes it claims to.
+fn decode_directory(data: &[u8], header: &Header) -> Result<Vec<BlockEntry>, Error> {
+    if data.len() as u64 != header.directory_len {
+        return Err(Error::Corrupt("block directory length mismatch"));
+    }
+    let count = data.len() / DIRECTORY_ENTRY_LEN;
+    let mut entries: Vec<BlockEntry> = Vec::with_capacity(count);
+    let mut stored_total = 0u64;
+    for index in 0..count {
+        let base = index * DIRECTORY_ENTRY_LEN;
+        let word = read_u32(data, base + 16)?;
+        let entry = BlockEntry {
+            logical_start: read_u64(data, base)?,
+            stored_offset: read_u64(data, base + 8)?,
+            stored_len: word & !STORED_RAW_FLAG,
+            raw: word & STORED_RAW_FLAG != 0,
+            crc32: read_u32(data, base + 20)?,
+            min_timestamp: read_u64(data, base + 24)?,
+        };
+        if entry.stored_len == 0 {
+            return Err(Error::Corrupt("block directory entry has zero length"));
         }
-        decode_record(
-            bytes,
-            (header.records_offset + *offset) as usize,
-            header.records_offset + header.records_len,
-        )?;
-        previous = Some(*offset);
+        if entry.logical_start >= header.records_logical_len {
+            return Err(Error::Corrupt("block starts beyond the logical region"));
+        }
+        // Stored blocks are contiguous from zero: the offset IS the running
+        // sum, which is a stronger claim than "strictly increasing" and is
+        // what makes the length sum check below airtight.
+        if entry.stored_offset != stored_total {
+            return Err(Error::Corrupt("block directory stored offsets have gaps"));
+        }
+        stored_total = stored_total
+            .checked_add(u64::from(entry.stored_len))
+            .ok_or(Error::Corrupt("block directory length overflow"))?;
+        if let Some(previous) = entries.last() {
+            if entry.logical_start <= previous.logical_start {
+                return Err(Error::Corrupt("block logical starts are unordered"));
+            }
+            if entry.min_timestamp < previous.min_timestamp {
+                return Err(Error::Corrupt("block min timestamps are unordered"));
+            }
+        } else if entry.logical_start != 0 {
+            return Err(Error::Corrupt("first block does not start at zero"));
+        }
+        entries.push(entry);
     }
-    if offsets.is_empty() && header.records_len != 0 {
-        return Err(Error::Corrupt("record region exists without records"));
+    if stored_total != header.records_len {
+        return Err(Error::Corrupt(
+            "block directory does not account for the stored region",
+        ));
     }
-    Ok(())
+    // A raw block's stored bytes ARE its logical bytes, so the two lengths
+    // must agree entry by entry.
+    for (index, entry) in entries.iter().enumerate() {
+        let logical_end = entries
+            .get(index + 1)
+            .map_or(header.records_logical_len, |next| next.logical_start);
+        if entry.raw && u64::from(entry.stored_len) != logical_end - entry.logical_start {
+            return Err(Error::Corrupt("raw block length mismatch"));
+        }
+    }
+    Ok(entries)
+}
+
+/// Ordinal of each block's first record. Locating every block's logical start
+/// in the offset table doubles as the record-alignment proof: a directory
+/// whose block starts inside a record describes a record spanning two blocks,
+/// which the format forbids.
+///
+/// It also bounds every block's LOGICAL extent to what the format can legally
+/// produce, because that extent later sizes the decompress allocation — and
+/// an allocation the machine cannot satisfy aborts the process instead of
+/// erroring. The header's `records_logical_len` (which fixes the last block's
+/// extent) carries no checksum, so without these bounds one flipped high bit
+/// passed every other open-time check and crashed the store at first read.
+/// The bounds are the writer's own: a block holding more than one record
+/// spans at most [`COMPRESSION_BLOCK_BYTES`] (the writer cuts before the
+/// record that would cross it), a single-record block stays below 2^31 (the
+/// record bound the raw flag imposes), and a compressed block cannot inflate
+/// past LZ4's ~255x expansion ceiling of its stored bytes. A directory
+/// claiming more describes bytes no encoder wrote: `Corrupt`, never a
+/// gigantic `vec![0; …]`.
+fn block_start_ordinals(
+    header: &Header,
+    offsets: &[u64],
+    directory: &[BlockEntry],
+) -> Result<Vec<usize>, Error> {
+    let ordinals: Vec<usize> = directory
+        .iter()
+        .map(|entry| {
+            offsets
+                .binary_search(&entry.logical_start)
+                .map_err(|_| Error::Corrupt("block does not start at a record boundary"))
+        })
+        .collect::<Result<_, _>>()?;
+    for (index, entry) in directory.iter().enumerate() {
+        let logical_end = directory
+            .get(index + 1)
+            .map_or(header.records_logical_len, |next| next.logical_start);
+        // Non-negative by decode_directory's ordering checks; the last
+        // block's start was checked below `records_logical_len`.
+        let extent = logical_end - entry.logical_start;
+        let records_in_block = ordinals
+            .get(index + 1)
+            .copied()
+            .unwrap_or(offsets.len())
+            .saturating_sub(ordinals[index]);
+        let legal = if records_in_block > 1 {
+            extent <= COMPRESSION_BLOCK_BYTES as u64
+        } else {
+            extent < u64::from(STORED_RAW_FLAG)
+        };
+        if !legal {
+            return Err(Error::Corrupt(
+                "block logical extent exceeds the format bound",
+            ));
+        }
+        if !entry.raw && extent > u64::from(entry.stored_len) * 256 + 64 {
+            return Err(Error::Corrupt(
+                "block logical extent exceeds what lz4 can decode from its stored bytes",
+            ));
+        }
+    }
+    Ok(ordinals)
 }
 
 /// Decodes the offsets index from ITS OWN section bytes (file-backed open).
@@ -1494,17 +2254,18 @@ fn decode_offsets_from(data: &[u8], header: &Header) -> Result<Vec<u64>, Error> 
 }
 
 /// Structural offset validation without touching record bytes: ordering and
-/// bounds only. The file-backed open validates records lazily on access —
-/// a corrupt record surfaces as Error::Corrupt from that read.
+/// LOGICAL bounds only. The file-backed open validates records lazily on
+/// access — a corrupt record surfaces as Error::Corrupt from that read —
+/// while `from_bytes` follows this with an eager decode of every record.
 fn validate_record_offsets_lengths(header: &Header, offsets: &[u64]) -> Result<(), Error> {
     let mut previous = None;
     for offset in offsets {
-        if *offset >= header.records_len || previous.is_some_and(|value| *offset <= value) {
+        if *offset >= header.records_logical_len || previous.is_some_and(|value| *offset <= value) {
             return Err(Error::Corrupt("record offsets are invalid or unordered"));
         }
         previous = Some(*offset);
     }
-    if offsets.is_empty() && header.records_len != 0 {
+    if offsets.is_empty() && header.records_logical_len != 0 {
         return Err(Error::Corrupt("record region exists without records"));
     }
     Ok(())
@@ -1535,21 +2296,22 @@ fn encode_attribute_index(
     let mut output = Vec::new();
     put_u32(
         &mut output,
-        u32::try_from(keys.len()).map_err(|_| Error::TooLarge("attribute key dictionary"))?,
+        u32::try_from(keys.len())
+            .map_err(|_| Error::TooLarge("attribute key dictionary".to_owned()))?,
     );
     for key in keys {
         put_len_bytes(&mut output, key.as_bytes(), "index key")?;
     }
     put_u32(
         &mut output,
-        u32::try_from(postings.len()).map_err(|_| Error::TooLarge("index"))?,
+        u32::try_from(postings.len()).map_err(|_| Error::TooLarge("index".to_owned()))?,
     );
     for ((key_id, digest), offsets) in postings {
         put_u32(&mut output, *key_id);
         output.extend_from_slice(digest.as_bytes());
         put_u32(
             &mut output,
-            u32::try_from(offsets.len()).map_err(|_| Error::TooLarge("postings"))?,
+            u32::try_from(offsets.len()).map_err(|_| Error::TooLarge("postings".to_owned()))?,
         );
         for offset in offsets {
             put_u64(&mut output, *offset);
@@ -1619,7 +2381,7 @@ fn encode_string_index(
     let mut output = Vec::new();
     put_u32(
         &mut output,
-        u32::try_from(index.len()).map_err(|_| Error::TooLarge("index"))?,
+        u32::try_from(index.len()).map_err(|_| Error::TooLarge("index".to_owned()))?,
     );
     for ((key, value), postings) in index {
         put_len_bytes(&mut output, key.as_bytes(), "index key")?;
@@ -1628,7 +2390,7 @@ fn encode_string_index(
         }
         put_u32(
             &mut output,
-            u32::try_from(postings.len()).map_err(|_| Error::TooLarge("postings"))?,
+            u32::try_from(postings.len()).map_err(|_| Error::TooLarge("postings".to_owned()))?,
         );
         for offset in postings {
             put_u64(&mut output, *offset);
@@ -1710,7 +2472,7 @@ fn section(bytes: &[u8], offset: u64, len: u64) -> Result<&[u8], Error> {
 fn put_len_bytes(output: &mut Vec<u8>, bytes: &[u8], field: &'static str) -> Result<(), Error> {
     put_u32(
         output,
-        u32::try_from(bytes.len()).map_err(|_| Error::TooLarge(field))?,
+        u32::try_from(bytes.len()).map_err(|_| Error::TooLarge(field.to_owned()))?,
     );
     output.extend_from_slice(bytes);
     Ok(())

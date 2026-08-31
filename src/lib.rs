@@ -11,6 +11,7 @@ pub mod annotations;
 pub mod attribution;
 pub mod auth;
 pub mod content;
+mod crc;
 pub mod erasure;
 pub mod evals;
 pub mod expiration;
@@ -20,6 +21,7 @@ pub mod insights;
 pub mod mcp;
 mod media;
 pub mod metrics;
+mod migration;
 pub mod otlp;
 pub mod otlp_pb;
 pub mod payload;
@@ -876,7 +878,8 @@ pub struct Config {
     pub pricing: std::sync::Arc<crate::pricing::Pricing>,
 }
 
-/// The last commit whose reader accepts every superseded segment format.
+/// The last commit whose reader accepts every segment format retired WITHOUT
+/// a migrator: 2 through 5.
 ///
 /// A commit rather than a release tag, and one rather than several, because
 /// neither alternative works for a real store. A store accumulates segments in
@@ -885,9 +888,10 @@ pub struct Config {
 /// cannot read the v3 segments sitting beside it. And formats 4 and 5 were
 /// never tagged, so for those there is no release to name at all.
 ///
-/// This commit reads 2 through 5 (`MIN_READABLE_VERSION` 2, `VERSION` 5), which
-/// covers every indexed format this project has written. Format 1 was JSONL and
-/// is refused separately, with its own message.
+/// This commit reads 2 through 5 (`MIN_READABLE_VERSION` 2, `VERSION` 5).
+/// Format 1 was JSONL and is refused separately, with its own message.
+/// Format 6 needs no build at all: any v0.24.0+ build migrates it
+/// automatically at open (`src/migration.rs`).
 pub const LEGACY_SEGMENT_READER: &str = "cf40bea";
 
 /// Default ceiling on log bytes before a flush seals the buffer. Large enough
@@ -1424,8 +1428,9 @@ impl Segment {
             .ordinal_range_for_window(since, until)
             .map_err(segment_error)?;
         let mut spans = Vec::with_capacity(range.len());
+        let mut walk = self.seg.walk();
         for ordinal in range {
-            if let Some(record) = self.seg.record(ordinal).map_err(segment_error)? {
+            if let Some(record) = walk.record(ordinal).map_err(segment_error)? {
                 spans.push(record_to_span(&record)?);
             }
         }
@@ -2148,8 +2153,6 @@ impl Store {
                 Some(live) => live,
                 None => migrate_to_generations(&directory)?,
             };
-            let manifest =
-                generation::load_manifest(&generation::manifest_path(&directory, live_generation))?;
 
             remove_orphan_temps(&directory)?;
             // Interrupted compaction rewrites are finished from their
@@ -2159,6 +2162,16 @@ impl Store {
             // review: acknowledged duplicate cardinality must survive
             // restart).
             recover_supersede_markers(&directory)?;
+            // v6 → v7 format migration, after crash recovery has settled the
+            // file set and BEFORE the manifest is trusted, the segments are
+            // opened, or the WAL is replayed. The live manifest is loaded
+            // only after this returns because migration may publish the
+            // completion checkpoint that advances `CURRENT`; the migrator
+            // consults the prior manifest solely for its trigger declaration
+            // and its `folded_through`. See `src/migration.rs`.
+            let live_generation = migration::run_at_open(&directory, &config, live_generation)?;
+            let manifest =
+                generation::load_manifest(&generation::manifest_path(&directory, live_generation))?;
             let mut segments = load_segments(&directory)?;
             // A sidecar whose segment is gone can never be read again — the
             // binding check ties a rollup to one exact segment — so it is
@@ -2980,6 +2993,9 @@ pub(crate) fn attribute_union_view(
     // Newest segment first, so the first version claimed for a key wins.
     let mut segments_examined: u32 = 0;
     let mut decoded_since_check: usize = 0;
+    // Each value's accepted index encodings, computed once: the digest
+    // prefilter below re-derives the same probes per candidate record.
+    let encoded_values: Vec<Vec<String>> = values.iter().map(attribute_encodings).collect();
     for segment in segments.iter().rev() {
         Deadline::check(deadline, segments_examined)?;
         segments_examined += 1;
@@ -2995,13 +3011,32 @@ pub(crate) fn attribute_union_view(
         }
         offsets.sort_unstable();
         offsets.dedup();
+        let mut walk = seg.walk();
         for offset in offsets {
             decoded_since_check += 1;
             if decoded_since_check >= DEADLINE_CHECK_INTERVAL {
                 decoded_since_check = 0;
                 Deadline::check(deadline, segments_examined)?;
             }
-            let record = seg.record_at_offset(offset).map_err(segment_error)?;
+            let record = walk.record_at_offset(offset).map_err(segment_error)?;
+            // Digest prefilter — honestly stated: every well-formed candidate
+            // CARRIES the probed pair by construction (posting lists are
+            // built from the records' own pair lists, under the same digests
+            // this re-checks), so on an intact segment this rejects nothing.
+            // What it rejects is a forged or corrupt posting — an index entry
+            // pointing at a record that never held the pair. A true 128-bit
+            // collision sails through it, exactly as it sailed through the
+            // index probe, which is why the parsed span below remains the
+            // authority — this narrows, it never answers.
+            let digest_match = keys.iter().any(|key| {
+                encoded_values
+                    .iter()
+                    .flatten()
+                    .any(|encoding| seg.record_carries_attribute(&record, key, encoding))
+            });
+            if !digest_match {
+                continue;
+            }
             let span = record_to_span(&record)?;
             // An index accelerates a filter, it never changes it.
             if !visible(&span) || !matches(&span) {
@@ -3188,10 +3223,15 @@ pub(crate) fn query_view_costed(
             enum Source<'a> {
                 Parsed(Vec<Span>),
                 Lazy {
-                    seg: &'a segment::Segment,
                     // Owned when the content index produced the candidates,
                     // borrowed when an attribute posting list did.
                     offsets: Cow<'a, [u64]>,
+                    /// This source's decoded-block memo: offsets are walked
+                    /// in ascending order, so neighbouring candidates share
+                    /// blocks, and the walk keeps that sharing even when a
+                    /// concurrent scan evicts the block from the shared
+                    /// cache between two advances.
+                    walk: segment::BlockWalk<'a>,
                     /// This segment's index in `segments`.
                     ///
                     /// Carried explicitly because it is NOT the source's own
@@ -3237,8 +3277,8 @@ pub(crate) fn query_view_costed(
                 };
                 sources.push((
                     Source::Lazy {
-                        seg,
                         offsets,
+                        walk: seg.walk(),
                         segment_position,
                     },
                     position,
@@ -3255,12 +3295,12 @@ pub(crate) fn query_view_costed(
                         }
                         Ok(span)
                     }
-                    Source::Lazy { seg, offsets, .. } => {
+                    Source::Lazy { offsets, walk, .. } => {
                         let Some(offset) = offsets.get(*pos).copied() else {
                             return Ok(None);
                         };
                         *pos += 1;
-                        let record = seg.record_at_offset(offset).map_err(segment_error)?;
+                        let record = walk.record_at_offset(offset).map_err(segment_error)?;
                         record_to_span(&record).map(Some)
                     }
                 }
@@ -3378,13 +3418,14 @@ pub(crate) fn query_view_costed(
                 continue;
             }
             let offsets = select_probe(seg, filter, content.as_ref(), metrics)?;
+            let mut walk = seg.walk();
             for offset in offsets.iter() {
                 decoded_since_check += 1;
                 if decoded_since_check >= DEADLINE_CHECK_INTERVAL {
                     decoded_since_check = 0;
                     Deadline::check(deadline, cost.segments_examined)?;
                 }
-                let record = seg.record_at_offset(*offset).map_err(segment_error)?;
+                let record = walk.record_at_offset(*offset).map_err(segment_error)?;
                 let span = record_to_span(&record)?;
                 if !visible(&span)
                     || !span_matches(&span, filter, content.as_ref())
@@ -3483,13 +3524,14 @@ pub(crate) fn fold_view(
             continue;
         }
         let offsets = select_probe(seg, filter, content.as_ref(), metrics)?;
+        let mut walk = seg.walk();
         for offset in offsets.iter() {
             decoded_since_check += 1;
             if decoded_since_check >= DEADLINE_CHECK_INTERVAL {
                 decoded_since_check = 0;
                 Deadline::check(deadline, cost.segments_examined)?;
             }
-            let record = seg.record_at_offset(*offset).map_err(segment_error)?;
+            let record = walk.record_at_offset(*offset).map_err(segment_error)?;
             let span = record_to_span(&record)?;
             if !visible(&span) || !span_matches(&span, filter, content.as_ref()) {
                 continue;
@@ -4222,16 +4264,14 @@ impl Store {
                     .attribute_candidate_offsets(IDX_TENANT, tenant)
                     .to_vec()
             };
+            let mut walk = segment.seg.walk();
             for offset in offsets {
                 decoded_since_check += 1;
                 if decoded_since_check >= DEADLINE_CHECK_INTERVAL {
                     decoded_since_check = 0;
                     Deadline::check(deadline, segments_examined)?;
                 }
-                let record = segment
-                    .seg
-                    .record_at_offset(offset)
-                    .map_err(segment_error)?;
+                let record = walk.record_at_offset(offset).map_err(segment_error)?;
                 let span = record_to_span(&record)?;
                 if span.tenant != tenant {
                     continue;
@@ -5074,11 +5114,16 @@ impl Store {
         Ok(0)
     }
 
-    /// Bytes of segment payload encoding currently resident in memory.
+    /// Bytes of segment record/payload content currently resident in memory.
     ///
     /// The larger-than-RAM rule: zero after open AND after flush — segments
     /// are file-backed, holding only their parsed indexes; record payloads
-    /// are read on demand.
+    /// are read on demand. Once queries run, this counts the decoded-block
+    /// cache too: each open segment retains at most a handful of decoded
+    /// compression blocks (see `BLOCK_CACHE_SLOTS` in `src/segment.rs` for
+    /// the bound — nominally 512 KiB per segment, larger only when a single
+    /// record exceeds the 128 KiB block target), retained for the segment's
+    /// life. That residency is real, so it is counted rather than hidden.
     pub fn resident_payload_bytes(&self) -> Result<usize> {
         let segments = self.lock_segments()?;
         Ok(segments
@@ -5477,6 +5522,12 @@ impl Store {
             created_unix_ns,
             folded_through: folded,
             files,
+            // Carried forward on every checkpoint, per the migration
+            // contract. Stating the constant rather than copying the prior
+            // manifest's field is deliberate: a checkpoint only ever runs
+            // against an open store, an open store has already been migrated,
+            // and this build's open serves exactly one format.
+            segment_format: Some(segment::VERSION),
         };
         // The manifest is durable before CURRENT moves, or a restart would
         // point at a generation whose contents are not proven.
@@ -6434,8 +6485,9 @@ impl Store {
                 }
                 offsets.sort_unstable();
                 offsets.dedup();
+                let mut walk = seg.walk();
                 for offset in offsets {
-                    let record = seg.record_at_offset(offset).map_err(segment_error)?;
+                    let record = walk.record_at_offset(offset).map_err(segment_error)?;
                     let span = record_to_span(&record)?;
                     if span.tenant == *tenant
                         && semconv::facts(&span.attributes).session.as_deref() == Some(session_id)
@@ -6446,8 +6498,9 @@ impl Store {
             }
             erasure::Subject::Tenant { tenant } => {
                 let offsets = seg.attribute_candidate_offsets(IDX_TENANT, tenant).to_vec();
+                let mut walk = seg.walk();
                 for offset in offsets {
-                    let record = seg.record_at_offset(offset).map_err(segment_error)?;
+                    let record = walk.record_at_offset(offset).map_err(segment_error)?;
                     let span = record_to_span(&record)?;
                     if span.tenant == *tenant {
                         keys.push(key_of(span));
@@ -6455,8 +6508,9 @@ impl Store {
                 }
             }
             erasure::Subject::Payload { reference } => {
+                let mut walk = seg.walk();
                 for ordinal in 0..seg.len() {
-                    if let Some(record) = seg.record(ordinal).map_err(segment_error)? {
+                    if let Some(record) = walk.record(ordinal).map_err(segment_error)? {
                         let span = record_to_span(&record)?;
                         if erasure::payload_unredacted(&span, reference) {
                             keys.push(key_of(span));
@@ -6621,11 +6675,29 @@ impl Store {
             // segment. The buffer above already applies exactly this rule.
             let failing = classes.re_delivered > 0;
             clean &= !failing;
+            // The domain is index-verified, and the receipt says HOW the
+            // records were read: through each block's decode, under the codec
+            // the segment names. Against compressed records a raw byte scan
+            // would not even be a scan of the record bytes, so the receipt
+            // must not let "scanned" be assumed.
+            let codecs = pinned
+                .iter()
+                .map(|segment| segment.seg.header().codec.name())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(", ");
+            let read_path = if pinned.is_empty() {
+                String::new()
+            } else {
+                format!(", records read through {codecs} block decode")
+            };
             let mut report = erasure::DomainReport::clear(
                 "segments",
                 format!(
-                    "{} segment(s) checked through their indexes; {}",
+                    "{} segment(s) checked through their indexes{}; {}",
                     pinned.len(),
+                    read_path,
                     match unredacted {
                         0 => "no record matches the subject".to_owned(),
                         found => format!("{found} record(s) match the subject"),
@@ -7468,6 +7540,15 @@ fn recover_merge(directory: &Path, journal: &str) -> Result<()> {
         // consistent whichever side that crash landed on.
         return Ok(());
     }
+    // `Segment::open` reads exactly one version, so a journal left by a
+    // v0.23 crash whose v6 outputs fully committed resolves BACKWARD on the
+    // upgrade open: the v6 outputs read as not-ready and, with every input
+    // still present, are deleted. Safe — the untouched inputs hold everything
+    // the outputs held, migration then converts the inputs, and a later
+    // compaction redoes the merge — but it discards completed v6 merge work
+    // across the version boundary. The cost is redone work on one
+    // upgrade-after-crash corner, never data; a version-aware readiness
+    // probe would preserve outputs this build cannot read, which is worse.
     let ready = |name: &str| {
         let path = directory.join(name);
         path.exists() && (!name.ends_with(SEGMENT_SUFFIX) || segment::Segment::open(&path).is_ok())
@@ -7864,22 +7945,48 @@ fn load_segments(directory: &Path) -> Result<Vec<std::sync::Arc<Segment>>> {
             // and the snapshot copies the write buffer) but leaves payload
             // bytes and annotations behind.
             let detail = match &error {
-                segment::Error::UnsupportedVersion { .. } => format!(
-                    "\nBack up the directory first — stop the server and copy it, \
-                     or take a filesystem snapshot atomic across the whole \
-                     directory. A file-by-file copy of a running store is not \
-                     safe.\n\
-                     A store can hold segments in SEVERAL formats — each build \
-                     writes the format of its day and leaves earlier segments \
-                     alone — so a reader has to cover all of them, not just \
-                     this one. Commit {LEGACY_SEGMENT_READER} reads formats 2 \
-                     through 5; build it and open the backup with that.\n\
-                     A span export carries every span, buffered ones included, \
-                     but offloaded values stay as $payload references and \
-                     annotations are not in it at all.\n\
-                     See docs/operations/durability.md#backups and \
-                     docs/segment-format.md."
-                ),
+                segment::Error::UnsupportedVersion { found, .. } => {
+                    // Advice must track what actually reads the found
+                    // version: cf40bea covers 2 through 5, v6 is migrated by
+                    // THIS build at open (so meeting one here means the
+                    // migration stepped aside for a reason its own error
+                    // named), and anything newer needs a newer build. The
+                    // old text pointed every mismatch at cf40bea, which for
+                    // a future format was affirmatively wrong guidance.
+                    let who_reads = match *found {
+                        2..=5 => format!(
+                            "Commit {LEGACY_SEGMENT_READER} reads formats 2 \
+                             through 5; build it and open the backup with \
+                             that."
+                        ),
+                        6 => "This build migrates format 6 at open, so this \
+                              refusal means the migration stepped aside: the \
+                              store also holds something it must not convert \
+                              around (an unreadable segment head or a legacy \
+                              v1 segment — that file was named by its own \
+                              refusal). Resolve that file and reopen, and \
+                              the migration will run."
+                            .to_owned(),
+                        _ => "A newer build than this one wrote it; open the \
+                              store with that build."
+                            .to_owned(),
+                    };
+                    format!(
+                        "\nBack up the directory first — stop the server and \
+                         copy it, or take a filesystem snapshot atomic across \
+                         the whole directory. A file-by-file copy of a \
+                         running store is not safe.\n\
+                         A store can hold segments in SEVERAL formats — each \
+                         build writes the format of its day and leaves \
+                         earlier segments alone — so a reader has to cover \
+                         all of them, not just this one. {who_reads}\n\
+                         A span export carries every span, buffered ones \
+                         included, but offloaded values stay as $payload \
+                         references and annotations are not in it at all.\n\
+                         See docs/operations/durability.md#backups and \
+                         docs/segment-format.md."
+                    )
+                }
                 segment::Error::Unsupported(_) | segment::Error::Corrupt(_) => {
                     // Deliberately does NOT say another build can read the rest:
                     // `load_segments` aborts on the first unreadable segment, so
@@ -8046,6 +8153,16 @@ fn migrate_to_generations(root: &Path) -> Result<u64> {
     let created_unix_ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| since.as_nanos().min(u128::from(u64::MAX)) as u64);
+    // A directory the v6 → v7 migrator would have nothing to do in — every
+    // segment already v7, no payload files, no pins; a brand-new store above
+    // all — is declared v7 at adoption, so it never enters the migration
+    // path. Anything else adopts UNDECLARED and the migrator's trigger takes
+    // it from there on this same open.
+    let segment_format = if migration::nothing_to_migrate(root)? {
+        Some(segment::VERSION)
+    } else {
+        None
+    };
     generation::write_manifest(
         root,
         &generation::Manifest {
@@ -8053,6 +8170,7 @@ fn migrate_to_generations(root: &Path) -> Result<u64> {
             created_unix_ns,
             folded_through: generation::FoldedThrough::NONE,
             files,
+            segment_format,
         },
     )?;
     generation::publish_current(root, 1)?;

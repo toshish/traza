@@ -52,6 +52,15 @@ verifies every digest before reporting success. Hard links share inodes, so the
 pin costs almost no disk **and holds its bytes even after compaction unlinks
 the originals** — which is what lets the copy proceed at its own pace:
 
+One exception to "almost no disk", inherited from the v6 → v7 migration in
+[segment-format.md](../segment-format.md#migration-v6--v7): a pin that
+pre-dates that migration is rewritten by it, file by file, into a **full
+independent copy** of its generation — rewriting a pinned file allocates a new
+inode, and the migrator does not re-link identical outputs. Pins taken after
+the migration (on a v7 store) are cheap again. When the disk cannot afford one
+full copy per pre-existing pin, release the pins before upgrading and re-take
+them after.
+
 ```sh
 cp -a /var/lib/traza/pins/nightly /backups/traza-$(date +%F)
 curl -X POST http://localhost:8080/v1/backups/nightly/release

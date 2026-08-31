@@ -112,6 +112,22 @@ pub(crate) struct Manifest {
     pub folded_through: FoldedThrough,
     /// Every load-bearing file, digested.
     pub files: Vec<ManifestFile>,
+    /// The segment/blob format generation this manifest's files are written
+    /// in ([`crate::segment::VERSION`]), or `None` for a manifest written
+    /// before the field existed.
+    ///
+    /// This is the v6 → v7 migration's completion record: the migrator's
+    /// final checkpoint declares the format, every later checkpoint carries
+    /// the declaration forward, and an open that finds every segment at v7
+    /// but NO declaration re-runs the idempotent blob pass and pin
+    /// re-validation before checkpointing — the blob pass and a pin's
+    /// manifest rewrite leave no version word behind for the trigger to
+    /// read, so their completion has to be recorded somewhere, and this is
+    /// where. Absent from pre-v0.24.0 manifests by construction
+    /// (`serde(default)`), which is exactly what makes absence the
+    /// resume-the-passes signal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub segment_format: Option<u16>,
 }
 
 /// Reads `CURRENT`, or `None` when the directory has never published one —
@@ -203,7 +219,15 @@ pub(crate) fn write_manifest(root: &Path, manifest: &Manifest) -> Result<()> {
         return Err(error);
     }
     fs::rename(&temp, dir.join(MANIFEST_NAME))?;
-    crate::sync_directory(&dir)
+    crate::sync_directory(&dir)?;
+    // The generation directory's own entry lives in `generations/`, whose
+    // data blocks the leaf fsync above does not cover. Without this sync a
+    // crash on a filesystem that reorders directory metadata could leave
+    // CURRENT durably naming a generation whose directory entry was lost —
+    // and every later open then fails at the manifest load with nothing to
+    // resume from. One fsync of the parent closes the chain: manifest file,
+    // its directory entry, the `generations/<N>` entry, then CURRENT.
+    crate::sync_directory(&root.join(GENERATIONS_DIR))
 }
 
 /// True for the files a manifest lists: segments, the annotation log, the
@@ -521,6 +545,11 @@ pub(crate) fn install_staged(root: &Path, staged: &Path) -> Result<u64> {
             created_unix_ns: manifest.created_unix_ns,
             folded_through: FoldedThrough::NONE,
             files: manifest.files.clone(),
+            // Carried from the staged manifest, not asserted: a pin taken
+            // before the v6 → v7 migration carries no declaration, and the
+            // restored store's next open must run the migrator over the
+            // installed files rather than trust a claim nobody made.
+            segment_format: manifest.segment_format,
         },
     )?;
     publish_current(root, next).map(|()| next)
@@ -659,6 +688,7 @@ mod tests {
             created_unix_ns: 0,
             folded_through: FoldedThrough::NONE,
             files,
+            segment_format: None,
         };
         write_manifest(&root, &manifest).expect("write");
         let loaded = load_manifest(&manifest_path(&root, 1)).expect("load");
@@ -717,6 +747,7 @@ mod tests {
             created_unix_ns: 0,
             folded_through: FoldedThrough::NONE,
             files: digest_engine(&engine, &[]).expect("digest"),
+            segment_format: None,
         };
         let mut file = OpenOptions::new()
             .append(true)
@@ -742,6 +773,7 @@ mod tests {
                     created_unix_ns: 0,
                     folded_through: FoldedThrough::NONE,
                     files: Vec::new(),
+                    segment_format: None,
                 },
             )
             .expect("write");

@@ -93,7 +93,7 @@ Traza's `wal` and `flushed` modes call `File::sync_data`, which is `fsync(2)`.
 On Linux that carries the usual guarantee. On macOS, flushing the device cache
 requires `F_FULLFSYNC`, which the Rust standard library does not expose and
 which this crate will not reach for while it forbids unsafe code and carries
-two dependencies.
+three dependencies.
 
 The consequence, precisely:
 

@@ -36,10 +36,13 @@
 //! A 128-bit digest is small enough to attack offline, and the keys below are
 //! public constants. An attacker who chooses attribute values can therefore
 //! manufacture colliding keys. That is *not* a correctness problem for Traza,
-//! because every index probe is verified against the record it points at (see
-//! `segment::Segment::query_attribute`): a collision costs one wasted record
-//! decode and can never produce a wrong answer. Do not reuse this hash
-//! anywhere the digest itself is trusted.
+//! because every candidate is re-checked: at the segment layer against the
+//! digest pairs the record itself carries (see
+//! `segment::Segment::query_attribute`), and in the store against the value
+//! derived from the record's parsed payload (`span_matches` and its
+//! relatives), which no digest forgery can satisfy. A collision costs one
+//! wasted record decode and can never produce a wrong answer. Do not reuse
+//! this hash anywhere the digest itself is trusted.
 //!
 //! [`DefaultHasher`]: std::collections::hash_map::DefaultHasher
 

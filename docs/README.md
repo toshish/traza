@@ -1,7 +1,7 @@
 # Traza documentation
 
 Traza is a trace datastore with first-class LLM and agent observability: one
-binary, two dependencies, no infrastructure to stand up. This index routes you
+binary, three dependencies, no infrastructure to stand up. This index routes you
 to the right document. Start with the row that matches what you are doing.
 
 | I want to… | Read |
@@ -82,7 +82,8 @@ Changing Traza's code.
   `ingest-bench`, `storage-bench` and `query-bench`, and the rules for
   reporting a measurement honestly.
 - **[Segment format](segment-format.md)** — the on-disk layout, byte by byte:
-  the shipped v6 format, and the v7 specification v0.24.0 will be held to.
+  the shipped v7 format, the v6 → v7 migration contract, and the historical
+  v6 layout the migrator's frozen decoder reads.
 - **[Dependencies](internals/dependencies.md)** — the standing dependency
   budget, the written case for each dependency taken, and the rejections
   that keep the count where it is.

@@ -7,19 +7,20 @@ job** and **what the dependency's own footprint is**. This file is where
 those justifications live, one section per decision, so that the absence of
 a dependency reads as a decision rather than an accident.
 
-The count today: **two direct dependencies**, `serde` and `serde_json`. The
-native wire is JSON in both directions and so are the annotation, eval,
-tombstone and manifest files; hand-writing serialization for every API type
-would be more code, and more wrong code, than the dependency. Everything
-else — HTTP, the OTLP protobuf decoder, the WAL, SHA-256, the digests, the
-Bloom filters — is the standard library, on purpose. The full supply chain
-is the lockfile: 12 packages, Traza itself included.
+The count today: **three direct dependencies** — `serde`, `serde_json`, and
+`lz4_flex` (argued in its own section below). The native wire is JSON in both
+directions and so are the annotation, eval, tombstone and manifest files;
+hand-writing serialization for every API type would be more code, and more
+wrong code, than the dependency. Everything else — HTTP, the OTLP protobuf
+decoder, the WAL, SHA-256, the digests, the Bloom filters — is the standard
+library, on purpose. The full supply chain is the lockfile: 13 packages,
+Traza itself included.
 
 ---
 
 ## lz4_flex — segment and blob compression (accepted, ships in v0.24.0)
 
-**The job.** [Format v7](../segment-format.md#format-v7-specification--ships-in-v0240)
+**The job.** [Format v7](../segment-format.md#format-v7)
 compresses the segment records region in 128 KiB record-aligned blocks and
 compresses payload blobs whole. The measured motivation is in the spec and in
 [storage-comparison](../storage-comparison.md): the records region is where
@@ -59,7 +60,11 @@ the dependency it would avoid — which is exactly the test the budget asks.
   optional and none is activated by these features: direct dependencies go
   2 → 3, and the lockfile grows by exactly the one package, 12 → 13. (The
   default feature set would add the frame format and a hash dependency; v7
-  needs neither.)
+  needs neither.) One more cost, learned from the MSRV gate rather than the
+  survey: `lz4_flex` 0.14.0 requires rustc 1.81, so the crate's floor moved
+  from 1.75 to 1.81 with it — a two-year-old stable at adoption time, and
+  the gate's job is exactly to make that a recorded decision instead of a
+  silent drift.
 - **Version pinned exact (`=` in `Cargo.toml`).** Compressor output bytes
   are format bytes under the acceptance tests — see
   [the determinism rule](../segment-format.md#determinism-compressor-output-is-format-bytes)
@@ -68,8 +73,9 @@ the dependency it would avoid — which is exactly the test the budget asks.
   constrains the encoder only; any correct LZ4 decoder reads any valid
   stream.
 - The dependency count is written down in more places than the two obvious
-  ones — all correct today, all stale the day the dependency lands. The
-  implementing PR updates every one:
+  ones — all correct before this dependency, all stale the day it landed.
+  The v7 implementation settled every one (plus two stray "two dependencies"
+  comments in `src/bin/ingest-bench.rs` the grep below caught):
   - `CONTRIBUTING.md` — "two direct dependencies" in the PR expectations;
   - `README.md` — "Two direct dependencies, twelve packages in the whole
     lockfile";
