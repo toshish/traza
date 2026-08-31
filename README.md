@@ -30,7 +30,7 @@ script asserts its own claims, and CI runs all six. Clone, then pick one:*
 The server with the dashboard already built in. No Rust, no Node.
 
 ```sh
-VERSION=0.22.1
+VERSION=0.23.0
 PLATFORM=macos-aarch64          # or linux-x86_64, linux-aarch64
 
 curl -LO https://github.com/toshish/traza/releases/download/v$VERSION/traza-$VERSION-$PLATFORM.tar.gz
