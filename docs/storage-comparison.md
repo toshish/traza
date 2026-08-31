@@ -49,9 +49,9 @@ including exact byte counts, is in [`storage.md`](benchmarks/storage.md).
 
 | Corpus | Spans | Ingested | On disk | Ratio | Bytes/span stored |
 |---|---:|---:|---:|---:|---:|
-| `generic` — service traces | 1,000,000 | 311.9 MiB | 556.7 MiB | **0.56 : 1** | 584 |
-| `llm` — LLM calls, ~2 KiB of text each | 200,000 | 438.7 MiB | 905.1 MiB | **0.48 : 1** | 4,745 |
-| `pinned-context` — 320 KiB pinned context per call | 10,000 | 3,144.4 MiB | 26.0 MiB | **121.03 : 1** | 2,724 |
+| `generic` — service traces | 1,000,000 | 311.9 MiB | 564.3 MiB | **0.55 : 1** | 592 |
+| `llm` — LLM calls, ~2 KiB of text each | 200,000 | 438.7 MiB | 909.4 MiB | **0.48 : 1** | 4,768 |
+| `pinned-context` — 320 KiB pinned context per call | 10,000 | 3,144.4 MiB | 26.3 MiB | **119.72 : 1** | 2,754 |
 
 The first two ratios are below 1:1, which means they are not compression ratios
 at all. Traza stores 1.8x to 2.1x *more* bytes than the client sent it.
@@ -69,7 +69,7 @@ document counts follow from each corpus's average document size.
 | Ingested data (MB) | 185,493 | 185,493 | 185,493 | 185,493 | 185,493 |
 | Documents | 173,384,804 | 173,834,714 | 594,685,181 | 84,556,578 | 589,913 |
 | Stored data (MB) | 52,152 | 3,891 | 331,081 | 382,646 | 1,533 |
-| Compression ratio | 3.56 | 47.67 | 0.56 | 0.48 | 121.03 |
+| Compression ratio | 3.56 | 47.67 | 0.55 | 0.48 | 119.72 |
 | Compression ratio to ES | 1 | 13.4 | 0.16 | 0.14 | 34.0 |
 | Storage cost for 1 node ($) | 4.07 | 0.087 | 25.87 | 29.89 | 0.12 |
 | Storage cost for 3-node HA cluster ($) | 12.22 | 0.087 | 77.60 | 89.68 | 0.36 |

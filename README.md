@@ -230,7 +230,7 @@ Every number is produced by a benchmark bundled in this repo, run over the real 
 
 ## When not to use Traza
 
-**Disk cost is your binding constraint.** Segments are uncompressed JSON plus indexes and cost 1.8–2.1× the bytes you send. A columnar engine writing compressed files to object storage will beat that by an order of magnitude. The exception is agent context: a repeated system prompt above the offload threshold is stored once, measured at 121:1 in Traza's favour.
+**Disk cost is your binding constraint.** Segments are uncompressed JSON plus indexes and cost 1.8–2.1× the bytes you send. A columnar engine writing compressed files to object storage will beat that by an order of magnitude. The exception is agent context: a repeated system prompt above the offload threshold is stored once, measured at 120:1 in Traza's favour.
 
 **You need metrics and logs in the same system.** Traza stores traces and their analytics. That is the whole surface, on purpose.
 
