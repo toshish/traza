@@ -5,7 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.23.0] - 2026-08-26
+
+The release where the production obligations land, and the first artifact to
+carry them: everything between v0.22.1 and here ships for the first time,
+including the [0.22.2] section below, whose tag was never cut. Generations and
+checkpoints with hot backup and one-flag restore; erasure with a receipt that
+re-checks every domain by name; tenant identity in the primary key; the eval
+entity model; attribution that names the failing step; a compute deadline on
+every query and a connection slot no panic can leak; and a six-demo tour that
+CI holds green. The format pays for it once: segment formats 1–5 are spent,
+and a pre-generation store migrates on first open, automatically.
 
 ### Added
 
@@ -2481,7 +2491,7 @@ completion trailers — clients parsing either surface must update.
 
 - This is an initial 0.1 release; consult README.md for the currently documented operational constraints and unsupported use cases.
 
-[Unreleased]: https://github.com/toshish/traza/compare/v0.22.2...HEAD
+[0.23.0]: https://github.com/toshish/traza/compare/v0.22.2...v0.23.0
 [0.22.2]: https://github.com/toshish/traza/compare/v0.22.1...v0.22.2
 [0.22.1]: https://github.com/toshish/traza/compare/v0.22.0...v0.22.1
 [0.22.0]: https://github.com/toshish/traza/compare/v0.21.0...v0.22.0
