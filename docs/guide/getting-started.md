@@ -9,8 +9,8 @@ The fastest path is a [release archive](https://github.com/toshish/traza/release
 — the server with the dashboard already built, no toolchains:
 
 ```sh
-curl -LO https://github.com/toshish/traza/releases/download/v0.23.0/traza-0.23.0-macos-aarch64.tar.gz
-tar xzf traza-0.23.0-macos-aarch64.tar.gz && cd traza-0.23.0-macos-aarch64
+curl -LO https://github.com/toshish/traza/releases/download/v0.24.0/traza-0.24.0-macos-aarch64.tar.gz
+tar xzf traza-0.24.0-macos-aarch64.tar.gz && cd traza-0.24.0-macos-aarch64
 ```
 
 (`linux-x86_64` and `linux-aarch64` likewise; the container image is

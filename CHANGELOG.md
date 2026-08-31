@@ -5,7 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.24.0] - 2026-08-31
+
+The storage release: segment format v7. The same store, at less than half
+the disk — measured by gates the benchmarks now enforce on themselves
+before they will write a number down. Records stop storing every indexed
+attribute value twice, the records region compresses into 128 KiB lz4
+blocks behind a validated directory, payload blobs compress under an
+unchanged content address, and a v6 store migrates automatically at first
+open: resumable, same names, pins included, proven by an aimed-SIGKILL
+crash matrix. Settled amplification lands at 0.41x of ingested bytes on
+service traces and 0.23x on LLM calls, against 1.81x and 2.07x before;
+ingest is faster because compression writes fewer bytes; a point read
+pays one block decode, priced and bounded in the format's own acceptance
+gates. lz4_flex is the third direct dependency, carried by the ledger in
+docs/internals/dependencies.md, and it raises the minimum supported Rust
+to 1.81.
 
 ### Changed
 
@@ -2561,6 +2576,7 @@ completion trailers — clients parsing either surface must update.
 
 - This is an initial 0.1 release; consult README.md for the currently documented operational constraints and unsupported use cases.
 
+[0.24.0]: https://github.com/toshish/traza/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/toshish/traza/compare/v0.22.2...v0.23.0
 [0.22.2]: https://github.com/toshish/traza/compare/v0.22.1...v0.22.2
 [0.22.1]: https://github.com/toshish/traza/compare/v0.22.0...v0.22.1
