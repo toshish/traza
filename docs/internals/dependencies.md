@@ -60,7 +60,11 @@ the dependency it would avoid — which is exactly the test the budget asks.
   optional and none is activated by these features: direct dependencies go
   2 → 3, and the lockfile grows by exactly the one package, 12 → 13. (The
   default feature set would add the frame format and a hash dependency; v7
-  needs neither.)
+  needs neither.) One more cost, learned from the MSRV gate rather than the
+  survey: `lz4_flex` 0.14.0 requires rustc 1.81, so the crate's floor moved
+  from 1.75 to 1.81 with it — a two-year-old stable at adoption time, and
+  the gate's job is exactly to make that a recorded decision instead of a
+  silent drift.
 - **Version pinned exact (`=` in `Cargo.toml`).** Compressor output bytes
   are format bytes under the acceptance tests — see
   [the determinism rule](../segment-format.md#determinism-compressor-output-is-format-bytes)

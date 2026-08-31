@@ -62,7 +62,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are format bytes under the acceptance tests (upgrading the pin is a
   deliberate re-baseline, never a routine bump). Built with
   `default-features = false` and the safe encode/decode features only, so
-  the crate-wide `#![forbid(unsafe_code)]` posture keeps its meaning. The
+  the crate-wide `#![forbid(unsafe_code)]` posture keeps its meaning. It
+  raises the minimum supported Rust from 1.75 to 1.81, recorded in the
+  ledger. The
   written justification lives in
   [docs/internals/dependencies.md](docs/internals/dependencies.md); the
   lockfile grows from twelve packages to thirteen.
