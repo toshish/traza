@@ -179,8 +179,11 @@ gives the records region at bytes 24 and 32 (see
 Columnar segment projections and an object-storage tier attack what
 compression cannot.
 The object tier is the one that matters most for the cost row, because it is the
-only thing that removes the per-replica multiplier. Neither has shipped, and
-compression itself is not currently a named roadmap item.
+only thing that removes the per-replica multiplier. Neither has shipped.
+Compression is now specified — the
+[v7 format](segment-format.md#format-v7-specification--ships-in-v0240),
+targeted at v0.24.0 — but remains unimplemented, and every number in this
+section stays a projection until it ships and is measured.
 
 ## What these eight metrics do not measure
 

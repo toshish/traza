@@ -81,7 +81,11 @@ Changing Traza's code.
 - **[Benchmarking](internals/benchmarking.md)** — running `bench`,
   `ingest-bench`, `storage-bench` and `query-bench`, and the rules for
   reporting a measurement honestly.
-- **[Segment format](segment-format.md)** — the on-disk layout, byte by byte.
+- **[Segment format](segment-format.md)** — the on-disk layout, byte by byte:
+  the shipped v6 format, and the v7 specification v0.24.0 will be held to.
+- **[Dependencies](internals/dependencies.md)** — the standing dependency
+  budget, the written case for each dependency taken, and the rejections
+  that keep the count where it is.
 - **[Contributing](../CONTRIBUTING.md)** — setup, the `./ci.sh` gate, and pull
   request expectations.
 
