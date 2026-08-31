@@ -65,6 +65,7 @@ with a plain `Instant` — see [benchmarking](../internals/benchmarking.md).
 | `traza_segment_merges_total` | counter | Merges that published their outputs. **Segment count cannot substitute for this**: seals raise it while merges lower it, so under sustained ingest the two hide each other and a store that is merging steadily can look like one that never merges |
 | `traza_segments_merged_away_total` | counter | Segments consumed by merges. Divided by `traza_segment_merges_total` this is the **mean fan-in actually achieved** — whether compaction is keeping up or nibbling |
 | `traza_supersede_probes_total` | counter | Exact primary-key probes into newer segments while resolving last-write-wins: the reads the key-hash prefilter could not rule out. Healthy is roughly one probe per superseded version actually held. **A number tracking matches × segments means the prefilter has stopped working** and every query is re-reading the store to prove keys were never replaced |
+| `traza_rollup_builds_total` | counter | Segment rollups rebuilt by decoding the segment, because neither the in-memory cache nor the on-disk sidecar could answer. Each rebuild writes the sidecar back, so a sidecar-less store pays this once per segment. **A counter that keeps climbing on a steady corpus means the heal is not landing** — check the data directory is writable and the sidecars are surviving beside their segments |
 
 ### Engine stages
 

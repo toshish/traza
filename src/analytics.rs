@@ -1287,7 +1287,7 @@ impl Store {
     /// the decode on every restart forever. The write is best-effort: failing
     /// a query because a derived cache could not be saved would trade a
     /// correct slow answer for no answer.
-    fn segment_rollup(&self, segment: &crate::Segment) -> Result<Arc<SegmentRollup>> {
+    pub(crate) fn segment_rollup(&self, segment: &crate::Segment) -> Result<Arc<SegmentRollup>> {
         let binding = segment.rollup_binding(self.pricing_fingerprint());
         if let Some(rollup) = self.cached_rollup(&segment.path, binding)? {
             return Ok(rollup);
@@ -1299,6 +1299,7 @@ impl Store {
                     &segment.spans_parsed()?,
                     self.pricing(),
                 ));
+                self.metrics.rollup_builds.increment();
                 let _ = crate::rollup_file::store(&segment.path, binding, &rollup);
                 rollup
             }

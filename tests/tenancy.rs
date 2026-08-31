@@ -1098,3 +1098,90 @@ fn the_reserved_tenant_key_is_forgiven_on_closed_schemas() {
         Subject::Session { tenant, .. } if tenant == "bigco"
     ));
 }
+
+#[test]
+fn a_bound_payload_probe_heals_the_sidecar_it_had_to_rebuild() {
+    // The bound-token reachability probe prefilters segments by their
+    // rollups. A store that lost its sidecars — a crash, a copied data
+    // directory, a pricing change invalidating every binding — must pay the
+    // rebuild once and write the sidecar back, not decode the segment on
+    // every probe forever. The oracle is the engine's own rebuild counter
+    // plus the file reappearing, never a stopwatch.
+    let dir = test_dir("probe-heals");
+    let config = Config {
+        payload_threshold: Some(64),
+        ..wal_config()
+    };
+    let secret = "acme confidential prompt body that offloads ".repeat(4);
+    let reference = {
+        let store = Store::open(&dir, config.clone()).expect("opens");
+        store
+            .ingest(tenant_span(
+                "acme",
+                "th",
+                "s1",
+                "op",
+                json!({"prompt": secret}),
+            ))
+            .expect("ingests");
+        store.flush().expect("seals");
+        store.get_trace_in(Some("acme"), "th").expect("trace")[0].attributes["prompt"]["$payload"]
+            .as_str()
+            .expect("offloaded")
+            .to_owned()
+    };
+    // The seal left a sidecar; lose it, as a crash or a copy would.
+    let mut removed = 0;
+    for entry in std::fs::read_dir(&dir).expect("read dir") {
+        let path = entry.expect("entry").path();
+        if path.extension().and_then(|extension| extension.to_str()) == Some("rollup") {
+            std::fs::remove_file(&path).expect("remove sidecar");
+            removed += 1;
+        }
+    }
+    assert!(removed >= 1, "the seal left a sidecar to lose");
+
+    // A cold store rebuilds once — and the sidecar is back on disk.
+    let store = Store::open(&dir, config.clone()).expect("reopens");
+    assert!(store
+        .payload_in(Some("acme"), &reference)
+        .expect("probe")
+        .is_some());
+    let builds = store.metrics().rollup_builds.get();
+    assert!(builds >= 1, "the sidecar-less probe paid a rebuild");
+    let healed = std::fs::read_dir(&dir)
+        .expect("read dir")
+        .filter(|entry| {
+            entry.as_ref().is_ok_and(|entry| {
+                entry.path().extension().and_then(|e| e.to_str()) == Some("rollup")
+            })
+        })
+        .count();
+    assert_eq!(healed, removed, "the rebuild wrote the sidecar back");
+
+    // A second probe answers from the cache: nothing is rebuilt.
+    assert!(store
+        .payload_in(Some("acme"), &reference)
+        .expect("probe")
+        .is_some());
+    assert_eq!(
+        store.metrics().rollup_builds.get(),
+        builds,
+        "a healed store never rebuilds for the same probe"
+    );
+
+    // The claim that matters survives the process: a fresh open reads the
+    // healed sidecar and pays no rebuild at all.
+    drop(store);
+    let store = Store::open(&dir, config).expect("reopens again");
+    assert!(store
+        .payload_in(Some("acme"), &reference)
+        .expect("probe")
+        .is_some());
+    assert_eq!(
+        store.metrics().rollup_builds.get(),
+        0,
+        "the healed sidecar answers a cold process; the decode was paid once"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}

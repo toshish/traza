@@ -333,6 +333,16 @@ pub struct Metrics {
     /// near matches × segments means the prefilter has stopped working and
     /// every query is re-reading the store to prove keys were never replaced.
     pub supersede_probes: Counter,
+    /// Segment rollups rebuilt by decoding the segment, because neither the
+    /// in-memory cache nor the on-disk sidecar could answer.
+    ///
+    /// Each rebuild writes the sidecar back, so a store that lost its
+    /// sidecars — a crash, a copy, a pricing change invalidating every
+    /// binding — pays this once per segment and then reads files again. A
+    /// counter that keeps climbing on a steady corpus means the heal is not
+    /// landing, and every aggregation is decoding the store to reconstruct
+    /// what the last one already knew.
+    pub rollup_builds: Counter,
     /// Segments TTL expiry ruled out without decoding them, because the
     /// rollup's end-time range put the whole segment on one side of the
     /// cutoff.
@@ -394,7 +404,7 @@ impl Metrics {
     pub fn render_prometheus(&self, into: &mut String) {
         use std::fmt::Write as _;
 
-        let counters: [(&str, &Counter); 19] = [
+        let counters: [(&str, &Counter); 20] = [
             ("traza_spans_admitted_total", &self.spans_admitted),
             ("traza_batches_admitted_total", &self.batches_admitted),
             ("traza_wal_commits_total", &self.wal_commits),
@@ -419,6 +429,7 @@ impl Metrics {
             ),
             ("traza_segments_examined_total", &self.segments_examined),
             ("traza_supersede_probes_total", &self.supersede_probes),
+            ("traza_rollup_builds_total", &self.rollup_builds),
             (
                 "traza_expiry_segments_skipped_total",
                 &self.expiry_segments_skipped,
