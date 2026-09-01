@@ -477,6 +477,215 @@ fn export_is_exempt_and_streams_to_completion_under_a_one_ms_budget() {
     );
 }
 
+// ---------------------------------------------------------------- library
+//
+// The escapes below were found by external review of v0.24.1: paths that
+// anchored a deadline and then did unbounded work anyway. They are
+// library-level because the holes are library holes — the server merely
+// inherits them — and because the precise triggers (a deleted rollup
+// sidecar, an unflushed buffer under a zero budget) are store states an
+// HTTP test cannot arrange directly.
+
+/// The sidecarless-rebuild corpus, sized for the LATENCY assertion below:
+/// decoding it unbudgeted costs ~2.5 s in this (unoptimized) test profile,
+/// so `assert_rebuild_refused_fast`'s 500 ms tripwire cleanly separates a
+/// budgeted refusal (one check interval of decode) from an unbudgeted
+/// decode that a late final check refuses anyway. At the shared `CORPUS`
+/// the unbudgeted cost was ~1.7 s — measurable, but too close to leave the
+/// tripwire an order of magnitude of headroom on a loaded machine.
+const REBUILD_CORPUS: usize = 80_000;
+
+/// A library store whose whole corpus sits in ONE sealed segment, its
+/// rollup sidecars deleted — the state a pre-sidecar store or a crash
+/// leaves behind, where the first aggregation must rebuild by decoding
+/// the segment.
+fn store_with_sidecarless_segment(
+    label: &str,
+    deadline: Option<Duration>,
+) -> (PathBuf, traza::Store) {
+    let dir = test_dir(label);
+    let config = traza::Config {
+        durability: traza::Durability::Buffered,
+        compaction: None,
+        flush_spans: 100_000,
+        max_buffer_age: None,
+        ..traza::Config::default()
+    };
+    let store = traza::Store::open(&dir, config.clone()).expect("store opens");
+    for index in 0..REBUILD_CORPUS {
+        store
+            .ingest(library_span(index))
+            .expect("library span ingests");
+    }
+    store.flush().expect("store flushes");
+    drop(store);
+    let mut deleted = 0;
+    for entry in std::fs::read_dir(&dir).expect("store dir lists") {
+        let path = entry.expect("dir entry").path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "rollup")
+        {
+            std::fs::remove_file(&path).expect("sidecar removes");
+            deleted += 1;
+        }
+    }
+    assert!(deleted >= 1, "the flush wrote no rollup sidecar to delete");
+    let store = traza::Store::open(
+        &dir,
+        traza::Config {
+            query_deadline: deadline,
+            ..config
+        },
+    )
+    .expect("store reopens");
+    (dir, store)
+}
+
+fn library_span(index: usize) -> traza::Span {
+    serde_json::from_value(json!({
+        "$tenant": "acme",
+        "trace_id": format!("trace-{index}"),
+        "span_id": format!("span-{index}"),
+        "name": format!("checkout retry payment {index}"),
+        "service": "svc",
+        "start_time_ns": BASE_NS + (index as u64) * 1_000,
+        "end_time_ns": BASE_NS + (index as u64) * 1_000 + 500,
+        "attributes": {"session.id": "night-shift"},
+    }))
+    .expect("library span parses")
+}
+
+/// External review, finding 1: the scoped payload fetch checked the budget
+/// per segment and then rebuilt a missing rollup sidecar INSIDE the
+/// segment with no check at all — ~1 s of decode under a 1 ms budget,
+/// answering `Ok(None)` as though the probe had been cheap.
+#[test]
+fn a_sidecarless_rollup_rebuild_on_the_payload_probe_is_budgeted() {
+    let (_dir, store) =
+        store_with_sidecarless_segment("rollup-rebuild-payload", Some(Duration::from_millis(1)));
+    let asked = Instant::now();
+    let absent = format!("sha256/{}", "ab".repeat(32));
+    let result = store.payload_in(Some("acme"), &absent);
+    let elapsed = asked.elapsed();
+    assert_rebuild_refused_fast(elapsed);
+    match result {
+        Err(traza::Error::DeadlineExceeded(_)) => {}
+        other => {
+            panic!("the sidecar-less rebuild escaped the 1 ms budget: {other:?} after {elapsed:?}")
+        }
+    }
+}
+
+/// External review, finding 1, second site: the analytics fold's rollup
+/// fast path rebuilds a missing sidecar through the same unbudgeted
+/// decode. With one segment the loop's next-iteration check never runs,
+/// so a 1 ms budget bought a full-corpus decode and a 200.
+#[test]
+fn a_sidecarless_rollup_rebuild_on_the_analytics_fold_is_budgeted() {
+    let (_dir, store) =
+        store_with_sidecarless_segment("rollup-rebuild-fold", Some(Duration::from_millis(1)));
+    let asked = Instant::now();
+    let result = store.sessions(None, None, 10, traza::analytics::SessionOrder::Recent);
+    let elapsed = asked.elapsed();
+    assert_rebuild_refused_fast(elapsed);
+    match result {
+        Err(traza::Error::DeadlineExceeded(_)) => {}
+        other => panic!(
+            "the fold's sidecar-less rebuild escaped the 1 ms budget: {other:?} after {elapsed:?}"
+        ),
+    }
+}
+
+/// The latency half of the rebuild tests' oracle: the refusal must arrive
+/// FAST, not merely arrive.
+///
+/// Second-round review proved the refusal alone under-pins the fix: with
+/// both `Deadline::check` sites inside `spans_parsed_budgeted` removed —
+/// the entire mechanism under test — these tests stayed green, because the
+/// callers' final checks still refused the answer AFTER paying the full
+/// corpus decode. That mutation reintroduces exactly the reviewed harm (a
+/// whole-corpus decode under a 1 ms budget, answered late with a refusal),
+/// so the tests must be latency-sensitive to the intra-rebuild cadence: a
+/// budgeted refusal costs one check interval of decode (a few thousand
+/// records), while the unbudgeted decode of the `REBUILD_CORPUS` costs
+/// ~2.5 s in this profile (measured under that exact mutation). 500 ms is
+/// a generous tripwire between the two — an order of magnitude above the
+/// honest refusal, several below the escape.
+fn assert_rebuild_refused_fast(elapsed: Duration) {
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "the refusal must arrive within one check interval, not after the \
+         full rebuild: {elapsed:?}"
+    );
+}
+
+/// External review, finding 2: none of the buffered-span sweeps checked
+/// the deadline, so a store whose corpus still sits in the write buffer
+/// answered complete results under a budget of zero. Every buffered
+/// query path gets the same assertion: an exhausted budget is
+/// `DeadlineExceeded`, never a full answer.
+///
+/// What this test pins is the result-visible contract — the refusal — NOT
+/// the mid-sweep check cadence: an in-memory sweep of this buffer costs
+/// tens of milliseconds here, so no wall-clock bound can tell a mid-sweep
+/// refusal from a final-check refusal the way the sidecarless-rebuild
+/// tests' latency assertion can. If every mid-sweep check were removed,
+/// the paths' final checks would keep this green while the sweep ran to
+/// completion; the cadence itself is pinned where it is expensive enough
+/// to measure (`assert_rebuild_refused_fast`).
+#[test]
+fn buffered_span_sweeps_enforce_the_deadline_on_every_query_path() {
+    let dir = test_dir("buffer-budget");
+    let store = traza::Store::open(
+        &dir,
+        traza::Config {
+            durability: traza::Durability::Buffered,
+            compaction: None,
+            flush_spans: 100_000,
+            max_buffer_age: None,
+            query_deadline: Some(Duration::ZERO),
+            ..traza::Config::default()
+        },
+    )
+    .expect("store opens");
+    // 20k spans, none flushed: the whole corpus is a buffer sweep.
+    for index in 0..20_000 {
+        store
+            .ingest(library_span(index))
+            .expect("library span ingests");
+    }
+
+    // The unlimited query path: the review's exact repro — an absent
+    // content word sweeps every buffered span and answered `Ok([])`.
+    let filter = traza::SpanFilter {
+        content: Some("zzznotpresent".to_owned()),
+        ..traza::SpanFilter::default()
+    };
+    match store.query(&filter) {
+        Err(traza::Error::DeadlineExceeded(_)) => {}
+        other => panic!("the unlimited buffer sweep escaped a zero budget: {other:?}"),
+    }
+
+    // The fold path.
+    match store.fold_spans(&filter, |_span| {}) {
+        Err(traza::Error::DeadlineExceeded(_)) => {}
+        other => panic!("the fold buffer sweep escaped a zero budget: {other:?}"),
+    }
+
+    // The session union — the both-locks attribute sweep.
+    match store.session_in(None, "night-shift") {
+        Err(traza::Error::DeadlineExceeded(_)) => {}
+        other => panic!("the session union's buffer sweep escaped a zero budget: {other:?}"),
+    }
+
+    // The analytics fold's buffer rollup.
+    match store.sessions(None, None, 10, traza::analytics::SessionOrder::Recent) {
+        Err(traza::Error::DeadlineExceeded(_)) => {}
+        other => panic!("the analytics buffer rollup escaped a zero budget: {other:?}"),
+    }
+}
+
 #[test]
 fn test_panic_zero_disables_the_route_like_every_other_knob() {
     // `TRAZA_TEST_PANIC=0` must mean OFF: every other knob reads `0` as

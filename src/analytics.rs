@@ -1063,15 +1063,28 @@ impl Store {
                 )
             })
             .collect();
-        let buffered: Vec<Arc<Span>> = buffer
-            .iter()
-            .filter(|span| {
-                in_window(span.start_time_ns, since_ns, until_ns)
-                    && mask.as_deref().map_or(true, |mask| !mask.covers(span))
-                    && tenant.map_or(true, |tenant| span.tenant == tenant)
-            })
-            .map(Arc::clone)
-            .collect();
+        // Budgeted at the standard cadence: the buffer rollup is a sweep
+        // over every unflushed span, and it ran unchecked (external review
+        // of v0.24.1). Exhaustion detected mid-sweep refuses before the
+        // rollup build; a budget that expires after the last mid-sweep
+        // check still pays the build at most once, and the fold's final
+        // check then refuses the answer — the pay-between-checks bound
+        // every budgeted path here accepts.
+        let mut swept_since_check: usize = 0;
+        let mut buffered: Vec<Arc<Span>> = Vec::new();
+        for span in buffer.iter() {
+            swept_since_check += 1;
+            if swept_since_check >= crate::DEADLINE_CHECK_INTERVAL {
+                swept_since_check = 0;
+                crate::Deadline::check(deadline, 0)?;
+            }
+            if in_window(span.start_time_ns, since_ns, until_ns)
+                && mask.as_deref().map_or(true, |mask| !mask.covers(span))
+                && tenant.map_or(true, |tenant| span.tenant == tenant)
+            {
+                buffered.push(Arc::clone(span));
+            }
+        }
         if !buffered.is_empty() {
             visit(&SegmentRollup::build(&buffered, self.pricing()));
         }
@@ -1102,7 +1115,10 @@ impl Store {
         for (position, segment) in segments.iter().enumerate().rev() {
             crate::Deadline::check(deadline, segments_examined)?;
             segments_examined += 1;
-            let rollup = self.segment_rollup(segment)?;
+            // The budget goes INTO the rollup read: on a sidecar miss this is
+            // a whole-segment decode, and with one segment in the corpus the
+            // loop's next-iteration check would never see it.
+            let rollup = self.segment_rollup(segment, deadline, segments_examined)?;
             let overlaps = since_ns.map_or(true, |bound| rollup.max_start_ns >= bound)
                 && until_ns.map_or(true, |bound| rollup.min_start_ns <= bound);
             if !overlaps {
@@ -1218,6 +1234,10 @@ impl Store {
         self.metrics
             .analytics_fold
             .record(u64::try_from(folding.elapsed().as_nanos()).unwrap_or(u64::MAX));
+        // Final check before the fold reports completion: an aggregate whose
+        // budget ran out on its last stretch is refused whole, exactly as it
+        // would have been refused mid-stream.
+        crate::Deadline::check(deadline, segments_examined)?;
         Ok(())
     }
 
@@ -1267,7 +1287,16 @@ impl Store {
             } else if let Some(rollup) = crate::rollup_file::load(&segment.path, binding) {
                 refs.extend(rollup.payload_refs);
             } else {
-                refs.extend(self.segment_rollup(&segment)?.payload_refs.iter().cloned());
+                // `None`: this is the maintenance thread's TTL sweep, which
+                // the deadline contract exempts — a protection set truncated
+                // by a compute budget would let the payload sweep delete
+                // bytes a live span still references.
+                refs.extend(
+                    self.segment_rollup(&segment, None, 0)?
+                        .payload_refs
+                        .iter()
+                        .cloned(),
+                );
             }
         }
         Ok(refs)
@@ -1287,7 +1316,21 @@ impl Store {
     /// the decode on every restart forever. The write is best-effort: failing
     /// a query because a derived cache could not be saved would trade a
     /// correct slow answer for no answer.
-    pub(crate) fn segment_rollup(&self, segment: &crate::Segment) -> Result<Arc<SegmentRollup>> {
+    ///
+    /// `deadline` is the calling request's compute budget, and it reaches
+    /// the rebuild's record-decode loop — the cache and sidecar arms cost a
+    /// map probe and a file read, but the rebuild decodes the whole segment,
+    /// and checking only at the caller's per-segment boundary left that
+    /// decode as one un-checked stretch (external review of v0.24.1). Query
+    /// paths pass their budget; the maintenance sweep passes `None`, exactly
+    /// as the deadline contract exempts it. `segments_examined` is the
+    /// caller's running count, for the refusal's message only.
+    pub(crate) fn segment_rollup(
+        &self,
+        segment: &crate::Segment,
+        deadline: Option<crate::Deadline>,
+        segments_examined: u32,
+    ) -> Result<Arc<SegmentRollup>> {
         let binding = segment.rollup_binding(self.pricing_fingerprint());
         if let Some(rollup) = self.cached_rollup(&segment.path, binding)? {
             return Ok(rollup);
@@ -1296,7 +1339,7 @@ impl Store {
             Some(rollup) => Arc::new(rollup),
             None => {
                 let rollup = Arc::new(SegmentRollup::build(
-                    &segment.spans_parsed()?,
+                    &segment.spans_parsed_budgeted(deadline, segments_examined)?,
                     self.pricing(),
                 ));
                 self.metrics.rollup_builds.increment();

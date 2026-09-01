@@ -248,6 +248,53 @@ usually inside the block the search just decoded. Either disagreement is
 column from the mandatory list; amended here under the drift rule after
 review demonstrated the silent-wrong-window consequence.
 
+**The header's timestamp range is validated too, not trusted.** *(Deliberate
+amendment #5, under the drift rule, after external review of v0.24.1
+demonstrated the silent-omission consequence; the validation was then
+grounded in record bytes after second-round review demonstrated that a
+fence-only check could be colluded with.)* The two range words at header
+offsets 80 and 88 carry no checksum, and `may_contain_timestamps` prunes
+whole segments on them before a single segment byte is read — so the format
+as first shipped let sixteen edited bytes hide decodable records from every
+time-bounded query: a false-negative predicate, which the corruption
+contract (an error or a conservative scan, never a silent omission)
+forbids. Three checks close it:
+
+- **Both opens, against the directory.** A non-empty segment's declared
+  minimum must EQUAL the first directory fence — a fence is its block's
+  first record's timestamp, and records are timestamp-sorted — and the
+  declared maximum must sit at or above the LAST fence (fences carry minima
+  only), which through the fences' own ordering also forces min ≤ max. An
+  empty segment must declare exactly the canonical empty range the encoder
+  writes — minimum `u64::MAX`, maximum `0` — and nothing else. Any
+  violation is `Corrupt`. On its own this is only a consistency check
+  between two pieces of unchecksummed metadata — the fences are derived
+  data too, so a forgery can move a fence and the header word together —
+  which is why the next check exists.
+- **Both opens, against the records.** The bounds are then proved against
+  record bytes. The eager, byte-resident open decodes every record anyway
+  and requires BOTH declared bounds to equal the observed extremes. The
+  lazy open decodes exactly two blocks: the FIRST — whose
+  fence-vs-first-record check (above) turns the pinned minimum into the
+  actual first record's timestamp — and the block holding the LAST record,
+  whose timestamp is the true maximum (records are timestamp-sorted) and
+  must EQUAL the declared maximum. That costs the lazy open two bounded
+  block decodes, which it drops from its cache afterwards so a freshly
+  opened segment still holds zero payload bytes.
+- **At read time, on every backing.** Any record decode — and any
+  fence-adjacent timestamp read — that observes a timestamp outside the
+  declared range is `Corrupt`: defense in depth behind the open-time
+  checks, for damage that arrives after open.
+
+So: both opens validate both bounds exactly, and there is no lazy/eager
+asymmetry in what they prove. A metadata-only forgery of the range — any
+combination of the header words and the fences — is refused at open,
+because the bounds are anchored to the first and last records themselves;
+a forgery that survives must therefore alter record bytes as well, and the
+block crc32 catches that on the very decode the validation performs. No
+forgery of the range can cause a wrong row to be SERVED either: every
+served record passes the read-time range check.
+
 **Posting lists keep their u64 currency as LOGICAL offsets** into the
 uncompressed records region — the record-offset index, the trace index, and
 the attribute index are byte-for-byte v6 encodings whose values simply mean
@@ -328,7 +375,9 @@ v6 contiguity rule extends to the new section: every section starts where
 the previous ends, the attribute index is still bounded by the content
 offset, the content index still runs to EOF, and trailing bytes are still
 refused. An empty segment has empty records, an empty directory, logical
-length zero, and otherwise encodes as v6-empty did.
+length zero, the canonical empty timestamp range (minimum `u64::MAX`,
+maximum `0` — mandatory since amendment #5 above), and otherwise encodes as
+v6-empty did.
 
 **The codec id is parameterization, not a version.** A reader refuses an
 unknown codec id with an error that names it — the same shape as the version
@@ -461,9 +510,10 @@ exists only inside the migrator module.
   as v7 but the digests disagree, it redoes the manifest rewrite.
   "Validate" is load-bearing and means the WHOLE file: a digest-moved
   pinned segment is accepted only after an eager open that checks every
-  block CRC and decodes every record — the lazy open reads only the header
-  and index sections, and trusting it would launder a bit-flipped pinned
-  block into a manifest that then verifies clean over garbage. A
+  block CRC and decodes every record — the lazy open reads the header and
+  index sections plus only the two blocks its bounds validation decodes
+  (amendment #5), and trusting it would launder a bit-flipped pinned
+  middle block into a manifest that then verifies clean over garbage. A
   digest-moved manifested file the migrator cannot validate in any format
   — neither a segment nor a content-addressed blob — refuses the resume by
   name, for the same reason. The

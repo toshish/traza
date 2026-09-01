@@ -16,6 +16,7 @@
 //! leaves the record alone.
 
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
@@ -31,6 +32,9 @@ const DEFAULT_COMPACTION_FANOUT: &str = "4";
 const BATCH_SIZE: usize = 1_000;
 const TRACE_SAMPLES: usize = 200;
 const FILTER_SAMPLES: usize = 100;
+/// The `limit` every filter sample carries — part of the oracle's arithmetic,
+/// so it is a named constant the query path and the verification share.
+const FILTER_LIMIT: usize = 100;
 
 /// Acceptance gate 6 (`docs/segment-format.md`, "Acceptance gates", as
 /// amended to absolute tripwires): median tripwires on the canonical corpus.
@@ -231,7 +235,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut filter_latencies = Vec::with_capacity(FILTER_SAMPLES);
     for sample in 0..FILTER_SAMPLES {
         let group = sample % 100;
-        let path = format!("/v1/spans?attr.benchmark.group=group-{group}&limit=100");
+        let path = format!("/v1/spans?attr.benchmark.group=group-{group}&limit={FILTER_LIMIT}");
         let started = Instant::now();
         let response = request(port, "GET", &path, None)?;
         let elapsed = started.elapsed();
@@ -243,7 +247,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .into());
         }
-        let _: Value = serde_json::from_slice(&response.1)?;
+        // The semantic oracle, before the latency is recorded: a wrong
+        // answer aborts the run — the same refuse-to-publish pattern as the
+        // gates — because a latency measured on a wrong answer is not a
+        // measurement of the store.
+        verify_filter_response(&response.1, group, SPAN_COUNT, FILTER_LIMIT)
+            .map_err(|error| format!("filter oracle failed, refusing to publish: {error}"))?;
         filter_latencies.push(elapsed);
     }
 
@@ -307,7 +316,7 @@ Additional percentiles:\n\n\
 - Corpus: {SPAN_COUNT} spans, 100,000 traces with 10 spans each, 20 services, 100 indexed `benchmark.group` attribute values, and occasional events.\n\
 - Ingest: HTTP `POST /v1/spans`, {BATCH_SIZE} spans per request, timed from the first request through the final successful response. JSON generation is intentionally inside the timed loop, so the reported rate includes client serialization and loopback HTTP overhead.\n\
 - Trace sampling: {TRACE_SAMPLES} deterministic trace IDs spread through the corpus; each response is parsed and checked for 10 spans.\n\
-- Filter sampling: {FILTER_SAMPLES} deterministic `attr.benchmark.group` queries with `limit=100`; each response body is parsed as JSON.\n\
+- Filter sampling: {FILTER_SAMPLES} deterministic `attr.benchmark.group` queries with `limit={FILTER_LIMIT}`; each response is verified against the corpus construction — exact span count, the requested group value on every span, and the exact expected span ids — before its latency is recorded. A wrong answer aborts the run without writing this file.\n\
 - Percentiles: nearest-rank selection over complete request wall-clock durations measured with `std::time::Instant`; no warm-up samples are discarded.\n\
 - Build: Cargo release profile. Timestamp: Unix {measured_at}.\n\
 - Machine context: {context}.\n\
@@ -529,4 +538,161 @@ fn load_average_1m() -> String {
         }
     }
     "unavailable".to_owned()
+}
+
+/// The filter samples' semantic oracle.
+///
+/// The corpus construction fixes each query's exact answer: spans carrying
+/// `benchmark.group = group-{g}` are exactly the indices `g + 100k` below
+/// `span_count`, the stable span order is ascending start time — which is
+/// ascending index by construction — and a limited query returns the first
+/// `limit` of them. So the oracle demands the exact span count the corpus
+/// defines, the requested group value on every returned span, and the exact
+/// set of span ids. Anything less gated latency on "200 and parseable",
+/// which a wrong (even empty) answer satisfies.
+fn verify_filter_response(
+    body: &[u8],
+    group: usize,
+    span_count: usize,
+    limit: usize,
+) -> Result<(), String> {
+    let parsed: Value = serde_json::from_slice(body)
+        .map_err(|error| format!("group-{group} response is not JSON: {error}"))?;
+    let spans = parsed
+        .get("spans")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("group-{group} response carries no spans array"))?;
+    // The generator writes `benchmark.group = group-{i % 100}`, so the
+    // group's population is the count of indices `≡ group (mod 100)` below
+    // the corpus size — NOT a constant: a scaled-down corpus has short
+    // groups, and the last groups run one shorter whenever 100 does not
+    // divide the corpus.
+    let population = if group < span_count {
+        (span_count - group - 1) / 100 + 1
+    } else {
+        0
+    };
+    let expected = population.min(limit);
+    if spans.len() != expected {
+        return Err(format!(
+            "group-{group} returned {} spans, the corpus defines exactly {expected}",
+            spans.len()
+        ));
+    }
+    // Start times ascend with the index, so the limited query's answer is
+    // the FIRST `expected` matches: indices `group + 100k`, whose span ids
+    // the generator derives as `{:016x}` of index + 1. Exact set, order
+    // left free.
+    let mut expected_ids: BTreeSet<String> = (0..expected)
+        .map(|position| format!("{:016x}", group + 100 * position + 1))
+        .collect();
+    let group_value = format!("group-{group}");
+    for span in spans {
+        let held = span
+            .get("attributes")
+            .and_then(|attributes| attributes.get("benchmark.group"))
+            .and_then(Value::as_str);
+        if held != Some(group_value.as_str()) {
+            return Err(format!(
+                "group-{group} returned a span carrying benchmark.group {held:?}"
+            ));
+        }
+        let span_id = span
+            .get("span_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("group-{group} returned a span without a span_id"))?;
+        if !expected_ids.remove(span_id) {
+            return Err(format!(
+                "group-{group} returned span {span_id}, which is not among the \
+                 expected ids (or is a duplicate)"
+            ));
+        }
+    }
+    // Counts matched and every returned id consumed a distinct expected id,
+    // so the sets are equal.
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The honest response for one group, built from the corpus rule
+    /// independently of the oracle's own arithmetic: matching indices are
+    /// `group + 100k` below `span_count`, ids are `{:016x}` of index + 1,
+    /// and the limited query returns the first `limit` in span order.
+    fn honest_response(group: usize, span_count: usize, limit: usize) -> Vec<u8> {
+        let spans: Vec<Value> = (group..span_count)
+            .step_by(100)
+            .take(limit)
+            .map(|index| honest_span(index, &format!("group-{group}")))
+            .collect();
+        serde_json::to_vec(&json!({"spans": spans})).expect("response encodes")
+    }
+
+    fn honest_span(index: usize, group_value: &str) -> Value {
+        json!({
+            "trace_id": format!("{:032x}", index / 10 + 1),
+            "span_id": format!("{:016x}", index + 1),
+            "attributes": {"benchmark.group": group_value},
+        })
+    }
+
+    #[test]
+    fn the_oracle_accepts_the_generators_exact_answer() {
+        verify_filter_response(&honest_response(7, 1_000_000, 100), 7, 1_000_000, 100)
+            .expect("the honest canonical answer passes");
+    }
+
+    #[test]
+    fn the_oracle_derives_the_expected_count_from_the_corpus() {
+        // 250 spans: group 30 holds indices 30, 130, 230 — three spans,
+        // nothing like the canonical 100. The oracle must derive that from
+        // the generator's rule, not assume the canonical fill.
+        verify_filter_response(&honest_response(30, 250, 100), 30, 250, 100)
+            .expect("a short group's exact population passes");
+        // The same three spans claimed against a corpus of 230 — where the
+        // group holds only indices 30 and 130 — are a wrong answer.
+        verify_filter_response(&honest_response(30, 250, 100), 30, 230, 100)
+            .expect_err("a count the corpus does not define is refused");
+    }
+
+    #[test]
+    fn the_oracle_rejects_a_parseable_empty_answer() {
+        let body = serde_json::to_vec(&json!({"spans": []})).expect("encodes");
+        let refusal = verify_filter_response(&body, 7, 1_000_000, 100)
+            .expect_err("an empty answer is wrong, however parseable");
+        assert!(
+            refusal.contains("0 spans"),
+            "the refusal names the wrong count: {refusal}"
+        );
+    }
+
+    #[test]
+    fn the_oracle_rejects_a_span_from_the_wrong_group() {
+        let mut spans: Vec<Value> = (7..1_000_000)
+            .step_by(100)
+            .take(100)
+            .map(|index| honest_span(index, "group-7"))
+            .collect();
+        spans[41] = honest_span(4_107, "group-8");
+        let body = serde_json::to_vec(&json!({"spans": spans})).expect("encodes");
+        verify_filter_response(&body, 7, 1_000_000, 100)
+            .expect_err("a span carrying another group's value is refused");
+    }
+
+    #[test]
+    fn the_oracle_rejects_substituted_span_ids() {
+        // Right count, right group value on every span — but the wrong
+        // rows: the window is shifted by one match, so the first expected
+        // id is missing and one id past the limit appears instead.
+        let spans: Vec<Value> = (107..1_000_000)
+            .step_by(100)
+            .take(100)
+            .map(|index| honest_span(index, "group-7"))
+            .collect();
+        let body = serde_json::to_vec(&json!({"spans": spans})).expect("encodes");
+        verify_filter_response(&body, 7, 1_000_000, 100)
+            .expect_err("the exact expected ids are part of the answer");
+    }
 }
