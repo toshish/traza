@@ -923,7 +923,13 @@ fn compaction_keeps_up_with_a_store_that_never_stops_ingesting() {
         // arrives while it runs would keep it going for as long as the writes
         // do — measured at 2,213 segments merged away in a single call that
         // never came back. That failure cannot be caught after the call, so
-        // the call is given a deadline of its own.
+        // the call is given a deadline of its own. The deadline is a
+        // tripwire, not the oracle: v7 merges re-encode lz4 blocks, a
+        // legitimate large-backlog tick measured 20+ seconds on a starved
+        // shared CI runner (this whole test runs in ~25 s on a fast idle
+        // ten-core laptop), and the runaway this guards holds the call open
+        // for as long as the writers keep writing — minutes, not tens of
+        // seconds — so two minutes still traps it decisively.
         let (sender, receiver) = std::sync::mpsc::channel();
         {
             let store = Arc::clone(&store);
@@ -931,13 +937,13 @@ fn compaction_keeps_up_with_a_store_that_never_stops_ingesting() {
                 let _ = sender.send(store.compact_segments());
             });
         }
-        let removed = match receiver.recv_timeout(Duration::from_secs(20)) {
+        let removed = match receiver.recv_timeout(Duration::from_secs(120)) {
             Ok(result) => result.expect("compacts"),
             Err(_) => {
                 // Let the writers stop so the runaway merge can drain.
                 stop.store(true, Ordering::Relaxed);
                 panic!(
-                    "a tick did not return within 20s while writes continued: \
+                    "a tick did not return within 120s while writes continued: \
                      it is merging what arrives instead of the backlog it found"
                 );
             }

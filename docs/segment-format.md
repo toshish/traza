@@ -41,9 +41,11 @@ remain normative for v7, carried over unchanged. The WAL, the
 annotation/eval/tombstone logs, and the rollup sidecar formats are
 untouched.
 
-The motivation is measured, at `65652a2` on the `storage-bench` corpora —
-the run recorded in [benchmarks/storage.md](benchmarks/storage.md), whose
-region-measurement footnote carries the figures cited here:
+The motivation is measured, at `65652a2` on the `storage-bench` corpora — a
+v6-era run whose figures are cited here.
+[benchmarks/storage.md](benchmarks/storage.md) now records the v7 run that
+superseded it (its records-region section restates these numbers as the
+retired motivation); the full v6-era record lives in that file's git history:
 
 - **The records region is where the bytes are**: 89.6% of segment bytes on
   `generic`, 95.3% on `llm`, 91.9% on `pinned-context`, corpus-wide, and no
@@ -58,7 +60,7 @@ region-measurement footnote carries the figures cited here:
   of `pinned-context`'s, and 7.4% of `generic`'s. The double-store grows
   with exactly the workload this store exists for.
 - **Compressing the records region is worth a multiple, not a percentage.**
-  The [projection in storage-comparison](storage-comparison.md#what-compression-would-buy)
+  The [projection in storage-comparison](storage-comparison.md#what-compression-bought-next-to-the-projection-that-motivated-it)
   — labeled a projection there and here — puts block-wise `zstd -3` at a
   6.30x/11.59x/9.27x segment shrink across the three corpora. v7 uses LZ4,
   which trades ratio for speed and safety of implementation, and cuts
@@ -246,6 +248,53 @@ usually inside the block the search just decoded. Either disagreement is
 column from the mandatory list; amended here under the drift rule after
 review demonstrated the silent-wrong-window consequence.
 
+**The header's timestamp range is validated too, not trusted.** *(Deliberate
+amendment #5, under the drift rule, after external review of v0.24.1
+demonstrated the silent-omission consequence; the validation was then
+grounded in record bytes after second-round review demonstrated that a
+fence-only check could be colluded with.)* The two range words at header
+offsets 80 and 88 carry no checksum, and `may_contain_timestamps` prunes
+whole segments on them before a single segment byte is read — so the format
+as first shipped let sixteen edited bytes hide decodable records from every
+time-bounded query: a false-negative predicate, which the corruption
+contract (an error or a conservative scan, never a silent omission)
+forbids. Three checks close it:
+
+- **Both opens, against the directory.** A non-empty segment's declared
+  minimum must EQUAL the first directory fence — a fence is its block's
+  first record's timestamp, and records are timestamp-sorted — and the
+  declared maximum must sit at or above the LAST fence (fences carry minima
+  only), which through the fences' own ordering also forces min ≤ max. An
+  empty segment must declare exactly the canonical empty range the encoder
+  writes — minimum `u64::MAX`, maximum `0` — and nothing else. Any
+  violation is `Corrupt`. On its own this is only a consistency check
+  between two pieces of unchecksummed metadata — the fences are derived
+  data too, so a forgery can move a fence and the header word together —
+  which is why the next check exists.
+- **Both opens, against the records.** The bounds are then proved against
+  record bytes. The eager, byte-resident open decodes every record anyway
+  and requires BOTH declared bounds to equal the observed extremes. The
+  lazy open decodes exactly two blocks: the FIRST — whose
+  fence-vs-first-record check (above) turns the pinned minimum into the
+  actual first record's timestamp — and the block holding the LAST record,
+  whose timestamp is the true maximum (records are timestamp-sorted) and
+  must EQUAL the declared maximum. That costs the lazy open two bounded
+  block decodes, which it drops from its cache afterwards so a freshly
+  opened segment still holds zero payload bytes.
+- **At read time, on every backing.** Any record decode — and any
+  fence-adjacent timestamp read — that observes a timestamp outside the
+  declared range is `Corrupt`: defense in depth behind the open-time
+  checks, for damage that arrives after open.
+
+So: both opens validate both bounds exactly, and there is no lazy/eager
+asymmetry in what they prove. A metadata-only forgery of the range — any
+combination of the header words and the fences — is refused at open,
+because the bounds are anchored to the first and last records themselves;
+a forgery that survives must therefore alter record bytes as well, and the
+block crc32 catches that on the very decode the validation performs. No
+forgery of the range can cause a wrong row to be SERVED either: every
+served record passes the read-time range check.
+
 **Posting lists keep their u64 currency as LOGICAL offsets** into the
 uncompressed records region — the record-offset index, the trace index, and
 the attribute index are byte-for-byte v6 encodings whose values simply mean
@@ -326,7 +375,9 @@ v6 contiguity rule extends to the new section: every section starts where
 the previous ends, the attribute index is still bounded by the content
 offset, the content index still runs to EOF, and trailing bytes are still
 refused. An empty segment has empty records, an empty directory, logical
-length zero, and otherwise encodes as v6-empty did.
+length zero, the canonical empty timestamp range (minimum `u64::MAX`,
+maximum `0` — mandatory since amendment #5 above), and otherwise encodes as
+v6-empty did.
 
 **The codec id is parameterization, not a version.** A reader refuses an
 unknown codec id with an error that names it — the same shape as the version
@@ -344,11 +395,14 @@ content — are stored uncompressed. The reader parses them at open and probes
 them per query: posting lists are probed by digest and intersected, content
 rows are read by exact byte range, the offset table is the scan path.
 Compressing them would put a decode in front of every probe, and it would
-buy little: [storage-comparison](storage-comparison.md#what-compression-would-buy)
-already makes the argument — compressing the index sections "would flatter
-the number and break the design". After v7 the indexes become the majority
-of segment bytes (the projection's tables show 55–75% post-compression, by
-corpus); shrinking *them* is future index-format work, not a codec knob.
+buy little — the argument
+[storage-comparison](storage-comparison.md#what-compression-bought-next-to-the-projection-that-motivated-it)
+makes: past compressed records, the work is in the indexes, not the payload.
+After v7 the indexes are roughly half of segment bytes — measured at 43–55%
+by corpus, the complement of the records shares in
+[storage.md's records-region table](benchmarks/storage.md#records-region-measurements);
+the projection's tables had put them at 55–75%, an overestimate — and
+shrinking *them* is future index-format work, not a codec knob.
 
 The WAL and the rollup sidecars also stay raw, deliberately: erasure
 verification runs byte-level occurrence scans over both (see
@@ -456,9 +510,10 @@ exists only inside the migrator module.
   as v7 but the digests disagree, it redoes the manifest rewrite.
   "Validate" is load-bearing and means the WHOLE file: a digest-moved
   pinned segment is accepted only after an eager open that checks every
-  block CRC and decodes every record — the lazy open reads only the header
-  and index sections, and trusting it would launder a bit-flipped pinned
-  block into a manifest that then verifies clean over garbage. A
+  block CRC and decodes every record — the lazy open reads the header and
+  index sections plus only the two blocks its bounds validation decodes
+  (amendment #5), and trusting it would launder a bit-flipped pinned
+  middle block into a manifest that then verifies clean over garbage. A
   digest-moved manifested file the migrator cannot validate in any format
   — neither a segment nor a content-addressed blob — refuses the resume by
   name, for the same reason. The
@@ -629,15 +684,36 @@ The implementation is held to these, each with an executable oracle:
    baseline** (measured +22%: compression writes fewer bytes), and the
    measured medians of both sides published beside each other in
    [benchmarks](benchmarks/) with the block-decode cost stated plainly.
+   *(Deliberate amendment #4, to the publication clause only: the files
+   under [benchmarks](benchmarks/) are harness-written records of canonical
+   runs, and no harness on this branch can produce a v6-side run — the v6
+   writer is gone, and the only v6 code left is the migrator's frozen
+   decoder — so a benchmarks/ file for the interleaved medians would be
+   hand-written prose wearing a harness record's clothes. The record of the
+   interleaved v6/v7 medians is amendment #3 above — 49 µs vs 38 µs on
+   trace lookup, ~1.23 ms vs 0.64 ms on the limit-100 attribute filter,
+   with the block-decode cost stated there — and this amendment names that
+   text as the publication the clause requires.)*
 
-Gates 1 through 4 are enforced by the test suite on this branch. Gates 5
-and 6 are measurement gates: their runs, and the rewrite of
-[benchmarks/storage.md](benchmarks/storage.md) that records them (that
-file's tables and region-measurement recipe still describe the v6-era run
-this section cites as motivation), land with the gates PR. Until those
-recorded numbers land, every ratio in this section remains a projection —
-including the development-run figures the changelog cites as unpublished
-measurements.
+Gates 1 through 4 are enforced by the test suite. Gates 5 and 6 are
+measurement gates, and they landed. `storage-bench` asserts gate 5 after
+measuring and before writing, and refuses to write
+[benchmarks/storage.md](benchmarks/storage.md) on a miss; `bench` asserts
+gate 6's two latency tripwires the same way against
+[benchmarks/canonical-corpus.md](benchmarks/canonical-corpus.md). Both
+gate and publish on canonical runs only — default corpora, default
+configuration; an experimental knob prints its table and leaves the record
+alone, un-gated, because the gates are defined on the canonical
+configuration. Gate 6's other two clauses are recorded rather than
+harness-asserted: the ingest clause rests on the interleaved A/B's measured
++22% above, and the publication clause is satisfied by amendment #3, per
+amendment #4. The recorded runs are published: settled amplification
+**0.41x** on `generic` and **0.23x** on `llm` (gate 5's bound is 1.0x), and
+trace-lookup p50 **0.425 ms** with attribute-filter p50 **2.974 ms** on the
+canonical corpus (gate 6's tripwires are 0.75 ms and 6 ms). Nothing in this
+section is a projection any more except what a sentence explicitly labels
+as one — the zstd reference numbers; the recorded runs in
+[benchmarks/](benchmarks/) are the published claims.
 
 ---
 

@@ -6,17 +6,17 @@ These values were measured by `cargo run --release --bin storage-bench`; they ar
 
 | Corpus | Spans | Ingested | On disk | Ratio (in:stored) | Amplification | Bytes/span |
 |---|---:|---:|---:|---:|---:|---:|
-| `generic` | 1000000 | 311.9 MiB | 564.3 MiB | 0.55 : 1 | 1.81x | 592 |
-| `llm` | 200000 | 438.7 MiB | 909.5 MiB | 0.48 : 1 | 2.07x | 4768 |
-| `pinned-context` | 10000 | 3144.4 MiB | 26.3 MiB | 119.72 : 1 | 0.01x | 2754 |
+| `generic` | 1000000 | 311.9 MiB | 126.5 MiB | 2.47 : 1 | 0.41x | 133 |
+| `llm` | 200000 | 438.7 MiB | 102.8 MiB | 4.27 : 1 | 0.23x | 539 |
+| `pinned-context` | 10000 | 3144.4 MiB | 4.1 MiB | 769.74 : 1 | 0.00x | 428 |
 
 Where the bytes are:
 
 | Corpus | Segment files | Write-ahead log | Payload store | Other | Total | Segment count |
 |---|---:|---:|---:|---:|---:|---:|
-| `generic` | 556.7 MiB | 0.0 MiB | 0.0 MiB | 7.64 MiB | 564.3 MiB | 3 |
-| `llm` | 905.0 MiB | 0.0 MiB | 0.0 MiB | 4.47 MiB | 909.5 MiB | 5 |
-| `pinned-context` | 25.7 MiB | 0.0 MiB | 0.3 MiB | 0.28 MiB | 26.3 MiB | 1 |
+| `generic` | 118.9 MiB | 0.0 MiB | 0.0 MiB | 7.64 MiB | 126.5 MiB | 3 |
+| `llm` | 98.4 MiB | 0.0 MiB | 0.0 MiB | 4.46 MiB | 102.8 MiB | 2 |
+| `pinned-context` | 3.8 MiB | 0.0 MiB | 0.0 MiB | 0.28 MiB | 4.1 MiB | 1 |
 
 ## Storage cost
 
@@ -24,9 +24,9 @@ Priced per GiB-month at the rates a storage comparison conventionally uses: $0.0
 
 | Corpus | Stored | 1 node / month | 3-node HA / month |
 |---|---:|---:|---:|
-| `generic` | 0.55 GiB | $0.044 | $0.132 |
-| `llm` | 0.89 GiB | $0.071 | $0.213 |
-| `pinned-context` | 0.03 GiB | $0.002 | $0.006 |
+| `generic` | 0.12 GiB | $0.010 | $0.030 |
+| `llm` | 0.10 GiB | $0.008 | $0.024 |
+| `pinned-context` | 0.00 GiB | $0.000 | $0.001 |
 
 For reference, the same stored volume on object storage at $0.023/GiB-month would cost 3.5x less. Traza has no object-storage tier; the rate is quoted only so the gap is legible.
 
@@ -42,32 +42,31 @@ For reference, the same stored volume on object storage at $0.023/GiB-month woul
 - "On disk" is a recursive walk of the whole data directory: segments, write-ahead log, payload store, and everything else. It is not the `bytes_on_disk` field of `/v1/stats`, which counts segments only.
 - Quiescence: the benchmark forces a flush, then polls `/v1/stats` until the segment count and disk usage stop changing, so compaction is not caught mid-rewrite.
 - Configuration: shipped defaults throughout — `--durability wal`, compaction on, payload threshold at its default. No setting was tuned for this measurement.
-- Build: Cargo release profile. Timestamp: Unix 1788161696.
+- Build: Cargo release profile. Timestamp: Unix 1788180702.
 - Machine context: macos/aarch64, 10 available hardware threads.
-- Final server stats (`generic`): `{"buffer_age_seconds":null,"buffered_records":0,"bytes_on_disk":583740679,"durability":"wal","persisted_records":1000000,"record_count":1000000,"segment_count":3,"total_records":1000000,"wal_bytes":0}`.
-- Final server stats (`llm`): `{"buffer_age_seconds":null,"buffered_records":0,"bytes_on_disk":948944130,"durability":"wal","persisted_records":200000,"record_count":200000,"segment_count":5,"total_records":200000,"wal_bytes":0}`.
-- Final server stats (`pinned-context`): `{"buffer_age_seconds":null,"buffered_records":0,"bytes_on_disk":26914752,"durability":"wal","persisted_records":10000,"record_count":10000,"segment_count":1,"total_records":10000,"wal_bytes":0}`.
+- Final server stats (`generic`): `{"buffer_age_seconds":null,"buffered_records":0,"bytes_on_disk":124662599,"durability":"wal","persisted_records":1000000,"record_count":1000000,"segment_count":3,"total_records":1000000,"wal_bytes":0}`.
+- Final server stats (`llm`): `{"buffer_age_seconds":null,"buffered_records":0,"bytes_on_disk":103133975,"durability":"wal","persisted_records":200000,"record_count":200000,"segment_count":2,"total_records":200000,"wal_bytes":0}`.
+- Final server stats (`pinned-context`): `{"buffer_age_seconds":null,"buffered_records":0,"bytes_on_disk":3979924,"durability":"wal","persisted_records":10000,"record_count":10000,"segment_count":1,"total_records":10000,"wal_bytes":0}`.
 
 ## Verification Notes
 
 - Every reported byte count is measured by this run, never estimated.
 - The benchmark fails rather than reports if the store does not hold exactly the corpus it ingested.
-- Traza stores span payloads as JSON and does not compress them. A ratio below 1:1 is amplification, and is reported as measured rather than inverted into a flattering number.
+- **This file exists only because the run passed acceptance gate 5** of [the segment format](../segment-format.md#acceptance-gates): settled amplification at or below 1.0x on `generic` and `llm`. The benchmark asserts the gate after measuring and before writing; a run that misses it exits non-zero and writes nothing.
+- Segment records and payload blobs are LZ4-compressed (format v7). A ratio below 1:1 would be amplification and would be reported as measured rather than inverted into a flattering number.
 - Exact byte counts, so anything derived from this table can be recomputed rather than re-rounded:
-  - `generic`: 1000000 spans, 327069707 bytes ingested, 591748106 bytes on disk (583740679 segments, 8 write-ahead log, 0 payload store, 8007419 other).
-  - `llm`: 200000 spans, 460055297 bytes ingested, 953628120 bytes on disk (948944130 segments, 8 write-ahead log, 0 payload store, 4683982 other).
-  - `pinned-context`: 10000 spans, 3297157900 bytes ingested, 27540241 bytes on disk (26914752 segments, 8 write-ahead log, 327910 payload store, 297571 other).
+  - `generic`: 1000000 spans, 327069707 bytes ingested, 132670049 bytes on disk (124662599 segments, 8 write-ahead log, 0 payload store, 8007442 other).
+  - `llm`: 200000 spans, 460055297 bytes ingested, 107814355 bytes on disk (103133975 segments, 8 write-ahead log, 0 payload store, 4680372 other).
+  - `pinned-context`: 10000 spans, 3297157900 bytes ingested, 4283487 bytes on disk (3979924 segments, 8 write-ahead log, 5961 payload store, 297594 other).
 
 ## Records-region measurements
 
-Measured from the kept corpora of the run above (`TRAZA_STORAGE_BENCH_KEEP=1` leaves each data directory on disk), by parsing every segment's header — records offset and length at bytes 24 and 32, per [the format document](../segment-format.md) — and decoding every record in the records region. "Value text" sums the value bytes of every record's key/value pairs; key names and length prefixes are excluded. These are the figures the [v7 format specification](../segment-format.md#format-v7) cites as its motivation.
+Measured by this same run, from the v7 header of every segment file the settled store holds: the header is 128 bytes, the records region's STORED (compressed) length is the u64 at byte 32, and its LOGICAL (uncompressed) length is the u64 at byte 120 — the header table in [the format document](../segment-format.md#the-v7-header) is the reference. The records region is LZ4-compressed and addressed through the block directory, so the logical column is the byte count the directory's blocks decode to, not anything present contiguously in the file.
 
-| Corpus | Segment bytes | Records region | Share | Largest per-file share | Value text | Share of records region |
+| Corpus | Segment bytes | Records stored | Stored share | Largest per-file share | Records logical | Stored/logical |
 |---|---:|---:|---:|---:|---:|---:|
-| `generic` | 583740679 | 522728707 | 89.6% | 89.6% | 38660000 | 7.4% |
-| `llm` | 948944130 | 904194098 | 95.3% | 95.3% | 326745627 | 36.1% |
-| `pinned-context` | 26914752 | 24745600 | 91.9% | 91.9% | 6337800 | 25.6% |
+| `generic` | 124662599 | 63530203 | 51.0% | 51.0% | 492068707 | 0.13 |
+| `llm` | 103133975 | 58384423 | 56.6% | 56.6% | 544648471 | 0.11 |
+| `pinned-context` | 3979924 | 1806620 | 45.4% | 45.4% | 16767800 | 0.11 |
 
-This section is a hand-measured addendum: `storage-bench` regenerates everything above it, so a rerun that overwrites this file re-measures these columns from its own kept corpora or removes the section rather than letting it describe a different run.
-
-**The recipe above is v6-specific and will not reproduce on a v7 store.** This whole file records a run taken while v6 was the shipped format; on a v7 store, byte 32 is the records region's STORED (compressed) length (the logical length moved to byte 120), the region is LZ4 blocks addressed through a block directory, and v7 records carry no attribute value text at all — so both the region decode and the "value text" column are v6-era semantics. The gate-5 rerun of `storage-bench` on the v7 format (the gates PR for [segment-format.md](../segment-format.md#acceptance-gates)) rewrites this file, its recipe included.
+The v6-era edition of this section also measured a "value text" column: the share of the records region that was attribute value text stored twice, once in the payload and once in the record's own key/value list. v7 removed that double-store — records carry fixed-width `(key id, digest)` pairs, and the value text lives only in the payload — so the column no longer measures anything. The v6-era numbers (36.1% of `llm`'s records region, 25.6% of `pinned-context`'s, 7.4% of `generic`'s, at `65652a2`) remain quoted in [the format document's motivation](../segment-format.md#format-v7) as the measurement that justified the change, and in this file's git history.

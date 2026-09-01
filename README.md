@@ -3,7 +3,7 @@ Traza
 
 Traza is a trace database for LLM and agent workloads. It runs as a single binary with no external database, no queue, and no coordinator.
 
-**Sub-millisecond trace lookup. 3.3 ms filtered search over a million spans. 208,000 spans/s sustained ingest.** One process, one directory.
+**Sub-millisecond trace lookup. 4.4 ms filtered search over a million spans. 208,000 spans/s sustained ingest. Stores 0.23–0.41x the bytes you send on service-trace and LLM-call shapes.** One process, one directory.
 
 [![CI](https://github.com/toshish/traza/actions/workflows/ci.yml/badge.svg)](https://github.com/toshish/traza/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/traza)](https://crates.io/crates/traza)
@@ -30,7 +30,7 @@ script asserts its own claims, and CI runs all six. Clone, then pick one:*
 The server with the dashboard already built in. No Rust, no Node.
 
 ```sh
-VERSION=0.23.0
+VERSION=0.24.2
 PLATFORM=macos-aarch64          # or linux-x86_64, linux-aarch64
 
 curl -LO https://github.com/toshish/traza/releases/download/v$VERSION/traza-$VERSION-$PLATFORM.tar.gz
@@ -195,7 +195,7 @@ Apps instrumented with OpenLLMetry or the OpenTelemetry GenAI conventions arrive
 
 ![An agent swarm in the trace browser: a 14-span waterfall with the critical path marked, per-span model and token counts, and the run's duration, tokens and cost across the top.](docs/assets/trace-waterfall.png)
 
-**Fast reads.** Trace lookup at p95 0.64 ms and filtered search at p95 3.3 ms over a million spans. Full-text search across prompt text returns a selective term in 1.5 ms where scanning takes 1,258 ms.
+**Fast reads.** Trace lookup at p95 0.86 ms and filtered search at p95 4.4 ms over a million spans. Full-text search across prompt text returns a selective term in 1.5 ms where scanning takes 1,258 ms.
 
 **One process.** No metadata database, no column store, no lock service, no object store to configure. It starts in milliseconds, and there is no control plane to lose a quorum at 3am.
 
@@ -219,18 +219,20 @@ Apps instrumented with OpenLLMetry or the OpenTelemetry GenAI conventions arrive
 
 | | |
 |---|---|
-| Trace lookup, 1M spans | p95 **0.64 ms** |
-| Filtered search, 1M spans | p95 **3.3 ms** |
-| Content search, selective term | **1.5 ms** (1,258 ms scanning) |
-| Sustained ingest, `wal` | **208,973 spans/s** |
+| Trace lookup, 1M spans | p95 **0.86 ms** |
+| Filtered search, 1M spans | p95 **4.4 ms** |
+| Content search, selective term | **1.5 ms** (1,258 ms scanning) *(v5-format record)* |
+| Sustained ingest, `wal` | **208,973 spans/s** *(v6-format run, 2026-07)* |
+| Stored vs ingested, service traces | **0.41x** |
+| Stored vs ingested, LLM calls | **0.23x** |
 | Binary | **3.4 MB** |
 | Direct dependencies | **3** |
 
-Every number is produced by a benchmark bundled in this repo, run over the real HTTP path. The harness writes the records itself and refuses to publish a result it cannot stand behind. Run them yourself with `cargo run --release --bin bench`.
+Every number is produced by a benchmark bundled in this repo, run over the real HTTP path. The harness writes the records itself and refuses to publish a result it cannot stand behind — the latency and storage benchmarks assert the format's [acceptance gates](docs/segment-format.md#acceptance-gates) before writing theirs. The two rows marked with a format vintage predate v7: sustained ingest is [ingest.md](docs/benchmarks/ingest.md)'s 2026-07 record on the v6-format build — conservative, since gate 6's interleaved A/B measured v7 ingest no slower — and content search is [capacity.md](docs/operations/capacity.md#content-search)'s v5-era record, not re-measured on the v7 scan path. Run them yourself with `cargo run --release --bin bench`.
 
 ## When not to use Traza
 
-**Disk cost is your binding constraint.** The recorded measurement — taken on the v6 format, where segments were uncompressed JSON plus indexes — is 1.8–2.1× the bytes you send; format v7 compresses the records region, and its recorded numbers land with the acceptance-gate rerun of `storage-bench`. A columnar engine writing compressed files to object storage will still beat a local block-storage store on raw disk price. The exception is agent context: a repeated system prompt above the offload threshold is stored once, measured at 120:1 in Traza's favour.
+**HA storage cost on ordinary traffic is your binding constraint.** Traza stores less than you send — measured at 0.41x the ingested bytes on service traces and 0.23x on LLM calls ([storage.md](docs/benchmarks/storage.md)); the v6-era 1.8–2.1x amplification is gone with format v7. What still stands is architectural: Traza keeps its data on local block storage, once per node, so a columnar engine writing to shared object storage still wins the HA cost row by two orders of magnitude on ordinary span traffic, and scan-heavy analytics over columns is not this engine's shape — [the comparison](docs/storage-comparison.md) runs the full table. The exception is agent context: a 320 KiB pinned context repeated across 10,000 calls is content-addressed, stored once, and compressed — 3.1 GiB ingested became 4.1 MiB on disk, a 770:1 ingested-to-stored ratio on the `pinned-context` corpus ([storage.md](docs/benchmarks/storage.md)).
 
 **You need metrics and logs in the same system.** Traza stores traces and their analytics. That is the whole surface, on purpose.
 

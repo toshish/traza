@@ -1702,13 +1702,29 @@ fn a_flipped_stored_byte_is_refused_by_the_block_crc() {
         "the refusal names the checksum: {refusal}"
     );
 
-    // The file-backed open is lazy about record bytes, so the same damage
-    // surfaces at the first read that touches the block.
+    // The file-backed open decodes the FIRST and LAST blocks for the
+    // exact-bounds validation (spec amendment #5), so damage in either is
+    // caught at open by the same checksum.
     let directory = temp_dir("crc-mutation");
     let path = directory.join("segment-00000000000000000000.seg");
     fs::write(&path, &corrupted).expect("write corrupted segment");
-    let opened = Segment::open(&path).expect("structural open succeeds");
-    let read = opened.query_trace("trace-random").expect_err("read fails");
+    let open_refusal =
+        Segment::open(&path).expect_err("the open-time validation decodes the first block");
+    assert!(
+        open_refusal.to_string().contains("crc32"),
+        "the open-time refusal names the checksum: {open_refusal}"
+    );
+
+    // A MIDDLE block stays lazy — no open-time decode touches it — so the
+    // same damage there surfaces at the first read that touches the block.
+    let dir_offset = get_u64(&honest, offsets::DIRECTORY_OFFSET) as usize;
+    let middle_stored_offset = get_u64(&honest, dir_offset + DIRECTORY_ENTRY_LEN + 8) as usize;
+    let mut middle_corrupted = honest.clone();
+    middle_corrupted[records_offset + middle_stored_offset + 10] ^= 0xff;
+    let middle_path = directory.join("segment-00000000000000000002.seg");
+    fs::write(&middle_path, &middle_corrupted).expect("write middle-corrupted segment");
+    let opened = Segment::open(&middle_path).expect("structural open succeeds");
+    let read = opened.query_trace("trace-repeat").expect_err("read fails");
     assert!(
         read.to_string().contains("crc32"),
         "the lazy read names the checksum too: {read}"
@@ -1716,7 +1732,6 @@ fn a_flipped_stored_byte_is_refused_by_the_block_crc() {
 
     // Flipping a directory entry is refused at open by the mandatory
     // directory validation — before any block is read.
-    let dir_offset = get_u64(&honest, offsets::DIRECTORY_OFFSET) as usize;
     let mut forged_directory = honest.clone();
     forged_directory[dir_offset + 16] ^= 0x01; // stored-length word, entry 0
     let refusal = Segment::from_bytes(forged_directory.clone())
@@ -1737,7 +1752,8 @@ fn a_flipped_stored_byte_is_refused_by_the_block_crc() {
         "mutation",
         &[
             "stored_byte_flip_fails_crc_eagerly",
-            "stored_byte_flip_fails_crc_lazily",
+            "first_block_flip_fails_crc_at_lazy_open",
+            "middle_block_flip_fails_crc_lazily",
             "directory_flip_refused_at_open",
         ],
     );
@@ -2213,6 +2229,396 @@ fn a_forged_record_digest_pair_is_caught_by_the_store_layer() {
             "record_pairs_and_index_both_forged",
             "segment_layer_admits_carried_collision",
             "store_layer_rejects_by_parsed_payload",
+        ],
+    );
+}
+
+/// External review of v0.24.1, finding 3, the store-level harm: the header's
+/// timestamp range was read at open and trusted by `may_contain_timestamps`
+/// before any validation, so editing sixteen uncovered header bytes hid a
+/// whole segment from time-bounded queries. A record the store could still
+/// decode was silently omitted — the one outcome the corruption contract
+/// forbids: corruption causes an error or a conservative scan, never a
+/// false-negative predicate.
+#[test]
+fn a_forged_header_timestamp_range_cannot_silently_hide_records() {
+    let directory = temp_dir("forged-header-range");
+    let config = traza::Config {
+        durability: traza::Durability::Buffered,
+        compaction: None,
+        ..traza::Config::default()
+    };
+    let store = traza::Store::open(&directory, config.clone()).expect("store opens");
+    let span: traza::Span = serde_json::from_value(serde_json::json!({
+        "trace_id": "t", "span_id": "s", "name": "op", "service": "svc",
+        "start_time_ns": 100u64, "end_time_ns": 200u64,
+    }))
+    .expect("span parses");
+    store.ingest(span).expect("span ingests");
+    store.flush().expect("store flushes");
+    drop(store);
+
+    // Forge the range to [1000, 2000]: the record at 100 is now outside
+    // what its own segment declares.
+    let segment_path = fs::read_dir(&directory)
+        .expect("store directory lists")
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .find(|path| path.extension().is_some_and(|ext| ext == "seg"))
+        .expect("the flush sealed a segment");
+    let mut bytes = fs::read(&segment_path).expect("segment reads");
+    bytes[offsets::MIN_TIMESTAMP..offsets::MIN_TIMESTAMP + 8]
+        .copy_from_slice(&1_000u64.to_le_bytes());
+    bytes[offsets::MAX_TIMESTAMP..offsets::MAX_TIMESTAMP + 8]
+        .copy_from_slice(&2_000u64.to_le_bytes());
+    fs::write(&segment_path, &bytes).expect("tampered segment writes");
+
+    // The contract admits an error at open, an error at query, or the
+    // record itself — never a clean empty answer.
+    match traza::Store::open(&directory, config) {
+        Err(refusal) => {
+            let text = refusal.to_string();
+            assert!(
+                text.contains("corrupt"),
+                "the open-time refusal names corruption: {text}"
+            );
+        }
+        Ok(store) => {
+            let filter = traza::SpanFilter {
+                since_ns: Some(100),
+                until_ns: Some(100),
+                ..traza::SpanFilter::default()
+            };
+            match store.query(&filter) {
+                Err(_) => {}
+                Ok(spans) => assert!(
+                    spans.iter().any(|span| span.span_id == "s"),
+                    "a decodable record was silently omitted by the forged header range"
+                ),
+            }
+        }
+    }
+    cleanup(&directory);
+    evidence("mutation", &["forged_header_range_never_a_false_negative"]);
+}
+
+/// The segment-level halves of the same finding, stated as the amended
+/// spec states them: BOTH opens validate BOTH bounds exactly — the lazy
+/// open by decoding the first block (whose fence-vs-first-record check
+/// makes the pinned min exact) and reading the last record's timestamp
+/// (the true max, records being timestamp-sorted), the eager open against
+/// every record — a record that decodes outside the declared range is
+/// corrupt, and an empty segment must declare the one canonical empty
+/// range.
+#[test]
+fn header_timestamp_forgeries_are_corrupt_not_silently_pruned() {
+    let records = corpus(); // timestamps 1_700_000_000_000_000_000 .. +200
+    let honest = segment::encode(&records).expect("encode");
+    let true_min = get_u64(&honest, offsets::MIN_TIMESTAMP);
+    let true_max = get_u64(&honest, offsets::MAX_TIMESTAMP);
+    let directory = temp_dir("header-range-forgeries");
+    let set_u64 = |bytes: &mut [u8], offset: usize, value: u64| {
+        bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    };
+
+    // A forged min disagrees with the first block fence: both opens refuse.
+    let mut forged_min = honest.clone();
+    set_u64(&mut forged_min, offsets::MIN_TIMESTAMP, true_min + 1);
+    let eager = Segment::from_bytes(forged_min.clone()).expect_err("eager open refuses");
+    assert!(
+        eager.to_string().contains("min timestamp"),
+        "the refusal names the min bound: {eager}"
+    );
+    let min_path = directory.join("segment-00000000000000000000.seg");
+    fs::write(&min_path, &forged_min).expect("forged-min segment writes");
+    assert!(
+        Segment::open(&min_path).is_err(),
+        "the lazy open validates the min bound against the first fence"
+    );
+
+    // A forged max below the last block fence is impossible for any
+    // encoder output: both opens refuse.
+    let mut forged_low_max = honest.clone();
+    set_u64(&mut forged_low_max, offsets::MAX_TIMESTAMP, true_min - 1);
+    assert!(
+        Segment::from_bytes(forged_low_max.clone()).is_err(),
+        "the eager open refuses a max below the last fence"
+    );
+    let low_max_path = directory.join("segment-00000000000000000001.seg");
+    fs::write(&low_max_path, &forged_low_max).expect("forged-low-max segment writes");
+    assert!(
+        Segment::open(&low_max_path).is_err(),
+        "the lazy open refuses a max below the last fence"
+    );
+
+    // A forged max BETWEEN the last fence and the true max used to be a
+    // lazy-open residual (fences carry minima only, so no fence exposed
+    // it), and it silently pruned tail windows for as long as no read
+    // touched the hidden record. Both opens refuse it now: the eager open
+    // against every record, the lazy open by reading the last record's
+    // timestamp — the true max — which the forged bound cannot hold.
+    let mut forged_mid_max = honest.clone();
+    set_u64(&mut forged_mid_max, offsets::MAX_TIMESTAMP, true_max - 1);
+    let eager = Segment::from_bytes(forged_mid_max.clone())
+        .expect_err("the eager open validates the exact max");
+    assert!(
+        eager.to_string().contains("timestamp"),
+        "the eager refusal names the range: {eager}"
+    );
+    let mid_max_path = directory.join("segment-00000000000000000002.seg");
+    fs::write(&mid_max_path, &forged_mid_max).expect("forged-mid-max segment writes");
+    let lazy = Segment::open(&mid_max_path)
+        .expect_err("the lazy open reads the last record and refuses the forged max");
+    assert!(
+        lazy.to_string().contains("outside the header"),
+        "the refusal names the range violation: {lazy}"
+    );
+
+    // An empty segment must declare the canonical empty range, nothing else.
+    let empty = segment::encode(&[]).expect("empty encode");
+    assert_eq!(get_u64(&empty, offsets::MIN_TIMESTAMP), u64::MAX);
+    assert_eq!(get_u64(&empty, offsets::MAX_TIMESTAMP), 0);
+    Segment::from_bytes(empty.clone()).expect("the canonical empty range opens");
+    let mut forged_empty = empty.clone();
+    set_u64(&mut forged_empty, offsets::MIN_TIMESTAMP, 0);
+    assert!(
+        Segment::from_bytes(forged_empty).is_err(),
+        "an empty segment declaring a non-canonical range is corrupt"
+    );
+
+    cleanup(&directory);
+    evidence(
+        "mutation",
+        &[
+            "forged_min_refused_both_opens",
+            "forged_low_max_refused_both_opens",
+            "forged_mid_max_refused_both_opens",
+            "empty_range_is_canonical",
+        ],
+    );
+}
+
+/// Seals a store holding exactly two spans, at record timestamps 100 and
+/// 300, and returns the sealed segment's path — the two-span corpus the
+/// fence-collusion tests below forge. One record per bound keeps the
+/// arithmetic bare: the head window `[100, 150]` selects only the first
+/// record, the tail window `[200, 400]` only the second.
+fn sealed_two_span_store(label: &str) -> (PathBuf, traza::Config) {
+    let directory = temp_dir(label);
+    let config = traza::Config {
+        durability: traza::Durability::Buffered,
+        compaction: None,
+        ..traza::Config::default()
+    };
+    let store = traza::Store::open(&directory, config.clone()).expect("store opens");
+    for (span_id, start) in [("s-head", 100u64), ("s-tail", 300u64)] {
+        let span: traza::Span = serde_json::from_value(serde_json::json!({
+            "trace_id": "t", "span_id": span_id, "name": "op", "service": "svc",
+            "start_time_ns": start, "end_time_ns": start + 50,
+        }))
+        .expect("span parses");
+        store.ingest(span).expect("span ingests");
+    }
+    store.flush().expect("store flushes");
+    drop(store);
+    (directory, config)
+}
+
+/// The sealed segment inside a store directory.
+fn sealed_segment_path(directory: &Path) -> PathBuf {
+    fs::read_dir(directory)
+        .expect("store directory lists")
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .find(|path| path.extension().is_some_and(|ext| ext == "seg"))
+        .expect("the flush sealed a segment")
+}
+
+fn forge_u64(bytes: &mut [u8], offset: usize, value: u64) {
+    bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+/// Byte offset of block `index`'s min-timestamp fence in the directory.
+fn fence_offset(bytes: &[u8], index: usize) -> usize {
+    let directory_offset = get_u64(bytes, offsets::DIRECTORY_OFFSET) as usize;
+    directory_offset + index * DIRECTORY_ENTRY_LEN + 24
+}
+
+/// The store-level contract every forgery test below asserts: an error at
+/// open, an error at query, or the record itself — never a clean empty
+/// answer.
+fn assert_never_a_clean_omission(
+    directory: &Path,
+    config: traza::Config,
+    since: u64,
+    until: u64,
+    span_id: &str,
+) {
+    match traza::Store::open(directory, config) {
+        Err(refusal) => {
+            let text = refusal.to_string();
+            assert!(
+                text.contains("corrupt"),
+                "the open-time refusal names corruption: {text}"
+            );
+        }
+        Ok(store) => {
+            let filter = traza::SpanFilter {
+                since_ns: Some(since),
+                until_ns: Some(until),
+                ..traza::SpanFilter::default()
+            };
+            match store.query(&filter) {
+                Err(_) => {}
+                Ok(spans) => assert!(
+                    spans.iter().any(|span| span.span_id == span_id),
+                    "a decodable record was silently omitted by the forged header range \
+                     (window [{since}, {until}] answered {} spans)",
+                    spans.len()
+                ),
+            }
+        }
+    }
+}
+
+/// Second-round review, the min-side residual: the header min is pinned to
+/// the first block fence, but the fence is derived metadata no checksum
+/// covers — so raising the header min word AND the first fence by the same
+/// amount (sixteen bytes, the same class the change claimed closed) passed
+/// `Segment::open`, and `may_contain_timestamps` then pruned head-window
+/// queries with a clean empty answer. The open must instead decode the
+/// first block, whose fence-vs-first-record check turns the collusion into
+/// `Corrupt` — a forgery has to alter record bytes plus the block crc32 to
+/// survive, at which point it is caught as any other corruption is.
+#[test]
+fn a_min_fence_collusion_cannot_silently_hide_the_head_window() {
+    let (directory, config) = sealed_two_span_store("min-fence-collusion");
+    let segment_path = sealed_segment_path(&directory);
+    let mut bytes = fs::read(&segment_path).expect("segment reads");
+    assert_eq!(get_u64(&bytes, offsets::MIN_TIMESTAMP), 100);
+    // The collusion: header min 100 -> 200 AND the first fence 100 -> 200,
+    // sixteen edited bytes that agree with each other.
+    forge_u64(&mut bytes, offsets::MIN_TIMESTAMP, 200);
+    let fence = fence_offset(&bytes, 0);
+    assert_eq!(get_u64(&bytes, fence), 100, "the first fence is the min");
+    forge_u64(&mut bytes, fence, 200);
+    fs::write(&segment_path, &bytes).expect("tampered segment writes");
+
+    // The head window [100, 150] holds exactly the record at 100, which the
+    // forged range [200, 300] denies. Never a clean empty answer.
+    assert_never_a_clean_omission(&directory, config, 100, 150, "s-head");
+    cleanup(&directory);
+    evidence("mutation", &["min_fence_collusion_never_a_silent_omission"]);
+}
+
+/// The symmetric tail forgery: lowering the header max alone (eight bytes,
+/// no fence edit — fences carry minima, so no fence pins the max) let the
+/// segment prune its own tail with a clean empty answer for as long as no
+/// read happened to touch the hidden record. The open must instead read the
+/// last record's timestamp — records are timestamp-sorted, so it IS the
+/// true max — and require it to equal the declared max.
+#[test]
+fn a_lowered_header_max_cannot_silently_hide_the_tail_window() {
+    let (directory, config) = sealed_two_span_store("lowered-header-max");
+    let segment_path = sealed_segment_path(&directory);
+    let mut bytes = fs::read(&segment_path).expect("segment reads");
+    assert_eq!(get_u64(&bytes, offsets::MAX_TIMESTAMP), 300);
+    // Eight bytes: header max 300 -> 150. The last fence (this segment is
+    // one block, so it is also the first) still reads 100, and 150 >= 100
+    // keeps the forgery consistent with every fence.
+    forge_u64(&mut bytes, offsets::MAX_TIMESTAMP, 150);
+    fs::write(&segment_path, &bytes).expect("tampered segment writes");
+
+    // The tail window [200, 400] holds exactly the record at 300, which the
+    // forged range [100, 150] denies. Never a clean empty answer.
+    assert_never_a_clean_omission(&directory, config, 200, 400, "s-tail");
+    cleanup(&directory);
+    evidence("mutation", &["lowered_max_never_a_silent_omission"]);
+}
+
+/// The tail-side COLLUSION on a multi-block segment: lowering the header
+/// max below the last fence is caught at open, so the colluding forgery
+/// lowers the last fence with it — the same sixteen-byte shape as the
+/// min-side collusion, and it passed the lazy open the same way. The
+/// exact-max check at open decodes the last record's block, whose
+/// fence-vs-first-record check refuses the forged fence.
+#[test]
+fn a_max_fence_collusion_is_refused_at_lazy_open() {
+    // Two records big enough that each gets its own compression block: the
+    // last fence is then the SECOND record's timestamp, 300, distinct from
+    // the first fence at 100.
+    let records = vec![
+        RecordInput::new(
+            100,
+            "trace-head",
+            attributes(&[("service", "checkout")]),
+            vec![0xAB; COMPRESSION_BLOCK_BYTES],
+        ),
+        RecordInput::new(
+            300,
+            "trace-tail",
+            attributes(&[("service", "checkout")]),
+            vec![0xCD; COMPRESSION_BLOCK_BYTES],
+        ),
+    ];
+    let honest = segment::encode(&records).expect("encode");
+    let directory_len = get_u64(&honest, offsets::DIRECTORY_LEN);
+    assert_eq!(
+        directory_len as usize / DIRECTORY_ENTRY_LEN,
+        2,
+        "the corpus must span two blocks for the fences to differ"
+    );
+    let mut forged = honest.clone();
+    assert_eq!(get_u64(&forged, offsets::MAX_TIMESTAMP), 300);
+    assert_eq!(get_u64(&forged, fence_offset(&forged, 1)), 300);
+    // The collusion: header max 300 -> 150 AND the last fence 300 -> 150.
+    // The fences stay sorted (100 <= 150) and the declared max sits at the
+    // forged fence, so every metadata-only cross-check still agrees.
+    let last_fence = fence_offset(&forged, 1);
+    forge_u64(&mut forged, offsets::MAX_TIMESTAMP, 150);
+    forge_u64(&mut forged, last_fence, 150);
+
+    // The eager open decodes everything and refuses.
+    assert!(
+        Segment::from_bytes(forged.clone()).is_err(),
+        "the eager open refuses the max-side fence collusion"
+    );
+    // The lazy open must refuse too: its exact-max check decodes the last
+    // block, and the fence-vs-first-record check catches the forged fence.
+    let directory = temp_dir("max-fence-collusion");
+    let path = directory.join("segment-00000000000000000000.seg");
+    fs::write(&path, &forged).expect("forged segment writes");
+    let refusal = Segment::open(&path).expect_err("the lazy open refuses the collusion");
+    assert!(
+        refusal
+            .to_string()
+            .contains("block min timestamp does not match its first record"),
+        "the refusal names the fence-vs-record check: {refusal}"
+    );
+
+    // An INFLATED max — no record reaches it — is the other direction the
+    // exact-max check closes: the last record's timestamp must EQUAL the
+    // declared max, not merely stay below it.
+    let mut inflated = honest.clone();
+    forge_u64(&mut inflated, offsets::MAX_TIMESTAMP, 1_000);
+    assert!(
+        Segment::from_bytes(inflated.clone()).is_err(),
+        "the eager open refuses an inflated max"
+    );
+    let inflated_path = directory.join("segment-00000000000000000001.seg");
+    fs::write(&inflated_path, &inflated).expect("inflated segment writes");
+    let refusal = Segment::open(&inflated_path).expect_err("the lazy open refuses an inflated max");
+    assert!(
+        refusal
+            .to_string()
+            .contains("header max timestamp does not match the last record"),
+        "the refusal names the exact-max check: {refusal}"
+    );
+
+    cleanup(&directory);
+    evidence(
+        "mutation",
+        &[
+            "max_fence_collusion_refused_both_opens",
+            "inflated_max_refused_both_opens",
         ],
     );
 }

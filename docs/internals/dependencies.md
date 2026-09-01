@@ -96,7 +96,7 @@ the dependency it would avoid — which is exactly the test the budget asks.
 **Rejected.**
 
 - **`zstd` (the C binding).** Better ratio — the
-  [projection](../storage-comparison.md#what-compression-would-buy) that
+  [projection](../storage-comparison.md#what-compression-bought-next-to-the-projection-that-motivated-it) that
   motivated compression was computed with zstd, and on those inputs
   `gzip -6` measured 7–10% worse than `zstd -3`, with LZ4 expected below
   both on ratio. But the crate chain (`zstd` → `zstd-safe` → `zstd-sys`)

@@ -60,8 +60,10 @@ Deploying, tuning, and keeping it healthy.
   characteristics, with every number traced to the file that recorded it.
 - **[Storage comparison](storage-comparison.md)** — bytes stored per byte
   ingested and what it costs, next to OpenObserve's published Elasticsearch
-  comparison. Traza loses this one on ordinary spans and wins it on
-  long-context agent traffic; both numbers are measured.
+  comparison. Traza stores less than it is sent on every corpus; the HA cost
+  row still belongs to object-storage economics on ordinary spans, and
+  long-context agent traffic wins outright. Every Traza number is measured;
+  the Elasticsearch and OpenObserve halves are their published figures.
 - **[Configuration reference](configuration.md)** — the exhaustive
   flag-by-flag reference plus throughput and latency profiles. Flags are
   documented there and nowhere else, so there is one place to correct.

@@ -94,7 +94,7 @@ dependencies = [
 
 [[package]]
 name = "traza"
-version = "0.23.0"
+version = "0.24.2"
 dependencies = [
  "lz4_flex",
  "serde",

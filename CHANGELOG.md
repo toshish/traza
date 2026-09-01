@@ -5,7 +5,101 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.24.2] - 2026-08-31
+
+The follow-up an external review of the v0.24.1 line earned: the query
+deadline now reaches the sidecar rebuilds and buffered sweeps it missed,
+the v7 header's timestamp range is validated against real records instead
+of trusted, and the filter benchmark refuses to publish a latency for an
+answer it did not verify. Every finding was reproduced red before its fix.
+
+
+### Fixed
+
+- **The query deadline reaches the rollup sidecar rebuild.** External
+  review of v0.24.1 found two query paths that check the budget per
+  segment and then rebuild a missing rollup sidecar INSIDE the segment
+  with no check at all — the scoped payload fetch's reachability probe
+  and the analytics fold's fast path. A 50k-span rebuild ran to
+  completion under a 1 ms budget (~1 s of decode) and answered as though
+  the probe had been cheap. The rebuild's record-decode loop now runs
+  under the calling request's budget at the standard cadence, with a
+  final check before it returns; second-round review found the sibling —
+  the supersede prefilter's key-hash rebuild, reachable per emitted span
+  on every query and fold — and it is threaded the same way. The
+  maintenance TTL sweep passes no budget, exactly as the deadline
+  contract exempts it, and the shadowed-tail scan never rebuilds at all
+  (a segment without a sidecar ends that scan).
+- **Buffered spans no longer escape the query deadline.** The same
+  review found every buffered-span sweep unchecked: an unflushed
+  20k-span corpus answered complete results under a zero budget on the
+  unlimited query, fold, session-union, and analytics-rollup paths, and
+  the limited query built its whole buffer source before the merge's
+  first check. Every buffer sweep on a query path now checks at the
+  standard cadence, and every budgeted query path performs one final
+  check before returning a completed answer — a request past its budget
+  is refused, never rewarded for finishing late. The deadline's cost
+  statement in docs/configuration.md is amended to match.
+- **The segment header's timestamp range is validated, never trusted.**
+  The same review demonstrated the harm: the two range words carry no
+  checksum, `may_contain_timestamps` pruned whole segments on them
+  before any validation, and editing sixteen header bytes silently hid a
+  record the store could still decode — the false-negative predicate the
+  corruption contract forbids. Both opens now prove both declared bounds
+  against record bytes: the eager open against every record, the lazy
+  open by decoding the first block (whose fence-vs-first-record check
+  pins the declared min to the actual first record) and reading the last
+  record's timestamp — the true max, records being timestamp-sorted —
+  which must equal the declared max. Second-round review forced that
+  grounding: pinning the min to the first FENCE alone could be colluded
+  with, since the fence is unchecksummed metadata too — raising the
+  header word and the fence together still silently hid the head window.
+  A metadata-only forgery of the range is now refused at open on either
+  bound; a forgery must alter record bytes plus the block crc32 to get
+  past it, which the validation's own decode catches. An empty segment
+  must declare the canonical empty range, and any record read outside
+  the declared range still fails loud as corrupt. Deliberate amendment
+  #5 in docs/segment-format.md states the validation and its cost — two
+  bounded block decodes per lazy open, dropped from the cache after.
+- **The canonical benchmark's filter gate gained a semantic oracle.**
+  Review also noted the bench recorded filter latency on any 200 with
+  parseable JSON — a wrong or empty answer would have been timed and
+  published as a healthy number. Each filter sample now asserts the
+  exact span count the corpus construction defines, the requested
+  `benchmark.group` value on every returned span, and the exact expected
+  span ids, before its latency is recorded; a wrong answer aborts the
+  run under the same refuse-to-publish rule as the gates.
+
+## [0.24.1] - 2026-08-31
+
+### Fixed
+
+- **The compaction keeps-up test's tick deadline is sized for v7 merges.**
+  The bound that proves a tick merges the backlog it found and returns —
+  rather than merging what arrives for as long as the writes do — was
+  twenty seconds, sized before v7 made every merge re-encode lz4 blocks.
+  The v0.24.0 tag run watched a starved shared runner push one legitimate
+  tick past it and fail release preflight, so the v0.24.0 tag exists but
+  published no artifacts on any channel; this release is the v7 line's
+  first shipped artifact. The tripwire is two minutes now, and the
+  comment says which failure the clock is for.
+
+## [0.24.0] - 2026-08-31
+
+The storage release: segment format v7. The same store, at less than half
+the disk — measured by gates the benchmarks now enforce on themselves
+before they will write a number down. Records stop storing every indexed
+attribute value twice, the records region compresses into 128 KiB lz4
+blocks behind a validated directory, payload blobs compress under an
+unchanged content address, and a v6 store migrates automatically at first
+open: resumable, same names, pins included, proven by an aimed-SIGKILL
+crash matrix. Settled amplification lands at 0.41x of ingested bytes on
+service traces and 0.23x on LLM calls, against 1.81x and 2.07x before;
+ingest is faster because compression writes fewer bytes; a point read
+pays one block decode, priced and bounded in the format's own acceptance
+gates. lz4_flex is the third direct dependency, carried by the ledger in
+docs/internals/dependencies.md, and it raises the minimum supported Rust
+to 1.81.
 
 ### Changed
 
@@ -22,14 +116,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   carved into 128 KiB record-aligned LZ4 blocks with per-block CRC-32 and a
   resident block directory, and payload blobs gain a `TRZBLOB1` header with
   the same codec-or-raw rule while keeping their uncompressed-bytes content
-  address, so dedup and erasure needles are unchanged. On this branch's
-  development run of `storage-bench`, settled amplification measured
-  **0.41x** on `generic` and **0.23x** on `llm` (v6 shipped at 1.81x and
-  2.07x) — cited here as an unpublished development measurement: the
-  recorded claims, [benchmarks/storage.md](docs/benchmarks/storage.md) and
-  acceptance gates 5 and 6 of
-  [segment-format.md](docs/segment-format.md#acceptance-gates), land with
-  the gates PR. Adversarial-review hardening shipped inside the same
+  address, so dedup and erasure needles are unchanged. The claims are
+  published: settled amplification measured **0.41x** on `generic` and
+  **0.23x** on `llm` (v6 shipped at 1.81x and 2.07x), recorded in
+  [benchmarks/storage.md](docs/benchmarks/storage.md) by a run that asserts
+  acceptance gate 5 — amplification at or below 1.0x on both corpora —
+  before it will write, and the canonical latency benchmark asserts gate 6's
+  tripwires the same way — trace-lookup p50 at or below 0.75 ms and
+  attribute-filter p50 at or below 6 ms (measured 0.425 ms and 2.974 ms) —
+  before writing
+  [benchmarks/canonical-corpus.md](docs/benchmarks/canonical-corpus.md);
+  both gates are defined in
+  [segment-format.md](docs/segment-format.md#acceptance-gates), and a run
+  that misses one exits non-zero with nothing written.
+  Adversarial-review hardening shipped inside the same
   change: every header- or directory-declared length is bounded before it
   can size an allocation (a flipped high bit used to abort the process at
   open instead of erroring), the block directory's min-timestamp fences are
@@ -2555,6 +2655,9 @@ completion trailers — clients parsing either surface must update.
 
 - This is an initial 0.1 release; consult README.md for the currently documented operational constraints and unsupported use cases.
 
+[0.24.2]: https://github.com/toshish/traza/compare/v0.24.1...v0.24.2
+[0.24.1]: https://github.com/toshish/traza/compare/v0.24.0...v0.24.1
+[0.24.0]: https://github.com/toshish/traza/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/toshish/traza/compare/v0.22.2...v0.23.0
 [0.22.2]: https://github.com/toshish/traza/compare/v0.22.1...v0.22.2
 [0.22.1]: https://github.com/toshish/traza/compare/v0.22.0...v0.22.1

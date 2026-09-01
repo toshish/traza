@@ -1,6 +1,22 @@
 //! Benchmark driver for Traza storage operations.
+//!
+//! **This run gates itself.** Acceptance gate 6 of the segment format
+//! (`docs/segment-format.md`, "Acceptance gates" — the deliberately amended,
+//! absolute form) sets tripwires on the canonical 1M-span corpus:
+//! **trace-lookup p50 at or below 0.75 ms** and **attribute-filter p50 at or
+//! below 6 ms**. They are asserted here after measurement and before
+//! `docs/benchmarks/canonical-corpus.md` is written: a canonical run that
+//! misses either exits non-zero and writes nothing, because the harness does
+//! not publish a number the format's own contract says is a failure.
+//! Non-canonical configurations — an overridden corpus size
+//! (`TRAZA_BENCH_SPANS`) or compaction knob (`TRAZA_BENCH_COMPACTION_FANOUT`,
+//! `TRAZA_BENCH_COMPACTION_MAX_SEGMENT_BYTES`) — never write the doc and are
+//! not gated: the tripwires are defined on the canonical corpus under the
+//! default configuration only, and an experiment prints its numbers and
+//! leaves the record alone.
 
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
@@ -11,9 +27,20 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_SPAN_COUNT: usize = 1_000_000;
+/// The compaction fan-out the published record is measured at.
+const DEFAULT_COMPACTION_FANOUT: &str = "4";
 const BATCH_SIZE: usize = 1_000;
 const TRACE_SAMPLES: usize = 200;
 const FILTER_SAMPLES: usize = 100;
+/// The `limit` every filter sample carries — part of the oracle's arithmetic,
+/// so it is a named constant the query path and the verification share.
+const FILTER_LIMIT: usize = 100;
+
+/// Acceptance gate 6 (`docs/segment-format.md`, "Acceptance gates", as
+/// amended to absolute tripwires): median tripwires on the canonical corpus.
+/// A canonical run past either exits non-zero and writes nothing.
+const GATE_TRACE_P50: Duration = Duration::from_micros(750);
+const GATE_FILTER_P50: Duration = Duration::from_millis(6);
 
 struct ServerGuard {
     child: Child,
@@ -30,7 +57,16 @@ impl Drop for ServerGuard {
 
 /// Compaction fan-out for the benchmarked server; `0` disables compaction.
 fn compaction_fanout() -> String {
-    std::env::var("TRAZA_BENCH_COMPACTION_FANOUT").unwrap_or_else(|_| "4".to_owned())
+    std::env::var("TRAZA_BENCH_COMPACTION_FANOUT")
+        .unwrap_or_else(|_| DEFAULT_COMPACTION_FANOUT.to_owned())
+}
+
+/// The segment ceiling the published record is measured at: the production
+/// default, read from the config rather than repeated as a literal.
+fn default_max_segment_bytes() -> String {
+    traza::CompactionConfig::default()
+        .max_segment_bytes
+        .to_string()
 }
 
 /// Size ceiling for compacted segments. This bounds the segment count from
@@ -38,21 +74,36 @@ fn compaction_fanout() -> String {
 /// it is the knob scaling experiments need to vary. Defaults to the real
 /// production default rather than a literal, so the two cannot drift apart.
 fn compaction_max_segment_bytes() -> String {
-    std::env::var("TRAZA_BENCH_COMPACTION_MAX_SEGMENT_BYTES").unwrap_or_else(|_| {
-        traza::CompactionConfig::default()
-            .max_segment_bytes
-            .to_string()
-    })
+    std::env::var("TRAZA_BENCH_COMPACTION_MAX_SEGMENT_BYTES")
+        .unwrap_or_else(|_| default_max_segment_bytes())
 }
 
-fn span_count() -> usize {
+fn span_count() -> Result<usize, Box<dyn std::error::Error>> {
     // TRAZA_BENCH_SPANS overrides the corpus size for scaling experiments.
-    // The published record is only rewritten for the canonical default
-    // corpus, so experimental runs cannot silently change its numbers.
-    std::env::var("TRAZA_BENCH_SPANS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(DEFAULT_SPAN_COUNT)
+    // The published record is only rewritten for the canonical configuration,
+    // so experimental runs cannot silently change its numbers. A set-but-
+    // unparseable value is an error, not a silent fall-through: falling back
+    // would run the full canonical corpus — and rewrite the record — under a
+    // configuration the operator explicitly asked to change.
+    match std::env::var("TRAZA_BENCH_SPANS") {
+        Ok(value) => value.parse().map_err(|_| {
+            format!("TRAZA_BENCH_SPANS is set to {value:?}, which is not a span count").into()
+        }),
+        Err(_) => Ok(DEFAULT_SPAN_COUNT),
+    }
+}
+
+/// True only for the configuration the published record is defined on: the
+/// canonical corpus at the default compaction knobs. Gate 6 and the rewrite of
+/// `docs/benchmarks/canonical-corpus.md` both key on this — an uncompacted-
+/// baseline experiment (`TRAZA_BENCH_COMPACTION_FANOUT=0`) runs the same
+/// corpus through hundreds of segments, so gating it against tripwires the
+/// spec defines for the default configuration would fail it spuriously, and
+/// writing its numbers over the record would be worse.
+fn canonical_configuration(span_count: usize) -> bool {
+    span_count == DEFAULT_SPAN_COUNT
+        && compaction_fanout() == DEFAULT_COMPACTION_FANOUT
+        && compaction_max_segment_bytes() == default_max_segment_bytes()
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -95,7 +146,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     wait_for_server(port, &mut server.child)?;
 
     #[allow(non_snake_case)]
-    let SPAN_COUNT = span_count();
+    let SPAN_COUNT = span_count()?;
     println!("Loading {SPAN_COUNT} spans in batches of {BATCH_SIZE}...");
     let ingest_started = Instant::now();
     let mut body = Vec::with_capacity(512 * BATCH_SIZE);
@@ -184,7 +235,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut filter_latencies = Vec::with_capacity(FILTER_SAMPLES);
     for sample in 0..FILTER_SAMPLES {
         let group = sample % 100;
-        let path = format!("/v1/spans?attr.benchmark.group=group-{group}&limit=100");
+        let path = format!("/v1/spans?attr.benchmark.group=group-{group}&limit={FILTER_LIMIT}");
         let started = Instant::now();
         let response = request(port, "GET", &path, None)?;
         let elapsed = started.elapsed();
@@ -196,7 +247,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .into());
         }
-        let _: Value = serde_json::from_slice(&response.1)?;
+        // The semantic oracle, before the latency is recorded: a wrong
+        // answer aborts the run — the same refuse-to-publish pattern as the
+        // gates — because a latency measured on a wrong answer is not a
+        // measurement of the store.
+        verify_filter_response(&response.1, group, SPAN_COUNT, FILTER_LIMIT)
+            .map_err(|error| format!("filter oracle failed, refusing to publish: {error}"))?;
         filter_latencies.push(elapsed);
     }
 
@@ -208,6 +264,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let filter_p50 = percentile(&filter_latencies, 50.0);
     let filter_p95 = percentile(&filter_latencies, 95.0);
     let filter_p99 = percentile(&filter_latencies, 99.0);
+
+    // Acceptance gate 6's tripwires, asserted before the record is written.
+    // Only the canonical configuration — default corpus, default compaction
+    // knobs — defines the gate, and only the canonical configuration writes
+    // the doc; the two share one predicate so they cannot drift apart.
+    let canonical = canonical_configuration(SPAN_COUNT);
+    if canonical {
+        let mut gate_misses = Vec::new();
+        if trace_p50 > GATE_TRACE_P50 {
+            gate_misses.push(format!(
+                "trace-lookup p50 measured {:.3} ms, tripwire is <= {:.3} ms",
+                ms(trace_p50),
+                ms(GATE_TRACE_P50),
+            ));
+        }
+        if filter_p50 > GATE_FILTER_P50 {
+            gate_misses.push(format!(
+                "attribute-filter p50 measured {:.3} ms, tripwire is <= {:.3} ms",
+                ms(filter_p50),
+                ms(GATE_FILTER_P50),
+            ));
+        }
+        if !gate_misses.is_empty() {
+            for miss in &gate_misses {
+                eprintln!("GATE FAILED: {miss}");
+            }
+            return Err("acceptance gate 6 (docs/segment-format.md) failed; \
+                 docs/benchmarks/canonical-corpus.md was not written"
+                .into());
+        }
+    }
 
     let context = machine_context();
     let measured_at = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
@@ -229,10 +316,11 @@ Additional percentiles:\n\n\
 - Corpus: {SPAN_COUNT} spans, 100,000 traces with 10 spans each, 20 services, 100 indexed `benchmark.group` attribute values, and occasional events.\n\
 - Ingest: HTTP `POST /v1/spans`, {BATCH_SIZE} spans per request, timed from the first request through the final successful response. JSON generation is intentionally inside the timed loop, so the reported rate includes client serialization and loopback HTTP overhead.\n\
 - Trace sampling: {TRACE_SAMPLES} deterministic trace IDs spread through the corpus; each response is parsed and checked for 10 spans.\n\
-- Filter sampling: {FILTER_SAMPLES} deterministic `attr.benchmark.group` queries with `limit=100`; each response body is parsed as JSON.\n\
+- Filter sampling: {FILTER_SAMPLES} deterministic `attr.benchmark.group` queries with `limit={FILTER_LIMIT}`; each response is verified against the corpus construction — exact span count, the requested group value on every span, and the exact expected span ids — before its latency is recorded. A wrong answer aborts the run without writing this file.\n\
 - Percentiles: nearest-rank selection over complete request wall-clock durations measured with `std::time::Instant`; no warm-up samples are discarded.\n\
 - Build: Cargo release profile. Timestamp: Unix {measured_at}.\n\
 - Machine context: {context}.\n\
+- Load conditions: 1-minute load average {loadavg} at the end of the run — ambient desktop load, not an idle host (the house rule is [ingest.md's](ingest.md#load-conditions)). An idle rerun will likely improve the tails; the gate tripwires, not these point estimates, are the contract.\n\
 - Final server stats: `{}`.\n\n\
 The ingest threshold is {}. The trace p95 threshold is {}. The filtered-query p95 threshold is {}. Any miss remains visible in the table rather than being substituted or estimated.\n",
         pass(ingest_rate >= 50_000.0),
@@ -254,12 +342,29 @@ The ingest threshold is {}. The trace p95 threshold is {}. The filtered-query p9
         pass(filter_p95 < Duration::from_millis(300)),
         fanout = compaction_fanout(),
         max_segment_bytes = compaction_max_segment_bytes(),
+        loadavg = load_average_1m(),
     );
-    report.push_str("\n## Verification Notes\n\n- Corpus declaration: `1000000` spans (1,000,000 spans).\n- Every reported result is measured by this benchmark run, never estimated.\n- Unsuccessful lookups are reported as misses.\n");
-    if SPAN_COUNT == DEFAULT_SPAN_COUNT {
+    report.push_str(&format!(
+        "\n## Verification Notes\n\n\
+- Corpus declaration: `1000000` spans (1,000,000 spans).\n\
+- Every reported result is measured by this benchmark run, never estimated.\n\
+- Unsuccessful lookups are reported as misses.\n\
+- **This file exists only because the run passed acceptance gate 6's tripwires** \
+([segment format](../segment-format.md#acceptance-gates), as amended to absolute bounds): \
+trace-lookup p50 <= {:.2} ms and attribute-filter p50 <= {:.0} ms on this canonical corpus. \
+The benchmark asserts them after measuring and before writing; a run that misses either exits \
+non-zero and writes nothing.\n",
+        ms(GATE_TRACE_P50),
+        ms(GATE_FILTER_P50),
+    ));
+    if canonical {
         fs::write("docs/benchmarks/canonical-corpus.md", report)?;
     } else {
-        println!("(experimental corpus — docs/benchmarks/canonical-corpus.md not rewritten)");
+        println!(
+            "(experimental configuration — docs/benchmarks/canonical-corpus.md not rewritten, \
+             gate 6 not asserted: the tripwires are defined on the canonical corpus at the \
+             default compaction configuration only)"
+        );
     }
 
     println!(
@@ -278,7 +383,7 @@ The ingest threshold is {}. The trace p95 threshold is {}. The filtered-query p9
         ms(filter_p95),
         ms(filter_p99)
     );
-    if SPAN_COUNT == DEFAULT_SPAN_COUNT {
+    if canonical {
         println!("Wrote docs/benchmarks/canonical-corpus.md");
     }
     Ok(())
@@ -409,4 +514,185 @@ fn machine_context() -> String {
     let arch = env::consts::ARCH;
     let parallelism = thread::available_parallelism().map_or(1, usize::from);
     format!("{os}/{arch}, {parallelism} available hardware threads")
+}
+
+/// The 1-minute load average, measured rather than asserted, for the
+/// load-conditions line of the record. Reads `/proc/loadavg` where it exists
+/// and falls back to `sysctl -n vm.loadavg` (macOS); anything else reports
+/// "unavailable" instead of a guess.
+fn load_average_1m() -> String {
+    if let Ok(contents) = fs::read_to_string("/proc/loadavg") {
+        if let Some(first) = contents.split_whitespace().next() {
+            return first.to_owned();
+        }
+    }
+    if let Ok(output) = Command::new("sysctl").args(["-n", "vm.loadavg"]).output() {
+        if output.status.success() {
+            let text = String::from_utf8_lossy(&output.stdout);
+            if let Some(first) = text
+                .split_whitespace()
+                .find(|token| token.starts_with(|c: char| c.is_ascii_digit()))
+            {
+                return first.to_owned();
+            }
+        }
+    }
+    "unavailable".to_owned()
+}
+
+/// The filter samples' semantic oracle.
+///
+/// The corpus construction fixes each query's exact answer: spans carrying
+/// `benchmark.group = group-{g}` are exactly the indices `g + 100k` below
+/// `span_count`, the stable span order is ascending start time — which is
+/// ascending index by construction — and a limited query returns the first
+/// `limit` of them. So the oracle demands the exact span count the corpus
+/// defines, the requested group value on every returned span, and the exact
+/// set of span ids. Anything less gated latency on "200 and parseable",
+/// which a wrong (even empty) answer satisfies.
+fn verify_filter_response(
+    body: &[u8],
+    group: usize,
+    span_count: usize,
+    limit: usize,
+) -> Result<(), String> {
+    let parsed: Value = serde_json::from_slice(body)
+        .map_err(|error| format!("group-{group} response is not JSON: {error}"))?;
+    let spans = parsed
+        .get("spans")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("group-{group} response carries no spans array"))?;
+    // The generator writes `benchmark.group = group-{i % 100}`, so the
+    // group's population is the count of indices `≡ group (mod 100)` below
+    // the corpus size — NOT a constant: a scaled-down corpus has short
+    // groups, and the last groups run one shorter whenever 100 does not
+    // divide the corpus.
+    let population = if group < span_count {
+        (span_count - group - 1) / 100 + 1
+    } else {
+        0
+    };
+    let expected = population.min(limit);
+    if spans.len() != expected {
+        return Err(format!(
+            "group-{group} returned {} spans, the corpus defines exactly {expected}",
+            spans.len()
+        ));
+    }
+    // Start times ascend with the index, so the limited query's answer is
+    // the FIRST `expected` matches: indices `group + 100k`, whose span ids
+    // the generator derives as `{:016x}` of index + 1. Exact set, order
+    // left free.
+    let mut expected_ids: BTreeSet<String> = (0..expected)
+        .map(|position| format!("{:016x}", group + 100 * position + 1))
+        .collect();
+    let group_value = format!("group-{group}");
+    for span in spans {
+        let held = span
+            .get("attributes")
+            .and_then(|attributes| attributes.get("benchmark.group"))
+            .and_then(Value::as_str);
+        if held != Some(group_value.as_str()) {
+            return Err(format!(
+                "group-{group} returned a span carrying benchmark.group {held:?}"
+            ));
+        }
+        let span_id = span
+            .get("span_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("group-{group} returned a span without a span_id"))?;
+        if !expected_ids.remove(span_id) {
+            return Err(format!(
+                "group-{group} returned span {span_id}, which is not among the \
+                 expected ids (or is a duplicate)"
+            ));
+        }
+    }
+    // Counts matched and every returned id consumed a distinct expected id,
+    // so the sets are equal.
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The honest response for one group, built from the corpus rule
+    /// independently of the oracle's own arithmetic: matching indices are
+    /// `group + 100k` below `span_count`, ids are `{:016x}` of index + 1,
+    /// and the limited query returns the first `limit` in span order.
+    fn honest_response(group: usize, span_count: usize, limit: usize) -> Vec<u8> {
+        let spans: Vec<Value> = (group..span_count)
+            .step_by(100)
+            .take(limit)
+            .map(|index| honest_span(index, &format!("group-{group}")))
+            .collect();
+        serde_json::to_vec(&json!({"spans": spans})).expect("response encodes")
+    }
+
+    fn honest_span(index: usize, group_value: &str) -> Value {
+        json!({
+            "trace_id": format!("{:032x}", index / 10 + 1),
+            "span_id": format!("{:016x}", index + 1),
+            "attributes": {"benchmark.group": group_value},
+        })
+    }
+
+    #[test]
+    fn the_oracle_accepts_the_generators_exact_answer() {
+        verify_filter_response(&honest_response(7, 1_000_000, 100), 7, 1_000_000, 100)
+            .expect("the honest canonical answer passes");
+    }
+
+    #[test]
+    fn the_oracle_derives_the_expected_count_from_the_corpus() {
+        // 250 spans: group 30 holds indices 30, 130, 230 — three spans,
+        // nothing like the canonical 100. The oracle must derive that from
+        // the generator's rule, not assume the canonical fill.
+        verify_filter_response(&honest_response(30, 250, 100), 30, 250, 100)
+            .expect("a short group's exact population passes");
+        // The same three spans claimed against a corpus of 230 — where the
+        // group holds only indices 30 and 130 — are a wrong answer.
+        verify_filter_response(&honest_response(30, 250, 100), 30, 230, 100)
+            .expect_err("a count the corpus does not define is refused");
+    }
+
+    #[test]
+    fn the_oracle_rejects_a_parseable_empty_answer() {
+        let body = serde_json::to_vec(&json!({"spans": []})).expect("encodes");
+        let refusal = verify_filter_response(&body, 7, 1_000_000, 100)
+            .expect_err("an empty answer is wrong, however parseable");
+        assert!(
+            refusal.contains("0 spans"),
+            "the refusal names the wrong count: {refusal}"
+        );
+    }
+
+    #[test]
+    fn the_oracle_rejects_a_span_from_the_wrong_group() {
+        let mut spans: Vec<Value> = (7..1_000_000)
+            .step_by(100)
+            .take(100)
+            .map(|index| honest_span(index, "group-7"))
+            .collect();
+        spans[41] = honest_span(4_107, "group-8");
+        let body = serde_json::to_vec(&json!({"spans": spans})).expect("encodes");
+        verify_filter_response(&body, 7, 1_000_000, 100)
+            .expect_err("a span carrying another group's value is refused");
+    }
+
+    #[test]
+    fn the_oracle_rejects_substituted_span_ids() {
+        // Right count, right group value on every span — but the wrong
+        // rows: the window is shifted by one match, so the first expected
+        // id is missing and one id past the limit appears instead.
+        let spans: Vec<Value> = (107..1_000_000)
+            .step_by(100)
+            .take(100)
+            .map(|index| honest_span(index, "group-7"))
+            .collect();
+        let body = serde_json::to_vec(&json!({"spans": spans})).expect("encodes");
+        verify_filter_response(&body, 7, 1_000_000, 100)
+            .expect_err("the exact expected ids are part of the answer");
+    }
 }
