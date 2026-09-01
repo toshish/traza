@@ -239,8 +239,17 @@ pub struct Header {
     /// Inclusive `(min, max)` record timestamp.
     ///
     /// Always present, so a query can always try to rule the segment out. An
-    /// empty segment carries an empty range (`min > max`), which overlaps
-    /// nothing — that is a real answer, not an unknown one.
+    /// empty segment carries the canonical empty range — exactly
+    /// `(u64::MAX, 0)`, which overlaps nothing: a real answer, not an
+    /// unknown one.
+    ///
+    /// Validated, never trusted (`validate_header_timestamps` and the
+    /// exact-bounds check at the end of each open, spec amendment #5):
+    /// these words carry no checksum and
+    /// [`Segment::may_contain_timestamps`] prunes whole segments on them,
+    /// so both opens require both bounds to match the records exactly —
+    /// grounded in the first and last records themselves, not just the
+    /// fences — and a record read outside the declared range is corrupt.
     pub timestamps: (u64, u64),
     /// Byte offset and length of the content index.
     ///
@@ -743,6 +752,16 @@ impl BlockCache {
         slots.truncate(BLOCK_CACHE_SLOTS);
     }
 
+    /// Drops every cached block. Used exactly once, at the end of the lazy
+    /// open: the exact-bounds validation decodes the first and last blocks,
+    /// and retaining them would break the larger-than-RAM rule that a
+    /// freshly opened file-backed segment holds zero payload bytes.
+    fn clear(&self) {
+        if let Ok(mut slots) = self.slots.lock() {
+            slots.clear();
+        }
+    }
+
     /// Decoded bytes the cache currently retains — real residency, counted
     /// by [`Segment::resident_bytes`] so the accounting surfaces cannot
     /// report a busy store's block cache as zero.
@@ -921,6 +940,7 @@ impl Segment {
             section(&bytes, header.directory_offset, header.directory_len)?,
             &header,
         )?;
+        validate_header_timestamps(&header, &directory)?;
         let block_start_ordinals = block_start_ordinals(&header, &record_offsets, &directory)?;
         let trace_index = decode_string_index(
             section(&bytes, header.trace_index_offset, header.trace_index_len)?,
@@ -958,8 +978,26 @@ impl Segment {
             last_query_used_index: AtomicBool::new(false),
         };
         let mut held = None;
+        // The eager decode sees every record, so this open validates the
+        // header's timestamp range against ALL of them, where the lazy open
+        // grounds its exact-bounds check in the first and last records
+        // alone. The per-record range check inside `decode_at_walked`
+        // already refuses anything outside the declared range; what remains
+        // to catch here is an inflated bound no record reaches.
+        let mut observed: Option<(u64, u64)> = None;
         for offset in &segment.record_offsets {
-            segment.decode_at_walked(&mut held, *offset)?;
+            let record = segment.decode_at_walked(&mut held, *offset)?;
+            observed = Some(match observed {
+                Some((lo, hi)) => (lo.min(record.timestamp), hi.max(record.timestamp)),
+                None => (record.timestamp, record.timestamp),
+            });
+        }
+        if let Some(range) = observed {
+            if range != segment.header.timestamps {
+                return Err(Error::Corrupt(
+                    "header timestamp range does not match the records",
+                ));
+            }
         }
         Ok(segment)
     }
@@ -1003,6 +1041,7 @@ impl Segment {
         validate_record_offsets_lengths(&header, &record_offsets)?;
         let directory_bytes = read_section(header.directory_offset, header.directory_len)?;
         let directory = decode_directory(&directory_bytes, &header)?;
+        validate_header_timestamps(&header, &directory)?;
         let block_start_ordinals = block_start_ordinals(&header, &record_offsets, &directory)?;
         let trace_bytes = read_section(header.trace_index_offset, header.trace_index_len)?;
         let trace_index = decode_string_index(&trace_bytes, false, header.record_count)?
@@ -1027,7 +1066,7 @@ impl Segment {
             let head = read_section(offset, head_len)?;
             decode_content_head(&head, offset, len, header.record_count)?
         };
-        Ok(Self {
+        let segment = Self {
             backing: Backing::File {
                 file: Mutex::new(file),
                 len: total,
@@ -1041,7 +1080,35 @@ impl Segment {
             attribute_index,
             content,
             last_query_used_index: AtomicBool::new(false),
-        })
+        };
+        // Exact-bounds validation (spec amendment #5): the directory
+        // cross-check above pinned the declared min to the first FENCE, but
+        // a fence is derived metadata no checksum covers — raising the
+        // header min and the first fence together (sixteen bytes) survived
+        // it, and `may_contain_timestamps` then pruned head windows with a
+        // clean empty answer. So the min pin is grounded in record bytes:
+        // decoding the first block runs its fence-vs-first-record check,
+        // which makes min == fence == first record — the true min, records
+        // being timestamp-sorted. The max, which no fence carries at all,
+        // is validated the same way: the LAST record's timestamp is the
+        // true max, and it must equal the declared max exactly
+        // (`timestamp_at` itself refuses a record beyond a lowered bound;
+        // the equality below refuses an inflated one). Any surviving
+        // forgery must now alter record bytes plus the block crc32 — that
+        // is data corruption, which the crc catches on decode. Cost: two
+        // bounded block decodes per lazy open, dropped from the cache
+        // below so a freshly opened segment still holds zero payload bytes.
+        if let Some(last_offset) = segment.record_offsets.last().copied() {
+            segment.decoded_block(0)?;
+            let last = segment.timestamp_at(last_offset)?;
+            if last != segment.header.timestamps.1 {
+                return Err(Error::Corrupt(
+                    "header max timestamp does not match the last record",
+                ));
+            }
+            segment.cache.clear();
+        }
+        Ok(segment)
     }
 
     /// Bytes of record/payload content currently resident in memory: the
@@ -1483,7 +1550,29 @@ impl Segment {
             return Err(Error::Corrupt("record timestamp crosses block bounds"));
         }
         let bytes = self.decoded_block(block)?;
-        read_u64(&bytes, (relative_offset - entry.logical_start) as usize)
+        let timestamp = read_u64(&bytes, (relative_offset - entry.logical_start) as usize)?;
+        self.check_timestamp_in_header_range(timestamp)?;
+        Ok(timestamp)
+    }
+
+    /// Refuses a record timestamp the header's declared range cannot hold.
+    ///
+    /// Defense in depth behind the open-time validation
+    /// (`validate_header_timestamps` plus the exact-bounds check at the end
+    /// of each open): both opens already require both declared bounds to
+    /// match the records, so on an honest segment this can never fire. It
+    /// stands so that corruption arriving AFTER open — or any validation
+    /// gap — surfaces as an error on the read that observes it, never as a
+    /// served record the segment's own pruning predicate
+    /// (`may_contain_timestamps`) denies holding.
+    fn check_timestamp_in_header_range(&self, timestamp: u64) -> Result<(), Error> {
+        let (min, max) = self.header.timestamps;
+        if timestamp < min || timestamp > max {
+            return Err(Error::Corrupt(
+                "record timestamp is outside the header range",
+            ));
+        }
+        Ok(())
     }
 
     /// Decodes exactly one record at a posting offset.
@@ -1634,7 +1723,11 @@ impl Segment {
         }
         let bytes = self.decoded_block_walked(held, block)?;
         let start = (relative_offset - entry.logical_start) as usize;
-        decode_record(&bytes, start, start as u64 + record_len)
+        let record = decode_record(&bytes, start, start as u64 + record_len)?;
+        // Same rule as `timestamp_at`: a decoded record outside the header's
+        // declared range is corruption surfacing, never data to serve.
+        self.check_timestamp_in_header_range(record.timestamp)?;
+        Ok(record)
     }
 }
 
@@ -2110,6 +2203,51 @@ fn decode_record(bytes: &[u8], start: usize, region_end: u64) -> Result<Record, 
         pairs,
         payload,
     })
+}
+
+/// Cross-checks the header's timestamp range against the block directory —
+/// the metadata layer of the range's validation, run by BOTH backings before
+/// a segment is served. The header words carry no checksum and
+/// `may_contain_timestamps` prunes whole segments on them before any decode,
+/// so an unvalidated range let sixteen edited bytes hide decodable records
+/// from every time-bounded query (external review of v0.24.1).
+///
+/// This check alone is trust-shifting, not proof — the fences are derived
+/// metadata no checksum covers, so a forgery can move a fence and the header
+/// word together. It still earns its place: the min must EQUAL the first
+/// block fence and the max must sit at or above the last (fences carry
+/// minima only), which also forces `min <= max` through the fences' own
+/// ordering, and an empty segment must declare the one canonical empty range
+/// the encoder writes, `(u64::MAX, 0)`. The PROOF is grounded in record
+/// bytes by the checks that follow: each open then requires both declared
+/// bounds to match the actual first and last records — `from_bytes` against
+/// every record it decodes anyway, `open` by decoding the first block (whose
+/// fence-vs-first-record check makes the pinned min exact) and reading the
+/// last record's timestamp, the true max. A forgery that survives all of
+/// that has altered record bytes, which the block crc32 catches on decode.
+fn validate_header_timestamps(header: &Header, directory: &[BlockEntry]) -> Result<(), Error> {
+    let (min, max) = header.timestamps;
+    let Some((first, last)) = directory.first().zip(directory.last()) else {
+        // Empty by `validate_total`'s all-or-nothing rule: no directory
+        // entries means no records.
+        if (min, max) != (u64::MAX, 0) {
+            return Err(Error::Corrupt(
+                "empty segment declares a non-canonical timestamp range",
+            ));
+        }
+        return Ok(());
+    };
+    if min != first.min_timestamp {
+        return Err(Error::Corrupt(
+            "header min timestamp does not match the first block fence",
+        ));
+    }
+    if max < last.min_timestamp {
+        return Err(Error::Corrupt(
+            "header max timestamp is below the last block fence",
+        ));
+    }
+    Ok(())
 }
 
 /// Decodes and validates the block directory. Every check is mandatory: a
