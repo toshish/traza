@@ -5,7 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.24.2] - 2026-08-31
+
+The follow-up an external review of the v0.24.1 line earned: the query
+deadline now reaches the sidecar rebuilds and buffered sweeps it missed,
+the v7 header's timestamp range is validated against real records instead
+of trusted, and the filter benchmark refuses to publish a latency for an
+answer it did not verify. Every finding was reproduced red before its fix.
+
 
 ### Fixed
 
@@ -2648,6 +2655,7 @@ completion trailers — clients parsing either surface must update.
 
 - This is an initial 0.1 release; consult README.md for the currently documented operational constraints and unsupported use cases.
 
+[0.24.2]: https://github.com/toshish/traza/compare/v0.24.1...v0.24.2
 [0.24.1]: https://github.com/toshish/traza/compare/v0.24.0...v0.24.1
 [0.24.0]: https://github.com/toshish/traza/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/toshish/traza/compare/v0.22.2...v0.23.0
