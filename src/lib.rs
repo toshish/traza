@@ -838,8 +838,12 @@ pub struct Config {
     /// engine, or `None` (the default) for the unbounded behaviour every
     /// embedder had before this existed.
     ///
-    /// Checked at segment boundaries and every few thousand decoded records,
-    /// so enforcement costs a clock read amortized over real work. A request
+    /// Checked at segment boundaries and every few thousand decoded or
+    /// buffered records — a rollup sidecar rebuilt on a query path included
+    /// — with one final check before a completed answer is returned, so
+    /// enforcement costs a clock read amortized over real work. (Amended
+    /// with the v0.24.1 external-review fixes: buffered sweeps and sidecar
+    /// rebuilds used to sit outside the budget.) A request
     /// that exhausts the budget gets [`Error::DeadlineExceeded`] and no rows
     /// — never a partial aggregate, which would be a wrong answer that looks
     /// like a right one, the same refusal [`Error::QueryTooBroad`] makes.
@@ -1388,9 +1392,19 @@ impl Segment {
     /// bound to the wrong rate table is one the analytics path will reject and
     /// rebuild — which would then be rejected here, each overwriting the
     /// other's file on every call.
+    ///
+    /// `deadline` is the calling request's compute budget, threaded into the
+    /// sidecar-miss rebuild exactly as `Store::segment_rollup` threads it:
+    /// the cached and sidecar arms cost a probe and a file read, but the
+    /// rebuild decodes the whole segment, and its only caller is
+    /// [`superseded_by_newer`] — a query path (second-round external
+    /// review). `segments_examined` is the caller's running count, for the
+    /// refusal's message only.
     fn key_hashes(
         &self,
         pricing: &crate::pricing::Pricing,
+        deadline: Option<Deadline>,
+        segments_examined: u32,
     ) -> Result<&std::collections::HashSet<u64>> {
         if let Some(hashes) = self.key_hashes.get() {
             return Ok(hashes);
@@ -1399,7 +1413,10 @@ impl Segment {
         let rollup = match rollup_file::load(&self.path, binding) {
             Some(rollup) => rollup,
             None => {
-                let rollup = analytics::SegmentRollup::build(&self.spans_parsed()?, pricing);
+                let rollup = analytics::SegmentRollup::build(
+                    &self.spans_parsed_budgeted(deadline, segments_examined)?,
+                    pricing,
+                );
                 let _ = rollup_file::store(&self.path, binding, &rollup);
                 rollup
             }
@@ -1409,9 +1426,43 @@ impl Segment {
         Ok(self.key_hashes.get_or_init(|| rollup.key_hashes))
     }
 
-    /// Full parse — the rewrite/inspection path, never the query path.
+    /// Full parse — the rewrite/inspection/maintenance path, which the
+    /// deadline contract exempts. A rebuild reachable from a query goes
+    /// through [`Self::spans_parsed_budgeted`] instead; keep it that way.
     fn spans_parsed(&self) -> Result<Vec<Span>> {
         self.spans_parsed_in_window(None, None)
+    }
+
+    /// [`Self::spans_parsed`] under the calling request's budget: the same
+    /// full decode, checked every few thousand records and once before
+    /// returning. This is the decode a query pays when it must rebuild a
+    /// missing rollup sidecar, and it used to run unbounded — a per-segment
+    /// check outside it left the whole corpus decode inside one un-checked
+    /// stretch (external review of v0.24.1). Maintenance callers pass `None`
+    /// and keep the unbounded decode they are documented to have.
+    /// `segments_examined` is the caller's running count, for the refusal's
+    /// message only.
+    fn spans_parsed_budgeted(
+        &self,
+        deadline: Option<Deadline>,
+        segments_examined: u32,
+    ) -> Result<Vec<Span>> {
+        let count = self.record_count();
+        let mut spans = Vec::with_capacity(count);
+        let mut walk = self.seg.walk();
+        let mut decoded_since_check: usize = 0;
+        for ordinal in 0..count {
+            decoded_since_check += 1;
+            if decoded_since_check >= DEADLINE_CHECK_INTERVAL {
+                decoded_since_check = 0;
+                Deadline::check(deadline, segments_examined)?;
+            }
+            if let Some(record) = walk.record(ordinal).map_err(segment_error)? {
+                spans.push(record_to_span(&record)?);
+            }
+        }
+        Deadline::check(deadline, segments_examined)?;
+        Ok(spans)
     }
 
     /// The spans whose start time falls in the window, decoding ONLY the
@@ -2653,7 +2704,14 @@ impl Store {
                 }
             }
         }
+        // The buffer sweep keeps the loop's cadence — the counter carries
+        // over from the segment walk above.
         for span in writer.spans.iter() {
+            decoded_since_check += 1;
+            if decoded_since_check >= DEADLINE_CHECK_INTERVAL {
+                decoded_since_check = 0;
+                Deadline::check(deadline, segments_examined)?;
+            }
             if span.trace_id == trace_id && in_scope(span) {
                 latest.insert(
                     (span.tenant.clone(), span.span_id.clone()),
@@ -2668,6 +2726,8 @@ impl Store {
         );
 
         sort_spans(&mut result);
+        // Final check before a complete trace leaves; see `query_view_costed`.
+        Deadline::check(deadline, segments_examined)?;
         Ok(result)
     }
 
@@ -2974,8 +3034,18 @@ pub(crate) fn attribute_union_view(
     let mut result: Vec<Span> = Vec::new();
     let mut claimed: std::collections::HashSet<(String, String, String)> =
         std::collections::HashSet::new();
-    // The buffer holds the newest version of anything it carries.
+    // The buffer holds the newest version of anything it carries. The sweep
+    // is budgeted at the standard cadence: this is the session union's hot
+    // loop over an unflushed corpus, and it ran unchecked (external review
+    // of v0.24.1).
+    let mut segments_examined: u32 = 0;
+    let mut decoded_since_check: usize = 0;
     for span in buffer.spans.iter() {
+        decoded_since_check += 1;
+        if decoded_since_check >= DEADLINE_CHECK_INTERVAL {
+            decoded_since_check = 0;
+            Deadline::check(deadline, segments_examined)?;
+        }
         if visible(span) && matches(span) {
             claimed.insert((
                 span.tenant.clone(),
@@ -2991,8 +3061,6 @@ pub(crate) fn attribute_union_view(
         claimed.insert(key.clone());
     }
     // Newest segment first, so the first version claimed for a key wins.
-    let mut segments_examined: u32 = 0;
-    let mut decoded_since_check: usize = 0;
     // Each value's accepted index encodings, computed once: the digest
     // prefilter below re-derives the same probes per candidate record.
     let encoded_values: Vec<Vec<String>> = values.iter().map(attribute_encodings).collect();
@@ -3052,6 +3120,8 @@ pub(crate) fn attribute_union_view(
         }
     }
     sort_spans(&mut result);
+    // Final check before a complete union leaves; see `query_view_costed`.
+    Deadline::check(deadline, segments_examined)?;
     Ok(result)
 }
 
@@ -3072,10 +3142,12 @@ pub(crate) fn attribute_union_view(
 /// would let a collision delete a live row.
 ///
 /// `deadline` is the calling request's budget, checked once per newer
-/// segment: `key_hashes` on a sidecar miss fully parses that segment, so
-/// without the check here the un-checked stretch between two of the caller's
-/// own check sites was every newer segment's parse — O(corpus). With it the
-/// stretch is one segment's parse, the same granularity as everywhere else.
+/// segment AND threaded into `key_hashes`, whose sidecar-miss rebuild fully
+/// parses that segment: without the per-segment check the un-checked stretch
+/// between two of the caller's own check sites was every newer segment's
+/// parse — O(corpus) — and without the threading the rebuild itself was
+/// still one whole-segment stretch. With both, the stretch is one check
+/// interval of decoded records, the same cadence as everywhere else.
 /// `segments_examined` is the caller's running count, passed through for the
 /// refusal's message only.
 fn superseded_by_newer(
@@ -3090,7 +3162,10 @@ fn superseded_by_newer(
     let hash = analytics::key_hash(&span.tenant, &span.trace_id, &span.span_id);
     for newer in segments.iter().skip(position + 1) {
         Deadline::check(deadline, segments_examined)?;
-        if !newer.key_hashes(pricing)?.contains(&hash) {
+        if !newer
+            .key_hashes(pricing, deadline, segments_examined)?
+            .contains(&hash)
+        {
             continue;
         }
         metrics.supersede_probes.increment();
@@ -3208,16 +3283,28 @@ pub(crate) fn query_view_costed(
             if limit == 0 {
                 return Ok(Vec::new());
             }
-            let mut buffered: Vec<Span> = writer
-                .spans
-                .iter()
-                .filter(|span| {
-                    visible(span)
-                        && span_matches(span, filter, content.as_ref())
-                        && cursor.map_or(true, |position| span_after_cursor(span, position))
-                })
-                .map(|span| Span::clone(span))
-                .collect();
+            // The buffer sweep is budgeted like a segment decode: the spans
+            // are already in memory, but `span_matches` (a content query
+            // most of all) is real per-span work over a buffer that can hold
+            // tens of thousands of spans, and building this whole source
+            // before the merge's first check let it escape the budget
+            // (external review of v0.24.1). Same cadence as everywhere: one
+            // check per few thousand spans.
+            let mut buffered: Vec<Span> = Vec::new();
+            let mut swept_since_check: usize = 0;
+            for span in writer.spans.iter() {
+                swept_since_check += 1;
+                if swept_since_check >= DEADLINE_CHECK_INTERVAL {
+                    swept_since_check = 0;
+                    Deadline::check(deadline, cost.segments_examined)?;
+                }
+                if visible(span)
+                    && span_matches(span, filter, content.as_ref())
+                    && cursor.map_or(true, |position| span_after_cursor(span, position))
+                {
+                    buffered.push(Span::clone(span));
+                }
+            }
             sort_spans(&mut buffered);
 
             enum Source<'a> {
@@ -3383,6 +3470,11 @@ pub(crate) fn query_view_costed(
                     result.push(span);
                 }
             }
+            // The final check, before a complete answer leaves: a request
+            // whose budget ran out finishing its last stretch of work is
+            // refused, not rewarded — the same rule every path here applies
+            // mid-stream.
+            Deadline::check(deadline, cost.segments_examined)?;
             return Ok(result);
         }
 
@@ -3449,7 +3541,17 @@ pub(crate) fn query_view_costed(
                 }
             }
         }
+        // The buffer sweep continues the segment loops' own cadence — the
+        // counter carries over, so the un-checked stretch across the
+        // boundary stays one check interval. An unchecked sweep here
+        // answered a whole buffered corpus under an exhausted budget
+        // (external review of v0.24.1).
         for span in writer.spans.iter() {
+            decoded_since_check += 1;
+            if decoded_since_check >= DEADLINE_CHECK_INTERVAL {
+                decoded_since_check = 0;
+                Deadline::check(deadline, cost.segments_examined)?;
+            }
             if visible(span)
                 && span_matches(span, filter, content.as_ref())
                 && cursor.map_or(true, |bound| span_after_cursor(span, bound))
@@ -3459,6 +3561,8 @@ pub(crate) fn query_view_costed(
         }
 
         sort_spans(&mut result);
+        // Final check before a complete answer leaves; see the limited path.
+        Deadline::check(deadline, cost.segments_examined)?;
         Ok(result)
     }
 }
@@ -3552,11 +3656,22 @@ pub(crate) fn fold_view(
             }
         }
     }
+    // Budgeted like the query path's buffer sweep, continuing the same
+    // counter so the cadence holds across the segments/buffer boundary.
     for span in writer.spans.iter() {
+        decoded_since_check += 1;
+        if decoded_since_check >= DEADLINE_CHECK_INTERVAL {
+            decoded_since_check = 0;
+            Deadline::check(deadline, cost.segments_examined)?;
+        }
         if visible(span) && span_matches(span, filter, content.as_ref()) {
             visit(span);
         }
     }
+    // Final check before the fold reports completion: a fold past its
+    // budget must surface as `DeadlineExceeded`, never as a full aggregate
+    // that happens to have finished late.
+    Deadline::check(deadline, cost.segments_examined)?;
     Ok(())
 }
 
@@ -4220,11 +4335,20 @@ impl Store {
         reference: &str,
         deadline: Option<Deadline>,
     ) -> Result<bool> {
-        // The write buffer first: cheap, and where the freshest refs live.
+        // The write buffer first: cheap per span, and where the freshest
+        // refs live — but a full buffer is still tens of thousands of
+        // reference walks, so it keeps the standard cadence.
+        let mut segments_examined: u32 = 0;
+        let mut decoded_since_check: usize = 0;
         {
             let writer = self.lock_writer()?;
             let mut refs = std::collections::HashSet::new();
             for span in writer.spans.iter() {
+                decoded_since_check += 1;
+                if decoded_since_check >= DEADLINE_CHECK_INTERVAL {
+                    decoded_since_check = 0;
+                    Deadline::check(deadline, segments_examined)?;
+                }
                 if span.tenant == tenant {
                     erasure::payload_refs_of(span, &mut refs);
                     if refs.contains(reference) {
@@ -4238,13 +4362,14 @@ impl Store {
         // The rollup comes through `segment_rollup` — cache, then sidecar,
         // then a rebuild that writes the sidecar back — so a missing sidecar
         // costs one decode ever, not one per probe.
-        let mut segments_examined: u32 = 0;
-        let mut decoded_since_check: usize = 0;
         for segment in self.pin_segments()? {
             Deadline::check(deadline, segments_examined)?;
             segments_examined += 1;
+            // The budget goes into the rollup read itself: a sidecar miss
+            // rebuilds by decoding the whole segment, which the per-segment
+            // check above cannot bound.
             if !self
-                .segment_rollup(&segment)?
+                .segment_rollup(&segment, deadline, segments_examined)?
                 .payload_refs
                 .contains(reference)
             {
@@ -4283,6 +4408,9 @@ impl Store {
                 }
             }
         }
+        // Final check before a complete "not held" leaves; see
+        // `query_view_costed`.
+        Deadline::check(deadline, segments_examined)?;
         Ok(false)
     }
 

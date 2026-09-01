@@ -5,6 +5,64 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **The query deadline reaches the rollup sidecar rebuild.** External
+  review of v0.24.1 found two query paths that check the budget per
+  segment and then rebuild a missing rollup sidecar INSIDE the segment
+  with no check at all — the scoped payload fetch's reachability probe
+  and the analytics fold's fast path. A 50k-span rebuild ran to
+  completion under a 1 ms budget (~1 s of decode) and answered as though
+  the probe had been cheap. The rebuild's record-decode loop now runs
+  under the calling request's budget at the standard cadence, with a
+  final check before it returns; second-round review found the sibling —
+  the supersede prefilter's key-hash rebuild, reachable per emitted span
+  on every query and fold — and it is threaded the same way. The
+  maintenance TTL sweep passes no budget, exactly as the deadline
+  contract exempts it, and the shadowed-tail scan never rebuilds at all
+  (a segment without a sidecar ends that scan).
+- **Buffered spans no longer escape the query deadline.** The same
+  review found every buffered-span sweep unchecked: an unflushed
+  20k-span corpus answered complete results under a zero budget on the
+  unlimited query, fold, session-union, and analytics-rollup paths, and
+  the limited query built its whole buffer source before the merge's
+  first check. Every buffer sweep on a query path now checks at the
+  standard cadence, and every budgeted query path performs one final
+  check before returning a completed answer — a request past its budget
+  is refused, never rewarded for finishing late. The deadline's cost
+  statement in docs/configuration.md is amended to match.
+- **The segment header's timestamp range is validated, never trusted.**
+  The same review demonstrated the harm: the two range words carry no
+  checksum, `may_contain_timestamps` pruned whole segments on them
+  before any validation, and editing sixteen header bytes silently hid a
+  record the store could still decode — the false-negative predicate the
+  corruption contract forbids. Both opens now prove both declared bounds
+  against record bytes: the eager open against every record, the lazy
+  open by decoding the first block (whose fence-vs-first-record check
+  pins the declared min to the actual first record) and reading the last
+  record's timestamp — the true max, records being timestamp-sorted —
+  which must equal the declared max. Second-round review forced that
+  grounding: pinning the min to the first FENCE alone could be colluded
+  with, since the fence is unchecksummed metadata too — raising the
+  header word and the fence together still silently hid the head window.
+  A metadata-only forgery of the range is now refused at open on either
+  bound; a forgery must alter record bytes plus the block crc32 to get
+  past it, which the validation's own decode catches. An empty segment
+  must declare the canonical empty range, and any record read outside
+  the declared range still fails loud as corrupt. Deliberate amendment
+  #5 in docs/segment-format.md states the validation and its cost — two
+  bounded block decodes per lazy open, dropped from the cache after.
+- **The canonical benchmark's filter gate gained a semantic oracle.**
+  Review also noted the bench recorded filter latency on any 200 with
+  parseable JSON — a wrong or empty answer would have been timed and
+  published as a healthy number. Each filter sample now asserts the
+  exact span count the corpus construction defines, the requested
+  `benchmark.group` value on every returned span, and the exact expected
+  span ids, before its latency is recorded; a wrong answer aborts the
+  run under the same refuse-to-publish rule as the gates.
+
 ## [0.24.1] - 2026-08-31
 
 ### Fixed
