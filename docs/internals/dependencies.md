@@ -7,14 +7,19 @@ job** and **what the dependency's own footprint is**. This file is where
 those justifications live, one section per decision, so that the absence of
 a dependency reads as a decision rather than an accident.
 
-The count today: **three direct dependencies** — `serde`, `serde_json`, and
-`lz4_flex` (argued in its own section below). The native wire is JSON in both
-directions and so are the annotation, eval, tombstone and manifest files;
-hand-writing serialization for every API type would be more code, and more
-wrong code, than the dependency. Everything else — HTTP, the OTLP protobuf
-decoder, the WAL, SHA-256, the digests, the Bloom filters — is the standard
-library, on purpose. The full supply chain is the lockfile: 13 packages,
-Traza itself included.
+The count today: **three direct dependencies in a default build** — `serde`,
+`serde_json`, and `lz4_flex` (argued in its own section below). The native
+wire is JSON in both directions and so are the annotation, eval, tombstone
+and manifest files; hand-writing serialization for every API type would be
+more code, and more wrong code, than the dependency. Everything else — HTTP,
+the OTLP protobuf decoder, the WAL, SHA-256, the digests, the Bloom filters —
+is the standard library, on purpose.
+
+The **opt-in `object-storage` feature** (preview) is the one deliberate
+exception, argued in its own section below: it adds `object_store` (plus
+`tokio`, `futures-util`, `async-trait`) behind a default-off feature, so a
+default build compiles none of it and the standalone supply chain stays the
+lockfile's small core.
 
 ---
 
@@ -134,3 +139,44 @@ the dependency it would avoid — which is exactly the test the budget asks.
 - **The HA track neither gates nor is gated by this.** Ship/follow/promote
   work proceeds independently of the v7 format, and nothing in this
   dependency decision waits on it.
+
+---
+
+## object_store — the opt-in object-storage archive (accepted as a preview, feature-gated, ships in 0.26.0-preview.1)
+
+This is the "gets its own entry when that phase is real" entry the TLS
+ruling above promised. The `object-storage` feature publishes verified pins
+to S3-compatible storage and queries them by ranged reads
+(`src/object_storage`, [operations guide](../operations/object-storage.md)).
+
+**The job.** Speak S3: SigV4 request signing, TLS, HTTP with retries and
+timeouts, multipart upload, conditional create, ranged reads, listing.
+
+**Why the standard library cannot reasonably do this job.** The same shape
+as the LZ4 argument, one tier up: hand-rolling an HTTPS client plus SigV4
+against a live cloud API is a security surface, not a codec, and every line
+of it would be the least-reviewed TLS/signing code its users run.
+`object_store` is the Rust ecosystem's maintained, widely-deployed
+implementation (Arrow/DataFusion lineage), and it owns exactly the layer
+this feature must not: transport, TLS (verifying by default; plain HTTP only
+by explicit opt-in), signing, retries.
+
+**Footprint, and why it is acceptable here and not in the core.**
+
+- **Default builds compile none of it.** All four direct additions
+  (`object_store` — pinned exact, `default-features = false`,
+  `features = ["aws"]` only — plus `tokio` `rt`/`sync`/`time`,
+  `futures-util`, and `async-trait` for the injectable fault backend) are
+  `optional = true` behind the default-off `object-storage` feature. The
+  standalone binary's dependency story is unchanged; the lockfile grows,
+  the built artifact does not.
+- **The transitive graph is real** (an async HTTP/TLS stack), which is why
+  this ships as a *feature*, with its own toolchain floor recorded in
+  `package.metadata.traza.object-storage-rust-version` rather than moving
+  the crate's `rust-version` — the standalone MSRV stays 1.81.
+- **Pinned exact** (`=0.14.1`): its wire behaviour is part of the archive's
+  security posture, so upgrading is a deliberate act, not a routine bump.
+- **What is still not taken:** no TLS or HTTP in the core engine or server,
+  no local-filesystem `object_store` backend (the engine's own file I/O
+  stays std), and no second copy of hashing — the archive's digests are the
+  crate's own SHA-256.

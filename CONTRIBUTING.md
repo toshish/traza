@@ -4,7 +4,7 @@ Thanks for helping build Traza. This document covers everything needed to go fro
 
 ## Development setup
 
-You need stable Rust (1.81 or newer, installed via [rustup](https://rustup.rs)) to build the server, and Node 22 or newer (see [`ui/.nvmrc`](ui/.nvmrc)) to build the dashboard. There is no database to run, no container to start, no service to configure:
+You need Rust 1.81 or newer (installed via [rustup](https://rustup.rs)) for the default standalone server, and Node 22 or newer (see [`ui/.nvmrc`](ui/.nvmrc)) for the dashboard. The optional `object-storage` feature and full CI gate require Rust 1.89 or newer, as declared separately in `Cargo.toml`. Python 3.10 or newer is required for release-channel checks, dependency notices, and the S3 integration harness. A standalone build needs no external service:
 
 ```sh
 git clone https://github.com/toshish/traza.git
@@ -23,11 +23,21 @@ The dashboard is a separate build artifact, never compiled into the binary — t
 cargo fmt -- --check                                       # formatting
 cargo clippy --all-targets --all-features -- -D warnings   # lints, warnings are errors
 cargo build --release                                      # release build
-cargo test                                                 # test suite
+cargo test --locked                                        # standalone test suite
+cargo test --features object-storage --locked              # optional feature suite
+python3 scripts/test-release-channel.py                    # stable and preview channels
+python3 scripts/test-rust-notices.py                       # notice collection checks
+python3 scripts/generate-rust-notices.py --check            # locked dependency notices
+python3 scripts/test-object-s3.py                         # authenticated disposable S3 backend
 (cd ui && npm ci && npm test && npm run build)             # dashboard
 ```
 
 The NUL-byte check is a gate rather than a guideline because it actually happened: a literal NUL makes git treat a source file as binary, its diff disappears from review, and grep and blame stop working on it.
+
+The object-storage harness downloads a checksum-pinned SeaweedFS binary for
+the supported Linux and macOS release platforms, starts an authenticated
+loopback S3 service with synthetic credentials, runs the real integration
+tests, and removes the temporary service and data when it finishes.
 
 The dashboard is a first-class part of the product, so a UI that does not build — or whose vitest suite fails — must not merge green. `TRAZA_SKIP_UI=1` skips that step for a deliberate Rust-only run, not for a merge.
 
@@ -64,7 +74,7 @@ Documentation lives in [`docs/`](docs/README.md), organised by audience: `guide/
 ## Pull request expectations
 
 - **`./ci.sh` is green.** Every gate, no exceptions.
-- **No new dependencies without justification.** Traza deliberately has three direct dependencies (`serde`, `serde_json`, `lz4_flex`); everything else uses the standard library. A PR that adds a dependency must explain why the standard library cannot reasonably do the job, and what the dependency's own footprint is. The written justifications live in [docs/internals/dependencies.md](docs/internals/dependencies.md), one section per decision — that is where a new one goes.
+- **No new dependencies without justification.** The standalone profile keeps three direct dependencies (`serde`, `serde_json`, `lz4_flex`). Object storage adds an optional maintained HTTP/TLS/signing stack. A PR that adds a dependency must explain its purpose and footprint in [docs/internals/dependencies.md](docs/internals/dependencies.md), preserve the feature boundary and advertised Rust floors, and regenerate the dependency notices with `python3 scripts/generate-rust-notices.py` after updating `Cargo.lock`.
 - **Public items are documented.** The crate denies `missing_docs`; clippy will hold you to it. `#![forbid(unsafe_code)]` is not negotiable.
 - **Focused diffs.** One logical change per PR; imperative mood in commit subjects ("Add X", "Fix Y").
 - **Honest claims.** Performance and durability statements in docs must be backed by a benchmark run or a test.

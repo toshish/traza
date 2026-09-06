@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "traza"
-version = "0.25.0"
+version = "0.26.0-preview.1"
 edition = "2021"
 rust-version = "1.81"
 description = "Single-binary trace datastore with first-class LLM/agent observability: OTLP ingest, sessions, token/cost analytics, and a built-in dashboard"
@@ -47,6 +47,21 @@ path = "src/bin/index-mem-bench.rs"
 name = "query-bench"
 path = "src/bin/query-bench.rs"
 
+[[bin]]
+name = "traza-object"
+path = "src/bin/traza-object.rs"
+required-features = ["object-storage"]
+
+[features]
+# Immutable snapshot archive on S3-compatible object storage: publish a
+# verified pin, query it remotely by range reads, restore it, and manage
+# snapshots. Off by default so the standalone engine keeps its dependency
+# footprint and MSRV (1.81); the resolved floor for THIS feature is recorded
+# in `package.metadata.traza.object-storage-rust-version` because the
+# transitive graph (object_store and its HTTP/TLS stack) requires a newer
+# toolchain than the standalone crate does.
+object-storage = ["dep:object_store", "dep:tokio", "dep:futures-util", "dep:async-trait"]
+
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -55,6 +70,25 @@ serde_json = "1.0"
 # commit, never a routine bump. Feature choice argued in
 # docs/internals/dependencies.md.
 lz4_flex = { version = "=0.14.0", default-features = false, features = ["std", "safe-encode", "safe-decode"] }
+# --- object-storage feature only; a default build compiles none of these. ---
+# Pinned exact and default-features off: object_store owns HTTP, TLS and
+# SigV4 for the archive, and its wire behaviour is part of the archive's
+# security posture — upgrading it is a deliberate act, not a routine bump.
+# Only the `aws` backend is enabled; no other cloud, no local-fs backend.
+object_store = { version = "=0.14.1", default-features = false, features = ["aws"], optional = true }
+# A dedicated runtime for the synchronous adapter around object_store's async
+# API (`object_storage::runtime`); the engine itself stays synchronous.
+tokio = { version = "1", default-features = false, features = ["rt", "sync", "time"], optional = true }
+futures-util = { version = "0.3", default-features = false, features = ["std"], optional = true }
+# Needed to implement `object_store::ObjectStore` for the injectable fault
+# backend used by the feature's tests.
+async-trait = { version = "0.1", optional = true }
+
+[package.metadata.traza]
+# Minimum Rust toolchain that builds `--features object-storage`, governed by
+# the resolved transitive graph (object_store 0.14 and its HTTP/TLS stack;
+# edition 2024). The crate's own `rust-version` stays the standalone MSRV.
+object-storage-rust-version = "1.89"
 
 [profile.release]
 lto = "thin"

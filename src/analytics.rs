@@ -1445,6 +1445,7 @@ pub(crate) fn resolve_session_spans_in(
     tenant: Option<&str>,
     session_id: &str,
     mask: Option<&crate::erasure::Mask>,
+    deadline: Option<crate::Deadline>,
 ) -> Result<Vec<Span>> {
     let candidates = crate::attribute_union_view(
         buffer,
@@ -1452,9 +1453,11 @@ pub(crate) fn resolve_session_spans_in(
         &semconv::SESSION_KEYS,
         &session_values(session_id),
         mask,
-        // A snapshot's callers are the documented-unbounded streams; see
-        // [`crate::SnapshotView::query_after`].
-        None,
+        // `None` from a pinned view's callers — the documented-unbounded
+        // streams (see [`crate::SnapshotView::query_after`]) — and a real
+        // budget from the remote snapshot, whose scans cost money as well
+        // as time.
+        deadline,
     )?;
     Ok(narrow_to_session(candidates, tenant, session_id))
 }

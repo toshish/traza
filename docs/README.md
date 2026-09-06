@@ -54,6 +54,10 @@ Deploying, tuning, and keeping it healthy.
   payload offloading, and backups.
 - **[Backup and restore](operations/backup.md)** — generations, `CURRENT`, and
   the pin-verify-copy backup that runs without stopping the server.
+- **[Object-storage archive (preview)](operations/object-storage.md)** —
+  publish a verified pin to S3-compatible storage as an immutable snapshot
+  that is queryable by range reads, restorable, and deletable; behind the
+  `object-storage` cargo feature.
 - **[Monitoring](operations/monitoring.md)** — `GET /v1/metrics` and
   `GET /v1/stats`, what each metric means, and what is worth alerting on.
 - **[Capacity and performance](operations/capacity.md)** — measured

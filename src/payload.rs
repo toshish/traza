@@ -117,6 +117,10 @@ impl Sha256 {
                 let block = self.pending;
                 self.compress(&block);
                 self.pending_len = 0;
+            } else {
+                // This update did not fill the buffered block. Preserve
+                // the tail, including when the incoming chunk was empty.
+                return;
             }
         }
         let mut chunks = bytes.chunks_exact(64);
@@ -513,7 +517,7 @@ pub(crate) fn sweep_expired(
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_blob, encode_blob, sha256_hex, store_payload, sweep_expired, TouchRegistry,
+        decode_blob, encode_blob, sha256_hex, store_payload, sweep_expired, Sha256, TouchRegistry,
     };
     use std::collections::HashSet;
     use std::time::{Duration, Instant, SystemTime};
@@ -617,5 +621,46 @@ mod tests {
             sha256_hex(&million_a),
             "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
         );
+    }
+
+    #[test]
+    fn streaming_sha256_is_independent_of_chunk_boundaries() {
+        let vectors: Vec<(Vec<u8>, &str)> = vec![
+            (
+                Vec::new(),
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            ),
+            (
+                b"abc".to_vec(),
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            ),
+            (
+                b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq".to_vec(),
+                "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1",
+            ),
+            // Independent oracle: Python hashlib.sha256(bytes(range(256))*4).
+            (
+                (0..=255u8).cycle().take(1024).collect(),
+                "785b0751fc2c53dc14a4ce3d800e69ef9ce1009eb327ccf458afe09c242c26c9",
+            ),
+        ];
+        for (input, expected) in vectors {
+            for chunk_bytes in [1, 2, 3, 7, 31, 55, 56, 63, 64, 65, 127, 128, 129] {
+                let mut hasher = Sha256::new();
+                hasher.update(&[]);
+                for chunk in input.chunks(chunk_bytes) {
+                    hasher.update(chunk);
+                    hasher.update(&[]);
+                }
+                assert_eq!(hasher.finalize_hex(), expected, "chunk size {chunk_bytes}");
+            }
+            for split in 0..=input.len() {
+                let mut hasher = Sha256::new();
+                hasher.update(&input[..split]);
+                hasher.update(&[]);
+                hasher.update(&input[split..]);
+                assert_eq!(hasher.finalize_hex(), expected, "split at {split}");
+            }
+        }
     }
 }
