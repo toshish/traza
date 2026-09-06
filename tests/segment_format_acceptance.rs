@@ -145,10 +145,195 @@ mod offsets {
     pub const MAX_TIMESTAMP: usize = 88;
     /// The content index, which is what bounds the attribute index.
     pub const CONTENT_INDEX_OFFSET: usize = 96;
-    /// The three u64s v7 appends.
+    /// The three u64s v7 appended.
     pub const DIRECTORY_OFFSET: usize = 104;
     pub const DIRECTORY_LEN: usize = 112;
     pub const RECORDS_LOGICAL_LEN: usize = 120;
+    /// v8's header CRC-32, over bytes [0, 128).
+    pub const HEADER_CRC: usize = 128;
+}
+
+/// Byte length of the section wrapper every v8 metadata section starts with:
+/// CRC-32 over everything after the checksum word, a flags word (bit 0 =
+/// LZ4-compressed body), and the body's uncompressed length.
+const WRAPPER: usize = 16;
+
+/// Hand-unwraps one metadata section at `[start, start + len)`: verifies the
+/// wrapper checksum with the test-local CRC implementation, honors the flags
+/// word, and returns the uncompressed body.
+fn unwrap_section_at(bytes: &[u8], start: usize, len: usize) -> Vec<u8> {
+    let raw = &bytes[start..start + len];
+    assert!(raw.len() >= WRAPPER, "section holds at least its wrapper");
+    assert_eq!(
+        crc32_ieee(&raw[4..]),
+        get_u32(raw, 0),
+        "the wrapper checksum covers flags, length and body"
+    );
+    let flags = get_u32(raw, 4);
+    assert_eq!(flags & !1, 0, "only the lz4 flag is defined");
+    let logical = get_u64(raw, 8);
+    let body = &raw[WRAPPER..];
+    if flags & 1 == 0 {
+        assert_eq!(
+            logical,
+            body.len() as u64,
+            "a raw body's declared length is its stored length"
+        );
+        body.to_vec()
+    } else {
+        let inflated =
+            lz4_flex::block::decompress(body, logical as usize).expect("section body inflates");
+        assert_eq!(
+            inflated.len() as u64,
+            logical,
+            "body inflates to its length"
+        );
+        inflated
+    }
+}
+
+/// Re-wraps a (possibly forged) section body raw, recomputing the wrapper
+/// checksum — the tool forgery tests use to march edited metadata PAST the
+/// wrapper CRC, proving the deeper record-anchored checks hold on their own.
+fn wrap_section_raw(body: &[u8]) -> Vec<u8> {
+    let mut tail = Vec::with_capacity(12 + body.len());
+    tail.extend_from_slice(&0u32.to_le_bytes());
+    tail.extend_from_slice(&(body.len() as u64).to_le_bytes());
+    tail.extend_from_slice(body);
+    let mut out = Vec::with_capacity(4 + tail.len());
+    out.extend_from_slice(&crc32_ieee(&tail).to_le_bytes());
+    out.extend_from_slice(&tail);
+    out
+}
+
+/// Rebuilds a whole segment file around one replaced metadata section,
+/// keeping every other byte and fixing the header's section offsets and its
+/// CRC. `section` names which header words to rewrite.
+fn replace_section(
+    bytes: &[u8],
+    section_start: usize,
+    section_len: usize,
+    new_raw: Vec<u8>,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    out.extend_from_slice(&bytes[..section_start]);
+    out.extend_from_slice(&new_raw);
+    out.extend_from_slice(&bytes[section_start + section_len..]);
+    let delta = new_raw.len() as i64 - section_len as i64;
+    // Shift every section offset that lies beyond the replaced one, and the
+    // replaced section's own length word where the header stores one.
+    for word in [
+        offsets::RECORDS_OFFSET,
+        offsets::DIRECTORY_OFFSET,
+        offsets::OFFSETS_OFFSET,
+        offsets::TRACE_INDEX_OFFSET,
+        offsets::ATTRIBUTE_INDEX_OFFSET,
+        offsets::CONTENT_INDEX_OFFSET,
+    ] {
+        let value = get_u64(bytes, word);
+        if value as usize > section_start {
+            let shifted = (value as i64 + delta) as u64;
+            out[word..word + 8].copy_from_slice(&shifted.to_le_bytes());
+        }
+    }
+    for (offset_word, len_word) in [
+        (offsets::DIRECTORY_OFFSET, offsets::DIRECTORY_LEN),
+        (offsets::OFFSETS_OFFSET, offsets::OFFSETS_LEN),
+        (offsets::TRACE_INDEX_OFFSET, offsets::TRACE_INDEX_LEN),
+    ] {
+        if get_u64(bytes, offset_word) as usize == section_start {
+            out[len_word..len_word + 8].copy_from_slice(&(new_raw.len() as u64).to_le_bytes());
+        }
+    }
+    rewrite_header_crc(&mut out);
+    out
+}
+
+/// Recomputes the header CRC over bytes [0, 128) — what a forgery test calls
+/// after editing header words, so the edit reaches the check it aims at
+/// instead of stopping loudly (and trivially) at the checksum.
+fn rewrite_header_crc(bytes: &mut [u8]) {
+    let crc = crc32_ieee(&bytes[..offsets::HEADER_CRC]);
+    bytes[offsets::HEADER_CRC..offsets::HEADER_CRC + 4].copy_from_slice(&crc.to_le_bytes());
+}
+
+/// Rewraps the block-directory section around an edited body, recomputing
+/// the wrapper checksum so a directory forgery reaches the record-anchored
+/// validation behind it.
+fn replace_directory_body(bytes: &[u8], body: &[u8]) -> Vec<u8> {
+    let start = get_u64(bytes, offsets::DIRECTORY_OFFSET) as usize;
+    let len = get_u64(bytes, offsets::DIRECTORY_LEN) as usize;
+    replace_section(bytes, start, len, wrap_section_raw(body))
+}
+
+/// Writes one LEB128 varint — the forgery tests' own encoder, independent of
+/// the crate's.
+fn put_varint(output: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value == 0 {
+            output.push(byte);
+            return;
+        }
+        output.push(byte | 0x80);
+    }
+}
+
+/// Writes one delta-coded posting list the way the format stores them:
+/// varint count, absolute first offset, strictly positive gaps.
+fn put_postings(output: &mut Vec<u8>, offsets_in: &[u64]) {
+    put_varint(output, offsets_in.len() as u64);
+    let mut previous = None;
+    for offset in offsets_in {
+        match previous {
+            None => put_varint(output, *offset),
+            Some(value) => put_varint(output, *offset - value),
+        }
+        previous = Some(*offset);
+    }
+}
+
+/// Reads one LEB128 varint at the cursor.
+fn get_varint(bytes: &[u8], cursor: &mut usize) -> u64 {
+    let mut value = 0u64;
+    let mut shift = 0u32;
+    loop {
+        let byte = bytes[*cursor];
+        *cursor += 1;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return value;
+        }
+        shift += 7;
+        assert!(shift <= 63, "varint is longer than ten bytes");
+    }
+}
+
+/// Hand-parses the record-offset index: `record_count` varints, the first
+/// absolute, the rest strictly positive gaps, accounting for every body byte.
+fn parse_record_offsets(bytes: &[u8]) -> Vec<u64> {
+    let start = get_u64(bytes, offsets::OFFSETS_OFFSET) as usize;
+    let len = get_u64(bytes, offsets::OFFSETS_LEN) as usize;
+    let body = unwrap_section_at(bytes, start, len);
+    let count = get_u64(bytes, offsets::RECORD_COUNT) as usize;
+    let mut cursor = 0usize;
+    let mut offsets_out = Vec::with_capacity(count);
+    let mut previous: Option<u64> = None;
+    for _ in 0..count {
+        let word = get_varint(&body, &mut cursor);
+        let offset = match previous {
+            None => word,
+            Some(value) => {
+                assert!(word > 0, "offset gaps are strictly positive");
+                value + word
+            }
+        };
+        previous = Some(offset);
+        offsets_out.push(offset);
+    }
+    assert_eq!(cursor, body.len(), "the offsets body holds nothing else");
+    offsets_out
 }
 
 /// Where the attribute index ends: the content index's offset.
@@ -167,29 +352,39 @@ struct DirEntry {
     min_timestamp: u64,
 }
 
-/// Hand-parses the block directory at its documented 32-byte-entry layout.
+/// Hand-parses the block directory: the section wrapper is unwrapped first,
+/// then the body read at its documented 32-byte-entry layout.
 fn parse_directory(bytes: &[u8]) -> Vec<DirEntry> {
     let start = get_u64(bytes, offsets::DIRECTORY_OFFSET) as usize;
     let length = get_u64(bytes, offsets::DIRECTORY_LEN) as usize;
+    let body = unwrap_section_at(bytes, start, length);
     assert_eq!(
-        length % DIRECTORY_ENTRY_LEN,
+        body.len() % DIRECTORY_ENTRY_LEN,
         0,
-        "the directory is whole 32-byte entries"
+        "the directory body is whole 32-byte entries"
     );
-    (0..length / DIRECTORY_ENTRY_LEN)
+    (0..body.len() / DIRECTORY_ENTRY_LEN)
         .map(|index| {
-            let base = start + index * DIRECTORY_ENTRY_LEN;
-            let word = get_u32(bytes, base + 16);
+            let base = index * DIRECTORY_ENTRY_LEN;
+            let word = get_u32(&body, base + 16);
             DirEntry {
-                logical_start: get_u64(bytes, base),
-                stored_offset: get_u64(bytes, base + 8),
+                logical_start: get_u64(&body, base),
+                stored_offset: get_u64(&body, base + 8),
                 stored_len: word & 0x7fff_ffff,
                 raw: word & (1 << 31) != 0,
-                crc32: get_u32(bytes, base + 20),
-                min_timestamp: get_u64(bytes, base + 24),
+                crc32: get_u32(&body, base + 20),
+                min_timestamp: get_u64(&body, base + 24),
             }
         })
         .collect()
+}
+
+/// The block-directory body's raw bytes, unwrapped — what a directory
+/// forgery edits before `replace_directory_body` re-wraps it.
+fn directory_body(bytes: &[u8]) -> Vec<u8> {
+    let start = get_u64(bytes, offsets::DIRECTORY_OFFSET) as usize;
+    let length = get_u64(bytes, offsets::DIRECTORY_LEN) as usize;
+    unwrap_section_at(bytes, start, length)
 }
 
 /// Reconstructs the LOGICAL record region by walking the directory and
@@ -240,19 +435,23 @@ fn inflate_records_region(bytes: &[u8]) -> Vec<u8> {
     region
 }
 
-/// The key dictionary as the attribute section stores it: distinct keys,
-/// sorted, length-prefixed.
-fn parse_dictionary(bytes: &[u8]) -> Vec<String> {
+/// The attribute section's unwrapped body.
+fn attribute_body(bytes: &[u8]) -> Vec<u8> {
     let start = get_u64(bytes, offsets::ATTRIBUTE_INDEX_OFFSET) as usize;
-    let mut cursor = start;
-    let key_count = get_u32(bytes, cursor) as usize;
-    cursor += 4;
+    unwrap_section_at(bytes, start, attribute_index_end(bytes) - start)
+}
+
+/// The key dictionary as the attribute section stores it: distinct keys,
+/// sorted, varint-length-prefixed.
+fn parse_dictionary(bytes: &[u8]) -> Vec<String> {
+    let body = attribute_body(bytes);
+    let mut cursor = 0usize;
+    let key_count = get_varint(&body, &mut cursor) as usize;
     let mut dictionary = Vec::with_capacity(key_count);
     for _ in 0..key_count {
-        let key_len = get_u32(bytes, cursor) as usize;
-        cursor += 4;
+        let key_len = get_varint(&body, &mut cursor) as usize;
         dictionary.push(
-            std::str::from_utf8(&bytes[cursor..cursor + key_len])
+            std::str::from_utf8(&body[cursor..cursor + key_len])
                 .expect("utf-8 key")
                 .to_owned(),
         );
@@ -298,7 +497,7 @@ fn format_conformance() {
     );
     assert_eq!(get_u16(&bytes, offsets::VERSION), VERSION, "format version");
     assert_eq!(
-        VERSION, 7,
+        VERSION, 8,
         "one readable format, numbered after every version that shipped before it"
     );
     assert_eq!(
@@ -306,11 +505,19 @@ fn format_conformance() {
         HEADER_LEN,
         "header length field matches the exported constant"
     );
-    assert_eq!(HEADER_LEN, 128, "header is 128 bytes");
+    assert_eq!(
+        HEADER_LEN, 132,
+        "header is v7's 128 field bytes plus the CRC word"
+    );
     assert_eq!(
         get_u32(&bytes, offsets::CODEC),
         Codec::Lz4.id(),
         "the default encoder writes the lz4 codec id in v6's reserved word"
+    );
+    assert_eq!(
+        get_u32(&bytes, offsets::HEADER_CRC),
+        crc32_ieee(&bytes[..offsets::HEADER_CRC]),
+        "the header CRC covers bytes [0, 128) under the documented polynomial"
     );
 
     // The timestamp range, hand-parsed at its documented offsets. This is
@@ -388,31 +595,19 @@ fn format_conformance() {
         "sections must account for every byte — no trailing slack"
     );
 
-    // The record-offset index is one u64 per record, by construction.
-    assert_eq!(
-        get_u64(&bytes, offsets::OFFSETS_LEN),
-        records.len() as u64 * 8,
-        "record-offset index length"
-    );
-
-    // Those offsets are LOGICAL — relative to the uncompressed record region
-    // — and strictly ascending.
+    // The record-offset index is one varint per record — the first absolute,
+    // the rest strictly positive gaps — inside a checksummed wrapper.
+    // `parse_record_offsets` asserts the gap rule and that the body holds
+    // nothing else; the offsets are LOGICAL, relative to the uncompressed
+    // record region.
     let logical_len = get_u64(&bytes, offsets::RECORDS_LOGICAL_LEN);
-    let offsets_offset = get_u64(&bytes, offsets::OFFSETS_OFFSET) as usize;
-    let mut previous: Option<u64> = None;
-    for index in 0..records.len() {
-        let relative = get_u64(&bytes, offsets_offset + index * 8);
+    let record_offsets = parse_record_offsets(&bytes);
+    assert_eq!(record_offsets.len(), records.len(), "one offset per record");
+    for (index, relative) in record_offsets.iter().enumerate() {
         assert!(
-            relative < logical_len,
+            *relative < logical_len,
             "record {index} offset must fall inside the LOGICAL record region"
         );
-        if let Some(previous) = previous {
-            assert!(
-                relative > previous,
-                "record offsets must ascend: {relative} after {previous}"
-            );
-        }
-        previous = Some(relative);
     }
 
     // Directory arithmetic, hand-checked in full: logical starts from zero
@@ -421,9 +616,6 @@ fn format_conformance() {
     // boundary, min timestamps equal to each block's first record.
     let directory = parse_directory(&bytes);
     assert!(!directory.is_empty(), "a non-empty segment has blocks");
-    let record_offsets: Vec<u64> = (0..records.len())
-        .map(|index| get_u64(&bytes, offsets_offset + index * 8))
-        .collect();
     let mut stored_total = 0u64;
     for (index, entry) in directory.iter().enumerate() {
         if index == 0 {
@@ -481,12 +673,27 @@ fn format_conformance() {
         raw_file[raw_records_offset..raw_records_offset + raw_records_len].to_vec(),
         "the logical record bytes are codec-independent"
     );
-    let index_sections =
-        |file: &[u8]| file[get_u64(file, offsets::OFFSETS_OFFSET) as usize..].to_vec();
+    // Under the LZ4 codec the section wrappers may store compressed bodies,
+    // so the codec-independence claim is about the UNWRAPPED bodies: what a
+    // section means never depends on how its bytes are stored.
+    let index_bodies = |file: &[u8]| {
+        let offsets_start = get_u64(file, offsets::OFFSETS_OFFSET) as usize;
+        let offsets_len = get_u64(file, offsets::OFFSETS_LEN) as usize;
+        let trace_start = get_u64(file, offsets::TRACE_INDEX_OFFSET) as usize;
+        let trace_len = get_u64(file, offsets::TRACE_INDEX_LEN) as usize;
+        let attribute_start = get_u64(file, offsets::ATTRIBUTE_INDEX_OFFSET) as usize;
+        let content_start = get_u64(file, offsets::CONTENT_INDEX_OFFSET) as usize;
+        (
+            unwrap_section_at(file, offsets_start, offsets_len),
+            unwrap_section_at(file, trace_start, trace_len),
+            unwrap_section_at(file, attribute_start, content_start - attribute_start),
+            unwrap_section_at(file, content_start, file.len() - content_start),
+        )
+    };
     assert_eq!(
-        index_sections(&bytes),
-        index_sections(&raw_file),
-        "offset, trace, attribute, and content sections are codec-independent"
+        index_bodies(&bytes),
+        index_bodies(&raw_file),
+        "offset, trace, attribute, and content section bodies are codec-independent"
     );
 
     // Hand-decode the first record at the offset the index points to, using
@@ -907,6 +1114,9 @@ fn foreign_bytes_are_rejected() {
     // errors.
     let mut wrong_codec = segment::encode(&corpus()).expect("encode");
     wrong_codec[offsets::CODEC] = 9;
+    // Recomputed so the edit reaches the codec check rather than stopping at
+    // the header checksum — the refusal under test is the codec's.
+    rewrite_header_crc(&mut wrong_codec);
     let refusal = Segment::from_bytes(wrong_codec).expect_err("unknown codec is refused");
     assert!(
         refusal.to_string().contains("codec id 9"),
@@ -929,6 +1139,7 @@ fn foreign_bytes_are_rejected() {
     let records_len = get_u64(&gapped, offsets::RECORDS_LEN);
     gapped[offsets::RECORDS_LEN..offsets::RECORDS_LEN + 8]
         .copy_from_slice(&(records_len + 1).to_le_bytes());
+    rewrite_header_crc(&mut gapped);
     assert!(
         Segment::from_bytes(gapped).is_err(),
         "non-contiguous sections must be refused"
@@ -974,55 +1185,49 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 /// tell a verifying reader from a trusting one. Forging the collision is the
 /// only way to make the difference observable.
 fn forge_digest_collisions(bytes: &[u8], record_count: usize) -> Vec<u8> {
-    let attribute_start = get_u64(bytes, offsets::ATTRIBUTE_INDEX_OFFSET) as usize;
-    let offsets_offset = get_u64(bytes, offsets::OFFSETS_OFFSET) as usize;
-    let all: Vec<u64> = (0..record_count)
-        .map(|ordinal| get_u64(bytes, offsets_offset + ordinal * 8))
-        .collect();
-
-    let mut cursor = attribute_start;
-    let key_count = get_u32(bytes, cursor) as usize;
-    cursor += 4;
+    let all = parse_record_offsets(bytes);
+    assert_eq!(all.len(), record_count, "one offset per record");
+    let body = attribute_body(bytes);
+    let mut cursor = 0usize;
+    let key_count = get_varint(&body, &mut cursor) as usize;
     let dictionary_start = cursor;
     for _ in 0..key_count {
-        cursor += 4 + get_u32(bytes, cursor) as usize;
+        let key_len = get_varint(&body, &mut cursor) as usize;
+        cursor += key_len;
     }
-    let dictionary = &bytes[dictionary_start..cursor];
-    let entry_count = get_u32(bytes, cursor) as usize;
-    cursor += 4;
+    let dictionary = body[dictionary_start..cursor].to_vec();
+    let entry_count = get_varint(&body, &mut cursor) as usize;
 
-    let mut section = Vec::new();
-    section.extend_from_slice(&(key_count as u32).to_le_bytes());
-    section.extend_from_slice(dictionary);
-    section.extend_from_slice(&(entry_count as u32).to_le_bytes());
+    let mut forged = Vec::new();
+    put_varint(&mut forged, key_count as u64);
+    forged.extend_from_slice(&dictionary);
+    put_varint(&mut forged, entry_count as u64);
     for _ in 0..entry_count {
-        section.extend_from_slice(&bytes[cursor..cursor + 4]); // key id
-        cursor += 4;
-        section.extend_from_slice(&bytes[cursor..cursor + 16]); // digest
+        let key_id = get_varint(&body, &mut cursor);
+        put_varint(&mut forged, key_id);
+        forged.extend_from_slice(&body[cursor..cursor + 16]); // digest
         cursor += 16;
-        let posting_count = get_u32(bytes, cursor) as usize;
-        cursor += 4 + posting_count * 8;
-        section.extend_from_slice(&(all.len() as u32).to_le_bytes());
-        for offset in &all {
-            section.extend_from_slice(&offset.to_le_bytes());
+        // Skip the honest posting list; forge one naming every record.
+        let posting_count = get_varint(&body, &mut cursor) as usize;
+        for _ in 0..posting_count {
+            get_varint(&body, &mut cursor);
         }
+        put_postings(&mut forged, &all);
     }
-    let attribute_end = attribute_index_end(bytes);
-    assert_eq!(
-        cursor, attribute_end,
-        "consumed the whole attribute section"
-    );
+    assert_eq!(cursor, body.len(), "consumed the whole attribute body");
 
-    // Inflating the posting lists moves the content index, so its offset in
-    // the header has to move with it or the reader rejects the file for
-    // non-contiguous sections.
-    let mut out = bytes[..attribute_start].to_vec();
-    let content_offset = attribute_start + section.len();
-    out[offsets::CONTENT_INDEX_OFFSET..offsets::CONTENT_INDEX_OFFSET + 8]
-        .copy_from_slice(&(content_offset as u64).to_le_bytes());
-    out.extend_from_slice(&section);
-    out.extend_from_slice(&bytes[attribute_end..]);
-    out
+    // Re-wrapped raw with a recomputed wrapper checksum, and the header's
+    // section offsets and CRC fixed up: the forgery must march PAST the
+    // integrity layer to prove the candidate-verification layer holds on
+    // its own.
+    let attribute_start = get_u64(bytes, offsets::ATTRIBUTE_INDEX_OFFSET) as usize;
+    let attribute_len = attribute_index_end(bytes) - attribute_start;
+    replace_section(
+        bytes,
+        attribute_start,
+        attribute_len,
+        wrap_section_raw(&forged),
+    )
 }
 
 #[test]
@@ -1127,7 +1332,11 @@ fn the_timestamp_range_is_always_readable_and_can_rule_a_segment_out() {
     // than an unknown one: it overlaps nothing and is always skippable. It
     // also carries an empty directory and a zero logical length.
     let empty_bytes = segment::encode(&[]).expect("encode empty");
-    assert_eq!(get_u64(&empty_bytes, offsets::DIRECTORY_LEN), 0);
+    assert_eq!(
+        directory_body(&empty_bytes).len(),
+        0,
+        "an empty segment's directory body holds no entries"
+    );
     assert_eq!(get_u64(&empty_bytes, offsets::RECORDS_LOGICAL_LEN), 0);
     let empty = Segment::from_bytes(empty_bytes).expect("opens");
     let (empty_min, empty_max) = empty.timestamp_range();
@@ -1209,7 +1418,8 @@ fn the_content_index_holds_filters_and_never_the_text() {
     let bytes = segment::encode(&records).expect("encode");
 
     let start = get_u64(&bytes, offsets::CONTENT_INDEX_OFFSET) as usize;
-    let section = &bytes[start..];
+    let section_owned = unwrap_section_at(&bytes, start, bytes.len() - start);
+    let section = section_owned.as_slice();
 
     // Prologue, hand-decoded at its documented layout.
     assert_eq!(get_u32(section, 0), 0, "reserved word is zero");
@@ -1224,14 +1434,28 @@ fn the_content_index_holds_filters_and_never_the_text() {
     assert!(summary_bits.is_power_of_two() && summary_bits >= 8);
     assert!(block_bits.is_power_of_two() && block_bits >= 8);
 
-    // The section is exactly the prologue, the summary filter, and one
+    // The section is exactly the prologue, the summary filter, the
+    // page-checksum table (one CRC-32 per 4096-byte page of rows), and one
     // bit-sliced row per bit position.
     let row_bytes = (block_count as usize).div_ceil(8);
+    let rows_len = block_bits * row_bytes;
+    let table_len = rows_len.div_ceil(4096) * 4;
     assert_eq!(
         section.len(),
-        32 + summary_bits / 8 + block_bits * row_bytes,
+        32 + summary_bits / 8 + table_len + rows_len,
         "the content section must account for every byte"
     );
+    // The table's entries are the CRC-32s of the row pages, under the
+    // test-local polynomial implementation.
+    let table_start = 32 + summary_bits / 8;
+    let rows = &section[table_start + table_len..];
+    for (page, chunk) in rows.chunks(4096).enumerate() {
+        assert_eq!(
+            get_u32(section, table_start + page * 4),
+            crc32_ieee(chunk),
+            "page {page} carries the CRC-32 of its row bytes"
+        );
+    }
 
     // No indexed WORD may appear anywhere in it. These words are distinctive
     // enough that a byte search is a fair test, and this assertion is what
@@ -1498,8 +1722,9 @@ fn blocks_are_carved_at_record_boundaries_with_raw_passthrough() {
         "two oversized records and one shared tail block"
     );
     assert_eq!(
-        get_u64(&bytes, offsets::DIRECTORY_LEN),
-        3 * DIRECTORY_ENTRY_LEN as u64
+        directory_body(&bytes).len(),
+        3 * DIRECTORY_ENTRY_LEN,
+        "the unwrapped directory body is exactly three entries"
     );
 
     // The incompressible block trips the raw-passthrough flag: compression
@@ -1718,7 +1943,7 @@ fn a_flipped_stored_byte_is_refused_by_the_block_crc() {
     // A MIDDLE block stays lazy — no open-time decode touches it — so the
     // same damage there surfaces at the first read that touches the block.
     let dir_offset = get_u64(&honest, offsets::DIRECTORY_OFFSET) as usize;
-    let middle_stored_offset = get_u64(&honest, dir_offset + DIRECTORY_ENTRY_LEN + 8) as usize;
+    let middle_stored_offset = parse_directory(&honest)[1].stored_offset as usize;
     let mut middle_corrupted = honest.clone();
     middle_corrupted[records_offset + middle_stored_offset + 10] ^= 0xff;
     let middle_path = directory.join("segment-00000000000000000002.seg");
@@ -1824,12 +2049,12 @@ fn stored_digest_pairs_are_rederivable_from_every_payload() {
 
     let dictionary = parse_dictionary(&bytes);
     let logical = inflate_records_region(&bytes);
-    let offsets_offset = get_u64(&bytes, offsets::OFFSETS_OFFSET) as usize;
+    let record_offsets = parse_record_offsets(&bytes);
     let record_count = get_u64(&bytes, offsets::RECORD_COUNT);
     assert_eq!(record_count, span_count, "every span was sealed");
 
-    for ordinal in 0..record_count as usize {
-        let start = get_u64(&bytes, offsets_offset + ordinal * 8) as usize;
+    for (ordinal, record_offset) in record_offsets.iter().enumerate() {
+        let start = *record_offset as usize;
         let trace_len = get_u32(&logical, start + 8) as usize;
         let attribute_count = get_u32(&logical, start + 12) as usize;
         let payload_len = get_u32(&logical, start + 16) as usize;
@@ -1894,7 +2119,7 @@ fn stored_digest_pairs_are_rederivable_from_every_payload() {
     evidence(
         "derivation_invariant",
         &[
-            "fresh_store_writes_v7",
+            "fresh_store_writes_v8",
             "pairs_rederived_from_parsed_payloads",
             "reserved_keys_raw_text",
             "user_attributes_canonical_json",
@@ -1919,6 +2144,10 @@ fn a_forged_records_logical_length_is_refused_not_allocated() {
         let mut forged = honest.clone();
         forged[offsets::RECORDS_LOGICAL_LEN..offsets::RECORDS_LOGICAL_LEN + 8]
             .copy_from_slice(&forged_len.to_le_bytes());
+        // Past the header checksum on purpose: the bound under test is the
+        // extent validation, and it must hold even against a forgery that
+        // recomputed the CRC.
+        rewrite_header_crc(&mut forged);
         let refusal = Segment::from_bytes(forged.clone())
             .expect_err("a forged logical length must refuse, never allocate");
         assert!(
@@ -1967,6 +2196,7 @@ fn a_forged_records_logical_length_is_refused_not_allocated() {
     let mut forged = bytes.clone();
     forged[offsets::RECORDS_LOGICAL_LEN..offsets::RECORDS_LOGICAL_LEN + 8]
         .copy_from_slice(&(1u64 << 30).to_le_bytes());
+    rewrite_header_crc(&mut forged);
     let refusal = Segment::from_bytes(forged)
         .expect_err("a sub-2^31 forgery on a single-record block must still refuse");
     assert!(
@@ -2013,13 +2243,17 @@ fn a_forged_block_min_timestamp_is_refused_not_believed() {
     assert_eq!(entries[2].min_timestamp, records[2].timestamp);
 
     // Nudge block 1's fence up by 50ns: the column stays sorted, so every
-    // pre-existing open-time check still passes.
-    let dir_offset = get_u64(&honest, offsets::DIRECTORY_OFFSET) as usize;
-    let fence_offset = dir_offset + DIRECTORY_ENTRY_LEN + 24;
+    // pre-existing open-time check still passes. The directory body is
+    // edited and RE-WRAPPED with a recomputed section checksum — the
+    // forgery must march past the integrity layer, because the property
+    // under test is that the fences are anchored to record bytes, not that
+    // a checksum happens to cover them.
+    let fence_offset = DIRECTORY_ENTRY_LEN + 24;
     let forged_fence = entries[1].min_timestamp + 50;
     assert!(forged_fence < entries[2].min_timestamp, "still sorted");
-    let mut forged = honest.clone();
-    forged[fence_offset..fence_offset + 8].copy_from_slice(&forged_fence.to_le_bytes());
+    let mut body = directory_body(&honest);
+    body[fence_offset..fence_offset + 8].copy_from_slice(&forged_fence.to_le_bytes());
+    let forged = replace_directory_body(&honest, &body);
 
     let refusal = Segment::from_bytes(forged.clone())
         .expect_err("the eager open verifies every fence against its block");
@@ -2144,13 +2378,13 @@ fn a_forged_record_digest_pair_is_caught_by_the_store_layer() {
         .position(|key| key == "\u{0}service")
         .expect("service key in dictionary") as u32;
     let records_offset = get_u64(&bytes, offsets::RECORDS_OFFSET) as usize;
-    let offsets_offset = get_u64(&bytes, offsets::OFFSETS_OFFSET) as usize;
+    let record_offsets = parse_record_offsets(&bytes);
     let record_count = get_u64(&bytes, offsets::RECORD_COUNT) as usize;
     let colliding = *hash_attribute("\u{0}service", "checkout").as_bytes();
     let mut forged = bytes.clone();
     let mut patched = false;
-    for ordinal in 0..record_count {
-        let start = records_offset + get_u64(&bytes, offsets_offset + ordinal * 8) as usize;
+    for record_offset in record_offsets.iter().take(record_count) {
+        let start = records_offset + *record_offset as usize;
         let trace_len = get_u32(&bytes, start + 8) as usize;
         let attribute_count = get_u32(&bytes, start + 12) as usize;
         let payload_len = get_u32(&bytes, start + 16) as usize;
@@ -2173,17 +2407,20 @@ fn a_forged_record_digest_pair_is_caught_by_the_store_layer() {
     assert!(patched, "the billing record's service digest was forged");
 
     // Re-seal the tampering: recompute every block CRC over the patched
-    // stored bytes (raw codec: stored bytes ARE the logical bytes), then
-    // forge the index postings too, as the posting-only test does.
-    let dir_offset = get_u64(&forged, offsets::DIRECTORY_OFFSET) as usize;
+    // stored bytes (raw codec: stored bytes ARE the logical bytes) inside
+    // the unwrapped directory body, re-wrap it with a fresh section
+    // checksum, then forge the index postings too, as the posting-only
+    // test does.
     let entries = parse_directory(&forged);
+    let mut body = directory_body(&forged);
     for (index, entry) in entries.iter().enumerate() {
         let stored_start = records_offset + entry.stored_offset as usize;
         let crc = crc32_ieee(&forged[stored_start..stored_start + entry.stored_len as usize])
             .to_le_bytes();
-        let at = dir_offset + index * DIRECTORY_ENTRY_LEN + 20;
-        forged[at..at + 4].copy_from_slice(&crc);
+        let at = index * DIRECTORY_ENTRY_LEN + 20;
+        body[at..at + 4].copy_from_slice(&crc);
     }
+    let forged = replace_directory_body(&forged, &body);
     let forged = forge_digest_collisions(&forged, record_count);
 
     // The segment layer, by design, admits the forged row: confirmation is
@@ -2323,6 +2560,10 @@ fn header_timestamp_forgeries_are_corrupt_not_silently_pruned() {
     // A forged min disagrees with the first block fence: both opens refuse.
     let mut forged_min = honest.clone();
     set_u64(&mut forged_min, offsets::MIN_TIMESTAMP, true_min + 1);
+    // Every forgery in this test recomputes the header CRC: the property
+    // under test is the record-anchored range validation, which must hold
+    // even against an adversary who fixes up the checksum.
+    rewrite_header_crc(&mut forged_min);
     let eager = Segment::from_bytes(forged_min.clone()).expect_err("eager open refuses");
     assert!(
         eager.to_string().contains("min timestamp"),
@@ -2339,6 +2580,7 @@ fn header_timestamp_forgeries_are_corrupt_not_silently_pruned() {
     // encoder output: both opens refuse.
     let mut forged_low_max = honest.clone();
     set_u64(&mut forged_low_max, offsets::MAX_TIMESTAMP, true_min - 1);
+    rewrite_header_crc(&mut forged_low_max);
     assert!(
         Segment::from_bytes(forged_low_max.clone()).is_err(),
         "the eager open refuses a max below the last fence"
@@ -2358,6 +2600,7 @@ fn header_timestamp_forgeries_are_corrupt_not_silently_pruned() {
     // timestamp — the true max — which the forged bound cannot hold.
     let mut forged_mid_max = honest.clone();
     set_u64(&mut forged_mid_max, offsets::MAX_TIMESTAMP, true_max - 1);
+    rewrite_header_crc(&mut forged_mid_max);
     let eager = Segment::from_bytes(forged_mid_max.clone())
         .expect_err("the eager open validates the exact max");
     assert!(
@@ -2380,6 +2623,7 @@ fn header_timestamp_forgeries_are_corrupt_not_silently_pruned() {
     Segment::from_bytes(empty.clone()).expect("the canonical empty range opens");
     let mut forged_empty = empty.clone();
     set_u64(&mut forged_empty, offsets::MIN_TIMESTAMP, 0);
+    rewrite_header_crc(&mut forged_empty);
     assert!(
         Segment::from_bytes(forged_empty).is_err(),
         "an empty segment declaring a non-canonical range is corrupt"
@@ -2436,10 +2680,10 @@ fn forge_u64(bytes: &mut [u8], offset: usize, value: u64) {
     bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
 
-/// Byte offset of block `index`'s min-timestamp fence in the directory.
-fn fence_offset(bytes: &[u8], index: usize) -> usize {
-    let directory_offset = get_u64(bytes, offsets::DIRECTORY_OFFSET) as usize;
-    directory_offset + index * DIRECTORY_ENTRY_LEN + 24
+/// Byte offset of block `index`'s min-timestamp fence in the UNWRAPPED
+/// directory body.
+fn fence_offset(index: usize) -> usize {
+    index * DIRECTORY_ENTRY_LEN + 24
 }
 
 /// The store-level contract every forgery test below asserts: an error at
@@ -2497,9 +2741,14 @@ fn a_min_fence_collusion_cannot_silently_hide_the_head_window() {
     // The collusion: header min 100 -> 200 AND the first fence 100 -> 200,
     // sixteen edited bytes that agree with each other.
     forge_u64(&mut bytes, offsets::MIN_TIMESTAMP, 200);
-    let fence = fence_offset(&bytes, 0);
-    assert_eq!(get_u64(&bytes, fence), 100, "the first fence is the min");
-    forge_u64(&mut bytes, fence, 200);
+    let mut body = directory_body(&bytes);
+    let fence = fence_offset(0);
+    assert_eq!(get_u64(&body, fence), 100, "the first fence is the min");
+    forge_u64(&mut body, fence, 200);
+    // Re-wrapped with fresh section and header checksums: the collusion
+    // must march past the integrity layer to prove the record-anchored
+    // check holds on its own.
+    let bytes = replace_directory_body(&bytes, &body);
     fs::write(&segment_path, &bytes).expect("tampered segment writes");
 
     // The head window [100, 150] holds exactly the record at 100, which the
@@ -2525,6 +2774,7 @@ fn a_lowered_header_max_cannot_silently_hide_the_tail_window() {
     // one block, so it is also the first) still reads 100, and 150 >= 100
     // keeps the forgery consistent with every fence.
     forge_u64(&mut bytes, offsets::MAX_TIMESTAMP, 150);
+    rewrite_header_crc(&mut bytes);
     fs::write(&segment_path, &bytes).expect("tampered segment writes");
 
     // The tail window [200, 400] holds exactly the record at 300, which the
@@ -2560,21 +2810,23 @@ fn a_max_fence_collusion_is_refused_at_lazy_open() {
         ),
     ];
     let honest = segment::encode(&records).expect("encode");
-    let directory_len = get_u64(&honest, offsets::DIRECTORY_LEN);
     assert_eq!(
-        directory_len as usize / DIRECTORY_ENTRY_LEN,
+        directory_body(&honest).len() / DIRECTORY_ENTRY_LEN,
         2,
         "the corpus must span two blocks for the fences to differ"
     );
     let mut forged = honest.clone();
     assert_eq!(get_u64(&forged, offsets::MAX_TIMESTAMP), 300);
-    assert_eq!(get_u64(&forged, fence_offset(&forged, 1)), 300);
+    let mut body = directory_body(&forged);
+    assert_eq!(get_u64(&body, fence_offset(1)), 300);
     // The collusion: header max 300 -> 150 AND the last fence 300 -> 150.
     // The fences stay sorted (100 <= 150) and the declared max sits at the
-    // forged fence, so every metadata-only cross-check still agrees.
-    let last_fence = fence_offset(&forged, 1);
+    // forged fence, so every metadata-only cross-check still agrees — and
+    // the section and header checksums are recomputed, so only the
+    // record-anchored check stands between the forgery and a pruned tail.
     forge_u64(&mut forged, offsets::MAX_TIMESTAMP, 150);
-    forge_u64(&mut forged, last_fence, 150);
+    forge_u64(&mut body, fence_offset(1), 150);
+    let forged = replace_directory_body(&forged, &body);
 
     // The eager open decodes everything and refuses.
     assert!(
@@ -2599,6 +2851,7 @@ fn a_max_fence_collusion_is_refused_at_lazy_open() {
     // declared max, not merely stay below it.
     let mut inflated = honest.clone();
     forge_u64(&mut inflated, offsets::MAX_TIMESTAMP, 1_000);
+    rewrite_header_crc(&mut inflated);
     assert!(
         Segment::from_bytes(inflated.clone()).is_err(),
         "the eager open refuses an inflated max"
@@ -2619,6 +2872,465 @@ fn a_max_fence_collusion_is_refused_at_lazy_open() {
         &[
             "max_fence_collusion_refused_both_opens",
             "inflated_max_refused_both_opens",
+        ],
+    );
+}
+
+/// The v8 metadata wrappers under hostile input: every mutation below must
+/// be a named refusal — never a misread index, never an allocation sized by
+/// a forged length, never a silent behavior change. Each forgery recomputes
+/// the checksums it can, so the check under test is the structural one
+/// behind the integrity layer.
+#[test]
+fn section_wrappers_refuse_malformed_flags_lengths_and_varints() {
+    let records = corpus();
+    let honest = segment::encode(&records).expect("encode");
+    let trace_start = get_u64(&honest, offsets::TRACE_INDEX_OFFSET) as usize;
+    let trace_len = get_u64(&honest, offsets::TRACE_INDEX_LEN) as usize;
+
+    // An unknown wrapper flag is refused by name, checksum notwithstanding.
+    let mut flagged_raw = honest[trace_start..trace_start + trace_len].to_vec();
+    let flags = get_u32(&flagged_raw, 4) | 2;
+    flagged_raw[4..8].copy_from_slice(&flags.to_le_bytes());
+    let crc = crc32_ieee(&flagged_raw[4..]).to_le_bytes();
+    flagged_raw[0..4].copy_from_slice(&crc);
+    let forged = replace_section(&honest, trace_start, trace_len, flagged_raw);
+    let refusal = Segment::from_bytes(forged).expect_err("unknown flag refused");
+    assert!(
+        refusal.to_string().contains("unknown wrapper flag"),
+        "the refusal names the flag: {refusal}"
+    );
+
+    // A compressed body whose declared length exceeds LZ4's expansion
+    // ceiling is refused BEFORE it sizes the decompress allocation: the
+    // decompress-bomb probe. The body is a legitimately compressed trace
+    // index with only its declared length forged to 1 GiB.
+    let honest_body = unwrap_section_at(&honest, trace_start, trace_len);
+    let compressed = lz4_flex::block::compress(&honest_body);
+    let mut bomb = Vec::new();
+    bomb.extend_from_slice(&1u32.to_le_bytes()); // flags: lz4
+    bomb.extend_from_slice(&(1u64 << 30).to_le_bytes()); // forged length
+    bomb.extend_from_slice(&compressed);
+    let mut bomb_raw = crc32_ieee(&bomb).to_le_bytes().to_vec();
+    bomb_raw.extend_from_slice(&bomb);
+    let forged = replace_section(&honest, trace_start, trace_len, bomb_raw);
+    let refusal = Segment::from_bytes(forged).expect_err("a decompress bomb is refused");
+    assert!(
+        refusal.to_string().contains("exceeds what lz4 can decode"),
+        "the refusal names the bound: {refusal}"
+    );
+
+    // The content index must be stored raw — its rows are read from disk by
+    // byte range — so a compressed content section is refused by name even
+    // when it would inflate correctly.
+    let content_start = get_u64(&honest, offsets::CONTENT_INDEX_OFFSET) as usize;
+    let content_len = honest.len() - content_start;
+    let content_body = unwrap_section_at(&honest, content_start, content_len);
+    let compressed = lz4_flex::block::compress(&content_body);
+    let mut wrapped = Vec::new();
+    wrapped.extend_from_slice(&1u32.to_le_bytes());
+    wrapped.extend_from_slice(&(content_body.len() as u64).to_le_bytes());
+    wrapped.extend_from_slice(&compressed);
+    let mut wrapped_raw = crc32_ieee(&wrapped).to_le_bytes().to_vec();
+    wrapped_raw.extend_from_slice(&wrapped);
+    let forged = replace_section(&honest, content_start, content_len, wrapped_raw);
+    let refusal = Segment::from_bytes(forged).expect_err("compressed content refused");
+    assert!(
+        refusal.to_string().contains("must be stored raw"),
+        "the refusal names the rule: {refusal}"
+    );
+
+    // A raw body whose declared length disagrees with its stored length.
+    let mut mislabeled = honest[trace_start..trace_start + trace_len].to_vec();
+    let flags = get_u32(&mislabeled, 4);
+    if flags & 1 == 0 {
+        let wrong = get_u64(&mislabeled, 8) + 1;
+        mislabeled[8..16].copy_from_slice(&wrong.to_le_bytes());
+        let crc = crc32_ieee(&mislabeled[4..]).to_le_bytes();
+        mislabeled[0..4].copy_from_slice(&crc);
+        let forged = replace_section(&honest, trace_start, trace_len, mislabeled);
+        let refusal = Segment::from_bytes(forged).expect_err("length mismatch refused");
+        assert!(
+            refusal.to_string().contains("raw body length mismatch"),
+            "the refusal names the mismatch: {refusal}"
+        );
+    }
+
+    // Structural varint refusals inside a re-wrapped trace-index body, each
+    // behind a correct checksum: a truncated varint, an over-long varint, a
+    // zero posting delta (an unordered posting in disguise), and a posting
+    // count above the record count (an allocation probe).
+    let rebuild = |edit: &dyn Fn(&mut Vec<u8>)| -> Vec<u8> {
+        let mut body = unwrap_section_at(&honest, trace_start, trace_len);
+        edit(&mut body);
+        replace_section(&honest, trace_start, trace_len, wrap_section_raw(&body))
+    };
+    let truncated = rebuild(&|body| {
+        body.truncate(body.len() - 1);
+        if let Some(last) = body.last_mut() {
+            *last |= 0x80; // the final varint now claims a continuation
+        }
+    });
+    assert!(
+        Segment::from_bytes(truncated).is_err(),
+        "a truncated varint is refused"
+    );
+    let overlong = rebuild(&|body| {
+        // Replace the leading entry-count varint with eleven continuation
+        // bytes: longer than any u64 encoding.
+        let mut forged = vec![0x80u8; 11];
+        forged.push(0x00);
+        forged.extend_from_slice(&body[1..]);
+        *body = forged;
+    });
+    assert!(
+        Segment::from_bytes(overlong).is_err(),
+        "an over-long varint is refused"
+    );
+    let inflated_count = rebuild(&|body| {
+        // Entry count 1 (single-byte varint in this corpus's trace index
+        // holds few entries) — rewrite the FIRST entry's posting count to
+        // outnumber the records. Walk: count varint, id length varint, id
+        // bytes, posting count varint.
+        let mut cursor = 0usize;
+        let _entries = get_varint(body, &mut cursor);
+        let id_len = get_varint(body, &mut cursor) as usize;
+        cursor += id_len;
+        // Corpus record count is 3; claim 200 postings (a canonical
+        // two-byte varint, spliced in place of the honest one-byte count so
+        // the posting bound — not the varint rules — is what answers).
+        assert!(body[cursor] < 0x80, "posting count is a one-byte varint");
+        let mut forged = body[..cursor].to_vec();
+        put_varint(&mut forged, 200);
+        forged.extend_from_slice(&body[cursor + 1..]);
+        *body = forged;
+    });
+    let refusal =
+        Segment::from_bytes(inflated_count).expect_err("an inflated posting count is refused");
+    assert!(
+        refusal.to_string().contains("too many postings"),
+        "the refusal names the bound: {refusal}"
+    );
+    let zero_delta = rebuild(&|body| {
+        // Find the first trace entry with two postings and zero its delta.
+        // In this corpus trace-a holds records 0 and 2, so its posting list
+        // is count=2, first, delta — all one-byte varints.
+        let mut cursor = 0usize;
+        let _entries = get_varint(body, &mut cursor);
+        let id_len = get_varint(body, &mut cursor) as usize;
+        cursor += id_len;
+        let count = get_varint(body, &mut cursor);
+        assert_eq!(count, 2, "trace-a posts twice");
+        let _first = get_varint(body, &mut cursor);
+        // Zeroing the delta's first byte makes the varint read 0; the
+        // reader refuses that before it can notice any leftover byte of a
+        // multi-byte delta.
+        body[cursor] = 0;
+    });
+    let refusal = Segment::from_bytes(zero_delta).expect_err("a zero delta is refused");
+    assert!(
+        refusal
+            .to_string()
+            .contains("posting deltas must be positive"),
+        "the refusal names the rule: {refusal}"
+    );
+
+    // And the honest bytes still open: the refusals reject forgeries, not
+    // legal segments.
+    Segment::from_bytes(honest).expect("the honest segment still opens");
+
+    evidence(
+        "wrapper_hardening",
+        &[
+            "unknown_flag_refused",
+            "decompress_bomb_bounded_before_allocation",
+            "compressed_content_section_refused",
+            "raw_length_mismatch_refused",
+            "truncated_varint_refused",
+            "overlong_varint_refused",
+            "inflated_posting_count_refused",
+            "zero_posting_delta_refused",
+            "honest_bytes_still_open",
+        ],
+    );
+}
+
+/// F1 of the independent codec review: the content prologue's bit
+/// geometries (`summary_bits`, `block_bits`) were validated only for being
+/// powers of two, and the matrix-length and row-position arithmetic
+/// multiplied them unchecked — so a CRC-consistent forgery (or a fuzzer
+/// flipping the checksum too) could overflow the length computation in
+/// debug (panic) or wrap it in release, and a wrapped row-offset multiply
+/// mis-addresses rows, whose only failure direction is a silently
+/// under-included content answer. Geometry must be bounded to the encoder's
+/// own ceilings and every derived length checked: `Corrupt`, never a panic,
+/// never fewer rows.
+#[test]
+fn crc_consistent_malicious_content_geometry_is_refused_not_panicking() {
+    let records = vec![
+        RecordInput::new(
+            1_700_000_000_000_000_000,
+            "trace-a",
+            attributes(&[("service", "checkout")]),
+            b"first".to_vec(),
+        )
+        .with_content(vec!["please issue a refund for order one".to_owned()]),
+        RecordInput::new(
+            1_700_000_000_000_000_100,
+            "trace-b",
+            attributes(&[("service", "billing")]),
+            b"second".to_vec(),
+        )
+        .with_content(vec!["the quarterly summary is ready".to_owned()]),
+    ];
+    let honest = segment::encode(&records).expect("encode");
+    let content_start = get_u64(&honest, offsets::CONTENT_INDEX_OFFSET) as usize;
+    let content_len = honest.len() - content_start;
+
+    // Forge each geometry word to a huge power of two, re-wrap with a
+    // recomputed section checksum so the forgery reaches the geometry
+    // validation, and demand a refusal that names the bound.
+    for (what, word_offset, forged) in [
+        ("summary_bits overflow", 16usize, 1u64 << 62),
+        ("block_bits overflow", 24usize, 1u64 << 62),
+        ("summary_bits above the encoder ceiling", 16, 1u64 << 22),
+        ("block_bits above the encoder ceiling", 24, 1u64 << 20),
+    ] {
+        let mut body = unwrap_section_at(&honest, content_start, content_len);
+        body[word_offset..word_offset + 8].copy_from_slice(&forged.to_le_bytes());
+        let forged_file =
+            replace_section(&honest, content_start, content_len, wrap_section_raw(&body));
+        let refusal = Segment::from_bytes(forged_file)
+            .expect_err(&format!("{what}: must refuse, never panic or misread"));
+        assert!(
+            matches!(
+                refusal,
+                segment::Error::Corrupt(_) | segment::Error::CorruptSection { .. }
+            ),
+            "{what}: the refusal is corruption, got {refusal}"
+        );
+    }
+
+    // The arithmetic-overflow shape needs `row_bytes >= 2`, which the
+    // two-record corpus cannot give a forger through `block_count` (it is
+    // cross-checked against the record count). A twelve-record corpus with
+    // `block_records` forged to 1 makes `block_count = 12` legitimate under
+    // that cross-check, `row_bytes = 2` — and `block_bits = 1 << 63` then
+    // overflows the matrix-length multiply: a debug-build panic and a
+    // release-build wrap before the fix, a named refusal after it.
+    let many: Vec<RecordInput> = (0..12u64)
+        .map(|index| {
+            RecordInput::new(
+                1_700_000_000_000_000_000 + index,
+                format!("trace-{index}"),
+                attributes(&[("service", "checkout")]),
+                b"payload".to_vec(),
+            )
+            .with_content(vec![format!("word{index} refund order")])
+        })
+        .collect();
+    let honest_many = segment::encode(&many).expect("encode");
+    let many_start = get_u64(&honest_many, offsets::CONTENT_INDEX_OFFSET) as usize;
+    let many_len = honest_many.len() - many_start;
+    let mut body = unwrap_section_at(&honest_many, many_start, many_len);
+    body[4..8].copy_from_slice(&1u32.to_le_bytes()); // block_records = 1
+    body[8..12].copy_from_slice(&12u32.to_le_bytes()); // block_count = 12
+    body[24..32].copy_from_slice(&(1u64 << 63).to_le_bytes()); // block_bits
+    let forged_file = replace_section(&honest_many, many_start, many_len, wrap_section_raw(&body));
+    let refusal = Segment::from_bytes(forged_file)
+        .expect_err("an overflowing matrix length must refuse, never panic or wrap");
+    assert!(
+        matches!(
+            refusal,
+            segment::Error::Corrupt(_) | segment::Error::CorruptSection { .. }
+        ),
+        "overflowing matrix length: the refusal is corruption, got {refusal}"
+    );
+
+    // And the honest files still open and still answer.
+    let opened = Segment::from_bytes(honest).expect("honest bytes open");
+    let query = traza::content::Query::new("quarterly");
+    assert!(opened.may_contain_content(&query));
+    Segment::from_bytes(honest_many).expect("honest twelve-record bytes open");
+
+    evidence(
+        "content_geometry",
+        &[
+            "overflowing_geometry_refused_not_panicking",
+            "matrix_length_multiply_checked",
+            "geometry_bounded_to_encoder_ceilings",
+            "honest_bytes_still_open",
+        ],
+    );
+}
+
+/// F2 of the independent codec review: `take_varint` accepted redundant
+/// continuation bytes (`0x82 0x00` decoding to 2), making the byte→value
+/// map non-injective — which breaks the byte-identical re-encode premise
+/// the acceptance tests and the migration's idempotent re-hash rely on,
+/// should non-canonical bytes ever enter. A multi-byte varint ending in a
+/// zero byte is now refused, behind a valid wrapper checksum so the varint
+/// rule itself is what answers.
+#[test]
+fn a_noncanonical_varint_is_refused_behind_a_valid_checksum() {
+    let honest = segment::encode(&corpus()).expect("encode");
+    let trace_start = get_u64(&honest, offsets::TRACE_INDEX_OFFSET) as usize;
+    let trace_len = get_u64(&honest, offsets::TRACE_INDEX_LEN) as usize;
+    let body = unwrap_section_at(&honest, trace_start, trace_len);
+
+    // The body's first varint is the entry count (2 for this corpus, one
+    // byte). Re-encode it as the two-byte non-canonical `0x80|value, 0x00`.
+    let mut cursor = 0usize;
+    let count = get_varint(&body, &mut cursor);
+    assert!(count < 0x80, "the entry count is a one-byte varint");
+    let mut forged_body = Vec::with_capacity(body.len() + 1);
+    forged_body.push(0x80 | count as u8);
+    forged_body.push(0x00);
+    forged_body.extend_from_slice(&body[cursor..]);
+    let forged = replace_section(
+        &honest,
+        trace_start,
+        trace_len,
+        wrap_section_raw(&forged_body),
+    );
+    let refusal = Segment::from_bytes(forged).expect_err("a non-canonical varint must be refused");
+    assert!(
+        refusal.to_string().contains("canonical"),
+        "the refusal names the rule: {refusal}"
+    );
+
+    evidence(
+        "varint_canonicality",
+        &["noncanonical_varint_refused_behind_valid_crc"],
+    );
+}
+
+/// The content-matrix corpus for the post-open integrity tests: enough
+/// blocks that a row is several bytes wide and enough distinct tokens that
+/// the bit-sliced rows span multiple checksum pages, including rows that
+/// straddle a page boundary (row_bytes = 5 does not divide 4096).
+fn paged_rows_corpus() -> Vec<RecordInput> {
+    (0..4_300u64)
+        .map(|index| {
+            RecordInput::new(
+                1_700_000_000_000_000_000 + index,
+                format!("trace-{index}"),
+                attributes(&[("service", "checkout")]),
+                b"payload".to_vec(),
+            )
+            .with_content(vec![format!("needleword{index} common")])
+        })
+        .collect()
+}
+
+/// Content-rows geometry hand-parsed from the file: the rows' absolute file
+/// offset (past the prologue, the summary, AND the page-checksum table),
+/// the row stride, and the per-block filter width.
+fn content_rows_geometry(bytes: &[u8]) -> (usize, u64, u64) {
+    let start = get_u64(bytes, offsets::CONTENT_INDEX_OFFSET) as usize;
+    let body = unwrap_section_at(bytes, start, bytes.len() - start);
+    let block_count = u64::from(get_u32(&body, 8));
+    let summary_bits = get_u64(&body, 16) as usize;
+    let block_bits = get_u64(&body, 24);
+    let row_bytes = block_count.div_ceil(8);
+    let table_len = (block_bits * row_bytes).div_ceil(4096) * 4;
+    let rows_in_body = 32 + summary_bits / 8 + table_len as usize;
+    (start + WRAPPER + rows_in_body, row_bytes, block_bits)
+}
+
+/// F3 of the independent codec review: record blocks are CRC-verified on
+/// EVERY read, but content rows were verified only once — by the section
+/// wrapper at open — and thereafter re-read from disk bare, so corruption
+/// arriving AFTER open cleared admit bits and silently excluded true
+/// content matches for the life of the segment. The rows are now covered by
+/// a resident page-checksum table (itself under the wrapper CRC), verified
+/// on every row read: post-open damage is `Corrupt` at the query that
+/// touches it, never a shrunken answer.
+#[test]
+fn post_open_content_row_corruption_is_corrupt_never_fewer_matches() {
+    let records = paged_rows_corpus();
+    let bytes = segment::encode(&records).expect("encode");
+    let (rows_offset, row_bytes, block_bits) = content_rows_geometry(&bytes);
+    assert!(
+        block_bits as usize * row_bytes as usize > 2 * 4096,
+        "the corpus makes the rows span several checksum pages"
+    );
+    assert_ne!(4096 % row_bytes, 0, "some rows straddle a page boundary");
+
+    let directory = temp_dir("content-rows");
+    let path = directory.join("segment-00000000000000000000.seg");
+    fs::write(&path, &bytes).expect("write segment");
+    let opened = Segment::open(&path).expect("file-backed open");
+    let record_offsets = parse_record_offsets(&bytes);
+
+    // Intact, cold: a straddling-row probe and an ordinary one both admit
+    // their record's block. The straddling needle is found by walking the
+    // real hash positions, so cross-page row assembly is genuinely
+    // exercised rather than hoped for.
+    let straddles = |position: usize| {
+        let start = position as u64 * row_bytes;
+        start / 4096 != (start + row_bytes - 1) / 4096
+    };
+    let straddler = (0..records.len())
+        .find(|index| {
+            traza::content::bit_positions(&format!("needleword{index}"), block_bits as usize)
+                .any(straddles)
+        })
+        .expect("some needle probes a straddling row");
+    for needle in [42usize, straddler] {
+        let query = traza::content::Query::new(&format!("needleword{needle}"));
+        let candidates = opened
+            .content_candidate_offsets(&query)
+            .expect("intact probe")
+            .expect("indexable query is narrowed");
+        assert!(
+            candidates.contains(&record_offsets[needle]),
+            "intact cold probe admits record {needle}'s block"
+        );
+        // Warm: same answer on the second read.
+        let again = opened
+            .content_candidate_offsets(&query)
+            .expect("warm probe")
+            .expect("narrowed");
+        assert_eq!(candidates, again, "warm probe agrees with cold");
+    }
+
+    // Now the corruption arrives AFTER open: clear record 42's block-admit
+    // bit inside the first row its token probes — the precise mutation that
+    // silently excluded the record before the page checksums.
+    let target = 42usize;
+    let position =
+        traza::content::bit_positions(&format!("needleword{target}"), block_bits as usize)
+            .next()
+            .expect("a probe position");
+    let block = target / 128;
+    let mut damaged = fs::read(&path).expect("segment bytes");
+    let at = rows_offset + (position as u64 * row_bytes) as usize + block / 8;
+    damaged[at] &= !(1u8 << (block % 8));
+    fs::write(&path, &damaged).expect("write damaged rows");
+
+    let query = traza::content::Query::new(&format!("needleword{target}"));
+    match opened.content_candidate_offsets(&query) {
+        Err(error) => assert!(
+            error.to_string().contains("content"),
+            "the refusal names the content matrix: {error}"
+        ),
+        Ok(None) => panic!("the index cannot vanish mid-life"),
+        Ok(Some(candidates)) => assert!(
+            candidates.contains(&record_offsets[target]),
+            "post-open row corruption silently excluded record {target} \
+             ({} candidates) — the under-inclusion F3 exists to close",
+            candidates.len()
+        ),
+    }
+
+    cleanup(&directory);
+    evidence(
+        "content_row_pages",
+        &[
+            "intact_cold_and_warm_probes_admit",
+            "straddling_row_assembled_across_pages",
+            "post_open_row_corruption_is_corrupt_not_fewer_matches",
         ],
     );
 }

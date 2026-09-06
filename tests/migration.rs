@@ -1,8 +1,9 @@
-//! Acceptance gate 4 of format v7: the v6 → v7 migration.
+//! Acceptance gate 4 of the segment format: legacy stores (v6 and v7)
+//! migrate to the current v8 at first open.
 //!
 //! The contract under test is the Migration section of
-//! `docs/segment-format.md`: a v6 store (segments, blobs, sidecars, pins,
-//! non-empty WAL) opened by this build serves query-identical results,
+//! `docs/segment-format.md`: a legacy store (segments, blobs, sidecars,
+//! pins, non-empty WAL) opened by this build serves query-identical results,
 //! preserves segment names, survives `kill -9` at the crash-matrix points
 //! with a clean resume, and publishes a completion checkpoint whose
 //! generation verifies clean — `/v1/verify` reports `intact: true` and a pin
@@ -11,6 +12,13 @@
 //! bytes the migration replaced. Erasure records ride across the migration:
 //! a pending one settles against the migrated store, and a settled receipt
 //! re-derives.
+//!
+//! The v6 half of the gate runs on downgraded fixtures (below); the v7 half
+//! runs on the COMMITTED baseline fixture `tests/fixtures/v8-migration/`,
+//! real bytes written by v0.24.2 at `016eab8` — three v7 segments with
+//! rollup sidecars, a `TRZBLOB1` payload blob, a pin, an annotation, and a
+//! WAL tail of acknowledged-but-unsealed frames, under a manifest declaring
+//! `segment_format: 7`.
 //!
 //! # Where the v6 fixtures come from
 //!
@@ -779,7 +787,7 @@ fn a_v6_store_migrates_at_first_open_with_identical_answers_same_names_and_idemp
     .expect("json");
     assert_eq!(
         manifest["segment_format"],
-        json!(7),
+        json!(traza::segment::VERSION),
         "the completion checkpoint declares the store format"
     );
 
@@ -941,10 +949,16 @@ fn observe(dir: &Path, template: &CrashTemplate) -> Observed {
         .map(|name| seg_version(&pin.join(name)))
         .collect();
     Observed {
-        live_v7: live.iter().filter(|v| **v == Some(7)).count(),
+        live_v7: live
+            .iter()
+            .filter(|v| **v == Some(traza::segment::VERSION))
+            .count(),
         live_total: live.len(),
         live_blob_v7: starts_with_blob_magic(&dir.join(&template.big_blob_relative)),
-        pin_v7: pin_versions.iter().filter(|v| **v == Some(7)).count(),
+        pin_v7: pin_versions
+            .iter()
+            .filter(|v| **v == Some(traza::segment::VERSION))
+            .count(),
         pin_total: pin_versions.len(),
         pin_blob_v7: starts_with_blob_magic(&pin.join(&template.big_blob_relative)),
         pin_manifest_rewritten: fs::read(pin.join("state-manifest.json"))
@@ -1472,7 +1486,7 @@ fn an_unreadable_segment_head_beside_v6_segments_is_refused_by_name() {
         "the refusal names the damaged file: {error}"
     );
     assert!(
-        error.contains("do not read as v6 or v7"),
+        error.contains("do not read as v6, v7, or v8"),
         "the refusal says what is wrong with it: {error}"
     );
     assert!(
@@ -1492,7 +1506,7 @@ fn an_unreadable_segment_head_beside_v6_segments_is_refused_by_name() {
     for path in segment_paths(&dir) {
         assert_eq!(
             seg_version(&path),
-            Some(7),
+            Some(traza::segment::VERSION),
             "every remaining segment migrated"
         );
     }
@@ -1561,7 +1575,7 @@ fn a_digest_moved_pinned_segment_is_validated_in_full_before_reacceptance() {
         "the refusal names the pin: {error}"
     );
     assert!(
-        error.contains("does not validate as a v7 segment"),
+        error.contains("does not validate as a v8 segment"),
         "the refusal says why the digest is not re-accepted: {error}"
     );
 
@@ -1573,5 +1587,477 @@ fn a_digest_moved_pinned_segment_is_validated_in_full_before_reacceptance() {
         pin_manifest_before, pin_manifest_after,
         "the pin manifest is left alone when the file cannot prove itself"
     );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ------------------------------------------- the committed v7 baseline fixture
+
+/// The committed fixture's location and the config its builder used.
+fn v7_fixture() -> (PathBuf, Config) {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v8-migration/store");
+    let config = Config {
+        durability: Durability::Wal,
+        payload_threshold: Some(1024),
+        ..Config::default()
+    };
+    (fixture, config)
+}
+
+/// The v7 half of gate 4, on real v0.24.2 bytes: the committed fixture holds
+/// three v7 segments (rollup sidecars beside them), a `TRZBLOB1` blob, a
+/// pin, an annotation, and a WAL tail, under a manifest declaring format 7.
+/// Opening it must convert every segment (live and pinned) onto its same
+/// name, leave the blob byte-for-byte alone (v8 did not change the blob
+/// format), replay the WAL tail, publish a completion checkpoint declaring
+/// v8 that verifies clean, and be idempotent on the second open.
+#[test]
+fn the_committed_v7_fixture_migrates_with_identical_answers_and_same_names() {
+    let (fixture, config) = v7_fixture();
+    let dir = test_dir("v7-fixture-migrates");
+    copy_tree(&fixture, &dir);
+
+    let before_names: Vec<String> = segment_paths(&dir)
+        .iter()
+        .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(before_names.len(), 3, "the fixture holds three segments");
+    for path in segment_paths(&dir) {
+        assert_eq!(seg_version(&path), Some(7), "the fixture is v7 at rest");
+    }
+    let blob = blob_paths(&dir).pop().expect("the fixture holds a blob");
+    let blob_bytes_before = fs::read(&blob).expect("blob bytes");
+    assert!(
+        blob_bytes_before.starts_with(b"TRZBLOB1"),
+        "the fixture's blob is already the current format"
+    );
+
+    let store = Store::open(&dir, config.clone()).expect("migrating open");
+    let all = store.query(&SpanFilter::default()).expect("scan");
+    assert_eq!(
+        all.len(),
+        25,
+        "24 sealed spans plus the WAL tail replay: {}",
+        all.len()
+    );
+    assert_eq!(
+        store.get_trace("trace-wal").expect("wal trace").len(),
+        1,
+        "the acknowledged-but-unsealed WAL frame replays after migration"
+    );
+    let filtered = store
+        .query(&SpanFilter {
+            attributes: vec![("marker".into(), "batch-1".into())],
+            ..SpanFilter::default()
+        })
+        .expect("attribute query");
+    assert_eq!(filtered.len(), 8, "attribute answers are identical");
+    // The offloaded value still resolves through its unchanged blob.
+    let with_payload = store.get_trace("trace-0-0").expect("offloaded trace");
+    let reference = with_payload
+        .iter()
+        .find_map(|span| {
+            span.attributes.get("big.context").and_then(|value| {
+                value
+                    .get("$payload")
+                    .and_then(|reference| reference.as_str())
+                    .map(str::to_owned)
+            })
+        })
+        .expect("the offloaded attribute carries its $payload reference");
+    let payload = store
+        .payload(&reference)
+        .expect("payload fetch")
+        .expect("payload present");
+    let text = String::from_utf8(payload).expect("utf-8 payload");
+    assert!(
+        text.contains("pinned-context") && text.len() >= 3_000,
+        "the offloaded bytes decode to the original ~3 KiB value: {} bytes",
+        text.len()
+    );
+    let generation = store.live_generation();
+    assert!(
+        store
+            .verify_generation(generation)
+            .expect("verify")
+            .is_empty(),
+        "the completion checkpoint's full re-hash verifies clean"
+    );
+    drop(store);
+
+    let after_names: Vec<String> = segment_paths(&dir)
+        .iter()
+        .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(before_names, after_names, "segment names are preserved");
+    for path in segment_paths(&dir) {
+        assert_eq!(
+            seg_version(&path),
+            Some(traza::segment::VERSION),
+            "every live segment migrated"
+        );
+    }
+    let pin = dir.join("pins").join("fixture-pin");
+    for path in segment_paths(&pin) {
+        assert_eq!(
+            seg_version(&path),
+            Some(traza::segment::VERSION),
+            "every pinned segment migrated"
+        );
+    }
+    assert_eq!(
+        fs::read(&blob).expect("blob bytes"),
+        blob_bytes_before,
+        "a current-format blob is left byte-for-byte alone"
+    );
+    let pin_manifest: Value =
+        serde_json::from_slice(&fs::read(pin.join("state-manifest.json")).expect("pin manifest"))
+            .expect("pin manifest json");
+    assert_eq!(
+        pin_manifest["segment_format"],
+        json!(traza::segment::VERSION),
+        "the pin's manifest digests were rewritten under the current format"
+    );
+    let current: u64 = fs::read_to_string(dir.join("CURRENT"))
+        .expect("CURRENT")
+        .trim()
+        .parse()
+        .expect("generation id");
+    let manifest: Value = serde_json::from_slice(
+        &fs::read(
+            dir.join("generations")
+                .join(current.to_string())
+                .join("state-manifest.json"),
+        )
+        .expect("live manifest"),
+    )
+    .expect("manifest json");
+    assert_eq!(
+        manifest["segment_format"],
+        json!(traza::segment::VERSION),
+        "the completion checkpoint declares the current format"
+    );
+
+    // Idempotent second open: no segment bytes change.
+    let watched = segment_paths(&dir);
+    let before = mtimes_of(&watched);
+    let store = Store::open(&dir, config).expect("second open");
+    assert_eq!(store.query(&SpanFilter::default()).expect("scan").len(), 25);
+    drop(store);
+    assert_eq!(
+        before,
+        mtimes_of(&watched),
+        "the second open rewrites nothing"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Resume from the exact mid-migration state a crash leaves: some segments
+/// already v8, the rest still v7, the manifest still declaring 7. Built
+/// deterministically — a reference copy is migrated whole, and one of its
+/// migrated segments is planted into a fresh fixture copy — rather than by
+/// timing a kill; the SIGKILL matrix above already proves the machinery
+/// under real crashes, and the v8 conversion runs through exactly the same
+/// per-file atomic rename.
+#[test]
+fn a_partially_migrated_v7_store_resumes_to_completion() {
+    let (fixture, config) = v7_fixture();
+    let reference = test_dir("v7-resume-reference");
+    copy_tree(&fixture, &reference);
+    drop(Store::open(&reference, config.clone()).expect("reference migration"));
+    let migrated_first = segment_paths(&reference)
+        .into_iter()
+        .next()
+        .expect("a migrated segment");
+
+    let dir = test_dir("v7-resume");
+    copy_tree(&fixture, &dir);
+    let target = dir.join(migrated_first.file_name().expect("name"));
+    fs::copy(&migrated_first, &target).expect("plant the already-migrated segment");
+    let versions: Vec<Option<u16>> = segment_paths(&dir)
+        .iter()
+        .map(|path| seg_version(path))
+        .collect();
+    assert!(
+        versions.contains(&Some(7)) && versions.contains(&Some(traza::segment::VERSION)),
+        "the store is mid-migration: {versions:?}"
+    );
+
+    let store = Store::open(&dir, config).expect("the resume finishes the migration");
+    assert_eq!(store.query(&SpanFilter::default()).expect("scan").len(), 25);
+    let generation = store.live_generation();
+    assert!(
+        store
+            .verify_generation(generation)
+            .expect("verify")
+            .is_empty(),
+        "the resumed completion checkpoint verifies clean"
+    );
+    drop(store);
+    for path in segment_paths(&dir) {
+        assert_eq!(
+            seg_version(&path),
+            Some(traza::segment::VERSION),
+            "the resume converted what remained"
+        );
+    }
+    let _ = fs::remove_dir_all(&reference);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ------------------------- F4: legacy record-stream completeness (review fix)
+
+fn word_at(bytes: &[u8], at: usize) -> u64 {
+    u64::from_le_bytes(bytes[at..at + 8].try_into().expect("u64 word"))
+}
+
+fn put_word(bytes: &mut [u8], at: usize, value: u64) {
+    bytes[at..at + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+/// Removes one entry from a legacy segment's record-offset index while
+/// keeping every header cross-check consistent — the deliberately
+/// internally-consistent corruption from the independent migration review:
+/// record count decremented, offsets length shrunk, later section offsets
+/// shifted, every record block untouched. Valid for v6 and v7 alike: both
+/// keep the offsets section ahead of the trace/attribute/content sections
+/// (header words 56, 72, 96), and v7's block directory (words 104/112) sits
+/// BEFORE the offsets section and does not move.
+fn omit_offset(bytes: &[u8], ordinal: usize) -> Vec<u8> {
+    let offsets_offset = word_at(bytes, 40) as usize;
+    let offsets_len = word_at(bytes, 48) as usize;
+    let count = word_at(bytes, 16);
+    assert!(ordinal * 8 < offsets_len, "ordinal inside the offset index");
+    let cut = offsets_offset + ordinal * 8;
+    let mut out = Vec::with_capacity(bytes.len() - 8);
+    out.extend_from_slice(&bytes[..cut]);
+    out.extend_from_slice(&bytes[cut + 8..]);
+    put_word(&mut out, 16, count - 1);
+    put_word(&mut out, 48, (offsets_len - 8) as u64);
+    for at in [56, 72, 96] {
+        let shifted = word_at(bytes, at) - 8;
+        put_word(&mut out, at, shifted);
+    }
+    out
+}
+
+/// Nudges one offset-index entry INTO the record it points at, leaving
+/// every length and count untouched.
+fn bump_offset(bytes: &[u8], ordinal: usize) -> Vec<u8> {
+    let offsets_offset = word_at(bytes, 40) as usize;
+    let mut out = bytes.to_vec();
+    let at = offsets_offset + ordinal * 8;
+    let value = word_at(&out, at);
+    put_word(&mut out, at, value + 1);
+    out
+}
+
+/// A minimal v6 store: one segment of three framed span records written by
+/// the test-local frozen v6 encoder, adopted at open exactly as the pr50
+/// fixture is.
+fn minimal_v6_store(label: &str) -> (PathBuf, PathBuf, Vec<u8>) {
+    let dir = test_dir(label);
+    let records: Vec<v6::Record> = (0..3u64)
+        .map(|index| {
+            let payload = serde_json::to_vec(&json!({
+                "trace_id": format!("trace-{index}"),
+                "span_id": format!("span-{index}"),
+                "name": "op", "service": "svc",
+                "start_time_ns": 1_000 + index, "end_time_ns": 2_000 + index,
+                "attributes": {"marker": "kept"},
+            }))
+            .expect("payload");
+            v6::Record {
+                timestamp: 1_000 + index,
+                trace_id: format!("trace-{index}"),
+                attributes: v6_attributes(&payload),
+                payload,
+            }
+        })
+        .collect();
+    let bytes = v6::encode(&records);
+    let segment = dir.join("segment-00000000000000000000.seg");
+    fs::write(&segment, &bytes).expect("write v6 segment");
+    (dir, segment, bytes)
+}
+
+/// The store-level contract for every mutation below: the migration REFUSES
+/// — naming the file, leaving the legacy bytes byte-for-byte untouched —
+/// and never publishes a reduced store. A migration that opens successfully
+/// here has converted detectable source damage into an apparently healthy
+/// current-format generation, which is the review's P1.
+fn assert_migration_refuses(
+    dir: &Path,
+    config: Config,
+    mutated: &Path,
+    mutated_bytes: &[u8],
+    what: &str,
+) {
+    match Store::open(dir, config) {
+        Err(error) => {
+            let text = error.to_string();
+            assert!(
+                text.contains("cannot migrate"),
+                "{what}: the refusal is a migration refusal: {text}"
+            );
+            assert!(
+                text.contains(&mutated.display().to_string())
+                    || text.contains(mutated.file_name().unwrap().to_str().unwrap()),
+                "{what}: the refusal names the damaged file: {text}"
+            );
+        }
+        Ok(store) => {
+            // A future change may choose recovery over refusal; if so it
+            // must recover EVERY record. This branch exists so the test
+            // fails on lossy success, not on a stricter-than-necessary
+            // shape.
+            let rows = store.query(&SpanFilter::default()).expect("scan").len();
+            drop(store);
+            panic!(
+                "{what}: migration accepted internally-consistent shortened \
+                 metadata and published {rows} rows over the reduced store"
+            );
+        }
+    }
+    assert_eq!(
+        fs::read(mutated).expect("mutated bytes").as_slice(),
+        mutated_bytes,
+        "{what}: the refusal left the legacy file untouched"
+    );
+}
+
+#[test]
+fn an_incomplete_v7_offset_index_is_refused_never_migrated_lossily() {
+    let (fixture, config) = v7_fixture();
+    // The fixture's first segment holds 8 records; omit the first, a middle,
+    // and the last offset, plus one offset nudged inside its record.
+    for (what, mutate) in [
+        (
+            "first offset omitted",
+            omit_offset as fn(&[u8], usize) -> Vec<u8>,
+        ),
+        ("middle offset omitted", omit_offset),
+        ("last offset omitted", omit_offset),
+        ("offset into a record", bump_offset),
+    ]
+    .iter()
+    .zip([0usize, 3, 7, 3])
+    .map(|((what, mutate), ordinal)| (*what, (*mutate, ordinal)))
+    {
+        let (mutate, ordinal) = mutate;
+        let dir = test_dir("v7-coverage");
+        copy_tree(&fixture, &dir);
+        let segment = segment_paths(&dir).into_iter().next().expect("segment");
+        let mutated = mutate(&fs::read(&segment).expect("bytes"), ordinal);
+        fs::write(&segment, &mutated).expect("write mutated");
+        assert_migration_refuses(&dir, config.clone(), &segment, &mutated, what);
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn an_incomplete_v7_offset_index_under_a_pin_is_refused_too() {
+    let (fixture, config) = v7_fixture();
+    let dir = test_dir("v7-pin-coverage");
+    copy_tree(&fixture, &dir);
+    let pinned = segment_paths(&dir.join("pins").join("fixture-pin"))
+        .into_iter()
+        .next()
+        .expect("pinned segment");
+    let mutated = omit_offset(&fs::read(&pinned).expect("bytes"), 3);
+    fs::write(&pinned, &mutated).expect("write mutated");
+    assert_migration_refuses(
+        &dir,
+        config,
+        &pinned,
+        &mutated,
+        "pinned middle offset omitted",
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_incomplete_v6_offset_index_is_refused_never_migrated_lossily() {
+    for (what, ordinal, into_record) in [
+        ("first offset omitted", 0usize, false),
+        ("middle offset omitted", 1, false),
+        ("last offset omitted", 2, false),
+        ("offset into a record", 1, true),
+    ] {
+        let (dir, segment, bytes) = minimal_v6_store("v6-coverage");
+        let mutated = if into_record {
+            bump_offset(&bytes, ordinal)
+        } else {
+            omit_offset(&bytes, ordinal)
+        };
+        fs::write(&segment, &mutated).expect("write mutated");
+        assert_migration_refuses(&dir, Config::default(), &segment, &mutated, what);
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn trailing_unindexed_v6_record_bytes_are_refused_not_dropped() {
+    // Eight bytes of record region no offset accounts for — the shape a
+    // whole omitted record leaves behind. The record stream is the
+    // authority, so unexplained record bytes must refuse rather than
+    // silently not migrating.
+    let (dir, segment, bytes) = minimal_v6_store("v6-trailing");
+    let records_offset = word_at(&bytes, 24) as usize;
+    let records_len = word_at(&bytes, 32) as usize;
+    let insert_at = records_offset + records_len;
+    let mut mutated = Vec::with_capacity(bytes.len() + 8);
+    mutated.extend_from_slice(&bytes[..insert_at]);
+    mutated.extend_from_slice(&[0xAAu8; 8]);
+    mutated.extend_from_slice(&bytes[insert_at..]);
+    put_word(&mut mutated, 32, (records_len + 8) as u64);
+    for at in [40, 56, 72, 96] {
+        let shifted = word_at(&bytes, at) + 8;
+        put_word(&mut mutated, at, shifted);
+    }
+    fs::write(&segment, &mutated).expect("write mutated");
+    assert_migration_refuses(
+        &dir,
+        Config::default(),
+        &segment,
+        &mutated,
+        "trailing record bytes",
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The other side of the authority split: the legacy QUERY indexes are not
+/// the completeness oracle and their damage must neither block nor corrupt
+/// a migration — the migrator rebuilds them from the CRC-checked (v7) or
+/// structurally re-walked (v6) record stream. Repair, not laundering.
+#[test]
+fn a_damaged_legacy_query_index_is_repaired_from_the_record_stream() {
+    // v7: flip a byte inside the fixture's trace index; migration must
+    // still produce a store that answers get_trace correctly.
+    let (fixture, config) = v7_fixture();
+    let dir = test_dir("v7-index-repair");
+    copy_tree(&fixture, &dir);
+    let segment = segment_paths(&dir).into_iter().next().expect("segment");
+    let mut bytes = fs::read(&segment).expect("bytes");
+    let trace_offset = word_at(&bytes, 56) as usize;
+    let trace_len = word_at(&bytes, 64) as usize;
+    bytes[trace_offset + trace_len / 2] ^= 0x01;
+    fs::write(&segment, &bytes).expect("write mutated");
+    let store = Store::open(&dir, config).expect("a damaged v7 query index migrates");
+    assert_eq!(store.query(&SpanFilter::default()).expect("scan").len(), 25);
+    assert_eq!(store.get_trace("trace-0-3").expect("trace").len(), 1);
+    drop(store);
+    let _ = fs::remove_dir_all(&dir);
+
+    // v6: same shape through the minimal fixture.
+    let (dir, segment, bytes) = minimal_v6_store("v6-index-repair");
+    let mut mutated = bytes.clone();
+    let trace_offset = word_at(&bytes, 56) as usize;
+    let trace_len = word_at(&bytes, 64) as usize;
+    mutated[trace_offset + trace_len / 2] ^= 0x01;
+    fs::write(&segment, &mutated).expect("write mutated");
+    let store = Store::open(&dir, Config::default()).expect("a damaged v6 query index migrates");
+    assert_eq!(store.query(&SpanFilter::default()).expect("scan").len(), 3);
+    assert_eq!(store.get_trace("trace-1").expect("trace").len(), 1);
+    drop(store);
     let _ = fs::remove_dir_all(&dir);
 }

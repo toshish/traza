@@ -845,13 +845,26 @@ fn supersede_journal_finishes_interrupted_rewrite() {
     store.flush().expect("flush");
     drop(store);
 
-    let original = std::fs::read_dir(&dir)
+    // Enumerate deterministically and adversarially: the rollup sidecar
+    // `segment-<id>.rollup` sorts before the segment `segment-<id>.seg`, so a
+    // selector matching every `segment-` name would pick the sidecar first and
+    // journal it as the superseded input — copying rollup bytes into a `.seg`
+    // name that recovery then reads as an uncommitted (unopenable) output and
+    // correctly rolls back, leaving the original in place. Select the real
+    // `.seg` segment only, past the earlier-sorting sidecar.
+    let mut entries: Vec<_> = std::fs::read_dir(&dir)
         .expect("dir")
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())
+        .collect();
+    entries.sort();
+    let original = entries
+        .into_iter()
         .find(|path| {
-            path.file_name()
-                .is_some_and(|n| n.to_string_lossy().starts_with("segment-"))
+            path.file_name().is_some_and(|n| {
+                let n = n.to_string_lossy();
+                n.starts_with("segment-") && n.ends_with(".seg")
+            })
         })
         .expect("segment exists");
     let old_name = original.file_name().unwrap().to_string_lossy().into_owned();
@@ -888,13 +901,22 @@ fn supersede_journal_without_replacement_keeps_original() {
     store.flush().expect("flush");
     drop(store);
 
-    let original = std::fs::read_dir(&dir)
+    // Sidecars sort before segments. The aborted-rewrite probe must name
+    // the real `.seg` input; selecting a sidecar can pass without testing
+    // whether recovery preserves the actual segment.
+    let mut entries: Vec<_> = std::fs::read_dir(&dir)
         .expect("dir")
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())
+        .collect();
+    entries.sort();
+    let original = entries
+        .into_iter()
         .find(|path| {
-            path.file_name()
-                .is_some_and(|n| n.to_string_lossy().starts_with("segment-"))
+            path.file_name().is_some_and(|n| {
+                let n = n.to_string_lossy();
+                n.starts_with("segment-") && n.ends_with(".seg")
+            })
         })
         .expect("segment exists");
     let old_name = original.file_name().unwrap().to_string_lossy().into_owned();
@@ -1856,13 +1878,13 @@ fn a_version_mismatch_advises_migration_and_never_deletion() {
     let dir = TestDir::new("foreign-segment-version");
     let segment = sealed_segment(&dir);
 
-    // Stamp a version this build neither writes NOR migrates. `VERSION - 1`
-    // is v6, which the migrator now converts (or refuses as corrupt when the
-    // body is not really v6) — so the version-mismatch advice is observed on
+    // Stamp a version this build neither writes NOR migrates. v6 and v7 are
+    // converted by the migrator (or refused as corrupt when the body is not
+    // really that format) — so the version-mismatch advice is observed on
     // the formats that still have no decoder in this build: 2 through 5, and
     // anything from the future (covered by its own test below).
     let mut bytes = fs::read(&segment).expect("read segment");
-    let foreign = traza::segment::VERSION - 2;
+    let foreign = 5_u16;
     bytes[8..10].copy_from_slice(&foreign.to_le_bytes());
     fs::write(&segment, &bytes).expect("write segment");
 
@@ -2094,12 +2116,12 @@ fn a_store_written_before_the_reserved_tenant_key_still_resolves_its_newest_vers
 fn a_future_format_is_refused_with_the_version_error_not_migrated_or_misread() {
     // This test's previous life proved a v6 store was refused through the
     // named version error while the migrator did not exist. The migrator
-    // exists now and v6 converts at open, so a v6 fixture can no longer
+    // exists now and v6/v7 convert at open, so those fixtures can no longer
     // observe the refusal — but the refusal path itself is preserved, and
     // what still needs it is the FUTURE: a store carrying a segment from a
     // format this build does not read must fail through the same named-file
     // version error, never be "migrated" (there is no decoder to migrate it
-    // with) and never misparsed. A v8 header is fabricated by flipping the
+    // with) and never misparsed. A v9 header is fabricated by flipping the
     // version word of a real, current-build segment.
     let dir = correctness_test_dir("future-format-refused");
     {
@@ -2115,7 +2137,7 @@ fn a_future_format_is_refused_with_the_version_error_not_migrated_or_misread() {
         .find(|path| path.extension().is_some_and(|ext| ext == "seg"))
         .expect("a sealed segment");
     let mut bytes = fs::read(&segment).expect("segment bytes");
-    bytes[8] = 8; // version word: 7 -> 8, little-endian low byte
+    bytes[8] = 9; // version word: 8 -> 9, little-endian low byte
     fs::write(&segment, &bytes).expect("tamper");
 
     let message = Store::open(&dir, Config::default())
@@ -2123,7 +2145,7 @@ fn a_future_format_is_refused_with_the_version_error_not_migrated_or_misread() {
         .expect("a future-format store must not open")
         .to_string();
     assert!(
-        message.contains("segment format v8"),
+        message.contains("segment format v9"),
         "the refusal names the format it found: {message}"
     );
     assert!(

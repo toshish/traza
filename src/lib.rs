@@ -8075,25 +8075,26 @@ fn load_segments(directory: &Path) -> Result<Vec<std::sync::Arc<Segment>>> {
             let detail = match &error {
                 segment::Error::UnsupportedVersion { found, .. } => {
                     // Advice must track what actually reads the found
-                    // version: cf40bea covers 2 through 5, v6 is migrated by
-                    // THIS build at open (so meeting one here means the
-                    // migration stepped aside for a reason its own error
-                    // named), and anything newer needs a newer build. The
-                    // old text pointed every mismatch at cf40bea, which for
-                    // a future format was affirmatively wrong guidance.
+                    // version: cf40bea covers 2 through 5, v6 and v7 are
+                    // migrated by THIS build at open (so meeting one here
+                    // means the migration stepped aside for a reason its own
+                    // error named), and anything newer needs a newer build.
+                    // The old text pointed every mismatch at cf40bea, which
+                    // for a future format was affirmatively wrong guidance.
                     let who_reads = match *found {
                         2..=5 => format!(
                             "Commit {LEGACY_SEGMENT_READER} reads formats 2 \
                              through 5; build it and open the backup with \
                              that."
                         ),
-                        6 => "This build migrates format 6 at open, so this \
-                              refusal means the migration stepped aside: the \
-                              store also holds something it must not convert \
-                              around (an unreadable segment head or a legacy \
-                              v1 segment — that file was named by its own \
-                              refusal). Resolve that file and reopen, and \
-                              the migration will run."
+                        6 | 7 => "This build migrates formats 6 and 7 at \
+                              open, so this refusal means the migration \
+                              stepped aside: the store also holds something \
+                              it must not convert around (an unreadable \
+                              segment head or a legacy v1 segment — that \
+                              file was named by its own refusal). Resolve \
+                              that file and reopen, and the migration will \
+                              run."
                             .to_owned(),
                         _ => "A newer build than this one wrote it; open the \
                               store with that build."
@@ -8115,7 +8116,9 @@ fn load_segments(directory: &Path) -> Result<Vec<std::sync::Arc<Segment>>> {
                          docs/segment-format.md."
                     )
                 }
-                segment::Error::Unsupported(_) | segment::Error::Corrupt(_) => {
+                segment::Error::Unsupported(_)
+                | segment::Error::Corrupt(_)
+                | segment::Error::CorruptSection { .. } => {
                     // Deliberately does NOT say another build can read the rest:
                     // `load_segments` aborts on the first unreadable segment, so
                     // no build opens this store until the file is dealt with.

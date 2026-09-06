@@ -6,20 +6,20 @@ These values were measured by `cargo run --release --bin query-bench`; they are 
 
 | Query | Cold (first request after restart) | Warm p50 | Warm p95 | Cold/warm |
 |---|---:|---:|---:|---:|
-| stats/llm group_by=model, whole corpus | 149.5 ms | 37.5 ms | 39.8 ms | 4x |
-| stats/llm group_by=model, 10% window | 478.5 ms | 292.7 ms | 298.1 ms | 2x |
-| stats/llm group_by=model, 1% window | 234.7 ms | 65.6 ms | 68.1 ms | 4x |
-| stats/llm group_by=session | 251.1 ms | 102.5 ms | 104.9 ms | 2x |
-| sessions list | 221.1 ms | 85.4 ms | 90.9 ms | 3x |
+| stats/llm group_by=model, whole corpus | 151.7 ms | 39.7 ms | 41.2 ms | 4x |
+| stats/llm group_by=model, 10% window | 497.3 ms | 300.4 ms | 323.6 ms | 2x |
+| stats/llm group_by=model, 1% window | 222.8 ms | 65.8 ms | 69.0 ms | 3x |
+| stats/llm group_by=session | 246.7 ms | 105.9 ms | 109.6 ms | 2x |
+| sessions list | 210.3 ms | 90.3 ms | 95.1 ms | 2x |
 
 ## Methodology
 
-- Corpus: 1000000 LLM spans, 6 models, 4 providers, 8 services, one session per 40 spans, ingested over 8 concurrent HTTP client(s) in batches of 1000. Ingest took 8.32s.
+- Corpus: 1000000 LLM spans, 6 models, 4 providers, 8 services, one session per 40 spans, ingested over 8 concurrent HTTP client(s) in batches of 1000. Ingest took 8.62s.
 - **Concurrency is a measured axis, not a detail.** Clients take a strided slice of the corpus, so their timestamps interleave and sealed segments overlap in time. With enough concurrent clients no segment is fully inside any query window, which is exactly when the windowed aggregation path stops being able to use a cached rollup. A single-threaded ingest reports the easy case.
 - Windows are absolute `since_ns`/`until_ns` bounds computed from the corpus's own time range and taken from its MIDDLE, so a 1% window really is one percent of the ingested time and is not partly answered by ruling out whole segments at the ends.
 - Cold: the single first request of that shape after a server restart. Warm: 20 subsequent identical requests, nearest-rank percentiles over complete request wall-clock durations.
-- Store at measurement time: 2 segments, 0 spans still in the write buffer, 0.27 GB on disk of which 29.9 MB is rollup sidecars (12.5% overhead, the price of the cold column), compaction fan-out 4 with a 268435456-byte segment ceiling. The segment count is polled until it stops moving BEFORE anything is timed, and again after every restart, so all rows describe one store shape. The buffered count matters: buffered spans have no cached rollup and are re-folded on every request, warm or cold.
-- Build: Cargo release profile. Timestamp: Unix 1788180835.
+- Store at measurement time: 20 segments, 0 spans still in the write buffer, 0.18 GB on disk of which 29.8 MB is rollup sidecars (19.5% overhead, the price of the cold column), compaction fan-out 4 with a 268435456-byte segment ceiling. The segment count is polled until it stops moving BEFORE anything is timed, and again after every restart, so all rows describe one store shape. The buffered count matters: buffered spans have no cached rollup and are re-folded on every request, warm or cold.
+- Build: Cargo release profile. Timestamp: Unix 1788687528.
 - Machine context: macos/aarch64, 10 available hardware threads.
 
 ## Query paths
@@ -31,13 +31,13 @@ Every merge drops its input segments' cached rollups and publishes an output seg
 
 | Metric | Value |
 |---|---:|
-| Queries fired during ingest | 695 |
-| Merge events observed | 2 |
-| p50 during compaction | 42.5 ms |
-| p95 during compaction | 107.7 ms |
-| Worst single query | 181.7 ms |
-| p50 once settled | 39.2 ms |
-| Churn penalty (p95 during / p50 settled) | 2.7x |
+| Queries fired during ingest | 285 |
+| Merge events observed | 0 |
+| p50 during compaction | 67.1 ms |
+| p95 during compaction | 145.6 ms |
+| Worst single query | 280.2 ms |
+| p50 once settled | 68.5 ms |
+| Churn penalty (p95 during / p50 settled) | 2.1x |
 
 A run that observed zero merge events proves nothing about compaction; check the merge count before reading the rest of this table.
 - `/v1/stats/llm?group_by=model` — every segment is fully inside the window, so every segment can be answered from its rollup

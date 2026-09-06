@@ -84,8 +84,8 @@ Changing Traza's code.
   `ingest-bench`, `storage-bench` and `query-bench`, and the rules for
   reporting a measurement honestly.
 - **[Segment format](segment-format.md)** — the on-disk layout, byte by byte:
-  the shipped v7 format, the v6 → v7 migration contract, and the historical
-  v6 layout the migrator's frozen decoder reads.
+  the shipped v8 format, the v6-and-v7 → v8 migration contract, and the
+  historical v7 and v6 layouts the migrator's frozen decoders read.
 - **[Dependencies](internals/dependencies.md)** — the standing dependency
   budget, the written case for each dependency taken, and the rejections
   that keep the count where it is.
@@ -115,5 +115,9 @@ for reporting a measurement honestly, are in
   per-cell results are committed alongside it as
   [`index-memory.json`](benchmarks/index-memory.json), which
   `tests/measurement_records.rs` checks the capacity guide against.
+- **[storage-v8-comparison.md](benchmarks/storage-v8-comparison.md)** — the
+  one hand-written page in this directory: the v7 → v8 before/after,
+  transcribing paired same-machine runs of the harnesses above that the
+  latest-run-only generated records cannot show.
 - **[CHANGELOG.md](../CHANGELOG.md)** — what changed, when, and what it
   measured.

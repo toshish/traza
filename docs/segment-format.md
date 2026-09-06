@@ -1,36 +1,432 @@
 # Segment Format: indexed segments
 
-This document has three parts. The [v7 format](#format-v7) is specified first
+This document has four parts. The [v8 format](#format-v8) is specified first
 and is **authoritative for what is on disk**: it is the one version this
 build writes and reads, and the format acceptance tests are written against
-its tables. The [historical v6 layout](#format-v6-historical--the-migration-source)
-follows — the format every release before v0.24.0 wrote, kept byte-precise
-because the migrator's frozen decoder reads it (and because v7 carries the
-four index sections' byte layouts over from it unchanged). The original v0.3
-design proposal is retained at the bottom as history. **The proposal does not
-describe the format that shipped** — it predates the implementation and
-differs in the layout, the section list, and the compatibility story. Read
-the first section for the current format, the second when working on the
-migrator, and the third only for the reasoning.
+its tables. The
+[historical v7 layout](#format-v7-historical--the-migration-source) follows —
+the format the v0.24.x line wrote, kept byte-precise because the migrator's
+frozen v7 decoder reads it and because v8 carries its records region (blocks,
+directory-entry layout, record encoding) forward unchanged. The
+[historical v6 layout](#format-v6-historical--the-migration-source) comes
+next — the format every release before v0.24.0 wrote, read by the migrator's
+frozen v6 decoder; its content-index table remains normative for v8, carried
+through v7 unchanged. The original v0.3 design proposal is retained at the
+bottom as history. **The proposal does not describe the format that
+shipped** — it predates the implementation and differs in the layout, the
+section list, and the compatibility story. Read the first section for the
+current format, the middle two when working on the migrator, and the last
+only for the reasoning.
 
-# Format v7
+# Format v8
 
 **Status: the shipped format.** This section describes what is on disk and
 is the contract the implementation is held to — the format acceptance tests
 (`tests/segment_format_acceptance.rs`) are written against these tables, and
 a divergence between spec and code is resolved by deliberately amending one
-of them, never by letting them drift. The amendments made while implementing
-are written into this section where they apply, each labeled as such; the
-two load-bearing ones are that the free-space precheck was removed from the
-migration contract, and that candidate confirmation at the segment layer
-moved from a payload parse to a digest-pair compare (with the store layer
-holding the parse authority).
+of them, never by letting them drift.
 
-v7 is the first bump made under [the policy below](#the-policy-from-here),
-and it pays point 3 in full: it ships with an automatic, resumable migrator,
-and the v6 decoder lives inside that migrator rather than surviving in the
-query path. The one readable version is 7; a v6 file is something the store
-converts at open, not something a query ever sees.
+v8 is the second bump under [the policy below](#the-policy-from-here) and
+pays point 3 the same way v7 did: it ships inside the automatic, resumable
+migrator, whose frozen v6 and v7 decoders are the only code outside this
+section's contract that still reads an older layout. The one readable
+version is 8; a v6 or v7 file is something the store converts at open, never
+something a query sees.
+
+Two things changed from v7, and they are two halves of one decision about
+the metadata sections. **The records region did not change**: v8 carries
+v7's compression blocks, block-directory entry layout, and record encoding
+(`(key id, value digest)` pairs, payload as the value-text authority)
+forward byte-for-byte, and the payload blob format (`TRZBLOB1`) is untouched
+— the [v7 section below](#format-v7-historical--the-migration-source)
+remains normative for all of that, exactly as v7 kept v6's index tables.
+
+**First: every metadata section is integrity-protected.** This is a defect
+fix, reproduced against v0.24.2 before it was designed away: flipping one
+byte of a trace id inside a sealed segment's trace-index section was
+accepted at reopen, and `get_trace` for that trace answered ZERO rows while
+a full scan still decoded the span — a silent empty answer from exclusion
+metadata nothing guarded. Every index section is exclusion metadata in that
+sense: an absent trace entry, a missing attribute posting, a cleared
+content-row bit, or a doctored header word each prunes work — and therefore
+rows — without decoding a record, and v7 checksummed none of them (the
+per-block CRCs guard record bytes only; the v0.24.2 timestamp-range
+validation guards exactly the two range words and nothing else). In v8 the
+header carries its own CRC-32 and every metadata section starts with a
+checksummed wrapper, both verified by BOTH opens before the segment serves
+anything. The corruption contract this enforces: **index or header
+corruption is an error naming the section, never a shrunken answer.**
+`tests/index_integrity.rs` pins it with the reproduced mutation and a sweep
+of every section and header byte, and was shown red against the unguarded
+behavior (checksum comparisons disabled) per the testing standard.
+
+Checksums guard corruption, not forgery — an adversary who can edit the file
+can recompute them. The record-anchored timestamp validation that closed the
+v0.24.1 pruning forgeries (v7's amendment #5, specified in the v7 section
+below) therefore carries into v8 unchanged and still runs at both opens: the
+declared range is proved against the first and last records themselves, and
+the acceptance tests drive their forgeries PAST the recomputed checksums to
+keep those deeper checks covered.
+
+**Second: the index sections earn their bytes.** Measured on the v7 run in
+[benchmarks/storage.md](benchmarks/storage.md) (records-region table), the
+records region is 45–57% of settled segment bytes by corpus — meaning the
+index sections are most of the rest, now that the records themselves are
+compressed. v7 stored them raw and fixed-width: 8 bytes per posting, 4-byte
+length prefixes, 4-byte counts. v8 stores the record-offset, trace, and
+attribute bodies as LEB128 varints with posting lists delta-coded, and every
+wrapped section body MAY additionally be LZ4-compressed (the same pinned
+`lz4_flex`, block format) when that is strictly smaller — with the content
+index deliberately excepted from compression, because its bit-sliced rows
+are read from disk by byte range at query time. Attribute-value digests keep
+their full 16 bytes: the 128-bit collision argument is load-bearing and is
+not traded for size. The savings are recorded where measurements live —
+[benchmarks/storage.md](benchmarks/storage.md), regenerated by
+`storage-bench` on the canonical corpora — rather than promised here as a
+percentage.
+
+## The v8 header
+
+Little-endian, fixed offsets, `header length = 132`:
+
+| Offset | Size | Field |
+|---:|---:|---|
+| 0 | 8 | magic, `TRAZASEG` |
+| 8 | 2 | format version (`8`) |
+| 10 | 2 | header length (`132`) |
+| 12 | 4 | codec id: 0 = raw, 1 = LZ4 block format |
+| 16 | 8 | record count |
+| 24 | 8 | records offset |
+| 32 | 8 | records length, **as stored** (compressed) |
+| 40 | 8 | record-offset index offset |
+| 48 | 8 | record-offset index length |
+| 56 | 8 | trace index offset |
+| 64 | 8 | trace index length |
+| 72 | 8 | attribute index offset |
+| 80 | 8 | minimum record timestamp |
+| 88 | 8 | maximum record timestamp |
+| 96 | 8 | content index offset |
+| 104 | 8 | block directory offset |
+| 112 | 8 | block directory length |
+| 120 | 8 | records **logical** length (uncompressed) |
+| 128 | 4 | **header CRC-32 over bytes [0, 128)** |
+
+Offsets 0 through 127 are v7's fields at v7's positions; the CRC word is
+appended. It is verified at parse, after the magic, version, and
+header-length words (so a future format is still a version refusal, not a
+checksum one) and before any other field is believed — every offset, length,
+count, codec id, and timestamp word below it steers section reads, negative
+pruning, or allocation sizes, and none was covered by anything else. Section
+order and the contiguity rule are v7's: header, records (stored), block
+directory, record-offset index, trace index, attribute index, content index
+to EOF; every section starts where the previous ends, the attribute index is
+bounded by the content offset, trailing bytes are refused. Two new
+structural checks ride on the count words: the record count must fit the
+logical region at the record framing's 24-byte minimum before it sizes any
+allocation, and a section shorter than its wrapper is refused outright.
+
+The segment-level timestamp-range validation — fences cross-checked at
+open, both bounds proved against the first and last RECORDS, out-of-range
+reads refused — is carried from v7 verbatim; see amendment #5 in the
+[v7 section](#format-v7-historical--the-migration-source).
+
+## The section wrapper
+
+Every metadata section — block directory, record-offset index, trace index,
+attribute index, content index — begins with a 16-byte wrapper:
+
+| Offset | Size | Field |
+|---:|---:|---|
+| 0 | 4 | CRC-32 (IEEE/gzip polynomial) over bytes 4..end of section |
+| 4 | 4 | flags: bit 0 = body is LZ4-compressed; all other bits must be zero |
+| 8 | 8 | body length, uncompressed |
+| 16 | — | stored body |
+
+Validation, all of it mandatory and run by both opens before the section is
+believed:
+
+- The checksum is verified first, over the flags, the length word, and the
+  stored body together — a flipped byte anywhere in the section is a
+  `Corrupt` refusal NAMING the section, never a shifted index.
+- An unknown flag bit is refused by name, exactly as an unknown codec id is:
+  it means "the wrong decoder", not "damaged bytes".
+- A raw body's declared length must equal its stored length.
+- A compressed body's declared length is bounded by LZ4's ~255x expansion
+  ceiling of the stored bytes BEFORE it sizes the decompress allocation —
+  the same rule the block reader and the blob decoder apply, because a
+  forged length must be `Corrupt`, never a gigantic allocation that aborts
+  the process — and the decoded length must then equal the declared one
+  exactly.
+- The content index's body must be stored raw (flag 0). Its bit-sliced rows
+  are read from disk by byte range at query time, so a compressed body could
+  not be row-addressed; the wrapper checksum still covers the rows, which is
+  why the file-backed open now reads the whole content section once (rows
+  are CRC-verified, then dropped — only the prologue, summary, and page
+  table stay resident). Rows read AFTER open are verified through the page
+  table below, so the record path and the content path carry the same
+  read-time guarantee.
+- All varints in the wrapped bodies must be canonically encoded — a
+  multi-byte varint whose final byte contributes no bits (`0x82 0x00` for 2)
+  is refused. The byte→value map stays injective, which the byte-identical
+  re-encode premise (the acceptance tests, the migration's idempotent
+  re-hash) rests on.
+
+The writer compresses a compressible section's body exactly when the
+compressed form is strictly smaller, mirroring the records region's
+raw-passthrough rule, so an incompressible section costs its raw bytes plus
+the 16-byte wrapper and never more. Under codec 0 every section body is
+stored raw, keeping "uncompressed segment" a codec choice rather than a
+format variant.
+
+## The index section bodies
+
+All integers below are LEB128 varints (seven value bits per byte, low bits
+first, high bit marking continuation). A decoder refuses a varint that
+overflows 64 bits or continues past its tenth byte. A **posting list** is:
+
+```
+varint  posting count            (bounded by the record count before allocation)
+varint  first offset, absolute
+varint  × (count − 1)            strictly positive gap to each next offset
+```
+
+Postings are logical record offsets in record order, so the sequence is
+strictly ascending in honest bytes; a zero gap is refused. The lists keep
+their u64 logical currency — only the encoding changed.
+
+**Record-offset index body**: exactly `record count` varints — the first
+record's absolute logical offset, then the gap to each next offset (which is
+the previous record's encoded length, restating v6's consecutive-offsets
+rule). The body must hold nothing else. Ordering and logical-bound
+validation are v7's, unchanged.
+
+**Trace index body**:
+
+```
+varint                entry count (bounded by the remaining bytes)
+per entry, in sorted trace-id order:
+  varint + bytes      trace id, length-prefixed
+  posting list        the trace's record offsets
+```
+
+**Attribute index body**:
+
+```
+varint                key count (dictionary, sorted key order)
+  varint + bytes      each attribute key name, length-prefixed
+varint                entry count
+per entry, in (key id, digest) order:
+  varint              key id (must index the dictionary)
+  16 bytes            digest of (key, value), see src/hash.rs
+  posting list        the pair's record offsets
+```
+
+The semantics of every probe are unchanged from v7: a digest probe returns
+CANDIDATES, the record's own pair list prefilters them, and the store's
+payload-derived verification remains the authority (v7's amendment #2, which
+carries forward whole).
+
+**Block directory body** is byte-for-byte the v7 encoding — 32-byte entries
+— inside the wrapper; its table in the
+[v7 section](#format-v7-historical--the-migration-source) remains normative.
+One bookkeeping consequence: the header's directory-length word now counts
+the wrapper (and any compression), so the entry count comes from the
+unwrapped body's length, and an empty segment's directory section is exactly
+one wrapper with an empty body.
+
+**Content index body** keeps the v6-era prologue, summary filter, and
+bit-sliced row layout (the tables in the
+[v6 section](#format-v6-historical--the-migration-source) remain normative
+for those) with ONE insertion between the summary and the rows: a
+**page-checksum table**, one CRC-32 per 4096-byte page of the rows region
+(`CONTENT_PAGE_BYTES`), the last page short:
+
+```
+[ 32-byte prologue        ]  unchanged fields, v6 layout
+[ summary filter          ]  summary_bits / 8 bytes, resident
+[ page-checksum table     ]  u32 × ceil(rows_len / 4096), resident
+[ bit-sliced rows         ]  block_bits × row_bytes bytes, on disk
+```
+
+The table exists because the rows are the one exclusion surface read from
+disk for the segment's LIFE: record blocks are CRC-checked on every read,
+but rows were verified only by the wrapper at open, so corruption arriving
+after open cleared admit bits and silently under-included content matches
+until the segment was reopened. The wrapper authenticates the table at
+open; the table then checks every row read. All pages overlapping the row
+are fetched and verified against their resident CRCs before their bytes are
+used; a mismatch is `Corrupt` naming the matrix. Rows wider than one page
+can require more than two page reads. The resident table costs four bytes
+per page, including the final partial page: about 0.1% of a matrix made of
+full pages. Matrix size itself depends on the record count and content.
+Geometry validation is mandatory before any of this sizes an allocation:
+`summary_bits` and `block_bits` must be powers of two AT OR BELOW the
+encoder's own ceilings (32 KiB and 8 KiB of filter respectively), and every
+derived length — rows, table, section — is computed with checked arithmetic
+and must account for the section exactly.
+
+## Migration: v6 and v7 → v8
+
+The contract is the one v7 shipped with, extended to a second source format:
+**automatic at first open, resumable, and never woven into the read path.**
+`Store::open` converts a store holding any v6 or v7 segment before serving
+anything; the frozen v6 decoder (copied at `5f23172`) and the frozen v7
+decoder (copied at `016eab8`, the last commit whose live reader spoke v7)
+live only inside `src/migration.rs`.
+
+- **Same path, temp + fsync + rename.** Each legacy segment is decoded by
+  the decoder its version word names, its records re-derived from their
+  payloads through the same span → record derivation ingest uses, and
+  re-encoded as v8 **onto the same file name** — name preservation is
+  [invariant 1](internals/invariants.md), not hygiene. Rollup sidecars are
+  rebuilt with fresh bindings in the same step, exactly as before.
+- **The record STREAM is the completeness authority, never the legacy
+  offset index.** Both legacy formats store their record-offset index and
+  record count unchecksummed, so an internally consistent shortened index —
+  one offset removed, the count decremented, later sections shifted, every
+  record block untouched — used to migrate a SUBSET of the intact records
+  and publish a freshly checksummed v8 store over the loss (independent
+  migration review, the release's P1). Both frozen decoders therefore walk
+  the framed records SEQUENTIALLY over the validated record bytes (v7's
+  after per-block CRC verification and inflation) and require exact,
+  zero-based, gap-free coverage: every record must start where the previous
+  ended AND where the offset index says, the final record must end exactly
+  at the region's end, the discovered count must equal the declared one,
+  and — for v7 — every block boundary must land on a discovered record
+  start. Any disagreement refuses the whole open by file name with the
+  legacy bytes untouched; nothing lossy is ever published. The legacy QUERY
+  indexes (trace, attribute, content) are deliberately never read and never
+  an authority: a damaged one is discarded and rebuilt from the record
+  stream — repair, not laundering.
+- **Blobs are already the current format.** v8 did not change the blob
+  format, so the blob pass is unchanged from v7's three-way rule: a file
+  passing full `TRZBLOB1` validation is left byte-for-byte alone (every
+  v7-written blob lands here and a v7 store's blob pass finds nothing to
+  do), a raw file whose bytes SHA-256 to its name is a v6 blob and is
+  rewritten, and a file matching neither is refused per file, never
+  laundered.
+- **Pins get the same passes plus the manifest-digest rewrite**, and resume
+  re-validates every pin without trusting the version-word trigger — a
+  digest-moved pinned segment is re-accepted only after an eager v8 open
+  that checks every wrapper and block checksum and decodes every record.
+- **Completion is a checkpoint that declares `segment_format: 8`** in its
+  manifest and is a FULL re-hash, forbidden from carrying any digest
+  forward, publishing `folded_through` unchanged — all for the reasons the
+  v7 contract states, which carry verbatim.
+- **The trigger rule at open**: any segment (live or pinned) declaring v6 or
+  v7 starts a full migration; all segments v8 but a manifest not declaring 8
+  — which includes every v0.24.x store's `segment_format: 7` — re-runs the
+  idempotent blob pass, re-validates every pin, and checkpoints. The WAL is
+  neither read nor rewritten; frames after `folded_through` replay against
+  the migrated store, and a pending erasure settles after migration.
+
+**Costs and the rollback boundary, stated.** Migration duration is
+proportional to store size — every record is decoded and re-encoded once,
+plus once more per pin — and nothing is served until it completes. Peak
+memory is several multiples of a segment's LOGICAL (uncompressed) record
+bytes, which no on-disk cap bounds for a v7 source; the module doc in
+`src/migration.rs` states what overlaps and why the estimate is
+workload-dependent rather than a promised ceiling. It is
+**one-way from the first converted file**: a v8 segment is not readable by
+any v0.24.x build, so after a mid-migration interruption the store holds
+mixed legacy/v8 files that only a v8-capable build can finish, and the store
+is down (data-safe, not availability-safe) until that open completes. The
+operator's rollback boundary is therefore BEFORE the first v8 open: take a
+backup by one of the two procedures in the
+[durability guide](operations/durability.md#backups) — stop the server and
+copy the directory, or take a filesystem snapshot atomic across the whole
+directory — and keep it until the migrated store has been verified
+(`/v1/verify` reporting `intact: true` after the completion checkpoint).
+Every conversion is atomic onto its own name, so `ENOSPC` mid-migration
+fails the open loudly at the file it starved and the next open resumes from
+exactly that file; free space to check beforehand is the live store's
+rewrite plus one full copy per pre-existing pin, because rewriting pinned
+files breaks their hard links — the cheap-pin promise stops holding for pins
+that pre-date the migration, exactly as it did across v6 → v7
+([backup guide](operations/backup.md)). Releasing pins before migrating and
+re-taking them after remains the cheap way out.
+
+## Determinism: encoder output is format bytes
+
+The rule carries from v7 and now covers the section wrappers too: encoding
+the same records twice yields identical bytes, compressed sections included,
+so the codec crate stays **pinned to an exact version** and upgrading it is
+a deliberate re-baseline. Varints are written minimally by the encoder; the
+decoder accepts any in-bounds encoding, so determinism is a property of the
+writer, exactly as it is for the compressor.
+
+## Acceptance gates
+
+Gates 1 through 4 of the v7 spec carry forward, re-based on v8 and enforced
+by the test suite:
+
+1. **Round trip**: encode/decode equality on randomized corpora, raw
+   passthrough and oversized records included.
+2. **Derivation invariant**: stored `(key id, digest)` lists re-derived from
+   parsed payloads, byte for byte.
+3. **Collision safety**: both layers, forged postings and planted pairs.
+4. **Migration**: v6 stores (downgraded fixtures plus the committed pr50
+   bytes) and v7 stores (the committed `tests/fixtures/v8-migration`
+   baseline bytes, written by v0.24.2 at `016eab8`) open into
+   query-identical answers, same names, verified manifests and pins, with
+   SIGKILL resume proven on the crash matrix and mid-migration v7 state
+   proven to resume. Completeness is gated too: an internally consistent
+   shortened legacy offset index (first, middle, or last offset omitted; an
+   offset nudged into a record; trailing unindexed record bytes; live and
+   pinned alike) refuses by file name with the legacy bytes untouched —
+   never a lossy conversion — while a damaged legacy QUERY index migrates
+   cleanly, rebuilt from the record stream.
+
+v8 adds a gate of its own:
+
+5. **Integrity**: single-byte mutations anywhere in the header or any
+   metadata section — including the reproduced trace-index defect — must
+   refuse at open or serve the span, never answer clean-and-empty; forged
+   wrapper lengths and content geometries must be refused before any
+   allocation and never panic; malformed or non-canonical varints, inflated
+   posting counts, and zero deltas are refusals by name; and content-matrix
+   damage arriving AFTER open surfaces as `Corrupt` at the query that
+   touches it, never as fewer matches (`tests/index_integrity.rs`, and the
+   hardening tests in the acceptance suite).
+
+The two measurement gates keep their v7 definitions and harness enforcement
+— `storage-bench` asserts settled amplification **at or below 1.0x** on
+`generic` and `llm` before writing its record, and `bench` asserts the
+trace-lookup and attribute-filter tripwires (0.75 ms / 6 ms p50) before
+writing its own. Both were re-run on v8 and passed: their published records in
+[benchmarks/](benchmarks/) are v8 runs — settled amplification **0.23x** on
+`generic` and **0.16x** on `llm` ([storage.md](benchmarks/storage.md)),
+trace-lookup p50 **0.577 ms** and attribute-filter p50 **3.657 ms** on the
+canonical corpus ([canonical-corpus.md](benchmarks/canonical-corpus.md)) —
+and the paired v7-vs-v8 before/after, with its run-variance honesty notes,
+is recorded in
+[storage-v8-comparison.md](benchmarks/storage-v8-comparison.md).
+
+---
+
+# Format v7 (historical — the migration source)
+
+**Status: historical.** This is the layout the v0.24.x line wrote. No
+shipped build writes it any more, and the only code that reads it is the
+migrator's FROZEN v7 decoder (`src/migration.rs`, copied from
+`src/segment.rs` at `016eab8`) — this section is that decoder's reference,
+kept byte-precise for exactly that reason. Most of it remains live beyond
+the migrator: the **records region** — the compression blocks, the
+block-directory entry layout, the record encoding with its digest pairs, the
+timestamp-range validation (amendment #5), and the two-layer candidate
+verification (amendment #2) — is carried into v8 unchanged and stays
+normative there, as do the payload-blob format and the erasure semantics.
+What v8 replaced is only the header length (a CRC word was appended), the
+raw index-section encodings below (now varint bodies inside checksummed
+wrappers), and the migration contract (superseded by the v6-and-v7 → v8
+section above). The section was written while v7 was the shipped format and
+keeps that voice, its labeled amendments included; read "the shipped
+format" here as "the format v0.24.x shipped".
+
+v7 was the first bump made under [the policy below](#the-policy-from-here),
+and it pays point 3 in full: it shipped with an automatic, resumable
+migrator, and the v6 decoder lives inside that migrator rather than
+surviving in the query path.
 
 Three things changed from v6 — the records region, the payload store, and
 the header that describes them. **The four index sections and the record
@@ -886,15 +1282,16 @@ the encoding that predated digests. Those branches were removed and the header
 fields became plain values, so the pruning path no longer carries a case where
 it cannot prune.
 
-**Versions 1 through 6 are spent.** 1 was JSONL. 2 was written by v0.16 and
+**Versions 1 through 7 are spent.** 1 was JSONL. 2 was written by v0.16 and
 v0.17, 3 by v0.18 and v0.19. **4 and 5 were never released** — they existed only
 on unreleased `main`, so no tag writes them and no tag reads them. 6 was
-written by every release after v0.19 and before v0.24.0. None of the six is
-written now, and none opens for serving: 2 through 5 are refused outright,
-and a 6 is read exactly once — by the migrator, which converts it before
-anything is served. The README's pre-1.0 terms permit an on-disk break
-between 0.x versions, and the 2-through-5 cut was one: `Store::open` refuses
-such a segment and names it, never advising deletion.
+written by every release after v0.19 and before v0.24.0, and 7 by the
+v0.24.x line. None of the seven is written now, and none opens for serving:
+2 through 5 are refused outright, and a 6 or a 7 is read exactly once — by
+the migrator, which converts it before anything is served. The README's
+pre-1.0 terms permit an on-disk break between 0.x versions, and the
+2-through-5 cut was one: `Store::open` refuses such a segment and names it,
+never advising deletion.
 
 ## Migrating between formats
 
@@ -923,10 +1320,10 @@ So export-and-reingest is a complete migration only for a store with no
 offloaded payloads and no annotations. Otherwise: back up, and read the backup
 with a build that can read it.
 
-**Which build?** For a v6 store: none — no manual step exists. Any v0.24.0+
-build migrates v6 automatically at first open, per the
-[Migration section](#migration-v6--v7) of the v7 spec above; back up first,
-open, done.
+**Which build?** For a v6 or v7 store: none — no manual step exists. Any
+current build migrates both automatically at first open, per the
+[Migration section](#migration-v6-and-v7--v8) of the v8 spec above; back up
+first, open, done.
 
 For anything older, not "the release that wrote this segment". A store
 accumulates segments in whichever format was current when each was sealed,
@@ -964,10 +1361,10 @@ Point 3 is the part the v6 cut did not pay for, and that was worth stating
 rather than hiding: a migrator from v2/v3/v5 would have meant resurrecting
 precisely the decoders just deleted, to serve stores that did not exist. The
 debt was declined once, on the last occasion it could be declined cheaply —
-and v6 is where it started being paid: the v6 → v7 bump ships with exactly
-the migrator point 3 demands, automatic at first open and resumable, with
-the v6 decoder frozen inside it (the [Migration section](#migration-v6--v7)
-above is its contract).
+and v6 is where it started being paid: the v6 → v7 bump shipped with exactly
+the migrator point 3 demands, and the v7 → v8 bump pays it again, both
+decoders frozen inside one migrator (the
+[Migration section](#migration-v6-and-v7--v8) above is its contract).
 
 ---
 
