@@ -25,7 +25,7 @@ the Elasticsearch and OpenObserve halves of every comparison are their
 published figures, carried over unverified. (An earlier edition of this
 document was measured on the uncompressed v6 format, which stored 1.8–2.1x
 the bytes ingested; those numbers survive in this file's git history and in
-the [format document's motivation](segment-format.md#format-v7).)
+the [format document's motivation](segment-format.md#format-v7-historical--the-migration-source).)
 
 ## What OpenObserve published
 
@@ -72,7 +72,7 @@ write its record. Full output, including exact byte counts, is in
 All three ratios are above 1:1: the store keeps 0.41x, 0.23x, and 0.0013x of
 the bytes it was sent. The v6 format measured 1.81x and 2.07x on the first two
 corpora — amplification, not compression — and the difference is what
-[format v7](segment-format.md#format-v7) shipped for.
+[format v7](segment-format.md#format-v7-historical--the-migration-source) shipped for.
 
 ## The same eight metrics, filled in
 

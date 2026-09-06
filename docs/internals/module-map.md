@@ -66,12 +66,15 @@ states the ordering rules they must not break.
 
 ### [`src/migration.rs`](../../src/migration.rs)
 
-The v6 → v7 migrator: automatic at first open, resumable, never in the read
-path. Owns the FROZEN v6 decoder (records only, copied from `src/segment.rs`
-at `5f23172`) — the one place the superseded layout is still understood — the
-three-way payload-blob classification, the per-pin file passes and manifest
-rewrite, and the completion checkpoint (a full re-hash that declares the
-store format in the manifest). `Store::open` calls it after crash recovery
+The legacy-format migrator (v6 and v7 → v8): automatic at first open,
+resumable, never in the read path. Owns the FROZEN v6 and v7 decoders
+(records only, copied from `src/segment.rs` at `5f23172` and `016eab8`
+respectively) — the one place the superseded layouts are still understood —
+each proving exact, gap-free coverage of the record stream rather than
+trusting the unchecksummed legacy offset index; plus the three-way
+payload-blob classification, the per-pin file passes and manifest rewrite,
+and the completion checkpoint (a full re-hash that declares the store format
+in the manifest). `Store::open` calls it after crash recovery
 and before the WAL is replayed; a store whose manifest already declares the
 format pays a ten-byte version-word read per segment — live and pinned —
 plus one read of the live manifest inside the trigger.

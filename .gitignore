@@ -4,3 +4,6 @@
 node_modules/
 .claude/
 __pycache__/
+
+# The frozen v7 fixture includes one durable, unsealed synthetic span.
+!tests/fixtures/v8-migration/store/wal.log

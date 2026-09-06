@@ -1,20 +1,22 @@
-//! The v6 → v7 migrator: automatic at first open, resumable, and never woven
-//! into the read path.
+//! The legacy-format migrator — v6 and v7 into the current v8 — automatic at
+//! first open, resumable, and never woven into the read path.
 //!
 //! The contract is the Migration section of `docs/segment-format.md`. In one
-//! paragraph: `Store::open` on a v0.24.0 build converts a v6 store before
-//! serving anything. Every v6 segment is decoded by the FROZEN decoder below,
-//! its records re-derived from their payloads through the same span → record
-//! derivation ingest uses, and re-encoded as v7 onto its SAME file name
-//! (temp + fsync + rename — segment path order IS recency order, so a fresh
-//! name would reorder last-write-wins). Rollup sidecars are rebuilt with
-//! fresh bindings from the records already in hand. Payload blobs are
-//! classified three ways — valid v7 is left alone, a raw file whose bytes
-//! SHA-256 to its name is a v6 blob and is rewritten as `TRZBLOB1`, and a
-//! file that is neither is refused per file rather than laundered into a
-//! validly framed blob. Pins get the same two passes plus a manifest-digest
-//! rewrite, because restore verifies a pin against those digests. Completion
-//! is a checkpoint whose manifest declares the store format and whose digests
+//! paragraph: `Store::open` converts a store holding any v6 or v7 segment
+//! before serving anything. Every legacy segment is decoded by the matching
+//! FROZEN decoder below, its records re-derived from their payloads through
+//! the same span → record derivation ingest uses, and re-encoded as v8 onto
+//! its SAME file name (temp + fsync + rename — segment path order IS recency
+//! order, so a fresh name would reorder last-write-wins). Rollup sidecars
+//! are rebuilt with fresh bindings from the records already in hand. Payload
+//! blobs are classified three ways — a valid current-format (`TRZBLOB1`)
+//! blob is left alone, a raw file whose bytes SHA-256 to its name is a v6
+//! blob and is rewritten as `TRZBLOB1`, and a file that is neither is
+//! refused per file rather than laundered into a validly framed blob; v8
+//! did not change the blob format, so a v7 store's blob pass finds nothing
+//! to do. Pins get the same two passes plus a manifest-digest rewrite,
+//! because restore verifies a pin against those digests. Completion is a
+//! checkpoint whose manifest declares the store format and whose digests
 //! are a FULL RE-HASH — the incremental carry-over rule assumes segments are
 //! immutable, and migration has just rewritten every one of them onto its
 //! same name, so a carried digest would describe bytes that no longer exist.
@@ -22,36 +24,53 @@
 //! WAL, and frames after the fold replay normally against the migrated store.
 //!
 //! Resumability is by construction, not by journal: every file conversion is
-//! atomic, a v7 segment is recognized by its version word, a v7 blob by full
-//! validation, and the completion checkpoint is the only bit of state. A
-//! crash at any point leaves a store the next open finishes — any v6 segment
-//! (live or pinned) restarts the full migration, and an all-v7 store with no
-//! manifest declaration re-runs the idempotent blob pass, re-validates every
-//! pin, and checkpoints. Pin re-validation deliberately does not trust the
-//! version-word trigger: between a pin's file pass and its manifest rewrite
-//! every file already reads as v7, so resume re-checks each pin's digests and
-//! redoes the manifest rewrite where the files validate as v7 but the
-//! digests disagree.
+//! atomic, a v8 segment is recognized by its version word, a current-format
+//! blob by full validation, and the completion checkpoint is the only bit of
+//! state. A crash at any point leaves a store the next open finishes — any
+//! v6 or v7 segment (live or pinned) restarts the full migration, and an
+//! all-v8 store whose manifest does not declare v8 re-runs the idempotent
+//! blob pass, re-validates every pin, and checkpoints. Pin re-validation
+//! deliberately does not trust the version-word trigger: between a pin's
+//! file pass and its manifest rewrite every file already reads as v8, so
+//! resume re-checks each pin's digests and redoes the manifest rewrite where
+//! the files validate as v8 but the digests disagree.
 //!
 //! There are no reads during migration; `Store::open` runs this before WAL
 //! replay and before any maintenance, and serves nothing until the store
-//! holds one format. The v6 decoder lives ONLY here — the live reader in
-//! `src/segment.rs` speaks exactly one version.
+//! holds one format. The v6 and v7 decoders live ONLY here — the live reader
+//! in `src/segment.rs` speaks exactly one version.
+//!
+//! **The record STREAM is the completeness authority, never the legacy
+//! offset index.** Both legacy formats store their record count and
+//! record-offset index unchecksummed, so an internally consistent shortened
+//! index used to migrate a SUBSET of the intact records and publish a
+//! freshly checksummed v8 store over the loss (independent migration
+//! review). Both frozen decoders walk the framed records sequentially over
+//! the validated record bytes and require exact, zero-based, gap-free
+//! coverage that agrees with the offset index entry for entry; any
+//! disagreement refuses the open by file name with the legacy bytes
+//! untouched. The legacy QUERY indexes are never read: a damaged one is
+//! rebuilt from the record stream, which is repair, not laundering.
 //!
 //! One cost is RAM, and it is stated rather than hidden: `migrate_segment`
-//! converts a segment entirely in memory, with roughly FOUR times the
-//! segment's size resident at peak — the raw v6 bytes, the re-derived
-//! records (payload copies included), the parsed spans, and the encoded v7
-//! output all overlap. Under the default 256 MiB compaction cap that peak is
-//! about 1 GiB; a store whose `max_segment_bytes = 0` (uncapped) grew
-//! multi-gigabyte segments needs commensurate memory to migrate them. An
-//! OOM kill mid-segment is crash-safe like every other kill — nothing is
-//! torn, the next open resumes — but it resumes INTO the same segment and
-//! the same kill, which makes it the one failure the resume design cannot
-//! make progress past; the way out is more memory, not a retry. A streaming
-//! converter would remove the ceiling at the cost of a second encoder shape,
-//! and is deliberately not built for a pre-release migration whose default
-//! configuration never comes near the limit.
+//! converts a segment entirely in memory. Resident at peak, all overlapping:
+//! the raw legacy file, the LOGICAL record bytes (for v7 the whole inflated
+//! record region — its size is the header's uncompressed length, which no
+//! on-disk cap bounds: a compressed 256 MiB segment of repetitive text can
+//! inflate to several times that), the re-derived records with their payload
+//! copies, the parsed spans, and the encoded v8 output. As a rule of thumb
+//! that is several multiples of the segment's LOGICAL size — measured
+//! per-workload, not promised — so a v6-era store under the default 256 MiB
+//! compaction cap needs on the order of a gigabyte per segment, while a
+//! store whose `max_segment_bytes = 0` (uncapped) grew multi-gigabyte
+//! segments, or whose records compress unusually well, needs commensurately
+//! more. An OOM kill mid-segment is crash-safe like every other kill —
+//! nothing is torn, the next open resumes — but it resumes INTO the same
+//! segment and the same kill, which makes it the one failure the resume
+//! design cannot make progress past; the way out is more memory, not a
+//! retry. A streaming converter would remove the ceiling at the cost of a
+//! second encoder shape, and is deliberately not built for a pre-release
+//! migration whose default configuration never comes near the limit.
 
 use std::fs;
 use std::io;
@@ -74,14 +93,14 @@ fn refuse(message: String) -> Error {
 /// published.
 ///
 /// The trigger rule, verbatim from the spec: any segment (live or pinned)
-/// declaring v6 starts a full migration; all segments v7 but no manifest
-/// declaration re-runs the idempotent blob pass, re-validates every pin, and
-/// then checkpoints. Both branches run the same sequence — the segment pass
-/// simply finds nothing to convert in the second — which is what makes a
-/// crash at any point re-run from where it stopped.
+/// declaring v6 or v7 starts a full migration; all segments v8 but no
+/// manifest declaration of v8 re-runs the idempotent blob pass, re-validates
+/// every pin, and then checkpoints. Both branches run the same sequence —
+/// the segment pass simply finds nothing to convert in the second — which is
+/// what makes a crash at any point re-run from where it stopped.
 pub(crate) fn run_at_open(directory: &Path, config: &Config, live_generation: u64) -> Result<u64> {
     // The legacy-JSONL guard `nothing_to_migrate` has, for the same reason:
-    // a v1 store is not this migrator's to declare v7. Step aside so
+    // a v1 store is not this migrator's to declare current. Step aside so
     // `load_segments` refuses it by name (migrate with 0.3.x first), instead
     // of publishing a completion checkpoint over segments this build cannot
     // read — and sweeping the adoption manifest on the way out.
@@ -96,11 +115,11 @@ pub(crate) fn run_at_open(directory: &Path, config: &Config, live_generation: u6
         }
     }
 
-    let mut any_v6 = false;
+    let mut any_legacy = false;
     let mut unreadable: Vec<String> = Vec::new();
     for path in segment_files(directory)? {
         match segment_version(&path)? {
-            Some(v6::VERSION) => any_v6 = true,
+            Some(v6::VERSION) | Some(v7::VERSION) => any_legacy = true,
             Some(version) if version == segment::VERSION => {}
             // A foreign version, a foreign magic, or a truncated head: not
             // this migrator's to convert. Collected rather than acted on,
@@ -117,49 +136,56 @@ pub(crate) fn run_at_open(directory: &Path, config: &Config, live_generation: u6
     }
     for pin in pin_dirs(directory)? {
         for path in segment_files(&pin)? {
-            if segment_version(&path)? == Some(v6::VERSION) {
-                any_v6 = true;
+            if matches!(
+                segment_version(&path)?,
+                Some(v6::VERSION) | Some(v7::VERSION)
+            ) {
+                any_legacy = true;
             }
         }
     }
     if !unreadable.is_empty() {
-        if any_v6 {
-            // A v6 store with a damaged file: converting around it would
+        if any_legacy {
+            // A legacy store with a damaged file: converting around it would
             // bury the report, and stepping aside would be worse —
             // `load_segments` aborts on the FIRST unreadable segment in path
-            // order, so a healthy v6 segment sorting earlier would draw a
+            // order, so a healthy legacy segment sorting earlier would draw a
             // version-mismatch refusal pointing away from the file that is
             // actually damaged. Refuse here, naming exactly what is wrong.
             return Err(refuse(format!(
-                "cannot migrate: {} segment file(s) beside this store's v6 \
-                 segments do not read as v6 or v7, and converting the store \
-                 around them would bury the report. Restore each from a \
-                 backup or remove it, then reopen and the migration will \
-                 run:\n{}",
+                "cannot migrate: {} segment file(s) beside this store's \
+                 legacy segments do not read as v6, v7, or v8, and \
+                 converting the store around them would bury the report. \
+                 Restore each from a backup or remove it, then reopen and \
+                 the migration will run:\n{}",
                 unreadable.len(),
                 unreadable.join("\n")
             )));
         }
-        // No v6 anywhere: there is nothing to migrate around, and
-        // `load_segments` owns the refusal — it names the file, and its
-        // version advice is correct for a store with no v6 in it.
+        // No legacy segment anywhere: there is nothing to migrate around,
+        // and `load_segments` owns the refusal — it names the file, and its
+        // version advice is correct for a store with no legacy format in it.
         return Ok(live_generation);
     }
 
     let manifest =
         generation::load_manifest(&generation::manifest_path(directory, live_generation))?;
-    // Declared v7 and no v6 version word anywhere: the ordinary open. The
-    // scan above is the whole per-open cost of the trigger.
-    if !any_v6 && manifest.segment_format.is_some() {
+    // Declared v8 and no legacy version word anywhere: the ordinary open.
+    // The scan above is the whole per-open cost of the trigger. A manifest
+    // declaring v7 — every store the v0.24.x line wrote — falls through and
+    // runs the passes, exactly like one with no declaration at all.
+    if !any_legacy && manifest.segment_format == Some(segment::VERSION) {
         return Ok(live_generation);
     }
 
     // ---- live segment pass -------------------------------------------------
     // Sorted path order, each conversion atomic onto its own name. A segment
-    // already v7 (a previous attempt got to it) is left exactly alone.
+    // already v8 (a previous attempt got to it) is left exactly alone.
     for path in segment_files(directory)? {
-        if segment_version(&path)? == Some(v6::VERSION) {
-            migrate_segment(&path, config, true)?;
+        match segment_version(&path)? {
+            Some(v6::VERSION) => migrate_segment(&path, config, true, Source::V6)?,
+            Some(v7::VERSION) => migrate_segment(&path, config, true, Source::V7)?,
+            _ => {}
         }
     }
     sync_directory(directory)?;
@@ -169,8 +195,8 @@ pub(crate) fn run_at_open(directory: &Path, config: &Config, live_generation: u6
     if !problems.is_empty() {
         return Err(refuse(format!(
             "migration refuses to rewrite {} payload file(s) that match neither \
-             format — not a valid v7 blob, and the raw bytes do not SHA-256 to \
-             the file name. Rewriting would launder unrecognized bytes into a \
+             format — not a valid TRZBLOB1 blob, and the raw bytes do not SHA-256 \
+             to the file name. Rewriting would launder unrecognized bytes into a \
              validly framed blob. Restore each file from a backup or remove it, \
              then reopen — the store serves nothing until then, the next open \
              resumes the migration from where this one stopped, and a pending \
@@ -191,10 +217,10 @@ pub(crate) fn run_at_open(directory: &Path, config: &Config, live_generation: u6
 }
 
 /// Whether `root` holds nothing the migrator would ever need to touch: no
-/// segment files in any format but v7, no payload files, no pins. Used at
-/// generation adoption so a store born on this build (or adopted with a
-/// purely-v7 working set) is declared v7 in its first manifest and never
-/// enters the migration path at all.
+/// segment files in any format but the current one, no payload files, no
+/// pins. Used at generation adoption so a store born on this build (or
+/// adopted with a purely-current working set) is declared v8 in its first
+/// manifest and never enters the migration path at all.
 pub(crate) fn nothing_to_migrate(root: &Path) -> Result<bool> {
     let entries = match fs::read_dir(root) {
         Ok(entries) => entries,
@@ -317,17 +343,38 @@ fn tree_has_files(root: &Path) -> Result<bool> {
     Ok(false)
 }
 
-/// Converts one v6 segment file to v7, onto its SAME path.
+/// Which frozen decoder reads a legacy segment. The version word chose it,
+/// and the decoder re-verifies that word itself, so a mis-stamped file is a
+/// named refusal rather than a misparse.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Source {
+    /// The pre-v0.24.0 layout: raw records carrying attribute value text.
+    V6,
+    /// The v0.24.x layout: LZ4 record blocks, digest pairs, raw indexes.
+    V7,
+}
+
+impl Source {
+    fn version(self) -> u16 {
+        match self {
+            Self::V6 => v6::VERSION,
+            Self::V7 => v7::VERSION,
+        }
+    }
+}
+
+/// Converts one legacy segment file to v8, onto its SAME path.
 ///
 /// The records are re-derived from their payloads: parse each payload as a
 /// span, run it through the same `span_to_record` derivation ingest uses —
 /// attributes, digests, and content text are all recoverable from the
 /// payload, which is what makes this a re-encode rather than a lossy copy.
-/// The v6 record's own attribute strings are decoded only to walk the bytes;
-/// the derivation from the payload is the definition, exactly as it is for
-/// the format's derivation invariant. (For records sealed under older
-/// decodings — the pre-`$tenant` fixture — the two legitimately differ, and
-/// the payload-derived answer is the current build's answer.)
+/// A v6 record's own attribute strings (and a v7 record's digest pairs) are
+/// decoded only to walk the bytes; the derivation from the payload is the
+/// definition, exactly as it is for the format's derivation invariant. (For
+/// records sealed under older decodings — the pre-`$tenant` fixture — the
+/// two legitimately differ, and the payload-derived answer is the current
+/// build's answer.)
 ///
 /// `with_rollup` distinguishes the live pass (which writes a freshly bound
 /// sidecar from the spans already decoded, so first query is not a rebuild
@@ -335,17 +382,22 @@ fn tree_has_files(root: &Path) -> Result<bool> {
 /// a manifest never lists). The write order of sidecar against segment
 /// rename is deliberately unspecified: a stale-bound sidecar self-invalidates
 /// and rebuilds on first use.
-fn migrate_segment(path: &Path, config: &Config, with_rollup: bool) -> Result<()> {
+fn migrate_segment(path: &Path, config: &Config, with_rollup: bool, source: Source) -> Result<()> {
     let bytes = fs::read(path)?;
-    let decoded = v6::decode_segment(&bytes).map_err(|reason| {
+    let decoded = match source {
+        Source::V6 => v6::decode_segment(&bytes),
+        Source::V7 => v7::decode_segment(&bytes),
+    }
+    .map_err(|reason| {
         refuse(format!(
-            "cannot migrate {}: {reason}. The file declares segment format v6 \
+            "cannot migrate {}: {reason}. The file declares segment format v{} \
              but does not decode as one — it may be truncated, damaged, or \
              mis-stamped. Nothing was rewritten. Back up the directory first — \
              stop the server and copy it, or take a filesystem snapshot atomic \
              across the whole directory — then inspect the file before \
              changing anything. See docs/operations/durability.md#backups",
-            path.display()
+            path.display(),
+            source.version()
         ))
     })?;
 
@@ -454,13 +506,15 @@ fn write_replacing(path: &Path, bytes: &[u8]) -> Result<()> {
 /// of every file that matched NEITHER format; the caller refuses the whole
 /// migration naming them, so the report covers all of them in one pass.
 ///
-/// The three-way rule, never magic alone: a file that passes full v7
-/// validation — magic, CRC, decode, SHA-256 of the decoded bytes against the
-/// name — is already migrated and left byte-for-byte alone. A file that fails
-/// that but whose RAW bytes SHA-256 to the name is a v6 blob (a v6 blob whose
-/// content merely begins with the magic lands here, which is why magic alone
-/// was never the test) and is rewritten as `TRZBLOB1` onto the same name.
-/// Anything else is corrupt and deliberately NOT rewritten.
+/// The three-way rule, never magic alone: a file that passes full
+/// current-format validation — magic, CRC, decode, SHA-256 of the decoded
+/// bytes against the name — is already migrated and left byte-for-byte
+/// alone (v8 did not change the blob format, so every v7-written blob lands
+/// here). A file that fails that but whose RAW bytes SHA-256 to the name is
+/// a v6 blob (a v6 blob whose content merely begins with the magic lands
+/// here, which is why magic alone was never the test) and is rewritten as
+/// `TRZBLOB1` onto the same name. Anything else is corrupt and deliberately
+/// NOT rewritten.
 ///
 /// Files that are not content-addressed blobs at all (a name that is not 64
 /// hex digits plus `.bin`) are outside the payload namespace — the serving
@@ -510,7 +564,7 @@ fn migrate_blob_tree(root: &Path) -> Result<Vec<String>> {
             let bytes = fs::read(&path)?;
             if let Ok(decoded) = payload::decode_blob(&bytes, stem) {
                 if payload::sha256_hex(&decoded).eq_ignore_ascii_case(stem) {
-                    continue; // already a valid v7 blob
+                    continue; // already a valid current-format blob
                 }
             }
             if payload::sha256_hex(&bytes).eq_ignore_ascii_case(stem) {
@@ -518,8 +572,8 @@ fn migrate_blob_tree(root: &Path) -> Result<Vec<String>> {
                 touched = true;
             } else {
                 problems.push(format!(
-                    "{}: not a valid v7 blob, and the raw bytes do not hash to \
-                     the file name",
+                    "{}: not a valid current-format blob, and the raw bytes do not \
+                     hash to the file name",
                     path.display()
                 ));
             }
@@ -557,7 +611,7 @@ fn is_validated_blob_path(relative: &str) -> bool {
 ///
 /// This also IS the resume re-validation: it runs on every migration resume,
 /// re-hashes every immutable file the manifest lists, and redoes the manifest
-/// rewrite exactly when the files read as v7 but the digests disagree — the
+/// rewrite exactly when the files read as v8 but the digests disagree — the
 /// crash window between a pin's file pass and its manifest rewrite, which the
 /// version-word trigger alone cannot see. Re-validating a finished pin costs
 /// a hash pass and changes nothing. The append-only log copies are never
@@ -575,14 +629,15 @@ fn migrate_pin(pin: &Path, config: &Config) -> Result<()> {
     }
     for path in segment_files(pin)? {
         match segment_version(&path)? {
-            Some(v6::VERSION) => migrate_segment(&path, config, false)?,
+            Some(v6::VERSION) => migrate_segment(&path, config, false, Source::V6)?,
+            Some(v7::VERSION) => migrate_segment(&path, config, false, Source::V7)?,
             Some(version) if version == segment::VERSION => {}
             other => {
                 return Err(refuse(format!(
-                    "cannot migrate pin {}: {} does not read as a v6 or v7 \
-                     segment (version {other:?}). Release the pin or restore \
-                     the file from the backup that was copied off it, then \
-                     reopen",
+                    "cannot migrate pin {}: {} does not read as a v6, v7, or \
+                     v8 segment (version {other:?}). Release the pin or \
+                     restore the file from the backup that was copied off it, \
+                     then reopen",
                     pin.display(),
                     path.display()
                 )))
@@ -620,7 +675,7 @@ fn migrate_pin(pin: &Path, config: &Config) -> Result<()> {
         let bytes = metadata.len();
         let sha256 = payload::sha256_file(&path)?;
         if file.bytes != bytes || file.sha256 != sha256 {
-            // The rewrite happens only "where the files validate as v7 but
+            // The rewrite happens only "where the files validate as v8 but
             // the digests disagree" — validate, not version-word. Blobs were
             // fully validated (or refused) by the pass above; a segment whose
             // digest moved must prove ALL of its bytes before the new digest
@@ -643,7 +698,7 @@ fn migrate_pin(pin: &Path, config: &Config) -> Result<()> {
                         });
                 if let Err(error) = validate {
                     return Err(refuse(format!(
-                        "cannot migrate pin {}: {} does not validate as a v7 \
+                        "cannot migrate pin {}: {} does not validate as a v8 \
                          segment ({error}); its manifest digest is left \
                          alone. Release the pin or restore the file, then \
                          reopen",
@@ -727,6 +782,16 @@ fn complete(
     Ok(next)
 }
 
+/// One decoded legacy record — the common currency of both frozen decoders.
+/// The attribute encodings each format carried (value text in v6, digest
+/// pairs in v7) are walked for structural validation and then discarded: the
+/// payload is the authority the migrator re-derives from.
+pub(crate) struct LegacyRecord {
+    pub(crate) timestamp: u64,
+    pub(crate) trace_id: String,
+    pub(crate) payload: Vec<u8>,
+}
+
 /// The FROZEN v6 decoder — records only, copied from `src/segment.rs` as of
 /// commit `5f23172` (the last commit whose live reader spoke v6) and then cut
 /// down to what migration needs. It exists nowhere else: the serving path
@@ -739,7 +804,8 @@ fn complete(
 /// and UTF-8-validated, then discarded — the migrator re-derives every
 /// attribute from the payload, which is the format's own definition of the
 /// pair list). What was dropped: the index decoders, the query paths, and the
-/// encoder — migration rebuilds all of that through the live v7 encoder.
+/// encoder — migration rebuilds all of that through the live current-format
+/// encoder.
 mod v6 {
     /// The one version this decoder reads. Everything else was refused by the
     /// v6 reader too, and is refused here with the same certainty.
@@ -748,14 +814,10 @@ mod v6 {
     const HEADER_LEN: usize = 104;
     const RECORD_FIXED_LEN: usize = 8 + 4 + 4 + 4 + 4;
 
-    /// One decoded v6 record. The attribute strings were walked for
-    /// structural validation but are not carried: the payload is the
-    /// authority the migrator re-derives from.
-    pub(super) struct Record {
-        pub timestamp: u64,
-        pub trace_id: String,
-        pub payload: Vec<u8>,
-    }
+    /// One decoded v6 record: the shared legacy shape. The attribute strings
+    /// were walked for structural validation but are not carried — the
+    /// payload is the authority the migrator re-derives from.
+    use super::LegacyRecord as Record;
 
     struct Header {
         record_count: u64,
@@ -772,17 +834,59 @@ mod v6 {
 
     /// Decodes a complete v6 segment file into its records, validating the
     /// header, the section layout, and every record's framing exactly as the
-    /// frozen reader did. Errors are reasons; the caller names the file.
+    /// frozen reader did — and then proving COMPLETE COVERAGE, which the
+    /// frozen reader never had to: the record STREAM, not the unchecksummed
+    /// offset index, is the authority on what the segment holds (independent
+    /// migration review, F4). Records are framed self-describing, so the
+    /// walk runs sequentially from byte zero of the record region and
+    /// requires that every record starts exactly where the previous ended,
+    /// that each start agrees with the offset index entry for its ordinal,
+    /// and that the final record ends exactly at the region's end with
+    /// exactly the header's declared count seen. An internally consistent
+    /// shortened index — one omitted offset, a decremented count, shifted
+    /// sections, record bytes untouched — previously migrated a SUBSET and
+    /// published a validly checksummed store over the loss; every such
+    /// disagreement is now a refusal, and the caller leaves the original
+    /// file byte-for-byte alone. Errors are reasons; the caller names the
+    /// file.
     pub(super) fn decode_segment(bytes: &[u8]) -> Result<Vec<Record>, String> {
         let header = parse_header(bytes)?;
         let offsets = decode_offsets(bytes, &header)?;
+        let region_start = header.records_offset as usize;
+        let region_end = (header.records_offset + header.records_len) as usize;
         let mut records = Vec::with_capacity(offsets.len());
-        for offset in &offsets {
-            records.push(decode_record(
-                bytes,
-                (header.records_offset + *offset) as usize,
-                (header.records_offset + header.records_len) as usize,
-            )?);
+        let mut cursor = region_start;
+        while cursor < region_end {
+            let ordinal = records.len();
+            let indexed = offsets
+                .get(ordinal)
+                .map(|offset| region_start as u64 + *offset);
+            if indexed != Some(cursor as u64) {
+                return Err(format!(
+                    "record #{ordinal} starts at record-region byte {} but the \
+                     offset index says {:?} — the record stream and the index \
+                     disagree, so migrating would lose or misframe records",
+                    cursor - region_start,
+                    indexed.map(|at| at - region_start as u64),
+                ));
+            }
+            let (record, next) = decode_record(bytes, cursor, region_end)?;
+            records.push(record);
+            cursor = next;
+        }
+        if cursor != region_end {
+            return Err(format!(
+                "the record stream ends {} byte(s) short of the record region",
+                region_end - cursor
+            ));
+        }
+        if records.len() != offsets.len() {
+            return Err(format!(
+                "the record stream holds {} record(s) but the offset index \
+                 lists {} — migrating would lose records",
+                records.len(),
+                offsets.len()
+            ));
         }
         Ok(records)
     }
@@ -878,7 +982,14 @@ mod v6 {
         Ok(offsets)
     }
 
-    fn decode_record(bytes: &[u8], start: usize, region_end: usize) -> Result<Record, String> {
+    /// Decodes one record and returns it WITH the byte after its payload —
+    /// the record's exact end, which the sequential coverage walk in
+    /// `decode_segment` requires so no slack between records can hide one.
+    fn decode_record(
+        bytes: &[u8],
+        start: usize,
+        region_end: usize,
+    ) -> Result<(Record, usize), String> {
         if start
             .checked_add(RECORD_FIXED_LEN)
             .filter(|end| *end <= region_end)
@@ -906,11 +1017,14 @@ mod v6 {
                 .map_err(|_| "attribute value is not valid UTF-8".to_owned())?;
         }
         let payload = take(bytes, &mut cursor, payload_len, region_end)?.to_vec();
-        Ok(Record {
-            timestamp,
-            trace_id,
-            payload,
-        })
+        Ok((
+            Record {
+                timestamp,
+                trace_id,
+                payload,
+            },
+            cursor,
+        ))
     }
 
     fn take_len_bytes<'a>(
@@ -928,6 +1042,425 @@ mod v6 {
             u32::from_le_bytes(raw.try_into().expect("four-byte slice")) as usize
         };
         take(bytes, cursor, len, end)
+    }
+
+    fn take<'a>(
+        bytes: &'a [u8],
+        cursor: &mut usize,
+        len: usize,
+        end: usize,
+    ) -> Result<&'a [u8], String> {
+        let next = cursor.checked_add(len).ok_or("field length overflow")?;
+        if next > end || next > bytes.len() {
+            return Err("truncated variable-length field".to_owned());
+        }
+        let value = &bytes[*cursor..next];
+        *cursor = next;
+        Ok(value)
+    }
+
+    fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, String> {
+        let raw = bytes.get(offset..offset + 4).ok_or("truncated integer")?;
+        Ok(u32::from_le_bytes(raw.try_into().expect("four-byte slice")))
+    }
+
+    fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, String> {
+        let raw = bytes.get(offset..offset + 8).ok_or("truncated integer")?;
+        Ok(u64::from_le_bytes(
+            raw.try_into().expect("eight-byte slice"),
+        ))
+    }
+}
+
+/// The FROZEN v7 decoder — records only, copied from `src/segment.rs` as of
+/// commit `016eab8` (the last commit whose live reader spoke v7) and cut
+/// down to what migration needs, exactly as the v6 decoder was before it.
+///
+/// What was kept: the v7 header parse with its section-contiguity and
+/// trailing-byte validation, the block-directory decode with its ordering,
+/// contiguity and allocation-bound checks, the per-block CRC-32 and LZ4
+/// inflation with the fence-vs-first-record check, the record-offset decode
+/// with its ordering checks, and the record decode (digest pairs walked for
+/// framing and order, then discarded — the migrator re-derives every
+/// attribute from the payload, which is the format's own definition of the
+/// pair list). What was dropped: the index decoders, the query paths, the
+/// lazy file backing, and the encoder — migration rebuilds all of that
+/// through the live v8 encoder. v7 stored its index sections raw and
+/// unchecksummed, which is the defect v8 exists to close; nothing here reads
+/// them, so a corrupt v7 index neither blocks nor corrupts a migration.
+mod v7 {
+    use crate::crc::crc32;
+
+    /// The one version this decoder reads.
+    pub(super) const VERSION: u16 = 7;
+    const MAGIC: [u8; 8] = *b"TRAZASEG";
+    const HEADER_LEN: usize = 128;
+    const DIRECTORY_ENTRY_LEN: usize = 32;
+    const STORED_RAW_FLAG: u32 = 1 << 31;
+    const RECORD_FIXED_LEN: usize = 8 + 4 + 4 + 4 + 4;
+    const ATTRIBUTE_PAIR_LEN: usize = 4 + 16;
+
+    use super::LegacyRecord as Record;
+
+    struct Header {
+        codec: u32,
+        record_count: u64,
+        records_offset: u64,
+        records_len: u64,
+        offsets_offset: u64,
+        offsets_len: u64,
+        directory_offset: u64,
+        directory_len: u64,
+        records_logical_len: u64,
+    }
+
+    struct BlockEntry {
+        logical_start: u64,
+        stored_offset: u64,
+        stored_len: u32,
+        raw: bool,
+        crc32: u32,
+        min_timestamp: u64,
+    }
+
+    /// Decodes a complete v7 segment file into its records, validating the
+    /// header, the section layout, every block's checksum, and every
+    /// record's framing exactly as the frozen reader did — and then proving
+    /// COMPLETE COVERAGE of the CRC-validated record stream, which the
+    /// frozen reader never had to (independent migration review, F4). The
+    /// blocks are per-block CRC-checked and inflated first; the walk then
+    /// runs sequentially over the logical bytes and requires that every
+    /// record starts exactly where the previous ended, that each start
+    /// agrees with the UNCHECKSUMMED offset index entry for its ordinal
+    /// (the v7 header and offset index carry no checksum, so they are
+    /// cross-checked against the stream, never trusted for completeness),
+    /// that the final record ends exactly at the logical length, and that
+    /// every block boundary lands on a record start (the format's
+    /// no-record-spans-blocks rule). An internally consistent shortened
+    /// index previously migrated a SUBSET of the intact, CRC-covered record
+    /// blocks and published a validly checksummed v8 store over the loss;
+    /// every such disagreement is now a refusal, and the caller leaves the
+    /// original file byte-for-byte alone. Errors are reasons; the caller
+    /// names the file.
+    pub(super) fn decode_segment(bytes: &[u8]) -> Result<Vec<Record>, String> {
+        let header = parse_header(bytes)?;
+        let offsets = decode_offsets(bytes, &header)?;
+        let directory = decode_directory(bytes, &header)?;
+        let logical = inflate_records(bytes, &header, &directory)?;
+        let mut records = Vec::with_capacity(offsets.len());
+        let mut cursor = 0usize;
+        while cursor < logical.len() {
+            let ordinal = records.len();
+            let indexed = offsets.get(ordinal).copied();
+            if indexed != Some(cursor as u64) {
+                return Err(format!(
+                    "record #{ordinal} starts at logical byte {cursor} but the \
+                     offset index says {indexed:?} — the record stream and the \
+                     index disagree, so migrating would lose or misframe records"
+                ));
+            }
+            let (record, next) = decode_record(&logical, cursor, logical.len())?;
+            records.push(record);
+            cursor = next;
+        }
+        if cursor != logical.len() {
+            return Err(format!(
+                "the record stream ends {} byte(s) short of the logical region",
+                logical.len() - cursor
+            ));
+        }
+        if records.len() != offsets.len() {
+            return Err(format!(
+                "the record stream holds {} record(s) but the offset index \
+                 lists {} — migrating would lose records",
+                records.len(),
+                offsets.len()
+            ));
+        }
+        // No record spans two blocks: every block's logical start must be a
+        // record boundary the walk just discovered. The walk's starts ARE
+        // `offsets` (checked equal above), which are sorted, so this is a
+        // binary search per block.
+        for entry in &directory {
+            if offsets.binary_search(&entry.logical_start).is_err() {
+                return Err("a block does not start at a record boundary — the \
+                     directory and the record stream disagree"
+                    .to_owned());
+            }
+        }
+        Ok(records)
+    }
+
+    fn parse_header(bytes: &[u8]) -> Result<Header, String> {
+        if bytes.len() < HEADER_LEN {
+            return Err("file is shorter than the v7 header".to_owned());
+        }
+        if bytes[..8] != MAGIC {
+            return Err("not a Traza segment (bad magic)".to_owned());
+        }
+        let version = u16::from_le_bytes([bytes[8], bytes[9]]);
+        if version != VERSION {
+            return Err(format!("declares format v{version}, not v7"));
+        }
+        let header_len = u16::from_le_bytes([bytes[10], bytes[11]]);
+        if usize::from(header_len) != HEADER_LEN {
+            return Err("header length does not match the version".to_owned());
+        }
+        let codec = read_u32(bytes, 12)?;
+        if codec > 1 {
+            return Err(format!("declares codec id {codec}, not raw or lz4"));
+        }
+        let total = bytes.len() as u64;
+        let attribute_index_offset = read_u64(bytes, 72)?;
+        let content_offset = read_u64(bytes, 96)?;
+        let header = Header {
+            codec,
+            record_count: read_u64(bytes, 16)?,
+            records_offset: read_u64(bytes, 24)?,
+            records_len: read_u64(bytes, 32)?,
+            offsets_offset: read_u64(bytes, 40)?,
+            offsets_len: read_u64(bytes, 48)?,
+            directory_offset: read_u64(bytes, 104)?,
+            directory_len: read_u64(bytes, 112)?,
+            records_logical_len: read_u64(bytes, 120)?,
+        };
+        // The v7 contiguity rule: six sections, each starting where the
+        // previous ends, the last ending at EOF, trailing bytes refused.
+        let trace_index_offset = read_u64(bytes, 56)?;
+        let trace_index_len = read_u64(bytes, 64)?;
+        let attribute_index_len = content_offset
+            .checked_sub(attribute_index_offset)
+            .ok_or("attribute index offset beyond file")?;
+        let content_len = total
+            .checked_sub(content_offset)
+            .ok_or("content index offset beyond file")?;
+        let sections = [
+            (header.records_offset, header.records_len),
+            (header.directory_offset, header.directory_len),
+            (header.offsets_offset, header.offsets_len),
+            (trace_index_offset, trace_index_len),
+            (attribute_index_offset, attribute_index_len),
+            (content_offset, content_len),
+        ];
+        let mut expected = HEADER_LEN as u64;
+        for (offset, len) in sections {
+            if offset != expected {
+                return Err("sections are not contiguous".to_owned());
+            }
+            expected = offset.checked_add(len).ok_or("section bounds overflow")?;
+            if expected > total {
+                return Err("section exceeds file bounds".to_owned());
+            }
+        }
+        if expected != total {
+            return Err("trailing or unaccounted segment bytes".to_owned());
+        }
+        let expected_offsets = header
+            .record_count
+            .checked_mul(8)
+            .ok_or("record-offset index length overflow")?;
+        if header.offsets_len != expected_offsets {
+            return Err("record-offset index has invalid length".to_owned());
+        }
+        if header.directory_len % DIRECTORY_ENTRY_LEN as u64 != 0 {
+            return Err("block directory has a partial entry".to_owned());
+        }
+        let empty = header.record_count == 0;
+        if (header.records_len == 0) != empty
+            || (header.records_logical_len == 0) != empty
+            || (header.directory_len == 0) != empty
+        {
+            return Err("record region and directory disagree".to_owned());
+        }
+        Ok(header)
+    }
+
+    fn decode_offsets(bytes: &[u8], header: &Header) -> Result<Vec<u64>, String> {
+        let start = header.offsets_offset as usize;
+        let end = start + header.offsets_len as usize;
+        let data = bytes
+            .get(start..end)
+            .ok_or("offsets section out of bounds")?;
+        let mut offsets = Vec::with_capacity(header.record_count as usize);
+        let mut previous = None;
+        for chunk in data.chunks_exact(8) {
+            let offset = u64::from_le_bytes(chunk.try_into().expect("eight-byte chunk"));
+            if offset >= header.records_logical_len || previous.is_some_and(|value| offset <= value)
+            {
+                return Err("record offsets are invalid or unordered".to_owned());
+            }
+            previous = Some(offset);
+            offsets.push(offset);
+        }
+        if offsets.is_empty() && header.records_logical_len != 0 {
+            return Err("record region exists without records".to_owned());
+        }
+        Ok(offsets)
+    }
+
+    fn decode_directory(bytes: &[u8], header: &Header) -> Result<Vec<BlockEntry>, String> {
+        let start = header.directory_offset as usize;
+        let end = start + header.directory_len as usize;
+        let data = bytes
+            .get(start..end)
+            .ok_or("directory section out of bounds")?;
+        let count = data.len() / DIRECTORY_ENTRY_LEN;
+        let mut entries: Vec<BlockEntry> = Vec::with_capacity(count);
+        let mut stored_total = 0u64;
+        for index in 0..count {
+            let base = index * DIRECTORY_ENTRY_LEN;
+            let word = read_u32(data, base + 16)?;
+            let entry = BlockEntry {
+                logical_start: read_u64(data, base)?,
+                stored_offset: read_u64(data, base + 8)?,
+                stored_len: word & !STORED_RAW_FLAG,
+                raw: word & STORED_RAW_FLAG != 0,
+                crc32: read_u32(data, base + 20)?,
+                min_timestamp: read_u64(data, base + 24)?,
+            };
+            if entry.stored_len == 0 {
+                return Err("block directory entry has zero length".to_owned());
+            }
+            if entry.logical_start >= header.records_logical_len {
+                return Err("block starts beyond the logical region".to_owned());
+            }
+            if entry.stored_offset != stored_total {
+                return Err("block directory stored offsets have gaps".to_owned());
+            }
+            stored_total = stored_total
+                .checked_add(u64::from(entry.stored_len))
+                .ok_or("block directory length overflow")?;
+            if let Some(previous) = entries.last() {
+                if entry.logical_start <= previous.logical_start {
+                    return Err("block logical starts are unordered".to_owned());
+                }
+                if entry.min_timestamp < previous.min_timestamp {
+                    return Err("block min timestamps are unordered".to_owned());
+                }
+            } else if entry.logical_start != 0 {
+                return Err("first block does not start at zero".to_owned());
+            }
+            entries.push(entry);
+        }
+        if stored_total != header.records_len {
+            return Err("block directory does not account for the stored region".to_owned());
+        }
+        // Allocation bounds, per block, before any extent sizes a buffer: a
+        // block stays below the 2^31 record bound, and a compressed block
+        // cannot inflate past LZ4's ~255x expansion ceiling of its stored
+        // bytes. (The live v7 reader also bounded multi-record blocks at the
+        // carving target through the offset table; the migrator's decode is
+        // sequential and whole-file, so these two bounds are what protects
+        // the allocation.)
+        for (index, entry) in entries.iter().enumerate() {
+            let logical_end = entries
+                .get(index + 1)
+                .map_or(header.records_logical_len, |next| next.logical_start);
+            let extent = logical_end - entry.logical_start;
+            if extent >= u64::from(STORED_RAW_FLAG) {
+                return Err("block logical extent exceeds the format bound".to_owned());
+            }
+            if entry.raw && u64::from(entry.stored_len) != extent {
+                return Err("raw block length mismatch".to_owned());
+            }
+            if !entry.raw && extent > u64::from(entry.stored_len) * 256 + 64 {
+                return Err(
+                    "block logical extent exceeds what lz4 can decode from its stored bytes"
+                        .to_owned(),
+                );
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Inflates the whole records region into its logical bytes, checking
+    /// every block's CRC before decode and its fence against its first
+    /// record after.
+    fn inflate_records(
+        bytes: &[u8],
+        header: &Header,
+        directory: &[BlockEntry],
+    ) -> Result<Vec<u8>, String> {
+        let logical_len = usize::try_from(header.records_logical_len)
+            .map_err(|_| "record region does not fit memory".to_owned())?;
+        let mut logical = Vec::with_capacity(logical_len);
+        for (index, entry) in directory.iter().enumerate() {
+            let start = usize::try_from(header.records_offset + entry.stored_offset)
+                .map_err(|_| "block offset does not fit memory".to_owned())?;
+            let end = start + entry.stored_len as usize;
+            let stored = bytes.get(start..end).ok_or("block outside file bounds")?;
+            if crc32(stored) != entry.crc32 {
+                return Err("block crc32 mismatch".to_owned());
+            }
+            let logical_end = directory
+                .get(index + 1)
+                .map_or(header.records_logical_len, |next| next.logical_start);
+            let extent = (logical_end - entry.logical_start) as usize;
+            let decoded = if entry.raw || header.codec == 0 {
+                stored.to_vec()
+            } else {
+                lz4_flex::block::decompress(stored, extent)
+                    .map_err(|_| "block does not decompress".to_owned())?
+            };
+            if decoded.len() != extent {
+                return Err("block decodes to the wrong length".to_owned());
+            }
+            if extent >= 8 && read_u64(&decoded, 0)? != entry.min_timestamp {
+                return Err("block min timestamp does not match its first record".to_owned());
+            }
+            logical.extend_from_slice(&decoded);
+        }
+        if logical.len() != logical_len {
+            return Err("blocks do not account for the logical region".to_owned());
+        }
+        Ok(logical)
+    }
+
+    /// Decodes one record and returns it WITH the byte after its payload —
+    /// the record's exact end, which the sequential coverage walk in
+    /// `decode_segment` requires so no slack between records can hide one.
+    fn decode_record(
+        bytes: &[u8],
+        start: usize,
+        region_end: usize,
+    ) -> Result<(Record, usize), String> {
+        if start
+            .checked_add(RECORD_FIXED_LEN)
+            .filter(|end| *end <= region_end)
+            .is_none()
+        {
+            return Err("truncated record header".to_owned());
+        }
+        let timestamp = read_u64(bytes, start)?;
+        let trace_len = read_u32(bytes, start + 8)? as usize;
+        let attribute_count = read_u32(bytes, start + 12)? as usize;
+        let payload_len = read_u32(bytes, start + 16)? as usize;
+        let mut cursor = start + RECORD_FIXED_LEN;
+        let trace = take(bytes, &mut cursor, trace_len, region_end)?;
+        let trace_id = std::str::from_utf8(trace)
+            .map_err(|_| "trace id is not valid UTF-8".to_owned())?
+            .to_owned();
+        // Walked and validated, then discarded: v7 stored each pair as a key
+        // id and a 16-byte value digest, and the migrator re-derives the
+        // pairs from the payload instead of trusting these.
+        let mut previous_id: Option<u32> = None;
+        for _ in 0..attribute_count {
+            let pair = take(bytes, &mut cursor, ATTRIBUTE_PAIR_LEN, region_end)?;
+            let id = u32::from_le_bytes(pair[..4].try_into().expect("four-byte slice"));
+            if previous_id.is_some_and(|value| value >= id) {
+                return Err("record attribute pairs are unordered".to_owned());
+            }
+            previous_id = Some(id);
+        }
+        let payload = take(bytes, &mut cursor, payload_len, region_end)?.to_vec();
+        Ok((
+            Record {
+                timestamp,
+                trace_id,
+                payload,
+            },
+            cursor,
+        ))
     }
 
     fn take<'a>(

@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.25.0] - 2026-09-06
+
+A lossless storage-efficiency release: format v8 compacts persisted indexes
+while preserving spans, payloads, query semantics, and retention settings.
+
+### Changed
+
+- Record offsets and trace/attribute postings use delta varints. Metadata
+  sections use LZ4 when it produces fewer bytes, with raw passthrough otherwise.
+  Record compression and content-addressed payloads retain their existing codecs.
+- Segment headers and all metadata used to exclude query results carry integrity
+  checks. Content-index pages are also checked when read after the segment opens.
+- Format v6 and v7 stores migrate automatically to v8, including pins and their
+  manifests. Migration preserves filenames and WAL fold boundaries and proves
+  complete coverage of legacy records before replacing a segment.
+
+### Fixed
+
+- Corrupted persisted query indexes can no longer silently hide matching spans
+  at open. Malformed geometry and noncanonical varints are refused.
+- Legacy offset metadata that omits intact records is refused instead of
+  publishing an apparently healthy but incomplete migrated store.
+
+### Upgrade
+
+Migration changes files in place through atomic replacements and resumes after
+interruption. It is **one-way from the first converted file**. Stop the old server
+and retain a complete cold backup plus a tested compatible binary before opening
+existing data with this release. Downgrade requires restoring that backup;
+replacing only the executable is insufficient. See
+[the format and migration contract](docs/segment-format.md).
+
 ## [0.24.2] - 2026-08-31
 
 The follow-up an external review of the v0.24.1 line earned: the query

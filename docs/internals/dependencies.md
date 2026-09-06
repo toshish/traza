@@ -20,7 +20,7 @@ Traza itself included.
 
 ## lz4_flex — segment and blob compression (accepted, ships in v0.24.0)
 
-**The job.** [Format v7](../segment-format.md#format-v7)
+**The job.** [Format v7](../segment-format.md#format-v7-historical--the-migration-source)
 compresses the segment records region in 128 KiB record-aligned blocks and
 compresses payload blobs whole. The measured motivation is in the spec and in
 [storage-comparison](../storage-comparison.md): the records region is where
@@ -67,7 +67,7 @@ the dependency it would avoid — which is exactly the test the budget asks.
   silent drift.
 - **Version pinned exact (`=` in `Cargo.toml`).** Compressor output bytes
   are format bytes under the acceptance tests — see
-  [the determinism rule](../segment-format.md#determinism-compressor-output-is-format-bytes)
+  [the determinism rule](../segment-format.md#determinism-encoder-output-is-format-bytes)
   — so a routine `cargo update` must not be able to change what the encoder
   writes. Upgrading the pin is a deliberate re-baseline commit. The pin
   constrains the encoder only; any correct LZ4 decoder reads any valid

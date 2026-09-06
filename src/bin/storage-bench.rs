@@ -96,7 +96,7 @@ struct Measurement {
     total_bytes: u64,
     segment_count: u64,
     /// Stored (compressed) records-region bytes, summed over every segment's
-    /// v7 header.
+    /// v8 header.
     records_stored_bytes: u64,
     /// Logical (uncompressed) records-region bytes, summed the same way.
     records_logical_bytes: u64,
@@ -381,13 +381,13 @@ fn measure(
     })
 }
 
-/// The records region's stored and logical lengths, read from a v7 segment
-/// header: 128 bytes, magic `TRAZASEG`, stored (compressed) records length at
+/// The records region's stored and logical lengths, read from a v8 segment
+/// header: 132 bytes, magic `TRAZASEG`, stored (compressed) records length at
 /// byte 32, logical (uncompressed) records length at byte 120 — see the
 /// header table in `docs/segment-format.md`. The bench refuses a file it does
 /// not recognize rather than measuring it as zero.
 fn records_region(path: &Path) -> Result<(u64, u64), Box<dyn std::error::Error>> {
-    let mut header = [0u8; 128];
+    let mut header = [0u8; 132];
     let mut file = fs::File::open(path)?;
     file.read_exact(&mut header)?;
     if &header[0..8] != b"TRAZASEG" {
@@ -395,10 +395,10 @@ fn records_region(path: &Path) -> Result<(u64, u64), Box<dyn std::error::Error>>
     }
     let version = u16::from_le_bytes([header[8], header[9]]);
     let header_len = u16::from_le_bytes([header[10], header[11]]);
-    if version != 7 || header_len != 128 {
+    if version != 8 || header_len != 132 {
         return Err(format!(
             "{}: segment declares version {version} with a {header_len}-byte header; \
-             this bench measures the v7 layout only",
+             this bench measures the v8 layout only",
             path.display()
         )
         .into());
@@ -691,7 +691,8 @@ defined at the default corpus sizes only — and the published record was not re
         );
     }
     report.push_str(
-        "- Segment records and payload blobs are LZ4-compressed (format v7). A ratio below 1:1 would be \
+        "- Segment records and payload blobs are LZ4-compressed (since format v7; the current format \
+is v8). A ratio below 1:1 would be \
 amplification and would be reported as measured rather than inverted into a flattering number.\n\
 - Exact byte counts, so anything derived from this table can be recomputed rather than \
 re-rounded:\n",
@@ -713,10 +714,10 @@ re-rounded:\n",
 
     report.push_str(
         "\n## Records-region measurements\n\n\
-Measured by this same run, from the v7 header of every segment file the settled store holds: \
-the header is 128 bytes, the records region's STORED (compressed) length is the u64 at byte 32, \
+Measured by this same run, from the v8 header of every segment file the settled store holds: \
+the header is 132 bytes, the records region's STORED (compressed) length is the u64 at byte 32, \
 and its LOGICAL (uncompressed) length is the u64 at byte 120 — the header table in \
-[the format document](../segment-format.md#the-v7-header) is the reference. The records region \
+[the format document](../segment-format.md#the-v8-header) is the reference. The records region \
 is LZ4-compressed and addressed through the block directory, so the logical column is the byte \
 count the directory's blocks decode to, not anything present contiguously in the file.\n\n\
 | Corpus | Segment bytes | Records stored | Stored share | Largest per-file share | Records logical | Stored/logical |\n\
@@ -741,7 +742,7 @@ in the record's own key/value list. v7 removed that double-store — records car
 `(key id, digest)` pairs, and the value text lives only in the payload — so the column no \
 longer measures anything. The v6-era numbers (36.1% of `llm`'s records region, 25.6% of \
 `pinned-context`'s, 7.4% of `generic`'s, at `65652a2`) remain quoted in \
-[the format document's motivation](../segment-format.md#format-v7) as the measurement that \
+[the format document's motivation](../segment-format.md#format-v7-historical--the-migration-source) as the measurement that \
 justified the change, and in this file's git history.\n",
     );
     Ok(report)
