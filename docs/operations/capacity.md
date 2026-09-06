@@ -41,14 +41,19 @@ spans over the real HTTP path, on macOS/aarch64 with 10 hardware threads.
 
 | Metric | Measured | Project target | Result |
 |---|---:|---:|---|
-| Sustained batched HTTP ingest | 69,980 spans/s | ≥ 50,000 spans/s | PASS |
-| Trace-by-id p95 | 0.862 ms | < 50 ms | PASS |
-| Attribute-filtered query p95 | 4.392 ms | < 300 ms | PASS |
+| Sustained batched HTTP ingest | 65,749 spans/s | ≥ 50,000 spans/s | PASS |
+| Trace-by-id p95 | 1.280 ms | < 50 ms | PASS |
+| Attribute-filtered query p95 | 5.443 ms | < 300 ms | PASS |
 
 | Query | p50 | p95 | p99 | samples |
 |---|---:|---:|---:|---:|
-| Trace by ID | 0.425 ms | 0.862 ms | 1.245 ms | 200 |
-| Attribute filter | 2.974 ms | 4.392 ms | 8.928 ms | 100 |
+| Trace by ID | 0.577 ms | 1.280 ms | 2.094 ms | 200 |
+| Attribute filter | 3.657 ms | 5.443 ms | 6.468 ms | 100 |
+
+This is the v8-format record. Run-to-run spread on the shared benchmark
+laptop is comparable to the v7 → v8 movement in the tails — the paired
+before/after runs and their honesty notes are in
+[storage-v8-comparison.md](../benchmarks/storage-v8-comparison.md).
 
 The ingest row measures the bench's compacting configuration (fan-out 4), so
 compaction runs concurrently with the flood.
@@ -56,9 +61,10 @@ compaction runs concurrently with the flood.
 engine-limit row is the same span shape without that contention — quiet
 machine, compaction off, and a server rate whose client JSON encoding sits
 outside the timed loop, where this row's sits inside it — so the two rates
-are not like-for-like beyond that. That corpus occupied 124,947,455 bytes on
-disk across 65 segments at measurement time — roughly 125 bytes per span
-*for this benchmark's span shape*, on the v7 compressed format. Your bytes-per-span depends entirely on
+are not like-for-like beyond that. That corpus occupied 66,854,329 bytes on
+disk across 65 segments at measurement time — roughly 67 bytes per span
+*for this benchmark's span shape*, on the v8 format (the same corpus
+measured ~125 bytes per span on v7). Your bytes-per-span depends entirely on
 your attribute volume, so treat it as a method rather than a constant: ingest
 a representative sample and read `bytes_on_disk` from
 [`GET /v1/stats`](../guide/http-api.md#get-v1stats).
@@ -71,7 +77,9 @@ what the server can do, not a ceiling.
 
 From [`ingest.md`](../benchmarks/ingest.md): 1,000,000 spans per
 run, 1,000 spans per batch, `wal` durability, median of 5 runs, on macOS/aarch64
-(Apple M1 Max, 10 hardware threads).
+(Apple M1 Max, 10 hardware threads). This matrix is the 2026-07 record on the
+v6-format build and has not been re-run since; the v8 canonical record above
+is the current single-configuration ingest measurement.
 
 | Scenario | Concurrency | Median spans/s |
 |---|---:|---:|
@@ -304,15 +312,35 @@ the index entirely.
 ### Content search
 
 `?content=refund` finds spans by the words in their text. It is served by a
-per-segment word filter (segment format v5), and its cost profile is worth
-understanding because it is very good in one regime and does nothing in
-another.
+per-segment word filter (introduced in segment format v5), and its cost
+profile is worth understanding because it is very good in one regime and
+does nothing in another.
 
-Measured with `cargo run --release --bin content-bench`, which runs the same
-corpus twice — once with the index and once with `--no-content-index` — so the
-comparison is two measurements rather than one measurement and a memory.
-200,000 spans carrying a prompt and a completion of 60 words each, 145 MiB of
-text, 100 segments, no compaction, load average 7-10:
+**Re-measured on the v8 build (2026-09).** `cargo run --release --bin
+content-bench` runs the same corpus twice — once with the index and once
+with `--no-content-index` — so the comparison is two measurements rather
+than one measurement and a memory. 100,000 spans carrying a prompt and a
+completion of 60 words each, 72.6 MiB of text, 50 segments, no compaction,
+on a loaded machine, paired against the identical run on the v7 build:
+
+| Query | Matches | v8 with index | v8 without | v7 with index |
+|---|---:|---:|---:|---:|
+| A word in one span | 1 | 0.570 ms | 484.873 ms | 0.555 ms |
+| Two words, one span | 1 | 0.613 ms | 513.076 ms | 0.556 ms |
+| A word in ~every span | 97,777 | 394.502 ms | 421.073 ms | 412.495 ms |
+| A word in no span | 0 | 0.011 ms | 490.379 ms | 0.005 ms |
+
+The indexed store's segment bytes fell 46.9 → 41.5 MiB from v7 to v8 on this
+corpus (index overhead over the no-index store: 0.7%), while the resident
+index measured 27.08 MiB on **both** builds — the v8 change is on-disk
+encoding, and it makes no RAM claim. Selective lookups stay
+sub-millisecond with v8's per-page checksum verification on the row-read
+path. These short runs on a loaded machine do not establish performance
+equivalence.
+
+**The v5-era record, kept for the regime analysis below.** 200,000 spans,
+145 MiB of text, 100 segments, load average 7-10 — a larger corpus than the
+v8 run above, so the columns are not comparable across the two tables:
 
 | Query | Matches | With index | Without | Speedup |
 |---|---:|---:|---:|---:|
@@ -485,7 +513,9 @@ the number of segments rather than the size of the corpus. That is what
 compaction exists to bound, and the effect is the largest single performance
 lever in the system.
 
-At **10M spans**, uncompacted against default compaction:
+At **10M spans**, uncompacted against default compaction (this table and
+the 100M one below are single-run records from before format v8; they have
+not been re-run on v8, whose 1M-span canonical record is above):
 
 | Metric | Uncompacted | Default compaction |
 |---|---:|---:|
@@ -516,9 +546,9 @@ samples — a shorter-lived merge spike between samples could exceed it.
 
 Read honestly: compaction is worth roughly **16–28x** on filtered search at the
 default cap, and raising the cap to 1 GiB is worth roughly another **3–4x** on
-top. **At a 1 GiB cap, filtered-search p99 is 22.2 ms at 100M spans — inside
-the 50 ms bar this project sets itself**, where the 256 MiB default measures
-72.9 ms and misses it.
+top. At a 1 GiB cap, historical filtered-search p99 is 22.2 ms at 100M spans,
+versus 72.9 ms at the 256 MiB default. These are not current-format acceptance
+results: the canonical gates apply to trace p95 < 50 ms and filter p95 < 300 ms.
 
 That win is paid for in memory and ingest: peak RSS 2.0 → 6.7 GB, and sustained
 ingest a further 24% lower (40,894 → 31,267 spans/s). Raising the cap is the
@@ -528,15 +558,14 @@ for a memory-constrained host. Both are one flag apart.
 **These are single-run measurements on one machine at 100M spans. Nothing above
 that size has been measured**, and segment count still grows with the corpus, so
 the same tail returns at a large enough store. The structural answer remains a
-per-segment inverted index, which is not built.
+cross-segment attribute routing index, which is not built.
 
 ## Trace lookup
 
 Limited queries decode only the records they return, which is why trace lookup
-stays fast as the corpus grows: p99 1.270 ms at 1M
+stays fast as the corpus grows: p99 2.094 ms at 1M on the v8 format
 ([`canonical-corpus.md`](../benchmarks/canonical-corpus.md)), 2.28 ms at 10M
-and 1.82 ms at 100M
-under default compaction. It is not *entirely* scale-independent — the 100M
+and 1.82 ms at 100M under default compaction (both pre-v8 runs, below). It is not *entirely* scale-independent — the 100M
 uncompacted column shows 7.72 ms — because a lookup still probes each segment's
 trace index, so it tracks segment count too, just far less steeply than a
 filtered search.
@@ -562,12 +591,13 @@ Two things follow for sizing:
   on the query-bench corpus — not as a stable share of the store.** The
   dominant term is eight bytes per span for the supersede prefilter, plus the
   per-session trace sets, so sidecar bytes scale with span count and
-  session/trace cardinality rather than with span size. Their *share* moved
-  with format v7: segments compressed to under a third of their v6 size while
-  sidecars stay raw (erasure's byte scans need them literal), so the same
-  1M-span corpus that measured 4.1% sidecar overhead on the v6 store measures
-  **12.5%** on the v7 store — 29.9 MB against 0.27 GB; see
-  [`query.md`](../benchmarks/query.md) for the store it was measured on.
+  session/trace cardinality rather than with span size. Sidecars stay raw
+  because erasure scans require literal bytes. In the paired 1M-span runs,
+  v7 measured 27.7 MB of sidecars and 11.6% overhead, while v8 measured
+  29.8 MB and 19.5% overhead; see [`query.md`](../benchmarks/query.md).
+  Here overhead means sidecar bytes divided by **non-sidecar** bytes, not
+  their share of the total directory. Segment layouts differed between runs,
+  so neither the sidecar totals nor the overhead are fixed sizing constants.
 - **Compaction no longer costs the aggregations a rebuild.** A merge replaces
   several segments with one, which kills the inputs' cached rollups and
   publishes an output that has none — so the next aggregation used to pay to
@@ -628,17 +658,26 @@ fully inside any window, so every one of them takes the decoding path.
 There is no single "spans per node" answer, because the binding constraint
 moves with the workload. Work through it in this order:
 
-1. **Disk.** Ingest a representative sample and read `bytes_on_disk`. Budget
+1. **Disk.** Ingest a representative sample and measure the whole data
+   directory, including WAL, payloads, sidecars, manifests, and pins.
+   `bytes_on_disk` reports persisted segment bytes only. Budget
    headroom for superseded versions (they persist until compaction rewrites
    their segment) and for a merge's output existing alongside its inputs.
+   **Upgrading a v6/v7 store:** the first open under v0.25.0 migrates it to
+   format v8 in place — automatically, and one-way from the first converted
+   file — so take a backup first and budget the migration's own transient
+   disk (the live rewrite plus one full copy per pre-existing pin). The
+   authoritative contract, including the rollback boundary, is
+   [the format document's migration section](../segment-format.md#migration-v6-and-v7--v8).
 2. **Filtered-search latency.** This is what degrades first as a store grows,
    and it tracks segment count. Watch `segment_count` and the
    `--compaction-max-segment-bytes` trade above.
-3. **Memory.** Driven by the compaction cap, not the corpus. Pick the cap your
-   host can hold during a merge.
-4. **Ingest rate.** Only if you are approaching the ~212k spans/s design
-   ceiling. Batch size is the first lever — the per-batch costs are paid once
-   per request regardless of how many spans it carries.
+3. **Memory.** Budget corpus-dependent resident indexes and caches, plus
+   transient compaction and migration allocations. Choose a compaction cap
+   that leaves room for both steady-state memory and a merge.
+4. **Ingest rate.** Measure your workload with the intended durability,
+   batching, compaction, and concurrency. Historical peak rates are not
+   current capacity guarantees. Per-batch costs are paid once per request.
 5. **File descriptors.** One per segment. Fine with compaction on; a real
    limit with it off. Rollup sidecars do not add to this — they are read once
    and closed, not held open.
@@ -648,6 +687,10 @@ moves with the workload. Work through it in this order:
 Stated plainly, because absence of a number is not a claim of good behaviour:
 
 - Anything above 100M spans on a single node.
+- The 10M and 100M compaction tables and the memory matrices on format v8 —
+  they were measured on earlier formats and have not been re-run; the 1M-span
+  canonical record and the content-search pairing are the v8 measurements on
+  this page.
 - Query performance under concurrent read load — the query percentiles above
   were sampled without competing readers.
 - Sustained mixed read/write workloads.

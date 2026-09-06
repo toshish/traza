@@ -393,10 +393,14 @@ The two measurement gates keep their v7 definitions and harness enforcement
 — `storage-bench` asserts settled amplification **at or below 1.0x** on
 `generic` and `llm` before writing its record, and `bench` asserts the
 trace-lookup and attribute-filter tripwires (0.75 ms / 6 ms p50) before
-writing its own. The published records in [benchmarks/](benchmarks/) are
-v7-era until the canonical harnesses are re-run on v8; re-running them is
-part of the release, and the harnesses will refuse to publish a v8 run that
-misses a gate.
+writing its own. Both were re-run on v8 and passed: their published records in
+[benchmarks/](benchmarks/) are v8 runs — settled amplification **0.23x** on
+`generic` and **0.16x** on `llm` ([storage.md](benchmarks/storage.md)),
+trace-lookup p50 **0.577 ms** and attribute-filter p50 **3.657 ms** on the
+canonical corpus ([canonical-corpus.md](benchmarks/canonical-corpus.md)) —
+and the paired v7-vs-v8 before/after, with its run-variance honesty notes,
+is recorded in
+[storage-v8-comparison.md](benchmarks/storage-v8-comparison.md).
 
 ---
 

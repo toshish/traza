@@ -10,6 +10,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 A lossless storage-efficiency release: format v8 compacts persisted indexes
 while preserving spans, payloads, query semantics, and retention settings.
 
+Measured on the three bundled synthetic corpora (paired same-machine
+before/after runs, identical ingested bytes; not a forecast for arbitrary
+traffic): whole-data-directory size fell **44.2%** on `generic`
+(132,663,519 → 73,968,447 bytes for 1M service-trace spans), **31.4%** on
+`llm` (107,692,288 → 73,909,976 bytes for 200k LLM-call spans), and
+**38.1%** on `pinned-context` (4,283,487 → 2,650,416 bytes for 10k
+long-context spans). The full normalized export of all 1.21M baseline spans
+is byte-identical after migration, and every migrated store verifies intact.
+Evidence, latency pairs, and reproduction commands:
+[docs/benchmarks/storage-v8-comparison.md](docs/benchmarks/storage-v8-comparison.md).
+
 ### Changed
 
 - Record offsets and trace/attribute postings use delta varints. Metadata

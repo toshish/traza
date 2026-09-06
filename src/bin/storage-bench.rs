@@ -617,10 +617,10 @@ waits for the flush and for compaction to quiesce, then walks the data directory
 
     report.push_str(
         "\n## Storage cost\n\n\
-Priced per GiB-month at the rates a storage comparison conventionally uses: \
+Illustrative storage-only arithmetic, assuming prices per GiB-month of \
 $0.08 for block storage, $0.023 for object storage. Traza keeps its data in a local data \
-directory, so it pays the block rate, and an HA cluster keeps one copy per node.\n\n\
-| Corpus | Stored | 1 node / month | 3-node HA / month |\n\
+directory. Three independent copies are a cost scenario, not supported HA.\n\n\
+| Corpus | Stored | 1 copy / month | 3 copies / month |\n\
 |---|---:|---:|---:|\n",
     );
     for m in measurements {
@@ -636,7 +636,7 @@ directory, so it pays the block rate, and an HA cluster keeps one copy per node.
     }
     report.push_str(&format!(
         "\nFor reference, the same stored volume on object storage at ${OBJECT_STORAGE_USD_PER_GIB_MONTH}/GiB-month would cost \
-{:.1}x less. Traza has no object-storage tier; the rate is quoted only so the gap is legible.\n",
+{:.1}x less. Traza has no object-storage tier; these are assumptions, not current price quotes or a deployment benchmark.\n",
         BLOCK_STORAGE_USD_PER_GIB_MONTH / OBJECT_STORAGE_USD_PER_GIB_MONTH,
     ));
 

@@ -3,7 +3,7 @@ Traza
 
 Traza is a trace database for LLM and agent workloads. It runs as a single binary with no external database, no queue, and no coordinator.
 
-**Sub-millisecond trace lookup. 4.4 ms filtered search over a million spans. 208,000 spans/s sustained ingest. Stores 0.23–0.41x the bytes you send on service-trace and LLM-call shapes.** One process, one directory.
+**Trace lookup at p95 1.3 ms and filtered search at p95 5.4 ms over a million spans. 65,749–69,615 spans/s in the canonical benchmark. Stores 0.16–0.23x the bytes you send on service-trace and LLM-call shapes.** One process, one directory.
 
 [![CI](https://github.com/toshish/traza/actions/workflows/ci.yml/badge.svg)](https://github.com/toshish/traza/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/traza)](https://crates.io/crates/traza)
@@ -195,9 +195,9 @@ Apps instrumented with OpenLLMetry or the OpenTelemetry GenAI conventions arrive
 
 ![An agent swarm in the trace browser: a 14-span waterfall with the critical path marked, per-span model and token counts, and the run's duration, tokens and cost across the top.](docs/assets/trace-waterfall.png)
 
-**Fast reads.** Trace lookup at p95 0.86 ms and filtered search at p95 4.4 ms over a million spans. Full-text search across prompt text returns a selective term in 1.5 ms where scanning takes 1,258 ms.
+**Fast reads.** Trace lookup at p95 1.28 ms and filtered search at p95 5.4 ms over a million spans. Full-text search across prompt text returns a selective term in 0.57 ms where scanning takes 485 ms.
 
-**One process.** No metadata database, no column store, no lock service, no object store to configure. It starts in milliseconds, and there is no control plane to lose a quorum at 3am.
+**One process.** No metadata database, no column store, no lock service, no object store to configure. Run the binary against a data directory; no control plane is required.
 
 **A small surface.** Three direct dependencies, thirteen packages in the whole lockfile, a 3.4 MB binary. HTTP, threading and file I/O are the standard library, and the crate is `#![forbid(unsafe_code)]`.
 
@@ -219,20 +219,19 @@ Apps instrumented with OpenLLMetry or the OpenTelemetry GenAI conventions arrive
 
 | | |
 |---|---|
-| Trace lookup, 1M spans | p95 **0.86 ms** |
-| Filtered search, 1M spans | p95 **4.4 ms** |
-| Content search, selective term | **1.5 ms** (1,258 ms scanning) *(v5-format record)* |
+| Trace lookup, 1M spans | p95 **1.28 ms** |
+| Filtered search, 1M spans | p95 **5.4 ms** |
+| Content search, selective term | **0.57 ms** (485 ms scanning) |
 | Sustained ingest, `wal` | **208,973 spans/s** *(v6-format run, 2026-07)* |
-| Stored vs ingested, service traces | **0.41x** |
-| Stored vs ingested, LLM calls | **0.23x** |
-| Binary | **3.4 MB** |
+| Stored vs ingested, service traces | **0.23x** |
+| Stored vs ingested, LLM calls | **0.16x** |
 | Direct dependencies | **3** |
 
-Every number is produced by a benchmark bundled in this repo, run over the real HTTP path. The harness writes the records itself and refuses to publish a result it cannot stand behind — the latency and storage benchmarks assert the format's [acceptance gates](docs/segment-format.md#acceptance-gates) before writing theirs. The two rows marked with a format vintage predate v7: sustained ingest is [ingest.md](docs/benchmarks/ingest.md)'s 2026-07 record on the v6-format build — conservative, since gate 6's interleaved A/B measured v7 ingest no slower — and content search is [capacity.md](docs/operations/capacity.md#content-search)'s v5-era record, not re-measured on the v7 scan path. Run them yourself with `cargo run --release --bin bench`.
+The performance and storage figures come from bundled benchmarks: HTTP ingest/query harnesses and the embedded-store content-search harness. Latency and storage harnesses assert the format's [acceptance gates](docs/segment-format.md#acceptance-gates). The sustained-ingest row is explicitly historical; current v8 canonical runs sustained 65,749–69,615 spans/s with concurrent compaction. The paired [v7 → v8 comparison](docs/benchmarks/storage-v8-comparison.md) measured 31–44% fewer bytes across three synthetic corpora and identical normalized exports across migration. These are workload-specific measurements, not customer capacity guarantees. Run `cargo run --release --bin bench` to reproduce the canonical benchmark.
 
 ## When not to use Traza
 
-**HA storage cost on ordinary traffic is your binding constraint.** Traza stores less than you send — measured at 0.41x the ingested bytes on service traces and 0.23x on LLM calls ([storage.md](docs/benchmarks/storage.md)); the v6-era 1.8–2.1x amplification is gone with format v7. What still stands is architectural: Traza keeps its data on local block storage, once per node, so a columnar engine writing to shared object storage still wins the HA cost row by two orders of magnitude on ordinary span traffic, and scan-heavy analytics over columns is not this engine's shape — [the comparison](docs/storage-comparison.md) runs the full table. The exception is agent context: a 320 KiB pinned context repeated across 10,000 calls is content-addressed, stored once, and compressed — 3.1 GiB ingested became 4.1 MiB on disk, a 770:1 ingested-to-stored ratio on the `pinned-context` corpus ([storage.md](docs/benchmarks/storage.md)).
+**You require native HA or shared object storage.** Traza currently uses a single writer and local storage; this release does not add replication, failover, or an object tier. Format v8 measured 0.23x the ingested bytes on service traces and 0.16x on LLM calls in the bundled synthetic corpora. Repeated large context can also benefit from content addressing: 3.1 GiB ingested became 2.5 MiB on the highly repetitive `pinned-context` corpus. These results do not establish comparative HA cost or compression against other databases. [Storage economics and limitations](docs/storage-comparison.md) explains the distinction.
 
 **You need metrics and logs in the same system.** Traza stores traces and their analytics. That is the whole surface, on purpose.
 

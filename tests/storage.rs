@@ -845,13 +845,26 @@ fn supersede_journal_finishes_interrupted_rewrite() {
     store.flush().expect("flush");
     drop(store);
 
-    let original = std::fs::read_dir(&dir)
+    // Enumerate deterministically and adversarially: the rollup sidecar
+    // `segment-<id>.rollup` sorts before the segment `segment-<id>.seg`, so a
+    // selector matching every `segment-` name would pick the sidecar first and
+    // journal it as the superseded input — copying rollup bytes into a `.seg`
+    // name that recovery then reads as an uncommitted (unopenable) output and
+    // correctly rolls back, leaving the original in place. Select the real
+    // `.seg` segment only, past the earlier-sorting sidecar.
+    let mut entries: Vec<_> = std::fs::read_dir(&dir)
         .expect("dir")
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())
+        .collect();
+    entries.sort();
+    let original = entries
+        .into_iter()
         .find(|path| {
-            path.file_name()
-                .is_some_and(|n| n.to_string_lossy().starts_with("segment-"))
+            path.file_name().is_some_and(|n| {
+                let n = n.to_string_lossy();
+                n.starts_with("segment-") && n.ends_with(".seg")
+            })
         })
         .expect("segment exists");
     let old_name = original.file_name().unwrap().to_string_lossy().into_owned();
@@ -888,13 +901,22 @@ fn supersede_journal_without_replacement_keeps_original() {
     store.flush().expect("flush");
     drop(store);
 
-    let original = std::fs::read_dir(&dir)
+    // Sidecars sort before segments. The aborted-rewrite probe must name
+    // the real `.seg` input; selecting a sidecar can pass without testing
+    // whether recovery preserves the actual segment.
+    let mut entries: Vec<_> = std::fs::read_dir(&dir)
         .expect("dir")
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())
+        .collect();
+    entries.sort();
+    let original = entries
+        .into_iter()
         .find(|path| {
-            path.file_name()
-                .is_some_and(|n| n.to_string_lossy().starts_with("segment-"))
+            path.file_name().is_some_and(|n| {
+                let n = n.to_string_lossy();
+                n.starts_with("segment-") && n.ends_with(".seg")
+            })
         })
         .expect("segment exists");
     let old_name = original.file_name().unwrap().to_string_lossy().into_owned();

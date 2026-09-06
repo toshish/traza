@@ -115,5 +115,9 @@ for reporting a measurement honestly, are in
   per-cell results are committed alongside it as
   [`index-memory.json`](benchmarks/index-memory.json), which
   `tests/measurement_records.rs` checks the capacity guide against.
+- **[storage-v8-comparison.md](benchmarks/storage-v8-comparison.md)** — the
+  one hand-written page in this directory: the v7 → v8 before/after,
+  transcribing paired same-machine runs of the harnesses above that the
+  latest-run-only generated records cannot show.
 - **[CHANGELOG.md](../CHANGELOG.md)** — what changed, when, and what it
   measured.
