@@ -209,6 +209,8 @@ Apps instrumented with OpenLLMetry or the OpenTelemetry GenAI conventions arrive
 
 **Backup without stopping.** One call pins and verifies a consistent copy of spans, annotations and payload bytes together. Restore is one flag.
 
+**Archive to object storage (preview).** Behind the default-off `object-storage` feature, `traza-object` publishes a verified pin to S3-compatible storage as an immutable snapshot — then queries it in place by verified range reads, restores it whole, or deletes it. Archives are explicit historical copies, not tiering: the live writer is untouched, and local retention never silently reaches a published snapshot. See [docs/operations/object-storage.md](docs/operations/object-storage.md).
+
 **Deletion with a receipt.** Erase a trace, a session, a whole tenant, or one offloaded payload from every domain — buffer, log, segments, annotations, payload files, datasets — then prove it: `verify --erasure` re-checks each domain by name and reports the result of each, down to the pinned backup that still holds the bytes and the dataset example that carries a promoted copy.
 
 **Tenants in the key, not bolted on.** Span identity is `(tenant, trace_id, span_id)`, so two customers sharing a trace id can never overwrite each other. A token bound with `rw@acme:token` writes and reads exactly one tenant on every surface; retention takes per-tenant windows; `GET /v1/tenants` accounts usage per tenant. Single-tenant stores write byte-identical files and notice nothing.

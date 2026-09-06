@@ -16,6 +16,8 @@ name: Release
 # is smoke-tested from an UNRELATED working directory — v0.22.0 shipped a
 # dashboard 404 only visible when launched from elsewhere, and that class
 # of bug does not get a second chance. Actions are pinned to commit SHAs.
+# Canonical prerelease tags publish to the preview channel and never advance
+# the container's latest alias or GitHub's latest stable release.
 
 on:
   push:
@@ -28,8 +30,24 @@ permissions:
   attestations: write
 
 jobs:
+  metadata:
+    name: Validate release channel
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.channel.outputs.version }}
+      prerelease: ${{ steps.channel.outputs.prerelease }}
+      container_alias: ${{ steps.channel.outputs.container_alias }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - run: python3 scripts/test-release-channel.py
+      - name: Refuse malformed tags before any build or publication
+        id: channel
+        run: python3 scripts/release-channel.py "$GITHUB_REF_NAME" --github-output "$GITHUB_OUTPUT"
+
   preflight:
     name: Full gate (${{ matrix.os }})
+    needs: metadata
     strategy:
       fail-fast: true
       matrix:
@@ -39,15 +57,21 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: The tag names one version, everywhere
+        env:
+          RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
         run: |
-          version="${GITHUB_REF_NAME#v}"
-          cargo_v=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
-          ui_v=$(python3 -c 'import json; print(json.load(open("ui/package.json"))["version"])')
-          fail=0
-          [ "$version" = "$cargo_v" ] || { echo "tag ${version} != Cargo.toml ${cargo_v}"; fail=1; }
-          [ "$version" = "$ui_v" ] || { echo "tag ${version} != ui/package.json ${ui_v}"; fail=1; }
-          grep -q "^## \[${version}\]" CHANGELOG.md || { echo "CHANGELOG.md has no [${version}] section"; fail=1; }
-          exit $fail
+          python3 - <<'PYTHON'
+          import json, os, re
+          from pathlib import Path
+          version = os.environ["RELEASE_VERSION"]
+          cargo = re.search(r'^version\s*=\s*"([^"]+)"', Path("Cargo.toml").read_text(), re.M).group(1)
+          ui = json.loads(Path("ui/package.json").read_text())["version"]
+          if version != cargo or version != ui:
+              raise SystemExit(f"tag {version} != Cargo {cargo} or UI {ui}")
+          headings = Path("CHANGELOG.md").read_text().splitlines()
+          if not any(line == f"## [{version}]" or line.startswith(f"## [{version}] ") for line in headings):
+              raise SystemExit(f"CHANGELOG.md has no [{version}] section")
+          PYTHON
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: stable
@@ -61,20 +85,43 @@ jobs:
 
   preflight-msrv:
     name: MSRV holds on the tagged commit
+    needs: metadata
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Read the standalone MSRV
+        id: msrv
+        run: python3 -c 'import os, tomllib; v = tomllib.load(open("Cargo.toml", "rb"))["package"]["rust-version"]; print("version=" + v, file=open(os.environ["GITHUB_OUTPUT"], "a"))'
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
-          toolchain: "1.81"
+          toolchain: ${{ steps.msrv.outputs.version }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: msrv
       - run: cargo check --all-targets --locked
 
+  preflight-object-msrv:
+    name: Optional object storage MSRV holds on the tagged commit
+    needs: metadata
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Read the optional object storage MSRV
+        id: msrv
+        run: python3 -c 'import os, tomllib; v = tomllib.load(open("Cargo.toml", "rb"))["package"]["metadata"]["traza"]["object-storage-rust-version"]; print("version=" + v, file=open(os.environ["GITHUB_OUTPUT"], "a"))'
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: object-msrv
+      - run: cargo check --all-targets --features object-storage --locked
+
   preflight-crates:
     name: crates.io can publish before anything does
+    needs: metadata
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -94,11 +141,13 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: The crate packages and builds as it will publish
-        run: cargo publish --dry-run --locked
+        run: |
+          cargo publish --dry-run --locked
+          cargo package --features object-storage --locked
 
   ui:
     name: Build the dashboard once
-    needs: [preflight, preflight-msrv, preflight-crates]
+    needs: [preflight, preflight-msrv, preflight-object-msrv, preflight-crates]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -149,8 +198,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools
-      - name: Build traza-server
-        run: cargo build --release --locked --bin traza-server --target ${{ matrix.target }}
+      - name: Build the server and optional object storage CLI
+        run: cargo build --release --locked --features object-storage --bin traza-server --bin traza-object --target ${{ matrix.target }}
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: ui-dist
@@ -160,9 +209,9 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           pkg="traza-${version}-${{ matrix.name }}"
           mkdir -p "stage/${pkg}"
-          cp "target/${{ matrix.target }}/release/traza-server" "stage/${pkg}/"
+          cp "target/${{ matrix.target }}/release/traza-server" "target/${{ matrix.target }}/release/traza-object" "stage/${pkg}/"
           cp -R ui-dist "stage/${pkg}/ui"
-          cp README.md LICENSE NOTICE THIRD_PARTY_NOTICES.md CHANGELOG.md "stage/${pkg}/"
+          cp README.md LICENSE NOTICE THIRD_PARTY_NOTICES.md THIRD_PARTY_RUST_NOTICES.md THIRD_PARTY_RUST_INVENTORY.json CERTIFICATE_BUNDLE_NOTICE.md MPL-2.0.txt CHANGELOG.md "stage/${pkg}/"
           tar -C stage -czf "${pkg}.tar.gz" "${pkg}"
           shasum -a 256 "${pkg}.tar.gz"
       - name: Smoke-test the archive from an unrelated directory
@@ -172,6 +221,8 @@ jobs:
           mkdir -p "$RUNNER_TEMP/smoke"
           tar -C "$RUNNER_TEMP/smoke" -xzf "${pkg}.tar.gz"
           cd "$RUNNER_TEMP"
+          python3 "$GITHUB_WORKSPACE/scripts/smoke-object-cli.py" \
+            --binary "$RUNNER_TEMP/smoke/${pkg}/traza-object" --version "$version"
           "$RUNNER_TEMP/smoke/${pkg}/traza-server" --data-dir "$RUNNER_TEMP/smoke-data" --port 18123 &
           server=$!
           for i in $(seq 1 20); do
@@ -198,12 +249,14 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: bin-${{ matrix.name }}
-          path: target/${{ matrix.target }}/release/traza-server
+          path: |
+            target/${{ matrix.target }}/release/traza-server
+            target/${{ matrix.target }}/release/traza-object
           if-no-files-found: error
 
   container:
     name: Multi-arch image to GHCR
-    needs: binaries
+    needs: [metadata, binaries]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -221,8 +274,14 @@ jobs:
           name: ui-dist
           path: stage/ui-dist
       - name: Restore the executable bit artifacts drop
-        run: chmod +x stage/amd64/traza-server stage/arm64/traza-server
+        run: chmod +x stage/amd64/traza-server stage/amd64/traza-object stage/arm64/traza-server stage/arm64/traza-object
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+      - name: Verify the container CLI before publishing any image
+        run: |
+          docker buildx build --load --platform linux/amd64 --file Dockerfile.release \
+            --build-arg VERSION="$GITHUB_REF_NAME" --tag traza-release-smoke .
+          python3 scripts/smoke-object-cli.py \
+            --container traza-release-smoke --version "${GITHUB_REF_NAME#v}"
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ghcr.io
@@ -238,7 +297,7 @@ jobs:
             VERSION=${{ github.ref_name }}
           tags: |
             ghcr.io/${{ github.repository }}:${{ github.ref_name }}
-            ghcr.io/${{ github.repository }}:latest
+            ghcr.io/${{ github.repository }}:${{ needs.metadata.outputs.container_alias }}
 
   crates:
     name: Publish to crates.io
@@ -257,7 +316,7 @@ jobs:
 
   release:
     name: Publish the GitHub release, last
-    needs: [binaries, container, crates]
+    needs: [metadata, binaries, container, crates]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -276,6 +335,11 @@ jobs:
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
+          IS_PRERELEASE: ${{ needs.metadata.outputs.prerelease }}
         run: |
+          flags=()
+          if [ "$IS_PRERELEASE" = "true" ]; then
+            flags+=(--prerelease --latest=false)
+          fi
           gh release create "$GITHUB_REF_NAME" traza-*.tar.gz SHA256SUMS \
-            --title "$GITHUB_REF_NAME" --notes-file notes.md
+            --title "$GITHUB_REF_NAME" --notes-file notes.md "${flags[@]}"

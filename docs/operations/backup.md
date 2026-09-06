@@ -161,6 +161,8 @@ deletion back into existence.
 
 ## See also
 
+- [Object-storage archive (preview)](object-storage.md) — publish a verified
+  pin to S3-compatible storage as an immutable, queryable snapshot
 - [Durability](durability.md) — what an acknowledgement means per mode
 - [Deployment](deployment.md) — one writer per directory, and what lives on disk
 - [Invariants](../internals/invariants.md) — rule 12 states the boundary

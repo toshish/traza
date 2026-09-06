@@ -5,6 +5,75 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.26.0-preview.1] - 2026-09-06
+
+Preview: an object-storage snapshot archive behind the new, default-off
+`object-storage` cargo feature and the feature-gated `traza-object` binary.
+A verified pin publishes to S3-compatible storage as an explicitly named,
+immutable snapshot — manifest written last under a conditional create, every
+object read back and SHA-256-verified before it is named — and reads back
+three ways: queryable in place by chunk-verified range reads (exact engine
+semantics: last-write-wins across segments, tenant scoping, content search,
+cursors, payload retrieval), verified full restore into a fresh directory,
+and snapshot administration (list, inspect, verify, delete, cleanup).
+
+### Added
+
+- `object-storage` feature: `traza::object_storage` (Rust API) and
+  `traza-object` (CLI) for publish/query/restore/delete against S3-compatible
+  backends via `object_store` (env credentials, TLS verifying by default,
+  bounded per-request and per-transfer budgets with retries, plain HTTP only
+  by explicit opt-in), plus injectable in-memory and fault backends for
+  tests.
+- Deletion is fenced by **permanent snapshot tombstones**: a deleted (or
+  swept-after-abandonment) snapshot id is never reusable, which is what
+  makes delete and cleanup safe against concurrent or resumed publishers
+  across machines without a lock service. Sweeping an abandoned upload
+  requires an explicit publisher-quiescent acknowledgment, retires the id,
+  and the publisher re-checks the tombstone and its own upload marker
+  around its commit.
+- Every remote manifest is **bound to the generation manifest it
+  archived** before a query is served — an omitted or substituted segment
+  fails the open instead of shrinking answers — and the archived tombstone
+  log is strictly re-parsed for pending erasures. Store identity is
+  checked on every read, verify, delete and cleanup; `publish` reports a
+  `manifest_sha256` to retain externally and enforce via
+  `--expect-manifest-sha`, which is the stated trust root (the bucket is
+  not assumed Byzantine-proof).
+- Source pins are validated before anything they name is opened: canonical
+  file naming, symlink refusal, and refusal of unmanifested or live-store
+  files, so a stale manifest can never silently archive an older subset.
+- `segment::RangeSource` and `Segment::open_from_source`: local file opens
+  and remote opens now share one implementation, so a remote segment gets
+  the full v8 validation story (header CRC, section checksums, timestamp
+  grounding, per-read block/content-page CRCs) by construction. Remote
+  reads additionally verify a per-chunk SHA-256 table from the snapshot
+  manifest, including cache hits, under one global bounded chunk cache.
+- `Store::pin_for_object_archive` (feature-gated): pin + verify + refuse
+  pending erasures — the pin publication requires and independently
+  re-checks from the pin's own tombstone log.
+- Operations guide: `docs/operations/object-storage.md`, stating the scope
+  honestly — archives are historical immutable state, not tiering; local
+  TTL/erasure never reaches published snapshots (delete the snapshots, and
+  mind bucket versioning/object-lock); remote querying saves the *archive
+  copy's* disk, not the live store's.
+
+### Changed
+
+- `pin_generation` now checkpoints and links under one maintenance/seal
+  acquisition, closing the between-locks gap in which compaction could
+  replace a just-manifested file and fail the pin.
+- Version metadata: crate and UI move to 0.26.0-preview.1. The standalone
+  MSRV stays 1.81; the `object-storage` feature's resolved toolchain floor
+  is recorded in `package.metadata.traza.object-storage-rust-version`.
+
+### Fixed
+
+- Incremental SHA-256 preserves a buffered partial block across small or
+  empty updates. Object verification now remains correct across arbitrary
+  network chunk boundaries; one-shot digests and the storage format are
+  unchanged.
+
 ## [0.25.0] - 2026-09-06
 
 A lossless storage-efficiency release: format v8 compacts persisted indexes

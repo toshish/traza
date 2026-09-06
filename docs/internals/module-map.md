@@ -64,6 +64,22 @@ underneath it.
 [`src/lib.rs`](../../src/lib.rs) are the operations built on this; invariant 12
 states the ordering rules they must not break.
 
+### [`src/object_storage.rs`](../../src/object_storage.rs) (feature `object-storage`, preview)
+
+The snapshot archive: publishes a verified pin to S3-compatible object
+storage as an immutable, explicitly named snapshot (manifest written last
+under a conditional create, every object read back and digest-verified), and
+reads it back — ranged queries through `segment::RangeSource` with per-chunk
+SHA-256 verification under one bounded cache, verified full restore, and
+snapshot administration. Submodules: `manifest` (the hostile-input remote
+manifest), `publish`, `snapshot` (the reader; reuses the crate root's
+`query_view` for exact engine semantics), `restore`, `admin`, `runtime` (the
+dedicated-runtime sync adapter), and `testing` (the injectable fault
+backend). Compiled only with `--features object-storage`; a default build
+carries none of its dependencies. Operator surface:
+[`src/bin/traza-object.rs`](../../src/bin/traza-object.rs) and
+[the operations guide](../operations/object-storage.md).
+
 ### [`src/migration.rs`](../../src/migration.rs)
 
 The legacy-format migrator (v6 and v7 → v8): automatic at first open,
@@ -233,6 +249,13 @@ request framing, the auth gate, route dispatch, chunked export streaming, and
 server-side metrics. **The authoritative source for routes and query
 parameters** — the API reference is checked against this file, not the other
 way round.
+
+### [`src/bin/traza-object.rs`](../../src/bin/traza-object.rs) (feature `object-storage`, preview)
+
+The archive CLI: `pin` (offline, exclusive), `publish`, `list`, `inspect`,
+`verify`, `query`/`trace`/`payload`, `restore`, `delete`, `cleanup`.
+Credentials come from the standard AWS environment, never flags. Built only
+with `--features object-storage`.
 
 ### [`src/bin/bench.rs`](../../src/bin/bench.rs)
 

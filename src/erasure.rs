@@ -542,6 +542,79 @@ pub struct NoteRecord {
     pub payload_refs: Vec<String>,
 }
 
+/// Ceiling on a tombstone log the archive-publication gate will read whole.
+/// The log is human-action-scale (one line per erasure requested or
+/// settled); a log past this is not a store state this check should guess
+/// about.
+#[cfg(feature = "object-storage")]
+pub(crate) const ARCHIVE_TOMBSTONE_LOG_BOUND: u64 = 64 << 20;
+
+/// Counts the PENDING erasures a tombstone log's BYTES record — erase
+/// records with no settle. Strict on purpose where [`ErasureLog::open`]
+/// heals: a torn or malformed line here is an error, never a guess, because
+/// the caller is about to assert "no erasure is pending" to an archive that
+/// outlives the store.
+#[cfg(feature = "object-storage")]
+pub(crate) fn pending_count_in_bytes(contents: &[u8]) -> Result<usize> {
+    if contents.len() as u64 > ARCHIVE_TOMBSTONE_LOG_BOUND {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "tombstone log is {} bytes, over the {ARCHIVE_TOMBSTONE_LOG_BOUND}-byte \
+                 archive bound",
+                contents.len()
+            ),
+        )));
+    }
+    let mut pending: BTreeMap<u64, ()> = BTreeMap::new();
+    for line in contents.split(|byte| *byte == b'\n') {
+        if line.iter().all(|byte| byte.is_ascii_whitespace()) {
+            continue;
+        }
+        match serde_json::from_slice::<LogRecord>(line)? {
+            LogRecord::Erase(erase) => {
+                pending.insert(erase.id, ());
+            }
+            LogRecord::Settle(settle) => {
+                pending.remove(&settle.id);
+            }
+            LogRecord::Note(_) => {}
+        }
+    }
+    Ok(pending.len())
+}
+
+/// [`pending_count_in_bytes`] over `directory`'s tombstone log, read only
+/// after its size passes the bound — never an unbounded `fs::read` of a
+/// hostile path. A missing log is zero (a store that never erased); a
+/// symlink or non-file at the log's name is refused.
+#[cfg(feature = "object-storage")]
+pub(crate) fn pending_count_in(directory: &Path) -> Result<usize> {
+    let path = directory.join(LOG_NAME);
+    let meta = match fs::symlink_metadata(&path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.into()),
+    };
+    if !meta.is_file() {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} is not a regular file", path.display()),
+        )));
+    }
+    if meta.len() > ARCHIVE_TOMBSTONE_LOG_BOUND {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "{} is {} bytes, over the {ARCHIVE_TOMBSTONE_LOG_BOUND}-byte archive bound",
+                path.display(),
+                meta.len()
+            ),
+        )));
+    }
+    pending_count_in_bytes(&fs::read(&path)?)
+}
+
 /// One line of the tombstone log.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]

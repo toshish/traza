@@ -35,7 +35,7 @@ LABEL org.opencontainers.image.source="https://github.com/toshish/traza" \
       org.opencontainers.image.version="${VERSION}"
 COPY --from=server /src/target/release/traza-server /traza-server
 COPY --from=ui /src/ui/dist /ui/dist
-COPY LICENSE NOTICE THIRD_PARTY_NOTICES.md /
+COPY LICENSE NOTICE THIRD_PARTY_NOTICES.md THIRD_PARTY_RUST_NOTICES.md THIRD_PARTY_RUST_INVENTORY.json CERTIFICATE_BUNDLE_NOTICE.md MPL-2.0.txt /
 COPY --from=server --chown=65534:65534 /data /data
 USER 65534:65534
 VOLUME /data

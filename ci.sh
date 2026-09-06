@@ -18,7 +18,7 @@ while IFS= read -r file; do
   fi
 done <<EOF
 $(git ls-files -- '*.rs' '*.js' '*.jsx' '*.ts' '*.tsx' '*.css' '*.html' \
-                  '*.md' '*.sh' '*.toml' '*.json' '*.yml' '*.yaml')
+                  '*.md' '*.sh' '*.py' '*.toml' '*.json' '*.yml' '*.yaml')
 EOF
 if [ -n "$nul_offenders" ]; then
   echo "ci: these tracked files contain a literal NUL byte, so git treats them" >&2
@@ -31,7 +31,15 @@ fi
 cargo fmt -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo build --release
-cargo test
+cargo test --locked
+cargo test --features object-storage --locked
+
+# Classify release tags before they can select registry aliases.
+python3 scripts/test-release-channel.py
+python3 scripts/test-rust-notices.py
+python3 scripts/test-smoke-object-cli.py
+python3 scripts/generate-rust-notices.py --check
+python3 scripts/test-object-s3.py
 
 # ---------------------------------------------------------------- examples
 # The demos are documentation people run, so each is a gate rather than a

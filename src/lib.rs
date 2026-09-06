@@ -22,6 +22,8 @@ pub mod mcp;
 mod media;
 pub mod metrics;
 mod migration;
+#[cfg(feature = "object-storage")]
+pub mod object_storage;
 pub mod otlp;
 pub mod otlp_pb;
 pub mod payload;
@@ -1146,6 +1148,16 @@ struct Segment {
     /// loaded from — where the full rollup this duplicates a corner of is
     /// counter-heavy and stays in the evictable cache.
     key_hashes: std::sync::OnceLock<std::collections::HashSet<u64>>,
+    /// Whether `path` names a real local segment file with rollup sidecars
+    /// beside it. True for every segment a `Store` opens. False for a remote
+    /// snapshot's wrappers, whose `path` is the ORIGINAL segment filename kept
+    /// purely for recency ordering: loading a sidecar from it would read an
+    /// unrelated local file and healing one would write beside a path that
+    /// does not exist here, so the supersede prefilter is skipped
+    /// ([`Segment::may_hold_key`] answers "maybe") and every candidate pays
+    /// the exact trace-index probe instead — a resident-map miss for the
+    /// overwhelming majority, and the same authority either way.
+    local_sidecars: bool,
 }
 
 fn canonical_value(value: &Value) -> String {
@@ -1410,20 +1422,55 @@ impl Segment {
             return Ok(hashes);
         }
         let binding = self.rollup_binding(pricing.fingerprint());
-        let rollup = match rollup_file::load(&self.path, binding) {
+        // A remote wrapper's `path` is an ordering key, not a file: loading a
+        // sidecar from it would read whatever unrelated local file happens to
+        // share the name, and healing one would write beside a path that does
+        // not exist here. `may_hold_key` never reaches this for such a
+        // wrapper; the guard stands so no future caller can either.
+        let rollup = match self
+            .local_sidecars
+            .then(|| rollup_file::load(&self.path, binding))
+            .flatten()
+        {
             Some(rollup) => rollup,
             None => {
                 let rollup = analytics::SegmentRollup::build(
                     &self.spans_parsed_budgeted(deadline, segments_examined)?,
                     pricing,
                 );
-                let _ = rollup_file::store(&self.path, binding, &rollup);
+                if self.local_sidecars {
+                    let _ = rollup_file::store(&self.path, binding, &rollup);
+                }
                 rollup
             }
         };
         // Two readers may race the build; first `set` wins and both answers
         // are identical, so the loser's work is discarded, not wrong.
         Ok(self.key_hashes.get_or_init(|| rollup.key_hashes))
+    }
+
+    /// Whether this segment MAY hold the primary key `hash` digests — the
+    /// supersede prefilter's question. `false` is proof of absence; `true`
+    /// obliges the caller to run the exact [`Self::contains_key`] probe.
+    ///
+    /// A remote wrapper always answers `true`: its key-hash set would cost a
+    /// whole-segment download to build, where the exact probe it forgoes
+    /// costs a resident trace-index lookup that misses for almost every
+    /// candidate. Same answers, different work — an index accelerates a
+    /// filter, it never changes one (invariant 7).
+    fn may_hold_key(
+        &self,
+        hash: u64,
+        pricing: &crate::pricing::Pricing,
+        deadline: Option<Deadline>,
+        segments_examined: u32,
+    ) -> Result<bool> {
+        if !self.local_sidecars {
+            return Ok(true);
+        }
+        Ok(self
+            .key_hashes(pricing, deadline, segments_examined)?
+            .contains(&hash))
     }
 
     /// Full parse — the rewrite/inspection/maintenance path, which the
@@ -2942,6 +2989,7 @@ impl SnapshotView<'_> {
                 filter.tenant.as_deref(),
                 session_id,
                 self.mask.as_deref(),
+                None,
             )?;
             return Ok(narrow_session_spans(spans, filter, cursor));
         }
@@ -3162,10 +3210,7 @@ fn superseded_by_newer(
     let hash = analytics::key_hash(&span.tenant, &span.trace_id, &span.span_id);
     for newer in segments.iter().skip(position + 1) {
         Deadline::check(deadline, segments_examined)?;
-        if !newer
-            .key_hashes(pricing, deadline, segments_examined)?
-            .contains(&hash)
-        {
+        if !newer.may_hold_key(hash, pricing, deadline, segments_examined)? {
             continue;
         }
         metrics.supersede_probes.increment();
@@ -5602,7 +5647,15 @@ impl Store {
             .sealing
             .lock()
             .map_err(|_| Error::LockPoisoned("sealing"))?;
+        self.checkpoint_locked()
+    }
 
+    /// [`Self::checkpoint`] with the maintenance lock and seal permit already
+    /// held by the caller. Factored out so `pin_generation` can checkpoint
+    /// and link under ONE acquisition: releasing between the two left a gap
+    /// in which compaction could replace a just-manifested file, and the pin
+    /// then failed its hard link or its verification rather than being taken.
+    fn checkpoint_locked(&self) -> Result<u64> {
         // Seal what the buffer holds, capturing the fold point at the drain.
         // An empty buffer means nothing was drained: capture the position
         // under a fresh writer lock instead, re-checking emptiness so a batch
@@ -5724,15 +5777,18 @@ impl Store {
                 "a pin label must be a single non-hidden path component",
             )));
         }
-        let generation = self.checkpoint()?;
-        let manifest =
-            generation::load_manifest(&generation::manifest_path(&self.directory, generation))?;
-
+        // One maintenance + seal-permit acquisition covers the checkpoint AND
+        // the linking below: nothing may replace or add a manifested file
+        // between the digest and the hard links, so the pin can never fail on
+        // a file compaction swapped out in a between-locks gap.
         let _maintenance = self.lock_maintenance()?;
         let _permit = self
             .sealing
             .lock()
             .map_err(|_| Error::LockPoisoned("sealing"))?;
+        let generation = self.checkpoint_locked()?;
+        let manifest =
+            generation::load_manifest(&generation::manifest_path(&self.directory, generation))?;
 
         let pin_dir = self.directory.join(generation::PINS_DIR).join(label);
         if pin_dir.exists() {
@@ -5797,6 +5853,67 @@ impl Store {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(Error::Io(error)),
         }
+    }
+
+    /// [`Self::pin_generation`] + [`Self::verify_pin`], additionally refusing
+    /// a store with PENDING erasures — the pin an object-storage archive is
+    /// allowed to publish from.
+    ///
+    /// A pending erasure masks its subject from every local read while the
+    /// purge runs, but the subject's bytes are still in the files a pin
+    /// links. An archive published from such a pin would serve — forever,
+    /// and outside the store's erasure machinery — exactly the spans the
+    /// operator asked to erase. So the recipe is: hold the erasure gate's
+    /// read half (no erasure can BEGIN mid-pin), require the pending set
+    /// empty, pin, and then re-check the PIN'S OWN tombstone log — the
+    /// authority on what the pin contains — before verifying every digest.
+    /// A pin that fails either check is released, not returned.
+    ///
+    /// Returns the pinned generation id; the pin itself is at
+    /// [`Self::pin_path`]`(label)`. On success the pin is verified intact and
+    /// carries no pending erasure, which is what
+    /// [`object_storage::publish_pin`] independently re-checks before any
+    /// byte leaves the machine.
+    #[cfg(feature = "object-storage")]
+    pub fn pin_for_object_archive(&self, label: &str) -> Result<u64> {
+        let gate = self
+            .erasure_gate
+            .read()
+            .map_err(|_| Error::LockPoisoned("erasure gate"))?;
+        if !self.erasures.pending()?.is_empty() {
+            return Err(Error::Conflict(
+                "erasures are pending; an archive pinned now would carry the \
+                 subject's bytes past the erasure — wait for the purge to \
+                 settle (resume_erasures) and retry"
+                    .to_owned(),
+            ));
+        }
+        let generation = self.pin_generation(label)?;
+        drop(gate);
+        // Defense in depth: the pin's own tombstone log is the authority on
+        // what the pin holds, whatever raced above.
+        let refused = (|| -> Result<()> {
+            if erasure::pending_count_in(&self.pin_path(label))? > 0 {
+                return Err(Error::Conflict(
+                    "the pin's tombstone log records a pending erasure; \
+                     refusing to hand it to an archive"
+                        .to_owned(),
+                ));
+            }
+            let problems = self.verify_pin(label)?;
+            if !problems.is_empty() {
+                return Err(Error::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("pin fails verification: {}", problems.join("; ")),
+                )));
+            }
+            Ok(())
+        })();
+        if let Err(error) = refused {
+            let _ = self.release_pin(label);
+            return Err(error);
+        }
+        Ok(generation)
     }
 
     /// Erases a subject — a trace, a span, a session, or an offloaded
@@ -7433,6 +7550,7 @@ impl Store {
                 bytes,
                 seg,
                 key_hashes: std::sync::OnceLock::new(),
+                local_sidecars: true,
             };
             // Write the rollup sidecar now, while the spans are still in hand.
             //
@@ -8141,6 +8259,7 @@ fn load_segments(directory: &Path) -> Result<Vec<std::sync::Arc<Segment>>> {
             bytes: bytes_meta,
             seg,
             key_hashes: std::sync::OnceLock::new(),
+            local_sidecars: true,
         }));
     }
     Ok(segments)

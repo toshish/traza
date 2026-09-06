@@ -987,18 +987,47 @@ pub struct Segment {
     last_query_used_index: AtomicBool,
 }
 
+/// A random-access byte source a segment can be opened over — the seam that
+/// lets one reader serve both local files and remote objects.
+///
+/// [`Segment::open_from_source`] runs EXACTLY the validation the file-backed
+/// open runs — header CRC, every section wrapper checksum, directory
+/// cross-checks, the first/last-record timestamp grounding, and the per-read
+/// content-page and block CRCs afterwards — because both paths share one
+/// implementation over this trait. A source therefore never has to be
+/// trusted about content, only about answering reads; damaged or forged
+/// bytes surface as [`Error::Corrupt`], never as shrunken answers.
+///
+/// Contract: `read_range` returns exactly `len` bytes starting at `start`
+/// or errors — a short read is an error, never a truncated buffer — and
+/// `total_len` is the fixed size of the underlying bytes for the life of
+/// the source (segments are immutable once published).
+pub trait RangeSource: Send + Sync + fmt::Debug {
+    /// Reads exactly `len` bytes at `start`. Must error rather than return
+    /// fewer bytes; the caller has already bounds-checked against
+    /// [`Self::total_len`], so an out-of-range request reaching here is a
+    /// source bug and may error however it likes.
+    fn read_range(&self, start: u64, len: u64) -> io::Result<Vec<u8>>;
+
+    /// The source's total byte length, fixed for its lifetime.
+    fn total_len(&self) -> u64;
+}
+
 /// Where a segment's payload bytes live.
 ///
 /// `Resident` holds the full encoding in memory (the state right after
 /// `build`/`from_bytes`). `File` holds only the opened file plus the parsed
 /// indexes — record payloads are read on demand, exactly the byte range each
 /// access needs, which is what makes stores larger than RAM serveable.
+/// `Source` is `File` with the file handle replaced by a caller-supplied
+/// [`RangeSource`], and inherits the same on-demand story.
 enum Backing {
     Resident(Vec<u8>),
     File {
         file: std::sync::Mutex<fs::File>,
         len: u64,
     },
+    Source(Box<dyn RangeSource>),
 }
 
 impl fmt::Debug for Backing {
@@ -1006,6 +1035,7 @@ impl fmt::Debug for Backing {
         match self {
             Self::Resident(bytes) => write!(f, "Resident({} bytes)", bytes.len()),
             Self::File { len, .. } => write!(f, "File({len} bytes)"),
+            Self::Source(source) => write!(f, "Source({} bytes)", source.total_len()),
         }
     }
 }
@@ -1032,6 +1062,18 @@ impl Backing {
                 guard.read_exact(&mut buffer)?;
                 Ok(buffer)
             }
+            Self::Source(source) => {
+                if start.saturating_add(len) > source.total_len() {
+                    return Err(Error::Corrupt("range outside segment source"));
+                }
+                let bytes = source.read_range(start, len)?;
+                // The trait promises exact-length reads; hold it to that
+                // before any decoder sizes work on the answer.
+                if bytes.len() as u64 != len {
+                    return Err(Error::Corrupt("range source returned a short read"));
+                }
+                Ok(bytes)
+            }
         }
     }
 
@@ -1039,13 +1081,14 @@ impl Backing {
         match self {
             Self::Resident(bytes) => bytes.len() as u64,
             Self::File { len, .. } => *len,
+            Self::Source(source) => source.total_len(),
         }
     }
 
     fn resident_len(&self) -> usize {
         match self {
             Self::Resident(bytes) => bytes.len(),
-            Self::File { .. } => 0,
+            Self::File { .. } | Self::Source(_) => 0,
         }
     }
 }
@@ -1152,24 +1195,46 @@ impl Segment {
     /// index is keyed on a digest now. [`Self::approx_index_bytes`] measures
     /// the result.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
-        use std::io::{Read, Seek, SeekFrom};
-        let mut file = fs::File::open(path)?;
+        let file = fs::File::open(path)?;
         let total = file.metadata()?.len();
-        // Parse the header from the file head; Header::parse needs the total
-        // length for its trailing-length arithmetic, so hand it a buffer whose
-        // length IS the file length but only materialize the head + indexes.
-        let head_len = (HEADER_LEN as u64).min(total) as usize;
-        let mut head = vec![0u8; head_len];
-        file.read_exact(&mut head)?;
+        Self::open_backing(Backing::File {
+            file: Mutex::new(file),
+            len: total,
+        })
+    }
+
+    /// Opens a segment over an arbitrary [`RangeSource`] — the same lazy,
+    /// fully validated open as [`Self::open`], with the file handle replaced
+    /// by the source. One implementation serves both, so a remote open can
+    /// never validate less than a local one: header CRC, every section
+    /// wrapper checksum, directory cross-checks, and the exact first/last
+    /// record timestamp grounding all run before the segment serves anything,
+    /// and block/content-page CRCs guard every later read.
+    ///
+    /// The resident cost is the same as [`Self::open`]'s: the index sections
+    /// are decoded eagerly and in full, scaling with index cardinality, while
+    /// record payloads stay in the source and are fetched by exact byte range
+    /// on demand.
+    pub fn open_from_source(source: Box<dyn RangeSource>) -> Result<Self, Error> {
+        Self::open_backing(Backing::Source(source))
+    }
+
+    /// The one lazy open both backings share.
+    fn open_backing(backing: Backing) -> Result<Self, Error> {
+        let total = backing.total_len();
+        if total < HEADER_LEN as u64 {
+            return Err(Error::Corrupt("file is shorter than the header"));
+        }
+        // Parse the header from the head; Header::parse needs the total
+        // length for its trailing-length arithmetic, so hand it the head
+        // bytes plus the real total and only materialize head + indexes.
+        let head = backing.read_range(0, HEADER_LEN as u64)?;
         let header = Header::parse_with_total(&head, total)?;
-        let mut read_section = |offset: u64, len: u64| -> Result<Vec<u8>, Error> {
+        let read_section = |offset: u64, len: u64| -> Result<Vec<u8>, Error> {
             if offset.saturating_add(len) > total {
                 return Err(Error::Corrupt("index section outside file"));
             }
-            file.seek(SeekFrom::Start(offset))?;
-            let mut buffer = vec![0u8; len as usize];
-            file.read_exact(&mut buffer)?;
-            Ok(buffer)
+            backing.read_range(offset, len)
         };
         let offsets_bytes = read_section(header.offsets_offset, header.offsets_len)?;
         let offsets_body = unwrap_section(&offsets_bytes, true, "record-offset index")?;
@@ -1204,10 +1269,7 @@ impl Segment {
             )?
         };
         let segment = Self {
-            backing: Backing::File {
-                file: Mutex::new(file),
-                len: total,
-            },
+            backing,
             header,
             record_offsets,
             directory,

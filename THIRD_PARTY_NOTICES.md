@@ -2,22 +2,36 @@
 
 Traza is Apache-2.0 (see [LICENSE](LICENSE) and [NOTICE](NOTICE)). The
 distributed artifacts — release archives and container images — additionally
-contain the third-party material below. Build-time tooling (Vite, the Rust
-proc-macro stack, and friends) is not distributed and is not listed.
+contain the third-party material below. The generated Rust inventory includes
+build tools and proc macros conservatively; their presence in the inventory
+does not mean they are linked into the distributed binaries.
 
-## In the server binary
+## In the Rust binaries
 
-Statically linked Rust crates, each dual-licensed `MIT OR Apache-2.0` and
-used here under **Apache-2.0**:
+The default standalone build uses `serde`, `serde_json`, `lz4_flex`, and their
+transitive dependencies. Release archives and images also include the optional
+`object-storage` feature and `traza-object` CLI, adding `object_store`, Tokio,
+the HTTP/TLS stack, and their dependencies.
 
-| Crate | Copyright |
-|---|---|
-| `serde`, `serde_core`, `serde_json` | Erick Tryzelaar, David Tolnay, and the Serde contributors |
-| `itoa` | David Tolnay |
-| `memchr` | Andrew Gallant and contributors (`MIT OR Unlicense`, used under MIT) |
-| `zmij` | David Tolnay and contributors |
+The exact versions, upstream license expressions, copyright notices, and
+license texts for the locked release graph are preserved in
+[THIRD_PARTY_RUST_NOTICES.md](THIRD_PARTY_RUST_NOTICES.md). The accompanying
+[inventory](THIRD_PARTY_RUST_INVENTORY.json) records each crate archive and
+license-file SHA256, its source URL, and the applicable release targets.
+This includes the Apache Arrow object-store NOTICE, AWS-LC/BoringSSL terms,
+Unicode data notices, and other component-specific terms.
 
-The Apache-2.0 text is in [LICENSE](LICENSE). The MIT text is below.
+These files are generated from checksum-verified published crate archives by
+`python3 scripts/generate-rust-notices.py`; CI rejects drift from `Cargo.lock`.
+The Apache-2.0 text for Traza itself is in [LICENSE](LICENSE).
+
+## In the release container's certificate bundle
+
+The container includes Mozilla certificate data from Alpine's
+`ca-certificates-bundle`. Its attribution and source location are in
+[CERTIFICATE_BUNDLE_NOTICE.md](CERTIFICATE_BUNDLE_NOTICE.md), with the Mozilla
+Public License text in [MPL-2.0.txt](MPL-2.0.txt). The archives use the host
+platform's certificate trust store.
 
 ## In the dashboard build (`ui/dist`)
 
