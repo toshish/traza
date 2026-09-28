@@ -72,7 +72,7 @@ jobs:
           if not any(line == f"## [{version}]" or line.startswith(f"## [{version}] ") for line in headings):
               raise SystemExit(f"CHANGELOG.md has no [{version}] section")
           PYTHON
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: stable
           components: rustfmt, clippy
@@ -93,7 +93,7 @@ jobs:
       - name: Read the standalone MSRV
         id: msrv
         run: python3 -c 'import os, tomllib; v = tomllib.load(open("Cargo.toml", "rb"))["package"]["rust-version"]; print("version=" + v, file=open(os.environ["GITHUB_OUTPUT"], "a"))'
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -111,7 +111,7 @@ jobs:
       - name: Read the optional object storage MSRV
         id: msrv
         run: python3 -c 'import os, tomllib; v = tomllib.load(open("Cargo.toml", "rb"))["package"]["metadata"]["traza"]["object-storage-rust-version"]; print("version=" + v, file=open(os.environ["GITHUB_OUTPUT"], "a"))'
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -136,7 +136,7 @@ jobs:
             echo "::error::Actions) and push the tag again."
             exit 1
           fi
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -186,7 +186,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
@@ -275,7 +275,7 @@ jobs:
           path: stage/ui-dist
       - name: Restore the executable bit artifacts drop
         run: chmod +x stage/amd64/traza-server stage/amd64/traza-object stage/arm64/traza-server stage/arm64/traza-object
-      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
       - name: Verify the container CLI before publishing any image
         run: |
           docker buildx build --load --platform linux/amd64 --file Dockerfile.release \
@@ -287,7 +287,7 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           file: Dockerfile.release
@@ -308,7 +308,7 @@ jobs:
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: stable
       - name: cargo publish
