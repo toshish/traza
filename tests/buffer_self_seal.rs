@@ -220,13 +220,27 @@ fn pure_inserts_never_trigger_shadow_maintenance() {
 
 /// An idle buffer seals once its oldest span reaches the age bound, via the
 /// maintenance path a scheduler drives.
+///
+/// The bound has to outlast this test's OWN setup, not just be small enough to
+/// keep the test quick. Everything between the ingest below and the first
+/// `maintain_buffer` — two `stats()` calls and their assertions — runs inside
+/// the buffer's lifetime, so if that stretch outlives the bound the buffer has
+/// already aged out and the "younger than the bound" assertion fails with 0
+/// spans instead of 3. At 50 ms that inverted on loaded CI runners (ubuntu,
+/// 2026-09-28). A second is orders of magnitude more than those few cheap
+/// calls need and still well under the sleep-driven half below, so the two
+/// halves cannot cross. Do not shrink it back to shave the sleep: the
+/// asymmetry is the point — an over-long bound only makes the first half
+/// stricter, while an over-short one makes it a coin flip.
+const AGE_BOUND: Duration = Duration::from_millis(1_000);
+
 #[test]
 fn age_bound_seals_an_idle_buffer() {
     let dir = test_dir("age");
     let store = Store::open(
         &dir,
         Config {
-            max_buffer_age: Some(Duration::from_millis(50)),
+            max_buffer_age: Some(AGE_BOUND),
             shadow_seal: false,
             ..config()
         },
@@ -247,7 +261,9 @@ fn age_bound_seals_an_idle_buffer() {
     store.maintain_buffer().expect("maintain");
     assert_eq!(store.stats().expect("stats").buffered_records, 3);
 
-    std::thread::sleep(Duration::from_millis(80));
+    // Past the bound: slowness here can only make the buffer older, so this
+    // half never flakes in the direction the first half can.
+    std::thread::sleep(AGE_BOUND + Duration::from_millis(100));
     store.maintain_buffer().expect("maintain");
     let stats = store.stats().expect("stats");
     assert_eq!(stats.buffered_records, 0, "age bound sealed the buffer");
