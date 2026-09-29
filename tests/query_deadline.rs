@@ -613,6 +613,17 @@ fn a_sidecarless_rollup_rebuild_on_the_analytics_fold_is_budgeted() {
 /// a generous tripwire between the two — an order of magnitude above the
 /// honest refusal, several below the escape.
 fn assert_rebuild_refused_fast(elapsed: Duration) {
+    // TEMPORARY CI PROBE - not for merge.
+    eprintln!(
+        "PROBE elapsed={:?} budgeted_decoded={} window_decoded={} checks_run={} \
+         (interval={} corpus={})",
+        elapsed,
+        traza::PROBE_BUDGETED_DECODED.load(std::sync::atomic::Ordering::Relaxed),
+        traza::PROBE_WINDOW_DECODED.load(std::sync::atomic::Ordering::Relaxed),
+        traza::PROBE_CHECKS_RUN.load(std::sync::atomic::Ordering::Relaxed),
+        4096,
+        REBUILD_CORPUS,
+    );
     assert!(
         elapsed < Duration::from_millis(500),
         "the refusal must arrive within one check interval, not after the \
