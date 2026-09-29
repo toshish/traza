@@ -16,6 +16,7 @@ The exact crate and license-file SHA256 values are in `THIRD_PARTY_RUST_INVENTOR
 | [aws-lc-rs 1.18.1](https://crates.io/crates/aws-lc-rs/1.18.1) | ISC AND (Apache-2.0 OR ISC) | [LICENSE](#text-b50b376e7d24a0598488b730c3034ffcd0b58dd36c0913a24b9903a3cfd04bf7) |
 | [aws-lc-sys 0.45.0](https://crates.io/crates/aws-lc-sys/0.45.0) | ISC AND (Apache-2.0 OR ISC) AND Apache-2.0 AND MIT AND BSD-3-Clause AND (Apache-2.0 OR ISC OR MIT) AND (Apache-2.0 OR ISC OR MIT-0) | [LICENSE](#text-728536b4160e051f86d7c9c388f704866b3d512cd7df97ac3516c65279523c4e), [aws-lc/LICENSE](#text-977c541bd25ffe36975dde25c028c0cd15ddf3d08243983b58e8a6a3d9447523), [aws-lc/third_party/fiat/LICENSE](#text-43e358d7b6eb109d0f51f7b3a090fd82607965767c25fadee39e922475de2061) |
 | [base64 0.22.1](https://crates.io/crates/base64/0.22.1) | MIT OR Apache-2.0 | [LICENSE-APACHE](#text-a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2), [LICENSE-MIT](#text-0dd882e53de11566d50f8e8e2d5a651bcf3fabee4987d70f306233cf39094ba7) |
+| [base64 0.23.1](https://crates.io/crates/base64/0.23.1) | MIT OR Apache-2.0 | [LICENSE-APACHE](#text-a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2), [LICENSE-MIT](#text-ab499c75a0f0da8e0fe83bf9ba3a27e5c39705310f07107c6c66b69958d2401c) |
 | [bitflags 2.13.1](https://crates.io/crates/bitflags/2.13.1) | MIT OR Apache-2.0 | [LICENSE-APACHE](#text-a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2), [LICENSE-MIT](#text-6485b8ed310d3f0340bf1ad1f47645069ce4069dcc6bb46c7d5c6faf41de1fdb) |
 | [block-buffer 0.12.1](https://crates.io/crates/block-buffer/0.12.1) | MIT OR Apache-2.0 | [LICENSE-APACHE](#text-a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5), [LICENSE-MIT](#text-98181e7249d0c01737645ec982499ce99a0f07eb8f7d625b8840d799d10dbc01) |
 | [bytes 1.12.1](https://crates.io/crates/bytes/1.12.1) | MIT | [LICENSE](#text-45f522cacecb1023856e46df79ca625dfc550c94910078bd8aec6e02880b3d42) |
@@ -87,7 +88,7 @@ The exact crate and license-file SHA256 values are in `THIRD_PARTY_RUST_INVENTOR
 | [memchr 2.8.3](https://crates.io/crates/memchr/2.8.3) | Unlicense OR MIT | [COPYING](#text-01c266bced4a434da0051174d6bee16a4c82cf634e2679b6155d40d75012390f), [LICENSE-MIT](#text-0f96a83840e146e43c0ec96a22ec1f392e0680e6c1226e6f3ba87e0740af850f) |
 | [mio 1.2.3](https://crates.io/crates/mio/1.2.3) | MIT | [LICENSE](#text-07919255c7e04793d8ea760d6c2ce32d19f9ff02bdbdde3ce90b1e1880929a9b) |
 | [num-traits 0.2.19](https://crates.io/crates/num-traits/0.2.19) | MIT OR Apache-2.0 | [LICENSE-APACHE](#text-a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2), [LICENSE-MIT](#text-6485b8ed310d3f0340bf1ad1f47645069ce4069dcc6bb46c7d5c6faf41de1fdb) |
-| [object_store 0.14.1](https://crates.io/crates/object_store/0.14.1) | MIT/Apache-2.0 | [LICENSE.txt](#text-240b8a39fdfd2bd3b3539c02e34466334884fc84b056b57f06e9da35323ecd97), [NOTICE.txt](#text-db0ba6e84734d37277ceae9dcca1ffbbb2f8e80e9c1db34e3788100792458c63) |
+| [object_store 0.14.2](https://crates.io/crates/object_store/0.14.2) | MIT/Apache-2.0 | [LICENSE.txt](#text-240b8a39fdfd2bd3b3539c02e34466334884fc84b056b57f06e9da35323ecd97), [NOTICE.txt](#text-db0ba6e84734d37277ceae9dcca1ffbbb2f8e80e9c1db34e3788100792458c63) |
 | [once_cell 1.21.4](https://crates.io/crates/once_cell/1.21.4) | MIT OR Apache-2.0 | [LICENSE-APACHE](#text-a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2), [LICENSE-MIT](#text-23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3) |
 | [openssl-probe 0.2.1](https://crates.io/crates/openssl-probe/0.2.1) | MIT OR Apache-2.0 | [LICENSE-APACHE](#text-a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2), [LICENSE-MIT](#text-378f5840b258e2779c39418f3f2d7b2ba96f1c7917dd6be0713f88305dbda397) |
 | [parking_lot 0.12.5](https://crates.io/crates/parking_lot/0.12.5) | MIT OR Apache-2.0 | [LICENSE-APACHE](#text-a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2), [LICENSE-MIT](#text-c9a75f18b9ab2927829a208fc6aa2cf4e63b8420887ba29cdb265d6619ae82d5) |
@@ -1122,7 +1123,7 @@ The exact crate and license-file SHA256 values are in `THIRD_PARTY_RUST_INVENTOR
 
 ## Text 240b8a39fdfd2bd3b3539c02e34466334884fc84b056b57f06e9da35323ecd97
 
-- object_store 0.14.1: LICENSE.txt
+- object_store 0.14.2: LICENSE.txt
 
 
                                      Apache License
@@ -6502,6 +6503,7 @@ The exact crate and license-file SHA256 values are in `THIRD_PARTY_RUST_INVENTOR
 - atomic-waker 1.1.2: LICENSE-APACHE
 - autocfg 1.5.1: LICENSE-APACHE
 - base64 0.22.1: LICENSE-APACHE
+- base64 0.23.1: LICENSE-APACHE
 - bitflags 2.13.1: LICENSE-APACHE
 - cc 1.4.5: LICENSE-APACHE
 - cfg-if 1.0.4: LICENSE-APACHE
@@ -7228,6 +7230,35 @@ The exact crate and license-file SHA256 values are in `THIRD_PARTY_RUST_INVENTOR
     WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
     See the License for the specific language governing permissions and
     limitations under the License.
+
+
+<a id="text-ab499c75a0f0da8e0fe83bf9ba3a27e5c39705310f07107c6c66b69958d2401c"></a>
+
+## Text ab499c75a0f0da8e0fe83bf9ba3a27e5c39705310f07107c6c66b69958d2401c
+
+- base64 0.23.1: LICENSE-MIT
+
+    The MIT License (MIT)
+
+    Copyright (c) 2025 Alice Maz, Marshall Pierce
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in
+    all copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+    THE SOFTWARE.
 
 
 <a id="text-af59cea35d7f5e2777a713b8d155d65efa2c339eb43f3c14e868c6ac8506edad"></a>
@@ -8796,7 +8827,7 @@ The exact crate and license-file SHA256 values are in `THIRD_PARTY_RUST_INVENTOR
 
 ## Text db0ba6e84734d37277ceae9dcca1ffbbb2f8e80e9c1db34e3788100792458c63
 
-- object_store 0.14.1: NOTICE.txt
+- object_store 0.14.2: NOTICE.txt
 
     Apache Arrow Object Store
     Copyright 2020-2026 The Apache Software Foundation

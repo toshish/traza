@@ -75,7 +75,7 @@ lz4_flex = { version = "=0.14.0", default-features = false, features = ["std", "
 # SigV4 for the archive, and its wire behaviour is part of the archive's
 # security posture — upgrading it is a deliberate act, not a routine bump.
 # Only the `aws` backend is enabled; no other cloud, no local-fs backend.
-object_store = { version = "=0.14.1", default-features = false, features = ["aws"], optional = true }
+object_store = { version = "=0.14.2", default-features = false, features = ["aws"], optional = true }
 # A dedicated runtime for the synchronous adapter around object_store's async
 # API (`object_storage::runtime`); the engine itself stays synchronous.
 tokio = { version = "1", default-features = false, features = ["rt", "sync", "time"], optional = true }
