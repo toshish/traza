@@ -1165,10 +1165,7 @@ impl Store {
             // dashboard window cost more than a whole-corpus one.
             let mut survivors: Vec<Span> = Vec::new();
             let __probe_window = segment.spans_parsed_in_window(since_ns, until_ns)?;
-            crate::PROBE_WINDOW_DECODED.fetch_add(
-                __probe_window.len() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
+            crate::probe_bump_window(__probe_window.len() as u64);
             for span in __probe_window {
                 decoded_since_check += 1;
                 if decoded_since_check >= crate::DEADLINE_CHECK_INTERVAL {

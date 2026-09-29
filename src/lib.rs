@@ -493,14 +493,35 @@ pub struct QueryCost {
 /// into the decode cost it is amortized over.
 pub(crate) const DEADLINE_CHECK_INTERVAL: usize = 4096;
 
-// TEMPORARY CI PROBE - not for merge. Counts records decoded on each route so
-// a failing deadline test can say which path paid, and how much.
+// TEMPORARY CI PROBE - not for merge. Per-THREAD so the file's parallel tests
+// cannot contaminate each other's counts; the engine is synchronous, so a
+// query's decode runs on the thread that asked for it.
+thread_local! {
+    static PROBE_BUDGETED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static PROBE_WINDOW: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static PROBE_CHECKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 #[doc(hidden)]
-pub static PROBE_BUDGETED_DECODED: AtomicU64 = AtomicU64::new(0);
+pub fn probe_bump_budgeted(n: u64) {
+    PROBE_BUDGETED.with(|c| c.set(c.get() + n));
+}
 #[doc(hidden)]
-pub static PROBE_WINDOW_DECODED: AtomicU64 = AtomicU64::new(0);
+pub fn probe_bump_window(n: u64) {
+    PROBE_WINDOW.with(|c| c.set(c.get() + n));
+}
 #[doc(hidden)]
-pub static PROBE_CHECKS_RUN: AtomicU64 = AtomicU64::new(0);
+pub fn probe_bump_checks(n: u64) {
+    PROBE_CHECKS.with(|c| c.set(c.get() + n));
+}
+#[doc(hidden)]
+pub fn probe_snapshot() -> (u64, u64, u64) {
+    (
+        PROBE_BUDGETED.with(|c| c.get()),
+        PROBE_WINDOW.with(|c| c.get()),
+        PROBE_CHECKS.with(|c| c.get()),
+    )
+}
 
 /// One request's compute budget: [`Config::query_deadline`] anchored at the
 /// instant the request entered the engine.
@@ -1509,10 +1530,10 @@ impl Segment {
         let mut decoded_since_check: usize = 0;
         for ordinal in 0..count {
             decoded_since_check += 1;
-            PROBE_BUDGETED_DECODED.fetch_add(1, Ordering::Relaxed);
+            crate::probe_bump_budgeted(1);
             if decoded_since_check >= DEADLINE_CHECK_INTERVAL {
                 decoded_since_check = 0;
-                PROBE_CHECKS_RUN.fetch_add(1, Ordering::Relaxed);
+                crate::probe_bump_checks(1);
                 Deadline::check(deadline, segments_examined)?;
             }
             if let Some(record) = walk.record(ordinal).map_err(segment_error)? {
