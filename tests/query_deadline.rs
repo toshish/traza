@@ -612,28 +612,23 @@ fn a_sidecarless_rollup_rebuild_on_the_analytics_fold_is_budgeted() {
 /// ~2.5 s in this profile (measured under that exact mutation). 500 ms is
 /// a generous tripwire between the two — an order of magnitude above the
 /// honest refusal, several below the escape.
-fn crate_interval() -> usize {
-    4096
-}
+/// Mirrors `traza::DEADLINE_CHECK_INTERVAL`, which is crate-private.
+const DEADLINE_CHECK_INTERVAL_MIRROR: usize = 4096;
 
 fn assert_rebuild_refused_fast(elapsed: Duration) {
     // TEMPORARY CI PROBE - not for merge. Panics UNCONDITIONALLY so cargo
     // prints the numbers for this test on every runner: a passing test's
     // output is captured and never reaches the CI log, and the failure we
     // need to characterise is intermittent. Read the counters, not the pass.
+    // The real 500 ms assertion is deliberately gone for the duration of the
+    // experiment; this branch is diagnostic and is not for merge.
     let (budgeted, window, checks) = traza::probe_snapshot();
     panic!(
         "PROBE elapsed={elapsed:?} budgeted_decoded={budgeted} window_decoded={window} \
-         checks_run={checks} interval={} corpus={REBUILD_CORPUS} :: \
-         ~{interval} means an honest refusal (contention); ~{REBUILD_CORPUS} means a real escape",
-        crate_interval(),
-        interval = crate_interval(),
-    );
-    #[allow(unreachable_code)]
-    assert!(
-        elapsed < Duration::from_millis(500),
-        "the refusal must arrive within one check interval, not after the \
-         full rebuild: {elapsed:?}"
+         checks_run={checks} interval={interval} corpus={corpus} :: \
+         ~{interval} means an honest refusal (contention); ~{corpus} means a real escape",
+        interval = DEADLINE_CHECK_INTERVAL_MIRROR,
+        corpus = REBUILD_CORPUS,
     );
 }
 
