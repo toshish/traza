@@ -504,14 +504,7 @@ fn store_with_sidecarless_segment(
     deadline: Option<Duration>,
 ) -> (PathBuf, traza::Store) {
     let dir = test_dir(label);
-    let config = traza::Config {
-        durability: traza::Durability::Buffered,
-        compaction: None,
-        flush_spans: 100_000,
-        max_buffer_age: None,
-        ..traza::Config::default()
-    };
-    let store = traza::Store::open(&dir, config.clone()).expect("store opens");
+    let store = traza::Store::open(&dir, rebuild_config(None)).expect("store opens");
     for index in 0..REBUILD_CORPUS {
         store
             .ingest(library_span(index))
@@ -531,15 +524,56 @@ fn store_with_sidecarless_segment(
         }
     }
     assert!(deleted >= 1, "the flush wrote no rollup sidecar to delete");
-    let store = traza::Store::open(
-        &dir,
-        traza::Config {
-            query_deadline: deadline,
-            ..config
-        },
-    )
-    .expect("store reopens");
+    let store = traza::Store::open(&dir, rebuild_config(deadline)).expect("store reopens");
     (dir, store)
+}
+
+/// The config the rebuild fixture opens with. Factored out because the
+/// calibration below has to reopen the SAME corpus with everything identical
+/// except the budget.
+fn rebuild_config(deadline: Option<Duration>) -> traza::Config {
+    traza::Config {
+        durability: traza::Durability::Buffered,
+        compaction: None,
+        flush_spans: 100_000,
+        max_buffer_age: None,
+        query_deadline: deadline,
+        ..traza::Config::default()
+    }
+}
+
+/// Page the store's files in before anything is timed.
+///
+/// The budgeted query is otherwise the FIRST thing to touch an 80_000-record
+/// segment after the fixture reopens, so a cold mmap and the page-in of that
+/// whole file land inside the timed region while only one check interval is
+/// actually decoded. On a runner with contended I/O that first touch, not the
+/// decode, dominates: ubuntu measured 2.9-3.7 s for a refusal a probe showed
+/// had decoded exactly 4096 records (2026-09-28). Reading the bytes here
+/// moves that cost outside the measurement, so `elapsed` means what the
+/// oracle below assumes it means.
+fn warm_page_cache(dir: &Path) {
+    for entry in std::fs::read_dir(dir).expect("store dir lists") {
+        let path = entry.expect("dir entry").path();
+        if path.is_file() {
+            let _ = std::fs::read(&path);
+        }
+    }
+}
+
+/// What the escape costs on THIS machine, in THIS build profile: the same
+/// rebuild, same corpus, with no budget at all.
+///
+/// The budgeted run refuses INSIDE the decode, before `SegmentRollup::build`
+/// returns, so it stores no sidecar — this reopen still pays the whole-corpus
+/// decode, which is exactly the quantity the oracle has to tell a refusal
+/// apart from.
+fn unbudgeted_rebuild_cost(dir: &Path, rebuild: impl FnOnce(&traza::Store)) -> Duration {
+    let store = traza::Store::open(dir, rebuild_config(None)).expect("store reopens unbudgeted");
+    warm_page_cache(dir);
+    let started = Instant::now();
+    rebuild(&store);
+    started.elapsed()
 }
 
 fn library_span(index: usize) -> traza::Span {
@@ -562,19 +596,24 @@ fn library_span(index: usize) -> traza::Span {
 /// answering `Ok(None)` as though the probe had been cheap.
 #[test]
 fn a_sidecarless_rollup_rebuild_on_the_payload_probe_is_budgeted() {
-    let (_dir, store) =
+    let (dir, store) =
         store_with_sidecarless_segment("rollup-rebuild-payload", Some(Duration::from_millis(1)));
-    let asked = Instant::now();
     let absent = format!("sha256/{}", "ab".repeat(32));
+    warm_page_cache(&dir);
+    let asked = Instant::now();
     let result = store.payload_in(Some("acme"), &absent);
     let elapsed = asked.elapsed();
-    assert_rebuild_refused_fast(elapsed);
     match result {
         Err(traza::Error::DeadlineExceeded(_)) => {}
         other => {
             panic!("the sidecar-less rebuild escaped the 1 ms budget: {other:?} after {elapsed:?}")
         }
     }
+    drop(store);
+    let unbudgeted = unbudgeted_rebuild_cost(&dir, |store| {
+        let _ = store.payload_in(Some("acme"), &absent);
+    });
+    assert_rebuild_refused_fast(elapsed, unbudgeted);
 }
 
 /// External review, finding 1, second site: the analytics fold's rollup
@@ -583,18 +622,23 @@ fn a_sidecarless_rollup_rebuild_on_the_payload_probe_is_budgeted() {
 /// so a 1 ms budget bought a full-corpus decode and a 200.
 #[test]
 fn a_sidecarless_rollup_rebuild_on_the_analytics_fold_is_budgeted() {
-    let (_dir, store) =
+    let (dir, store) =
         store_with_sidecarless_segment("rollup-rebuild-fold", Some(Duration::from_millis(1)));
+    warm_page_cache(&dir);
     let asked = Instant::now();
     let result = store.sessions(None, None, 10, traza::analytics::SessionOrder::Recent);
     let elapsed = asked.elapsed();
-    assert_rebuild_refused_fast(elapsed);
     match result {
         Err(traza::Error::DeadlineExceeded(_)) => {}
         other => panic!(
             "the fold's sidecar-less rebuild escaped the 1 ms budget: {other:?} after {elapsed:?}"
         ),
     }
+    drop(store);
+    let unbudgeted = unbudgeted_rebuild_cost(&dir, |store| {
+        let _ = store.sessions(None, None, 10, traza::analytics::SessionOrder::Recent);
+    });
+    assert_rebuild_refused_fast(elapsed, unbudgeted);
 }
 
 /// The latency half of the rebuild tests' oracle: the refusal must arrive
@@ -606,17 +650,29 @@ fn a_sidecarless_rollup_rebuild_on_the_analytics_fold_is_budgeted() {
 /// callers' final checks still refused the answer AFTER paying the full
 /// corpus decode. That mutation reintroduces exactly the reviewed harm (a
 /// whole-corpus decode under a 1 ms budget, answered late with a refusal),
-/// so the tests must be latency-sensitive to the intra-rebuild cadence: a
-/// budgeted refusal costs one check interval of decode (a few thousand
-/// records), while the unbudgeted decode of the `REBUILD_CORPUS` costs
-/// ~2.5 s in this profile (measured under that exact mutation). 500 ms is
-/// a generous tripwire between the two — an order of magnitude above the
-/// honest refusal, several below the escape.
-fn assert_rebuild_refused_fast(elapsed: Duration) {
+/// so the tests must be latency-sensitive to the intra-rebuild cadence.
+///
+/// The comparison is RELATIVE, against a decode measured on the same corpus,
+/// machine and build profile moments earlier — not an absolute millisecond
+/// constant. The mechanism bounds RECORDS, not time: an honest refusal costs
+/// one `DEADLINE_CHECK_INTERVAL` (4096 records) out of `REBUILD_CORPUS`
+/// (80_000), about a nineteenth of the decode, and what that costs in
+/// wall clock depends entirely on the host. The old absolute 500 ms tripwire
+/// was calibrated against a ~2.5 s unbudgeted decode but left only ~4x over
+/// the honest refusal's real ~120 ms in a debug build, so loaded CI runners
+/// tripped it on healthy code (macOS 561 ms and 652 ms, 2026-09-28) while a
+/// genuine escape on a fast host could still slip under it. A quarter of the
+/// measured unbudgeted decode keeps roughly five times the headroom over an
+/// honest refusal and stays four times below the escape, on any host, in
+/// either profile. `fold_concurrency` and `compaction` calibrate the same
+/// way for the same reason.
+fn assert_rebuild_refused_fast(elapsed: Duration, unbudgeted: Duration) {
     assert!(
-        elapsed < Duration::from_millis(500),
+        elapsed * 4 < unbudgeted,
         "the refusal must arrive within one check interval, not after the \
-         full rebuild: {elapsed:?}"
+         full rebuild: refused in {elapsed:?}, but the unbudgeted rebuild of \
+         the same corpus on this machine took {unbudgeted:?} — an honest \
+         refusal is about a nineteenth of that"
     );
 }
 
