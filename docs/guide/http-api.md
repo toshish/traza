@@ -8,26 +8,53 @@ run against a live server; the response bodies shown are real output.
 **Base URL.** `http://HOST:PORT`, default `http://127.0.0.1:8080`. TLS is
 reverse-proxy territory — Traza speaks plain HTTP.
 
-**Authentication.** When `TRAZA_TOKENS` is set, every `/v1` request needs
-`Authorization: Bearer TOKEN`. Entries are `scope[@tenant]:token`: a `ro` token
-may `GET`; an `rw` token may `GET` and `POST`; `admin` adds erasure. The
-optional `@tenant` **binds** the credential — a bound credential reads and
-writes only its tenant's data, on every surface: search, export, tail,
-analytics, annotations, payload fetch, evals, erasure, and MCP alike. The
-binding is applied where queries are constructed, so no endpoint can forget
-it. Two consequences worth knowing before they surprise you:
+**Authentication.** Once any credential exists — from `TRAZA_TOKENS`, or
+minted at runtime with [`POST /v1/admin/credentials`](#post-v1admincredentials)
+— every `/v1` request needs `Authorization: Bearer TOKEN`. With neither, the
+server is open (on loopback by default). A `ro` credential may `GET`; an `rw`
+credential may `GET` and `POST`; `admin` adds erasure, eval tombstones,
+backups and the `/v1/admin/*` routes. A credential may be **bound** to one
+tenant (`scope@tenant:token` in `TRAZA_TOKENS`, `"tenant"` when minted): a
+bound credential reads and writes only its tenant's data, on every surface:
+search, export, tail, analytics, annotations, payload fetch, evals, erasure,
+usage, and MCP alike. The binding is applied where queries are constructed, so
+no endpoint can forget it. Consequences worth knowing before they surprise
+you:
 
 - Naming a foreign tenant in any `tenant=` parameter answers
-  `403 {"error":"this credential is bound to a different tenant"}` — the
-  caller knows what it asked for, so the refusal says why.
+  `403 {"error":"this credential is bound to a different tenant","required":"unbound"}`
+  — the caller knows what it asked for, so the refusal says why.
 - The store-global operator endpoints — `/v1/stats`, `/v1/metrics`,
   `/v1/metrics.json`, `/v1/verify`, `/v1/checkpoint`, `/v1/flush`, and
-  `/v1/backups/*` — answer bound credentials `403 {"error":"forbidden"}`:
-  they report and move the whole store's data, and even the volumes disclose
-  co-tenants. A bound credential's accounting surface is
+  `/v1/backups/*` — answer bound credentials
+  `403 {"error":"forbidden","required":"unbound"}`: they report and move the
+  whole store's data, and even the volumes disclose co-tenants. A bound
+  credential's accounting surfaces are [`GET /v1/usage`](#get-v1usage) and
   [`GET /v1/tenants`](#get-v1tenants).
+- **Every path under `/v1/admin/` is unbound-admin only**, decided by the
+  prefix rather than a list of routes, so a bound or non-admin credential is
+  refused there before any route is consulted — including a path that does
+  not exist.
+- Every `403` from the auth gate carries `"required"`: `"rw"`, `"admin"` or
+  `"unbound"`, naming the capability the credential lacked, so a client can
+  say which grant would have worked.
+- **In open mode, admin operations refuse cross-site browser requests.** With
+  no credential configured, erasure, eval tombstones, backups and every path
+  under `/v1/admin/` answer a request whose `Origin` is not a loopback page
+  with `403 {"error":"origin not allowed: …","next":"…"}`. Without it, any web
+  page the operator visits could mint a credential or erase data through the
+  operator's browser with a plain cross-site `POST`. Requests with no `Origin`
+  (`curl`, scripts) and pages served from loopback (the dashboard) are
+  unaffected, and once a credential exists the rule is not applied — a page
+  cannot attach a bearer token it does not know. This `403` carries `next`
+  rather than `required`: no grant is missing.
+- **Admin request bodies must be declared JSON.** A `POST` under `/v1/admin/`
+  that carries a body must send `Content-Type: application/json`, or it is
+  `415`. An HTML form cannot send that type, and a cross-site script cannot
+  send it without a CORS preflight this server never approves.
 
-See [administration](../operations/administration.md#authentication).
+[`GET /v1/whoami`](#get-v1whoami) tells any caller what its own credential
+is. See [administration](../operations/administration.md#authentication).
 
 **Timestamps** are integer Unix nanoseconds everywhere, in both directions.
 
@@ -40,18 +67,36 @@ is the one route that always closes its connection, because it is chunked with
 trailers and has no declared length.
 
 **Limits.** Request bodies are capped at 64 MiB, request headers at 64 KiB.
+Ingest batches are additionally held to the admission caps (attributes,
+key length, events, stored span size, spans per batch; see
+[configuration](../configuration.md#server-flags)).
+
+**Compressed bodies.** `POST /v1/spans` and `POST /v1/traces` accept
+`Content-Encoding: gzip` (or `x-gzip`) — what an OpenTelemetry exporter sends
+with compression on. The body is decompressed by the server's own inflate
+(RFC 1951/1952, no dependency), every member's CRC-32 and length checked, with
+the decompressed size capped at the same 64 MiB as an uncompressed body: past
+it the request is refused with `413` before more is produced, so a compressed
+request can hold at most the compressed body plus 64 MiB in memory while it is
+decoded. A damaged body is `400` naming the damage
+(`invalid gzip body: CRC-32 mismatch`). Every other route, and every other
+coding (`br`, `deflate`, `zstd`, a doubled `gzip`), is `415`.
 
 ### Status codes
 
 | Code | Meaning |
 |---|---|
 | `200` | Success |
-| `400` | Malformed body, invalid parameter, or a violated ingest invariant |
-| `401` | Missing, malformed, or unknown bearer token. Carries `WWW-Authenticate: Bearer` |
-| `403` | Valid token without the scope for this method, or a tenant-bound credential naming a foreign tenant or a store-global operator endpoint |
-| `404` | No such route, or the requested trace/session/payload/dataset/experiment does not exist. Cross-tenant reads answer `404`, never `403` — existence is a fact about another tenant |
-| `409` | A conflict a retry may resolve: a mutation for a tenant whose erasure is pending, a tombstoned parent version, a payload reference not in the store, a pin label already taken |
+| `201` | Created: a backup pin, a credential |
+| `400` | Malformed body, invalid parameter, a violated ingest invariant, or an exceeded admission cap |
+| `401` | Missing, malformed, unknown, expired, or revoked bearer token. Carries `WWW-Authenticate: Bearer` |
+| `403` | Valid token without the grant this request needs — the body's `"required"` names it (`rw`, `admin`, `unbound`) — or a tenant-bound credential naming a foreign tenant; in open mode, also a browser request from a non-loopback page to an admin operation |
+| `404` | No such route, or the requested trace/session/payload/dataset/experiment/credential does not exist. Cross-tenant reads answer `404`, never `403` — existence is a fact about another tenant |
+| `409` | A conflict a retry may resolve: a mutation for a tenant whose erasure is pending, a tombstoned parent version, a payload reference not in the store, a pin label already taken, a credential token already registered, an environment credential named for revocation, a first credential that is not an unbound admin |
 | `410` | A tombstoned dataset version: the content is withheld, the fact of the deletion is not |
+| `413` | A gzip body that decompresses past the 64 MiB body cap |
+| `415` | A `Content-Encoding` other than `gzip` on an ingest route, or any coding elsewhere; a `/v1/admin/` body not declared `application/json` |
+| `429` | An ingest batch refused by its tenant's monthly quota or ingest pause. Carries `Retry-After` |
 | `503` | The store could not serve the request, or the server is at its connection limit. Retry with backoff |
 
 ## Route index
@@ -62,8 +107,8 @@ trailers and has no declared length.
 | `POST` | [`/v1/traces`](#post-v1traces) | Ingest OTLP/HTTP (protobuf or JSON) |
 | `POST` | [`/v1/flush`](#post-v1flush) | Seal buffered spans into a segment |
 | `POST` | [`/v1/checkpoint`](#post-v1checkpoint) | Publish a generation |
-| `POST` | [`/v1/backups/{label}`](#post-v1backupslabel) | Pin and verify a backup |
-| `POST` | [`/v1/backups/{label}/release`](#post-v1backupslabelrelease) | Release a pin |
+| `POST` | [`/v1/backups/{label}`](#post-v1backupslabel) | Pin and verify a backup (unbound `admin`) |
+| `POST` | [`/v1/backups/{label}/release`](#post-v1backupslabelrelease) | Release a pin (unbound `admin`) |
 | `GET` | [`/v1/verify`](#get-v1verify) | Verify the live generation |
 | `POST` | [`/v1/erasures`](#post-v1erasures) | Erase a trace, span, session, payload, or whole tenant |
 | `GET` | [`/v1/erasures`](#get-v1erasures) | The tombstone log |
@@ -94,12 +139,20 @@ trailers and has no declared length.
 | `GET` | [`/v1/experiments/{id}/summary`](#get-v1experimentsidsummary) | Per-name score distributions |
 | `GET` | [`/v1/experiments/diff`](#get-v1experimentsdiff) | Compare two experiments' scores |
 | `GET` | [`/v1/tenants`](#get-v1tenants) | Per-tenant usage accounting |
+| `GET` | [`/v1/usage`](#get-v1usage) | Per-tenant ingest counters, limits and quota state |
+| `GET` | [`/v1/whoami`](#get-v1whoami) | What the calling credential is |
+| `POST` | [`/v1/admin/credentials`](#post-v1admincredentials) | Mint or register a credential (unbound `admin`) |
+| `GET` | [`/v1/admin/credentials`](#get-v1admincredentials) | List credentials (unbound `admin`) |
+| `POST` | [`/v1/admin/credentials/{id}/revoke`](#post-v1admincredentialsidrevoke) | Revoke a credential (unbound `admin`) |
+| `POST` | [`/v1/admin/tenants/{tenant}/limits`](#post-v1admintenantstenantlimits) | Replace a tenant's quotas, pause and retention (unbound `admin`) |
+| `GET` | [`/v1/admin/tenants/{tenant}/limits`](#get-v1admintenantstenantlimits) | A tenant's limits (unbound `admin`) |
 | `GET` | [`/v1/payloads/{reference}`](#get-v1payloadsreference) | Raw bytes of an offloaded payload |
 | `GET` | [`/v1/export`](#get-v1export) | Streaming NDJSON export |
 | `GET` | [`/v1/tail`](#get-v1tail) | Live span stream, in admission order |
 | `GET` | [`/v1/stats`](#get-v1stats) | Store statistics |
 | `GET` | [`/v1/metrics`](#get-v1metrics) | Prometheus text metrics |
 | `GET` | [`/v1/metrics.json`](#get-v1metricsjson) | The same metrics as JSON |
+| `GET` | [`/healthz`, `/readyz`](#get-healthz-and-readyz) | Liveness and readiness probes (no auth) |
 | `POST` | [`/v1/mcp`](#post-v1mcp) | Model Context Protocol endpoint (off unless `--mcp`) |
 | `GET` | [`/`, `/dashboard`](#get--and-dashboard) | The trace browser |
 
@@ -161,9 +214,45 @@ namespaces and keep the plain name.
 | `400 {"error":"span 0: span_id is empty"}` | As above |
 | `400 {"error":"span 0: tenant does not match the credential's binding"}` | A bound credential's span claims another tenant |
 | `400 {"error":"tenant must be lowercase [a-z0-9][a-z0-9._-], at most 64 bytes"}` | An inadmissible tenant identity, refused by the engine |
+| `400 {"error":"span 0 (trace t1, span s1): 1500 attributes exceeds the max-span-attributes cap of 1024"}` | An admission cap; the message names the cap and the span (index, trace id, span id) |
+| `400 {"error":"batch of 120000 spans exceeds the max-batch-spans cap of 100000"}` | Too many spans in one request |
+| `429 {"error":"quota exceeded: monthly_spans for tenant acme","quota":{…}}` | The tenant's monthly quota or ingest pause; see [quota refusals](#quota-refusals) |
 | `503 {"error":"…"}` | The store rejected the write |
 
-Validation is atomic per batch: one invalid span stores none of them.
+Validation is atomic per batch: one invalid span stores none of them. The
+admission caps are checked before anything is written — before payload
+offload too, so a refused span leaves no payload file behind.
+
+#### Quota refusals
+
+A batch that would take its tenant's month past `monthly_spans` or
+`monthly_bytes`, or that belongs to a tenant whose ingest is paused (see
+[tenant limits](#post-v1admintenantstenantlimits)), is refused **whole** with
+`429 Too Many Requests` and a `Retry-After` header: the seconds until the
+first instant of next month (UTC) for a monthly limit, `60` for a pause.
+
+```json
+{"error":"quota exceeded: monthly_spans for tenant acme",
+ "quota":{"tenant":"acme","dimension":"monthly_spans","limit":1000000,
+          "used":999990,"window":"2026-10","resets_at":"2026-11-01T00:00:00Z"}}
+```
+
+| Field | Description |
+|---|---|
+| `tenant` | The tenant whose limit refused the batch (`""` is the default tenant) |
+| `dimension` | `monthly_spans`, `monthly_bytes`, or `paused` |
+| `limit` | The limit's value; `null` for a pause |
+| `used` | The month's usage in that dimension before this batch (spans, for a pause) |
+| `window` | The month, `YYYY-MM` (UTC) |
+| `resets_at` | When the month resets (RFC 3339); `null` for a pause |
+
+A batch is refused when its spans or bytes **would** exceed the limit, so a
+batch that lands exactly on it is accepted and the next one is refused. A
+batch mixing tenants (possible only for an unbound credential) is refused
+whole if any tenant in it is over. Reads, exports and erasure are never
+blocked by a quota. Concurrent batches are checked against the counters as
+they stand, so batches in flight together can overshoot a limit by at most
+their own size.
 
 ### `POST /v1/traces`
 
@@ -194,8 +283,12 @@ a `400` for the **whole export**, deliberately loud — OTLP's `partialSuccess`
 is for data the server chose to drop, not for a defect the client must fix.
 
 **Errors.** `400` with the decode failure for malformed protobuf or JSON, a
-non-hex id, or a timestamp that is not a `u64`. `503` if the store rejected the
-write.
+non-hex id, or a timestamp that is not a `u64`; `400` for an exceeded
+admission cap, exactly as native ingest words it. `429` with the same JSON
+body and `Retry-After` as [native ingest](#quota-refusals) when a quota or
+pause refuses the export — for a protobuf request too, since an OTLP exporter
+retries on `429` with `Retry-After` and the body is for whoever reads its
+logs. `503` if the store rejected the write.
 
 The full field mapping is in [ingest](ingest.md#otlp-mapping).
 
@@ -237,6 +330,17 @@ copy can proceed at its own pace.
 `path` is a directory to copy — Traza never writes outside its own data
 directory. Copy it, then release the pin.
 
+**Needs an unbound `admin` credential.** A pin holds every byte of its
+generation on disk until it is released, so taking one is a capacity
+decision rather than a write; `rw` gets `403` with `"required":"admin"`, and a
+bound credential `"required":"unbound"`.
+
+The pin carries the telemetry — segments, the annotation, eval and tombstone
+logs, payload bytes — and **not** `credentials.jsonl`, `limits.json` or
+`usage.json`: a backup never carries credential digests, and restoring one
+never resurrects a revoked token, rolls back a tenant's limits, or rewinds
+what it has been charged for.
+
 Errors: `409` if a pin by that label already exists or the label is not a
 single non-hidden path component; `500` with a `problems` array if the pin does
 not verify; `503` if the checkpoint or linking failed.
@@ -244,6 +348,7 @@ not verify; `503` if the checkpoint or linking failed.
 ### `POST /v1/backups/{label}/release`
 
 Removes a pin, freeing the disk its unshared bytes were holding. Idempotent.
+Unbound `admin`, like taking one.
 
 ```json
 {"released":true,"backup":"nightly"}
@@ -1293,6 +1398,196 @@ route when the question is "what does each tenant hold right now".
 
 **Errors.** `503` on store failure.
 
+### `GET /v1/usage`
+
+What each tenant has **sent**, against its limits: monotonic counters kept as
+batches are acknowledged, answered in O(tenants) without reading a segment.
+Where [`/v1/tenants`](#get-v1tenants) answers "what does it hold now" (expiry
+and erasure shrink that), this answers "what has it been charged for".
+
+A bound credential gets exactly its own row (a `ro` token suffices — this is
+not an operator surface); naming another tenant is `403`. An unbound one gets
+every tenant that has counters or limits, or one tenant with `?tenant=` (empty
+selects the default tenant). A tenant with neither gets a zero row when asked
+for by name.
+
+```sh
+curl -H "Authorization: Bearer $ACME_TOKEN" http://localhost:8080/v1/usage
+```
+
+```json
+{"as_of_ns":1792061745453808000,"tenants":[{"lifetime":{"batches":1,"bytes":209,"rejected":0,"spans":1},"limits":{"ingest_paused":false,"monthly_bytes":10000000000,"monthly_spans":1000000,"ttl_seconds":2592000},"month":{"bytes":209,"spans":1,"window":"2026-10"},"state":"ok","tenant":"acme"}]}
+```
+
+| Field | Description |
+|---|---|
+| `lifetime.spans` | Spans admitted since the counters began |
+| `lifetime.bytes` | Their size: each span's native JSON after tenant stamping and **before** payload offload — what the client sent, in Traza's encoding. An OTLP batch is charged its native-JSON size, not its protobuf wire size |
+| `lifetime.batches` | Ingest calls that admitted at least one of the tenant's spans |
+| `lifetime.rejected` | Spans refused by a quota or a pause. Admission-cap refusals (`400`) are not counted here |
+| `month.window` | The current UTC calendar month, `YYYY-MM` |
+| `month.spans`, `month.bytes` | The same counts for that month; zero once it turns |
+| `limits` | The tenant's [limits document](#post-v1admintenantstenantlimits) (defaults when never set) |
+| `state` | `paused`; else `capped` when a monthly limit is reached; else `warning` at 80% or more of any monthly limit; else `ok` |
+
+Spans a pending erasure suppressed at ingest are not admitted and not
+charged. **The counters are written to `usage.json` every five seconds and on
+every flush**, and only when they changed. The five-second writer is a server
+thread of its own, so a long merge or expiry pass does not delay it; a crash
+loses the counts since the last completed write — normally five seconds'
+worth, plus however long that write's fsync took — an undercount, never an
+overcount. They are kept outside generations: a restore does not rewind them.
+
+**Errors.** `400` for an unknown query parameter; `403` when a bound
+credential names another tenant.
+
+### `POST /v1/admin/tenants/{tenant}/limits`
+
+Replaces a tenant's limits document — the **whole** document: a field left out
+returns to its default. Unbound `admin` only. `{tenant}` is a tenant name, or
+`_default` for the default tenant.
+
+```sh
+curl -X POST http://localhost:8080/v1/admin/tenants/acme/limits \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"monthly_spans":1000000,"monthly_bytes":10000000000,"ingest_paused":false,"ttl_seconds":2592000}'
+```
+
+```json
+{"ingest_paused":false,"monthly_bytes":10000000000,"monthly_spans":1000000,"tenant":"acme","ttl_seconds":2592000}
+```
+
+| Field | Type | Default | Effect |
+|---|---|---|---|
+| `monthly_spans` | integer or null | `null` | Spans the tenant may ingest per UTC calendar month; `null` is unlimited |
+| `monthly_bytes` | integer or null | `null` | Bytes (counted as in [`/v1/usage`](#get-v1usage)) per month; `null` is unlimited |
+| `ingest_paused` | bool | `false` | Refuse every batch for the tenant with `429`. Reads, exports and erasure are unaffected |
+| `ttl_seconds` | integer or null | `null` | Retention for this tenant, overriding `--tenant-ttl` and `--ttl-seconds`. `0` keeps everything; `null` falls back to the flags |
+
+The response is the stored document plus `tenant` (`""` for the default
+tenant). It is durable before the response is sent (`limits.json`, rewritten
+atomically and fsynced, outside generations). Quotas and the pause apply from
+the next batch; a TTL change applies at the next retention pass, which the
+server runs every minute.
+
+**Errors.** `400` for an invalid tenant, an unknown field, or a value of the
+wrong type; `403` for any credential that is not an unbound `admin`; `415`
+when the body is not declared `application/json`.
+
+### `GET /v1/admin/tenants/{tenant}/limits`
+
+The tenant's document, in the same shape; the defaults (no limits) when it was
+never set. Unbound `admin` only.
+
+```json
+{"ingest_paused":false,"monthly_bytes":null,"monthly_spans":null,"tenant":"acme","ttl_seconds":null}
+```
+
+---
+
+## Credentials and identity
+
+### `GET /v1/whoami`
+
+What the calling credential is. Any valid credential may ask, and in open
+mode the server answers too. Not an operator surface.
+
+```sh
+curl -H "Authorization: Bearer $ACME_TOKEN" http://localhost:8080/v1/whoami
+```
+
+```json
+{"auth":"token","credential":{"id":"cr_b218d515889e9779","label":""},"operator":false,"scope":"rw","tenant":"acme"}
+```
+
+| Field | Description |
+|---|---|
+| `auth` | `token`, or `open` when no credential exists anywhere |
+| `scope` | `ro`, `rw` or `admin` (`admin` in open mode, which permits everything) |
+| `tenant` | The binding, or `null` for an unbound credential |
+| `operator` | `true` for an unbound credential (or open mode): it may use the operator surfaces. Scope does not decide this; the absence of a binding does |
+| `credential` | `{"id","label"}` of the credential that authenticated; `null` in open mode |
+
+An environment credential's id is derived from its token's digest, so it is
+the same after every restart.
+
+### `POST /v1/admin/credentials`
+
+Creates a credential while the server runs. Unbound `admin` only — or open
+mode, which is how the first credential of a store is minted: from the moment
+one exists, every request must authenticate. **The first credential must
+itself be an unbound `admin`** (`409` otherwise): any other would switch
+authentication on with no credential able to manage credentials. In open mode
+the request must not come from a non-loopback browser page (see
+[Conventions](#conventions)).
+
+```sh
+curl -X POST http://localhost:8080/v1/admin/credentials \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"scope":"rw","tenant":"acme","label":"acme collector","expires_in_seconds":2592000}'
+```
+
+`201`:
+
+```json
+{"created_at_ns":1792061745307152000,"expires_at_ns":1794653745307152000,"id":"cr_1b4e75684650c646","label":"acme collector","prefix":"trz_c168ab97","scope":"rw","tenant":"acme","token":"trz_c168ab97dd0fc7340e749c2d449cc3cf846c2e13fe11b0f86590342816360821"}
+```
+
+| Body field | Type | Effect |
+|---|---|---|
+| `scope` | string, required | `ro`, `rw` or `admin` |
+| `tenant` | string | Bind to this tenant; omit for an unbound credential |
+| `label` | string | A note for the credential list, at most 256 bytes |
+| `expires_in_seconds` | integer | Lifetime from now, at least 1; omit for no expiry |
+| `token` | string | Register this token instead of minting one: at least 24 bytes, no whitespace, control characters or commas. For a control plane reconciling a credential it already issued. **It must be high-entropy** (at least 128 random bits): the store protects it at rest with nothing but an unsalted SHA-256, and only its length is checked |
+
+**`token` is in this response and nowhere else, ever.** The store keeps only
+its SHA-256, so it cannot be shown again; lose it and revoke the credential.
+A minted token is `trz_` plus 64 hex digits from the operating system's
+random source (`/dev/urandom`; where that does not exist, minting fails with
+`503` and a supplied `token` still works). `prefix` is the part safe to show
+later: at most a quarter of the token and never more than 12 characters —
+`trz_` and eight hex digits for a minted one.
+
+**Errors.** `400` naming the offending field (unknown fields are refused);
+`409` when the token is already registered — live, expired, revoked, or in
+`TRAZA_TOKENS`: a token is never reused, so a revoked one cannot come back —
+or when the store has no credential yet and this one is not an unbound
+`admin`; `403` for anything but an unbound `admin`, and in open mode for a
+non-loopback browser `Origin`; `415` when the body is not declared
+`application/json`.
+
+### `GET /v1/admin/credentials`
+
+Every credential: environment ones first, then runtime ones in creation
+order. Never a token or a digest. Unbound `admin` only.
+
+```json
+{"credentials":[{"created_at_ns":1792061745172064000,"expires_at_ns":null,"id":"cr_5cd4bd2cc16c3087","label":"","last_used_at_ns":1792061745321685000,"prefix":"root-","revoked_at_ns":null,"scope":"admin","source":"env","tenant":null},{"created_at_ns":1792061745307152000,"expires_at_ns":1794653745307152000,"id":"cr_1b4e75684650c646","label":"acme collector","last_used_at_ns":null,"prefix":"trz_c168ab97","revoked_at_ns":null,"scope":"rw","source":"api","tenant":"acme"}]}
+```
+
+`source` is `env` (from `TRAZA_TOKENS`; `created_at_ns` is when this process
+loaded it) or `api`. `last_used_at_ns` is kept **in memory only**: a restart
+forgets it, because recording it durably would put an fsync on every
+authenticated request.
+
+### `POST /v1/admin/credentials/{id}/revoke`
+
+Revokes a runtime credential: from the next request its token is `401`, like
+an unknown one. The revocation is fsynced before the response, so it survives
+a crash. Idempotent — revoking again answers with the original instant.
+Unbound `admin` only.
+
+```json
+{"id":"cr_1b4e75684650c646","revoked_at_ns":1792061745365355000}
+```
+
+**Errors.** `404` for an unknown id;
+`409 {"error":"env credentials are revoked by restarting without them"}` for
+an environment credential.
+
 ---
 
 ## Erasure
@@ -1308,8 +1603,8 @@ stays read-only, so stored adversarial text has no deletion verb to actuate.
 
 ### `POST /v1/erasures`
 
-**Requires the `admin` scope** when `TRAZA_TOKENS` is configured — an `rw`
-token gets `403 {"error":"forbidden"}`. Erasure is a POST like any ingest, so
+**Requires the `admin` scope** when authentication is on — an `rw` token gets
+`403 {"error":"forbidden","required":"admin"}`. Erasure is a POST like any ingest, so
 the method rule cannot distinguish it, and it must be distinguished: a
 credential minted to write telemetry must not be able to destroy it. See
 [administration § Authentication](../operations/administration.md#authentication).
@@ -1484,6 +1779,25 @@ read — expect it to cost more than a query.
 
 ## Operations
 
+### `GET /healthz` and `/readyz`
+
+Liveness and readiness probes, answered **before** the auth gate — an
+orchestrator probing them holds no credential — and not counted in the request
+metrics. `GET` only; any other method goes through the gate like any request.
+
+```json
+{"status":"ok","version":"0.27.0"}
+```
+
+```json
+{"ready":true}
+```
+
+`version` is the server's build version (the crate version it was built
+from). The listener binds only after the
+store has opened and recovered its log, so `/readyz` answers `200` whenever it
+answers at all; "not ready yet" is a refused connection.
+
 ### `GET /v1/stats`
 
 ```json
@@ -1522,7 +1836,10 @@ traza_spans_admitted_total 4
 
 Every metric name and its meaning is documented in
 [monitoring](../operations/monitoring.md), including the accuracy bound on the
-percentile gauges.
+percentile gauges. Two families carry a `tenant` label, one series per tenant
+with usage counters: `traza_tenant_spans_ingested_total` and
+`traza_quota_rejected_total` (the [`/v1/usage`](#get-v1usage) lifetime
+counters).
 
 **Errors.** None — the route always renders.
 

@@ -40,6 +40,11 @@ impl Drop for TestDir {
 fn config() -> Config {
     Config {
         pricing: Default::default(),
+        max_span_attributes: Some(traza::caps::DEFAULT_MAX_SPAN_ATTRIBUTES),
+        max_attribute_key_bytes: Some(traza::caps::DEFAULT_MAX_ATTRIBUTE_KEY_BYTES),
+        max_span_events: Some(traza::caps::DEFAULT_MAX_SPAN_EVENTS),
+        max_span_bytes: Some(traza::caps::DEFAULT_MAX_SPAN_BYTES),
+        max_batch_spans: Some(traza::caps::DEFAULT_MAX_BATCH_SPANS),
         tenant_ttl_seconds: Default::default(),
         flush_spans: 1_000_000, // keep everything in the buffer; the scan is the point
         max_buffer_age: None,

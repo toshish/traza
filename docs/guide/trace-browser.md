@@ -30,7 +30,8 @@ The dashboard **shell** loads without credentials — it is static build output
 carrying no data. Every `/v1` call it makes is gated exactly like any other
 client.
 
-When the server has `TRAZA_TOKENS` set, the first API call returns `401` and
+When the server has credentials configured (`TRAZA_TOKENS`, or runtime
+credentials), the first API call returns `401` and
 the page prompts for a token. Use **Set token** in the header. The token is
 held in `sessionStorage` only: it does not persist across a browser restart and
 is never written to `localStorage` or a cookie. A `403` tells you the token

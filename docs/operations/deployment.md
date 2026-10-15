@@ -55,6 +55,9 @@ data/
   segment-00000000000000000000.seg      immutable sorted segments
   segment-00000000000000000001.seg
   annotations.jsonl                     append-only annotation log
+  credentials.jsonl                     runtime credentials, as digests (outside backups)
+  limits.json                           per-tenant limits (outside backups)
+  usage.json                            per-tenant usage counters (outside backups)
   payloads/
     29/29927e…fa.bin                    content-addressed offloaded payloads
     66/660f56…51.bin
@@ -88,12 +91,13 @@ The default bind is `127.0.0.1`. Binding anywhere else without authentication
 is **refused at startup**:
 
 ```
-traza-server: refusing unauthenticated non-loopback bind 0.0.0.0; configure TRAZA_TOKENS or pass --allow-unauthenticated-non-loopback explicitly
+traza-server: refusing unauthenticated non-loopback bind 0.0.0.0; configure TRAZA_TOKENS, create a runtime credential (POST /v1/admin/credentials on a loopback start), or pass --allow-unauthenticated-non-loopback explicitly
 ```
 
-Configure `TRAZA_TOKENS`, or pass the explicit escape hatch if the network is
-genuinely trusted. See
-[administration](administration.md#authentication).
+Configure `TRAZA_TOKENS`, mint a runtime credential on a loopback start first
+(the data directory's credential log then counts as configured
+authentication), or pass the explicit escape hatch if the network is genuinely
+trusted. See [administration](administration.md#authentication).
 
 `--port 0` binds an ephemeral port and announces the real one on stderr, which
 is how the test suite discovers it.

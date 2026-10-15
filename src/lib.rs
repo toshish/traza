@@ -10,16 +10,20 @@ pub mod analytics;
 pub mod annotations;
 pub mod attribution;
 pub mod auth;
+pub mod caps;
 pub mod content;
 mod crc;
+pub mod credentials;
 pub mod erasure;
 pub mod evals;
 pub mod expiration;
 mod generation;
 pub mod guard;
+pub mod gzip;
 pub mod hash;
 mod ingest_hooks;
 pub mod insights;
+pub mod limits;
 pub mod mcp;
 mod media;
 pub mod metrics;
@@ -29,6 +33,7 @@ pub mod object_storage;
 pub mod otlp;
 pub mod otlp_pb;
 pub mod payload;
+pub mod platform;
 pub mod pricing;
 mod rollup_file;
 pub mod run;
@@ -37,6 +42,7 @@ pub mod segment;
 pub mod semconv;
 pub mod tail;
 pub mod ui;
+pub mod usage;
 mod wal;
 
 use serde::{Deserialize, Serialize};
@@ -885,6 +891,20 @@ pub struct Config {
     /// counters computed under the old ones rather than silently reporting
     /// them forever. See [`crate::pricing`].
     pub pricing: std::sync::Arc<crate::pricing::Pricing>,
+    /// Attributes one span may carry at top level, or `None` for no cap.
+    /// A violation refuses the whole batch ([`Error::Invalid`]); see
+    /// [`crate::caps`].
+    pub max_span_attributes: Option<usize>,
+    /// Bytes one attribute key may have, in any of the span's attribute maps
+    /// (its own, its events', its links'), or `None` for no cap.
+    pub max_attribute_key_bytes: Option<usize>,
+    /// Events one span may carry, or `None` for no cap.
+    pub max_span_events: Option<usize>,
+    /// Serialized bytes one span may occupy AS STORED — after oversized
+    /// values are offloaded to payload references — or `None` for no cap.
+    pub max_span_bytes: Option<usize>,
+    /// Spans one ingest call may carry, or `None` for no cap.
+    pub max_batch_spans: Option<usize>,
 }
 
 /// The last commit whose reader accepts every segment format retired WITHOUT
@@ -988,6 +1008,11 @@ impl Default for Config {
             tail_ring_spans: DEFAULT_TAIL_RING_SPANS,
             tail_ring_bytes: DEFAULT_TAIL_RING_BYTES,
             pricing: std::sync::Arc::new(crate::pricing::Pricing::default()),
+            max_span_attributes: Some(caps::DEFAULT_MAX_SPAN_ATTRIBUTES),
+            max_attribute_key_bytes: Some(caps::DEFAULT_MAX_ATTRIBUTE_KEY_BYTES),
+            max_span_events: Some(caps::DEFAULT_MAX_SPAN_EVENTS),
+            max_span_bytes: Some(caps::DEFAULT_MAX_SPAN_BYTES),
+            max_batch_spans: Some(caps::DEFAULT_MAX_BATCH_SPANS),
         }
     }
 }
@@ -1083,6 +1108,11 @@ pub enum Error {
     /// payload reference whose bytes are gone. Retryable once the state
     /// changes, which is exactly what HTTP 409 means.
     Conflict(String),
+    /// A tenant's monthly quota or ingest pause refused the whole batch (see
+    /// [`usage`]). Not the client's defect and not the store's: HTTP 429,
+    /// with the refusal saying which limit, how much is used, and when it
+    /// resets.
+    QuotaExceeded(usage::QuotaRefusal),
 }
 
 impl fmt::Display for Error {
@@ -1099,6 +1129,7 @@ impl fmt::Display for Error {
             Self::WalCorrupt(detail) => write!(f, "write-ahead log is corrupt: {detail}"),
             Self::Invalid(reason) => write!(f, "invalid request: {reason}"),
             Self::Conflict(reason) => write!(f, "conflict: {reason}"),
+            Self::QuotaExceeded(refusal) => write!(f, "{refusal}"),
         }
     }
 }
@@ -1116,7 +1147,8 @@ impl StdError for Error {
             | Self::WalCorrupt(_)
             | Self::UnsupportedFilter(_)
             | Self::Invalid(_)
-            | Self::Conflict(_) => None,
+            | Self::Conflict(_)
+            | Self::QuotaExceeded(_) => None,
         }
     }
 }
@@ -2035,15 +2067,20 @@ impl ExpiryCutoffs {
     /// The configured policy as absolute cutoffs, or `None` when no window
     /// is configured anywhere (retention wholly disabled). A zero GLOBAL
     /// TTL is documented as "disabled"; a zero PER-TENANT TTL is that
-    /// tenant's exemption from the global window.
-    fn from_config(config: &Config, now_ns: u64) -> Option<Self> {
+    /// tenant's exemption from the global window. `tenant_ttl_seconds` is
+    /// the configured map with runtime overrides already laid over it
+    /// ([`Store::tenant_ttl_policy`]).
+    fn from_policy(
+        ttl_seconds: Option<u64>,
+        tenant_ttl_seconds: &std::collections::HashMap<String, u64>,
+        now_ns: u64,
+    ) -> Option<Self> {
         let cutoff = |ttl_seconds: u64| {
             (ttl_seconds > 0)
                 .then(|| now_ns.saturating_sub(ttl_seconds.saturating_mul(1_000_000_000)))
         };
-        let default = config.ttl_seconds.and_then(cutoff);
-        let tenants: std::collections::HashMap<String, Option<u64>> = config
-            .tenant_ttl_seconds
+        let default = ttl_seconds.and_then(cutoff);
+        let tenants: std::collections::HashMap<String, Option<u64>> = tenant_ttl_seconds
             .iter()
             .map(|(tenant, ttl)| (tenant.clone(), cutoff(*ttl)))
             .collect();
@@ -2208,6 +2245,10 @@ pub struct Store {
     /// futility backoff. See [`Store::finish_shadow_pass`].
     shadow_pass: Mutex<ShadowPassClock>,
     metrics: metrics::Metrics,
+    /// Credentials, tenant limits and usage counters — the hosting state,
+    /// kept outside generations (see [`platform`]). Each part's lock is
+    /// leaf-level.
+    platform: platform::State,
     _directory_lock: DirectoryLock,
 }
 
@@ -2347,6 +2388,7 @@ impl Store {
                 // this store answers, and stays masked until the resumed purge
                 // settles it (see [`Store::resume_erasures`]).
                 erasures: erasure::ErasureLog::open(&directory)?,
+                platform: platform::State::open(&directory)?,
                 erasure_gate: std::sync::RwLock::new(()),
                 directory,
                 live_generation: AtomicU64::new(live_generation),
@@ -2395,7 +2437,7 @@ impl Store {
         // Admission policy refuses here: the batch is known valid, and
         // nothing about it has been decided yet — no gate, no offload, no
         // log append — so a refusal is batch-atomic and leaves no trace.
-        self.admission_check(&spans)?;
+        let admitting = self.admission_check(&spans)?;
         let sent = spans.len();
         let mut spans = spans;
 
@@ -2457,7 +2499,7 @@ impl Store {
             }
         }
 
-        self.admit(spans, sent, gate)
+        self.admit(spans, sent, gate, &admitting)
     }
 
     /// The acknowledgement path shared by both ingest surfaces.
@@ -2486,6 +2528,7 @@ impl Store {
         spans: Vec<Span>,
         sent: usize,
         gate: std::sync::RwLockReadGuard<'_, ()>,
+        admitting: &caps::Admitting,
     ) -> Result<Admission> {
         // The caller holds the erasure gate in read mode and already applied
         // the mask it loaded under it — drops, masked offloading, redaction.
@@ -2576,6 +2619,9 @@ impl Store {
         // Observers see the same acknowledged batch the tail just did, for
         // the same reason: what they react to must be what the store kept.
         let observed = self.observe_admitted(&admitted_handles);
+        // Usage is charged for the same acknowledged batch, at the sizes
+        // admission measured before the offload rewrote the large values.
+        self.record_usage(&admitted_handles, admitting);
 
         self.metrics.spans_admitted.add(admitted);
         self.metrics.batches_admitted.increment();
@@ -2693,8 +2739,12 @@ impl Store {
     /// was called are in a segment on disk. Spans ingested by other threads
     /// WHILE it runs may still be buffered afterwards — they arrived after the
     /// snapshot this call sealed, and the next seal takes them.
+    ///
+    /// The usage counters are written too ([`Store::persist_usage`]): a flush
+    /// is the embedder's "make it durable" verb.
     pub fn flush(&self) -> Result<()> {
-        self.seal(SealWait::ForPermit).map(|_| ())
+        self.seal(SealWait::ForPermit)?;
+        self.persist_usage()
     }
 
     /// Returns all spans belonging to `trace_id`, ordered by start time.
@@ -4477,7 +4527,8 @@ impl Store {
 
     /// Expires spans, annotations, and payload files older than their
     /// tenant's retention window (no-op when no TTL is configured at all).
-    /// Every tenant expires on its own cutoff: its override if listed in
+    /// Every tenant expires on its own cutoff: its runtime override
+    /// ([`limits::TenantLimits::ttl_seconds`]), else its entry in
     /// [`Config::tenant_ttl_seconds`], else the global TTL, else never.
     pub fn compact_expired(&self) -> Result<usize> {
         let now_ns = SystemTime::now()
@@ -4485,7 +4536,9 @@ impl Store {
             .unwrap_or_default()
             .as_nanos()
             .min(u128::from(u64::MAX)) as u64;
-        let Some(cutoffs) = ExpiryCutoffs::from_config(&self.config, now_ns) else {
+        let policy = self.tenant_ttl_policy()?;
+        let Some(cutoffs) = ExpiryCutoffs::from_policy(self.config.ttl_seconds, &policy, now_ns)
+        else {
             return Ok(0);
         };
         let _maintenance = self.lock_maintenance()?;

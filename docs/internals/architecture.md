@@ -228,6 +228,11 @@ The server starts one maintenance thread when TTL or compaction is enabled. It
 ticks every 5 seconds and runs `compact_segments`; every twelfth tick (one
 minute) it also runs `compact_expired` if TTL is configured.
 
+A second thread writes the per-tenant usage counters (`usage.json`) every
+5 seconds. It is separate because the maintenance tick runs its duties one
+after another, and a long merge or expiry pass there would stretch the gap
+between two usage writes — which is exactly what a crash can lose.
+
 **Compaction** merges same-size segments to bound the segment count, because a
 filtered query costs one index probe per segment — a store that only ever
 appends flush-sized segments gets steadily slower to search. Only the **tail**

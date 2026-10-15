@@ -17,6 +17,15 @@ Provenance, stated per source rather than as a blanket claim.
   observations, not as reproducible records, until they are re-run and
   recorded.
 - The 29 GB projection is an **extrapolation**, marked as such where it is used.
+- **The ingest figures predate the admission measurement pass.** Ingest now
+  serializes every span once more before admitting it, to enforce the
+  [admission caps](../configuration.md#server-flags) and to charge
+  [usage bytes](../guide/http-api.md#get-v1usage). The pass runs on the
+  request's own thread, outside every engine lock. The committed ingest
+  records were measured without it and have not been re-run since. An
+  interleaved before/after run on a heavily loaded host could not separate
+  the two from run-to-run noise — which is not the same as showing the pass
+  costs nothing.
 
 Nothing is carried over from a version that no longer exists, and where a
 figure's configuration is not recorded, this page says so rather than guessing.
