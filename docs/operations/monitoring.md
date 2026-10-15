@@ -67,6 +67,21 @@ with a plain `Instant` — see [benchmarking](../internals/benchmarking.md).
 | `traza_supersede_probes_total` | counter | Exact primary-key probes into newer segments while resolving last-write-wins: the reads the key-hash prefilter could not rule out. Healthy is roughly one probe per superseded version actually held. **A number tracking matches × segments means the prefilter has stopped working** and every query is re-reading the store to prove keys were never replaced |
 | `traza_rollup_builds_total` | counter | Segment rollups rebuilt by decoding the segment, because neither the in-memory cache nor the on-disk sidecar could answer. Each rebuild writes the sidecar back, so a sidecar-less store pays this once per segment. **A counter that keeps climbing on a steady corpus means the heal is not landing** — check the data directory is writable and the sidecars are surviving beside their segments |
 
+### Per-tenant counters
+
+One series per tenant that has usage counters, labelled `tenant` (`""` is the
+default tenant). They are the [`GET /v1/usage`](../guide/http-api.md#get-v1usage)
+lifetime counters, persisted in `usage.json`, so they do **not** reset on a
+restart — though a crash can lose the increments since the last write (at most
+five seconds), so after one a series may step back by that much. The label set
+grows with the number of tenants; on a store with very many tenants, these two
+families dominate the scrape.
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `traza_tenant_spans_ingested_total{tenant}` | counter | Spans admitted for the tenant |
+| `traza_quota_rejected_total{tenant}` | counter | The tenant's spans refused by a monthly quota or an ingest pause (`429`). Admission-cap refusals (`400`) are not counted |
+
 ### Engine stages
 
 Each is timed **per batch**, not per span, so the instrumentation sits far below

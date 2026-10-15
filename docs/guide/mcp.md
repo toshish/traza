@@ -354,8 +354,8 @@ adds no new credential concept.
 
 | Server configuration | MCP surface |
 |---|---|
-| No `TRAZA_TOKENS`, loopback bind | Open, exactly like `/v1/spans` today |
-| No `TRAZA_TOKENS`, non-loopback | Refused at startup, unchanged |
+| No credential at all (no `TRAZA_TOKENS`, no runtime credential), loopback bind | Open, exactly like `/v1/spans` today |
+| No credential at all, non-loopback | Refused at startup, unchanged |
 | `ro` token | Every read tool |
 | `rw` token | Read tools, plus `record_annotation` when `--mcp-annotations` is set |
 

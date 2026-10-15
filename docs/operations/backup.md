@@ -28,6 +28,9 @@ data/
   payloads/                  and offloaded payload bytes
   generations/<id>/state-manifest.json
   pins/<label>/              a pin: hard links to one manifest's files
+  credentials.jsonl          runtime credential digests  -- outside generations
+  limits.json                tenant limits               -- outside generations
+  usage.json                 tenant usage counters       -- outside generations
 ```
 
 Existing data directories are adopted at first open — nothing moves, and
@@ -36,7 +39,8 @@ adopted directory is not readable by a pre-generation binary.
 
 ## Taking a backup
 
-Against a running server, with ingest continuing throughout:
+Against a running server, with ingest continuing throughout (with auth on,
+this needs an unbound `admin` credential):
 
 ```sh
 curl -X POST http://localhost:8080/v1/backups/nightly
@@ -110,6 +114,14 @@ The library equivalent is [`Store::restore`](../../src/lib.rs).
 
 A restored store starts with an empty write-ahead log: its state is entirely in
 the installed files, and any prior log belonged to a different lineage.
+
+**What a backup does not contain.** `credentials.jsonl` (runtime credential
+digests), `limits.json` (tenant limits) and `usage.json` (usage counters) are
+outside generations, so no pin carries them and `--restore` leaves the live
+copies untouched: a restore never resurrects a revoked credential, rolls back
+a tenant's limits, or rewinds its usage. Restoring into an empty directory
+therefore starts with no runtime credentials — open on loopback, unless
+`TRAZA_TOKENS` is set.
 
 ## Checkpoints
 

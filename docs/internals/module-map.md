@@ -187,10 +187,32 @@ bounds-checked; malformed input yields a decode error, never a panic.
 
 ### [`src/auth.rs`](../../src/auth.rs)
 
-Bearer authentication: `TRAZA_TOKENS` parsing, `ro`/`rw` scopes, constant-time
-token comparison, and the 401/403 verdicts. `AuthConfig` implements a redacted
-`Debug` so an accidental structured log cannot disclose credentials, and parse
-errors name the defect without echoing the value.
+The authentication vocabulary — `Scope`, `Principal`, and the 401/403
+verdicts, each 403 naming the capability it lacked (`Required`) — and the
+`TRAZA_TOKENS` parser. `AuthConfig` implements a redacted `Debug` so an
+accidental structured log cannot disclose credentials, and parse errors name
+the defect without echoing the value.
+
+### [`src/credentials.rs`](../../src/credentials.rs)
+
+The credential set the server authenticates against: environment entries plus
+runtime credentials, looked up by the SHA-256 of the presented token. Runtime
+credentials persist in `credentials.jsonl` (digests only, append-only, torn
+tail healed), outside generations so backups never carry them.
+
+### [`src/limits.rs`](../../src/limits.rs), [`src/usage.rs`](../../src/usage.rs), [`src/caps.rs`](../../src/caps.rs)
+
+Per-tenant runtime limits (`limits.json`: quotas, ingest pause, TTL
+override), per-tenant usage counters and the quota check (`usage.json`), and
+the admission caps plus the one measurement pass ingest makes over a batch.
+The caps and the quota check run in `Store::admission_check`; usage is
+charged at acknowledgement.
+
+### [`src/platform.rs`](../../src/platform.rs)
+
+The hosting state (`credentials`, `limits`, `usage`, one field on `Store`)
+and the HTTP handlers for `/v1/whoami`, `/v1/usage` and `/v1/admin/*`, as
+request → reply functions the server routes to with one call.
 
 ### [`src/mcp.rs`](../../src/mcp.rs)
 

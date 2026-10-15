@@ -7,8 +7,16 @@ behaviour behind them.
 
 ## Authentication
 
-Traza is unauthenticated by default **on loopback only**. Set `TRAZA_TOKENS` to
-require bearer tokens.
+Traza is unauthenticated by default **on loopback only**. Credentials come from
+two places, and they coexist:
+
+- **`TRAZA_TOKENS`** — configured in the environment, fixed for the life of the
+  process.
+- **Runtime credentials** — minted, listed and revoked over HTTP by an unbound
+  `admin` while the server runs; see [Runtime credentials](#runtime-credentials).
+
+With neither, the server is open (on loopback). **The moment any credential
+exists, from either source, every request must authenticate.**
 
 ```sh
 TRAZA_TOKENS="rw:$(openssl rand -hex 16),ro:$(openssl rand -hex 16)" \
@@ -23,7 +31,7 @@ A comma-separated list of `scope[@tenant]:token` entries.
 |---|---|
 | `ro` | `GET` only |
 | `rw` | `GET` and `POST` |
-| `admin` | Everything `rw` permits, **plus erasure** |
+| `admin` | Everything `rw` permits, **plus erasure**, eval version tombstones, and — unbound only — backups and the `/v1/admin/*` routes |
 
 Tokens must be non-empty, unique, and free of whitespace and commas. Entries
 may not have surrounding whitespace. The first `:` isolates the token — which
@@ -52,8 +60,13 @@ a multi-tenant deployment:
   `/v1/metrics`, `/v1/metrics.json`, `/v1/verify`, `/v1/checkpoint`,
   `/v1/flush`, and `/v1/backups/*` answer bound credentials `403`: they
   report and move the whole store's data, and even the volumes disclose
-  co-tenants. A bound credential's accounting surface is
+  co-tenants. A bound credential's accounting surfaces are
+  [`GET /v1/usage`](#quotas-and-usage) and
   [`GET /v1/tenants`](#tenant-accounting).
+- **Everything under `/v1/admin/` is unbound-admin only**, by prefix: a bound
+  credential is refused on every path there, including paths that do not
+  exist yet, so a route added under the prefix later is denied before anyone
+  remembers to list it.
 - **Cross-tenant reads answer `404`, never `403`** — existence is a fact
   about another tenant, and a distinguishable refusal would leak it.
 - A bound `admin` may erase only its own tenant; see
@@ -72,14 +85,21 @@ be bound to a tenant no span could ever carry.
 
 | Situation | Response |
 |---|---|
-| No, malformed, or unknown token | `401 {"error":"unauthorized"}` with `WWW-Authenticate: Bearer` |
-| Valid token, wrong scope for the method | `403 {"error":"forbidden"}` |
-| Valid token, permitted method | The route's normal response |
+| No, malformed, unknown, expired, or revoked token | `401 {"error":"unauthorized"}` with `WWW-Authenticate: Bearer` — the same body for all five, so a leaked token's state is not disclosed to whoever holds it |
+| `ro` token on a `POST` | `403 {"error":"forbidden","required":"rw"}` |
+| Non-`admin` token on erasure, a tombstone, a backup, or `/v1/admin/*` | `403 {"error":"forbidden","required":"admin"}` |
+| Bound token on an operator endpoint or `/v1/admin/*` | `403 {"error":"forbidden","required":"unbound"}` |
+| Valid token, permitted request | The route's normal response |
 
-Comparison is constant-time, and every configured credential is checked even
-after a match, so lookup timing does not depend on credential ordering.
-`AuthConfig` implements a redacted `Debug`, so an accidental structured log
-cannot disclose credentials.
+`"required"` names the capability the credential lacked, so a dashboard can
+say which grant would have worked rather than only that this one did not.
+
+**Lookup is by digest.** Every credential, environment ones included, is held
+as the SHA-256 of its token; the presented bearer is hashed and the digest
+looked up in a table. The lookup's timing depends on the digest, not the
+token, and learning bytes of a SHA-256 output does not help anyone construct a
+token that produces it. `AuthConfig` (the `TRAZA_TOKENS` parser) implements a
+redacted `Debug`, so an accidental structured log cannot disclose credentials.
 
 The verdict is reached from the request **head**, before the body is read: an
 unauthenticated client cannot make the server buffer a 64 MiB body just by
@@ -95,8 +115,8 @@ through one `POST`, so applying the method rule there would either refuse every
 `ro` token a read-only surface or hand every caller that got in the write
 scope.
 
-The token is authenticated identically — same constant-time comparison, same
-401 — and then authorized per tool: a `ro` token reaches every read tool, and
+The token is authenticated identically — same digest lookup, same 401 — and
+then authorized per tool: a `ro` token reaches every read tool, and
 each writing tool additionally requires `rw` **and** its own switch. A tool the
 presented token cannot call is not advertised to it.
 
@@ -114,12 +134,65 @@ payload references it carries keep those bytes alive past their retention
 window. Deleting it means tombstoning the dataset version, or erasing the whole
 tenant. Grant it to an agent you would let keep a copy.
 
+### Runtime credentials
+
+An unbound `admin` manages credentials over HTTP while the server runs —
+`POST /v1/admin/credentials` to mint (or register) one,
+`GET /v1/admin/credentials` to list them, and
+`POST /v1/admin/credentials/{id}/revoke` to revoke one. Shapes are in the
+[HTTP API](../guide/http-api.md#post-v1admincredentials).
+
+```sh
+curl -X POST http://localhost:8080/v1/admin/credentials \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -d '{"scope":"rw","tenant":"acme","label":"acme collector"}'
+```
+
+- **Bootstrapping.** On a loopback start with no credential anywhere, the
+  server is open and the caller is an unbound admin, so the first `admin`
+  credential can be minted with a plain `curl` on the host. From that request
+  on, the store is closed — and the credential log persists, so it stays
+  closed across restarts, and a later non-loopback start counts the log as
+  configured authentication.
+- **The token is shown once.** It is in the `201` response and nowhere else:
+  the store writes only its SHA-256. A minted token is `trz_` plus 64 hex
+  digits from `/dev/urandom`. The list shows a short `prefix` — at most a
+  quarter of the token, never more than 12 characters — to tell credentials
+  apart.
+- **Registering a token.** A control plane that issues tokens itself may pass
+  `"token"` (at least 24 bytes, no whitespace or commas) to register it. A
+  token's digest can be registered once, ever: a duplicate — including a
+  revoked token, or one in `TRAZA_TOKENS` — is `409`, so a revoked token can
+  never come back.
+- **Revocation is immediate and durable.** The revoke record is fsynced before
+  the response; from the next request the token is `401`, and a `kill -9`
+  does not bring it back. Environment credentials cannot be revoked this way
+  (`409`): they are revoked by restarting without them.
+- **Expiry.** `expires_in_seconds` gives a credential a lifetime; at its
+  instant it starts answering `401`, like a revoked one, and stays listed.
+- **Revoking every credential locks the store; it does not reopen it.** Once
+  any runtime credential has been created, enforcement stays on. If every
+  credential is revoked, start the server with `TRAZA_TOKENS` to get back in.
+- `last_used_at_ns` is kept in memory only, so a restart forgets it — writing
+  it durably would put an fsync on every authenticated request.
+
+**Storage.** `credentials.jsonl` in the data directory: append-only `create`
+and `revoke` records holding digests, never tokens, fsynced per write; a torn
+final record (a crash mid-append) is truncated at the next start, and damage
+anywhere else refuses the start rather than guessing which credentials the
+file held. **It is outside generations and pins**: a backup never carries it,
+and `--restore` leaves the live file in place — restoring last month's backup
+does not resurrect a token revoked last week. Back the file up separately if
+you need to, knowing it holds digests that would authenticate nobody without
+their tokens.
+
 ### The non-loopback refusal
 
-Without `TRAZA_TOKENS`, a non-loopback `--host` is refused at startup:
+With no `TRAZA_TOKENS` and no runtime credential in the data directory, a
+non-loopback `--host` is refused at startup:
 
 ```
-traza-server: refusing unauthenticated non-loopback bind 0.0.0.0; configure TRAZA_TOKENS or pass --allow-unauthenticated-non-loopback explicitly
+traza-server: refusing unauthenticated non-loopback bind 0.0.0.0; configure TRAZA_TOKENS, create a runtime credential (POST /v1/admin/credentials on a loopback start), or pass --allow-unauthenticated-non-loopback explicitly
 ```
 
 `--allow-unauthenticated-non-loopback` is the deliberate escape hatch — it
@@ -134,6 +207,10 @@ a browser without credentials so it can prompt for a token. Every `/v1` call
 the page makes is gated exactly like any other client's. The page holds the
 token in `sessionStorage` only.
 
+`GET /healthz` and `GET /readyz` are answered before the gate too, so a load
+balancer or orchestrator can probe without a credential; they disclose
+nothing but the build version.
+
 ### Operational notes
 
 - **TLS is reverse-proxy territory.** Traza speaks plain HTTP; tokens on an
@@ -141,16 +218,22 @@ token in `sessionStorage` only.
 - **Supply tokens through the environment, not the command line.** Arguments
   are visible in `ps`. A systemd `EnvironmentFile` with mode 0600 is the
   straightforward answer.
-- **Rotation is a restart.** There is no reload signal. Configure the new token
-  alongside the old, restart, move clients over, then remove the old one and
-  restart again.
+- **Rotating a runtime credential is not a restart.** Mint the new one, move
+  clients over, revoke the old one — every step takes effect on the next
+  request. Rotating a `TRAZA_TOKENS` entry still is a restart (there is no
+  reload signal): configure the new token alongside the old, restart, move
+  clients over, then remove the old one and restart again. To move off
+  environment tokens entirely, mint runtime replacements, move clients, and
+  restart without `TRAZA_TOKENS`.
 - Give collectors and exporters an `rw` token; give dashboards, alerting, and
   anything read-only a `ro` token. A `ro` token cannot ingest, flush, or
   annotate — and over MCP it reaches the read tools but not the writer.
 - Mint `admin` tokens for operators and compliance tooling only, and never
   hand one to a telemetry producer. Erasure is the one destructive verb in
   the API, and it is gated on this scope precisely so that a compromised or
-  overprivileged ingest credential cannot destroy the telemetry it writes.
+  overprivileged ingest credential cannot destroy the telemetry it writes. An
+  unbound `admin` can also mint credentials, so treat it as the root of the
+  deployment.
 - **Two similarly named variables.** `TRAZA_TOKENS` (plural) configures the
   *server's* credential set. `TRAZA_TOKEN` (singular) is the bearer token the
   bundled `seed --url` client sends. They are not interchangeable.
@@ -187,9 +270,17 @@ traza-server --data-dir /var/lib/traza \
   --tenant-ttl acme=2592000 --tenant-ttl trial-co=86400
 ```
 
-A tenant's cutoff is resolved in one order: **its override, else
-`--ttl-seconds`, else never.** A tenant with no override on a server with no
-global TTL keeps everything, whatever other tenants are configured with.
+A tenant's cutoff is resolved in one order: **its runtime limits document's
+`ttl_seconds`, else its `--tenant-ttl` override, else `--ttl-seconds`, else
+never.** A tenant with no override on a server with no global TTL keeps
+everything, whatever other tenants are configured with.
+
+The runtime layer is set with
+[`POST /v1/admin/tenants/{tenant}/limits`](../guide/http-api.md#post-v1admintenantstenantlimits)
+(`"ttl_seconds": 0` keeps everything, `null` falls back to the flags) and takes
+effect at the next minutely pass, with no restart — the retention pass now
+runs every minute whether or not any flag configured a window, and returns
+immediately when nothing does.
 Retention is a per-tenant policy the moment tenants exist — a single window
 forced on every tenant would make one customer's compliance clock another's
 data loss. `--tenant-ttl acme=0` disables `acme`'s window (same rule as the
@@ -376,6 +467,64 @@ for a dashboard polling per minute against a hundred-million-span corpus —
 use `/v1/metrics` for continuous monitoring and this route when the per-tenant
 answer is actually needed.
 
+## Quotas and usage
+
+Each tenant can carry a **limits document**, replaced whole at runtime by an
+unbound admin with
+[`POST /v1/admin/tenants/{tenant}/limits`](../guide/http-api.md#post-v1admintenantstenantlimits)
+(`_default` names the default tenant):
+
+```sh
+curl -X POST http://localhost:8080/v1/admin/tenants/acme/limits \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -d '{"monthly_spans":1000000,"monthly_bytes":10000000000,"ingest_paused":false,"ttl_seconds":null}'
+```
+
+- `monthly_spans` / `monthly_bytes` — what the tenant may ingest per UTC
+  calendar month.
+- `ingest_paused` — refuse every batch for the tenant, at once.
+- `ttl_seconds` — the tenant's retention; see
+  [Per-tenant retention](#per-tenant-retention).
+
+**Usage counters.** The store counts every acknowledged batch per tenant —
+lifetime spans, bytes, batches and refused spans, and the current month's
+spans and bytes — and serves them in O(tenants) at
+[`GET /v1/usage`](../guide/http-api.md#get-v1usage), a bound credential seeing
+its own row. `bytes` is each span's native JSON after tenant stamping and
+**before** payload offload: what the client sent, not what the store keeps.
+The counters are written to `usage.json` on the five-second maintenance tick
+and on every flush, when they changed; a crash loses at most the counts since
+the last write — an **undercount**, never an overcount.
+
+**Enforcement.** Before a batch reaches the write-ahead log, a paused tenant's
+batch is refused, and so is a batch whose spans or bytes would take the month
+past a limit — the whole batch, never a prefix — with `429` and `Retry-After`
+(the seconds to next month, or `60` for a pause). The body names the limit,
+the month's usage and when it resets; see
+[quota refusals](../guide/http-api.md#quota-refusals). Reads, exports and
+erasure are never blocked, so a paused or capped tenant can always get its data
+out. The check reads the counters as they stand without reserving anything:
+batches admitted concurrently can together overshoot a limit by at most what
+was in flight, after which the next batch is refused.
+
+**What the limits do not do.** They meter ingest, not storage: deleting data
+does not hand quota back (that is what [`GET /v1/tenants`](#tenant-accounting)
+measures), and there is no rate limit within a month. The month is the UTC
+calendar month; there is no per-tenant billing anchor.
+
+**Erasure leaves them.** A tenant [erasure](#erasure-deletion-with-a-receipt)
+removes the tenant's telemetry, not its accounting and access records: the
+usage counters, the limits document, and any credentials bound to the tenant
+survive it, and the erasure receipt does not examine those files. Revoke the
+credentials and replace the limits document separately when a tenant leaves.
+
+`limits.json` and `usage.json` live in the data directory **outside
+generations and pins**, like `credentials.jsonl`: a backup carries telemetry,
+not commercial terms or billing counters, and a restore rewinds neither. Both
+are rewritten atomically (temp file, fsync, rename); a file that does not
+parse refuses the start rather than running with no quotas — move it aside to
+start from none.
+
 ## Compaction
 
 On by default, and you should leave it on.
@@ -483,6 +632,12 @@ tokens.
 
 See [durability § Backups](durability.md#backups) — backup correctness is a
 consequence of the crash-recovery model, so the two are documented together.
+
+Two things specific to administration: taking or releasing a pin
+(`/v1/backups/*`) needs an **unbound `admin`** credential, because a pin holds
+its generation's bytes on disk until released; and a backup deliberately does
+**not** contain `credentials.jsonl`, `limits.json` or `usage.json`, which a
+restore leaves exactly as they are.
 
 ## See also
 
