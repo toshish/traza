@@ -599,6 +599,7 @@ fn an_evidence_pack_recomputes_and_a_bound_tenant_sees_only_itself() {
     assert_eq!(pack["format"], "traza-evidence/1");
     assert_eq!(pack["engine_version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(pack["tenant"], Value::Null);
+    // A whole-store pack is nobody's account, so it carries no usage row.
     assert_eq!(pack["usage"], Value::Null);
     assert_eq!(pack["window"]["since_ns"], json!(0));
     assert_eq!(pack["store_id"], pack["ledger"]["head"]["store_id"]);
@@ -637,10 +638,17 @@ fn an_evidence_pack_recomputes_and_a_bound_tenant_sees_only_itself() {
         .map(|day| day["cost_usd"].as_f64().expect("cost"))
         .sum();
     assert!((cost - 0.75).abs() < 1e-9, "{days:?}");
+    // The --tenant-ttl override keeps acme forever: `null`, from the flag.
     assert_eq!(
         mine["retention"],
-        json!({"ttl_seconds": null, "source": "tenant"})
+        json!({"ttl_seconds": null, "source": "flag"})
     );
+    // Its usage row is GET /v1/usage's, counting what acme sent.
+    let (status, usage) = as_json(&server, "acme-ro", "GET", "/v1/usage", None);
+    assert_eq!(status, 200, "{usage}");
+    assert_eq!(mine["usage"], usage["tenants"][0], "{mine}");
+    assert_eq!(mine["usage"]["tenant"], "acme");
+    assert_eq!(mine["usage"]["lifetime"]["spans"], json!(3));
     let erasures = mine["erasures"].as_array().expect("erasures");
     assert_eq!(erasures.len(), 1, "only acme's erasure: {erasures:?}");
     assert_eq!(erasures[0]["subject_kind"], "trace");
@@ -700,12 +708,24 @@ fn an_evidence_pack_recomputes_and_a_bound_tenant_sees_only_itself() {
     assert_eq!(status, 403);
     assert_eq!(
         body,
-        json!({"error": "this credential is bound to a different tenant"})
+        json!({"error": "this credential is bound to a different tenant", "required": "unbound"})
     );
     let (status, _) = as_json(&server, "acme-ro", "GET", "/v1/evidence?tenant=acme", None);
     assert_eq!(status, 200);
 
-    // An unbound caller may name a tenant.
+    // An unbound caller may name a tenant. A runtime retention override in
+    // bigco's limits document outranks the global window, and the pack says
+    // so — it states the policy expiry acts on, not the flags alone.
+    let limits = json!({"monthly_spans": null, "monthly_bytes": null,
+                        "ingest_paused": false, "ttl_seconds": 7776000});
+    let (status, body) = as_json(
+        &server,
+        "root",
+        "POST",
+        "/v1/admin/tenants/bigco/limits",
+        Some(&limits),
+    );
+    assert_eq!(status, 200, "{body}");
     let (status, theirs) = as_json(
         &server,
         "observer",
@@ -719,8 +739,11 @@ fn an_evidence_pack_recomputes_and_a_bound_tenant_sees_only_itself() {
     assert_eq!(theirs["activity"]["errors"], json!(1));
     assert_eq!(
         theirs["retention"],
-        json!({"ttl_seconds": 31536000, "source": "global"})
+        json!({"ttl_seconds": 7776000, "source": "limits"})
     );
+    assert_eq!(theirs["usage"]["tenant"], "bigco");
+    assert_eq!(theirs["usage"]["lifetime"]["spans"], json!(2));
+    assert_eq!(theirs["usage"]["limits"]["ttl_seconds"], json!(7776000));
     assert_digest(&theirs);
 
     // The window bounds activity by span start.

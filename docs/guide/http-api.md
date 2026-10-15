@@ -14,7 +14,7 @@ minted at runtime with [`POST /v1/admin/credentials`](#post-v1admincredentials)
 server is open (on loopback by default). A `ro` credential may `GET` (and
 `POST /v1/fuses/check`, the one read that carries a body); an `rw` credential
 may `GET` and `POST`; `admin` adds erasure, eval tombstones,
-backups and the `/v1/admin/*` routes. A credential may be **bound** to one
+backups, ledger anchors and the `/v1/admin/*` routes. A credential may be **bound** to one
 tenant (`scope@tenant:token` in `TRAZA_TOKENS`, `"tenant"` when minted): a
 bound credential reads and writes only its tenant's data, on every surface:
 search, export, tail, analytics, annotations, payload fetch, evals, erasure,
@@ -2193,7 +2193,7 @@ rather than raced.
 **A bound admin erases its own tenant and nothing else** — the
 tenant-subject arm very much included, or a per-tenant admin could destroy a
 neighbour wholesale. Naming a foreign tenant answers
-`403 {"error":"this credential is bound to a different tenant"}`; a payload
+`403 {"error":"this credential is bound to a different tenant","required":"unbound"}`; a payload
 subject answers `403 {"error":"payload subjects are store-global; erasing one
 requires an unbound admin credential"}`. Bound credentials also see only
 their own tenant's records at [`GET /v1/erasures`](#get-v1erasures), and a
@@ -2470,7 +2470,7 @@ Abbreviated (heads and entries elided):
                        {"cost_usd":1.5e+20,"day":"2023-11-15","errors":1,"spans":1}],
              "errors":1,"sessions":1,"spans":2,"traces":2},
  "digest":"a621ab3b040e67bd6f8899c3654dea99b4e42b5ad56e9259a701fad9837c6bf9",
- "engine_version":"0.26.0-preview.1",
+ "engine_version":"0.27.0",
  "erasures":[{"conclusive":true,"id":1,"published_at_ns":1792061585528589000,"result":"erased","subject_kind":"session"}],
  "format":"traza-evidence/1","generated_at_ns":1792061592996325000,
  "ledger":{"entries":[…],"entries_truncated":false,"entries_unreadable":0,"head":{"at_ns":1792061585533710000,"head":"34e6…","seq":4,"store_id":"66022a6e1d87f73e3ba52202b53d1998"},
@@ -2491,7 +2491,10 @@ most 10,000 (`entries_truncated` says whether more exist), and
 `ledger.entries_unreadable` counts the chain's lines the pack could not place
 (not a JSON object, or no integer `seq` or `at_ns`); the verification names
 each. `ledger.head`, `ledger.entries` and `ledger.verification` come from one
-snapshot of the chain. `usage` is `null` in this build. A tenant's pack shows
+snapshot of the chain. A tenant's pack carries that tenant's
+[`GET /v1/usage`](#get-v1usage) row as `usage` and the retention window expiry
+applies to it (`source`: `limits`, `flag`, `global` or `none`); a whole-store
+pack has `"usage":null` and the global window. A tenant's pack shows
 other tenants' erasure entries only as stubs (`seq`, `kind`, `at_ns`,
 `prev`, `head`, `"redacted": true` — no `salt`, so the head cannot be
 recomputed for a guessed subject), summarizes file problems as a count, and

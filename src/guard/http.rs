@@ -8,8 +8,9 @@
 //!
 //! The binding rules are the server's everywhere else: a bound credential is
 //! forced to its tenant, and naming another one is `403 {"error": "this
-//! credential is bound to a different tenant"}`. Unknown query parameters
-//! and unknown body fields are refused, so a typo fails loudly.
+//! credential is bound to a different tenant", "required": "unbound"}`.
+//! Unknown query parameters and unknown body fields are refused, so a typo
+//! fails loudly.
 
 use std::time::Duration;
 
@@ -52,8 +53,17 @@ impl Reply {
         }
     }
 
+    /// The server's one cross-tenant refusal, byte for byte: `required`
+    /// says what would have worked, so a dashboard can name it.
     fn foreign_tenant() -> Self {
-        Self::error(403, "this credential is bound to a different tenant")
+        Self {
+            status: 403,
+            body: json!({
+                "error": "this credential is bound to a different tenant",
+                "required": "unbound",
+            }),
+            deadline_exceeded: false,
+        }
     }
 
     /// The server's uniform engine-error mapping: the caller's defects are
@@ -372,6 +382,15 @@ mod tests {
         assert_eq!(
             run_tenant(Some(&other), Some("acme")).map_err(|r| r.status),
             Err(403)
+        );
+        // The same body every other cross-tenant refusal carries, `required`
+        // included, so a dashboard reads one shape from every surface.
+        assert_eq!(
+            run_tenant(Some(&other), Some("acme")).map_err(|r| r.body),
+            Err(json!({
+                "error": "this credential is bound to a different tenant",
+                "required": "unbound",
+            }))
         );
         assert_eq!(run_tenant(None, None), Ok(String::new()));
         assert_eq!(scope_tenant(None, None), Ok(None));

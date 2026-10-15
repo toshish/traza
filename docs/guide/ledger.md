@@ -324,8 +324,8 @@ above, has no secret.
 | `ledger.entries` | Entries whose `at_ns` falls in the window, up to the head and at most 10,000. `ledger.entries_truncated` says whether more exist; page through the rest with `GET /v1/ledger` |
 | `ledger.entries_unreadable` | How many of the chain's lines the pack could not place: not a JSON object, or no integer `seq` or `at_ns`. The verification names each one |
 | `ledger.verification` | The verify document above |
-| `retention` | `{"ttl_seconds","source"}`. `source` is `tenant` (a `--tenant-ttl` override), `global` (`--ttl-seconds`) or `none`. `ttl_seconds` is `null` whenever data is kept forever |
-| `usage` | `null` in this build |
+| `retention` | `{"ttl_seconds","source"}`: the window expiry applies to the tenant right now. `source` is `limits` (the tenant's runtime [limits document](http-api.md#post-v1admintenantstenantlimits)), `flag` (a `--tenant-ttl` override), `global` (`--ttl-seconds`) or `none`. `ttl_seconds` is `null` whenever data is kept forever. A whole-store pack reports the global window |
+| `usage` | The tenant's row from [`GET /v1/usage`](http-api.md#get-v1usage) — lifetime and month counters, limits, and quota state — as of generation. `null` in a whole-store pack |
 | `activity` | Spans, distinct traces, distinct sessions and errors among spans that **started** in the window and are still stored, plus `by_day` (`{"day","spans","errors","cost_usd"}` per UTC day) |
 | `erasures` | Erasures settled in the window: `{"id","subject_kind","published_at_ns","conclusive","result"}`, where `conclusive` and `result` are the [receipt's](http-api.md#get-v1erasuresidverify) own fields |
 | `digest` | SHA-256 of the canonical JSON of every field above |
@@ -426,9 +426,12 @@ copy. It archives manifested files only.
 
 - **No anchoring is built in.** Traza stores anchors and checks their
   `target_head`, but it never calls a notary.
-- **`usage` is `null`.** The per-tenant usage counters are a separate feature.
-- **Retention in a whole-store pack** reports the global window only.
-  Per-tenant overrides appear in tenant packs.
+- **A whole-store pack has no usage row,** and its retention is the global
+  window only. Per-tenant usage and retention overrides appear in tenant packs.
+- **Usage counts are not ledgered.** The pack's `usage` row is the in-memory
+  counter at generation time, which a crash can undercount by a few seconds'
+  worth (see [`GET /v1/usage`](http-api.md#get-v1usage)). The digest commits
+  to what the pack said, not to the counts being complete.
 - **No rotation.** The ledger grows by one line per published generation,
   forever. Every open reads it in full to find the tip and the erasures already
   ledgered.

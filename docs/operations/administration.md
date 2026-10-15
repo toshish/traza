@@ -55,10 +55,11 @@ a multi-tenant deployment:
 - **Every read is scoped.** The binding is applied where queries are
   constructed — one choke point, so no endpoint can forget it — and naming a
   foreign tenant in any `tenant=` parameter is a
-  `403 {"error":"this credential is bound to a different tenant"}`.
+  `403 {"error":"this credential is bound to a different tenant","required":"unbound"}`.
 - **The store-global operator endpoints refuse bound tokens.** `/v1/stats`,
   `/v1/metrics`, `/v1/metrics.json`, `/v1/verify`, `/v1/checkpoint`,
-  `/v1/flush`, and `/v1/backups/*` answer bound credentials `403`: they
+  `/v1/flush`, `/v1/backups/*`, `/v1/ledger`, `/v1/ledger/verify` and
+  `/v1/ledger/anchors` answer bound credentials `403`: they
   report and move the whole store's data, and even the volumes disclose
   co-tenants. A bound credential's accounting surfaces are
   [`GET /v1/usage`](#quotas-and-usage) and
@@ -86,10 +87,10 @@ be bound to a tenant no span could ever carry.
 | Situation | Response |
 |---|---|
 | No, malformed, unknown, expired, or revoked token | `401 {"error":"unauthorized"}` with `WWW-Authenticate: Bearer` — the same body for all five, so a leaked token's state is not disclosed to whoever holds it |
-| `ro` token on a `POST` | `403 {"error":"forbidden","required":"rw"}` |
-| Non-`admin` token on erasure, a tombstone, a backup, or `/v1/admin/*` | `403 {"error":"forbidden","required":"admin"}` |
+| `ro` token on a `POST` (other than `POST /v1/fuses/check` and the `/v1/replays` routes, which are reads) | `403 {"error":"forbidden","required":"rw"}` |
+| Non-`admin` token on erasure, a tombstone, a backup, a ledger anchor, or `/v1/admin/*` | `403 {"error":"forbidden","required":"admin"}` |
 | Bound token on an operator endpoint or `/v1/admin/*` | `403 {"error":"forbidden","required":"unbound"}` |
-| Open mode: a browser request from a non-loopback page to erasure, a tombstone, a backup, or `/v1/admin/*` | `403 {"error":"origin not allowed: …","next":"…"}` — see [Bootstrapping](#runtime-credentials) |
+| Open mode: a browser request from a non-loopback page to erasure, a tombstone, a backup, a ledger anchor, or `/v1/admin/*` | `403 {"error":"origin not allowed: …","next":"…"}` — see [Bootstrapping](#runtime-credentials) |
 | A `/v1/admin/*` `POST` whose body is not declared `Content-Type: application/json` | `415` |
 | Valid token, permitted request | The route's normal response |
 

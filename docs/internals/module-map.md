@@ -166,6 +166,50 @@ together.
 A four-line placeholder. Expiration is implemented in `Store::expire_before` in
 `lib.rs`; this module reserves the unit and contains no public API.
 
+### [`src/ingest_hooks.rs`](../../src/ingest_hooks.rs)
+
+The two seams on the ingest path: `Store::admission_check`, which runs the
+admission caps and then the tenant quotas before anything about a batch is
+decided, and `Store::observe_admitted`, which feeds the run guard once a batch
+is acknowledged. A batch refused at the first never reaches the second.
+
+### [`src/ledger.rs`](../../src/ledger.rs)
+
+The ledger: `ledger.jsonl`, an append-only hash chain over every published
+generation, every published erasure (as a salted digest of its subject) and
+every external anchor, outside generations because it commits to them. Also
+chain verification, the evidence pack, and the offline `verify --ledger`.
+Documented in [the ledger guide](../guide/ledger.md).
+
+## Agent runs
+
+A run is a session id, or `trace:<trace_id>` for a trace with none
+([`semconv::run_id`](../../src/semconv.rs)). These modules read runs; none of
+them stores anything new about a span.
+
+### [`src/run.rs`](../../src/run.rs)
+
+Resolves a run id to its spans in step order under the snapshot, erasure mask
+and query deadline, and pairs step facts with priced LLM facts.
+
+### [`src/guard.rs`](../../src/guard.rs) and [`src/guard/`](../../src/guard)
+
+Run fuses: policies (`policy.rs`), the bounded live run state the ingest
+observer updates (`state.rs`), the event ring (`events.rs`), `fuses.jsonl`
+for policies, trips, resets and grants (`log.rs`), and the `/v1/fuses/*`
+routes as request → reply functions (`http.rs`). Documented in
+[the run fuses guide](../guide/guard.md).
+
+### [`src/tape.rs`](../../src/tape.rs), [`src/replay.rs`](../../src/replay.rs), [`src/diff.rs`](../../src/diff.rs), [`src/recall.rs`](../../src/recall.rs)
+
+A run read as a tape of steps; the in-memory replay registry that serves a
+tape's model answers back in OpenAI and Anthropic wire shapes; LCS alignment
+of two tapes and their first divergence; and recall of earlier runs from the
+content index. Their HTTP routes are in
+[`src/bin/traza-server/replay_routes.rs`](../../src/bin/traza-server/replay_routes.rs)
+and their MCP tools in [`src/mcp/replay_tools.rs`](../../src/mcp/replay_tools.rs).
+Documented in [the replay guide](../guide/replay.md).
+
 ## Ingest surfaces
 
 ### [`src/otlp.rs`](../../src/otlp.rs)
@@ -226,7 +270,7 @@ declared JSON.
 ### [`src/mcp.rs`](../../src/mcp.rs)
 
 The Model Context Protocol surface: JSON-RPC framing, `initialize` and version
-negotiation, the ten tool schemas and handlers, five resources and three URI
+negotiation, the sixteen tool schemas and handlers, five resources and three URI
 templates, four prompts, and the renderers that turn spans into something a
 context window can hold. Tool handlers call `Store` directly — never back
 through HTTP — so the module works with no listener in the process at all,

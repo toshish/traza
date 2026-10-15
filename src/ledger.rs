@@ -1685,8 +1685,9 @@ impl Store {
     /// the chain, so the pack never reports a head older than an entry or a
     /// verification it carries.
     ///
-    /// `usage` is `null` in this build: the per-tenant usage counters are a
-    /// separate feature, and this pack carries them when they exist.
+    /// A tenant's pack carries that tenant's usage row and the retention
+    /// window expiry actually applies to it; a whole-store pack carries the
+    /// global window and no usage row, since it is nobody's account.
     pub fn evidence(
         &self,
         tenant: Option<&str>,
@@ -1761,8 +1762,8 @@ impl Store {
                 "entries_unreadable": entries_unreadable,
                 "verification": verification,
             },
-            "retention": self.retention_for(tenant),
-            "usage": Value::Null,
+            "retention": self.retention_for(tenant)?,
+            "usage": self.evidence_usage(tenant)?,
             "activity": self.evidence_activity(tenant, since, until)?,
             "erasures": self.evidence_erasures(tenant, since, until, started)?,
         });
@@ -1773,20 +1774,43 @@ impl Store {
         Ok(pack)
     }
 
-    /// The retention window that applies to `tenant`, and where it comes
-    /// from: a per-tenant override (`tenant`), the global window (`global`),
-    /// or nothing configured (`none`). `ttl_seconds` is `null` whenever the
-    /// effective policy keeps data forever — a `0` override included. A
-    /// store-wide pack reports the global window.
-    fn retention_for(&self, tenant: Option<&str>) -> Value {
-        let global = self.config.ttl_seconds.filter(|ttl| *ttl > 0);
-        match tenant.and_then(|tenant| self.config.tenant_ttl_seconds.get(tenant)) {
-            Some(ttl) => json!({"ttl_seconds": (*ttl > 0).then_some(*ttl), "source": "tenant"}),
-            None => match global {
+    /// The retention window that applies to `tenant`, and the layer that
+    /// decided it — the same resolution expiry acts on
+    /// ([`Store::effective_ttl`]), so the pack states the policy in force
+    /// rather than the one the flags alone describe: the tenant's runtime
+    /// limits document (`limits`), a `--tenant-ttl` override (`flag`), the
+    /// global window (`global`), or nothing configured (`none`).
+    /// `ttl_seconds` is `null` whenever the effective policy keeps data
+    /// forever — a `0` at any layer included. A store-wide pack reports the
+    /// global window: per-tenant layers describe no single answer for it.
+    fn retention_for(&self, tenant: Option<&str>) -> Result<Value> {
+        let Some(tenant) = tenant else {
+            return Ok(match self.config.ttl_seconds.filter(|ttl| *ttl > 0) {
                 Some(ttl) => json!({"ttl_seconds": ttl, "source": "global"}),
                 None => json!({"ttl_seconds": Value::Null, "source": "none"}),
-            },
-        }
+            });
+        };
+        let effective = self.effective_ttl(tenant)?;
+        Ok(json!({
+            "ttl_seconds": effective.ttl_seconds,
+            "source": effective.source,
+        }))
+    }
+
+    /// The tenant's usage row — exactly what `GET /v1/usage?tenant=` serves,
+    /// counters, limits and quota state — or `null` for a store-wide pack.
+    /// O(1): the counters are in memory, and no segment is read.
+    fn evidence_usage(&self, tenant: Option<&str>) -> Result<Value> {
+        let Some(tenant) = tenant else {
+            return Ok(Value::Null);
+        };
+        Ok(self
+            .usage_report(Some(tenant))?
+            .tenants
+            .into_iter()
+            .next()
+            .and_then(|row| serde_json::to_value(row).ok())
+            .unwrap_or(Value::Null))
     }
 
     /// Spans, traces, sessions and errors started in the window, with a
@@ -2061,7 +2085,8 @@ pub fn serve(
                     Some(named) if named != bound => {
                         return Ok((
                             403,
-                            json!({"error": "this credential is bound to a different tenant"}),
+                            json!({"error": "this credential is bound to a different tenant",
+                                   "required": "unbound"}),
                         ))
                     }
                     _ => Some(bound),

@@ -94,7 +94,8 @@ pub struct Head<'a> {
     /// The path, without its query string.
     pub path: &'a str,
     /// Whether the route needs the `admin` capability: erasure, eval
-    /// tombstones, backups, and everything under `/v1/admin/`.
+    /// tombstones, backups, ledger anchors, and everything under
+    /// `/v1/admin/`.
     pub needs_admin: bool,
     /// Whether any credential exists, so requests authenticate. `false` is
     /// open mode.
@@ -118,7 +119,9 @@ pub struct Head<'a> {
 /// credential with a token it chose: the operator is locked out on the spot,
 /// the attacker holds a live admin token, and the credential log then counts
 /// as configured auth, so a later non-loopback start serves that token to the
-/// network. Erasure, tombstones and backups are the same request shape. So in
+/// network. Erasure, tombstones, backups and ledger anchors are the same
+/// request shape — an anchor written cross-site would plant a notary
+/// countersignature nobody gave into the chain an auditor relies on. So in
 /// open mode every admin-capability route refuses a request whose `Origin`
 /// is not a loopback page. A browser stamps `Origin` on every cross-origin
 /// `POST` and a page cannot forge it; `curl` and scripts send none and are
