@@ -152,7 +152,10 @@ positive, and `max_repeats` at least 2 — one occurrence is not a repeat.
 edit applies to live runs at once:
 
 1. the run's tenant's policy whose `match.service` is the service of the
-   run's first span (several: the most recently created);
+   run's first span (several: the most recently created). First by **start
+   time**, not arrival: a root agent span ends, and so arrives, after its
+   children, and the policy must not depend on which arrived first — a
+   rebuild, which reads spans in start order, picks the same one;
 2. else the tenant's policy named `default`;
 3. else the **global** policy from the server's
    [`--fuse-*` flags](../configuration.md#server-flags), reported as
@@ -160,7 +163,10 @@ edit applies to live runs at once:
 
 A non-`default` policy must name a `match.service`, and `default` must not —
 otherwise one would never be chosen and the other would be ambiguous. The
-name `global` is reserved.
+name `global` is reserved. A tenant keeps at most 256 policies (creating
+another is `409`), and a `match.service` is at most 256 bytes: a run's
+policy is resolved among its tenant's policies on every acknowledged batch,
+so one tenant's policy count must not reach into every tenant's ingest.
 
 **Limits do not inherit.** A tenant policy that sets only `max_cost_usd`
 holds its runs to that alone; the global policy's repeat limit does not
@@ -174,7 +180,9 @@ made.
 ## Stopping and resetting
 
 A `stop` from a policy is sticky. Later spans of the run, a raised limit, a
-deleted policy — none of them lift it. Two things do:
+deleted policy, eviction from memory — none of them lift it (but see
+[what is durable](#what-is-durable-and-what-is-rebuilt) for the bound on
+stopped runs held, and for restarts). Two things do:
 
 - **[Reset](http-api.md#post-v1fusesrunsrunreset)** clears the stop, the
   kill switch, the error streak and the repeat counts. It does **not** refill
@@ -189,33 +197,57 @@ The **[kill switch](http-api.md#post-v1fusesrunsruntrip)** stops any run at
 once, whatever its usage and policy, until it is reset. It is durable, and
 a killed run stays listed as stopped across restarts.
 
+Durable controls are bounded per tenant: at most 10,000 runs with a kill
+switch, a reset or a grant. Past that, a trip or reset of another run drops
+the controls of the run reset longest ago — its grant and its reset stop
+applying, which can only make it stricter — and when all 10,000 are active
+kill switches, the trip or reset is refused with `409`. A kill switch is
+never dropped to make room.
+
 ## What is durable, and what is rebuilt
 
 Live usage is an in-memory cache over the store, folded from every
-acknowledged batch on the ingest path. It is bounded: at most
-`--fuse-max-runs` runs (default 100,000), at most 1,000,000 span
-contributions across them (each a 32-byte record under an 8-byte key, before
-hash-table overhead), least recently active evicted first, and any run idle
-for six hours dropped. A run is followed from its **first step**: a trace of
-HTTP and database spans costs the observer a read of each span and holds no
-state.
+acknowledged batch on the ingest path. It is bounded, with no exceptions: at
+most `--fuse-max-runs` live runs (default 100,000, shared by every tenant),
+at most 1,000,000 span contributions across them (each a 32-byte record under
+an 8-byte key, before hash-table overhead), least recently active evicted
+first, and any run idle for six hours evicted. A run is followed from its
+**first step**: a trace of HTTP and database spans costs the observer a read
+of each span and holds no state. A run id longer than 1,024 bytes is not
+followed at all, and asking about one is `400`.
+
+A run evicted while **stopped** — by a policy or by hand — is **parked**:
+its stop (reasons, time, evidence) and its usage as last seen stay in memory,
+its per-span state does not. A later span of the run is answered `stop`, a
+rebuild keeps the stop whatever the policy now says, and the run stays in
+the stopped listing. Up to `--fuse-max-runs` runs are parked; past that the
+oldest are dropped, and a policy stop dropped that way is recomputed by the
+next rebuild under the policy then in force — which, if the policy was raised
+or deleted since, no longer stops it. A dropped kill switch loses only its
+place in the listing: the switch itself is durable.
 
 The first time a verdict is asked for a run, the run is **rebuilt** from
 its stored spans and the answer says `"source": "rebuilt"`; after that it is
 answered from memory (`"live"`) and kept current by ingest. The process
 cannot know whether a run had spans before it began following it — the run
 may predate a restart, or have been evicted — so it never assumes it did
-not. A rebuild reads at most 100,000 spans (a larger
-run is rebuilt from its earliest ones) under the same budget as any query,
-`--query-deadline-ms`; if it runs out, a run with live state is answered from
-that, marked `live`, and the rebuild is retried next time.
+not. A rebuild reads at most 100,000 spans (a larger run is rebuilt from its
+earliest ones), and reading them and extracting their facts both run under
+the same budget as any query, `--query-deadline-ms`; if it runs out, a run
+with live state is answered from that, and a parked or kill-switched run
+still answers `stop`, both marked `live`, and the rebuild is retried next
+time. Asking about a run no span carries — a fresh run, or a made-up id —
+answers `continue` and holds nothing.
 
 `fuses.jsonl` in the data directory holds what spans cannot reconstruct:
 policies, kill switches, resets and grants, one fsynced line each, replayed
 at startup (a torn final line from a crash is healed; damage anywhere else
-refuses startup rather than silently dropping a later kill switch). It only
-grows, except when an erasure rewrites it — atomically, by rename — without
-the erased subject. It lives
+refuses startup rather than silently dropping a later kill switch). Most of
+its lines are superseded sooner or later — a policy replaced, a kill switch
+reset — so once it holds at least twice the records that reproduce the state
+(and at least 1,024 lines) it is rewritten to just those, at startup or on the
+next change; an erasure rewrites it too, without the erased subject. Both
+rewrites are atomic, by rename. It lives
 **outside** the generation layout, beside the store rather than in it: a
 backup does not carry it, and a restore neither replaces nor resurrects it.
 Fuse settings are operator configuration about the running service, and a
@@ -243,11 +275,13 @@ What a restart loses, and what it does not:
   when it enters `warn`, and once more if a `warn` policy's limit is then
   reached — the moment a `stop` policy would have stopped it — and not again
   until the run returns to `continue` or is reset.
-- **[`GET /v1/fuses/runs`](http-api.md#get-v1fusesruns)** lists live runs by
-  verdict, most recently active first — from memory alone, so a partly
-  followed run lists with what this process has seen.
+- **[`GET /v1/fuses/runs`](http-api.md#get-v1fusesruns)** lists the runs
+  the guard holds — live and parked — by verdict, most recently active
+  first, from memory alone: a partly followed run lists with what this
+  process has seen, a parked one with its usage as last seen live.
 - **`/v1/metrics`** reports `traza_fuse_trips_total` (policy and manual
-  stops), `traza_fuse_warnings_total` and the `traza_fuse_live_runs` gauge.
+  stops), `traza_fuse_warnings_total` and the `traza_fuse_live_runs` gauge
+  (live runs only; parked ones are not counted).
 - **MCP**: [`check_run_guard`](mcp.md) lets an agent read its own run's
   verdict. It cannot reset or trip anything — the MCP surface has no
   actuators.
@@ -284,8 +318,12 @@ Stated plainly, so none of them is discovered in production:
   only what arrived since**, until something asks for the run's verdict and
   it is rebuilt. The pre-call check is such a question, so an agent that
   checks before each step is judged on its whole history from its first
-  step after the restart. A stop that a rebuild recomputes is not
-  re-announced on the event feed.
+  step after the restart. A stop survives eviction (parked), but not a
+  restart: a rebuild after one recomputes it under the policy then in force,
+  and does not re-announce it on the event feed.
+- **Tenants share the live bound.** One tenant with many active runs can
+  evict another's; those are rebuilt when asked about, and their stops are
+  parked, but their ingest verdicts see only new spans until then.
 - **Clocks.** Duration uses the spans' own timestamps. A rebuild compares
   span end times with the server's reset time, so a client clock far off the
   server's can put a span on the wrong side of a reset.
@@ -298,9 +336,17 @@ Stated plainly, so none of them is discovered in production:
   guard concluded from it.** The guard keeps no span text, but it does keep
   identifiers: an [erasure](http-api.md#post-v1erasures) drops every live run
   a purged span contributed to (rebuilt, if asked about again, from what the
-  store still holds), removes an erased session's or trace's events and its
-  kill switch, reset and grant, and a tenant erasure takes the tenant's runs,
-  events and policies wholesale, rewriting `fuses.jsonl` without them. A
+  store still holds) and every parked run it names or whose evidence names a
+  purged span, removes an erased session's or trace's events and its kill
+  switch, reset and grant, and a tenant erasure takes the tenant's runs,
+  events and policies wholesale; for a tenant, session or trace subject
+  `fuses.jsonl` is rewritten from what remains. Work in flight cannot undo
+  it: a rebuild that read the store before the erasure discards what it read
+  and reads again, and an ingest acknowledged just before the erasure began
+  — whose observer can run after the guard was swept — has its observer skip
+  the spans the pending erasure covers. The one window left is such an
+  observer stalled until after the erasure has settled, which would follow
+  the run again from the erased spans until it is next rebuilt or evicted. A
   `traza_fuse_*` counter, and an alert a dispatcher already sent from the
   event feed, are not taken back. A kill-switch reason belongs to its run, so
   it goes with an erased session; a span erasure that leaves the session
@@ -312,5 +358,6 @@ Stated plainly, so none of them is discovered in production:
 
 `--no-fuses` turns the observer off entirely: ingest does no fuse work,
 `fuses.jsonl` is not read or written, responses carry no `fuses` field or
-header, and every `/v1/fuses/*` route answers
-`409 {"error": "run fuses are disabled on this store (traza-server --no-fuses)"}`.
+header, every `/v1/fuses/*` route answers
+`409 {"error": "run fuses are disabled on this store (traza-server --no-fuses)"}`,
+and MCP does not list `check_run_guard`.

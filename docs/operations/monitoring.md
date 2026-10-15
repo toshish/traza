@@ -185,7 +185,7 @@ Present unless the server runs with `--no-fuses`. See [run fuses](../guide/guard
 |---|---|---|
 | `traza_fuse_trips_total` | counter | Stops since this process started: every policy stop observed live, and every kill-switch trip. A stop a rebuild recomputes after a restart is not counted again |
 | `traza_fuse_warnings_total` | counter | Warn announcements: a run entering `warn`, and a `warn` policy's limit then being reached — each once per run until it returns to `continue` or is reset |
-| `traza_fuse_live_runs` | gauge | Runs held in memory, bounded by `--fuse-max-runs` |
+| `traza_fuse_live_runs` | gauge | Live runs held in memory, bounded by `--fuse-max-runs`. Stopped runs parked out of the live set by eviction are not counted |
 
 ## `GET /v1/stats`
 

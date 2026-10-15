@@ -97,7 +97,7 @@ trailers and has no declared length.
 | `GET` | [`/v1/tenants`](#get-v1tenants) | Per-tenant usage accounting |
 | `POST` | [`/v1/fuses/check`](#post-v1fusescheck) | Pre-call gate: may a run take its next step |
 | `GET` | [`/v1/fuses/runs/{run}`](#get-v1fusesrunsrun) | One run's fuse verdict, usage and limits |
-| `GET` | [`/v1/fuses/runs`](#get-v1fusesruns) | Live runs by verdict |
+| `GET` | [`/v1/fuses/runs`](#get-v1fusesruns) | Runs the guard holds, by verdict |
 | `POST` | [`/v1/fuses/runs/{run}/trip`](#post-v1fusesrunsruntrip) | The kill switch |
 | `POST` | [`/v1/fuses/runs/{run}/reset`](#post-v1fusesrunsrunreset) | Clear a stop, optionally granting higher limits |
 | `POST` | [`/v1/fuses/policies`](#post-v1fusespolicies) | Create or replace a fuse policy |
@@ -1334,7 +1334,8 @@ at 80% of any limit, and at 100% the policy's action, where `stop` is sticky
 until reset. The [guide](guard.md) explains the model; this is the wire.
 
 Every route answers `409` when the server runs with `--no-fuses`. A run id in
-a path is percent-decoded, so a run containing `/` travels as `%2F`. On the
+a path is percent-decoded, so a run containing `/` travels as `%2F`; it is at
+most 1,024 bytes (`400` beyond). On the
 single-run routes `?tenant=` selects the run's tenant for an unbound
 credential (absent: the default tenant); a bound credential is forced to its
 own, and naming another is `403`. Unknown query parameters and unknown body
@@ -1379,16 +1380,20 @@ curl -X POST http://127.0.0.1:8080/v1/fuses/check \
 {"evidence":[{"span_id":"b1","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736"}],"grant":null,"limits":{"max_cost_usd":2.0,"max_error_streak":3,"max_repeats":4,"max_steps":40},"policy":"support","reasons":["max_cost_usd 2 would be exceeded by the next step: $1.7 spent + $0.4 estimated"],"run":"sess-9c21","source":"live","tenant":"","tripped_at_ns":null,"tripped_by":null,"usage":{"cost_usd":1.7,"duration_ns":900000000,"error_streak":0,"errors":0,"llm_calls":1,"steps":1,"tokens":1920,"tool_calls":0,"top_repeat":null},"verdict":"stop"}
 ```
 
-**Errors.** `400` for a body that does not parse, an empty run id or a bare
-`trace:`, or a negative `est_cost_usd`; `400` if rebuilding the run exhausted
-`--query-deadline-ms` and nothing about it was live.
+**Errors.** `400` for a body that does not parse, an empty, bare `trace:` or
+over-long run id, or a negative `est_cost_usd`; `400` if rebuilding the run
+exhausted `--query-deadline-ms` and nothing about it was in memory (a run
+under a parked policy stop or a kill switch still answers `stop`); `409` in
+the rare case that erasures kept overlapping the run's rebuild (each overlap
+discards what the rebuild read, so retry once they settle).
 
 ### `GET /v1/fuses/runs/{run}`
 
 The run's verdict document. The first question about a run rebuilds it
 from the store (`"source": "rebuilt"`), since the process cannot know what
 was stored before it began following the run; later ones are answered from
-memory (`"live"`). A run no span carries answers `continue` with zero usage.
+memory (`"live"`). A run no span carries answers `continue` with zero usage,
+and asking about one holds no state for it.
 
 ```sh
 curl http://127.0.0.1:8080/v1/fuses/runs/sess-7f3a
@@ -1402,12 +1407,16 @@ curl http://127.0.0.1:8080/v1/fuses/runs/sess-7f3a
 
 ### `GET /v1/fuses/runs`
 
-Live runs, most recently active first: `{"runs": [verdict documents]}`.
-`?state=active|warn|stop` (default `active`, every live run), `?limit=`
+Runs the guard holds, most recently active first: `{"runs": [verdict
+documents]}`. That is every live run plus every stopped run parked out of the
+live set by eviction (see
+[the guide](guard.md#what-is-durable-and-what-is-rebuilt)).
+`?state=active|warn|stop` (default `active`, all of them), `?limit=`
 (default 100, at most 1000), `?tenant=` (an unbound credential naming none
 sees every tenant). Answered from memory alone — a listing never rebuilds —
-so each document is `"source": "live"`, and a run followed only partly lists
-with what this process has seen.
+so each document is `"source": "live"`, a run followed only partly lists
+with what this process has seen, and a parked run with its usage as last
+seen live.
 
 ```sh
 curl 'http://127.0.0.1:8080/v1/fuses/runs?state=stop'
@@ -1423,6 +1432,11 @@ The kill switch: stops the run until it is reset, whatever its usage,
 durably. **Body** (optional): `{"reason": string}`, at most 1,024 bytes,
 stored as given in `fuses.jsonl` until the run's session or tenant is erased
 — keep personal data out of it. Answers the verdict document.
+
+**Errors.** `409` when the tenant already holds durable controls (a kill
+switch, a reset or a grant) for 10,000 runs and every one of them is an
+active kill switch; below that, a new run takes the place of the run reset
+longest ago, whose grant and reset stop applying.
 
 ```sh
 curl -X POST http://127.0.0.1:8080/v1/fuses/runs/sess-9c21/trip \
@@ -1441,7 +1455,7 @@ streak and repeat counts, durably. **Body** (optional):
 merged over earlier grants; it takes the [policy limit](#post-v1fusespolicies)
 fields and the same validation. Cumulative usage is not reset, so a run still
 over a cumulative limit answers `stop` again at once. Answers the verdict
-document.
+document. **Errors** as for the trip: the same 10,000-run bound applies.
 
 ```sh
 curl -X POST http://127.0.0.1:8080/v1/fuses/runs/sess-7f3a/reset \
@@ -1462,7 +1476,7 @@ its `id` and `created_at_ns`). Live runs of the tenant are re-judged at once.
 |---|---|---|
 | `name` | string | 1–64 bytes, unique within the tenant. `default` is the tenant's fallback; `global` is reserved |
 | `tenant` | string | Optional; a bound credential is forced to its own |
-| `match` | object | `{"service": string}` — runs whose first span came from that service. Required unless the name is `default`, which must not have one |
+| `match` | object | `{"service": string}` (1–256 bytes) — runs whose first span, by start time, came from that service. Required unless the name is `default`, which must not have one |
 | `limits` | object | Any of `max_cost_usd`, `max_tokens`, `max_steps`, `max_llm_calls`, `max_tool_calls`, `max_duration_seconds`, `max_repeats`, `max_error_streak`. Each positive; `max_repeats` at least 2. Absent is unbounded, and nothing is inherited from `default` or `global` |
 | `action` | string | `stop` or `warn` (default `warn`) |
 
@@ -1478,7 +1492,9 @@ curl -X POST http://127.0.0.1:8080/v1/fuses/policies -d '{
 ```
 
 **Errors.** `400` naming the defect (a policy that matches nothing, a zero
-limit, an unknown field); `403` for a bound credential naming another tenant.
+limit, an unknown field); `403` for a bound credential naming another tenant;
+`409` when creating (not replacing) a policy would give the tenant more than
+256.
 
 ### `GET /v1/fuses/policies`
 

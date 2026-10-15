@@ -201,7 +201,9 @@ block. It is read-only: nothing on this surface can trip or reset a run, so a
 stopped agent cannot talk its way past its own fuse. It answers what is
 recorded, which is the pre-call check without an estimate; an agent wanting
 to price its next step uses
-[`POST /v1/fuses/check`](http-api.md#post-v1fusescheck).
+[`POST /v1/fuses/check`](http-api.md#post-v1fusescheck). On a server started
+with `--no-fuses` it is not listed — ten reads, then — and a call naming it
+is refused as invalid params.
 
 **The eval entities are not on this surface.** Datasets, versions, examples,
 experiments, runs and scores are served over HTTP only — no tool reads them,
