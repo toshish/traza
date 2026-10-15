@@ -41,6 +41,16 @@ pub const DEFAULT_MAX_RUNS: usize = 100_000;
 /// Longest a policy name may be, in bytes.
 const MAX_NAME_BYTES: usize = 64;
 
+/// Longest a `match.service` may be, in bytes. Service names are short; the
+/// bound keeps one policy from holding megabytes in memory and in
+/// `fuses.jsonl`, which is replayed whole at startup.
+pub const MAX_SERVICE_BYTES: usize = 256;
+
+/// Most policies one tenant may keep. A run's policy is resolved among its
+/// tenant's policies on every acknowledged batch, so the bound is what keeps
+/// one tenant's policy count out of every other tenant's ingest path.
+pub const MAX_POLICIES_PER_TENANT: usize = 256;
+
 /// What a policy does when a run reaches one of its limits.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -247,6 +257,11 @@ impl PolicySpec {
                     "match.service must not be empty; omit it instead".to_owned(),
                 ))
             }
+            (Some(service), _) if service.len() > MAX_SERVICE_BYTES => {
+                return Err(Error::Invalid(format!(
+                    "match.service must be at most {MAX_SERVICE_BYTES} bytes"
+                )))
+            }
             (Some(_), true) => {
                 return Err(Error::Invalid(format!(
                     "the `{DEFAULT_POLICY_NAME}` policy is the fallback for every run no other \
@@ -308,8 +323,10 @@ pub(crate) struct Resolved {
     pub(crate) action: Action,
 }
 
-/// Resolves the policy for a run of `tenant` whose first span had `service`;
-/// see the module docs for the order.
+/// Resolves the policy for a run of `tenant` whose first span had `service`,
+/// among `policies` — the tenant's own, which the guard keeps indexed by
+/// tenant so this never walks another tenant's; see the module docs for the
+/// order.
 pub(crate) fn resolve(
     policies: &[FusePolicy],
     config: &FuseConfig,
@@ -452,6 +469,7 @@ mod tests {
             (spec("global", None), "server-wide default"),
             (spec("", Some("x")), "1 to 64 bytes"),
             (spec("x", Some("")), "must not be empty"),
+            (spec("x", Some(&"s".repeat(257))), "at most 256 bytes"),
         ] {
             match bad.validate() {
                 Err(Error::Invalid(message)) => assert!(message.contains(needle), "{message}"),

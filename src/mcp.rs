@@ -591,31 +591,39 @@ impl<'a> Server<'a> {
                 }),
                 Nature::Read,
             ),
-            tool(
-                "check_run_guard",
-                "Check a run's guard verdict",
-                "Whether an agent run may take its next step: continue, warn (approaching a \
-                 limit) or stop (a limit was crossed, or an operator stopped it), with the \
-                 reasons, the policy, and the run's usage against its limits. A run id is a \
-                 session id, or trace:<trace_id> for a run without one. Read-only: a stop can \
-                 only be cleared by an operator over HTTP, never from here.",
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "run_id": {"type": "string", "description": "The run to check."},
-                        "tenant": {
-                            "type": "string",
-                            "description": "The run's tenant, for an unbound credential. \
-                                            Default: the default tenant.",
-                        },
-                    },
-                    "required": ["run_id"],
-                    "additionalProperties": false,
-                }),
-                Nature::Read,
-            )
-            .with_output_schema(guard_output_schema()),
         ];
+        // Listed only where it can answer: under --no-fuses every fuse
+        // surface is off, and a tool that can only fail is noise in a
+        // model's context.
+        if self.store.fuses_enabled() {
+            tools.push(
+                tool(
+                    "check_run_guard",
+                    "Check a run's guard verdict",
+                    "Whether an agent run may take its next step: continue, warn (approaching \
+                     a limit) or stop (a limit was crossed, or an operator stopped it), with \
+                     the reasons, the policy, and the run's usage against its limits. A run \
+                     id is a session id, or trace:<trace_id> for a run without one. \
+                     Read-only: a stop can only be cleared by an operator over HTTP, never \
+                     from here.",
+                    json!({
+                        "type": "object",
+                        "properties": {
+                            "run_id": {"type": "string", "description": "The run to check."},
+                            "tenant": {
+                                "type": "string",
+                                "description": "The run's tenant, for an unbound credential. \
+                                                Default: the default tenant.",
+                            },
+                        },
+                        "required": ["run_id"],
+                        "additionalProperties": false,
+                    }),
+                    Nature::Read,
+                )
+                .with_output_schema(guard_output_schema()),
+            );
+        }
         if self.annotation_tool_available(access) {
             tools.push(tool(
                 "record_annotation",
@@ -726,7 +734,15 @@ impl<'a> Server<'a> {
             "slowest_spans" => self.slowest_spans(arguments, context.clone()),
             "analyze_cost" => self.analyze_cost(arguments, context.clone()),
             "get_payload" => self.get_payload(arguments, &context),
-            "check_run_guard" => self.check_run_guard(arguments, &context),
+            "check_run_guard" if self.store.fuses_enabled() => {
+                self.check_run_guard(arguments, &context)
+            }
+            "check_run_guard" => {
+                return RpcError::invalid_params(
+                    "check_run_guard is disabled; the server was started with --no-fuses",
+                )
+                .into_response(id)
+            }
             "record_annotation" if self.annotation_tool_available(context.access) => {
                 self.record_annotation(arguments, context)
             }
@@ -2870,13 +2886,6 @@ fn cost_output_schema() -> Value {
     })
 }
 
-/// The fixed resources.
-///
-/// Deliberately few and stable. Resources are for content a client can
-/// enumerate and attach by identity; the store's traces are discovered by
-/// querying, and listing millions of them as resources would be an unbounded
-/// enumeration rather than a context menu. Anything identified by an id is a
-/// [template](resource_templates) instead.
 /// `check_run_guard`'s structured result: the HTTP verdict document.
 fn guard_output_schema() -> Value {
     let span_ref = json!({
@@ -2925,6 +2934,13 @@ fn guard_output_schema() -> Value {
     })
 }
 
+/// The fixed resources.
+///
+/// Deliberately few and stable. Resources are for content a client can
+/// enumerate and attach by identity; the store's traces are discovered by
+/// querying, and listing millions of them as resources would be an unbounded
+/// enumeration rather than a context menu. Anything identified by an id is a
+/// [template](resource_templates) instead.
 fn resource_definitions() -> Vec<Value> {
     vec![
         json!({

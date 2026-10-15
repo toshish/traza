@@ -360,12 +360,31 @@ fn the_kill_switch_stops_any_run_until_it_is_reset() {
     let (status, doc) = server.json("POST", "/v1/fuses/runs/a%2Fb/trip", None, &[]);
     assert_eq!((status, doc["run"].as_str()), (200, Some("a/b")), "{doc}");
 
+    // Paths that start with a route's prefix and end with its suffix, with
+    // no id between: not found — and the server keeps serving.
+    for path in [
+        "/v1/fuses/runs/trip",
+        "/v1/fuses/runs/reset",
+        "/v1/fuses/policies/delete",
+    ] {
+        let (status, _) = server.json("POST", path, None, &[]);
+        assert_eq!(status, 404, "{path}");
+    }
+    let still = verdict(&server, "/v1/fuses/runs/k1", &[]);
+    assert_eq!(still["run"], "k1");
+
+    let long_run = format!("/v1/fuses/runs/{}/trip", "r".repeat(1_025));
     for (path, body, needle) in [
         ("/v1/fuses/runs/trace:/trip", json!({}), "names no trace"),
         (
             "/v1/fuses/runs/k2/trip",
             json!({"reason": "x".repeat(2_000)}),
             "at most 1024 bytes",
+        ),
+        (
+            long_run.as_str(),
+            json!({}),
+            "run id must be at most 1024 bytes",
         ),
     ] {
         let (status, error) = server.json("POST", path, Some(&body), &[]);
@@ -467,8 +486,12 @@ fn policies_and_verdicts_are_per_tenant_and_bound_tokens_cannot_cross() {
     let foreign = json!({"name": "x", "tenant": "beta", "match": {"service": "s"}, "limits": {}});
     let (status, _) = server.json("POST", "/v1/fuses/policies", Some(&foreign), &acme);
     assert_eq!(status, 403);
-    let (status, _) = server.json("POST", "/v1/fuses/policies", Some(&foreign), &acme_ro);
+    // Naming no tenant, so the missing scope is the only reason to refuse.
+    let own = json!({"name": "x", "match": {"service": "s"}, "limits": {}});
+    let (status, _) = server.json("POST", "/v1/fuses/policies", Some(&own), &acme_ro);
     assert_eq!(status, 403, "a read-only token cannot write policy");
+    let (status, written) = server.json("POST", "/v1/fuses/policies", Some(&own), &acme);
+    assert_eq!(status, 200, "the same body with write scope: {written}");
 
     let listed = verdict(&server, "/v1/fuses/policies", &beta);
     assert_eq!(listed["policies"], json!([]), "beta sees none of acme's");
@@ -825,6 +848,7 @@ fn a_crash_restart_rebuilds_runs_from_the_store_and_keeps_durable_controls() {
 fn no_fuses_turns_every_surface_off() {
     let server = Server::spawn(&[
         "--no-fuses",
+        "--mcp",
         "--fuse-max-steps",
         "1",
         "--fuse-action",
@@ -847,6 +871,36 @@ fn no_fuses_turns_every_surface_off() {
     }
     let (_, _, metrics) = server.request("GET", "/v1/metrics", None, &[]);
     assert!(!metrics.contains("traza_fuse_"), "{metrics}");
+    // MCP neither lists the guard tool nor answers it.
+    let mcp = |body: Value| {
+        server.json(
+            "POST",
+            "/v1/mcp",
+            Some(&body),
+            &[("Accept", "application/json, text/event-stream")],
+        )
+    };
+    let (status, listed) = mcp(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}));
+    assert_eq!(status, 200, "{listed}");
+    let names: Vec<&str> = listed["result"]["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap_or_default())
+        .collect();
+    assert!(
+        !names.is_empty() && !names.contains(&"check_run_guard"),
+        "{names:?}"
+    );
+    let (_, called) = mcp(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {"name": "check_run_guard", "arguments": {"run_id": "n"}}}));
+    assert!(
+        called["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("--no-fuses"),
+        "{called}"
+    );
     assert!(
         server.stderr().contains("run fuses off"),
         "{}",

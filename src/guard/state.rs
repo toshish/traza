@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use super::policy::{Action, Limits, Resolved};
+use super::Verdict;
 use crate::semconv::{self, StepKind};
 use crate::{Error, Result, Span, Store};
 
@@ -118,8 +119,8 @@ pub(crate) struct Trip {
 }
 
 /// A span reduced to what a run's usage needs. Extracted with no lock held:
-/// the step facts behind a fingerprint include a request digest, which costs
-/// time proportional to the request's size.
+/// a fingerprint includes a request digest, which costs time proportional to
+/// the request's size.
 #[derive(Clone, Debug)]
 pub(crate) struct Observation {
     key: u64,
@@ -138,13 +139,14 @@ pub(crate) struct Observation {
 impl Observation {
     /// Reads one span: priced facts for tokens and cost, the step kind, and
     /// — for steps only — the fingerprint. Non-step spans never pay for a
-    /// request digest they would not use.
+    /// request digest they would not use, and no span pays for a response
+    /// digest: the fingerprint does not cover the response.
     pub(crate) fn of(store: &Store, span: &Span) -> Self {
         let llm = store.facts(span);
         let kind = semconv::step_kind_with(span, &llm);
         let fingerprint = kind
             .is_step()
-            .then(|| semconv::step_facts_with(span, &llm).fingerprint);
+            .then(|| semconv::step_fingerprint_with(span, &llm));
         Self {
             key: span_key(&span.trace_id, &span.span_id),
             trace_id: span.trace_id.clone(),
@@ -237,7 +239,10 @@ struct Repeats {
 /// One run's folded state.
 #[derive(Debug)]
 pub(crate) struct RunState {
-    /// The first absorbed span's service, which picks the run's policy.
+    /// The service of the earliest-starting span absorbed — the run's first
+    /// span, which picks its policy. By start time, not arrival: a root span
+    /// ends, and so arrives, after its children, and a rebuild (which reads
+    /// spans in start order) must pick the same policy live state did.
     pub(crate) service: Option<String>,
     first_start_ns: u64,
     last_end_ns: u64,
@@ -263,6 +268,9 @@ pub(crate) struct RunState {
     pub(crate) warn_level: u8,
     /// Recency position in the guard's eviction order.
     pub(crate) tick: u64,
+    /// The verdict class the guard's listing index files this run under —
+    /// kept here so a re-filing knows where to remove it from.
+    pub(crate) class: Verdict,
     /// Server clock at the last observation or query, Unix nanoseconds.
     pub(crate) last_seen_ns: u64,
 }
@@ -288,6 +296,7 @@ impl RunState {
             trip: None,
             warn_level: 0,
             tick: 0,
+            class: Verdict::Continue,
             last_seen_ns: 0,
         }
     }
@@ -363,13 +372,15 @@ impl RunState {
                 self.count_repeat(mark.fingerprint, fingerprint, observation);
             }
         }
+        // Strictly earlier only: among spans starting together, the first
+        // to arrive keeps the run's policy, so a retry cannot flip it.
+        if self.service.is_none() || observation.start_ns < self.first_start_ns {
+            self.service = Some(observation.service.clone());
+        }
         // Span-clock bounds only ever widen: an upsert that narrowed a span
         // would leave them slightly wide, which errs toward the limit.
         self.first_start_ns = self.first_start_ns.min(observation.start_ns);
         self.last_end_ns = self.last_end_ns.max(observation.end_ns);
-        if self.service.is_none() {
-            self.service = Some(observation.service.clone());
-        }
         self.last_span = Some(observation.span_ref());
     }
 
@@ -552,7 +563,8 @@ pub(crate) struct Assessment {
 /// span's end — the replay has no admission clock to offer instead — or at
 /// the reset itself when a reset left cumulative usage over a limit, which
 /// live would re-trip at once. `resolve` names the run's policy from its
-/// first span's service.
+/// first span's service — the first span replayed, reset or not, exactly as
+/// [`RunState::service`] has it.
 pub(crate) fn replay(
     observations: &[Observation],
     reset_at: Option<u64>,
@@ -566,7 +578,8 @@ pub(crate) fn replay(
         if before || state.trip.is_some() {
             continue;
         }
-        let (limits, action) = *policy.get_or_insert_with(|| resolve(&observation.service));
+        let (limits, action) =
+            *policy.get_or_insert_with(|| resolve(state.service.as_deref().unwrap_or("")));
         if action == Action::Stop {
             let assessment = state.assess(&limits, None);
             if !assessment.reached.is_empty() {
@@ -1050,6 +1063,40 @@ mod tests {
         // Under a warn action nothing is sticky.
         let warn = |_: &str| (Limits::default(), Action::Warn);
         assert!(replay(&observations, None, &warn).trip.is_none());
+    }
+
+    #[test]
+    fn the_policy_follows_the_earliest_starting_span_live_and_in_replay() {
+        let at = |id: &str, service: &str, start: u64, end: u64| {
+            let mut observation = step(id, &format!("tool:x#{id}"));
+            observation.service = service.into();
+            observation.start_ns = start;
+            observation.end_ns = end;
+            observation
+        };
+        // Live: children arrive before the root that started first.
+        let mut run = RunState::new(false);
+        run.absorb(&at("child", "child-svc", 10, 20), false);
+        assert_eq!(run.service.as_deref(), Some("child-svc"));
+        run.absorb(&at("root", "root-svc", 5, 30), false);
+        assert_eq!(run.service.as_deref(), Some("root-svc"));
+        // A tie keeps the first arrival, so a retry cannot flip it.
+        run.absorb(&at("twin", "twin-svc", 5, 30), false);
+        assert_eq!(run.service.as_deref(), Some("root-svc"));
+
+        // Replay resolves from the first span replayed, even when a reset
+        // made a later span the first that counts.
+        let resolved = std::cell::RefCell::new(Vec::new());
+        let resolve = |service: &str| {
+            resolved.borrow_mut().push(service.to_owned());
+            (Limits::default(), Action::Stop)
+        };
+        let observations = [
+            at("root", "root-svc", 5, 6),
+            at("child", "child-svc", 10, 20),
+        ];
+        replay(&observations, Some(7), &resolve);
+        assert_eq!(resolved.borrow().as_slice(), ["root-svc"]);
     }
 
     #[test]

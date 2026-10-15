@@ -87,28 +87,35 @@ pub fn serve(
     body: &[u8],
     bound: Option<&str>,
 ) -> Reply {
+    // Ids are cut out with strip_prefix/strip_suffix, never by index: a path
+    // like `/v1/fuses/runs/trip` both starts with the prefix and ends with
+    // the suffix, and slicing between the two would run backwards.
+    let between = |prefix: &str, suffix: &str| {
+        path.strip_prefix(prefix)
+            .and_then(|rest| rest.strip_suffix(suffix))
+            .filter(|id| !id.is_empty())
+    };
     let routed = match (method, path) {
         ("POST", "/v1/fuses/check") => check(store, query, body, bound),
         ("GET", "/v1/fuses/policies") => list_policies(store, query, bound),
         ("POST", "/v1/fuses/policies") => put_policy(store, query, body, bound),
-        ("POST", path) if path.starts_with("/v1/fuses/policies/") && path.ends_with("/delete") => {
-            let id = &path["/v1/fuses/policies/".len()..path.len() - "/delete".len()];
-            delete_policy(store, &percent_decode(id), query, bound)
-        }
         ("GET", "/v1/fuses/runs") => list_runs(store, query, bound),
         ("GET", "/v1/fuses/events") => events(store, query, bound),
-        ("POST", path) if path.starts_with("/v1/fuses/runs/") && path.ends_with("/trip") => {
-            let run = &path["/v1/fuses/runs/".len()..path.len() - "/trip".len()];
-            trip(store, &percent_decode(run), query, body, bound)
+        ("POST", _) => {
+            if let Some(id) = between("/v1/fuses/policies/", "/delete") {
+                delete_policy(store, &percent_decode(id), query, bound)
+            } else if let Some(run) = between("/v1/fuses/runs/", "/trip") {
+                trip(store, &percent_decode(run), query, body, bound)
+            } else if let Some(run) = between("/v1/fuses/runs/", "/reset") {
+                reset(store, &percent_decode(run), query, body, bound)
+            } else {
+                Err(Reply::error(404, "not found"))
+            }
         }
-        ("POST", path) if path.starts_with("/v1/fuses/runs/") && path.ends_with("/reset") => {
-            let run = &path["/v1/fuses/runs/".len()..path.len() - "/reset".len()];
-            reset(store, &percent_decode(run), query, body, bound)
-        }
-        ("GET", path) if path.starts_with("/v1/fuses/runs/") => {
-            let run = &path["/v1/fuses/runs/".len()..];
-            verdict(store, &percent_decode(run), query, bound)
-        }
+        ("GET", _) => match between("/v1/fuses/runs/", "") {
+            Some(run) => verdict(store, &percent_decode(run), query, bound),
+            None => Err(Reply::error(404, "not found")),
+        },
         _ => Err(Reply::error(404, "not found")),
     };
     routed.unwrap_or_else(|reply| reply)
@@ -389,6 +396,50 @@ mod tests {
             json!({"error": "unknown query parameter: tenat"})
         );
         assert!(params("tenant=a&tenant=b", &["tenant"]).is_err());
+    }
+
+    #[test]
+    fn paths_whose_prefix_and_suffix_overlap_are_not_found_not_a_panic() {
+        // Each of these starts with a route's prefix AND ends with its
+        // suffix, with nothing between: slicing the id out by index panicked.
+        let dir = std::env::temp_dir().join(format!(
+            "traza-guard-http-{}-{}",
+            std::process::id(),
+            super::super::unix_now_ns()
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let store = Store::open(&dir, crate::Config::default()).expect("opens");
+        for path in [
+            "/v1/fuses/policies/delete",
+            "/v1/fuses/runs/trip",
+            "/v1/fuses/runs/reset",
+            "/v1/fuses/policies//delete",
+            "/v1/fuses/runs//trip",
+            "/v1/fuses/runs//reset",
+        ] {
+            let reply = serve(&store, "POST", path, "", b"", None);
+            assert_eq!(reply.status, 404, "{path}: {:?}", reply.body);
+        }
+        let empty = serve(&store, "GET", "/v1/fuses/runs/", "", b"", None);
+        assert_eq!(empty.status, 404);
+        let unknown = serve(&store, "PUT", "/v1/fuses/runs/x", "", b"", None);
+        assert_eq!(unknown.status, 404);
+        // The real routes still resolve.
+        let reply = serve(&store, "POST", "/v1/fuses/runs/x/trip", "", b"", None);
+        assert_eq!(reply.status, 200, "{:?}", reply.body);
+        let reply = serve(&store, "POST", "/v1/fuses/runs/x/reset", "", b"", None);
+        assert_eq!(reply.status, 200, "{:?}", reply.body);
+        let reply = serve(&store, "GET", "/v1/fuses/runs/x", "", b"", None);
+        assert_eq!(reply.status, 200, "{:?}", reply.body);
+        let path = "/v1/fuses/policies/fp_none/delete";
+        let reply = serve(&store, "POST", path, "", b"", None);
+        assert_eq!(reply.status, 404, "an unknown policy: {:?}", reply.body);
+        assert!(reply.body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("fp_none"));
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

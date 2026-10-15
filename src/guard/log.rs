@@ -3,9 +3,12 @@
 //! Live run state is a cache over the store and is rebuilt from spans; what
 //! spans cannot reconstruct — policies, manual trips, resets and the grants
 //! they carry — is written here, one JSON object per line, fsynced per append
-//! and replayed at open. Volume is human scale (an operator edits a policy or
-//! pulls a kill switch), so the file is never compacted; the one rewrite is
-//! an erasure's, which replaces it atomically without the erased subject.
+//! and replayed at open. Most lines are superseded sooner or later (a policy
+//! replaced, a kill switch reset), so once the log holds at least twice the
+//! records that reproduce the state — and at least [`COMPACT_SLACK`] lines —
+//! it is rewritten to just those: replay time and size track the state, not
+//! its history. An erasure rewrites it too, without the erased subject. Both
+//! rewrites replace the file atomically.
 //!
 //! It lives in the data directory OUTSIDE the generation layout: a backup
 //! does not carry it and a restore does not replace it. Fuse settings are
@@ -25,6 +28,10 @@ use crate::{Error, Result};
 
 /// The log's file name in the data directory.
 pub(crate) const LOG_NAME: &str = "fuses.jsonl";
+
+/// Lines a log may hold before compaction is considered at all: below it,
+/// a rewrite would save less than it costs.
+pub(crate) const COMPACT_SLACK: usize = 1024;
 
 /// One durable fuse fact.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -70,10 +77,14 @@ pub(crate) enum Record {
     },
 }
 
-/// The open log: its path, for appends.
+/// The open log: its path, for appends, and how many lines it holds.
 #[derive(Debug)]
 pub(crate) struct FuseLog {
     path: PathBuf,
+    /// Records in the file.
+    lines: usize,
+    /// The line count at which compaction is next considered.
+    compact_at: usize,
 }
 
 impl FuseLog {
@@ -134,7 +145,40 @@ impl FuseLog {
                 file.sync_all()?;
             }
         }
-        Ok((Self { path }, records))
+        let lines = records.len();
+        Ok((
+            Self {
+                path,
+                lines,
+                // Considered at the first opportunity: a log that grew large
+                // before this process started is compacted at open.
+                compact_at: COMPACT_SLACK,
+            },
+            records,
+        ))
+    }
+
+    /// Whether enough lines have accumulated to be worth comparing with the
+    /// state; when it is, pass [`Self::compact`] the state's records.
+    pub(crate) fn compaction_due(&self) -> bool {
+        self.lines >= self.compact_at
+    }
+
+    /// Rewrites the log to `records` — the records that reproduce the state
+    /// — when at least half its lines are superseded, and re-arms the check
+    /// either way. Halving is what keeps compaction amortized O(1) per
+    /// append. Returns whether it rewrote.
+    pub(crate) fn compact(&mut self, records: &[Record]) -> Result<bool> {
+        let rewrote = self.lines >= records.len().saturating_mul(2);
+        if rewrote {
+            self.rewrite(records)?;
+        }
+        self.compact_at = records
+            .len()
+            .saturating_mul(2)
+            .max(self.lines.saturating_add(1))
+            .max(COMPACT_SLACK);
+        Ok(rewrote)
     }
 
     /// Replaces the whole log with `records`, atomically: written to a
@@ -142,7 +186,7 @@ impl FuseLog {
     /// crash leaves the old log or the new one, never a blend — which is what
     /// an erasure needs, since a half-rewritten log could keep what it was
     /// asked to forget.
-    pub(crate) fn rewrite(&self, records: &[Record]) -> Result<()> {
+    pub(crate) fn rewrite(&mut self, records: &[Record]) -> Result<()> {
         let staged = self.path.with_extension("jsonl.tmp");
         let mut bytes = Vec::new();
         for record in records {
@@ -156,12 +200,14 @@ impl FuseLog {
         if let Some(directory) = self.path.parent() {
             crate::sync_directory(directory)?;
         }
+        self.lines = records.len();
+        self.compact_at = self.lines.saturating_mul(2).max(COMPACT_SLACK);
         Ok(())
     }
 
     /// Appends one record durably: written whole in one call, then fsynced.
     /// When this returns `Ok` the record survives a crash.
-    pub(crate) fn append(&self, record: &Record) -> Result<()> {
+    pub(crate) fn append(&mut self, record: &Record) -> Result<()> {
         let mut line = serde_json::to_vec(record)?;
         line.push(b'\n');
         let fresh = !self.path.exists();
@@ -178,6 +224,7 @@ impl FuseLog {
                 crate::sync_directory(directory)?;
             }
         }
+        self.lines = self.lines.saturating_add(1);
         Ok(())
     }
 }
@@ -211,7 +258,7 @@ mod tests {
     #[test]
     fn records_round_trip_in_append_order() {
         let path = dir("roundtrip");
-        let (log, records) = FuseLog::open(&path).expect("opens empty");
+        let (mut log, records) = FuseLog::open(&path).expect("opens empty");
         assert!(records.is_empty());
         log.append(&trip("a")).expect("appends");
         log.append(&Record::Reset {
@@ -237,14 +284,14 @@ mod tests {
     #[test]
     fn a_torn_tail_is_healed_and_inner_damage_refuses() {
         let path = dir("torn");
-        let (log, _) = FuseLog::open(&path).expect("opens");
+        let (mut log, _) = FuseLog::open(&path).expect("opens");
         log.append(&trip("a")).expect("appends");
         let file = path.join(LOG_NAME);
         let mut bytes = fs::read(&file).expect("reads");
         bytes.extend_from_slice(br#"{"op":"trip","run":"b","#);
         fs::write(&file, &bytes).expect("tears");
 
-        let (log, records) = FuseLog::open(&path).expect("heals");
+        let (mut log, records) = FuseLog::open(&path).expect("heals");
         assert_eq!(records, vec![trip("a")]);
         log.append(&trip("c")).expect("appends after healing");
         let (_, records) = FuseLog::open(&path).expect("reopens");
@@ -264,12 +311,12 @@ mod tests {
     #[test]
     fn a_rewrite_replaces_the_log_whole() {
         let path = dir("rewrite");
-        let (log, _) = FuseLog::open(&path).expect("opens");
+        let (mut log, _) = FuseLog::open(&path).expect("opens");
         for run in ["a", "b", "c"] {
             log.append(&trip(run)).expect("appends");
         }
         log.rewrite(&[trip("b")]).expect("rewrites");
-        let (log, records) = FuseLog::open(&path).expect("reopens");
+        let (mut log, records) = FuseLog::open(&path).expect("reopens");
         assert_eq!(records, vec![trip("b")]);
         assert!(!path.join("fuses.jsonl.tmp").exists());
         log.append(&trip("d")).expect("appends after a rewrite");
@@ -279,12 +326,47 @@ mod tests {
     }
 
     #[test]
+    fn compaction_rewrites_once_half_the_log_is_superseded() {
+        let path = dir("compact");
+        let (mut log, _) = FuseLog::open(&path).expect("opens");
+        for _ in 0..COMPACT_SLACK - 1 {
+            log.append(&trip("a")).expect("appends");
+        }
+        assert!(!log.compaction_due(), "below the slack nothing is checked");
+        log.append(&trip("a")).expect("appends");
+        assert!(log.compaction_due());
+        // The state is one record: everything else is superseded.
+        assert!(log.compact(&[trip("a")]).expect("compacts"));
+        let (log, records) = FuseLog::open(&path).expect("reopens");
+        assert_eq!(records, vec![trip("a")]);
+        assert!(!log.compaction_due());
+
+        // A log that is mostly live — the state grew rather than churned —
+        // is left alone, and the check re-arms past it instead of repeating
+        // on every append.
+        let state: Vec<Record> = (0..COMPACT_SLACK * 2)
+            .map(|index| trip(&index.to_string()))
+            .collect();
+        let (mut log, _) = FuseLog::open(&path).expect("opens");
+        log.rewrite(&state[..COMPACT_SLACK]).expect("rewrites");
+        for record in &state[COMPACT_SLACK..] {
+            log.append(record).expect("appends");
+        }
+        assert!(log.compaction_due());
+        assert!(!log.compact(&state).expect("checks"));
+        assert!(!log.compaction_due());
+        let (_, records) = FuseLog::open(&path).expect("reopens");
+        assert_eq!(records.len(), COMPACT_SLACK * 2, "nothing was dropped");
+        let _ = fs::remove_dir_all(&path);
+    }
+
+    #[test]
     fn a_record_missing_only_its_newline_is_kept_and_terminated() {
         let path = dir("newline");
         let file = path.join(LOG_NAME);
         let line = serde_json::to_vec(&trip("a")).expect("encodes");
         fs::write(&file, &line).expect("writes without newline");
-        let (log, records) = FuseLog::open(&path).expect("opens");
+        let (mut log, records) = FuseLog::open(&path).expect("opens");
         assert_eq!(records, vec![trip("a")]);
         log.append(&trip("b")).expect("appends");
         let (_, records) = FuseLog::open(&path).expect("reopens");
