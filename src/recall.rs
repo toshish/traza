@@ -149,7 +149,9 @@ impl Store {
     ///
     /// A query with no searchable word (ASCII letters or digits — see
     /// [`crate::content`]) is [`crate::Error::Invalid`]: it could match
-    /// nothing, and would scan the whole store to find that out.
+    /// nothing, and would scan the whole store to find that out. A query
+    /// matching more spans than the engine will rank
+    /// ([`crate::SORT_CANDIDATE_LIMIT`]) is [`crate::Error::QueryTooBroad`].
     pub fn recall(
         &self,
         tenant: Option<&str>,
@@ -174,7 +176,20 @@ impl Store {
             limit: Some(MAX_RECALL_MATCHES + 1),
             ..SpanFilter::default()
         };
-        let mut matches = self.query_under(&filter, deadline)?;
+        // Newest-first needs every match ranked, which the engine refuses past
+        // its sort ceiling. Its advice — narrow by time, service or attribute
+        // — names filters recall does not take, so the refusal is reworded
+        // into the one remedy recall has.
+        let mut matches = self
+            .query_under(&filter, deadline)
+            .map_err(|error| match error {
+                crate::Error::QueryTooBroad(_) => crate::Error::QueryTooBroad(format!(
+                    "the query's words appear in more than {} spans, too many to rank by \
+                     recency; add a word to narrow it",
+                    crate::SORT_CANDIDATE_LIMIT
+                )),
+                other => other,
+            })?;
         let truncated = matches.len() > MAX_RECALL_MATCHES;
         matches.truncate(MAX_RECALL_MATCHES);
 

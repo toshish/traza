@@ -416,7 +416,9 @@ the last 15 minutes) is `unknown` and never ranked as a success.
 
 Recall groups the newest 5,000 matching spans into runs and reads the 100 runs
 with the most matches among them in full; a query whose matches overflow the
-first bound says `"truncated": true`.
+first bound says `"truncated": true`. Finding the newest matches means ranking
+all of them, so words that appear in more than 200,000 spans are refused with
+`400` — add a word to narrow them.
 
 ## From an agent: the MCP tools
 

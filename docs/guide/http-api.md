@@ -1101,7 +1101,8 @@ whose last span ended within the last 15 minutes is `unknown`.
 Recall groups the newest 5,000 matching spans into runs and reads the 100 runs
 with the most matches among them; `truncated: true` says the first bound
 applied. A `q` with no ASCII letters or digits is `400` — it could match
-nothing.
+nothing — and so is a `q` whose words appear in more than 200,000 spans, too
+many to rank by recency; add a word.
 
 ---
 

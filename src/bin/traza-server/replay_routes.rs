@@ -357,6 +357,10 @@ fn recall(
             200,
             serde_json::to_value(recall).unwrap_or_else(|_| json!({})),
         ),
+        // The caller's to narrow, as on span search: retrying cannot help.
+        Err(error @ traza::Error::QueryTooBroad(_)) => {
+            responder.json(400, json!({"error": error.to_string()}))
+        }
         Err(error) => engine_error(responder, metrics, error),
     }
 }
