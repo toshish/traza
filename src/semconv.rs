@@ -900,7 +900,7 @@ fn payload_value(value: &Value) -> Option<Value> {
 /// Only objects and arrays: a prompt that reads `42`, `true` or `null` is
 /// text, and parsing it would both change what the step said and digest it as
 /// a different type than the instrumentation recorded.
-fn field_value(value: &Value) -> Value {
+pub(crate) fn field_value(value: &Value) -> Value {
     if let Value::String(text) = value {
         let trimmed = text.trim_start();
         if trimmed.starts_with('{') || trimmed.starts_with('[') {

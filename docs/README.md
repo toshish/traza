@@ -36,12 +36,16 @@ Sending traces to Traza and getting answers back out.
   attributes Traza recognizes, sessions, token and cost analytics, prompt and
   completion payloads, span links, and query recipes.
 - **[MCP server](guide/mcp.md)** — the Model Context Protocol endpoint: its
-  thirteen tools, its resources and prompts, how results are bounded for a context
-  window, and the untrusted-content boundary stored span text is held behind.
+  sixteen tools, its resources and prompts, how results are bounded for a
+  context window, and the untrusted-content boundary stored span text is held
+  behind.
 - **[Run fuses](guide/guard.md)** — per-run limits on cost, tokens, steps,
   repeated calls and failure streaks; the pre-call check, the verdict on every
   ingest acknowledgement, the kill switch, and why a post-ack stop always
   lands one step late.
+- **[Replay](guide/replay.md)** — a run read as a tape, replaying it through
+  the OpenAI or Anthropic SDK with zero model calls, diffing two runs, and
+  recalling earlier runs that did the same thing.
 - **[Trace browser](guide/trace-browser.md)** — what each view shows and how to
   move between them.
 

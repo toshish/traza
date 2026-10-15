@@ -14,6 +14,7 @@ pub mod caps;
 pub mod content;
 mod crc;
 pub mod credentials;
+pub mod diff;
 pub mod erasure;
 pub mod evals;
 pub mod expiration;
@@ -35,12 +36,15 @@ pub mod otlp_pb;
 pub mod payload;
 pub mod platform;
 pub mod pricing;
+pub mod recall;
+pub mod replay;
 mod rollup_file;
 pub mod run;
 pub mod seed;
 pub mod segment;
 pub mod semconv;
 pub mod tail;
+pub mod tape;
 pub mod ui;
 pub mod usage;
 mod wal;
@@ -4352,40 +4356,58 @@ impl Store {
     /// reference sets, then the tenant posting), paid only by bound
     /// callers on a fetch-shaped request.
     pub fn payload_in(&self, tenant: Option<&str>, reference: &str) -> Result<Option<Vec<u8>>> {
-        // A payload a pending erasure is due to account for is withheld
-        // while it is pending — the bytes may be seconds from deletion, and
-        // serving them from under an erasure in progress is the same failure
-        // as serving the span. A shared reference that survives (retained
-        // for live spans outside the subject) resurfaces at settle.
-        if let Some(mask) = self.erasure_mask() {
-            if mask.covers_payload_file(reference) {
-                return Ok(None);
-            }
-            // A whole-tenant erasure discovers its span-held references only
-            // as its purge walks them, so `payload_files` is still filling
-            // while the mask already hides the tenant. A scoped fetch must
-            // not race that gap: the tenant is being erased, so nothing of
-            // its is served, whether or not this exact reference has been
-            // enumerated yet. The operator (unscoped) fetch is governed by
-            // `payload_files` alone, as it was — its capability is the hash.
-            if let Some(tenant) = tenant {
-                if mask.covers_tenant(tenant) {
-                    return Ok(None);
-                }
-            }
+        self.payload_in_under(tenant, reference, self.query_deadline(Instant::now()))
+    }
+
+    /// [`Self::payload_in`] under the calling request's compute budget, for
+    /// a request that reads many payloads (a resolved tape) and must spend
+    /// ONE budget across them rather than a fresh one per reference.
+    pub(crate) fn payload_in_under(
+        &self,
+        tenant: Option<&str>,
+        reference: &str,
+        deadline: Option<Deadline>,
+    ) -> Result<Option<Vec<u8>>> {
+        if self.payload_withheld(tenant, reference) {
+            return Ok(None);
         }
         if let Some(tenant) = tenant {
             // The reachability probe can decode a tenant's every record in a
-            // sidecar-less segment, per request, so it runs under the same
-            // budget as any other query — anchored here, at the public
-            // entry. Erasure work never reaches this probe: its accounting
-            // reads mask-free through `tenant_span_payload_refs`.
-            let deadline = self.query_deadline(Instant::now());
+            // sidecar-less segment, per request, so it runs under the
+            // request's budget like any other query. Erasure work never
+            // reaches this probe: its accounting reads mask-free through
+            // `tenant_span_payload_refs`.
             if !self.tenant_holds_reference(tenant, reference, deadline)? {
                 return Ok(None);
             }
         }
         payload::load_payload(&self.directory, reference)
+    }
+
+    /// Whether a pending erasure withholds `reference` from a read under
+    /// `tenant` — the cheap, probe-free half of [`Self::payload_in`], which a
+    /// caller that has already proven reachability re-checks before every
+    /// re-read.
+    pub(crate) fn payload_withheld(&self, tenant: Option<&str>, reference: &str) -> bool {
+        // A payload a pending erasure is due to account for is withheld
+        // while it is pending — the bytes may be seconds from deletion, and
+        // serving them from under an erasure in progress is the same failure
+        // as serving the span. A shared reference that survives (retained
+        // for live spans outside the subject) resurfaces at settle.
+        let Some(mask) = self.erasure_mask() else {
+            return false;
+        };
+        if mask.covers_payload_file(reference) {
+            return true;
+        }
+        // A whole-tenant erasure discovers its span-held references only as
+        // its purge walks them, so `payload_files` is still filling while the
+        // mask already hides the tenant. A scoped fetch must not race that
+        // gap: the tenant is being erased, so nothing of its is served,
+        // whether or not this exact reference has been enumerated yet. The
+        // operator (unscoped) fetch is governed by `payload_files` alone, as
+        // it was — its capability is the hash.
+        tenant.is_some_and(|tenant| mask.covers_tenant(tenant))
     }
 
     /// The eval log's payload references, for the liveness union in

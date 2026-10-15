@@ -114,10 +114,11 @@ over `curl`.
 
 ## The tools
 
-Thirteen tools: eleven reads and two gated writers. They are shaped like the
+Sixteen tools: fourteen reads and two gated writers. They are shaped like the
 questions somebody asks at 2am, not like the route index — two routes may serve
 one tool, and one route may serve two. Most of them describe what is in the
-store; `diagnose_session` is the one that answers a question about it.
+store; `diagnose_session` and `compare_runs` are the ones that answer a
+question about it.
 
 | Tool | The question it answers |
 |---|---|
@@ -132,6 +133,9 @@ store; `diagnose_session` is the one that answers a question about it.
 | `analyze_cost` | Where did the tokens and the money go? |
 | `get_payload` | Show me the full prompt behind this reference |
 | `check_run_guard` | May this run take its next step? |
+| `get_run_tape` | What did this run do, step by step? |
+| `compare_runs` | **Where did this run part from that one, and why?** |
+| `recall_runs` | Has this been done before, and how did it go? |
 | `record_annotation` | Attach a note or rating to a trace or span (**`rw` token + `--mcp-annotations`**) |
 | `promote_failures_to_dataset` | Turn this run's failures into a regression dataset (**`rw` token + `--mcp-promote`**) |
 
@@ -140,13 +144,13 @@ host asks for approval before each call:
 
 | Tool | `readOnlyHint` | `destructiveHint` | `idempotentHint` | `openWorldHint` |
 |---|---|---|---|---|
-| the eleven readers | `true` | — | — | `false` |
+| the fourteen readers | `true` | — | — | `false` |
 | `record_annotation` | `false` | `false` | `false` | `false` |
 | `promote_failures_to_dataset` | `false` | `false` | `false` | `false` |
 
 **Absent annotations are not neutral.** Every hint defaults to the pessimistic
 answer — not read-only, potentially destructive, open world — so a server that
-omits them advertises eleven read tools as though each might delete something and
+omits them advertises fourteen read tools as though each might delete something and
 call out to the internet. A host that gates on that asks for confirmation on
 every call, and one running non-interactively, with nobody to ask, declines
 them. `destructiveHint` and `idempotentHint` are meaningful only when
@@ -165,7 +169,7 @@ whole failure mode — which is why it is also named in the server's
 `instructions`, where a host puts it in front of the model once rather than per
 call.
 
-Four tools are worth knowing the reasoning behind:
+The reasoning behind these is worth knowing:
 
 - **`diagnose_session` instead of reading a trace and judging its shape.** It
   examines every span of a run and reports the outcome, the step the failure is
@@ -188,6 +192,19 @@ Four tools are worth knowing the reasoning behind:
 - **`get_payload` is separate from the search tools on purpose.** Pulling a
   large third-party document into a context window should be a decision, not a
   side effect of a search matching a span.
+- **`get_run_tape`, `compare_runs` and `recall_runs` read runs, not spans.** A
+  run is a session id or `trace:<trace_id>`; its steps are its model calls,
+  tool calls and agent invocations in order. `get_run_tape` renders them with
+  short input and output previews; `compare_runs` aligns two runs and names
+  the first divergence — different input, a different decision on the same
+  input, a different model or parameters, or a step only one run has — with
+  both runs' cost, tokens, errors and outcome in structured content;
+  `recall_runs` finds earlier runs whose text contains every word of a query,
+  successful ones first, each with a skeleton of the steps it took. They are
+  the [replay guide](replay.md)'s tapes, diffs and recall. There is
+  deliberately no tool that creates a replay: a replay serves model answers to
+  an agent harness, and letting the model under test create one would let
+  stored telemetry choose which recording its next run is fed.
 
 **`check_run_guard` reads a run's [fuse](guard.md) verdict** — `continue`,
 `warn` or `stop` — with its reasons, policy, limits and usage: the same
@@ -202,7 +219,7 @@ stopped agent cannot talk its way past its own fuse. It answers what is
 recorded, which is the pre-call check without an estimate; an agent wanting
 to price its next step uses
 [`POST /v1/fuses/check`](http-api.md#post-v1fusescheck). On a server started
-with `--no-fuses` it is not listed — ten reads, then — and a call naming it
+with `--no-fuses` it is not listed — thirteen reads, then — and a call naming it
 is refused as invalid params.
 
 **The eval entities are not on this surface.** Datasets, versions, examples,
@@ -273,11 +290,12 @@ honest caveat: the budget anchors per engine operation, not per tool call,
 so a tool composed of several folds — `describe_store` runs half a dozen —
 can spend several budgets end to end.
 
-`analyze_cost` and `list_sessions` additionally return `structuredContent`
-against a declared `outputSchema`, because their rows are small, genuinely
-tabular, and the thing a client is most likely to chart. Everything else is
-text only — for span data the compact rendering is strictly better, and sending
-both doubles the bytes for identical information.
+`list_sessions`, `diagnose_session`, `analyze_cost`, `check_run_guard`,
+`compare_runs` and `recall_runs` additionally return `structuredContent` against a declared
+`outputSchema`, because their answers are small, genuinely tabular or
+record-shaped, and the thing a client is most likely to chart or act on.
+Everything else is text only — for span data the compact rendering is strictly
+better, and sending both doubles the bytes for identical information.
 
 Both halves are budgeted together, and trimmed in lockstep: the ceiling bounds
 the tool result a client receives, not one field of it. Rows come off both at
@@ -466,7 +484,8 @@ bounding is what a data source can honestly offer.
   specification's negotiation rule, and the client decides whether to continue.
   An `MCP-Protocol-Version` header naming an unsupported revision is a `400`.
   Older revisions are refused rather than half-served: `structuredContent`,
-  which two tools return, does not exist before `2025-06-18`.
+  which every tool declaring an `outputSchema` returns, does not exist before
+  `2025-06-18`.
 - **Origin is validated against an allowlist the operator controls.** A
   request carrying an `Origin` that is neither a loopback page nor named by
   `--mcp-allowed-origin` is refused with `403`. Native MCP clients send no

@@ -65,6 +65,10 @@ use serde_json::{json, Value};
 use traza::tail::{TailCursor, TailRead};
 use traza::{CompactionConfig, Config, Durability, Profile, Span, SpanCursor, SpanFilter, Store};
 
+// Tapes, replays, diffs and recall: their routes live beside this file.
+#[path = "traza-server/replay_routes.rs"]
+mod replay_routes;
+
 const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 // Headers get a far tighter budget than bodies: without one, a 64 MiB
 // garbage "header" plus a 64 MiB declared body doubles the documented
@@ -182,6 +186,8 @@ impl RouteClass {
                 Self::Lookup
             }
             ("GET", "/v1/annotations") => Self::Lookup,
+            ("GET", path) if path.starts_with("/v1/tapes/") => Self::Lookup,
+            ("GET", "/v1/diff" | "/v1/recall") => Self::Stats,
             _ => Self::Other,
         }
     }
@@ -650,6 +656,7 @@ besides loopback)] \
 (the global default run-fuse policy; 0 removes a limit) \
 [--fuse-action stop|warn (default warn)] [--fuse-max-runs N (live runs kept; default 100000)] \
 [--no-fuses (do not observe runs; every /v1/fuses route answers 409)] \
+[--tape-max-bytes N (payload bytes one tape or replay inlines; default 8MiB)] \
 [--allow-unauthenticated-non-loopback] [--version] \
 [--restore BACKUP_DIR (install a backup into --data-dir, then serve it)]\n\
        traza-server mcp --url URL [--token TOKEN] \
@@ -672,6 +679,8 @@ struct Options {
     profile: Profile,
     compaction_enabled: bool,
     mcp: McpOptions,
+    /// `--tape-max-bytes`: payload bytes one tape (or replay) inlines.
+    tape_max_bytes: usize,
     config: Config,
 }
 
@@ -744,6 +753,7 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
     let mut max_batch_spans = traza::caps::DEFAULT_MAX_BATCH_SPANS as u64;
     let cap = |value: u64| (value > 0).then_some(value as usize);
     let mut fuses = traza::guard::FuseConfig::default();
+    let mut tape_max_bytes = traza::tape::DEFAULT_TAPE_MAX_BYTES;
 
     let value = |i: usize, name: &str| -> Result<&String, String> {
         args.get(i)
@@ -1000,6 +1010,10 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
             "--allow-unauthenticated-non-loopback" => {
                 allow_unauthenticated_non_loopback = true;
             }
+            "--tape-max-bytes" => {
+                i += 1;
+                tape_max_bytes = number(i, "--tape-max-bytes")? as usize;
+            }
             "--help" | "-h" => {
                 println!("{USAGE}");
                 return Ok(None);
@@ -1037,6 +1051,7 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
         profile,
         compaction_enabled,
         mcp,
+        tape_max_bytes,
         config: Config {
             // Explicit flag beats profile beats built-in default, in that
             // order and regardless of where each appeared.
@@ -1194,8 +1209,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         profile,
         compaction_enabled,
         mcp,
+        tape_max_bytes,
         config,
     } = options;
+    replay_routes::configure(tape_max_bytes);
     let durability = config.durability;
 
     // Bearer auth from TRAZA_TOKENS; unset is allowed on loopback by default.
@@ -1840,13 +1857,21 @@ fn handle_connection(
         // to list it.
         let is_admin_surface = head_path == "/v1/admin" || head_path.starts_with("/v1/admin/");
         let needs_admin = is_erasure_write || is_eval_tombstone || is_backup || is_admin_surface;
+        // Replay routes are reads under any method, and their call routes
+        // also accept the token as `x-api-key`; see `replay_routes`.
+        let is_replay = replay_routes::is_replay_path(head_path);
+        let presented = replay_routes::presented_credential(
+            head.authorization.as_deref(),
+            head.x_api_key.as_deref(),
+            head_path,
+        );
         let mut access = traza::mcp::Access::ReadWrite;
         let mut principal: Option<traza::auth::Principal> = None;
         let credentials = engine.credentials();
         let enforced = credentials.enforced();
         if enforced {
             let verdict = credentials
-                .authenticate(head.authorization.as_deref(), traza::mcp::unix_nanos_now())
+                .authenticate(presented.as_deref(), traza::mcp::unix_nanos_now())
                 .and_then(|granted| {
                     use traza::auth::{AuthFailure, Required};
                     // Binding first: a bound credential on a store-global
@@ -1854,7 +1879,7 @@ fn handle_connection(
                     if granted.tenant.is_some() && (is_operator_surface || is_admin_surface) {
                         return Err(AuthFailure::Forbidden(Required::Unbound));
                     }
-                    let allowed = if is_mcp {
+                    let allowed = if is_mcp || is_replay {
                         true
                     } else if needs_admin {
                         granted.scope == traza::auth::Scope::Admin
@@ -2169,6 +2194,18 @@ fn serve_request(
         principal,
     ) {
         return responder.json(reply.status, reply.body);
+    }
+    if replay_routes::handles(path) {
+        return replay_routes::serve(
+            responder,
+            &request.method,
+            path,
+            query,
+            &request.body,
+            engine,
+            metrics,
+            principal,
+        );
     }
     match (request.method.as_str(), path) {
         ("POST", "/v1/spans") => {
@@ -4002,6 +4039,9 @@ struct RequestHead {
     mcp_protocol_version: Option<String>,
     /// `Content-Encoding:`, trimmed and lowercased.
     content_encoding: Option<String>,
+    /// `x-api-key:` as sent — the Anthropic SDK's credential header, honoured
+    /// on replay routes only (see `replay_routes::presented_credential`).
+    x_api_key: Option<String>,
     content_length: usize,
     header_end: usize,
 }
@@ -4140,6 +4180,7 @@ fn parse_head(bytes: &[u8], header_end: usize) -> io::Result<RequestHead> {
     let mut origin = None;
     let mut mcp_protocol_version = None;
     let mut content_encoding: Option<String> = None;
+    let mut x_api_key = None;
     let mut header_lines: Vec<&str> = Vec::new();
     for line in lines {
         if let Some((name, value)) = line.split_once(':') {
@@ -4167,6 +4208,9 @@ fn parse_head(bytes: &[u8], header_end: usize) -> io::Result<RequestHead> {
                     Some(previous) => format!("{previous}, {value}"),
                     None => value,
                 });
+            }
+            if name.eq_ignore_ascii_case("x-api-key") {
+                x_api_key = Some(value.trim().to_owned());
             }
         }
         header_lines.push(line);
@@ -4218,6 +4262,7 @@ fn parse_head(bytes: &[u8], header_end: usize) -> io::Result<RequestHead> {
         origin,
         mcp_protocol_version,
         content_encoding,
+        x_api_key,
         content_length,
         header_end,
     })

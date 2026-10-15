@@ -41,6 +41,9 @@ use crate::analytics::{LlmAggregateRow, LlmGroupBy, SessionOrder};
 use crate::annotations::Annotation;
 use crate::{semconv, Error, Span, SpanCursor, SpanFilter, SpanSort, Store};
 
+// get_run_tape, compare_runs and recall_runs live beside this file.
+mod replay_tools;
+
 /// The MCP endpoint path served by `traza-server`.
 pub const ENDPOINT: &str = "/v1/mcp";
 
@@ -53,8 +56,8 @@ pub const PROTOCOL_VERSION: &str = "2025-11-25";
 /// Negotiation follows the specification: a recognized request is echoed back
 /// unchanged, and anything else is answered with [`PROTOCOL_VERSION`] so the
 /// client can decide whether to continue or disconnect. Older revisions are
-/// refused rather than half-served — `structuredContent`, which two tools
-/// return, does not exist before `2025-06-18`.
+/// refused rather than half-served — `structuredContent`, which every tool
+/// declaring an `outputSchema` returns, does not exist before `2025-06-18`.
 pub const SUPPORTED_VERSIONS: [&str; 2] = ["2025-11-25", "2025-06-18"];
 
 /// Opens the block that stored telemetry is rendered inside.
@@ -141,7 +144,7 @@ const MAX_PROMOTED_EXAMPLES: usize = 50;
 /// derived from "the last span that finished" is only meaningful once nothing
 /// more is coming. Inside this window the answer is `unknown`, which is the
 /// honest reading: a run still going has not succeeded yet.
-const SESSION_IDLE_NS: u64 = 900_000_000_000;
+pub(crate) const SESSION_IDLE_NS: u64 = 900_000_000_000;
 
 /// Byte ceilings on what one call may return.
 ///
@@ -624,6 +627,7 @@ impl<'a> Server<'a> {
                 .with_output_schema(guard_output_schema()),
             );
         }
+        tools.extend(replay_tools::definitions());
         if self.annotation_tool_available(access) {
             tools.push(tool(
                 "record_annotation",
@@ -742,6 +746,9 @@ impl<'a> Server<'a> {
                     "check_run_guard is disabled; the server was started with --no-fuses",
                 )
                 .into_response(id)
+            }
+            name if replay_tools::handles(name) => {
+                replay_tools::call(self, name, arguments, &context)
             }
             "record_annotation" if self.annotation_tool_available(context.access) => {
                 self.record_annotation(arguments, context)
@@ -3235,6 +3242,36 @@ fn budgeted_structured_result(
     extra: &[(&str, Value)],
     max_bytes: usize,
 ) -> Value {
+    budgeted_structured_result_narrowing(
+        head,
+        rows,
+        notes,
+        key,
+        structured_rows,
+        extra,
+        max_bytes,
+        (
+            "Narrow with 'since' or a smaller 'limit'.",
+            NARROW_WITH_FILTERS,
+        ),
+    )
+}
+
+/// [`budgeted_structured_result`] for a tool whose arguments narrow it some
+/// other way. `narrow` is the advice a truncation note ends with: the first
+/// when rows are trimmed from both halves, the second when the text alone is
+/// clamped. A truncation note must name an argument the tool actually takes.
+#[allow(clippy::too_many_arguments)]
+fn budgeted_structured_result_narrowing(
+    head: &str,
+    rows: &[String],
+    notes: &[String],
+    key: &str,
+    structured_rows: &[Value],
+    extra: &[(&str, Value)],
+    max_bytes: usize,
+    narrow: (&str, &str),
+) -> Value {
     debug_assert_eq!(rows.len(), structured_rows.len());
     let assemble = |kept: usize, notes: &[String]| -> Value {
         let mut structured = Map::new();
@@ -3248,7 +3285,7 @@ fn budgeted_structured_result(
         json!({
             "content": [{
                 "type": "text",
-                "text": clamp_report(head, &rows[..kept], notes, max_bytes),
+                "text": clamp_report_narrowing(head, &rows[..kept], notes, max_bytes, narrow.1),
             }],
             "structuredContent": Value::Object(structured),
             "isError": false,
@@ -3260,10 +3297,10 @@ fn budgeted_structured_result(
         if kept < rows.len() {
             trimmed.push(format!(
                 "Truncated: {} of {} shown, because the whole result — text and structured \
-                 content together — would exceed this server's --mcp-max-result-bytes. \
-                 Narrow with 'since' or a smaller 'limit'.",
+                 content together — would exceed this server's --mcp-max-result-bytes. {}",
                 kept,
-                count(rows.len() as u64, "row")
+                count(rows.len() as u64, "row"),
+                narrow.0,
             ));
         }
         let candidate = assemble(kept, &trimmed);
@@ -3406,6 +3443,21 @@ fn report(head: &str, rows: &[String], notes: &[String]) -> String {
 /// partial answer as complete and reports it as fact. So the loss is always
 /// stated, along with the argument that would have avoided it.
 fn clamp_report(head: &str, rows: &[String], notes: &[String], max_bytes: usize) -> String {
+    clamp_report_narrowing(head, rows, notes, max_bytes, NARROW_WITH_FILTERS)
+}
+
+/// The truncation advice for tools that take the usual filters.
+const NARROW_WITH_FILTERS: &str = "Narrow with 'since', a 'service', or a smaller 'limit'.";
+
+/// [`clamp_report`] with the tool's own narrowing advice in the truncation
+/// note — which must name an argument the tool takes.
+fn clamp_report_narrowing(
+    head: &str,
+    rows: &[String],
+    notes: &[String],
+    max_bytes: usize,
+    narrow: &str,
+) -> String {
     let full = report(head, rows, notes);
     if full.len() <= max_bytes {
         return full;
@@ -3416,7 +3468,7 @@ fn clamp_report(head: &str, rows: &[String], notes: &[String], max_bytes: usize)
         let mut with_note = notes.to_vec();
         with_note.push(format!(
             "Truncated: {} of {} shown, because the rest would exceed this server's \
-             --mcp-max-result-bytes. Narrow with 'since', a 'service', or a smaller 'limit'.",
+             --mcp-max-result-bytes. {narrow}",
             kept,
             count(rows.len() as u64, "row")
         ));

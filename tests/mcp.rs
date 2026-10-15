@@ -329,17 +329,18 @@ fn every_tool_declares_what_it_does_to_the_store() {
         }
     }
 
-    // Eleven readers and one writer, so a tool added without a decision about
-    // its nature fails here rather than shipping as pessimistically annotated.
-    // (The second writer, promote_failures_to_dataset, needs --mcp-promote and
-    // so is absent from this listing; its own gating test covers it.)
+    // Fourteen readers and one writer, so a tool added without a decision
+    // about its nature fails here rather than shipping as pessimistically
+    // annotated. (The second writer, promote_failures_to_dataset, needs
+    // --mcp-promote and so is absent from this listing; its own gating test
+    // covers it.)
     let read_only = tools
         .iter()
         .filter(|tool| tool["annotations"]["readOnlyHint"] == json!(true))
         .count();
     assert_eq!(
-        read_only, 11,
-        "expected eleven read-only tools, found {read_only}"
+        read_only, 14,
+        "expected fourteen read-only tools, found {read_only}"
     );
 }
 
