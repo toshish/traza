@@ -258,8 +258,9 @@ pub(crate) struct RunState {
     pub(crate) complete: bool,
     /// A policy stop, sticky until reset.
     pub(crate) trip: Option<Trip>,
-    /// Whether the run's warn has been announced.
-    pub(crate) warned: bool,
+    /// The warn level last announced: 0 none, 1 approaching a limit, 2 a
+    /// limit reached under a `warn` policy.
+    pub(crate) warn_level: u8,
     /// Recency position in the guard's eviction order.
     pub(crate) tick: u64,
     /// Server clock at the last observation or query, Unix nanoseconds.
@@ -285,7 +286,7 @@ impl RunState {
             last_span: None,
             complete,
             trip: None,
-            warned: false,
+            warn_level: 0,
             tick: 0,
             last_seen_ns: 0,
         }
@@ -432,13 +433,13 @@ impl RunState {
         }
     }
 
-    /// Clears what a reset clears: the sticky stop, the warn latch, the
+    /// Clears what a reset clears: the sticky stop, the warn level, the
     /// error streak and the repeat table. Cumulative usage is untouched — a
     /// budget does not refill because someone pressed reset; a grant is what
     /// raises it.
     pub(crate) fn reset(&mut self) {
         self.trip = None;
-        self.warned = false;
+        self.warn_level = 0;
         self.error_streak = 0;
         self.repeats.clear();
         self.top = None;

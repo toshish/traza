@@ -36,15 +36,18 @@ is shaped around both:
   refuse a step before it happens, and it is what an agent framework or a
   hook (see [the Claude Code example](../../examples/guard/README.md)) should
   call.
-- **The post-ack verdict is a backstop.** Every ingest response carries the
-  verdicts of the runs in its batch, so a client that does nothing but export
-  still learns its run was stopped — one batch late.
+- **The post-ack verdict is a backstop.** Every ingest response names the
+  runs in its batch whose verdict is not `continue`, so a client that does
+  nothing but export still learns its run was stopped — at least one batch
+  late.
 
 The two agree on where a limit is. Recorded usage *at* a limit has reached
 it: a run holding `max_steps: 50` whose fiftieth step is recorded is stopped,
-so the fifty-first is refused. A hypothetical next step reaches a limit only
-by going *past* it: a run at 49 of 50 may take its fiftieth. Neither surface
-lets a run take step 51.
+so the fifty-first should not start. A hypothetical next step reaches a limit
+only by going *past* it: a run at 49 of 50 may take its fiftieth. So the two
+never disagree about step 51 — the check refuses it, and the acknowledgement
+of step 50 says stop — though a client relying on acknowledgements alone may
+already have started it.
 
 ## Quick start
 
@@ -236,8 +239,10 @@ What a restart loses, and what it does not:
   transition as it happens — a run entering `warn`, a policy `stop`, a
   `manual_stop`, a `reset` — in a ring of 4,096, read by cursor with an
   optional long-poll of up to 30 seconds. An alert dispatcher holding an
-  unbound credential polls it for every tenant. Each warn is announced once
-  per run until the run returns to `continue` or is reset.
+  unbound credential polls it for every tenant. A run's warn is announced
+  when it enters `warn`, and once more if a `warn` policy's limit is then
+  reached — the moment a `stop` policy would have stopped it — and not again
+  until the run returns to `continue` or is reset.
 - **[`GET /v1/fuses/runs`](http-api.md#get-v1fusesruns)** lists live runs by
   verdict, most recently active first — from memory alone, so a partly
   followed run lists with what this process has seen.

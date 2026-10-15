@@ -388,12 +388,18 @@ impl Guard {
             run.trip = judged.new_trip.clone();
             self.trips.fetch_add(1, Ordering::Relaxed);
             self.announce(key, EventKind::Stop, &judged, now);
-        } else if judged.verdict == Verdict::Warn && !run.warned {
-            run.warned = true;
-            self.warnings.fetch_add(1, Ordering::Relaxed);
-            self.announce(key, EventKind::Warn, &judged, now);
+        } else if judged.verdict == Verdict::Warn {
+            // Announced when the level RISES: entering warn, and again when
+            // a warn policy's limit is reached — the moment a stop policy
+            // would have stopped the run, which a dispatcher wants to hear
+            // about separately from "approaching".
+            if judged.warn_level > run.warn_level {
+                self.warnings.fetch_add(1, Ordering::Relaxed);
+                self.announce(key, EventKind::Warn, &judged, now);
+            }
+            run.warn_level = judged.warn_level;
         } else if judged.verdict == Verdict::Continue {
-            run.warned = false;
+            run.warn_level = 0;
         }
         judged
     }
@@ -425,6 +431,29 @@ impl Guard {
     }
 }
 
+/// Everything durable a rebuild's replay depends on besides the spans.
+#[derive(Clone, Debug, PartialEq)]
+struct ReplayInputs {
+    reset_at: Option<u64>,
+    grant: Option<Limits>,
+    policies: Vec<FusePolicy>,
+}
+
+impl ReplayInputs {
+    /// Replays `observations` (in step order) into a complete run state.
+    fn replay(&self, config: &FuseConfig, tenant: &str, observations: &[Observation]) -> RunState {
+        let resolve = |service: &str| {
+            let resolved = policy::resolve(&self.policies, config, tenant, service);
+            let limits = match &self.grant {
+                Some(grant) => resolved.limits.overlaid(grant),
+                None => resolved.limits,
+            };
+            (limits, resolved.action)
+        };
+        state::replay(observations, self.reset_at, &resolve)
+    }
+}
+
 /// A run judged at one moment.
 #[derive(Clone, Debug, Default)]
 struct Judgement {
@@ -436,6 +465,9 @@ struct Judgement {
     tripped_at_ns: Option<u64>,
     tripped_by: Option<TrippedBy>,
     evidence: Vec<SpanRef>,
+    /// For a warn: 1 when limits are only approached, 2 when one is reached
+    /// under a `warn` policy.
+    warn_level: u8,
     /// A policy stop this judgement found that the run does not carry yet.
     new_trip: Option<Trip>,
 }
@@ -479,6 +511,21 @@ impl State {
                     });
                 }
             }
+        }
+    }
+
+    /// What a rebuild of `key` replays against, as of now.
+    fn replay_inputs(&self, key: &RunKey) -> ReplayInputs {
+        let controls = self.controls.get(key);
+        ReplayInputs {
+            reset_at: controls.and_then(|controls| controls.last_reset_ns),
+            grant: controls.and_then(|controls| controls.grant),
+            policies: self
+                .policies
+                .iter()
+                .filter(|policy| policy.tenant == key.tenant)
+                .cloned()
+                .collect(),
         }
     }
 
@@ -560,7 +607,7 @@ impl State {
                 // sent, and a stop observed live stays sticky with the time
                 // and reasons it tripped with — a rebuild refines usage, it
                 // does not un-blow a fuse.
-                run.warned |= previous.warned;
+                run.warn_level = run.warn_level.max(previous.warn_level);
                 if previous.trip.is_some() {
                     run.trip = previous.trip;
                 }
@@ -637,6 +684,7 @@ impl State {
         }
         if state::warns(&assessment, &resolved) {
             judged.verdict = Verdict::Warn;
+            judged.warn_level = if assessment.reached.is_empty() { 1 } else { 2 };
             judged.reasons = assessment.reached;
             judged.reasons.extend(assessment.approaching);
             judged.evidence = assessment.evidence;
@@ -672,10 +720,7 @@ impl State {
             victims.push(key.clone());
         }
         for key in victims {
-            if let Some(run) = self.runs.remove(&key) {
-                self.order.remove(&run.tick);
-                self.tracked = self.tracked.saturating_sub(run.tracked());
-            }
+            self.remove(&key);
         }
     }
 
@@ -802,18 +847,24 @@ impl Store {
             state.rebuilding.entry(key.clone()).or_default().0 += 1;
         }
 
-        // The store is read with no guard lock held. Observations that land
-        // meanwhile are captured for this run and replayed over the result,
-        // so nothing admitted during the read is lost or counted twice.
+        // The store is read, and its spans replayed, with no guard lock held
+        // — a rebuild of a long run must not stall every ingest observer.
+        // Observations that land meanwhile are captured for this run and
+        // replayed over the result, so nothing admitted during the read is
+        // lost or counted twice.
         let deadline = self.query_deadline(Instant::now());
-        let read = self.run_spans(Some(tenant), run, REBUILD_MAX_SPANS, deadline);
-        let observations: Option<Vec<Observation>> = read.as_ref().ok().map(|stored| {
-            stored
-                .spans
-                .iter()
-                .map(|span| Observation::of(self, span))
-                .collect()
-        });
+        let replayed = self
+            .run_spans(Some(tenant), run, REBUILD_MAX_SPANS, deadline)
+            .and_then(|stored| {
+                let observations: Vec<Observation> = stored
+                    .spans
+                    .iter()
+                    .map(|span| Observation::of(self, span))
+                    .collect();
+                let inputs = guard.lock_state()?.replay_inputs(&key);
+                let rebuilt = inputs.replay(&guard.config, tenant, &observations);
+                Ok((observations, inputs, rebuilt))
+            });
 
         let mut state = guard.lock_state()?;
         let pending = match state.rebuilding.get_mut(&key) {
@@ -827,9 +878,9 @@ impl Store {
             }
             None => Vec::new(),
         };
-        let observations = match (observations, read) {
-            (Some(observations), _) => observations,
-            (None, Err(error)) => {
+        let (observations, inputs, mut rebuilt) = match replayed {
+            Ok(replayed) => replayed,
+            Err(error) => {
                 if state.runs.contains_key(&key) {
                     state.entry(&key, now);
                     let judged = state.judge(&guard.config, &key, next, now);
@@ -837,25 +888,15 @@ impl Store {
                 }
                 return Err(error);
             }
-            (None, Ok(_)) => unreachable!("observations exist exactly when the read succeeded"),
         };
         // A concurrent rebuild may have installed first; its answer stands.
         if !state.runs.get(&key).is_some_and(|live| live.complete) {
-            let reset_at = state
-                .controls
-                .get(&key)
-                .and_then(|controls| controls.last_reset_ns);
-            let policies = state.policies.clone();
-            let grant = state.controls.get(&key).and_then(|controls| controls.grant);
-            let resolve = |service: &str| {
-                let resolved = policy::resolve(&policies, &guard.config, tenant, service);
-                let limits = match &grant {
-                    Some(grant) => resolved.limits.overlaid(grant),
-                    None => resolved.limits,
-                };
-                (limits, resolved.action)
-            };
-            let mut rebuilt = state::replay(&observations, reset_at, &resolve);
+            // A reset or a policy edit that landed during the replay changes
+            // what it must say. Rare, so the replay is simply redone.
+            let current = state.replay_inputs(&key);
+            if current != inputs {
+                rebuilt = current.replay(&guard.config, tenant, &observations);
+            }
             for observation in &pending {
                 rebuilt.absorb(observation, false);
             }
@@ -1454,6 +1495,62 @@ mod tests {
         let mut rendered = String::new();
         store.render_fuse_metrics(&mut rendered);
         assert!(rendered.is_empty());
+    }
+
+    #[test]
+    fn a_warn_policy_announces_approaching_and_then_reached() {
+        let fixture = TempStore::open(
+            "warnlevels",
+            FuseConfig {
+                limits: Limits {
+                    max_steps: Some(5),
+                    ..Limits::default()
+                },
+                ..FuseConfig::default()
+            },
+        );
+        let store = fixture.store();
+        let step = |id: &str| tool_span("w", id, "search", id, 1);
+        let mut kinds = Vec::new();
+        for batch in [vec!["a", "b", "c", "d"], vec!["e"], vec!["f"]] {
+            let admission = store
+                .ingest_batch(batch.into_iter().map(step).collect())
+                .expect("ingests");
+            kinds.push(admission.signals[0].reasons.clone());
+        }
+        assert_eq!(kinds[0], ["max_steps 5 at 80%: 4 steps"]);
+        assert_eq!(
+            kinds[1],
+            ["max_steps 5 reached: 5 steps"],
+            "warn, never stop"
+        );
+        let feed = store
+            .fuse_events(None, None, Duration::ZERO)
+            .expect("events");
+        let reasons: Vec<&str> = feed
+            .events
+            .iter()
+            .map(|event| event.reasons[0].as_str())
+            .collect();
+        // Entering warn, then reaching the limit; the sixth step is still at
+        // the reached level and is not announced again.
+        assert_eq!(
+            reasons,
+            [
+                "max_steps 5 at 80%: 4 steps",
+                "max_steps 5 reached: 5 steps"
+            ]
+        );
+        let mut rendered = String::new();
+        store.render_fuse_metrics(&mut rendered);
+        assert!(
+            rendered.contains("traza_fuse_warnings_total 2\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("traza_fuse_trips_total 0\n"),
+            "{rendered}"
+        );
     }
 
     #[test]

@@ -86,6 +86,13 @@ impl FuseLog {
     /// because skipping it would silently drop a later kill switch.
     pub(crate) fn open(directory: &Path) -> Result<(Self, Vec<Record>)> {
         let path = directory.join(LOG_NAME);
+        // A rewrite a crash interrupted before its rename: the log itself is
+        // intact, and the erasure that started the rewrite resumes and
+        // redoes it.
+        match fs::remove_file(path.with_extension("jsonl.tmp")) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+            _ => {}
+        }
         let mut records = Vec::new();
         if path.exists() {
             let contents = fs::read(&path)?;

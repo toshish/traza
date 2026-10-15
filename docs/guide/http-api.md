@@ -1513,9 +1513,9 @@ curl 'http://127.0.0.1:8080/v1/fuses/events?wait_ms=0'
 {"events":[{"at_ns":1792062221822334000,"cursor":"1792062221423179000.1","kind":"stop","policy":"support","reasons":["max_repeats 4 reached: tool:search_orders#465a6bab9a1c447d repeated 4 times"],"run":"sess-7f3a","tenant":""},{"at_ns":1792062221847207000,"cursor":"1792062221423179000.2","kind":"warn","policy":"support","reasons":["max_cost_usd 2 at 85%: $1.7 spent"],"run":"sess-9c21","tenant":""},{"at_ns":1792062221850690000,"cursor":"1792062221423179000.3","kind":"reset","policy":"support","reasons":["reset with grant {\"max_repeats\":8}"],"run":"sess-7f3a","tenant":""},{"at_ns":1792062221860163000,"cursor":"1792062221423179000.4","kind":"manual_stop","policy":"support","reasons":["manually tripped: customer escalated; take over by hand"],"run":"sess-9c21","tenant":""}],"next":"1792062221423179000.4"}
 ```
 
-`kind` is `warn` (a run entered `warn`; announced once until it returns to
-`continue` or is reset), `stop` (a policy stopped it), `manual_stop` or
-`reset`. Pass `next` back as `after`; it advances past events a tenant filter
+`kind` is `warn` (a run entered `warn`, or a `warn` policy's limit was
+then reached; not repeated until the run returns to `continue` or is reset),
+`stop` (a policy stopped it), `manual_stop` or `reset`. Pass `next` back as `after`; it advances past events a tenant filter
 skipped, so a filtered reader keeps pace with the feed. A read returns as soon
 as a matching event exists, at most 1,000 at a time.
 
