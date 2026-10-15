@@ -77,6 +77,14 @@ trailers and has no declared length.
 | `GET` | [`/v1/stats/duration`](#get-v1statsduration) | Duration distribution and percentiles |
 | `GET` | [`/v1/stats/failures`](#get-v1statsfailures) | Errors grouped by signature |
 | `GET` | [`/v1/stats/slowest`](#get-v1statsslowest) | The slowest matching spans |
+| `GET` | [`/v1/tapes/{run}`](#get-v1tapesrun) | A run's steps in order, with inputs, outputs and digests |
+| `POST` | [`/v1/replays`](#post-v1replays) | Snapshot a run for replay |
+| `GET` | [`/v1/replays/{id}`](#get-v1replaysid) | What a replay has served |
+| `POST` | [`/v1/replays/{id}/openai/v1/chat/completions`](#post-v1replaysidopenaiv1chatcompletions) | The next recorded model answer, as an OpenAI chat completion |
+| `POST` | [`/v1/replays/{id}/anthropic/v1/messages`](#post-v1replaysidanthropicv1messages) | The next recorded model answer, as an Anthropic message |
+| `POST` | [`/v1/replays/{id}/tools/next`](#post-v1replaysidtoolsnext) | The next recorded tool result |
+| `GET` | [`/v1/diff`](#get-v1diff) | Two runs aligned, and where they first diverge |
+| `GET` | [`/v1/recall`](#get-v1recall) | Earlier runs containing the same words, successes first |
 | `POST` | [`/v1/annotations`](#post-v1annotations) | Attach a score or feedback record |
 | `GET` | [`/v1/annotations`](#get-v1annotations) | Query annotations |
 | `POST` | [`/v1/datasets`](#post-v1datasets) | Create a dataset |
@@ -860,6 +868,243 @@ server to hold the match set in memory.
 
 ---
 
+## Runs: tapes, replays, diffs and recall
+
+A **run** is a session id, or `trace:<trace_id>` for one trace
+([run identity](../llm-semantics.md#run-identity)); its **steps** are its
+`llm`, `tool` and `agent` spans in `(start, trace, span)` order. These routes
+read runs that way. The [replay guide](replay.md) walks through them with a
+worked example; this section is the reference.
+
+Every route here takes the usual `tenant=` selector and binding: a bound
+credential reads its own tenant, and naming another is `403`. A run that has
+no spans under the caller's scope is `404 {"error":"run not found"}`.
+
+**Replay routes are reads under any method.** Creating a replay snapshots the
+store and changes nothing in it, and the provider-shaped routes must be `POST`s
+because that is what an SDK sends — so every route under `/v1/replays` accepts
+any valid credential, `ro` included. And on the routes under `/v1/replays/`
+only, `x-api-key: TOKEN` (the Anthropic SDK's header) is accepted as the
+credential when `Authorization` is absent.
+
+### `GET /v1/tapes/{run}`
+
+The run's tape.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `tenant` | string | Tenant scope, as on every route |
+| `resolve` | `true` / `false` | Inline `$payload` references in requests and responses, up to `--tape-max-bytes` of payload content per tape. Default `false` |
+| `max_steps` | integer | Steps to return. Default and maximum 20,000 |
+
+```sh
+curl 'http://localhost:8080/v1/tapes/weather-7?max_steps=1'
+```
+
+```json
+{"run":"weather-7","spans_examined":4,"steps":[{"duration_ns":390000000,"fingerprint":"llm:gpt-4o-2024-08-06#8b9a07d4aac0a133","index":0,"kind":"llm","model":"gpt-4o-2024-08-06","name":"openai.chat","parent_span_id":"wf","request":[{"content":"You are a weather assistant.","role":"system"},{"content":"What's the weather in Paris?","role":"user"}],"request_digest":"8b9a07d4aac0a133c789406dfccd9477618c1049ca0255f58b262fc72fca3d8b","response":[{"finish_reason":"tool_calls","role":"assistant","tool_calls":[{"arguments":{"city":"Paris"},"id":"call_w1","name":"get_weather"}]}],"response_digest":"bc0a9a93dfc45c687262d0e46fceb83a1c7c92d362ccb045210310872c51d35f","service":"weather-agent","span_id":"llm-1","start_ns":1791964800010000000,"status":"ok","tokens":{"cache_read":null,"cache_write":null,"input":82,"output":17},"trace_id":"4bf92f3577b34da6a3ce929d0e0e4736"}],"tenant":null,"truncated":true}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `run` | string | The run id asked for |
+| `tenant` | string or null | The tenant scope read under; `null` is the operator view across tenants |
+| `steps[].index` | integer | Position on the tape, from 0 |
+| `steps[].kind` | string | `llm`, `tool` or `agent` |
+| `steps[].name`, `service`, `status` | string | The span's own fields |
+| `steps[].model`, `tool`, `agent` | string | Present when the span names one |
+| `steps[].start_ns`, `duration_ns` | integer | Start time and `end - start` |
+| `steps[].request`, `response` | any | The step's input and output as stored ([precedence](../llm-semantics.md#input-and-output)); omitted when not recorded |
+| `steps[].request_digest`, `response_digest` | string | SHA-256 of the **stored** value's canonical JSON, or the content address of a `$payload` reference |
+| `steps[].fingerprint` | string | `kind:name#` plus 16 hex characters of the request digest |
+| `steps[].tokens` | object | `input`, `output`, `cache_read`, `cache_write`; each `null` when not reported |
+| `steps[].cost_usd` | number | Metered, or priced from `--pricing`; omitted when neither |
+| `truncated` | boolean | The run had more than 20,000 spans, or more steps than `max_steps` |
+| `spans_examined` | integer | Spans read, steps and non-steps alike |
+| `resolved_partial` | boolean | Only with `resolve=true`: some reference stayed a reference — the byte budget ran out (the cut is a prefix: everything after the first reference that did not fit stays unresolved), or its bytes are gone |
+
+### `POST /v1/replays`
+
+Snapshots a run's tape into a replay that serves its model answers back.
+
+```sh
+curl -X POST http://localhost:8080/v1/replays -d '{"run":"weather-7","mode":"loose"}'
+```
+
+```json
+{"base_urls":{"anthropic":"/v1/replays/rp_70235b53074a150e1cca9771c76a88bf/anthropic","openai":"/v1/replays/rp_70235b53074a150e1cca9771c76a88bf/openai/v1"},"expires_at_ns":1792065849919268000,"id":"rp_70235b53074a150e1cca9771c76a88bf","llm_steps":2,"mode":"loose","run":"weather-7","steps":3}
+```
+
+| Body field | Type | Description |
+|---|---|---|
+| `run` | string, required | The run to replay |
+| `tenant` | string | Tenant scope; a bound credential's own tenant by default |
+| `mode` | `strict` / `loose` | `strict` (default) refuses a request whose messages do not match the recorded step; `loose` serves in order regardless. See [matching](#post-v1replaysidopenaiv1chatcompletions) |
+
+`201` on success. The replay lives in memory for one hour from creation and
+does not survive a restart. A replay created under a tenant is usable by that
+tenant's credentials and unbound operators; one created from the operator view
+(no tenant) by unbound operators only.
+
+| Response | Cause |
+|---|---|
+| `400 {"error":"…"}` | Missing `run`, unknown field, or a bad `mode` / `tenant` |
+| `403` | A bound credential named another tenant |
+| `404 {"error":"run not found"}` | No spans carry that run id in scope |
+| `409 {"error":"step 0 (llm:gpt-4o) recorded no response — …"}` | A model step cannot be replayed: no recorded answer (content capture off), an answer or (strict) a request that is an unreadable offloaded payload, or (strict) a request recorded as text rather than a message list. The message names the step and the remedy |
+| `429` with `Retry-After` | 1,024 live replays, or 512 MiB of snapshotted answers, already held. Seconds until the oldest expires; a live replay is never evicted |
+
+### `GET /v1/replays/{id}`
+
+What a replay has served.
+
+```json
+{"calls":[{"at_ns":1792062255964194000,"matched":true,"step":0}],"diverged":null,"expires_at_ns":1792065849919268000,"id":"rp_70235b53074a150e1cca9771c76a88bf","mode":"loose","remaining":1,"run":"weather-7","served":1}
+```
+
+`served` and `remaining` count model steps. `calls` lists each model call
+served or refused for divergence — `step` is its tape index and `matched`
+whether its messages matched the recording (informational in loose mode) — up
+to 4,096 entries. `diverged` is the first divergence, `{"step",
+"expected_digest", "got_digest"}`, or `null`. An unknown, expired or foreign
+replay is `404 {"error":"replay not found"}`.
+
+### `POST /v1/replays/{id}/openai/v1/chat/completions`
+
+The OpenAI SDK's chat-completions call, answered with the next recorded model
+step: set the SDK's base URL to the replay's `base_urls.openai`. The body is an
+ordinary chat-completions request. The answer is a `chat.completion` object —
+the recorded text, the recorded tool calls as `tool_calls` (arguments as a JSON
+string), the recorded finish reason translated into OpenAI's vocabulary, the
+recorded model and token usage. With `"stream": true` it is
+`text/event-stream`: `chat.completion.chunk` events, a usage chunk when
+`stream_options.include_usage` is set, then `data: [DONE]`. The stream is
+reconstructed from stored text in Traza's own chunking.
+
+**Matching.** Model steps are served in recorded order. In `strict` mode the
+request's `messages` are normalised into the message shape step facts use and
+digested; the recorded request is normalised the same way (for the indexed
+layouts and native events its digest is the tape's `request_digest`). Only the
+messages are compared — not the model or other parameters.
+
+| Response | Cause |
+|---|---|
+| `200` | The next recorded answer; the step is consumed |
+| `400 {"error":{"type":"invalid_request_error",…}}` | The body is not a JSON object with a `messages` array; or a path other than `chat/completions` under the base URL |
+| `404 {"error":{"type":"not_found_error",…}}` | Unknown, expired or foreign replay |
+| `409 {"error":{"type":"replay_divergence","message","step","expected_digest","got_digest"}}` | Strict mode: the messages do not match recorded step `step`. The step is **not** consumed. Carries `x-should-retry: false` |
+| `410 {"error":{"type":"replay_exhausted","message","served"}}` | Every recorded model step has been served. Carries `x-should-retry: false` |
+
+### `POST /v1/replays/{id}/anthropic/v1/messages`
+
+The Anthropic SDK's messages call, by the same rules: set the SDK's base URL
+to the replay's `base_urls.anthropic`. A `system` prompt is normalised as a
+leading system message. The answer is a `message` object — a `text` block for
+the recorded text and a `tool_use` block per recorded tool call, the recorded
+stop reason translated into Anthropic's vocabulary, and usage including
+`cache_read_input_tokens` / `cache_creation_input_tokens` when recorded. A
+recording holding several assistant messages is served as one message. With
+`"stream": true`: `message_start`, `content_block_start` / `content_block_delta`
+(`text_delta`, `input_json_delta`) / `content_block_stop` per block,
+`message_delta`, `message_stop`.
+
+```sh
+curl -X POST http://localhost:8080/v1/replays/rp_70235b53074a150e1cca9771c76a88bf/anthropic/v1/messages \
+  -H 'x-api-key: TOKEN' -H 'anthropic-version: 2023-06-01' \
+  -d '{"model":"claude-x","max_tokens":256,"system":"You are a weather assistant.","messages":[{"role":"user","content":"What'"'"'s the weather in Paris?"}]}'
+```
+
+```json
+{"content":[{"id":"call_w1","input":{"city":"Paris"},"name":"get_weather","type":"tool_use"}],"id":"msg_traza70235b53074as0","model":"gpt-4o-2024-08-06","role":"assistant","stop_reason":"tool_use","stop_sequence":null,"type":"message","usage":{"input_tokens":82,"output_tokens":17}}
+```
+
+Errors take Anthropic's shape, `{"type":"error","error":{"type",…}}`, with the
+same statuses and types as the OpenAI route:
+
+```json
+{"error":{"message":"all 2 recorded model calls have been served","served":2,"type":"replay_exhausted"},"type":"error"}
+```
+
+### `POST /v1/replays/{id}/tools/next`
+
+The next recorded tool step not yet served, on a cursor independent of the
+model steps — for a harness that replays tool results instead of running the
+tools. Body `{"tool": "<name>"}` takes the next one with that name; an empty
+body or `{}` takes the next of any name.
+
+```json
+{"arguments":{"city":"Paris"},"result":{"celsius":12,"forecast":"rain"},"step":1,"tool":"get_weather"}
+```
+
+`410 {"error":{"type":"replay_exhausted",…}}` when none is left; `404
+{"error":"replay not found"}` for an unknown replay.
+
+### `GET /v1/diff`
+
+Two runs aligned step by step. Parameters: `a` and `b` (required run ids),
+`tenant`.
+
+```sh
+curl 'http://localhost:8080/v1/diff?a=weather-7&b=weather-8'
+```
+
+```json
+{"a":{"cost_usd":0.0,"duration_ns":1000000000,"errors":0,"outcome":"success","run":"weather-7","steps":3,"tokens":233},"aligned":[{"a":0,"b":0,"fingerprint_a":"llm:gpt-4o-2024-08-06#8b9a07d4aac0a133","fingerprint_b":"llm:gpt-4o-2024-08-06#1ae84ec741143bc4","op":"changed","why":"input"},{"a":1,"b":1,"fingerprint_a":"tool:get_weather#6e1e312d537bc71b","fingerprint_b":"tool:get_weather#ac8cc520a3295a36","op":"changed","why":"input"},{"a":2,"b":2,"fingerprint_a":"llm:gpt-4o-2024-08-06#6db28425e9e18cdb","fingerprint_b":"llm:gpt-4o-2024-08-06#592c7b1d345f6104","op":"changed","why":"input"}],"b":{"cost_usd":0.0,"duration_ns":1000000000,"errors":0,"outcome":"success","run":"weather-8","steps":3,"tokens":233},"delta":{"cost_usd":0.0,"duration_ns":0,"errors":0,"steps":0,"tokens":0},"first_divergence":{"a":0,"b":0,"explanation":"step 0 of a and step 0 of b (llm:gpt-4o-2024-08-06) received different input: request 8b9a07d4aac0 in a, 1ae84ec74114 in b","kind":"input"},"truncated":false}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `a`, `b` | object | Per run: `run`, `steps`, `cost_usd` and `tokens` over every span (cost metered or priced), `duration_ns` (latest end minus earliest start), `errors` (spans with status `error`), `outcome` (`success`, `failure`, `abandoned`, `unknown`) |
+| `aligned[]` | array | `op` (`same`, `changed`, `insert`, `delete`), the step index on each side (`null` on the side without it), both fingerprints, and `why` (`input`, `decision`, `config`, `structure`) unless `same` |
+| `first_divergence` | object or null | The first entry that is not `same`: `a`, `b`, `kind`, `explanation`. For an insertion or deletion the side without the step reports the index of its next step |
+| `delta` | object | `b` minus `a`: `cost_usd`, `tokens`, `duration_ns`, `errors`, `steps` |
+| `truncated` | boolean | A side had more than 5,000 steps; the alignment describes prefixes |
+
+Alignment is a longest common subsequence over `kind:name` signatures. Equal
+signature, input, output and configuration is `same`; a different input is
+`input`; the same input with a different output is `decision`; a model call
+whose `gen_ai.request.*` parameters differ is `config`, and so is a model swap
+— two model calls naming different models in the same unaligned stretch are
+paired as one `config` change. A step only one run has is `structure`. Step
+status is not compared. `404 {"error":"run not found: <run>"}` names a run
+with no spans; `400` when `a` or `b` is missing.
+
+### `GET /v1/recall`
+
+Earlier runs whose recorded text contains every word of `q`.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `q` | string, required | Words every matching span must contain — whole words, any order, exactly as [`content=`](#content-search-content) |
+| `outcome` | `success` / `failure` / `any` | Only runs that ended this way. Default `any`, which ranks successes first |
+| `limit` | integer | Runs to return. Default 10, capped at 50 |
+| `tenant` | string | Tenant scope |
+
+```sh
+curl 'http://localhost:8080/v1/recall?q=weather+Paris&limit=1'
+```
+
+```json
+{"runs":[{"cost_usd":0.0,"last_end_ns":1791964801000000000,"outcome":"success","outcome_source":"derived","run":"weather-7","score":3,"skeleton":["llm:gpt-4o-2024-08-06","tool:get_weather","llm:gpt-4o-2024-08-06"],"skeleton_truncated":false,"steps":3,"tenant":""}],"truncated":false}
+```
+
+Ranking: outcome first (successes first under `any`), then `score` — the
+number of the run's spans that matched — then the latest `last_end_ns`. Each
+run carries `outcome_source` (`declared` or `derived`), `goal` when a span
+declared one, `steps`, `cost_usd`, and a `skeleton`: step signatures in order
+with consecutive repeats folded as `"tool:search x3"`, at most 40 entries
+(`skeleton_truncated` says when more were cut). A failed run adds `cause`,
+`{"trace_id","span_id","name","rule"}`, the step its failure is attributed to.
+`tenant` disambiguates a run id two tenants share in the operator view. A run
+whose last span ended within the last 15 minutes is `unknown`.
+
+Recall groups the newest 5,000 matching spans into runs and reads the 100 runs
+with the most matches among them; `truncated: true` says the first bound
+applied. A `q` with no ASCII letters or digits is `400` — it could match
+nothing.
+
+---
+
 ## Annotations
 
 ### `POST /v1/annotations`
@@ -1559,7 +1804,7 @@ Streamable HTTP transport, one message per request. **Served only when the
 server was started with `--mcp`**; otherwise every method answers `404` with
 the flag named.
 
-This route is documented in full in **[the MCP guide](mcp.md)** — its ten
+This route is documented in full in **[the MCP guide](mcp.md)** — its fifteen
 tools, five resources, three templates and four prompts, and what each returns.
 What belongs here is the transport contract:
 

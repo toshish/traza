@@ -415,7 +415,7 @@ fn explain(entry: &Aligned, kind: DivergenceKind, a: &[TapeStep], b: &[TapeStep]
     match (entry.a.map(|i| &a[i]), entry.b.map(|j| &b[j])) {
         (Some(left), Some(right)) => {
             let at = format!(
-                "step {} of a and {} of b ({})",
+                "step {} of a and step {} of b ({})",
                 left.index, right.index, left.detail.signature
             );
             match kind {
@@ -431,7 +431,7 @@ fn explain(entry: &Aligned, kind: DivergenceKind, a: &[TapeStep], b: &[TapeStep]
                     preview(right.response_digest.as_ref()),
                 ),
                 DivergenceKind::Config if left.model != right.model => format!(
-                    "step {} of a and {} of b is the same model call with a different model: \
+                    "step {} of a and step {} of b is the same model call with a different model: \
                      {} in a, {} in b",
                     left.index,
                     right.index,

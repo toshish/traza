@@ -114,10 +114,11 @@ over `curl`.
 
 ## The tools
 
-Twelve tools: ten reads and two gated writers. They are shaped like the
+Fifteen tools: thirteen reads and two gated writers. They are shaped like the
 questions somebody asks at 2am, not like the route index — two routes may serve
 one tool, and one route may serve two. Most of them describe what is in the
-store; `diagnose_session` is the one that answers a question about it.
+store; `diagnose_session` and `compare_runs` are the ones that answer a
+question about it.
 
 | Tool | The question it answers |
 |---|---|
@@ -131,6 +132,9 @@ store; `diagnose_session` is the one that answers a question about it.
 | `slowest_spans` | What is slow? |
 | `analyze_cost` | Where did the tokens and the money go? |
 | `get_payload` | Show me the full prompt behind this reference |
+| `get_run_tape` | What did this run do, step by step? |
+| `compare_runs` | **Where did this run part from that one, and why?** |
+| `recall_runs` | Has this been done before, and how did it go? |
 | `record_annotation` | Attach a note or rating to a trace or span (**`rw` token + `--mcp-annotations`**) |
 | `promote_failures_to_dataset` | Turn this run's failures into a regression dataset (**`rw` token + `--mcp-promote`**) |
 
@@ -139,13 +143,13 @@ host asks for approval before each call:
 
 | Tool | `readOnlyHint` | `destructiveHint` | `idempotentHint` | `openWorldHint` |
 |---|---|---|---|---|
-| the ten readers | `true` | — | — | `false` |
+| the thirteen readers | `true` | — | — | `false` |
 | `record_annotation` | `false` | `false` | `false` | `false` |
 | `promote_failures_to_dataset` | `false` | `false` | `false` | `false` |
 
 **Absent annotations are not neutral.** Every hint defaults to the pessimistic
 answer — not read-only, potentially destructive, open world — so a server that
-omits them advertises ten read tools as though each might delete something and
+omits them advertises thirteen read tools as though each might delete something and
 call out to the internet. A host that gates on that asks for confirmation on
 every call, and one running non-interactively, with nobody to ask, declines
 them. `destructiveHint` and `idempotentHint` are meaningful only when
@@ -187,6 +191,19 @@ Four tools are worth knowing the reasoning behind:
 - **`get_payload` is separate from the search tools on purpose.** Pulling a
   large third-party document into a context window should be a decision, not a
   side effect of a search matching a span.
+- **`get_run_tape`, `compare_runs` and `recall_runs` read runs, not spans.** A
+  run is a session id or `trace:<trace_id>`; its steps are its model calls,
+  tool calls and agent invocations in order. `get_run_tape` renders them with
+  short input and output previews; `compare_runs` aligns two runs and names
+  the first divergence — different input, a different decision on the same
+  input, a different model or parameters, or a step only one run has — with
+  both runs' cost, tokens, errors and outcome in structured content;
+  `recall_runs` finds earlier runs whose text contains every word of a query,
+  successful ones first, each with a skeleton of the steps it took. They are
+  the [replay guide](replay.md)'s tapes, diffs and recall. There is
+  deliberately no tool that creates a replay: a replay serves model answers to
+  an agent harness, and letting the model under test create one would let
+  stored telemetry choose which recording its next run is fed.
 
 **The eval entities are not on this surface.** Datasets, versions, examples,
 experiments, runs and scores are served over HTTP only — no tool reads them,
