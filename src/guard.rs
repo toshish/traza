@@ -559,12 +559,12 @@ impl State {
         let assessment = run.assess(&limits, next);
         if resolved.action == Action::Stop && !assessment.reached.is_empty() {
             judged.verdict = Verdict::Stop;
-            judged.tripped_by = Some(TrippedBy::Policy);
             judged.evidence = run.trip_evidence(&assessment);
             judged.reasons = assessment.reached.clone();
             // A hypothetical step never trips anything: only recorded usage
-            // makes a stop sticky.
+            // makes a stop sticky, so only it reports who tripped it.
             if next.is_none() {
+                judged.tripped_by = Some(TrippedBy::Policy);
                 judged.tripped_at_ns = Some(now);
                 judged.new_trip = Some(Trip {
                     at_ns: now,
