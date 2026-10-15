@@ -561,7 +561,7 @@ pub(crate) fn key_hash(tenant: &str, trace_id: &str, span_id: &str) -> u64 {
 
 /// UTC calendar day (YYYY-MM-DD) of a nanosecond timestamp, dependency-free
 /// (civil-from-days, H. Hinnant's algorithm).
-fn day_bucket(start_ns: u64) -> String {
+pub(crate) fn day_bucket(start_ns: u64) -> String {
     let days = (start_ns / 1_000_000_000 / 86_400) as i64;
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
