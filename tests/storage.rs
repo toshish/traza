@@ -72,6 +72,7 @@ fn buffer_flush_persists_sorted_batches() {
     let store = Store::open(
         dir.path(),
         Config {
+            fuses: Default::default(),
             pricing: Default::default(),
             max_span_attributes: Some(traza::caps::DEFAULT_MAX_SPAN_ATTRIBUTES),
             max_attribute_key_bytes: Some(traza::caps::DEFAULT_MAX_ATTRIBUTE_KEY_BYTES),
@@ -138,6 +139,7 @@ fn crash_recovery_preserves_flushed_spans() {
         let store = Store::open(
             dir.path(),
             Config {
+                fuses: Default::default(),
                 pricing: Default::default(),
                 max_span_attributes: Some(traza::caps::DEFAULT_MAX_SPAN_ATTRIBUTES),
                 max_attribute_key_bytes: Some(traza::caps::DEFAULT_MAX_ATTRIBUTE_KEY_BYTES),
@@ -192,6 +194,7 @@ fn crash_recovery_preserves_flushed_spans() {
     let reopened = Store::open(
         dir.path(),
         Config {
+            fuses: Default::default(),
             pricing: Default::default(),
             max_span_attributes: Some(traza::caps::DEFAULT_MAX_SPAN_ATTRIBUTES),
             max_attribute_key_bytes: Some(traza::caps::DEFAULT_MAX_ATTRIBUTE_KEY_BYTES),
@@ -323,6 +326,7 @@ fn randomized_filters_match_naive_reference() {
     let store = Store::open(
         dir.path(),
         Config {
+            fuses: Default::default(),
             pricing: Default::default(),
             max_span_attributes: Some(traza::caps::DEFAULT_MAX_SPAN_ATTRIBUTES),
             max_attribute_key_bytes: Some(traza::caps::DEFAULT_MAX_ATTRIBUTE_KEY_BYTES),
@@ -429,6 +433,7 @@ fn ttl_compaction_drops_expired_segments() {
     let store = Store::open(
         dir.path(),
         Config {
+            fuses: Default::default(),
             pricing: Default::default(),
             max_span_attributes: Some(traza::caps::DEFAULT_MAX_SPAN_ATTRIBUTES),
             max_attribute_key_bytes: Some(traza::caps::DEFAULT_MAX_ATTRIBUTE_KEY_BYTES),
@@ -550,6 +555,7 @@ fn lock_order_no_deadlock() {
         Store::open(
             &dir,
             Config {
+                fuses: Default::default(),
                 pricing: Default::default(),
                 max_span_attributes: Some(traza::caps::DEFAULT_MAX_SPAN_ATTRIBUTES),
                 max_attribute_key_bytes: Some(traza::caps::DEFAULT_MAX_ATTRIBUTE_KEY_BYTES),
@@ -621,6 +627,7 @@ fn reads_never_miss_committed_spans() {
         Store::open(
             &dir,
             Config {
+                fuses: Default::default(),
                 pricing: Default::default(),
                 max_span_attributes: Some(traza::caps::DEFAULT_MAX_SPAN_ATTRIBUTES),
                 max_attribute_key_bytes: Some(traza::caps::DEFAULT_MAX_ATTRIBUTE_KEY_BYTES),
@@ -706,6 +713,7 @@ fn stale_temp_does_not_wedge_flush() {
     let store = Store::open(
         &dir,
         Config {
+            fuses: Default::default(),
             pricing: Default::default(),
             max_span_attributes: Some(traza::caps::DEFAULT_MAX_SPAN_ATTRIBUTES),
             max_attribute_key_bytes: Some(traza::caps::DEFAULT_MAX_ATTRIBUTE_KEY_BYTES),
@@ -776,6 +784,7 @@ fn stale_lock_from_dead_process_is_recovered() {
 fn second_open_is_rejected() {
     let dir = correctness_test_dir("single-writer");
     let config = Config {
+        fuses: Default::default(),
         pricing: Default::default(),
         max_span_attributes: Some(traza::caps::DEFAULT_MAX_SPAN_ATTRIBUTES),
         max_attribute_key_bytes: Some(traza::caps::DEFAULT_MAX_ATTRIBUTE_KEY_BYTES),

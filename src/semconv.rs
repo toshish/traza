@@ -631,62 +631,33 @@ pub(crate) fn step_facts_with(span: &Span, llm: &LlmFacts) -> StepFacts {
         attr_str(attributes, TRACELOOP_SPAN_KIND).map(|kind| kind.to_ascii_lowercase());
     let kind = step_kind(attributes, traceloop_kind.as_deref(), llm);
 
-    let tool = first_str(attributes, &[GEN_AI_TOOL_NAME, OI_TOOL_NAME]).or_else(|| {
-        match traceloop_kind.as_deref() {
-            Some("tool") => attr_str(attributes, TRACELOOP_ENTITY_NAME),
-            _ => None,
-        }
-    });
-    let agent = attr_str(attributes, GEN_AI_AGENT_NAME)
-        .or_else(|| match traceloop_kind.as_deref() {
-            Some("agent" | "workflow") => attr_str(attributes, TRACELOOP_ENTITY_NAME),
-            _ => None,
-        })
-        .or_else(|| attr_str(attributes, OI_AGENT_NAME));
+    let tool = step_tool(attributes, traceloop_kind.as_deref());
+    let agent = step_agent(attributes, traceloop_kind.as_deref());
     let tool_call_id = attr_str(attributes, GEN_AI_TOOL_CALL_ID);
 
-    let (request, response) = match kind {
-        StepKind::Llm => (llm_request(span), llm_response(span)),
-        StepKind::Tool => (
-            first_payload(
-                attributes,
-                &[
-                    GEN_AI_TOOL_CALL_ARGUMENTS,
-                    TRACELOOP_ENTITY_INPUT,
-                    OI_INPUT_VALUE,
-                ],
-            ),
-            first_payload(
-                attributes,
-                &[
-                    GEN_AI_TOOL_CALL_RESULT,
-                    TRACELOOP_ENTITY_OUTPUT,
-                    OI_OUTPUT_VALUE,
-                ],
-            ),
+    let request = step_request(span, kind);
+    let response = match kind {
+        StepKind::Llm => llm_response(span),
+        StepKind::Tool => first_payload(
+            attributes,
+            &[
+                GEN_AI_TOOL_CALL_RESULT,
+                TRACELOOP_ENTITY_OUTPUT,
+                OI_OUTPUT_VALUE,
+            ],
         ),
-        _ => (
-            first_payload(attributes, &[TRACELOOP_ENTITY_INPUT, OI_INPUT_VALUE]),
-            first_payload(attributes, &[TRACELOOP_ENTITY_OUTPUT, OI_OUTPUT_VALUE]),
-        ),
+        _ => first_payload(attributes, &[TRACELOOP_ENTITY_OUTPUT, OI_OUTPUT_VALUE]),
     };
     let request_digest = request.as_ref().map(value_digest);
     let response_digest = response.as_ref().map(value_digest);
-
-    let name = match kind {
-        StepKind::Tool => tool.clone(),
-        StepKind::Llm => llm.model.clone(),
-        StepKind::Agent => agent.clone(),
-        _ => None,
-    }
-    .unwrap_or_else(|| span.name.clone());
-    let mut fingerprint = format!("{kind}:{name}");
-    if let Some(digest) = &request_digest {
-        // Every digest is 64 hex characters (a SHA-256 or a validated content
-        // address), so the slice is in bounds and on a char boundary.
-        fingerprint.push('#');
-        fingerprint.push_str(&digest[..FINGERPRINT_DIGEST_CHARS]);
-    }
+    let fingerprint = step_fingerprint(
+        span,
+        kind,
+        tool.as_deref(),
+        agent.as_deref(),
+        llm,
+        request_digest.as_deref(),
+    );
 
     StepFacts {
         kind,
@@ -699,6 +670,108 @@ pub(crate) fn step_facts_with(span: &Span, llm: &LlmFacts) -> StepFacts {
         response_digest,
         fingerprint,
     }
+}
+
+/// The fingerprint [`step_facts_with`] would report, computed from the
+/// request alone: the response is neither extracted nor digested, since the
+/// fingerprint does not cover it. For a caller that fingerprints every
+/// acknowledged step on the ingest path (the run guard), where a second
+/// digest per step would be pure waste. Built from the same helpers as
+/// [`step_facts_with`], so the two cannot disagree.
+pub(crate) fn step_fingerprint_with(span: &Span, llm: &LlmFacts) -> String {
+    let attributes = &span.attributes;
+    let traceloop_kind =
+        attr_str(attributes, TRACELOOP_SPAN_KIND).map(|kind| kind.to_ascii_lowercase());
+    let kind = step_kind(attributes, traceloop_kind.as_deref(), llm);
+    // Only the name the kind uses is looked up.
+    let tool = match kind {
+        StepKind::Tool => step_tool(attributes, traceloop_kind.as_deref()),
+        _ => None,
+    };
+    let agent = match kind {
+        StepKind::Agent => step_agent(attributes, traceloop_kind.as_deref()),
+        _ => None,
+    };
+    let request_digest = step_request(span, kind).as_ref().map(value_digest);
+    step_fingerprint(
+        span,
+        kind,
+        tool.as_deref(),
+        agent.as_deref(),
+        llm,
+        request_digest.as_deref(),
+    )
+}
+
+/// The tool name, per the names table on [`step_facts`].
+fn step_tool(attributes: &Map<String, Value>, traceloop_kind: Option<&str>) -> Option<String> {
+    first_str(attributes, &[GEN_AI_TOOL_NAME, OI_TOOL_NAME]).or_else(|| match traceloop_kind {
+        Some("tool") => attr_str(attributes, TRACELOOP_ENTITY_NAME),
+        _ => None,
+    })
+}
+
+/// The agent name, per the names table on [`step_facts`].
+fn step_agent(attributes: &Map<String, Value>, traceloop_kind: Option<&str>) -> Option<String> {
+    attr_str(attributes, GEN_AI_AGENT_NAME)
+        .or_else(|| match traceloop_kind {
+            Some("agent" | "workflow") => attr_str(attributes, TRACELOOP_ENTITY_NAME),
+            _ => None,
+        })
+        .or_else(|| attr_str(attributes, OI_AGENT_NAME))
+}
+
+/// The step's request, per the request table on [`step_facts`].
+fn step_request(span: &Span, kind: StepKind) -> Option<Value> {
+    match kind {
+        StepKind::Llm => llm_request(span),
+        StepKind::Tool => first_payload(
+            &span.attributes,
+            &[
+                GEN_AI_TOOL_CALL_ARGUMENTS,
+                TRACELOOP_ENTITY_INPUT,
+                OI_INPUT_VALUE,
+            ],
+        ),
+        _ => first_payload(&span.attributes, &[TRACELOOP_ENTITY_INPUT, OI_INPUT_VALUE]),
+    }
+}
+
+/// `"{kind}:{name}"`, then `#` and the request digest's prefix when there is
+/// a request; see [`step_facts`].
+fn step_fingerprint(
+    span: &Span,
+    kind: StepKind,
+    tool: Option<&str>,
+    agent: Option<&str>,
+    llm: &LlmFacts,
+    request_digest: Option<&str>,
+) -> String {
+    let name = match kind {
+        StepKind::Tool => tool,
+        StepKind::Llm => llm.model.as_deref(),
+        StepKind::Agent => agent,
+        _ => None,
+    }
+    .unwrap_or(&span.name);
+    let mut fingerprint = format!("{kind}:{name}");
+    if let Some(digest) = request_digest {
+        // Every digest is 64 hex characters (a SHA-256 or a validated content
+        // address), so the slice is in bounds and on a char boundary.
+        fingerprint.push('#');
+        fingerprint.push_str(&digest[..FINGERPRINT_DIGEST_CHARS]);
+    }
+    fingerprint
+}
+
+/// The kind [`step_facts_with`] would report, without extracting or
+/// digesting the step's request and response — for a caller that needs the
+/// rest of the facts only for some kinds (the run guard fingerprints steps
+/// alone).
+pub(crate) fn step_kind_with(span: &Span, llm: &LlmFacts) -> StepKind {
+    let traceloop_kind =
+        attr_str(&span.attributes, TRACELOOP_SPAN_KIND).map(|kind| kind.to_ascii_lowercase());
+    step_kind(&span.attributes, traceloop_kind.as_deref(), llm)
 }
 
 /// The kind precedence documented on [`step_facts`].
@@ -2145,5 +2218,39 @@ mod tests {
         priced.cost_usd = Some(1.0);
         priced.cost_derived = true;
         assert_eq!(step_facts_with(&span, &priced), step_facts(&span));
+    }
+
+    #[test]
+    fn the_fingerprint_alone_is_the_fingerprint_step_facts_report() {
+        // The run guard keys repeats on `step_fingerprint_with`, and every
+        // other surface shows `step_facts().fingerprint`: one shape per kind
+        // and name source, with and without a request, must agree.
+        let shapes = [
+            json!({"gen_ai.operation.name": "chat", "gen_ai.request.model": "gpt-4o",
+                   "gen_ai.input.messages": "[{\"role\":\"user\",\"content\":\"hi\"}]",
+                   "gen_ai.output.messages": "[{\"role\":\"assistant\",\"content\":\"yo\"}]"}),
+            json!({"gen_ai.operation.name": "chat"}),
+            json!({"gen_ai.operation.name": "execute_tool", "gen_ai.tool.name": "search",
+                   "gen_ai.tool.call.arguments": "{\"q\":1}",
+                   "gen_ai.tool.call.result": "{\"hits\":3}"}),
+            json!({"traceloop.span.kind": "tool", "traceloop.entity.name": "fetch",
+                   "traceloop.entity.input": "{\"url\":\"x\"}"}),
+            json!({"gen_ai.operation.name": "invoke_agent", "gen_ai.agent.name": "planner",
+                   "input.value": "plan it"}),
+            json!({"traceloop.span.kind": "workflow", "traceloop.entity.name": "flow",
+                   "traceloop.entity.input": "go"}),
+            json!({"openinference.span.kind": "TOOL", "tool.name": "calc"}),
+            json!({"http.method": "GET"}),
+        ];
+        for attributes in shapes {
+            let span = span_named("op", attributes);
+            let llm = facts(&span.attributes);
+            assert_eq!(
+                step_fingerprint_with(&span, &llm),
+                step_facts_with(&span, &llm).fingerprint,
+                "{:?}",
+                span.attributes
+            );
+        }
     }
 }

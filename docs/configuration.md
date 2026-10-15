@@ -190,6 +190,15 @@ better p95/p99 with peak capacity. Do not pick it hoping for a lower median;
 | `--mcp-max-result-bytes N` | `32768` | Ceiling on one MCP tool result or resource read, counting the **whole serialized result** — text block, `structuredContent`, and the JSON envelope around them — in UTF-8 bytes, which is what goes on the wire. **Refused below 1,024**: beneath that there is no result that both fits and conforms to the `outputSchema` its tool advertises, and failing at startup beats answering every request with something a validating client rejects. Past it, rows are dropped and the truncation is stated with the argument that would have narrowed it. Raise for a client with a large context window; lower to make an agent narrow its own queries. |
 | `--mcp-max-payload-bytes N` | `262144` | Ceiling on one `get_payload` fetch, whatever the call asks for. This is what stops a single offloaded prompt filling a context window. The **effective** cap is the smaller of this and `--mcp-max-result-bytes`, so that the byte count the tool reports is the one it returns. |
 | `--pricing FILE` | none | Per-model rates used to derive a cost for LLM spans that did not meter one. Nothing is derived without it, which is the behaviour every store had before it existed. A malformed file refuses startup rather than being ignored — silently reporting `$0.00` is the symptom the file was supplied to fix. Changing the rates invalidates rollups folded under the old ones, which costs a rebuild of the affected sidecars. See [Model pricing](#model-pricing). |
+| `--fuse-max-cost-usd F` | off | The **global** [run fuse](guide/guard.md) policy's cost limit, in USD: the policy every run gets whose tenant has no service-matching or `default` policy. Priced cost — metered, else derived from `--pricing`. `0` removes the limit. |
+| `--fuse-max-tokens N` | off | The global policy's token limit. `0` removes it. |
+| `--fuse-max-steps N` | off | The global policy's step limit (LLM, tool and agent spans). `0` removes it. |
+| `--fuse-max-duration-seconds N` | off | The global policy's duration limit, first span start to last span end by the spans' clocks. `0` removes it. |
+| `--fuse-max-repeats N` | `12` | The global policy's repeat limit: how often one step fingerprint — the same call with the same input — may occur before the run reaches it. At least 2; `0` removes it. |
+| `--fuse-max-error-streak N` | off | The global policy's limit on consecutive failed steps. `0` removes it. |
+| `--fuse-action stop\|warn` | `warn` | What the global policy does at a limit. `warn` reports; `stop` makes the run's verdict `stop` until it is reset. Every policy warns at 80% of a limit either way. The default warns, because a default that stopped someone's agent would be a decision nobody made. |
+| `--fuse-max-runs N` | `100000` | Live runs the fuse observer keeps in memory, least recently active evicted first, shared by every tenant; independently, at most 1,000,000 span contributions are held across them. An evicted run is rebuilt from the store when next asked about, but until then ingest verdicts for it see only the spans that arrive after the eviction. A run evicted while **stopped** is parked instead — its stop kept, its per-span state dropped — and up to this many runs are parked; past that the oldest parked runs are dropped, and a policy stop dropped that way is recomputed by the next rebuild under the policy then in force (a kill switch is durable and is never lost, only its place in the stopped listing). See [run fuses § What is durable](guide/guard.md#what-is-durable-and-what-is-rebuilt). |
+| `--no-fuses` | off (fuses on) | Turns the run-fuse observer off entirely: ingest does no fuse work, `fuses.jsonl` is neither read nor written (so a damaged one cannot keep the server from starting), responses carry no `fuses` field or `Traza-Fuse` header, and every `/v1/fuses/*` route answers `409`. |
 | `--allow-unauthenticated-non-loopback` | off | Explicitly permit an unauthenticated non-loopback bind. **Every client that reaches the port is then an unbound admin**, and the first to call `POST /v1/admin/credentials` mints the store's first admin credential — closing the store to everyone else, persistently (a later restart with `TRAZA_TOKENS` keeps it alongside). See [the non-loopback refusal](operations/administration.md#the-non-loopback-refusal). |
 | `--version`, `-V` | — | Print `traza-server <version>` and exit. |
 | `--restore DIR` | — | Install a backup from `DIR` into `--data-dir`, then serve it. The backup is verified before anything is swapped and the swap commits at one `CURRENT` rename, so a failed restore leaves the prior store. See [backup and restore](operations/backup.md). |
@@ -331,6 +340,7 @@ same values a `--profile` would give the server.
 | `max_span_events` | `Option<usize>` | `Some(1024)` | As `--max-span-events`. |
 | `max_span_bytes` | `Option<usize>` | `Some(4 MiB)` | As `--max-span-bytes`: measured as stored, after offload under `payload_threshold`. |
 | `max_batch_spans` | `Option<usize>` | `Some(100_000)` | As `--max-batch-spans`: one `ingest_batch` call may carry at most this many spans. |
+| `fuses` | `guard::FuseConfig` | on, warn at 12 repeats | The [run fuses](guide/guard.md): see `FuseConfig` below. On by default for embedders too — every acknowledged batch feeds the observer, which follows runs from their first step. |
 
 `CompactionConfig`:
 
@@ -339,6 +349,15 @@ same values a `--profile` would give the server.
 | `fanout` | `usize` | `4` | Same-tier segments that trigger a merge. |
 | `base_bytes` | `u64` | 8 MiB | Tier-0 size ceiling; each tier is `fanout` times larger. |
 | `max_segment_bytes` | `u64` | 256 MiB | Never merge into a segment larger than this. |
+
+`guard::FuseConfig`:
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `enabled` | `bool` | `true` | As `--no-fuses` inverted. `false` skips the observer and never opens `fuses.jsonl`; the `Store::fuse_*` methods then return `Error::Conflict`. |
+| `limits` | `guard::Limits` | `max_repeats: Some(12)` | The global policy's limits, as the `--fuse-max-*` flags. `None` is unbounded. |
+| `action` | `guard::Action` | `Warn` | As `--fuse-action`. |
+| `max_runs` | `usize` | `100_000` | As `--fuse-max-runs`. |
 
 `Profile` exposes `parse`, `as_str`, `flush_spans`, `wal_commit_window`, and
 `config`. There is deliberately no `Profile` → `Durability` mapping.

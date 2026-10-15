@@ -114,7 +114,7 @@ over `curl`.
 
 ## The tools
 
-Twelve tools: ten reads and two gated writers. They are shaped like the
+Thirteen tools: eleven reads and two gated writers. They are shaped like the
 questions somebody asks at 2am, not like the route index — two routes may serve
 one tool, and one route may serve two. Most of them describe what is in the
 store; `diagnose_session` is the one that answers a question about it.
@@ -131,6 +131,7 @@ store; `diagnose_session` is the one that answers a question about it.
 | `slowest_spans` | What is slow? |
 | `analyze_cost` | Where did the tokens and the money go? |
 | `get_payload` | Show me the full prompt behind this reference |
+| `check_run_guard` | May this run take its next step? |
 | `record_annotation` | Attach a note or rating to a trace or span (**`rw` token + `--mcp-annotations`**) |
 | `promote_failures_to_dataset` | Turn this run's failures into a regression dataset (**`rw` token + `--mcp-promote`**) |
 
@@ -139,13 +140,13 @@ host asks for approval before each call:
 
 | Tool | `readOnlyHint` | `destructiveHint` | `idempotentHint` | `openWorldHint` |
 |---|---|---|---|---|
-| the ten readers | `true` | — | — | `false` |
+| the eleven readers | `true` | — | — | `false` |
 | `record_annotation` | `false` | `false` | `false` | `false` |
 | `promote_failures_to_dataset` | `false` | `false` | `false` | `false` |
 
 **Absent annotations are not neutral.** Every hint defaults to the pessimistic
 answer — not read-only, potentially destructive, open world — so a server that
-omits them advertises ten read tools as though each might delete something and
+omits them advertises eleven read tools as though each might delete something and
 call out to the internet. A host that gates on that asks for confirmation on
 every call, and one running non-interactively, with nobody to ask, declines
 them. `destructiveHint` and `idempotentHint` are meaningful only when
@@ -187,6 +188,22 @@ Four tools are worth knowing the reasoning behind:
 - **`get_payload` is separate from the search tools on purpose.** Pulling a
   large third-party document into a context window should be a decision, not a
   side effect of a search matching a span.
+
+**`check_run_guard` reads a run's [fuse](guard.md) verdict** — `continue`,
+`warn` or `stop` — with its reasons, policy, limits and usage: the same
+document as [`GET /v1/fuses/runs/{run}`](http-api.md#get-v1fusesrunsrun), as
+`structuredContent` under an `outputSchema`, and summarized as text. It takes
+`run_id` (a session id, or `trace:<trace_id>`) and, for an unbound credential,
+an optional `tenant`; a bound credential naming another tenant is refused. The
+run id, the reasons — which quote step fingerprints, and so tool and model
+names from the telemetry — and the policy name render inside the telemetry
+block. It is read-only: nothing on this surface can trip or reset a run, so a
+stopped agent cannot talk its way past its own fuse. It answers what is
+recorded, which is the pre-call check without an estimate; an agent wanting
+to price its next step uses
+[`POST /v1/fuses/check`](http-api.md#post-v1fusescheck). On a server started
+with `--no-fuses` it is not listed — ten reads, then — and a call naming it
+is refused as invalid params.
 
 **The eval entities are not on this surface.** Datasets, versions, examples,
 experiments, runs and scores are served over HTTP only — no tool reads them,

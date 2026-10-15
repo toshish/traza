@@ -905,6 +905,10 @@ pub struct Config {
     pub max_span_bytes: Option<usize>,
     /// Spans one ingest call may carry, or `None` for no cap.
     pub max_batch_spans: Option<usize>,
+    /// The run guard: whether ingest feeds it, its default policy, and how
+    /// many runs it keeps live. On by default, warning on repeated steps
+    /// only. See [`guard`].
+    pub fuses: guard::FuseConfig,
 }
 
 /// The last commit whose reader accepts every segment format retired WITHOUT
@@ -1013,6 +1017,7 @@ impl Default for Config {
             max_span_events: Some(caps::DEFAULT_MAX_SPAN_EVENTS),
             max_span_bytes: Some(caps::DEFAULT_MAX_SPAN_BYTES),
             max_batch_spans: Some(caps::DEFAULT_MAX_BATCH_SPANS),
+            fuses: guard::FuseConfig::default(),
         }
     }
 }
@@ -2249,6 +2254,10 @@ pub struct Store {
     /// kept outside generations (see [`platform`]). Each part's lock is
     /// leaf-level.
     platform: platform::State,
+    /// The run guard, fed by every acknowledged batch; `None` when
+    /// [`Config::fuses`] disables it. Its locks are leaf-level: never held
+    /// while an engine lock is taken.
+    guard: Option<guard::Guard>,
     _directory_lock: DirectoryLock,
 }
 
@@ -2381,6 +2390,7 @@ impl Store {
             let tail_ring_bytes = config.tail_ring_bytes;
 
             Ok(Self {
+                guard: guard::Guard::open(&directory, &config.fuses)?,
                 annotations: annotations::AnnotationLog::open(&directory)?,
                 evals: evals::EvalLog::open(&directory)?,
                 // Replayed before serving: a pending erasure — one whose purge
@@ -6369,6 +6379,7 @@ impl Store {
         // admitted later are new data and flow normally. A tenant subject
         // resolves no keys — its veil is the tenant predicate itself.
         self.veil_tail(subject, &purge.keys);
+        self.forget_fuse_subject(subject, &purge.keys)?;
 
         // ---- confirm: everything mutable, BEFORE the checkpoint ----------
         // The admission barrier suppresses covered spans (and the annotate
@@ -6411,6 +6422,7 @@ impl Store {
         };
         if !confirm.keys.is_empty() {
             self.veil_tail(subject, &confirm.keys);
+            self.forget_fuse_subject(subject, &confirm.keys)?;
         }
         // Annotations that arrived before the annotate barrier went up get
         // the same confirm treatment; a no-op rewrite costs nothing (the

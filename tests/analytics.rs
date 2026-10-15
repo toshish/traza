@@ -370,6 +370,7 @@ fn rollup_cache_survives_compaction_supersede() {
     let store = Store::open(
         &dir,
         Config {
+            fuses: Default::default(),
             pricing: Default::default(),
             max_span_attributes: Some(traza::caps::DEFAULT_MAX_SPAN_ATTRIBUTES),
             max_attribute_key_bytes: Some(traza::caps::DEFAULT_MAX_ATTRIBUTE_KEY_BYTES),

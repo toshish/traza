@@ -28,3 +28,11 @@ Pick by what you came to see:
 The dashboard demos (`swarm/` above all) want a built UI: `cd ui && npm ci &&
 npm run build`, once — the server picks it up without a restart. Everything
 else needs only the binary, `python3` and `curl`.
+
+Integrations
+------------
+
+Not demos — pieces to wire into your own setup:
+
+- [`guard/`](guard/README.md): a Claude Code hook that puts a
+  [run fuse](../docs/guide/guard.md) in front of every tool call.

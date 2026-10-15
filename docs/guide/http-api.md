@@ -11,8 +11,9 @@ reverse-proxy territory — Traza speaks plain HTTP.
 **Authentication.** Once any credential exists — from `TRAZA_TOKENS`, or
 minted at runtime with [`POST /v1/admin/credentials`](#post-v1admincredentials)
 — every `/v1` request needs `Authorization: Bearer TOKEN`. With neither, the
-server is open (on loopback by default). A `ro` credential may `GET`; an `rw`
-credential may `GET` and `POST`; `admin` adds erasure, eval tombstones,
+server is open (on loopback by default). A `ro` credential may `GET` (and
+`POST /v1/fuses/check`, the one read that carries a body); an `rw` credential
+may `GET` and `POST`; `admin` adds erasure, eval tombstones,
 backups and the `/v1/admin/*` routes. A credential may be **bound** to one
 tenant (`scope@tenant:token` in `TRAZA_TOKENS`, `"tenant"` when minted): a
 bound credential reads and writes only its tenant's data, on every surface:
@@ -92,7 +93,7 @@ coding (`br`, `deflate`, `zstd`, a doubled `gzip`), is `415`.
 | `401` | Missing, malformed, unknown, expired, or revoked bearer token. Carries `WWW-Authenticate: Bearer` |
 | `403` | Valid token without the grant this request needs — the body's `"required"` names it (`rw`, `admin`, `unbound`) — or a tenant-bound credential naming a foreign tenant; in open mode, also a browser request from a non-loopback page to an admin operation |
 | `404` | No such route, or the requested trace/session/payload/dataset/experiment/credential does not exist. Cross-tenant reads answer `404`, never `403` — existence is a fact about another tenant |
-| `409` | A conflict a retry may resolve: a mutation for a tenant whose erasure is pending, a tombstoned parent version, a payload reference not in the store, a pin label already taken, a credential token already registered, an environment credential named for revocation, a first credential that is not an unbound admin |
+| `409` | A conflict a retry may resolve: a mutation for a tenant whose erasure is pending, a tombstoned parent version, a payload reference not in the store, a pin label already taken, a credential token already registered, an environment credential named for revocation, a first credential that is not an unbound admin, a `/v1/fuses/*` route on a server started with `--no-fuses` |
 | `410` | A tombstoned dataset version: the content is withheld, the fact of the deletion is not |
 | `413` | A gzip body that decompresses past the 64 MiB body cap |
 | `415` | A `Content-Encoding` other than `gzip` on an ingest route, or any coding elsewhere; a `/v1/admin/` body not declared `application/json` |
@@ -146,6 +147,15 @@ coding (`br`, `deflate`, `zstd`, a doubled `gzip`), is `415`.
 | `POST` | [`/v1/admin/credentials/{id}/revoke`](#post-v1admincredentialsidrevoke) | Revoke a credential (unbound `admin`) |
 | `POST` | [`/v1/admin/tenants/{tenant}/limits`](#post-v1admintenantstenantlimits) | Replace a tenant's quotas, pause and retention (unbound `admin`) |
 | `GET` | [`/v1/admin/tenants/{tenant}/limits`](#get-v1admintenantstenantlimits) | A tenant's limits (unbound `admin`) |
+| `POST` | [`/v1/fuses/check`](#post-v1fusescheck) | Pre-call gate: may a run take its next step |
+| `GET` | [`/v1/fuses/runs/{run}`](#get-v1fusesrunsrun) | One run's fuse verdict, usage and limits |
+| `GET` | [`/v1/fuses/runs`](#get-v1fusesruns) | Runs the guard holds, by verdict |
+| `POST` | [`/v1/fuses/runs/{run}/trip`](#post-v1fusesrunsruntrip) | The kill switch |
+| `POST` | [`/v1/fuses/runs/{run}/reset`](#post-v1fusesrunsrunreset) | Clear a stop, optionally granting higher limits |
+| `POST` | [`/v1/fuses/policies`](#post-v1fusespolicies) | Create or replace a fuse policy |
+| `GET` | [`/v1/fuses/policies`](#get-v1fusespolicies) | Fuse policies and the global default |
+| `POST` | [`/v1/fuses/policies/{id}/delete`](#post-v1fusespoliciesiddelete) | Delete a fuse policy |
+| `GET` | [`/v1/fuses/events`](#get-v1fusesevents) | Fuse transitions by cursor, with long-poll |
 | `GET` | [`/v1/payloads/{reference}`](#get-v1payloadsreference) | Raw bytes of an offloaded payload |
 | `GET` | [`/v1/export`](#get-v1export) | Streaming NDJSON export |
 | `GET` | [`/v1/tail`](#get-v1tail) | Live span stream, in admission order |
@@ -184,6 +194,23 @@ deliberately not stored; the response then carries the split explicitly:
 ```
 
 `suppressed` appears only when nonzero.
+
+**Run fuses.** When the batch touched a run whose [fuse](guard.md) verdict is
+not `continue`, the response names it, and a `Traza-Fuse` header carries the
+most severe verdict in the batch:
+
+```
+HTTP/1.1 200 OK
+Traza-Fuse: stop; run=sess-7f3a
+
+{"accepted":1,"durability":"wal","fuses":[{"reasons":["max_repeats 4 reached: tool:search_orders#465a6bab9a1c447d repeated 4 times"],"run":"sess-7f3a","tenant":"","verdict":"stop"}]}
+```
+
+`fuses` and the header are absent when nothing is to be reported. The run id
+in the header is percent-encoded outside visible ASCII and in `%`, `;`, `,`,
+`"` and space, because it comes from telemetry. The spans are stored either
+way — a verdict is a statement about the run's NEXT step, never a refusal of
+the batch it rides on; see [the guide](guard.md#the-ack-is-the-brake--and-it-brakes-the-next-step).
 
 **Tenancy.** A span may carry a top-level `$tenant` field: lowercase
 `[a-z0-9][a-z0-9._-]`, at most 64 bytes. Empty or absent is the **default
@@ -274,6 +301,10 @@ with a zero-length body — the encoding of an empty `ExportTraceServiceResponse
 With suppressions, the body encodes
 `partial_success { rejected_spans, error_message }` instead, for the same
 reason: an empty response is a claim of full success, and it would be false.
+
+**Run fuses.** OTLP's response schema has no place for a verdict, so both
+encodings carry only the `Traza-Fuse` header described under
+[`POST /v1/spans`](#post-v1spans), with the body unchanged.
 
 **Tenancy.** OTLP has no top-level tenant field, so Traza reads the
 `traza.tenant` **resource attribute**: set it on the exporter's resource and
@@ -1590,6 +1621,225 @@ an environment credential.
 
 ---
 
+## Run fuses
+
+Per-run limits — cost, tokens, steps, LLM and tool calls, duration, repeated
+steps, consecutive failures — and the verdict they give: `continue`, `warn`
+at 80% of any limit, and at 100% the policy's action, where `stop` is sticky
+until reset. The [guide](guard.md) explains the model; this is the wire.
+
+Every route answers `409` when the server runs with `--no-fuses`. A run id in
+a path is percent-decoded, so a run containing `/` travels as `%2F`; it is at
+most 1,024 bytes (`400` beyond). On the
+single-run routes `?tenant=` selects the run's tenant for an unbound
+credential (absent: the default tenant); a bound credential is forced to its
+own, and naming another is `403`. Unknown query parameters and unknown body
+fields are `400`.
+
+**The verdict document** is what every run route answers:
+
+| Field | Type | Description |
+|---|---|---|
+| `run` | string | The run id |
+| `tenant` | string | The run's tenant; empty is the default tenant |
+| `verdict` | string | `continue`, `warn` or `stop` |
+| `reasons` | string[] | For a stop, the reasons it tripped with; otherwise the limits reached or approached now. Empty for `continue` |
+| `policy` | string | The policy the run is held to; `global` for the server default |
+| `usage` | object | `steps`, `llm_calls`, `tool_calls`, `tokens`, `cost_usd`, `errors`, `error_streak`, `duration_ns`, and `top_repeat` (`{fingerprint, count, example: {trace_id, span_id}}` or `null`) |
+| `limits` | object | The limits in force: the policy's, with the run's grant over them. Absent limits are unbounded |
+| `grant` | object \| null | Limits raised for this run by resets |
+| `tripped_at_ns` | integer \| null | When the stop tripped |
+| `tripped_by` | string \| null | `policy` or `manual`, for a recorded stop |
+| `evidence` | object[] | `{trace_id, span_id}` of the span that tripped a stop, and of the repeated step when repeats are a reason |
+| `source` | string | `live` from memory, `rebuilt` when answering read the run's stored spans |
+
+### `POST /v1/fuses/check`
+
+The pre-call gate. Needs only the `ro` scope. **Body:**
+`{"run": string, "tenant"?: string, "next"?: {"est_cost_usd"?: number,
+"est_tokens"?: integer, "tool"?: string}}`.
+
+Answers the verdict document with `next` added to the run's usage
+**hypothetically**: one step, an LLM call unless `tool` is named, plus the
+estimates. A step that would go **past** a stop limit answers `stop`. Nothing
+about the run changes — `usage` is what it has recorded, and a hypothetical
+stop has no `tripped_by` — and a stop is still a `200`: the verdict is the
+answer. A run with no spans is a fresh run with zero usage.
+
+```sh
+curl -X POST http://127.0.0.1:8080/v1/fuses/check \
+  -d '{"run": "sess-9c21", "next": {"est_cost_usd": 0.40}}'
+```
+
+```json
+{"evidence":[{"span_id":"b1","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736"}],"grant":null,"limits":{"max_cost_usd":2.0,"max_error_streak":3,"max_repeats":4,"max_steps":40},"policy":"support","reasons":["max_cost_usd 2 would be exceeded by the next step: $1.7 spent + $0.4 estimated"],"run":"sess-9c21","source":"live","tenant":"","tripped_at_ns":null,"tripped_by":null,"usage":{"cost_usd":1.7,"duration_ns":900000000,"error_streak":0,"errors":0,"llm_calls":1,"steps":1,"tokens":1920,"tool_calls":0,"top_repeat":null},"verdict":"stop"}
+```
+
+**Errors.** `400` for a body that does not parse, an empty, bare `trace:` or
+over-long run id, or a negative `est_cost_usd`; `400` if rebuilding the run
+exhausted `--query-deadline-ms` and nothing about it was in memory (a run
+under a parked policy stop or a kill switch still answers `stop`); `409` in
+the rare case that erasures kept overlapping the run's rebuild (each overlap
+discards what the rebuild read, so retry once they settle).
+
+### `GET /v1/fuses/runs/{run}`
+
+The run's verdict document. The first question about a run rebuilds it
+from the store (`"source": "rebuilt"`), since the process cannot know what
+was stored before it began following the run; later ones are answered from
+memory (`"live"`). A run no span carries answers `continue` with zero usage,
+and asking about one holds no state for it.
+
+```sh
+curl http://127.0.0.1:8080/v1/fuses/runs/sess-7f3a
+```
+
+```json
+{"evidence":[{"span_id":"r2","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736"}],"grant":null,"limits":{"max_cost_usd":2.0,"max_error_streak":3,"max_repeats":4,"max_steps":40},"policy":"support","reasons":["max_repeats 4 reached: tool:search_orders#465a6bab9a1c447d repeated 4 times"],"run":"sess-7f3a","source":"rebuilt","tenant":"","tripped_at_ns":1792062221822334000,"tripped_by":"policy","usage":{"cost_usd":0.42,"duration_ns":4250000000,"error_streak":0,"errors":0,"llm_calls":1,"steps":5,"tokens":1920,"tool_calls":4,"top_repeat":{"count":4,"example":{"span_id":"r2","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736"},"fingerprint":"tool:search_orders#465a6bab9a1c447d"}},"verdict":"stop"}
+```
+
+**Errors.** As for the check.
+
+### `GET /v1/fuses/runs`
+
+Runs the guard holds, most recently active first: `{"runs": [verdict
+documents]}`. That is every live run plus every stopped run parked out of the
+live set by eviction (see
+[the guide](guard.md#what-is-durable-and-what-is-rebuilt)).
+`?state=active|warn|stop` (default `active`, all of them), `?limit=`
+(default 100, at most 1000), `?tenant=` (an unbound credential naming none
+sees every tenant). Answered from memory alone — a listing never rebuilds —
+so each document is `"source": "live"`, a run followed only partly lists
+with what this process has seen, and a parked run with its usage as last
+seen live.
+
+```sh
+curl 'http://127.0.0.1:8080/v1/fuses/runs?state=stop'
+```
+
+```json
+{"runs":[{"evidence":[],"grant":null,"limits":{"max_cost_usd":2.0,"max_error_streak":3,"max_repeats":4,"max_steps":40},"policy":"support","reasons":["manually tripped: customer escalated; take over by hand"],"run":"sess-9c21","source":"live","tenant":"","tripped_at_ns":1792062221860163000,"tripped_by":"manual","usage":{"cost_usd":1.7,"duration_ns":900000000,"error_streak":0,"errors":0,"llm_calls":1,"steps":1,"tokens":1920,"tool_calls":0,"top_repeat":null},"verdict":"stop"}]}
+```
+
+### `POST /v1/fuses/runs/{run}/trip`
+
+The kill switch: stops the run until it is reset, whatever its usage,
+durably. **Body** (optional): `{"reason": string}`, at most 1,024 bytes,
+stored as given in `fuses.jsonl` until the run's session or tenant is erased
+— keep personal data out of it. Answers the verdict document.
+
+**Errors.** `409` when the tenant already holds durable controls (a kill
+switch, a reset or a grant) for 10,000 runs and every one of them is an
+active kill switch; below that, a new run takes the place of the run reset
+longest ago, whose grant and reset stop applying.
+
+```sh
+curl -X POST http://127.0.0.1:8080/v1/fuses/runs/sess-9c21/trip \
+  -d '{"reason": "customer escalated; take over by hand"}'
+```
+
+```json
+{"evidence":[],"grant":null,"limits":{"max_cost_usd":2.0,"max_error_streak":3,"max_repeats":4,"max_steps":40},"policy":"support","reasons":["manually tripped: customer escalated; take over by hand"],"run":"sess-9c21","source":"live","tenant":"","tripped_at_ns":1792062221860163000,"tripped_by":"manual","usage":{"cost_usd":1.7,"duration_ns":900000000,"error_streak":0,"errors":0,"llm_calls":1,"steps":1,"tokens":1920,"tool_calls":0,"top_repeat":null},"verdict":"stop"}
+```
+
+### `POST /v1/fuses/runs/{run}/reset`
+
+Clears the run's stop — a policy stop or the kill switch — and its error
+streak and repeat counts, durably. **Body** (optional):
+`{"grant": {limits}}` raises the run's limits to the absolute values named,
+merged over earlier grants; it takes the [policy limit](#post-v1fusespolicies)
+fields and the same validation. Cumulative usage is not reset, so a run still
+over a cumulative limit answers `stop` again at once. Answers the verdict
+document. **Errors** as for the trip: the same 10,000-run bound applies.
+
+```sh
+curl -X POST http://127.0.0.1:8080/v1/fuses/runs/sess-7f3a/reset \
+  -d '{"grant": {"max_repeats": 8}}'
+```
+
+```json
+{"evidence":[],"grant":{"max_repeats":8},"limits":{"max_cost_usd":2.0,"max_error_streak":3,"max_repeats":8,"max_steps":40},"policy":"support","reasons":[],"run":"sess-7f3a","source":"live","tenant":"","tripped_at_ns":null,"tripped_by":null,"usage":{"cost_usd":0.42,"duration_ns":4250000000,"error_streak":0,"errors":0,"llm_calls":1,"steps":5,"tokens":1920,"tool_calls":4,"top_repeat":null},"verdict":"continue"}
+```
+
+### `POST /v1/fuses/policies`
+
+Creates a policy, or replaces the tenant's policy of the same name (keeping
+its `id` and `created_at_ns`). Live runs of the tenant are re-judged at once.
+**Body:**
+
+| Field | Type | Description |
+|---|---|---|
+| `name` | string | 1–64 bytes, unique within the tenant. `default` is the tenant's fallback; `global` is reserved |
+| `tenant` | string | Optional; a bound credential is forced to its own |
+| `match` | object | `{"service": string}` (1–256 bytes) — runs whose first span, by start time, came from that service. Required unless the name is `default`, which must not have one |
+| `limits` | object | Any of `max_cost_usd`, `max_tokens`, `max_steps`, `max_llm_calls`, `max_tool_calls`, `max_duration_seconds`, `max_repeats`, `max_error_streak`. Each positive; `max_repeats` at least 2. Absent is unbounded, and nothing is inherited from `default` or `global` |
+| `action` | string | `stop` or `warn` (default `warn`) |
+
+```sh
+curl -X POST http://127.0.0.1:8080/v1/fuses/policies -d '{
+  "name": "support", "match": {"service": "support-agent"},
+  "limits": {"max_cost_usd": 2.0, "max_steps": 40, "max_repeats": 4, "max_error_streak": 3},
+  "action": "stop"}'
+```
+
+```json
+{"action":"stop","created_at_ns":1792062221773128000,"id":"fp_58ed88d43fc762ba","limits":{"max_cost_usd":2.0,"max_error_streak":3,"max_repeats":4,"max_steps":40},"match":{"service":"support-agent"},"name":"support","tenant":""}
+```
+
+**Errors.** `400` naming the defect (a policy that matches nothing, a zero
+limit, an unknown field); `403` for a bound credential naming another tenant;
+`409` when creating (not replacing) a policy would give the tenant more than
+256.
+
+### `GET /v1/fuses/policies`
+
+`{"policies": [...], "global": {...}}`: the stored policies by tenant then
+name (a bound credential sees its own; `?tenant=` narrows for an unbound
+one), and the server-wide default every run without a matching or `default`
+policy gets.
+
+```json
+{"global":{"action":"warn","limits":{"max_repeats":12,"max_steps":50},"name":"global"},"policies":[{"action":"stop","created_at_ns":1792062221773128000,"id":"fp_58ed88d43fc762ba","limits":{"max_cost_usd":2.0,"max_error_streak":3,"max_repeats":4,"max_steps":40},"match":{"service":"support-agent"},"name":"support","tenant":""}]}
+```
+
+### `POST /v1/fuses/policies/{id}/delete`
+
+Deletes a policy, durably; live runs of its tenant are re-judged at once (a
+sticky stop stays). Answers `{"deleted": true, "policy": {...}}`, or `404`
+when no such policy exists — another tenant's policy, to a bound credential,
+included.
+
+### `GET /v1/fuses/events`
+
+Verdict transitions as they happen, by cursor. `?after=<cursor>` (absent:
+everything retained), `?wait_ms=0..30000` (default 0) to wait for an event
+when none is there yet, `?tenant=` (an unbound credential naming none sees
+every tenant).
+
+```sh
+curl 'http://127.0.0.1:8080/v1/fuses/events?wait_ms=0'
+```
+
+```json
+{"events":[{"at_ns":1792062221822334000,"cursor":"1792062221423179000.1","kind":"stop","policy":"support","reasons":["max_repeats 4 reached: tool:search_orders#465a6bab9a1c447d repeated 4 times"],"run":"sess-7f3a","tenant":""},{"at_ns":1792062221847207000,"cursor":"1792062221423179000.2","kind":"warn","policy":"support","reasons":["max_cost_usd 2 at 85%: $1.7 spent"],"run":"sess-9c21","tenant":""},{"at_ns":1792062221850690000,"cursor":"1792062221423179000.3","kind":"reset","policy":"support","reasons":["reset with grant {\"max_repeats\":8}"],"run":"sess-7f3a","tenant":""},{"at_ns":1792062221860163000,"cursor":"1792062221423179000.4","kind":"manual_stop","policy":"support","reasons":["manually tripped: customer escalated; take over by hand"],"run":"sess-9c21","tenant":""}],"next":"1792062221423179000.4"}
+```
+
+`kind` is `warn` (a run entered `warn`, or a `warn` policy's limit was
+then reached; not repeated until the run returns to `continue` or is reset),
+`stop` (a policy stopped it), `manual_stop` or `reset`. Pass `next` back as `after`; it advances past events a tenant filter
+skipped, so a filtered reader keeps pace with the feed. A read returns as soon
+as a matching event exists, at most 1,000 at a time.
+
+The feed is an in-memory ring of 4,096 events, and a cursor is
+`<epoch>.<seq>` like the [live tail's](#get-v1tail): the epoch names the
+process. A cursor the feed can no longer honour — evicted, or from before a
+restart — answers everything still retained with `"gap": true`, meaning
+events may have been missed in between.
+
+**Errors.** `400` for a malformed cursor or a `wait_ms` above 30,000.
+
+---
+
 ## Erasure
 
 Targeted deletion by **subject**, with a receipt to prove it. TTL removes
@@ -1619,7 +1869,8 @@ stored, no bytes written; counted in
 and covered annotations are dropped at [`POST /v1/annotations`](#post-v1annotations)
 the same way. The purge and a confirm pass then rewrite the buffer,
 write-ahead log, segments (superseded versions included) and annotation log,
-and delete payload files reference-aware. Only after every rewrite does the
+delete payload files reference-aware, and remove what the
+[run fuses](guard.md#limitations) hold about the subject. Only after every rewrite does the
 checkpoint publish — durable at the `CURRENT` rename — so the generation the
 settle record cites digests exactly the store the erasure left behind, and
 `GET /v1/verify` holds against it. The cut is exact: **every span

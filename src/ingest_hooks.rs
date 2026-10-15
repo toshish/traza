@@ -17,7 +17,8 @@
 //! admission check enforces the admission caps ([`crate::caps`]) and then the
 //! tenant quotas and pauses ([`crate::usage`]); what it measured on the way
 //! rides to the acknowledgement as [`crate::caps::Admitting`], where usage is
-//! charged.
+//! charged. The observer feeds the run guard ([`crate::guard`]), so a batch
+//! refused by a cap or a quota never reaches it.
 
 use std::sync::Arc;
 
@@ -61,7 +62,9 @@ impl Store {
     /// acknowledged — so it returns what it saw rather than a `Result`, and it
     /// must be non-blocking and O(batch): every ingest waits for it before
     /// its response is written.
-    pub(crate) fn observe_admitted(&self, _spans: &[Arc<Span>]) -> Observed {
-        Observed::default()
+    pub(crate) fn observe_admitted(&self, spans: &[Arc<Span>]) -> Observed {
+        Observed {
+            fuses: self.observe_fuses(spans),
+        }
     }
 }

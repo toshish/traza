@@ -170,6 +170,8 @@ impl RouteClass {
             // dragging the search percentiles toward whatever the largest
             // export happened to be.
             ("GET", "/v1/export" | "/v1/tail") => Self::Stream,
+            // A long-poll is held open by the consumer's wait, not by work.
+            ("GET", "/v1/fuses/events") => Self::Stream,
             ("GET", path) if path.starts_with("/v1/stats") => Self::Stats,
             ("GET", "/v1/sessions") => Self::Stats,
             ("GET", path)
@@ -643,6 +645,11 @@ a metered llm.cost_usd always wins)] \
 [--mcp-max-result-bytes N (default 32768)] [--mcp-max-payload-bytes N (default 262144)] \
 [--mcp-allowed-origin ORIGIN (repeatable; browser origins allowed to drive /v1/mcp \
 besides loopback)] \
+[--fuse-max-cost-usd F] [--fuse-max-tokens N] [--fuse-max-steps N] \
+[--fuse-max-duration-seconds N] [--fuse-max-repeats N (default 12)] [--fuse-max-error-streak N] \
+(the global default run-fuse policy; 0 removes a limit) \
+[--fuse-action stop|warn (default warn)] [--fuse-max-runs N (live runs kept; default 100000)] \
+[--no-fuses (do not observe runs; every /v1/fuses route answers 409)] \
 [--allow-unauthenticated-non-loopback] [--version] \
 [--restore BACKUP_DIR (install a backup into --data-dir, then serve it)]\n\
        traza-server mcp --url URL [--token TOKEN] \
@@ -736,6 +743,7 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
     let mut max_span_bytes = traza::caps::DEFAULT_MAX_SPAN_BYTES as u64;
     let mut max_batch_spans = traza::caps::DEFAULT_MAX_BATCH_SPANS as u64;
     let cap = |value: u64| (value > 0).then_some(value as usize);
+    let mut fuses = traza::guard::FuseConfig::default();
 
     let value = |i: usize, name: &str| -> Result<&String, String> {
         args.get(i)
@@ -932,6 +940,63 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
                 mcp.allowed_origins
                     .push(origin.trim_end_matches('/').to_owned());
             }
+            // The global default fuse policy. `0` removes a limit, as it
+            // disables every other knob here.
+            "--fuse-max-cost-usd" => {
+                i += 1;
+                let raw = value(i, "--fuse-max-cost-usd")?;
+                let cost: f64 = raw
+                    .parse()
+                    .ok()
+                    .filter(|cost: &f64| cost.is_finite() && *cost >= 0.0)
+                    .ok_or("--fuse-max-cost-usd must be a non-negative number".to_owned())?;
+                fuses.limits.max_cost_usd = (cost > 0.0).then_some(cost);
+            }
+            "--fuse-max-tokens" => {
+                i += 1;
+                let limit = number(i, "--fuse-max-tokens")?;
+                fuses.limits.max_tokens = (limit > 0).then_some(limit);
+            }
+            "--fuse-max-steps" => {
+                i += 1;
+                let limit = number(i, "--fuse-max-steps")?;
+                fuses.limits.max_steps = (limit > 0).then_some(limit);
+            }
+            "--fuse-max-duration-seconds" => {
+                i += 1;
+                let limit = number(i, "--fuse-max-duration-seconds")?;
+                fuses.limits.max_duration_seconds = (limit > 0).then_some(limit);
+            }
+            "--fuse-max-repeats" => {
+                i += 1;
+                let limit = number(i, "--fuse-max-repeats")?;
+                if limit == 1 {
+                    return Err(
+                        "--fuse-max-repeats must be 0 (off) or at least 2 — a single \
+                                occurrence is not a repeat"
+                            .to_owned(),
+                    );
+                }
+                fuses.limits.max_repeats = (limit > 0).then_some(limit);
+            }
+            "--fuse-max-error-streak" => {
+                i += 1;
+                let limit = number(i, "--fuse-max-error-streak")?;
+                fuses.limits.max_error_streak = (limit > 0).then_some(limit);
+            }
+            "--fuse-action" => {
+                i += 1;
+                fuses.action = match value(i, "--fuse-action")?.as_str() {
+                    "stop" => traza::guard::Action::Stop,
+                    "warn" => traza::guard::Action::Warn,
+                    _ => return Err("--fuse-action must be stop|warn".to_owned()),
+                };
+            }
+            "--fuse-max-runs" => {
+                i += 1;
+                fuses.max_runs = (number(i, "--fuse-max-runs")? as usize).max(1);
+            }
+            "--no-fuses" => fuses.enabled = false,
             "--allow-unauthenticated-non-loopback" => {
                 allow_unauthenticated_non_loopback = true;
             }
@@ -1009,6 +1074,7 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
             max_span_events: cap(max_span_events),
             max_span_bytes: cap(max_span_bytes),
             max_batch_spans: cap(max_batch_spans),
+            fuses,
         },
     }))
 }
@@ -1315,6 +1381,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             },
             mcp.limits.max_result_bytes,
         );
+    }
+
+    // The global fuse policy applies to every run no tenant policy governs,
+    // so what it will do is announced rather than discovered from a header.
+    match config.fuses.enabled {
+        true => eprintln!(
+            "traza-server: run fuses on — global policy: {} at {}",
+            config.fuses.action.as_str(),
+            serde_json::to_string(&config.fuses.limits).unwrap_or_default(),
+        ),
+        false => eprintln!("traza-server: run fuses off (--no-fuses)"),
     }
 
     // The dashboard is served from disk (ui/ `npm run build` output), never
@@ -1732,6 +1809,11 @@ fn handle_connection(
         let is_eval_tombstone = head.method.eq_ignore_ascii_case("POST")
             && head_path.starts_with("/v1/datasets/")
             && head_path.ends_with("/tombstone");
+        // The pre-call fuse check is a READ that needs a body: an agent
+        // holding a read-only token must be able to ask whether its next step
+        // may run, so the method rule's POST-means-write does not apply.
+        let is_fuse_check =
+            head.method.eq_ignore_ascii_case("POST") && head_path == "/v1/fuses/check";
         // Store-global operator surfaces. A bound (tenant-scoped) credential
         // is an untrusted principal in a multi-tenant deployment, and these
         // answer with the WHOLE store's numbers and controls — volumes that
@@ -1776,6 +1858,8 @@ fn handle_connection(
                         true
                     } else if needs_admin {
                         granted.scope == traza::auth::Scope::Admin
+                    } else if is_fuse_check {
+                        granted.scope.permits("GET")
                     } else {
                         granted.scope.permits(&head.method)
                     };
@@ -2016,6 +2100,34 @@ fn decode_content(encoding: &str, ingest: bool, body: Vec<u8>) -> Result<Vec<u8>
     }
 }
 
+/// The `Traza-Fuse` header line (with its CRLF) for an ingest's signals, or
+/// nothing when the batch raised none.
+fn fuse_header_line(signals: &[traza::guard::Signal]) -> String {
+    traza::guard::fuse_header(signals)
+        .map(|value| format!("Traza-Fuse: {value}\r\n"))
+        .unwrap_or_default()
+}
+
+/// A native ingest's `200`: the body plus, when the batch touched runs that
+/// are not `continue`, a `fuses` array naming them and the `Traza-Fuse`
+/// header for the most severe. The verdict rides the acknowledgement because
+/// the acknowledgement is the one thing every exporter already waits for.
+fn ingest_reply(
+    responder: &mut Responder<'_>,
+    mut body: Value,
+    signals: &[traza::guard::Signal],
+) -> io::Result<()> {
+    if !signals.is_empty() {
+        if let Some(object) = body.as_object_mut() {
+            object.insert(
+                "fuses".to_owned(),
+                serde_json::to_value(signals).unwrap_or_else(|_| Value::Array(Vec::new())),
+            );
+        }
+    }
+    responder.json_with_headers(200, body, &fuse_header_line(signals))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn serve_request(
     responder: &mut Responder<'_>,
@@ -2109,20 +2221,22 @@ fn serve_request(
                 // were acknowledged and deliberately not stored, and saying
                 // "accepted" about them would promise a durability nothing
                 // is backing.
-                Ok(admission) if admission.suppressed > 0 => responder.json(
-                    200,
+                Ok(admission) if admission.suppressed > 0 => ingest_reply(
+                    responder,
                     json!({
                         "accepted": admission.accepted,
                         "suppressed": admission.suppressed,
                         "durability": engine.durability().as_str(),
                     }),
+                    &admission.signals,
                 ),
-                Ok(admission) => responder.json(
-                    200,
+                Ok(admission) => ingest_reply(
+                    responder,
                     json!({
                         "accepted": admission.accepted,
                         "durability": engine.durability().as_str(),
                     }),
+                    &admission.signals,
                 ),
                 // A span the ENGINE refuses (an inadmissible tenant, an
                 // empty id from a library caller's shape) is the client's
@@ -2192,21 +2306,29 @@ fn serve_request(
                     // on a protobuf writer dependency.
                     let body = otlp_partial_success_protobuf(admission.suppressed);
                     let head = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/x-protobuf\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n",
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/x-protobuf\r\n{}Content-Length: {}\r\nConnection: {}\r\n\r\n",
+                        fuse_header_line(&admission.signals),
                         body.len(),
                         responder.connection_header()
                     );
                     responder.raw(&head, &body)
                 }
-                Ok(admission) if admission.suppressed > 0 => responder.json(
+                // OTLP's response schema has no place for a verdict, so OTLP
+                // clients get the header alone and an unchanged body.
+                Ok(admission) if admission.suppressed > 0 => responder.json_with_headers(
                     200,
                     json!({"partialSuccess": {
                         "rejectedSpans": admission.suppressed,
                         "errorMessage":
                             "suppressed by a pending erasure covering these spans",
                     }}),
+                    &fuse_header_line(&admission.signals),
                 ),
-                Ok(_) => responder.json(200, json!({"partialSuccess": {}})),
+                Ok(admission) => responder.json_with_headers(
+                    200,
+                    json!({"partialSuccess": {}}),
+                    &fuse_header_line(&admission.signals),
+                ),
                 // Same rule as native ingest: a resource attribute the
                 // engine refuses (an invalid `traza.tenant`) is the
                 // exporter's misconfiguration, answered 400 and loudly —
@@ -2463,6 +2585,7 @@ fn serve_request(
             let mut rendered = String::with_capacity(2048);
             engine.metrics().render_prometheus(&mut rendered);
             engine.render_usage_prometheus(&mut rendered);
+            engine.render_fuse_metrics(&mut rendered);
             metrics.render_prometheus(&mut rendered);
             let head = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n",
@@ -3227,6 +3350,23 @@ fn serve_request(
                 ),
                 Err(error) => responder.json(503, json!({"error": error.to_string()})),
             }
+        }
+        // Run fuses: policies, verdicts, the kill switch and the event feed.
+        // The routes live beside the engine API they call (traza::guard::http);
+        // the method rule above already authorized the request.
+        (_, path) if path.starts_with("/v1/fuses/") => {
+            let reply = traza::guard::http::serve(
+                engine,
+                &request.method,
+                path,
+                query,
+                &request.body,
+                scope,
+            );
+            if reply.deadline_exceeded {
+                metrics.query_deadline_exceeded.increment();
+            }
+            responder.json(reply.status, reply.body)
         }
         // A deliberate, externally reachable panic, for proving the slot
         // guard releases on unwind. The guard is the startup latch and only
@@ -4122,6 +4262,12 @@ impl Responder<'_> {
     /// Sends a JSON body. Head and body go out in one write: at ingest rates
     /// the extra syscall per response is pure overhead.
     fn json(&mut self, status: u16, body: Value) -> io::Result<()> {
+        self.json_with_headers(status, body, "")
+    }
+
+    /// [`Self::json`] with extra header lines, each already CRLF-terminated
+    /// and already safe to send.
+    fn json_with_headers(&mut self, status: u16, body: Value, extra: &str) -> io::Result<()> {
         self.status = Some(status);
         let encoded = serde_json::to_vec(&body)?;
         let reason = match status {
@@ -4138,7 +4284,7 @@ impl Responder<'_> {
         };
         self.raw(
             &format!(
-                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n",
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n{extra}Content-Length: {}\r\nConnection: {}\r\n\r\n",
                 encoded.len(),
                 self.connection_header(),
             ),
