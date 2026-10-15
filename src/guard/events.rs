@@ -112,6 +112,10 @@ struct Ring {
     /// The sequence number the next event gets; the first is 1, so `epoch.0`
     /// reads from the beginning.
     next_seq: u64,
+    /// The last sequence number capacity EVICTED, so the oldest position a
+    /// reader can resume from without having missed anything. Events an
+    /// erasure removed do not move it: those were withheld, not missed.
+    evicted_through: u64,
     entries: VecDeque<Entry>,
     capacity: usize,
 }
@@ -121,12 +125,9 @@ impl Ring {
         self.next_seq - 1
     }
 
-    /// The oldest position still readable without a gap: the seq just before
-    /// the first retained event.
+    /// The oldest position still readable without a gap.
     fn floor(&self) -> u64 {
-        self.entries
-            .front()
-            .map_or(self.last_seq(), |entry| entry.seq - 1)
+        self.evicted_through
     }
 
     /// Where a read starting from `after` begins, and whether that is a gap.
@@ -185,6 +186,7 @@ impl EventFeed {
             ring: Mutex::new(Ring {
                 epoch,
                 next_seq: 1,
+                evicted_through: 0,
                 entries: VecDeque::new(),
                 capacity: capacity.max(1),
             }),
@@ -207,10 +209,22 @@ impl EventFeed {
             .token();
             ring.entries.push_back(Entry { seq, event });
             while ring.entries.len() > ring.capacity {
-                ring.entries.pop_front();
+                if let Some(evicted) = ring.entries.pop_front() {
+                    ring.evicted_through = evicted.seq;
+                }
             }
         }
         self.signal.notify_all();
+    }
+
+    /// Drops every retained event `keep` rejects — what an erasure does to
+    /// the feed. Positions stay valid: sequence numbers are not reused, and
+    /// a cursor that pointed into a dropped run of events simply resumes
+    /// after it.
+    pub(crate) fn retain(&self, keep: &dyn Fn(&FuseEvent) -> bool) {
+        if let Ok(mut ring) = self.ring.lock() {
+            ring.entries.retain(|entry| keep(&entry.event));
+        }
     }
 
     /// Reads the events after `after` that `keep` accepts, waiting up to
@@ -353,6 +367,28 @@ mod tests {
             assert_eq!(page.events.len(), 3, "{foreign}");
         }
         assert!(feed.read(Some("garbage"), Duration::ZERO, &all).is_err());
+    }
+
+    #[test]
+    fn an_erasure_withholds_events_without_inventing_a_gap() {
+        let feed = EventFeed::new();
+        for run in ["gone", "kept", "gone"] {
+            feed.push(event("", run, EventKind::Stop));
+        }
+        let start = feed.read(None, Duration::ZERO, &all).expect("reads");
+        let epoch = start.next.split_once('.').expect("cursor").0.to_owned();
+        feed.retain(&|event: &FuseEvent| event.run != "gone");
+        let page = feed
+            .read(Some(&format!("{epoch}.0")), Duration::ZERO, &all)
+            .expect("reads");
+        assert!(!page.gap, "nothing was missed; it was withheld");
+        let runs: Vec<_> = page.events.iter().map(|e| e.run.as_str()).collect();
+        assert_eq!(runs, ["kept"]);
+        // A cursor past the withheld tail is still a valid position.
+        let tail = feed
+            .read(Some(&format!("{epoch}.3")), Duration::ZERO, &all)
+            .expect("reads");
+        assert!(!tail.gap && tail.events.is_empty());
     }
 
     #[test]

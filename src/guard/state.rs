@@ -160,6 +160,11 @@ impl Observation {
         }
     }
 
+    /// Whether the span is a step of its run.
+    pub(crate) fn is_step(&self) -> bool {
+        self.kind.is_step()
+    }
+
     fn span_ref(&self) -> SpanRef {
         SpanRef {
             trace_id: self.trace_id.clone(),
@@ -170,7 +175,7 @@ impl Observation {
 
 /// A 64-bit key for a span within its run (the tenant is fixed by the run).
 /// Length-prefixed so `("ab", "c")` and `("a", "bc")` differ.
-fn span_key(trace_id: &str, span_id: &str) -> u64 {
+pub(crate) fn span_key(trace_id: &str, span_id: &str) -> u64 {
     let mut bytes = Vec::with_capacity(8 + trace_id.len() + span_id.len());
     bytes.extend_from_slice(&(trace_id.len() as u32).to_le_bytes());
     bytes.extend_from_slice(trace_id.as_bytes());
@@ -284,6 +289,11 @@ impl RunState {
             tick: 0,
             last_seen_ns: 0,
         }
+    }
+
+    /// Whether any span keyed in `keys` (by [`span_key`]) contributed here.
+    pub(crate) fn holds_any(&self, keys: &std::collections::HashSet<u64>) -> bool {
+        self.marks.keys().any(|key| keys.contains(key))
     }
 
     /// Spans this state holds a mark for — its share of the guard's memory
@@ -1039,6 +1049,13 @@ mod tests {
         // Under a warn action nothing is sticky.
         let warn = |_: &str| (Limits::default(), Action::Warn);
         assert!(replay(&observations, None, &warn).trip.is_none());
+    }
+
+    #[test]
+    fn a_span_contribution_stays_a_fixed_small_record() {
+        // MAX_TRACKED_SPANS is documented in these terms; a field added to
+        // Mark has to be a decision about that bound, not a side effect.
+        assert_eq!(std::mem::size_of::<Mark>(), 32);
     }
 
     #[test]

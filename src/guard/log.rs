@@ -4,7 +4,8 @@
 //! spans cannot reconstruct — policies, manual trips, resets and the grants
 //! they carry — is written here, one JSON object per line, fsynced per append
 //! and replayed at open. Volume is human scale (an operator edits a policy or
-//! pulls a kill switch), so the file is never compacted.
+//! pulls a kill switch), so the file is never compacted; the one rewrite is
+//! an erasure's, which replaces it atomically without the erased subject.
 //!
 //! It lives in the data directory OUTSIDE the generation layout: a backup
 //! does not carry it and a restore does not replace it. Fuse settings are
@@ -129,6 +130,28 @@ impl FuseLog {
         Ok((Self { path }, records))
     }
 
+    /// Replaces the whole log with `records`, atomically: written to a
+    /// sibling, fsynced, renamed over the log, and the directory fsynced. A
+    /// crash leaves the old log or the new one, never a blend — which is what
+    /// an erasure needs, since a half-rewritten log could keep what it was
+    /// asked to forget.
+    pub(crate) fn rewrite(&self, records: &[Record]) -> Result<()> {
+        let staged = self.path.with_extension("jsonl.tmp");
+        let mut bytes = Vec::new();
+        for record in records {
+            serde_json::to_writer(&mut bytes, record)?;
+            bytes.push(b'\n');
+        }
+        let mut file = File::create(&staged)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        fs::rename(&staged, &self.path)?;
+        if let Some(directory) = self.path.parent() {
+            crate::sync_directory(directory)?;
+        }
+        Ok(())
+    }
+
     /// Appends one record durably: written whole in one call, then fsynced.
     /// When this returns `Ok` the record survives a crash.
     pub(crate) fn append(&self, record: &Record) -> Result<()> {
@@ -228,6 +251,23 @@ mod tests {
             Err(Error::Invalid(message)) => assert!(message.contains("corrupt"), "{message}"),
             other => panic!("inner damage must refuse the open, got {other:?}"),
         }
+        let _ = fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn a_rewrite_replaces_the_log_whole() {
+        let path = dir("rewrite");
+        let (log, _) = FuseLog::open(&path).expect("opens");
+        for run in ["a", "b", "c"] {
+            log.append(&trip(run)).expect("appends");
+        }
+        log.rewrite(&[trip("b")]).expect("rewrites");
+        let (log, records) = FuseLog::open(&path).expect("reopens");
+        assert_eq!(records, vec![trip("b")]);
+        assert!(!path.join("fuses.jsonl.tmp").exists());
+        log.append(&trip("d")).expect("appends after a rewrite");
+        let (_, records) = FuseLog::open(&path).expect("reopens");
+        assert_eq!(records, vec![trip("b"), trip("d")]);
         let _ = fs::remove_dir_all(&path);
     }
 

@@ -184,6 +184,14 @@ fn each_limit_stops_the_run_that_reaches_it() {
         &[],
     );
     assert!(header.is_none(), "a streak of two is 66%: {body}");
+    // A retried batch moves nothing, the streak included: [ok, err, err]
+    // sent twice is still a streak of two, so one more failure makes three.
+    let batch = failing("retried", &["a", "b", "c"], &["ok", "error", "error"]);
+    ingest(&server, &batch, &[]);
+    let (_, header, _) = ingest(&server, &batch, &[]);
+    assert!(header.is_none());
+    let (_, header, _) = ingest(&server, &failing("retried", &["d"], &["error"]), &[]);
+    assert_eq!(header.as_deref(), Some("stop; run=retried"));
 
     // Every stop is on the run's own document, attributed to the policy.
     for run in ["cost", "steps", "loop", "streak"] {
@@ -215,6 +223,14 @@ fn a_run_is_warned_at_eighty_percent_before_it_is_stopped() {
         json!({"accepted": 4, "durability": "wal", "fuses": [
             {"run": "w", "tenant": "", "verdict": "warn",
              "reasons": ["max_steps 5 at 80%: 4 steps"]}]})
+    );
+    // An exporter retrying a batch the store already acknowledged sends the
+    // same spans again: they are upserts, not four more steps.
+    let (_, header, body) = ingest(&server, &distinct_steps("w", 4, 0), &[]);
+    assert_eq!(header.as_deref(), Some("warn; run=w"), "{body}");
+    assert_eq!(
+        body["fuses"][0]["reasons"],
+        json!(["max_steps 5 at 80%: 4 steps"])
     );
     let (_, header, _) = ingest(&server, &distinct_steps("w", 1, 4), &[]);
     assert_eq!(header.as_deref(), Some("stop; run=w"));

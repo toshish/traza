@@ -12,6 +12,7 @@ to the right document. Start with the row that matches what you are doing.
 | Look up an exact route, parameter, or response shape | [HTTP API reference](guide/http-api.md) |
 | Query LLM/agent telemetry — sessions, tokens, cost | [LLM semantics](llm-semantics.md) |
 | Let a coding agent read the store over MCP | [MCP server](guide/mcp.md) · [demo](../examples/mcp-demo/README.md) |
+| Stop a runaway agent run before its next step | [Run fuses](guide/guard.md) · [Claude Code hook](../examples/guard/README.md) |
 | Watch the claims proven live before reading further | [The demo tour](../examples/README.md) |
 | Navigate the trace browser | [Trace browser](guide/trace-browser.md) |
 | Deploy, tune, or operate a server | [Operations](#operators) |
@@ -34,9 +35,13 @@ Sending traces to Traza and getting answers back out.
 - **[LLM semantics](llm-semantics.md)** — the OpenLLMetry / OTel GenAI
   attributes Traza recognizes, sessions, token and cost analytics, prompt and
   completion payloads, span links, and query recipes.
-- **[MCP server](guide/mcp.md)** — the Model Context Protocol endpoint: its ten
-  tools, its resources and prompts, how results are bounded for a context
+- **[MCP server](guide/mcp.md)** — the Model Context Protocol endpoint: its
+  thirteen tools, its resources and prompts, how results are bounded for a context
   window, and the untrusted-content boundary stored span text is held behind.
+- **[Run fuses](guide/guard.md)** — per-run limits on cost, tokens, steps,
+  repeated calls and failure streaks; the pre-call check, the verdict on every
+  ingest acknowledgement, the kill switch, and why a post-ack stop always
+  lands one step late.
 - **[Trace browser](guide/trace-browser.md)** — what each view shows and how to
   move between them.
 

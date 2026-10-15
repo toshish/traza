@@ -154,7 +154,7 @@ trace lookup differ by orders of magnitude. The classes are:
 | `search` | `GET /v1/spans` |
 | `lookup` | `GET /v1/traces/…`, `/v1/sessions/…`, `/v1/payloads/…`, `/v1/annotations` |
 | `stats` | `GET /v1/stats*`, `GET /v1/sessions` |
-| `stream` | `GET /v1/tail`, `GET /v1/export` |
+| `stream` | `GET /v1/tail`, `GET /v1/export`, `GET /v1/fuses/events` (a long-poll) |
 | `mcp` | `POST /v1/mcp` |
 | `other` | dashboard assets, `/v1/metrics`, `/v1/flush` |
 
@@ -176,6 +176,16 @@ what an agent is costing this server.
 above carries percentiles under the accuracy bound stated at the top of this
 page. [`GET /v1/metrics.json`](../guide/http-api.md#get-v1metricsjson) returns
 all of it as JSON, including that bound.
+
+### Run fuses
+
+Present unless the server runs with `--no-fuses`. See [run fuses](../guide/guard.md).
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `traza_fuse_trips_total` | counter | Stops since this process started: every policy stop observed live, and every kill-switch trip. A stop a rebuild recomputes after a restart is not counted again |
+| `traza_fuse_warnings_total` | counter | Runs that entered `warn`, each counted once until it returns to `continue` or is reset |
+| `traza_fuse_live_runs` | gauge | Runs held in memory, bounded by `--fuse-max-runs` |
 
 ## `GET /v1/stats`
 

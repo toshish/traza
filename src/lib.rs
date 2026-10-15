@@ -6326,6 +6326,7 @@ impl Store {
         // admitted later are new data and flow normally. A tenant subject
         // resolves no keys — its veil is the tenant predicate itself.
         self.veil_tail(subject, &purge.keys);
+        self.forget_fuse_subject(subject, &purge.keys)?;
 
         // ---- confirm: everything mutable, BEFORE the checkpoint ----------
         // The admission barrier suppresses covered spans (and the annotate
@@ -6368,6 +6369,7 @@ impl Store {
         };
         if !confirm.keys.is_empty() {
             self.veil_tail(subject, &confirm.keys);
+            self.forget_fuse_subject(subject, &confirm.keys)?;
         }
         // Annotations that arrived before the annotate barrier went up get
         // the same confirm treatment; a no-op rewrite costs nothing (the

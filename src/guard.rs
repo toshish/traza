@@ -21,12 +21,13 @@
 //! # State, and what survives a restart
 //!
 //! Usage is a bounded in-memory cache over the store, folded from every
-//! acknowledged batch by [`crate::Store::observe_admitted`] — O(batch), with
-//! no lock held while a span's facts are extracted. A run this process has
-//! not seen from its first span (it predates a restart, or was evicted) is
-//! rebuilt from the store the first time a verdict is asked for it, under the
-//! query deadline. What spans cannot reconstruct — policies, manual trips,
-//! resets and grants — is durable in `fuses.jsonl` (see the `log` module).
+//! acknowledged batch by the ingest observer — O(batch), with no lock held
+//! while a span's facts are extracted. Every run is rebuilt from the store
+//! the first time a verdict is asked for it, under the query deadline: the
+//! process cannot know whether a run had spans before it began following it
+//! (the run may predate a restart, or have been evicted), so it never assumes
+//! not. What spans cannot reconstruct — policies, manual trips, resets and
+//! grants — is durable in `fuses.jsonl` (see the `log` module).
 //!
 //! Live runs are bounded: at most [`FuseConfig::max_runs`], least recently
 //! active evicted first, idle ones dropped after six hours, and at most
@@ -58,11 +59,12 @@ pub use state::{NextStep, SpanRef, TopRepeat, TrippedBy, Usage};
 use log::{FuseLog, Record};
 use state::{Observation, RunState, Trip};
 
-use crate::{semconv, Error, Result, Span, Store};
+use crate::{erasure, semconv, Error, Result, Span, Store};
 
-/// Ceiling on span contributions held across every live run (about 40 bytes
-/// each). Past it, whole runs are evicted least-recently-active first; they
-/// rebuild from the store when next asked about.
+/// Ceiling on span contributions held across every live run — each a 32-byte
+/// record under an 8-byte key, before hash-table overhead. Past it, whole
+/// runs are evicted least-recently-active first; they rebuild from the store
+/// when next asked about.
 pub const MAX_TRACKED_SPANS: usize = 1_000_000;
 
 /// Most spans a rebuild reads for one run. A larger run is rebuilt from its
@@ -338,6 +340,17 @@ impl Guard {
         for (key, observations) in groups {
             if let Some((_, pending)) = state.rebuilding.get_mut(&key) {
                 pending.extend(observations.iter().cloned());
+            } else if !state.runs.contains_key(&key)
+                && !observations.iter().any(Observation::is_step)
+            {
+                // A run starts being followed at its first step. A trace of
+                // HTTP and database spans is a "run" by identity too, but it
+                // has nothing a fuse limits that a step would not bring, so
+                // ordinary tracing traffic costs the observer this read and
+                // no state. A later step starts following it from there,
+                // and the first verdict asked for it rebuilds it whole from
+                // the store, these spans included.
+                continue;
             }
             state.entry(&key, now);
             let added = {
@@ -466,6 +479,54 @@ impl State {
                     });
                 }
             }
+        }
+    }
+
+    /// The durable state as the records that reproduce it, for a rewrite:
+    /// every policy, then per run its last reset (carrying the merged grant)
+    /// before its kill switch — a kill switch is only ever active AFTER the
+    /// last reset, so that order replays to the same controls.
+    fn records(&self) -> Vec<Record> {
+        let mut policies = self.policies.clone();
+        policies.sort_by(|left, right| {
+            (left.created_at_ns, &left.tenant, &left.name).cmp(&(
+                right.created_at_ns,
+                &right.tenant,
+                &right.name,
+            ))
+        });
+        let mut records: Vec<Record> = policies
+            .into_iter()
+            .map(|policy| Record::Policy { policy })
+            .collect();
+        let mut controls: Vec<(&RunKey, &Controls)> = self.controls.iter().collect();
+        controls.sort_by(|left, right| left.0.cmp(right.0));
+        for (key, controls) in controls {
+            if let Some(at_ns) = controls.last_reset_ns {
+                records.push(Record::Reset {
+                    tenant: key.tenant.clone(),
+                    run: key.run.clone(),
+                    grant: controls.grant,
+                    at_ns,
+                });
+            }
+            if let Some((at_ns, reason)) = &controls.manual {
+                records.push(Record::Trip {
+                    tenant: key.tenant.clone(),
+                    run: key.run.clone(),
+                    reason: reason.clone(),
+                    at_ns: *at_ns,
+                });
+            }
+        }
+        records
+    }
+
+    /// Drops one live run and its share of the budget.
+    fn remove(&mut self, key: &RunKey) {
+        if let Some(run) = self.runs.remove(key) {
+            self.order.remove(&run.tick);
+            self.tracked = self.tracked.saturating_sub(run.tracked());
         }
     }
 
@@ -704,8 +765,9 @@ impl Store {
     /// The verdict document for `run` within `tenant` (empty: the default
     /// tenant).
     ///
-    /// A run this process has not followed from its first span is rebuilt
-    /// from the store first, under the query deadline; a run no span carries
+    /// The first question about a run rebuilds it from the store, under the
+    /// query deadline, and later ones are answered from memory; a run no span
+    /// carries
     /// is a fresh run with zero usage — `continue`, since a fresh run is
     /// allowed to start. If a rebuild fails (an exhausted deadline), a run
     /// with live state is answered from it, marked `live`, and the rebuild is
@@ -1025,6 +1087,92 @@ impl Store {
             .map_err(Error::Invalid)
     }
 
+    /// Removes what the run guard holds about an erasure subject, for one
+    /// purge pass that removed the spans `keys` names.
+    ///
+    /// The guard keeps no span text, but it does keep identifiers and
+    /// telemetry-derived strings: live runs hold span ids as evidence and
+    /// fingerprints that carry tool and model names, the event feed holds run
+    /// ids and reasons, and `fuses.jsonl` holds run ids — which are session
+    /// ids — with kill-switch reasons. So: every live run any purged span
+    /// contributed to is dropped (asked about again, it is rebuilt from what
+    /// the store still holds); a tenant subject drops the tenant's runs,
+    /// events, policies and controls wholesale; a session or trace subject
+    /// drops that run's events and controls. When the durable state changed,
+    /// `fuses.jsonl` is rewritten without it. Idempotent, so a resumed
+    /// erasure may run it again.
+    pub(crate) fn forget_fuse_subject(
+        &self,
+        subject: &erasure::Subject,
+        keys: &std::collections::HashSet<(String, String, String)>,
+    ) -> Result<()> {
+        let Some(guard) = &self.guard else {
+            return Ok(());
+        };
+        let tenant = subject.tenant();
+        let whole_tenant = matches!(subject, erasure::Subject::Tenant { .. });
+        let named_run = match subject {
+            erasure::Subject::Session { session_id, .. } => Some(session_id.clone()),
+            erasure::Subject::Trace { trace_id, .. } => {
+                Some(format!("{}{trace_id}", semconv::TRACE_RUN_PREFIX))
+            }
+            _ => None,
+        };
+        let names = |key_tenant: &str, run: &str| {
+            tenant == Some(key_tenant) && (whole_tenant || named_run.as_deref() == Some(run))
+        };
+        let mut purged: HashMap<&str, std::collections::HashSet<u64>> = HashMap::new();
+        for (key_tenant, trace_id, span_id) in keys {
+            purged
+                .entry(key_tenant.as_str())
+                .or_default()
+                .insert(state::span_key(trace_id, span_id));
+        }
+
+        let log = guard.lock_log()?;
+        let records = {
+            let mut state = guard.lock_state()?;
+            let doomed: Vec<RunKey> = state
+                .runs
+                .iter()
+                .filter(|(key, run)| {
+                    names(&key.tenant, &key.run)
+                        || purged
+                            .get(key.tenant.as_str())
+                            .is_some_and(|spans| run.holds_any(spans))
+                })
+                .map(|(key, _)| key.clone())
+                .collect();
+            for key in &doomed {
+                state.remove(key);
+            }
+            state
+                .rebuilding
+                .retain(|key, _| !names(&key.tenant, &key.run));
+            guard
+                .events
+                .retain(&|event: &FuseEvent| !names(&event.tenant, &event.run));
+            let before = (state.policies.len(), state.controls.len());
+            if whole_tenant {
+                state
+                    .policies
+                    .retain(|policy| Some(policy.tenant.as_str()) != tenant);
+            }
+            state
+                .controls
+                .retain(|key, _| !names(&key.tenant, &key.run));
+            ((state.policies.len(), state.controls.len()) != before).then(|| state.records())
+        };
+        // Written with the state lock released — ingest observers never wait
+        // on this fsync — but under the log lock, which every durable
+        // mutation takes first, so nothing can interleave with the rewrite.
+        if let Some(records) = records {
+            log.rewrite(&records)?;
+        }
+        drop(log);
+        Ok(())
+    }
+
     /// Appends the fuse counters in Prometheus text format: trips (policy and
     /// manual), warnings, and the live-run gauge. Nothing when fuses are
     /// disabled.
@@ -1306,6 +1454,112 @@ mod tests {
         let mut rendered = String::new();
         store.render_fuse_metrics(&mut rendered);
         assert!(rendered.is_empty());
+    }
+
+    #[test]
+    fn a_trace_without_steps_is_not_followed_until_asked_about() {
+        let fixture = TempStore::open("stepless", FuseConfig::default());
+        let store = fixture.store();
+        let mut http = tool_span("plain", "a", "GET /", "{}", 5);
+        http.attributes.clear();
+        http.end_time_ns = 905;
+        store.ingest_batch(vec![http]).expect("ingests");
+        let live = store
+            .fuse_runs(None, RunListFilter::Active, 10)
+            .expect("lists");
+        assert!(live.is_empty(), "{live:?}");
+        // Asked about, it is rebuilt like any other run.
+        let doc = store.fuse_verdict("", "trace:t-plain").expect("verdict");
+        assert_eq!((doc.source, doc.usage.duration_ns), (Source::Rebuilt, 900));
+        assert_eq!(doc.usage.steps, 0);
+    }
+
+    #[test]
+    fn an_erasure_reaches_live_runs_the_feed_and_the_fuse_log() {
+        let mut fixture = TempStore::open(
+            "erase",
+            stop_on(Limits {
+                max_steps: Some(2),
+                ..Limits::default()
+            }),
+        );
+        let store = fixture.store();
+        let acme = |run: &str, id: &str| {
+            let mut span = tool_span(run, id, "search", id, 1);
+            span.tenant = "acme".into();
+            span
+        };
+        store
+            .ingest_batch(vec![
+                acme("secret-session", "a"),
+                acme("secret-session", "b"),
+            ])
+            .expect("ingests");
+        store
+            .ingest_batch(vec![tool_span("keep", "a", "x", "1", 1)])
+            .expect("ingests");
+        store
+            .fuse_trip("acme", "secret-session", "customer 4417 complained")
+            .expect("trips");
+        store.fuse_trip("", "keep", "unrelated").expect("trips");
+        store
+            .put_fuse_policy(PolicySpec {
+                name: "default".into(),
+                tenant: "acme".into(),
+                limits: Limits {
+                    max_steps: Some(9),
+                    ..Limits::default()
+                },
+                ..PolicySpec::default()
+            })
+            .expect("policy");
+
+        store
+            .erase(erasure::Subject::Session {
+                session_id: "secret-session".into(),
+                tenant: "acme".into(),
+            })
+            .expect("erases");
+        let log = std::fs::read_to_string(fixture.dir.join(log::LOG_NAME)).expect("log");
+        assert!(
+            !log.contains("secret-session") && !log.contains("4417"),
+            "{log}"
+        );
+        assert!(
+            log.contains("unrelated"),
+            "other runs' controls stay: {log}"
+        );
+        let feed = store
+            .fuse_events(None, None, Duration::ZERO)
+            .expect("events");
+        assert!(feed
+            .events
+            .iter()
+            .all(|event| event.run != "secret-session"));
+        // Asked about again, the run is rebuilt from what the store still
+        // holds: nothing.
+        let doc = store
+            .fuse_verdict("acme", "secret-session")
+            .expect("verdict");
+        assert_eq!((doc.verdict, doc.usage.steps), (Verdict::Continue, 0));
+        assert!(doc.evidence.is_empty());
+
+        // A tenant subject takes the tenant's policies too.
+        store
+            .erase(erasure::Subject::Tenant {
+                tenant: "acme".into(),
+            })
+            .expect("erases");
+        assert!(store.fuse_policies(Some("acme")).expect("lists").is_empty());
+        fixture.reopen(stop_on(Limits::default()));
+        let store = fixture.store();
+        assert!(store.fuse_policies(None).expect("lists").is_empty());
+        let kept = store.fuse_verdict("", "keep").expect("verdict");
+        assert_eq!(
+            kept.tripped_by,
+            Some(TrippedBy::Manual),
+            "the rewrite kept it"
+        );
     }
 
     #[test]
