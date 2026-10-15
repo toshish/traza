@@ -38,6 +38,20 @@ you:
 - Every `403` from the auth gate carries `"required"`: `"rw"`, `"admin"` or
   `"unbound"`, naming the capability the credential lacked, so a client can
   say which grant would have worked.
+- **In open mode, admin operations refuse cross-site browser requests.** With
+  no credential configured, erasure, eval tombstones, backups and every path
+  under `/v1/admin/` answer a request whose `Origin` is not a loopback page
+  with `403 {"error":"origin not allowed: …","next":"…"}`. Without it, any web
+  page the operator visits could mint a credential or erase data through the
+  operator's browser with a plain cross-site `POST`. Requests with no `Origin`
+  (`curl`, scripts) and pages served from loopback (the dashboard) are
+  unaffected, and once a credential exists the rule is not applied — a page
+  cannot attach a bearer token it does not know. This `403` carries `next`
+  rather than `required`: no grant is missing.
+- **Admin request bodies must be declared JSON.** A `POST` under `/v1/admin/`
+  that carries a body must send `Content-Type: application/json`, or it is
+  `415`. An HTML form cannot send that type, and a cross-site script cannot
+  send it without a CORS preflight this server never approves.
 
 [`GET /v1/whoami`](#get-v1whoami) tells any caller what its own credential
 is. See [administration](../operations/administration.md#authentication).
@@ -76,12 +90,12 @@ coding (`br`, `deflate`, `zstd`, a doubled `gzip`), is `415`.
 | `201` | Created: a backup pin, a credential |
 | `400` | Malformed body, invalid parameter, a violated ingest invariant, or an exceeded admission cap |
 | `401` | Missing, malformed, unknown, expired, or revoked bearer token. Carries `WWW-Authenticate: Bearer` |
-| `403` | Valid token without the grant this request needs — the body's `"required"` names it (`rw`, `admin`, `unbound`) — or a tenant-bound credential naming a foreign tenant |
+| `403` | Valid token without the grant this request needs — the body's `"required"` names it (`rw`, `admin`, `unbound`) — or a tenant-bound credential naming a foreign tenant; in open mode, also a browser request from a non-loopback page to an admin operation |
 | `404` | No such route, or the requested trace/session/payload/dataset/experiment/credential does not exist. Cross-tenant reads answer `404`, never `403` — existence is a fact about another tenant |
-| `409` | A conflict a retry may resolve: a mutation for a tenant whose erasure is pending, a tombstoned parent version, a payload reference not in the store, a pin label already taken, a credential token already registered, an environment credential named for revocation |
+| `409` | A conflict a retry may resolve: a mutation for a tenant whose erasure is pending, a tombstoned parent version, a payload reference not in the store, a pin label already taken, a credential token already registered, an environment credential named for revocation, a first credential that is not an unbound admin |
 | `410` | A tombstoned dataset version: the content is withheld, the fact of the deletion is not |
 | `413` | A gzip body that decompresses past the 64 MiB body cap |
-| `415` | A `Content-Encoding` other than `gzip` on an ingest route, or any coding elsewhere |
+| `415` | A `Content-Encoding` other than `gzip` on an ingest route, or any coding elsewhere; a `/v1/admin/` body not declared `application/json` |
 | `429` | An ingest batch refused by its tenant's monthly quota or ingest pause. Carries `Retry-After` |
 | `503` | The store could not serve the request, or the server is at its connection limit. Retry with backoff |
 
@@ -1418,9 +1432,11 @@ curl -H "Authorization: Bearer $ACME_TOKEN" http://localhost:8080/v1/usage
 
 Spans a pending erasure suppressed at ingest are not admitted and not
 charged. **The counters are written to `usage.json` every five seconds and on
-every flush**, and only when they changed; a crash loses at most the counts
-since the last write — an undercount, never an overcount. They are kept
-outside generations: a restore does not rewind them.
+every flush**, and only when they changed. The five-second writer is a server
+thread of its own, so a long merge or expiry pass does not delay it; a crash
+loses the counts since the last completed write — normally five seconds'
+worth, plus however long that write's fsync took — an undercount, never an
+overcount. They are kept outside generations: a restore does not rewind them.
 
 **Errors.** `400` for an unknown query parameter; `403` when a bound
 credential names another tenant.
@@ -1434,6 +1450,7 @@ returns to its default. Unbound `admin` only. `{tenant}` is a tenant name, or
 ```sh
 curl -X POST http://localhost:8080/v1/admin/tenants/acme/limits \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' \
   -d '{"monthly_spans":1000000,"monthly_bytes":10000000000,"ingest_paused":false,"ttl_seconds":2592000}'
 ```
 
@@ -1455,7 +1472,8 @@ the next batch; a TTL change applies at the next retention pass, which the
 server runs every minute.
 
 **Errors.** `400` for an invalid tenant, an unknown field, or a value of the
-wrong type; `403` for any credential that is not an unbound `admin`.
+wrong type; `403` for any credential that is not an unbound `admin`; `415`
+when the body is not declared `application/json`.
 
 ### `GET /v1/admin/tenants/{tenant}/limits`
 
@@ -1498,11 +1516,16 @@ the same after every restart.
 
 Creates a credential while the server runs. Unbound `admin` only — or open
 mode, which is how the first credential of a store is minted: from the moment
-one exists, every request must authenticate.
+one exists, every request must authenticate. **The first credential must
+itself be an unbound `admin`** (`409` otherwise): any other would switch
+authentication on with no credential able to manage credentials. In open mode
+the request must not come from a non-loopback browser page (see
+[Conventions](#conventions)).
 
 ```sh
 curl -X POST http://localhost:8080/v1/admin/credentials \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' \
   -d '{"scope":"rw","tenant":"acme","label":"acme collector","expires_in_seconds":2592000}'
 ```
 
@@ -1518,7 +1541,7 @@ curl -X POST http://localhost:8080/v1/admin/credentials \
 | `tenant` | string | Bind to this tenant; omit for an unbound credential |
 | `label` | string | A note for the credential list, at most 256 bytes |
 | `expires_in_seconds` | integer | Lifetime from now, at least 1; omit for no expiry |
-| `token` | string | Register this token instead of minting one: at least 24 bytes, no whitespace, control characters or commas. For a control plane reconciling a credential it already issued |
+| `token` | string | Register this token instead of minting one: at least 24 bytes, no whitespace, control characters or commas. For a control plane reconciling a credential it already issued. **It must be high-entropy** (at least 128 random bits): the store protects it at rest with nothing but an unsalted SHA-256, and only its length is checked |
 
 **`token` is in this response and nowhere else, ever.** The store keeps only
 its SHA-256, so it cannot be shown again; lose it and revoke the credential.
@@ -1530,8 +1553,11 @@ later: at most a quarter of the token and never more than 12 characters —
 
 **Errors.** `400` naming the offending field (unknown fields are refused);
 `409` when the token is already registered — live, expired, revoked, or in
-`TRAZA_TOKENS`: a token is never reused, so a revoked one cannot come back;
-`403` for anything but an unbound `admin`.
+`TRAZA_TOKENS`: a token is never reused, so a revoked one cannot come back —
+or when the store has no credential yet and this one is not an unbound
+`admin`; `403` for anything but an unbound `admin`, and in open mode for a
+non-loopback browser `Origin`; `415` when the body is not declared
+`application/json`.
 
 ### `GET /v1/admin/credentials`
 
@@ -1760,14 +1786,15 @@ orchestrator probing them holds no credential — and not counted in the request
 metrics. `GET` only; any other method goes through the gate like any request.
 
 ```json
-{"status":"ok","version":"0.26.0-preview.1"}
+{"status":"ok","version":"0.27.0"}
 ```
 
 ```json
 {"ready":true}
 ```
 
-`version` is the server's build version. The listener binds only after the
+`version` is the server's build version (the crate version it was built
+from). The listener binds only after the
 store has opened and recovered its log, so `/readyz` answers `200` whenever it
 answers at all; "not ready yet" is a refused connection.
 

@@ -72,8 +72,9 @@ with a plain `Instant` — see [benchmarking](../internals/benchmarking.md).
 One series per tenant that has usage counters, labelled `tenant` (`""` is the
 default tenant). They are the [`GET /v1/usage`](../guide/http-api.md#get-v1usage)
 lifetime counters, persisted in `usage.json`, so they do **not** reset on a
-restart — though a crash can lose the increments since the last write (at most
-five seconds), so after one a series may step back by that much. The label set
+restart — though a crash can lose the increments since the last write
+(normally five seconds' worth, plus however long that write took), so after
+one a series may step back by that much. The label set
 grows with the number of tenants; on a store with very many tenants, these two
 families dominate the scrape.
 
@@ -292,7 +293,8 @@ decomposition and how it moved are in
 `traza-server` writes to stderr, sparingly: the listening address, the
 durability contract, the dashboard directory (or every path searched), and
 failures from the background maintenance thread (`segment compaction failed:`,
-`expiry compaction failed:`, `export failed after N rows:`). There is no
+`expiry compaction failed:`, `export failed after N rows:`) and from the usage
+writer (`usage persistence failed:`). There is no
 request log — if you need one, the reverse proxy in front is the right place.
 
 Maintenance failures are worth surfacing. They do not stop the server, and a

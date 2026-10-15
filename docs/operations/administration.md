@@ -89,6 +89,8 @@ be bound to a tenant no span could ever carry.
 | `ro` token on a `POST` | `403 {"error":"forbidden","required":"rw"}` |
 | Non-`admin` token on erasure, a tombstone, a backup, or `/v1/admin/*` | `403 {"error":"forbidden","required":"admin"}` |
 | Bound token on an operator endpoint or `/v1/admin/*` | `403 {"error":"forbidden","required":"unbound"}` |
+| Open mode: a browser request from a non-loopback page to erasure, a tombstone, a backup, or `/v1/admin/*` | `403 {"error":"origin not allowed: …","next":"…"}` — see [Bootstrapping](#runtime-credentials) |
+| A `/v1/admin/*` `POST` whose body is not declared `Content-Type: application/json` | `415` |
 | Valid token, permitted request | The route's normal response |
 
 `"required"` names the capability the credential lacked, so a dashboard can
@@ -145,25 +147,49 @@ An unbound `admin` manages credentials over HTTP while the server runs —
 ```sh
 curl -X POST http://localhost:8080/v1/admin/credentials \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' \
   -d '{"scope":"rw","tenant":"acme","label":"acme collector"}'
 ```
 
+Admin request bodies must be declared `application/json`; anything else is
+`415`.
+
 - **Bootstrapping.** On a loopback start with no credential anywhere, the
-  server is open and the caller is an unbound admin, so the first `admin`
-  credential can be minted with a plain `curl` on the host. From that request
-  on, the store is closed — and the credential log persists, so it stays
-  closed across restarts, and a later non-loopback start counts the log as
-  configured authentication.
+  server is open and the caller is an unbound admin, so the first credential
+  can be minted with a plain `curl` on the host:
+
+  ```sh
+  curl -X POST http://localhost:8080/v1/admin/credentials \
+    -H 'Content-Type: application/json' -d '{"scope":"admin","label":"root"}'
+  ```
+
+  **The first credential must be an unbound `admin`** — anything else is
+  `409`, because it would close the store with no credential able to reach
+  `/v1/admin/*`. From that request on, the store is closed — and the
+  credential log persists, so it stays closed across restarts, and a later
+  non-loopback start counts the log as configured authentication.
+- **No bootstrapping from a web page.** While the store is open, erasure,
+  tombstones, backups and `/v1/admin/*` refuse a browser request whose
+  `Origin` is not a loopback page (`403`). Otherwise any site the operator
+  visited could mint itself an admin credential with a cross-site `POST` —
+  locking the operator out and keeping a token that a later non-loopback
+  start would serve to the network. `curl` sends no `Origin` and the
+  dashboard is a loopback page, so neither is affected. Once a credential
+  exists the rule is not applied: a page cannot attach a bearer token it does
+  not know.
 - **The token is shown once.** It is in the `201` response and nowhere else:
   the store writes only its SHA-256. A minted token is `trz_` plus 64 hex
   digits from `/dev/urandom`. The list shows a short `prefix` — at most a
   quarter of the token, never more than 12 characters — to tell credentials
   apart.
 - **Registering a token.** A control plane that issues tokens itself may pass
-  `"token"` (at least 24 bytes, no whitespace or commas) to register it. A
-  token's digest can be registered once, ever: a duplicate — including a
-  revoked token, or one in `TRAZA_TOKENS` — is `409`, so a revoked token can
-  never come back.
+  `"token"` (at least 24 bytes, no whitespace or commas) to register it.
+  **Supply a high-entropy token** — at least 128 random bits, such as
+  `openssl rand -hex 16` or longer. Only the length is checked, and at rest
+  the token is protected by nothing but an unsalted SHA-256, which a guessable
+  token does not survive. A token's digest can be registered once, ever: a
+  duplicate — including a revoked token, or one in `TRAZA_TOKENS` — is `409`,
+  so a revoked token can never come back.
 - **Revocation is immediate and durable.** The revoke record is fsynced before
   the response; from the next request the token is `401`, and a `kill -9`
   does not bring it back. Environment credentials cannot be revoked this way
@@ -182,9 +208,15 @@ final record (a crash mid-append) is truncated at the next start, and damage
 anywhere else refuses the start rather than guessing which credentials the
 file held. **It is outside generations and pins**: a backup never carries it,
 and `--restore` leaves the live file in place — restoring last month's backup
-does not resurrect a token revoked last week. Back the file up separately if
-you need to, knowing it holds digests that would authenticate nobody without
-their tokens.
+does not resurrect a token revoked last week. The file is created owner-only
+(`0600`). Back it up separately if you need to, knowing it holds digests: for
+minted tokens (256 random bits) those authenticate nobody without the tokens,
+but a weak supplied token could be guessed from its digest offline.
+
+Creating or revoking a credential fsyncs the log while holding a writer lock
+of its own; requests keep authenticating through it, and a revoked token
+stops working once the revoke record is durable, before the response is
+sent.
 
 ### The non-loopback refusal
 
@@ -198,6 +230,18 @@ traza-server: refusing unauthenticated non-loopback bind 0.0.0.0; configure TRAZ
 `--allow-unauthenticated-non-loopback` is the deliberate escape hatch — it
 exists so that running open on a network is a decision someone made, not
 something that happened by default.
+
+**Running open on a network hands the store to whoever reaches it first.**
+Every client that can reach the port is an unbound admin: it can read, write
+and erase everything, and the first to call `POST /v1/admin/credentials` mints
+the store's first admin credential. That closes the store to everyone else at
+once, and it persists: the credential log survives restarts, and a restart
+with `TRAZA_TOKENS` adds the environment's credentials beside it rather than
+removing it — removing a planted credential means revoking it with an admin
+token, or moving `credentials.jsonl` aside while the server is stopped. The
+cross-site check above does not help here: it stops browsers, not network
+clients, which send no `Origin`. Configure a credential instead wherever the
+network is not entirely trusted.
 
 ### What is *not* gated
 
@@ -477,6 +521,7 @@ unbound admin with
 ```sh
 curl -X POST http://localhost:8080/v1/admin/tenants/acme/limits \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' \
   -d '{"monthly_spans":1000000,"monthly_bytes":10000000000,"ingest_paused":false,"ttl_seconds":null}'
 ```
 
@@ -492,9 +537,11 @@ spans and bytes — and serves them in O(tenants) at
 [`GET /v1/usage`](../guide/http-api.md#get-v1usage), a bound credential seeing
 its own row. `bytes` is each span's native JSON after tenant stamping and
 **before** payload offload: what the client sent, not what the store keeps.
-The counters are written to `usage.json` on the five-second maintenance tick
-and on every flush, when they changed; a crash loses at most the counts since
-the last write — an **undercount**, never an overcount.
+The counters are written to `usage.json` every five seconds, by a server
+thread of their own so a long merge or expiry pass cannot delay them, and on
+every flush, when they changed; a crash loses the counts since the last
+completed write — normally five seconds' worth, plus however long that write
+took — an **undercount**, never an overcount.
 
 **Enforcement.** Before a batch reaches the write-ahead log, a paused tenant's
 batch is refused, and so is a batch whose spans or bytes would take the month

@@ -190,7 +190,7 @@ better p95/p99 with peak capacity. Do not pick it hoping for a lower median;
 | `--mcp-max-result-bytes N` | `32768` | Ceiling on one MCP tool result or resource read, counting the **whole serialized result** — text block, `structuredContent`, and the JSON envelope around them — in UTF-8 bytes, which is what goes on the wire. **Refused below 1,024**: beneath that there is no result that both fits and conforms to the `outputSchema` its tool advertises, and failing at startup beats answering every request with something a validating client rejects. Past it, rows are dropped and the truncation is stated with the argument that would have narrowed it. Raise for a client with a large context window; lower to make an agent narrow its own queries. |
 | `--mcp-max-payload-bytes N` | `262144` | Ceiling on one `get_payload` fetch, whatever the call asks for. This is what stops a single offloaded prompt filling a context window. The **effective** cap is the smaller of this and `--mcp-max-result-bytes`, so that the byte count the tool reports is the one it returns. |
 | `--pricing FILE` | none | Per-model rates used to derive a cost for LLM spans that did not meter one. Nothing is derived without it, which is the behaviour every store had before it existed. A malformed file refuses startup rather than being ignored — silently reporting `$0.00` is the symptom the file was supplied to fix. Changing the rates invalidates rollups folded under the old ones, which costs a rebuild of the affected sidecars. See [Model pricing](#model-pricing). |
-| `--allow-unauthenticated-non-loopback` | off | Explicitly permit an unauthenticated non-loopback bind. |
+| `--allow-unauthenticated-non-loopback` | off | Explicitly permit an unauthenticated non-loopback bind. **Every client that reaches the port is then an unbound admin**, and the first to call `POST /v1/admin/credentials` mints the store's first admin credential — closing the store to everyone else, persistently (a later restart with `TRAZA_TOKENS` keeps it alongside). See [the non-loopback refusal](operations/administration.md#the-non-loopback-refusal). |
 | `--version`, `-V` | — | Print `traza-server <version>` and exit. |
 | `--restore DIR` | — | Install a backup from `DIR` into `--data-dir`, then serve it. The backup is verified before anything is swapped and the swap commits at one `CURRENT` rename, so a failed restore leaves the prior store. See [backup and restore](operations/backup.md). |
 
@@ -406,6 +406,11 @@ The consequence: **relative comparisons between rows are sound; absolute rates
 are pessimistic.** Where a row's spread is wide, it is wide because rounds
 executed under materially different load, and the median mixes those
 conditions.
+
+These runs also predate the admission measurement pass, which serializes each
+span once more before admitting it; see
+[capacity](operations/capacity.md#capacity-and-performance) for what is and is
+not known about its cost.
 
 ### The two knobs interact — the measured grid
 

@@ -218,7 +218,10 @@ the caller and every member's CRC-32 and length verified.
 
 The hosting state (`credentials`, `limits`, `usage`, one field on `Store`)
 and the HTTP handlers for `/v1/whoami`, `/v1/usage` and `/v1/admin/*`, as
-request → reply functions the server routes to with one call.
+request → reply functions the server routes to with one call. Also `screen`,
+the head-only refusals the gate applies after authentication: cross-site
+browser requests to admin operations in open mode, and admin bodies not
+declared JSON.
 
 ### [`src/mcp.rs`](../../src/mcp.rs)
 
