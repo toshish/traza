@@ -41,6 +41,9 @@ use crate::analytics::{LlmAggregateRow, LlmGroupBy, SessionOrder};
 use crate::annotations::Annotation;
 use crate::{semconv, Error, Span, SpanCursor, SpanFilter, SpanSort, Store};
 
+// get_run_tape, compare_runs and recall_runs live beside this file.
+mod replay_tools;
+
 /// The MCP endpoint path served by `traza-server`.
 pub const ENDPOINT: &str = "/v1/mcp";
 
@@ -592,6 +595,7 @@ impl<'a> Server<'a> {
                 Nature::Read,
             ),
         ];
+        tools.extend(replay_tools::definitions());
         if self.annotation_tool_available(access) {
             tools.push(tool(
                 "record_annotation",
@@ -702,6 +706,9 @@ impl<'a> Server<'a> {
             "slowest_spans" => self.slowest_spans(arguments, context.clone()),
             "analyze_cost" => self.analyze_cost(arguments, context.clone()),
             "get_payload" => self.get_payload(arguments, &context),
+            name if replay_tools::handles(name) => {
+                replay_tools::call(self, name, arguments, &context)
+            }
             "record_annotation" if self.annotation_tool_available(context.access) => {
                 self.record_annotation(arguments, context)
             }

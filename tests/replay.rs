@@ -1444,3 +1444,55 @@ fn unreplayable_runs_and_bad_requests_are_refused_precisely() {
     let (status, body) = send_json(&server, "GET", "/v1/replays/rp_nope", None, &[]);
     assert_eq!((status, body), (404, json!({"error": "replay not found"})));
 }
+
+#[test]
+fn mcp_tools_read_tapes_comparisons_and_recall_over_http() {
+    let server = seeded_open_server(&["--mcp"]);
+    let rpc = |name: &str, arguments: Value| -> Value {
+        let (status, body) = send_json(
+            &server,
+            "POST",
+            "/v1/mcp",
+            Some(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                         "params": {"name": name, "arguments": arguments}})),
+            &[("Accept", "application/json, text/event-stream".into())],
+        );
+        assert_eq!(status, 200, "{body}");
+        body["result"].clone()
+    };
+
+    let tape = rpc("get_run_tape", json!({"run_id": "sess-oi"}));
+    assert_eq!(tape["isError"], json!(false), "{tape}");
+    let text = tape["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.starts_with("Run sess-oi: 4 steps from 4 spans."),
+        "{text}"
+    );
+    assert!(
+        text.contains("<traza:telemetry untrusted=\"true\">"),
+        "{text}"
+    );
+    assert!(text.contains("#2 tool lookup_order"), "{text}");
+
+    let compared = rpc("compare_runs", json!({"a": "sess-llmetry", "b": "sess-oi"}));
+    assert_eq!(compared["isError"], json!(false), "{compared}");
+    assert_eq!(compared["structuredContent"]["a"]["steps"], json!(3));
+    assert_eq!(compared["structuredContent"]["b"]["steps"], json!(4));
+    assert!(compared["structuredContent"]["first_divergence"]["kind"].is_string());
+
+    let recalled = rpc(
+        "recall_runs",
+        json!({"query": "order A-17", "outcome": "success"}),
+    );
+    assert_eq!(recalled["isError"], json!(false), "{recalled}");
+    let runs: Vec<&str> = recalled["structuredContent"]["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|run| run["run"].as_str().unwrap())
+        .collect();
+    assert!(
+        runs.contains(&"sess-oi") && runs.contains(&"sess-claude"),
+        "{recalled}"
+    );
+}
