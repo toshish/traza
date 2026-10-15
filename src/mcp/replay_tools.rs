@@ -18,9 +18,10 @@
 use serde_json::{json, Map, Value};
 
 use super::{
-    budgeted_structured_result, clamp_report, count, duration_human, json_safe, known_keys,
-    optional_string, optional_usize, render_value, required_str, rfc3339, sanitize, text_result,
-    thousands, tool, Context, Nature, Server, Tool, ToolError, ToolResult, VALUE_CHARS,
+    budgeted_structured_result_narrowing, clamp_report_narrowing, count, duration_human, json_safe,
+    known_keys, optional_string, optional_usize, render_value, required_str, rfc3339, sanitize,
+    serialized_len, text_result, thousands, tool, truncate_bytes, Context, Nature, Server, Tool,
+    ToolError, ToolResult, VALUE_CHARS,
 };
 use crate::diff::{Aligned, Op, RunDiff, RunSide};
 use crate::recall::{OutcomeFilter, RecalledRun, DEFAULT_RECALL_LIMIT, MAX_RECALL_LIMIT};
@@ -34,6 +35,19 @@ const MAX_TAPE_STEPS: usize = 2_000;
 
 /// Characters of a request or response preview.
 const PREVIEW_CHARS: usize = 160;
+
+/// What to do about a `get_run_tape` result the ceiling cut short. The tool
+/// always starts at the first step, so the only argument that changes what
+/// fits is `max_steps`.
+const TAPE_NARROW: &str = "This tool always starts at the run's first step: a smaller 'max_steps' \
+                           shows fewer steps, each in full.";
+
+/// What to do about a `compare_runs` result the ceiling cut short. Its
+/// arguments are two run ids and nothing else.
+const COMPARE_NARROW: &str = "Compare shorter runs, or open each with get_run_tape.";
+
+/// What to do about a `recall_runs` result the ceiling cut short.
+const RECALL_NARROW: &str = "Ask for a smaller 'limit', or add words to 'query'.";
 
 /// The tool definitions, appended to the server's read tools.
 pub(super) fn definitions() -> Vec<Tool> {
@@ -182,7 +196,8 @@ fn get_run_tape(
         count(tape.steps.len() as u64, "step"),
         count(tape.spans_examined as u64, "span"),
         if tape.truncated {
-            " TRUNCATED: the run has more steps than shown; raise max_steps to see further."
+            " TRUNCATED: the run has more steps than shown; a larger max_steps shows more of \
+             it, as far as this server's result ceiling allows."
         } else {
             ""
         },
@@ -209,11 +224,12 @@ fn get_run_tape(
          with get_payload. Costs are metered by the span or priced from the server's rates."
             .to_owned(),
     ];
-    Ok(text_result(clamp_report(
+    Ok(text_result(clamp_report_narrowing(
         &head,
         &rows,
         &notes,
         server.limits.max_result_bytes,
+        TAPE_NARROW,
     )))
 }
 
@@ -252,13 +268,19 @@ fn step_line(step: &TapeStep) -> String {
 
 fn side_phrase(label: &str, side: &RunSide) -> String {
     format!(
-        "{label}: {} · {} tok · ${:.4} · {} · {} · {}",
+        "{label}: {} · {} tok · ${:.4} · {} · {} · {}{}",
         count(side.steps as u64, "step"),
         thousands(side.tokens),
         side.cost_usd,
         duration_human(side.duration_ns),
         count(side.errors as u64, "error"),
         outcome_word(side.outcome),
+        if side.truncated {
+            " (TRUNCATED: longer than the span budget; these figures describe its \
+             beginning, and how it ended is unknown)"
+        } else {
+            ""
+        },
     )
 }
 
@@ -340,15 +362,51 @@ fn compare_runs(
          only one run has. Open either run with get_run_tape to read the steps themselves."
             .to_owned(),
     ];
-    Ok(budgeted_structured_result(
-        &head,
-        &rows,
-        &notes,
-        "aligned",
-        &structured_rows,
-        &compare_extras(&diff),
-        server.limits.max_result_bytes,
-    ))
+    // The rows are trimmed to fit by the budgeting below; the extras are
+    // not, and two of them quote producer text — run ids, and the
+    // explanation's names and parameter values. Each is bounded where it is
+    // made, and if the structured half still cannot fit the ceiling with no
+    // rows at all, they are clipped further, halving until it does. The text
+    // half is the ceiling's to trim afterwards.
+    let max_bytes = server.limits.max_result_bytes;
+    let mut quoted: Option<usize> = None;
+    loop {
+        let result = budgeted_structured_result_narrowing(
+            &head,
+            &rows,
+            &notes,
+            "aligned",
+            &structured_rows,
+            &compare_extras(&diff, quoted),
+            max_bytes,
+            (COMPARE_NARROW, COMPARE_NARROW),
+        );
+        let structured_only = json!({
+            "content": [{"type": "text", "text": ""}],
+            "structuredContent": result["structuredContent"],
+            "isError": false,
+        });
+        if quoted == Some(0) || serialized_len(&structured_only) <= max_bytes {
+            return Ok(result);
+        }
+        quoted = Some(quoted.map_or(512, |bytes| bytes / 2));
+    }
+}
+
+/// `text` made JSON-safe and, when `max_bytes` is given, cut to at most that
+/// many bytes at a character boundary, with an ellipsis when it was cut.
+fn quoted_text(text: &str, max_bytes: Option<usize>) -> String {
+    let safe = json_safe(text);
+    match max_bytes {
+        Some(max) if safe.len() > max => {
+            let mut cut = truncate_bytes(&safe, max);
+            if max > 0 {
+                cut.push('…');
+            }
+            cut
+        }
+        _ => safe,
+    }
 }
 
 fn aligned_line(entry: &Aligned) -> String {
@@ -385,10 +443,12 @@ fn aligned_structured(entry: &Aligned) -> Value {
     value
 }
 
-fn compare_extras(diff: &RunDiff) -> Vec<(&'static str, Value)> {
+/// The structured fields beside the aligned rows. `quoted` bounds each value
+/// that quotes producer or caller text, in bytes; `None` leaves them whole.
+fn compare_extras(diff: &RunDiff, quoted: Option<usize>) -> Vec<(&'static str, Value)> {
     let side = |side: &RunSide| {
         let mut value = serde_json::to_value(side).unwrap_or_else(|_| json!({}));
-        value["run"] = json!(json_safe(&side.run));
+        value["run"] = json!(quoted_text(&side.run, quoted));
         value
     };
     let first = diff.first_divergence.as_ref().map(|first| {
@@ -396,7 +456,7 @@ fn compare_extras(diff: &RunDiff) -> Vec<(&'static str, Value)> {
             "a": first.a,
             "b": first.b,
             "kind": first.kind.as_str(),
-            "explanation": json_safe(&first.explanation),
+            "explanation": quoted_text(&first.explanation, quoted),
         })
     });
     vec![
@@ -463,7 +523,7 @@ fn recall_runs(
                 .to_owned(),
         );
     }
-    Ok(budgeted_structured_result(
+    Ok(budgeted_structured_result_narrowing(
         &head,
         &rows,
         &notes,
@@ -471,6 +531,7 @@ fn recall_runs(
         &structured_rows,
         &[("truncated", json!(recall.truncated))],
         server.limits.max_result_bytes,
+        (RECALL_NARROW, RECALL_NARROW),
     ))
 }
 
@@ -501,6 +562,12 @@ fn recalled_line(index: usize, run: &RecalledRun) -> String {
             ""
         },
     );
+    if run.truncated {
+        line.push_str(
+            " · TRUNCATED: longer than recall reads, so its figures describe its beginning \
+             and its outcome is unknown",
+        );
+    }
     if let Some(goal) = &run.goal {
         line.push_str(&format!(
             " · goal: {}",
@@ -552,7 +619,7 @@ fn compare_output_schema() -> Value {
         "type": "object",
         "properties": {
             "a": {"type": "object", "description": "Run a: steps, cost_usd, tokens, \
-                  duration_ns, errors, outcome."},
+                  duration_ns, errors, outcome, truncated."},
             "b": {"type": "object", "description": "Run b, the same fields."},
             "aligned": {
                 "type": "array",
@@ -577,7 +644,8 @@ fn recall_output_schema() -> Value {
             "runs": {
                 "type": "array",
                 "description": "Recalled runs, ranked: run, tenant, outcome, outcome_source, \
-                                goal, score, last_end_ns, steps, cost_usd, skeleton, cause.",
+                                goal, score, last_end_ns, steps, cost_usd, skeleton, cause, \
+                                truncated.",
             },
             "truncated": {"type": "boolean"},
         },
@@ -736,6 +804,116 @@ mod tests {
             text(&missing).starts_with("Run b has no spans"),
             "{missing}"
         );
+    }
+
+    #[test]
+    fn compare_runs_fits_the_ceiling_whatever_the_producer_wrote() {
+        let fixture = TempStore::open("mcp-compare-ceiling", crate::Config::default());
+        // Every value the comparison quotes is producer text, unbounded: a
+        // model name, a parameter blob, and the run ids themselves.
+        let long_model = format!("model-{}", "m".repeat(3_000));
+        let run_a = format!("trace:{}", "a".repeat(2_000));
+        let run_b = format!("trace:{}", "b".repeat(2_000));
+        let llm = |trace: &str, model: &str, parameters: Value| {
+            let mut span = span(
+                trace,
+                "1",
+                1,
+                json!({"gen_ai.operation.name": "chat", "gen_ai.request.model": model,
+                       "gen_ai.request.response_format": parameters,
+                       "gen_ai.prompt.0.content": "hi", "gen_ai.completion.0.content": "ok"}),
+            );
+            span.start_time_ns += 1_600_000_000_000_000_000;
+            span.end_time_ns += 1_600_000_000_000_000_000;
+            span
+        };
+        fixture
+            .store()
+            .ingest_batch(vec![
+                llm(
+                    &run_a[6..],
+                    &long_model,
+                    json!({"schema": "\"".repeat(4_000)}),
+                ),
+                llm(&run_b[6..], &long_model, json!("text")),
+            ])
+            .expect("ingests");
+        for ceiling in [super::super::MIN_RESULT_BYTES, 2_048, 32 * 1024] {
+            let result = call_tool(
+                fixture.store(),
+                "compare_runs",
+                json!({"a": run_a, "b": run_b}),
+                ceiling,
+            );
+            assert_eq!(result["isError"], json!(false), "{result}");
+            let serialized = serde_json::to_vec(&result).expect("serializes");
+            assert!(
+                serialized.len() <= ceiling,
+                "{} > {ceiling}",
+                serialized.len()
+            );
+            let structured = &result["structuredContent"];
+            for required in compare_output_schema()["required"].as_array().unwrap() {
+                assert!(
+                    structured.get(required.as_str().unwrap()).is_some(),
+                    "{required} at {ceiling}"
+                );
+            }
+            assert_eq!(structured["first_divergence"]["kind"], json!("config"));
+        }
+    }
+
+    #[test]
+    fn truncation_notes_name_only_arguments_the_tool_takes() {
+        let fixture = TempStore::open("mcp-narrow", crate::Config::default());
+        let store = fixture.store();
+        let mut spans = Vec::new();
+        for index in 0..12 {
+            let trace = format!("run{index}");
+            for step in 0..20u64 {
+                let mut span = span(
+                    &trace,
+                    &format!("s{step}"),
+                    step + 1,
+                    json!({"gen_ai.operation.name": "chat", "gen_ai.request.model": "gpt-4o",
+                           "gen_ai.prompt.0.content": format!("refund order {index} {}", "p".repeat(150)),
+                           "gen_ai.completion.0.content": "q".repeat(150)}),
+                );
+                span.start_time_ns += 1_600_000_000_000_000_000;
+                span.end_time_ns += 1_600_000_000_000_000_000;
+                spans.push(span);
+            }
+        }
+        store.ingest_batch(spans).expect("ingests");
+        let ceiling = 2_048;
+        for (name, arguments, takes) in [
+            (
+                "get_run_tape",
+                json!({"run_id": "trace:run0", "max_steps": 20}),
+                "'max_steps'",
+            ),
+            (
+                "compare_runs",
+                json!({"a": "trace:run0", "b": "trace:run1"}),
+                "Compare shorter runs",
+            ),
+            (
+                "recall_runs",
+                json!({"query": "refund order", "limit": 50}),
+                "'limit'",
+            ),
+        ] {
+            let result = call_tool(store, name, arguments, ceiling);
+            let body = text(&result);
+            let note = body
+                .lines()
+                .find(|line| line.starts_with("Truncated:"))
+                .unwrap_or_else(|| panic!("{name} was not truncated: {body}"));
+            assert!(note.contains(takes), "{name}: {note}");
+            for foreign in ["'since'", "'service'"] {
+                assert!(!note.contains(foreign), "{name} suggests {foreign}: {note}");
+            }
+        }
     }
 
     #[test]

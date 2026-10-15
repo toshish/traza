@@ -18,6 +18,7 @@
 //! fingerprints always describe the stored form, resolved or not, so a tape
 //! fetched with and without `resolve` agrees on every identity it reports.
 
+use std::collections::HashMap;
 use std::time::Instant;
 
 use serde::Serialize;
@@ -33,6 +34,12 @@ use crate::{Deadline, Result, Span, Store};
 /// threshold — room for a long run's offloaded prompts — while keeping a
 /// single tape response a size a browser or an SDK can hold without thought.
 pub const DEFAULT_TAPE_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// Payload content one [`Resolver`] keeps after reading it, so that a
+/// payload referenced from many steps — an offloaded system prompt repeated
+/// in every request — is read from disk once per request rather than once
+/// per step. Past it, later payloads are read each time they are referenced.
+const RESOLVE_CACHE_BYTES: usize = 8 * 1024 * 1024;
 
 /// Spans one tape examines before it says it was truncated.
 ///
@@ -137,6 +144,12 @@ pub(crate) struct StepDetail {
     /// The call's configuration attributes (see [`CONFIG_PREFIX`]); empty for
     /// steps that are not model calls.
     pub(crate) config: Map<String, Value>,
+    /// The span's tenant — needed, with the session, to tell whether an
+    /// erasure covers a copy of this step held outside the store.
+    pub(crate) tenant: String,
+    /// The span's session id under the store's session precedence, which is
+    /// what a session erasure matches.
+    pub(crate) session: Option<String>,
 }
 
 /// A run read as a tape.
@@ -190,16 +203,20 @@ pub(crate) struct RunTape {
     pub(crate) steps: Vec<TapeStep>,
     /// Whether either cap cut the run short.
     pub(crate) truncated: bool,
+    /// Whether the SPAN cap did: then `spans` is the run's beginning, and
+    /// anything summarised over them — cost, errors, how the run ended —
+    /// describes that beginning, not the run.
+    pub(crate) spans_truncated: bool,
 }
 
 impl Store {
     /// The tape of `run_id` under `tenant` (the scoping rules of
     /// [`Store::get_run_in`]), or `None` when no span carries that run id.
     ///
-    /// Budgeted by [`crate::Config::query_deadline`]. Payload resolution, when
-    /// asked for, reads each reference through [`Store::payload_in`] under the
-    /// same tenant, so a bound caller can inline only bytes its own tenant's
-    /// spans reference.
+    /// Budgeted by [`crate::Config::query_deadline`] — ONE budget for the
+    /// whole request, payload resolution included. Resolution reads each
+    /// reference under the same tenant ([`Resolver`]), so a bound caller can
+    /// inline only bytes its own tenant's spans reference.
     pub fn tape(
         &self,
         tenant: Option<&str>,
@@ -216,12 +233,13 @@ impl Store {
             None => None,
             Some(max_bytes) => {
                 let mut budget = ResolveBudget::new(max_bytes);
+                let mut resolver = Resolver::new(self, tenant, deadline);
                 for step in &mut steps {
                     for value in [&mut step.request, &mut step.response]
                         .into_iter()
                         .flatten()
                     {
-                        self.resolve_payloads(tenant, value, &mut budget)?;
+                        resolver.resolve(value, &mut budget)?;
                     }
                 }
                 Some(budget.unresolved)
@@ -249,7 +267,8 @@ impl Store {
     ) -> Result<RunTape> {
         let run = self.run_spans(tenant, run_id, max_spans, deadline)?;
         let mut steps = Vec::new();
-        let mut truncated = run.truncated;
+        let spans_truncated = run.truncated;
+        let mut truncated = spans_truncated;
         for span in &run.spans {
             let (facts, llm) = self.step_facts(span);
             if !facts.kind.is_step() {
@@ -265,76 +284,23 @@ impl Store {
             spans: run.spans,
             steps,
             truncated,
+            spans_truncated,
         })
-    }
-
-    /// Replaces every `$payload` reference inside `value` with the content it
-    /// names, while `budget` lasts.
-    ///
-    /// The budget is a PREFIX cut: the first reference that does not fit
-    /// exhausts it, and every reference after it stays a reference even if it
-    /// would fit. A tape is therefore "resolved up to a point", which a reader
-    /// can reason about, rather than resolved in a scatter that depends on the
-    /// sizes involved. A reference whose bytes are gone stays a reference too.
-    ///
-    /// Resolved text is read under the same rule as an inline value
-    /// ([`semconv::field_value`]): text holding a JSON object or array becomes
-    /// that JSON, so a resolved request has the shape it would have had if it
-    /// had never been offloaded. Content that came out of a payload is not
-    /// walked again: a producer's own text that happens to look like a
-    /// reference is data, not an instruction to read another file.
-    pub(crate) fn resolve_payloads(
-        &self,
-        tenant: Option<&str>,
-        value: &mut Value,
-        budget: &mut ResolveBudget,
-    ) -> Result<()> {
-        if let Some(reference) = payload_reference(value) {
-            if budget.exhausted {
-                budget.unresolved = true;
-                return Ok(());
-            }
-            let reference = reference.to_owned();
-            let Some(bytes) = self.payload_in(tenant, &reference)? else {
-                budget.unresolved = true;
-                return Ok(());
-            };
-            if bytes.len() > budget.remaining {
-                budget.exhausted = true;
-                budget.unresolved = true;
-                return Ok(());
-            }
-            // Offload only ever moves string attribute values, so a payload is
-            // the UTF-8 text of one; anything else is not ours to reinterpret.
-            let Ok(text) = String::from_utf8(bytes) else {
-                budget.unresolved = true;
-                return Ok(());
-            };
-            budget.remaining -= text.len();
-            *value = semconv::field_value(&Value::String(text));
-            return Ok(());
-        }
-        match value {
-            Value::Array(items) => {
-                for item in items {
-                    self.resolve_payloads(tenant, item, budget)?;
-                }
-            }
-            Value::Object(fields) => {
-                for field in fields.values_mut() {
-                    self.resolve_payloads(tenant, field, budget)?;
-                }
-            }
-            _ => {}
-        }
-        Ok(())
     }
 }
 
 /// Payload bytes still available to one tape's resolution, and what it left
 /// unresolved.
+///
+/// The budget is a PREFIX cut: the first reference that does not fit
+/// exhausts it, and every reference after it stays a reference even if it
+/// would fit. A tape is therefore "resolved up to a point", which a reader
+/// can reason about, rather than resolved in a scatter that depends on the
+/// sizes involved. Each occurrence is charged — a payload inlined at three
+/// steps is three copies in the response.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ResolveBudget {
+    limit: usize,
     remaining: usize,
     exhausted: bool,
     /// Whether any reference was left as a reference.
@@ -344,10 +310,203 @@ pub(crate) struct ResolveBudget {
 impl ResolveBudget {
     pub(crate) fn new(max_bytes: usize) -> Self {
         Self {
+            limit: max_bytes,
             remaining: max_bytes,
             exhausted: false,
             unresolved: false,
         }
+    }
+
+    /// Payload bytes inlined so far.
+    pub(crate) fn spent(&self) -> usize {
+        self.limit - self.remaining
+    }
+}
+
+/// What one [`Resolver::resolve`] call left as references, and why.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Leftover {
+    /// A reference stayed because the byte budget ran out at or before it.
+    pub(crate) past_budget: bool,
+    /// A reference stayed because its bytes cannot be read in scope: erased,
+    /// swept by retention, withheld by a pending erasure, unreachable from
+    /// the caller's tenant, or not text.
+    pub(crate) unreadable: bool,
+}
+
+impl Leftover {
+    /// Whether anything stayed a reference.
+    pub(crate) fn any(self) -> bool {
+        self.past_budget || self.unreadable
+    }
+}
+
+/// Payload resolution for ONE request: its tenant scope, its compute budget,
+/// and what it has already learned about each reference.
+///
+/// Every reference costs a deadline check before it is read, so resolving a
+/// long run spends the request's one budget rather than a fresh budget per
+/// reference — and a reference whose bytes are gone, which consumes no byte
+/// budget, still consumes time and is still stopped by the deadline. What a
+/// reference resolved to is remembered: its tenant-reachability probe (a
+/// write-buffer walk plus a segment scan) runs once per request however many
+/// steps repeat it, and its content is kept while [`RESOLVE_CACHE_BYTES`]
+/// lasts.
+pub(crate) struct Resolver<'s> {
+    store: &'s Store,
+    tenant: Option<&'s str>,
+    deadline: Option<Deadline>,
+    /// Whether each reference probed so far was readable in scope.
+    readable: HashMap<String, bool>,
+    /// Content already read: the value it resolves to, and its byte size.
+    cache: HashMap<String, (Value, usize)>,
+    cached_bytes: usize,
+}
+
+impl<'s> Resolver<'s> {
+    /// A resolver reading under `tenant` (the scoping of
+    /// [`Store::payload_in`]) within `deadline`.
+    pub(crate) fn new(
+        store: &'s Store,
+        tenant: Option<&'s str>,
+        deadline: Option<Deadline>,
+    ) -> Self {
+        Self {
+            store,
+            tenant,
+            deadline,
+            readable: HashMap::new(),
+            cache: HashMap::new(),
+            cached_bytes: 0,
+        }
+    }
+
+    /// Replaces every `$payload` reference inside `value` with the content it
+    /// names, while `budget` lasts, and reports what stayed a reference.
+    ///
+    /// Resolved text is read under the same rule as an inline value
+    /// ([`semconv::field_value`]): text holding a JSON object or array becomes
+    /// that JSON, so a resolved request has the shape it would have had if it
+    /// had never been offloaded. Content that came out of a payload is not
+    /// walked again: a producer's own text that happens to look like a
+    /// reference is data, not an instruction to read another file.
+    ///
+    /// Errs when the request's compute budget runs out, or the store fails;
+    /// a reference that cannot be read is a [`Leftover`], not an error.
+    pub(crate) fn resolve(
+        &mut self,
+        value: &mut Value,
+        budget: &mut ResolveBudget,
+    ) -> Result<Leftover> {
+        let mut leftover = Leftover::default();
+        self.walk(value, budget, &mut leftover)?;
+        Ok(leftover)
+    }
+
+    fn walk(
+        &mut self,
+        value: &mut Value,
+        budget: &mut ResolveBudget,
+        leftover: &mut Leftover,
+    ) -> Result<()> {
+        if let Some(reference) = payload_reference(value) {
+            if budget.exhausted {
+                budget.unresolved = true;
+                leftover.past_budget = true;
+                return Ok(());
+            }
+            let reference = reference.to_owned();
+            let Some((resolved, size)) = self.read(&reference)? else {
+                budget.unresolved = true;
+                leftover.unreadable = true;
+                return Ok(());
+            };
+            if size > budget.remaining {
+                budget.exhausted = true;
+                budget.unresolved = true;
+                leftover.past_budget = true;
+                return Ok(());
+            }
+            budget.remaining -= size;
+            *value = resolved;
+            return Ok(());
+        }
+        match value {
+            Value::Array(items) => {
+                for item in items {
+                    self.walk(item, budget, leftover)?;
+                }
+            }
+            Value::Object(fields) => {
+                for field in fields.values_mut() {
+                    self.walk(field, budget, leftover)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// The value `reference` resolves to and its size in bytes, or `None`
+    /// when its bytes cannot be read in scope.
+    fn read(&mut self, reference: &str) -> Result<Option<(Value, usize)>> {
+        Deadline::check(self.deadline, 0)?;
+        if let Some((value, size)) = self.cache.get(reference) {
+            // An erasure may have begun since the read that filled the
+            // cache; what it withholds is withheld from here on.
+            if self.store.payload_withheld(self.tenant, reference) {
+                return Ok(None);
+            }
+            return Ok(Some((value.clone(), *size)));
+        }
+        let bytes = match self.readable.get(reference) {
+            Some(false) => return Ok(None),
+            // Reachability is already proven for this request; only the
+            // erasure check is repeated before the file is read again.
+            Some(true) => match self.store.payload_withheld(self.tenant, reference) {
+                true => None,
+                false => crate::payload::load_payload(&self.store.directory, reference)?,
+            },
+            None => {
+                let bytes = self
+                    .store
+                    .payload_in_under(self.tenant, reference, self.deadline)?;
+                self.readable.insert(reference.to_owned(), bytes.is_some());
+                bytes
+            }
+        };
+        let Some(bytes) = bytes else {
+            return Ok(None);
+        };
+        // Offload only ever moves string attribute values, so a payload is
+        // the UTF-8 text of one; anything else is not ours to reinterpret.
+        let Ok(text) = String::from_utf8(bytes) else {
+            self.readable.insert(reference.to_owned(), false);
+            return Ok(None);
+        };
+        let size = text.len();
+        let value = semconv::field_value(&Value::String(text));
+        if self.cached_bytes.saturating_add(size) <= RESOLVE_CACHE_BYTES {
+            self.cached_bytes += size;
+            self.cache
+                .insert(reference.to_owned(), (value.clone(), size));
+        }
+        Ok(Some((value, size)))
+    }
+}
+
+/// Adds every `$payload` reference inside a STORED value to `into`.
+pub(crate) fn collect_references(value: &Value, into: &mut std::collections::HashSet<String>) {
+    if let Some(reference) = payload_reference(value) {
+        into.insert(reference.to_owned());
+        return;
+    }
+    match value {
+        Value::Array(items) => items.iter().for_each(|item| collect_references(item, into)),
+        Value::Object(fields) => fields
+            .values()
+            .for_each(|field| collect_references(field, into)),
+        _ => {}
     }
 }
 
@@ -361,6 +520,7 @@ pub(crate) fn payload_reference(value: &Value) -> Option<&str> {
 }
 
 /// Whether `value` holds a `$payload` reference anywhere inside it.
+#[cfg(test)]
 pub(crate) fn contains_reference(value: &Value) -> bool {
     if payload_reference(value).is_some() {
         return true;
@@ -390,6 +550,8 @@ fn tape_step(index: usize, span: &Span, facts: StepFacts, llm: LlmFacts) -> Tape
         response_id: semconv::attr_str(attributes, "gen_ai.response.id"),
         finish_reasons: finish_reasons(attributes.get("gen_ai.response.finish_reasons")),
         config,
+        tenant: span.tenant.clone(),
+        session: llm.session.clone(),
     };
     TapeStep {
         index,
@@ -728,6 +890,72 @@ pub(crate) mod tests {
         assert!(contains_reference(
             partial.steps[1].request.as_ref().expect("request")
         ));
+    }
+
+    #[test]
+    fn resolution_spends_the_callers_compute_budget() {
+        let config = crate::Config {
+            payload_threshold: Some(64),
+            ..crate::Config::default()
+        };
+        let fixture = TempStore::open("resolve-deadline", config);
+        let store = fixture.store();
+        store
+            .ingest_batch(vec![span(
+                "t8",
+                "one",
+                1,
+                json!({"gen_ai.operation.name": "chat", "gen_ai.prompt.0.content": "q".repeat(100)}),
+            )])
+            .expect("ingests");
+        let stored = store
+            .tape(Some(""), "trace:t8", TapeOptions::default())
+            .expect("reads")
+            .expect("exists");
+        let request = stored.steps[0].request.clone().expect("request");
+        assert!(contains_reference(&request));
+
+        // A budget already spent: resolving refuses at the first reference,
+        // under a tenant scope (whose reachability probe used to start a
+        // budget of its own) and in the operator view alike.
+        let spent = crate::Deadline::starting(Instant::now(), Some(std::time::Duration::ZERO));
+        for tenant in [Some(""), None] {
+            let mut value = request.clone();
+            let mut resolver = Resolver::new(store, tenant, spent);
+            assert!(
+                matches!(
+                    resolver.resolve(&mut value, &mut ResolveBudget::new(1 << 20)),
+                    Err(crate::Error::DeadlineExceeded(_))
+                ),
+                "{tenant:?}"
+            );
+        }
+        // With budget left, the same reference resolves — and a repeat is
+        // served from what the first read learned.
+        let mut resolver = Resolver::new(store, Some(""), None);
+        let mut budget = ResolveBudget::new(1 << 20);
+        for _ in 0..2 {
+            let mut value = request.clone();
+            assert_eq!(
+                resolver.resolve(&mut value, &mut budget).expect("resolves"),
+                Leftover::default()
+            );
+            assert_eq!(value, json!([{"content": "q".repeat(100)}]));
+        }
+        assert_eq!(budget.spent(), 200, "each occurrence is charged");
+        assert_eq!(resolver.readable.len(), 1, "probed once");
+
+        // A reference whose bytes are gone stays a reference, as unreadable.
+        let mut gone = json!({"$payload": format!("sha256/{}", "0".repeat(64))});
+        assert_eq!(
+            resolver
+                .resolve(&mut gone, &mut budget)
+                .expect("not an error"),
+            Leftover {
+                past_budget: false,
+                unreadable: true
+            }
+        );
     }
 
     #[test]

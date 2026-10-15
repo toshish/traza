@@ -1063,6 +1063,34 @@ impl ErasureLog {
             settle: settle.clone(),
         }))
     }
+
+    /// The newest erasure's id, or 0 before the first.
+    ///
+    /// Ids are allocated monotonically inside [`Self::begin`], in the same
+    /// critical section that installs the mask, so this is an EPOCH: a holder
+    /// of copies taken out of the store (a replay's snapshot) that read the
+    /// epoch before its read knows that every erasure at or below it was
+    /// already masking that read, and only newer ones need checking.
+    pub(crate) fn latest_id(&self) -> Result<u64> {
+        let inner = self.lock()?;
+        Ok(inner.records.keys().next_back().copied().unwrap_or(0))
+    }
+
+    /// The id of the first erasure newer than `after` — pending or settled —
+    /// whose record `covers` accepts, or `None`. Walks the log in memory
+    /// without cloning records.
+    pub(crate) fn first_since(
+        &self,
+        after: u64,
+        covers: impl Fn(&EraseRecord) -> bool,
+    ) -> Result<Option<u64>> {
+        let inner = self.lock()?;
+        Ok(inner
+            .records
+            .range(after.saturating_add(1)..)
+            .find(|(_, (erase, _))| covers(erase))
+            .map(|(id, _)| *id))
+    }
 }
 
 // ----------------------------------------------------------------- receipt

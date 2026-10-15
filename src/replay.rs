@@ -29,6 +29,23 @@
 //! indexed layouts (OpenLLMetry, OpenInference) or as native events, the
 //! normalised digest is exactly the tape's `request_digest`.
 //!
+//! # What a replay holds
+//!
+//! Only what it serves: each model step's answer and each tool step's
+//! arguments and result, resolved from payload files where they were
+//! offloaded, within `--tape-max-bytes`. A recorded REQUEST is resolved on its
+//! own, digested and dropped — strict mode compares against the digest, so
+//! keeping a long conversation's ever-growing prompts would spend the budget
+//! on content nothing reads. A run longer than the span cap is refused rather
+//! than replayed as its beginning.
+//!
+//! A replay is a copy taken out of the store, so erasure must reach it: every
+//! call first checks whether an erasure recorded since the replay was created
+//! covers any span, trace, session, tenant or payload it holds, and if one
+//! does, the replay is withdrawn — its content dropped, every later call
+//! refused `410 replay_erased`. The check is an epoch comparison when nothing
+//! has been erased, so it costs a call nothing in the common case.
+//!
 //! # What a replay does not do
 //!
 //! - **Tools still execute live.** A replay answers model calls only. An agent
@@ -43,29 +60,34 @@
 //!   requests reach the server; strict mode will report the swap as a
 //!   divergence rather than silently mismatching answers to questions.
 //!
-//! The registry is bounded — [`MAX_LIVE_REPLAYS`] replays, each living
-//! [`REPLAY_TTL`] from creation, holding at most [`MAX_REGISTRY_BYTES`] of
-//! recorded content between them — and lives in memory only: a restart forgets
-//! every replay, and creating one again is a read of the store.
+//! The registry is bounded twice — per tenant ([`MAX_TENANT_REPLAYS`] replays,
+//! [`MAX_TENANT_BYTES`] of recorded content), so one credential cannot fill
+//! it for everybody, and as a whole ([`MAX_LIVE_REPLAYS`],
+//! [`MAX_REGISTRY_BYTES`]) as the backstop behind every share. Each replay
+//! lives [`REPLAY_TTL`] from creation, in memory only: a restart forgets every
+//! replay, and creating one again is a read of the store.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::hash::{BuildHasher, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
 
+use crate::erasure::{EraseRecord, Subject};
 use crate::semconv::{self, StepKind};
-use crate::tape::{self, TapeOptions, TapeStep};
-use crate::{Span, Store};
+use crate::tape::{self, Leftover, ResolveBudget, Resolver, TapeStep};
+use crate::{Deadline, Span, Store};
 
 /// How long a replay lives, counted from creation. Fixed rather than renewed
 /// by use, so when a replay expires is a fact of its creation response.
 pub const REPLAY_TTL: Duration = Duration::from_secs(60 * 60);
 
-/// Replays held at once. Past it, creation is refused until one expires —
-/// never by evicting a live replay, which would break somebody's run halfway.
+/// Replays held at once across every tenant. Past it, creation is refused
+/// until one expires — never by evicting a live replay, which would break
+/// somebody's run halfway.
 pub const MAX_LIVE_REPLAYS: usize = 1024;
 
 /// Recorded content the registry holds across every live replay, measured as
@@ -76,6 +98,23 @@ pub const MAX_LIVE_REPLAYS: usize = 1024;
 /// generous for replaying agent runs and still a number an operator can plan
 /// a process around.
 pub const MAX_REGISTRY_BYTES: usize = 512 * 1024 * 1024;
+
+/// Replays one tenant's data may hold at once — the same for the operator
+/// view, which counts as a share of its own.
+///
+/// Any credential may create a replay (it is a read), so without a share one
+/// read-only token could fill the registry and refuse every other tenant for
+/// an hour. A sixteenth of the registry is far more than one harness drives
+/// at a time, and sixteen tenants can hold full shares before the registry
+/// itself is what refuses.
+pub const MAX_TENANT_REPLAYS: usize = 64;
+
+/// Recorded content one tenant's replays may hold together.
+///
+/// An eighth of the registry rather than a sixteenth, because a share is also
+/// the largest single replay that can ever exist: a long run with large
+/// answers has to fit in it whole.
+pub const MAX_TENANT_BYTES: usize = 64 * 1024 * 1024;
 
 /// Calls one replay records for `GET /v1/replays/{id}`. A client stuck
 /// retrying a divergence must not grow a replay without bound; past this the
@@ -124,6 +163,39 @@ impl Mode {
     }
 }
 
+/// The bounds one [`Registry`] enforces. [`Limits::default`] is the
+/// documented set; tests lower them to reach the edges cheaply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    /// How long a replay lives from creation.
+    pub ttl: Duration,
+    /// Replays held at once, across every tenant.
+    pub max_live: usize,
+    /// Recorded content held at once, across every tenant.
+    pub max_bytes: usize,
+    /// Replays one tenant's data (or the operator view) may hold at once.
+    pub max_live_per_tenant: usize,
+    /// Recorded content one tenant's replays may hold together — and so the
+    /// largest replay that can ever be created.
+    pub max_bytes_per_tenant: usize,
+    /// Spans a replayed run may have. A longer run is refused, never replayed
+    /// as its beginning.
+    pub max_spans: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            ttl: REPLAY_TTL,
+            max_live: MAX_LIVE_REPLAYS,
+            max_bytes: MAX_REGISTRY_BYTES,
+            max_live_per_tenant: MAX_TENANT_REPLAYS,
+            max_bytes_per_tenant: MAX_TENANT_BYTES,
+            max_spans: tape::MAX_TAPE_SPANS,
+        }
+    }
+}
+
 /// Why a replay operation was refused.
 #[derive(Debug)]
 pub enum ReplayError {
@@ -133,10 +205,27 @@ pub enum ReplayError {
     NotFound,
     /// The run has no spans under the caller's tenant scope.
     RunNotFound,
-    /// The registry is at [`MAX_LIVE_REPLAYS`] or [`MAX_REGISTRY_BYTES`].
+    /// No room for the replay now; there will be once replays expire.
     Full {
-        /// Seconds until the oldest live replay expires and frees room.
+        /// `true` when the share of the tenant whose data the replay would
+        /// hold is what is full; `false` when it is the registry as a whole.
+        own_share: bool,
+        /// The share's (or registry's) replay bound.
+        max_live: usize,
+        /// The share's (or registry's) content bound, in bytes.
+        max_bytes: usize,
+        /// Seconds until enough replays expire to make room — computed over
+        /// the bound that refused, so it never promises room an expiry would
+        /// not free.
         retry_after_seconds: u64,
+    },
+    /// The snapshot is larger than one tenant's share of the registry, so it
+    /// can never be held, however long the caller waits.
+    TooLarge {
+        /// The snapshot's recorded content, in bytes.
+        bytes: usize,
+        /// The most one tenant's replays may hold together.
+        limit: usize,
     },
     /// The run cannot be replayed as asked; the message says which step and
     /// why, and what would make it replayable.
@@ -162,6 +251,22 @@ pub enum ReplayError {
         /// The tool name asked for, if any.
         tool: Option<String>,
     },
+    /// The next tool step's arguments or result could not be snapshotted, so
+    /// there is no recorded value to serve. The step is not consumed.
+    ToolUnreadable {
+        /// Its tape index.
+        step: usize,
+        /// Its tool name, when recorded.
+        tool: Option<String>,
+        /// Why its value is missing.
+        reason: String,
+    },
+    /// An erasure recorded after the replay was created covers content the
+    /// replay held; the replay has been withdrawn.
+    Erased {
+        /// The erasure's id in the tombstone log.
+        erasure: u64,
+    },
     /// The store refused the read the replay needed.
     Engine(crate::Error),
 }
@@ -169,6 +274,82 @@ pub enum ReplayError {
 impl From<crate::Error> for ReplayError {
     fn from(error: crate::Error) -> Self {
         Self::Engine(error)
+    }
+}
+
+impl fmt::Display for ReplayError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotFound => f.write_str(
+                "no live replay has this id; replays expire an hour after creation and do not \
+                 survive a restart",
+            ),
+            Self::RunNotFound => f.write_str("run not found"),
+            Self::Full {
+                own_share: true,
+                max_live,
+                max_bytes,
+                ..
+            } => write!(
+                f,
+                "replays of this tenant's data already hold its share of the registry \
+                 ({max_live} live replays, or {} of recorded content between them); retry \
+                 once one of them expires",
+                size(*max_bytes)
+            ),
+            Self::Full {
+                own_share: false, ..
+            } => f.write_str("the server's replay registry is full; retry once a replay expires"),
+            Self::TooLarge { bytes, limit } => write!(
+                f,
+                "this run's replay would hold {} of recorded answers and tool records, more \
+                 than the {} one tenant's replays may hold together, so it can never be \
+                 created; retrying will not help",
+                size(*bytes),
+                size(*limit)
+            ),
+            Self::Unreplayable(reason) | Self::Invalid(reason) => f.write_str(reason),
+            Self::Diverged { step, .. } => write!(
+                f,
+                "this request's messages do not match recorded step {step}: the agent \
+                 diverged from the recording, so replaying the recorded answer would answer \
+                 a different question"
+            ),
+            Self::Exhausted { served } => {
+                write!(f, "all {served} recorded model calls have been served")
+            }
+            Self::ToolsExhausted { tool: Some(name) } => {
+                write!(f, "no unserved recorded tool step named {name} remains")
+            }
+            Self::ToolsExhausted { tool: None } => {
+                f.write_str("no unserved recorded tool step remains")
+            }
+            Self::ToolUnreadable { step, tool, reason } => write!(
+                f,
+                "recorded tool step {step}{} cannot be served: {reason}",
+                tool.as_deref()
+                    .map(|name| format!(" ({name})"))
+                    .unwrap_or_default()
+            ),
+            Self::Erased { erasure } => write!(
+                f,
+                "the recording this replay held was erased (erasure {erasure}) after the \
+                 replay was created; the replay is withdrawn and serves nothing more"
+            ),
+            Self::Engine(error) => write!(f, "the replay could not be served: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for ReplayError {}
+
+/// A byte count for a message: whole mebibytes when it is one, else bytes.
+fn size(bytes: usize) -> String {
+    const MIB: usize = 1024 * 1024;
+    if bytes >= MIB && bytes % MIB == 0 {
+        format!("{} MiB", bytes / MIB)
+    } else {
+        format!("{bytes} bytes")
     }
 }
 
@@ -187,6 +368,10 @@ pub struct Created {
     pub mode: Mode,
     /// When the replay expires, Unix nanoseconds.
     pub expires_at_ns: u64,
+    /// Tape indices of tool steps whose arguments or result could not be
+    /// snapshotted; `tools/next` refuses them rather than serving a payload
+    /// reference as if it were the recorded value.
+    pub unreadable_tool_steps: Vec<usize>,
 }
 
 impl Created {
@@ -199,6 +384,7 @@ impl Created {
             "llm_steps": self.llm_steps,
             "mode": self.mode.as_str(),
             "expires_at_ns": self.expires_at_ns,
+            "unreadable_tool_steps": self.unreadable_tool_steps,
             "base_urls": {
                 "openai": format!("/v1/replays/{}/openai/v1", self.id),
                 "anthropic": format!("/v1/replays/{}/anthropic", self.id),
@@ -284,6 +470,9 @@ struct ToolStep {
     arguments: Value,
     result: Value,
     served: bool,
+    /// Why the arguments or result could not be snapshotted, when they could
+    /// not; such a step is refused rather than served.
+    unreadable: Option<String>,
 }
 
 /// One served or refused call, for the status document.
@@ -302,10 +491,66 @@ struct Divergence {
     got_digest: Option<String>,
 }
 
+/// Everything an erasure could name that a replay holds a copy of: the spans
+/// its served content came from, by key and by the trace, session and tenant
+/// they belong to, and every payload reference their stored values carried —
+/// requests included, because a digest kept for strict matching would still
+/// confirm a guess at erased content.
+#[derive(Debug, Default)]
+struct Coverage {
+    keys: HashSet<(String, String, String)>,
+    traces: HashSet<(String, String)>,
+    sessions: HashSet<(String, String)>,
+    tenants: HashSet<String>,
+    payloads: HashSet<String>,
+}
+
+impl Coverage {
+    /// Records one snapshotted step, from its STORED values.
+    fn add(&mut self, step: &TapeStep) {
+        let tenant = &step.detail.tenant;
+        self.keys
+            .insert((tenant.clone(), step.trace_id.clone(), step.span_id.clone()));
+        self.traces.insert((tenant.clone(), step.trace_id.clone()));
+        if let Some(session) = &step.detail.session {
+            self.sessions.insert((tenant.clone(), session.clone()));
+        }
+        self.tenants.insert(tenant.clone());
+        for value in [&step.request, &step.response].into_iter().flatten() {
+            tape::collect_references(value, &mut self.payloads);
+        }
+    }
+
+    /// Whether `record`'s erasure covers anything this replay holds: by its
+    /// subject — the same predicates the store's own read mask applies — or
+    /// by any key it resolved.
+    fn covers(&self, record: &EraseRecord) -> bool {
+        let by_subject = match &record.subject {
+            Subject::Trace { trace_id, tenant } => {
+                self.traces.contains(&(tenant.clone(), trace_id.clone()))
+            }
+            Subject::Span {
+                trace_id,
+                span_id,
+                tenant,
+            } => self
+                .keys
+                .contains(&(tenant.clone(), trace_id.clone(), span_id.clone())),
+            Subject::Session { session_id, tenant } => self
+                .sessions
+                .contains(&(tenant.clone(), session_id.clone())),
+            Subject::Tenant { tenant } => self.tenants.contains(tenant),
+            Subject::Payload { reference } => self.payloads.contains(reference),
+        };
+        by_subject || record.span_keys.iter().any(|key| self.keys.contains(key))
+    }
+}
+
 struct Replay {
     run: String,
     /// The tenant whose data the replay holds: `Some` when it was created
-    /// under a tenant scope, `None` for the operator view.
+    /// under a tenant scope, `None` for the operator view. Also the share of
+    /// the registry it counts against.
     tenant: Option<String>,
     mode: Mode,
     expires_at_ns: u64,
@@ -315,6 +560,13 @@ struct Replay {
     diverged: Option<Divergence>,
     calls: Vec<CallRecord>,
     bytes: usize,
+    coverage: Coverage,
+    /// The newest erasure known not to cover this replay: the store's epoch
+    /// read BEFORE the snapshot (an erasure at or below it was already
+    /// masking that read), raised as later erasures are checked.
+    erasure_epoch: u64,
+    /// Set when an erasure covered the replay and it was withdrawn.
+    erased: Option<u64>,
 }
 
 impl Replay {
@@ -338,31 +590,56 @@ impl Replay {
             });
         }
     }
+
+    /// Drops everything the replay holds, keeping only what it takes to keep
+    /// answering "erased" until it expires: its tenant (for visibility) and
+    /// its expiry. A withdrawn replay counts against no bound.
+    fn withdraw(&mut self, erasure: u64) {
+        self.erased = Some(erasure);
+        self.run = String::new();
+        self.llm = Vec::new();
+        self.tools = Vec::new();
+        self.calls = Vec::new();
+        self.diverged = None;
+        self.coverage = Coverage::default();
+        self.bytes = 0;
+    }
+
+    fn unreadable_tool_steps(&self) -> Vec<usize> {
+        self.tools
+            .iter()
+            .filter(|tool| tool.unreadable.is_some())
+            .map(|tool| tool.step)
+            .collect()
+    }
 }
 
 /// The in-memory registry of live replays.
 pub struct Registry {
     replays: Mutex<HashMap<String, Replay>>,
-    ttl: Duration,
-    max_live: usize,
-    max_bytes: usize,
+    limits: Limits,
 }
 
 impl Default for Registry {
     fn default() -> Self {
-        Self::new(REPLAY_TTL, MAX_LIVE_REPLAYS, MAX_REGISTRY_BYTES)
+        Self::new(Limits::default())
     }
 }
 
 impl Registry {
     /// A registry with explicit bounds; [`Registry::default`] uses the
-    /// documented ones.
-    pub fn new(ttl: Duration, max_live: usize, max_bytes: usize) -> Self {
+    /// documented ones. Every bound is at least one.
+    pub fn new(limits: Limits) -> Self {
         Self {
             replays: Mutex::new(HashMap::new()),
-            ttl,
-            max_live,
-            max_bytes,
+            limits: Limits {
+                max_live: limits.max_live.max(1),
+                max_bytes: limits.max_bytes.max(1),
+                max_live_per_tenant: limits.max_live_per_tenant.max(1),
+                max_bytes_per_tenant: limits.max_bytes_per_tenant.max(1),
+                max_spans: limits.max_spans.max(1),
+                ..limits
+            },
         }
     }
 
@@ -377,11 +654,16 @@ impl Registry {
 
     /// Snapshots `run_id`'s tape under `tenant` and registers a replay of it.
     ///
-    /// `tape_max_bytes` bounds the payload bytes resolved while snapshotting
-    /// (`--tape-max-bytes`). Refused, naming the step, when a model step
-    /// recorded no answer (content capture was off), when an answer or — in
-    /// strict mode — a request is an offloaded payload that could not be read,
-    /// or when strict mode has no recorded message list to compare against.
+    /// The run's read and every payload resolved for it share ONE compute
+    /// budget ([`crate::Config::query_deadline`]). `tape_max_bytes`
+    /// (`--tape-max-bytes`) bounds the payload bytes the replay RETAINS —
+    /// answers and tool records; requests are resolved one at a time to be
+    /// digested and are not charged. Refused, naming the step, when a model
+    /// step recorded no answer (content capture was off), when an answer or —
+    /// in strict mode — a request is an offloaded payload that could not be
+    /// read or is past the budget, or when strict mode has no recorded
+    /// message list to compare against; refused too when the run has more
+    /// spans than [`Limits::max_spans`].
     pub fn create(
         &self,
         store: &Store,
@@ -391,91 +673,169 @@ impl Registry {
         tape_max_bytes: usize,
         now_ns: u64,
     ) -> Result<Created, ReplayError> {
-        // Cheap refusal first: a full registry should not cost a store read.
-        self.check_room(now_ns, 0)?;
-        let tape = store
-            .tape(
-                tenant,
-                run_id,
-                TapeOptions {
-                    max_steps: tape::MAX_TAPE_SPANS,
-                    resolve: Some(tape_max_bytes),
-                },
-            )?
-            .ok_or(ReplayError::RunNotFound)?;
-        let (llm, tools) = snapshot(&tape.steps, mode)?;
-        let bytes = llm
-            .iter()
-            .map(|step| approximate_bytes(&step.choices))
-            .chain(
-                tools
-                    .iter()
-                    .map(|tool| value_bytes(&tool.arguments) + value_bytes(&tool.result) + 64),
-            )
-            .sum::<usize>();
+        // Cheap refusal first: a full share should not cost a store read.
+        {
+            let mut replays = self.lock();
+            self.purge(&mut replays, now_ns);
+            self.ensure_room(&replays, tenant, 0, now_ns)?;
+        }
+        // The epoch BEFORE the read: an erasure at or below it was already
+        // masking what the read saw; anything newer is checked on every call.
+        let erasure_epoch = store.erasures.latest_id()?;
+        let deadline = store.query_deadline(Instant::now());
+        let max_spans = self.limits.max_spans;
+        let read = store.run_tape(tenant, run_id, max_spans, max_spans, deadline)?;
+        if read.spans.is_empty() {
+            return Err(ReplayError::RunNotFound);
+        }
+        if read.truncated {
+            return Err(ReplayError::Unreplayable(format!(
+                "the run has more than {max_spans} spans, more than one replay holds; replaying \
+                 its first {max_spans} would end the agent's run early with every later model \
+                 call refused as if the recording ended there"
+            )));
+        }
+        let steps = read.steps.len();
+        let snapshot = snapshot(store, tenant, deadline, read.steps, mode, tape_max_bytes)?;
 
         let mut replays = self.lock();
         self.purge(&mut replays, now_ns);
-        self.ensure_room(&replays, now_ns, bytes)?;
+        self.ensure_room(&replays, tenant, snapshot.bytes, now_ns)?;
         let id = new_id();
-        let ttl_ns = self.ttl.as_nanos().min(u128::from(u64::MAX)) as u64;
+        let ttl_ns = self.limits.ttl.as_nanos().min(u128::from(u64::MAX)) as u64;
+        let replay = Replay {
+            run: run_id.to_owned(),
+            tenant: tenant.map(str::to_owned),
+            mode,
+            expires_at_ns: now_ns.saturating_add(ttl_ns),
+            llm: snapshot.llm,
+            tools: snapshot.tools,
+            served: 0,
+            diverged: None,
+            calls: Vec::new(),
+            bytes: snapshot.bytes,
+            coverage: snapshot.coverage,
+            erasure_epoch,
+            erased: None,
+        };
         let created = Created {
             id: id.clone(),
             run: run_id.to_owned(),
-            steps: tape.steps.len(),
-            llm_steps: llm.len(),
+            steps,
+            llm_steps: replay.llm.len(),
             mode,
-            expires_at_ns: now_ns.saturating_add(ttl_ns),
+            expires_at_ns: replay.expires_at_ns,
+            unreadable_tool_steps: replay.unreadable_tool_steps(),
         };
-        replays.insert(
-            id,
-            Replay {
-                run: run_id.to_owned(),
-                tenant: tenant.map(str::to_owned),
-                mode,
-                expires_at_ns: created.expires_at_ns,
-                llm,
-                tools,
-                served: 0,
-                diverged: None,
-                calls: Vec::new(),
-                bytes,
-            },
-        );
+        replays.insert(id, replay);
         Ok(created)
     }
 
-    fn check_room(&self, now_ns: u64, bytes: usize) -> Result<(), ReplayError> {
-        let mut replays = self.lock();
-        self.purge(&mut replays, now_ns);
-        self.ensure_room(&replays, now_ns, bytes)
-    }
-
+    /// Refuses a snapshot of `bytes` that the share of `tenant` (its data's
+    /// tenant, or the operator view) or the registry cannot hold now.
+    ///
+    /// A snapshot larger than a whole share is [`ReplayError::TooLarge`]:
+    /// waiting cannot make it fit, and a `Retry-After` would send a client
+    /// round a loop that never ends. The share is checked before the
+    /// registry, so a caller is told about its own share — and its retry time
+    /// is computed from its own replays, which reveals nothing about anybody
+    /// else's.
     fn ensure_room(
         &self,
         replays: &HashMap<String, Replay>,
-        now_ns: u64,
+        tenant: Option<&str>,
         bytes: usize,
+        now_ns: u64,
     ) -> Result<(), ReplayError> {
-        let held: usize = replays.values().map(|replay| replay.bytes).sum();
-        if replays.len() < self.max_live && held.saturating_add(bytes) <= self.max_bytes {
-            return Ok(());
+        let limits = &self.limits;
+        let share_bytes = limits.max_bytes_per_tenant.min(limits.max_bytes);
+        if bytes > share_bytes {
+            return Err(ReplayError::TooLarge {
+                bytes,
+                limit: share_bytes,
+            });
         }
-        let oldest = replays
-            .values()
-            .map(|replay| replay.expires_at_ns)
-            .min()
-            .unwrap_or(now_ns);
-        // Rounded up: a retry that arrives a fraction early would be refused
-        // again for nothing.
-        let retry_after_seconds = oldest.saturating_sub(now_ns).div_ceil(1_000_000_000).max(1);
-        Err(ReplayError::Full {
-            retry_after_seconds,
-        })
+        let held = || {
+            replays
+                .values()
+                .filter(|replay| replay.erased.is_none())
+                .map(|replay| (replay.tenant.as_deref(), replay.expires_at_ns, replay.bytes))
+        };
+        let share: Vec<(u64, usize)> = held()
+            .filter(|(owner, _, _)| *owner == tenant)
+            .map(|(_, expires, size)| (expires, size))
+            .collect();
+        if let Some(retry_after_seconds) = wait_for_room(
+            share,
+            limits.max_live_per_tenant,
+            share_bytes,
+            bytes,
+            now_ns,
+        ) {
+            return Err(ReplayError::Full {
+                own_share: true,
+                max_live: limits.max_live_per_tenant,
+                max_bytes: share_bytes,
+                retry_after_seconds,
+            });
+        }
+        let all: Vec<(u64, usize)> = held().map(|(_, expires, size)| (expires, size)).collect();
+        if let Some(retry_after_seconds) =
+            wait_for_room(all, limits.max_live, limits.max_bytes, bytes, now_ns)
+        {
+            return Err(ReplayError::Full {
+                own_share: false,
+                max_live: limits.max_live,
+                max_bytes: limits.max_bytes,
+                retry_after_seconds,
+            });
+        }
+        Ok(())
     }
 
     fn purge(&self, replays: &mut HashMap<String, Replay>, now_ns: u64) {
         replays.retain(|_, replay| replay.expires_at_ns > now_ns);
+    }
+
+    /// The live replay `id` as `binding` may see it, or why not — after
+    /// checking it against every erasure recorded since it was last checked.
+    ///
+    /// `latest_erasure` is the store's erasure epoch, read by the caller
+    /// before taking the registry lock so that the common case never waits
+    /// on the tombstone log's lock (held across an fsync while an erasure is
+    /// recorded). An erasure recorded after that read is concurrent with this
+    /// call and is caught by the next one; every call that STARTS after an
+    /// erasure is recorded sees it. Consulting the log under the registry
+    /// lock is an in-memory read, and nothing on the erasure path takes the
+    /// registry lock, so the two cannot deadlock.
+    fn live<'r>(
+        &self,
+        replays: &'r mut HashMap<String, Replay>,
+        store: &Store,
+        latest_erasure: u64,
+        id: &str,
+        binding: Option<&str>,
+        now_ns: u64,
+    ) -> Result<&'r mut Replay, ReplayError> {
+        self.purge(replays, now_ns);
+        let replay = replays
+            .get_mut(id)
+            .filter(|replay| replay.visible_to(binding))
+            .ok_or(ReplayError::NotFound)?;
+        if let Some(erasure) = replay.erased {
+            return Err(ReplayError::Erased { erasure });
+        }
+        if latest_erasure > replay.erasure_epoch {
+            let covering = store.erasures.first_since(replay.erasure_epoch, |record| {
+                replay.coverage.covers(record)
+            })?;
+            if let Some(erasure) = covering {
+                replay.withdraw(erasure);
+                return Err(ReplayError::Erased { erasure });
+            }
+            replay.erasure_epoch = latest_erasure;
+        }
+        Ok(replay)
     }
 
     /// Serves the next recorded llm step to a request whose messages
@@ -483,17 +843,15 @@ impl Registry {
     /// [`anthropic_request_digest`]).
     pub fn next_llm(
         &self,
+        store: &Store,
         id: &str,
         binding: Option<&str>,
         got_digest: Option<String>,
         now_ns: u64,
     ) -> Result<ServedStep, ReplayError> {
+        let latest_erasure = store.erasures.latest_id()?;
         let mut replays = self.lock();
-        self.purge(&mut replays, now_ns);
-        let replay = replays
-            .get_mut(id)
-            .filter(|replay| replay.visible_to(binding))
-            .ok_or(ReplayError::NotFound)?;
+        let replay = self.live(&mut replays, store, latest_erasure, id, binding, now_ns)?;
         let Some(step) = replay.llm.get(replay.served).cloned() else {
             return Err(ReplayError::Exhausted {
                 served: replay.served,
@@ -530,20 +888,21 @@ impl Registry {
 
     /// Serves the next unserved recorded tool step, or the next one named
     /// `tool`. Tool steps have their own cursor, independent of the llm one,
-    /// so a harness may take results whenever its agent calls a tool.
+    /// so a harness may take results whenever its agent calls a tool. A step
+    /// whose value could not be snapshotted is refused, not consumed: the
+    /// recording does not have its result, and moving past it would hand the
+    /// harness the NEXT step's result as if it were this one's.
     pub fn next_tool(
         &self,
+        store: &Store,
         id: &str,
         binding: Option<&str>,
         tool: Option<&str>,
         now_ns: u64,
     ) -> Result<ServedTool, ReplayError> {
+        let latest_erasure = store.erasures.latest_id()?;
         let mut replays = self.lock();
-        self.purge(&mut replays, now_ns);
-        let replay = replays
-            .get_mut(id)
-            .filter(|replay| replay.visible_to(binding))
-            .ok_or(ReplayError::NotFound)?;
+        let replay = self.live(&mut replays, store, latest_erasure, id, binding, now_ns)?;
         let next = replay.tools.iter_mut().find(|candidate| {
             !candidate.served && tool.map_or(true, |name| candidate.tool.as_deref() == Some(name))
         });
@@ -552,6 +911,13 @@ impl Registry {
                 tool: tool.map(str::to_owned),
             });
         };
+        if let Some(reason) = &next.unreadable {
+            return Err(ReplayError::ToolUnreadable {
+                step: next.step,
+                tool: next.tool.clone(),
+                reason: reason.clone(),
+            });
+        }
         next.served = true;
         Ok(ServedTool {
             step: next.step,
@@ -564,16 +930,14 @@ impl Registry {
     /// The status document of `GET /v1/replays/{id}`.
     pub fn status(
         &self,
+        store: &Store,
         id: &str,
         binding: Option<&str>,
         now_ns: u64,
     ) -> Result<Value, ReplayError> {
+        let latest_erasure = store.erasures.latest_id()?;
         let mut replays = self.lock();
-        self.purge(&mut replays, now_ns);
-        let replay = replays
-            .get(id)
-            .filter(|replay| replay.visible_to(binding))
-            .ok_or(ReplayError::NotFound)?;
+        let replay = self.live(&mut replays, store, latest_erasure, id, binding, now_ns)?;
         let calls: Vec<Value> = replay
             .calls
             .iter()
@@ -591,11 +955,12 @@ impl Registry {
                 "got_digest": divergence.got_digest,
             })),
             "calls": calls,
+            "unreadable_tool_steps": replay.unreadable_tool_steps(),
             "expires_at_ns": replay.expires_at_ns,
         }))
     }
 
-    /// Live replays, for tests and diagnostics.
+    /// Live replays, withdrawn ones included, for tests and diagnostics.
     pub fn len(&self, now_ns: u64) -> usize {
         let mut replays = self.lock();
         self.purge(&mut replays, now_ns);
@@ -608,28 +973,158 @@ impl Registry {
     }
 }
 
-/// Builds a replay's llm and tool snapshots from a resolved tape, refusing
-/// what cannot be replayed.
-fn snapshot(steps: &[TapeStep], mode: Mode) -> Result<(Vec<LlmStep>, Vec<ToolStep>), ReplayError> {
-    let mut llm = Vec::new();
-    let mut tools = Vec::new();
-    for step in steps {
-        match step.kind {
-            StepKind::Llm => llm.push(llm_snapshot(step, mode)?),
-            StepKind::Tool => tools.push(ToolStep {
-                step: step.index,
-                tool: step.tool.clone(),
-                arguments: step.request.clone().unwrap_or(Value::Null),
-                result: step.response.clone().unwrap_or(Value::Null),
-                served: false,
-            }),
-            _ => {}
+/// Seconds until replays expiring in order free room for `bytes` more under
+/// `max_live` and `max_bytes`, or `None` when there is room now.
+///
+/// Requires `bytes <= max_bytes` and `max_live >= 1`, so room always comes
+/// once every held replay has expired; the answer is the earliest expiry
+/// after which both bounds hold — not merely the oldest expiry, which would
+/// tell a large snapshot to retry when one small replay frees too little.
+fn wait_for_room(
+    mut held: Vec<(u64, usize)>,
+    max_live: usize,
+    max_bytes: usize,
+    bytes: usize,
+    now_ns: u64,
+) -> Option<u64> {
+    let fits =
+        |count: usize, total: usize| count < max_live && total.saturating_add(bytes) <= max_bytes;
+    let mut count = held.len();
+    let mut total: usize = held.iter().map(|(_, size)| size).sum();
+    if fits(count, total) {
+        return None;
+    }
+    held.sort_unstable();
+    let mut at = now_ns;
+    for (expires, size) in held {
+        count -= 1;
+        total -= size;
+        at = expires;
+        if fits(count, total) {
+            break;
         }
     }
-    Ok((llm, tools))
+    // Rounded up: a retry that arrives a fraction early would be refused
+    // again for nothing.
+    Some(at.saturating_sub(now_ns).div_ceil(1_000_000_000).max(1))
 }
 
-fn llm_snapshot(step: &TapeStep, mode: Mode) -> Result<LlmStep, ReplayError> {
+/// A replay's content before it is registered.
+#[derive(Default)]
+struct Snapshot {
+    llm: Vec<LlmStep>,
+    tools: Vec<ToolStep>,
+    coverage: Coverage,
+    bytes: usize,
+}
+
+/// What a recorded request came to, for strict matching.
+enum RecordedRequest {
+    /// The step recorded no request.
+    Missing,
+    /// It references a payload that could not be read.
+    Unreadable,
+    /// It is not a message list (a bare-text prompt).
+    Text,
+    /// Its normalised digest.
+    Digest(String),
+}
+
+/// Builds a replay's llm and tool snapshots from a run's steps as stored,
+/// resolving what the replay will hold and refusing what cannot be replayed.
+fn snapshot(
+    store: &Store,
+    tenant: Option<&str>,
+    deadline: Option<Deadline>,
+    steps: Vec<TapeStep>,
+    mode: Mode,
+    tape_max_bytes: usize,
+) -> Result<Snapshot, ReplayError> {
+    let mut resolver = Resolver::new(store, tenant, deadline);
+    // Only what the replay RETAINS is charged: answers and tool records.
+    let mut retained = ResolveBudget::new(tape_max_bytes);
+    let mut out = Snapshot::default();
+    for mut step in steps {
+        if !matches!(step.kind, StepKind::Llm | StepKind::Tool) {
+            continue;
+        }
+        out.coverage.add(&step);
+        if step.kind == StepKind::Llm {
+            let answer = match step.response.as_mut() {
+                Some(response) => resolver.resolve(response, &mut retained)?,
+                None => Leftover::default(),
+            };
+            // Resolved on its own, digested, dropped: never retained, so
+            // never charged. Its size is bounded by what ingest accepted for
+            // one span, and its cost by the request's deadline.
+            let request = match step.request.take() {
+                None => RecordedRequest::Missing,
+                Some(mut request) => {
+                    let leftover =
+                        resolver.resolve(&mut request, &mut ResolveBudget::new(usize::MAX))?;
+                    match (leftover.any(), recorded_digest(&request)) {
+                        (true, _) => RecordedRequest::Unreadable,
+                        (false, Some(digest)) => RecordedRequest::Digest(digest),
+                        (false, None) => RecordedRequest::Text,
+                    }
+                }
+            };
+            out.llm
+                .push(llm_snapshot(&step, mode, answer, request, &retained)?);
+        } else {
+            let mut leftover = Leftover::default();
+            for value in [&mut step.request, &mut step.response]
+                .into_iter()
+                .flatten()
+            {
+                let left = resolver.resolve(value, &mut retained)?;
+                leftover.past_budget |= left.past_budget;
+                leftover.unreadable |= left.unreadable;
+            }
+            let unreadable = match (leftover.unreadable, leftover.past_budget) {
+                (true, _) => Some(
+                    "its recorded arguments or result is an offloaded payload that could not \
+                     be read — erased, or swept by retention"
+                        .to_owned(),
+                ),
+                (false, true) => Some(format!(
+                    "its recorded arguments or result is an offloaded payload past \
+                     --tape-max-bytes ({} of answers and tool records were resolved before \
+                     it); raise --tape-max-bytes to replay it",
+                    size(retained.spent())
+                )),
+                (false, false) => None,
+            };
+            out.tools.push(ToolStep {
+                step: step.index,
+                tool: step.tool.clone(),
+                arguments: step.request.take().unwrap_or(Value::Null),
+                result: step.response.take().unwrap_or(Value::Null),
+                served: false,
+                unreadable,
+            });
+        }
+    }
+    out.bytes = out
+        .llm
+        .iter()
+        .map(|step| approximate_bytes(&step.choices))
+        .chain(
+            out.tools
+                .iter()
+                .map(|tool| value_bytes(&tool.arguments) + value_bytes(&tool.result) + 64),
+        )
+        .sum::<usize>();
+    Ok(out)
+}
+
+fn llm_snapshot(
+    step: &TapeStep,
+    mode: Mode,
+    answer: Leftover,
+    request: RecordedRequest,
+    retained: &ResolveBudget,
+) -> Result<LlmStep, ReplayError> {
     let label = || format!("step {} ({})", step.index, step.detail.signature);
     let Some(response) = &step.response else {
         return Err(ReplayError::Unreplayable(format!(
@@ -638,11 +1133,20 @@ fn llm_snapshot(step: &TapeStep, mode: Mode) -> Result<LlmStep, ReplayError> {
             label()
         )));
     };
-    if tape::contains_reference(response) {
+    // Unreadable first: raising the budget cannot bring back erased bytes.
+    if answer.unreadable {
         return Err(ReplayError::Unreplayable(format!(
-            "{}'s response is an offloaded payload that could not be read — erased, swept by \
-             retention, or past --tape-max-bytes",
+            "{}'s response is an offloaded payload that could not be read — erased, or swept \
+             by retention",
             label()
+        )));
+    }
+    if answer.past_budget {
+        return Err(ReplayError::Unreplayable(format!(
+            "{}'s response is an offloaded payload past --tape-max-bytes: the answers and tool \
+             records before it already resolve to {}; raise --tape-max-bytes to replay this run",
+            label(),
+            size(retained.spent())
         )));
     }
     let choices = recorded_choices(response, &step.detail.finish_reasons);
@@ -652,18 +1156,20 @@ fn llm_snapshot(step: &TapeStep, mode: Mode) -> Result<LlmStep, ReplayError> {
             label()
         )));
     }
-    let expected_digest = match &step.request {
-        Some(request) if !tape::contains_reference(request) => recorded_digest(request),
-        _ => None,
+    let (expected_digest, why) = match request {
+        RecordedRequest::Digest(digest) => (Some(digest), ""),
+        RecordedRequest::Missing => (None, "recorded no request"),
+        RecordedRequest::Unreadable => (
+            None,
+            "has a request that is an offloaded payload that could not be read — erased, or \
+             swept by retention",
+        ),
+        RecordedRequest::Text => (
+            None,
+            "recorded its request as text rather than a message list",
+        ),
     };
     if mode == Mode::Strict && expected_digest.is_none() {
-        let why = match &step.request {
-            None => "recorded no request".to_owned(),
-            Some(request) if tape::contains_reference(request) => {
-                "has a request that is an offloaded payload that could not be read".to_owned()
-            }
-            Some(_) => "recorded its request as text rather than a message list".to_owned(),
-        };
         return Err(ReplayError::Unreplayable(format!(
             "{} {why}, so strict mode has nothing to compare an incoming request against; \
              create the replay with \"mode\": \"loose\" to serve steps in order",
@@ -1519,6 +2025,7 @@ fn deltas(text: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::tape::tests::{span, TempStore};
+    use crate::tape::TapeOptions;
 
     const NOW: u64 = 1_800_000_000_000_000_000;
 
@@ -1705,7 +2212,7 @@ mod tests {
         let mut wrong = first_request();
         wrong["messages"][1]["content"] = json!("Weather in Rome?");
         let got = openai_request_digest(&wrong).expect("parses");
-        match registry.next_llm(&created.id, Some(""), got.clone(), NOW + 1) {
+        match registry.next_llm(store, &created.id, Some(""), got.clone(), NOW + 1) {
             Err(ReplayError::Diverged {
                 step,
                 expected_digest,
@@ -1720,6 +2227,7 @@ mod tests {
 
         let served = registry
             .next_llm(
+                store,
                 &created.id,
                 Some(""),
                 openai_request_digest(&first_request()).expect("parses"),
@@ -1738,6 +2246,7 @@ mod tests {
 
         let served = registry
             .next_llm(
+                store,
                 &created.id,
                 Some(""),
                 openai_request_digest(&second_request()).expect("parses"),
@@ -1749,13 +2258,13 @@ mod tests {
             "the tool step in between is not an llm step"
         );
 
-        match registry.next_llm(&created.id, Some(""), None, NOW + 4) {
+        match registry.next_llm(store, &created.id, Some(""), None, NOW + 4) {
             Err(ReplayError::Exhausted { served }) => assert_eq!(served, 2),
             other => panic!("expected exhaustion, got {other:?}"),
         }
 
         let status = registry
-            .status(&created.id, Some(""), NOW + 5)
+            .status(store, &created.id, Some(""), NOW + 5)
             .expect("live");
         assert_eq!(status["served"], json!(2));
         assert_eq!(status["remaining"], json!(0));
@@ -1779,10 +2288,12 @@ mod tests {
             .create(store, None, "run-1", Mode::Loose, 1 << 20, NOW)
             .expect("creates");
         let served = registry
-            .next_llm(&created.id, None, Some("0".repeat(64)), NOW)
+            .next_llm(store, &created.id, None, Some("0".repeat(64)), NOW)
             .expect("loose serves anyway");
         assert_eq!(served.step, 0);
-        let status = registry.status(&created.id, None, NOW).expect("live");
+        let status = registry
+            .status(store, &created.id, None, NOW)
+            .expect("live");
         assert_eq!(status["calls"][0]["matched"], json!(false));
         assert_eq!(status["diverged"], Value::Null);
     }
@@ -1798,11 +2309,11 @@ mod tests {
             .expect("creates")
             .id;
         assert!(matches!(
-            registry.next_tool(&id, Some(""), Some("search"), NOW),
+            registry.next_tool(store, &id, Some(""), Some("search"), NOW),
             Err(ReplayError::ToolsExhausted { tool: Some(_) })
         ));
         let tool = registry
-            .next_tool(&id, Some(""), Some("get_weather"), NOW)
+            .next_tool(store, &id, Some(""), Some("get_weather"), NOW)
             .expect("serves");
         assert_eq!(
             tool.to_json(),
@@ -1810,7 +2321,7 @@ mod tests {
                    "arguments": {"city": "Paris"}, "result": "rainy, 12C"})
         );
         assert!(matches!(
-            registry.next_tool(&id, Some(""), None, NOW),
+            registry.next_tool(store, &id, Some(""), None, NOW),
             Err(ReplayError::ToolsExhausted { tool: None })
         ));
     }
@@ -1828,18 +2339,22 @@ mod tests {
         );
         acme.tenant = "acme".into();
         store.ingest_batch(vec![acme]).expect("ingests");
-        let registry = Registry::new(Duration::from_secs(10), 2, MAX_REGISTRY_BYTES);
+        let registry = Registry::new(Limits {
+            ttl: Duration::from_secs(10),
+            max_live: 2,
+            ..Limits::default()
+        });
         let id = registry
             .create(store, Some("acme"), "trace:t7", Mode::Loose, 1 << 20, NOW)
             .expect("creates")
             .id;
         assert!(matches!(
-            registry.status(&id, Some("beta"), NOW),
+            registry.status(store, &id, Some("beta"), NOW),
             Err(ReplayError::NotFound)
         ));
-        assert!(registry.status(&id, Some("acme"), NOW).is_ok());
+        assert!(registry.status(store, &id, Some("acme"), NOW).is_ok());
         assert!(
-            registry.status(&id, None, NOW).is_ok(),
+            registry.status(store, &id, None, NOW).is_ok(),
             "an operator sees all"
         );
         // The default tenant has no such run.
@@ -1854,20 +2369,22 @@ mod tests {
             .expect("creates")
             .id;
         assert!(matches!(
-            registry.status(&operator, Some("acme"), NOW),
+            registry.status(store, &operator, Some("acme"), NOW),
             Err(ReplayError::NotFound)
         ));
         // Full at two: refused, never evicting, with a retry hint.
         match registry.create(store, None, "trace:t7", Mode::Loose, 1 << 20, NOW) {
             Err(ReplayError::Full {
+                own_share,
                 retry_after_seconds,
-            }) => assert_eq!(retry_after_seconds, 10),
+                ..
+            }) => assert_eq!((own_share, retry_after_seconds), (false, 10)),
             other => panic!("expected a full registry, got {other:?}"),
         }
         let later = NOW + 10_000_000_000;
         assert!(registry.is_empty(later), "both expired at their TTL");
         assert!(matches!(
-            registry.status(&id, None, later),
+            registry.status(store, &id, None, later),
             Err(ReplayError::NotFound)
         ));
     }
@@ -1916,7 +2433,7 @@ mod tests {
             .create(store, Some(""), "trace:t3", Mode::Loose, 1 << 20, NOW)
             .expect("loose replays a text prompt");
         let served = registry
-            .next_llm(&loose.id, Some(""), None, NOW)
+            .next_llm(store, &loose.id, Some(""), None, NOW)
             .expect("serves");
         let body: Value = serde_json::from_slice(&served.anthropic(&json!({})).body).unwrap();
         assert_eq!(body["content"], json!([{"type": "text", "text": "hello"}]));
@@ -2084,5 +2601,359 @@ mod tests {
         // Multi-byte characters are never split.
         let accented = "é".repeat(40);
         assert_eq!(deltas(&accented).concat(), accented);
+    }
+
+    /// A one-step run in its own trace and session: a model call and its
+    /// answer, under `tenant`.
+    fn single(tenant: &str, trace: &str, session: &str) -> Span {
+        let mut span = span(
+            trace,
+            "llm",
+            1,
+            json!({"session.id": session, "gen_ai.operation.name": "chat",
+                   "gen_ai.prompt.0.role": "user", "gen_ai.prompt.0.content": "hi",
+                   "gen_ai.completion.0.content": "hello"}),
+        );
+        span.tenant = tenant.into();
+        span
+    }
+
+    #[test]
+    fn an_erasure_withdraws_every_replay_holding_what_it_erased() {
+        let fixture = TempStore::open("replay-erasure", crate::Config::default());
+        let store = fixture.store();
+        openllmetry_run(store);
+        store
+            .ingest_batch(vec![single("", "t-other", "run-other")])
+            .expect("ingests");
+        let registry = Registry::default();
+        let create = |run: &str| {
+            registry
+                .create(store, Some(""), run, Mode::Loose, 1 << 20, NOW)
+                .expect("creates")
+                .id
+        };
+        let (held, untouched, tools) = (create("run-1"), create("run-other"), create("run-1"));
+        let request = openai_request_digest(&first_request()).expect("parses");
+        registry
+            .next_llm(store, &held, Some(""), request.clone(), NOW)
+            .expect("serves before the erasure");
+
+        let status = store
+            .erase(Subject::Session {
+                session_id: "run-1".into(),
+                tenant: String::new(),
+            })
+            .expect("erases");
+        let erasure = status.erase.id;
+
+        // Every route of a replay holding the session refuses from now on,
+        // naming the erasure, and keeps refusing.
+        for _ in 0..2 {
+            match registry.next_llm(store, &held, Some(""), request.clone(), NOW) {
+                Err(ReplayError::Erased { erasure: named }) => assert_eq!(named, erasure),
+                other => panic!("expected the replay withdrawn, got {other:?}"),
+            }
+        }
+        assert!(matches!(
+            registry.status(store, &held, Some(""), NOW),
+            Err(ReplayError::Erased { .. })
+        ));
+        assert!(matches!(
+            registry.next_tool(store, &tools, Some(""), None, NOW),
+            Err(ReplayError::Erased { .. })
+        ));
+        // A foreign caller still learns nothing: not found, not erased.
+        assert!(matches!(
+            registry.status(store, &held, Some("acme"), NOW),
+            Err(ReplayError::NotFound)
+        ));
+        // A replay of other data keeps serving.
+        registry
+            .next_llm(store, &untouched, Some(""), None, NOW)
+            .expect("an unrelated replay is not withdrawn");
+        // A replay created AFTER the erasure is new data, served normally —
+        // and the run it names is gone, so there is nothing to create.
+        assert!(matches!(
+            registry.create(store, Some(""), "run-1", Mode::Loose, 1 << 20, NOW),
+            Err(ReplayError::RunNotFound)
+        ));
+        // Withdrawn replays hold nothing and count against no bound.
+        assert_eq!(registry.len(NOW), 3);
+    }
+
+    #[test]
+    fn payload_tenant_and_span_erasures_reach_replays_too() {
+        let config = crate::Config {
+            payload_threshold: Some(64),
+            ..crate::Config::default()
+        };
+        let fixture = TempStore::open("replay-erasure-kinds", config);
+        let store = fixture.store();
+        let long_answer = "a".repeat(200);
+        let mut offloaded = single("", "t-pay", "s-pay");
+        offloaded
+            .attributes
+            .insert("gen_ai.completion.0.content".into(), json!(long_answer));
+        store
+            .ingest_batch(vec![
+                offloaded,
+                single("acme", "t-acme", "s-acme"),
+                single("", "t-span", "s-span"),
+            ])
+            .expect("ingests");
+        let registry = Registry::default();
+        let paid = registry
+            .create(store, Some(""), "s-pay", Mode::Loose, 1 << 20, NOW)
+            .expect("creates")
+            .id;
+        let acme = registry
+            .create(store, Some("acme"), "s-acme", Mode::Loose, 1 << 20, NOW)
+            .expect("creates")
+            .id;
+        let spanned = registry
+            .create(store, Some(""), "s-span", Mode::Loose, 1 << 20, NOW)
+            .expect("creates")
+            .id;
+        let tape = store
+            .tape(Some(""), "s-pay", TapeOptions::default())
+            .expect("reads")
+            .expect("exists");
+        let mut references = HashSet::new();
+        tape::collect_references(tape.steps[0].response.as_ref().unwrap(), &mut references);
+        let reference = references.into_iter().next().expect("offloaded");
+
+        store
+            .erase(Subject::Payload { reference })
+            .expect("erases the payload");
+        store
+            .erase(Subject::Tenant {
+                tenant: "acme".into(),
+            })
+            .expect("erases the tenant");
+        store
+            .erase(Subject::Span {
+                trace_id: "t-span".into(),
+                span_id: "llm".into(),
+                tenant: String::new(),
+            })
+            .expect("erases the span");
+        for (id, binding) in [(&paid, Some("")), (&acme, Some("acme")), (&spanned, None)] {
+            assert!(
+                matches!(
+                    registry.next_llm(store, id, binding, None, NOW),
+                    Err(ReplayError::Erased { .. })
+                ),
+                "{id}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_tenant_has_its_own_share_of_the_registry() {
+        let fixture = TempStore::open("replay-shares", crate::Config::default());
+        let store = fixture.store();
+        store
+            .ingest_batch(vec![
+                single("acme", "t-a", "s-a"),
+                single("beta", "t-b", "s-b"),
+            ])
+            .expect("ingests");
+        let registry = Registry::new(Limits {
+            ttl: Duration::from_secs(10),
+            max_live_per_tenant: 2,
+            ..Limits::default()
+        });
+        let create = |tenant: Option<&str>, run: &str, at: u64| {
+            registry.create(store, tenant, run, Mode::Loose, 1 << 20, at)
+        };
+        create(Some("acme"), "s-a", NOW).expect("first");
+        create(Some("acme"), "s-a", NOW + 2_000_000_000).expect("second");
+        // Acme's share is full; the retry time is its own oldest replay's.
+        match create(Some("acme"), "s-a", NOW + 3_000_000_000) {
+            Err(ReplayError::Full {
+                own_share: true,
+                max_live: 2,
+                retry_after_seconds,
+                ..
+            }) => assert_eq!(retry_after_seconds, 7),
+            other => panic!("expected acme's share full, got {other:?}"),
+        }
+        // Beta, and the operator view, are untouched by it.
+        create(Some("beta"), "s-b", NOW).expect("beta has its own share");
+        create(None, "s-b", NOW).expect("so does the operator view");
+        // Once acme's oldest expires, it has room again.
+        create(Some("acme"), "s-a", NOW + 10_000_000_000).expect("room after expiry");
+    }
+
+    #[test]
+    fn a_snapshot_larger_than_a_share_is_refused_for_good() {
+        let fixture = TempStore::open("replay-too-large", crate::Config::default());
+        let store = fixture.store();
+        openllmetry_run(store);
+        let registry = Registry::new(Limits {
+            max_bytes_per_tenant: 300,
+            ..Limits::default()
+        });
+        match registry.create(store, Some(""), "run-1", Mode::Loose, 1 << 20, NOW) {
+            Err(error @ ReplayError::TooLarge { bytes, limit: 300 }) => {
+                assert!(bytes > 300);
+                assert!(
+                    error.to_string().contains("can never be created"),
+                    "{error}"
+                );
+            }
+            other => panic!("expected a permanent refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn retry_after_waits_until_enough_room_is_freed() {
+        let second = 1_000_000_000;
+        // Room now: no wait.
+        assert_eq!(
+            wait_for_room(vec![(NOW + second, 10)], 2, 100, 50, NOW),
+            None
+        );
+        // The count bound: the oldest expiry frees a slot.
+        assert_eq!(
+            wait_for_room(
+                vec![(NOW + 5 * second, 1), (NOW + 3 * second, 1)],
+                2,
+                100,
+                1,
+                NOW
+            ),
+            Some(3)
+        );
+        // The byte bound: the oldest expiry frees too little, so the answer
+        // is the expiry after which the snapshot fits — not the oldest.
+        assert_eq!(
+            wait_for_room(
+                vec![(NOW + 2 * second, 10), (NOW + 9 * second, 80)],
+                10,
+                100,
+                50,
+                NOW
+            ),
+            Some(9)
+        );
+        // Never less than a second.
+        assert_eq!(wait_for_room(vec![(NOW + 1, 1)], 1, 100, 1, NOW), Some(1));
+    }
+
+    #[test]
+    fn a_run_longer_than_the_span_cap_is_refused_not_cut() {
+        let fixture = TempStore::open("replay-span-cap", crate::Config::default());
+        let store = fixture.store();
+        openllmetry_run(store);
+        let registry = Registry::new(Limits {
+            max_spans: 2,
+            ..Limits::default()
+        });
+        match registry.create(store, Some(""), "run-1", Mode::Loose, 1 << 20, NOW) {
+            Err(ReplayError::Unreplayable(message)) => {
+                assert!(message.contains("more than 2 spans"), "{message}")
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        let fits = Registry::new(Limits {
+            max_spans: 3,
+            ..Limits::default()
+        });
+        fits.create(store, Some(""), "run-1", Mode::Loose, 1 << 20, NOW)
+            .expect("a run exactly at the cap replays");
+    }
+
+    #[test]
+    fn only_what_a_replay_holds_is_charged_against_the_tape_budget() {
+        // A 64-byte threshold offloads every long value below.
+        let config = crate::Config {
+            payload_threshold: Some(64),
+            ..crate::Config::default()
+        };
+        let fixture = TempStore::open("replay-budget", config);
+        let store = fixture.store();
+        let history = |turns: usize| {
+            let messages: Vec<Value> = (0..turns)
+                .map(|turn| {
+                    json!({"role": "user", "parts": [
+                    {"type": "text", "content": format!("{turn}: {}", "x".repeat(120))}]})
+                })
+                .collect();
+            serde_json::to_string(&messages).expect("encodes")
+        };
+        let mut spans = Vec::new();
+        // A conversation whose whole message list is one offloaded attribute
+        // that grows at every step — the OTel GenAI shape — with short,
+        // inline answers.
+        for turn in 1..=6 {
+            spans.push(span(
+                "t-long",
+                &format!("llm-{turn}"),
+                turn as u64 * 10,
+                json!({"session.id": "long", "gen_ai.operation.name": "chat",
+                       "gen_ai.input.messages": history(turn),
+                       "gen_ai.completion.0.role": "assistant",
+                       "gen_ai.completion.0.content": format!("ok {turn}")}),
+            ));
+        }
+        // A tool whose result is offloaded and larger than the budget.
+        spans.push(span(
+            "t-long",
+            "tool",
+            100,
+            json!({"session.id": "long", "gen_ai.operation.name": "execute_tool",
+                   "gen_ai.tool.name": "fetch", "gen_ai.tool.call.arguments": "{\"u\":1}",
+                   "gen_ai.tool.call.result": "r".repeat(400)}),
+        ));
+        store.ingest_batch(spans).expect("ingests");
+        let registry = Registry::default();
+
+        // 300 bytes would not hold even the second request (the six come to
+        // over 3 KB); requests are digested, not held, so strict creation
+        // succeeds.
+        let created = registry
+            .create(store, Some(""), "long", Mode::Strict, 300, NOW)
+            .expect("requests are not charged");
+        assert_eq!(created.llm_steps, 6);
+        // The over-budget tool result is flagged, not served as a reference.
+        assert_eq!(created.unreadable_tool_steps, [6]);
+        match registry.next_tool(store, &created.id, Some(""), Some("fetch"), NOW) {
+            Err(ReplayError::ToolUnreadable {
+                step: 6, reason, ..
+            }) => {
+                assert!(reason.contains("past --tape-max-bytes"), "{reason}")
+            }
+            other => panic!("expected the tool step refused, got {other:?}"),
+        }
+        assert!(
+            matches!(
+                registry.next_tool(store, &created.id, Some(""), None, NOW),
+                Err(ReplayError::ToolUnreadable { step: 6, .. })
+            ),
+            "a refused tool step is not consumed"
+        );
+
+        // An offloaded ANSWER past the budget refuses creation, and says the
+        // budget is why.
+        store
+            .ingest_batch(vec![span(
+                "t-big",
+                "llm",
+                1,
+                json!({"gen_ai.operation.name": "chat", "gen_ai.prompt.0.content": "hi",
+                       "gen_ai.completion.0.content": "z".repeat(400)}),
+            )])
+            .expect("ingests");
+        match registry.create(store, Some(""), "trace:t-big", Mode::Loose, 300, NOW) {
+            Err(ReplayError::Unreplayable(message)) => {
+                assert!(message.contains("past --tape-max-bytes"), "{message}")
+            }
+            other => panic!("expected a budget refusal, got {other:?}"),
+        }
+        registry
+            .create(store, Some(""), "trace:t-big", Mode::Loose, 1 << 20, NOW)
+            .expect("a larger budget holds it");
     }
 }

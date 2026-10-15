@@ -40,8 +40,10 @@ use crate::{Result, Span, Store};
 /// steps and the diff says so.
 pub const MAX_DIFF_STEPS: usize = 5000;
 
-/// Spans read per side while finding its steps.
-const MAX_DIFF_SPANS: usize = 50_000;
+/// Spans read per side. Past it the side is read from its earliest spans:
+/// its steps, and every summary over its spans (cost, tokens, duration,
+/// errors), describe that beginning, and its outcome is `unknown`.
+pub const MAX_DIFF_SPANS: usize = 50_000;
 
 /// Below this many cells the alignment is a plain dynamic-programming table;
 /// above it, Hirschberg's linear-space recursion, so two 5,000-step runs cost
@@ -50,6 +52,15 @@ const DIRECT_TABLE_CELLS: usize = 1 << 16;
 
 /// Hex characters of a digest quoted in an explanation.
 const DIGEST_PREVIEW: usize = 12;
+
+/// Characters of one producer-chosen value quoted in an explanation — a
+/// model, tool or span name, a parameter's key or its value. Producers bound
+/// none of these, and an explanation travels into size-capped results (the
+/// MCP ceiling), so each is clipped where it is quoted.
+const QUOTED_CHARS: usize = 80;
+
+/// Characters of a whole explanation, at most.
+const MAX_EXPLANATION_CHARS: usize = 400;
 
 /// One side of a diff, summarised.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -66,8 +77,13 @@ pub struct RunSide {
     pub duration_ns: u64,
     /// Spans whose status is `error`.
     pub errors: usize,
-    /// How the run ended ([`attribution::session_outcome`]).
+    /// How the run ended ([`attribution::session_outcome`]) — `unknown`
+    /// when the side was truncated, because a run read from its beginning
+    /// has not been read to its end.
     pub outcome: attribution::Outcome,
+    /// Whether this side had more than [`MAX_DIFF_SPANS`] spans, so that
+    /// every figure above describes its earliest spans only.
+    pub truncated: bool,
 }
 
 /// What an aligned entry is.
@@ -172,9 +188,10 @@ pub struct RunDiff {
     pub first_divergence: Option<FirstDivergence>,
     /// `b` minus `a`.
     pub delta: Delta,
-    /// Whether either side was cut to [`MAX_DIFF_STEPS`] (or its span budget),
-    /// in which case the alignment describes prefixes and its tail may report
-    /// steps as missing that the cut removed.
+    /// Whether either side was cut to [`MAX_DIFF_STEPS`] steps or
+    /// [`MAX_DIFF_SPANS`] spans, in which case the alignment describes
+    /// prefixes and its tail may report steps as missing that the cut removed.
+    /// Which side's summary is also a prefix is its own `truncated`.
     pub truncated: bool,
 }
 
@@ -196,12 +213,26 @@ impl Store {
         b: &str,
         now_ns: u64,
     ) -> Result<std::result::Result<RunDiff, MissingRun>> {
+        self.diff_runs_capped(tenant, a, b, now_ns, MAX_DIFF_SPANS, MAX_DIFF_STEPS)
+    }
+
+    /// [`Self::diff_runs`] with explicit per-side caps, so tests can reach
+    /// the truncation edges without fifty thousand spans.
+    pub(crate) fn diff_runs_capped(
+        &self,
+        tenant: Option<&str>,
+        a: &str,
+        b: &str,
+        now_ns: u64,
+        max_spans: usize,
+        max_steps: usize,
+    ) -> Result<std::result::Result<RunDiff, MissingRun>> {
         let deadline = self.query_deadline(Instant::now());
-        let left = self.run_tape(tenant, a, MAX_DIFF_SPANS, MAX_DIFF_STEPS, deadline)?;
+        let left = self.run_tape(tenant, a, max_spans, max_steps, deadline)?;
         if left.spans.is_empty() {
             return Ok(Err(MissingRun(a.to_owned())));
         }
-        let right = self.run_tape(tenant, b, MAX_DIFF_SPANS, MAX_DIFF_STEPS, deadline)?;
+        let right = self.run_tape(tenant, b, max_spans, max_steps, deadline)?;
         if right.spans.is_empty() {
             return Ok(Err(MissingRun(b.to_owned())));
         }
@@ -228,16 +259,19 @@ impl Store {
 
     fn side(&self, run: &str, tape: &RunTape, now_ns: u64) -> RunSide {
         let (cost_usd, tokens) = run_cost(self, &tape.spans);
-        let outcome =
-            attribution::session_outcome(&tape.spans, now_ns, crate::mcp::SESSION_IDLE_NS);
+        let ended = attribution::session_outcome(&tape.spans, now_ns, crate::mcp::SESSION_IDLE_NS);
         RunSide {
             run: run.to_owned(),
             steps: tape.steps.len(),
             cost_usd,
             tokens,
             duration_ns: run_duration(&tape.spans),
-            errors: outcome.error_count,
-            outcome: outcome.outcome,
+            errors: ended.error_count,
+            outcome: match tape.spans_truncated {
+                true => attribution::Outcome::Unknown,
+                false => ended.outcome,
+            },
+            truncated: tape.spans_truncated,
         }
     }
 }
@@ -390,7 +424,7 @@ fn first_divergence(
     for entry in aligned {
         if entry.op != Op::Same {
             let kind = entry.why.unwrap_or(DivergenceKind::Structure);
-            let explanation = explain(entry, kind, a, b);
+            let explanation = clip(&explain(entry, kind, a, b), MAX_EXPLANATION_CHARS);
             return Some(FirstDivergence {
                 a: entry.a.unwrap_or(next_a),
                 b: entry.b.unwrap_or(next_b),
@@ -411,12 +445,28 @@ fn preview(digest: Option<&String>) -> String {
     )
 }
 
+/// `text`, cut to `max` characters with an ellipsis when longer.
+fn clip(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_owned();
+    }
+    let mut clipped: String = text.chars().take(max).collect();
+    clipped.push('…');
+    clipped
+}
+
+fn quote(text: &str) -> String {
+    clip(text, QUOTED_CHARS)
+}
+
 fn explain(entry: &Aligned, kind: DivergenceKind, a: &[TapeStep], b: &[TapeStep]) -> String {
     match (entry.a.map(|i| &a[i]), entry.b.map(|j| &b[j])) {
         (Some(left), Some(right)) => {
             let at = format!(
                 "step {} of a and step {} of b ({})",
-                left.index, right.index, left.detail.signature
+                left.index,
+                right.index,
+                quote(&left.detail.signature)
             );
             match kind {
                 DivergenceKind::Input => format!(
@@ -435,8 +485,8 @@ fn explain(entry: &Aligned, kind: DivergenceKind, a: &[TapeStep], b: &[TapeStep]
                      {} in a, {} in b",
                     left.index,
                     right.index,
-                    left.model.as_deref().unwrap_or("none"),
-                    right.model.as_deref().unwrap_or("none"),
+                    quote(left.model.as_deref().unwrap_or("none")),
+                    quote(right.model.as_deref().unwrap_or("none")),
                 ),
                 DivergenceKind::Config => {
                     let keys = config_differences(&left.detail.config, &right.detail.config);
@@ -447,11 +497,13 @@ fn explain(entry: &Aligned, kind: DivergenceKind, a: &[TapeStep], b: &[TapeStep]
         }
         (Some(left), None) => format!(
             "run a has step {} ({}) where run b has no matching step",
-            left.index, left.detail.signature
+            left.index,
+            quote(&left.detail.signature)
         ),
         (None, Some(right)) => format!(
             "run b has step {} ({}) where run a has no matching step",
-            right.index, right.detail.signature
+            right.index,
+            quote(&right.detail.signature)
         ),
         (None, None) => "the runs differ".to_owned(),
     }
@@ -469,9 +521,15 @@ fn config_differences(
         .into_iter()
         .filter(|key| a.get(*key) != b.get(*key))
         .map(|key| {
-            let show =
-                |value: Option<&Value>| value.map_or_else(|| "unset".to_owned(), Value::to_string);
-            format!("{key} {} in a, {} in b", show(a.get(key)), show(b.get(key)))
+            let show = |value: Option<&Value>| {
+                value.map_or_else(|| "unset".to_owned(), |value| quote(&value.to_string()))
+            };
+            format!(
+                "{} {} in a, {} in b",
+                quote(key),
+                show(a.get(key)),
+                show(b.get(key))
+            )
         })
         .collect();
     let shown = differing.len().min(3);
@@ -814,6 +872,84 @@ mod tests {
             "{}",
             found.explanation
         );
+    }
+
+    #[test]
+    fn a_side_past_the_span_cap_says_so_and_does_not_claim_an_outcome() {
+        let fixture = TempStore::open("diff-span-cap", crate::Config::default());
+        let store = fixture.store();
+        let run = |trace: &str| {
+            vec![
+                llm(trace, "1", 10, "gpt-4o", "plan", "search"),
+                tool(trace, "2", 20, "search", "{}"),
+                llm(trace, "3", 30, "gpt-4o", "answer", "done"),
+            ]
+        };
+        let mut spans = run("long");
+        spans.extend(run("short").into_iter().take(2));
+        store.ingest_batch(spans).expect("ingests");
+        let diff = store
+            .diff_runs_capped(Some(""), "trace:short", "trace:long", NOW, 2, 100)
+            .expect("reads")
+            .expect("both exist");
+        assert!(diff.truncated);
+        assert!(!diff.a.truncated, "two spans fit a cap of two");
+        assert_eq!(diff.a.outcome, attribution::Outcome::Success);
+        assert!(diff.b.truncated);
+        assert_eq!(
+            diff.b.outcome,
+            attribution::Outcome::Unknown,
+            "a run read from its beginning has not been read to its end"
+        );
+        assert_eq!(diff.b.steps, 2);
+        assert_eq!(diff.b.tokens, 15, "summaries describe the spans read");
+        // A step cap alone leaves the side's summary whole.
+        let stepped = store
+            .diff_runs_capped(Some(""), "trace:long", "trace:long", NOW, 100, 1)
+            .expect("reads")
+            .expect("both exist");
+        assert!(stepped.truncated);
+        assert!(!stepped.a.truncated);
+        assert_eq!(stepped.a.outcome, attribution::Outcome::Success);
+        assert_eq!(stepped.a.tokens, 30);
+    }
+
+    #[test]
+    fn explanations_clip_the_producer_text_they_quote() {
+        let fixture = TempStore::open("diff-clip", crate::Config::default());
+        let store = fixture.store();
+        let blob = json!({"stop": ["x".repeat(5_000)]});
+        let mut left = llm("left", "1", 10, "m", "hi", "hello");
+        left.attributes
+            .insert("gen_ai.request.response_format".into(), blob.clone());
+        let mut right = llm("right", "1", 10, "m", "hi", "hello");
+        right
+            .attributes
+            .insert("gen_ai.request.response_format".into(), json!("text"));
+        let long_name = "t".repeat(5_000);
+        store
+            .ingest_batch(vec![
+                left,
+                right,
+                tool("insert-a", "1", 10, "search", "{}"),
+                tool("insert-b", "1", 10, &long_name, "{}"),
+            ])
+            .expect("ingests");
+        for (a, b) in [("left", "right"), ("insert-b", "insert-a")] {
+            let found = store
+                .diff_runs(Some(""), &format!("trace:{a}"), &format!("trace:{b}"), NOW)
+                .expect("reads")
+                .expect("both exist")
+                .first_divergence
+                .expect("differs");
+            let length = found.explanation.chars().count();
+            assert!(
+                length <= MAX_EXPLANATION_CHARS + 1,
+                "{length}: {}",
+                found.explanation
+            );
+            assert!(found.explanation.contains('…'), "{}", found.explanation);
+        }
     }
 
     #[test]

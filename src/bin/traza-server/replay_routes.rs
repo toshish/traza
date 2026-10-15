@@ -19,10 +19,12 @@
 //!
 //! The provider-shaped routes answer errors in the provider's shape —
 //! `{"error": {"type", "message"}}`, plus `"type": "error"` at the top for
-//! Anthropic — because the client reading them is that provider's SDK, and
-//! they mark divergence and exhaustion `x-should-retry: false`: both SDKs
-//! retry a 409 by default, and retrying a request that does not match the
-//! recording cannot make it match.
+//! Anthropic — because the client reading them is that provider's SDK; the
+//! native routes answer the API's `{"error": "<message>"}` with the kind
+//! beside it as `"type"`. Every refusal a retry cannot cure — divergence,
+//! exhaustion, erasure, an unreplayable run — is marked `x-should-retry:
+//! false`: both SDKs retry a 409 by default, and retrying a request that does
+//! not match the recording cannot make it match.
 
 use std::io;
 use std::sync::OnceLock;
@@ -41,6 +43,11 @@ const TAPES_PREFIX: &str = "/v1/tapes/";
 const OPENAI_CHAT: &str = "/openai/v1/chat/completions";
 const ANTHROPIC_MESSAGES: &str = "/anthropic/v1/messages";
 const TOOLS_NEXT: &str = "/tools/next";
+
+/// `Retry-After` for a bound caller refused because the WHOLE registry is
+/// full (see [`create`]): a minute, a fixed figure that says nothing about
+/// when another tenant's replay expires.
+const REGISTRY_FULL_RETRY_SECONDS: u64 = 60;
 
 /// The process's replay registry. One server is one store, so one registry;
 /// it is created on first use and lives as long as the process.
@@ -127,7 +134,7 @@ pub(super) fn serve(
         (_, _) if path.starts_with(REPLAY_PREFIX) => {
             let rest = &path[REPLAY_PREFIX.len()..];
             let (id, route) = rest.find('/').map_or((rest, ""), |at| rest.split_at(at));
-            call(responder, method, id, route, body, binding)
+            call(responder, method, id, route, body, engine, binding)
         }
         _ => responder.json(404, json!({"error": "not found"})),
     }
@@ -427,24 +434,43 @@ fn create(
     ) {
         Ok(created) => send_json(responder, 201, &[], &created.to_json()),
         Err(ReplayError::RunNotFound) => responder.json(404, json!({"error": "run not found"})),
-        Err(ReplayError::Unreplayable(reason)) => {
-            send_json(responder, 409, &[], &json!({"error": reason}))
-        }
-        Err(ReplayError::Full {
-            retry_after_seconds,
-        }) => send_json(
+        // Permanent: the run cannot be replayed as asked, and a retry would
+        // be refused the same way. `x-should-retry: false` for any SDK-style
+        // client wrapping this call, which would otherwise retry a 409.
+        Err(error @ (ReplayError::Unreplayable(_) | ReplayError::TooLarge { .. })) => send_json(
             responder,
-            429,
-            &[("Retry-After", retry_after_seconds.to_string())],
-            &json!({"error": format!(
-                "the replay registry is full ({} live replays, or {} MiB of recorded content); \
-                 retry once the oldest expires",
-                traza::replay::MAX_LIVE_REPLAYS,
-                traza::replay::MAX_REGISTRY_BYTES / (1024 * 1024),
-            )}),
+            409,
+            &[("x-should-retry", "false".to_owned())],
+            &json!({"error": error.to_string()}),
         ),
+        Err(
+            error @ ReplayError::Full {
+                own_share,
+                retry_after_seconds,
+                ..
+            },
+        ) => {
+            // A bound caller refused by the registry as a whole is told to
+            // come back later, not WHEN: the exact time would be when some
+            // other tenant's replay expires, which is not its to learn. Its
+            // own share's retry time is computed from its own replays.
+            let bound = principal.is_some_and(|principal| principal.tenant.is_some());
+            let retry_after = if own_share || !bound {
+                retry_after_seconds
+            } else {
+                REGISTRY_FULL_RETRY_SECONDS
+            };
+            send_json(
+                responder,
+                429,
+                &[("Retry-After", retry_after.to_string())],
+                &json!({"error": error.to_string()}),
+            )
+        }
         Err(ReplayError::Engine(error)) => engine_error(responder, metrics, error),
-        Err(other) => responder.json(503, json!({"error": format!("{other:?}")})),
+        // Creation produces none of the call-time refusals; should one ever
+        // arrive here it is still answered in words, never in debug output.
+        Err(other) => responder.json(503, json!({"error": other.to_string()})),
     }
 }
 
@@ -456,79 +482,68 @@ enum Shape {
     Native,
 }
 
-/// A replay error in the caller's shape. Divergence and exhaustion carry
-/// `x-should-retry: false` (see the module docs).
+/// A replay error in the caller's shape.
+///
+/// The provider routes answer `{"error": {"type", "message", …}}` (plus a
+/// top-level `"type": "error"` for Anthropic), because the client reading
+/// them is that provider's SDK. The native routes — status and `tools/next`
+/// — answer the API's own convention, `{"error": "<message>"}`, with the
+/// machine-readable kind beside it as `"type"` and any detail as further
+/// siblings; an unknown replay there is exactly `{"error": "replay not
+/// found"}`. Every refusal that a retry cannot cure — divergence, exhaustion,
+/// erasure, an unreadable tool step — carries `x-should-retry: false` (see
+/// the module docs).
 fn replay_error(responder: &mut Responder<'_>, shape: Shape, error: ReplayError) -> io::Result<()> {
-    let no_retry = [("x-should-retry", "false".to_owned())];
-    let (status, kind, message, mut extra, retry) = match error {
-        ReplayError::NotFound => (
-            404,
-            "not_found_error",
-            "no live replay has this id; replays expire an hour after creation and do not \
-             survive a restart"
-                .to_owned(),
-            Map::new(),
-            false,
-        ),
+    let message = error.to_string();
+    let mut extra = Map::new();
+    let (status, kind, retry) = match error {
+        ReplayError::NotFound => (404, "not_found_error", false),
         ReplayError::Diverged {
             step,
             expected_digest,
             got_digest,
         } => {
-            let mut extra = Map::new();
             extra.insert("step".to_owned(), json!(step));
             extra.insert("expected_digest".to_owned(), json!(expected_digest));
             extra.insert("got_digest".to_owned(), json!(got_digest));
-            (
-                409,
-                "replay_divergence",
-                format!(
-                    "this request's messages do not match recorded step {step}: the agent \
-                     diverged from the recording, so replaying the recorded answer would \
-                     answer a different question"
-                ),
-                extra,
-                true,
-            )
+            (409, "replay_divergence", true)
         }
         ReplayError::Exhausted { served } => {
-            let mut extra = Map::new();
             extra.insert("served".to_owned(), json!(served));
-            (
-                410,
-                "replay_exhausted",
-                format!("all {served} recorded model calls have been served"),
-                extra,
-                true,
-            )
+            (410, "replay_exhausted", true)
         }
-        ReplayError::ToolsExhausted { tool } => (
-            410,
-            "replay_exhausted",
-            match tool {
-                Some(name) => format!("no unserved recorded tool step named {name} remains"),
-                None => "no unserved recorded tool step remains".to_owned(),
-            },
-            Map::new(),
-            true,
-        ),
-        ReplayError::Invalid(reason) => (400, "invalid_request_error", reason, Map::new(), false),
-        other => (
-            503,
-            "api_error",
-            format!("the replay could not be served: {other:?}"),
-            Map::new(),
-            false,
-        ),
+        ReplayError::ToolsExhausted { .. } => (410, "replay_exhausted", true),
+        ReplayError::ToolUnreadable { step, .. } => {
+            extra.insert("step".to_owned(), json!(step));
+            (409, "tool_unreadable", true)
+        }
+        ReplayError::Erased { erasure } => {
+            extra.insert("erasure".to_owned(), json!(erasure));
+            (410, "replay_erased", true)
+        }
+        ReplayError::Invalid(_) => (400, "invalid_request_error", false),
+        // Creation-time refusals never reach a call route; the store's own
+        // failures (a poisoned lock, a failed read) land here, in words.
+        ReplayError::Engine(_)
+        | ReplayError::RunNotFound
+        | ReplayError::Full { .. }
+        | ReplayError::TooLarge { .. }
+        | ReplayError::Unreplayable(_) => (503, "api_error", false),
     };
+    let no_retry = [("x-should-retry", "false".to_owned())];
     let headers: &[(&str, String)] = if retry { &no_retry } else { &[] };
-    if shape == Shape::Native && status == 404 {
-        return send_json(
-            responder,
-            status,
-            headers,
-            &json!({"error": "replay not found"}),
-        );
+    if shape == Shape::Native {
+        if status == 404 {
+            return send_json(
+                responder,
+                status,
+                headers,
+                &json!({"error": "replay not found"}),
+            );
+        }
+        extra.insert("error".to_owned(), json!(message));
+        extra.insert("type".to_owned(), json!(kind));
+        return send_json(responder, status, headers, &Value::Object(extra));
     }
     extra.insert("type".to_owned(), json!(kind));
     extra.insert("message".to_owned(), json!(message));
@@ -540,18 +555,20 @@ fn replay_error(responder: &mut Responder<'_>, shape: Shape, error: ReplayError)
     send_json(responder, status, headers, &Value::Object(body))
 }
 
-/// A route under `/v1/replays/{id}`.
+/// A route under `/v1/replays/{id}`. These routes take no query parameters:
+/// an SDK appends none, and the replay's tenant was fixed when it was made.
 fn call(
     responder: &mut Responder<'_>,
     method: &str,
     id: &str,
     route: &str,
     body: &[u8],
+    engine: &Store,
     binding: Option<&str>,
 ) -> io::Result<()> {
     let now = now_ns();
     match (method, route) {
-        ("GET", "") => match registry().status(id, binding, now) {
+        ("GET", "") => match registry().status(engine, id, binding, now) {
             Ok(status) => responder.json(200, status),
             Err(error) => replay_error(responder, Shape::Native, error),
         },
@@ -582,7 +599,7 @@ fn call(
                 Ok(digest) => digest,
                 Err(reason) => return replay_error(responder, shape, ReplayError::Invalid(reason)),
             };
-            match registry().next_llm(id, binding, digest, now) {
+            match registry().next_llm(engine, id, binding, digest, now) {
                 Ok(served) => {
                     let rendered = match shape {
                         Shape::OpenAi => served.openai(&request),
@@ -621,7 +638,7 @@ fn call(
                     Err(error) => return responder.json(400, json!({"error": error.to_string()})),
                 }
             };
-            match registry().next_tool(id, binding, tool.as_deref(), now) {
+            match registry().next_tool(engine, id, binding, tool.as_deref(), now) {
                 Ok(served) => responder.json(200, served.to_json()),
                 Err(error) => replay_error(responder, Shape::Native, error),
             }

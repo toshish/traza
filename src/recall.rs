@@ -41,8 +41,10 @@ pub const MAX_RECALL_MATCHES: usize = 5000;
 /// of them.
 pub const MAX_RECALL_CANDIDATES: usize = 100;
 
-/// Spans read per candidate run.
-const MAX_RECALL_RUN_SPANS: usize = 20_000;
+/// Spans read per candidate run. A longer run is read from its beginning and
+/// says so (`truncated`); its outcome is then `unknown`, never ranked as a
+/// success it may not have been.
+pub const MAX_RECALL_RUN_SPANS: usize = 20_000;
 
 /// Entries in a skeleton, at most.
 pub const MAX_SKELETON: usize = 40;
@@ -99,7 +101,7 @@ pub struct RecalledRun {
     /// The run's tenant (`""` is the default tenant) — the run id alone is
     /// ambiguous in an operator view, where two tenants may reuse one.
     pub tenant: String,
-    /// How it ended.
+    /// How it ended — `unknown` when the run was truncated.
     pub outcome: Outcome,
     /// Whether that was declared by a span or derived from the run.
     pub outcome_source: OutcomeSource,
@@ -121,6 +123,12 @@ pub struct RecalledRun {
     /// For a failed run, the step its failure is attributed to.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cause: Option<RecallCause>,
+    /// Whether the run had more than [`MAX_RECALL_RUN_SPANS`] spans, so that
+    /// `steps`, `cost_usd`, `last_end_ns` and the skeleton describe its
+    /// earliest spans. Its outcome is then `unknown` and it names no cause:
+    /// how a run ended cannot be read from its beginning, and a failure read
+    /// that way would rank as a success.
+    pub truncated: bool,
 }
 
 /// A recall answer.
@@ -159,6 +167,20 @@ impl Store {
         outcome: OutcomeFilter,
         limit: usize,
         now_ns: u64,
+    ) -> Result<Recall> {
+        self.recall_capped(tenant, query, outcome, limit, now_ns, MAX_RECALL_RUN_SPANS)
+    }
+
+    /// [`Self::recall`] with an explicit per-run span cap, so tests can reach
+    /// the truncation edge without twenty thousand spans.
+    pub(crate) fn recall_capped(
+        &self,
+        tenant: Option<&str>,
+        query: &str,
+        outcome: OutcomeFilter,
+        limit: usize,
+        now_ns: u64,
+        run_spans: usize,
     ) -> Result<Recall> {
         if crate::content::tokens(query).is_empty() {
             return Err(crate::Error::Invalid(
@@ -220,7 +242,7 @@ impl Store {
 
         let mut recalled = Vec::new();
         for candidate in candidates {
-            if let Some(run) = self.recalled_run(candidate, outcome, now_ns, deadline)? {
+            if let Some(run) = self.recalled_run(candidate, outcome, now_ns, run_spans, deadline)? {
                 recalled.push(run);
             }
         }
@@ -250,6 +272,7 @@ impl Store {
         candidate: Candidate,
         filter: OutcomeFilter,
         now_ns: u64,
+        max_spans: usize,
         deadline: Option<Deadline>,
     ) -> Result<Option<RecalledRun>> {
         // Each run is read within its OWN tenant, even in the operator view:
@@ -257,31 +280,32 @@ impl Store {
         let tape = self.run_tape(
             Some(&candidate.tenant),
             &candidate.run,
-            MAX_RECALL_RUN_SPANS,
+            max_spans,
             usize::MAX,
             deadline,
         )?;
         if tape.spans.is_empty() {
             return Ok(None);
         }
-        let ended = attribution::session_outcome(&tape.spans, now_ns, crate::mcp::SESSION_IDLE_NS);
+        let truncated = tape.spans_truncated;
+        let mut ended =
+            attribution::session_outcome(&tape.spans, now_ns, crate::mcp::SESSION_IDLE_NS);
+        if truncated {
+            ended.outcome = Outcome::Unknown;
+            ended.source = OutcomeSource::Unknown;
+        }
         if !filter.admits(ended.outcome) {
             return Ok(None);
         }
         let cause = if ended.outcome == Outcome::Failure {
-            attribution::diagnose(
-                &tape.spans,
-                now_ns,
-                crate::mcp::SESSION_IDLE_NS,
-                MAX_RECALL_RUN_SPANS,
-            )
-            .cause
-            .map(|cause| RecallCause {
-                trace_id: cause.span.trace_id,
-                span_id: cause.span.span_id,
-                name: cause.name,
-                rule: cause.rule.to_owned(),
-            })
+            attribution::diagnose(&tape.spans, now_ns, crate::mcp::SESSION_IDLE_NS, max_spans)
+                .cause
+                .map(|cause| RecallCause {
+                    trace_id: cause.span.trace_id,
+                    span_id: cause.span.span_id,
+                    name: cause.name,
+                    rule: cause.rule.to_owned(),
+                })
         } else {
             None
         };
@@ -306,6 +330,7 @@ impl Store {
             skeleton,
             skeleton_truncated,
             cause,
+            truncated,
         }))
     }
 
@@ -503,6 +528,63 @@ mod tests {
         ));
         assert!(store
             .recall(Some("acme"), "refund order", OutcomeFilter::Any, 10, NOW)
+            .expect("recalls")
+            .runs
+            .is_empty());
+    }
+
+    #[test]
+    fn a_run_past_the_span_cap_is_flagged_and_never_ranked_by_its_beginning() {
+        let fixture = TempStore::open("recall-span-cap", crate::Config::default());
+        let store = fixture.store();
+        let old = NOW - 3 * DAY;
+        store
+            .ingest_batch(vec![
+                // Starts well, ends in an error the first two spans do not
+                // show.
+                run_span(
+                    "long",
+                    "a",
+                    old,
+                    "ok",
+                    json!({"gen_ai.operation.name": "chat", "gen_ai.prompt.0.content": "refund"}),
+                ),
+                run_span(
+                    "long",
+                    "b",
+                    old + 1,
+                    "ok",
+                    json!({"gen_ai.operation.name": "execute_tool", "gen_ai.tool.name": "refund_api"}),
+                ),
+                run_span(
+                    "long",
+                    "c",
+                    old + 2,
+                    "error",
+                    json!({"gen_ai.operation.name": "execute_tool", "gen_ai.tool.name": "refund_api"}),
+                ),
+            ])
+            .expect("ingests");
+        let whole = store
+            .recall_capped(Some(""), "refund", OutcomeFilter::Any, 10, NOW, 3)
+            .expect("recalls");
+        assert_eq!(whole.runs[0].outcome, Outcome::Failure);
+        assert!(!whole.runs[0].truncated);
+
+        let cut = store
+            .recall_capped(Some(""), "refund", OutcomeFilter::Any, 10, NOW, 2)
+            .expect("recalls");
+        let run = &cut.runs[0];
+        assert!(run.truncated);
+        assert_eq!(
+            (run.outcome, run.outcome_source),
+            (Outcome::Unknown, OutcomeSource::Unknown),
+            "its first two spans would read as a success"
+        );
+        assert!(run.cause.is_none());
+        assert_eq!(run.steps, 2);
+        assert!(store
+            .recall_capped(Some(""), "refund", OutcomeFilter::Success, 10, NOW, 2)
             .expect("recalls")
             .runs
             .is_empty());

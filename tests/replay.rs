@@ -1213,8 +1213,15 @@ fn tools_next_serves_recorded_tool_results() {
         Some(&json!({"tool": "refund"})),
         &[],
     );
+    // A native route: the API's own error shape, the kind beside it.
     assert_eq!(status, 410, "{body}");
-    assert_eq!(body["error"]["type"], json!("replay_exhausted"));
+    assert_eq!(body["type"], json!("replay_exhausted"));
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("refund")),
+        "{body}"
+    );
 
     let (status, body) = send_json(
         &server,
@@ -1338,6 +1345,106 @@ fn replays_and_tapes_are_isolated_by_tenant() {
         &[bearer(ACME)],
     );
     assert_eq!(status, 404);
+}
+
+#[test]
+fn an_erasure_withdraws_a_replay_holding_what_it_erased() {
+    let server = seeded_open_server(&[]);
+    let held = create_replay(&server, json!({"run": "sess-llmetry"}), &[]);
+    let other = create_replay(&server, json!({"run": "sess-oi", "mode": "loose"}), &[]);
+    let held_id = held["id"].as_str().unwrap();
+    let path = format!("/v1/replays/{held_id}/openai/v1/chat/completions");
+    let (first, second) = weather_requests(false);
+    let (status, body) = send_json(&server, "POST", &path, Some(&first), &openai_sdk("any"));
+    assert_eq!(status, 200, "{body}");
+
+    let (status, erased) = send_json(
+        &server,
+        "POST",
+        "/v1/erasures",
+        Some(&json!({"subject": {"kind": "session", "session_id": "sess-llmetry"}})),
+        &[],
+    );
+    assert_eq!(status, 200, "{erased}");
+    let erasure = erased["id"].as_u64().expect("an erasure id");
+
+    // The recorded answer the agent would get next was erased: refused, in
+    // the provider's shape, never to be retried.
+    let (status, headers, text) = send(&server, "POST", &path, Some(&second), &openai_sdk("any"));
+    assert_eq!(status, 410, "{text}");
+    assert_eq!(header(&headers, "x-should-retry"), Some("false"));
+    let body: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(body["error"]["type"], json!("replay_erased"));
+    assert_eq!(body["error"]["erasure"], json!(erasure));
+    // The native routes answer the same, in the API's own shape.
+    let (status, body) = send_json(&server, "GET", &format!("/v1/replays/{held_id}"), None, &[]);
+    assert_eq!(status, 410, "{body}");
+    assert_eq!(body["type"], json!("replay_erased"));
+    assert!(body["error"].as_str().unwrap().contains("erased"), "{body}");
+    let (status, _) = send_json(
+        &server,
+        "POST",
+        &format!("/v1/replays/{held_id}/tools/next"),
+        None,
+        &[],
+    );
+    assert_eq!(status, 410);
+
+    // A replay of other data is untouched.
+    let (status, body) = send_json(
+        &server,
+        "GET",
+        &format!("/v1/replays/{}", other["id"].as_str().unwrap()),
+        None,
+        &[],
+    );
+    assert_eq!(status, 200, "{body}");
+}
+
+#[test]
+fn one_tenants_replays_cannot_crowd_out_another() {
+    const BETA_WRITER: &str = "beta-writer-token";
+    let server = Server::spawn_with_env(
+        &[],
+        &[(
+            "TRAZA_TOKENS",
+            &format!("{},rw@beta:{BETA_WRITER}", tokens()),
+        )],
+    );
+    ingest(&server, openllmetry_run(), Some(ACME_WRITER));
+    ingest(&server, openllmetry_run(), Some(BETA_WRITER));
+
+    // A read-only credential fills its own tenant's share...
+    for _ in 0..64 {
+        create_replay(&server, json!({"run": "sess-llmetry"}), &[bearer(ACME)]);
+    }
+    let (status, headers, text) = send(
+        &server,
+        "POST",
+        "/v1/replays",
+        Some(&json!({"run": "sess-llmetry"})),
+        &[bearer(ACME)],
+    );
+    assert_eq!(status, 429, "{text}");
+    let body: Value = serde_json::from_str(&text).unwrap();
+    assert!(
+        body["error"].as_str().unwrap().contains("share"),
+        "the refusal is about the caller's own share: {body}"
+    );
+    // Its retry time is its own oldest replay's expiry, an hour out.
+    let retry: u64 = header(&headers, "retry-after")
+        .and_then(|value| value.parse().ok())
+        .expect("Retry-After");
+    assert!((3000..=3600).contains(&retry), "{retry}");
+
+    // ...and nobody else is refused for it.
+    create_replay(&server, json!({"run": "sess-llmetry"}), &[bearer(BETA)]);
+    create_replay(
+        &server,
+        json!({"run": "sess-llmetry", "tenant": "beta"}),
+        &[bearer(OPERATOR)],
+    );
+    create_replay(&server, json!({"run": "sess-llmetry"}), &[bearer(OPERATOR)]);
 }
 
 #[test]
