@@ -876,9 +876,13 @@ A **run** is a session id, or `trace:<trace_id>` for one trace
 read runs that way. The [replay guide](replay.md) walks through them with a
 worked example; this section is the reference.
 
-Every route here takes the usual `tenant=` selector and binding: a bound
-credential reads its own tenant, and naming another is `403`. A run that has
-no spans under the caller's scope is `404 {"error":"run not found"}`.
+The tape, diff and recall routes take the usual `tenant=` selector and
+binding, and `POST /v1/replays` takes the same as a `tenant` body field: a
+bound credential reads its own tenant, and naming another is `403`. A run that
+has no spans under the caller's scope is `404 {"error":"run not found"}`. The
+routes under `/v1/replays/{id}` take **no query parameters** — an SDK sends
+none, and a replay's tenant was fixed when it was created — and ignore any
+that are sent.
 
 **Replay routes are reads under any method.** Creating a replay snapshots the
 store and changes nothing in it, and the provider-shaped routes must be `POST`s
@@ -894,7 +898,7 @@ The run's tape.
 | Parameter | Type | Description |
 |---|---|---|
 | `tenant` | string | Tenant scope, as on every route |
-| `resolve` | `true` / `false` | Inline `$payload` references in requests and responses, up to `--tape-max-bytes` of payload content per tape. Default `false` |
+| `resolve` | `true` / `false` | Inline `$payload` references in requests and responses, up to `--tape-max-bytes` of payload content per tape, within the request's one `--query-deadline-ms` budget (past it, `400`). Default `false` |
 | `max_steps` | integer | Steps to return. Default and maximum 20,000 |
 
 ```sh
@@ -932,7 +936,7 @@ curl -X POST http://localhost:8080/v1/replays -d '{"run":"weather-7","mode":"loo
 ```
 
 ```json
-{"base_urls":{"anthropic":"/v1/replays/rp_70235b53074a150e1cca9771c76a88bf/anthropic","openai":"/v1/replays/rp_70235b53074a150e1cca9771c76a88bf/openai/v1"},"expires_at_ns":1792065849919268000,"id":"rp_70235b53074a150e1cca9771c76a88bf","llm_steps":2,"mode":"loose","run":"weather-7","steps":3}
+{"base_urls":{"anthropic":"/v1/replays/rp_70235b53074a150e1cca9771c76a88bf/anthropic","openai":"/v1/replays/rp_70235b53074a150e1cca9771c76a88bf/openai/v1"},"expires_at_ns":1792065849919268000,"id":"rp_70235b53074a150e1cca9771c76a88bf","llm_steps":2,"mode":"loose","run":"weather-7","steps":3,"unreadable_tool_steps":[]}
 ```
 
 | Body field | Type | Description |
@@ -944,22 +948,27 @@ curl -X POST http://localhost:8080/v1/replays -d '{"run":"weather-7","mode":"loo
 `201` on success. The replay lives in memory for one hour from creation and
 does not survive a restart. A replay created under a tenant is usable by that
 tenant's credentials and unbound operators; one created from the operator view
-(no tenant) by unbound operators only.
+(no tenant) by unbound operators only. It holds each model step's answer and
+each tool step's arguments and result, resolved within `--tape-max-bytes`;
+recorded requests are resolved one at a time, digested for strict matching,
+and not held. `unreadable_tool_steps` lists the tape indices of tool steps
+whose value could not be resolved (see
+[`tools/next`](#post-v1replaysidtoolsnext)).
 
 | Response | Cause |
 |---|---|
 | `400 {"error":"…"}` | Missing `run`, unknown field, or a bad `mode` / `tenant` |
 | `403` | A bound credential named another tenant |
 | `404 {"error":"run not found"}` | No spans carry that run id in scope |
-| `409 {"error":"step 0 (llm:gpt-4o) recorded no response — …"}` | A model step cannot be replayed: no recorded answer (content capture off), an answer or (strict) a request that is an unreadable offloaded payload, or (strict) a request recorded as text rather than a message list. The message names the step and the remedy |
-| `429` with `Retry-After` | 1,024 live replays, or 512 MiB of snapshotted answers, already held. Seconds until the oldest expires; a live replay is never evicted |
+| `409 {"error":"step 0 (llm:gpt-4o) recorded no response — …"}` | The run cannot be replayed: a model step with no recorded answer (content capture off); an offloaded answer that cannot be read, or that is past `--tape-max-bytes` (the message says which); in strict mode a request that cannot be read or was recorded as text rather than a message list; a run of more than 20,000 spans; or a snapshot larger than one tenant's whole share (64 MiB), which can never be held. The message names the step and the remedy. Carries `x-should-retry: false` |
+| `429` with `Retry-After` | No room now. Each tenant's data — and the operator view, as a share of its own — may be held by 64 live replays and 64 MiB of recorded content; the registry as a whole by 1,024 replays and 512 MiB. A full share answers with the seconds until enough of that share's replays expire. A full registry answers the same to unbound operators and a flat `60` to bound credentials, which do not learn when another tenant's replay expires. A live replay is never evicted |
 
 ### `GET /v1/replays/{id}`
 
 What a replay has served.
 
 ```json
-{"calls":[{"at_ns":1792062255964194000,"matched":true,"step":0}],"diverged":null,"expires_at_ns":1792065849919268000,"id":"rp_70235b53074a150e1cca9771c76a88bf","mode":"loose","remaining":1,"run":"weather-7","served":1}
+{"calls":[{"at_ns":1792062255964194000,"matched":true,"step":0}],"diverged":null,"expires_at_ns":1792065849919268000,"id":"rp_70235b53074a150e1cca9771c76a88bf","mode":"loose","remaining":1,"run":"weather-7","served":1,"unreadable_tool_steps":[]}
 ```
 
 `served` and `remaining` count model steps. `calls` lists each model call
@@ -967,7 +976,10 @@ served or refused for divergence — `step` is its tape index and `matched`
 whether its messages matched the recording (informational in loose mode) — up
 to 4,096 entries. `diverged` is the first divergence, `{"step",
 "expected_digest", "got_digest"}`, or `null`. An unknown, expired or foreign
-replay is `404 {"error":"replay not found"}`.
+replay is `404 {"error":"replay not found"}`. A replay withdrawn by an
+erasure is `410 {"error":"…","type":"replay_erased","erasure":N}` on this and
+every route under it, from the moment the erasure is recorded until the
+replay would have expired.
 
 ### `POST /v1/replays/{id}/openai/v1/chat/completions`
 
@@ -994,6 +1006,7 @@ messages are compared — not the model or other parameters.
 | `404 {"error":{"type":"not_found_error",…}}` | Unknown, expired or foreign replay |
 | `409 {"error":{"type":"replay_divergence","message","step","expected_digest","got_digest"}}` | Strict mode: the messages do not match recorded step `step`. The step is **not** consumed. Carries `x-should-retry: false` |
 | `410 {"error":{"type":"replay_exhausted","message","served"}}` | Every recorded model step has been served. Carries `x-should-retry: false` |
+| `410 {"error":{"type":"replay_erased","message","erasure"}}` | An erasure recorded after the replay was created covers content it held; the replay is withdrawn. Carries `x-should-retry: false` |
 
 ### `POST /v1/replays/{id}/anthropic/v1/messages`
 
@@ -1036,8 +1049,17 @@ body or `{}` takes the next of any name.
 {"arguments":{"city":"Paris"},"result":{"celsius":12,"forecast":"rain"},"step":1,"tool":"get_weather"}
 ```
 
-`410 {"error":{"type":"replay_exhausted",…}}` when none is left; `404
-{"error":"replay not found"}` for an unknown replay.
+Errors on this route, and on `GET /v1/replays/{id}`, take the API's own
+shape — `{"error": "<message>"}` with the machine-readable kind beside it as
+`type` — rather than a provider's:
+
+| Response | Cause |
+|---|---|
+| `400 {"error":"…"}` | A body that is not `{}` or `{"tool": "<name>"}` |
+| `404 {"error":"replay not found"}` | Unknown, expired or foreign replay |
+| `409 {"error":"…","type":"tool_unreadable","step"}` | The next tool step's arguments or result was offloaded and could not be resolved — erased, swept by retention, or past `--tape-max-bytes`. The step is **not** consumed. Carries `x-should-retry: false` |
+| `410 {"error":"…","type":"replay_exhausted"}` | No unserved tool step (of that name) remains. Carries `x-should-retry: false` |
+| `410 {"error":"…","type":"replay_erased","erasure"}` | The replay was withdrawn by an erasure. Carries `x-should-retry: false` |
 
 ### `GET /v1/diff`
 
@@ -1049,16 +1071,16 @@ curl 'http://localhost:8080/v1/diff?a=weather-7&b=weather-8'
 ```
 
 ```json
-{"a":{"cost_usd":0.0,"duration_ns":1000000000,"errors":0,"outcome":"success","run":"weather-7","steps":3,"tokens":233},"aligned":[{"a":0,"b":0,"fingerprint_a":"llm:gpt-4o-2024-08-06#8b9a07d4aac0a133","fingerprint_b":"llm:gpt-4o-2024-08-06#1ae84ec741143bc4","op":"changed","why":"input"},{"a":1,"b":1,"fingerprint_a":"tool:get_weather#6e1e312d537bc71b","fingerprint_b":"tool:get_weather#ac8cc520a3295a36","op":"changed","why":"input"},{"a":2,"b":2,"fingerprint_a":"llm:gpt-4o-2024-08-06#6db28425e9e18cdb","fingerprint_b":"llm:gpt-4o-2024-08-06#592c7b1d345f6104","op":"changed","why":"input"}],"b":{"cost_usd":0.0,"duration_ns":1000000000,"errors":0,"outcome":"success","run":"weather-8","steps":3,"tokens":233},"delta":{"cost_usd":0.0,"duration_ns":0,"errors":0,"steps":0,"tokens":0},"first_divergence":{"a":0,"b":0,"explanation":"step 0 of a and step 0 of b (llm:gpt-4o-2024-08-06) received different input: request 8b9a07d4aac0 in a, 1ae84ec74114 in b","kind":"input"},"truncated":false}
+{"a":{"cost_usd":0.0,"duration_ns":1000000000,"errors":0,"outcome":"success","run":"weather-7","steps":3,"tokens":233,"truncated":false},"aligned":[{"a":0,"b":0,"fingerprint_a":"llm:gpt-4o-2024-08-06#8b9a07d4aac0a133","fingerprint_b":"llm:gpt-4o-2024-08-06#1ae84ec741143bc4","op":"changed","why":"input"},{"a":1,"b":1,"fingerprint_a":"tool:get_weather#6e1e312d537bc71b","fingerprint_b":"tool:get_weather#ac8cc520a3295a36","op":"changed","why":"input"},{"a":2,"b":2,"fingerprint_a":"llm:gpt-4o-2024-08-06#6db28425e9e18cdb","fingerprint_b":"llm:gpt-4o-2024-08-06#592c7b1d345f6104","op":"changed","why":"input"}],"b":{"cost_usd":0.0,"duration_ns":1000000000,"errors":0,"outcome":"success","run":"weather-8","steps":3,"tokens":233,"truncated":false},"delta":{"cost_usd":0.0,"duration_ns":0,"errors":0,"steps":0,"tokens":0},"first_divergence":{"a":0,"b":0,"explanation":"step 0 of a and step 0 of b (llm:gpt-4o-2024-08-06) received different input: request 8b9a07d4aac0 in a, 1ae84ec74114 in b","kind":"input"},"truncated":false}
 ```
 
 | Field | Type | Description |
 |---|---|---|
-| `a`, `b` | object | Per run: `run`, `steps`, `cost_usd` and `tokens` over every span (cost metered or priced), `duration_ns` (latest end minus earliest start), `errors` (spans with status `error`), `outcome` (`success`, `failure`, `abandoned`, `unknown`) |
+| `a`, `b` | object | Per run: `run`, `steps`, `cost_usd` and `tokens` over every span (cost metered or priced), `duration_ns` (latest end minus earliest start), `errors` (spans with status `error`), `outcome` (`success`, `failure`, `abandoned`, `unknown`), and `truncated`: the run had more than 50,000 spans, so every figure describes its first 50,000 and its outcome is `unknown` |
 | `aligned[]` | array | `op` (`same`, `changed`, `insert`, `delete`), the step index on each side (`null` on the side without it), both fingerprints, and `why` (`input`, `decision`, `config`, `structure`) unless `same` |
 | `first_divergence` | object or null | The first entry that is not `same`: `a`, `b`, `kind`, `explanation`. For an insertion or deletion the side without the step reports the index of its next step |
 | `delta` | object | `b` minus `a`: `cost_usd`, `tokens`, `duration_ns`, `errors`, `steps` |
-| `truncated` | boolean | A side had more than 5,000 steps; the alignment describes prefixes |
+| `truncated` | boolean | A side had more than 5,000 steps or 50,000 spans; the alignment describes prefixes |
 
 Alignment is a longest common subsequence over `kind:name` signatures. Equal
 signature, input, output and configuration is `same`; a different input is
@@ -1085,7 +1107,7 @@ curl 'http://localhost:8080/v1/recall?q=weather+Paris&limit=1'
 ```
 
 ```json
-{"runs":[{"cost_usd":0.0,"last_end_ns":1791964801000000000,"outcome":"success","outcome_source":"derived","run":"weather-7","score":3,"skeleton":["llm:gpt-4o-2024-08-06","tool:get_weather","llm:gpt-4o-2024-08-06"],"skeleton_truncated":false,"steps":3,"tenant":""}],"truncated":false}
+{"runs":[{"cost_usd":0.0,"last_end_ns":1791964801000000000,"outcome":"success","outcome_source":"derived","run":"weather-7","score":3,"skeleton":["llm:gpt-4o-2024-08-06","tool:get_weather","llm:gpt-4o-2024-08-06"],"skeleton_truncated":false,"steps":3,"tenant":"","truncated":false}],"truncated":false}
 ```
 
 Ranking: outcome first (successes first under `any`), then `score` — the
@@ -1096,7 +1118,11 @@ with consecutive repeats folded as `"tool:search x3"`, at most 40 entries
 (`skeleton_truncated` says when more were cut). A failed run adds `cause`,
 `{"trace_id","span_id","name","rule"}`, the step its failure is attributed to.
 `tenant` disambiguates a run id two tenants share in the operator view. A run
-whose last span ended within the last 15 minutes is `unknown`.
+whose last span ended within the last 15 minutes is `unknown`. Each run is
+read up to its first 20,000 spans; a longer one says `truncated: true`, its
+`steps`, `cost_usd`, `last_end_ns` and skeleton describe those spans, and its
+outcome is `unknown` with no `cause` — how a run ended cannot be read from its
+beginning, and ranking it by its beginning could rank a failure as a success.
 
 Recall groups the newest 5,000 matching spans into runs and reads the 100 runs
 with the most matches among them; `truncated: true` says the first bound
@@ -1640,6 +1666,13 @@ carry their tenant. Schema-1 records — two-element `(trace_id, span_id)`
 pairs — replay as the default tenant; arity decides the decoding, never a
 guess.
 
+[Replays](#post-v1replays) hold copies of recorded answers and tool records
+in memory, so erasure reaches them too: from the moment the tombstone is
+recorded, every call through a replay holding a covered span, trace, session,
+tenant or payload answers `410` with `"type": "replay_erased"`, and the
+replay's copy is dropped at that call (or when it expires, at most an hour
+after creation, if nothing calls it again).
+
 Reads and ingest continue throughout. From the moment the tombstone is
 recorded the subject is invisible to every query — before the rewrites run —
 and a crash mid-erasure leaves a pending erasure that masks at the next open
@@ -1661,7 +1694,9 @@ inhabit and reports the result of each, by name — write buffer, live tail,
 write-ahead log, segments, annotations, **eval records**, payload files,
 derived caches, pins, generation metadata, and the tombstone log itself
 (retained by design: the record of the erasure is what this receipt verifies
-against).
+against). Replays are not a domain it walks: their copies live in the server
+process rather than the store, and are withdrawn by the replay routes
+themselves, as [`POST /v1/erasures`](#post-v1erasures) describes.
 
 The `eval-records` domain sits between annotations and payloads, and what it
 reports depends on the subject:

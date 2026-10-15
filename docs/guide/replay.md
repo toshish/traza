@@ -100,7 +100,11 @@ per tape (8 MiB by default). The cut is a prefix — the first reference that
 does not fit, and every one after it, stays a reference — and the tape then
 says `"resolved_partial": true`. Digests and fingerprints always describe the
 stored form, so a tape read with and without `resolve` agrees on every
-identity it reports.
+identity it reports. Resolution spends the request's one
+[`--query-deadline-ms`](../configuration.md#server-flags) budget — reading the
+run and every payload together — so a run whose payloads cannot all be read
+within it is refused with `400` rather than allowed to run past it. A payload
+repeated across steps is probed for tenant reachability once per request.
 
 ## Replaying a run with zero model calls
 
@@ -130,6 +134,7 @@ curl -s -X POST localhost:8080/v1/replays \
   "steps": 3,
   "llm_steps": 2,
   "expires_at_ns": 1792065649987347000,
+  "unreadable_tool_steps": [],
   "base_urls": {
     "openai": "/v1/replays/rp_ac879985abef9cba12bb342bdc3b8bd1/openai/v1",
     "anthropic": "/v1/replays/rp_ac879985abef9cba12bb342bdc3b8bd1/anthropic"
@@ -141,6 +146,18 @@ The replay is a snapshot of the tape taken now. It lives for one hour from
 creation, in memory; a restart forgets it, and creating another is just
 another read. Any valid credential may create one — an `ro` token is enough,
 because nothing in the store changes.
+
+A replay holds only what it serves: each model step's answer and each tool
+step's arguments and result, read from payload files where they were
+offloaded, up to [`--tape-max-bytes`](../configuration.md#server-flags)
+between them. Recorded *requests* are not held — each is read, digested for
+strict matching, and dropped — so a long conversation whose prompt grows at
+every step costs the budget nothing for its prompts. A tool step whose value
+could not be read is listed in `unreadable_tool_steps` (see
+[tools](#tools-still-execute-live--unless-you-replay-them-too)). A run with
+more than 20,000 spans is refused (`409`) rather than replayed as its
+beginning, which would end the agent's run early as if the recording stopped
+there.
 
 **3. Point the SDK at it and run the agent.**
 
@@ -213,6 +230,7 @@ curl -s localhost:8080/v1/replays/rp_ac879985abef9cba12bb342bdc3b8bd1 \
     {"step": 0, "matched": true, "at_ns": 1792062055501840000},
     {"step": 2, "matched": true, "at_ns": 1792062063623225000}
   ],
+  "unreadable_tool_steps": [],
   "expires_at_ns": 1792065649987347000
 }
 ```
@@ -313,9 +331,30 @@ curl -s -X POST localhost:8080/v1/replays/rp_ac879985abef9cba12bb342bdc3b8bd1/to
 
 Each call returns the next recorded tool step not yet served (the next one
 with that name, when `tool` is given), on a cursor of its own, independent of
-the model steps; `410` when none is left. Wiring it in is a harness decision —
-for example, a wrapper your tool dispatcher calls instead of the tool when a
-`REPLAY_ID` is set. Traza does not intercept tool execution.
+the model steps; `410` when none is left. A step whose arguments or result was
+offloaded and could not be read — erased, swept by retention, or past
+`--tape-max-bytes` — is listed in the replay's `unreadable_tool_steps` and
+answered `409` with `"type": "tool_unreadable"` instead of a payload reference
+dressed up as the result; the step is not consumed, because moving past it
+would hand your harness the next step's result as this one's. Wiring it in is
+a harness decision — for example, a wrapper your tool dispatcher calls instead
+of the tool when a `REPLAY_ID` is set. Traza does not intercept tool
+execution.
+
+### Erasure reaches replays
+
+A replay is a copy taken out of the store, so an
+[erasure](http-api.md#post-v1erasures) has to reach it. Every call through a
+replay first checks whether an erasure recorded since the replay was created
+covers anything it holds — a span, trace or session its answers or tool
+records came from, their tenant, or a payload they referenced. If one does,
+the replay is withdrawn: its content is dropped, and that call and every
+later one answer `410` with `"type": "replay_erased"` and the erasure's id,
+until the replay would have expired. The check applies from the moment the
+erasure is recorded, before its purge runs, exactly as the store's own reads
+do; when nothing has been erased it is one comparison. Withdrawn content
+leaves memory at the replay's next call — a replay nobody calls again keeps
+its copy until it expires, at most an hour later.
 
 ## Comparing two runs
 
@@ -329,9 +368,9 @@ curl -s "localhost:8080/v1/diff?a=weather-7&b=weather-8"
 ```json
 {
   "a": {"run": "weather-7", "steps": 3, "cost_usd": 0.0, "tokens": 233,
-        "duration_ns": 1000000000, "errors": 0, "outcome": "success"},
+        "duration_ns": 1000000000, "errors": 0, "outcome": "success", "truncated": false},
   "b": {"run": "weather-8", "steps": 3, "cost_usd": 0.0, "tokens": 233,
-        "duration_ns": 1000000000, "errors": 0, "outcome": "success"},
+        "duration_ns": 1000000000, "errors": 0, "outcome": "success", "truncated": false},
   "aligned": [
     {"op": "changed", "why": "input", "a": 0, "b": 0,
      "fingerprint_a": "llm:gpt-4o-2024-08-06#8b9a07d4aac0a133",
@@ -371,9 +410,13 @@ and sit in the same unaligned stretch are paired as one `config` change.
 `cost_usd` is the run's metered cost, or its cost priced from `--pricing` —
 `0.0` here because these spans carry neither. Each side is compared up to its
 first 5,000 steps; past that the diff says `"truncated": true`, and its tail
-may report steps as missing that the cut removed. A step's status is not
-compared: a step that errored with the same input and output digests as a
-successful one is `same` — read `errors` and the outcome for that.
+may report steps as missing that the cut removed. Each side is also read up to
+its first 50,000 spans: a side longer than that says `"truncated": true` in
+its own summary, its cost, tokens, duration and errors describe those first
+spans, and its outcome is `unknown` — how a run ended cannot be read from its
+beginning. A step's status is not compared: a step that errored with the same
+input and output digests as a successful one is `same` — read `errors` and
+the outcome for that.
 
 ## Recall: has this been done before?
 
@@ -399,7 +442,8 @@ curl -s "localhost:8080/v1/recall?q=weather+Paris"
     "steps": 3,
     "cost_usd": 0.0,
     "skeleton": ["llm:gpt-4o-2024-08-06", "tool:get_weather", "llm:gpt-4o-2024-08-06"],
-    "skeleton_truncated": false
+    "skeleton_truncated": false,
+    "truncated": false
   }],
   "truncated": false
 }
@@ -416,7 +460,11 @@ the last 15 minutes) is `unknown` and never ranked as a success.
 
 Recall groups the newest 5,000 matching spans into runs and reads the 100 runs
 with the most matches among them in full; a query whose matches overflow the
-first bound says `"truncated": true`. Finding the newest matches means ranking
+first bound says `"truncated": true`. Each run is read up to its first 20,000
+spans; a longer one carries `"truncated": true` of its own, its steps, cost
+and skeleton describe those first spans, and its outcome is `unknown` with no
+`cause` — so a long run that failed late is never ranked as a success on the
+strength of its beginning. Finding the newest matches means ranking
 all of them, so words that appear in more than 200,000 spans are refused with
 `400` — add a word to narrow them.
 
@@ -437,9 +485,11 @@ telemetry choose which recording its next run is fed. See the
 - **Tools execute live** unless your harness takes results from `tools/next`.
 - **Streams are reconstructed** from stored text, not the provider's bytes.
 - **Only what was recorded can be replayed.** A model step without a recorded
-  answer refuses the replay at creation, naming the step. Offloaded content
+  answer refuses the replay at creation, naming the step. An offloaded answer
   that cannot be read — erased, swept by retention, or past
-  `--tape-max-bytes` — refuses it the same way (`409`).
+  `--tape-max-bytes` — refuses it the same way (`409`), and the message says
+  which of those it was. A run longer than 20,000 spans is refused rather than
+  cut.
 - **Only chat completions and messages are replayed.** The OpenAI Responses
   API, embeddings and legacy completions under the replay's base URL answer
   `400`.
@@ -458,10 +508,20 @@ telemetry choose which recording its next run is fed. See the
 - **Concurrent model calls are served in arrival order.** Strict mode reports
   a swapped pair as a divergence rather than serving answers to the wrong
   questions.
-- **The registry is bounded**: at most 1,024 live replays holding at most
-  512 MiB of recorded answers between them. Past either bound, creation
-  answers `429` with `Retry-After` until the oldest expires; a live replay is
-  never evicted to make room.
+- **The registry is bounded, per tenant first.** One tenant's data — or the
+  operator view, which counts as a share of its own — may be held by at most
+  64 live replays and 64 MiB of recorded content; the registry as a whole
+  holds at most 1,024 replays and 512 MiB, as the backstop behind every
+  share. Past a bound, creation answers `429` with `Retry-After`: for a share,
+  the time until enough of *that share's* replays expire; for the whole
+  registry, the same for unbound operators and a flat 60 seconds for bound
+  credentials, which have no business learning when another tenant's replay
+  expires. A live replay is never evicted to make room. A snapshot larger than
+  a whole share can never be held and is refused with `409`, not told to
+  retry.
+- **Erasure withdraws replays**, from the moment the erasure is recorded; see
+  [above](#erasure-reaches-replays). A withdrawn replay's copy stays in memory
+  until its next call or its expiry.
 - **Replays follow tenancy.** A replay created under a tenant can be used only
   by that tenant's credentials and unbound operators; one created from the
   operator view (no tenant) only by unbound operators. A foreign credential

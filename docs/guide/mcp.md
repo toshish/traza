@@ -168,7 +168,7 @@ whole failure mode — which is why it is also named in the server's
 `instructions`, where a host puts it in front of the model once rather than per
 call.
 
-Four tools are worth knowing the reasoning behind:
+The reasoning behind these is worth knowing:
 
 - **`diagnose_session` instead of reading a trace and judging its shape.** It
   examines every span of a run and reports the outcome, the step the failure is
@@ -273,11 +273,12 @@ honest caveat: the budget anchors per engine operation, not per tool call,
 so a tool composed of several folds — `describe_store` runs half a dozen —
 can spend several budgets end to end.
 
-`analyze_cost` and `list_sessions` additionally return `structuredContent`
-against a declared `outputSchema`, because their rows are small, genuinely
-tabular, and the thing a client is most likely to chart. Everything else is
-text only — for span data the compact rendering is strictly better, and sending
-both doubles the bytes for identical information.
+`list_sessions`, `diagnose_session`, `analyze_cost`, `compare_runs` and
+`recall_runs` additionally return `structuredContent` against a declared
+`outputSchema`, because their answers are small, genuinely tabular or
+record-shaped, and the thing a client is most likely to chart or act on.
+Everything else is text only — for span data the compact rendering is strictly
+better, and sending both doubles the bytes for identical information.
 
 Both halves are budgeted together, and trimmed in lockstep: the ceiling bounds
 the tool result a client receives, not one field of it. Rows come off both at
@@ -466,7 +467,8 @@ bounding is what a data source can honestly offer.
   specification's negotiation rule, and the client decides whether to continue.
   An `MCP-Protocol-Version` header naming an unsupported revision is a `400`.
   Older revisions are refused rather than half-served: `structuredContent`,
-  which two tools return, does not exist before `2025-06-18`.
+  which every tool declaring an `outputSchema` returns, does not exist before
+  `2025-06-18`.
 - **Origin is validated against an allowlist the operator controls.** A
   request carrying an `Origin` that is neither a loopback page nor named by
   `--mcp-allowed-origin` is refused with `403`. Native MCP clients send no

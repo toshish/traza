@@ -34,9 +34,13 @@ Sending traces to Traza and getting answers back out.
 - **[LLM semantics](llm-semantics.md)** — the OpenLLMetry / OTel GenAI
   attributes Traza recognizes, sessions, token and cost analytics, prompt and
   completion payloads, span links, and query recipes.
-- **[MCP server](guide/mcp.md)** — the Model Context Protocol endpoint: its ten
-  tools, its resources and prompts, how results are bounded for a context
-  window, and the untrusted-content boundary stored span text is held behind.
+- **[MCP server](guide/mcp.md)** — the Model Context Protocol endpoint: its
+  fifteen tools, its resources and prompts, how results are bounded for a
+  context window, and the untrusted-content boundary stored span text is held
+  behind.
+- **[Replay](guide/replay.md)** — a run read as a tape, replaying it through
+  the OpenAI or Anthropic SDK with zero model calls, diffing two runs, and
+  recalling earlier runs that did the same thing.
 - **[Trace browser](guide/trace-browser.md)** — what each view shows and how to
   move between them.
 
