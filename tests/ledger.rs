@@ -390,7 +390,14 @@ fn anchors_are_accepted_only_for_the_head_they_name() {
         "/v1/ledger/anchors",
         Some(&anchor(tip_seq, "not-a-head")),
     );
-    assert_eq!(status, 400, "{body}");
+    assert_eq!(
+        status, 409,
+        "a malformed head cannot be the recorded one: {body}"
+    );
+    assert!(
+        !body["error"].as_str().unwrap_or("").contains("not-a-head"),
+        "the value is not echoed: {body}"
+    );
     let mut smuggled = anchor(tip_seq, &tip_head);
     smuggled["head"] = json!(wrong);
     let (status, body) = as_json(
@@ -485,6 +492,11 @@ fn erasure_entries_carry_the_subject_digest_never_the_subject() {
         "the default tenant is the empty string"
     );
     assert_eq!(entry["subject_kind"], "session");
+    assert_eq!(
+        entry["generation"], published_in,
+        "the generation that published it"
+    );
+    assert_eq!(entry["salt"].as_str().map(str::len), Some(32), "{entry}");
     // Recomputable by anyone who knows the subject, and only by them.
     let subject = json!({"kind": "session", "session_id": secret});
     assert_eq!(entry["subject_digest"], json!(sha256(&canonical(&subject))));
@@ -600,6 +612,8 @@ fn an_evidence_pack_recomputes_and_a_bound_tenant_sees_only_itself() {
     );
     assert_eq!(pack["erasures"].as_array().expect("erasures").len(), 2);
     assert_eq!(pack["ledger"]["verification"]["intact"], json!(true));
+    assert_eq!(pack["ledger"]["entries_truncated"], json!(false));
+    assert_eq!(pack["ledger"]["entries_unreadable"], json!(0));
     assert_digest(&pack);
     let operator_entries = pack["ledger"]["entries"].as_array().expect("entries");
     assert_chain(operator_entries);
@@ -646,8 +660,25 @@ fn an_evidence_pack_recomputes_and_a_bound_tenant_sees_only_itself() {
         .partition(|entry| entry["tenant"] == "acme");
     assert_eq!(own.len(), 1);
     assert_eq!(foreign.len(), 1);
+    // The tenant's own entry is whole — salt included — so it recomputes.
+    assert_eq!(
+        own[0]["salt"].as_str().map(str::len),
+        Some(32),
+        "{}",
+        own[0]
+    );
+    assert_eq!(own[0]["head"], json!(recompute_head(own[0])));
     assert_eq!(foreign[0]["redacted"], json!(true));
-    for key in ["tenant", "erasure_id", "subject_kind", "subject_digest"] {
+    // The salt above all: without it, the stub's head cannot be recomputed
+    // for a guessed neighbour.
+    for key in [
+        "tenant",
+        "erasure_id",
+        "subject_kind",
+        "subject_digest",
+        "generation",
+        "salt",
+    ] {
         assert!(
             foreign[0].get(key).is_none(),
             "{key} leaked: {}",
@@ -863,6 +894,77 @@ fn verify_ledger_offline_exits_by_verdict() {
         String::from_utf8_lossy(&owned.stderr).contains("GET /v1/ledger/verify"),
         "{owned:?}"
     );
+}
+
+#[test]
+fn verify_ledger_offline_names_an_undone_erasure_and_the_crash_window() {
+    let dir = TempDir::new("cli-rollback");
+    let path = dir.0.to_str().expect("utf8 path").to_owned();
+    let open = || traza::Store::open(&dir.0, traza::Config::default()).expect("open");
+    let erase = |store: &traza::Store| {
+        store
+            .erase(traza::erasure::Subject::Trace {
+                trace_id: "t1".to_owned(),
+                tenant: String::new(),
+            })
+            .expect("erase")
+    };
+    {
+        let store = open();
+        let span: traza::Span = serde_json::from_value(span("t1", 1_000, json!({}))).expect("span");
+        store.ingest(span).expect("ingest");
+        store.pin_generation("before").expect("pin");
+        erase(&store);
+    }
+    // Offline, the erasure's entry is checked against the tombstone log read
+    // straight from disk: it holds.
+    let verdict = cli(&["verify", "--ledger", "--data-dir", &path]);
+    assert_eq!(verdict.status.code(), Some(0), "{verdict:?}");
+
+    // A restore of the pin from before the erasure, in place: the data and
+    // the pre-erasure tombstone log come back, the ledger stays — and the
+    // verdict says the ledgered erasure no longer holds.
+    drop(
+        traza::Store::restore(&dir.0, dir.0.join("pins/before"), traza::Config::default())
+            .expect("restore"),
+    );
+    let verdict = cli(&["verify", "--ledger", "--data-dir", &path]);
+    assert_eq!(verdict.status.code(), Some(2), "{verdict:?}");
+    let stdout = String::from_utf8_lossy(&verdict.stdout);
+    assert!(
+        stdout.contains("holds no settled erasure of that subject")
+            && stdout.contains("re-apply the erasure"),
+        "{stdout}"
+    );
+
+    // Re-applied, it holds again.
+    erase(&open());
+    let verdict = cli(&["verify", "--ledger", "--data-dir", &path]);
+    assert_eq!(verdict.status.code(), Some(0), "{verdict:?}");
+
+    // The crash window — `CURRENT` moved, its checkpoint entry not yet
+    // appended — reads as not intact, and says what it likely is and how it
+    // heals rather than only that it is broken.
+    let ledger = dir.0.join("ledger.jsonl");
+    let text = std::fs::read_to_string(&ledger).expect("ledger");
+    let lines: Vec<&str> = text.lines().collect();
+    let last_checkpoint = lines
+        .iter()
+        .rposition(|line| line.contains("\"kind\":\"checkpoint\""))
+        .expect("a checkpoint entry");
+    assert_eq!(last_checkpoint, lines.len() - 2, "checkpoint, then erasure");
+    std::fs::write(&ledger, lines[..last_checkpoint].join("\n") + "\n").expect("truncate");
+    let verdict = cli(&["verify", "--ledger", "--data-dir", &path]);
+    assert_eq!(verdict.status.code(), Some(2), "{verdict:?}");
+    let stdout = String::from_utf8_lossy(&verdict.stdout);
+    assert!(
+        stdout.contains("is newer and not ledgered yet") && stdout.contains("opening the store"),
+        "{stdout}"
+    );
+    // And opening the store does heal it.
+    drop(open());
+    let verdict = cli(&["verify", "--ledger", "--data-dir", &path]);
+    assert_eq!(verdict.status.code(), Some(0), "{verdict:?}");
 }
 
 /// The `python` blocks of `docs/guide/ledger.md`, in order.

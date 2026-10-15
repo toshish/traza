@@ -17,9 +17,21 @@
 //! canonical JSON is the crate's one canonical form (`evals::canonical_json`):
 //! keys sorted bytewise, no whitespace, serde_json's string escaping and
 //! number formatting. Entries carry only strings, integers and `null`, so the
-//! formula is reproducible with any language's standard JSON library —
-//! `docs/guide/ledger.md` has a ten-line script, and that reproducibility is
-//! the point: an auditor must not need this code to check this code's claims.
+//! formula is reproducible with any JSON library that parses integers exactly
+//! (timestamps exceed 2^53, so a doubles-only parser such as JavaScript's
+//! `JSON.parse` does not) — `docs/guide/ledger.md` has a ten-line script, and
+//! that reproducibility is the point: an auditor must not need this code to
+//! check this code's claims.
+//!
+//! **Erasure entries are salted.** Every erasure entry carries a random
+//! `salt` inside its head's preimage. A tenant's evidence pack shows other
+//! tenants' erasure entries as stubs (`seq`, `prev`, `head`), and without the
+//! salt every other input to such a head is guessable — the erasure id is a
+//! small integer, the subject kind one of five, and a tenant subject's digest
+//! depends only on the tenant's name — so a tenant could recompute stub heads
+//! for candidate neighbours and learn which one was erased. With the salt
+//! withheld from the stub, it cannot; with the salt on the full entry, an
+//! operator or auditor who knows the subject still recomputes everything.
 //!
 //! **What the chain proves, and what it does not.** Rewriting any committed
 //! entry changes its head and breaks every later `prev`; recomputing the
@@ -44,7 +56,15 @@
 //! **Evidence, not state.** A damaged ledger never stops the store: open heals
 //! a torn final append exactly as the other append-only logs do, tolerates
 //! anything else, and keeps appending from the last entry it can read.
-//! Verification is what reports a break, naming the entry.
+//! Verification is what reports a break, naming the entry. A ledger append
+//! that FAILS (a full disk, a file the server may not write) never fails what
+//! it records either: the checkpoint, erasure or open it belongs to has
+//! already committed, and reporting a committed generation as a failure would
+//! leave an erasure unsettled — its admission barrier dropping the tenant's
+//! new spans — over evidence. The failure is kept instead, reported by
+//! verification until the next checkpoint re-ledgers what it missed. The one
+//! refusal is a ledger open cannot READ: without the tip, an append would
+//! fork the chain rather than extend it.
 //!
 //! **Crash consistency.** Entries are appended after the fact they record is
 //! durable — a checkpoint entry after `CURRENT` moved, an erasure entry after
@@ -55,8 +75,14 @@
 //! reconcile is what ledgers generations published while no store was open —
 //! a restore's install, a format migration's checkpoint, and the store's
 //! first generation.
+//!
+//! **One snapshot per answer.** Every reader — a page, a verification, an
+//! evidence pack, a pin's copy — reads a prefix of the file whose length was
+//! taken under the tip lock, never the file to its end: erasure and anchor
+//! appends are not serialized by the maintenance lock a verification holds,
+//! and reading to EOF could take in half a line mid-append.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -96,13 +122,21 @@ const MAX_ANCHOR_FIELD_BYTES: usize = 4096;
 /// Ceiling on the ledger entries one evidence pack carries. A year of the
 /// server's five-minute checkpoints is about 105,000 entries; a pack past this
 /// says so (`entries_truncated`) and the rest pages through `GET /v1/ledger`.
+/// Lowered under test so the cap itself is exercised.
+#[cfg(not(test))]
 const EVIDENCE_MAX_ENTRIES: usize = 10_000;
+#[cfg(test)]
+const EVIDENCE_MAX_ENTRIES: usize = 4;
 
 /// Ceiling on the erasure receipts one evidence pack runs. Each receipt is a
 /// real verification walk, so a window with many erasures would otherwise
 /// make one request cost many walks; past this, `conclusive` is `null` and
-/// `GET /v1/erasures/{id}/verify` answers for that erasure.
+/// `GET /v1/erasures/{id}/verify` answers for that erasure. Lowered under
+/// test, likewise.
+#[cfg(not(test))]
 const EVIDENCE_MAX_RECEIPTS: usize = 32;
+#[cfg(test)]
+const EVIDENCE_MAX_RECEIPTS: usize = 1;
 
 /// How long an evidence pack may reuse a file verification of the SAME live
 /// generation. Re-digesting every manifested byte is O(store); a pack is
@@ -146,6 +180,19 @@ pub enum Body {
         /// SHA-256 of the canonical JSON of the subject as the tombstone log
         /// records it (see [`subject_digest`]).
         subject_digest: String,
+        /// The generation whose publication carried the deletion — the
+        /// settle record's `generation`. It is also what tells two
+        /// publications of the same erasure id apart: a restore of an
+        /// earlier pin rewinds the tombstone log, so re-applying an erasure
+        /// afterwards can reuse an id and a subject the chain already
+        /// carries, but never a generation (a data directory never reuses
+        /// one; an install takes the next id past both stores).
+        generation: u64,
+        /// 32 random hex characters inside the head's preimage, so a stub
+        /// of this entry (in another tenant's evidence pack) cannot be
+        /// matched to a guessed subject by recomputing its head. See the
+        /// module docs.
+        salt: String,
     },
     /// An external notary's countersignature over an earlier head, stored
     /// opaque: Traza neither checks the signature nor knows the scheme.
@@ -287,28 +334,46 @@ fn manifest_digest(directory: &Path, generation: u64) -> Result<String> {
     Ok(payload::sha256_hex(&bytes))
 }
 
-/// 32 hex characters naming a new chain.
+/// 32 random hex characters, for a chain's `store_id` and an erasure entry's
+/// `salt`.
 ///
-/// Unique, not secret: two stores must not share an id, and nothing is
-/// authenticated by it. OS randomness where the platform exposes it as a
-/// file, always mixed with std's per-process random hasher keys, the clock,
-/// the pid and the path, so a platform without `/dev/urandom` still gets a
-/// distinct id — no dependency is needed for that.
-fn fresh_store_id(directory: &Path) -> String {
+/// OS randomness where the platform exposes it as a file, always mixed with
+/// two outputs of std's randomly keyed hasher (its keys come from the OS
+/// generator on every platform std supports), the clock, the pid, a
+/// process-wide counter and `context`. The salt's job needs the result
+/// unpredictable, which either source alone provides; the store id's only
+/// needs it distinct. No dependency is needed for either.
+fn random_hex(context: &[u8]) -> String {
     use std::hash::{BuildHasher, Hasher};
-    let mut seed = Vec::with_capacity(64);
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let mut seed = Vec::with_capacity(96);
     if let Ok(mut file) = File::open("/dev/urandom") {
         let mut buffer = [0u8; 32];
         if file.read_exact(&mut buffer).is_ok() {
             seed.extend_from_slice(&buffer);
         }
     }
-    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
-    hasher.write(directory.as_os_str().as_encoded_bytes());
-    seed.extend_from_slice(&hasher.finish().to_le_bytes());
-    seed.extend_from_slice(&crate::unix_now_ns().to_le_bytes());
+    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let now = crate::unix_now_ns();
+    for lane in 0_u8..2 {
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u8(lane);
+        hasher.write(context);
+        hasher.write_u64(count);
+        hasher.write_u64(now);
+        seed.extend_from_slice(&hasher.finish().to_le_bytes());
+    }
+    seed.extend_from_slice(&now.to_le_bytes());
     seed.extend_from_slice(&std::process::id().to_le_bytes());
+    seed.extend_from_slice(&count.to_le_bytes());
     payload::sha256_hex(&seed)[..32].to_owned()
+}
+
+/// A new chain's id. Unique, not secret: two stores must not share one, and
+/// nothing is authenticated by it.
+fn fresh_store_id(directory: &Path) -> String {
+    random_hex(directory.as_os_str().as_encoded_bytes())
 }
 
 // --------------------------------------------------------------------- log
@@ -319,11 +384,13 @@ pub(crate) struct Ledger {
     path: PathBuf,
     /// Leaf-level: taken briefly, never while acquiring another engine lock.
     /// Held across an append's write and fsync, which is what serializes
-    /// appends and keeps a copy or a read from seeing half a line.
+    /// appends and gives every reader a length that ends on a whole line.
     tip: Mutex<Tip>,
     /// The last file verification, for evidence packs to reuse briefly; see
     /// [`EVIDENCE_VERIFY_REUSE`]. Leaf-level.
     file_check: Mutex<Option<FileCheck>>,
+    /// Appends that failed since the ledger last caught up. Leaf-level.
+    failures: Mutex<Failures>,
 }
 
 #[derive(Debug, Default)]
@@ -333,15 +400,28 @@ struct Tip {
     store_id: Option<String>,
     /// `manifest_sha256` of the latest checkpoint entry.
     last_manifest: Option<String>,
-    /// `(erasure_id, subject_digest)` of every erasure entry. Keyed by the
-    /// digest too, so an erasure id reused by a different lineage (a restore
-    /// of another store's backup into this directory) is not mistaken for
-    /// one already ledgered.
-    erasures: HashSet<(u64, String)>,
+    /// `(generation, length)`: the latest checkpoint entry's generation and
+    /// the ledger's length in bytes just past that entry's line — the prefix
+    /// a pin of that generation copies.
+    last_checkpoint_end: Option<(u64, u64)>,
+    /// The bytes of the file the chain owns: through the end of the last
+    /// line appended or read. Anything past it is a torn or failed append
+    /// that healing could not remove, and the next append cuts it off first.
+    len: u64,
+    /// The final entry is complete but lacks its newline, because adding one
+    /// at open failed: the next append writes it first.
+    unterminated: bool,
+    /// `(erasure_id, subject_digest, generation)` of every erasure entry —
+    /// one publication of one erasure. The digest guards against an id
+    /// reused by another store's lineage (a restore of its backup into this
+    /// directory); the generation tells a re-application after a rollback
+    /// restore from the publication already ledgered.
+    erasures: HashSet<(u64, String, u64)>,
 }
 
 impl Tip {
-    fn absorb(&mut self, entry: &Entry) {
+    /// Takes in one entry whose line ends at byte `end` of the file.
+    fn absorb(&mut self, entry: &Entry, end: u64) {
         self.last = Some((entry.seq, entry.head.clone(), entry.at_ns));
         match &entry.body {
             Body::Genesis { store_id } => {
@@ -350,18 +430,59 @@ impl Tip {
                 }
             }
             Body::Checkpoint {
-                manifest_sha256, ..
-            } => self.last_manifest = Some(manifest_sha256.clone()),
+                generation,
+                manifest_sha256,
+            } => {
+                self.last_manifest = Some(manifest_sha256.clone());
+                self.last_checkpoint_end = Some((*generation, end));
+            }
             Body::Erasure {
                 erasure_id,
                 subject_digest,
+                generation,
                 ..
             } => {
-                self.erasures.insert((*erasure_id, subject_digest.clone()));
+                self.erasures
+                    .insert((*erasure_id, subject_digest.clone(), *generation));
             }
             Body::Anchor { .. } => {}
         }
     }
+
+    fn head(&self) -> LedgerHead {
+        let (seq, head, at_ns) = self.last.clone().unwrap_or((0, GENESIS_PREV.to_owned(), 0));
+        LedgerHead {
+            seq,
+            head,
+            store_id: self.store_id.clone(),
+            at_ns,
+        }
+    }
+}
+
+/// A consistent view of the chain: its tip, and the length of the file
+/// prefix that ends on it. Readers read exactly that prefix.
+#[derive(Clone, Debug)]
+struct Snapshot {
+    head: LedgerHead,
+    len: u64,
+}
+
+/// Append failures not yet caught up: what they would have recorded is not
+/// in the chain yet. `epoch` counts failures ever noted, so a catch-up clears
+/// only the failures it began after — one landing mid-catch-up stays
+/// reported.
+#[derive(Debug, Default)]
+struct Failures {
+    epoch: u64,
+    outstanding: Option<Failure>,
+}
+
+#[derive(Clone, Debug)]
+struct Failure {
+    count: u64,
+    first_at_ns: u64,
+    last_error: String,
 }
 
 /// One file verification result, kept for reuse.
@@ -382,15 +503,20 @@ impl Ledger {
     /// line and newline in one write. Anything else that fails to parse is
     /// left exactly as found: it is evidence of damage, and verification
     /// names it.
+    ///
+    /// Fails only when the file cannot be READ. A heal or genesis that
+    /// cannot be WRITTEN is noted as an append failure (verification reports
+    /// it) and retried by the next append, which cuts off whatever the heal
+    /// could not and writes the genesis first.
     pub(crate) fn open(directory: &Path) -> Result<Self> {
         let path = directory.join(LOG_NAME);
         let mut tip = Tip::default();
+        let mut heal_failure = None;
         if path.exists() {
             let mut reader = BufReader::new(File::open(&path)?);
             let mut valid_len = 0_u64;
             let mut line = Vec::new();
             let mut torn = false;
-            let mut unterminated_tail = false;
             loop {
                 line.clear();
                 let read = reader.read_until(b'\n', &mut line)?;
@@ -400,40 +526,69 @@ impl Ledger {
                 let terminated = line.ends_with(b"\n");
                 match serde_json::from_slice::<Entry>(&line) {
                     Ok(entry) => {
-                        tip.absorb(&entry);
-                        unterminated_tail = !terminated;
+                        valid_len += read as u64;
+                        tip.absorb(&entry, valid_len);
+                        tip.unterminated = !terminated;
                     }
                     Err(_) if !terminated => {
                         torn = true;
                         break;
                     }
-                    Err(_) => {}
+                    Err(_) => valid_len += read as u64,
                 }
-                valid_len += read as u64;
             }
-            if torn {
-                let file = OpenOptions::new().write(true).open(&path)?;
-                file.set_len(valid_len)?;
-                file.sync_all()?;
-            } else if unterminated_tail {
+            tip.len = valid_len;
+            let healed = if torn {
+                OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .and_then(|file| file.set_len(valid_len).and_then(|()| file.sync_all()))
+            } else if tip.unterminated {
                 // A complete entry missing only its newline: terminate it,
                 // or the next append would be glued onto the same line.
-                let mut file = OpenOptions::new().append(true).open(&path)?;
-                file.write_all(b"\n")?;
-                file.sync_all()?;
+                OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .and_then(|mut file| file.write_all(b"\n").and_then(|()| file.sync_all()))
+                    .map(|()| {
+                        tip.unterminated = false;
+                        tip.len += 1;
+                        if let Some((_, end)) = &mut tip.last_checkpoint_end {
+                            if *end == valid_len {
+                                *end += 1;
+                            }
+                        }
+                    })
+            } else {
+                Ok(())
+            };
+            if let Err(error) = healed {
+                heal_failure = Some(Error::Io(error));
             }
         }
         let ledger = Self {
             path,
             tip: Mutex::new(tip),
             file_check: Mutex::new(None),
+            failures: Mutex::new(Failures::default()),
         };
-        {
+        if let Some(error) = heal_failure {
+            ledger.note_failure("healing the final line at open", &error);
+        }
+        let genesis = {
             let mut tip = ledger.lock()?;
-            if tip.last.is_none() {
-                let store_id = fresh_store_id(directory);
-                ledger.append_locked(&mut tip, Body::Genesis { store_id })?;
+            match tip.last.is_none() {
+                true => {
+                    let store_id = fresh_store_id(directory);
+                    ledger
+                        .append_locked(&mut tip, Body::Genesis { store_id })
+                        .map(drop)
+                }
+                false => Ok(()),
             }
+        };
+        if let Err(error) = genesis {
+            ledger.note_failure("the genesis entry", &error);
         }
         Ok(ledger)
     }
@@ -442,8 +597,70 @@ impl Ledger {
         self.tip.lock().map_err(|_| Error::LockPoisoned("ledger"))
     }
 
-    /// Appends `body` as the next entry, durably, under the held tip lock.
+    fn lock_failures(&self) -> Result<std::sync::MutexGuard<'_, Failures>> {
+        self.failures
+            .lock()
+            .map_err(|_| Error::LockPoisoned("ledger failures"))
+    }
+
+    /// Keeps an append failure for verification to report. Never fails: a
+    /// poisoned lock here would mean a panic mid-note, and the failure is
+    /// then reported by the chain itself (the missing entry).
+    fn note_failure(&self, what: &str, error: &Error) {
+        if let Ok(mut failures) = self.lock_failures() {
+            failures.epoch = failures.epoch.wrapping_add(1);
+            let failure = failures.outstanding.get_or_insert_with(|| Failure {
+                count: 0,
+                first_at_ns: crate::unix_now_ns(),
+                last_error: String::new(),
+            });
+            failure.count = failure.count.saturating_add(1);
+            failure.last_error = format!("{what}: {error}");
+        }
+    }
+
+    /// The failure count so far, for a catch-up to clear only what it began
+    /// after; see [`Failures`].
+    fn failure_epoch(&self) -> Option<u64> {
+        self.lock_failures().ok().map(|failures| failures.epoch)
+    }
+
+    /// Clears the outstanding failure if none was noted since `epoch`.
+    fn clear_failures_since(&self, epoch: Option<u64>) {
+        if let (Some(epoch), Ok(mut failures)) = (epoch, self.lock_failures()) {
+            if failures.epoch == epoch {
+                failures.outstanding = None;
+            }
+        }
+    }
+
+    fn outstanding_failure(&self) -> Option<Failure> {
+        self.lock_failures()
+            .ok()
+            .and_then(|failures| failures.outstanding.clone())
+    }
+
+    /// The tip and the prefix length that ends on it, read together.
+    fn snapshot(&self) -> Result<Snapshot> {
+        let tip = self.lock()?;
+        Ok(Snapshot {
+            head: tip.head(),
+            len: tip.len,
+        })
+    }
+
+    /// Appends `body` as the next entry, durably, under the held tip lock —
+    /// after a genesis entry first, when the chain has none yet (one that
+    /// failed at open is retried here, so a chain never starts headless).
     fn append_locked(&self, tip: &mut Tip, body: Body) -> Result<Entry> {
+        if tip.last.is_none() && !matches!(body, Body::Genesis { .. }) {
+            let store_id = fresh_store_id(self.path.parent().unwrap_or(Path::new(".")));
+            self.append_one(tip, Body::Genesis { store_id })?;
+        }
+        self.append_one(tip, body)
+    }
+
+    fn append_one(&self, tip: &mut Tip, body: Body) -> Result<Entry> {
         let (seq, prev) = match &tip.last {
             Some((seq, head, _)) => (seq.saturating_add(1), head.clone()),
             None => (0, GENESIS_PREV.to_owned()),
@@ -456,31 +673,43 @@ impl Ledger {
             body,
         };
         entry.head = compute_head(&entry.prev, &serde_json::to_value(&entry)?);
-        let mut line = serde_json::to_string(&entry)?;
+        let mut line = String::new();
+        if tip.unterminated {
+            line.push('\n');
+        }
+        line.push_str(&serde_json::to_string(&entry)?);
         line.push('\n');
         let created = !self.path.exists();
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.path)?;
-        let before = file.metadata()?.len();
+        // The file must be exactly the chain's bytes before a line goes on:
+        // anything past them is a torn or failed append that healing could
+        // not remove, and glued onto, it would read as a broken chain
+        // forever after.
+        if file.metadata()?.len() > tip.len {
+            file.set_len(tip.len)?;
+        }
         if let Err(error) = file
             .write_all(line.as_bytes())
             .and_then(|()| file.sync_all())
         {
-            // A failed append (a full disk) must not leave half a line behind:
-            // the next append would be glued onto it, and one I/O error would
-            // read forever after as a broken chain. Best effort — if the
-            // truncate fails too, open's torn-tail healing is the backstop.
-            let _ = file.set_len(before);
+            // Best effort: if this truncate fails too, the next append's cut
+            // above is the backstop, and no reader looks past `tip.len`.
+            let _ = file.set_len(tip.len);
             return Err(Error::Io(error));
         }
+        // The line is in the file: the tip moves now, even if the directory
+        // sync below fails, or the next append would reuse this seq.
+        tip.len += line.len() as u64;
+        tip.unterminated = false;
+        tip.absorb(&entry, tip.len);
         if created {
             if let Some(directory) = self.path.parent() {
                 crate::sync_directory(directory)?;
             }
         }
-        tip.absorb(&entry);
         Ok(entry)
     }
 
@@ -501,11 +730,20 @@ impl Ledger {
         .map(Some)
     }
 
-    /// Ledgers a published erasure unless the chain already carries it.
-    fn record_erasure(&self, erasure_id: u64, subject: &erasure::Subject) -> Result<Option<Entry>> {
+    /// Ledgers one publication of an erasure — published by `generation` —
+    /// unless the chain already carries that publication.
+    fn record_erasure(
+        &self,
+        erasure_id: u64,
+        subject: &erasure::Subject,
+        generation: u64,
+    ) -> Result<Option<Entry>> {
         let digest = subject_digest(subject);
         let mut tip = self.lock()?;
-        if tip.erasures.contains(&(erasure_id, digest.clone())) {
+        if tip
+            .erasures
+            .contains(&(erasure_id, digest.clone(), generation))
+        {
             return Ok(None);
         }
         self.append_locked(
@@ -515,9 +753,22 @@ impl Ledger {
                 tenant: subject.tenant().map(str::to_owned),
                 subject_kind: subject_kind(subject).to_owned(),
                 subject_digest: digest,
+                generation,
+                salt: random_hex(b"erasure salt"),
             },
         )
         .map(Some)
+    }
+
+    /// Ledgers every settled erasure in `statuses` the chain does not yet
+    /// carry. Idempotent; stops at the first failed append.
+    fn reconcile_erasures(&self, statuses: &[erasure::ErasureStatus]) -> Result<()> {
+        for status in statuses {
+            if let Some(settle) = &status.settle {
+                self.record_erasure(status.erase.id, &status.erase.subject, settle.generation)?;
+            }
+        }
+        Ok(())
     }
 
     /// Appends an anchor after checking it names a real head.
@@ -547,10 +798,16 @@ impl Ledger {
                 "anchor note is over the {MAX_ANCHOR_FIELD_BYTES}-byte limit"
             )));
         }
+        // A malformed head cannot equal the recorded one, and the contract
+        // answers every target_head that is not the recorded head with a
+        // conflict — so this is a 409 too, not a 400, and it does not echo
+        // the value back.
         if !is_sha256_hex(&request.target_head) {
-            return Err(Error::Invalid(
-                "target_head is 64 lowercase hex characters".to_owned(),
-            ));
+            return Err(Error::Conflict(format!(
+                "target_head is not 64 lowercase hex characters, so it cannot be the head \
+                 recorded at seq {}",
+                request.target_seq
+            )));
         }
         // The check and the append share one tip lock: an append landing
         // between them cannot change what `target_seq` names (entries are
@@ -567,9 +824,7 @@ impl Ledger {
         }
         let recorded = match request.target_seq == tip_seq {
             true => Some(tip_head),
-            // Under the held tip lock the file is exactly the tip's prefix,
-            // so its current length is the length to scan.
-            false => self.head_at(request.target_seq, self.length()?)?,
+            false => self.head_at(request.target_seq, tip.len)?,
         };
         match recorded {
             Some(head) if head == request.target_head => {}
@@ -614,33 +869,18 @@ impl Ledger {
         Ok(found)
     }
 
-    /// Streams every readable entry, as stored, to `visit` until it returns
-    /// false. Reads only the prefix that existed when the scan began, under
-    /// no lock: the file is append-only, so that prefix cannot change, and a
-    /// long read must not hold up a checkpoint's append.
-    fn scan(&self, visit: impl FnMut(Value) -> bool) -> Result<()> {
-        // The tip lock only orders the length read after any append in
-        // flight, so the prefix ends on a complete line; the scan itself runs
-        // unlocked.
-        let length = {
-            let _tip = self.lock()?;
-            self.length()?
-        };
-        self.scan_prefix(length, visit)
-    }
-
-    /// The ledger's current length in bytes; zero when it does not exist.
-    fn length(&self) -> Result<u64> {
-        match fs::metadata(&self.path) {
-            Ok(metadata) => Ok(metadata.len()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(0),
-            Err(error) => Err(Error::Io(error)),
-        }
-    }
-
-    /// [`Self::scan`] over the first `length` bytes, for a caller that
-    /// already holds the tip lock (the lock is not reentrant).
-    fn scan_prefix(&self, length: u64, mut visit: impl FnMut(Value) -> bool) -> Result<()> {
+    /// Streams every line of the first `length` bytes to `visit` — the JSON
+    /// object it holds, or `None` for a non-blank line that is not one —
+    /// until it returns false. Blank lines are skipped.
+    ///
+    /// Runs under no lock: `length` comes from a [`Snapshot`] (or the held
+    /// tip), the file is append-only, and nothing ever rewrites bytes inside
+    /// the chain's prefix, so a long read never holds up an append.
+    fn scan_lines(
+        &self,
+        length: u64,
+        mut visit: impl FnMut(Option<Map<String, Value>>) -> bool,
+    ) -> Result<()> {
         if length == 0 {
             return Ok(());
         }
@@ -651,32 +891,48 @@ impl Ledger {
             if reader.read_until(b'\n', &mut line)? == 0 {
                 return Ok(());
             }
-            let Ok(entry) = serde_json::from_slice::<Value>(&line) else {
+            if line.iter().all(u8::is_ascii_whitespace) {
                 continue;
+            }
+            let entry = match serde_json::from_slice::<Value>(&line) {
+                Ok(Value::Object(map)) => Some(map),
+                _ => None,
             };
-            if entry.is_object() && !visit(entry) {
+            if !visit(entry) {
                 return Ok(());
             }
         }
     }
 
-    fn head(&self) -> Result<LedgerHead> {
-        let tip = self.lock()?;
-        let (seq, head, at_ns) = tip.last.clone().unwrap_or((0, GENESIS_PREV.to_owned(), 0));
-        Ok(LedgerHead {
-            seq,
-            head,
-            store_id: tip.store_id.clone(),
-            at_ns,
+    /// [`Self::scan_lines`], readable entries only.
+    fn scan_prefix(&self, length: u64, mut visit: impl FnMut(Value) -> bool) -> Result<()> {
+        self.scan_lines(length, |entry| match entry {
+            Some(map) => visit(Value::Object(map)),
+            None => true,
         })
     }
 
-    /// Copies the ledger, whole, to `target` — under the tip lock, so the
-    /// copy ends on a complete line.
-    fn copy_to(&self, target: &Path) -> Result<()> {
-        let _tip = self.lock()?;
-        let length = fs::metadata(&self.path)?.len();
-        generation::copy_prefix(&self.path, target, length)
+    fn head(&self) -> Result<LedgerHead> {
+        Ok(self.lock()?.head())
+    }
+
+    /// Copies the chain through the checkpoint entry for `generation` to
+    /// `target`, when that is the latest checkpoint entry, and returns
+    /// whether it did. Returns false when the latest checkpoint names
+    /// another generation — its own append failed — since a copy that did
+    /// not end on the pinned checkpoint would misstate what it evidences.
+    ///
+    /// The prefix length is taken under the tip lock and copied outside it:
+    /// an erasure or anchor appended between the checkpoint and the copy
+    /// lands past that length, so the copy ends exactly on the pinned
+    /// checkpoint, whatever raced it.
+    fn copy_through_checkpoint(&self, generation: u64, target: &Path) -> Result<bool> {
+        let end = match self.lock()?.last_checkpoint_end {
+            Some((ledgered, end)) if ledgered == generation => end,
+            _ => return Ok(false),
+        };
+        generation::copy_prefix(&self.path, target, end)?;
+        Ok(true)
     }
 }
 
@@ -686,7 +942,9 @@ impl Ledger {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Verification {
     /// True when every head recomputes and links, the latest checkpoint names
-    /// the live generation's manifest, and every manifested file verifies.
+    /// the live generation's manifest, every manifested file verifies, every
+    /// ledgered erasure still holds in the live tombstone log, and no ledger
+    /// append is outstanding.
     pub intact: bool,
     /// Entry lines in the ledger, readable or not.
     pub entries: u64,
@@ -696,10 +954,24 @@ pub struct Verification {
     pub problems: Vec<String>,
     /// The live generation, checked against the chain and against its files.
     pub generation: GenerationCheck,
-    /// How many of `problems`, at the end, are file problems — so a tenant's
-    /// evidence pack can summarize them rather than name other tenants' files.
+    /// Who each of `problems` concerns, index for index — so a tenant's
+    /// evidence pack can keep its own, summarize the store's files, and
+    /// withhold other tenants'.
     #[serde(skip)]
-    file_problems: usize,
+    scopes: Vec<Scope>,
+}
+
+/// Who one verification problem concerns.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Scope {
+    /// The chain or the store as a whole: shown to every reader.
+    Store,
+    /// A manifested file: store-global names (segments, content-addressed
+    /// payload paths), summarized as a count for a tenant.
+    File,
+    /// A ledgered erasure of this tenant (`None`: a store-global payload
+    /// subject), shown only to that tenant and to unbound readers.
+    Tenant(Option<String>),
 }
 
 /// The live generation's half of a [`Verification`].
@@ -741,20 +1013,50 @@ impl Verification {
         out
     }
 
-    /// The verification as a tenant's evidence pack carries it: file
-    /// problems name store-global files (segments, content-addressed payload
-    /// paths), so they collapse into a count.
-    fn scoped(mut self) -> Self {
-        if self.file_problems > 0 {
-            let keep = self.problems.len() - self.file_problems;
-            self.problems.truncate(keep);
-            self.problems.push(format!(
-                "generation {}: {} file(s) fail verification",
-                self.generation.id, self.file_problems
-            ));
-            self.file_problems = 1;
+    /// The verification as `tenant`'s evidence pack carries it. File
+    /// problems name store-global files, so they collapse into a count;
+    /// problems about another tenant's erasures (or a store-global payload
+    /// erasure) collapse into a count that says nothing of whose. `intact`
+    /// is unchanged: a pack never claims a store intact that is not.
+    fn scoped(self, tenant: &str) -> Self {
+        let mut problems = Vec::with_capacity(self.problems.len());
+        let mut scopes = Vec::with_capacity(self.scopes.len());
+        let mut files = 0_usize;
+        let mut withheld = 0_usize;
+        for (problem, scope) in self.problems.into_iter().zip(self.scopes) {
+            match &scope {
+                Scope::Store => {}
+                Scope::Tenant(Some(owner)) if owner == tenant => {}
+                Scope::File => {
+                    files += 1;
+                    continue;
+                }
+                Scope::Tenant(_) => {
+                    withheld += 1;
+                    continue;
+                }
+            }
+            problems.push(problem);
+            scopes.push(scope);
         }
-        self
+        if files > 0 {
+            problems.push(format!(
+                "generation {}: {files} file(s) fail verification",
+                self.generation.id
+            ));
+            scopes.push(Scope::File);
+        }
+        if withheld > 0 {
+            problems.push(format!(
+                "{withheld} problem(s) about data outside this tenant are withheld from this pack"
+            ));
+            scopes.push(Scope::Store);
+        }
+        Self {
+            problems,
+            scopes,
+            ..self
+        }
     }
 }
 
@@ -772,16 +1074,29 @@ struct ChainReport {
     head: Option<String>,
     /// `(seq, generation, manifest_sha256)` of the last checkpoint entry.
     last_checkpoint: Option<(u64, u64, String)>,
+    /// The latest erasure entry per subject digest, for the cross-check
+    /// against the live tombstone log.
+    erasures: HashMap<String, LedgeredErasure>,
     problems: Vec<String>,
 }
 
-/// Recomputes every head in the ledger at `path` and checks each link.
+/// One erasure entry, as the cross-check needs it.
+#[derive(Debug)]
+struct LedgeredErasure {
+    seq: u64,
+    erasure_id: u64,
+    subject_kind: String,
+    tenant: Option<String>,
+}
+
+/// Recomputes every head in the first `length` bytes of the ledger at `path`
+/// (the whole file when `None`) and checks each link.
 ///
 /// Works on the generic JSON of each line, never a decoded [`Entry`]: a field
 /// added by hand must change the recomputed head, and decoding into a typed
 /// struct would silently drop it. Problems name the entry by `seq` where the
 /// line says one, else by line number.
-fn verify_chain(path: &Path) -> Result<ChainReport> {
+fn verify_chain(path: &Path, length: Option<u64>) -> Result<ChainReport> {
     let mut report = ChainReport::default();
     let file = match File::open(path) {
         Ok(file) => file,
@@ -791,7 +1106,7 @@ fn verify_chain(path: &Path) -> Result<ChainReport> {
         }
         Err(error) => return Err(Error::Io(error)),
     };
-    let mut reader = BufReader::new(file);
+    let mut reader = BufReader::new(file.take(length.unwrap_or(u64::MAX)));
     let mut line = Vec::new();
     let mut line_number = 0_u64;
     // What the next entry must say, or `None` after a line that could not be
@@ -853,13 +1168,39 @@ fn verify_chain(path: &Path) -> Result<ChainReport> {
             Some(_) => {}
         }
         check_body(&entry, seq, &heads, &mut genesis_seen, &mut report.problems);
-        if entry.get("kind").and_then(Value::as_str) == Some("checkpoint") {
-            if let (Some(generation), Some(manifest)) = (
-                entry.get("generation").and_then(Value::as_u64),
-                entry.get("manifest_sha256").and_then(Value::as_str),
-            ) {
-                report.last_checkpoint = Some((seq, generation, manifest.to_owned()));
+        match entry.get("kind").and_then(Value::as_str) {
+            Some("checkpoint") => {
+                if let (Some(generation), Some(manifest)) = (
+                    entry.get("generation").and_then(Value::as_u64),
+                    entry.get("manifest_sha256").and_then(Value::as_str),
+                ) {
+                    report.last_checkpoint = Some((seq, generation, manifest.to_owned()));
+                }
             }
+            Some("erasure") => {
+                if let (Some(digest), Some(erasure_id)) = (
+                    entry.get("subject_digest").and_then(Value::as_str),
+                    entry.get("erasure_id").and_then(Value::as_u64),
+                ) {
+                    report.erasures.insert(
+                        digest.to_owned(),
+                        LedgeredErasure {
+                            seq,
+                            erasure_id,
+                            subject_kind: entry
+                                .get("subject_kind")
+                                .and_then(Value::as_str)
+                                .unwrap_or("?")
+                                .to_owned(),
+                            tenant: entry
+                                .get("tenant")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned),
+                        },
+                    );
+                }
+            }
+            _ => {}
         }
         let head = recorded_head.unwrap_or(recomputed);
         if seq == heads.len() as u64 {
@@ -915,9 +1256,12 @@ fn check_body(
                 || !tenant_ok
                 || text("subject_kind").is_none()
                 || !text("subject_digest").is_some_and(is_sha256_hex)
+                || number("generation").is_none()
+                || text("salt").is_none()
             {
                 problems.push(format!(
-                    "{name}: erasure without erasure_id, tenant, subject_kind and subject_digest"
+                    "{name}: erasure without erasure_id, tenant, subject_kind, subject_digest, \
+                     generation and salt"
                 ));
             }
         }
@@ -942,49 +1286,165 @@ fn check_body(
     }
 }
 
-/// Verifies the ledger in `directory` against generation `live` and the file
-/// check `files`.
-fn assemble(directory: &Path, live: u64, files: &FileCheck) -> Result<Verification> {
-    let chain = verify_chain(&directory.join(LOG_NAME))?;
-    let manifest_sha256 = manifest_digest(directory, live)?;
+/// Subject digests of every SETTLED erasure in a tombstone log's statuses.
+fn settled_subjects(statuses: &[erasure::ErasureStatus]) -> HashSet<String> {
+    statuses
+        .iter()
+        .filter(|status| status.settle.is_some())
+        .map(|status| subject_digest(&status.erase.subject))
+        .collect()
+}
+
+/// [`settled_subjects`] read straight from `directory`'s tombstone log,
+/// without opening it: the offline verification must not heal or append.
+/// Lines that do not parse are skipped — a damaged tombstone log is the
+/// file check's to report, and a skipped settle can only add a problem
+/// here, never hide one.
+fn settled_subjects_offline(directory: &Path) -> Result<HashSet<String>> {
+    let contents = match fs::read(directory.join(erasure::LOG_NAME)) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(HashSet::new()),
+        Err(error) => return Err(Error::Io(error)),
+    };
+    let mut subjects: HashMap<u64, String> = HashMap::new();
+    let mut settled: HashSet<u64> = HashSet::new();
+    for line in contents.split(|byte| *byte == b'\n') {
+        let Ok(Value::Object(record)) = serde_json::from_slice::<Value>(line) else {
+            continue;
+        };
+        let Some(id) = record.get("id").and_then(Value::as_u64) else {
+            continue;
+        };
+        match record.get("op").and_then(Value::as_str) {
+            Some("erase") => {
+                let subject = record
+                    .get("subject")
+                    .cloned()
+                    .and_then(|subject| serde_json::from_value::<erasure::Subject>(subject).ok());
+                if let Some(subject) = subject {
+                    subjects.insert(id, subject_digest(&subject));
+                }
+            }
+            Some("settle") => {
+                settled.insert(id);
+            }
+            _ => {}
+        }
+    }
+    Ok(subjects
+        .into_iter()
+        .filter(|(id, _)| settled.contains(id))
+        .map(|(_, digest)| digest)
+        .collect())
+}
+
+/// What [`assemble`] checks the chain against, besides the files.
+struct LiveFacts<'a> {
+    /// The generation `CURRENT` names.
+    generation: u64,
+    /// The file check of that generation.
+    files: &'a FileCheck,
+    /// Subject digests of every settled erasure in the live tombstone log,
+    /// read AFTER the chain's prefix was fixed: an erasure entry is appended
+    /// only once its settle is durable, so every erasure in the prefix is
+    /// already in this set unless the log lost it.
+    settled: &'a HashSet<String>,
+    /// An append failure not yet caught up, if any.
+    failure: Option<Failure>,
+}
+
+/// Verifies the first `length` bytes of the ledger in `directory` (all of it
+/// when `None`) against the live facts.
+fn assemble(directory: &Path, length: Option<u64>, live: LiveFacts<'_>) -> Result<Verification> {
+    let chain = verify_chain(&directory.join(LOG_NAME), length)?;
+    let generation = live.generation;
+    let manifest_sha256 = manifest_digest(directory, generation)?;
     let mut problems = chain.problems;
     let matches_ledger = match &chain.last_checkpoint {
-        Some((_, generation, digest)) if *generation == live && *digest == manifest_sha256 => true,
-        Some((seq, generation, digest)) => {
+        Some((_, ledgered, digest)) if *ledgered == generation && *digest == manifest_sha256 => {
+            true
+        }
+        // Newer than the chain: the window between `CURRENT` moving and the
+        // checkpoint entry landing — a crash or a failed append in it, or a
+        // restore's install not yet opened. Benign when that is the cause,
+        // and the problem says how it heals; still not intact, because
+        // nothing yet commits the chain to this generation.
+        Some((seq, ledgered, _)) if generation > *ledgered => {
             problems.push(format!(
-                "seq {seq}: the latest checkpoint entry names generation {generation} \
-                 (manifest {digest}), but the live generation is {live} (manifest \
+                "seq {seq}: the latest checkpoint entry names generation {ledgered}, but the \
+                 live generation {generation} (manifest {manifest_sha256}) is newer and not \
+                 ledgered yet. A crash or a failed ledger append between publishing a \
+                 generation and ledgering it leaves exactly this, and opening the store (or \
+                 its next checkpoint) ledgers the live generation; any other cause is a \
+                 discrepancy to investigate"
+            ));
+            false
+        }
+        Some((seq, ledgered, digest)) => {
+            problems.push(format!(
+                "seq {seq}: the latest checkpoint entry names generation {ledgered} (manifest \
+                 {digest}), but the live generation is {generation} (manifest \
                  {manifest_sha256})"
             ));
             false
         }
         None => {
             problems.push(format!(
-                "no checkpoint entry; the live generation {live} is not ledgered"
+                "no checkpoint entry; the live generation {generation} is not ledgered"
             ));
             false
         }
     };
-    let file_problems = files.problems.len();
-    problems.extend(
-        files
-            .problems
-            .iter()
-            .map(|problem| format!("generation {live}: {problem}")),
-    );
+    let mut scopes = vec![Scope::Store; problems.len()];
+
+    // Every ledgered erasure must still hold. The tombstone log never
+    // rotates, so the one ordinary way for a settled erasure to leave it is
+    // a restore of a pin taken before it — which also brings the subject's
+    // data back, and is exactly what an auditor must not miss. Ordered by
+    // seq so the report reads in chain order.
+    let mut undone: Vec<&LedgeredErasure> = chain
+        .erasures
+        .iter()
+        .filter(|(digest, _)| !live.settled.contains(digest.as_str()))
+        .map(|(_, erasure)| erasure)
+        .collect();
+    undone.sort_by_key(|erasure| erasure.seq);
+    for erasure in undone {
+        problems.push(format!(
+            "seq {}: erasure {} ({} subject) is ledgered, but the live tombstone log holds no \
+             settled erasure of that subject. Restoring a pin taken before an erasure undoes \
+             it and brings the subject's data back; re-apply the erasure",
+            erasure.seq, erasure.erasure_id, erasure.subject_kind
+        ));
+        scopes.push(Scope::Tenant(erasure.tenant.clone()));
+    }
+
+    if let Some(failure) = &live.failure {
+        problems.push(format!(
+            "{} ledger append(s) failed since {} (most recently, {}). What they would have \
+             recorded is ledgered at the next checkpoint or open",
+            failure.count, failure.first_at_ns, failure.last_error
+        ));
+        scopes.push(Scope::Store);
+    }
+
+    for problem in &live.files.problems {
+        problems.push(format!("generation {generation}: {problem}"));
+        scopes.push(Scope::File);
+    }
     Ok(Verification {
         intact: problems.is_empty(),
         entries: chain.entries,
         head: chain.head,
         problems,
         generation: GenerationCheck {
-            id: live,
+            id: generation,
             manifest_sha256,
             matches_ledger,
-            files_verified: files.problems.is_empty(),
-            verified_at_ns: files.at_ns,
+            files_verified: live.files.problems.is_empty(),
+            verified_at_ns: live.files.at_ns,
         },
-        file_problems,
+        scopes,
     })
 }
 
@@ -1006,8 +1466,11 @@ fn check_files(directory: &Path, live: u64) -> Result<FileCheck> {
 /// Read-only on purpose. Opening the store would run recovery and the
 /// ledger's own reconcile — appends, the very thing under examination — so
 /// this takes the directory lock (refusing a directory a live server owns,
-/// with [`Error::AlreadyOpen`]) and reads `CURRENT`, the manifest, the files
-/// and the ledger as they are.
+/// with [`Error::AlreadyOpen`]) and reads `CURRENT`, the manifest, the files,
+/// the tombstone log and the ledger as they are. A store that crashed
+/// between publishing a generation and ledgering it therefore reports the
+/// live generation as not ledgered yet (and says so); its next open ledgers
+/// it.
 pub fn verify_offline(directory: &Path) -> Result<Verification> {
     if !directory.join(generation::CURRENT_NAME).exists() {
         return Err(Error::Invalid(format!(
@@ -1024,7 +1487,20 @@ pub fn verify_offline(directory: &Path) -> Result<Verification> {
         ))
     })?;
     let files = check_files(directory, live)?;
-    assemble(directory, live, &files)
+    // The directory lock excludes every writer, so neither the chain nor the
+    // tombstone log can move while they are read: the whole file is the
+    // chain, and the order of the two reads does not matter.
+    let settled = settled_subjects_offline(directory)?;
+    assemble(
+        directory,
+        None,
+        LiveFacts {
+            generation: live,
+            files: &files,
+            settled: &settled,
+            failure: None,
+        },
+    )
 }
 
 // ------------------------------------------------------------------- store
@@ -1032,20 +1508,57 @@ pub fn verify_offline(directory: &Path) -> Result<Verification> {
 impl Store {
     /// Ledgers the generation just published, unless its manifest is the one
     /// already ledgered. Called by the checkpoint once `CURRENT` is durable.
-    pub(crate) fn ledger_checkpoint(&self, generation: u64) -> Result<()> {
-        let digest = manifest_digest(&self.directory, generation)?;
-        self.ledger.record_checkpoint(generation, digest).map(drop)
+    ///
+    /// Never fails the checkpoint: the generation is committed whatever
+    /// happens here (see the module docs, evidence not state). A failure is
+    /// kept for verification to report, and the next checkpoint catches up —
+    /// it ledgers its own generation and, while a failure is outstanding,
+    /// every settled erasure the chain lacks, so a failed erasure entry waits
+    /// one checkpoint rather than a restart.
+    pub(crate) fn ledger_checkpoint(&self, generation: u64) {
+        let epoch = self.ledger.failure_epoch();
+        let catching_up = self.ledger.outstanding_failure().is_some();
+        let outcome = (|| -> Result<()> {
+            let digest = manifest_digest(&self.directory, generation)?;
+            self.ledger.record_checkpoint(generation, digest)?;
+            if catching_up {
+                self.ledger.reconcile_erasures(&self.erasures.list()?)?;
+            }
+            Ok(())
+        })();
+        match outcome {
+            Ok(()) => self.ledger.clear_failures_since(epoch),
+            Err(error) => self
+                .ledger
+                .note_failure(&format!("ledgering generation {generation}"), &error),
+        }
     }
 
-    /// Ledgers an erasure just published. Called once its settle record is
-    /// durable.
-    pub(crate) fn ledger_erasure(&self, erasure_id: u64, subject: &erasure::Subject) -> Result<()> {
-        self.ledger.record_erasure(erasure_id, subject).map(drop)
+    /// Ledgers an erasure just published by `generation`. Called once its
+    /// settle record is durable, and — like [`Self::ledger_checkpoint`] —
+    /// never fails it: the erasure is settled and its barrier lifted whatever
+    /// happens here; a failure is kept and caught up at the next checkpoint.
+    pub(crate) fn ledger_erasure(
+        &self,
+        erasure_id: u64,
+        subject: &erasure::Subject,
+        generation: u64,
+    ) {
+        if let Err(error) = self.ledger.record_erasure(erasure_id, subject, generation) {
+            self.ledger
+                .note_failure(&format!("ledgering erasure {erasure_id}"), &error);
+        }
     }
 
-    /// Copies the ledger into a pin being built, beside its manifest.
-    pub(crate) fn ledger_copy_into(&self, pin_dir: &Path) -> Result<()> {
-        self.ledger.copy_to(&pin_dir.join(LOG_NAME))
+    /// Copies the ledger into a pin of `generation` being built, beside its
+    /// manifest: the chain through that generation's checkpoint entry, and
+    /// nothing after it. Copies nothing when that entry's append failed —
+    /// the pin is still a complete backup, and a copy ending elsewhere would
+    /// misstate what it evidences.
+    pub(crate) fn ledger_copy_into(&self, pin_dir: &Path, generation: u64) -> Result<()> {
+        self.ledger
+            .copy_through_checkpoint(generation, &pin_dir.join(LOG_NAME))
+            .map(drop)
     }
 
     /// The chain's tip.
@@ -1057,38 +1570,59 @@ impl Store {
     /// `after` is `None`), in file order, exactly as stored. Lines that do not
     /// parse are skipped here; [`Self::verify_ledger`] names them.
     pub fn ledger_entries(&self, after: Option<u64>, limit: usize) -> Result<Vec<Value>> {
+        self.ledger_page(after, limit).map(|(_, entries)| entries)
+    }
+
+    /// [`Self::ledger_entries`] together with the head they were read up to:
+    /// one snapshot, so no entry in the page is past the head reported with
+    /// it.
+    pub fn ledger_page(
+        &self,
+        after: Option<u64>,
+        limit: usize,
+    ) -> Result<(LedgerHead, Vec<Value>)> {
+        let snapshot = self.ledger.snapshot()?;
         let mut entries = Vec::new();
-        if limit == 0 {
-            return Ok(entries);
+        if limit > 0 {
+            self.ledger.scan_prefix(snapshot.len, |entry| {
+                let seq = entry.get("seq").and_then(Value::as_u64);
+                if after.map_or(true, |after| seq.is_some_and(|seq| seq > after)) {
+                    entries.push(entry);
+                }
+                entries.len() < limit
+            })?;
         }
-        self.ledger.scan(|entry| {
-            let seq = entry.get("seq").and_then(Value::as_u64);
-            if after.map_or(true, |after| seq.is_some_and(|seq| seq > after)) {
-                entries.push(entry);
-            }
-            entries.len() < limit
-        })?;
-        Ok(entries)
+        Ok((snapshot.head, entries))
     }
 
     /// Verifies the whole chain, checks that the latest checkpoint entry
-    /// names the live generation's manifest, and re-digests every file that
-    /// manifest names.
+    /// names the live generation's manifest, re-digests every file that
+    /// manifest names, checks every ledgered erasure still holds in the live
+    /// tombstone log, and reports any ledger append not yet caught up.
     ///
     /// O(store bytes), like [`Self::verify_generation`], and under the same
     /// maintenance lock: no compaction, expiry or checkpoint can move files
-    /// or the chain mid-check. Note that compaction and expiry replace files
-    /// BETWEEN checkpoints, so the live manifest can name files that are gone
-    /// until the next checkpoint publishes; those report as missing.
+    /// or the chain's checkpoint entries mid-check. Erasure and anchor
+    /// appends do not take that lock; the chain is read up to a snapshot
+    /// taken under it, so they land past what is checked. Note that
+    /// compaction and expiry replace files BETWEEN checkpoints, so the live
+    /// manifest can name files that are gone until the next checkpoint
+    /// publishes; those report as missing.
     pub fn verify_ledger(&self) -> Result<Verification> {
-        self.verify_ledger_reusing(None)
+        self.verify_snapshot(None)
+            .map(|(verification, _)| verification)
     }
 
     /// [`Self::verify_ledger`], reusing a file check of the same live
-    /// generation that is at most `reuse` old. The chain and the manifest
-    /// digest are always re-read.
-    fn verify_ledger_reusing(&self, reuse: Option<Duration>) -> Result<Verification> {
+    /// generation that is at most `reuse` old, and returning the snapshot
+    /// the chain was read up to. The chain, the manifest digest and the
+    /// tombstone log are always re-read.
+    fn verify_snapshot(&self, reuse: Option<Duration>) -> Result<(Verification, Snapshot)> {
         let _maintenance = self.lock_maintenance()?;
+        // Under the maintenance lock, so no checkpoint entry can land between
+        // this and reading `CURRENT`; erasure and anchor appends may, and
+        // the snapshot leaves them out.
+        let snapshot = self.ledger.snapshot()?;
         let live = self.live_generation();
         let cached = match reuse {
             Some(reuse) => self
@@ -1112,7 +1646,19 @@ impl Store {
                 files
             }
         };
-        assemble(&self.directory, live, &files)
+        // Read after the snapshot: see `LiveFacts::settled`.
+        let settled = settled_subjects(&self.erasures()?);
+        let verification = assemble(
+            &self.directory,
+            Some(snapshot.len),
+            LiveFacts {
+                generation: live,
+                files: &files,
+                settled: &settled,
+                failure: self.ledger.outstanding_failure(),
+            },
+        )?;
+        Ok((verification, snapshot))
     }
 
     /// Appends an external notary's anchor, after checking its `target_head`
@@ -1131,7 +1677,13 @@ impl Store {
     /// canonical JSON, which is what an external notary signs. A tenant's
     /// pack shows other tenants' erasure entries only as chain stubs (`seq`,
     /// `kind`, `at_ns`, `prev`, `head`, `redacted: true`), so the chain
-    /// stays followable without disclosing whose erasure it was.
+    /// stays followable without disclosing whose erasure it was — the salt
+    /// the stub leaves out is what keeps its head from being recomputed for
+    /// a guessed subject.
+    ///
+    /// The head, the entries and the verification come from one snapshot of
+    /// the chain, so the pack never reports a head older than an entry or a
+    /// verification it carries.
     ///
     /// `usage` is `null` in this build: the per-tenant usage counters are a
     /// separate feature, and this pack carries them when they exist.
@@ -1158,31 +1710,42 @@ impl Store {
             }
         }
 
-        // Head first, then entries bounded by it: an append landing mid-pack
-        // must not put an entry past the head the pack reports.
-        let head = self.ledger_head()?;
+        let (verification, snapshot) = self.verify_snapshot(Some(EVIDENCE_VERIFY_REUSE))?;
+        let verification = match tenant {
+            Some(tenant) => verification.scoped(tenant),
+            None => verification,
+        };
+        let head = snapshot.head;
         let mut entries = Vec::new();
         let mut entries_truncated = false;
-        self.ledger.scan(|entry| {
-            let seq = entry.get("seq").and_then(Value::as_u64).unwrap_or(u64::MAX);
-            if seq > head.seq {
-                return false;
-            }
-            let at = entry.get("at_ns").and_then(Value::as_u64).unwrap_or(0);
+        // Lines the pack cannot place in the window: not a JSON object, or
+        // no integer seq or at_ns. Counted, never silently dropped, so a
+        // damaged chain's pack does not read as complete; the verification
+        // names each one.
+        let mut entries_unreadable = 0_u64;
+        self.ledger.scan_lines(snapshot.len, |entry| {
+            let Some(entry) = entry else {
+                entries_unreadable += 1;
+                return true;
+            };
+            let (Some(_), Some(at)) = (
+                entry.get("seq").and_then(Value::as_u64),
+                entry.get("at_ns").and_then(Value::as_u64),
+            ) else {
+                entries_unreadable += 1;
+                return true;
+            };
             if at < since || at > until {
                 return true;
             }
-            if entries.len() == EVIDENCE_MAX_ENTRIES {
-                entries_truncated = true;
-                return false;
+            // Past the cap the scan goes on, counting: `entries_unreadable`
+            // covers the whole chain, not just the part that fit.
+            match entries.len() == EVIDENCE_MAX_ENTRIES {
+                true => entries_truncated = true,
+                false => entries.push(scope_entry(Value::Object(entry), tenant)),
             }
-            entries.push(scope_entry(entry, tenant));
             true
         })?;
-        let mut verification = self.verify_ledger_reusing(Some(EVIDENCE_VERIFY_REUSE))?;
-        if tenant.is_some() {
-            verification = verification.scoped();
-        }
 
         let mut pack = json!({
             "format": EVIDENCE_FORMAT,
@@ -1195,6 +1758,7 @@ impl Store {
                 "head": head,
                 "entries": entries,
                 "entries_truncated": entries_truncated,
+                "entries_unreadable": entries_unreadable,
                 "verification": verification,
             },
             "retention": self.retention_for(tenant),
@@ -1334,7 +1898,8 @@ impl Store {
 
 /// One stored entry as `tenant`'s evidence pack shows it: whole, unless it is
 /// an erasure entry that is not the tenant's, which becomes a stub carrying
-/// only what following the chain needs.
+/// only what following the chain needs. The stub leaves out the `salt`, and
+/// with it any way to recompute its head for a guessed subject.
 fn scope_entry(entry: Value, tenant: Option<&str>) -> Value {
     let Some(tenant) = tenant else {
         return entry;
@@ -1357,20 +1922,26 @@ fn scope_entry(entry: Value, tenant: Option<&str>) -> Value {
 /// Opens the ledger for a store being opened and reconciles it with what is
 /// durable: the live generation and every settled erasure. See the module
 /// docs (crash consistency).
+///
+/// Fails only when the ledger cannot be read. A reconcile append that fails
+/// is kept for verification to report, and the store opens: the generation
+/// and erasures it would have recorded are committed already, and the next
+/// checkpoint retries them.
 pub(crate) fn open_reconciled(
     directory: &Path,
     live_generation: u64,
     erasures: &erasure::ErasureLog,
 ) -> Result<Ledger> {
     let ledger = Ledger::open(directory)?;
-    ledger.record_checkpoint(
-        live_generation,
-        manifest_digest(directory, live_generation)?,
-    )?;
-    for status in erasures.list()? {
-        if status.settle.is_some() {
-            ledger.record_erasure(status.erase.id, &status.erase.subject)?;
-        }
+    let reconciled = (|| -> Result<()> {
+        ledger.record_checkpoint(
+            live_generation,
+            manifest_digest(directory, live_generation)?,
+        )?;
+        ledger.reconcile_erasures(&erasures.list()?)
+    })();
+    if let Err(error) = reconciled {
+        ledger.note_failure("reconciling at open", &error);
     }
     Ok(ledger)
 }
@@ -1439,8 +2010,7 @@ pub fn serve(
                     other => return refuse(format!("unknown query parameter: {other}")),
                 }
             }
-            let head = store.ledger_head()?;
-            let entries = store.ledger_entries(after, limit)?;
+            let (head, entries) = store.ledger_page(after, limit)?;
             Ok((
                 200,
                 json!({"entries": entries, "head": {"seq": head.seq, "head": head.head}}),
@@ -1590,7 +2160,7 @@ mod tests {
             .expect("cp")
             .is_none());
 
-        let report = verify_chain(&dir.join(LOG_NAME)).expect("verify");
+        let report = verify_chain(&dir.join(LOG_NAME), None).expect("verify");
         assert!(report.problems.is_empty(), "{:?}", report.problems);
         assert_eq!(report.entries, 3);
         assert_eq!(report.head.as_deref(), Some(head.head.as_str()));
@@ -1627,7 +2197,7 @@ mod tests {
         let ledger = Ledger::open(&dir).expect("reopen heals");
         assert_eq!(ledger.head().expect("head").seq, 1);
         ledger.record_checkpoint(2, digest(2)).expect("cp");
-        let report = verify_chain(&dir.join(LOG_NAME)).expect("verify");
+        let report = verify_chain(&dir.join(LOG_NAME), None).expect("verify");
         assert!(report.problems.is_empty(), "{:?}", report.problems);
         assert_eq!(report.entries, 3);
     }
@@ -1644,7 +2214,7 @@ mod tests {
         all[1] = all[1].replace("\"generation\":1", "\"generation\":7");
         fs::write(dir.join(LOG_NAME), all.join("\n") + "\n").expect("write");
 
-        let report = verify_chain(&dir.join(LOG_NAME)).expect("verify");
+        let report = verify_chain(&dir.join(LOG_NAME), None).expect("verify");
         assert_eq!(report.problems.len(), 1, "{:?}", report.problems);
         assert!(report.problems[0].starts_with("seq 1: head does not match"));
 
@@ -1652,7 +2222,7 @@ mod tests {
         // last readable entry, and the damage stays reported.
         let ledger = Ledger::open(&dir).expect("open over damage");
         ledger.record_checkpoint(3, digest(3)).expect("cp");
-        let report = verify_chain(&dir.join(LOG_NAME)).expect("verify");
+        let report = verify_chain(&dir.join(LOG_NAME), None).expect("verify");
         assert_eq!(report.problems.len(), 1, "{:?}", report.problems);
     }
 
@@ -1665,7 +2235,7 @@ mod tests {
         let mut all = lines(&dir);
         all[1] = all[1].replacen('{', "{\"note\":\"hello\",", 1);
         fs::write(dir.join(LOG_NAME), all.join("\n") + "\n").expect("write");
-        let report = verify_chain(&dir.join(LOG_NAME)).expect("verify");
+        let report = verify_chain(&dir.join(LOG_NAME), None).expect("verify");
         assert!(
             report.problems.iter().any(|p| p.starts_with("seq 1: head")),
             "{:?}",
@@ -1684,7 +2254,7 @@ mod tests {
         let mut all = lines(&dir);
         all.remove(2);
         fs::write(dir.join(LOG_NAME), all.join("\n") + "\n").expect("write");
-        let report = verify_chain(&dir.join(LOG_NAME)).expect("verify");
+        let report = verify_chain(&dir.join(LOG_NAME), None).expect("verify");
         assert!(
             report
                 .problems
@@ -1719,10 +2289,13 @@ mod tests {
             ledger.anchor(request(5, &genesis_head.head)),
             Err(Error::Conflict(_))
         ));
-        assert!(matches!(
-            ledger.anchor(request(0, "not-hex")),
-            Err(Error::Invalid(_))
-        ));
+        assert!(
+            matches!(
+                ledger.anchor(request(0, "not-hex")),
+                Err(Error::Conflict(_))
+            ),
+            "a malformed head cannot be the recorded one: a conflict, like any other"
+        );
         let mut empty = request(0, &genesis_head.head);
         empty.signature.clear();
         assert!(matches!(ledger.anchor(empty), Err(Error::Invalid(_))));
@@ -1737,7 +2310,7 @@ mod tests {
         ledger
             .anchor(request(tip.seq, &tip.head))
             .expect("anchor the tip");
-        let report = verify_chain(&dir.join(LOG_NAME)).expect("verify");
+        let report = verify_chain(&dir.join(LOG_NAME), None).expect("verify");
         assert!(report.problems.is_empty(), "{:?}", report.problems);
     }
 
@@ -1750,10 +2323,13 @@ mod tests {
             tenant: "acme".to_owned(),
         };
         let entry = ledger
-            .record_erasure(3, &subject)
+            .record_erasure(3, &subject, 9)
             .expect("record")
             .expect("appended");
-        assert!(ledger.record_erasure(3, &subject).expect("again").is_none());
+        assert!(ledger
+            .record_erasure(3, &subject, 9)
+            .expect("again")
+            .is_none());
         let text = fs::read_to_string(dir.join(LOG_NAME)).expect("read");
         assert!(!text.contains("alice"), "{text}");
         let canonical =
@@ -1764,11 +2340,16 @@ mod tests {
                 tenant,
                 subject_kind,
                 subject_digest,
+                generation,
+                salt,
             } => {
                 assert_eq!(erasure_id, 3);
                 assert_eq!(tenant.as_deref(), Some("acme"));
                 assert_eq!(subject_kind, "session");
                 assert_eq!(subject_digest, payload::sha256_hex(canonical.as_bytes()));
+                assert_eq!(generation, 9);
+                assert_eq!(salt.len(), 32);
+                assert!(salt.bytes().all(|byte| byte.is_ascii_hexdigit()));
             }
             other => panic!("not an erasure entry: {other:?}"),
         }
@@ -1777,7 +2358,7 @@ mod tests {
             reference: format!("sha256/{}", digest(7)),
         };
         let entry = ledger
-            .record_erasure(4, &payload_subject)
+            .record_erasure(4, &payload_subject, 9)
             .expect("record")
             .expect("appended");
         let value = serde_json::to_value(&entry).expect("json");
@@ -1791,7 +2372,7 @@ mod tests {
                          "subject_digest": "d"});
         let foreign = json!({"seq": 4, "kind": "erasure", "at_ns": 2, "prev": "h", "head": "i",
                              "tenant": "bigco", "erasure_id": 2, "subject_kind": "tenant",
-                             "subject_digest": "e"});
+                             "subject_digest": "e", "generation": 5, "salt": "s"});
         assert_eq!(scope_entry(own.clone(), Some("acme")), own);
         assert_eq!(scope_entry(foreign.clone(), None), foreign);
         let stub = scope_entry(foreign, Some("acme"));
@@ -1887,5 +2468,432 @@ mod tests {
         assert!(verification.intact, "{verification:?}");
         assert!(verification.generation.matches_ledger);
         assert!(verification.generation.files_verified);
+    }
+
+    fn test_span(trace: &str, tenant: &str) -> crate::Span {
+        serde_json::from_value(json!({
+            "trace_id": trace, "span_id": "s1", "name": "chat", "service": "svc",
+            "start_time_ns": 1_000u64, "end_time_ns": 2_000u64, "$tenant": tenant,
+        }))
+        .expect("span")
+    }
+
+    fn trace_subject(trace: &str, tenant: &str) -> erasure::Subject {
+        erasure::Subject::Trace {
+            trace_id: trace.to_owned(),
+            tenant: tenant.to_owned(),
+        }
+    }
+
+    fn anchor_request(target_seq: u64, target_head: &str, note: Option<String>) -> AnchorRequest {
+        AnchorRequest {
+            target_seq,
+            target_head: target_head.to_owned(),
+            authority: "notary.example".to_owned(),
+            anchored_at_ns: 42,
+            signature: "c2ln".to_owned(),
+            public_key: "a2V5".to_owned(),
+            note,
+        }
+    }
+
+    #[test]
+    fn a_foreign_stub_cannot_be_matched_to_a_guessed_tenant() {
+        // What a bound tenant holds about a neighbour's erasure: the stub in
+        // its evidence pack — seq, at_ns, prev, head — plus everything that
+        // is guessable: small erasure ids and generations, five subject
+        // kinds, and candidate tenant names (a tenant subject's digest
+        // depends on nothing else). It tries them all against the stub's
+        // head.
+        let dir = temp_dir("bruteforce");
+        let ledger = Ledger::open(&dir).expect("open");
+        ledger.record_checkpoint(1, digest(1)).expect("cp");
+        let erased = erasure::Subject::Tenant {
+            tenant: "bigco".to_owned(),
+        };
+        let entry = ledger
+            .record_erasure(7, &erased, 2)
+            .expect("record")
+            .expect("appended");
+        let full = serde_json::to_value(&entry).expect("json");
+        let stub = scope_entry(full.clone(), Some("acme"));
+        assert!(stub.get("salt").is_none(), "{stub}");
+        let prev = stub["prev"].as_str().expect("prev");
+        let guess = |salt: Option<&str>| -> Option<String> {
+            for tenant in ["acme", "bigco", "globex", "initech"] {
+                let subject = erasure::Subject::Tenant {
+                    tenant: tenant.to_owned(),
+                };
+                for erasure_id in 0..=16_u64 {
+                    for generation in 0..=8_u64 {
+                        for kind in ["trace", "span", "session", "payload", "tenant"] {
+                            let mut attempt = json!({
+                                "seq": stub["seq"], "kind": "erasure", "at_ns": stub["at_ns"],
+                                "prev": prev, "erasure_id": erasure_id, "tenant": tenant,
+                                "subject_kind": kind, "subject_digest": subject_digest(&subject),
+                                "generation": generation,
+                            });
+                            if let Some(salt) = salt {
+                                attempt["salt"] = json!(salt);
+                            }
+                            if compute_head(prev, &attempt) == stub["head"] {
+                                return Some(tenant.to_owned());
+                            }
+                        }
+                    }
+                }
+            }
+            None
+        };
+        // The search is sound: given the salt, which only the full entry
+        // carries, it names the erased tenant...
+        assert_eq!(guess(full["salt"].as_str()).as_deref(), Some("bigco"));
+        // ...and from the stub alone it names nobody.
+        assert_eq!(guess(None), None);
+    }
+
+    #[test]
+    fn a_rollback_restore_is_flagged_and_re_erasing_is_ledgered_again() {
+        let dir = temp_dir("rollback");
+        {
+            let store = Store::open(&dir, crate::Config::default()).expect("open");
+            store.ingest(test_span("a1", "acme")).expect("ingest");
+            store.ingest(test_span("b1", "bigco")).expect("ingest");
+            store.pin_generation("before").expect("pin");
+            store.erase(trace_subject("a1", "acme")).expect("erase");
+            store.erase(trace_subject("b1", "bigco")).expect("erase");
+            let verification = store.verify_ledger().expect("verify");
+            assert!(verification.intact, "{verification:?}");
+        }
+
+        // Rewind: the pin from before both erasures, restored in place. The
+        // tombstone log goes back with it and the data comes back; the
+        // ledger stays, as it must — and still records both erasures.
+        let store = Store::restore(&dir, dir.join("pins/before"), crate::Config::default())
+            .expect("restore");
+        let verification = store.verify_ledger().expect("verify");
+        assert!(!verification.intact);
+        assert!(
+            verification.generation.matches_ledger,
+            "the install is ledgered"
+        );
+        let undone = |problems: &[String]| {
+            problems
+                .iter()
+                .filter(|problem| problem.contains("holds no settled erasure"))
+                .count()
+        };
+        assert_eq!(
+            undone(&verification.problems),
+            2,
+            "{:?}",
+            verification.problems
+        );
+        // acme's pack keeps acme's finding and withholds bigco's, saying
+        // only that something outside the tenant was withheld.
+        let scoped = verification.clone().scoped("acme");
+        assert!(!scoped.intact);
+        assert_eq!(undone(&scoped.problems), 1, "{:?}", scoped.problems);
+        assert!(
+            scoped
+                .problems
+                .iter()
+                .any(|problem| problem.starts_with("1 problem(s) about data outside this tenant")),
+            "{:?}",
+            scoped.problems
+        );
+        assert!(!format!("{:?}", scoped.problems).contains("bigco"));
+
+        // Re-applying them: the rewound log reuses the ids, and the subjects
+        // are the same — but each is a new publication, and is ledgered.
+        let again = store.erase(trace_subject("a1", "acme")).expect("re-erase");
+        store.erase(trace_subject("b1", "bigco")).expect("re-erase");
+        let acme: Vec<Value> = store
+            .ledger_entries(None, MAX_PAGE)
+            .expect("entries")
+            .into_iter()
+            .filter(|entry| entry["kind"] == "erasure" && entry["tenant"] == "acme")
+            .collect();
+        assert_eq!(acme.len(), 2, "{acme:?}");
+        assert_eq!(
+            acme[0]["erasure_id"], acme[1]["erasure_id"],
+            "the id is reused"
+        );
+        assert_eq!(acme[0]["subject_digest"], acme[1]["subject_digest"]);
+        assert_ne!(acme[0]["generation"], acme[1]["generation"]);
+        assert_eq!(
+            acme[1]["generation"],
+            json!(again.settle.as_ref().expect("settled").generation)
+        );
+        let verification = store.verify_ledger().expect("verify");
+        assert!(verification.intact, "{verification:?}");
+        drop(store);
+
+        // The reconcile recognizes each publication: a reopen appends none.
+        let store = Store::open(&dir, crate::Config::default()).expect("reopen");
+        assert_eq!(
+            kinds(&store)
+                .iter()
+                .filter(|kind| *kind == "erasure")
+                .count(),
+            4
+        );
+    }
+
+    #[test]
+    fn a_failed_append_never_fails_what_it_records_and_the_next_checkpoint_catches_up() {
+        let dir = temp_dir("failing");
+        let store = Store::open(&dir, crate::Config::default()).expect("open");
+        store.ingest(test_span("t1", "")).expect("ingest");
+        let path = dir.join(LOG_NAME);
+        let saved = fs::read(&path).expect("ledger");
+        // A ledger nobody can append to — on every platform, as root too: a
+        // directory where the file was.
+        fs::remove_file(&path).expect("remove");
+        fs::create_dir(&path).expect("a directory in its place");
+
+        let published = store
+            .checkpoint()
+            .expect("a committed checkpoint is reported as committed");
+        assert_eq!(store.live_generation(), published);
+        let erased = store
+            .erase(trace_subject("t1", ""))
+            .expect("the erasure settles");
+        let settle = erased.settle.clone().expect("settled");
+        assert!(
+            store
+                .erasures()
+                .expect("erasures")
+                .iter()
+                .all(|status| status.settle.is_some()),
+            "nothing is left pending, so no barrier keeps dropping spans"
+        );
+        store
+            .pin_generation("during")
+            .expect("a pin is a backup, ledger or not");
+        assert!(
+            !dir.join("pins/during").join(LOG_NAME).exists(),
+            "no copy rather than one that does not end on the pinned checkpoint"
+        );
+
+        // Appendable again. Until the ledger catches up, verification says
+        // what is missing and why.
+        fs::remove_dir(&path).expect("rmdir");
+        fs::write(&path, &saved).expect("put the ledger back");
+        let verification = store.verify_ledger().expect("verify");
+        assert!(!verification.intact);
+        assert!(!verification.generation.matches_ledger);
+        let problems = format!("{:?}", verification.problems);
+        assert!(problems.contains("ledger append(s) failed"), "{problems}");
+        assert!(
+            problems.contains("is newer and not ledgered yet"),
+            "{problems}"
+        );
+
+        // The next checkpoint ledgers its generation and the erasure whose
+        // entry failed, and the failure clears.
+        store.checkpoint().expect("checkpoint");
+        let verification = store.verify_ledger().expect("verify");
+        assert!(verification.intact, "{verification:?}");
+        let entries = store.ledger_entries(None, MAX_PAGE).expect("entries");
+        let tail: Vec<&str> = entries[entries.len() - 2..]
+            .iter()
+            .map(|entry| entry["kind"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(tail, ["checkpoint", "erasure"]);
+        let last = &entries[entries.len() - 1];
+        assert_eq!(last["erasure_id"], json!(erased.erase.id));
+        assert_eq!(last["generation"], json!(settle.generation));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_ledger_open_cannot_append_to_does_not_stop_the_store() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("readonly");
+        {
+            let store = Store::open(&dir, crate::Config::default()).expect("open");
+            store.ingest(test_span("t1", "")).expect("ingest");
+            store.checkpoint().expect("checkpoint");
+        }
+        // The last checkpoint's entry lost, as a crash before its append
+        // loses it — so the reopen has something to ledger — and a ledger
+        // the server may read but not write.
+        let path = dir.join(LOG_NAME);
+        let all = lines(&dir);
+        fs::write(&path, all[..all.len() - 1].join("\n") + "\n").expect("truncate");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).expect("chmod");
+        if OpenOptions::new().append(true).open(&path).is_ok() {
+            eprintln!(
+                "SKIPPED: this user can write a read-only file (root?); \
+                 the open-time append failure was not exercised"
+            );
+            return;
+        }
+        let store = Store::open(&dir, crate::Config::default())
+            .expect("a ledger it cannot append to does not stop the store");
+        let verification = store.verify_ledger().expect("verify");
+        assert!(!verification.intact);
+        assert!(
+            verification
+                .problems
+                .iter()
+                .any(|problem| problem.contains("reconciling at open")),
+            "{:?}",
+            verification.problems
+        );
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("chmod");
+        store.checkpoint().expect("checkpoint");
+        let verification = store.verify_ledger().expect("verify");
+        assert!(verification.intact, "{verification:?}");
+    }
+
+    #[test]
+    fn readers_stop_at_the_snapshot_and_the_next_append_cuts_off_a_partial_line() {
+        let dir = temp_dir("partial");
+        let store = Store::open(&dir, crate::Config::default()).expect("open");
+        let before = store.ledger_head().expect("head");
+        // Half a line past the chain: what a reader racing an append in
+        // flight would meet at EOF, or what a failed append leaves when its
+        // own rollback fails too.
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(dir.join(LOG_NAME))
+            .expect("append");
+        file.write_all(b"{\"seq\":2,\"kind\":\"anch")
+            .expect("partial");
+        drop(file);
+
+        let verification = store.verify_ledger().expect("verify");
+        assert!(verification.intact, "{verification:?}");
+        assert_eq!(verification.head.as_deref(), Some(before.head.as_str()));
+        let pack = store.evidence(None, None, None).expect("pack");
+        let ledger = &pack["ledger"];
+        assert_eq!(ledger["entries_unreadable"], json!(0));
+        assert_eq!(ledger["entries"].as_array().expect("entries").len(), 2);
+        assert_eq!(ledger["verification"]["head"], ledger["head"]["head"]);
+        let (head, page) = store.ledger_page(None, MAX_PAGE).expect("page");
+        assert_eq!(head.seq, before.seq);
+        assert_eq!(page.len(), 2);
+
+        // The next append cuts the partial line off before writing its own.
+        store.checkpoint().expect("checkpoint");
+        let text = fs::read_to_string(dir.join(LOG_NAME)).expect("read");
+        assert!(!text.contains("anch"), "{text}");
+        let report = verify_chain(&dir.join(LOG_NAME), None).expect("verify");
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
+    }
+
+    #[test]
+    fn verification_stays_intact_while_anchors_append_concurrently() {
+        let dir = temp_dir("concurrent");
+        let store = Store::open(&dir, crate::Config::default()).expect("open");
+        let genesis: Entry = serde_json::from_str(&lines(&dir)[0]).expect("genesis");
+        std::thread::scope(|scope| {
+            let appender = scope.spawn(|| {
+                // Wide lines, so a read to EOF would routinely meet one
+                // half-written.
+                for _ in 0..200 {
+                    store
+                        .anchor_ledger(anchor_request(0, &genesis.head, Some("x".repeat(4096))))
+                        .expect("anchor");
+                }
+            });
+            for _ in 0..20 {
+                let verification = store.verify_ledger().expect("verify");
+                assert!(verification.intact, "{:?}", verification.problems);
+                let (head, page) = store.ledger_page(None, MAX_PAGE).expect("page");
+                assert!(page
+                    .iter()
+                    .all(|entry| entry["seq"].as_u64().is_some_and(|seq| seq <= head.seq)));
+            }
+            appender.join().expect("appender");
+        });
+        assert!(store.verify_ledger().expect("verify").intact);
+    }
+
+    #[test]
+    fn a_pin_copy_ends_on_its_checkpoint_whatever_was_appended_after() {
+        let dir = temp_dir("pincopy");
+        let ledger = Ledger::open(&dir).expect("open");
+        ledger.record_checkpoint(5, digest(5)).expect("cp");
+        // An erasure and an anchor landing after the pinned checkpoint, as
+        // they can between a pin's checkpoint and its copy (neither takes
+        // the locks a pin holds).
+        ledger
+            .record_erasure(1, &trace_subject("t1", ""), 5)
+            .expect("erasure");
+        let tip = ledger.head().expect("head");
+        ledger
+            .anchor(anchor_request(tip.seq, &tip.head, None))
+            .expect("anchor");
+
+        let target = dir.join("copy.jsonl");
+        assert!(ledger.copy_through_checkpoint(5, &target).expect("copy"));
+        let copied = fs::read_to_string(&target).expect("copied");
+        assert!(copied.ends_with('\n'));
+        assert_eq!(copied.lines().count(), 2);
+        let last: Value =
+            serde_json::from_str(copied.lines().last().expect("a line")).expect("entry");
+        assert_eq!(last["kind"], "checkpoint");
+        assert_eq!(last["generation"], json!(5));
+
+        // A generation whose entry is not the latest checkpoint: no copy.
+        let none = dir.join("none.jsonl");
+        assert!(!ledger.copy_through_checkpoint(6, &none).expect("copy"));
+        assert!(!none.exists());
+
+        // The bound survives a reopen: it is recomputed from the scan.
+        drop(ledger);
+        let ledger = Ledger::open(&dir).expect("reopen");
+        let again = dir.join("again.jsonl");
+        assert!(ledger.copy_through_checkpoint(5, &again).expect("copy"));
+        assert_eq!(
+            fs::read(&again).expect("again"),
+            fs::read(&target).expect("copy")
+        );
+    }
+
+    #[test]
+    fn an_evidence_pack_states_its_caps_and_counts_what_it_cannot_place() {
+        let dir = temp_dir("caps");
+        {
+            let store = Store::open(&dir, crate::Config::default()).expect("open");
+            for trace in ["t1", "t2"] {
+                store.ingest(test_span(trace, "")).expect("ingest");
+            }
+            for trace in ["t1", "t2"] {
+                store.erase(trace_subject(trace, "")).expect("erase");
+            }
+        }
+        // A damaged line inside the chain, right after the genesis: a JSON
+        // object with no seq. It must neither end the scan nor vanish.
+        let mut all = lines(&dir);
+        all.insert(1, "{\"kind\":\"checkpoint\"}".to_owned());
+        fs::write(dir.join(LOG_NAME), all.join("\n") + "\n").expect("write");
+
+        let store = Store::open(&dir, crate::Config::default()).expect("reopen");
+        let pack = store.evidence(None, None, None).expect("pack");
+        let ledger = &pack["ledger"];
+        // Six readable entries (the genesis, the first open's checkpoint,
+        // and a checkpoint and an erasure per erasure), capped.
+        assert_eq!(
+            ledger["entries"].as_array().expect("entries").len(),
+            EVIDENCE_MAX_ENTRIES
+        );
+        assert_eq!(ledger["entries_truncated"], json!(true));
+        assert_eq!(ledger["entries_unreadable"], json!(1));
+        assert_eq!(ledger["verification"]["intact"], json!(false));
+
+        let erasures = pack["erasures"].as_array().expect("erasures");
+        assert_eq!(erasures.len(), 2);
+        assert!(erasures[0]["conclusive"].is_boolean());
+        assert_eq!(erasures[0]["result"], "erased");
+        assert_eq!(
+            erasures[1]["conclusive"],
+            Value::Null,
+            "past the receipt cap"
+        );
+        assert_eq!(erasures[1]["result"], Value::Null);
     }
 }

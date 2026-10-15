@@ -78,11 +78,19 @@ a dataset export meant only part of a session's state.
 
 A pin also carries `ledger.jsonl`: the store's [ledger](../guide/ledger.md)
 as of the pin, ending with the checkpoint entry whose `manifest_sha256` is the
-SHA-256 of the pin's `state-manifest.json`. It is evidence that travels with
+SHA-256 of the pin's `state-manifest.json` — an erasure or anchor appended
+while the pin was being built is left out. It is evidence that travels with
 the backup, not state: it is not manifested, pin verification ignores it, and
 a restore does not install it — the restored store keeps the ledger already in
 its data directory, or starts a new chain in an empty one, and ledgers the
-installed generation either way.
+installed generation either way. If the ledger could not record the pinned
+generation (a failed append, which `GET /v1/ledger/verify` reports), the pin
+is still taken and carries no `ledger.jsonl`.
+
+Restoring a pin taken before an erasure **undoes that erasure**: the
+subject's data comes back with the pre-erasure tombstone log. The ledger
+still records the erasure, and its verification names the entry until the
+erasure is applied again.
 
 ## Verifying
 

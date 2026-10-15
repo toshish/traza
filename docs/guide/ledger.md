@@ -35,6 +35,9 @@ Read this section before relying on the ledger for anything.
 - **A known erasure was recorded.** Anyone who knows an erasure's subject
   can recompute its `subject_digest` and find the entry, and the chain shows
   where it sits relative to the generations around it.
+- **A recorded erasure still holds.** Verification checks every ledgered
+  erasure's subject against the live tombstone log and names any that no
+  longer has a settled erasure there (see the restore bullet below).
 
 **It does not prove:**
 
@@ -62,7 +65,21 @@ Read this section before relying on the ledger for anything.
   timestamp.
 - **That an erasure subject stays secret.** A `subject_digest` hides the
   subject from someone who does not know it. A guessable subject, such as a
-  short or sequential session id, can still be confirmed by guessing.
+  short or sequential session id, can still be confirmed by guessing by
+  anyone who sees the full entry (unbound credentials). For a tenant subject
+  the entry's `tenant` field is the tenant's name.
+- **That an erasure was never undone.** Restoring a pin taken before an
+  erasure brings the subject's data back, together with the tombstone log as
+  it was. The chain records the install as an ordinary `checkpoint` entry.
+  Verification catches it only by comparing the ledgered erasure against the
+  live tombstone log; it names the entry as no longer holding until the
+  erasure is re-applied. An erasure re-applied after such a restore gets a
+  new entry. Its `erasure_id` can repeat an earlier entry's (the tombstone log
+  was rewound), but its `generation` will not.
+- **That other tenants learn nothing.** A tenant's evidence pack shows when
+  other tenants' erasures were ledgered: each one is a stub with its `seq` and
+  `at_ns`. `GET /v1/ledger/head`, open to bound credentials, also shows when
+  the chain grows. Neither shows whose erasure it was or what it covered.
 
 ## The chain
 
@@ -82,7 +99,7 @@ Each kind then adds its own fields:
 |---|---|---|
 | `genesis` | `store_id`: 32 random hex characters | The ledger is first opened |
 | `checkpoint` | `generation`, `manifest_sha256` | A published generation's manifest differs from the last one ledgered: every checkpoint, backup pin, erasure publication, restore install and format migration |
-| `erasure` | `erasure_id`, `tenant` (`""` for the default tenant, `null` for a store-global payload subject), `subject_kind`, `subject_digest` | An erasure settles |
+| `erasure` | `erasure_id`, `tenant` (`""` for the default tenant, `null` for a store-global payload subject), `subject_kind`, `subject_digest`, `generation` (the generation that published the erasure), `salt` (32 random hex characters) | An erasure settles |
 | `anchor` | `target_seq`, `target_head`, `authority`, `anchored_at_ns`, `signature`, `public_key`, `note` (optional) | [`POST /v1/ledger/anchors`](http-api.md#post-v1ledgeranchors) accepts one |
 
 The head is:
@@ -94,7 +111,21 @@ head = sha256("traza-ledger/1\n" + prev + "\n" + canonical_json(entry without "h
 The hash is SHA-256 in lowercase hex. Canonical JSON means object keys
 sorted, no whitespace, standard JSON string escaping (with non-ASCII left
 as-is), and integers in decimal. Entries carry only strings, integers and
-`null`, so any standard JSON library produces the same bytes.
+`null`, so any JSON library that parses integers exactly produces the same
+bytes. Python's `json` module does. JavaScript's `JSON.parse` does not: every
+`at_ns` and `anchored_at_ns` is around 1.8 × 10^18, above 2^53, and parsing
+them as doubles rounds them, so the recomputed heads and pack digests will
+not match. In JavaScript, use a parser that keeps big integers exact (as
+`BigInt` or as their source text); any other doubles-only parser has the same
+problem.
+
+The `salt` in an erasure entry is there for tenant isolation. A tenant's
+evidence pack shows other tenants' erasure entries as stubs without it, and
+without the salt the stub's head can't be recomputed. Every other field that
+goes into that head can be guessed: the erasure id is a small integer, the
+subject kind is one of five, and a tenant subject's digest depends only on
+the tenant's name. Without the salt, a tenant could try candidate neighbours
+until a head matched.
 
 The other two digests:
 
@@ -120,17 +151,25 @@ an entry with no fact. The next open reconciles that. If the latest checkpoint
 entry names a different manifest from the live one, it ledgers the live
 generation, and it ledgers every settled erasure the chain does not yet carry.
 The same reconcile ledgers generations published while no store was open,
-such as a restore's install. If an append fails because of an I/O error, the
-checkpoint or erasure reports that error, but what it recorded stays
-published. A generation whose entry failed is then missing from the chain;
-the next checkpoint or restart ledgers whichever generation is live by then.
-An erasure whose entry failed is ledgered at the next open.
+such as a restore's install.
+
+**A failed append never fails what it records.** If an append fails, for
+example on a full disk or a `ledger.jsonl` the server may not write, the
+checkpoint, erasure, backup pin or open it belongs to still succeeds. The
+generation is already published, and the erasure is settled with its
+admission barrier lifted. Verification reports the failure (`ledger
+append(s) failed since …`) until the ledger catches up. The next checkpoint
+ledgers the generation that is live by then, along with every settled
+erasure the chain lacks. A generation published while appends were failing
+may never get an entry of its own; only the live one is ledgered.
 
 **Damage never stops the store.** At open, Traza truncates a torn final append
 (an unterminated line that does not parse, which is what a crash mid-write
 leaves), just as it does for the other append-only logs. Anything else is left
 exactly as found: the store keeps appending after the last entry it can read,
-and verification names every break.
+and verification names every break. The one thing that stops an open is a
+`ledger.jsonl` the server cannot **read**. Without the tip, an append would
+start a second chain rather than extend the first.
 
 ## Recomputing the heads yourself
 
@@ -168,7 +207,7 @@ notary's own tools.
 ## Verifying
 
 `GET /v1/ledger/verify` and `traza-server verify --ledger` each perform
-three checks:
+these checks:
 
 1. Recompute every head and check every link. Entries are checked as generic
    JSON, so a field added by hand breaks the head, and every problem names its
@@ -177,18 +216,38 @@ three checks:
    manifest digest.
 3. Re-digest every file the live manifest names. This is the same check as
    [`GET /v1/verify`](http-api.md#get-v1verify).
+4. Check that the subject of every erasure entry still has a settled erasure
+   in the live tombstone log. Restoring a pin taken before an erasure fails
+   this check, and the problem names the entry until the erasure is applied
+   again.
+5. Report any ledger append that failed and has not been caught up
+   (`GET /v1/ledger/verify` only, since a fresh offline process has no record
+   of a running server's failures).
 
 ```json
-{"entries":5,"head":"13c3…","intact":true,"problems":[],
+{"entries":5,"head":"34e6…","intact":true,"problems":[],
  "generation":{"id":3,"manifest_sha256":"97bc…","matches_ledger":true,
                "files_verified":true,"verified_at_ns":1792061580401844000}}
 ```
 
-`intact` is true only when all three checks pass.
+`intact` is true only when every check passes.
+
+**A live generation newer than the chain.** Suppose the latest checkpoint
+entry names an older generation than the live one. That is exactly what
+appears if the server crashed, or an append failed, between publishing a
+generation and ledgering it, or if a restore installed a generation that no
+store has opened since. The problem says so. The next open (or, on a live
+server, the next checkpoint) ledgers the live generation and clears it. Any
+other cause is a discrepancy to investigate. It still counts against
+`intact`, because until that entry exists nothing commits the chain to the
+live state.
 
 **What it costs.** The file check reads every manifested byte, so the cost
 grows with store size. It runs under the maintenance lock, so compaction,
-expiry and checkpoints wait for it to finish.
+expiry and checkpoints wait for it to finish. Erasure and anchor appends do
+not wait: the chain is read only up to the tip as it stood when the check
+began, so an entry appended mid-check is left for the next check rather than
+read half-written.
 
 **After compaction or expiry.** Both replace segment files between
 checkpoints. Until the next checkpoint publishes, the live manifest can name
@@ -204,9 +263,12 @@ traza-server verify --ledger --data-dir /var/lib/traza [--json]
 It exits `0` when intact, `2` when anything is broken (every problem printed),
 and `1` when it cannot verify at all: the directory is not a store, or a live
 server owns it. It is read-only. It takes the directory lock and reads
-`CURRENT`, the manifest, the files and the ledger exactly as they are. It runs
-no recovery and appends nothing, because appending is the very thing under
-examination.
+`CURRENT`, the manifest, the files, the tombstone log and the ledger exactly
+as they are. It runs no recovery and appends nothing, because appending is the
+very thing under examination. One consequence: on a store that crashed between
+publishing a generation and ledgering it, it exits `2` with the
+newer-than-the-chain problem above. Start the server (or open the store) once,
+and the generation is ledgered.
 
 ## Anchoring
 
@@ -225,7 +287,7 @@ into the chain:
 curl -X POST http://localhost:8080/v1/ledger/anchors \
   -H "Authorization: Bearer $ADMIN" -d '{
     "target_seq": 4,
-    "target_head": "13c3f1df2ba7c1fadf6d7d966a0d19d25be4a6c1c2e9d3ead88f9fade0f43524",
+    "target_head": "34e64ba565ed353f7db1ab6f1e9611b8815053c45548c22b9827d2c3dfc415e5",
     "authority": "notary.example",
     "anchored_at_ns": 1792061622000000000,
     "signature": "MEUCIQ…",
@@ -234,9 +296,15 @@ curl -X POST http://localhost:8080/v1/ledger/anchors \
 ```
 
 The route answers `201` with the appended entry. It answers `409` when
-`target_head` is not the head recorded at `target_seq`, including when that
-seq does not exist yet. An anchor can name any earlier entry, not just the
-tip.
+`target_head` is not the head recorded at `target_seq`. That includes a
+`target_head` that is not 64 lowercase hex characters, and a seq that does
+not exist yet. An anchor can name any earlier entry, not just the tip.
+
+**Anchors are visible to every tenant.** An anchor entry appears whole in
+every tenant's evidence pack, `authority` and `note` included, because it is
+what lets a tenant's auditor check the chain with the notary. Keep anything
+tenant-specific (a customer's name in a note, for instance) out of anchor
+fields.
 
 Anchor as often as you need to be able to detect a rewrite. Anything committed
 after your most recent anchor is protected only by the chain, which, as stated
@@ -254,6 +322,7 @@ above, has no secret.
 | `window` | `{"since_ns","until_ns"}`; the defaults are the epoch and now |
 | `ledger.head` | The tip, as `GET /v1/ledger/head` reports it |
 | `ledger.entries` | Entries whose `at_ns` falls in the window, up to the head and at most 10,000. `ledger.entries_truncated` says whether more exist; page through the rest with `GET /v1/ledger` |
+| `ledger.entries_unreadable` | How many of the chain's lines the pack could not place: not a JSON object, or no integer `seq` or `at_ns`. The verification names each one |
 | `ledger.verification` | The verify document above |
 | `retention` | `{"ttl_seconds","source"}`. `source` is `tenant` (a `--tenant-ttl` override), `global` (`--ttl-seconds`) or `none`. `ttl_seconds` is `null` whenever data is kept forever |
 | `usage` | `null` in this build |
@@ -266,12 +335,25 @@ Naming a different tenant gets `403`. An unbound caller can name a tenant
 (`tenant=` with an empty value means the default tenant) or leave it out to get
 the whole store.
 
+`ledger.head`, `ledger.entries` and `ledger.verification` come from one
+snapshot of the chain. No entry in the pack is newer than the head it
+reports, and the verification covers exactly that chain.
+
 A tenant's pack contains only that tenant's activity and erasures. Other
-tenants' erasure entries become stubs that keep `seq`, `kind`, `at_ns`, `prev`
-and `head`, plus `"redacted": true`. The chain can still be followed across a
-stub, but you cannot recompute the stub's own head or tell whose erasure it
-was. File problems in a tenant pack's verification are reduced to a count,
-because they would otherwise name store-wide files.
+tenants' erasure entries (and store-global payload erasures) become stubs
+that keep `seq`, `kind`, `at_ns`, `prev` and `head`, plus `"redacted": true`.
+The chain can still be followed across a stub. You cannot recompute the
+stub's own head, because its `salt` is withheld, and you cannot tell whose
+erasure it was. The stub does show when it was ledgered (see
+[what it does not prove](#what-it-proves-and-what-it-does-not)). The tenant's
+own erasure entries are whole, salt included, so they recompute. Anchor
+entries are whole in every pack ([Anchoring](#anchoring)).
+
+The verification in a tenant's pack keeps the chain's problems and the
+tenant's own. File problems are reduced to a count, because they would
+otherwise name store-wide files. Problems about other tenants' erasures are
+withheld behind a count that does not say whose. `intact` is the store's
+verdict either way: a pack never reports a store intact when it isn't.
 
 **Bounds.** Activity comes from the same fold the analytics use, so the query
 deadline (`--query-deadline-ms`) applies. A window too large to fold within it
@@ -316,15 +398,26 @@ Have the notary sign `digest`. To tie the pack into the chain itself, anchor
 A backup pin (`POST /v1/backups/{label}`) copies the ledger into the pin
 directory as `pins/<label>/ledger.jsonl`, next to `state-manifest.json`. The
 last entry of that copy is the checkpoint for the pinned generation, and its
-`manifest_sha256` is the SHA-256 of the pin's `state-manifest.json`. The
-backup therefore carries its own evidence. Pin verification ignores the copy,
-because it is not manifested.
+`manifest_sha256` is the SHA-256 of the pin's `state-manifest.json`. An
+erasure or anchor appended while the pin was being built is left out of the
+copy. The backup therefore carries its own evidence. Pin verification ignores
+the copy, because it is not manifested. If the ledger could not record the
+pinned generation (a failed append, which verification reports), the pin is
+still taken and carries no `ledger.jsonl`. A copy that ended anywhere else
+would misstate what it evidences.
 
 A restore does not install a backup's ledger. Restoring into a directory that
 already has a ledger continues that chain. Restoring into an empty directory
 starts a new chain with a new `store_id`. Either way, the installed generation
 is ledgered at the first open. Keep the backup's `ledger.jsonl` alongside it
 if you need the source store's history.
+
+**Restoring an earlier pin can undo erasures.** A pin taken before an
+erasure holds the subject's data and the tombstone log from before the
+erasure. Restore it into the same directory and both come back, while the
+chain keeps the erasure's entry. Verification names that entry until you
+apply the erasure again. The re-application is ledgered as a new entry with
+the same subject, often the same `erasure_id`, and a later `generation`.
 
 An object-storage archive published from a pin does not carry the ledger
 copy. It archives manifested files only.
@@ -339,3 +432,10 @@ copy. It archives manifested files only.
 - **No rotation.** The ledger grows by one line per published generation,
   forever. Every open reads it in full to find the tip and the erasures already
   ledgered.
+- **Anchor signatures are stored, never checked.** See
+  [what it does not prove](#what-it-proves-and-what-it-does-not).
+- **A failed append is caught up, not retried immediately.** The next
+  checkpoint (every five minutes on the server) or the next open ledgers what
+  it missed. Until then, verification reports the failure.
+- **Verification right after compaction or expiry** reports files as missing
+  until the next checkpoint. See [Verifying](#verifying).

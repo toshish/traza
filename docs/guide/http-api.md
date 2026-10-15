@@ -1422,7 +1422,8 @@ write-ahead log, segments, annotations, **eval records**, payload files,
 derived caches, pins, generation metadata, the tombstone log itself
 (retained by design: the record of the erasure is what this receipt verifies
 against), and the [ledger](ledger.md) (retained by design: its erasure entry
-carries a digest of the subject, never the subject's identifiers).
+carries a digest of the subject, never a trace, span or session id or a
+payload reference — though a tenant subject's name is the entry's `tenant`).
 
 The `eval-records` domain sits between annotations and payloads, and what it
 reports depends on the subject:
@@ -1516,9 +1517,17 @@ curl 'http://localhost:8080/v1/ledger?after=2'
 ```json
 {"entries":[
   {"at_ns":1792061585524084000,"generation":3,"head":"eb5610460e9657ed3ec706d3831bbff1ee732b9cc6f3365f55519f769d752ac9","kind":"checkpoint","manifest_sha256":"97bcc77723139e1d84ac46f786ee85152e6be3ce0d35938d797c85b33429b983","prev":"0dee27bf2cb8dd9fb141908e863e72dfb6964515b564eeb27bb824eac34adf45","seq":3},
-  {"at_ns":1792061585533710000,"erasure_id":1,"head":"13c3f1df2ba7c1fadf6d7d966a0d19d25be4a6c1c2e9d3ead88f9fade0f43524","kind":"erasure","prev":"eb5610460e9657ed3ec706d3831bbff1ee732b9cc6f3365f55519f769d752ac9","seq":4,"subject_digest":"f6b6db7b0f95581e281ebdcc1eef0310d01ce2a791289e32e6cdddb8e40e7142","subject_kind":"session","tenant":""}],
- "head":{"head":"13c3f1df2ba7c1fadf6d7d966a0d19d25be4a6c1c2e9d3ead88f9fade0f43524","seq":4}}
+  {"at_ns":1792061585533710000,"erasure_id":1,"generation":3,"head":"34e64ba565ed353f7db1ab6f1e9611b8815053c45548c22b9827d2c3dfc415e5","kind":"erasure","prev":"eb5610460e9657ed3ec706d3831bbff1ee732b9cc6f3365f55519f769d752ac9","salt":"9f1c27e04b6a5d83c0e2f7a14b98d635","seq":4,"subject_digest":"f6b6db7b0f95581e281ebdcc1eef0310d01ce2a791289e32e6cdddb8e40e7142","subject_kind":"session","tenant":""}],
+ "head":{"head":"34e64ba565ed353f7db1ab6f1e9611b8815053c45548c22b9827d2c3dfc415e5","seq":4}}
 ```
+
+An erasure entry's `generation` is the generation that published it, and its
+`salt` is 32 random hex characters inside its head, so a tenant shown only a
+stub of the entry (see [`GET /v1/evidence`](#get-v1evidence)) cannot
+recompute that head for a guessed subject. `head` and `entries` come from one
+snapshot, so no entry in a page is past the head reported with it. Timestamps
+exceed 2^53: parse them with an exact integer type (a JavaScript client needs
+a lossless parser) or recomputed heads will not match.
 
 A line that does not parse is skipped here and named by
 [`GET /v1/ledger/verify`](#get-v1ledgerverify). Errors: `400` for a `limit`
@@ -1540,21 +1549,31 @@ new id.
 ### `GET /v1/ledger/verify`
 
 Recomputes every head and link, checks that the latest checkpoint entry
-names the live generation's manifest digest, and re-digests every file that
-manifest names (the [`GET /v1/verify`](#get-v1verify) check). Unbound
-credentials only. Always `200` — the verdict is the body:
+names the live generation's manifest digest, re-digests every file that
+manifest names (the [`GET /v1/verify`](#get-v1verify) check), checks that
+every ledgered erasure's subject still has a settled erasure in the live
+tombstone log, and reports any ledger append that failed and has not been
+caught up. Unbound credentials only. Always `200` — the verdict is the body:
 
 ```json
-{"entries":5,"generation":{"files_verified":true,"id":3,"manifest_sha256":"97bcc77723139e1d84ac46f786ee85152e6be3ce0d35938d797c85b33429b983","matches_ledger":true,"verified_at_ns":1792061580401844000},"head":"13c3f1df2ba7c1fadf6d7d966a0d19d25be4a6c1c2e9d3ead88f9fade0f43524","intact":true,"problems":[]}
+{"entries":5,"generation":{"files_verified":true,"id":3,"manifest_sha256":"97bcc77723139e1d84ac46f786ee85152e6be3ce0d35938d797c85b33429b983","matches_ledger":true,"verified_at_ns":1792061580401844000},"head":"34e64ba565ed353f7db1ab6f1e9611b8815053c45548c22b9827d2c3dfc415e5","intact":true,"problems":[]}
 ```
 
-`intact` requires all three checks. `problems` names each break by entry —
-`seq 2: head does not match its contents (recorded 0dee…, recomputed 9edc…)`
-— or by file, prefixed with the generation. The file check reads every
-manifested byte under the maintenance lock, so it costs O(store) like
-`GET /v1/verify`. Compaction and expiry replace files between checkpoints,
-so until the next checkpoint the live manifest can name files that are gone,
-reported as missing; `POST /v1/checkpoint` first for a clean check.
+`intact` requires every check to pass. `problems` names each break by entry
+— `seq 2: head does not match its contents (recorded 0dee…, recomputed
+9edc…)` — or by file, prefixed with the generation. A ledgered erasure whose
+subject the live tombstone log no longer records as erased (what restoring a
+pin from before the erasure does) is named by its entry until the erasure is
+re-applied. A live generation newer than the latest checkpoint entry is
+reported as not ledgered yet: a crash or a failed append between publishing
+and ledgering leaves exactly that, and the next open or checkpoint ledgers
+it. The file check reads every manifested byte under the maintenance lock,
+so it costs O(store) like `GET /v1/verify`; the chain is read up to a
+snapshot taken under that lock, so an erasure or anchor appended mid-check is
+left for the next one rather than read half-written. Compaction and expiry
+replace files between checkpoints, so until the next checkpoint the live
+manifest can name files that are gone, reported as missing;
+`POST /v1/checkpoint` first for a clean check.
 
 The same verification runs offline, read-only, against a directory no live
 server owns:
@@ -1565,7 +1584,9 @@ traza-server verify --ledger --data-dir /var/lib/traza [--json]
 
 Exits `0` when intact, `2` when anything is broken (every problem printed),
 `1` when it cannot verify at all — not a data directory, or owned by a live
-server.
+server. It never opens the store, so a store that crashed between publishing
+a generation and ledgering it exits `2` with the not-ledgered-yet problem
+until its next open ledgers the generation.
 
 ### `POST /v1/ledger/anchors`
 
@@ -1577,7 +1598,7 @@ names any other field.
 ```sh
 curl -X POST http://localhost:8080/v1/ledger/anchors -d '{
   "target_seq":4,
-  "target_head":"13c3f1df2ba7c1fadf6d7d966a0d19d25be4a6c1c2e9d3ead88f9fade0f43524",
+  "target_head":"34e64ba565ed353f7db1ab6f1e9611b8815053c45548c22b9827d2c3dfc415e5",
   "authority":"notary.example","anchored_at_ns":1,
   "signature":"s","public_key":"k","note":"q3"}'
 ```
@@ -1585,18 +1606,24 @@ curl -X POST http://localhost:8080/v1/ledger/anchors -d '{
 `201`, with the appended entry:
 
 ```json
-{"anchored_at_ns":1,"at_ns":1792061622506982000,"authority":"notary.example","head":"e1fc54ba6d24717db1eaac15df74031b55b449c2b18e7a57b52d0b86a3aee2d0","kind":"anchor","note":"q3","prev":"13c3f1df2ba7c1fadf6d7d966a0d19d25be4a6c1c2e9d3ead88f9fade0f43524","public_key":"k","seq":5,"signature":"s","target_head":"13c3f1df2ba7c1fadf6d7d966a0d19d25be4a6c1c2e9d3ead88f9fade0f43524","target_seq":4}
+{"anchored_at_ns":1,"at_ns":1792061622506982000,"authority":"notary.example","head":"d3e217800bca9aed7d05ba27d5fe88c954f4e2cc452b5c22ac192001f1547a61","kind":"anchor","note":"q3","prev":"34e64ba565ed353f7db1ab6f1e9611b8815053c45548c22b9827d2c3dfc415e5","public_key":"k","seq":5,"signature":"s","target_head":"34e64ba565ed353f7db1ab6f1e9611b8815053c45548c22b9827d2c3dfc415e5","target_seq":4}
 ```
 
 `signature`, `public_key` and `authority` are stored opaque — Traza does not
 know the scheme and does not check the signature. What it does check is that
 `target_head` is the head recorded at `target_seq`.
 
-Errors: `409` when it is not, or when `target_seq` does not exist yet
+**Every tenant sees anchors whole.** An anchor entry appears unredacted in
+every tenant's evidence pack, `authority` and `note` included — it is what
+lets a tenant's auditor check the chain against the notary. Keep anything
+tenant-specific out of those fields.
+
+Errors: `409` when `target_head` is not the recorded head — including one
+that is not 64 lowercase hex characters, which cannot be — or when
+`target_seq` does not exist yet
 (`{"error":"the ledger has no entry 99 yet; its head is seq 6"}`); `400` for
-a `target_head` that is not 64 lowercase hex characters, an empty
-`authority`/`signature`/`public_key`, a field over 4096 bytes, or an unknown
-field; `403` for an `rw` or bound credential.
+an empty `authority`/`signature`/`public_key`, a field over 4096 bytes, or an
+unknown field; `403` for an `rw` or bound credential.
 
 ### `GET /v1/evidence`
 
@@ -1618,7 +1645,7 @@ Abbreviated (heads and entries elided):
  "engine_version":"0.26.0-preview.1",
  "erasures":[{"conclusive":true,"id":1,"published_at_ns":1792061585528589000,"result":"erased","subject_kind":"session"}],
  "format":"traza-evidence/1","generated_at_ns":1792061592996325000,
- "ledger":{"entries":[…],"entries_truncated":false,"head":{"at_ns":1792061585533710000,"head":"13c3…","seq":4,"store_id":"66022a6e1d87f73e3ba52202b53d1998"},
+ "ledger":{"entries":[…],"entries_truncated":false,"entries_unreadable":0,"head":{"at_ns":1792061585533710000,"head":"34e6…","seq":4,"store_id":"66022a6e1d87f73e3ba52202b53d1998"},
            "verification":{"entries":5,"generation":{…},"head":"…","intact":true,"problems":[]}},
  "retention":{"source":"none","ttl_seconds":null},
  "store_id":"66022a6e1d87f73e3ba52202b53d1998","tenant":null,"usage":null,
@@ -1632,12 +1659,17 @@ too large for `--query-deadline-ms` answers `400`, never a partial pack).
 `erasures` lists those settled in the window with their receipt's
 `conclusive` and `result`; past 32 receipts or the query deadline both are
 `null`. `ledger.entries` holds entries whose `at_ns` is in the window, at
-most 10,000 (`entries_truncated` says whether more exist). `usage` is `null`
-in this build. A tenant's pack shows other tenants' erasure entries only as
-stubs (`seq`, `kind`, `at_ns`, `prev`, `head`, `"redacted": true`) and
-summarizes file problems as a count. The field table, the scoping rules, and
-a stdlib Python check of the digest are in
-[the ledger guide](ledger.md#evidence-packs).
+most 10,000 (`entries_truncated` says whether more exist), and
+`ledger.entries_unreadable` counts the chain's lines the pack could not place
+(not a JSON object, or no integer `seq` or `at_ns`); the verification names
+each. `ledger.head`, `ledger.entries` and `ledger.verification` come from one
+snapshot of the chain. `usage` is `null` in this build. A tenant's pack shows
+other tenants' erasure entries only as stubs (`seq`, `kind`, `at_ns`,
+`prev`, `head`, `"redacted": true` — no `salt`, so the head cannot be
+recomputed for a guessed subject), summarizes file problems as a count, and
+withholds verification problems about other tenants' erasures behind a count;
+anchors appear whole. The field table, the scoping rules, and a stdlib Python
+check of the digest are in [the ledger guide](ledger.md#evidence-packs).
 
 ---
 

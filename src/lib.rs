@@ -5757,7 +5757,10 @@ impl Store {
         // Ledgered last, once the generation is durable: a crash before this
         // leaves a generation without an entry, which the next open's
         // reconcile appends — never an entry for a generation that is not.
-        self.ledger_checkpoint(next)?;
+        // Housekeeping like the sweep: a failed append is kept for
+        // verification and caught up later, never reported as a failed
+        // checkpoint (the generation is committed).
+        self.ledger_checkpoint(next);
         Ok(next)
     }
 
@@ -5850,10 +5853,10 @@ impl Store {
                 }
             }
             generation::write_pin_manifest(&staged, &manifest)?;
-            // The ledger as of this pin, which ends with the checkpoint entry
+            // The ledger as of this pin, ending on the checkpoint entry
             // naming the pinned manifest — evidence that travels with the
             // backup. Never installed by a restore: it is not manifested.
-            self.ledger_copy_into(&staged)?;
+            self.ledger_copy_into(&staged, generation)?;
             Ok(())
         })();
         if let Err(error) = build {
@@ -6431,8 +6434,9 @@ impl Store {
             self.erasures.record_settle(settle.clone())?;
         }
         // Ledgered once the settle is durable; a crash in between is healed
-        // by the next open's reconcile.
-        self.ledger_erasure(record.id, subject)?;
+        // by the next open's reconcile. Never fails the erasure: it is
+        // settled and its barrier lifted, whatever the ledger does.
+        self.ledger_erasure(record.id, subject, generation);
         self.metrics.erasures_settled.increment();
         self.metrics.erasure_spans_removed.add(spans_removed as u64);
         self.metrics.erasure.record(elapsed_nanos(&erasing));
@@ -7367,9 +7371,9 @@ impl Store {
             let mut report = erasure::DomainReport::clear(
                 "ledger",
                 "the erasure's ledger entry, appended once it settles, carries its id, \
-                 subject kind, tenant and a SHA-256 of the subject — never a trace, span \
-                 or session id or a payload reference (a tenant subject's name is its \
-                 tenant field)"
+                 subject kind, tenant, publishing generation and a SHA-256 of the subject \
+                 — never a trace, span or session id or a payload reference (a tenant \
+                 subject's name is its tenant field)"
                     .to_owned(),
             );
             report.result = "retained-by-design".to_owned();
