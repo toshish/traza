@@ -126,6 +126,13 @@ fn validate_pin_directory(root: &Path, manifested: &BTreeSet<String>) -> Result<
             if relative == STATE_MANIFEST_FILE || manifested.contains(&relative) {
                 continue;
             }
+            // Every pin carries a copy of the ledger as evidence of the
+            // history up to it. It is not manifested (the ledger commits to
+            // generations, so no generation can contain it) and is not
+            // archived: only manifested files are packed.
+            if relative == crate::ledger::LOG_NAME {
+                continue;
+            }
             // Name the refusal precisely: live-store artifacts mean "this
             // is not a pin", unmanifested load-bearing files mean "this pin
             // and its manifest disagree" — different operator responses.

@@ -663,7 +663,10 @@ besides loopback)] \
 (stdio bridge: speaks MCP on stdin/stdout and forwards to a running server)\n\
        traza-server verify --erasure ID|latest [--data-dir DIR] [--json] \
 (offline erasure receipt: re-checks every domain and prints the result of each; \
-exits 0 erased-and-conclusive, 3 erased-but-inconclusive, 2 not erased)";
+exits 0 erased-and-conclusive, 3 erased-but-inconclusive, 2 not erased)\n\
+       traza-server verify --ledger [--data-dir DIR] [--json] \
+(offline ledger verification: recomputes every head, checks the latest checkpoint names the \
+live manifest, re-digests its files; read-only; exits 0 intact, 2 broken)";
 
 /// Everything the command line decides, with the profile already resolved
 /// against the explicit flags.
@@ -1108,6 +1111,7 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
 fn run_verify(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut data_dir = PathBuf::from("./data");
     let mut erasure: Option<String> = None;
+    let mut ledger = false;
     let mut as_json = false;
     let mut i = 0;
     while i < args.len() {
@@ -1125,6 +1129,7 @@ fn run_verify(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                         .clone(),
                 );
             }
+            "--ledger" => ledger = true,
             "--json" => as_json = true,
             "--help" | "-h" => {
                 println!("{USAGE}");
@@ -1134,8 +1139,14 @@ fn run_verify(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
         i += 1;
     }
+    if ledger {
+        if erasure.is_some() {
+            return Err("verify takes one of --erasure or --ledger, not both".into());
+        }
+        return run_verify_ledger(&data_dir, as_json);
+    }
     let Some(erasure) = erasure else {
-        return Err("verify requires --erasure <id|latest>".into());
+        return Err("verify requires --erasure <id|latest> or --ledger".into());
     };
 
     let store = match Store::open(&data_dir, Config::default()) {
@@ -1182,6 +1193,39 @@ fn run_verify(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// `traza-server verify --ledger`: the ledger and the live generation,
+/// verified offline and read-only (see [`traza::ledger::verify_offline`]).
+/// Exits 0 when intact, 2 when anything is broken — every problem named, by
+/// entry or by file — and 1 when it cannot verify at all.
+fn run_verify_ledger(
+    data_dir: &std::path::Path,
+    as_json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let verification = match traza::ledger::verify_offline(data_dir) {
+        Ok(verification) => verification,
+        Err(traza::Error::AlreadyOpen) => {
+            return Err(format!(
+                "{} is owned by a live traza-server; ask that server instead: \
+                 GET /v1/ledger/verify returns the same verification",
+                data_dir.display()
+            )
+            .into())
+        }
+        Err(error) => return Err(error.into()),
+    };
+    match as_json {
+        true => println!(
+            "{}",
+            serde_json::to_string_pretty(&verification).unwrap_or_else(|_| "{}".to_owned())
+        ),
+        false => print!("{}", verification.render_text()),
+    }
+    if !verification.intact {
+        std::process::exit(2);
+    }
+    Ok(())
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // `traza-server mcp --url ...` is the stdio bridge, not a server. It opens
@@ -1190,8 +1234,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if args.first().map(String::as_str) == Some("mcp") {
         return run_mcp_bridge(&args[1..]);
     }
-    // `traza-server verify --erasure ...` produces the erasure receipt
-    // offline, against a data directory no live server owns.
+    // `traza-server verify --erasure ...` produces the erasure receipt, and
+    // `verify --ledger` the ledger verification, offline, against a data
+    // directory no live server owns.
     if args.first().map(String::as_str) == Some("verify") {
         return run_verify(&args[1..]);
     }
@@ -1831,6 +1876,9 @@ fn handle_connection(
         // may run, so the method rule's POST-means-write does not apply.
         let is_fuse_check =
             head.method.eq_ignore_ascii_case("POST") && head_path == "/v1/fuses/check";
+        // Anchoring writes into the chain an auditor relies on: admin only,
+        // and (below) unbound only. The rule lives with the routes.
+        let is_ledger_admin = traza::ledger::requires_admin(&head.method, head_path);
         // Store-global operator surfaces. A bound (tenant-scoped) credential
         // is an untrusted principal in a multi-tenant deployment, and these
         // answer with the WHOLE store's numbers and controls — volumes that
@@ -1845,7 +1893,8 @@ fn handle_connection(
                 | "/v1/verify"
                 | "/v1/checkpoint"
                 | "/v1/flush"
-        ) || head_path.starts_with("/v1/backups/");
+        ) || head_path.starts_with("/v1/backups/")
+            || traza::ledger::operator_only(head_path);
         // Backups need `admin` as well as an unbound credential: a pin holds
         // every manifested byte on disk until it is released, so taking one
         // is a capacity decision, not a write.
@@ -1856,7 +1905,11 @@ fn handle_connection(
         // denied to bound and non-admin credentials before anyone remembers
         // to list it.
         let is_admin_surface = head_path == "/v1/admin" || head_path.starts_with("/v1/admin/");
-        let needs_admin = is_erasure_write || is_eval_tombstone || is_backup || is_admin_surface;
+        let needs_admin = is_erasure_write
+            || is_eval_tombstone
+            || is_backup
+            || is_admin_surface
+            || is_ledger_admin;
         // Replay routes are reads under any method, and their call routes
         // also accept the token as `x-api-key`; see `replay_routes`.
         let is_replay = replay_routes::is_replay_path(head_path);
@@ -3404,6 +3457,24 @@ fn serve_request(
                 metrics.query_deadline_exceeded.increment();
             }
             responder.json(reply.status, reply.body)
+        }
+        // The ledger and evidence packs. Routing, parameters and the
+        // evidence pack's tenant binding live in the library beside the
+        // ledger; the auth gate above already applied its operator and admin
+        // rules.
+        (method, path) if traza::ledger::handles(path) => {
+            let pairs: Vec<(String, String)> = query
+                .split('&')
+                .filter(|pair| !pair.is_empty())
+                .map(|pair| {
+                    let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+                    (percent_decode(key), percent_decode(value))
+                })
+                .collect();
+            match traza::ledger::serve(engine, method, path, &pairs, &request.body, principal) {
+                Ok((status, body)) => responder.json(status, body),
+                Err(error) => engine_error(responder, metrics, error),
+            }
         }
         // A deliberate, externally reachable panic, for proving the slot
         // guard releases on unwind. The guard is the startup latch and only

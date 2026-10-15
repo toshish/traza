@@ -24,6 +24,7 @@ pub mod gzip;
 pub mod hash;
 mod ingest_hooks;
 pub mod insights;
+pub mod ledger;
 pub mod limits;
 pub mod mcp;
 mod media;
@@ -2239,6 +2240,9 @@ pub struct Store {
     /// astride it. Outermost in the lock order: taken before writer,
     /// erasures, or annotations, and never while holding any of them.
     erasure_gate: std::sync::RwLock<()>,
+    /// The hash chain over published generations and erasures, outside
+    /// every generation. See [`ledger`]; its lock is leaf-level.
+    ledger: ledger::Ledger,
     next_segment: AtomicU64,
     /// Present unless durability is [`Durability::Buffered`]. Guards the gap
     /// between acknowledging a write and sealing it into a segment.
@@ -2392,18 +2396,23 @@ impl Store {
                 .map_or(0, |number| number.saturating_add(1));
             let tail_ring_spans = config.tail_ring_spans;
             let tail_ring_bytes = config.tail_ring_bytes;
+            // Replayed before serving: a pending erasure — one whose purge a
+            // crash interrupted — masks its subject from the first query this
+            // store answers, and stays masked until the resumed purge settles
+            // it (see [`Store::resume_erasures`]).
+            let erasures = erasure::ErasureLog::open(&directory)?;
+            // After the erasure log, because the ledger's reconcile ledgers
+            // every settled erasure a crash left unledgered.
+            let ledger = ledger::open_reconciled(&directory, live_generation, &erasures)?;
 
             Ok(Self {
                 guard: guard::Guard::open(&directory, &config.fuses)?,
                 annotations: annotations::AnnotationLog::open(&directory)?,
                 evals: evals::EvalLog::open(&directory)?,
-                // Replayed before serving: a pending erasure — one whose purge
-                // a crash interrupted — masks its subject from the first query
-                // this store answers, and stays masked until the resumed purge
-                // settles it (see [`Store::resume_erasures`]).
-                erasures: erasure::ErasureLog::open(&directory)?,
+                erasures,
                 platform: platform::State::open(&directory)?,
                 erasure_gate: std::sync::RwLock::new(()),
+                ledger,
                 directory,
                 live_generation: AtomicU64::new(live_generation),
                 config,
@@ -5830,6 +5839,13 @@ impl Store {
             }
         }
         let _ = generation::sweep_generations(&self.directory, next);
+        // Ledgered last, once the generation is durable: a crash before this
+        // leaves a generation without an entry, which the next open's
+        // reconcile appends — never an entry for a generation that is not.
+        // Housekeeping like the sweep: a failed append is kept for
+        // verification and caught up later, never reported as a failed
+        // checkpoint (the generation is committed).
+        self.ledger_checkpoint(next);
         Ok(next)
     }
 
@@ -5922,6 +5938,10 @@ impl Store {
                 }
             }
             generation::write_pin_manifest(&staged, &manifest)?;
+            // The ledger as of this pin, ending on the checkpoint entry
+            // naming the pinned manifest — evidence that travels with the
+            // backup. Never installed by a restore: it is not manifested.
+            self.ledger_copy_into(&staged, generation)?;
             Ok(())
         })();
         if let Err(error) = build {
@@ -6500,6 +6520,10 @@ impl Store {
                 .map_err(|_| Error::LockPoisoned("erasure gate"))?;
             self.erasures.record_settle(settle.clone())?;
         }
+        // Ledgered once the settle is durable; a crash in between is healed
+        // by the next open's reconcile. Never fails the erasure: it is
+        // settled and its barrier lifted, whatever the ledger does.
+        self.ledger_erasure(record.id, subject, generation);
         self.metrics.erasures_settled.increment();
         self.metrics.erasure_spans_removed.add(spans_removed as u64);
         self.metrics.erasure.record(elapsed_nanos(&erasing));
@@ -7425,6 +7449,18 @@ impl Store {
                 "retains the subject's identifiers and resolved keys as the record \
                  of this erasure — that record is what this receipt verifies against; \
                  erasing the record of erasure means deleting the store"
+                    .to_owned(),
+            );
+            report.result = "retained-by-design".to_owned();
+            domains.push(report);
+        }
+        {
+            let mut report = erasure::DomainReport::clear(
+                "ledger",
+                "the erasure's ledger entry, appended once it settles, carries its id, \
+                 subject kind, tenant, publishing generation and a SHA-256 of the subject \
+                 — never a trace, span or session id or a payload reference (a tenant \
+                 subject's name is its tenant field)"
                     .to_owned(),
             );
             report.result = "retained-by-design".to_owned();

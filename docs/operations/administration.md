@@ -437,6 +437,16 @@ crash-resume the physical work of the first pass is already done and cannot
 be re-counted, so the audit-grade answer to "is it gone" is always the
 receipt, never the tallies.
 
+The [ledger](../guide/ledger.md) keeps a second record. Every settled erasure
+appends one entry to `ledger.jsonl`: the erasure id, the subject kind, the
+tenant (`null` for a payload subject), the generation that published it, and
+a SHA-256 of the subject — never a trace, span or session id or a payload
+reference. For a **tenant subject the `tenant` field is the erased tenant's
+name**, so the entry identifies it outright. The ledger never rotates, every
+backup pin carries a copy of it, and rewriting an entry breaks the chain that
+makes it evidence — so this record outlives the erasure on purpose too, and
+the receipt's `ledger` domain says so.
+
 **Pins hold their bytes.** A backup pinned before the erasure still contains
 the subject in its hard-link farm — that is what a pin is for. The receipt
 checks every pin and names the ones to release; a backup already copied
