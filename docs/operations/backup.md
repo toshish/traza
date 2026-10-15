@@ -27,6 +27,7 @@ data/
   annotations.jsonl          the annotation log,
   payloads/                  and offloaded payload bytes
   generations/<id>/state-manifest.json
+  ledger.jsonl               the hash chain over published generations (outside every generation)
   pins/<label>/              a pin: hard links to one manifest's files
 ```
 
@@ -74,6 +75,14 @@ problem.
 The copy carries **spans, annotations, and payload bytes together**. That is
 the part a span export never could: an export pinned spans and nothing else, so
 a dataset export meant only part of a session's state.
+
+A pin also carries `ledger.jsonl`: the store's [ledger](../guide/ledger.md)
+as of the pin, ending with the checkpoint entry whose `manifest_sha256` is the
+SHA-256 of the pin's `state-manifest.json`. It is evidence that travels with
+the backup, not state: it is not manifested, pin verification ignores it, and
+a restore does not install it — the restored store keeps the ledger already in
+its data directory, or starts a new chain in an empty one, and ledgers the
+installed generation either way.
 
 ## Verifying
 
