@@ -2,10 +2,12 @@
 //!
 //! Every batch now passes an admission check before the erasure gate and an
 //! observer after acknowledgement, and the observer's signals ride back on
-//! `Admission::signals`. Nothing in this build raises a signal, so the proof
-//! is that both ingest surfaces answer exactly as they did — the response
-//! bodies pinned whole, so a stray `fuses` field fails here — and that the
-//! engine reports an empty signal list on every admission path it has. The
+//! `Admission::signals`. These batches stay far from every default fuse
+//! limit, so the proof is that both ingest surfaces answer exactly as they
+//! did — the response bodies pinned whole, so a stray `fuses` field fails
+//! here — and that the engine reports an empty signal list on every
+//! admission path it has (`tests/guard.rs` covers the batches that do raise
+//! one). The
 //! last test exercises the shared process harness itself, which every new
 //! integration test builds on.
 

@@ -12,10 +12,11 @@
 //! a batch whose ingest then failed. Whatever it reports rides back to the
 //! caller on [`crate::Admission`].
 //!
-//! Both hooks are deliberately empty in this build. They exist as named seams
-//! so policy (quotas, pauses, admission caps) and observation (run guards,
-//! usage counters) are added here rather than threaded through the admission
-//! path's lock-ordering argument.
+//! They exist as named seams so policy (quotas, pauses, admission caps) and
+//! observation (run guards, usage counters) are added here rather than
+//! threaded through the admission path's lock-ordering argument. The
+//! observer feeds the run guard ([`crate::guard`]); the admission check is
+//! still empty.
 
 use std::sync::Arc;
 
@@ -47,7 +48,9 @@ impl Store {
     /// acknowledged — so it returns what it saw rather than a `Result`, and it
     /// must be non-blocking and O(batch): every ingest waits for it before
     /// its response is written.
-    pub(crate) fn observe_admitted(&self, _spans: &[Arc<Span>]) -> Observed {
-        Observed::default()
+    pub(crate) fn observe_admitted(&self, spans: &[Arc<Span>]) -> Observed {
+        Observed {
+            fuses: self.observe_fuses(spans),
+        }
     }
 }

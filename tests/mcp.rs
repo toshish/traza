@@ -74,6 +74,7 @@ fn open_store(dir: &Path) -> Store {
     Store::open(
         dir,
         Config {
+            fuses: Default::default(),
             pricing: Default::default(),
             tenant_ttl_seconds: Default::default(),
             flush_spans: 100_000,
@@ -323,7 +324,7 @@ fn every_tool_declares_what_it_does_to_the_store() {
         }
     }
 
-    // Ten readers and one writer, so a tool added without a decision about
+    // Eleven readers and one writer, so a tool added without a decision about
     // its nature fails here rather than shipping as pessimistically annotated.
     // (The second writer, promote_failures_to_dataset, needs --mcp-promote and
     // so is absent from this listing; its own gating test covers it.)
@@ -332,8 +333,8 @@ fn every_tool_declares_what_it_does_to_the_store() {
         .filter(|tool| tool["annotations"]["readOnlyHint"] == json!(true))
         .count();
     assert_eq!(
-        read_only, 10,
-        "expected ten read-only tools, found {read_only}"
+        read_only, 11,
+        "expected eleven read-only tools, found {read_only}"
     );
 }
 

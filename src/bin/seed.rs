@@ -129,6 +129,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 // be memory spent on an audience that does not exist.
                 tail_ring_spans: 1,
                 tail_ring_bytes: 1,
+                // Nobody is guarding a seeded corpus's runs, and fingerprinting
+                // millions of synthetic steps would be work nothing reads.
+                fuses: traza::guard::FuseConfig {
+                    enabled: false,
+                    ..traza::guard::FuseConfig::default()
+                },
             },
         )?),
         None => None,

@@ -39,6 +39,7 @@ impl Drop for TestDir {
 
 fn config() -> Config {
     Config {
+        fuses: Default::default(),
         pricing: Default::default(),
         tenant_ttl_seconds: Default::default(),
         flush_spans: 1_000_000, // keep everything in the buffer; the scan is the point

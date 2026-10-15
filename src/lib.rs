@@ -885,6 +885,10 @@ pub struct Config {
     /// counters computed under the old ones rather than silently reporting
     /// them forever. See [`crate::pricing`].
     pub pricing: std::sync::Arc<crate::pricing::Pricing>,
+    /// The run guard: whether ingest feeds it, its default policy, and how
+    /// many runs it keeps live. On by default, warning on repeated steps
+    /// only. See [`guard`].
+    pub fuses: guard::FuseConfig,
 }
 
 /// The last commit whose reader accepts every segment format retired WITHOUT
@@ -988,6 +992,7 @@ impl Default for Config {
             tail_ring_spans: DEFAULT_TAIL_RING_SPANS,
             tail_ring_bytes: DEFAULT_TAIL_RING_BYTES,
             pricing: std::sync::Arc::new(crate::pricing::Pricing::default()),
+            fuses: guard::FuseConfig::default(),
         }
     }
 }
@@ -2208,6 +2213,10 @@ pub struct Store {
     /// futility backoff. See [`Store::finish_shadow_pass`].
     shadow_pass: Mutex<ShadowPassClock>,
     metrics: metrics::Metrics,
+    /// The run guard, fed by every acknowledged batch; `None` when
+    /// [`Config::fuses`] disables it. Its locks are leaf-level: never held
+    /// while an engine lock is taken.
+    guard: Option<guard::Guard>,
     _directory_lock: DirectoryLock,
 }
 
@@ -2340,6 +2349,7 @@ impl Store {
             let tail_ring_bytes = config.tail_ring_bytes;
 
             Ok(Self {
+                guard: guard::Guard::open(&directory, &config.fuses)?,
                 annotations: annotations::AnnotationLog::open(&directory)?,
                 evals: evals::EvalLog::open(&directory)?,
                 // Replayed before serving: a pending erasure — one whose purge

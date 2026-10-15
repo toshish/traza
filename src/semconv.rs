@@ -701,6 +701,16 @@ pub(crate) fn step_facts_with(span: &Span, llm: &LlmFacts) -> StepFacts {
     }
 }
 
+/// The kind [`step_facts_with`] would report, without extracting or
+/// digesting the step's request and response — for a caller that needs the
+/// rest of the facts only for some kinds (the run guard fingerprints steps
+/// alone).
+pub(crate) fn step_kind_with(span: &Span, llm: &LlmFacts) -> StepKind {
+    let traceloop_kind =
+        attr_str(&span.attributes, TRACELOOP_SPAN_KIND).map(|kind| kind.to_ascii_lowercase());
+    step_kind(&span.attributes, traceloop_kind.as_deref(), llm)
+}
+
 /// The kind precedence documented on [`step_facts`].
 fn step_kind(
     attributes: &Map<String, Value>,

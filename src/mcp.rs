@@ -591,6 +591,30 @@ impl<'a> Server<'a> {
                 }),
                 Nature::Read,
             ),
+            tool(
+                "check_run_guard",
+                "Check a run's guard verdict",
+                "Whether an agent run may take its next step: continue, warn (approaching a \
+                 limit) or stop (a limit was crossed, or an operator stopped it), with the \
+                 reasons, the policy, and the run's usage against its limits. A run id is a \
+                 session id, or trace:<trace_id> for a run without one. Read-only: a stop can \
+                 only be cleared by an operator over HTTP, never from here.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "run_id": {"type": "string", "description": "The run to check."},
+                        "tenant": {
+                            "type": "string",
+                            "description": "The run's tenant, for an unbound credential. \
+                                            Default: the default tenant.",
+                        },
+                    },
+                    "required": ["run_id"],
+                    "additionalProperties": false,
+                }),
+                Nature::Read,
+            )
+            .with_output_schema(guard_output_schema()),
         ];
         if self.annotation_tool_available(access) {
             tools.push(tool(
@@ -702,6 +726,7 @@ impl<'a> Server<'a> {
             "slowest_spans" => self.slowest_spans(arguments, context.clone()),
             "analyze_cost" => self.analyze_cost(arguments, context.clone()),
             "get_payload" => self.get_payload(arguments, &context),
+            "check_run_guard" => self.check_run_guard(arguments, &context),
             "record_annotation" if self.annotation_tool_available(context.access) => {
                 self.record_annotation(arguments, context)
             }
@@ -1824,6 +1849,121 @@ impl<'a> Server<'a> {
         }
     }
 
+    fn check_run_guard(&self, arguments: &Map<String, Value>, context: &Context) -> ToolResult {
+        known_keys(arguments, &["run_id", "tenant"], "check_run_guard")?;
+        let run = required_str(arguments, "run_id")?;
+        let tenant = match (context.scope(), optional_string(arguments, "tenant")?) {
+            (Some(bound), Some(named)) if named != bound => {
+                return Err(ToolError(
+                    "This credential is bound to a different tenant; omit 'tenant'.".to_owned(),
+                ))
+            }
+            (Some(bound), _) => bound.to_owned(),
+            (None, named) => named.unwrap_or_default(),
+        };
+        let doc = self.store.fuse_verdict(&tenant, run)?;
+        let usage = &doc.usage;
+        let head = format!(
+            "Run guard: {}. {} ({} LLM, {} tool), {}, ${:.4}, {}, error streak {}, {}.",
+            doc.verdict.as_str().to_ascii_uppercase(),
+            count(usage.steps, "step"),
+            usage.llm_calls,
+            usage.tool_calls,
+            count(usage.tokens, "token"),
+            usage.cost_usd,
+            count(usage.errors, "error"),
+            usage.error_streak,
+            duration_human(usage.duration_ns),
+        );
+        // The run id, the reasons (which quote step fingerprints, and so tool
+        // and model names) and the policy name all came from callers of this
+        // store, so they render inside the telemetry frame.
+        let mut rows = vec![
+            format!(
+                "run {} (tenant {})",
+                sanitize(&doc.run),
+                if doc.tenant.is_empty() {
+                    "default".to_owned()
+                } else {
+                    sanitize(&doc.tenant)
+                }
+            ),
+            format!("policy {}", sanitize(&doc.policy)),
+        ];
+        rows.extend(
+            doc.reasons
+                .iter()
+                .map(|reason| format!("reason: {}", sanitize(reason))),
+        );
+        if let Some(top) = &usage.top_repeat {
+            rows.push(format!(
+                "top repeat: {} x{} (trace={} span={})",
+                sanitize(&top.fingerprint),
+                top.count,
+                sanitize(&top.example.trace_id),
+                sanitize(&top.example.span_id),
+            ));
+        }
+        if let (Some(at), Some(by)) = (doc.tripped_at_ns, doc.tripped_by) {
+            let by = match by {
+                crate::guard::TrippedBy::Policy => "a policy limit",
+                crate::guard::TrippedBy::Manual => "an operator",
+            };
+            rows.push(format!("stopped by {by} at {}", rfc3339(at)));
+        }
+        let mut notes = vec![match doc.verdict {
+            crate::guard::Verdict::Stop => {
+                "The run is stopped: do not start another step. Spans arrive when steps end, \
+                 so the step that crossed a limit has already happened — the stop applies to \
+                 the next one. Only an operator can clear it, over HTTP with a write \
+                 credential (POST /v1/fuses/runs/{run}/reset); this surface cannot."
+            }
+            crate::guard::Verdict::Warn => {
+                "The run is approaching a limit (or reached one under a warn-only policy). \
+                 It may continue."
+            }
+            crate::guard::Verdict::Continue => "No limit is near. The run may continue.",
+        }
+        .to_owned()];
+        if doc.source == crate::guard::Source::Rebuilt {
+            notes.push("Usage was rebuilt from the run's stored spans for this answer.".to_owned());
+        }
+        let text = clamp_report(&head, &rows, &notes, self.limits.max_result_bytes);
+        let mut structured = serde_json::to_value(&doc).unwrap_or_else(|_| json!({}));
+        let mut result = json!({
+            "content": [{"type": "text", "text": text}],
+            "structuredContent": structured.clone(),
+            "isError": false,
+        });
+        // The structured half travels whatever the ceiling, because the tool
+        // advertises a schema for it; what can give way inside it is the
+        // free text — reasons and the fingerprint — and the evidence list.
+        if serialized_len(&result) > self.limits.max_result_bytes {
+            if let Some(object) = structured.as_object_mut() {
+                object.insert("evidence".to_owned(), json!([]));
+                if let Some(reasons) = object.get_mut("reasons").and_then(Value::as_array_mut) {
+                    for reason in reasons.iter_mut() {
+                        if let Some(text) = reason.as_str() {
+                            *reason = json!(truncate_bytes(text, 120));
+                        }
+                    }
+                }
+                if let Some(top) = object
+                    .get_mut("usage")
+                    .and_then(|usage| usage.get_mut("top_repeat"))
+                    .and_then(Value::as_object_mut)
+                {
+                    if let Some(text) = top.get("fingerprint").and_then(Value::as_str) {
+                        let short = truncate_bytes(text, 80);
+                        top.insert("fingerprint".to_owned(), json!(short));
+                    }
+                }
+            }
+            result["structuredContent"] = structured;
+        }
+        Ok(result)
+    }
+
     fn record_annotation(&self, arguments: &Map<String, Value>, context: Context) -> ToolResult {
         // Checked before the generic unknown-argument refusal, which would
         // otherwise shadow it: "no argument named source" is true but useless
@@ -2737,6 +2877,54 @@ fn cost_output_schema() -> Value {
 /// querying, and listing millions of them as resources would be an unbounded
 /// enumeration rather than a context menu. Anything identified by an id is a
 /// [template](resource_templates) instead.
+/// `check_run_guard`'s structured result: the HTTP verdict document.
+fn guard_output_schema() -> Value {
+    let span_ref = json!({
+        "type": "object",
+        "properties": {"trace_id": {"type": "string"}, "span_id": {"type": "string"}},
+        "required": ["trace_id", "span_id"],
+    });
+    json!({
+        "type": "object",
+        "properties": {
+            "run": {"type": "string"},
+            "tenant": {"type": "string"},
+            "verdict": {"type": "string", "enum": ["continue", "warn", "stop"]},
+            "reasons": {"type": "array", "items": {"type": "string"}},
+            "policy": {"type": "string"},
+            "usage": {
+                "type": "object",
+                "properties": {
+                    "steps": {"type": "integer"},
+                    "llm_calls": {"type": "integer"},
+                    "tool_calls": {"type": "integer"},
+                    "tokens": {"type": "integer"},
+                    "cost_usd": {"type": "number"},
+                    "errors": {"type": "integer"},
+                    "error_streak": {"type": "integer"},
+                    "duration_ns": {"type": "integer"},
+                    "top_repeat": {
+                        "type": ["object", "null"],
+                        "properties": {
+                            "fingerprint": {"type": "string"},
+                            "count": {"type": "integer"},
+                            "example": span_ref.clone(),
+                        },
+                    },
+                },
+                "required": ["steps", "cost_usd", "tokens"],
+            },
+            "limits": {"type": "object"},
+            "grant": {"type": ["object", "null"]},
+            "tripped_at_ns": {"type": ["integer", "null"]},
+            "tripped_by": {"type": ["string", "null"], "enum": ["policy", "manual", null]},
+            "evidence": {"type": "array", "items": span_ref},
+            "source": {"type": "string", "enum": ["live", "rebuilt"]},
+        },
+        "required": ["run", "verdict", "reasons", "policy", "usage", "source"],
+    })
+}
+
 fn resource_definitions() -> Vec<Value> {
     vec![
         json!({
