@@ -2567,6 +2567,8 @@ percentile gauges. Two families carry a `tenant` label, one series per tenant
 with usage counters: `traza_tenant_spans_ingested_total` and
 `traza_quota_rejected_total` (the [`/v1/usage`](#get-v1usage) lifetime
 counters).
+The run guard adds `traza_fuse_trips_total`, `traza_fuse_warnings_total` and
+`traza_fuse_live_runs`, unlabelled (absent under `--no-fuses`).
 
 **Errors.** None — the route always renders.
 

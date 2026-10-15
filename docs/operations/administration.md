@@ -109,9 +109,9 @@ unauthenticated client cannot make the server buffer a 64 MiB body just by
 declaring one. A rejected request closes its connection, precisely because that
 body was never consumed.
 
-### The one route that authorizes per operation, not per method
+### Routes that authorize per operation, not per method
 
-`POST /v1/mcp` is the exception, and it is deliberate. The `ro`/`rw` rule above
+`POST /v1/mcp` is the main exception, and it is deliberate. The `ro`/`rw` rule above
 maps scope to HTTP method because everywhere else the method *is* the
 operation. The [MCP endpoint](../guide/mcp.md) tunnels reads and writes alike
 through one `POST`, so applying the method rule there would either refuse every
@@ -136,6 +136,19 @@ suite — so erasing the source trace afterwards does not remove it, and the
 payload references it carries keep those bytes alive past their retention
 window. Deleting it means tombstoning the dataset version, or erasing the whole
 tenant. Grant it to an agent you would let keep a copy.
+
+Two smaller exceptions are reads that happen to be `POST`s, so a `ro` token
+may call them:
+
+- **`POST /v1/fuses/check`** — an agent holding a read-only token must be able
+  to ask whether its next step may run, and the question carries a body. See
+  [run fuses](../guide/guard.md).
+- **Every route under `/v1/replays`** — creating a replay snapshots a run into
+  server memory and serving one writes nothing to the store, but the OpenAI
+  and Anthropic SDKs send each model call as a `POST`. On the routes under
+  `/v1/replays/` only, the token may also arrive as `x-api-key: TOKEN`, the
+  Anthropic SDK's header; it is looked up exactly like a bearer token, and no
+  other route accepts it. See [replay](../guide/replay.md).
 
 ### Runtime credentials
 

@@ -176,8 +176,10 @@ export ANTHROPIC_API_KEY=$TRAZA_TOKEN
 
 The OpenAI SDK sends its key as `Authorization: Bearer`; the Anthropic SDK
 sends `x-api-key`, which Traza accepts as the credential on the routes under
-`/v1/replays/` (and nowhere else). On a server without `TRAZA_TOKENS` any
-non-empty key works — the SDKs refuse to start without one.
+`/v1/replays/` (and nowhere else), looked up like any bearer token — a
+`TRAZA_TOKENS` entry or a credential minted at runtime. On an open server (no
+credential of either kind) any non-empty key works — the SDKs refuse to start
+without one.
 
 The agent's first call — `POST …/openai/v1/chat/completions` with the system
 and user messages — receives the recorded answer as an ordinary

@@ -26,8 +26,8 @@ JSON-RPC message per request. Clients that speak HTTP connect straight to it.
 claude mcp add --transport http traza http://localhost:8080/v1/mcp
 ```
 
-With `TRAZA_TOKENS` set, pass the bearer token the same way you would to any
-other route:
+Once any credential exists — `TRAZA_TOKENS`, or one minted at runtime — pass
+the bearer token the same way you would to any other route:
 
 ```sh
 claude mcp add --transport http traza http://localhost:8080/v1/mcp \
@@ -406,9 +406,10 @@ shown a tool it will be refused on calls it, reads the refusal as transient,
 and retries.
 
 **A tenant-bound credential is bound over MCP exactly as over HTTP.** The
-`@tenant` binding in `TRAZA_TOKENS` travels with the authenticated principal
-into every tool call: a bound token's searches, trace and session lookups,
-aggregates, and payload fetches see only its own tenant's data. The binding
+binding — `@tenant` in `TRAZA_TOKENS`, or `tenant` on a minted credential —
+travels with the authenticated principal into every tool call: a bound
+token's searches, trace and session lookups, aggregates, and payload fetches
+see only its own tenant's data. The binding
 rides the same query construction the HTTP routes use — one choke point, not
 per-tool care — so there is no tool that forgets it.
 
