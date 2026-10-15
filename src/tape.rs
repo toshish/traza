@@ -1,0 +1,744 @@
+//! Tapes: a run's steps in order, with what went into each and what came out.
+//!
+//! A tape is the run read as a recording. Every span whose step kind is a
+//! model call, a tool call or an agent invocation ([`StepKind::is_step`])
+//! becomes one step, in the run's step order (`start, trace, span` — see
+//! [`crate::run`]), carrying its request and response as stored, their
+//! digests, its fingerprint, and its priced token usage.
+//!
+//! Three surfaces read runs this way and all three come through here, so they
+//! cannot disagree about what a step is: `GET /v1/tapes/{run}`, the replay
+//! proxy (which serves a tape's model answers back to an agent in place of the
+//! model — see [`crate::replay`]), and run diffing ([`crate::diff`]).
+//!
+//! **Values are stored values.** A request or response that ingest offloaded
+//! is its `{"$payload": "sha256/…"}` reference until a caller asks for
+//! resolution, and resolution is bounded: inlining every payload of a long run
+//! could otherwise turn one request into hundreds of megabytes. Digests and
+//! fingerprints always describe the stored form, resolved or not, so a tape
+//! fetched with and without `resolve` agrees on every identity it reports.
+
+use std::time::Instant;
+
+use serde::Serialize;
+use serde_json::{Map, Value};
+
+use crate::semconv::{self, LlmFacts, StepFacts, StepKind};
+use crate::{Deadline, Result, Span, Store};
+
+/// Default ceiling on the payload bytes one tape inlines when resolution is
+/// asked for (`--tape-max-bytes`).
+///
+/// Eight MiB is thirty-two payloads at the server's default 256 KiB offload
+/// threshold — room for a long run's offloaded prompts — while keeping a
+/// single tape response a size a browser or an SDK can hold without thought.
+pub const DEFAULT_TAPE_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// Spans one tape examines before it says it was truncated.
+///
+/// The same budget the session diagnosis uses: past it a run is analyzed from
+/// its EARLIEST spans, because a tape is read from the start and a suffix would
+/// be a recording with its beginning cut off.
+pub const MAX_TAPE_SPANS: usize = 20_000;
+
+/// Attribute keys whose values configure a model call rather than describe
+/// it: a change in any of them between two runs is a CONFIG change, not a
+/// different decision on the same input (see [`crate::diff`]).
+///
+/// Every `gen_ai.request.*` key qualifies (model, temperature, top_p,
+/// max_tokens, seed, stop sequences, …) plus OpenInference's single
+/// `llm.invocation_parameters` blob.
+const CONFIG_PREFIX: &str = "gen_ai.request.";
+const OI_INVOCATION_PARAMETERS: &str = "llm.invocation_parameters";
+
+/// Token usage one step reported. Each count is `None` when the span did not
+/// report it — a tool step reports none, and an unreported count is not zero.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct StepTokens {
+    /// Prompt/input tokens.
+    pub input: Option<u64>,
+    /// Completion/output tokens.
+    pub output: Option<u64>,
+    /// Prompt tokens served from a provider's cache.
+    pub cache_read: Option<u64>,
+    /// Prompt tokens written into a provider's cache.
+    pub cache_write: Option<u64>,
+}
+
+/// One step of a tape.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct TapeStep {
+    /// Position on the tape, from zero.
+    pub index: usize,
+    /// The span's trace.
+    pub trace_id: String,
+    /// The span.
+    pub span_id: String,
+    /// The span's parent, if it has one.
+    pub parent_span_id: Option<String>,
+    /// The step kind: `llm`, `tool` or `agent`.
+    pub kind: StepKind,
+    /// The span's operation name.
+    pub name: String,
+    /// The emitting service.
+    pub service: String,
+    /// The model, when the span names one ([`semconv::facts`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The tool, when the span names one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    /// The agent, when the span names one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// Start time, Unix nanoseconds.
+    pub start_ns: u64,
+    /// `end - start`, saturating at zero.
+    pub duration_ns: u64,
+    /// The span's status as recorded.
+    pub status: String,
+    /// The step's input as stored, or resolved when the tape was asked to
+    /// resolve payload references.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request: Option<Value>,
+    /// The step's output, under the same rules as [`Self::request`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response: Option<Value>,
+    /// Digest of the STORED input ([`semconv::step_facts`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_digest: Option<String>,
+    /// Digest of the STORED output.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_digest: Option<String>,
+    /// `kind:name#hash` ([`StepFacts::fingerprint`]).
+    pub fingerprint: String,
+    /// Token usage as reported.
+    pub tokens: StepTokens,
+    /// Cost in USD, metered or priced by this store's table.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+    /// Facts the replay proxy and the differ need that the tape's wire shape
+    /// does not carry.
+    #[serde(skip)]
+    pub(crate) detail: StepDetail,
+}
+
+/// The parts of a step only the replay proxy and the differ read.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct StepDetail {
+    /// `kind:name` — the fingerprint without its request hash.
+    pub(crate) signature: String,
+    /// `gen_ai.tool.call.id`.
+    pub(crate) tool_call_id: Option<String>,
+    /// `gen_ai.response.id`, the provider's id for the answer.
+    pub(crate) response_id: Option<String>,
+    /// `gen_ai.response.finish_reasons`, in recorded order.
+    pub(crate) finish_reasons: Vec<String>,
+    /// The call's configuration attributes (see [`CONFIG_PREFIX`]); empty for
+    /// steps that are not model calls.
+    pub(crate) config: Map<String, Value>,
+}
+
+/// A run read as a tape.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Tape {
+    /// The run id asked for.
+    pub run: String,
+    /// The tenant scope it was read under: a tenant (`""` is the default
+    /// tenant), or `None` for the operator view across every tenant.
+    pub tenant: Option<String>,
+    /// The steps, in step order.
+    pub steps: Vec<TapeStep>,
+    /// Whether the run held more spans than [`MAX_TAPE_SPANS`], or more steps
+    /// than the caller's maximum, so that `steps` is a prefix of the run.
+    pub truncated: bool,
+    /// Spans read to build the tape, steps and non-steps alike.
+    pub spans_examined: usize,
+    /// Present only when resolution was asked for: whether any payload
+    /// reference was left unresolved — because the byte budget ran out, or
+    /// because its bytes are gone (erased or swept by retention).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_partial: Option<bool>,
+}
+
+/// What a tape read should include.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TapeOptions {
+    /// Steps to return at most; past it the tape is truncated.
+    pub max_steps: usize,
+    /// `Some(bytes)` inlines `$payload` references in requests and responses,
+    /// inlining at most `bytes` of payload content per tape; `None` returns
+    /// stored values.
+    pub resolve: Option<usize>,
+}
+
+impl Default for TapeOptions {
+    fn default() -> Self {
+        Self {
+            max_steps: MAX_TAPE_SPANS,
+            resolve: None,
+        }
+    }
+}
+
+/// A run's spans and the tape made of them, read together so every number
+/// derived from either describes the same instant.
+pub(crate) struct RunTape {
+    /// The run's spans in step order (at most the span cap).
+    pub(crate) spans: Vec<Span>,
+    /// The steps among them, at most the step cap.
+    pub(crate) steps: Vec<TapeStep>,
+    /// Whether either cap cut the run short.
+    pub(crate) truncated: bool,
+}
+
+impl Store {
+    /// The tape of `run_id` under `tenant` (the scoping rules of
+    /// [`Store::get_run_in`]), or `None` when no span carries that run id.
+    ///
+    /// Budgeted by [`crate::Config::query_deadline`]. Payload resolution, when
+    /// asked for, reads each reference through [`Store::payload_in`] under the
+    /// same tenant, so a bound caller can inline only bytes its own tenant's
+    /// spans reference.
+    pub fn tape(
+        &self,
+        tenant: Option<&str>,
+        run_id: &str,
+        options: TapeOptions,
+    ) -> Result<Option<Tape>> {
+        let deadline = self.query_deadline(Instant::now());
+        let read = self.run_tape(tenant, run_id, MAX_TAPE_SPANS, options.max_steps, deadline)?;
+        if read.spans.is_empty() {
+            return Ok(None);
+        }
+        let mut steps = read.steps;
+        let resolved_partial = match options.resolve {
+            None => None,
+            Some(max_bytes) => {
+                let mut budget = ResolveBudget::new(max_bytes);
+                for step in &mut steps {
+                    for value in [&mut step.request, &mut step.response]
+                        .into_iter()
+                        .flatten()
+                    {
+                        self.resolve_payloads(tenant, value, &mut budget)?;
+                    }
+                }
+                Some(budget.unresolved)
+            }
+        };
+        Ok(Some(Tape {
+            run: run_id.to_owned(),
+            tenant: tenant.map(str::to_owned),
+            steps,
+            truncated: read.truncated,
+            spans_examined: read.spans.len(),
+            resolved_partial,
+        }))
+    }
+
+    /// A run's spans plus its steps, under a caller-anchored budget so a
+    /// request reading several runs spends one budget across all of them.
+    pub(crate) fn run_tape(
+        &self,
+        tenant: Option<&str>,
+        run_id: &str,
+        max_spans: usize,
+        max_steps: usize,
+        deadline: Option<Deadline>,
+    ) -> Result<RunTape> {
+        let run = self.run_spans(tenant, run_id, max_spans, deadline)?;
+        let mut steps = Vec::new();
+        let mut truncated = run.truncated;
+        for span in &run.spans {
+            let (facts, llm) = self.step_facts(span);
+            if !facts.kind.is_step() {
+                continue;
+            }
+            if steps.len() == max_steps {
+                truncated = true;
+                break;
+            }
+            steps.push(tape_step(steps.len(), span, facts, llm));
+        }
+        Ok(RunTape {
+            spans: run.spans,
+            steps,
+            truncated,
+        })
+    }
+
+    /// Replaces every `$payload` reference inside `value` with the content it
+    /// names, while `budget` lasts.
+    ///
+    /// The budget is a PREFIX cut: the first reference that does not fit
+    /// exhausts it, and every reference after it stays a reference even if it
+    /// would fit. A tape is therefore "resolved up to a point", which a reader
+    /// can reason about, rather than resolved in a scatter that depends on the
+    /// sizes involved. A reference whose bytes are gone stays a reference too.
+    ///
+    /// Resolved text is read under the same rule as an inline value
+    /// ([`semconv::field_value`]): text holding a JSON object or array becomes
+    /// that JSON, so a resolved request has the shape it would have had if it
+    /// had never been offloaded. Content that came out of a payload is not
+    /// walked again: a producer's own text that happens to look like a
+    /// reference is data, not an instruction to read another file.
+    pub(crate) fn resolve_payloads(
+        &self,
+        tenant: Option<&str>,
+        value: &mut Value,
+        budget: &mut ResolveBudget,
+    ) -> Result<()> {
+        if let Some(reference) = payload_reference(value) {
+            if budget.exhausted {
+                budget.unresolved = true;
+                return Ok(());
+            }
+            let reference = reference.to_owned();
+            let Some(bytes) = self.payload_in(tenant, &reference)? else {
+                budget.unresolved = true;
+                return Ok(());
+            };
+            if bytes.len() > budget.remaining {
+                budget.exhausted = true;
+                budget.unresolved = true;
+                return Ok(());
+            }
+            // Offload only ever moves string attribute values, so a payload is
+            // the UTF-8 text of one; anything else is not ours to reinterpret.
+            let Ok(text) = String::from_utf8(bytes) else {
+                budget.unresolved = true;
+                return Ok(());
+            };
+            budget.remaining -= text.len();
+            *value = semconv::field_value(&Value::String(text));
+            return Ok(());
+        }
+        match value {
+            Value::Array(items) => {
+                for item in items {
+                    self.resolve_payloads(tenant, item, budget)?;
+                }
+            }
+            Value::Object(fields) => {
+                for field in fields.values_mut() {
+                    self.resolve_payloads(tenant, field, budget)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+/// Payload bytes still available to one tape's resolution, and what it left
+/// unresolved.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ResolveBudget {
+    remaining: usize,
+    exhausted: bool,
+    /// Whether any reference was left as a reference.
+    pub(crate) unresolved: bool,
+}
+
+impl ResolveBudget {
+    pub(crate) fn new(max_bytes: usize) -> Self {
+        Self {
+            remaining: max_bytes,
+            exhausted: false,
+            unresolved: false,
+        }
+    }
+}
+
+/// The `sha256/<hex>` a `$payload` reference object names, or `None` for any
+/// other value.
+pub(crate) fn payload_reference(value: &Value) -> Option<&str> {
+    value
+        .as_object()?
+        .get(crate::payload::PAYLOAD_KEY)?
+        .as_str()
+}
+
+/// Whether `value` holds a `$payload` reference anywhere inside it.
+pub(crate) fn contains_reference(value: &Value) -> bool {
+    if payload_reference(value).is_some() {
+        return true;
+    }
+    match value {
+        Value::Array(items) => items.iter().any(contains_reference),
+        Value::Object(fields) => fields.values().any(contains_reference),
+        _ => false,
+    }
+}
+
+/// One span as a tape step.
+fn tape_step(index: usize, span: &Span, facts: StepFacts, llm: LlmFacts) -> TapeStep {
+    let attributes = &span.attributes;
+    let config = if facts.kind == StepKind::Llm {
+        attributes
+            .iter()
+            .filter(|(key, _)| key.starts_with(CONFIG_PREFIX) || *key == OI_INVOCATION_PARAMETERS)
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
+    } else {
+        Map::new()
+    };
+    let detail = StepDetail {
+        signature: facts.signature().to_owned(),
+        tool_call_id: facts.tool_call_id.clone(),
+        response_id: semconv::attr_str(attributes, "gen_ai.response.id"),
+        finish_reasons: finish_reasons(attributes.get("gen_ai.response.finish_reasons")),
+        config,
+    };
+    TapeStep {
+        index,
+        trace_id: span.trace_id.clone(),
+        span_id: span.span_id.clone(),
+        parent_span_id: span.parent_span_id.clone(),
+        kind: facts.kind,
+        name: span.name.clone(),
+        service: span.service.clone(),
+        model: llm.model,
+        tool: facts.tool,
+        agent: facts.agent,
+        start_ns: span.start_time_ns,
+        duration_ns: span.end_time_ns.saturating_sub(span.start_time_ns),
+        status: span.status.clone(),
+        request: facts.request,
+        response: facts.response,
+        request_digest: facts.request_digest,
+        response_digest: facts.response_digest,
+        fingerprint: facts.fingerprint,
+        tokens: StepTokens {
+            input: llm.prompt_tokens,
+            output: llm.completion_tokens,
+            cache_read: llm.cache_read_tokens,
+            cache_write: llm.cache_creation_tokens,
+        },
+        cost_usd: llm.cost_usd,
+        detail,
+    }
+}
+
+/// `gen_ai.response.finish_reasons` read whichever way a producer wrote it: a
+/// list of strings (the convention), one string, or a list JSON-encoded into a
+/// string (exporters that cannot carry arrays).
+fn finish_reasons(value: Option<&Value>) -> Vec<String> {
+    let Some(value) = value else {
+        return Vec::new();
+    };
+    match semconv::field_value(value) {
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|item| item.as_str().filter(|text| !text.is_empty()))
+            .map(str::to_owned)
+            .collect(),
+        Value::String(text) if !text.is_empty() => vec![text],
+        _ => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A store in a private temporary directory, removed on drop.
+    pub(crate) struct TempStore {
+        dir: std::path::PathBuf,
+        store: Option<Store>,
+    }
+
+    impl TempStore {
+        pub(crate) fn open(label: &str, config: crate::Config) -> Self {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let dir = std::env::temp_dir()
+                .join(format!("traza-tape-{label}-{}-{nonce}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("dir");
+            let store = Store::open(&dir, config).expect("opens");
+            Self {
+                dir,
+                store: Some(store),
+            }
+        }
+
+        pub(crate) fn store(&self) -> &Store {
+            self.store.as_ref().expect("open")
+        }
+    }
+
+    impl Drop for TempStore {
+        fn drop(&mut self) {
+            drop(self.store.take());
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    pub(crate) fn span(trace: &str, id: &str, start: u64, attributes: Value) -> Span {
+        Span {
+            trace_id: trace.into(),
+            span_id: id.into(),
+            tenant: String::new(),
+            parent_span_id: None,
+            name: format!("op-{id}"),
+            start_time_ns: start,
+            end_time_ns: start + 10,
+            status: "ok".into(),
+            service: "agent".into(),
+            attributes: attributes.as_object().expect("object").clone(),
+            events: Vec::new(),
+            links: Vec::new(),
+            extra: Map::new(),
+        }
+    }
+
+    fn seeded(label: &str, config: crate::Config) -> TempStore {
+        let fixture = TempStore::open(label, config);
+        fixture
+            .store()
+            .ingest_batch(vec![
+                span(
+                    "t1",
+                    "root",
+                    100,
+                    json!({"session.id": "s1", "traceloop.span.kind": "workflow"}),
+                ),
+                span(
+                    "t1",
+                    "llm-1",
+                    110,
+                    json!({
+                        "session.id": "s1",
+                        "gen_ai.operation.name": "chat",
+                        "gen_ai.request.model": "gpt-4o",
+                        "gen_ai.request.temperature": 0.2,
+                        "gen_ai.response.id": "chatcmpl-1",
+                        "gen_ai.response.finish_reasons": ["tool_calls"],
+                        "gen_ai.usage.input_tokens": 50,
+                        "gen_ai.usage.output_tokens": 7,
+                        "gen_ai.prompt.0.role": "user",
+                        "gen_ai.prompt.0.content": "weather in Paris?",
+                    }),
+                ),
+                span(
+                    "t1",
+                    "tool-1",
+                    120,
+                    json!({
+                        "session.id": "s1",
+                        "gen_ai.operation.name": "execute_tool",
+                        "gen_ai.tool.name": "get_weather",
+                        "gen_ai.tool.call.id": "call_1",
+                        "gen_ai.tool.call.arguments": "{\"city\":\"Paris\"}",
+                        "gen_ai.tool.call.result": "rainy",
+                    }),
+                ),
+                span(
+                    "t1",
+                    "http",
+                    125,
+                    json!({"session.id": "s1", "http.method": "GET"}),
+                ),
+            ])
+            .expect("ingests");
+        fixture
+    }
+
+    #[test]
+    fn a_tape_is_the_runs_steps_in_order_with_their_facts() {
+        let fixture = seeded("order", crate::Config::default());
+        let tape = fixture
+            .store()
+            .tape(Some(""), "s1", TapeOptions::default())
+            .expect("reads")
+            .expect("the run exists");
+        // The workflow wrapper and the HTTP span are context, not steps.
+        let kinds: Vec<&str> = tape.steps.iter().map(|step| step.kind.as_str()).collect();
+        assert_eq!(kinds, ["llm", "tool"]);
+        assert_eq!(tape.spans_examined, 4);
+        assert!(!tape.truncated);
+        assert_eq!(
+            tape.resolved_partial, None,
+            "absent unless resolution was asked"
+        );
+
+        let llm = &tape.steps[0];
+        assert_eq!(llm.index, 0);
+        assert_eq!(llm.model.as_deref(), Some("gpt-4o"));
+        assert_eq!(llm.tokens.input, Some(50));
+        assert_eq!(llm.tokens.cache_read, None, "unreported is not zero");
+        assert_eq!(
+            llm.request,
+            Some(json!([{"role": "user", "content": "weather in Paris?"}]))
+        );
+        assert!(llm.fingerprint.starts_with("llm:gpt-4o#"));
+        assert_eq!(llm.detail.signature, "llm:gpt-4o");
+        assert_eq!(llm.detail.response_id.as_deref(), Some("chatcmpl-1"));
+        assert_eq!(llm.detail.finish_reasons, ["tool_calls"]);
+        assert_eq!(
+            llm.detail.config.get("gen_ai.request.temperature"),
+            Some(&json!(0.2))
+        );
+
+        let tool = &tape.steps[1];
+        assert_eq!(tool.index, 1);
+        assert_eq!(tool.tool.as_deref(), Some("get_weather"));
+        assert_eq!(tool.request, Some(json!({"city": "Paris"})));
+        assert_eq!(tool.response, Some(json!("rainy")));
+        assert_eq!(tool.detail.tool_call_id.as_deref(), Some("call_1"));
+        assert!(
+            tool.detail.config.is_empty(),
+            "only model calls carry config"
+        );
+
+        // The wire shape: optional facts are omitted, tokens are always an
+        // object, and the replay-only detail never serializes.
+        let wire = serde_json::to_value(tool).expect("serializes");
+        assert!(wire.get("model").is_none() && wire.get("detail").is_none());
+        assert_eq!(
+            wire["tokens"],
+            json!({"input": null, "output": null, "cache_read": null, "cache_write": null})
+        );
+        assert_eq!(wire["kind"], json!("tool"));
+    }
+
+    #[test]
+    fn an_unknown_run_has_no_tape_and_the_step_cap_truncates() {
+        let fixture = seeded("cap", crate::Config::default());
+        let store = fixture.store();
+        assert!(store
+            .tape(Some(""), "nope", TapeOptions::default())
+            .expect("reads")
+            .is_none());
+        let capped = store
+            .tape(
+                Some(""),
+                "s1",
+                TapeOptions {
+                    max_steps: 1,
+                    resolve: None,
+                },
+            )
+            .expect("reads")
+            .expect("exists");
+        assert_eq!(capped.steps.len(), 1);
+        assert!(capped.truncated);
+        let exact = store
+            .tape(
+                Some(""),
+                "s1",
+                TapeOptions {
+                    max_steps: 2,
+                    resolve: None,
+                },
+            )
+            .expect("reads")
+            .expect("exists");
+        assert!(
+            !exact.truncated,
+            "a tape that fits exactly is not truncated"
+        );
+    }
+
+    #[test]
+    fn resolution_inlines_payloads_as_a_prefix_within_the_budget() {
+        // A 64-byte threshold offloads both long prompts below.
+        let config = crate::Config {
+            payload_threshold: Some(64),
+            ..crate::Config::default()
+        };
+        let fixture = TempStore::open("resolve", config);
+        let store = fixture.store();
+        let first = format!(
+            "[{{\"role\":\"user\",\"content\":\"{}\"}}]",
+            "a".repeat(100)
+        );
+        let second = "b".repeat(200);
+        store
+            .ingest_batch(vec![
+                span(
+                    "t9",
+                    "one",
+                    1,
+                    json!({"gen_ai.operation.name": "chat", "gen_ai.input.messages": first}),
+                ),
+                span(
+                    "t9",
+                    "two",
+                    2,
+                    json!({"gen_ai.operation.name": "chat", "gen_ai.prompt.0.content": second}),
+                ),
+            ])
+            .expect("ingests");
+
+        let stored = store
+            .tape(Some(""), "trace:t9", TapeOptions::default())
+            .expect("reads")
+            .expect("exists");
+        assert!(payload_reference(stored.steps[0].request.as_ref().expect("request")).is_some());
+
+        let resolved = store
+            .tape(
+                Some(""),
+                "trace:t9",
+                TapeOptions {
+                    max_steps: 10,
+                    resolve: Some(1024),
+                },
+            )
+            .expect("reads")
+            .expect("exists");
+        assert_eq!(resolved.resolved_partial, Some(false));
+        // The resolved JSON text is read as JSON, exactly as inline text is.
+        assert_eq!(
+            resolved.steps[0].request,
+            Some(json!([{"role": "user", "content": "a".repeat(100)}]))
+        );
+        assert_eq!(
+            resolved.steps[1].request,
+            Some(json!([{"content": second.clone()}]))
+        );
+        // Identities describe the stored form whether or not it was resolved.
+        for (left, right) in stored.steps.iter().zip(&resolved.steps) {
+            assert_eq!(left.request_digest, right.request_digest);
+            assert_eq!(left.fingerprint, right.fingerprint);
+        }
+
+        // A budget that fits the first payload but not the second resolves
+        // the first and leaves the rest as references, and says so.
+        let partial = store
+            .tape(
+                Some(""),
+                "trace:t9",
+                TapeOptions {
+                    max_steps: 10,
+                    resolve: Some(150),
+                },
+            )
+            .expect("reads")
+            .expect("exists");
+        assert_eq!(partial.resolved_partial, Some(true));
+        assert!(!contains_reference(
+            partial.steps[0].request.as_ref().expect("request")
+        ));
+        assert!(contains_reference(
+            partial.steps[1].request.as_ref().expect("request")
+        ));
+    }
+
+    #[test]
+    fn finish_reasons_read_every_spelling() {
+        assert_eq!(finish_reasons(Some(&json!(["stop"]))), ["stop"]);
+        assert_eq!(finish_reasons(Some(&json!("length"))), ["length"]);
+        assert_eq!(
+            finish_reasons(Some(&json!("[\"tool_calls\"]"))),
+            ["tool_calls"]
+        );
+        assert!(finish_reasons(Some(&json!(""))).is_empty());
+        assert!(finish_reasons(None).is_empty());
+    }
+}

@@ -141,7 +141,7 @@ const MAX_PROMOTED_EXAMPLES: usize = 50;
 /// derived from "the last span that finished" is only meaningful once nothing
 /// more is coming. Inside this window the answer is `unknown`, which is the
 /// honest reading: a run still going has not succeeded yet.
-const SESSION_IDLE_NS: u64 = 900_000_000_000;
+pub(crate) const SESSION_IDLE_NS: u64 = 900_000_000_000;
 
 /// Byte ceilings on what one call may return.
 ///
