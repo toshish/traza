@@ -14,32 +14,45 @@ OpenTelemetry GenAI semantic conventions. Point any OpenLLMetry- or OTel-GenAI-
 instrumented app at Traza over OTLP and its sessions, token counts, cost, and
 provider/model rollups populate with **no attribute renaming**. Traza's earlier
 native `llm.*` / `session.id` shorthand is still accepted as an alias, so
-existing instrumentation keeps working unchanged.
+existing instrumentation keeps working unchanged. The
+[OpenInference](https://github.com/Arize-ai/openinference) keys emitted by
+Arize Phoenix instrumentation (`llm.model_name`, `llm.token_count.*`,
+`openinference.span.kind`, …) are recognized too, ranked after every other
+spelling so they only ever fill blanks.
 
 The single source of truth for the key precedence is
-[`src/semconv.rs`](../src/semconv.rs); the dashboard mirrors it in
-`ui/src/lib/spans.js`.
+[`src/semconv.rs`](../src/semconv.rs). The dashboard's trace, conversation
+and compare views compute per-span usage in the browser from the OpenLLMetry
+and native keys, mirrored in `ui/src/lib/spans.js`; they do not yet read the
+OpenInference keys, so an OpenInference-only span's model and tokens appear in
+the server's rollups (`/v1/stats/llm`, `/v1/sessions`) but not in those views.
 
 ## Recognized attributes
 
 Each fact is resolved from the first key present, in this order. Current OTel
 GenAI names come first; the names OTel has since deprecated are kept as
-aliases, and Traza's native `llm.*` shorthand last:
+aliases, then Traza's native `llm.*` shorthand, and the OpenInference spelling
+last:
 
 | Fact | Keys (first present wins) |
 |---|---|
-| Provider | `gen_ai.provider.name` → `gen_ai.system` *(deprecated)* |
-| Model | `gen_ai.response.model` → `gen_ai.request.model` → `llm.model` |
-| Prompt tokens | `gen_ai.usage.input_tokens` → `gen_ai.usage.prompt_tokens` *(deprecated)* → `llm.prompt_tokens` |
-| Completion tokens | `gen_ai.usage.output_tokens` → `gen_ai.usage.completion_tokens` *(deprecated)* → `llm.completion_tokens` |
-| Total tokens | `llm.usage.total_tokens` → `gen_ai.usage.total_tokens` → `llm.total_tokens` → (prompt + completion) |
+| Provider | `gen_ai.provider.name` → `gen_ai.system` *(deprecated)* → `llm.provider` → `llm.system` |
+| Model | `gen_ai.response.model` → `gen_ai.request.model` → `llm.model` → `llm.model_name` |
+| Prompt tokens | `gen_ai.usage.input_tokens` → `gen_ai.usage.prompt_tokens` *(deprecated)* → `llm.prompt_tokens` → `llm.token_count.prompt` |
+| Completion tokens | `gen_ai.usage.output_tokens` → `gen_ai.usage.completion_tokens` *(deprecated)* → `llm.completion_tokens` → `llm.token_count.completion` |
+| Total tokens | `llm.usage.total_tokens` → `gen_ai.usage.total_tokens` → `llm.total_tokens` → `llm.token_count.total` → (prompt + completion) |
 | Session id | `session.id` → `gen_ai.conversation.id` → `traceloop.association.properties.session_id` → `traceloop.association.properties.chat_id` |
 
 A span counts as an **LLM call** when it carries any of: a model, a provider,
-a token count, `gen_ai.operation.name`, `llm.request.type`, or
-`traceloop.span.kind == "llm"`. Numeric token values may be supplied as numbers
-or numeric strings (some OTLP exporters stringify counters); an explicit total
-wins over the prompt+completion sum.
+a token count, `gen_ai.operation.name`, `llm.request.type`,
+`traceloop.span.kind == "llm"`, or `openinference.span.kind == "LLM"` (any
+letter case). Numeric token values may be supplied as numbers or numeric
+strings (some OTLP exporters stringify counters); an explicit total wins over
+the prompt+completion sum.
+
+OpenInference's `llm.provider` names the host (`openai`, `azure`, `aws`) and
+`llm.system` the model family (`openai`, `anthropic`); the host ranks first
+because that is what `gen_ai.provider.name` means.
 
 **Cost is a Traza extension, not an OpenLLMetry attribute.** OpenTelemetry
 GenAI defines no cost attribute — providers meter cost out of band. Traza
@@ -85,7 +98,14 @@ This matters wherever a growing conversation is being watched: read the
 uncached remainder alone and a context that is growing appears to *shrink* as
 its cache warms. [`diagnose_session`](guide/mcp.md) reads the resolved figure,
 and where cache counters appear under a provider whose convention Traza does
-not know, it reports the trend as unreadable rather than guessing.
+not know, it reports the trend as unreadable rather than guessing. The
+OpenInference host names (`aws`, `azure`, `google`) are not in the table
+above, so they fall in that last case.
+
+OpenInference's own cache counters
+(`llm.token_count.prompt_details.cache_read` / `.cache_write`) are **not**
+read: OpenInference reports its prompt count inclusive of them, and folding
+them into the cache fields would double-count the cached part.
 
 ### Session outcome and goal — Traza extensions
 
@@ -136,6 +156,84 @@ Traceloop's workflow model is carried by `traceloop.span.kind`
 (`workflow`/`task`/`agent`/`tool`/`llm`), `traceloop.workflow.name`, and
 `traceloop.entity.name` / `traceloop.entity.path`. Traza stores and indexes
 these verbatim, so they are all filterable.
+
+## Steps and runs
+
+Traza also reads each span as one **step** of a **run**: what kind of work it
+was, what it called, what went in and what came out, and a fingerprint that
+says whether the same call with the same input happened before. The full
+precedence is documented on `step_facts` and `run_id` in
+[`src/semconv.rs`](../src/semconv.rs); this is the summary.
+
+### Step kind
+
+The first source carrying a recognized value decides; an unrecognized value
+falls through to the next source. Values compare case-insensitively.
+
+| Source | Values |
+|---|---|
+| `gen_ai.operation.name` | `chat`, `text_completion`, `generate_content` → **llm**; `execute_tool` → **tool**; `invoke_agent`, `create_agent` → **agent**; `embeddings` → **embedding** |
+| `openinference.span.kind` | `LLM` → llm; `TOOL` → tool; `AGENT` → agent; `RETRIEVER` → **retrieval**; `EMBEDDING` → embedding; `CHAIN` → **other** |
+| `traceloop.span.kind` | `llm` → llm; `tool` → tool; `agent` → agent; `workflow`, `task` → other |
+| the span is an LLM call (above) | llm |
+| `gen_ai.tool.name` or `tool.name` present | tool |
+| none of these | other |
+
+Only **llm**, **tool** and **agent** spans count as steps; retrievals,
+embeddings and wrappers are context around them. Because any
+`gen_ai.operation.name` makes a span an LLM call, an operation name not in the
+first row lands at llm unless an OpenInference or Traceloop kind decided
+first.
+
+### Tool, agent and call id
+
+| Fact | Keys (first present wins) |
+|---|---|
+| Tool | `gen_ai.tool.name` → `tool.name` → `traceloop.entity.name` *(only when `traceloop.span.kind` is `tool`)* |
+| Agent | `gen_ai.agent.name` → `traceloop.entity.name` *(only when `traceloop.span.kind` is `agent` or `workflow`)* → `agent.name` |
+| Tool call id | `gen_ai.tool.call.id` |
+
+### Input and output
+
+| Step kind | Input (first present wins) | Output (first present wins) |
+|---|---|---|
+| llm | `gen_ai.input.messages` → `gen_ai.prompt.{i}.*` → `llm.input_messages.{i}.message.*` → `input.value` → `llm.prompt` attribute → `llm.prompt` events | `gen_ai.output.messages` → `gen_ai.completion.{i}.*` → `llm.output_messages.{i}.message.*` → `output.value` → `llm.completion` attribute → `llm.completion` events |
+| tool | `gen_ai.tool.call.arguments` → `traceloop.entity.input` → `input.value` | `gen_ai.tool.call.result` → `traceloop.entity.output` → `output.value` |
+| any other | `traceloop.entity.input` → `input.value` | `traceloop.entity.output` → `output.value` |
+
+Values are taken as stored: an offloaded value stays its `$payload` reference.
+A string holding a JSON object or array is read as that JSON; any other string
+stays text. The indexed layouts are reassembled into a message list in numeric
+index order, each message carrying whichever of `role`, `content`,
+`finish_reason`, `tool_call_id` and `tool_calls` (`[{id, name, arguments}]`)
+was recorded; the OpenLLMetry and OpenInference layouts fold to that same
+shape. Native events become `[{role, content}]` in event order. On an llm step
+`gen_ai.system_instructions` becomes a leading `{"role": "system", …}` message
+when the input is a message list (or the whole input when there is none).
+
+Each input and output has a **digest**: the SHA-256 of its canonical JSON
+(keys sorted, no whitespace), so the same messages sent with different key
+order or spacing digest identically. An input that is wholly a `$payload`
+reference digests to the content address it names, without reading the
+payload — and since that address hashes the original attribute *text*, an
+offloaded copy and an inline copy of the same input digest differently.
+
+A step's **fingerprint** is `kind:name` — the tool name for a tool step, the
+model for an llm step, the agent name for an agent step, otherwise (or when
+that is absent) the span name — followed by `#` and the first 16 hex
+characters of the input digest when there is an input; for example
+`tool:web_search#50951da9bae64397`. Two steps with the same fingerprint made
+the same call with the same input.
+
+### Run identity
+
+A span's **run** is its session id (the session precedence above), else
+`trace:<trace_id>`, within its tenant. A conversation spanning many traces is
+therefore one run, and a trace with no session key is a run of its own.
+Membership is per span, as it is for sessions: a trace whose root carries
+`session.id` but whose children do not puts those children in the trace's run,
+not the session's. A session id that itself begins with `trace:` reads as the
+trace form.
 
 ## Sessions and aggregation
 

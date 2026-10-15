@@ -16,7 +16,9 @@ pub mod erasure;
 pub mod evals;
 pub mod expiration;
 mod generation;
+pub mod guard;
 pub mod hash;
+mod ingest_hooks;
 pub mod insights;
 pub mod mcp;
 mod media;
@@ -29,6 +31,7 @@ pub mod otlp_pb;
 pub mod payload;
 pub mod pricing;
 mod rollup_file;
+pub mod run;
 pub mod seed;
 pub mod segment;
 pub mod semconv;
@@ -1024,12 +1027,16 @@ pub struct Stats {
 /// a suppressed span as durable: a `200` whose body says `accepted: 1` about
 /// a span that never reached memory or the log would be a durability claim
 /// with nothing behind it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Admission {
     /// Spans stored under the configured durability mode.
     pub accepted: usize,
     /// Spans dropped by the erasure admission barrier.
     pub suppressed: usize,
+    /// Run-guard signals the ingest observer raised for runs in this batch:
+    /// one per run whose verdict is not [`guard::Verdict::Continue`]. Empty
+    /// when nothing was raised, which in this build is always.
+    pub signals: Vec<guard::Signal>,
 }
 
 /// Errors returned by storage operations.
@@ -2385,6 +2392,10 @@ impl Store {
         for span in &spans {
             validate_span(span)?;
         }
+        // Admission policy refuses here: the batch is known valid, and
+        // nothing about it has been decided yet — no gate, no offload, no
+        // log append — so a refusal is batch-atomic and leaves no trace.
+        self.admission_check(&spans)?;
         let sent = spans.len();
         let mut spans = spans;
 
@@ -2441,6 +2452,7 @@ impl Store {
                 return Ok(Admission {
                     accepted: 0,
                     suppressed: sent,
+                    signals: Vec::new(),
                 });
             }
         }
@@ -2561,6 +2573,9 @@ impl Store {
         // The cursor only needs the numbers to be monotonic and gapless, which
         // assigning them at push guarantees however threads interleave.
         self.tail.publish(&admitted_handles);
+        // Observers see the same acknowledged batch the tail just did, for
+        // the same reason: what they react to must be what the store kept.
+        let observed = self.observe_admitted(&admitted_handles);
 
         self.metrics.spans_admitted.add(admitted);
         self.metrics.batches_admitted.increment();
@@ -2571,6 +2586,7 @@ impl Store {
         Ok(Admission {
             accepted: admitted as usize,
             suppressed,
+            signals: observed.fuses,
         })
     }
 

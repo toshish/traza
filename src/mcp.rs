@@ -2914,17 +2914,17 @@ threshold lives behind a `$payload` reference that `get_payload` resolves.
 
 const SEMANTICS_GUIDE: &str = r#"# LLM attribute conventions Traza recognizes
 
-Traza folds two vocabularies into one set of facts: the OpenLLMetry / OpenTelemetry
-GenAI conventions, and Traza's own shorthand. Instrumented applications need no
-attribute renaming.
+Traza folds three vocabularies into one set of facts: the OpenLLMetry / OpenTelemetry
+GenAI conventions, Traza's own shorthand, and the OpenInference keys (ranked last).
+Instrumented applications need no attribute renaming.
 
 | Fact | Keys, in precedence order |
 |---|---|
-| Model | `gen_ai.response.model` → `gen_ai.request.model` → `llm.model` |
-| Provider | `gen_ai.provider.name` → `gen_ai.system` (deprecated) |
-| Prompt tokens | `gen_ai.usage.input_tokens` → `gen_ai.usage.prompt_tokens` → `llm.prompt_tokens` |
-| Completion tokens | `gen_ai.usage.output_tokens` → `gen_ai.usage.completion_tokens` → `llm.completion_tokens` |
-| Total tokens | `llm.usage.total_tokens` → `gen_ai.usage.total_tokens` → `llm.total_tokens` |
+| Model | `gen_ai.response.model` → `gen_ai.request.model` → `llm.model` → `llm.model_name` |
+| Provider | `gen_ai.provider.name` → `gen_ai.system` (deprecated) → `llm.provider` → `llm.system` |
+| Prompt tokens | `gen_ai.usage.input_tokens` → `gen_ai.usage.prompt_tokens` → `llm.prompt_tokens` → `llm.token_count.prompt` |
+| Completion tokens | `gen_ai.usage.output_tokens` → `gen_ai.usage.completion_tokens` → `llm.completion_tokens` → `llm.token_count.completion` |
+| Total tokens | `llm.usage.total_tokens` → `gen_ai.usage.total_tokens` → `llm.total_tokens` → `llm.token_count.total` |
 | Cost (USD) | `llm.cost_usd` → `gen_ai.usage.cost` |
 | Session | `session.id` → `gen_ai.conversation.id` → `traceloop.association.properties.session_id` → `traceloop.association.properties.chat_id` |
 

@@ -286,3 +286,73 @@ fn conventions_flow_through_otlp() {
     assert_eq!(spans[0]["events"][0]["attributes"]["content"], "hi");
     server.kill();
 }
+
+#[test]
+fn openinference_keys_feed_the_llm_rollups() {
+    let dir = test_dir("openinference");
+    let server = Server::spawn(&dir);
+    // One OpenInference LLM span over OTLP, carrying the model, host and
+    // token counts under their OpenInference names only…
+    let (status, body) = server.request(
+        "POST",
+        "/v1/traces",
+        Some(&json!({"resourceSpans": [{
+            "resource": {"attributes": [
+                {"key": "service.name", "value": {"stringValue": "phoenix-app"}}]},
+            "scopeSpans": [{"spans": [{
+                "traceId": "dddddddddddddddddddddddddddddddd",
+                "spanId": "eeeeeeeeeeeeeeee",
+                "name": "ChatCompletion",
+                "startTimeUnixNano": "1700000000000000000",
+                "endTimeUnixNano": "1700000001000000000",
+                "attributes": [
+                    {"key": "openinference.span.kind", "value": {"stringValue": "LLM"}},
+                    {"key": "llm.model_name", "value": {"stringValue": "phoenix-model"}},
+                    {"key": "llm.provider", "value": {"stringValue": "openai"}},
+                    {"key": "llm.token_count.prompt", "value": {"intValue": "30"}},
+                    {"key": "llm.token_count.completion", "value": {"intValue": "12"}},
+                    {"key": "llm.token_count.total", "value": {"intValue": "42"}}
+                ]
+            }]}]
+        }]})),
+    );
+    assert_eq!(status, 200, "OTLP OpenInference span: {body}");
+    // …and, natively, a span whose ONLY LLM evidence is its OpenInference kind.
+    let (status, body) = server.request(
+        "POST",
+        "/v1/spans",
+        Some(&json!([{
+            "trace_id": "t-kind", "span_id": "k1", "name": "llm", "service": "kind-only",
+            "start_time_ns": 1_000u64, "end_time_ns": 2_000u64,
+            "attributes": {"openinference.span.kind": "LLM"}
+        }])),
+    );
+    assert_eq!(status, 200, "{body}");
+
+    let row = |rows: &Value, key: &str| -> Value {
+        rows.as_array()
+            .expect("rows")
+            .iter()
+            .find(|row| row["key"] == json!(key))
+            .cloned()
+            .unwrap_or_else(|| panic!("no row {key} in {rows}"))
+    };
+    let (status, body) = server.request("GET", "/v1/stats/llm?group_by=model", None);
+    assert_eq!(status, 200);
+    let model = row(&body["rows"], "phoenix-model");
+    assert_eq!(model["llm_calls"], 1, "{body}");
+    assert_eq!(model["total_tokens"], 42);
+
+    let (status, body) = server.request("GET", "/v1/stats/llm?group_by=provider", None);
+    assert_eq!(status, 200);
+    assert_eq!(row(&body["rows"], "openai")["llm_calls"], 1, "{body}");
+
+    let (status, body) = server.request("GET", "/v1/stats/llm?group_by=service", None);
+    assert_eq!(status, 200);
+    assert_eq!(
+        row(&body["rows"], "kind-only")["llm_calls"],
+        1,
+        "openinference.span.kind=LLM alone is an LLM call: {body}"
+    );
+    server.kill();
+}
