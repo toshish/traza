@@ -57,6 +57,17 @@ Ingest batches are additionally held to the admission caps (attributes,
 key length, events, stored span size, spans per batch; see
 [configuration](../configuration.md#server-flags)).
 
+**Compressed bodies.** `POST /v1/spans` and `POST /v1/traces` accept
+`Content-Encoding: gzip` (or `x-gzip`) — what an OpenTelemetry exporter sends
+with compression on. The body is decompressed by the server's own inflate
+(RFC 1951/1952, no dependency), every member's CRC-32 and length checked, with
+the decompressed size capped at the same 64 MiB as an uncompressed body: past
+it the request is refused with `413` before more is produced, so a compressed
+request can hold at most the compressed body plus 64 MiB in memory while it is
+decoded. A damaged body is `400` naming the damage
+(`invalid gzip body: CRC-32 mismatch`). Every other route, and every other
+coding (`br`, `deflate`, `zstd`, a doubled `gzip`), is `415`.
+
 ### Status codes
 
 | Code | Meaning |
@@ -69,6 +80,8 @@ key length, events, stored span size, spans per batch; see
 | `404` | No such route, or the requested trace/session/payload/dataset/experiment/credential does not exist. Cross-tenant reads answer `404`, never `403` — existence is a fact about another tenant |
 | `409` | A conflict a retry may resolve: a mutation for a tenant whose erasure is pending, a tombstoned parent version, a payload reference not in the store, a pin label already taken, a credential token already registered, an environment credential named for revocation |
 | `410` | A tombstoned dataset version: the content is withheld, the fact of the deletion is not |
+| `413` | A gzip body that decompresses past the 64 MiB body cap |
+| `415` | A `Content-Encoding` other than `gzip` on an ingest route, or any coding elsewhere |
 | `429` | An ingest batch refused by its tenant's monthly quota or ingest pause. Carries `Retry-After` |
 | `503` | The store could not serve the request, or the server is at its connection limit. Retry with backoff |
 

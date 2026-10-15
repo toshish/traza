@@ -71,6 +71,8 @@ from the batch is stored.
 | A required field is missing | `400 {"error":"missing field \`name\` at line 1 column 31"}` |
 | `trace_id` is empty | `400 {"error":"span 0: trace_id is empty"}` |
 | `span_id` is empty | `400 {"error":"span 0: span_id is empty"}` |
+| An admission cap is exceeded (too many attributes or events, an oversized key or span, too many spans) | `400` naming the cap and the span, e.g. `span 0 (trace t1, span s1): 1500 attributes exceeds the max-span-attributes cap of 1024` |
+| The tenant's monthly quota or ingest pause refuses the batch | `429` with `Retry-After`; see [quota refusals](http-api.md#quota-refusals) |
 | The store could not accept the write | `503` — retry with backoff |
 
 The index in the error message is the span's position in the batch.
@@ -93,8 +95,12 @@ Point any OpenTelemetry SDK at Traza:
 ```sh
 export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:8080
 export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf   # or http/json
-export OTEL_EXPORTER_OTLP_COMPRESSION=none
+export OTEL_EXPORTER_OTLP_COMPRESSION=gzip         # or none
 ```
+
+`Content-Encoding: gzip` is decoded on both ingest routes, with the
+decompressed body held to the same 64 MiB cap as an uncompressed one; see
+[compressed bodies](http-api.md#conventions).
 
 The route accepts an `ExportTraceServiceRequest`. `Content-Type:
 application/x-protobuf` selects the binary decoder; anything else is parsed as
@@ -183,8 +189,10 @@ an attribute.
 ### Error handling
 
 A body that does not decode — malformed protobuf, malformed JSON, a non-hex id,
-a timestamp that is not a `u64` — is a `400` with the reason. A store failure is
-a `503`. There is no partial acceptance: `partialSuccess` is always empty
+a timestamp that is not a `u64`, a damaged gzip body — is a `400` with the
+reason, and so is an exceeded admission cap. A quota or ingest-pause refusal is
+a `429` with `Retry-After`, which OTLP exporters honour by retrying later. A
+store failure is a `503`. There is no partial acceptance: `partialSuccess` is always empty
 because a batch either lands entirely or is rejected entirely.
 
 ## LLM and agent telemetry

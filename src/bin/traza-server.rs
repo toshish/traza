@@ -1823,6 +1823,7 @@ fn handle_connection(
             content_type: head.content_type,
             origin: head.origin,
             mcp_protocol_version: head.mcp_protocol_version,
+            content_encoding: head.content_encoding,
             body,
         };
         let mut responder = connection.responder(keep_alive);
@@ -1956,6 +1957,36 @@ fn quota_exceeded(
     responder.raw(&head, &body)
 }
 
+/// Applies a request's `Content-Encoding`, or says why it cannot (`Err`
+/// carries the status and message).
+///
+/// gzip is accepted on the two ingest routes only — that is what OTLP
+/// exporters send when compression is on — and decoded with a cap equal to
+/// the body cap, so a compressed request can never become a larger one than
+/// an uncompressed request could be. Any other route, and any other coding,
+/// is `415`: refusing names the problem, where passing compressed bytes to a
+/// JSON parser would answer with a parse error about the wrong thing.
+fn decode_content(encoding: &str, ingest: bool, body: Vec<u8>) -> Result<Vec<u8>, (u16, String)> {
+    match encoding {
+        "" | "identity" => Ok(body),
+        "gzip" | "x-gzip" if ingest => {
+            traza::gzip::gunzip(&body, MAX_REQUEST_BYTES).map_err(|error| match error {
+                traza::gzip::GzipError::TooLarge(_) => (413, error.to_string()),
+                traza::gzip::GzipError::Malformed(_) => (400, error.to_string()),
+            })
+        }
+        "gzip" | "x-gzip" => Err((
+            415,
+            "Content-Encoding: gzip is accepted on POST /v1/spans and POST /v1/traces only"
+                .to_owned(),
+        )),
+        other => Err((
+            415,
+            format!("unsupported Content-Encoding: {other}; send gzip or an uncompressed body"),
+        )),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn serve_request(
     responder: &mut Responder<'_>,
@@ -1966,6 +1997,18 @@ fn serve_request(
     access: traza::mcp::Access,
     principal: Option<&traza::auth::Principal>,
 ) -> io::Result<()> {
+    let mut request = request;
+    if let Some(encoding) = request.content_encoding.take() {
+        let path = request
+            .target
+            .split_once('?')
+            .map_or(request.target.as_str(), |(path, _)| path);
+        let ingest = request.method == "POST" && matches!(path, "/v1/spans" | "/v1/traces");
+        match decode_content(&encoding, ingest, std::mem::take(&mut request.body)) {
+            Ok(body) => request.body = body,
+            Err((status, message)) => return responder.json(status, json!({"error": message})),
+        }
+    }
     let (path, query) = request
         .target
         .split_once('?')
@@ -3779,6 +3822,8 @@ struct Request {
     /// endpoint has header-level rules the REST routes do not.
     origin: Option<String>,
     mcp_protocol_version: Option<String>,
+    /// `Content-Encoding:`, lowercased; see [`decode_content`].
+    content_encoding: Option<String>,
     body: Vec<u8>,
 }
 
@@ -3803,6 +3848,8 @@ struct RequestHead {
     origin: Option<String>,
     /// `MCP-Protocol-Version:` as sent. An unsupported value is a `400`.
     mcp_protocol_version: Option<String>,
+    /// `Content-Encoding:`, trimmed and lowercased.
+    content_encoding: Option<String>,
     content_length: usize,
     header_end: usize,
 }
@@ -3940,6 +3987,7 @@ fn parse_head(bytes: &[u8], header_end: usize) -> io::Result<RequestHead> {
     let mut connection = String::new();
     let mut origin = None;
     let mut mcp_protocol_version = None;
+    let mut content_encoding: Option<String> = None;
     let mut header_lines: Vec<&str> = Vec::new();
     for line in lines {
         if let Some((name, value)) = line.split_once(':') {
@@ -3957,6 +4005,16 @@ fn parse_head(bytes: &[u8], header_end: usize) -> io::Result<RequestHead> {
             }
             if name.eq_ignore_ascii_case("mcp-protocol-version") {
                 mcp_protocol_version = Some(value.trim().to_owned());
+            }
+            // Repeated headers join into the list they mean, so two
+            // `gzip` headers read as "gzip, gzip" and are refused rather than
+            // decoded once and misparsed.
+            if name.eq_ignore_ascii_case("content-encoding") {
+                let value = value.trim().to_ascii_lowercase();
+                content_encoding = Some(match content_encoding {
+                    Some(previous) => format!("{previous}, {value}"),
+                    None => value,
+                });
             }
         }
         header_lines.push(line);
@@ -4007,6 +4065,7 @@ fn parse_head(bytes: &[u8], header_end: usize) -> io::Result<RequestHead> {
         connection,
         origin,
         mcp_protocol_version,
+        content_encoding,
         content_length,
         header_end,
     })
@@ -4060,6 +4119,7 @@ impl Responder<'_> {
             404 => "Not Found",
             405 => "Method Not Allowed",
             413 => "Payload Too Large",
+            415 => "Unsupported Media Type",
             429 => "Too Many Requests",
             503 => "Service Unavailable",
             _ => "Error",

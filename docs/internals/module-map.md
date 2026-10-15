@@ -208,6 +208,12 @@ the admission caps plus the one measurement pass ingest makes over a batch.
 The caps and the quota check run in `Store::admission_check`; usage is
 charged at acknowledgement.
 
+### [`src/gzip.rs`](../../src/gzip.rs)
+
+A dependency-free inflate (RFC 1951) inside gzip framing (RFC 1952) for
+`Content-Encoding: gzip` ingest bodies, with the decompressed size capped by
+the caller and every member's CRC-32 and length verified.
+
 ### [`src/platform.rs`](../../src/platform.rs)
 
 The hosting state (`credentials`, `limits`, `usage`, one field on `Store`)

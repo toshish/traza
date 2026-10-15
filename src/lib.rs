@@ -19,6 +19,7 @@ pub mod evals;
 pub mod expiration;
 mod generation;
 pub mod guard;
+pub mod gzip;
 pub mod hash;
 mod ingest_hooks;
 pub mod insights;
