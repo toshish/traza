@@ -10,8 +10,12 @@
 //! **Storage.** `credentials.jsonl` in the data directory: append-only
 //! `create` and `revoke` records, fsynced per write, a torn final append
 //! healed at open exactly as the annotation log heals one. The token itself
-//! is never written — only its SHA-256 — so a copy of the data directory is
-//! not a copy of anyone's credentials.
+//! is never written — only its SHA-256 — so for a minted token (256 random
+//! bits) a copy of the data directory is not a copy of anyone's credentials.
+//! The digest is unsalted, which is sound only for high-entropy tokens: a
+//! caller-supplied token is protected at rest by nothing but that digest, so
+//! it must be random enough not to be guessed offline. The file is created
+//! owner-only (`0600` on Unix) so the digests are not world-readable either.
 //!
 //! **Outside generations and pins.** The file is not in the manifest's
 //! whitelist ([`crate::generation`]), so a backup never carries it and a
@@ -32,14 +36,24 @@
 //! exactly as before (loopback by default). The first credential, from either
 //! source, turns enforcement on — and it stays on: revoking every credential
 //! locks the store rather than reopening it, because "the last revoke made the
-//! server public" is not a failure mode anyone would choose.
+//! server public" is not a failure mode anyone would choose. For the same
+//! reason the first API credential must be an unbound admin: anything else
+//! would switch enforcement on with no credential able to reach
+//! `/v1/admin/*`, a lockout only a restart with `TRAZA_TOKENS` undoes.
+//!
+//! **Writers never stall readers on the disk.** Create and revoke serialize
+//! on a mutex of their own and append and fsync under it alone; the set's
+//! read-write lock is taken for writing only for the in-memory change, after
+//! the record is durable. Authentication takes only the read lock, so it
+//! never waits on an fsync.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -53,7 +67,9 @@ pub const LOG_NAME: &str = "credentials.jsonl";
 
 /// Shortest token a caller may supply instead of having one minted. A control
 /// plane reconciling credentials it already issued needs to register ITS
-/// token; the floor keeps that from being a way to install `password1`.
+/// token; the floor keeps that from being a way to install `password1`. Length
+/// is not entropy, though, and only an unsalted digest protects the token at
+/// rest: a supplied token should carry at least 128 random bits.
 pub const MIN_SUPPLIED_TOKEN_BYTES: usize = 24;
 
 /// Longest supplied token. Tokens ride in a header capped at 64 KiB; this is
@@ -77,7 +93,10 @@ pub enum Source {
 }
 
 /// What `POST /v1/admin/credentials` asks for.
-#[derive(Clone, Debug, Default, Deserialize)]
+///
+/// `Debug` is written by hand to redact `token`, as
+/// [`crate::auth::AuthConfig`]'s is: a supplied token is a live secret.
+#[derive(Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NewCredential {
     /// `ro`, `rw` or `admin`.
@@ -99,7 +118,11 @@ pub struct NewCredential {
 
 /// A credential just created. The token is in here and NOWHERE else, ever:
 /// the store keeps only its digest, so this is the one chance to read it.
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// `Debug` is written by hand to redact `token` (`prefix` is shown — the
+/// credential list shows it anyway): an error path or a log line that formats
+/// this must not become a second place the token appears.
+#[derive(Clone, Eq, PartialEq)]
 pub struct Created {
     /// The credential id.
     pub id: String,
@@ -117,6 +140,35 @@ pub struct Created {
     pub created_at_ns: u64,
     /// When it stops authenticating, if ever.
     pub expires_at_ns: Option<u64>,
+}
+
+impl fmt::Debug for NewCredential {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NewCredential")
+            .field("scope", &self.scope)
+            .field("tenant", &self.tenant)
+            .field("label", &self.label)
+            .field("expires_in_seconds", &self.expires_in_seconds)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+impl fmt::Debug for Created {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Created")
+            .field("id", &self.id)
+            .field("token", &"<redacted>")
+            .field("prefix", &self.prefix)
+            .field("scope", &self.scope)
+            .field("tenant", &self.tenant)
+            .field("label", &self.label)
+            .field("created_at_ns", &self.created_at_ns)
+            .field("expires_at_ns", &self.expires_at_ns)
+            .finish()
+    }
 }
 
 impl Created {
@@ -272,6 +324,12 @@ impl Inner {
 #[derive(Debug)]
 pub struct CredentialStore {
     path: PathBuf,
+    /// Serializes every change to the set — create, revoke, installing the
+    /// environment's entries — so a writer can check the set under the read
+    /// lock, append and fsync holding only this, and then apply its change
+    /// under the write lock with no other writer having moved anything in
+    /// between. Taken before `inner`, never after.
+    writer: Mutex<()>,
     inner: RwLock<Inner>,
 }
 
@@ -289,6 +347,7 @@ impl CredentialStore {
         }
         Ok(Self {
             path,
+            writer: Mutex::new(()),
             inner: RwLock::new(inner),
         })
     }
@@ -313,6 +372,7 @@ impl CredentialStore {
     /// on lookup order, and if the runtime one was revoked, the environment
     /// would be silently resurrecting it.
     pub fn install_env(&self, config: &AuthConfig, now_ns: u64) -> Result<()> {
+        let _writer = self.writer()?;
         let mut inner = self.write()?;
         inner.entries.retain(|entry| entry.source == Source::Api);
         inner.reindex();
@@ -389,13 +449,15 @@ impl CredentialStore {
 
     /// Creates a credential, minting its token unless one was supplied.
     ///
-    /// The record is fsynced before this returns, and the in-memory set is
-    /// updated under the same write lock as the append, so the credential
-    /// authenticates from the moment the caller can read its token — and a
-    /// duplicate digest is refused atomically. Invalid requests are
-    /// [`Error::Invalid`]; a token already registered (live, expired,
-    /// revoked, or in `TRAZA_TOKENS`) is [`Error::Conflict`] — a revoked token
-    /// can never come back.
+    /// The record is fsynced before the credential joins the in-memory set,
+    /// and both happen before this returns, so the credential authenticates
+    /// from the moment the caller can read its token and never before it is
+    /// durable. Writers are serialized (the `writer` field), so a duplicate
+    /// digest is refused atomically. Invalid requests are [`Error::Invalid`];
+    /// a token already registered (live, expired, revoked, or in
+    /// `TRAZA_TOKENS`) is [`Error::Conflict`] — a revoked token can never come
+    /// back — and so is a first credential that is not an unbound admin (see
+    /// the module docs on posture).
     pub fn create(&self, request: NewCredential, now_ns: u64) -> Result<Created> {
         let scope = Scope::parse(&request.scope).ok_or_else(|| {
             Error::Invalid(format!(
@@ -439,18 +501,30 @@ impl CredentialStore {
         };
         let digest = sha256_hex(token.as_bytes());
 
-        let mut inner = self.write()?;
-        if inner.by_digest.contains_key(&digest) {
-            return Err(Error::Conflict(
-                "a credential with this token already exists (tokens are never reused, \
-                 revoked ones included)"
-                    .to_owned(),
-            ));
-        }
-        let id = loop {
-            let candidate = format!("cr_{}", random_hex(8)?);
-            if !inner.by_id.contains_key(&candidate) {
-                break candidate;
+        let _writer = self.writer()?;
+        let id = {
+            let inner = self.read()?;
+            let first = !inner.api_ever && !inner.has_env();
+            if first && (scope != Scope::Admin || request.tenant.is_some()) {
+                return Err(Error::Conflict(
+                    "the first credential must be an unbound admin (scope \"admin\", no \
+                     tenant): any other would turn authentication on with no credential able \
+                     to manage credentials"
+                        .to_owned(),
+                ));
+            }
+            if inner.by_digest.contains_key(&digest) {
+                return Err(Error::Conflict(
+                    "a credential with this token already exists (tokens are never reused, \
+                     revoked ones included)"
+                        .to_owned(),
+                ));
+            }
+            loop {
+                let candidate = format!("cr_{}", random_hex(8)?);
+                if !inner.by_id.contains_key(&candidate) {
+                    break candidate;
+                }
             }
         };
         let prefix = token_prefix(&token);
@@ -465,7 +539,7 @@ impl CredentialStore {
             expires_at_ns,
         };
         self.append(&record)?;
-        inner.push(Entry {
+        self.write()?.push(Entry {
             id: id.clone(),
             digest,
             prefix: prefix.clone(),
@@ -503,25 +577,36 @@ impl CredentialStore {
     /// answers with its original revocation time and writes nothing. An
     /// environment credential is [`Error::Conflict`] — it is not this store's
     /// to revoke, and pretending would last only until the next restart.
+    ///
+    /// The token stops authenticating before this returns, once the revoke
+    /// record is durable — so from the caller's next request on. A request
+    /// racing the revoke itself may still be admitted, exactly as it would
+    /// have been had it arrived a moment earlier.
     pub fn revoke(&self, id: &str, now_ns: u64) -> Result<Revoked> {
-        let mut inner = self.write()?;
-        let Some(&position) = inner.by_id.get(id) else {
-            return Ok(Revoked::Unknown);
+        let _writer = self.writer()?;
+        let position = {
+            let inner = self.read()?;
+            let Some(&position) = inner.by_id.get(id) else {
+                return Ok(Revoked::Unknown);
+            };
+            let entry = &inner.entries[position];
+            if entry.source == Source::Env {
+                return Err(Error::Conflict(
+                    "env credentials are revoked by restarting without them".to_owned(),
+                ));
+            }
+            if let Some(at) = entry.revoked_at_ns {
+                return Ok(Revoked::At(at));
+            }
+            position
         };
-        let entry = &inner.entries[position];
-        if entry.source == Source::Env {
-            return Err(Error::Conflict(
-                "env credentials are revoked by restarting without them".to_owned(),
-            ));
-        }
-        if let Some(at) = entry.revoked_at_ns {
-            return Ok(Revoked::At(at));
-        }
         self.append(&Record::Revoke {
             id: id.to_owned(),
             revoked_at_ns: now_ns,
         })?;
-        inner.entries[position].revoked_at_ns = Some(now_ns);
+        // `position` is still this entry's: only a writer moves entries, and
+        // this thread is the writer until it returns.
+        self.write()?.entries[position].revoked_at_ns = Some(now_ns);
         Ok(Revoked::At(now_ns))
     }
 
@@ -529,10 +614,17 @@ impl CredentialStore {
         let mut line = serde_json::to_string(record)?;
         line.push('\n');
         let created = !self.path.exists();
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        // Owner-only from the moment it exists. The file holds digests, not
+        // tokens, but the digest of a weak supplied token can be guessed
+        // offline, and nothing but the server needs to read it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&self.path)?;
         file.write_all(line.as_bytes())?;
         file.sync_all()?;
         if created {
@@ -541,6 +633,12 @@ impl CredentialStore {
             }
         }
         Ok(())
+    }
+
+    fn writer(&self) -> Result<std::sync::MutexGuard<'_, ()>> {
+        self.writer
+            .lock()
+            .map_err(|_| Error::LockPoisoned("credential writer"))
     }
 
     fn read(&self) -> Result<std::sync::RwLockReadGuard<'_, Inner>> {
@@ -771,6 +869,11 @@ mod tests {
         let dir = Dir::new();
         let store = CredentialStore::open(&dir.0).expect("opens");
         assert!(!store.enforced(), "an empty set is open mode");
+        store.create(request("admin"), 500).expect("bootstraps");
+        assert!(
+            store.enforced(),
+            "the first credential turns enforcement on"
+        );
         let created = store
             .create(
                 NewCredential {
@@ -786,10 +889,6 @@ mod tests {
         assert!(created.token.starts_with("trz_") && created.token.len() == 68);
         assert!(created.token[4..].bytes().all(|b| b.is_ascii_hexdigit()));
         assert_eq!(created.prefix, &created.token[..12]);
-        assert!(
-            store.enforced(),
-            "the first credential turns enforcement on"
-        );
 
         let principal = store
             .authenticate(Some(&bearer(&created.token)), 2_000)
@@ -809,8 +908,9 @@ mod tests {
         assert!(on_disk.contains(&sha256_hex(created.token.as_bytes())));
 
         let listed = store.list().expect("lists");
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].last_used_at_ns, Some(2_000));
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].last_used_at_ns, None, "the admin was never used");
+        assert_eq!(listed[1].last_used_at_ns, Some(2_000));
         let wire = serde_json::to_string(&listed).expect("serializes");
         assert!(!wire.contains(&created.token[12..]), "{wire}");
         assert!(!wire.contains("digest"), "{wire}");
@@ -885,6 +985,7 @@ mod tests {
     fn supplied_tokens_are_validated_and_never_reused() {
         let dir = Dir::new();
         let store = CredentialStore::open(&dir.0).expect("opens");
+        store.create(request("admin"), 0).expect("bootstraps");
         let supplied = "control-plane-issued-0123456789";
         let created = store
             .create(
@@ -969,7 +1070,7 @@ mod tests {
         }
         assert_eq!(
             store.list().expect("lists").len(),
-            1,
+            2,
             "refusals write nothing"
         );
     }
@@ -1039,7 +1140,7 @@ mod tests {
         let dir = Dir::new();
         let token = {
             let store = CredentialStore::open(&dir.0).expect("opens");
-            store.create(request("rw"), 1).expect("creates").token
+            store.create(request("admin"), 1).expect("creates").token
         };
         let path = dir.0.join(LOG_NAME);
         let mut file = OpenOptions::new().append(true).open(&path).expect("log");
@@ -1068,7 +1169,7 @@ mod tests {
     fn malformed_headers_never_authenticate() {
         let dir = Dir::new();
         let store = CredentialStore::open(&dir.0).expect("opens");
-        let created = store.create(request("rw"), 1).expect("creates");
+        let created = store.create(request("admin"), 1).expect("creates");
         for header in [
             None,
             Some(created.token.clone()),
@@ -1092,5 +1193,136 @@ mod tests {
         );
         assert_eq!(token_prefix("abcdefgh"), "ab");
         assert_eq!(token_prefix("abc"), "");
+    }
+
+    #[test]
+    fn the_first_credential_must_be_an_unbound_admin() {
+        let dir = Dir::new();
+        let store = CredentialStore::open(&dir.0).expect("opens");
+        for (scope, tenant) in [
+            ("ro", None),
+            ("rw", None),
+            ("ro", Some("acme")),
+            ("admin", Some("acme")),
+        ] {
+            let refused = store.create(
+                NewCredential {
+                    tenant: tenant.map(str::to_owned),
+                    ..request(scope)
+                },
+                1,
+            );
+            match refused {
+                Err(Error::Conflict(message)) => {
+                    assert!(message.contains("unbound admin"), "{message}")
+                }
+                other => panic!("{scope}@{tenant:?}: {other:?}"),
+            }
+        }
+        assert!(
+            !store.enforced(),
+            "a refused bootstrap leaves the store open"
+        );
+        assert!(
+            !dir.0.join(LOG_NAME).exists(),
+            "and writes nothing, so a later non-loopback start is still refused"
+        );
+        store.create(request("admin"), 2).expect("bootstraps");
+        store
+            .create(
+                NewCredential {
+                    tenant: Some("acme".into()),
+                    ..request("ro")
+                },
+                3,
+            )
+            .expect("after the first, anything an admin may grant");
+
+        // Environment credentials are already "a credential": an operator who
+        // configured TRAZA_TOKENS chose its admin there, and the store is not
+        // locked whatever the first runtime credential is.
+        let dir = Dir::new();
+        let store = CredentialStore::open(&dir.0).expect("opens");
+        let config = AuthConfig::parse("admin:env-operator-token").expect("parses");
+        store.install_env(&config, 1).expect("installs");
+        store
+            .create(
+                NewCredential {
+                    tenant: Some("acme".into()),
+                    ..request("rw")
+                },
+                2,
+            )
+            .expect("not the first credential");
+    }
+
+    #[test]
+    fn debug_output_never_shows_a_token() {
+        let dir = Dir::new();
+        let store = CredentialStore::open(&dir.0).expect("opens");
+        let supplied = "supplied-secret-0123456789abcdef";
+        let asked = NewCredential {
+            token: Some(supplied.into()),
+            label: Some("ops".into()),
+            ..request("admin")
+        };
+        let shown = format!("{asked:?}");
+        assert!(!shown.contains(supplied), "{shown}");
+        assert!(
+            shown.contains("<redacted>") && shown.contains("ops"),
+            "{shown}"
+        );
+        let created = store.create(asked, 1).expect("creates");
+        let shown = format!("{created:?}");
+        assert!(!shown.contains(supplied), "{shown}");
+        assert!(
+            shown.contains(&created.prefix),
+            "the prefix is fine: {shown}"
+        );
+        let minted = store.create(request("ro"), 2).expect("mints");
+        let shown = format!("{:?}", Ok::<_, Error>(minted.clone()));
+        assert!(!shown.contains(&minted.token), "{shown}");
+        assert!(
+            !format!("{:?}", NewCredential::default()).contains("<redacted>"),
+            "no token, nothing to redact"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_log_is_created_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = Dir::new();
+        let store = CredentialStore::open(&dir.0).expect("opens");
+        store.create(request("admin"), 1).expect("creates");
+        let mode = fs::metadata(dir.0.join(LOG_NAME))
+            .expect("log")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "{mode:o}");
+    }
+
+    /// A writer holds its mutex through the append's fsync; authentication
+    /// and listing must not need it, or every request would stall behind a
+    /// credential being minted. The writer is held here by hand — standing in
+    /// for a slow disk — while another thread authenticates. The bound is a
+    /// hang guard, not a performance claim.
+    #[test]
+    fn authentication_never_waits_for_a_writer() {
+        let dir = Dir::new();
+        let store = std::sync::Arc::new(CredentialStore::open(&dir.0).expect("opens"));
+        let created = store.create(request("admin"), 1).expect("creates");
+        let held = store.writer().expect("writer");
+        let (send, receive) = std::sync::mpsc::channel();
+        let reader = std::sync::Arc::clone(&store);
+        let token = created.token.clone();
+        std::thread::spawn(move || {
+            let verdict = reader.authenticate(Some(&bearer(&token)), 2).is_ok();
+            let listed = reader.list().map(|views| views.len()).unwrap_or(0);
+            let _ = send.send((verdict, listed));
+        });
+        let answered = receive.recv_timeout(std::time::Duration::from_secs(30));
+        drop(held);
+        assert_eq!(answered, Ok((true, 1)));
     }
 }

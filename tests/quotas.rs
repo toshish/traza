@@ -470,17 +470,18 @@ fn usage_is_scoped_by_binding_and_survives_a_crash_after_a_flush() {
 }
 
 #[test]
-fn the_maintenance_tick_writes_the_counters_without_a_flush() {
+fn the_counters_are_written_every_five_seconds_without_a_flush() {
     let mut server = Server::spawn(&[]);
     let (status, _) = server.json("POST", "/v1/spans", Some(&spans("t", 2)), &[]);
     assert_eq!(status, 200);
-    // The tick is every 5 s; wait for its write rather than for a duration.
+    // The usage writer runs every 5 s; wait for its write rather than for a
+    // duration.
     let path = server.data_dir.join("usage.json");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while !path.exists() {
         assert!(
             std::time::Instant::now() < deadline,
-            "no tick wrote usage.json"
+            "the usage writer never wrote usage.json"
         );
         std::thread::sleep(std::time::Duration::from_millis(200));
     }

@@ -87,8 +87,12 @@ struct LimitsFile {
 #[derive(Debug)]
 pub(crate) struct LimitsBook {
     path: PathBuf,
-    /// Leaf lock: never held while taking another, and held across the file
-    /// rewrite only, which is operator-rate.
+    /// Serializes [`LimitsBook::set`], which holds it across the file rewrite
+    /// (two fsyncs and a rename). Taken before `tenants`, never after.
+    writer: Mutex<()>,
+    /// Leaf lock, and never held across I/O: every ingest batch reads it (the
+    /// quota check), so a limits write must not make ingest wait on a disk
+    /// flush — on macOS `sync_all` is a full device flush.
     tenants: Mutex<BTreeMap<String, TenantLimits>>,
 }
 
@@ -118,6 +122,7 @@ impl LimitsBook {
         };
         Ok(Self {
             path,
+            writer: Mutex::new(()),
             tenants: Mutex::new(tenants),
         })
     }
@@ -133,18 +138,24 @@ impl LimitsBook {
     }
 
     /// Replaces the tenant's document, durably, before it takes effect.
+    ///
+    /// The next map is built and written holding only the writer mutex; the
+    /// map readers use is locked just long enough to copy it and, once the file is
+    /// durable, to swap the new one in. Writers are serialized, so nothing
+    /// changes the map between the copy and the swap.
     pub(crate) fn set(&self, tenant: &str, limits: TenantLimits) -> Result<()> {
-        let mut tenants = self.lock()?;
-        let mut next = tenants.clone();
+        let _writer = self
+            .writer
+            .lock()
+            .map_err(|_| Error::LockPoisoned("tenant limits writer"))?;
+        let mut next = self.lock()?.clone();
         next.insert(tenant.to_owned(), limits);
-        write_atomically(
-            &self.path,
-            &serde_json::to_vec_pretty(&LimitsFile {
-                version: 1,
-                tenants: next.clone(),
-            })?,
-        )?;
-        *tenants = next;
+        let file = LimitsFile {
+            version: 1,
+            tenants: next,
+        };
+        write_atomically(&self.path, &serde_json::to_vec_pretty(&file)?)?;
+        *self.lock()? = file.tenants;
         Ok(())
     }
 
@@ -290,6 +301,33 @@ mod tests {
             !path.join(".limits.json.tmp").exists(),
             "the temp is renamed away"
         );
+        let _ = fs::remove_dir_all(&path);
+    }
+
+    /// Every ingest batch reads the book, so a write in progress — held here
+    /// by hand, standing in for a slow fsync — must not block a read. The
+    /// bound is a hang guard, not a performance claim.
+    #[test]
+    fn reads_never_wait_for_a_write_in_progress() {
+        let path = dir();
+        let book = std::sync::Arc::new(LimitsBook::open(&path).expect("opens"));
+        book.set(
+            "acme",
+            TenantLimits {
+                monthly_spans: Some(7),
+                ..TenantLimits::default()
+            },
+        )
+        .expect("sets");
+        let held = book.writer.lock().expect("writer");
+        let (send, receive) = std::sync::mpsc::channel();
+        let reader = std::sync::Arc::clone(&book);
+        std::thread::spawn(move || {
+            let _ = send.send(reader.get("acme").map(|limits| limits.monthly_spans).ok());
+        });
+        let answered = receive.recv_timeout(std::time::Duration::from_secs(30));
+        drop(held);
+        assert_eq!(answered, Ok(Some(Some(7))));
         let _ = fs::remove_dir_all(&path);
     }
 

@@ -124,6 +124,144 @@ fn the_first_credential_bootstraps_enforcement_from_open_mode() {
     assert!(!log.contains(&token), "the token never reaches disk");
 }
 
+/// The attack this guards against: with no credential configured, a web page
+/// the operator visits sends the loopback server a "simple" cross-site POST —
+/// `text/plain`, no preflight — minting an admin credential with a token the
+/// page chose. That would lock the operator out, hand the page a live admin
+/// token, and make the credential log count as configured auth for a later
+/// non-loopback start.
+#[test]
+fn a_cross_site_page_cannot_mint_erase_or_pin_in_open_mode() {
+    let server = Server::spawn(&[]);
+    let attack = br#"{"scope":"admin","token":"attacker-chosen-0123456789abcd"}"#;
+    let evil = ("Origin", "https://evil.example");
+
+    // Exactly as a browser sends it.
+    let (status, _, body) = server.request(
+        "POST",
+        "/v1/admin/credentials",
+        Some(attack),
+        &[("Content-Type", "text/plain;charset=UTF-8"), evil],
+    );
+    assert_eq!(status, 403, "{body}");
+    assert!(body.contains("origin not allowed"), "{body}");
+    // Declaring JSON does not help a foreign page (a browser would preflight,
+    // and the server's own answer is the same refusal).
+    let (status, _, body) = server.request(
+        "POST",
+        "/v1/admin/credentials",
+        Some(attack),
+        &[("Content-Type", "application/json"), evil],
+    );
+    assert_eq!(status, 403, "{body}");
+    // A browser that omits Origin can still only send a form or text/plain,
+    // and an admin body must be declared JSON.
+    let (status, _, body) = server.request(
+        "POST",
+        "/v1/admin/credentials",
+        Some(attack),
+        &[("Content-Type", "text/plain")],
+    );
+    assert_eq!(status, 415, "{body}");
+    assert!(body.contains("application/json"), "{body}");
+
+    // Erasure and backups are the same request shape, refused the same way.
+    let (status, _) = server.json("POST", "/v1/spans", Some(&one_span("victim")), &[]);
+    assert_eq!(status, 200);
+    let (status, _, body) = server.request(
+        "POST",
+        "/v1/erasures",
+        Some(br#"{"subject":{"kind":"trace","trace_id":"victim"}}"#),
+        &[("Content-Type", "text/plain"), evil],
+    );
+    assert_eq!(status, 403, "{body}");
+    let (status, _, body) = server.request(
+        "POST",
+        "/v1/backups/planted",
+        None,
+        &[("Content-Type", "text/plain"), evil],
+    );
+    assert_eq!(status, 403, "{body}");
+
+    // Nothing happened: still open, no credential log, the trace intact.
+    assert!(!server.data_dir.join("credentials.jsonl").exists());
+    let (_, me) = server.json("GET", "/v1/whoami", None, &[]);
+    assert_eq!(me["auth"], json!("open"));
+    let (status, trace) = server.json("GET", "/v1/traces/victim", None, &[]);
+    assert_eq!(status, 200, "{trace}");
+    // Non-admin routes are not this rule's business: a foreign Origin on
+    // ingest is answered as before.
+    let (status, _, body) = server.request(
+        "POST",
+        "/v1/spans",
+        Some(one_span("other").to_string().as_bytes()),
+        &[evil],
+    );
+    assert_eq!(status, 200, "{body}");
+
+    // A page on this server (the dashboard) and a script with no Origin are
+    // let through.
+    let own_page = server.url("");
+    let created = {
+        let (status, created) = server.json(
+            "POST",
+            "/v1/admin/credentials",
+            Some(&json!({"scope": "admin"})),
+            &[("Origin", &own_page)],
+        );
+        assert_eq!(status, 201, "{created}");
+        created
+    };
+    let token = created["token"].as_str().expect("token");
+    // Once a credential exists a page cannot attach the bearer it would need,
+    // so the origin no longer decides anything — the token does.
+    let authorization = format!("Bearer {token}");
+    let (status, _) = server.json(
+        "GET",
+        "/v1/admin/credentials",
+        None,
+        &[evil, ("Authorization", &authorization)],
+    );
+    assert_eq!(status, 200);
+    let (status, _) = server.json(
+        "POST",
+        "/v1/admin/credentials",
+        Some(&json!({"scope": "ro"})),
+        &[evil],
+    );
+    assert_eq!(status, 401, "and without the token, it is unauthorized");
+}
+
+#[test]
+fn the_first_credential_must_be_an_unbound_admin() {
+    let server = Server::spawn(&[]);
+    for body in [
+        json!({"scope": "ro", "tenant": "acme", "label": "acme dashboard"}),
+        json!({"scope": "rw"}),
+        json!({"scope": "admin", "tenant": "acme"}),
+    ] {
+        let (status, refused) = server.json("POST", "/v1/admin/credentials", Some(&body), &[]);
+        assert_eq!(status, 409, "{body}: {refused}");
+        assert!(
+            refused["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("unbound admin")),
+            "{refused}"
+        );
+    }
+    // Refused without a trace: the store is still open and still has no log.
+    let (_, me) = server.json("GET", "/v1/whoami", None, &[]);
+    assert_eq!(me["auth"], json!("open"));
+    assert!(!server.data_dir.join("credentials.jsonl").exists());
+    let admin = mint(&server, None, json!({"scope": "admin"}));
+    let admin = admin["token"].as_str().expect("token");
+    mint(
+        &server,
+        Some(admin),
+        json!({"scope": "ro", "tenant": "acme"}),
+    );
+}
+
 #[test]
 fn bound_and_non_admin_credentials_are_denied_every_admin_path() {
     let server = Server::spawn_with_env(
@@ -456,24 +594,11 @@ fn an_expiring_credential_stops_authenticating_at_its_instant() {
 #[test]
 fn a_runtime_credential_counts_as_configured_auth_for_a_non_loopback_bind() {
     let dir = scratch_dir("non-loopback");
-    // 192.0.2.1 is TEST-NET-1: a non-loopback address no host has, so a
-    // server that gets PAST the auth check fails at bind instead — which is
-    // how this test tells the two apart without opening a public socket.
-    let attempt = |dir: &Path| {
-        let output = Command::new(env!("CARGO_BIN_EXE_traza-server"))
-            .arg("--data-dir")
-            .arg(dir)
-            .arg("--host")
-            .arg("192.0.2.1")
-            .arg("--port")
-            .arg("0")
-            .env_remove("TRAZA_TOKENS")
-            .output()
-            .expect("runs");
-        assert!(!output.status.success());
-        String::from_utf8_lossy(&output.stderr).into_owned()
-    };
-    let refused = attempt(&dir);
+    let (outcome, refused) = start_non_loopback(&dir);
+    assert!(
+        matches!(outcome, Start::Exited(Some(false))),
+        "{outcome:?}: {refused}"
+    );
     assert!(
         refused.contains("refusing unauthenticated non-loopback bind"),
         "{refused}"
@@ -496,12 +621,98 @@ fn a_runtime_credential_counts_as_configured_auth_for_a_non_loopback_bind() {
             )
             .expect("creates");
     }
-    let passed = attempt(&dir);
+    // Past the auth check, the server either fails at bind (the usual case:
+    // no host has the address) or binds and listens (a host that permits
+    // non-local binds). Either way it did not refuse for want of auth.
+    let (outcome, passed) = start_non_loopback(&dir);
     assert!(
         !passed.contains("refusing unauthenticated non-loopback bind"),
-        "credentials.jsonl is configured auth: {passed}"
+        "credentials.jsonl is configured auth ({outcome:?}): {passed}"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// How a [`start_non_loopback`] attempt ended.
+#[derive(Debug)]
+enum Start {
+    /// The process exited; `Some(success)` when it reported a status.
+    Exited(Option<bool>),
+    /// It announced it was listening (and was then killed).
+    Listening,
+    /// It did neither within the deadline (and was then killed).
+    TimedOut,
+}
+
+/// Starts the server on 192.0.2.1 — TEST-NET-1, a non-loopback address that
+/// normally no host has, so a server that gets PAST the auth check usually
+/// fails at bind instead, which is how this test tells the two apart without
+/// opening a public socket. Returns how the attempt ended and its stderr.
+///
+/// Never blocks for good: on a host that allows binding a non-local address
+/// (Linux with `net.ipv4.ip_nonlocal_bind=1`, as some container and CI images
+/// set) the bind succeeds and the server would serve forever, so the child is
+/// watched against a deadline and killed once it announces it is listening.
+fn start_non_loopback(dir: &Path) -> (Start, String) {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_traza-server"));
+    command
+        .arg("--data-dir")
+        .arg(dir)
+        .arg("--host")
+        .arg("192.0.2.1")
+        .arg("--port")
+        .arg("0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("TRAZA_") {
+            command.env_remove(key);
+        }
+    }
+    let mut child = command.spawn().expect("spawns traza-server");
+    let stderr = child.stderr.take().expect("stderr piped");
+    let (send, lines) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if send.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut seen = Vec::new();
+    let outcome = loop {
+        match lines.recv_timeout(Duration::from_millis(100)) {
+            Ok(line) => {
+                let listening = line.starts_with("traza-server listening on");
+                seen.push(line);
+                if listening {
+                    break Start::Listening;
+                }
+                continue;
+            }
+            // The pipe closed: the process is exiting, or has.
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                break Start::Exited(child.wait().ok().map(|status| status.success()));
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        if Instant::now() >= deadline {
+            break Start::TimedOut;
+        }
+    };
+    if !matches!(outcome, Start::Exited(_)) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let _ = reader.join();
+    seen.extend(lines.try_iter());
+    (outcome, seen.join("\n"))
 }
 
 #[test]
@@ -510,11 +721,12 @@ fn backups_carry_no_credentials_and_a_restore_never_resurrects_a_revoked_token()
     let elsewhere = scratch_dir("restore-elsewhere");
     let (token, pin) = {
         let store = Store::open(&root, Config::default()).expect("opens");
+        // The first credential of a store must be an unbound admin.
         let created = store
             .credentials()
             .create(
                 NewCredential {
-                    scope: "rw".into(),
+                    scope: "admin".into(),
                     ..NewCredential::default()
                 },
                 1,

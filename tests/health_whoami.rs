@@ -125,11 +125,21 @@ fn whoami_describes_each_environment_credential() {
 #[test]
 fn whoami_names_a_runtime_credential_and_its_label() {
     let server = Server::spawn(&[]);
+    // The first credential must be an unbound admin; it mints the one under
+    // test.
+    let (status, admin) = server.json(
+        "POST",
+        "/v1/admin/credentials",
+        Some(&json!({"scope": "admin", "label": "bootstrap"})),
+        &[],
+    );
+    assert_eq!(status, 201, "{admin}");
+    let admin = bearer(admin["token"].as_str().expect("token"));
     let (status, created) = server.json(
         "POST",
         "/v1/admin/credentials",
         Some(&json!({"scope": "ro", "tenant": "acme", "label": "acme dashboard"})),
-        &[],
+        &[("Authorization", &admin)],
     );
     assert_eq!(status, 201, "{created}");
     let token = created["token"].as_str().expect("token");

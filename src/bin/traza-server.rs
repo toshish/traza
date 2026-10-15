@@ -1226,12 +1226,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     if let Err(error) = maintainer.compact_segments() {
                         eprintln!("segment compaction failed: {error}");
                     }
-                    // Usage counters: written only when they changed, so an
-                    // idle store does not fsync every tick. A crash loses at
-                    // most this interval's counts — an undercount.
-                    if let Err(error) = maintainer.persist_usage() {
-                        eprintln!("usage persistence failed: {error}");
-                    }
                     // TTL keeps its documented one-minute cadence. Not gated
                     // on the startup flags any more: a runtime limits
                     // document can introduce a window, and with no window
@@ -1256,6 +1250,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             eprintln!("checkpoint failed: {error}");
                         }
                     }
+                }
+            })?;
+    }
+    // Usage counters get a thread of their own rather than a slot in the
+    // maintenance tick: that tick runs a merge, an expiry pass or an erasure
+    // purge serially, any of which can take far longer than five seconds,
+    // and the documented crash-loss bound is the gap between two writes. The
+    // write is skipped when nothing changed, so an idle store does not fsync.
+    {
+        let persister = Arc::clone(&engine);
+        thread::Builder::new()
+            .name("traza-usage".into())
+            .spawn(move || loop {
+                thread::sleep(std::time::Duration::from_secs(5));
+                if let Err(error) = persister.persist_usage() {
+                    eprintln!("usage persistence failed: {error}");
                 }
             })?;
     }
@@ -1747,10 +1757,12 @@ fn handle_connection(
         // denied to bound and non-admin credentials before anyone remembers
         // to list it.
         let is_admin_surface = head_path == "/v1/admin" || head_path.starts_with("/v1/admin/");
+        let needs_admin = is_erasure_write || is_eval_tombstone || is_backup || is_admin_surface;
         let mut access = traza::mcp::Access::ReadWrite;
         let mut principal: Option<traza::auth::Principal> = None;
         let credentials = engine.credentials();
-        if credentials.enforced() {
+        let enforced = credentials.enforced();
+        if enforced {
             let verdict = credentials
                 .authenticate(head.authorization.as_deref(), traza::mcp::unix_nanos_now())
                 .and_then(|granted| {
@@ -1760,8 +1772,6 @@ fn handle_connection(
                     if granted.tenant.is_some() && (is_operator_surface || is_admin_surface) {
                         return Err(AuthFailure::Forbidden(Required::Unbound));
                     }
-                    let needs_admin =
-                        is_erasure_write || is_eval_tombstone || is_backup || is_admin_surface;
                     let allowed = if is_mcp {
                         true
                     } else if needs_admin {
@@ -1809,6 +1819,25 @@ fn handle_connection(
                     return responder.raw(&head, body.as_bytes());
                 }
             }
+        }
+        // What the head alone can still refuse once authentication passed: a
+        // cross-site request to an admin-capability route in open mode, and
+        // an admin body not declared as JSON. The reasoning is on
+        // `traza::platform::screen`.
+        if let Some(reply) = traza::platform::screen(&traza::platform::Head {
+            method: &head.method,
+            path: head_path,
+            needs_admin,
+            enforced,
+            origin: head.origin.as_deref(),
+            content_type: &head.content_type,
+            content_length: head.content_length,
+        }) {
+            if reply.status == 403 {
+                metrics.rejected.increment();
+            }
+            let mut responder = connection.responder(false);
+            return responder.json(reply.status, reply.body);
         }
         let body = match connection.read_body(&head) {
             Ok(body) => body,
@@ -3782,9 +3811,10 @@ fn serve_mcp(
 /// the attacker owns the name, so the browser sends *their* host in both
 /// headers and the comparison succeeds. Only two things may permit an origin:
 ///
-/// - it is a loopback page, which an attacker's site can never be — the
-///   browser stamps the origin of the page, and a page served from
-///   `evil.example` has that origin however its DNS resolves;
+/// - it is a loopback page ([`traza::platform::loopback_origin`]), which an
+///   attacker's site can never be — the browser stamps the origin of the
+///   page, and a page served from `evil.example` has that origin however its
+///   DNS resolves;
 /// - the operator named it with `--mcp-allowed-origin`.
 fn origin_allowed(origin: &str, allowed: &[String]) -> bool {
     // "null" is what a sandboxed iframe or a `file://` page sends. It is
@@ -3793,25 +3823,7 @@ fn origin_allowed(origin: &str, allowed: &[String]) -> bool {
         return false;
     }
     let origin = origin.trim().trim_end_matches('/');
-    if allowed.iter().any(|entry| entry == origin) {
-        return true;
-    }
-    let Some((scheme, authority)) = origin.split_once("://") else {
-        return false;
-    };
-    // A loopback *origin* — not a loopback destination. The scheme is checked
-    // too, so `javascript://localhost` and friends cannot pass as one.
-    matches!(scheme, "http" | "https")
-        && matches!(authority_host(authority), "localhost" | "127.0.0.1" | "::1")
-}
-
-/// The host part of an authority, with an IPv6 literal unwrapped from its
-/// brackets so `[::1]:8080` compares as `::1`.
-fn authority_host(authority: &str) -> &str {
-    if let Some(rest) = authority.strip_prefix('[') {
-        return rest.split(']').next().unwrap_or(rest);
-    }
-    authority.split(':').next().unwrap_or(authority)
+    allowed.iter().any(|entry| entry == origin) || traza::platform::loopback_origin(origin)
 }
 
 struct Request {

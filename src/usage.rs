@@ -26,11 +26,14 @@
 //! by at most what was in flight; the next batch is then refused.
 //!
 //! **Persistence** is `usage.json` (atomic rewrite + fsync), written by
-//! [`crate::Store::persist_usage`] — on the server's 5-second maintenance tick
-//! and on every flush — and only when something changed. A crash loses the
-//! counts since the last write: an UNDERCOUNT, never an overcount, bounded by
-//! one tick. Outside generations and pins: a restore brings back data, it does
-//! not wind back what a tenant has already been charged for.
+//! [`crate::Store::persist_usage`] — every five seconds by a server thread
+//! that does nothing else (so a long merge or expiry pass on the maintenance
+//! thread cannot stretch the gap), and on every flush — and only when
+//! something changed. A crash loses the counts since the last completed
+//! write: an UNDERCOUNT, never an overcount, normally five seconds' worth plus
+//! the time that write took. Outside generations and pins: a restore brings
+//! back data, it does not wind back what a tenant has already been charged
+//! for.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -203,18 +206,19 @@ struct Counters {
     month: Month,
 }
 
+/// What a report copies out of one tenant's counters under the lock: the
+/// lifetime counters and the month's spans and bytes as of the report's
+/// window. Plain numbers — no allocation inside the lock.
+type Snapshot = (Lifetime, u64, u64);
+
 impl Counters {
-    /// The month counters as of `window`: these, or zeros if they belong to
-    /// an earlier month.
-    fn month_in(&self, window: &str) -> Month {
+    /// The lifetime counters, and the month's as of `window` (zeros when they
+    /// belong to an earlier month).
+    fn snapshot(&self, window: &str) -> Snapshot {
         if self.month.window == window {
-            self.month.clone()
+            (self.lifetime, self.month.spans, self.month.bytes)
         } else {
-            Month {
-                window: window.to_owned(),
-                spans: 0,
-                bytes: 0,
-            }
+            (self.lifetime, 0, 0)
         }
     }
 
@@ -317,10 +321,10 @@ impl UsageBook {
         let mut inner = self.lock()?;
         let mut refusal = None;
         for (tenant, doc) in &limited {
-            let month = inner
+            let (_, month_spans, month_bytes) = inner
                 .tenants
                 .get(*tenant)
-                .map(|counters| counters.month_in(&window))
+                .map(|counters| counters.snapshot(&window))
                 .unwrap_or_default();
             let (spans, bytes) = tally[tenant];
             let refuse = |dimension, limit: Option<u64>, used| QuotaRefusal {
@@ -336,24 +340,24 @@ impl UsageBook {
                 },
             };
             if doc.ingest_paused {
-                refusal = Some(refuse(QuotaDimension::Paused, None, month.spans));
+                refusal = Some(refuse(QuotaDimension::Paused, None, month_spans));
             } else if let Some(limit) = doc
                 .monthly_spans
-                .filter(|limit| month.spans.saturating_add(spans) > *limit)
+                .filter(|limit| month_spans.saturating_add(spans) > *limit)
             {
                 refusal = Some(refuse(
                     QuotaDimension::MonthlySpans,
                     Some(limit),
-                    month.spans,
+                    month_spans,
                 ));
             } else if let Some(limit) = doc
                 .monthly_bytes
-                .filter(|limit| month.bytes.saturating_add(bytes) > *limit)
+                .filter(|limit| month_bytes.saturating_add(bytes) > *limit)
             {
                 refusal = Some(refuse(
                     QuotaDimension::MonthlyBytes,
                     Some(limit),
-                    month.bytes,
+                    month_bytes,
                 ));
             }
             if refusal.is_some() {
@@ -441,6 +445,13 @@ impl UsageBook {
     }
 
     /// The row for every tenant with counters or limits, or for one tenant.
+    ///
+    /// The counter lock is the one every ingest batch takes, so the report
+    /// holds it only to copy numbers out: one entry for a single tenant (a
+    /// bound dashboard polling its own row costs O(1) inside the lock, however
+    /// many tenants the store has), and names plus plain counts for all of
+    /// them. Building, merging and sorting the rows happen after it is
+    /// released.
     pub(crate) fn report(
         &self,
         limits: &LimitsBook,
@@ -448,61 +459,87 @@ impl UsageBook {
         now_ns: u64,
     ) -> Result<UsageReport> {
         let (window, _) = month_window(now_ns);
-        let all_limits = limits.all()?;
-        let counters = self.lock()?.tenants.clone();
-        let names: Vec<String> = match tenant {
-            Some(tenant) => vec![tenant.to_owned()],
-            None => {
-                let mut names: Vec<String> = counters.keys().cloned().collect();
-                names.extend(all_limits.keys().cloned());
-                names.sort();
-                names.dedup();
-                names
+        let row = |name: String, (lifetime, spans, bytes): Snapshot, doc: TenantLimits| {
+            let month = Month {
+                window: window.clone(),
+                spans,
+                bytes,
+            };
+            UsageRow {
+                state: state_of(&doc, &month),
+                tenant: name,
+                lifetime,
+                month,
+                limits: doc,
             }
         };
-        let tenants = names
-            .into_iter()
-            .map(|name| {
-                let counted = counters.get(&name).cloned().unwrap_or_default();
-                let doc = all_limits.get(&name).cloned().unwrap_or_default();
-                let month = counted.month_in(&window);
-                UsageRow {
-                    state: state_of(&doc, &month),
-                    tenant: name,
-                    lifetime: counted.lifetime,
-                    month,
-                    limits: doc,
+        let tenants = match tenant {
+            Some(tenant) => {
+                let doc = limits.get(tenant)?;
+                let counted = self
+                    .lock()?
+                    .tenants
+                    .get(tenant)
+                    .map(|counters| counters.snapshot(&window))
+                    .unwrap_or_default();
+                vec![row(tenant.to_owned(), counted, doc)]
+            }
+            None => {
+                let mut all_limits = limits.all()?;
+                let counted: Vec<(String, Snapshot)> = self
+                    .lock()?
+                    .tenants
+                    .iter()
+                    .map(|(name, counters)| (name.clone(), counters.snapshot(&window)))
+                    .collect();
+                let mut merged: BTreeMap<String, Snapshot> = counted.into_iter().collect();
+                for name in all_limits.keys() {
+                    merged.entry(name.clone()).or_default();
                 }
-            })
-            .collect();
+                merged
+                    .into_iter()
+                    .map(|(name, counted)| {
+                        let doc = all_limits.remove(&name).unwrap_or_default();
+                        row(name, counted, doc)
+                    })
+                    .collect()
+            }
+        };
         Ok(UsageReport {
             as_of_ns: now_ns,
             tenants,
         })
     }
 
-    /// The per-tenant counters in Prometheus text.
+    /// The per-tenant counters in Prometheus text. Like the report, it copies
+    /// the numbers out under the counter lock and formats after releasing it.
     pub(crate) fn render_prometheus(&self, into: &mut String) {
         use std::fmt::Write as _;
-        let Ok(inner) = self.inner.lock() else {
-            return;
+        let series: Vec<(String, u64, u64)> = match self.inner.lock() {
+            Ok(inner) => inner
+                .tenants
+                .iter()
+                .map(|(tenant, counters)| {
+                    (
+                        tenant.clone(),
+                        counters.lifetime.spans,
+                        counters.lifetime.rejected,
+                    )
+                })
+                .collect(),
+            Err(_) => return,
         };
-        for (name, read) in [
-            (
-                "traza_tenant_spans_ingested_total",
-                (|counters: &Counters| counters.lifetime.spans) as fn(&Counters) -> u64,
-            ),
-            ("traza_quota_rejected_total", |counters: &Counters| {
-                counters.lifetime.rejected
-            }),
+        for (name, spans_or_rejected) in [
+            ("traza_tenant_spans_ingested_total", true),
+            ("traza_quota_rejected_total", false),
         ] {
             let _ = writeln!(into, "# TYPE {name} counter");
-            for (tenant, counters) in &inner.tenants {
+            for (tenant, spans, rejected) in &series {
                 let _ = writeln!(
                     into,
                     "{name}{{tenant=\"{}\"}} {}",
                     label_value(tenant),
-                    read(counters)
+                    if spans_or_rejected { spans } else { rejected }
                 );
             }
         }
@@ -593,9 +630,9 @@ impl Store {
     }
 
     /// Writes the usage counters to `usage.json` if they changed since the
-    /// last write. The server calls this every maintenance tick, and
-    /// [`Store::flush`] calls it too; an embedder that does neither loses the
-    /// counts since its last call when the process ends.
+    /// last write. The server calls this every five seconds from a thread of
+    /// its own, and [`Store::flush`] calls it too; an embedder that does
+    /// neither loses the counts since its last call when the process ends.
     pub fn persist_usage(&self) -> Result<()> {
         self.platform.usage.persist()
     }

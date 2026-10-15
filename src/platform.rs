@@ -85,6 +85,114 @@ impl Reply {
     }
 }
 
+/// What [`screen`] reads from a request: its head, and how the gate classified
+/// it. Everything here is known before the body is read.
+#[derive(Clone, Copy, Debug)]
+pub struct Head<'a> {
+    /// The request method, as sent.
+    pub method: &'a str,
+    /// The path, without its query string.
+    pub path: &'a str,
+    /// Whether the route needs the `admin` capability: erasure, eval
+    /// tombstones, backups, and everything under `/v1/admin/`.
+    pub needs_admin: bool,
+    /// Whether any credential exists, so requests authenticate. `false` is
+    /// open mode.
+    pub enforced: bool,
+    /// `Origin:` as sent (lowercased), if any.
+    pub origin: Option<&'a str>,
+    /// `Content-Type:` as sent (lowercased), empty when absent.
+    pub content_type: &'a str,
+    /// The declared body length.
+    pub content_length: usize,
+}
+
+/// Refusals the server decides from a request's head once authentication has
+/// passed, before reading the body. `None` lets the request through.
+///
+/// **Cross-site requests in open mode.** With no credential configured, the
+/// only thing standing between a web page the operator happens to visit and
+/// the admin surfaces of a loopback server is the browser — and a browser
+/// sends a cross-site `POST` with a `text/plain` body without asking anyone
+/// (a "simple" request, no CORS preflight). Such a page could mint an admin
+/// credential with a token it chose: the operator is locked out on the spot,
+/// the attacker holds a live admin token, and the credential log then counts
+/// as configured auth, so a later non-loopback start serves that token to the
+/// network. Erasure, tombstones and backups are the same request shape. So in
+/// open mode every admin-capability route refuses a request whose `Origin`
+/// is not a loopback page. A browser stamps `Origin` on every cross-origin
+/// `POST` and a page cannot forge it; `curl` and scripts send none and are
+/// unaffected. Once a credential exists the rule is moot — a page cannot
+/// attach a bearer token it does not know — and it is not applied.
+///
+/// **JSON or nothing on `/v1/admin/*`.** Every admin `POST` that carries a
+/// body must declare `Content-Type: application/json`. An HTML form can only
+/// send `application/x-www-form-urlencoded`, `multipart/form-data` or
+/// `text/plain`, and a cross-site `fetch` declaring JSON needs a CORS
+/// preflight this server never approves — so this closes the form-POST route
+/// even in a browser that omits `Origin`. It applies whether or not auth is
+/// enforced, so a client that works before the first credential keeps working
+/// after it.
+pub fn screen(head: &Head<'_>) -> Option<Reply> {
+    if head.needs_admin && !head.enforced {
+        if let Some(origin) = head.origin {
+            if !loopback_origin(origin) {
+                return Some(Reply::new(
+                    403,
+                    json!({
+                        "error": "origin not allowed: with no credential configured, admin \
+                                  operations accept browser requests from loopback pages only",
+                        "next": "send the request without an Origin header (curl, a script), \
+                                 or create a credential and authenticate with it",
+                    }),
+                ));
+            }
+        }
+    }
+    let admin_surface = head.path == "/v1/admin" || head.path.starts_with("/v1/admin/");
+    if admin_surface && head.method.eq_ignore_ascii_case("POST") && head.content_length > 0 {
+        let media_type = head.content_type.split(';').next().unwrap_or("").trim();
+        if media_type != "application/json" {
+            return Some(Reply::error(
+                415,
+                "admin requests with a body must send Content-Type: application/json",
+            ));
+        }
+    }
+    None
+}
+
+/// Whether a browser `Origin` is a loopback page: `http` or `https` on
+/// `localhost`, `127.0.0.1` or `::1`, any port.
+///
+/// This is a statement about the PAGE, not about where the request is going.
+/// A page served from `evil.example` has that origin however its DNS
+/// resolves — which is what makes this a defence against DNS rebinding as
+/// well as against cross-site requests. The origin is deliberately never
+/// compared with the request's `Host`: a rebinding request supplies the
+/// attacker's name in both, so they agree exactly when it matters. `null`
+/// (a sandboxed iframe or a `file://` page) is same-origin with nothing and
+/// is not loopback.
+pub fn loopback_origin(origin: &str) -> bool {
+    let origin = origin.trim().trim_end_matches('/');
+    let Some((scheme, authority)) = origin.split_once("://") else {
+        return false;
+    };
+    // The scheme is checked too, so `javascript://localhost` and friends
+    // cannot pass as one.
+    let host = match authority.strip_prefix('[') {
+        // An IPv6 literal, unwrapped from its brackets so `[::1]:8080`
+        // compares as `::1`.
+        Some(rest) => rest.split(']').next().unwrap_or(rest),
+        None => authority.split(':').next().unwrap_or(authority),
+    };
+    matches!(scheme, "http" | "https")
+        && matches!(
+            host.to_ascii_lowercase().as_str(),
+            "localhost" | "127.0.0.1" | "::1"
+        )
+}
+
 /// `GET /healthz`: the process is up. Answered before authentication.
 pub fn health() -> Value {
     json!({"status": "ok", "version": env!("CARGO_PKG_VERSION")})
@@ -367,6 +475,147 @@ mod tests {
             Err(400)
         );
         assert_eq!(tenant_segment("").map_err(|reply| reply.status), Err(400));
+    }
+
+    fn head<'a>(path: &'a str, origin: Option<&'a str>, content_type: &'a str) -> Head<'a> {
+        Head {
+            method: "POST",
+            path,
+            needs_admin: true,
+            enforced: false,
+            origin,
+            content_type,
+            content_length: 16,
+        }
+    }
+
+    #[test]
+    fn open_mode_refuses_cross_site_admin_requests_and_only_those() {
+        // The attack: a page on another site POSTs a credential as text/plain.
+        let attack = screen(&head(
+            "/v1/admin/credentials",
+            Some("https://evil.example"),
+            "text/plain",
+        ))
+        .expect("refused");
+        assert_eq!(attack.status, 403);
+        assert!(
+            attack.body["error"]
+                .as_str()
+                .is_some_and(|error| error.starts_with("origin not allowed")),
+            "{}",
+            attack.body
+        );
+        // Erasure and the other admin-capability routes are the same shape.
+        assert_eq!(
+            screen(&head(
+                "/v1/erasures",
+                Some("http://evil.example:8080"),
+                "text/plain"
+            ))
+            .map(|reply| reply.status),
+            Some(403)
+        );
+        // A loopback page, or no browser at all, is let through.
+        for origin in [
+            None,
+            Some("http://127.0.0.1:8080"),
+            Some("http://localhost:5173"),
+            Some("https://[::1]:8443"),
+        ] {
+            assert_eq!(
+                screen(&head("/v1/admin/credentials", origin, "application/json")),
+                None,
+                "{origin:?}"
+            );
+        }
+        // Once a credential exists, a page cannot attach the bearer it would
+        // need, so the origin no longer matters.
+        let enforced = Head {
+            enforced: true,
+            ..head(
+                "/v1/admin/credentials",
+                Some("https://evil.example"),
+                "application/json",
+            )
+        };
+        assert_eq!(screen(&enforced), None);
+        // Routes that do not need admin are not this rule's business.
+        let ingest = Head {
+            needs_admin: false,
+            ..head("/v1/spans", Some("https://evil.example"), "text/plain")
+        };
+        assert_eq!(screen(&ingest), None);
+    }
+
+    #[test]
+    fn admin_bodies_must_be_declared_json() {
+        for content_type in [
+            "",
+            "text/plain",
+            "application/x-www-form-urlencoded",
+            "multipart/form-data; boundary=x",
+            "application/jsonp",
+        ] {
+            let enforced = Head {
+                enforced: true,
+                ..head("/v1/admin/credentials", None, content_type)
+            };
+            assert_eq!(
+                screen(&enforced).map(|reply| reply.status),
+                Some(415),
+                "{content_type:?}"
+            );
+        }
+        assert_eq!(
+            screen(&head(
+                "/v1/admin/tenants/acme/limits",
+                None,
+                "application/json; charset=utf-8"
+            )),
+            None
+        );
+        // A bodyless POST (a revoke) declares nothing and needs nothing; a
+        // GET is not a write; and the rule is about /v1/admin/ only.
+        let revoke = Head {
+            content_length: 0,
+            ..head("/v1/admin/credentials/cr_x/revoke", None, "")
+        };
+        assert_eq!(screen(&revoke), None);
+        let list = Head {
+            method: "GET",
+            ..head("/v1/admin/credentials", None, "")
+        };
+        assert_eq!(screen(&list), None);
+        assert_eq!(screen(&head("/v1/erasures", None, "text/plain")), None);
+    }
+
+    #[test]
+    fn loopback_origins_are_pages_on_loopback_and_nothing_else() {
+        for origin in [
+            "http://localhost",
+            "http://localhost:8080",
+            "https://127.0.0.1:8443",
+            "http://[::1]:8080",
+            "http://LOCALHOST:8080",
+            "http://127.0.0.1:8080/",
+        ] {
+            assert!(loopback_origin(origin), "{origin}");
+        }
+        for origin in [
+            "",
+            "null",
+            "https://evil.example",
+            "http://localhost.evil.example",
+            "http://127.0.0.1.evil.example",
+            "http://127.0.0.1@evil.example",
+            "javascript://localhost",
+            "file://localhost",
+            "localhost:8080",
+            "http://[::2]:8080",
+        ] {
+            assert!(!loopback_origin(origin), "{origin}");
+        }
     }
 
     #[test]
