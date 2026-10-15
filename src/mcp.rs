@@ -4042,7 +4042,7 @@ fn days_in_month(year: i64, month: i64) -> i64 {
 /// Days since the Unix epoch for a civil date (Howard Hinnant's algorithm,
 /// which is exact for the whole proleptic Gregorian calendar and needs no
 /// lookup tables).
-fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+pub(crate) fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
     let year = if month <= 2 { year - 1 } else { year };
     let era = if year >= 0 { year } else { year - 399 } / 400;
     let year_of_era = year - era * 400;
@@ -4054,7 +4054,7 @@ fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
 }
 
 /// The inverse of [`days_from_civil`].
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
+pub(crate) fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let days = days + 719_468;
     let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
     let day_of_era = days - era * 146_097;

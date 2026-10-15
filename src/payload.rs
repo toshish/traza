@@ -361,12 +361,28 @@ pub(crate) fn store_payload(
         }
         fs::rename(&temp, &path)?;
     }
+    Ok(reference_object(&hash, content))
+}
+
+/// The reference object that replaces an offloaded `content` addressed by
+/// `hash`. One constructor, shared with [`offloaded_reference`], so the size
+/// admission measures can never drift from the object ingest writes.
+fn reference_object(hash: &str, content: &str) -> Value {
     let preview: String = content.chars().take(PREVIEW_CHARS).collect();
     let mut reference = Map::new();
     reference.insert(PAYLOAD_KEY.into(), Value::String(format!("sha256/{hash}")));
     reference.insert("bytes".into(), Value::from(content.len()));
     reference.insert("preview".into(), Value::String(preview));
-    Ok(Value::Object(reference))
+    Value::Object(reference)
+}
+
+/// The reference object `content` WOULD offload to, without hashing it or
+/// touching the filesystem: the digest is a placeholder of the real one's
+/// fixed length, so the object serializes to exactly the real one's size.
+/// Admission uses it to bound a span's post-offload size before anything is
+/// written.
+pub(crate) fn offloaded_reference(content: &str) -> Value {
+    reference_object(&"0".repeat(64), content)
 }
 
 /// Reads a payload by its `sha256/<hex>` reference, validating the blob's

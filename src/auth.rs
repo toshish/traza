@@ -3,6 +3,12 @@
 //! Authentication configuration is intentionally kept out of logs and error
 //! messages. `AuthConfig` also implements a redacted `Debug` representation so
 //! an accidental structured log cannot disclose configured credentials.
+//!
+//! This module owns the vocabulary — [`Scope`], [`Principal`], the refusals —
+//! and the `TRAZA_TOKENS` parser. The credential set a running server actually
+//! authenticates against is [`crate::credentials::CredentialStore`]: the
+//! environment's entries plus every credential minted at runtime, looked up by
+//! digest.
 
 use std::env;
 use std::fmt;
@@ -11,8 +17,12 @@ use std::fmt;
 pub const AUTH_ENV: &str = "TRAZA_TOKENS";
 /// JSON body returned with 401 responses.
 pub const UNAUTHORIZED_BODY: &str = "{\"error\":\"unauthorized\"}";
-/// JSON body returned with 403 responses.
-pub const FORBIDDEN_BODY: &str = "{\"error\":\"forbidden\"}";
+/// JSON body returned with 403 responses that need the `rw` scope.
+pub const FORBIDDEN_RW_BODY: &str = "{\"error\":\"forbidden\",\"required\":\"rw\"}";
+/// JSON body returned with 403 responses that need the `admin` scope.
+pub const FORBIDDEN_ADMIN_BODY: &str = "{\"error\":\"forbidden\",\"required\":\"admin\"}";
+/// JSON body returned with 403 responses that need an unbound credential.
+pub const FORBIDDEN_UNBOUND_BODY: &str = "{\"error\":\"forbidden\",\"required\":\"unbound\"}";
 /// Challenge scheme advertised on 401 responses.
 pub const WWW_AUTHENTICATE: &str = "Bearer";
 
@@ -33,12 +43,22 @@ pub enum Scope {
 }
 
 impl Scope {
-    fn parse(value: &str) -> Option<Self> {
+    /// Parses the wire name: `ro`, `rw` or `admin`.
+    pub fn parse(value: &str) -> Option<Self> {
         match value {
             "ro" => Some(Self::ReadOnly),
             "rw" => Some(Self::ReadWrite),
             "admin" => Some(Self::Admin),
             _ => None,
+        }
+    }
+
+    /// The wire name: `ro`, `rw` or `admin`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "ro",
+            Self::ReadWrite => "rw",
+            Self::Admin => "admin",
         }
     }
 
@@ -71,6 +91,11 @@ pub struct Principal {
     /// its tenant's data, on every surface; binding is applied where queries
     /// are constructed, so no endpoint can forget it.
     pub tenant: Option<String>,
+    /// Which credential authenticated, when the credential set knows it —
+    /// always, for a principal from [`crate::credentials::CredentialStore`];
+    /// never, for one from [`AuthConfig::principal_for`], which predates
+    /// credential ids. Identity only: nothing authorizes on it.
+    pub credential: Option<CredentialRef>,
 }
 
 impl Principal {
@@ -78,6 +103,23 @@ impl Principal {
     pub fn tenant_scope(&self) -> Option<&str> {
         self.tenant.as_deref()
     }
+
+    /// Whether this principal may use the operator surfaces. Admin scope does
+    /// not make an operator; the ABSENCE of a tenant binding does. A bound
+    /// `admin` is its tenant's administrator and nobody else's.
+    pub fn is_operator(&self) -> bool {
+        self.tenant.is_none()
+    }
+}
+
+/// The public handle of a credential: its id and its label, never anything
+/// derived from the token.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CredentialRef {
+    /// `cr_` plus 16 hex digits.
+    pub id: String,
+    /// The operator's label; empty when none was given.
+    pub label: String,
 }
 
 #[derive(Clone)]
@@ -123,13 +165,39 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
+/// The capability a refused request was missing, carried on every 403 as
+/// `"required"` so a client can say WHICH grant would have worked instead of
+/// only that this one did not.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// Why a request was refused: unknown token (401) or insufficient scope (403).
+pub enum Required {
+    /// The write scope: a `ro` credential attempted a `POST`.
+    Rw,
+    /// The `admin` scope: erasure, eval tombstones, backups, `/v1/admin/*`.
+    Admin,
+    /// An unbound credential: a tenant-bound one reached a store-global
+    /// operator surface, `/v1/admin/*`, or another tenant's data.
+    Unbound,
+}
+
+impl Required {
+    /// The wire name: `rw`, `admin` or `unbound`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Rw => "rw",
+            Self::Admin => "admin",
+            Self::Unbound => "unbound",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Why a request was refused: unknown token (401) or insufficient grant (403).
 pub enum AuthFailure {
-    /// No, malformed, or unknown bearer token (HTTP 401).
+    /// No, malformed, unknown, expired or revoked bearer token (HTTP 401).
     Unauthorized,
-    /// Valid token without the scope for this method (HTTP 403).
-    Forbidden,
+    /// Valid token without the grant this request needs (HTTP 403), naming
+    /// the capability that was missing.
+    Forbidden(Required),
 }
 
 impl AuthFailure {
@@ -137,15 +205,18 @@ impl AuthFailure {
     pub fn status(self) -> u16 {
         match self {
             Self::Unauthorized => 401,
-            Self::Forbidden => 403,
+            Self::Forbidden(_) => 403,
         }
     }
 
-    /// The JSON error body for this failure.
+    /// The JSON error body for this failure. Static per variant, so a refusal
+    /// costs no allocation and can never echo request content.
     pub fn body(self) -> &'static str {
         match self {
             Self::Unauthorized => UNAUTHORIZED_BODY,
-            Self::Forbidden => FORBIDDEN_BODY,
+            Self::Forbidden(Required::Rw) => FORBIDDEN_RW_BODY,
+            Self::Forbidden(Required::Admin) => FORBIDDEN_ADMIN_BODY,
+            Self::Forbidden(Required::Unbound) => FORBIDDEN_UNBOUND_BODY,
         }
     }
 
@@ -153,7 +224,7 @@ impl AuthFailure {
     pub fn www_authenticate(self) -> Option<&'static str> {
         match self {
             Self::Unauthorized => Some(WWW_AUTHENTICATE),
-            Self::Forbidden => None,
+            Self::Forbidden(_) => None,
         }
     }
 }
@@ -247,7 +318,7 @@ impl AuthConfig {
         if principal.scope.permits(method) {
             Ok(())
         } else {
-            Err(AuthFailure::Forbidden)
+            Err(AuthFailure::Forbidden(Required::Rw))
         }
     }
 
@@ -283,11 +354,32 @@ impl AuthConfig {
                 matched = Some(Principal {
                     scope: credential.scope,
                     tenant: credential.tenant.clone(),
+                    credential: None,
                 });
             }
         }
         matched.ok_or(AuthFailure::Unauthorized)
     }
+
+    /// Every configured credential as `(token, scope, binding)`, in
+    /// configuration order. Crate-private: the raw tokens leave this module
+    /// only to be hashed by [`crate::credentials`], which keeps digests.
+    pub(crate) fn entries(&self) -> impl Iterator<Item = (&[u8], Scope, Option<&str>)> {
+        self.credentials.iter().map(|credential| {
+            (
+                credential.token.as_slice(),
+                credential.scope,
+                credential.tenant.as_deref(),
+            )
+        })
+    }
+}
+
+/// The bearer token in an `Authorization` header value, or `None` when the
+/// header is not exactly `Bearer <token>` with a token free of whitespace and
+/// commas.
+pub(crate) fn bearer_token(header: &str) -> Option<&str> {
+    parse_bearer(header)
 }
 
 fn parse_bearer(header: &str) -> Option<&str> {
@@ -324,8 +416,38 @@ mod tests {
         assert_eq!(auth.authorize(Some("Bearer writer-token"), "POST"), Ok(()));
         assert_eq!(
             auth.authorize(Some("Bearer reader-token"), "POST"),
-            Err(AuthFailure::Forbidden)
+            Err(AuthFailure::Forbidden(Required::Rw))
         );
+    }
+
+    #[test]
+    fn every_refusal_names_the_missing_capability() {
+        for (required, name) in [
+            (Required::Rw, "rw"),
+            (Required::Admin, "admin"),
+            (Required::Unbound, "unbound"),
+        ] {
+            let failure = AuthFailure::Forbidden(required);
+            assert_eq!(failure.status(), 403);
+            assert_eq!(failure.www_authenticate(), None);
+            let body: serde_json::Value = serde_json::from_str(failure.body()).expect("json");
+            assert_eq!(
+                body,
+                serde_json::json!({"error": "forbidden", "required": name})
+            );
+            assert_eq!(required.as_str(), name);
+        }
+        let body: serde_json::Value =
+            serde_json::from_str(AuthFailure::Unauthorized.body()).expect("json");
+        assert_eq!(body, serde_json::json!({"error": "unauthorized"}));
+    }
+
+    #[test]
+    fn scopes_round_trip_their_wire_names() {
+        for scope in [Scope::ReadOnly, Scope::ReadWrite, Scope::Admin] {
+            assert_eq!(Scope::parse(scope.as_str()), Some(scope));
+        }
+        assert_eq!(Scope::parse("root"), None);
     }
 
     #[test]
@@ -390,21 +512,24 @@ mod tests {
             auth.principal_for(Some("Bearer tok-a")),
             Ok(Principal {
                 scope: Scope::ReadWrite,
-                tenant: Some("acme".to_owned())
+                tenant: Some("acme".to_owned()),
+                credential: None,
             })
         );
         assert_eq!(
             auth.principal_for(Some("Bearer tok-open")),
             Ok(Principal {
                 scope: Scope::ReadOnly,
-                tenant: None
+                tenant: None,
+                credential: None,
             })
         );
         assert_eq!(
             auth.principal_for(Some("Bearer tok-b")),
             Ok(Principal {
                 scope: Scope::Admin,
-                tenant: Some("big.co".to_owned())
+                tenant: Some("big.co".to_owned()),
+                credential: None,
             })
         );
         // A token may contain '@' or ':' — the first colon decides, and the

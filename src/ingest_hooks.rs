@@ -12,14 +12,16 @@
 //! a batch whose ingest then failed. Whatever it reports rides back to the
 //! caller on [`crate::Admission`].
 //!
-//! Both hooks are deliberately empty in this build. They exist as named seams
-//! so policy (quotas, pauses, admission caps) and observation (run guards,
-//! usage counters) are added here rather than threaded through the admission
-//! path's lock-ordering argument.
+//! They exist as named seams so policy and observation are added here rather
+//! than threaded through the admission path's lock-ordering argument. The
+//! admission check enforces the admission caps ([`crate::caps`]) and then the
+//! tenant quotas and pauses ([`crate::usage`]); what it measured on the way
+//! rides to the acknowledgement as [`crate::caps::Admitting`], where usage is
+//! charged.
 
 use std::sync::Arc;
 
-use crate::{guard, Result, Span, Store};
+use crate::{caps, guard, Result, Span, Store};
 
 /// What observing an admitted batch produced.
 #[derive(Debug, Default)]
@@ -36,8 +38,20 @@ impl Store {
     /// is on every ingest's path: it must be O(batch) and must not do I/O that
     /// can block on another request. An `Err` here fails the whole batch
     /// before any of it is written.
-    pub(crate) fn admission_check(&self, _spans: &[Span]) -> Result<()> {
-        Ok(())
+    ///
+    /// Caps first, then quotas: a malformed batch is the client's defect
+    /// whatever the tenant's quota says, and must not be counted as a quota
+    /// rejection. The `Ok` carries each span's measured size for the usage
+    /// charge at acknowledgement.
+    pub(crate) fn admission_check(&self, spans: &[Span]) -> Result<caps::Admitting> {
+        let admitting = caps::measure(&self.config, spans)?;
+        self.platform.usage.check(
+            &self.platform.limits,
+            spans,
+            &admitting,
+            crate::unix_now_ns(),
+        )?;
+        Ok(admitting)
     }
 
     /// Observes a batch the store has just acknowledged.

@@ -630,6 +630,10 @@ default 30000; streams and erasure work are exempt)] \
 [--tail-ring-spans N (live-tail replay depth; default 8192)] \
 [--tail-ring-bytes N (live-tail memory ceiling, whichever bound binds first; \
 default 32MiB)] \
+[--max-span-attributes N (default 1024)] [--max-attribute-key-bytes N (default 256)] \
+[--max-span-events N (default 1024)] [--max-span-bytes N (as stored, after payload offload; \
+default 4MiB)] [--max-batch-spans N (default 100000)] \
+(admission caps: a violating batch is refused whole with 400; 0 disables each) \
 [--ui-dir DIR (built dashboard; default: TRAZA_UI_DIR, beside the binary, then ./ui/dist)] \
 [--pricing FILE (per-model rates, to derive a cost for LLM spans that did not meter one; \
 a metered llm.cost_usd always wins)] \
@@ -725,6 +729,13 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
     let mut tail_ring_spans = traza::DEFAULT_TAIL_RING_SPANS;
     let mut tail_ring_bytes = traza::DEFAULT_TAIL_RING_BYTES;
     let mut wal_commit_window_us: Option<u64> = None;
+    // Admission caps; 0 disables each, like every other bound here.
+    let mut max_span_attributes = traza::caps::DEFAULT_MAX_SPAN_ATTRIBUTES as u64;
+    let mut max_attribute_key_bytes = traza::caps::DEFAULT_MAX_ATTRIBUTE_KEY_BYTES as u64;
+    let mut max_span_events = traza::caps::DEFAULT_MAX_SPAN_EVENTS as u64;
+    let mut max_span_bytes = traza::caps::DEFAULT_MAX_SPAN_BYTES as u64;
+    let mut max_batch_spans = traza::caps::DEFAULT_MAX_BATCH_SPANS as u64;
+    let cap = |value: u64| (value > 0).then_some(value as usize);
 
     let value = |i: usize, name: &str| -> Result<&String, String> {
         args.get(i)
@@ -821,6 +832,26 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
             "--wal-commit-window-us" => {
                 i += 1;
                 wal_commit_window_us = Some(number(i, "--wal-commit-window-us")?);
+            }
+            "--max-span-attributes" => {
+                i += 1;
+                max_span_attributes = number(i, "--max-span-attributes")?;
+            }
+            "--max-attribute-key-bytes" => {
+                i += 1;
+                max_attribute_key_bytes = number(i, "--max-attribute-key-bytes")?;
+            }
+            "--max-span-events" => {
+                i += 1;
+                max_span_events = number(i, "--max-span-events")?;
+            }
+            "--max-span-bytes" => {
+                i += 1;
+                max_span_bytes = number(i, "--max-span-bytes")?;
+            }
+            "--max-batch-spans" => {
+                i += 1;
+                max_batch_spans = number(i, "--max-batch-spans")?;
             }
             // Content search still works without it — segments are scanned
             // rather than skipped — so this trades query latency for seal CPU
@@ -973,6 +1004,11 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
             tail_ring_spans,
             tail_ring_bytes,
             pricing: std::sync::Arc::new(pricing),
+            max_span_attributes: cap(max_span_attributes),
+            max_attribute_key_bytes: cap(max_attribute_key_bytes),
+            max_span_events: cap(max_span_events),
+            max_span_bytes: cap(max_span_bytes),
+            max_batch_spans: cap(max_batch_spans),
         },
     }))
 }
@@ -1095,20 +1131,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         config,
     } = options;
     let durability = config.durability;
-    let ttl_seconds = config.ttl_seconds;
 
     // Bearer auth from TRAZA_TOKENS; unset is allowed on loopback by default.
     // A set-but-invalid value refuses startup — running open when the operator
-    // tried to configure auth would be the worst failure mode.
+    // tried to configure auth would be the worst failure mode. Runtime
+    // credentials (credentials.jsonl) count as configured auth too; the peek
+    // is read-only because the directory lock is not held yet.
     let auth_config = traza::auth::AuthConfig::from_env()
         .map_err(|error| format!("auth configuration: {error}"))?;
-    if auth_config.is_none() && !is_loopback_bind(&host) && !allow_unauthenticated_non_loopback {
+    if auth_config.is_none()
+        && !is_loopback_bind(&host)
+        && !allow_unauthenticated_non_loopback
+        && !traza::credentials::CredentialStore::has_api_credentials(&data_dir)?
+    {
         return Err(format!(
-            "refusing unauthenticated non-loopback bind {host}; configure TRAZA_TOKENS or pass --allow-unauthenticated-non-loopback explicitly"
+            "refusing unauthenticated non-loopback bind {host}; configure TRAZA_TOKENS, create a runtime credential (POST /v1/admin/credentials on a loopback start), or pass --allow-unauthenticated-non-loopback explicitly"
         )
         .into());
     }
-    let auth = Arc::new(auth_config);
     let metrics = Arc::new(ServerMetrics::default());
     // Latched before the first connection is accepted; see [`TEST_PANIC`].
     // Unset, empty, and "0" all disable — `TRAZA_TEST_PANIC=0` must not
@@ -1139,6 +1179,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => Store::open(&data_dir, config.clone())?,
     });
+    // The environment's credentials join the runtime ones; from here on the
+    // store's credential set is the only thing the auth gate consults.
+    if let Some(auth_config) = &auth_config {
+        engine
+            .credentials()
+            .install_env(auth_config, traza::mcp::unix_nanos_now())
+            .map_err(|error| format!("auth configuration: {error}"))?;
+    }
 
     // TTL enforcement, segment compaction, and the buffer's non-volume bounds
     // live in the engine; the server only schedules them. Compaction ticks far
@@ -1153,7 +1201,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // buffer bounds all switched off.
     {
         let maintainer = Arc::clone(&engine);
-        let ttl_enabled = ttl_seconds.is_some() || !config.tenant_ttl_seconds.is_empty();
         let _ = compaction_enabled;
         thread::Builder::new()
             .name("traza-maintenance".into())
@@ -1179,8 +1226,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     if let Err(error) = maintainer.compact_segments() {
                         eprintln!("segment compaction failed: {error}");
                     }
-                    // TTL keeps its documented one-minute cadence.
-                    if ttl_enabled && ticks % 12 == 0 {
+                    // Usage counters: written only when they changed, so an
+                    // idle store does not fsync every tick. A crash loses at
+                    // most this interval's counts — an undercount.
+                    if let Err(error) = maintainer.persist_usage() {
+                        eprintln!("usage persistence failed: {error}");
+                    }
+                    // TTL keeps its documented one-minute cadence. Not gated
+                    // on the startup flags any more: a runtime limits
+                    // document can introduce a window, and with no window
+                    // anywhere the pass returns before taking a lock.
+                    if ticks % 12 == 0 {
                         if let Err(error) = maintainer.compact_expired() {
                             eprintln!("expiry compaction failed: {error}");
                         }
@@ -1338,7 +1394,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
         metrics.connections_accepted.increment();
         let connection_engine = Arc::clone(&engine);
-        let connection_auth = Arc::clone(&auth);
         let connection_ui = Arc::clone(&ui);
         let connection_metrics = Arc::clone(&metrics);
         let connection_mcp = Arc::clone(&mcp);
@@ -1349,7 +1404,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let _ = handle_connection(
                     stream,
                     &connection_engine,
-                    &connection_auth,
                     &connection_ui,
                     &connection_metrics,
                     &connection_mcp,
@@ -1547,7 +1601,6 @@ fn is_loopback_bind(host: &str) -> bool {
 fn handle_connection(
     stream: TcpStream,
     engine: &Store,
-    auth: &Option<traza::auth::AuthConfig>,
     ui: &traza::ui::UiRoot,
     metrics: &ServerMetrics,
     mcp: &McpOptions,
@@ -1579,6 +1632,30 @@ fn handle_connection(
         // path must close.
         let body_is_unread = head.content_length > 0;
         let keep_alive = head.wants_keep_alive();
+
+        // Liveness and readiness probes answer before the auth gate: a load
+        // balancer or orchestrator probing them holds no credential, and the
+        // answers carry nothing but the version. Not counted in the request
+        // metrics, which a probe every second would dominate.
+        if head.method == "GET" {
+            let probe = match head
+                .target
+                .split_once('?')
+                .map_or(head.target.as_str(), |(path, _)| path)
+            {
+                "/healthz" => Some(traza::platform::health()),
+                "/readyz" => Some(traza::platform::readiness()),
+                _ => None,
+            };
+            if let Some(body) = probe {
+                let mut responder = connection.responder(keep_alive && !body_is_unread);
+                responder.json(200, body)?;
+                if responder.keep_alive {
+                    continue;
+                }
+                return Ok(());
+            }
+        }
 
         // The dashboard SHELL is served before the auth gate: the page must
         // load in a browser without credentials, while every /v1 call it makes
@@ -1650,7 +1727,7 @@ fn handle_connection(
         // answer with the WHOLE store's numbers and controls — volumes that
         // disclose co-tenants, checkpoints and backups that move everyone's
         // data. Bound tokens get 403 here; their accounting surface is
-        // /v1/tenants.
+        // /v1/tenants (and /v1/usage).
         let is_operator_surface = matches!(
             head_path,
             "/v1/stats"
@@ -1660,24 +1737,44 @@ fn handle_connection(
                 | "/v1/checkpoint"
                 | "/v1/flush"
         ) || head_path.starts_with("/v1/backups/");
+        // Backups need `admin` as well as an unbound credential: a pin holds
+        // every manifested byte on disk until it is released, so taking one
+        // is a capacity decision, not a write.
+        let is_backup = head_path.starts_with("/v1/backups/");
+        // The admin surfaces — credentials, tenant limits, and whatever is
+        // added under the prefix later — are unbound-admin only, decided by
+        // PREFIX rather than by a list, so a route added under /v1/admin/ is
+        // denied to bound and non-admin credentials before anyone remembers
+        // to list it.
+        let is_admin_surface = head_path == "/v1/admin" || head_path.starts_with("/v1/admin/");
         let mut access = traza::mcp::Access::ReadWrite;
         let mut principal: Option<traza::auth::Principal> = None;
-        if let Some(config) = auth {
-            let verdict = config
-                .principal_for(head.authorization.as_deref())
+        let credentials = engine.credentials();
+        if credentials.enforced() {
+            let verdict = credentials
+                .authenticate(head.authorization.as_deref(), traza::mcp::unix_nanos_now())
                 .and_then(|granted| {
+                    use traza::auth::{AuthFailure, Required};
+                    // Binding first: a bound credential on a store-global
+                    // surface is refused for WHAT it is, whatever its scope.
+                    if granted.tenant.is_some() && (is_operator_surface || is_admin_surface) {
+                        return Err(AuthFailure::Forbidden(Required::Unbound));
+                    }
+                    let needs_admin =
+                        is_erasure_write || is_eval_tombstone || is_backup || is_admin_surface;
                     let allowed = if is_mcp {
                         true
-                    } else if is_erasure_write || is_eval_tombstone {
-                        granted.scope.permits_erasure()
+                    } else if needs_admin {
+                        granted.scope == traza::auth::Scope::Admin
                     } else {
                         granted.scope.permits(&head.method)
                     };
                     if !allowed {
-                        return Err(traza::auth::AuthFailure::Forbidden);
-                    }
-                    if granted.tenant.is_some() && is_operator_surface {
-                        return Err(traza::auth::AuthFailure::Forbidden);
+                        return Err(AuthFailure::Forbidden(if needs_admin {
+                            Required::Admin
+                        } else {
+                            Required::Rw
+                        }));
                     }
                     Ok(granted)
                 });
@@ -1816,6 +1913,7 @@ fn engine_error(
         traza::Error::InvalidSpan(reason) => responder.json(400, json!({"error": reason})),
         traza::Error::Invalid(reason) => responder.json(400, json!({"error": reason})),
         traza::Error::Conflict(reason) => responder.json(409, json!({"error": reason})),
+        traza::Error::QuotaExceeded(refusal) => quota_exceeded(responder, &refusal),
         // An exhausted compute budget is the caller's to narrow, the same
         // rule as a too-broad sort: 503 would tell the client to retry with
         // backoff, and retrying an over-budget query without narrowing
@@ -1830,12 +1928,32 @@ fn engine_error(
     }
 }
 
-/// The one 403 body every cross-tenant refusal shares.
+/// The one 403 body every cross-tenant refusal shares. `required` says what
+/// would have worked: an unbound credential.
 fn foreign_tenant(responder: &mut Responder<'_>) -> io::Result<()> {
     responder.json(
         403,
-        json!({"error": "this credential is bound to a different tenant"}),
+        json!({"error": "this credential is bound to a different tenant", "required": "unbound"}),
     )
+}
+
+/// A `429` for a batch a tenant's quota or ingest pause refused: the refusal
+/// as JSON, and `Retry-After` in seconds. Native and OTLP ingest share it —
+/// an OTLP exporter retries on 429 with exactly this header, so the JSON body
+/// is for the humans reading its logs.
+fn quota_exceeded(
+    responder: &mut Responder<'_>,
+    refusal: &traza::usage::QuotaRefusal,
+) -> io::Result<()> {
+    responder.status = Some(429);
+    let body = serde_json::to_vec(&refusal.to_json())?;
+    let head = format!(
+        "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nRetry-After: {}\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n",
+        refusal.retry_after_seconds,
+        body.len(),
+        responder.connection_header()
+    );
+    responder.raw(&head, &body)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1855,6 +1973,18 @@ fn serve_request(
     let scope: Option<&str> = principal.and_then(|principal| principal.tenant.as_deref());
     if path == traza::mcp::ENDPOINT {
         return serve_mcp(responder, &request, engine, mcp, access, principal);
+    }
+    // Identity, usage, and the /v1/admin/* surfaces (credentials, tenant
+    // limits): handled in the library, behind the gate above.
+    if let Some(reply) = traza::platform::route(
+        engine,
+        &request.method,
+        path,
+        query,
+        &request.body,
+        principal,
+    ) {
+        return responder.json(reply.status, reply.body);
     }
     match (request.method.as_str(), path) {
         ("POST", "/v1/spans") => {
@@ -1929,6 +2059,10 @@ fn serve_request(
                 Err(traza::Error::InvalidSpan(reason)) => {
                     responder.json(400, json!({"error": reason}))
                 }
+                // An admission cap, naming itself and the span: as much the
+                // client's defect as an empty id.
+                Err(traza::Error::Invalid(reason)) => responder.json(400, json!({"error": reason})),
+                Err(traza::Error::QuotaExceeded(refusal)) => quota_exceeded(responder, &refusal),
                 Err(error) => responder.json(503, json!({"error": error.to_string()})),
             }
         }
@@ -2009,6 +2143,8 @@ fn serve_request(
                 Err(traza::Error::InvalidSpan(reason)) => {
                     responder.json(400, json!({"error": reason}))
                 }
+                Err(traza::Error::Invalid(reason)) => responder.json(400, json!({"error": reason})),
+                Err(traza::Error::QuotaExceeded(refusal)) => quota_exceeded(responder, &refusal),
                 Err(error) => responder.json(503, json!({"error": error.to_string()})),
             }
         }
@@ -2114,7 +2250,8 @@ fn serve_request(
                         return responder.json(
                             403,
                             json!({"error": "payload subjects are store-global; erasing one \
-                                             requires an unbound admin credential"}),
+                                             requires an unbound admin credential",
+                                   "required": "unbound"}),
                         )
                     }
                     Some(named) if named != bound => return foreign_tenant(responder),
@@ -2253,6 +2390,7 @@ fn serve_request(
             // layer, so a reader sees the whole ingest path in one scrape.
             let mut rendered = String::with_capacity(2048);
             engine.metrics().render_prometheus(&mut rendered);
+            engine.render_usage_prometheus(&mut rendered);
             metrics.render_prometheus(&mut rendered);
             let head = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n",

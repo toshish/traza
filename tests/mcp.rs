@@ -75,6 +75,11 @@ fn open_store(dir: &Path) -> Store {
         dir,
         Config {
             pricing: Default::default(),
+            max_span_attributes: Some(traza::caps::DEFAULT_MAX_SPAN_ATTRIBUTES),
+            max_attribute_key_bytes: Some(traza::caps::DEFAULT_MAX_ATTRIBUTE_KEY_BYTES),
+            max_span_events: Some(traza::caps::DEFAULT_MAX_SPAN_EVENTS),
+            max_span_bytes: Some(traza::caps::DEFAULT_MAX_SPAN_BYTES),
+            max_batch_spans: Some(traza::caps::DEFAULT_MAX_BATCH_SPANS),
             tenant_ttl_seconds: Default::default(),
             flush_spans: 100_000,
             max_buffer_age: None,
