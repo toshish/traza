@@ -22,10 +22,11 @@ spelling so they only ever fill blanks.
 
 The single source of truth for the key precedence is
 [`src/semconv.rs`](../src/semconv.rs). The dashboard's trace, conversation
-and compare views compute per-span usage in the browser from the OpenLLMetry
-and native keys, mirrored in `ui/src/lib/spans.js`; they do not yet read the
-OpenInference keys, so an OpenInference-only span's model and tokens appear in
-the server's rollups (`/v1/stats/llm`, `/v1/sessions`) but not in those views.
+and compare views compute per-span usage, messages and step kind in the
+browser from the same keys — OTel GenAI, OpenLLMetry, OpenInference and
+native — mirrored in `ui/src/lib/spans.js`. The run, guard and diff views read
+the server's own step facts (the tape, the verdicts, the alignment) and
+compute none of them.
 
 ## Recognized attributes
 

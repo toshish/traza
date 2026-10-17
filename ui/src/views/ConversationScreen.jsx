@@ -110,7 +110,7 @@ export function ConversationScreen({ kind, id, go }) {
     <div style={{ minWidth: 0, display: 'grid', gap: 12 }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
         <Mono size={13}>{id}</Mono>
-        <span style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
+        <span style={{ marginLeft: 'auto', display: 'flex', flexWrap: 'wrap', gap: 6 }}>
           <Chip onClick={() => go(isSession ? ['sessions', id] : ['trace', id])}>
             Back to {isSession ? 'session' : 'trace'}
           </Chip>

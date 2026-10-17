@@ -112,8 +112,10 @@ export function collectPayloadRefs(span) {
 }
 
 // Semantic-convention key precedence, mirroring src/semconv.rs (the source of
-// truth on the server). Traza recognizes the OpenLLMetry / OTel GenAI
-// conventions (gen_ai.*, llm.usage.*, traceloop.*) and its own native llm.* /
+// truth on the server). Traza recognizes the OTel GenAI and OpenLLMetry
+// conventions (gen_ai.*, llm.usage.*, traceloop.*), OpenInference
+// (openinference.span.kind, llm.model_name, llm.token_count.*, tool.name,
+// agent.name, input.value / output.value) and its own native llm.* /
 // session.id shorthand; keep these lists in step with the Rust module.
 const SESSION_KEYS = [
   'session.id',
@@ -141,26 +143,139 @@ function firstStr(attrs, keys) {
 }
 
 /** LLM usage figures when the span carries recognized LLM attributes, else
-    null. Resolves both the OpenLLMetry / OTel GenAI conventions and Traza's
-    native llm.* shorthand (mirror of src/semconv.rs) — current OTel names
-    first, the deprecated names OTel replaced as aliases. */
+    null. Resolves the OTel GenAI conventions, OpenLLMetry, OpenInference and
+    Traza's native llm.* shorthand in the order src/semconv.rs `facts()` does
+    — current OTel names first, the deprecated names OTel replaced as
+    aliases, OpenInference's `llm.model_name` / `llm.token_count.*` last. */
 export function llmUsage(span) {
   const attrs = span.attributes || {};
-  const model = firstStr(attrs, ['gen_ai.response.model', 'gen_ai.request.model', 'llm.model']);
-  const provider = firstStr(attrs, ['gen_ai.provider.name', 'gen_ai.system']);
-  const promptTokens = firstNum(attrs, ['gen_ai.usage.input_tokens', 'gen_ai.usage.prompt_tokens', 'llm.prompt_tokens']);
-  const completionTokens = firstNum(attrs, ['gen_ai.usage.output_tokens', 'gen_ai.usage.completion_tokens', 'llm.completion_tokens']);
-  const explicitTotal = firstNum(attrs, ['llm.usage.total_tokens', 'gen_ai.usage.total_tokens', 'llm.total_tokens']);
+  const model = firstStr(attrs, ['gen_ai.response.model', 'gen_ai.request.model', 'llm.model', 'llm.model_name']);
+  const provider = firstStr(attrs, ['gen_ai.provider.name', 'gen_ai.system', 'llm.provider', 'llm.system']);
+  const promptTokens = firstNum(attrs, ['gen_ai.usage.input_tokens', 'gen_ai.usage.prompt_tokens', 'llm.prompt_tokens', 'llm.token_count.prompt']);
+  const completionTokens = firstNum(attrs, ['gen_ai.usage.output_tokens', 'gen_ai.usage.completion_tokens', 'llm.completion_tokens', 'llm.token_count.completion']);
+  const explicitTotal = firstNum(attrs, ['llm.usage.total_tokens', 'gen_ai.usage.total_tokens', 'llm.total_tokens', 'llm.token_count.total']);
   const costUsd = firstNum(attrs, ['llm.cost_usd', 'gen_ai.usage.cost']);
+  const cacheReadTokens = firstNum(attrs, ['gen_ai.usage.cache_read.input_tokens', 'gen_ai.usage.cache_read_input_tokens']);
+  const cacheCreationTokens = firstNum(attrs, ['gen_ai.usage.cache_creation.input_tokens', 'gen_ai.usage.cache_creation_input_tokens']);
   const stopReason = firstStr(attrs, ['gen_ai.response.finish_reason', 'gen_ai.response.stop_reason', 'llm.stop_reason']);
   const operation = firstStr(attrs, ['gen_ai.operation.name', 'llm.request.type']);
-  const spanKind = firstStr(attrs, ['traceloop.span.kind']);
+  const spanKind = lower(firstStr(attrs, ['traceloop.span.kind']));
+  const oiKind = lower(firstStr(attrs, ['openinference.span.kind']));
   const anything = model != null || provider != null || promptTokens != null || completionTokens != null
-    || explicitTotal != null || costUsd != null || stopReason != null || operation != null || spanKind === 'llm';
+    || explicitTotal != null || costUsd != null || stopReason != null || operation != null
+    || spanKind === 'llm' || oiKind === 'llm';
   if (!anything) return null;
   const totalTokens = explicitTotal != null ? explicitTotal
     : (promptTokens != null || completionTokens != null) ? (promptTokens || 0) + (completionTokens || 0) : null;
-  return { model, provider, promptTokens, completionTokens, totalTokens, costUsd, stopReason };
+  return {
+    model, provider, promptTokens, completionTokens, totalTokens, costUsd, stopReason,
+    cacheReadTokens, cacheCreationTokens,
+  };
+}
+
+/** ASCII-only lowercasing, as the server's `to_ascii_lowercase`: a
+    Unicode-aware `toLowerCase` would fold characters (the Kelvin sign to
+    `k`) that the server leaves alone, and call a kind recognized that it
+    does not recognize. */
+function lower(value) {
+  return typeof value === 'string' ? value.replace(/[A-Z]+/g, (upper) => upper.toLowerCase()) : value;
+}
+
+function has(attrs, key) { return Object.prototype.hasOwnProperty.call(attrs, key); }
+
+const U64_MAX = 18446744073709551615n;
+
+/** Whether the server reads `key` as a token count: any JSON number, or a
+    string that is an unsigned integer once trimmed (Rust's `u64` parse — an
+    optional `+`, digits, in range). `"1.5"` and `"-3"` are not counts there,
+    so they are not counts here. */
+function serverCount(attrs, keys) {
+  return keys.some((key) => {
+    const v = attrs[key];
+    if (typeof v === 'number') return true;
+    if (typeof v !== 'string') return false;
+    const text = v.trim();
+    return /^\+?[0-9]+$/.test(text) && BigInt(text.replace(/^\+/, '')) <= U64_MAX;
+  });
+}
+
+/** Whether src/semconv.rs `facts()` calls the span an LLM call (`is_llm`),
+    exactly: any model, provider or token count; `gen_ai.operation.name` or
+    `llm.request.type` present with any value at all (the server tests the
+    key, not the value); `traceloop.span.kind` exactly `llm` (case-sensitive
+    there, unlike the kind table); or `openinference.span.kind` equal to
+    `LLM` in any ASCII case.
+
+    Narrower than `llmUsage`'s test on purpose. That one decides whether a
+    span has figures worth SHOWING, and a cost or a stop reason is worth
+    showing; this one decides what the span IS, and the server does not make
+    a wrapper a model call for carrying a rolled-up cost. */
+export function isLlm(span) {
+  const attrs = span.attributes || {};
+  return firstStr(attrs, ['gen_ai.response.model', 'gen_ai.request.model', 'llm.model', 'llm.model_name']) != null
+    || firstStr(attrs, ['gen_ai.provider.name', 'gen_ai.system', 'llm.provider', 'llm.system']) != null
+    || serverCount(attrs, ['gen_ai.usage.input_tokens', 'gen_ai.usage.prompt_tokens', 'llm.prompt_tokens', 'llm.token_count.prompt'])
+    || serverCount(attrs, ['gen_ai.usage.output_tokens', 'gen_ai.usage.completion_tokens', 'llm.completion_tokens', 'llm.token_count.completion'])
+    || serverCount(attrs, ['llm.usage.total_tokens', 'gen_ai.usage.total_tokens', 'llm.total_tokens', 'llm.token_count.total'])
+    || has(attrs, 'gen_ai.operation.name')
+    || has(attrs, 'llm.request.type')
+    || firstStr(attrs, ['traceloop.span.kind']) === 'llm'
+    || lower(firstStr(attrs, ['openinference.span.kind'])) === 'llm';
+}
+
+/** What kind of step a span is, by the precedence of src/semconv.rs
+    `step_kind`: `gen_ai.operation.name`, then `openinference.span.kind`,
+    then `traceloop.span.kind` (each compared ASCII case-insensitively), then
+    `isLlm`, then a tool name. An unrecognized value falls through to the
+    next source. Returns `llm`, `tool`, `agent`, `retrieval`, `embedding` or
+    `other`. */
+export function stepKindOf(span) {
+  const attrs = span.attributes || {};
+  const operation = lower(firstStr(attrs, ['gen_ai.operation.name']));
+  const byOperation = {
+    chat: 'llm', text_completion: 'llm', generate_content: 'llm', execute_tool: 'tool',
+    invoke_agent: 'agent', create_agent: 'agent', embeddings: 'embedding',
+  }[operation];
+  if (byOperation) return byOperation;
+  const oi = lower(firstStr(attrs, ['openinference.span.kind']));
+  const byOi = { llm: 'llm', tool: 'tool', agent: 'agent', retriever: 'retrieval', embedding: 'embedding', chain: 'other' }[oi];
+  if (byOi) return byOi;
+  const traceloop = lower(firstStr(attrs, ['traceloop.span.kind']));
+  const byTraceloop = { llm: 'llm', tool: 'tool', agent: 'agent', workflow: 'other', task: 'other' }[traceloop];
+  if (byTraceloop) return byTraceloop;
+  if (isLlm(span)) return 'llm';
+  if (firstStr(attrs, ['gen_ai.tool.name', 'tool.name'])) return 'tool';
+  return 'other';
+}
+
+/** Whether a span is a STEP of its run (a model call, a tool call, or an
+    agent invocation) — what a tape, a step count and repeat detection are
+    made of. Retrievals, embeddings and wrappers are context, not steps. */
+export function isStep(span) {
+  const kind = stepKindOf(span);
+  return kind === 'llm' || kind === 'tool' || kind === 'agent';
+}
+
+/** The tool and agent a span names, by the semconv.rs names table:
+    tool `gen_ai.tool.name` → `tool.name` → `traceloop.entity.name` (when the
+    Traceloop kind is `tool`); agent `gen_ai.agent.name` →
+    `traceloop.entity.name` (kind `agent` or `workflow`) → `agent.name`. */
+export function stepNamesOf(span) {
+  const attrs = span.attributes || {};
+  const traceloop = lower(firstStr(attrs, ['traceloop.span.kind']));
+  const tool = firstStr(attrs, ['gen_ai.tool.name', 'tool.name'])
+    || (traceloop === 'tool' ? firstStr(attrs, ['traceloop.entity.name']) : null);
+  const agent = firstStr(attrs, ['gen_ai.agent.name'])
+    || ((traceloop === 'agent' || traceloop === 'workflow') ? firstStr(attrs, ['traceloop.entity.name']) : null)
+    || firstStr(attrs, ['agent.name']);
+  return { tool: tool || null, agent: agent || null };
+}
+
+/** The run a span belongs to: its session id, else `trace:<trace_id>`
+    (src/semconv.rs `run_id`). Membership is per span, as it is there. */
+export function runIdOf(span) {
+  const session = sessionIdOf(span);
+  return session ? session.id : 'trace:' + span.trace_id;
 }
 
 /** The span's session id and the attribute key carrying it, or null. Mirrors
@@ -402,48 +517,125 @@ function parseMessagesAttr(value, direction) {
   return list.map((m) => normalizeMessage(m, direction));
 }
 
+/** Messages reassembled from an indexed layout — OpenLLMetry's
+    `gen_ai.prompt.{i}.{role,content,…}` or OpenInference's
+    `llm.input_messages.{i}.message.{role,content,…}` — ordered by numeric
+    index, with tool calls folded into tool_call parts the way semconv.rs
+    folds them (`{i}.tool_calls.{j}.{id,name,arguments}`, and OpenInference's
+    `{i}.message.tool_calls.{j}.tool_call.{id,function.name,function.arguments}`). */
+function indexedMessages(attrs, prefix, inner, direction) {
+  const byIndex = new Map();
+  for (const [key, value] of Object.entries(attrs)) {
+    if (!key.startsWith(prefix)) continue;
+    let rest = key.slice(prefix.length);
+    const dot = rest.indexOf('.');
+    if (dot < 0) continue;
+    const index = rest.slice(0, dot);
+    // An index with a leading zero is not an index (semconv.rs ignores it).
+    if (!/^(0|[1-9]\d*)$/.test(index)) continue;
+    rest = rest.slice(dot + 1);
+    if (inner) {
+      if (!rest.startsWith(inner)) continue;
+      rest = rest.slice(inner.length);
+    }
+    if (!byIndex.has(index)) byIndex.set(index, { calls: new Map() });
+    const message = byIndex.get(index);
+    if (rest === 'role' || rest === 'content' || rest === 'finish_reason' || rest === 'tool_call_id') {
+      message[rest] = value;
+      continue;
+    }
+    const call = /^tool_calls\.(\d+)\.(.+)$/.exec(rest);
+    if (!call) continue;
+    const field = {
+      id: 'id', name: 'name', arguments: 'arguments', 'tool_call.id': 'id',
+      'tool_call.function.name': 'name', 'tool_call.function.arguments': 'arguments',
+    }[call[2]];
+    if (!field) continue;
+    if (!message.calls.has(call[1])) message.calls.set(call[1], {});
+    message.calls.get(call[1])[field] = value;
+  }
+  return [...byIndex.entries()]
+    .sort((a, b) => Number(a[0]) - Number(b[0]))
+    .map(([, m]) => {
+      const parts = [];
+      if (m.content != null) parts.push(normalizePart({ content: m.content }));
+      [...m.calls.entries()].sort((a, b) => Number(a[0]) - Number(b[0])).forEach(([, c]) => {
+        parts.push({ kind: 'tool_call', id: c.id, name: c.name || '', args: parseMaybeJson(c.arguments ?? {}) });
+      });
+      if (!parts.length) parts.push(normalizePart({ content: '' }));
+      return { direction, role: m.role, finishReason: m.finish_reason, parts };
+    });
+}
+
+function parseMaybeJson(value) {
+  if (typeof value !== 'string') return value;
+  const trimmed = value.trim();
+  if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) return value;
+  try { return JSON.parse(trimmed); } catch (e) { return value; }
+}
+
+/** One plain value (`input.value`, `llm.prompt`) as messages: a JSON list
+    of `{role, …}` objects reads as that conversation, anything else as one
+    message. */
+function valueMessage(value, direction) {
+  if (value == null || value === '') return [];
+  if (isPayloadRef(value)) return [{ direction, role: undefined, parts: [normalizePart(value)] }];
+  if (typeof value === 'string') {
+    const parsed = parseMaybeJson(value);
+    if (Array.isArray(parsed) && parsed.length && parsed.every((m) => m && typeof m === 'object' && 'role' in m)) {
+      return parsed.map((m) => normalizeMessage(m, direction));
+    }
+    return [normalizeMessage(value, direction)];
+  }
+  return [normalizeMessage({ content: value }, direction)];
+}
+
 /** Chat turns recovered from an LLM span, in order, as structured messages:
     { direction: 'prompt'|'completion', role, finishReason, parts: [...] }.
     Part kinds are 'text', 'media', 'tool_call', 'tool_result', 'payload'.
 
-    Recognizes, newest OTel convention first: JSON gen_ai.input.messages /
-    gen_ai.output.messages ({role, parts:[{type,content}]}); then the legacy
-    indexed gen_ai.prompt.{i}.{role,content} / gen_ai.completion.{i}.*; then
-    Traza's native llm.prompt / llm.completion events. */
+    Each side takes the first source present, by the precedence of
+    src/semconv.rs: JSON `gen_ai.input.messages` / `gen_ai.output.messages`
+    ({role, parts:[{type,content}]}); then OpenLLMetry's indexed
+    `gen_ai.prompt.{i}.*` / `gen_ai.completion.{i}.*`; then OpenInference's
+    indexed `llm.input_messages.{i}.message.*` / `llm.output_messages.*`; then
+    `input.value` / `output.value`; then a native `llm.prompt` /
+    `llm.completion` attribute; then those native events.
+    `gen_ai.system_instructions` leads the prompt as a system message. */
 export function llmMessages(span) {
   const attrs = span.attributes || {};
-  if (attrs['gen_ai.input.messages'] != null || attrs['gen_ai.output.messages'] != null) {
-    return [
-      ...parseMessagesAttr(attrs['gen_ai.input.messages'], 'prompt'),
-      ...parseMessagesAttr(attrs['gen_ai.output.messages'], 'completion'),
-    ];
-  }
-  const collectIndexed = (kind) => {
-    const prefix = 'gen_ai.' + kind + '.';
-    const byIndex = new Map();
-    for (const [key, value] of Object.entries(attrs)) {
-      if (!key.startsWith(prefix)) continue;
-      const rest = key.slice(prefix.length); // e.g. "0.content" or "0.role"
-      const dot = rest.indexOf('.');
-      if (dot < 0) continue;
-      const i = rest.slice(0, dot);
-      const field = rest.slice(dot + 1);
-      if (field !== 'role' && field !== 'content') continue;
-      if (!byIndex.has(i)) byIndex.set(i, {});
-      byIndex.get(i)[field] = value;
-    }
-    return [...byIndex.entries()]
-      .sort((a, b) => Number(a[0]) - Number(b[0]))
-      .map(([, m]) => ({ direction: kind, role: m.role, parts: [normalizePart({ content: m.content })] }));
-  };
-  const events = (span.events || [])
-    .filter((e) => e.name === 'llm.prompt' || e.name === 'llm.completion')
+  const eventsOf = (name, direction) => (span.events || [])
+    .filter((e) => e.name === name)
     .map((e) => ({
-      direction: e.name === 'llm.prompt' ? 'prompt' : 'completion',
+      direction,
       role: (e.attributes || {}).role,
       parts: [normalizePart({ content: (e.attributes || {}).content })],
     }));
-  return [...collectIndexed('prompt'), ...collectIndexed('completion'), ...events];
+  const side = (direction) => {
+    const prompt = direction === 'prompt';
+    const sources = [
+      () => parseMessagesAttr(attrs[prompt ? 'gen_ai.input.messages' : 'gen_ai.output.messages'], direction),
+      () => indexedMessages(attrs, prompt ? 'gen_ai.prompt.' : 'gen_ai.completion.', '', direction),
+      () => indexedMessages(attrs, prompt ? 'llm.input_messages.' : 'llm.output_messages.', 'message.', direction),
+      () => valueMessage(attrs[prompt ? 'input.value' : 'output.value'], direction),
+      () => valueMessage(attrs[prompt ? 'llm.prompt' : 'llm.completion'], direction),
+      () => eventsOf(prompt ? 'llm.prompt' : 'llm.completion', direction),
+    ];
+    for (const source of sources) {
+      const found = source();
+      if (found.length) return found;
+    }
+    return [];
+  };
+  const prompt = side('prompt');
+  const instructions = attrs['gen_ai.system_instructions'];
+  if (instructions != null && instructions !== '') {
+    const parsed = parseMaybeJson(instructions);
+    prompt.unshift(Array.isArray(parsed)
+      ? { direction: 'prompt', role: 'system', parts: parsed.map(normalizePart) }
+      : { direction: 'prompt', role: 'system', parts: [normalizePart(isPayloadRef(parsed) ? parsed : { content: parsed })] });
+  }
+  return [...prompt, ...side('completion')];
 }
 
 /** The messages inside a loaded payload body, normalized like any other

@@ -1,0 +1,1 @@
+{"global":{"action":"warn","limits":{"max_repeats":12,"max_steps":50},"name":"global"},"policies":[{"action":"stop","created_at_ns":1792221802400278000,"id":"fp_739c7ebfbf198493","limits":{"max_cost_usd":2.0,"max_error_streak":3,"max_repeats":4,"max_steps":40},"match":{"service":"support-agent"},"name":"support","tenant":""}]}

@@ -28,9 +28,9 @@
 //! belongs to).
 //!
 //! This module is the single source of truth for the key precedence. The
-//! React dashboard mirrors the OpenLLMetry / native part of the [`facts`] and
-//! session precedence in `ui/src/lib/spans.js`; it does not yet read the
-//! OpenInference keys.
+//! React dashboard mirrors the [`facts`], session, step-kind, tool/agent name
+//! and message precedence (OpenInference included) in `ui/src/lib/spans.js`,
+//! for the views that read spans in the browser.
 
 use std::collections::BTreeMap;
 use std::fmt;

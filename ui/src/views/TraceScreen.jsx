@@ -9,8 +9,11 @@ import {
   llmUsage,
   sessionIdOf,
   collectPayloadRefs,
+  isStep,
+  runIdOf,
 } from '../lib/spans.js';
 import { fmtCost, fmtDurationNs, fmtNum, fmtPercent, fmtTimeNs } from '../lib/format.js';
+import { tenantParams } from '../lib/runs.js';
 import { Card, Chip, Eyebrow, ErrorState, Mono, Skeleton } from '../components/primitives/Chrome.jsx';
 import { TimeRuler } from '../components/charts/Marks.jsx';
 import { AttrTree } from '../components/data/AttrTree.jsx';
@@ -112,11 +115,15 @@ export function TraceScreen({ traceId, go, params, pushToast }) {
 
   // Agent mode hides the plumbing: HTTP and framework spans that carry no
   // model call and no error are noise when you are reading a conversation.
+  // A span is kept when its step kind (src/semconv.rs, mirrored in spans.js)
+  // makes it a step — model call, tool call, agent — so OpenInference and
+  // OTel tool spans count without their names having to say so; the name
+  // test stays for instrumentation that declares no kind at all.
   const visible = React.useMemo(() => {
     if (!analysis) return [];
     let rows = analysis.ordered;
     if (agentMode) {
-      rows = rows.filter(({ span }) => llmUsage(span) || span.status === 'error'
+      rows = rows.filter(({ span }) => isStep(span) || span.status === 'error'
         || /agent|tool|llm|chat|completion|task/i.test(span.name));
     }
     // A collapsed span hides its descendants, which is what makes a 200-span
@@ -172,7 +179,12 @@ export function TraceScreen({ traceId, go, params, pushToast }) {
 
   const scale = (ns) => ((ns - view.startNs) / Math.max(1, view.endNs - view.startNs)) * 100;
 
-  return <div style={{
+  // The run this trace belongs to: the session its root carries, else the
+  // trace itself — the server's run identity, applied to the root span.
+  const root = spans.find((s) => !s.parent_span_id) || spans[0];
+  const runId = root ? runIdOf(root) : 'trace:' + traceId;
+
+  return <div className="tz-split" style={{
     display: 'grid', gridTemplateColumns: 'minmax(560px,1fr) minmax(320px,428px)',
     gap: 14, maxWidth: 1900, alignItems: 'start',
   }}>
@@ -180,16 +192,22 @@ export function TraceScreen({ traceId, go, params, pushToast }) {
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
         <Mono size={13}>{traceId}</Mono>
         <Chip onClick={() => navigator.clipboard?.writeText(traceId)}>copy id</Chip>
-        <span style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
+        <span style={{ marginLeft: 'auto', display: 'flex', flexWrap: 'wrap', gap: 6 }}>
           <Chip active={agentMode} onClick={() => setAgentMode((on) => !on)}>Agent mode</Chip>
-          {sessionIdOf(spans[0] || {}) ? <Chip onClick={() => go(['sessions', sessionIdOf(spans[0]).id])}>Session</Chip> : null}
+          {sessionIdOf(spans[0] || {}) ? <Chip onClick={() => go(['sessions', sessionIdOf(spans[0]).id],
+            tenantParams(spans[0].$tenant || ''))}>Session</Chip> : null}
+          {/* A span's tenant is definite — `$tenant` is omitted for the
+              default one — so the run opens in its tenant, named even when
+              it is the default: unnamed, a tape reads every tenant. */}
+          <Chip onClick={() => go(['run', runId], root ? tenantParams(root.$tenant || '') : undefined)}
+            title={'The tape of run ' + runId}>Run</Chip>
           <Chip onClick={() => go(['conversation', 'traces', traceId])}>Conversation</Chip>
           <Chip onClick={() => go(['compare'], { a: traceId })}>Compare</Chip>
           <Chip tone="primary" onClick={() => setAnnotating(true)}>Annotate</Chip>
         </span>
       </div>
 
-      <Card pad="0" style={{ display: 'grid', gridTemplateColumns: 'repeat(7,1fr)', overflow: 'hidden' }}>
+      <Card pad="0" className="tz-reflow" style={{ display: 'grid', gridTemplateColumns: 'repeat(7,1fr)', overflow: 'hidden' }}>
         <Tile label="duration" value={fmtDurationNs(analysis.span)} />
         <Tile label="critical path" value={fmtPercent(
           [...analysis.path].reduce((total, id) => {
@@ -204,7 +222,10 @@ export function TraceScreen({ traceId, go, params, pushToast }) {
           tone={analysis.errors ? 'var(--error)' : 'var(--ink)'} />
       </Card>
 
-      <Card pad="10px 14px 12px">
+      {/* The waterfall needs its label column and a readable bar width; on a
+          phone it scrolls sideways inside its card rather than pushing the
+          whole page wider than the screen. */}
+      <Card pad="10px 14px 12px" style={{ overflowX: 'auto' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8, flexWrap: 'wrap' }}>
           <Eyebrow>waterfall</Eyebrow>
           <Legend color="var(--accent)" label="critical path" />

@@ -3,6 +3,7 @@ import { api } from '../lib/api.js';
 import { useRead } from '../lib/route.js';
 import { RANGES, windowOf } from '../lib/query.js';
 import { fmtAgo, fmtCostProvenance, fmtDurationNs, fmtNum, fmtWindow } from '../lib/format.js';
+import { routeTenant, tenantParams } from '../lib/runs.js';
 import { Card, Chip, ErrorState, EmptyState, LoadingBar, Mono } from '../components/primitives/Chrome.jsx';
 
 // Sessions gained the time window the API always had, a sort, an efficiency
@@ -63,9 +64,13 @@ export function SessionsScreen({ go }) {
       </div>
       {rows.map((session) => {
         const cost = fmtCostProvenance(session);
-        return <div key={session.session_id}
-        onClick={() => go(['sessions', session.session_id])} role="link" tabIndex={0}
-        onKeyDown={(e) => { if (e.key === 'Enter') go(['sessions', session.session_id]); }}
+        // A row omits `tenant` for the default tenant. The link names it
+        // either way, so the session — and the run it opens — is read in
+        // its own tenant rather than merged with another's of the same id.
+        const open = () => go(['sessions', session.session_id], tenantParams(session.tenant || ''));
+        return <div key={(session.tenant || '') + '\u0000' + session.session_id}
+        onClick={open} role="link" tabIndex={0}
+        onKeyDown={(e) => { if (e.key === 'Enter') open(); }}
         style={{
           display: 'grid', gridTemplateColumns: '1fr 76px 74px 84px 92px 92px 100px 72px 64px',
           alignItems: 'center', borderBottom: '1px solid var(--hairline)',
@@ -99,8 +104,9 @@ export function SessionsScreen({ go }) {
   </div>;
 }
 
-export function SessionScreen({ sessionId, go }) {
-  const detail = useRead((signal) => api.session(sessionId, signal), [sessionId]);
+export function SessionScreen({ sessionId, go, params }) {
+  const tenant = routeTenant(params);
+  const detail = useRead((signal) => api.session(sessionId, tenantParams(tenant), signal), [sessionId, tenant]);
   const data = detail.data;
 
   if (detail.error) {
@@ -113,6 +119,10 @@ export function SessionScreen({ sessionId, go }) {
 
   const traces = data.traces || [];
   const maxCost = Math.max(...traces.map((t) => t.cost_usd || 0), 0);
+  // The run's tenant: the one this session was read in, else the one its
+  // spans agree on. Read without a tenant, an empty answer means the default
+  // tenant OR spans that disagree, so it names nothing.
+  const runScope = tenantParams(tenant !== undefined ? tenant : data.tenant || undefined);
 
   return <div style={{ display: 'grid', gap: 12, maxWidth: 1560 }}>
     <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
@@ -121,14 +131,16 @@ export function SessionScreen({ sessionId, go }) {
         {fmtWindow(data.first_start_ns, data.last_end_ns)}
         {data.session_attribute && data.session_attribute !== 'session.id' ? ` · via ${data.session_attribute}` : ''}
       </span>
-      <span style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
+      <span style={{ marginLeft: 'auto', display: 'flex', flexWrap: 'wrap', gap: 6 }}>
         <Chip onClick={() => navigator.clipboard?.writeText(sessionId)}>copy id</Chip>
+        <Chip onClick={() => go(['run', sessionId], runScope)}
+          title="The session as a run: its steps in order, a replay, a diff">Run</Chip>
         <Chip onClick={() => go(['conversation', 'sessions', sessionId])}>Conversation</Chip>
         <Chip onClick={() => go(['traces'], { q: `session|=|${sessionId}` })}>Search its spans</Chip>
       </span>
     </div>
 
-    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(7,1fr)', gap: 12 }}>
+    <div className="tz-reflow" style={{ display: 'grid', gridTemplateColumns: 'repeat(7,1fr)', gap: 12 }}>
       {[
         ['turns', fmtNum(data.trace_count)],
         ['spans', fmtNum(data.span_count)],

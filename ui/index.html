@@ -3,15 +3,29 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!-- Where the API lives relative to this page. Empty when traza-server
+         serves the dashboard itself; a reverse proxy that mounts the store
+         under a path prefix sets it to that prefix (e.g. /x/org/project). -->
+    <meta name="traza-api-base" content="" />
     <title>Traza</title>
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48'%3E%3Crect width='48' height='48' rx='6' fill='%23FAF7F2'/%3E%3Cg fill='%23C65D3B'%3E%3Crect x='12' y='8' width='7' height='27' rx='2'/%3E%3Crect x='4' y='14' width='26' height='7' rx='2'/%3E%3Crect x='17' y='25' width='21' height='7' rx='2'/%3E%3Crect x='22' y='34' width='18' height='7' rx='2'/%3E%3C/g%3E%3C/svg%3E" />
     <script>
       // Theme before first paint: stored choice, else OS preference.
+      //
+      // The app stores preferences as JSON, so the stored value is the string
+      // '"dark"' with its quotes. Comparing the raw value with 'dark' never
+      // matched, and every dark-theme reload painted paper first and then
+      // flipped. Parse it the way the app does (a bare value from an older
+      // build still reads as itself), and only an explicit choice overrides
+      // the OS.
       (function () {
         var stored = null;
-        try { stored = localStorage.getItem('traza_theme'); } catch (e) {}
-        var dark = stored ? stored === 'dark'
-          : window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+        try {
+          var raw = localStorage.getItem('traza_theme');
+          if (raw != null) { try { stored = JSON.parse(raw); } catch (e) { stored = raw; } }
+        } catch (e) {}
+        var dark = stored === 'dark' ? true : stored === 'light' ? false
+          : !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
         if (dark) document.documentElement.setAttribute('data-theme', 'dark');
       })();
     </script>

@@ -1,5 +1,6 @@
 import React from 'react';
 import { useStored } from '../lib/route.js';
+import { publicBase } from '../lib/base.js';
 import { fromHash, toHash, toCurl, describe } from '../lib/query.js';
 import { fmtAgo } from '../lib/format.js';
 import { Card, Chip, Eyebrow, EmptyState, Mono } from '../components/primitives/Chrome.jsx';
@@ -14,7 +15,8 @@ export function DatasetsScreen({ go, params, pushToast }) {
   const [datasets, setDatasets] = useStored('traza_datasets', []);
   const [name, setName] = React.useState('');
   const incoming = React.useMemo(() => fromHash(params), [params]);
-  const origin = typeof window !== 'undefined' ? window.location.origin : '';
+  // Origin plus any path prefix, so the curl is right behind a proxy.
+  const origin = publicBase();
   const hasIncoming = incoming.preds.length > 0;
 
   const save = () => {
@@ -53,7 +55,7 @@ export function DatasetsScreen({ go, params, pushToast }) {
         <span style={{ fontSize: 12, color: 'var(--ink-faint)' }}>
           saved {fmtAgo(dataset.made * 1e6)} ago · {dataset.query.preds.length} predicates
         </span>
-        <span style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
+        <span style={{ marginLeft: 'auto', display: 'flex', flexWrap: 'wrap', gap: 6 }}>
           <Chip onClick={() => go(['traces'], toHash(dataset.query))}>Open in Traces</Chip>
           <Chip onClick={() => go(['store'], toHash(dataset.query))}>Export</Chip>
           <Chip onClick={() => setDatasets(datasets.filter((_, i) => i !== index))}>Remove</Chip>

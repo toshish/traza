@@ -111,3 +111,61 @@ a:hover { color: var(--accent-hover); text-decoration-color: var(--accent-hover)
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
 }
+
+/* ------------------------------------------------ focus and buttons */
+/* Text fields draw their own hairline box and remove the input's outline, so
+   the ring goes on the box when anything inside it has focus. */
+.tz-field:focus-within { outline: var(--focus-ring); outline-offset: var(--focus-offset); }
+/* Navigation and header controls are real <button>s, for keyboard and
+   assistive-technology semantics; this strips the user-agent chrome so the
+   inline styles alone decide how they look. */
+.tz-plain-button {
+  appearance: none; -webkit-appearance: none; margin: 0; border: none; background: none;
+  font: inherit; color: inherit; text-align: left;
+}
+
+/* ------------------------------------------------ breakpoints
+   Inline styles cannot hold media queries, so the few layout facts that
+   change with width live here as classes, with !important to win over the
+   inline values they replace. Three widths:
+     < 1150px  the trace detail's waterfall and inspector stack instead of
+               sitting side by side (the pair needs ~900px of content)
+     <  900px  the rail leaves the layout and becomes a drawer behind a Menu
+               button in the header
+     <  700px  stat-tile grids drop to two columns, wide forms to one, and
+               the header sheds its secondary text */
+.tz-menu-button { display: none !important; }
+.tz-scrim { display: none; }
+.tz-scroll-x { overflow-x: auto; }
+
+@media (max-width: 1149px) {
+  .tz-split { grid-template-columns: minmax(0, 1fr) !important; }
+}
+
+@media (max-width: 899px) {
+  .tz-rail {
+    position: fixed !important; left: 0; top: 0; z-index: 70;
+    transform: translateX(-100%); visibility: hidden;
+    transition: transform var(--dur-base) var(--ease-out), visibility 0s linear var(--dur-base);
+  }
+  .tz-rail[data-open="true"] {
+    transform: none; visibility: visible;
+    transition: transform var(--dur-base) var(--ease-out);
+  }
+  .tz-scrim[data-open="true"] {
+    display: block; position: fixed; inset: 0; z-index: 65; background: rgba(31, 27, 23, 0.4);
+  }
+  .tz-menu-button { display: inline-flex !important; }
+  .tz-header-count { display: none !important; }
+  .tz-palette-text { display: none !important; }
+  .tz-palette { min-width: 0 !important; }
+}
+
+@media (max-width: 699px) {
+  .tz-reflow { grid-template-columns: repeat(2, minmax(0, 1fr)) !important; }
+  .tz-reflow-1 { grid-template-columns: minmax(0, 1fr) !important; }
+  .tz-main { padding: 12px 12px 48px !important; }
+  .tz-header { padding: 8px 12px !important; gap: 8px !important; }
+  .tz-header-sub { display: none !important; }
+  .tz-hide-narrow { display: none !important; }
+}

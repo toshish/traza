@@ -3,6 +3,8 @@
 // showing lives in those params, so a search is a URL somebody else can open.
 
 import React from 'react';
+import { isAuthBlocked } from './session.js';
+import { consumeFragmentToken } from './handoff.js';
 
 export function parseHash(hash) {
   const raw = (hash || '').replace(/^#\/?/, '');
@@ -41,11 +43,32 @@ export function goBack(fallbackParts) {
   else navigate(fallbackParts || ['overview']);
 }
 
-export function useHashRoute() {
+/** The current route, following the fragment.
+
+    It also takes a handed-off token (see handoff.js) on every fragment
+    navigation, before the route is parsed. A handoff link opened in a tab
+    that already shows the dashboard differs only after `#`, so the page does
+    not reload and the read at startup never sees it: the token would stay in
+    the address bar, unadopted, and the router would take `token=…` for a
+    screen name. `onToken` runs when one was taken, so the app can treat it
+    as the token change it is. */
+export function useHashRoute(onToken) {
   const [route, setRoute] = React.useState(() => parseHash(window.location.hash));
+  const onTokenRef = React.useRef(onToken);
+  onTokenRef.current = onToken;
   React.useEffect(() => {
-    const onChange = () => setRoute(parseHash(window.location.hash));
+    const take = () => {
+      if (!consumeFragmentToken()) return false;
+      if (onTokenRef.current) onTokenRef.current();
+      return true;
+    };
+    const onChange = () => {
+      take();
+      setRoute(parseHash(window.location.hash));
+    };
     window.addEventListener('hashchange', onChange);
+    // A handoff that landed between the startup read and this listener.
+    if (take()) setRoute(parseHash(window.location.hash));
     return () => window.removeEventListener('hashchange', onChange);
   }, []);
   return route;
@@ -94,14 +117,18 @@ export function useRead(run, deps, { skip = false } = {}) {
 
     A background tab polling every two seconds is pure waste — nobody is
     looking, and on a laptop it is the difference between an idle radio and a
-    busy one. Visibility is the cheapest correct gate. */
+    busy one. Visibility is the cheapest correct gate.
+
+    It also stands down after a 401 until a token is set: a rejected
+    credential re-sent by every poll on the page is noise in the server's log
+    and nothing on screen can change until somebody acts. */
 export function usePoll(callback, intervalMs, enabled = true) {
   const saved = React.useRef(callback);
   saved.current = callback;
   React.useEffect(() => {
     if (!enabled || !intervalMs) return undefined;
     let timer = null;
-    const tick = () => { if (!document.hidden) saved.current(); };
+    const tick = () => { if (!document.hidden && !isAuthBlocked()) saved.current(); };
     const start = () => { stop(); timer = setInterval(tick, intervalMs); };
     const stop = () => { if (timer) clearInterval(timer); timer = null; };
     const onVisibility = () => { if (document.hidden) stop(); else { tick(); start(); } };
@@ -131,16 +158,49 @@ export function useKeys(handler, deps = []) {
 
 /** A value that survives reloads. Saved views, density and theme are
     preferences, not state — losing them on refresh is a papercut every
-    single time. */
+    single time.
+
+    Values are stored as JSON. A value that does not parse (one written
+    before the dashboard stored JSON, such as a bare `dark`) is read as the
+    string it is rather than discarded. `null` or `undefined` REMOVES the key,
+    which is how "no choice made" is stored: the theme, for one, must be able
+    to say "follow the system" rather than freezing whatever the default was
+    on the first visit. */
 export function useStored(key, initial) {
-  const [value, setValue] = React.useState(() => {
-    try {
-      const raw = localStorage.getItem(key);
-      return raw == null ? initial : JSON.parse(raw);
-    } catch (e) { return initial; }
-  });
+  const [value, setValue] = React.useState(() => readStored(key, initial));
   React.useEffect(() => {
-    try { localStorage.setItem(key, JSON.stringify(value)); } catch (e) { /* private mode */ }
+    try {
+      if (value == null) localStorage.removeItem(key);
+      else localStorage.setItem(key, JSON.stringify(value));
+    } catch (e) { /* private mode */ }
   }, [key, value]);
   return [value, setValue];
+}
+
+export function readStored(key, initial) {
+  let raw = null;
+  try { raw = localStorage.getItem(key); } catch (e) { return initial; }
+  if (raw == null) return initial;
+  try { return JSON.parse(raw); } catch (e) { return raw; }
+}
+
+/** The OS colour-scheme preference, live: it changes when the user flips
+    their system theme, and a page that honours it only at load is wrong
+    for the rest of the session. */
+export function useSystemTheme() {
+  const query = typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+    ? window.matchMedia('(prefers-color-scheme: dark)') : null;
+  const [dark, setDark] = React.useState(() => Boolean(query && query.matches));
+  React.useEffect(() => {
+    if (!query) return undefined;
+    const onChange = (event) => setDark(event.matches);
+    if (query.addEventListener) query.addEventListener('change', onChange);
+    else if (query.addListener) query.addListener(onChange);
+    return () => {
+      if (query.removeEventListener) query.removeEventListener('change', onChange);
+      else if (query.removeListener) query.removeListener(onChange);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  return dark ? 'dark' : 'light';
 }

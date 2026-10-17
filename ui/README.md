@@ -34,18 +34,41 @@ Run a server beside `npm run dev` for live data:
     distribution with percentile marks, time ruler and axis, share bar.
   - `nav/` — the rail, the header, the command palette.
   - `data/`, `trace/` — attribute tree, code block, message list.
-- `src/views/` — one file per screen, seventeen of them.
+  - `runs/` — the usage bar the Guard and Run screens draw, and the note an
+    operator sees when a tape or diff is read across every tenant.
+- `src/views/` — one file per screen, twenty-two files (`SessionsScreen.jsx`
+  holds both the list and one session). The run screens are `GuardScreen`,
+  `RunScreen` and `DiffScreen`; `LedgerScreen` and `CredentialsScreen` cover
+  the ledger, evidence packs and runtime credentials.
 - `src/lib/`
-  - `api.js` — API client. Bearer token in sessionStorage, 401 → token prompt.
-    Reads take an `AbortSignal`, identical in-flight GETs are coalesced, and
-    paging uses the server's cursor.
+  - `api.js` — API client. Bearer token in sessionStorage. Reads take an
+    `AbortSignal`, identical in-flight GETs made with the same token are
+    coalesced, and paging uses the server's cursor. It refuses two things
+    locally, before the network: anything at all after a 401 for the token
+    in use (a 401 for a request sent with an older token blocks nothing), and
+    an operator surface for a credential `/v1/whoami` has not confirmed as an
+    operator. `tenant` is the one query parameter sent when empty, because
+    `tenant=` names the default tenant.
+  - `base.js` — the API base, from `<meta name="traza-api-base">`, for a
+    store mounted under a path prefix; every request and copyable snippet is
+    built from it.
+  - `session.js` — the `/v1/whoami` identity, the 401 block, and the list of
+    operator paths a tenant-bound credential is refused.
+  - `handoff.js` — the `#token=` handoff: a token in the fragment is stored
+    and stripped from the address bar, at startup and on every fragment
+    navigation.
+  - `runs.js` — the run screens' arithmetic: limit bars, fingerprints,
+    replay snippets, and which tenant a run is read in.
   - `query.js` — **the query as a value.** Predicates serialize into the hash
     route, out of it, into API parameters and into curl. Sharing, saved views,
     "copy as curl" and the matching export all fall out of that one
     representation.
-  - `route.js` — hash routing, `useRead` (aborts the superseded request),
-    `usePoll` (stops in a background tab), `useKeys`, `useStored`.
-  - `format.js`, `spans.js` — formatting, span-tree and critical-path helpers.
+  - `route.js` — hash routing (which also takes a handed-off token before a
+    route is parsed), `useRead` (aborts the superseded request), `usePoll`
+    (stops in a background tab and after a 401), `useKeys`, `useStored`.
+  - `format.js`, `spans.js` — formatting, span-tree and critical-path
+    helpers; `spans.js` also mirrors `src/semconv.rs` for the views that read
+    spans in the browser.
 - Routing is hash-based (`#/traces`, `#/trace/<id>`, …), so the app works from
   any static host without server-side route rewrites.
 

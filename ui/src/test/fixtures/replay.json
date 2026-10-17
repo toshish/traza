@@ -1,0 +1,1 @@
+{"base_urls":{"anthropic":"/v1/replays/rp_d8279b2994cfb23822add5567c190dcf/anthropic","openai":"/v1/replays/rp_d8279b2994cfb23822add5567c190dcf/openai/v1"},"expires_at_ns":1792225419521526000,"id":"rp_d8279b2994cfb23822add5567c190dcf","llm_steps":2,"mode":"strict","run":"weather-7","steps":3,"unreadable_tool_steps":[]}

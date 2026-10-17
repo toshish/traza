@@ -1,0 +1,1 @@
+{"as_of_ns":1792223814784273000,"tenants":[{"lifetime":{"batches":1,"bytes":6194,"rejected":0,"spans":8},"limits":{"ingest_paused":false,"monthly_bytes":1000000,"monthly_spans":10,"ttl_seconds":2592000},"month":{"bytes":6194,"spans":8,"window":"2026-10"},"state":"warning","tenant":"acme"}]}
