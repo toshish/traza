@@ -1776,71 +1776,31 @@ fn handle_connection(
             }
         };
         let started = std::time::Instant::now();
-        // A request answered WITHOUT reading its body leaves those bytes in
-        // the socket, where they would be read as the next request. Any such
-        // path must close.
-        let body_is_unread = head.content_length > 0;
         let keep_alive = head.wants_keep_alive();
 
-        // Liveness and readiness probes answer before the auth gate: a load
-        // balancer or orchestrator probing them holds no credential, and the
-        // answers carry nothing but the version. Not counted in the request
-        // metrics, which a probe every second would dominate.
-        if head.method == "GET" {
-            let probe = match head
-                .target
-                .split_once('?')
-                .map_or(head.target.as_str(), |(path, _)| path)
-            {
-                "/healthz" => Some(traza::platform::health()),
-                "/readyz" => Some(traza::platform::readiness()),
-                _ => None,
-            };
-            if let Some(body) = probe {
-                let mut responder = connection.responder(keep_alive && !body_is_unread);
-                responder.json(200, body)?;
-                if responder.keep_alive {
-                    continue;
-                }
-                return Ok(());
+        // Answers that need no credential, decided from the head alone and
+        // all sent from here, so that consuming the request is not each
+        // route's job to remember. It is consumed BEFORE the answer: on a
+        // reused connection the next head must be parsed from where this
+        // request ends, and on a closing one the close must not find the
+        // client's bytes unread (which turns it into a reset that can beat
+        // the response). The declared body is discarded, never buffered, so
+        // this gives an unauthenticated client no way to make the server hold
+        // its bytes.
+        if let Some(answer) = pre_auth_answer(&head, ui) {
+            if let Err(error) = connection.discard_request() {
+                let mut responder = connection.responder(false);
+                return responder.json(400, json!({"error": error.to_string()}));
             }
-        }
-
-        // The dashboard SHELL is served before the auth gate: the page must
-        // load in a browser without credentials, while every /v1 call it makes
-        // below stays gated (the page attaches the bearer token itself).
-        // Static assets carry no stored data, so this leaks nothing.
-        if head.method == "GET" {
-            let path = percent_decode(
-                head.target
-                    .split_once('?')
-                    .map_or(head.target.as_str(), |(path, _)| path),
-            );
-            if let Some(file) = ui.resolve(&path) {
-                let mut responder = connection.responder(keep_alive && !body_is_unread);
-                responder.file(&file)?;
-                if responder.keep_alive {
-                    continue;
-                }
-                return Ok(());
+            let mut responder = connection.responder(keep_alive);
+            match answer {
+                PreAuthAnswer::Json(status, body) => responder.json(status, body)?,
+                PreAuthAnswer::File(file) => responder.file(&file)?,
             }
-            if matches!(path.as_str(), "/" | "/dashboard" | "/dashboard/") {
-                let mut responder = connection.responder(keep_alive && !body_is_unread);
-                responder.json(
-                    404,
-                    json!({
-                        "error": "no dashboard build found",
-                        "next": format!(
-                            "build it with: cd ui && npm ci && npm run build (serving {})",
-                            ui.directory().display()
-                        ),
-                    }),
-                )?;
-                if responder.keep_alive {
-                    continue;
-                }
-                return Ok(());
+            if keep_alive {
+                continue;
             }
+            return Ok(());
         }
         // Auth verdicts need only the head: rejecting BEFORE the body read
         // means an unauthenticated client cannot make this server buffer
@@ -2049,6 +2009,57 @@ fn handle_connection(
         }
     }
     Ok(())
+}
+
+/// What a request answered before the auth gate gets back.
+enum PreAuthAnswer {
+    Json(u16, Value),
+    File(traza::ui::UiFile),
+}
+
+/// The answer to a request that needs no credential, or `None` when the
+/// request must go through the auth gate.
+///
+/// Decides only: [`handle_connection`] consumes the request and sends the
+/// answer, so a route added here cannot answer without consuming.
+fn pre_auth_answer(head: &RequestHead, ui: &traza::ui::UiRoot) -> Option<PreAuthAnswer> {
+    if head.method != "GET" {
+        return None;
+    }
+    let path = head
+        .target
+        .split_once('?')
+        .map_or(head.target.as_str(), |(path, _)| path);
+    // Liveness and readiness probes: a load balancer or orchestrator probing
+    // them holds no credential, and the answers carry nothing but the
+    // version. Not counted in the request metrics, which a probe every second
+    // would dominate.
+    match path {
+        "/healthz" => return Some(PreAuthAnswer::Json(200, traza::platform::health())),
+        "/readyz" => return Some(PreAuthAnswer::Json(200, traza::platform::readiness())),
+        _ => {}
+    }
+    // The dashboard SHELL: the page must load in a browser without
+    // credentials, while every /v1 call it makes stays gated (the page
+    // attaches the bearer token itself). Static assets carry no stored data,
+    // so this leaks nothing.
+    let path = percent_decode(path);
+    if let Some(file) = ui.resolve(&path) {
+        return Some(PreAuthAnswer::File(file));
+    }
+    if matches!(path.as_str(), "/" | "/dashboard" | "/dashboard/") {
+        return Some(PreAuthAnswer::Json(
+            404,
+            json!({
+                "error": "no dashboard build found",
+                "next": format!(
+                    "build it with: cd ui && npm ci && npm run build (serving {})",
+                    ui.directory().display()
+                ),
+            }),
+        ));
+    }
+    None
 }
 
 /// Answers a request the auth gate refused, and closes the connection: the
@@ -4186,6 +4197,16 @@ impl RequestHead {
 struct Connection {
     stream: TcpStream,
     buffer: Vec<u8>,
+    /// Bytes of the request [`Self::read_head`] last returned — head and
+    /// declared body, counted from the front of `buffer` and running on into
+    /// the socket — that nothing has consumed yet. Tracked here, not by the
+    /// caller, because a request that is answered but not consumed is parsed
+    /// AGAIN as the next one: a single probe once came back to its client
+    /// `MAX_REQUESTS_PER_CONNECTION` times on a kept-alive connection.
+    unconsumed: usize,
+    /// The request being answered is a `HEAD`, whose response must not carry
+    /// a body.
+    head_request: bool,
 }
 
 impl Connection {
@@ -4193,6 +4214,8 @@ impl Connection {
         Self {
             stream,
             buffer: Vec::with_capacity(8192),
+            unconsumed: 0,
+            head_request: false,
         }
     }
 
@@ -4202,6 +4225,7 @@ impl Connection {
         Responder {
             stream: &mut self.stream,
             keep_alive,
+            omit_body: self.head_request,
             status: None,
         }
     }
@@ -4211,6 +4235,11 @@ impl Connection {
     /// `Ok(None)` means the peer closed cleanly at a request boundary — the
     /// ordinary end of a keep-alive connection, not an error.
     fn read_head(&mut self) -> io::Result<Option<RequestHead>> {
+        // Whatever of the previous request was not consumed is discarded
+        // first, so the head parsed below starts where that request ended
+        // whichever path answered it.
+        self.head_request = false;
+        self.discard_request()?;
         let mut chunk = [0_u8; 8192];
         let header_end = loop {
             // Check BEFORE reading: a pipelined request may already be sitting
@@ -4237,7 +4266,36 @@ impl Connection {
             }
             self.buffer.extend_from_slice(&chunk[..read]);
         };
-        parse_head(&self.buffer, header_end).map(Some)
+        let head = parse_head(&self.buffer, header_end)?;
+        self.unconsumed = head.header_end + head.content_length;
+        // Methods are case-sensitive: `head` is not HEAD, and its client
+        // expects whatever body the response declares.
+        self.head_request = head.method == "HEAD";
+        Ok(Some(head))
+    }
+
+    /// Consumes the rest of the current request without keeping its body.
+    ///
+    /// The part of the body still in the socket is read in chunks and
+    /// dropped, never accumulated, and never past the request's end: the
+    /// bytes after it are the next request.
+    fn discard_request(&mut self) -> io::Result<()> {
+        let buffered = self.unconsumed.min(self.buffer.len());
+        self.buffer.drain(..buffered);
+        self.unconsumed -= buffered;
+        let mut chunk = [0_u8; 8192];
+        while self.unconsumed > 0 {
+            let want = self.unconsumed.min(chunk.len());
+            let read = self.stream.read(&mut chunk[..want])?;
+            if read == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "incomplete body",
+                ));
+            }
+            self.unconsumed -= read;
+        }
+        Ok(())
     }
 
     /// Reads `head`'s body and consumes the whole request from the buffer.
@@ -4257,6 +4315,7 @@ impl Connection {
         let body = self.buffer[head.header_end..needed].to_vec();
         // Whatever is left belongs to the next request.
         self.buffer.drain(..needed);
+        self.unconsumed = 0;
         Ok(body)
     }
 }
@@ -4393,6 +4452,11 @@ struct Responder<'a> {
     stream: &'a mut TcpStream,
     /// Whether this connection will read another request after this response.
     keep_alive: bool,
+    /// Answering a `HEAD`: the head goes out as it would for `GET`, the body
+    /// does not. Its client reads no body whatever `Content-Length` says, so
+    /// one sent anyway would be read as the start of the next response. The
+    /// streaming routes write past this, and are GET-only.
+    omit_body: bool,
     /// Status of the response actually sent, for per-class accounting. A
     /// request that never reached a responder leaves this `None` and is not
     /// counted — an uncounted request beats one filed under a status it
@@ -4484,6 +4548,7 @@ impl Responder<'_> {
 
     /// Sends a caller-built head followed by `body`, in a single write.
     fn raw(&mut self, head: &str, body: &[u8]) -> io::Result<()> {
+        let body = if self.omit_body { &[] } else { body };
         let mut out = Vec::with_capacity(head.len() + body.len());
         out.extend_from_slice(head.as_bytes());
         out.extend_from_slice(body);
