@@ -127,7 +127,13 @@ The definition is in [LLM semantics](../llm-semantics.md#steps-and-runs).
 A span that is ingested again is an upsert here, as it is in the store: a
 client retrying a batch the store already acknowledged changes no count —
 not even the error streak — and a span re-sent with different content
-replaces its earlier contribution.
+replaces its earlier contribution. One re-sent with only a later end time
+extends the run's `duration_ns` (a re-sent span that ends *earlier* leaves
+it where it was: the bounds only widen, which errs toward the limit). When
+two requests write the same span concurrently, the version the store kept is
+the one counted, whichever request's acknowledgement happens to be observed
+last; and when one batch carries two versions of a span, only the later —
+the one the store keeps — is counted.
 
 ## Policies
 
@@ -179,8 +185,13 @@ made.
 
 ## Stopping and resetting
 
-A `stop` from a policy is sticky. Later spans of the run, a raised limit, a
-deleted policy, eviction from memory — none of them lift it (but see
+A `stop` from a policy latches at the span that reaches the limit, wherever
+that span falls in a batch: three failed steps and then a successful one,
+sent together, stop a run held to `max_error_streak: 3` exactly as they
+would sent one at a time, or replayed from the store after a restart — the
+success ends the streak, not the stop. And it is sticky. Later spans of the
+run, a raised limit, a deleted policy, eviction from memory — none of them
+lift it (but see
 [what is durable](#what-is-durable-and-what-is-rebuilt) for the bound on
 stopped runs held, and for restarts). Two things do:
 
@@ -209,7 +220,7 @@ never dropped to make room.
 Live usage is an in-memory cache over the store, folded from every
 acknowledged batch on the ingest path. It is bounded, with no exceptions: at
 most `--fuse-max-runs` live runs (default 100,000, shared by every tenant),
-at most 1,000,000 span contributions across them (each a 32-byte record under
+at most 1,000,000 span contributions across them (each a 40-byte record under
 an 8-byte key, before hash-table overhead), least recently active evicted
 first, and any run idle for six hours evicted. A run is followed from its
 **first step**: a trace of HTTP and database spans costs the observer a read
@@ -231,18 +242,42 @@ its stored spans and the answer says `"source": "rebuilt"`; after that it is
 answered from memory (`"live"`) and kept current by ingest. The process
 cannot know whether a run had spans before it began following it — the run
 may predate a restart, or have been evicted — so it never assumes it did
-not. A rebuild reads at most 100,000 spans (a larger run is rebuilt from its
-earliest ones), and reading them and extracting their facts both run under
-the same budget as any query, `--query-deadline-ms`; if it runs out, a run
-with live state is answered from that, and a parked or kill-switched run
-still answers `stop`, both marked `live`, and the rebuild is retried next
-time. Asking about a run no span carries — a fresh run, or a made-up id —
+not. Asking about a run no span carries — a fresh run, or a made-up id —
 answers `continue` and holds nothing.
+
+**Part of a history answers only `stop`.** What part of a run's history
+used is a lower bound on what the run used: enough to establish that it
+must stop, never that it may go on. Two things leave the guard with part:
+
+- A rebuild reads and extracts the run's spans under the same budget as any
+  query, `--query-deadline-ms`. If it runs out, what memory holds of the run
+  — live state followed since some point, a parked stop, a kill switch — is
+  all there is. If that stops the run (a kill switch, a stop latched live or
+  parked, or a checked next step that would go past a limit on what is
+  known), the answer is `stop`, marked `live`; otherwise the question is
+  refused with the deadline's `400`, and the rebuild is retried next time.
+- A rebuild reads at most a run's earliest 100,000 spans. If the run has
+  more, and those already stop it, the answer is `stop` (exactly: a replay
+  of the whole run stops at the same span). If they do not, the question is
+  refused with `400` — and every later one too, without reading the run
+  again, until the run is evicted, since its history only grows. Such a run
+  answers `stop` once something stops it — what arrives live is added to
+  what was read, and a kill switch always works — but never `continue` or
+  `warn`.
+
+Either way a refusal is an error, not a `200`: a hook configured to fail
+closed (the Claude Code example's `TRAZA_FUSE_FAIL_CLOSED=1`) blocks the
+step, and one that fails open lets it through — the operator's choice,
+rather than a `continue` that would have let the step through either way.
 
 `fuses.jsonl` in the data directory holds what spans cannot reconstruct:
 policies, kill switches, resets and grants, one fsynced line each, replayed
 at startup (a torn final line from a crash is healed; damage anywhere else
-refuses startup rather than silently dropping a later kill switch). Most of
+refuses startup rather than silently dropping a later kill switch). A change
+whose append fails part-way — a full disk — is refused and its fragment cut
+back out of the file, so the next change cannot be written onto it; if even
+that cut fails, every further change is refused with `503` until a restart
+heals the torn tail. Most of
 its lines are superseded sooner or later — a policy replaced, a kill switch
 reset — so once it holds at least twice the records that reproduce the state
 (and at least 1,024 lines) it is rewritten to just those, at startup or on the
@@ -321,6 +356,12 @@ Stated plainly, so none of them is discovered in production:
   step after the restart. A stop survives eviction (parked), but not a
   restart: a rebuild after one recomputes it under the policy then in force,
   and does not re-announce it on the event feed.
+- **A run of more than 100,000 spans gets no verdict short of `stop`.** A
+  rebuild reads its earliest 100,000 only, which cannot clear it (see
+  [part of a history](#what-is-durable-and-what-is-rebuilt)). A run first
+  asked about while still shorter — as the run of an agent that checks
+  before every step is — is rebuilt whole and then followed live past that
+  length, in full, until it is evicted or the server restarts.
 - **Tenants share the live bound.** One tenant with many active runs can
   evict another's; those are rebuilt when asked about, and their stops are
   parked, but their ingest verdicts see only new spans until then.

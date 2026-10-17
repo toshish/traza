@@ -85,6 +85,16 @@ pub(crate) struct FuseLog {
     lines: usize,
     /// The line count at which compaction is next considered.
     compact_at: usize,
+    /// A failed append could not be cut away, so the file may end in its
+    /// fragment: appends are refused until a rewrite replaces the file.
+    damaged: bool,
+    /// Makes the next append write only this many bytes of its line and then
+    /// fail, as a full disk does mid-`write`.
+    #[cfg(test)]
+    short_write: Option<usize>,
+    /// Makes the next failed append's truncation fail too.
+    #[cfg(test)]
+    uncuttable: bool,
 }
 
 impl FuseLog {
@@ -153,6 +163,11 @@ impl FuseLog {
                 // Considered at the first opportunity: a log that grew large
                 // before this process started is compacted at open.
                 compact_at: COMPACT_SLACK,
+                damaged: false,
+                #[cfg(test)]
+                short_write: None,
+                #[cfg(test)]
+                uncuttable: false,
             },
             records,
         ))
@@ -202,12 +217,34 @@ impl FuseLog {
         }
         self.lines = records.len();
         self.compact_at = self.lines.saturating_mul(2).max(COMPACT_SLACK);
+        // Whatever a failed append left at the old file's end went with it.
+        self.damaged = false;
         Ok(())
     }
 
     /// Appends one record durably: written whole in one call, then fsynced.
     /// When this returns `Ok` the record survives a crash.
+    ///
+    /// When it returns `Err`, the record is not in the file: a write can land
+    /// a prefix and then fail (a full disk), and an fsync can fail after the
+    /// bytes reached the page cache, so whatever this append put there is
+    /// cut away again and that cut fsynced. Left in place, the fragment would
+    /// be durable garbage the NEXT append is written straight after — once
+    /// space is back, a successful, acknowledged append — and the merged line
+    /// is damage before the final line, which refuses the next startup and
+    /// takes every later control with it. If the cut itself fails the log is
+    /// marked damaged and refuses appends, so nothing acknowledged is ever
+    /// written after the fragment; a rewrite, which replaces the file whole,
+    /// clears that, and so does a restart, which heals a torn final line.
     pub(crate) fn append(&mut self, record: &Record) -> Result<()> {
+        if self.damaged {
+            return Err(Error::Io(std::io::Error::other(format!(
+                "{} ends in the remains of an append that failed and could not be cut \
+                 away; refusing to append after them until the log is rewritten or the \
+                 server restarts (which heals a torn final line)",
+                self.path.display()
+            ))));
+        }
         let mut line = serde_json::to_vec(record)?;
         line.push(b'\n');
         let fresh = !self.path.exists();
@@ -215,7 +252,28 @@ impl FuseLog {
             .create(true)
             .append(true)
             .open(&self.path)?;
-        file.write_all(&line)?;
+        // Appends are serialized by the guard's log lock and nothing else
+        // writes the file, so this is exactly where the record will begin.
+        let start = file.metadata()?.len();
+        if let Err(error) = self.write_line(&mut file, &line, fresh) {
+            if self.cut_back(&file, start).is_err() {
+                self.damaged = true;
+            }
+            return Err(error);
+        }
+        self.lines = self.lines.saturating_add(1);
+        Ok(())
+    }
+
+    /// The fallible half of an append: the line, its fsync and — for the
+    /// file's first record — the directory entry's.
+    fn write_line(&mut self, file: &mut File, line: &[u8], fresh: bool) -> Result<()> {
+        #[cfg(test)]
+        if let Some(prefix) = self.short_write.take() {
+            file.write_all(&line[..prefix.min(line.len())])?;
+            return Err(std::io::Error::other("injected short write").into());
+        }
+        file.write_all(line)?;
         file.sync_all()?;
         if fresh {
             // The file's directory entry must be durable too, or the first
@@ -224,8 +282,17 @@ impl FuseLog {
                 crate::sync_directory(directory)?;
             }
         }
-        self.lines = self.lines.saturating_add(1);
         Ok(())
+    }
+
+    /// Truncates a failed append away, durably.
+    fn cut_back(&mut self, file: &File, start: u64) -> std::io::Result<()> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.uncuttable) {
+            return Err(std::io::Error::other("injected truncate failure"));
+        }
+        file.set_len(start)?;
+        file.sync_all()
     }
 }
 
@@ -357,6 +424,59 @@ mod tests {
         assert!(!log.compaction_due());
         let (_, records) = FuseLog::open(&path).expect("reopens");
         assert_eq!(records.len(), COMPACT_SLACK * 2, "nothing was dropped");
+        let _ = fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn a_failed_append_leaves_nothing_behind_for_the_next_one_to_land_on() {
+        // A write that lands a prefix and then fails — a full disk — must not
+        // leave that prefix in the file: the next append, once space is
+        // back, would be fsynced straight after it, and the merged line is
+        // corruption before the final line, which refuses the next startup.
+        let path = dir("shortwrite");
+        let (mut log, _) = FuseLog::open(&path).expect("opens");
+        log.append(&trip("a")).expect("appends");
+        log.short_write = Some(10);
+        assert!(log.append(&trip("b")).is_err(), "the short write fails");
+        log.append(&trip("c")).expect("appends once space is back");
+        let (_, records) = FuseLog::open(&path).expect("reopens");
+        assert_eq!(records, vec![trip("a"), trip("c")]);
+
+        // On a log's very first append, too.
+        let path = dir("shortfirst");
+        let (mut log, _) = FuseLog::open(&path).expect("opens");
+        log.short_write = Some(5);
+        assert!(log.append(&trip("a")).is_err());
+        log.append(&trip("b")).expect("appends");
+        let (_, records) = FuseLog::open(&path).expect("reopens");
+        assert_eq!(records, vec![trip("b")]);
+        let _ = fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn a_fragment_that_cannot_be_cut_away_refuses_appends_until_a_rewrite() {
+        let path = dir("uncuttable");
+        let (mut log, _) = FuseLog::open(&path).expect("opens");
+        log.append(&trip("a")).expect("appends");
+        log.short_write = Some(10);
+        log.uncuttable = true;
+        assert!(log.append(&trip("b")).is_err());
+        // Nothing may land after the fragment: a refused append is one the
+        // caller knows failed, an appended one would be lost at startup.
+        match log.append(&trip("c")) {
+            Err(Error::Io(error)) => assert!(error.to_string().contains("cut"), "{error}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        // A restart heals the torn tail the fragment is...
+        let (_, records) = FuseLog::open(&path).expect("heals");
+        assert_eq!(records, vec![trip("a")]);
+
+        // ...and a rewrite replaces it, after which appends resume.
+        assert!(log.append(&trip("d")).is_err(), "still refused");
+        log.rewrite(&[trip("a")]).expect("rewrites");
+        log.append(&trip("e")).expect("appends after the rewrite");
+        let (_, records) = FuseLog::open(&path).expect("reopens");
+        assert_eq!(records, vec![trip("a"), trip("e")]);
         let _ = fs::remove_dir_all(&path);
     }
 

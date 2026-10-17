@@ -1123,6 +1123,11 @@ pub enum Error {
     /// with the refusal saying which limit, how much is used, and when it
     /// resets.
     QuotaExceeded(usage::QuotaRefusal),
+    /// The caller presented no credential and the store now requires one: a
+    /// request admitted in open mode that reached the store after the first
+    /// credential did (see [`credentials::Caller`]). HTTP 401, answered like
+    /// any other missing credential.
+    Unauthenticated,
 }
 
 impl fmt::Display for Error {
@@ -1140,6 +1145,7 @@ impl fmt::Display for Error {
             Self::Invalid(reason) => write!(f, "invalid request: {reason}"),
             Self::Conflict(reason) => write!(f, "conflict: {reason}"),
             Self::QuotaExceeded(refusal) => write!(f, "{refusal}"),
+            Self::Unauthenticated => write!(f, "unauthorized: a credential is required"),
         }
     }
 }
@@ -1158,7 +1164,8 @@ impl StdError for Error {
             | Self::UnsupportedFilter(_)
             | Self::Invalid(_)
             | Self::Conflict(_)
-            | Self::QuotaExceeded(_) => None,
+            | Self::QuotaExceeded(_)
+            | Self::Unauthenticated => None,
         }
     }
 }
@@ -1670,6 +1677,12 @@ struct WriteBuffer {
     /// against a bound measured in minutes, in the direction of a later, not
     /// earlier, seal.
     oldest_at: Option<Instant>,
+    /// Upserts over the buffer's life — never reset by a seal — so the
+    /// revision of the latest write. Assigned under the writer lock, it is
+    /// the order the store kept versions of a span in, which observers that
+    /// run after the lock is released cannot otherwise recover (see
+    /// [`Store::write_revision`]).
+    revision: u64,
 }
 
 impl WriteBuffer {
@@ -1687,6 +1700,7 @@ impl WriteBuffer {
             span.span_id.clone(),
         );
         self.upserts += 1;
+        self.revision += 1;
         if self.spans.is_empty() {
             self.oldest_at = Some(Instant::now());
         }
@@ -1704,6 +1718,11 @@ impl WriteBuffer {
             }
         }
         handle
+    }
+
+    /// The revision of the latest upsert; the next one takes this plus one.
+    fn revision(&self) -> u64 {
+        self.revision
     }
 
     fn len(&self) -> usize {
@@ -2241,7 +2260,10 @@ pub struct Store {
     /// erasures, or annotations, and never while holding any of them.
     erasure_gate: std::sync::RwLock<()>,
     /// The hash chain over published generations and erasures, outside
-    /// every generation. See [`ledger`]; its lock is leaf-level.
+    /// every generation. See [`ledger`]. Its locks are leaf-level but one:
+    /// the lock serializing evidence packs' chain walks, which a pack takes
+    /// BEFORE `maintenance` and holds while it walks after releasing
+    /// `maintenance`, and which nothing takes while holding an engine lock.
     ledger: ledger::Ledger,
     next_segment: AtomicU64,
     /// Present unless durability is [`Durability::Buffered`]. Guards the gap
@@ -2460,7 +2482,7 @@ impl Store {
         // Admission policy refuses here: the batch is known valid, and
         // nothing about it has been decided yet — no gate, no offload, no
         // log append — so a refusal is batch-atomic and leaves no trace.
-        let admitting = self.admission_check(&spans)?;
+        let mut admitting = self.admission_check(&spans)?;
         let sent = spans.len();
         let mut spans = spans;
 
@@ -2486,7 +2508,9 @@ impl Store {
         if let Some(mask) = &mask {
             // Covered spans are dropped BEFORE payload offloading, so a
             // suppressed span's oversized values never reach the filesystem.
-            spans.retain(|span| !mask.covers_for_drop(span));
+            // Their measurements are dropped with them, in the same pass, so
+            // usage charges every survivor its own size.
+            admitting.retain(&mut spans, |span| !mask.covers_for_drop(span));
         }
         if let Some(threshold) = self.config.payload_threshold {
             // Offloading consults the mask too: content whose hash IS a
@@ -2566,6 +2590,7 @@ impl Store {
         let seal_must_wait;
         let admitted;
         let admitted_handles;
+        let first_revision;
         // Encode the log frame BEFORE taking the writer lock. Serializing a
         // batch is pure CPU proportional to its size, and doing it under the
         // lock made every concurrent ingest wait for it. Only the file write
@@ -2586,6 +2611,10 @@ impl Store {
                 );
             }
             admitted = spans.len() as u64;
+            // Span `i` of the batch is stored at `first_revision + i`: the
+            // order observers need to tell a newer version from an older one
+            // whose observer happens to run after it.
+            first_revision = writer.revision() + 1;
             admitted_handles = self.metrics.buffer_upsert.time(|| {
                 spans
                     .into_iter()
@@ -2641,7 +2670,7 @@ impl Store {
         self.tail.publish(&admitted_handles);
         // Observers see the same acknowledged batch the tail just did, for
         // the same reason: what they react to must be what the store kept.
-        let observed = self.observe_admitted(&admitted_handles);
+        let observed = self.observe_admitted(&admitted_handles, first_revision);
         // Usage is charged for the same acknowledged batch, at the sizes
         // admission measured before the offload rewrote the large values.
         self.record_usage(&admitted_handles, admitting);
@@ -3823,13 +3852,20 @@ impl Store {
     /// [`SnapshotView`], whose cost is one copy of the bounded write buffer
     /// and one `Arc` clone per segment. That also makes the answer coherent:
     /// a fold sees one instant of the store rather than a moving one.
-    pub fn fold_spans(
+    pub fn fold_spans(&self, filter: &SpanFilter, visit: impl FnMut(&Span)) -> Result<QueryCost> {
+        self.fold_spans_under(filter, self.query_deadline(Instant::now()), visit)
+    }
+
+    /// [`Self::fold_spans`] under a budget the caller anchored — for a
+    /// request whose fold is one step of several sharing one budget (an
+    /// evidence pack), so the fold gets what is left, not a fresh one.
+    pub(crate) fn fold_spans_under(
         &self,
         filter: &SpanFilter,
+        deadline: Option<Deadline>,
         mut visit: impl FnMut(&Span),
     ) -> Result<QueryCost> {
         let started = std::time::Instant::now();
-        let deadline = self.query_deadline(started);
         let mut cost = QueryCost::default();
         if let Some(session_id) = &filter.session {
             // A session unions several attribute keys, which no single index
@@ -6513,6 +6549,10 @@ impl Store {
             payloads_retained,
             eval_records_removed,
         };
+        // From before the settle is written until its entry is appended, a
+        // live ledger verification that finds the settle without the entry
+        // knows the entry is on its way rather than missing.
+        let settling = self.ledger_settling(record.id);
         {
             let _gate = self
                 .erasure_gate
@@ -6520,10 +6560,13 @@ impl Store {
                 .map_err(|_| Error::LockPoisoned("erasure gate"))?;
             self.erasures.record_settle(settle.clone())?;
         }
+        #[cfg(test)]
+        self.ledger_after_settle_hook();
         // Ledgered once the settle is durable; a crash in between is healed
         // by the next open's reconcile. Never fails the erasure: it is
         // settled and its barrier lifted, whatever the ledger does.
         self.ledger_erasure(record.id, subject, generation);
+        drop(settling);
         self.metrics.erasures_settled.increment();
         self.metrics.erasure_spans_removed.add(spans_removed as u64);
         self.metrics.erasure.record(elapsed_nanos(&erasing));

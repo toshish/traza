@@ -46,10 +46,6 @@ pub const DEFAULT_MAX_BATCH_SPANS: usize = 100_000;
 /// One span's measurement, in batch order.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Measured {
-    /// A hash of the span's primary key, so the post-admission observer can
-    /// re-align measurements with the spans actually admitted — a pending
-    /// erasure may have dropped some — without holding a copy of every key.
-    pub(crate) key: u64,
     /// Serialized JSON size as sent: after tenant stamping, before offload.
     pub(crate) bytes: u64,
 }
@@ -57,8 +53,38 @@ pub(crate) struct Measured {
 /// What admission learned about a batch it let through.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Admitting {
-    /// One entry per span, in batch order.
+    /// One entry per span, in batch order: the i-th measures the i-th span
+    /// of the batch as it stands, which [`Admitting::retain`] keeps true
+    /// when spans are dropped.
     pub(crate) spans: Vec<Measured>,
+}
+
+impl Admitting {
+    /// Drops from `spans` every span `keep` refuses, and its measurement
+    /// with it, in one pass — so each measurement stays paired with the
+    /// span it measured however the batch is filtered.
+    ///
+    /// The pairing is positional on purpose. Re-aligning afterwards by
+    /// primary key cannot work: a batch may carry two spans with one key
+    /// that differ in exactly what decides the drop (a session attribute a
+    /// pending erasure covers), and a key cannot say which of the two
+    /// survived — the survivor would be charged the dropped copy's size.
+    pub(crate) fn retain(&mut self, spans: &mut Vec<Span>, mut keep: impl FnMut(&Span) -> bool) {
+        debug_assert_eq!(spans.len(), self.spans.len(), "one measurement per span");
+        let mut measured = std::mem::take(&mut self.spans).into_iter();
+        let mut kept = Vec::with_capacity(spans.len());
+        // `Vec::retain` visits every element exactly once, in order, which
+        // is what lets the measurements be walked alongside it.
+        spans.retain(|span| {
+            let measurement = measured.next();
+            let keeping = keep(span);
+            if keeping {
+                kept.extend(measurement);
+            }
+            keeping
+        });
+        self.spans = kept;
+    }
 }
 
 /// Measures `spans` and enforces `config`'s caps, refusing the whole batch
@@ -122,27 +148,9 @@ pub(crate) fn measure(config: &Config, spans: &[Span]) -> Result<Admitting> {
                 )));
             }
         }
-        measured.push(Measured {
-            key: key_hash(&span.tenant, &span.trace_id, &span.span_id),
-            bytes,
-        });
+        measured.push(Measured { bytes });
     }
     Ok(Admitting { spans: measured })
-}
-
-/// FNV-1a over the primary key, with separators so `("ab","c")` and
-/// `("a","bc")` differ. Not a commitment — a collision misattributes one
-/// span's byte count to another span of the same batch, and only in a batch a
-/// pending erasure partly suppressed.
-pub(crate) fn key_hash(tenant: &str, trace_id: &str, span_id: &str) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for part in [tenant, trace_id, span_id] {
-        for byte in part.bytes().chain(std::iter::once(0xff)) {
-            hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-    }
-    hash
 }
 
 /// The span's size once stored: `sent` minus every value the offload would
@@ -241,7 +249,33 @@ mod tests {
             serde_json::to_vec(&stamped).expect("encodes").len() as u64,
             "the tenant stamp is part of what is charged"
         );
-        assert_eq!(admitted.spans[0].key, key_hash("acme", "t1", "s1"));
+    }
+
+    /// Two spans with one primary key, told apart only by an attribute:
+    /// whichever the filter keeps, its own measurement stays with it.
+    #[test]
+    fn retain_keeps_each_measurement_with_its_span() {
+        let first = span(json!({"session.id": "doomed", "pad": "x"}));
+        let second = span(json!({"session.id": "kept", "pad": "x".repeat(500)}));
+        for (batch, survivor) in [
+            (vec![first.clone(), second.clone()], &second),
+            (vec![second.clone(), first.clone()], &second),
+        ] {
+            let mut spans = batch;
+            let mut admitting = measure(&Config::default(), &spans).expect("ok");
+            admitting.retain(&mut spans, |span| span.attributes["session.id"] == "kept");
+            assert_eq!(spans.len(), 1);
+            assert_eq!(
+                admitting.spans,
+                vec![Measured {
+                    bytes: json_len(survivor)
+                }]
+            );
+        }
+        let mut spans = vec![first, second];
+        let mut admitting = measure(&Config::default(), &spans).expect("ok");
+        admitting.retain(&mut spans, |_| false);
+        assert!(spans.is_empty() && admitting.spans.is_empty());
     }
 
     /// The estimate must equal what the offload actually produces, byte for

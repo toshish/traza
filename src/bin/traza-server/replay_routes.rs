@@ -22,16 +22,16 @@
 //! Anthropic — because the client reading them is that provider's SDK; the
 //! native routes answer the API's `{"error": "<message>"}` with the kind
 //! beside it as `"type"`. Every refusal a retry cannot cure — divergence,
-//! exhaustion, erasure, an unreplayable run — is marked `x-should-retry:
-//! false`: both SDKs retry a 409 by default, and retrying a request that does
-//! not match the recording cannot make it match.
+//! exhaustion, erasure, an unreplayable run, an answer too large to render —
+//! is marked `x-should-retry: false`: both SDKs retry a 409 by default, and
+//! retrying a request that does not match the recording cannot make it match.
 
 use std::io;
 use std::sync::OnceLock;
 
 use serde_json::{json, Map, Value};
 use traza::recall::OutcomeFilter;
-use traza::replay::{Mode, Registry, ReplayError};
+use traza::replay::{Mode, Registry, ReplayError, ServedStep};
 use traza::tape::{TapeOptions, DEFAULT_TAPE_MAX_BYTES, MAX_TAPE_SPANS};
 use traza::Store;
 
@@ -491,8 +491,8 @@ enum Shape {
 /// machine-readable kind beside it as `"type"` and any detail as further
 /// siblings; an unknown replay there is exactly `{"error": "replay not
 /// found"}`. Every refusal that a retry cannot cure — divergence, exhaustion,
-/// erasure, an unreadable tool step — carries `x-should-retry: false` (see
-/// the module docs).
+/// erasure, an unreadable tool step, an answer too large to render — carries
+/// `x-should-retry: false` (see the module docs).
 fn replay_error(responder: &mut Responder<'_>, shape: Shape, error: ReplayError) -> io::Result<()> {
     let message = error.to_string();
     let mut extra = Map::new();
@@ -516,6 +516,11 @@ fn replay_error(responder: &mut Responder<'_>, shape: Shape, error: ReplayError)
         ReplayError::ToolUnreadable { step, .. } => {
             extra.insert("step".to_owned(), json!(step));
             (409, "tool_unreadable", true)
+        }
+        ReplayError::ResponseTooLarge { step, limit } => {
+            extra.insert("step".to_owned(), json!(step));
+            extra.insert("limit".to_owned(), json!(limit));
+            (409, "response_too_large", true)
         }
         ReplayError::Erased { erasure } => {
             extra.insert("erasure".to_owned(), json!(erasure));
@@ -599,14 +604,14 @@ fn call(
                 Ok(digest) => digest,
                 Err(reason) => return replay_error(responder, shape, ReplayError::Invalid(reason)),
             };
-            match registry().next_llm(engine, id, binding, digest, now) {
-                Ok(served) => {
-                    let rendered = match shape {
-                        Shape::OpenAi => served.openai(&request),
-                        _ => served.anthropic(&request),
-                    };
-                    send(responder, 200, rendered.content_type, &[], &rendered.body)
-                }
+            // Rendered before the step is consumed, so a rendering refused as
+            // too large leaves the step for a request that asks differently.
+            let render = |served: &ServedStep| match shape {
+                Shape::OpenAi => served.openai(&request),
+                _ => served.anthropic(&request),
+            };
+            match registry().next_llm(engine, id, binding, digest, now, render) {
+                Ok(rendered) => send(responder, 200, rendered.content_type, &[], &rendered.body),
                 Err(error) => replay_error(responder, shape, error),
             }
         }

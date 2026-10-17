@@ -181,7 +181,11 @@ Admin request bodies must be declared `application/json`; anything else is
   `409`, because it would close the store with no credential able to reach
   `/v1/admin/*`. From that request on, the store is closed — and the
   credential log persists, so it stays closed across restarts, and a later
-  non-loopback start counts the log as configured authentication.
+  non-loopback start counts the log as configured authentication. Closed
+  means closed to requests already in flight as well: one whose headers
+  arrived while the store was open but whose body arrived after the first
+  credential is authenticated again, and without a credential it is `401`.
+  Of two bootstraps racing, exactly one creates a credential.
 - **No bootstrapping from a web page.** While the store is open, erasure,
   tombstones, backups and `/v1/admin/*` refuse a browser request whose
   `Origin` is not a loopback page (`403`). Otherwise any site the operator
@@ -220,7 +224,12 @@ Admin request bodies must be declared `application/json`; anything else is
 and `revoke` records holding digests, never tokens, fsynced per write; a torn
 final record (a crash mid-append) is truncated at the next start, and damage
 anywhere else refuses the start rather than guessing which credentials the
-file held. **It is outside generations and pins**: a backup never carries it,
+file held. A write that fails while the server runs — a full disk, a failed
+fsync — is truncated away at once and answered `503`, so a failed create
+created nothing and a failed revoke revoked nothing, and the request can be
+retried. If that truncation fails too, every create and revoke answers `503`
+until a restart heals the file; authentication carries on meanwhile.
+**It is outside generations and pins**: a backup never carries it,
 and `--restore` leaves the live file in place — restoring last month's backup
 does not resurrect a token revoked last week. The file is created owner-only
 (`0600`). Back it up separately if you need to, knowing it holds digests: for
@@ -581,7 +590,10 @@ was in flight, after which the next batch is refused.
 **What the limits do not do.** They meter ingest, not storage: deleting data
 does not hand quota back (that is what [`GET /v1/tenants`](#tenant-accounting)
 measures), and there is no rate limit within a month. The month is the UTC
-calendar month; there is no per-tenant billing anchor.
+calendar month; there is no per-tenant billing anchor. It only moves
+forward: a batch acknowledged across the boundary out of order, or under a
+wall clock stepped back (across a restart too), is charged to the newest
+month already counted rather than resetting it.
 
 **Erasure leaves them.** A tenant [erasure](#erasure-deletion-with-a-receipt)
 removes the tenant's telemetry, not its accounting and access records: the
