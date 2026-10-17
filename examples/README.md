@@ -1,13 +1,15 @@
 Demos
 =====
 
-Six scripted demos, one claim each. Every number they print is measured while
+Nine scripted demos, one claim each. Every number they print is measured while
 you watch — a timed request, a counter, a field the server answered with —
 and each script checks its own claims and exits non-zero if the store stops
 backing them. CI runs them all for the same reason.
 
 Each is one command from the repo root, works in a throwaway directory, and
-cleans up after itself. They build what they need on first run.
+cleans up after itself. They build what they need on first run; `guard/`,
+`replay/` and `prove/` also run a prebuilt binary named by `TRAZA_BIN` (a
+path, or a command on `PATH`).
 
 | Demo | The claim it proves | Runs for |
 |---|---|---|
@@ -17,13 +19,17 @@ cleans up after itself. They build what they need on first run.
 | [`incident/`](incident/README.md) | An agent investigates a runaway session over MCP: a diagnosis with evidence, a defused prompt injection, failures promoted into a dataset, a fix proven by an experiment diff | ~30 s |
 | [`vanish/`](vanish/README.md) | Two tenants, one deletion request: tenant-precise erasure with a receipt that catches the backup pin still holding the bytes | ~5 s |
 | [`mcp-demo/`](mcp-demo/README.md) | The whole MCP tool surface, including everything it refuses to do | ~30 s |
+| [`guard/`](guard/README.md) | A looping agent stopped between steps: the ack says stop, the pre-call check refuses the next step, the kill switch stops a healthy run, a grant approves more budget — and the same fuse blocks a Claude Code session | ~3 s |
+| [`replay/`](replay/README.md) | A recorded run replays through the agent's own OpenAI-wire code with zero model calls; a changed prompt is refused, naming the step; a diff names where two runs parted | ~2 s |
+| [`prove/`](prove/README.md) | A hash chain over everything committed, recomputed with `hashlib`; an anchor; an erasure ledgered by digest, not by name; one flipped byte named offline, exit 2 | ~2 s |
 
 Pick by what you came to see:
 
 - **"Show me it working."** `swarm/`. Leave it running and click around the dashboard.
 - **"Show me it's a real database."** `crash/`, then `needle/`.
 - **"Show me the agent story."** `incident/`, then `mcp-demo/`.
-- **"Show me the obligations."** `vanish/`.
+- **"Show me the flight recorder."** `guard/`, then `replay/`.
+- **"Show me the obligations."** `vanish/`, then `prove/`.
 
 The dashboard demos (`swarm/` above all) want a built UI: `cd ui && npm ci &&
 npm run build`, once — the server picks it up without a restart. Everything
@@ -34,5 +40,6 @@ Integrations
 
 Not demos — pieces to wire into your own setup:
 
-- [`guard/`](guard/README.md): a Claude Code hook that puts a
-  [run fuse](../docs/guide/guard.md) in front of every tool call.
+- [`guard/claude-code-hook.sh`](guard/README.md#the-claude-code-hook): a
+  Claude Code hook that puts a [run fuse](../docs/guide/guard.md) in front of
+  every tool call. The `guard/` demo runs it in its last beat.

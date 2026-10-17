@@ -70,7 +70,10 @@ if event == "PostToolUse":
         },
     }
     if tenant:
-        span["tenant"] = tenant
+        # The span key is the reserved `$tenant`: a bare `tenant` is stored
+        # as client data and the span lands in the default tenant, where the
+        # gate below (which asks about the named tenant) never sees it.
+        span["$tenant"] = tenant
     body = [span]
     path = "/v1/spans"
 else:

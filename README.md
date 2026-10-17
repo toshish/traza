@@ -9,11 +9,11 @@ Traza is a trace database for LLM and agent workloads. It runs as a single binar
 [![crates.io](https://img.shields.io/crates/v/traza)](https://crates.io/crates/traza)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
-![Three of the six demos, replayed: a million spans ingested in 6.1 seconds and answered in microseconds to milliseconds; a kill -9 with all 33,000 acknowledged spans recovered; an agent diagnosing a runaway session over MCP and proving the fix with an experiment diff.](docs/assets/demo-reel.svg)
+![Three of the nine demos, replayed: a million spans ingested in 6.1 seconds and answered in microseconds to milliseconds; a kill -9 with all 33,000 acknowledged spans recovered; an agent diagnosing a runaway session over MCP and proving the fix with an experiment diff.](docs/assets/demo-reel.svg)
 
-*Replayed from real runs of the [demo tour](examples/README.md) — six scripted proofs, one
+*Replayed from real runs of the [demo tour](examples/README.md) — nine scripted proofs, one
 command each. Every number a demo prints is measured on your machine while you watch, each
-script asserts its own claims, and CI runs all six. Clone, then pick one:*
+script asserts its own claims, and CI runs all nine. Clone, then pick one:*
 
 ```sh
 ./examples/swarm/run.sh      # a live agent cockpit in the dashboard, until Ctrl-C
@@ -21,6 +21,9 @@ script asserts its own claims, and CI runs all six. Clone, then pick one:*
 ./examples/needle/run.sh     # a million spans in, one sentence found in milliseconds
 ./examples/incident/run.sh   # an agent diagnoses a runaway over MCP, promotes, diffs
 ./examples/vanish/run.sh     # tenant-precise erasure, and a receipt that names the backup
+./examples/guard/run.sh      # a looping agent stopped between steps; a Claude Code session too
+./examples/replay/run.sh     # record an agent run, replay it with zero model calls
+./examples/prove/run.sh      # a hash chain recomputed with hashlib; one flipped byte, exit 2
 ```
 
 ## Install

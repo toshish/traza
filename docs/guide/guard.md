@@ -34,8 +34,8 @@ is shaped around both:
   and tool — it answers whether the step may run. A step that **would go
   past** a stop limit answers `stop`. This is the only surface that can
   refuse a step before it happens, and it is what an agent framework or a
-  hook (see [the Claude Code example](../../examples/guard/README.md)) should
-  call.
+  hook (see [the Claude Code example](../../examples/guard/README.md#the-claude-code-hook))
+  should call.
 - **The post-ack verdict is a backstop.** Every ingest response names the
   runs in its batch whose verdict is not `continue`, so a client that does
   nothing but export still learns its run was stopped — at least one batch
@@ -91,6 +91,25 @@ curl -X POST http://127.0.0.1:8080/v1/fuses/check \
 The check changed nothing: `usage` is what the run has recorded, and the run
 itself is still `warn` (85% of its budget). Every route is in the
 [HTTP reference](http-api.md#run-fuses).
+
+## See it run
+
+[`examples/guard/run.sh`](../../examples/guard/README.md) drives this page
+against a real server in a few seconds. A scripted agent loops on a failing
+tool until `max_repeats` stops it: the acknowledgement of the step that
+crossed the limit carries `Traza-Fuse: stop`, the verdict names the reason
+and points at the repeated span, and the pre-call check refuses the next
+step. The kill switch stops a second, healthy run. A reset of the first run
+answers `warn`, because it does not refill what the loop spent, and the
+pre-call check refuses the next step under `max_cost_usd`: what the run has
+spent, priced by the server from a `--pricing` file, plus the agent's estimate
+for the step would pass the limit. A grant then approves the run to finish.
+The last beat runs the
+[Claude Code hook](../../examples/guard/README.md#the-claude-code-hook)
+against the same server. The verdicts, reasons, usage and run costs it prints
+are the server's answers. The per-step prices are the agent's own arithmetic
+on the same pricing file, and the demo asserts that the server's cost for the
+run equals their sum. It exits non-zero if any claim fails.
 
 ## Runs
 
