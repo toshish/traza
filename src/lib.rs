@@ -1123,6 +1123,11 @@ pub enum Error {
     /// with the refusal saying which limit, how much is used, and when it
     /// resets.
     QuotaExceeded(usage::QuotaRefusal),
+    /// The caller presented no credential and the store now requires one: a
+    /// request admitted in open mode that reached the store after the first
+    /// credential did (see [`credentials::Caller`]). HTTP 401, answered like
+    /// any other missing credential.
+    Unauthenticated,
 }
 
 impl fmt::Display for Error {
@@ -1140,6 +1145,7 @@ impl fmt::Display for Error {
             Self::Invalid(reason) => write!(f, "invalid request: {reason}"),
             Self::Conflict(reason) => write!(f, "conflict: {reason}"),
             Self::QuotaExceeded(refusal) => write!(f, "{refusal}"),
+            Self::Unauthenticated => write!(f, "unauthorized: a credential is required"),
         }
     }
 }
@@ -1158,7 +1164,8 @@ impl StdError for Error {
             | Self::UnsupportedFilter(_)
             | Self::Invalid(_)
             | Self::Conflict(_)
-            | Self::QuotaExceeded(_) => None,
+            | Self::QuotaExceeded(_)
+            | Self::Unauthenticated => None,
         }
     }
 }

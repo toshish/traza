@@ -50,6 +50,12 @@ you:
   unaffected, and once a credential exists the rule is not applied — a page
   cannot attach a bearer token it does not know. This `403` carries `next`
   rather than `required`: no grant is missing.
+- **Open mode ends for requests already in flight.** Authentication is
+  decided from a request's headers, before its body is read. A request whose
+  headers arrived while the store was open, but whose body arrived after the
+  store's first credential was minted, is authenticated again once its body
+  is in: without a credential it is `401`, exactly as if it had arrived after
+  the bootstrap. Of two bootstraps racing, exactly one creates a credential.
 - **Admin request bodies must be declared JSON.** A `POST` under `/v1/admin/`
   that carries a body must send `Content-Type: application/json`, or it is
   `415`. An HTML form cannot send that type, and a cross-site script cannot
@@ -91,7 +97,7 @@ coding (`br`, `deflate`, `zstd`, a doubled `gzip`), is `415`.
 | `200` | Success |
 | `201` | Created: a backup pin, a credential, a replay, a ledger anchor |
 | `400` | Malformed body, invalid parameter, a violated ingest invariant, or an exceeded admission cap |
-| `401` | Missing, malformed, unknown, expired, or revoked bearer token. Carries `WWW-Authenticate: Bearer` |
+| `401` | Missing, malformed, unknown, expired, or revoked bearer token — including a request admitted in open mode whose body arrived after the store's first credential. Carries `WWW-Authenticate: Bearer` |
 | `403` | Valid token without the grant this request needs — the body's `"required"` names it (`rw`, `admin`, `unbound`) — or a tenant-bound credential naming a foreign tenant; in open mode, also a browser request from a non-loopback page to an admin operation |
 | `404` | No such route, or the requested trace/session/payload/dataset/experiment/credential/replay does not exist. Cross-tenant reads answer `404`, never `403` — existence is a fact about another tenant |
 | `409` | A conflict a retry may resolve: a mutation for a tenant whose erasure is pending, a tombstoned parent version, a payload reference not in the store, a pin label already taken, a credential token already registered, an environment credential named for revocation, a first credential that is not an unbound admin, a `/v1/fuses/*` route on a server started with `--no-fuses`, an anchor whose `target_head` is not the recorded head. Also a run that cannot be replayed and a strict replay's divergence — see [replays](#post-v1replays) for which of those a retry cannot fix |
@@ -1829,7 +1835,11 @@ one exists, every request must authenticate. **The first credential must
 itself be an unbound `admin`** (`409` otherwise): any other would switch
 authentication on with no credential able to manage credentials. In open mode
 the request must not come from a non-loopback browser page (see
-[Conventions](#conventions)).
+[Conventions](#conventions)). **Exactly one bootstrap wins:** whether the
+store is still open is decided together with the create, so of two
+unauthenticated requests racing to mint the first credential one gets `201`
+and the other `401` — it creates nothing and must come back with a
+credential.
 
 ```sh
 curl -X POST http://localhost:8080/v1/admin/credentials \
@@ -1864,9 +1874,14 @@ later: at most a quarter of the token and never more than 12 characters —
 `409` when the token is already registered — live, expired, revoked, or in
 `TRAZA_TOKENS`: a token is never reused, so a revoked one cannot come back —
 or when the store has no credential yet and this one is not an unbound
-`admin`; `403` for anything but an unbound `admin`, and in open mode for a
+`admin`; `401` for an unauthenticated request that lost the bootstrap (above);
+`403` for anything but an unbound `admin`, and in open mode for a
 non-loopback browser `Origin`; `415` when the body is not declared
-`application/json`.
+`application/json`; `503` when the credential log could not be written. A
+failed write is truncated away before the `503`, so nothing was created and
+retrying the same request is safe; if even that truncation fails, every
+create and revoke answers `503` until the server restarts and heals the log,
+while authentication carries on unaffected.
 
 ### `GET /v1/admin/credentials`
 
@@ -1895,7 +1910,9 @@ Unbound `admin` only.
 
 **Errors.** `404` for an unknown id;
 `409 {"error":"env credentials are revoked by restarting without them"}` for
-an environment credential.
+an environment credential; `503` when the revoke record could not be written
+— undone, as for a create, so the token still authenticates and the revoke
+can be retried.
 
 ---
 
