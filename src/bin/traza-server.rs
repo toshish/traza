@@ -1918,13 +1918,13 @@ fn handle_connection(
             head.x_api_key.as_deref(),
             head_path,
         );
-        let mut access = traza::mcp::Access::ReadWrite;
-        let mut principal: Option<traza::auth::Principal> = None;
         let credentials = engine.credentials();
-        let enforced = credentials.enforced();
-        if enforced {
-            let verdict = credentials
-                .authenticate(presented.as_deref(), traza::mcp::unix_nanos_now())
+        // The gate's verdict on a presented credential: who it is, then
+        // whether this route allows it. Run from the head, and run again
+        // after the body for a request the head admitted in open mode.
+        let authorize = |presented: Option<&str>| {
+            credentials
+                .authenticate(presented, traza::mcp::unix_nanos_now())
                 .and_then(|granted| {
                     use traza::auth::{AuthFailure, Required};
                     // Binding first: a bound credential on a store-global
@@ -1949,37 +1949,14 @@ fn handle_connection(
                         }));
                     }
                     Ok(granted)
-                });
-            match verdict {
-                Ok(granted) => {
-                    access = match granted.scope {
-                        traza::auth::Scope::ReadOnly => traza::mcp::Access::Read,
-                        traza::auth::Scope::ReadWrite | traza::auth::Scope::Admin => {
-                            traza::mcp::Access::ReadWrite
-                        }
-                    };
-                    principal = Some(granted);
-                }
-                Err(failure) => {
-                    metrics.rejected.increment();
-                    let challenge = failure
-                        .www_authenticate()
-                        .map(|value| format!("WWW-Authenticate: {value}\r\n"))
-                        .unwrap_or_default();
-                    let body = failure.body();
-                    let reason = if failure.status() == 401 {
-                        "Unauthorized"
-                    } else {
-                        "Forbidden"
-                    };
-                    let mut responder = connection.responder(false);
-                    let head = format!(
-                        "HTTP/1.1 {} {reason}\r\n{challenge}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        failure.status(),
-                        body.len(),
-                    );
-                    return responder.raw(&head, body.as_bytes());
-                }
+                })
+        };
+        let mut principal: Option<traza::auth::Principal> = None;
+        let enforced = credentials.enforced();
+        if enforced {
+            match authorize(presented.as_deref()) {
+                Ok(granted) => principal = Some(granted),
+                Err(failure) => return refuse_auth(&mut connection, metrics, failure),
             }
         }
         // What the head alone can still refuse once authentication passed: a
@@ -2006,6 +1983,27 @@ fn handle_connection(
             Err(error) => {
                 let mut responder = connection.responder(false);
                 return responder.json(400, json!({"error": error.to_string()}));
+            }
+        };
+        // The verdict above is as of the head, and the client decides how
+        // long its body takes to arrive. A request admitted in OPEN mode
+        // whose body lands after another request minted the first credential
+        // would otherwise act as the open-mode admin it no longer is — for as
+        // long as it cared to stall. So it authenticates now, exactly as if
+        // it had arrived after the bootstrap. This closes the window the
+        // client controls, on every route; the credential operations decide
+        // open mode once more under their own lock, which closes the rest
+        // for the one change that outlives the request.
+        if principal.is_none() && credentials.enforced() {
+            match authorize(presented.as_deref()) {
+                Ok(granted) => principal = Some(granted),
+                Err(failure) => return refuse_auth(&mut connection, metrics, failure),
+            }
+        }
+        let access = match principal.as_ref().map(|granted| granted.scope) {
+            Some(traza::auth::Scope::ReadOnly) => traza::mcp::Access::Read,
+            Some(traza::auth::Scope::ReadWrite | traza::auth::Scope::Admin) | None => {
+                traza::mcp::Access::ReadWrite
             }
         };
         let request = Request {
@@ -2051,6 +2049,40 @@ fn handle_connection(
         }
     }
     Ok(())
+}
+
+/// Answers a request the auth gate refused, and closes the connection: the
+/// gate usually refuses before the body is read, and bytes left unread in
+/// the socket must not be parsed as the next request.
+fn refuse_auth(
+    connection: &mut Connection,
+    metrics: &ServerMetrics,
+    failure: traza::auth::AuthFailure,
+) -> io::Result<()> {
+    metrics.rejected.increment();
+    let challenge = failure
+        .www_authenticate()
+        .map(|value| format!("WWW-Authenticate: {value}\r\n"))
+        .unwrap_or_default();
+    let body = failure.body();
+    let reason = if failure.status() == 401 {
+        "Unauthorized"
+    } else {
+        "Forbidden"
+    };
+    let mut responder = connection.responder(false);
+    let head = format!(
+        "HTTP/1.1 {} {reason}\r\n{challenge}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        failure.status(),
+        body.len(),
+    );
+    responder.raw(&head, body.as_bytes())
+}
+
+/// The challenge line a 401 decided past the gate carries, the same one the
+/// gate's own 401 does.
+fn unauthorized_challenge() -> String {
+    format!("WWW-Authenticate: {}\r\n", traza::auth::WWW_AUTHENTICATE)
 }
 
 /// Decodes an ingest body straight into spans.
@@ -2106,6 +2138,11 @@ fn engine_error(
         traza::Error::Invalid(reason) => responder.json(400, json!({"error": reason})),
         traza::Error::Conflict(reason) => responder.json(409, json!({"error": reason})),
         traza::Error::QuotaExceeded(refusal) => quota_exceeded(responder, &refusal),
+        traza::Error::Unauthenticated => responder.json_with_headers(
+            401,
+            json!({"error": "unauthorized"}),
+            &unauthorized_challenge(),
+        ),
         // An exhausted compute budget is the caller's to narrow, the same
         // rule as a too-broad sort: 503 would tell the client to retry with
         // backoff, and retrying an over-budget query without narrowing
@@ -2246,6 +2283,11 @@ fn serve_request(
         &request.body,
         principal,
     ) {
+        // A 401 here is a request that lost the bootstrap race (see
+        // `traza::credentials::Caller`); it carries the gate's challenge.
+        if reply.status == 401 {
+            return responder.json_with_headers(401, reply.body, &unauthorized_challenge());
+        }
         return responder.json(reply.status, reply.body);
     }
     if replay_routes::handles(path) {
@@ -4389,6 +4431,7 @@ impl Responder<'_> {
         let reason = match status {
             200 => "OK",
             400 => "Bad Request",
+            401 => "Unauthorized",
             403 => "Forbidden",
             404 => "Not Found",
             405 => "Method Not Allowed",

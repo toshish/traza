@@ -10,13 +10,16 @@
 
 mod common;
 
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use common::Server;
 use serde_json::{json, Value};
-use traza::credentials::{CredentialStore, NewCredential};
+use traza::credentials::{Caller, CredentialStore, NewCredential};
 use traza::{Config, Store};
 
 /// `server.json` as `token`.
@@ -230,6 +233,79 @@ fn a_cross_site_page_cannot_mint_erase_or_pin_in_open_mode() {
         &[evil],
     );
     assert_eq!(status, 401, "and without the token, it is unauthorized");
+}
+
+/// Opens a connection and sends a request's head, withholding its body: the
+/// server reads the head, passes it through the auth gate, and then waits.
+fn withhold_body(server: &Server, method: &str, path: &str, body: &[u8]) -> TcpStream {
+    let mut stream = TcpStream::connect(("127.0.0.1", server.port)).expect("connects");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(120)))
+        .expect("sets read timeout");
+    let head = format!(
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        server.port,
+        body.len()
+    );
+    stream.write_all(head.as_bytes()).expect("writes the head");
+    stream
+}
+
+/// Sends the withheld body and returns the status and the raw response.
+fn finish_body(mut stream: TcpStream, body: &[u8]) -> (u16, String) {
+    // The server may already have answered and closed; the response decides.
+    let _ = stream.write_all(body);
+    let mut raw = Vec::new();
+    let _ = stream.read_to_end(&mut raw);
+    let raw = String::from_utf8_lossy(&raw).into_owned();
+    let status = raw
+        .split_whitespace()
+        .nth(1)
+        .and_then(|status| status.parse().ok())
+        .unwrap_or_else(|| panic!("no response: {raw:?}"));
+    (status, raw)
+}
+
+/// The race: a request's head arrives while the store is open, so the gate
+/// admits it as the open-mode admin; its body is withheld while another
+/// caller mints the first credential; then the body arrives. Whatever the
+/// late request is — a competing bootstrap, a read — it must now
+/// authenticate like any request arriving after the bootstrap, or a caller
+/// that started early keeps open-mode powers for as long as it can stall.
+#[test]
+fn a_request_admitted_in_open_mode_authenticates_if_the_store_closed_before_its_body() {
+    let server = Server::spawn(&[]);
+    let loser = "withheld-body-loser-0123456789abcdef";
+    let loser_body = json!({"scope": "admin", "token": loser}).to_string();
+    let late_mint = withhold_body(
+        &server,
+        "POST",
+        "/v1/admin/credentials",
+        loser_body.as_bytes(),
+    );
+    let late_read = withhold_body(&server, "GET", "/v1/whoami", b"{}");
+    // Time for the server to read both heads and gate them while the store
+    // is still open. A server slower than this cannot make the test pass
+    // wrongly — a head gated after the bootstrap is refused anyway — it
+    // only stops exercising the race.
+    std::thread::sleep(Duration::from_millis(500));
+    let admin = mint(&server, None, json!({"scope": "admin", "label": "winner"}));
+    let admin = admin["token"].as_str().expect("token");
+
+    let (status, raw) = finish_body(late_mint, loser_body.as_bytes());
+    assert_eq!(status, 401, "the losing bootstrap must authenticate: {raw}");
+    assert!(raw.contains("WWW-Authenticate: Bearer"), "{raw}");
+    let (status, raw) = finish_body(late_read, b"{}");
+    assert_eq!(status, 401, "and so must a late read: {raw}");
+
+    let (status, listed) = call(&server, admin, "GET", "/v1/admin/credentials", None);
+    assert_eq!(status, 200);
+    let rows = listed["credentials"].as_array().expect("credentials");
+    assert_eq!(rows.len(), 1, "only the winner exists: {listed}");
+    assert_eq!(rows[0]["label"], json!("winner"));
+    let (status, _) = call(&server, loser, "GET", "/v1/stats", None);
+    assert_eq!(status, 401, "the loser's token never became a credential");
 }
 
 #[test]
@@ -617,6 +693,7 @@ fn a_runtime_credential_counts_as_configured_auth_for_a_non_loopback_bind() {
                     scope: "admin".into(),
                     ..NewCredential::default()
                 },
+                Caller::Open,
                 1,
             )
             .expect("creates");
@@ -656,7 +733,7 @@ fn start_non_loopback(dir: &Path) -> (Start, String) {
     use std::io::{BufRead, BufReader};
     use std::process::Stdio;
     use std::sync::mpsc;
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_traza-server"));
     command
@@ -729,6 +806,7 @@ fn backups_carry_no_credentials_and_a_restore_never_resurrects_a_revoked_token()
                     scope: "admin".into(),
                     ..NewCredential::default()
                 },
+                Caller::Open,
                 1,
             )
             .expect("creates");
@@ -768,7 +846,7 @@ fn backups_carry_no_credentials_and_a_restore_never_resurrects_a_revoked_token()
         }
         store
             .credentials()
-            .revoke(&created.id, 2)
+            .revoke(&created.id, Caller::Authenticated, 2)
             .expect("revokes after the backup");
         (created.token, pin)
     };

@@ -1123,6 +1123,11 @@ pub enum Error {
     /// with the refusal saying which limit, how much is used, and when it
     /// resets.
     QuotaExceeded(usage::QuotaRefusal),
+    /// The caller presented no credential and the store now requires one: a
+    /// request admitted in open mode that reached the store after the first
+    /// credential did (see [`credentials::Caller`]). HTTP 401, answered like
+    /// any other missing credential.
+    Unauthenticated,
 }
 
 impl fmt::Display for Error {
@@ -1140,6 +1145,7 @@ impl fmt::Display for Error {
             Self::Invalid(reason) => write!(f, "invalid request: {reason}"),
             Self::Conflict(reason) => write!(f, "conflict: {reason}"),
             Self::QuotaExceeded(refusal) => write!(f, "{refusal}"),
+            Self::Unauthenticated => write!(f, "unauthorized: a credential is required"),
         }
     }
 }
@@ -1158,7 +1164,8 @@ impl StdError for Error {
             | Self::UnsupportedFilter(_)
             | Self::Invalid(_)
             | Self::Conflict(_)
-            | Self::QuotaExceeded(_) => None,
+            | Self::QuotaExceeded(_)
+            | Self::Unauthenticated => None,
         }
     }
 }
@@ -2472,7 +2479,7 @@ impl Store {
         // Admission policy refuses here: the batch is known valid, and
         // nothing about it has been decided yet — no gate, no offload, no
         // log append — so a refusal is batch-atomic and leaves no trace.
-        let admitting = self.admission_check(&spans)?;
+        let mut admitting = self.admission_check(&spans)?;
         let sent = spans.len();
         let mut spans = spans;
 
@@ -2498,7 +2505,9 @@ impl Store {
         if let Some(mask) = &mask {
             // Covered spans are dropped BEFORE payload offloading, so a
             // suppressed span's oversized values never reach the filesystem.
-            spans.retain(|span| !mask.covers_for_drop(span));
+            // Their measurements are dropped with them, in the same pass, so
+            // usage charges every survivor its own size.
+            admitting.retain(&mut spans, |span| !mask.covers_for_drop(span));
         }
         if let Some(threshold) = self.config.payload_threshold {
             // Offloading consults the mask too: content whose hash IS a
