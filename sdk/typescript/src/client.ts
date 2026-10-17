@@ -140,6 +140,8 @@ export class Client {
   // JSON.stringify(client) must never print the token.
   readonly #token: string | undefined;
   readonly #fetch: FetchLike | undefined;
+  // Scheme, host and port: the only place the token may be sent.
+  readonly #origin: string;
 
   constructor(url: string = DEFAULT_URL, options: ClientOptions = {}) {
     let parsed: URL;
@@ -152,6 +154,7 @@ export class Client {
       throw new TypeError(`url must be an http:// or https:// URL, got ${JSON.stringify(url)}`);
     }
     this.url = url.replace(/\/+$/, "");
+    this.#origin = parsed.origin;
     this.#token = options.token || undefined;
     this.tenant = options.tenant;
     this.timeoutMs = options.timeoutMs ?? 10_000;
@@ -438,7 +441,11 @@ export class Client {
   /**
    * Sends one request and resolves its parsed JSON body: the escape hatch for
    * routes this client does not wrap, with the same credential, timeout and
-   * error mapping as every method above. A success whose body is not JSON
+   * error mapping as every method above. `path` is appended to the client's
+   * URL and must start with `/`: any other path would continue the URL's host
+   * (`.attacker.example` names another server), so it rejects with a
+   * `TypeError` before anything is sent, as does a request URL whose scheme,
+   * host or port is not the client's. A success whose body is not JSON
    * rejects with {@link TrazaError}.
    */
   async request<T = unknown>(method: string, path: string, options: RequestOptions = {}): Promise<T> {
@@ -487,6 +494,15 @@ export class Client {
   }
 
   async #send(method: string, path: string, options: RequestOptions): Promise<{ status: number; text: string }> {
+    // Appended, not resolved, so a reverse proxy's path prefix on the
+    // client's URL is kept. That makes a path not starting with "/" a
+    // continuation of the host: "https://traza.example" and
+    // ".attacker.example/v1/whoami" name another host, which the token would
+    // reach with no redirect involved. Both checks come before the token is
+    // attached; the second holds whatever builds the path.
+    if (typeof path !== "string" || !path.startsWith("/")) {
+      throw new TypeError(`path must start with "/", got ${JSON.stringify(path)}`);
+    }
     let url = this.url + path;
     const query = new URLSearchParams();
     for (const [key, value] of Object.entries(options.query ?? {})) {
@@ -494,6 +510,17 @@ export class Client {
     }
     const search = query.toString();
     if (search) url += `?${search}`;
+    // The parsed URL is what is fetched, so a `fetch` of the caller's that
+    // parses differently still gets the URL whose origin was checked.
+    let target: URL | undefined;
+    try {
+      target = new URL(url);
+    } catch {
+      // Not a URL at all: refused below, like one on another origin.
+    }
+    if (target?.origin !== this.#origin) {
+      throw new TypeError(`${JSON.stringify(url)} is not a URL on the client's origin ${this.#origin}`);
+    }
 
     const headers: Record<string, string> = { accept: "application/json" };
     let body: string | undefined;
@@ -519,7 +546,7 @@ export class Client {
         // upgrading a scheme). Following it would carry the token along in a
         // same-origin hop, and in any fetch that does not strip it across
         // origins as the platform's does.
-        response = await fetcher(url, { method, headers, body, signal: deadline.signal, redirect: "manual" });
+        response = await fetcher(target.href, { method, headers, body, signal: deadline.signal, redirect: "manual" });
       } catch (error) {
         throw this.#transportError(error, options.signal, deadline.timedOut(), timeoutMs);
       }

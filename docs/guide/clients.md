@@ -75,6 +75,17 @@ token wherever the redirect points (Python's `urllib` copies the
 to `http`). Both clients raise a `TrazaError` with the `3xx` status and the
 `Location` in its message instead: configure the URL the redirect names.
 
+**A `request` path must start with `/`.** The path is appended to the
+client's URL rather than resolved against it, so a path prefix the URL carries
+behind a reverse proxy is kept. A path that does not start with `/` would
+continue the URL's host instead: `https://traza.example` and
+`.attacker.example/v1/whoami` make a request to another server, token
+included, with no redirect involved. Both clients refuse such a path before
+anything is sent — `ValueError` in Python, `TypeError` in TypeScript — and
+refuse a request URL whose scheme, host or port differs from the client's
+before attaching the token. This matters most to code that forwards a route
+it was handed.
+
 **Run ids are percent-encoded as one path segment.** They come from
 telemetry, so `/`, `?`, `#`, `%` and spaces are all expected; the tests use
 `team/a?x=1#frag %41`.

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 import time
 import unittest
@@ -18,6 +19,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -683,6 +685,40 @@ class Transport(unittest.TestCase):
                         self.assertIn(location, str(caught.exception))
                     self.assertEqual(len(front.requests), 2)
             self.assertEqual(elsewhere.requests, [], "nothing followed the redirect")
+
+    def test_a_path_not_starting_with_a_slash_is_refused_before_the_token_is_attached(self):
+        # The path is appended to the client's URL, so one that does not start
+        # with "/" continues the host instead of starting the path:
+        # "http://traza.example" and ".attacker.example/v1/whoami" make a
+        # request to traza.example.attacker.example, token and all, with no
+        # redirect involved. A caller forwarding a route it was handed would
+        # give its credential away. The stub stands in as an HTTP proxy, so it
+        # receives every request whatever host it names, without any name
+        # having to resolve; the proxy settings stay in force for the whole
+        # test because urllib asks whether to bypass the proxy on every call.
+        token = "trz_secret_token_0123456789"
+        with Stub(lambda request: response(200, b"{}")) as proxy:
+            with mock.patch.dict(os.environ, {"http_proxy": proxy.url, "no_proxy": ""}):
+                client = Client("http://traza.example", token=token)
+                # What a permitted request looks like through the proxy, so
+                # its silence below means nothing was sent.
+                self.assertEqual(client.request("GET", "/v1/whoami"), {})
+                [allowed] = proxy.requests
+                self.assertEqual(allowed.target, "http://traza.example/v1/whoami")
+                self.assertEqual(allowed.headers["authorization"], "Bearer " + token)
+                for path in (
+                    ".attacker.example/v1/whoami",
+                    "@attacker.example/v1/whoami",
+                    ":8443/v1/whoami",
+                    "v1/whoami",
+                    "",
+                    "http://attacker.example/v1/whoami",
+                ):
+                    with self.subTest(path), self.assertRaises(ValueError):
+                        client.request("GET", path)
+                self.assertEqual(
+                    [request.target for request in proxy.requests[1:]], [], "a refused path sent nothing anywhere"
+                )
 
     def test_an_unreadable_answer_is_a_traza_error_and_fail_open_covers_it(self):
         # A reverse proxy's sign-in page, a captive portal, a JSON value that

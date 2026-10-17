@@ -727,6 +727,38 @@ describe("@trazadb/sdk against traza-server", () => {
       }
     });
 
+    it("a path not starting with a slash is refused before the token is attached", async () => {
+      // The path is appended to the client's URL, so one that does not start
+      // with "/" continues the host instead of starting the path:
+      // "https://traza.example" and ".attacker.example/v1/whoami" make a
+      // request to traza.example.attacker.example, token and all, with no
+      // redirect involved. A caller forwarding a route it was handed would
+      // give its credential away. A recording fetch sees every URL the client
+      // asks for, whatever host it names, without any name having to resolve.
+      const token = "trz_secret_token_0123456789";
+      const sent = [];
+      const fetch = async (url, init) => {
+        sent.push({ url, authorization: init.headers.authorization });
+        return new Response("{}", { status: 200 });
+      };
+      const client = new Client("https://traza.example", { token, fetch });
+      // What a permitted request looks like, so the silence below means
+      // nothing was sent.
+      assert.deepEqual(await client.request("GET", "/v1/whoami"), {});
+      assert.deepEqual(sent, [{ url: "https://traza.example/v1/whoami", authorization: `Bearer ${token}` }]);
+      for (const path of [
+        ".attacker.example/v1/whoami",
+        "@attacker.example/v1/whoami",
+        ":8443/v1/whoami",
+        "v1/whoami",
+        "",
+        "https://attacker.example/v1/whoami",
+      ]) {
+        await assert.rejects(client.request("GET", path), TypeError, JSON.stringify(path));
+      }
+      assert.deepEqual(sent.slice(1), [], "a refused path sent nothing anywhere");
+    });
+
     it("an unreadable answer is a TrazaError, and failOpen covers it", async () => {
       // A reverse proxy's sign-in page, a captive portal, a JSON value that is
       // not the object the route answers, a check with no verdict, a body cut
@@ -817,5 +849,6 @@ describe("@trazadb/sdk against traza-server", () => {
       assert.throws(() => parseJson('{"a":1,}'), SyntaxError);
       assert.equal(stringifyJson({ t: 1792061561108805000n, u: undefined, a: [undefined, 1] }), '{"t":1792061561108805000,"a":[null,1]}');
     });
+
   });
 });
