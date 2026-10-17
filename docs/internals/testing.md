@@ -177,12 +177,17 @@ order:
 3. `cargo clippy --all-targets --all-features -- -D warnings`
 4. `cargo build --release`
 5. `cargo test`, then `cargo test --features object-storage`
-6. The release-tooling script tests (`scripts/test-*.py`) and the Rust
-   notices check (`scripts/generate-rust-notices.py --check`)
+6. The script tests (`scripts/test-*.py`) and the Rust notices check
+   (`scripts/generate-rust-notices.py --check`). Most cover the release
+   tooling; `test-demos.py` covers the demos: their agents refuse a redirect
+   rather than carry a token to wherever it points, and step 7 runs every
+   demo, against the binary just built, from a path with a space in it
 7. The demos — every directory under [`examples/`](../../examples/README.md)
    that has a `run.sh`, at its documented smoke setting, against the release
-   binary; each asserts its own claims, so a change that breaks a surface a
-   demo shows fails here
+   binary (`TRAZA_BIN` is set, never inherited from the caller's shell), each
+   run through a symlink to the checkout whose path has a space in it; each
+   asserts its own claims, so a change that breaks a surface a demo shows
+   fails here
 8. The client libraries: `scripts/check-sdk-metadata.py` (their versions match
    `Cargo.toml`, their `LICENSE` and `NOTICE` copies match the root's), then
    their suites against the release binary. The Python suite always runs

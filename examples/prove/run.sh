@@ -39,7 +39,9 @@ if [ -n "${TRAZA_BIN:-}" ]; then
 fi
 cd "$root"
 
-render="python3 $here/render.py"
+# A function, not a command kept in a string: expanding the string would
+# split "$here" wherever the checkout's path has a space.
+render() { python3 "$here/render.py" "$@"; }
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/traza-prove.XXXXXX")
 data=$tmp/data
 # The notary's key and its copy of the signed head live here, outside the
@@ -160,7 +162,7 @@ bold "▸ 1 · ingest and checkpoint"
 dim "  Three support conversations. Session $subject belongs to a customer who"
 dim "  will ask to be forgotten in beat 4."
 echo
-$render ingest "$port" "$admin" "$subject"
+render ingest "$port" "$admin" "$subject"
 code=$(post /v1/checkpoint '{}' "$tmp/checkpoint.json")
 need "$code" 200 "checkpointing"
 echo "  POST /v1/checkpoint → $(cat "$tmp/checkpoint.json")"
@@ -172,19 +174,19 @@ dim "  One entry per published generation; each head commits to the one before."
 echo
 code=$(get /v1/ledger/head "$tmp/head.json")
 need "$code" 200 "reading the head"
-$render head "$tmp/head.json"
+render head "$tmp/head.json"
 code=$(get /v1/ledger "$tmp/ledger.json")
 need "$code" 200 "reading the chain"
 echo
-$render chain "$tmp/ledger.json"
+render chain "$tmp/ledger.json"
 echo
 echo "  GET /v1/ledger/verify — heads, links, the live manifest, every file re-digested:"
 code=$(get /v1/ledger/verify "$tmp/verify.json")
 need "$code" 200 "verifying the ledger"
-$render verify-live "$tmp/verify.json"
+render verify-live "$tmp/verify.json"
 echo
 echo "  and independently, from the file on disk:"
-$render recompute "$data/ledger.jsonl" "$tmp/head.json" tip
+render recompute "$data/ledger.jsonl" "$tmp/head.json" tip
 
 # --------------------------------------------------------- 3 · an anchor
 
@@ -193,12 +195,12 @@ dim "  The chain has no secret: whoever can write ledger.jsonl can rewrite it an
 dim "  recompute every head. An external countersignature over a head, kept"
 dim "  elsewhere, is what makes a later rewrite detectable."
 echo
-$render sign "$tmp/head.json" "$notary/key" "$notary/anchor.json"
+render sign "$tmp/head.json" "$notary/key" "$notary/anchor.json"
 cp "$tmp/head.json" "$notary/signed-head.json"
 code=$(post /v1/ledger/anchors "$(cat "$notary/anchor.json")" "$tmp/anchor.json")
 need "$code" 201 "recording the anchor"
 echo "  POST /v1/ledger/anchors →"
-$render anchored "$tmp/anchor.json"
+render anchored "$tmp/anchor.json"
 forged=$(python3 -c 'import json,sys; b=json.load(open(sys.argv[1])); b["target_head"]="0"*64; print(json.dumps(b))' \
   "$notary/anchor.json")
 code=$(post /v1/ledger/anchors "$forged" "$tmp/forged.json")
@@ -214,13 +216,13 @@ dim "  happened and of what kind — never what was erased."
 echo
 code=$(post /v1/erasures "{\"subject\": {\"kind\": \"session\", \"session_id\": \"$subject\"}}" "$tmp/erasure.json")
 need "$code" 200 "erasing the session"
-$render erased "$tmp/erasure.json"
+render erased "$tmp/erasure.json"
 code=$(get /v1/ledger "$tmp/ledger2.json")
 need "$code" 200 "re-reading the chain"
 echo
-$render chain "$tmp/ledger2.json"
+render chain "$tmp/ledger2.json"
 echo
-$render erasure-entry "$tmp/ledger2.json" "$data/ledger.jsonl" "$subject"
+render erasure-entry "$tmp/ledger2.json" "$data/ledger.jsonl" "$subject"
 echo
 dim "  Anyone who knows the subject can recompute the digest and find the entry;"
 dim "  anyone who does not sees 64 hex characters and a salt."
@@ -233,7 +235,7 @@ dim "  erasures in one document. Its digest is what a notary would sign."
 echo
 code=$(get /v1/evidence "$tmp/evidence.json")
 need "$code" 200 "fetching the evidence pack"
-$render evidence "$tmp/evidence.json" "$subject"
+render evidence "$tmp/evidence.json" "$subject"
 code=$(get /v1/ledger/head "$tmp/head-final.json")
 need "$code" 200 "reading the final head"
 
@@ -252,7 +254,7 @@ sed 's/^/    /' "$tmp/offline-1.txt"
 echo "    exit code: $rc"
 need "$rc" 0 "the untouched store should verify intact offline"
 echo
-damage=$($render flip "$data")
+damage=$(render flip "$data")
 set -- $damage
 echo "  one bit flipped at byte $2 of $3 in $1 —"
 echo "  a sealed segment the live manifest names:"
@@ -267,8 +269,8 @@ grep -q "$1: digest mismatch" "$tmp/offline-2.txt" ||
 echo
 echo "  the chain itself is untouched — the damage is in the data, and only"
 echo "  re-digesting the files finds it:"
-$render recompute "$data/ledger.jsonl" "$tmp/head-final.json" holds
-$render check-signature "$data/ledger.jsonl" "$notary/key" "$notary/signed-head.json"
+render recompute "$data/ledger.jsonl" "$tmp/head-final.json" holds
+render check-signature "$data/ledger.jsonl" "$notary/key" "$notary/signed-head.json"
 
 cat <<'CLOSING'
 

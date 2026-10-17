@@ -19,7 +19,9 @@ the point of the replay. It runs its real loop — call the model, run the tool
 the model asks for, send the result back — and writes what it saw to
 RESULT_FILE: every assistant message as received, every URL it sent a model
 call to, and the final answer. Exit 0 on an answer, 4 when the model endpoint
-refused a call (the refusal is in RESULT_FILE).
+refused a call (the refusal is in RESULT_FILE), 1 when either endpoint answered
+with a redirect: one is never followed, so each key goes only to the URL it
+was configured for.
 """
 
 import hashlib
@@ -49,11 +51,35 @@ def get_weather(city):
     return {"city": city, "celsius": 12, "forecast": "raining"}
 
 
+class RedirectRefused(Exception):
+    """A 3xx answered a request that carried a key."""
+
+
+class RefuseRedirects(urllib.request.HTTPRedirectHandler):
+    """Refuses every redirect instead of following it.
+
+    urllib copies a request's headers onto the redirected one, Authorization
+    included: to another host, and from https to plain http. Each key belongs
+    to the one endpoint it was configured for (the model, or Traza's ingest),
+    so a redirect is refused whatever sent it, and the key follows it nowhere.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise RedirectRefused(
+            "%s answered %d, a redirect to %s: not followed, so the key goes only "
+            "to the URL it was configured for" % (req.full_url, code, newurl))
+
+
+# Built once: building an opener reads the proxy settings, which on macOS
+# asks the system configuration.
+OPENER = urllib.request.build_opener(RefuseRedirects)
+
+
 def post(url, key, body):
     req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST")
     req.add_header("Content-Type", "application/json")
     req.add_header("Authorization", "Bearer " + key)
-    with urllib.request.urlopen(req, timeout=10) as reply:
+    with OPENER.open(req, timeout=10) as reply:
         return json.loads(reply.read())
 
 
@@ -101,13 +127,8 @@ class Recorder:
         root = {"trace_id": self.trace, "span_id": self.root, "name": "weather-agent run",
                 "service": "weather-agent", "status": "ok", "start_time_ns": start,
                 "end_time_ns": time.time_ns(), "attributes": {"session.id": self.run}}
-        req = urllib.request.Request(
-            os.environ["TRAZA_URL"] + "/v1/spans", method="POST",
-            data=json.dumps([root] + self.spans).encode())
-        req.add_header("Content-Type", "application/json")
-        req.add_header("Authorization", "Bearer " + os.environ["TRAZA_TOKEN"])
-        with urllib.request.urlopen(req, timeout=10) as reply:
-            ack = json.loads(reply.read())
+        ack = post(os.environ["TRAZA_URL"] + "/v1/spans", os.environ["TRAZA_TOKEN"],
+                   [root] + self.spans)
         if ack.get("accepted") != len(self.spans) + 1:
             sys.exit("not every span was stored: %s" % ack)
 
@@ -183,4 +204,7 @@ def main(result_path):
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1]))
+    try:
+        sys.exit(main(sys.argv[1]))
+    except RedirectRefused as refusal:
+        sys.exit("REFUSED: %s" % refusal)

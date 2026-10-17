@@ -40,6 +40,9 @@ python3 scripts/test-rust-notices.py
 python3 scripts/test-smoke-object-cli.py
 python3 scripts/generate-rust-notices.py --check
 python3 scripts/test-object-s3.py
+# The demos' agents refuse redirects, and the section below runs every demo
+# against the binary just built, from a path with a space in it.
+python3 scripts/test-demos.py
 
 # ---------------------------------------------------------------- examples
 # The demos are documentation people run, so each is a gate rather than a
@@ -47,24 +50,36 @@ python3 scripts/test-object-s3.py
 # own claims, and a change that breaks a surface they show should not merge
 # green. Each runs at its documented smoke setting; guard, replay and prove
 # have no scale knob and run as they are, in seconds each.
+#
+# They run through a symlink to this checkout whose path has a space in it:
+# a checkout can live under such a path, and a script that splits its own
+# path on spaces works from any path without one, so CI would never see it
+# break otherwise. guard, replay and prove run the binary TRAZA_BIN names, so
+# it is set here, never inherited: an older install exported in the caller's
+# shell must not stand in for the one just built.
 if command -v python3 >/dev/null 2>&1; then
-  TRAZA_DEMO_PORT=${TRAZA_DEMO_PORT:-8123} ./examples/mcp-demo/run.sh >/dev/null
+  demo_dir=$(mktemp -d "${TMPDIR:-/tmp}/traza-ci.XXXXXX")
+  demos="$demo_dir/traza checkout"
+  trap 'rm -f "$demos"; rmdir "$demo_dir"' EXIT
+  ln -s "$PWD" "$demos"
+  built="$demos/target/release/traza-server"
+  TRAZA_DEMO_PORT=${TRAZA_DEMO_PORT:-8123} "$demos/examples/mcp-demo/run.sh" >/dev/null
   echo "ci: mcp demo ran"
-  TRAZA_SWARM_SECONDS=8 ./examples/swarm/run.sh >/dev/null
+  TRAZA_SWARM_SECONDS=8 "$demos/examples/swarm/run.sh" >/dev/null
   echo "ci: swarm demo ran"
-  TRAZA_CRASH_SPANS=8000 ./examples/crash/run.sh >/dev/null
+  TRAZA_CRASH_SPANS=8000 "$demos/examples/crash/run.sh" >/dev/null
   echo "ci: crash demo ran"
-  TRAZA_NEEDLE_SPANS=60000 ./examples/needle/run.sh >/dev/null
+  TRAZA_NEEDLE_SPANS=60000 "$demos/examples/needle/run.sh" >/dev/null
   echo "ci: needle demo ran"
-  TRAZA_INCIDENT_SCALE=2 ./examples/incident/run.sh >/dev/null
+  TRAZA_INCIDENT_SCALE=2 "$demos/examples/incident/run.sh" >/dev/null
   echo "ci: incident demo ran"
-  TRAZA_VANISH_SCALE=1 ./examples/vanish/run.sh >/dev/null
+  TRAZA_VANISH_SCALE=1 "$demos/examples/vanish/run.sh" >/dev/null
   echo "ci: vanish demo ran"
-  ./examples/guard/run.sh >/dev/null
+  TRAZA_BIN="$built" "$demos/examples/guard/run.sh" >/dev/null
   echo "ci: guard demo ran"
-  ./examples/replay/run.sh >/dev/null
+  TRAZA_BIN="$built" "$demos/examples/replay/run.sh" >/dev/null
   echo "ci: replay demo ran"
-  ./examples/prove/run.sh >/dev/null
+  TRAZA_BIN="$built" "$demos/examples/prove/run.sh" >/dev/null
   echo "ci: prove demo ran"
 else
   echo "ci: skipping the demos (python3 not found)"
