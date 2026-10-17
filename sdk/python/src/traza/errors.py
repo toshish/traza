@@ -12,7 +12,7 @@ not swallow it by accident.
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, Any, Mapping, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .models import Verdict
@@ -126,9 +126,11 @@ class QuotaExceeded(TrazaError):
             return None
 
     @property
-    def quota(self) -> Optional[dict]:
-        if isinstance(self.body, dict) and isinstance(self.body.get("quota"), dict):
-            return self.body["quota"]
+    def quota(self) -> Optional[Dict[str, Any]]:
+        if isinstance(self.body, dict):
+            quota = self.body.get("quota")
+            if isinstance(quota, dict):
+                return quota
         return None
 
 
@@ -146,7 +148,7 @@ class FuseTripped(Exception):
         super().__init__(f"run {verdict.run!r} is stopped: {reasons}")
 
     @property
-    def reasons(self) -> list:
+    def reasons(self) -> List[str]:
         return list(self.verdict.reasons)
 
 

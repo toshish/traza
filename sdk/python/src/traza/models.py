@@ -16,7 +16,7 @@ import hashlib
 import json
 import typing
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Type, TypeVar, Union, cast
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .client import Client
@@ -449,7 +449,7 @@ class Replay:
     def _require_client(self) -> "Client":
         if self._client is None:
             raise RuntimeError("this Replay was not created by a Client")
-        return self._client
+        return cast("Client", self._client)
 
     def _require_id(self) -> str:
         if not self.id:
@@ -661,8 +661,10 @@ def _canonical(value: Any) -> str:
 
 _HINTS: Dict[type, Dict[str, Any]] = {}
 
+T = TypeVar("T")
 
-def decode(cls: Any, data: Any) -> Any:
+
+def decode(cls: Type[T], data: Any) -> T:
     """Builds ``cls`` from a JSON object, recursively, by its type hints.
 
     Unknown keys are ignored here (and kept in ``raw`` where the class has
@@ -675,7 +677,7 @@ def decode(cls: Any, data: Any) -> Any:
         hints = typing.get_type_hints(cls)
         _HINTS[cls] = hints
     kwargs: Dict[str, Any] = {}
-    for f in dataclasses.fields(cls):
+    for f in dataclasses.fields(cls):  # type: ignore[arg-type]  # every T here is a dataclass
         if f.name.startswith("_"):
             continue
         if f.name == "raw":
@@ -703,7 +705,7 @@ def _convert(hint: Any, value: Any) -> Any:
         if not isinstance(value, Mapping):
             return value
         return {k: _convert(args[1], v) for k, v in value.items()} if args else dict(value)
-    if dataclasses.is_dataclass(hint) and isinstance(value, Mapping):
+    if isinstance(hint, type) and dataclasses.is_dataclass(hint) and isinstance(value, Mapping):
         return decode(hint, value)
     if hint is float and isinstance(value, int) and not isinstance(value, bool):
         return float(value)

@@ -16,7 +16,7 @@ import socket
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, TypeVar, Union
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Tuple, TypeVar, Union
 
 from . import __version__
 from .errors import FuseTripped, TrazaError, error_from_response
@@ -360,7 +360,8 @@ class Client:
         req = urllib.request.Request(url, data=data, method=method, headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=timeout) as response:
-                return response.read().decode("utf-8")
+                raw: bytes = response.read()
+                return raw.decode("utf-8")
         except urllib.error.HTTPError as error:
             raw = error.read() if error.fp is not None else b""
             raise error_from_response(error.code, error.reason or "", dict(error.headers.items()), raw) from None
@@ -440,19 +441,19 @@ class Guard:
         self.check()
         return self
 
-    def __exit__(self, *exc_info: Any) -> bool:
-        return False
+    def __exit__(self, *exc_info: Any) -> None:
+        return None
 
     async def __aenter__(self) -> "Guard":
         # urllib blocks; a worker thread keeps the event loop serving.
         await asyncio.get_running_loop().run_in_executor(None, self.check)
         return self
 
-    async def __aexit__(self, *exc_info: Any) -> bool:
-        return False
+    async def __aexit__(self, *exc_info: Any) -> None:
+        return None
 
     def __call__(self, fn: F) -> F:
-        def run_for(args: tuple, kwargs: dict) -> str:
+        def run_for(args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> str:
             return self.run(*args, **kwargs) if callable(self.run) else self.run
 
         if inspect.iscoroutinefunction(fn):
