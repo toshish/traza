@@ -533,6 +533,23 @@ impl Deadline {
         })
     }
 
+    /// The sooner of `deadline` and `slice` from now: for work a request
+    /// may do with what is left of its budget, but never more than `slice`
+    /// of it, and never unbounded even when no budget is configured.
+    pub(crate) fn capped(deadline: Option<Self>, slice: std::time::Duration) -> Self {
+        let now = Instant::now();
+        match deadline {
+            Some(deadline) => Self {
+                started: deadline.started,
+                at: deadline.at.min(now + slice),
+            },
+            None => Self {
+                started: now,
+                at: now + slice,
+            },
+        }
+    }
+
     /// Errs once the deadline has passed; a `None` deadline never does.
     /// `segments_examined` is whatever the caller has counted so far —
     /// reporting for the refusal's message, not accounting.

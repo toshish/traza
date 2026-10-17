@@ -2419,8 +2419,11 @@ not been caught up. Unbound credentials only. Always `200` — the verdict is
 the body:
 
 ```json
-{"entries":5,"generation":{"files_verified":true,"id":3,"manifest_sha256":"97bcc77723139e1d84ac46f786ee85152e6be3ce0d35938d797c85b33429b983","matches_ledger":true,"verified_at_ns":1792061580401844000},"head":"34e64ba565ed353f7db1ab6f1e9611b8815053c45548c22b9827d2c3dfc415e5","intact":true,"problems":[]}
+{"chain_verified_at_ns":1792061580401790000,"entries":5,"generation":{"files_verified":true,"id":3,"manifest_sha256":"97bcc77723139e1d84ac46f786ee85152e6be3ce0d35938d797c85b33429b983","matches_ledger":true,"verified_at_ns":1792061580401844000},"head":"34e64ba565ed353f7db1ab6f1e9611b8815053c45548c22b9827d2c3dfc415e5","intact":true,"problems":[]}
 ```
+
+`chain_verified_at_ns` is when the chain walk began and `verified_at_ns`
+when the file check ran: here, both during this request.
 
 `intact` requires every check to pass. `problems` names each break by entry
 — `seq 2: head does not match its contents (recorded 0dee…, recomputed
@@ -2515,9 +2518,10 @@ Abbreviated (heads and entries elided):
  "digest":"a621ab3b040e67bd6f8899c3654dea99b4e42b5ad56e9259a701fad9837c6bf9",
  "engine_version":"0.27.0",
  "erasures":[{"conclusive":true,"id":1,"published_at_ns":1792061585528589000,"result":"erased","subject_kind":"session"}],
+ "erasures_truncated":false,
  "format":"traza-evidence/1","generated_at_ns":1792061592996325000,
  "ledger":{"entries":[…],"entries_truncated":false,"entries_unreadable":0,"head":{"at_ns":1792061585533710000,"head":"34e6…","seq":4,"store_id":"66022a6e1d87f73e3ba52202b53d1998"},
-           "verification":{"entries":5,"generation":{…},"head":"…","intact":true,"problems":[]}},
+           "verification":{"chain_verified_at_ns":1792061561102233000,"entries":5,"generation":{…},"head":"…","intact":true,"problems":[]}},
  "retention":{"source":"none","ttl_seconds":null},
  "store_id":"66022a6e1d87f73e3ba52202b53d1998","tenant":null,"usage":null,
  "window":{"since_ns":0,"until_ns":1792061592996325000}}
@@ -2525,17 +2529,24 @@ Abbreviated (heads and entries elided):
 
 `digest` is the SHA-256 of the canonical JSON of every other field — what a
 notary signs. One `--query-deadline-ms` budget covers the whole pack. The
-chain walk continues the previous pack's (or verification's) walk when that
-walk began within the last 60 seconds, so a pack usually walks only what was
-appended since. If the budget runs out mid-walk, the pack answers `400`
-(`… the ledger chain was verified through line N …`); the walk keeps its
-progress, so a retry resumes and completes it. `activity` counts spans that
+server keeps what packs have checked: the chain walk continues the last
+completed walk (a pack's or a verification's), the erasure checks and the
+index of settled erasures take in only what is new, and the file check
+re-digests only files a checkpoint added or changed, without the maintenance
+lock. If the budget runs out in one of these, the pack answers `400` saying
+how far it got (`… the ledger chain was verified through line N …`, `… N of
+M files of generation G were digested …`); the work keeps its progress,
+however long until the retry, so retrying completes it. A completed walk or
+file digest more than 60 seconds old is still used, and the pack says how old
+(`ledger.verification.chain_verified_at_ns`, and the `verified_at_ns` of its
+`generation`), while each pack spends up to 250 ms of its remaining budget
+redoing it. `activity` counts spans that
 started in the window and are still stored, from the same fold as the
 analytics, under the same budget (a window too large for it answers `400`,
-never a partial pack). `erasures` lists those settled in the window with
+never a partial pack). `erasures` lists those settled in the window, oldest
+first and at most 10,000 (`erasures_truncated` says whether more exist), with
 their receipt's `conclusive` and `result`; past 32 receipts or the budget
-both are `null`. The file check, reused for 60 seconds, is the one step the
-budget does not cut short. `ledger.entries` holds entries whose `at_ns` is in the window, at
+both are `null`. `ledger.entries` holds entries whose `at_ns` is in the window, at
 most 10,000 (`entries_truncated` says whether more exist), and
 `ledger.entries_unreadable` counts the chain's lines the pack could not place
 (not a JSON object, or no integer `seq` or `at_ns`); the verification names
