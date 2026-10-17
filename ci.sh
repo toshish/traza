@@ -45,8 +45,8 @@ python3 scripts/test-object-s3.py
 # The demos are documentation people run, so each is a gate rather than a
 # sample: they drive the real binary over the real endpoints and assert their
 # own claims, and a change that breaks a surface they show should not merge
-# green. Each runs at its documented smoke setting; the whole tour stays
-# under a minute.
+# green. Each runs at its documented smoke setting; guard, replay and prove
+# have no scale knob and run as they are, in seconds each.
 if command -v python3 >/dev/null 2>&1; then
   TRAZA_DEMO_PORT=${TRAZA_DEMO_PORT:-8123} ./examples/mcp-demo/run.sh >/dev/null
   echo "ci: mcp demo ran"
