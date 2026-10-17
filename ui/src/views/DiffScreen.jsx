@@ -1,11 +1,12 @@
 import React from 'react';
 import { api } from '../lib/api.js';
-import { useRead } from '../lib/route.js';
+import { navigate, useRead } from '../lib/route.js';
 import { fmtDurationNs, fmtNum } from '../lib/format.js';
-import { fmtMoney, splitFingerprint } from '../lib/runs.js';
+import { fmtMoney, routeTenant, singleTenantScope, splitFingerprint, tenantParams } from '../lib/runs.js';
 import { Card, Chip, EmptyState, ErrorState, Mono, PanelHead, Skeleton } from '../components/primitives/Chrome.jsx';
 import { Tag } from '../components/primitives/Tag.jsx';
 import { Input } from '../components/primitives/Input.jsx';
+import { UnscopedNote } from '../components/runs/UnscopedNote.jsx';
 
 // Two runs aligned step by step, and the first place they parted. The server
 // does the alignment (a longest common subsequence over `kind:name`
@@ -22,12 +23,13 @@ export const WHY = {
 
 const OP_TAG = { same: 'neutral', changed: 'warn', insert: 'accent', delete: 'accent' };
 
-export function DiffScreen({ go, params }) {
+export function DiffScreen({ go, params, identity }) {
   const a = params.get('a') || '';
   const b = params.get('b') || '';
-  const tenant = params.get('tenant') || '';
+  // `undefined` when the route names no tenant; '' is the default tenant.
+  const tenant = routeTenant(params);
   if (!a || !b) return <DiffForm a={a} b={b} tenant={tenant} go={go} />;
-  return <DiffView a={a} b={b} tenant={tenant} go={go} />;
+  return <DiffView a={a} b={b} tenant={tenant} go={go} identity={identity} />;
 }
 
 function DiffForm({ a, b, tenant, go }) {
@@ -35,7 +37,7 @@ function DiffForm({ a, b, tenant, go }) {
   const [right, setRight] = React.useState(b);
   const submit = () => {
     if (!left.trim() || !right.trim()) return;
-    go(['diff'], { a: left.trim(), b: right.trim(), ...(tenant ? { tenant } : {}) });
+    go(['diff'], { a: left.trim(), b: right.trim(), ...tenantParams(tenant) });
   };
   return <div style={{ display: 'grid', gap: 14, maxWidth: 900 }}>
     <Card>
@@ -56,10 +58,13 @@ function DiffForm({ a, b, tenant, go }) {
   </div>;
 }
 
-function DiffView({ a, b, tenant, go }) {
-  const diff = useRead((signal) => api.diff({ a, b, tenant: tenant || undefined }, signal), [a, b, tenant]);
+function DiffView({ a, b, tenant, go, identity }) {
+  const diff = useRead((signal) => api.diff({ a, b, ...tenantParams(tenant) }, signal), [a, b, tenant]);
   const firstRef = React.useRef(null);
-  const scope = tenant ? { tenant } : {};
+  // Carried into every link, so a step opens on the tape this diff read.
+  const scope = tenantParams(tenant) || {};
+  const unscoped = !singleTenantScope(tenant, identity) && Boolean(identity && identity.operator);
+  const scopeTo = (name) => navigate(['diff'], { a, b, tenant: name }, { replace: true });
 
   if (diff.loading && !diff.data) return <Skeleton height={240} />;
   if (diff.error) {
@@ -85,6 +90,11 @@ function DiffView({ a, b, tenant, go }) {
         <Chip onClick={() => go(['diff'], scope)}>Other runs</Chip>
       </span>
     </div>
+
+    {unscoped ? <UnscopedNote onScope={scopeTo}>
+      These runs are read across every tenant: no tenant is named, so if two tenants use one of
+      these run ids, their steps are aligned as one run. Name the tenant to read them in:
+    </UnscopedNote> : null}
 
     <Totals data={data} />
 

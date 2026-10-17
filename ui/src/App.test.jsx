@@ -12,7 +12,7 @@ import React from 'react';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, act, cleanup, screen } from '@testing-library/react';
 import { App } from './App.jsx';
-import { setToken } from './lib/api.js';
+import { getToken, setToken } from './lib/api.js';
 import { setIdentity } from './lib/session.js';
 import { isOperatorPath } from './lib/session.js';
 import whoamiBound from './test/fixtures/whoami_bound.json';
@@ -133,5 +133,97 @@ describe('a 401', () => {
     await settle(30000);
     expect(paths.length).toBe(before);
     expect(screen.getByRole('dialog', { name: 'Set token' })).toBeTruthy();
+  });
+});
+
+describe('a token handed off by navigating the open tab', () => {
+  /** A server whose whoami answers by the bearer token: bound with one, an
+      open store without. */
+  function serveByToken() {
+    const whoamiAuth = [];
+    globalThis.fetch = vi.fn(async (url, init = {}) => {
+      const path = String(url).split('?')[0];
+      const auth = init.headers && init.headers.Authorization;
+      if (path === '/v1/whoami') {
+        whoamiAuth.push(auth);
+        return json(200, auth ? whoamiBound : whoamiOpen);
+      }
+      if (path === '/v1/usage') return json(200, usageBound);
+      return json(200, EMPTY[path] || {});
+    });
+    return whoamiAuth;
+  }
+
+  async function navigateTo(hash) {
+    await act(async () => {
+      window.location.hash = hash;
+      // jsdom queues its own hashchange; dispatching one as well makes the
+      // test independent of when that runs. Taking a token is idempotent.
+      window.dispatchEvent(new HashChangeEvent('hashchange'));
+    });
+    await settle(10);
+  }
+
+  it('takes a route-form token, strips it, keeps the route, and asks who it is', async () => {
+    const whoamiAuth = serveByToken();
+    render(<App />);
+    await settle(0);
+    await navigateTo('#/guard?token=trz_handed&state=stop');
+    expect(getToken()).toBe('trz_handed');
+    expect(window.location.hash).toBe('#/guard?state=stop');
+    expect(whoamiAuth).toEqual([undefined, 'Bearer trz_handed']);
+    expect(screen.getByTestId('rail-scope').textContent).toContain('tenant acme');
+  });
+
+  it('takes a whole-fragment token and opens the default screen', async () => {
+    serveByToken();
+    render(<App />);
+    await settle(0);
+    await navigateTo('#token=trz_whole');
+    expect(getToken()).toBe('trz_whole');
+    expect(window.location.hash).not.toContain('trz_whole');
+    expect(document.querySelector('header').textContent).toContain('Overview');
+  });
+});
+
+describe('a whoami that fails for a reason other than 401', () => {
+  function serveFlaky(failures) {
+    let calls = 0;
+    const paths = [];
+    globalThis.fetch = vi.fn(async (url) => {
+      const path = String(url).split('?')[0];
+      paths.push(path);
+      if (path === '/v1/whoami') {
+        calls += 1;
+        return calls <= failures ? json(503, { error: 'busy' }) : json(200, whoamiOpen);
+      }
+      if (path === '/v1/usage') return json(200, usageBound);
+      return json(200, EMPTY[path] || {});
+    });
+    return { paths, calls: () => calls };
+  }
+
+  const nav = () => Array.from(document.querySelectorAll('nav[aria-label="Screens"] button')).map((b) => b.textContent);
+
+  it('is asked again, and the operator gets its screens back once it answers', async () => {
+    const server = serveFlaky(1);
+    render(<App />);
+    await settle(0);
+    expect(nav()).not.toContain('Server');
+    await settle(2500);
+    expect(server.calls()).toBe(2);
+    expect(nav()).toContain('Server');
+    await settle(6000);
+    expect(server.paths).toContain('/v1/metrics.json');
+  });
+
+  it('backs off while it keeps failing, rather than giving up or hammering', async () => {
+    const server = serveFlaky(Infinity);
+    render(<App />);
+    await settle(0);
+    await settle(30000);
+    // 0 s, then 2, 5 and 15 s apart: four asks in the first 30 seconds.
+    expect(server.calls()).toBe(4);
+    expect(nav()).not.toContain('Server');
   });
 });

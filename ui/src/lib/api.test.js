@@ -7,7 +7,7 @@
 // server said was missing).
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { api, setToken } from './api.js';
+import { api, onUnauthorized, setToken } from './api.js';
 import { apiBase, apiUrl, publicBase } from './base.js';
 import { isAuthBlocked, isOperatorPath, setIdentity } from './session.js';
 
@@ -106,6 +106,74 @@ describe('after a 401', () => {
     await api.whoami();
     expect(calls).toHaveLength(2);
     expect(calls[1].init.headers.Authorization).toBe('Bearer trz_test_token');
+  });
+});
+
+describe('a 401 for an older token', () => {
+  it('does not block the token set since, nor open the prompt', async () => {
+    // The open-store bootstrap: polls sent with no token are still in flight
+    // when the tab adopts the credential it just minted.
+    const releases = [];
+    mockFetch(() => new Promise((resolve) => { releases.push(() => resolve(json(401, { error: 'unauthorized' }))); }));
+    setIdentity({ auth: 'open', operator: true, scope: 'admin', tenant: null });
+    const prompted = vi.fn();
+    onUnauthorized(prompted);
+    const stale = api.spans({ limit: 1 }).catch((e) => e);
+    const staleMcp = api.mcp('tools/list').catch((e) => e);
+    await Promise.resolve();
+    setToken('trz_fresh');
+    releases.forEach((release) => release());
+    expect((await stale).status).toBe(401);
+    expect((await staleMcp).status).toBe(401);
+    expect(isAuthBlocked()).toBe(false);
+    expect(prompted).not.toHaveBeenCalled();
+    onUnauthorized(null);
+  });
+
+  it('still blocks when the token refused is the one in use', async () => {
+    mockFetch(() => json(401, { error: 'unauthorized' }));
+    const prompted = vi.fn();
+    onUnauthorized(prompted);
+    setToken('trz_revoked');
+    await expect(api.spans({ limit: 1 })).rejects.toMatchObject({ status: 401 });
+    expect(isAuthBlocked()).toBe(true);
+    expect(prompted).toHaveBeenCalledTimes(1);
+    onUnauthorized(null);
+  });
+
+  it('does not let a read made with a new token join one sent with the old', async () => {
+    const releases = [];
+    const calls = mockFetch(() => new Promise((resolve) => { releases.push(() => resolve(json(200, { spans: [] }))); }));
+    setIdentity({ auth: 'open', operator: true, scope: 'admin', tenant: null });
+    const first = api.spans({ limit: 1 });
+    setToken('trz_new');
+    const second = api.spans({ limit: 1 });
+    await Promise.resolve();
+    const seen = calls.map((c) => c.init.headers.Authorization);
+    // Settled before asserting, so a failure here cannot leave a request in
+    // flight for the next test to join.
+    releases.forEach((release) => release());
+    await Promise.all([first, second]);
+    expect(seen).toEqual([undefined, 'Bearer trz_new']);
+  });
+});
+
+describe('the tenant parameter', () => {
+  it('is sent even when empty, because `tenant=` names the default tenant', async () => {
+    setIdentity({ auth: 'open', operator: true, scope: 'admin', tenant: null });
+    const calls = mockFetch(() => json(200, { runs: [], steps: [], aligned: [] }));
+    await api.tape('weather-7', { tenant: '', max_steps: 5 });
+    await api.diff({ a: 'x', b: 'y', tenant: '' });
+    await api.fuseRun('weather-7', { tenant: '' });
+    await api.tape('weather-7', { tenant: undefined, max_steps: 5 });
+    await api.spans({ name: '', limit: 1 });
+    expect(calls.map((c) => c.url)).toEqual([
+      '/v1/tapes/weather-7?tenant=&max_steps=5',
+      '/v1/diff?a=x&b=y&tenant=',
+      '/v1/fuses/runs/weather-7?tenant=',
+      '/v1/tapes/weather-7?max_steps=5',
+      '/v1/spans?limit=1',
+    ]);
   });
 });
 

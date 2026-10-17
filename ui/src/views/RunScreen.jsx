@@ -4,12 +4,15 @@ import { publicBase } from '../lib/base.js';
 import { navigate, useRead } from '../lib/route.js';
 import { bytesLabel, isPayloadRef, normalizePart } from '../lib/spans.js';
 import { fmtDurationNs, fmtNum, fmtTimeNs } from '../lib/format.js';
-import { fmtMoney, replayEnv, replayPython, splitFingerprint, tapeTotals, tenantParams } from '../lib/runs.js';
+import {
+  fmtMoney, replayEnv, replayPython, routeTenant, singleTenantScope, splitFingerprint, tapeTotals, tenantParams,
+} from '../lib/runs.js';
 import { Card, Chip, EmptyState, ErrorState, LoadingBar, Mono, PanelHead, Skeleton } from '../components/primitives/Chrome.jsx';
 import { Tag } from '../components/primitives/Tag.jsx';
 import { Input } from '../components/primitives/Input.jsx';
 import { CodeBlock } from '../components/data/CodeBlock.jsx';
 import { MessageList } from '../components/trace/MessageList.jsx';
+import { UnscopedNote } from '../components/runs/UnscopedNote.jsx';
 import { VERDICT_TAG } from './GuardScreen.jsx';
 
 // A run read as a tape: its model calls, tool calls and agent invocations in
@@ -18,30 +21,55 @@ import { VERDICT_TAG } from './GuardScreen.jsx';
 // `trace:<id>` for a trace with none; sessions and traces link here with
 // exactly that rule.
 
-/** Steps the screen asks for. The server holds up to 20,000; drawing that
-    many rows would stall the page, and the tape says when it was cut. */
+/** Steps the screen asks for at a time. The server holds up to 20,000;
+    drawing that many rows would stall the page, and the tape says when it
+    was cut. */
 const MAX_STEPS = 2000;
+
+/** The most steps the server returns for one tape. */
+const TAPE_MAX_STEPS = 20000;
+
+/** Steps to ask for so that `focus` — a step a diff linked to — is on the
+    tape: the first page, or as many whole pages as reach it. The diff aligns
+    up to 5,000 steps a side, so its links can point past the first page. */
+export function stepsToLoad(focus) {
+  if (focus == null || focus < MAX_STEPS) return MAX_STEPS;
+  return Math.min(TAPE_MAX_STEPS, (Math.floor(focus / MAX_STEPS) + 1) * MAX_STEPS);
+}
 
 // Kinds are categories, not measurements, so they stay ink: the accent is
 // for the duration bars and the cost column.
 const KIND_TAG = { llm: 'neutral', tool: 'neutral', agent: 'neutral' };
 
 export function RunScreen({ runId, go, params, identity, pushToast }) {
-  const tenant = params.get('tenant') || '';
+  // `undefined` when the route names no tenant: the run's tenant is unknown.
+  const tenant = routeTenant(params);
+  const scope = tenantParams(tenant);
+  const operator = Boolean(identity && identity.operator);
+  // Unscoped, an unbound credential reads every tenant's run of this id; the
+  // verdict, which is always one tenant's, would describe something else.
+  const oneTenant = singleTenantScope(tenant, identity);
   const resolve = params.get('resolve') === 'true';
   const focusStep = params.get('step');
-  const scope = tenantParams(tenant);
+  const focus = focusStep != null && /^[0-9]+$/.test(focusStep) ? Number(focusStep) : null;
+  const maxSteps = stepsToLoad(focus);
 
   const tape = useRead((signal) => api.tape(runId, {
-    ...scope, resolve: resolve ? 'true' : undefined, max_steps: MAX_STEPS,
-  }, signal), [runId, tenant, resolve]);
+    ...scope, resolve: resolve ? 'true' : undefined, max_steps: maxSteps,
+  }, signal), [runId, tenant, resolve, maxSteps]);
   // The guard's verdict is context, not the point: a store started with
   // --no-fuses answers 409 here, and the tape stands on its own.
-  const verdict = useRead((signal) => api.fuseRun(runId, scope, signal).catch(() => null), [runId, tenant]);
+  const verdict = useRead((signal) => api.fuseRun(runId, scope, signal).catch(() => null), [runId, tenant],
+    { skip: !oneTenant });
 
   const setParam = (key, value) => {
     const next = new URLSearchParams(params);
     if (value) next.set(key, value); else next.delete(key);
+    navigate(['run', runId], Object.fromEntries(next), { replace: true });
+  };
+  const scopeTo = (name) => {
+    const next = new URLSearchParams(params);
+    next.set('tenant', name);
     navigate(['run', runId], Object.fromEntries(next), { replace: true });
   };
 
@@ -58,18 +86,20 @@ export function RunScreen({ runId, go, params, identity, pushToast }) {
   if (!data) return null;
   const totals = tapeTotals(data);
   const sessionLike = !runId.startsWith('trace:');
+  const missing = focus != null && !data.steps.some((step) => step.index === focus);
 
   return <div style={{ display: 'grid', gap: 14, maxWidth: 1700 }}>
     <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
       <Mono size={13}>{runId}</Mono>
-      {data.tenant ? <Mono color="var(--ink-muted)">tenant {data.tenant}</Mono> : null}
+      {data.tenant ? <Mono color="var(--ink-muted)">tenant {data.tenant}</Mono>
+        : data.tenant === '' && operator ? <Mono color="var(--ink-muted)">default tenant</Mono> : null}
       <Chip onClick={() => navigator.clipboard?.writeText(runId)}>copy id</Chip>
-      {verdict.data && verdict.data.verdict ? <Tag status={VERDICT_TAG[verdict.data.verdict] || 'neutral'} mono>
+      {oneTenant && verdict.data && verdict.data.verdict ? <Tag status={VERDICT_TAG[verdict.data.verdict] || 'neutral'} mono>
         guard: {verdict.data.verdict}
       </Tag> : null}
       <span style={{ marginLeft: 'auto', display: 'flex', gap: 6, flexWrap: 'wrap' }}>
         {sessionLike
-          ? <Chip onClick={() => go(['sessions', runId])}>Session</Chip>
+          ? <Chip onClick={() => go(['sessions', runId], scope)}>Session</Chip>
           : <Chip onClick={() => go(['trace', runId.slice('trace:'.length)])}>Trace</Chip>}
         <Chip onClick={() => go(['guard'])}>Guard</Chip>
         <Chip active={resolve} onClick={() => setParam('resolve', resolve ? '' : 'true')}
@@ -89,9 +119,19 @@ export function RunScreen({ runId, go, params, identity, pushToast }) {
       <Tile label="spans read" value={fmtNum(data.spans_examined)} tone="var(--ink)" />
     </Card>
 
+    {!oneTenant && operator ? <UnscopedNote onScope={scopeTo}>
+      This tape is read across every tenant: no tenant is named, so if two tenants use this run id
+      their steps are interleaved here, and no guard verdict is shown, since a verdict is one
+      tenant's. Name the tenant to read it in:
+    </UnscopedNote> : null}
+
     {data.truncated ? <div style={{ fontSize: 12, color: 'var(--warn)' }}>
-      This tape is cut: the run has more steps than shown (at most {fmtNum(MAX_STEPS)} here), or more
+      This tape is cut: the run has more steps than shown (at most {fmtNum(maxSteps)} here), or more
       than 20,000 spans.
+    </div> : null}
+    {missing ? <div data-testid="missing-step" role="status" style={{ fontSize: 12, color: 'var(--warn)' }}>
+      Step {fmtNum(focus)} is not on this tape: it has {fmtNum(data.steps.length)} steps
+      {data.truncated ? ', and was cut before the step' : ''}.
     </div> : null}
     {data.resolved_partial ? <div style={{ fontSize: 12, color: 'var(--warn)' }}>
       Some payloads stayed references: the server's per-tape budget (<code>--tape-max-bytes</code>) ran
@@ -332,7 +372,9 @@ function ReplayPanel({ runId, tenant, tape, identity, pushToast }) {
     setStatus(null);
     try {
       const body = { run: runId, mode };
-      if (tenant) body.tenant = tenant;
+      // Empty names the default tenant; absent is the operator view, which
+      // is what an unscoped tape on this page shows.
+      if (tenant !== undefined) body.tenant = tenant;
       setReplay(await api.createReplay(body));
     } catch (e) {
       setError(e);
@@ -396,12 +438,13 @@ function ReplayPanel({ runId, tenant, tape, identity, pushToast }) {
 function ComparePanel({ runId, tenant, go }) {
   const [other, setOther] = React.useState('');
   const recent = useRead((signal) => api.sessions({ limit: 30 }, signal).catch(() => null), []);
+  // A session row omits `tenant` for the default tenant.
   const suggestions = (recent.data?.sessions || [])
-    .filter((s) => s.session_id !== runId && (!tenant || s.tenant === tenant));
+    .filter((s) => s.session_id !== runId && (tenant === undefined || (s.tenant || '') === tenant));
   const compare = () => {
     const b = other.trim();
     if (!b) return;
-    go(['diff'], { a: runId, b, ...(tenant ? { tenant } : {}) });
+    go(['diff'], { a: runId, b, ...tenantParams(tenant) });
   };
   return <Card>
     <PanelHead title="Compare with…" note="aligns the two tapes and names the first divergence" />

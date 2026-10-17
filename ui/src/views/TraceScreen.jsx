@@ -13,6 +13,7 @@ import {
   runIdOf,
 } from '../lib/spans.js';
 import { fmtCost, fmtDurationNs, fmtNum, fmtPercent, fmtTimeNs } from '../lib/format.js';
+import { tenantParams } from '../lib/runs.js';
 import { Card, Chip, Eyebrow, ErrorState, Mono, Skeleton } from '../components/primitives/Chrome.jsx';
 import { TimeRuler } from '../components/charts/Marks.jsx';
 import { AttrTree } from '../components/data/AttrTree.jsx';
@@ -193,8 +194,12 @@ export function TraceScreen({ traceId, go, params, pushToast }) {
         <Chip onClick={() => navigator.clipboard?.writeText(traceId)}>copy id</Chip>
         <span style={{ marginLeft: 'auto', display: 'flex', flexWrap: 'wrap', gap: 6 }}>
           <Chip active={agentMode} onClick={() => setAgentMode((on) => !on)}>Agent mode</Chip>
-          {sessionIdOf(spans[0] || {}) ? <Chip onClick={() => go(['sessions', sessionIdOf(spans[0]).id])}>Session</Chip> : null}
-          <Chip onClick={() => go(['run', runId], root?.$tenant ? { tenant: root.$tenant } : undefined)}
+          {sessionIdOf(spans[0] || {}) ? <Chip onClick={() => go(['sessions', sessionIdOf(spans[0]).id],
+            tenantParams(spans[0].$tenant || ''))}>Session</Chip> : null}
+          {/* A span's tenant is definite — `$tenant` is omitted for the
+              default one — so the run opens in its tenant, named even when
+              it is the default: unnamed, a tape reads every tenant. */}
+          <Chip onClick={() => go(['run', runId], root ? tenantParams(root.$tenant || '') : undefined)}
             title={'The tape of run ' + runId}>Run</Chip>
           <Chip onClick={() => go(['conversation', 'traces', traceId])}>Conversation</Chip>
           <Chip onClick={() => go(['compare'], { a: traceId })}>Compare</Chip>

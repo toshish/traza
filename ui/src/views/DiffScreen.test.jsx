@@ -16,9 +16,9 @@ vi.mock('../lib/api.js', () => ({
 const { DiffScreen } = await import('./DiffScreen.jsx');
 const { api } = await import('../lib/api.js');
 
-async function show(query) {
+async function show(query, identity = null) {
   const go = vi.fn();
-  const view = render(<DiffScreen go={go} params={new URLSearchParams(query)} />);
+  const view = render(<DiffScreen go={go} params={new URLSearchParams(query)} identity={identity} />);
   await act(async () => { for (let i = 0; i < 4; i += 1) await Promise.resolve(); });
   return { view, go };
 }
@@ -66,6 +66,25 @@ describe('two runs aligned', () => {
     const changed = screen.getAllByTestId('aligned-row')[3];
     fireEvent.click(within(changed).getByText('3'));
     expect(go).toHaveBeenCalledWith(['run', 'weather-9'], { step: '3' });
+  });
+});
+
+describe('the tenant the runs are read in', () => {
+  it('names the default tenant explicitly to the diff and to every step link', async () => {
+    const { go } = await show('a=weather-7&b=weather-9&tenant=');
+    // `tenant=` is the default tenant; leaving it out would align every
+    // tenant's runs of these ids.
+    expect(api.diff).toHaveBeenCalledWith({ a: 'weather-7', b: 'weather-9', tenant: '' }, expect.anything());
+    fireEvent.click(within(screen.getAllByTestId('aligned-row')[3]).getByText('3'));
+    expect(go).toHaveBeenCalledWith(['run', 'weather-9'], { tenant: '', step: '3' });
+    fireEvent.click(screen.getByText('Swap'));
+    expect(go).toHaveBeenCalledWith(['diff'], { a: 'weather-9', b: 'weather-7', tenant: '' });
+  });
+
+  it('tells an operator an unscoped diff reads every tenant', async () => {
+    const { view } = await show('a=weather-7&b=weather-9', { operator: true, tenant: null });
+    expect(api.diff.mock.calls[0][0]).not.toHaveProperty('tenant');
+    expect(view.container.textContent).toMatch(/every tenant/);
   });
 });
 

@@ -28,6 +28,19 @@ describe('takeTokenFromHash', () => {
     expect(takeTokenFromHash('#/overview?token=trz_y')).toEqual({ token: 'trz_y', hash: '#/overview' });
   });
 
+  it('decodes a route-query token exactly as the whole-fragment form does', () => {
+    // A token registered through TRAZA_TOKENS may be base64 with `+` in it;
+    // form decoding would turn that into a space and every request into 401.
+    expect(takeTokenFromHash('#/overview?token=ab+cd').token).toBe('ab+cd');
+    expect(takeTokenFromHash('#token=ab+cd').token).toBe('ab+cd');
+    expect(takeTokenFromHash('#/overview?token=a%2Bb%3D').token).toBe('a+b=');
+  });
+
+  it('leaves the other route parameters exactly as written', () => {
+    expect(takeTokenFromHash('#/traces?q=name%7C%3D%7Ca+b&token=t&range=1h'))
+      .toEqual({ token: 't', hash: '#/traces?q=name%7C%3D%7Ca+b&range=1h' });
+  });
+
   it('leaves every other fragment alone', () => {
     for (const hash of ['', '#', '#/traces', '#/traces?q=a', '#tokens=x', '#/token=x']) {
       expect(takeTokenFromHash(hash)).toEqual({ token: null, hash });

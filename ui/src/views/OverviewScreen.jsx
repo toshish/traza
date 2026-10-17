@@ -2,6 +2,7 @@ import React from 'react';
 import { api } from '../lib/api.js';
 import { useRead, usePoll } from '../lib/route.js';
 import { RANGES, windowOf } from '../lib/query.js';
+import { tenantParams } from '../lib/runs.js';
 import {
   durabilityMeans, fmtBytes, fmtCompact, fmtCost, fmtCostProvenance, fmtDelta, fmtDurationNs, fmtNum,
   fmtPercent, fmtAgo, fmtClockNs, fmtWindowLabel,
@@ -340,8 +341,8 @@ export function OverviewScreen({ go, identity }) {
             onKeyDown={(e) => { if (e.key === 'Enter') go(['sessions']); }}
             style={{ marginLeft: 'auto', fontSize: 12, color: 'var(--accent)', cursor: 'pointer' }}>All sessions →</span>
         </div>
-        {(sessions.data?.sessions || []).map((s) => <SessionRow key={s.session_id} session={s}
-          onClick={() => go(['sessions', s.session_id])} />)}
+        {(sessions.data?.sessions || []).map((s) => <SessionRow key={(s.tenant || '') + '\u0000' + s.session_id} session={s}
+          onClick={() => go(['sessions', s.session_id], tenantParams(s.tenant || ''))} />)}
         {sessions.data && !sessions.data.sessions?.length
           ? <div style={{ fontSize: 13, color: 'var(--ink-muted)', padding: '6px 0' }}>No sessions yet.</div>
           : null}

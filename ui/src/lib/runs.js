@@ -78,12 +78,32 @@ export function runIdFor({ sessionId, traceId }) {
   return traceId ? 'trace:' + traceId : '';
 }
 
-/** Route parameters that carry a run's tenant, for the operator view: an
-    unbound credential reading another tenant's run must name it, and a
-    bound one is forced to its own whatever is sent. Empty for the default
-    tenant, which is what naming none selects on the single-run routes. */
+/** Parameters that carry a run's tenant, for a route or a request: `{tenant}`
+    when the tenant is known — `''` for the default tenant, named explicitly —
+    and undefined when it is not.
+
+    The empty value matters. On the fuse routes naming no tenant happens to
+    select the default one, but on tapes, diffs and replays naming none is the
+    operator view across every tenant, and `tenant=` is what names the
+    default tenant. A default-tenant run opened without it reads every
+    tenant's run of that id, interleaved, while its verdict reads the default
+    tenant alone. A bound credential is held to its own tenant either way. */
 export function tenantParams(tenant) {
-  return tenant ? { tenant } : undefined;
+  return typeof tenant === 'string' ? { tenant } : undefined;
+}
+
+/** The tenant a route names: the `tenant` parameter's value (`''` naming the
+    default tenant), or undefined when the route names none and the run's
+    tenant is unknown. */
+export function routeTenant(params) {
+  return params && params.has('tenant') ? params.get('tenant') : undefined;
+}
+
+/** Whether a run read without a tenant is one tenant's: the server holds a
+    bound credential to its own, so only an unbound one reads across every
+    tenant. An identity not yet known counts as not one tenant's. */
+export function singleTenantScope(tenant, identity) {
+  return tenant !== undefined || Boolean(identity && identity.tenant);
 }
 
 /** A JSON value as a Python literal: `true`/`false`/`null` become

@@ -4,6 +4,7 @@
 
 import React from 'react';
 import { isAuthBlocked } from './session.js';
+import { consumeFragmentToken } from './handoff.js';
 
 export function parseHash(hash) {
   const raw = (hash || '').replace(/^#\/?/, '');
@@ -42,11 +43,32 @@ export function goBack(fallbackParts) {
   else navigate(fallbackParts || ['overview']);
 }
 
-export function useHashRoute() {
+/** The current route, following the fragment.
+
+    It also takes a handed-off token (see handoff.js) on every fragment
+    navigation, before the route is parsed. A handoff link opened in a tab
+    that already shows the dashboard differs only after `#`, so the page does
+    not reload and the read at startup never sees it: the token would stay in
+    the address bar, unadopted, and the router would take `token=…` for a
+    screen name. `onToken` runs when one was taken, so the app can treat it
+    as the token change it is. */
+export function useHashRoute(onToken) {
   const [route, setRoute] = React.useState(() => parseHash(window.location.hash));
+  const onTokenRef = React.useRef(onToken);
+  onTokenRef.current = onToken;
   React.useEffect(() => {
-    const onChange = () => setRoute(parseHash(window.location.hash));
+    const take = () => {
+      if (!consumeFragmentToken()) return false;
+      if (onTokenRef.current) onTokenRef.current();
+      return true;
+    };
+    const onChange = () => {
+      take();
+      setRoute(parseHash(window.location.hash));
+    };
     window.addEventListener('hashchange', onChange);
+    // A handoff that landed between the startup read and this listener.
+    if (take()) setRoute(parseHash(window.location.hash));
     return () => window.removeEventListener('hashchange', onChange);
   }, []);
   return route;

@@ -24,10 +24,11 @@ const { RunScreen } = await import('./RunScreen.jsx');
 const { api } = await import('../lib/api.js');
 
 const OPEN = { auth: 'open', scope: 'admin', operator: true, tenant: null };
+const BOUND = { auth: 'token', scope: 'rw', operator: false, tenant: 'acme' };
 
-async function show(params = new URLSearchParams(), runId = 'weather-9') {
+async function show(params = new URLSearchParams(), runId = 'weather-9', identity = OPEN) {
   const go = vi.fn();
-  const view = render(<RunScreen runId={runId} go={go} params={params} identity={OPEN} pushToast={vi.fn()} />);
+  const view = render(<RunScreen runId={runId} go={go} params={params} identity={identity} pushToast={vi.fn()} />);
   await act(async () => { for (let i = 0; i < 4; i += 1) await Promise.resolve(); });
   return { view, go };
 }
@@ -72,6 +73,58 @@ describe('the tape', () => {
   it('asks the server to inline payloads when told to', async () => {
     await show(new URLSearchParams('resolve=true'));
     expect(api.tape).toHaveBeenCalledWith('weather-9', expect.objectContaining({ resolve: 'true' }), expect.anything());
+  });
+});
+
+describe('the tenant the tape is read in', () => {
+  it('reads a default-tenant run in the default tenant, named explicitly, on every route', async () => {
+    const { go } = await show(new URLSearchParams('tenant='));
+    // `tenant=` is the default tenant on tapes, diffs and replays; leaving it
+    // out is the operator view across every tenant.
+    expect(api.tape).toHaveBeenCalledWith('weather-9', expect.objectContaining({ tenant: '' }), expect.anything());
+    expect(api.fuseRun).toHaveBeenCalledWith('weather-9', { tenant: '' }, expect.anything());
+    expect(screen.getByText('guard: continue')).toBeTruthy();
+    await act(async () => { fireEvent.click(screen.getByText('Create replay')); });
+    expect(api.createReplay).toHaveBeenCalledWith({ run: 'weather-9', mode: 'strict', tenant: '' });
+    fireEvent.change(screen.getByLabelText('Run to compare with'), { target: { value: 'weather-7' } });
+    fireEvent.click(screen.getByText('Compare'));
+    expect(go).toHaveBeenCalledWith(['diff'], { a: 'weather-9', b: 'weather-7', tenant: '' });
+  });
+
+  it('tells an operator an unscoped tape spans every tenant, and shows no verdict for a scope it does not share', async () => {
+    const { view } = await show(new URLSearchParams());
+    expect(api.tape.mock.calls[0][1]).not.toHaveProperty('tenant');
+    expect(view.container.textContent).toMatch(/every tenant/);
+    expect(view.container.textContent).not.toContain('guard:');
+    expect(api.fuseRun).not.toHaveBeenCalled();
+  });
+
+  it('lets an operator scope an unscoped tape to the default tenant', async () => {
+    await show(new URLSearchParams());
+    const before = window.location.hash;
+    fireEvent.click(screen.getByText('Scope'));
+    expect(window.location.hash).toBe('#/run/weather-9?tenant=');
+    window.history.replaceState(null, '', before || '#');
+  });
+
+  it('shows a bound credential its verdict without naming a tenant: the server reads its own', async () => {
+    const { view } = await show(new URLSearchParams(), 'weather-9', BOUND);
+    expect(api.tape.mock.calls[0][1]).not.toHaveProperty('tenant');
+    expect(api.fuseRun).toHaveBeenCalledWith('weather-9', undefined, expect.anything());
+    expect(view.container.textContent).not.toMatch(/every tenant/);
+    expect(screen.getByText('guard: continue')).toBeTruthy();
+  });
+});
+
+describe('a step past the first page', () => {
+  it('asks for enough steps to include the step a diff linked to', async () => {
+    await show(new URLSearchParams('tenant=&step=3500'));
+    expect(api.tape).toHaveBeenCalledWith('weather-9', expect.objectContaining({ max_steps: 4000 }), expect.anything());
+  });
+
+  it('says so when the linked step is not on the tape at all', async () => {
+    await show(new URLSearchParams('tenant=&step=9'));
+    expect(screen.getByTestId('missing-step').textContent).toMatch(/step 9.*4 steps/i);
   });
 });
 

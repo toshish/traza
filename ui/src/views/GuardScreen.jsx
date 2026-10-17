@@ -18,6 +18,13 @@ import { UsageBar } from '../components/runs/UsageBar.jsx';
 // The listing is the server's memory (GET /v1/fuses/runs never rebuilds), so
 // it is cheap to poll; a run the guard is not following does not appear here
 // until something asks about it.
+//
+// The server lists most recently active first, and a stopped run takes no
+// more steps, so it sinks: past a page of busy runs it is not in the first
+// page at all. Filtering one page in the browser would therefore miss exactly
+// the runs someone needs to act on, and count them as zero. So stopped and
+// warning runs are each asked for by `state`, and the "all" view puts those
+// answers first, then the most recently active page.
 
 const STATES = [
   { id: 'all', label: 'all' },
@@ -27,6 +34,42 @@ const STATES = [
 ];
 
 const POLL_MS = 5000;
+
+/** Runs each read shows. One more is asked for, so the screen knows when
+    there are more than it shows and can say so in the count. */
+const LIST_LIMIT = 200;
+
+/** A listing cut to what is shown, and whether the server had more. */
+function page(read) {
+  const runs = read.data?.runs || [];
+  return { runs: runs.slice(0, LIST_LIMIT), more: runs.length > LIST_LIMIT };
+}
+
+const runKey = (run) => run.tenant + '\u0000' + run.run;
+
+/** What each chip lists and counts, from the three reads. `stop` and `warn`
+    are the server's own filters, complete up to the limit. `continue` has no
+    server filter, so it is the most recently active page's continuing runs,
+    and its count is marked when that page was full. `all` is stopped, then
+    warning, then the active page's other runs, each run once (the three
+    reads are separate moments, and a run can change verdict between them). */
+export function guardLists(stopped, warned, active) {
+  const seen = new Set();
+  const all = [];
+  for (const run of [...stopped.runs, ...warned.runs, ...active.runs]) {
+    const key = runKey(run);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    all.push(run);
+  }
+  const continuing = active.runs.filter((run) => run.verdict === 'continue');
+  return {
+    all: { runs: all, more: stopped.more || warned.more || active.more },
+    stop: stopped,
+    warn: warned,
+    continue: { runs: continuing, more: active.more },
+  };
+}
 
 export const VERDICT_TAG = { stop: 'error', warn: 'warn', continue: 'ok' };
 
@@ -47,31 +90,30 @@ export function GuardScreen({ go, params, pushToast, identity }) {
   const state = STATES.some((s) => s.id === params.get('state')) ? params.get('state') : 'all';
   const tenantFilter = operator ? (params.get('tenant') || '') : '';
 
-  const runs = useRead((signal) => api.fuseRuns({ limit: 200, tenant: tenantFilter || undefined }, signal), [tenantFilter]);
+  // An empty filter is every tenant (the operator view), so it is left out.
+  const list = (filter) => (signal) => api.fuseRuns({
+    state: filter, limit: LIST_LIMIT + 1, tenant: tenantFilter || undefined,
+  }, signal);
+  const stopRead = useRead(list('stop'), [tenantFilter]);
+  const warnRead = useRead(list('warn'), [tenantFilter]);
+  const activeRead = useRead(list(undefined), [tenantFilter]);
+  const reads = [stopRead, warnRead, activeRead];
   const policies = useRead((signal) => api.policies(tenantFilter ? { tenant: tenantFilter } : undefined, signal), [tenantFilter]);
-  usePoll(() => runs.reload(), POLL_MS);
+  const reload = () => reads.forEach((read) => read.reload());
+  usePoll(reload, POLL_MS);
 
   const [tripping, setTripping] = React.useState(null);
   const [resetting, setResetting] = React.useState(null);
   const [editing, setEditing] = React.useState(null);
   const [deleting, setDeleting] = React.useState(null);
 
-  const all = runs.data?.runs || [];
-  const counts = React.useMemo(() => {
-    const out = { all: all.length, stop: 0, warn: 0, continue: 0 };
-    for (const run of all) out[run.verdict] = (out[run.verdict] || 0) + 1;
-    return out;
-  }, [all]);
-  // Stopped runs first, then warnings, then the rest — each group in the
-  // server's own order, most recently active first. The runs someone may
-  // need to act on should not sit below a page of healthy ones.
-  const shown = React.useMemo(() => {
-    const rank = { stop: 0, warn: 1 };
-    const list = state === 'all' ? all : all.filter((run) => run.verdict === state);
-    return list.map((run, i) => [run, i])
-      .sort((x, y) => (rank[x[0].verdict] ?? 2) - (rank[y[0].verdict] ?? 2) || x[1] - y[1])
-      .map(([run]) => run);
-  }, [all, state]);
+  const lists = React.useMemo(
+    () => guardLists(page(stopRead), page(warnRead), page(activeRead)),
+    [stopRead.data, warnRead.data, activeRead.data], // eslint-disable-line react-hooks/exhaustive-deps
+  );
+  const shown = lists[state].runs;
+  const loaded = reads.every((read) => read.data);
+  const error = reads.map((read) => read.error).find(Boolean);
 
   // A filter is a change of focus, not a new place: replace the history
   // entry, so Back leaves the screen instead of walking through keystrokes.
@@ -82,7 +124,7 @@ export function GuardScreen({ go, params, pushToast, identity }) {
   };
 
   const afterAction = (doc, verb) => {
-    runs.reload();
+    reload();
     if (doc && doc.verdict === 'stop' && verb === 'reset') {
       pushToast({
         status: 'warn', title: 'Reset, and stopped again',
@@ -94,7 +136,7 @@ export function GuardScreen({ go, params, pushToast, identity }) {
     }
   };
 
-  if (disabledMessage(runs.error)) {
+  if (disabledMessage(error)) {
     return <EmptyState message={<span>Run fuses are off on this server. It was started with{' '}
       <code>--no-fuses</code>, so ingest does no fuse work and every <code>/v1/fuses</code> route
       answers <code>409</code>. Restart without the flag to watch runs here.</span>} />;
@@ -102,8 +144,11 @@ export function GuardScreen({ go, params, pushToast, identity }) {
 
   return <div style={{ display: 'grid', gap: 14, maxWidth: 1560 }}>
     <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
-      {STATES.map((s) => <Chip key={s.id} active={state === s.id} onClick={() => setParam('state', s.id === 'all' ? '' : s.id)}>
-        {s.label} <span style={{ fontFamily: 'var(--font-mono)', fontVariantNumeric: 'tabular-nums' }}>{counts[s.id] || 0}</span>
+      {STATES.map((s) => <Chip key={s.id} active={state === s.id} onClick={() => setParam('state', s.id === 'all' ? '' : s.id)}
+        title={lists[s.id].more ? `More than the ${LIST_LIMIT} most recently active ${s.id === 'all' ? 'runs' : s.label + ' runs'} shown` : undefined}>
+        {s.label} <span style={{ fontFamily: 'var(--font-mono)', fontVariantNumeric: 'tabular-nums' }}>
+          {loaded ? lists[s.id].runs.length + (lists[s.id].more ? '+' : '') : '…'}
+        </span>
       </Chip>)}
       {operator ? <span style={{ marginLeft: 8 }}>
         <Input size="sm" mono placeholder="tenant (all)" ariaLabel="Filter by tenant" value={tenantFilter}
@@ -114,21 +159,29 @@ export function GuardScreen({ go, params, pushToast, identity }) {
       </span>
     </div>
 
-    <LoadingBar active={runs.loading && !runs.data} />
-    {runs.error ? <ErrorState what={runs.error.what} next={runs.error.next} onRetry={runs.reload} /> : null}
+    <LoadingBar active={!loaded && !error} />
+    {error ? <ErrorState what={error.what} next={error.next} onRetry={reload} /> : null}
 
     {policies.data?.global ? <GlobalDefault global={policies.data.global} /> : null}
 
-    {runs.data && !shown.length ? <EmptyState message={state === 'all'
+    {loaded && !shown.length ? <EmptyState message={state === 'all'
       ? <span>The guard is following no runs yet. A run is followed from its first step: a model
         call, a tool call or an agent invocation, grouped by session id (or <code>trace:&lt;id&gt;</code>{' '}
         without one). Send one and it appears here.</span>
       : <span>No run is {STATES.find((s) => s.id === state).label} right now.</span>} /> : null}
 
     <div style={{ display: 'grid', gap: 10 }}>
-      {shown.map((run) => <RunCard key={run.tenant + '\u0000' + run.run} run={run} operator={operator}
+      {shown.map((run) => <RunCard key={runKey(run)} run={run} operator={operator}
         writer={writer} go={go} onTrip={() => setTripping(run)} onReset={() => setResetting(run)} />)}
     </div>
+    {loaded && lists[state].more ? <div style={{ fontSize: 12, color: 'var(--ink-muted)' }}>
+      {state === 'continue'
+        ? `Continuing runs among the ${LIST_LIMIT} most recently active; more runs are followed than that.`
+        : state === 'all'
+          ? `Stopped and warning runs first, up to ${LIST_LIMIT} of each, then the ${LIST_LIMIT} most recently active; more runs are followed than shown.`
+          : `The ${LIST_LIMIT} most recently active of more ${STATES.find((s) => s.id === state).label} runs.`}
+      {operator ? ' Filter by tenant to narrow it.' : null}
+    </div> : null}
 
     <PoliciesPanel policies={policies} operator={operator} writer={writer}
       onEdit={(policy) => setEditing(policy || {})} onDelete={(policy) => setDeleting(policy)} />
@@ -146,14 +199,14 @@ export function GuardScreen({ go, params, pushToast, identity }) {
       onSaved={(saved) => {
         setEditing(null);
         policies.reload();
-        runs.reload();
+        reload();
         pushToast({ status: 'ok', title: 'Policy saved', detail: `${saved.name} · ${saved.action}` });
       }} />
     <DeletePolicy policy={deleting} onClose={() => setDeleting(null)}
       onDeleted={(policy) => {
         setDeleting(null);
         policies.reload();
-        runs.reload();
+        reload();
         pushToast({ status: 'ok', title: 'Policy deleted', detail: policy.name });
       }} />
   </div>;

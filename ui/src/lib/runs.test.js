@@ -1,11 +1,33 @@
 import { describe, it, expect } from 'vitest';
-import { pyLiteral, replayEnv, replayPython, splitFingerprint, tapeTotals, usageBars } from './runs.js';
+import { pyLiteral, replayEnv, replayPython, routeTenant, splitFingerprint, tapeTotals, tenantParams, usageBars } from './runs.js';
 import { rulerTicks } from '../components/charts/Marks.jsx';
 import fuseRuns from '../test/fixtures/fuse_runs.json';
 import tape from '../test/fixtures/tape_weather9.json';
 import replay from '../test/fixtures/replay.json';
 
 const stopped = fuseRuns.runs.find((run) => run.verdict === 'stop');
+
+describe('tenantParams', () => {
+  it('names a known tenant, the default one as an empty value', () => {
+    expect(tenantParams('acme')).toEqual({ tenant: 'acme' });
+    // `tenant=` is the default tenant on tapes, diffs and replays; naming
+    // none there is the operator view across every tenant.
+    expect(tenantParams('')).toEqual({ tenant: '' });
+  });
+
+  it('names nothing when the tenant is unknown', () => {
+    expect(tenantParams(undefined)).toBeUndefined();
+    expect(tenantParams(null)).toBeUndefined();
+  });
+});
+
+describe('routeTenant', () => {
+  it('tells an empty tenant parameter from an absent one', () => {
+    expect(routeTenant(new URLSearchParams('tenant=acme'))).toBe('acme');
+    expect(routeTenant(new URLSearchParams('tenant='))).toBe('');
+    expect(routeTenant(new URLSearchParams('step=2'))).toBeUndefined();
+  });
+});
 
 describe('usageBars', () => {
   it('draws one bar per limit in force, against the verdict document', () => {

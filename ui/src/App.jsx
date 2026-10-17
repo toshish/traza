@@ -38,21 +38,36 @@ import { CredentialsScreen } from './views/CredentialsScreen.jsx';
     that a burst three minutes ago is not still claiming the eye. */
 const PULSE_SAMPLES = 28;
 
-/** Asks the server what the current credential is, once per token.
+/** How long to wait before asking whoami again after it failed for a reason
+    other than 401: quickly at first (a restart, a moment at the connection
+    limit), then at a pace that costs nothing. The last delay repeats. */
+const WHOAMI_RETRY_MS = [2000, 5000, 15000];
+
+/** Asks the server what the current credential is, once per token — and
+    again, with backoff, until it gets an answer.
 
     Everything tenant-aware hangs off this answer: which screens are offered,
     which surfaces are polled, what the rail says you are looking at. Until it
     arrives the identity is `null`, and nothing that depends on it runs — a
     bound token must never have asked an operator surface "just while we
     found out". The answer is also handed to the API client, which refuses
-    operator paths for a non-operator itself. */
+    operator paths for a non-operator itself.
+
+    A failure that is not a 401 (the server restarting, a 503 at the
+    connection limit, a dropped connection) says nothing about the
+    credential. It is read as "not an operator" for as long as it lasts, but
+    only that long: asking once and keeping the failure would leave an
+    operator without its screens, polling the tenant surfaces, until somebody
+    happened to change the token. */
 function useIdentity(authVersion) {
   const [identity, setState] = React.useState(null);
   React.useEffect(() => {
     let live = true;
+    let timer = null;
+    let failures = 0;
     setState(null);
     setIdentity(null);
-    api.whoami().then(
+    const ask = () => api.whoami().then(
       (who) => {
         if (!live) return;
         setIdentity(who);
@@ -66,13 +81,19 @@ function useIdentity(authVersion) {
         }
         // Unknown is treated as "not an operator": the safe reading of a
         // credential nobody has described is the one that never touches a
-        // store-global surface.
-        const unknown = { auth: 'unknown', operator: false, scope: null, tenant: null, error };
-        setIdentity(unknown);
-        setState(unknown);
+        // store-global surface. Set once, so a retry that fails again does
+        // not hand every screen a new identity to re-render for.
+        if (failures === 0) {
+          const unknown = { auth: 'unknown', operator: false, scope: null, tenant: null, error };
+          setIdentity(unknown);
+          setState(unknown);
+        }
+        timer = setTimeout(ask, WHOAMI_RETRY_MS[Math.min(failures, WHOAMI_RETRY_MS.length - 1)]);
+        failures += 1;
       },
     );
-    return () => { live = false; };
+    ask();
+    return () => { live = false; clearTimeout(timer); };
   }, [authVersion]);
   return identity;
 }
@@ -143,7 +164,9 @@ function useIngestPulse(identity, authVersion) {
 }
 
 export function App() {
-  const route = useHashRoute();
+  // A token handed off by fragment navigation is stored by the router hook
+  // before the route is parsed; from here it is a token change like any other.
+  const route = useHashRoute(() => tokenChanged());
   const [toasts, setToasts] = React.useState([]);
   const [tokenModal, setTokenModal] = React.useState(false);
   const [tokenDraft, setTokenDraft] = React.useState('');
@@ -191,12 +214,18 @@ export function App() {
   const operator = Boolean(identity && identity.operator === true);
   const pulse = useIngestPulse(identity, authVersion);
 
-  const changeToken = (token) => {
-    setToken(token);
+  // After a new token is stored: close the prompt, re-arm it, and bump the
+  // version that re-asks whoami and remounts every screen under the token.
+  function tokenChanged() {
     setTokenDraft('');
     setTokenModal(false);
     authFailed.current = false;
     setAuthVersion((v) => v + 1);
+  }
+
+  const changeToken = (token) => {
+    setToken(token);
+    tokenChanged();
   };
 
   const [head, second, third] = route.parts;

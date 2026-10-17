@@ -173,13 +173,62 @@ export function llmUsage(span) {
   };
 }
 
-function lower(value) { return typeof value === 'string' ? value.toLowerCase() : value; }
+/** ASCII-only lowercasing, as the server's `to_ascii_lowercase`: a
+    Unicode-aware `toLowerCase` would fold characters (the Kelvin sign to
+    `k`) that the server leaves alone, and call a kind recognized that it
+    does not recognize. */
+function lower(value) {
+  return typeof value === 'string' ? value.replace(/[A-Z]+/g, (upper) => upper.toLowerCase()) : value;
+}
+
+function has(attrs, key) { return Object.prototype.hasOwnProperty.call(attrs, key); }
+
+const U64_MAX = 18446744073709551615n;
+
+/** Whether the server reads `key` as a token count: any JSON number, or a
+    string that is an unsigned integer once trimmed (Rust's `u64` parse — an
+    optional `+`, digits, in range). `"1.5"` and `"-3"` are not counts there,
+    so they are not counts here. */
+function serverCount(attrs, keys) {
+  return keys.some((key) => {
+    const v = attrs[key];
+    if (typeof v === 'number') return true;
+    if (typeof v !== 'string') return false;
+    const text = v.trim();
+    return /^\+?[0-9]+$/.test(text) && BigInt(text.replace(/^\+/, '')) <= U64_MAX;
+  });
+}
+
+/** Whether src/semconv.rs `facts()` calls the span an LLM call (`is_llm`),
+    exactly: any model, provider or token count; `gen_ai.operation.name` or
+    `llm.request.type` present with any value at all (the server tests the
+    key, not the value); `traceloop.span.kind` exactly `llm` (case-sensitive
+    there, unlike the kind table); or `openinference.span.kind` equal to
+    `LLM` in any ASCII case.
+
+    Narrower than `llmUsage`'s test on purpose. That one decides whether a
+    span has figures worth SHOWING, and a cost or a stop reason is worth
+    showing; this one decides what the span IS, and the server does not make
+    a wrapper a model call for carrying a rolled-up cost. */
+export function isLlm(span) {
+  const attrs = span.attributes || {};
+  return firstStr(attrs, ['gen_ai.response.model', 'gen_ai.request.model', 'llm.model', 'llm.model_name']) != null
+    || firstStr(attrs, ['gen_ai.provider.name', 'gen_ai.system', 'llm.provider', 'llm.system']) != null
+    || serverCount(attrs, ['gen_ai.usage.input_tokens', 'gen_ai.usage.prompt_tokens', 'llm.prompt_tokens', 'llm.token_count.prompt'])
+    || serverCount(attrs, ['gen_ai.usage.output_tokens', 'gen_ai.usage.completion_tokens', 'llm.completion_tokens', 'llm.token_count.completion'])
+    || serverCount(attrs, ['llm.usage.total_tokens', 'gen_ai.usage.total_tokens', 'llm.total_tokens', 'llm.token_count.total'])
+    || has(attrs, 'gen_ai.operation.name')
+    || has(attrs, 'llm.request.type')
+    || firstStr(attrs, ['traceloop.span.kind']) === 'llm'
+    || lower(firstStr(attrs, ['openinference.span.kind'])) === 'llm';
+}
 
 /** What kind of step a span is, by the precedence of src/semconv.rs
-    `step_facts()`: `gen_ai.operation.name`, then `openinference.span.kind`,
-    then `traceloop.span.kind`, then "it looks like an LLM call", then a tool
-    name. An unrecognized value falls through to the next source. Returns
-    `llm`, `tool`, `agent`, `retrieval`, `embedding` or `other`. */
+    `step_kind`: `gen_ai.operation.name`, then `openinference.span.kind`,
+    then `traceloop.span.kind` (each compared ASCII case-insensitively), then
+    `isLlm`, then a tool name. An unrecognized value falls through to the
+    next source. Returns `llm`, `tool`, `agent`, `retrieval`, `embedding` or
+    `other`. */
 export function stepKindOf(span) {
   const attrs = span.attributes || {};
   const operation = lower(firstStr(attrs, ['gen_ai.operation.name']));
@@ -194,7 +243,7 @@ export function stepKindOf(span) {
   const traceloop = lower(firstStr(attrs, ['traceloop.span.kind']));
   const byTraceloop = { llm: 'llm', tool: 'tool', agent: 'agent', workflow: 'other', task: 'other' }[traceloop];
   if (byTraceloop) return byTraceloop;
-  if (llmUsage(span)) return 'llm';
+  if (isLlm(span)) return 'llm';
   if (firstStr(attrs, ['gen_ai.tool.name', 'tool.name'])) return 'tool';
   return 'other';
 }

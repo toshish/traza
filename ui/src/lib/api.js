@@ -90,11 +90,23 @@ export function isAbort(error) {
   return error && (error.name === 'AbortError' || error.aborted === true);
 }
 
-function authHeaders(extra) {
+function authHeaders(token, extra) {
   const headers = { ...extra };
-  const token = getToken();
   if (token) headers['Authorization'] = 'Bearer ' + token;
   return headers;
+}
+
+/** What a 401 means depends on the token it refused. Only a refusal of the
+    token in use NOW says anything about it: a request sent with an older
+    token (or with none) that comes back 401 after a new one was set is old
+    news. Blocking on it would refuse a valid token locally and open the
+    prompt over whatever the page was showing — on the open-store bootstrap,
+    over the one-time display of the credential just minted, because polls
+    sent before minting answer 401 after the tab has adopted it. */
+function refused(token) {
+  if (token !== getToken()) return;
+  blockAuth();
+  if (unauthorizedHandler) unauthorizedHandler();
 }
 
 async function request(path, { method = 'GET', body, raw = false, signal } = {}) {
@@ -109,11 +121,12 @@ async function request(path, { method = 'GET', body, raw = false, signal } = {})
   if (isOperatorPath(path) && !(identity && identity.operator === true)) {
     throw forbidden({ error: 'forbidden', required: 'unbound' });
   }
+  const token = getToken();
   let response;
   try {
     response = await fetch(apiUrl(path), {
       method,
-      headers: authHeaders(body != null ? { 'Content-Type': 'application/json' } : {}),
+      headers: authHeaders(token, body != null ? { 'Content-Type': 'application/json' } : {}),
       body: body != null ? JSON.stringify(body) : undefined,
       signal,
     });
@@ -123,8 +136,7 @@ async function request(path, { method = 'GET', body, raw = false, signal } = {})
       'Check that traza-server is running and reachable, then retry.');
   }
   if (response.status === 401) {
-    blockAuth();
-    if (unauthorizedHandler) unauthorizedHandler();
+    refused(token);
     throw unauthorized();
   }
   if (response.status === 403) {
@@ -167,24 +179,32 @@ function retryAfterText(response) {
 
 /** Builds a query string, dropping empties and expanding repeated keys.
     An array value repeats the parameter, which is how the API expresses more
-    than one predicate on the same key (`attr.k=a&attr.k=b`). */
+    than one predicate on the same key (`attr.k=a&attr.k=b`).
+
+    `tenant` is the one parameter whose empty value is sent. Across the API
+    `tenant=` names the default tenant and leaving it out is the operator
+    view across every tenant, so dropping it would turn "this default-tenant
+    run" into "every tenant's run of this id". A caller that means "every
+    tenant" passes undefined. */
 function query(params) {
   const pairs = [];
   for (const [key, value] of Object.entries(params || {})) {
-    if (value === undefined || value === null || value === '') continue;
     const list = Array.isArray(value) ? value : [value];
     for (const one of list) {
-      if (one === undefined || one === null || one === '') continue;
+      if (one === undefined || one === null) continue;
+      if (one === '' && key !== 'tenant') continue;
       pairs.push(encodeURIComponent(key) + '=' + encodeURIComponent(one));
     }
   }
   return pairs.length ? '?' + pairs.join('&') : '';
 }
 
-// In-flight GETs by URL: `{controller, subscribers, promise}`. A panel that
-// asks for a window another panel is already fetching joins that request
-// instead of opening a second one, and the request is cancelled once the last
-// subscriber has gone.
+// In-flight GETs by token and URL: `{controller, subscribers, promise}`. A
+// panel that asks for a window another panel is already fetching joins that
+// request instead of opening a second one, and the request is cancelled once
+// the last subscriber has gone. The token is part of the key because the
+// answer depends on it: a read made after a token change must not join one
+// sent with the old token and inherit its 401, or another tenant's rows.
 const inFlight = new Map();
 
 /** A coalesced GET whose underlying request is cancelled when — and only
@@ -197,12 +217,13 @@ const inFlight = new Map();
     paying for an answer nobody wants. Reference counting gets both halves —
     one subscriber leaving cancels nothing, the last one leaving cancels the
     work. */
-function read(url, signal) {
+function read(path, signal) {
+  const url = getToken() + '\u0000' + path;
   let entry = inFlight.get(url);
   if (!entry) {
     const controller = new AbortController();
     entry = { controller, subscribers: 0, promise: null };
-    entry.promise = request(url, { signal: controller.signal })
+    entry.promise = request(path, { signal: controller.signal })
       // Only ever evict THIS entry. An unconditional `delete(url)` could run
       // after an abort had already replaced the map slot with a fresh request
       // for the same URL, evicting the live one and making the next caller
@@ -274,7 +295,10 @@ export const api = {
 
   trace: (traceId, signal) => read('/v1/traces/' + encodeURIComponent(traceId), signal),
   sessions: (params, signal) => read('/v1/sessions' + query(params), signal),
-  session: (sessionId, signal) => read('/v1/sessions/' + encodeURIComponent(sessionId), signal),
+  /** One session. Session identity is `(tenant, session_id)`: `tenant`
+      names whose (empty is the default tenant); without it the operator
+      view merges every tenant's session of that id. */
+  session: (sessionId, params, signal) => read('/v1/sessions/' + encodeURIComponent(sessionId) + query(params), signal),
   llmStats: (params, signal) => read('/v1/stats/llm' + query(params), signal),
 
   /** Per-bucket volume, errors, tokens, cost and duration percentiles over a
@@ -403,12 +427,10 @@ export const api = {
       digest no longer checks.
 
       `tenant` is sent even when empty — `tenant=` names the default tenant,
-      and leaving it out asks for the whole store — so it bypasses `query()`,
-      which drops empty values. */
-  evidenceText: async ({ tenant, ...rest } = {}) => {
-    let qs = query(rest);
-    if (tenant !== undefined && tenant !== null) qs += (qs ? '&' : '?') + 'tenant=' + encodeURIComponent(tenant);
-    const response = await request('/v1/evidence' + qs, { raw: true });
+      and leaving it out asks for the whole store — as `query()` does for
+      that parameter everywhere. */
+  evidenceText: async (params = {}) => {
+    const response = await request('/v1/evidence' + query(params), { raw: true });
     return response.text();
   },
 
@@ -434,11 +456,12 @@ export const api = {
    *  thrown, for the same reason: it is the server's answer. */
   mcp: async (method, params, signal) => {
     if (isAuthBlocked()) throw unauthorized();
+    const token = getToken();
     let response;
     try {
       response = await fetch(apiUrl('/v1/mcp'), {
         method: 'POST',
-        headers: authHeaders({
+        headers: authHeaders(token, {
           'Content-Type': 'application/json',
           'MCP-Protocol-Version': MCP_PROTOCOL_VERSION,
         }),
@@ -452,8 +475,7 @@ export const api = {
     }
     if (response.status === 404) return { enabled: false };
     if (response.status === 401) {
-      blockAuth();
-      if (unauthorizedHandler) unauthorizedHandler();
+      refused(token);
       throw unauthorized();
     }
     const data = await response.json().catch(() => null);
