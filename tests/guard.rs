@@ -973,8 +973,8 @@ fn run_hook(payload: &Value, env: &[(&str, &str)]) -> (i32, String) {
     )
 }
 
-#[test]
-fn the_claude_code_hook_gates_tool_calls_on_the_run_verdict() {
+/// Whether the hook example can run here; says why not when it cannot.
+fn hook_can_run() -> bool {
     let available = |tool: &str| {
         Command::new(tool)
             .arg("--version")
@@ -985,6 +985,14 @@ fn the_claude_code_hook_gates_tool_calls_on_the_run_verdict() {
     };
     if !std::path::Path::new("/bin/sh").exists() || !available("curl") || !available("python3") {
         eprintln!("skipping: the hook needs /bin/sh, curl and python3");
+        return false;
+    }
+    true
+}
+
+#[test]
+fn the_claude_code_hook_gates_tool_calls_on_the_run_verdict() {
+    if !hook_can_run() {
         return;
     }
     let server = Server::spawn(&["--fuse-max-repeats", "3", "--fuse-action", "stop"]);
@@ -1066,4 +1074,59 @@ fn the_claude_code_hook_gates_tool_calls_on_the_run_verdict() {
         ("TRAZA_FUSE_FAIL_CLOSED", "1"),
     ];
     assert_eq!(run_hook(&pre, &closed).0, 2);
+}
+
+/// TRAZA_TENANT must name the same tenant on both halves of the hook. The
+/// gate asks about the run in that tenant, so the calls the PostToolUse half
+/// records must land there too — under the reserved `$tenant` key, since a
+/// bare `tenant` is client data. Recorded anywhere else, the tenant's policy
+/// would never see them and the hook would fail open without a word.
+#[test]
+fn the_claude_code_hook_records_into_the_tenant_it_checks() {
+    if !hook_can_run() {
+        return;
+    }
+    let server = Server::spawn(&[]);
+    let (status, policy) = server.json(
+        "POST",
+        "/v1/fuses/policies",
+        Some(&json!({"name": "claude-code", "tenant": "acme",
+                     "match": {"service": "claude-code"},
+                     "limits": {"max_repeats": 3}, "action": "stop"})),
+        &[],
+    );
+    assert_eq!(status, 200, "{policy}");
+    let url = format!("http://127.0.0.1:{}", server.port);
+    let env = [("TRAZA_URL", url.as_str()), ("TRAZA_TENANT", "acme")];
+    let pre = json!({"session_id": "cc-tenant", "hook_event_name": "PreToolUse",
+                     "tool_name": "Bash", "tool_input": {"command": "make test"}});
+    let mut post = pre.clone();
+    post["hook_event_name"] = json!("PostToolUse");
+
+    assert_eq!(run_hook(&pre, &env), (0, String::new()));
+    assert_eq!(run_hook(&post, &env).0, 0);
+    assert_eq!(run_hook(&post, &env).0, 0);
+    let (code, stderr) = run_hook(&post, &env);
+    assert_eq!(
+        code, 2,
+        "the tenant's policy stops the third identical call: {stderr}"
+    );
+    assert!(
+        stderr.contains("max_repeats 3 reached: tool:Bash#"),
+        "{stderr}"
+    );
+    let (code, stderr) = run_hook(&pre, &env);
+    assert_eq!(code, 2, "and its gate refuses the next: {stderr}");
+
+    let run = verdict(&server, "/v1/fuses/runs/cc-tenant?tenant=acme", &[]);
+    assert_eq!(
+        (run["policy"].as_str(), run["usage"]["tool_calls"].as_u64()),
+        (Some("claude-code"), Some(3)),
+        "{run}"
+    );
+    let default = verdict(&server, "/v1/fuses/runs/cc-tenant", &[]);
+    assert_eq!(
+        default["usage"]["steps"], 0,
+        "nothing leaked into the default tenant: {default}"
+    );
 }
