@@ -425,12 +425,14 @@ export class Client {
     }
     if (this.#token) headers.authorization = `Bearer ${this.#token}`;
 
-    const timeoutMs = options.timeoutMs ?? this.timeoutMs;
-    const deadline = linkSignals(options.signal, timeoutMs);
     const fetcher = this.#fetch ?? globalThis.fetch;
     if (typeof fetcher !== "function") {
       throw new TrazaError("no fetch is available; pass one as the `fetch` option");
     }
+    const timeoutMs = options.timeoutMs ?? this.timeoutMs;
+    // Armed only now, with the try below to disarm it: a timer started
+    // before a throw would hold the event loop open until it fired.
+    const deadline = linkSignals(options.signal, timeoutMs);
     try {
       let response: Response;
       try {
