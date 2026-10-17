@@ -242,7 +242,11 @@ answers `continue` and holds nothing.
 `fuses.jsonl` in the data directory holds what spans cannot reconstruct:
 policies, kill switches, resets and grants, one fsynced line each, replayed
 at startup (a torn final line from a crash is healed; damage anywhere else
-refuses startup rather than silently dropping a later kill switch). Most of
+refuses startup rather than silently dropping a later kill switch). A change
+whose append fails part-way — a full disk — is refused and its fragment cut
+back out of the file, so the next change cannot be written onto it; if even
+that cut fails, every further change is refused with `503` until a restart
+heals the torn tail. Most of
 its lines are superseded sooner or later — a policy replaced, a kill switch
 reset — so once it holds at least twice the records that reproduce the state
 (and at least 1,024 lines) it is rewritten to just those, at startup or on the
