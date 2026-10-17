@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import subprocess
 import sys
 import time
 import unittest
@@ -169,12 +170,15 @@ AUTH = None
 
 def setUpModule():
     global OPEN, AUTH
+    # Each server is handed to addModuleCleanup the moment it runs, not left
+    # to a tearDownModule: unittest skips tearDownModule when setUpModule
+    # raises, so the second server failing to start, or a seed request below
+    # being refused, would leave processes and stores behind. Module cleanups
+    # run either way.
     OPEN = Server()
-    try:
-        AUTH = Server(env={"TRAZA_TOKENS": f"admin:{ADMIN},ro@acme:{ACME_RO},rw@acme:{ACME_RW},ro@beta:{BETA_RO}"})
-    except Exception:
-        OPEN.stop()
-        raise
+    unittest.addModuleCleanup(OPEN.stop)
+    AUTH = Server(env={"TRAZA_TOKENS": f"admin:{ADMIN},ro@acme:{ACME_RO},rw@acme:{ACME_RW},ro@beta:{BETA_RO}"})
+    unittest.addModuleCleanup(AUTH.stop)
     seed = Client(OPEN.url)
     seed.request("POST", "/v1/spans", body=weather_run("weather-7", "4bf92f3577b34da6a3ce929d0e0e4736", "Paris"))
     lyon = weather_run("weather-8", "5cf92f3577b34da6a3ce929d0e0e4737", "Lyon")
@@ -183,12 +187,6 @@ def setUpModule():
     # would hash different bytes.
     lyon[1]["attributes"]["llm.cost_usd"] = 0.00001
     seed.request("POST", "/v1/spans", body=lyon)
-
-
-def tearDownModule():
-    for server in (OPEN, AUTH):
-        if server is not None:
-            server.stop()
 
 
 class IdentityAndUsage(unittest.TestCase):
@@ -781,6 +779,64 @@ class Configuration(unittest.TestCase):
         with self.assertRaises(AuthError):
             Client(AUTH.url, token=ACME_RO, tenant="").check("r1")
         self.assertIsNone(Client.from_env({"TRAZA_TENANT": ""}).tenant)
+
+
+# Runs this module's fixture in a child interpreter with one step made to
+# fail, and reports which of the servers it started outlived the failure.
+# argv: the tests directory, and which step fails.
+_FIXTURE_PROBE = """
+import json, os, sys, unittest
+sys.path.insert(0, sys.argv[1])
+import test_client
+
+failing = sys.argv[2]
+started = []
+
+class Recorded(test_client.Server):
+    def __init__(self, *args, **kwargs):
+        if failing == "second server" and kwargs.get("env"):
+            raise RuntimeError("the second server did not start")
+        super().__init__(*args, **kwargs)
+        started.append(self)
+
+test_client.Server = Recorded
+if failing == "seed":
+    # An ingest regression, as the fixture meets it: the seed batch refused.
+    test_client.weather_run = lambda *args, **kwargs: {"not": "a batch"}
+result = unittest.TestResult()
+try:
+    unittest.defaultTestLoader.loadTestsFromTestCase(test_client.Configuration).run(result)
+    print(json.dumps({
+        "errors": [str(test) for test, _ in result.errors],
+        "started": len(started),
+        "left": [s.port for s in started if s.process.poll() is None or os.path.isdir(s.data_dir)],
+    }))
+finally:
+    for server in started:
+        server.stop()
+"""
+
+
+class ModuleFixture(unittest.TestCase):
+    def test_a_failed_set_up_leaves_no_server_behind(self):
+        # unittest skips tearDownModule when setUpModule raises, so stopping
+        # the servers there would leave both processes and their stores behind
+        # whenever a seed request is refused. The fixture is run in a child
+        # interpreter because module cleanups live in one process-wide list:
+        # a nested run here would also run, and stop, this module's own.
+        for failing, servers in (("seed", 2), ("second server", 1)):
+            with self.subTest(failing):
+                child = subprocess.run(
+                    [sys.executable, "-c", _FIXTURE_PROBE, str(Path(__file__).resolve().parent), failing],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+                self.assertEqual(child.returncode, 0, child.stderr)
+                report = json.loads(child.stdout.splitlines()[-1])
+                self.assertEqual(report["errors"], ["setUpModule (test_client)"], child.stdout)
+                self.assertEqual(report["started"], servers)
+                self.assertEqual(report["left"], [], "a server outlived the failed setUpModule")
 
 
 if __name__ == "__main__":

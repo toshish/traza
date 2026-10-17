@@ -232,9 +232,12 @@ than skipping it. Answers the real server never gives — redirects, HTML
 pages, truncated bodies — come from a small canned-answer stub beside each
 suite, and the TypeScript suite also drives its own harness's failure paths
 (a server that never listens, exits first or cannot be executed), which must
-end the test process promptly rather than hang it. Both run in a few
-seconds. `./ci.sh` runs `scripts/check-sdk-metadata.py` and the Python suite
-after the demos, and the TypeScript suite when Node 20+ with npm is present.
+end the test process promptly rather than hang it. The Python suite runs its
+own module fixture in a child interpreter with a seed request refused, and
+again with the second server failing to start, and checks that no server or
+data directory outlives either. Both run in a few seconds. `./ci.sh` runs
+`scripts/check-sdk-metadata.py` and the Python suite after the demos, and the
+TypeScript suite when Node 20+ with npm is present.
 
 ## Limitations
 
