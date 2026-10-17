@@ -1246,9 +1246,10 @@ status is not compared. `404 {"error":"run not found: <run>"}` names a run
 with no spans; `400` when `a` or `b` is missing, or when reading, extracting,
 aligning, classifying and explaining the two runs does not fit the request's
 one `--query-deadline-ms` budget — the alignment compares interned signatures
-and both it and the classification check the budget as they go, so neither
-long names nor large configurations can keep a diff running past it, and a
-diff that finishes after the budget ran out is refused too.
+and checks the budget as it goes, and the classification and the explanation
+check it while they compare configurations, so neither long names nor large
+or numerous parameters can keep a diff running past it, and a diff that
+finishes after the budget ran out is refused too.
 
 ### `GET /v1/recall`
 

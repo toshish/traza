@@ -465,10 +465,13 @@ aligned pair and explaining the first divergence all spend the request's one
 [`--query-deadline-ms`](../configuration.md#server-flags) budget. The
 alignment is quadratic in steps — two 5,000-step runs that share nothing
 compare every pair — so it compares signatures as interned ids, whatever the
-length of the names inside them, and checks the budget as it goes; so does
-the classification, which compares each pair's configuration whole. A pair it
-cannot diff within the budget is refused with `400` rather than left running,
-and so is one whose diff finished after the budget ran out.
+length of the names inside them, and checks the budget as it goes; so do
+the classification, which compares each pair's configuration whole, and the
+explanation, which compares every parameter of the divergent pair to count
+how many differ — both check it while they compare, so neither many
+parameters nor one large one can keep a comparison running past it. A pair
+it cannot diff within the budget is refused with `400` rather than left
+running, and so is one whose diff finished after the budget ran out.
 
 ## Recall: has this been done before?
 

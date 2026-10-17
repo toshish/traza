@@ -28,14 +28,19 @@
 //! extraction; the alignment, which is quadratic in steps, so it compares
 //! interned signatures rather than their (producer-sized) text, and checks the
 //! clock every table row; the classification, which compares producer-sized
-//! configurations pair by pair; and the explanation. A diff that finishes
-//! past the budget is refused like one stopped at it.
+//! configurations pair by pair; and the explanation, which compares every
+//! parameter of the divergent pair to count how many differ. Configurations
+//! are compared under a meter that checks the clock as the comparison walks
+//! them — not only between pairs, which would leave one pair's comparison as
+//! long as its producer made it. A diff that finishes past the budget is
+//! refused like one stopped at it.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::time::Instant;
 
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::attribution;
 use crate::semconv::StepKind;
@@ -58,6 +63,20 @@ const DIRECT_TABLE_CELLS: usize = 1 << 16;
 
 /// Signatures interned between two deadline checks.
 const DEADLINE_CHECK_STEPS: usize = 64;
+
+/// Units of comparison work between two deadline checks, where a unit is one
+/// JSON node or one [`COMPARE_CHUNK_BYTES`] of text ([`Meter`]). A unit
+/// costs nanoseconds to a microsecond, so a check every thousand of them is
+/// invisible next to the work and overruns the budget by a fraction of a
+/// millisecond at most.
+const DEADLINE_CHECK_UNITS: usize = 1024;
+
+/// Bytes of text compared as one unit. Text is compared a chunk at a time,
+/// so a single producer-sized string cannot run on between two checks.
+const COMPARE_CHUNK_BYTES: usize = 4096;
+
+/// Differing parameters an explanation describes; the rest are counted.
+const SHOWN_DIFFERENCES: usize = 3;
 
 /// Hex characters of a digest quoted in an explanation.
 const DIGEST_PREVIEW: usize = 12;
@@ -338,11 +357,12 @@ fn assemble(
     deadline: Option<Deadline>,
 ) -> Result<Vec<Aligned>> {
     let mut aligned = Vec::with_capacity(a.len().max(b.len()));
+    let mut meter = Meter::new(deadline);
     let (mut next_a, mut next_b) = (0, 0);
     for &(pa, pb) in pairs {
         gap(a, b, next_a..pa, next_b..pb, &mut aligned, deadline)?;
         pace(&aligned, deadline)?;
-        let why = classify(&a[pa], &b[pb]);
+        let why = classify(&a[pa], &b[pb], &mut meter)?;
         aligned.push(Aligned {
             op: if why.is_some() { Op::Changed } else { Op::Same },
             a: Some(pa),
@@ -410,17 +430,118 @@ fn intern<'t>(
 }
 
 /// Why two steps with the same signature differ, or `None` when they do not.
-fn classify(a: &TapeStep, b: &TapeStep) -> Option<DivergenceKind> {
-    if a.kind == StepKind::Llm && a.detail.config != b.detail.config {
-        return Some(DivergenceKind::Config);
+/// The configurations are compared under `meter`: they are as large as their
+/// producer made them, and the pair was checked against the budget only
+/// before this began.
+fn classify(a: &TapeStep, b: &TapeStep, meter: &mut Meter) -> Result<Option<DivergenceKind>> {
+    if a.kind == StepKind::Llm && !maps_equal(&a.detail.config, &b.detail.config, meter)? {
+        return Ok(Some(DivergenceKind::Config));
     }
     if a.request_digest != b.request_digest {
-        return Some(DivergenceKind::Input);
+        return Ok(Some(DivergenceKind::Input));
     }
     if a.response_digest != b.response_digest {
-        return Some(DivergenceKind::Decision);
+        return Ok(Some(DivergenceKind::Decision));
     }
-    None
+    Ok(None)
+}
+
+/// Comparison work spent against a deadline, checked once every
+/// [`DEADLINE_CHECK_UNITS`] units however the units fall.
+///
+/// A check per aligned pair, or per configuration key, still leaves one
+/// comparison between two checks — and a comparison of two producer-sized
+/// values is as long as the producer made them. Counting the walk itself
+/// bounds every stretch between checks by the meter, not by the data.
+struct Meter {
+    deadline: Option<Deadline>,
+    since_check: usize,
+}
+
+impl Meter {
+    fn new(deadline: Option<Deadline>) -> Self {
+        Self {
+            deadline,
+            since_check: 0,
+        }
+    }
+
+    /// Counts one unit of work, checking the deadline once enough are spent.
+    fn spend(&mut self) -> Result<()> {
+        self.since_check += 1;
+        if self.since_check >= DEADLINE_CHECK_UNITS {
+            self.since_check = 0;
+            Deadline::check(self.deadline, 0)?;
+        }
+        Ok(())
+    }
+}
+
+/// `a == b`, answered exactly as `Value`'s own equality answers it, but
+/// walked under `meter`.
+fn equal(a: &Value, b: &Value, meter: &mut Meter) -> Result<bool> {
+    meter.spend()?;
+    match (a, b) {
+        (Value::String(a), Value::String(b)) => text_equal(a, b, meter),
+        (Value::Array(a), Value::Array(b)) => {
+            if a.len() != b.len() {
+                return Ok(false);
+            }
+            for (a, b) in a.iter().zip(b) {
+                if !equal(a, b, meter)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        (Value::Object(a), Value::Object(b)) => maps_equal(a, b, meter),
+        // Nulls, booleans and numbers compare in constant time, and values
+        // of two different kinds are unequal on sight.
+        _ => Ok(a == b),
+    }
+}
+
+/// `a == b` for two configurations or JSON objects, under `meter`.
+///
+/// Pairwise in key order, which is how `Map`'s own equality compares: the
+/// map is a `BTreeMap`, because nothing enables `serde_json`'s
+/// `preserve_order` (`configurations_iterate_in_key_order` fails if anything
+/// does).
+fn maps_equal(a: &Map<String, Value>, b: &Map<String, Value>, meter: &mut Meter) -> Result<bool> {
+    if a.len() != b.len() {
+        return Ok(false);
+    }
+    for ((key_a, value_a), (key_b, value_b)) in a.iter().zip(b) {
+        if !text_equal(key_a, key_b, meter)? || !equal(value_a, value_b, meter)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// `a == b` for two strings, under `meter`.
+fn text_equal(a: &str, b: &str, meter: &mut Meter) -> Result<bool> {
+    Ok(a.len() == b.len() && text_order(a, b, meter)? == Ordering::Equal)
+}
+
+/// `a.cmp(b)` for two strings — byte order, as `str` orders — compared
+/// [`COMPARE_CHUNK_BYTES`] at a time under `meter`.
+fn text_order(a: &str, b: &str, meter: &mut Meter) -> Result<Ordering> {
+    let pieces = a
+        .as_bytes()
+        .chunks(COMPARE_CHUNK_BYTES)
+        .zip(b.as_bytes().chunks(COMPARE_CHUNK_BYTES));
+    for (a, b) in pieces {
+        meter.spend()?;
+        // Unequal pieces decide it, a shorter last piece included: it is a
+        // prefix of its partner exactly when its string is a prefix of the
+        // other.
+        match a.cmp(b) {
+            Ordering::Equal => {}
+            order => return Ok(order),
+        }
+    }
+    Ok(a.len().cmp(&b.len()))
 }
 
 /// Whether two unaligned steps are one model call whose model changed.
@@ -494,8 +615,9 @@ fn gap(
 }
 
 /// The first entry that is not `same`, explained — within `deadline`, which
-/// the scan checks every [`DEADLINE_CHECK_STEPS`] entries and the
-/// explanation once more before it compares the two steps' configurations.
+/// the scan checks every [`DEADLINE_CHECK_STEPS`] entries, and the
+/// explanation once more before it begins and then throughout its comparison
+/// of the two steps' configurations.
 fn first_divergence(
     aligned: &[Aligned],
     a: &[TapeStep],
@@ -511,7 +633,8 @@ fn first_divergence(
         if entry.op != Op::Same {
             Deadline::check(deadline, 0)?;
             let kind = entry.why.unwrap_or(DivergenceKind::Structure);
-            let explanation = clip(&explain(entry, kind, a, b), MAX_EXPLANATION_CHARS);
+            let explanation = explain(entry, kind, a, b, &mut Meter::new(deadline))?;
+            let explanation = clip(&explanation, MAX_EXPLANATION_CHARS);
             return Ok(Some(FirstDivergence {
                 a: entry.a.unwrap_or(next_a),
                 b: entry.b.unwrap_or(next_b),
@@ -578,8 +701,16 @@ fn quote_json(value: &Value) -> String {
     quote(&String::from_utf8_lossy(&prefix.0))
 }
 
-fn explain(entry: &Aligned, kind: DivergenceKind, a: &[TapeStep], b: &[TapeStep]) -> String {
-    match (entry.a.map(|i| &a[i]), entry.b.map(|j| &b[j])) {
+/// The sentence for one divergent entry. Only a parameter change compares
+/// producer-sized data, and does it under `meter`.
+fn explain(
+    entry: &Aligned,
+    kind: DivergenceKind,
+    a: &[TapeStep],
+    b: &[TapeStep],
+    meter: &mut Meter,
+) -> Result<String> {
+    Ok(match (entry.a.map(|i| &a[i]), entry.b.map(|j| &b[j])) {
         (Some(left), Some(right)) => {
             let at = format!(
                 "step {} of a and step {} of b ({})",
@@ -608,7 +739,8 @@ fn explain(entry: &Aligned, kind: DivergenceKind, a: &[TapeStep], b: &[TapeStep]
                     quote(right.model.as_deref().unwrap_or("none")),
                 ),
                 DivergenceKind::Config => {
-                    let keys = config_differences(&left.detail.config, &right.detail.config);
+                    let keys =
+                        config_differences(&left.detail.config, &right.detail.config, meter)?;
                     format!("{at} ran with different parameters: {keys}")
                 }
                 DivergenceKind::Structure => format!("{at} differs in structure"),
@@ -625,36 +757,72 @@ fn explain(entry: &Aligned, kind: DivergenceKind, a: &[TapeStep], b: &[TapeStep]
             quote(&right.detail.signature)
         ),
         (None, None) => "the runs differ".to_owned(),
-    }
+    })
 }
 
-/// The configuration keys that differ, with both values, at most three.
+/// The configuration keys that differ, in key order, with both values: the
+/// first [`SHOWN_DIFFERENCES`] described and the rest counted.
+///
+/// The two configurations are walked side by side in key order (see
+/// [`maps_equal`]), every key compared under `meter`. Counting the rest
+/// still compares every one of them, but builds nothing for it — a
+/// description is quoted text, and thousands of them would be work and
+/// memory spent on sentences the explanation clips away.
 fn config_differences(
-    a: &serde_json::Map<String, Value>,
-    b: &serde_json::Map<String, Value>,
-) -> String {
-    let mut keys: Vec<&String> = a.keys().chain(b.keys()).collect();
-    keys.sort();
-    keys.dedup();
-    let differing: Vec<String> = keys
-        .into_iter()
-        .filter(|key| a.get(*key) != b.get(*key))
-        .map(|key| {
-            let show = |value: Option<&Value>| value.map_or_else(|| "unset".to_owned(), quote_json);
-            format!(
-                "{} {} in a, {} in b",
-                quote(key),
-                show(a.get(key)),
-                show(b.get(key))
-            )
-        })
-        .collect();
-    let shown = differing.len().min(3);
-    let mut text = differing[..shown].join("; ");
-    if differing.len() > shown {
-        text.push_str(&format!("; and {} more", differing.len() - shown));
+    a: &Map<String, Value>,
+    b: &Map<String, Value>,
+    meter: &mut Meter,
+) -> Result<String> {
+    let mut shown: Vec<String> = Vec::with_capacity(SHOWN_DIFFERENCES);
+    let mut more = 0usize;
+    let mut differs = |key: &str, left: Option<&Value>, right: Option<&Value>| {
+        if shown.len() == SHOWN_DIFFERENCES {
+            more += 1;
+            return;
+        }
+        let show = |value: Option<&Value>| value.map_or_else(|| "unset".to_owned(), quote_json);
+        shown.push(format!(
+            "{} {} in a, {} in b",
+            quote(key),
+            show(left),
+            show(right)
+        ));
+    };
+    let (mut left, mut right) = (a.iter().peekable(), b.iter().peekable());
+    loop {
+        // A key only one side has is a step of the walk like any other.
+        meter.spend()?;
+        let order = match (left.peek(), right.peek()) {
+            (None, None) => break,
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (Some((key_a, _)), Some((key_b, _))) => text_order(key_a, key_b, meter)?,
+        };
+        match order {
+            Ordering::Less => {
+                if let Some((key, value)) = left.next() {
+                    differs(key, Some(value), None);
+                }
+            }
+            Ordering::Greater => {
+                if let Some((key, value)) = right.next() {
+                    differs(key, None, Some(value));
+                }
+            }
+            Ordering::Equal => {
+                if let (Some((key, value_a)), Some((_, value_b))) = (left.next(), right.next()) {
+                    if !equal(value_a, value_b, meter)? {
+                        differs(key, Some(value_a), Some(value_b));
+                    }
+                }
+            }
+        }
     }
-    text
+    let mut text = shown.join("; ");
+    if more > 0 {
+        text.push_str(&format!("; and {more} more"));
+    }
+    Ok(text)
 }
 
 // ---------------------------------------------------------------- alignment
@@ -1226,6 +1394,247 @@ mod tests {
             (found.kind, found.a, found.b),
             (DivergenceKind::Config, 199, 199)
         );
+    }
+
+    /// One llm step from each of two runs, read as the differ reads them, for
+    /// a test to give configurations of its own — built in memory, because
+    /// ingesting producer-sized configurations would time the store, not the
+    /// differ.
+    fn one_step_each(store: &Store) -> (Vec<TapeStep>, Vec<TapeStep>) {
+        store
+            .ingest_batch(vec![
+                llm("one-a", "1", 10, "gpt-4o", "go", "ok"),
+                llm("one-b", "1", 10, "gpt-4o", "go", "ok"),
+            ])
+            .expect("ingests");
+        let tape = |run: &str| {
+            store
+                .run_tape(Some(""), run, MAX_DIFF_SPANS, MAX_DIFF_STEPS, None)
+                .expect("reads")
+                .steps
+        };
+        (tape("trace:one-a"), tape("trace:one-b"))
+    }
+
+    /// `length` numbers, and the same numbers with only the last one changed:
+    /// a pair that compares equal right up to its end.
+    fn nearly_equal(length: usize) -> (Value, Value) {
+        let same: Vec<Value> = (0..length).map(Value::from).collect();
+        let mut changed = same.clone();
+        changed[length - 1] = json!(-1);
+        (Value::Array(same), Value::Array(changed))
+    }
+
+    /// What `work` costs with no budget on THIS machine, in THIS build
+    /// profile — the fastest of three runs, so a stall in one cannot inflate
+    /// the yardstick a budgeted run of the same work is held against.
+    fn unbudgeted_cost<T>(mut work: impl FnMut() -> T) -> std::time::Duration {
+        (0..3)
+            .map(|_| {
+                let started = Instant::now();
+                std::hint::black_box(work());
+                started.elapsed()
+            })
+            .min()
+            .expect("three runs")
+    }
+
+    /// Runs `work` under an eighth of `unbudgeted`, three times, and requires
+    /// every run to be refused at the deadline — and the fastest well before
+    /// the whole work would have finished, which is what tells a check
+    /// INSIDE the work from one after it. The fastest of three, like the
+    /// yardstick, so one stall on a busy machine is not read as an escape.
+    fn assert_stops_inside<T: std::fmt::Debug>(
+        what: &str,
+        unbudgeted: std::time::Duration,
+        work: impl Fn(Option<Deadline>) -> Result<T>,
+    ) {
+        let budget = unbudgeted / 8;
+        let fastest = (0..3)
+            .map(|_| {
+                let started = Instant::now();
+                let outcome = work(Deadline::starting(started, Some(budget)));
+                let elapsed = started.elapsed();
+                match outcome {
+                    Err(crate::Error::DeadlineExceeded(_)) => elapsed,
+                    other => panic!(
+                        "{what} ran past its {budget:?} budget: {other:?} after {elapsed:?} \
+                         (unbudgeted {unbudgeted:?})"
+                    ),
+                }
+            })
+            .min()
+            .expect("three runs");
+        assert!(
+            fastest < unbudgeted / 2,
+            "{what} was refused only after {fastest:?} of a {budget:?} budget \
+             (unbudgeted {unbudgeted:?})"
+        );
+    }
+
+    #[test]
+    fn explaining_a_config_change_stops_at_the_deadline_however_many_parameters() {
+        // Many parameters whose values agree right up to their last element.
+        // Telling the configurations apart is instant — b has one more key —
+        // so classification is cheap and the pair is checked against the
+        // budget before it is explained; describing HOW they differ compares
+        // every value whole. That walk is producer-sized and has to check
+        // the clock as it goes, not leave it to whoever looks next.
+        const PARAMETERS: usize = 400;
+        const LENGTH: usize = 2_000;
+        let fixture = TempStore::open("diff-explain-budget", crate::Config::default());
+        let (mut a, mut b) = one_step_each(fixture.store());
+        for index in 0..PARAMETERS {
+            let key = format!("gen_ai.request.p{index:04}");
+            let (same, changed) = nearly_equal(LENGTH);
+            a[0].detail.config.insert(key.clone(), same);
+            b[0].detail.config.insert(key, changed);
+        }
+        b[0].detail
+            .config
+            .insert("gen_ai.request.zz".into(), json!(1));
+        let aligned = assemble(&a, &b, &[(0, 0)], None).expect("no deadline to miss");
+        assert_eq!(aligned[0].why, Some(DivergenceKind::Config));
+
+        let unbudgeted = unbudgeted_cost(|| {
+            first_divergence(&aligned, &a, &b, None)
+                .expect("no deadline to miss")
+                .expect("the runs part")
+        });
+        assert_stops_inside("the explanation", unbudgeted, |deadline| {
+            first_divergence(&aligned, &a, &b, deadline)
+        });
+    }
+
+    #[test]
+    fn classifying_a_pair_stops_at_the_deadline_however_large_its_configuration() {
+        // One parameter whose two values agree right up to their last
+        // element: the pair is checked against the budget before it is
+        // classified, and comparing its configurations is then one walk
+        // over the whole value — which has to check the clock as it goes.
+        const LENGTH: usize = 800_000;
+        let fixture = TempStore::open("diff-classify-budget", crate::Config::default());
+        let (mut a, mut b) = one_step_each(fixture.store());
+        let (same, changed) = nearly_equal(LENGTH);
+        let key = "gen_ai.request.response_format".to_owned();
+        a[0].detail.config.insert(key.clone(), same);
+        b[0].detail.config.insert(key, changed);
+
+        let unbudgeted = unbudgeted_cost(|| {
+            let aligned = assemble(&a, &b, &[(0, 0)], None).expect("no deadline to miss");
+            assert_eq!(aligned[0].why, Some(DivergenceKind::Config));
+        });
+        assert_stops_inside("classifying the pair", unbudgeted, |deadline| {
+            assemble(&a, &b, &[(0, 0)], deadline)
+        });
+    }
+
+    #[test]
+    fn metered_equality_answers_as_value_equality_does() {
+        let long = "x".repeat(3 * COMPARE_CHUNK_BYTES + 7);
+        let mut long_changed = long.clone();
+        long_changed.push('y');
+        long_changed.remove(0);
+        let values = [
+            json!(null),
+            json!(false),
+            json!(true),
+            json!(0),
+            json!(0.0),
+            json!(-1),
+            json!(u64::MAX),
+            json!(""),
+            json!("a"),
+            json!(long),
+            json!(long_changed),
+            json!([]),
+            json!([1, 2]),
+            json!([1, 2, 3]),
+            json!([2, 1]),
+            json!({}),
+            json!({"a": 1}),
+            json!({"a": 2}),
+            json!({"b": 1}),
+            json!({"a": 1, "b": [1, {"c": null}]}),
+            json!({"a": 1, "b": [1, {"c": false}]}),
+        ];
+        for left in &values {
+            for right in &values {
+                let metered = equal(left, right, &mut Meter::new(None)).expect("no deadline");
+                assert_eq!(metered, left == right, "{left} vs {right}");
+            }
+        }
+        // Keys are walked in order by the same chunked comparison.
+        let mut prefix = long.clone();
+        prefix.truncate(2 * COMPARE_CHUNK_BYTES);
+        let texts = ["", "a", "ab", "b", &long, &long_changed, &prefix];
+        for left in texts {
+            for right in texts {
+                let metered = text_order(left, right, &mut Meter::new(None)).expect("no deadline");
+                assert_eq!(
+                    metered,
+                    left.cmp(right),
+                    "{} vs {}",
+                    left.len(),
+                    right.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_config_explanation_describes_three_differences_and_counts_the_rest() {
+        let config = |pairs: &[(&str, Value)]| -> Map<String, Value> {
+            pairs
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), value.clone()))
+                .collect()
+        };
+        let a = config(&[
+            ("a", json!(1)),
+            ("b", json!(1)),
+            ("c", json!(1)),
+            ("same", json!([1, 2])),
+            ("x", json!(1)),
+            ("y", json!(1)),
+        ]);
+        let b = config(&[
+            ("b", json!(2)),
+            ("c", json!(2)),
+            ("d", json!(2)),
+            ("same", json!([1, 2])),
+            ("x", json!(2)),
+            ("z", json!(2)),
+        ]);
+        // Seven keys differ — one only in a, one only in b, the rest by
+        // value — and `same` does not. The first three in key order are
+        // described, each side's value or `unset`; the other four counted.
+        let text = config_differences(&a, &b, &mut Meter::new(None)).expect("no deadline");
+        assert_eq!(
+            text,
+            "a 1 in a, unset in b; b 1 in a, 2 in b; c 1 in a, 2 in b; and 4 more"
+        );
+        let few = config_differences(&a, &config(&[("a", json!(1))]), &mut Meter::new(None))
+            .expect("no deadline");
+        assert!(few.starts_with("b 1 in a, unset in b; "), "{few}");
+        assert!(few.ends_with("; and 2 more"), "{few}");
+        assert_eq!(
+            config_differences(&a, &a, &mut Meter::new(None)).expect("no deadline"),
+            ""
+        );
+    }
+
+    #[test]
+    fn configurations_iterate_in_key_order() {
+        // `maps_equal` compares configurations pair by pair and
+        // `config_differences` walks two side by side, both in key order —
+        // serde_json's default `BTreeMap`. Its `preserve_order` feature
+        // would make `Map` an insertion-ordered `IndexMap`, and both would
+        // answer wrongly without anything else failing.
+        let mut map = Map::new();
+        map.insert("b".to_owned(), json!(1));
+        map.insert("a".to_owned(), json!(2));
+        assert_eq!(map.keys().collect::<Vec<_>>(), ["a", "b"]);
     }
 
     #[test]
