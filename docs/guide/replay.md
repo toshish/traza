@@ -585,7 +585,10 @@ telemetry choose which recording its next run is fed. See the
   questions. Calls to one replay take turns, each from reading the next step
   to consuming it, so every served answer is rendered once: a call waits
   while an earlier call to the same replay renders, and calls to other
-  replays do not wait.
+  replays do not wait. Waiting does not stretch the replay's hour: a call
+  whose turn comes after the replay expired is refused `404` without being
+  rendered, and an answer that finishes rendering after it is dropped
+  unserved, so no step is consumed past `expires_at_ns`.
 - **The registry is bounded, per tenant first.** One tenant's data — or the
   operator view, which counts as a share of its own — may be held by at most
   64 live replays and 64 MiB of memory; the registry as a whole holds at most

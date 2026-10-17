@@ -1156,7 +1156,7 @@ messages are compared — not the model or other parameters.
 |---|---|
 | `200` | The next recorded answer; the step is consumed |
 | `400 {"error":{"type":"invalid_request_error",…}}` | The body is not a JSON object with a `messages` array; or a path other than `chat/completions` under the base URL |
-| `404 {"error":{"type":"not_found_error",…}}` | Unknown, expired or foreign replay |
+| `404 {"error":{"type":"not_found_error",…}}` | Unknown, expired or foreign replay — including one that expired while the call waited for an earlier call to the same replay to render, or while its own answer rendered; nothing is consumed |
 | `409 {"error":{"type":"replay_divergence","message","step","expected_digest","got_digest"}}` | Strict mode: the messages do not match recorded step `step`. The step is **not** consumed. Carries `x-should-retry: false` |
 | `409 {"error":{"type":"response_too_large","message","step","limit"}}` | The next recorded answer would render past 64 MiB in the asked-for shape — a stream can be many times its recording. The step is **not** consumed; the same step unstreamed may fit. Carries `x-should-retry: false` |
 | `410 {"error":{"type":"replay_exhausted","message","served"}}` | Every recorded model step has been served. Carries `x-should-retry: false` |

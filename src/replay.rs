@@ -72,6 +72,11 @@
 //! run too large for a share is refused before it is all in memory. Each
 //! replay lives [`REPLAY_TTL`] from creation, in memory only: a restart
 //! forgets every replay, and creating one again is a read of the store.
+//! Nothing is consumed past that expiry. A call is judged by the time it
+//! reaches the replay, not the time its request arrived — once more when its
+//! turn comes and again when it commits — so a call that waited past the
+//! expiry is refused without rendering, and a rendering that finishes past
+//! it is dropped unserved.
 //!
 //! A served answer is bounded too: no rendered response exceeds
 //! [`MAX_RESPONSE_BYTES`], and the identifiers a stream repeats in every
@@ -710,10 +715,38 @@ impl Replay {
     }
 }
 
+/// Monotonic time as a registry reads it: real elapsed time in service, a
+/// hand-moved reading in tests — so a test can hold a call across a replay's
+/// expiry without sleeping through a TTL.
+type Clock = Arc<dyn Fn() -> Duration + Send + Sync>;
+
+/// The registry's clock in service: time elapsed since the registry was made.
+fn monotonic() -> Clock {
+    let origin = Instant::now();
+    Arc::new(move || origin.elapsed())
+}
+
+/// A registry call's place in time: the Unix time its caller handed it — when
+/// the request arrived — and the registry clock's reading then.
+///
+/// A call can wait after it arrives: for the registry's lock, and in
+/// [`Registry::next_llm`] for its replay's turn while an earlier call renders.
+/// Expiry judged by the arrival time alone would let a call that queued just
+/// before a replay expired consume it after, and every call queued behind it
+/// after that. So each check reads the time afresh ([`Registry::now`]): the
+/// arrival advanced by the monotonic time the call has spent, which a wall
+/// clock stepped backwards cannot turn back.
+#[derive(Clone, Copy)]
+struct CallTime {
+    arrived_ns: u64,
+    began: Duration,
+}
+
 /// The in-memory registry of live replays.
 pub struct Registry {
     replays: Mutex<HashMap<String, Replay>>,
     limits: Limits,
+    clock: Clock,
 }
 
 impl Default for Registry {
@@ -726,7 +759,13 @@ impl Registry {
     /// A registry with explicit bounds; [`Registry::default`] uses the
     /// documented ones. Every bound is at least one.
     pub fn new(limits: Limits) -> Self {
+        Self::with_clock(limits, monotonic())
+    }
+
+    /// [`Self::new`], reading time from `clock`.
+    fn with_clock(limits: Limits, clock: Clock) -> Self {
         Self {
+            clock,
             replays: Mutex::new(HashMap::new()),
             limits: Limits {
                 max_live: limits.max_live.max(1),
@@ -747,6 +786,30 @@ impl Registry {
         self.replays
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// A call that arrived at `now_ns`, starting its clock.
+    fn arrived(&self, now_ns: u64) -> CallTime {
+        CallTime {
+            arrived_ns: now_ns,
+            began: (self.clock)(),
+        }
+    }
+
+    /// The Unix time `call` has reached: its arrival, advanced by the time it
+    /// has spent since.
+    fn now(&self, call: CallTime) -> u64 {
+        let spent = (self.clock)().saturating_sub(call.began);
+        call.arrived_ns
+            .saturating_add(u64::try_from(spent.as_nanos()).unwrap_or(u64::MAX))
+    }
+
+    /// The registry's lock, and the time `call` is judged at while holding
+    /// it — read once the lock is held, so a wait for it counts.
+    fn lock_at(&self, call: CallTime) -> (std::sync::MutexGuard<'_, HashMap<String, Replay>>, u64) {
+        let replays = self.lock();
+        let now_ns = self.now(call);
+        (replays, now_ns)
     }
 
     /// Snapshots `run_id`'s tape under `tenant` and registers a replay of it.
@@ -772,11 +835,12 @@ impl Registry {
         tape_max_bytes: usize,
         now_ns: u64,
     ) -> Result<Created, ReplayError> {
+        let call = self.arrived(now_ns);
         // Cheap refusal first: a full share should not cost a store read.
         {
-            let mut replays = self.lock();
-            self.purge(&mut replays, now_ns);
-            self.ensure_room(&replays, tenant, 0, now_ns)?;
+            let (mut replays, at_ns) = self.lock_at(call);
+            self.purge(&mut replays, at_ns);
+            self.ensure_room(&replays, tenant, 0, at_ns)?;
         }
         // The epoch BEFORE the read: an erasure at or below it was already
         // masking what the read saw; anything newer is checked on every call.
@@ -802,9 +866,12 @@ impl Registry {
         };
         let snapshot = snapshot(store, tenant, deadline, read.steps, mode, budget)?;
 
-        let mut replays = self.lock();
-        self.purge(&mut replays, now_ns);
-        self.ensure_room(&replays, tenant, snapshot.bytes, now_ns)?;
+        // Room judged at the time the snapshot is done, which may be a whole
+        // query budget after the request arrived; the replay's lifetime still
+        // counts from its arrival, the time its creation response states.
+        let (mut replays, at_ns) = self.lock_at(call);
+        self.purge(&mut replays, at_ns);
+        self.ensure_room(&replays, tenant, snapshot.bytes, at_ns)?;
         let id = new_id();
         let ttl_ns = self.limits.ttl.as_nanos().min(u128::from(u64::MAX)) as u64;
         let replay = Replay {
@@ -1010,6 +1077,13 @@ impl Registry {
     /// registry's lock, so a large answer holds up calls to its own replay
     /// only, never every other replay. An erasure recorded while a step
     /// renders is caught at the commit, which drops the rendering unserved.
+    ///
+    /// Expiry is judged afresh at every check — when the call arrives, when
+    /// its turn comes and at the commit — by `now_ns` advanced by the time
+    /// the call has spent. A call whose turn comes after the replay expired
+    /// is refused ([`ReplayError::NotFound`]) without rendering, and a
+    /// rendering that finishes after it is dropped unserved: no step is
+    /// consumed past the expiry the creation response stated.
     pub fn next_llm<R>(
         &self,
         store: &Store,
@@ -1019,9 +1093,10 @@ impl Registry {
         now_ns: u64,
         render: impl Fn(&ServedStep) -> Result<R, ReplayError>,
     ) -> Result<R, ReplayError> {
+        let call = self.arrived(now_ns);
         let serving = {
             let latest_erasure = store.erasures.latest_id()?;
-            let mut replays = self.lock();
+            let (mut replays, now_ns) = self.lock_at(call);
             let replay = self.live(&mut replays, store, latest_erasure, id, binding, now_ns)?;
             Arc::clone(&replay.serving)
         };
@@ -1032,9 +1107,10 @@ impl Registry {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let (served, cursor, matched) = {
             // Checked afresh: the replay may have been withdrawn, or have
-            // expired, while this call waited for its turn.
+            // expired, while this call waited for its turn — and expiry is
+            // judged at the time the turn came, not the time the call arrived.
             let latest_erasure = store.erasures.latest_id()?;
-            let mut replays = self.lock();
+            let (mut replays, now_ns) = self.lock_at(call);
             let replay = self.live(&mut replays, store, latest_erasure, id, binding, now_ns)?;
             let cursor = replay.served;
             let Some(step) = replay.llm.get(cursor).cloned() else {
@@ -1070,9 +1146,10 @@ impl Registry {
         };
         let rendered = render(&served)?;
         // An erasure recorded while the step rendered withdraws the replay
-        // here, and the rendering is dropped unserved.
+        // here, and an expiry passed while it rendered drops it; either way
+        // the rendering is dropped unserved.
         let latest_erasure = store.erasures.latest_id()?;
-        let mut replays = self.lock();
+        let (mut replays, now_ns) = self.lock_at(call);
         let replay = self.live(&mut replays, store, latest_erasure, id, binding, now_ns)?;
         debug_assert_eq!(
             replay.served, cursor,
@@ -1097,8 +1174,9 @@ impl Registry {
         tool: Option<&str>,
         now_ns: u64,
     ) -> Result<ServedTool, ReplayError> {
+        let call = self.arrived(now_ns);
         let latest_erasure = store.erasures.latest_id()?;
-        let mut replays = self.lock();
+        let (mut replays, now_ns) = self.lock_at(call);
         let replay = self.live(&mut replays, store, latest_erasure, id, binding, now_ns)?;
         let next = replay.tools.iter_mut().find(|candidate| {
             !candidate.served && tool.map_or(true, |name| candidate.tool.as_deref() == Some(name))
@@ -1132,8 +1210,9 @@ impl Registry {
         binding: Option<&str>,
         now_ns: u64,
     ) -> Result<Value, ReplayError> {
+        let call = self.arrived(now_ns);
         let latest_erasure = store.erasures.latest_id()?;
-        let mut replays = self.lock();
+        let (mut replays, now_ns) = self.lock_at(call);
         let replay = self.live(&mut replays, store, latest_erasure, id, binding, now_ns)?;
         let calls: Vec<Value> = replay
             .calls
@@ -4175,5 +4254,129 @@ mod tests {
             matches!(outcome, Err(ReplayError::Erased { .. })),
             "{outcome:?}"
         );
+    }
+
+    #[test]
+    fn a_call_that_waits_past_the_expiry_is_refused_without_rendering() {
+        // Call A renders while call B waits for the replay's turn. Both
+        // arrived a second before the replay expires, and A's rendering runs
+        // on past the expiry. Expiry is judged when a call reaches the
+        // replay, not when its request arrived, so B is refused when its
+        // turn comes, rendering nothing and consuming nothing. Two cases,
+        // because each check has to hold on its own:
+        // - A's rendering fails: A never commits, so nothing but B's own
+        //   check once its turn comes stands between B and the replay.
+        // - A's rendering succeeds: its commit, judged after the expiry,
+        //   drops it unserved — which also drops the replay before B's turn.
+        let fixture = TempStore::open("replay-queued-expiry", crate::Config::default());
+        let store = fixture.store();
+        store
+            .ingest_batch(
+                (0..2)
+                    .map(|index| {
+                        span(
+                            "t-exp",
+                            &format!("llm-{index}"),
+                            1 + index,
+                            json!({"gen_ai.operation.name": "chat",
+                                   "gen_ai.prompt.0.content": format!("q{index}"),
+                                   "gen_ai.completion.0.content": format!("a{index}")}),
+                        )
+                    })
+                    .collect(),
+            )
+            .expect("ingests");
+        let ttl = Duration::from_secs(10);
+        let arrival = NOW + ttl.as_nanos() as u64 - 1_000_000_000;
+        let wait_for = |what: &str, ready: &dyn Fn() -> bool| {
+            let started = Instant::now();
+            while !ready() {
+                assert!(started.elapsed() < Duration::from_secs(10), "{what}");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        for first_renders in [false, true] {
+            let elapsed = Arc::new(AtomicU64::new(0));
+            let clock: Clock = {
+                let elapsed = Arc::clone(&elapsed);
+                Arc::new(move || Duration::from_nanos(elapsed.load(Ordering::SeqCst)))
+            };
+            let registry = Registry::with_clock(
+                Limits {
+                    ttl,
+                    ..Limits::default()
+                },
+                clock,
+            );
+            let id = registry
+                .create(store, Some(""), "trace:t-exp", Mode::Loose, 1 << 20, NOW)
+                .expect("creates")
+                .id;
+            // Handles on the replay's turn: the registry's own, plus one per
+            // call that has passed its arrival check and is taking or
+            // awaiting it.
+            let turn_handles = || {
+                registry
+                    .lock()
+                    .get(&id)
+                    .map_or(0, |replay| Arc::strong_count(&replay.serving))
+            };
+            let rendering = std::sync::atomic::AtomicBool::new(false);
+            let queued_renders = AtomicU64::new(0);
+            let (first, queued) = std::thread::scope(|scope| {
+                let first = scope.spawn(|| {
+                    registry.next_llm(store, &id, Some(""), None, arrival, |step: &ServedStep| {
+                        rendering.store(true, Ordering::SeqCst);
+                        wait_for("the second call never queued", &|| turn_handles() == 3);
+                        // The rendering outlasts the replay, by a second.
+                        elapsed.fetch_add(2_000_000_000, Ordering::SeqCst);
+                        match first_renders {
+                            true => Ok(step.step),
+                            false => Err(ReplayError::Invalid("refused".to_owned())),
+                        }
+                    })
+                });
+                wait_for("the first call never rendered", &|| {
+                    rendering.load(Ordering::SeqCst)
+                });
+                let queued = scope.spawn(|| {
+                    registry.next_llm(store, &id, Some(""), None, arrival, |step: &ServedStep| {
+                        queued_renders.fetch_add(1, Ordering::SeqCst);
+                        Ok(step.step)
+                    })
+                });
+                (first.join().expect("joins"), queued.join().expect("joins"))
+            });
+            let case = match first_renders {
+                true => "after a rendering that finished",
+                false => "after a rendering that failed",
+            };
+            assert!(
+                matches!(queued, Err(ReplayError::NotFound)),
+                "{case}: the queued call was served after the expiry: {queued:?}"
+            );
+            assert_eq!(
+                queued_renders.load(Ordering::SeqCst),
+                0,
+                "{case}: the queued call rendered a step of an expired replay"
+            );
+            match first_renders {
+                true => assert!(
+                    matches!(first, Err(ReplayError::NotFound)),
+                    "a rendering finished after the expiry was served: {first:?}"
+                ),
+                false => assert!(matches!(first, Err(ReplayError::Invalid(_))), "{first:?}"),
+            }
+            // The expired replay is gone, even asked about at the arrival
+            // time — not held with its cursor moved on, as it would be had
+            // either call been served.
+            assert!(
+                matches!(
+                    registry.status(store, &id, Some(""), arrival),
+                    Err(ReplayError::NotFound)
+                ),
+                "{case}: the expired replay is still held"
+            );
+        }
     }
 }
