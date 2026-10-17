@@ -121,14 +121,16 @@ export function SessionScreen({ sessionId, go }) {
         {fmtWindow(data.first_start_ns, data.last_end_ns)}
         {data.session_attribute && data.session_attribute !== 'session.id' ? ` · via ${data.session_attribute}` : ''}
       </span>
-      <span style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
+      <span style={{ marginLeft: 'auto', display: 'flex', flexWrap: 'wrap', gap: 6 }}>
         <Chip onClick={() => navigator.clipboard?.writeText(sessionId)}>copy id</Chip>
+        <Chip onClick={() => go(['run', sessionId], data.tenant ? { tenant: data.tenant } : undefined)}
+          title="The session as a run: its steps in order, a replay, a diff">Run</Chip>
         <Chip onClick={() => go(['conversation', 'sessions', sessionId])}>Conversation</Chip>
         <Chip onClick={() => go(['traces'], { q: `session|=|${sessionId}` })}>Search its spans</Chip>
       </span>
     </div>
 
-    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(7,1fr)', gap: 12 }}>
+    <div className="tz-reflow" style={{ display: 'grid', gridTemplateColumns: 'repeat(7,1fr)', gap: 12 }}>
       {[
         ['turns', fmtNum(data.trace_count)],
         ['spans', fmtNum(data.span_count)],

@@ -24,8 +24,8 @@ export function Eyebrow({ children, style }) {
 
 /** A panel header: eyebrow on the left, optional note, optional action right. */
 export function PanelHead({ title, note, action, style }) {
-  return <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, marginBottom: 10, ...style }}>
-    <Eyebrow>{title}</Eyebrow>
+  return <div style={{ display: 'flex', alignItems: 'baseline', flexWrap: 'wrap', gap: '4px 10px', marginBottom: 10, ...style }}>
+    <Eyebrow style={{ whiteSpace: 'nowrap' }}>{title}</Eyebrow>
     {note ? <span style={{ fontSize: 12, color: 'var(--ink-faint)' }}>{note}</span> : null}
     {action ? <span style={{ marginLeft: 'auto' }}>{action}</span> : null}
   </div>;

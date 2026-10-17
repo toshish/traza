@@ -78,7 +78,7 @@ export function AnalyticsScreen({ go }) {
     <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
       <Eyebrow style={{ fontSize: 11 }}>group by</Eyebrow>
       {GROUPS.map((group) => <Chip key={group} active={groupBy === group} onClick={() => setGroupBy(group)}>{group}</Chip>)}
-      <span style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
+      <span style={{ marginLeft: 'auto', display: 'flex', flexWrap: 'wrap', gap: 6 }}>
         {RANGES.map((r) => <Chip key={r.id} mono active={range === r.id} onClick={() => setRange(r.id)}>{r.label}</Chip>)}
       </span>
     </div>

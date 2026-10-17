@@ -1,5 +1,6 @@
 import React from 'react';
 import { api } from '../lib/api.js';
+import { publicBase } from '../lib/base.js';
 import { useRead } from '../lib/route.js';
 import { fromHash, toCurl, toParams, describe } from '../lib/query.js';
 import { fmtBytes, fmtNum } from '../lib/format.js';
@@ -26,7 +27,8 @@ export function StoreScreen({ params, pushToast }) {
     const parsed = fromHash(params);
     return params.get('q') || params.get('t') ? parsed : { ...parsed, range: 'all' };
   }, [params]);
-  const origin = typeof window !== 'undefined' ? window.location.origin : '';
+  // Origin plus any path prefix, so the curl is right behind a proxy.
+  const origin = publicBase();
 
   const data = stats.data;
   const bounded = /^[1-9]\d*$/.test(limit.trim());
@@ -81,7 +83,7 @@ export function StoreScreen({ params, pushToast }) {
         </div>
       </Card>
 
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(6,1fr)', gap: 12 }}>
+      <div className="tz-reflow" style={{ display: 'grid', gridTemplateColumns: 'repeat(6,1fr)', gap: 12 }}>
         {[
           ['records', fmtNum(data.record_count)],
           ['segments', fmtNum(data.segment_count)],

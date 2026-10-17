@@ -1,5 +1,6 @@
 import React from 'react';
 import { api } from '../lib/api.js';
+import { publicBase } from '../lib/base.js';
 import { useRead, useKeys } from '../lib/route.js';
 import { RANGES, windowOf } from '../lib/query.js';
 import { fmtAgo, fmtNum, fmtPercent } from '../lib/format.js';
@@ -115,7 +116,7 @@ export function ScoresScreen({ go }) {
     {scores.error ? <ErrorState what={scores.error.what} next={scores.error.next} onRetry={scores.reload} /> : null}
     {scores.data && !annotations.length ? <EmptyState
       message="No annotations in this window. Record one from any trace, or post them from an eval run:"
-      command={`curl -X POST ${window.location?.origin || 'http://localhost:8080'}/v1/annotations \\
+      command={`curl -X POST ${publicBase()}/v1/annotations \\
   -H 'Content-Type: application/json' \\
   -d '{"trace_id":"…","name":"groundedness","value":0.9,"source":"eval:nightly"}'`} /> : null}
 

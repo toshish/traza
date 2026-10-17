@@ -3,7 +3,7 @@ import { api } from '../lib/api.js';
 import { useRead, usePoll } from '../lib/route.js';
 import { RANGES, windowOf } from '../lib/query.js';
 import {
-  durabilityMeans, fmtCompact, fmtCost, fmtCostProvenance, fmtDelta, fmtDurationNs, fmtNum,
+  durabilityMeans, fmtBytes, fmtCompact, fmtCost, fmtCostProvenance, fmtDelta, fmtDurationNs, fmtNum,
   fmtPercent, fmtAgo, fmtClockNs, fmtWindowLabel,
 } from '../lib/format.js';
 import { Card, Chip, Eyebrow, ErrorState, LiveDot, LoadingBar, Skeleton } from '../components/primitives/Chrome.jsx';
@@ -67,7 +67,8 @@ const M = ({ children, color }) => <span style={{ fontFamily: 'var(--font-mono)'
 /** How often a screen labelled "live" actually re-reads. */
 const REFRESH_MS = 15000;
 
-export function OverviewScreen({ go }) {
+export function OverviewScreen({ go, identity }) {
+  const operator = Boolean(identity && identity.operator);
   const [range, setRange] = React.useState('24h');
   // The screen says "live", so it has to be. The window was resolved once at
   // mount and never again: every figure, spark and lead card was frozen at the
@@ -152,7 +153,12 @@ export function OverviewScreen({ go }) {
   // These two are window-independent, but they are still on a screen labelled
   // live, so they follow the tick like everything else.
   const sessions = useRead((signal) => api.sessions({ limit: 5 }, signal), [tick]);
-  const metrics = useRead((signal) => api.metrics(signal), [tick]);
+  // The server card reads /v1/metrics.json, a store-global operator surface:
+  // a tenant-bound credential sees its own usage against its limits instead,
+  // and the operator read is not made at all until the identity says it may
+  // be.
+  const metrics = useRead((signal) => api.metrics(signal), [tick], { skip: !operator });
+  const usage = useRead((signal) => api.usage(undefined, signal), [tick], { skip: !identity || operator });
 
   const buckets = series.data?.buckets || [];
   const half = Math.floor(buckets.length / 2);
@@ -193,7 +199,7 @@ export function OverviewScreen({ go }) {
   // range change the series could finish first and paint new volume beside the
   // previous range's p95 with no loading bar, and a failed histogram silently
   // became an em dash.
-  const reads = [series, failures, models, durationNow, durationBefore, sessions, metrics];
+  const reads = [series, failures, models, durationNow, durationBefore, sessions, metrics, usage];
   const loading = reads.some((read) => read.loading);
   const error = reads.map((read) => read.error).find(Boolean);
   const reload = () => reads.forEach((read) => read.reload());
@@ -214,7 +220,7 @@ export function OverviewScreen({ go }) {
     <LoadingBar active={loading} />
     {error ? <ErrorState what={error.what} next={error.next} onRetry={reload} /> : null}
 
-    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5,1fr)', gap: 12 }}>
+    <div className="tz-reflow" style={{ display: 'grid', gridTemplateColumns: 'repeat(5,1fr)', gap: 12 }}>
       <Tile label="spans" value={fmtCompact(spans)}
         delta={fmtDelta(spans, sum(before, 'spans'))}
         spark={now.map((b) => b.spans)} />
@@ -243,7 +249,7 @@ export function OverviewScreen({ go }) {
           ranked by how much they moved against the previous {RANGES.find((r) => r.id === range)?.label}
         </span>
       </div>
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 12 }}>
+      <div className="tz-reflow-1" style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 12 }}>
         <Lead tone="var(--warn)" kind="latency" delta={fmtDelta(p95, p95Before) || '—'}
           onClick={() => go(['latency'])}
           chart={<div style={{ position: 'relative', height: 38, background: 'var(--bg-sunken)', borderRadius: 3, overflow: 'hidden' }}>
@@ -295,8 +301,8 @@ export function OverviewScreen({ go }) {
       </div>
     </div>
 
-    <div style={{ display: 'grid', gridTemplateColumns: '1.15fr 1fr', gap: 12 }}>
-      <Card>
+    <div className="tz-reflow-1" style={{ display: 'grid', gridTemplateColumns: '1.15fr 1fr', gap: 12 }}>
+      {operator ? <Card>
         <div style={{ display: 'flex', alignItems: 'baseline', marginBottom: 10 }}>
           <Eyebrow>Server, in its own words</Eyebrow>
           <span onClick={() => go(['server'])} role="link" tabIndex={0}
@@ -310,7 +316,7 @@ export function OverviewScreen({ go }) {
             <M color="var(--accent)">{fmtNum(metrics.data.ingest.spans_admitted)}</M> spans. Durability is{' '}
             <M>{metrics.data.durability || '—'}</M> — {durabilityMeans(metrics.data.durability)}.
           </div>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 10 }}>
+          <div className="tz-reflow" style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 10 }}>
             {[
               ['search p95', fmtDurationNs(metrics.data.by_class.search.p95_ns)],
               ['lookup p95', fmtDurationNs(metrics.data.by_class.lookup.p95_ns)],
@@ -325,7 +331,7 @@ export function OverviewScreen({ go }) {
             </div>)}
           </div>
         </> : <Skeleton height={92} />}
-      </Card>
+      </Card> : <UsageCard usage={usage} identity={identity} />}
 
       <Card>
         <div style={{ display: 'flex', alignItems: 'baseline', marginBottom: 8 }}>
@@ -374,4 +380,58 @@ function SessionRow({ session, onClick }) {
       {fmtAgo(session.last_end_ns)}
     </span>
   </div>;
+}
+
+/** What a tenant-bound credential sees where an operator sees the server:
+    its tenant's counters against its limits, from GET /v1/usage — the
+    accounting surface it is allowed. Bars use the measured ramp; the state
+    word is the server's own (`ok`, `warning`, `capped`, `paused`). */
+function UsageCard({ usage, identity }) {
+  const rows = usage.data?.tenants || [];
+  const row = rows.find((r) => r.tenant === (identity?.tenant || '')) || rows[0];
+  const limits = row?.limits || {};
+  const meters = row ? [
+    ['spans this month', row.month.spans, limits.monthly_spans, fmtNum],
+    ['bytes this month', row.month.bytes, limits.monthly_bytes, fmtBytes],
+  ] : [];
+  return <Card>
+    <div style={{ display: 'flex', alignItems: 'baseline', marginBottom: 10, gap: 8 }}>
+      <Eyebrow>Usage</Eyebrow>
+      {row ? <span style={{ fontSize: 12, color: 'var(--ink-faint)', fontFamily: 'var(--font-mono)' }}>
+        {row.tenant ? 'tenant ' + row.tenant : 'default tenant'} · {row.month.window}
+      </span> : null}
+      {row ? <span style={{
+        marginLeft: 'auto', fontSize: 12, fontFamily: 'var(--font-mono)',
+        color: row.state === 'ok' ? 'var(--ok)' : row.state === 'warning' ? 'var(--warn)' : 'var(--error)',
+      }}>{row.state}</span> : null}
+    </div>
+    {!usage.data ? <Skeleton height={92} /> : !row ? <div style={{ fontSize: 13, color: 'var(--ink-muted)' }}>
+      No counters yet for this tenant.
+    </div> : <>
+      <div style={{ display: 'grid', gap: 10 }}>
+        {meters.map(([label, used, limit, fmt]) => {
+          const fraction = limit ? Math.min(1, used / limit) : 0;
+          return <div key={label}>
+            <div style={{ display: 'flex', alignItems: 'baseline', marginBottom: 4 }}>
+              <span style={{ fontSize: 12, color: 'var(--ink-muted)' }}>{label}</span>
+              <span style={{ marginLeft: 'auto', fontFamily: 'var(--font-mono)', fontSize: 12, fontVariantNumeric: 'tabular-nums', color: 'var(--accent)' }}>
+                {fmt(used)}{limit ? <span style={{ color: 'var(--ink-muted)' }}> / {fmt(limit)}</span> : <span style={{ color: 'var(--ink-faint)' }}> · no limit</span>}
+              </span>
+            </div>
+            {limit ? <div style={{ height: 7, background: 'var(--bg-sunken)', borderRadius: 1.5, overflow: 'hidden' }}>
+              <div style={{
+                height: '100%', width: Math.max(used ? 1 : 0, fraction * 100) + '%', borderRadius: 1.5,
+                background: fraction >= 1 ? 'var(--measure-5)' : fraction >= 0.8 ? 'var(--measure-4)' : 'var(--measure-3)',
+              }} />
+            </div> : null}
+          </div>;
+        })}
+      </div>
+      <div style={{ marginTop: 10, fontSize: 12, color: 'var(--ink-muted)' }}>
+        <M color="var(--ink)">{fmtNum(row.lifetime.spans)}</M> spans sent since the counters began,
+        {' '}<M color="var(--ink)">{fmtNum(row.lifetime.rejected)}</M> refused by a quota or pause.
+        {limits.ingest_paused ? <span style={{ color: 'var(--error)' }}> Ingest is paused.</span> : null}
+      </div>
+    </>}
+  </Card>;
 }
