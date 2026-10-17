@@ -16,6 +16,19 @@ All of it runs in the one `traza-server` process. Traza never calls a model:
 a replay answers *in place of* the provider, from what was recorded. Route
 shapes are in the [HTTP API reference](http-api.md#runs-tapes-replays-diffs-and-recall).
 
+## See it run
+
+[`examples/replay/run.sh`](../../examples/replay/README.md) records a run of
+an agent written against the OpenAI chat-completions wire — a model call that
+asks for a tool, the tool, a model call that answers — with a scripted
+stand-in model, as OpenTelemetry GenAI spans. Then it stops the model, creates
+a replay, and runs the same agent code with `OPENAI_BASE_URL` set to the
+replay: both answers come back identical, every model call goes to the
+replay, and the replay reports `served` equal to the run's model steps. A
+changed system prompt is refused with `replay_divergence` at step 0, and
+`GET /v1/diff` names where a run with that prompt parted from the original.
+It takes about two seconds and exits non-zero if any claim fails.
+
 ## Runs and tapes
 
 A **run** is one unit of agent work. Its id is the span's session id when it
