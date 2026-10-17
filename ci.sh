@@ -60,6 +60,12 @@ if command -v python3 >/dev/null 2>&1; then
   echo "ci: incident demo ran"
   TRAZA_VANISH_SCALE=1 ./examples/vanish/run.sh >/dev/null
   echo "ci: vanish demo ran"
+  ./examples/guard/run.sh >/dev/null
+  echo "ci: guard demo ran"
+  ./examples/replay/run.sh >/dev/null
+  echo "ci: replay demo ran"
+  ./examples/prove/run.sh >/dev/null
+  echo "ci: prove demo ran"
 else
   echo "ci: skipping the demos (python3 not found)"
 fi
