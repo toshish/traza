@@ -83,7 +83,10 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 /// slice, which is what keeps the standard test vectors pinning both paths.
 ///
 /// Buffers at most 63 bytes — the tail of the last incomplete block — and
-/// compresses everything else as it arrives.
+/// compresses everything else as it arrives. Cloning copies that state, so a
+/// digest of a prefix can be finished while the prefix's state is kept to
+/// continue over a longer one.
+#[derive(Clone)]
 pub(crate) struct Sha256 {
     state: [u32; 8],
     /// Tail bytes that have not yet filled a 64-byte block.

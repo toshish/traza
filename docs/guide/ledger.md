@@ -257,7 +257,7 @@ these checks:
 
 ```json
 {"entries":5,"head":"34e6…","intact":true,"problems":[],
- "chain_verified_at_ns":1792061580401790000,
+ "problems_truncated":false,"chain_verified_at_ns":1792061580401790000,
  "generation":{"id":3,"manifest_sha256":"97bc…","matches_ledger":true,
                "files_verified":true,"verified_at_ns":1792061580401844000}}
 ```
@@ -265,7 +265,9 @@ these checks:
 `intact` is true only when every check passes. `chain_verified_at_ns` is
 when the walk of the chain began at its first entry, and `verified_at_ns` is
 when the file check ran. Both are the moment of the request here. In an
-evidence pack they can be earlier (see [Bounds](#evidence-packs)).
+evidence pack they can be earlier (see [Bounds](#evidence-packs)). This
+check names every problem, so `problems_truncated` is always `false` here;
+an evidence pack names at most 100 of each kind.
 
 **A live generation newer than the chain.** Suppose the latest checkpoint
 entry names an older generation than the live one. That is exactly what
@@ -365,7 +367,7 @@ above, has no secret.
 | `ledger.head` | The tip, as `GET /v1/ledger/head` reports it |
 | `ledger.entries` | Entries whose `at_ns` falls in the window, up to the head and at most 10,000. `ledger.entries_truncated` says whether more exist; page through the rest with `GET /v1/ledger` |
 | `ledger.entries_unreadable` | How many of the chain's lines the pack could not place: not a JSON object, or no integer `seq` or `at_ns`. The verification names each one |
-| `ledger.verification` | The verify document above |
+| `ledger.verification` | The verify document above, naming at most 100 problems of each kind (see below) |
 | `retention` | `{"ttl_seconds","source"}`: the window expiry applies to the tenant right now. `source` is `limits` (the tenant's runtime [limits document](http-api.md#post-v1admintenantstenantlimits)), `flag` (a `--tenant-ttl` override), `global` (`--ttl-seconds`) or `none`. `ttl_seconds` is `null` whenever data is kept forever. A whole-store pack reports the global window |
 | `usage` | The tenant's row from [`GET /v1/usage`](http-api.md#get-v1usage) — lifetime and month counters, limits, and quota state — as of generation. `null` in a whole-store pack |
 | `activity` | Spans, distinct traces, distinct sessions and errors among spans that **started** in the window and are still stored, plus `by_day` (`{"day","spans","errors","cost_usd"}` per UTC day) |
@@ -398,6 +400,17 @@ otherwise name store-wide files. Problems about other tenants' erasures are
 withheld behind a count that does not say whose. `intact` is the store's
 verdict either way: a pack never reports a store intact when it isn't.
 
+A pack names at most 100 problems of each kind it shows: damage to the chain,
+ledgered erasures the tombstone log no longer holds, settled erasures missing
+from the chain, and failing files. The rest of a kind is one line giving how
+many more there are and the total (`… are not named here (N in all)`), and
+`problems_truncated` is `true`. A restore that undoes thousands of erasures
+therefore costs each pack the problems it names, not one line per erasure,
+and costs a tenant those erasures do not concern only the count. Problems
+withheld from a tenant are counted, not truncated, so they leave
+`problems_truncated` alone. `GET /v1/ledger/verify` and the offline check
+name every problem.
+
 **Bounds.** Bound credentials can request packs, so a pack must not cost the
 whole chain, every erasure or the whole store on every request, and must not
 hold off checkpoints, compaction or erasures while it works. The server keeps
@@ -413,11 +426,39 @@ below shares it, and none gets a fresh budget of its own.
   appended since. It runs without the lock that checkpoints, compaction and
   erasures take. The erasure checks (steps 4 and 5 above) are kept with the
   walk and take in only the entries and settled erasures new to it.
+- **A new generation's manifest** is read without that lock, a budget at a
+  time. Only opening it takes the lock. A manifest is never rewritten once
+  published, so the open file is a fixed snapshot of that generation's
+  manifest even if a checkpoint deletes it meanwhile. Reading it, digesting
+  it and decoding one entry per file stop at the budget and resume where they
+  stopped. If the live generation moves on before a manifest is taken in,
+  packs start on the new one.
 - **The file check** digests files without that lock too, a budget at a time.
   Each file is digested from one open handle, so a file the budget stopped
   part-way through is continued, not started again. A new generation
   re-digests only the files its checkpoint added or changed. The others keep
-  their last digest, and when it ran.
+  their last digest, and when it ran. The append-only logs (annotations,
+  evals, tombstones) grow at every checkpoint, so a pack keeps each one open
+  with its digest so far and continues over the longer prefix the next
+  manifest names, rather than starting again at byte 0. A pack continues
+  only while the path still names the same file, so a log rewritten by
+  expiry or an erasure is digested afresh. If a continued digest disagrees
+  with the manifest, the log is digested again from byte 0 before anything
+  is reported, because the earlier bytes may have been edited in place.
+- **A file problem found without the lock is checked again under it** before
+  a pack reports it. Compaction, expiry and checkpoints carry on while a pack
+  digests, so a file the pack reaches after expiry removed or replaced it
+  looks missing or changed although nothing is damaged. The problem stands
+  only if the generation the pack is checking is still live and the path
+  still holds the file the pack read, or still nothing. That is what
+  `GET /v1/ledger/verify` would find at that moment, which includes
+  reporting as missing a file compaction removed before the next checkpoint
+  (see [Verifying](#verifying)). If the path holds a different file now, the
+  pack digests that file. If a checkpoint has published a new generation,
+  the pack checks that generation instead: it takes in the new manifest and
+  digests what changed. A pack that keeps finding the store moved this way,
+  eight times running, answers `409`; what it checked is kept, so a retry
+  continues.
 - **The window's entries and erasures** are found by binary search in indexes
   by time, so a pack reads only those lines.
 - **Activity** comes from the same fold the analytics use. A window too large
@@ -427,10 +468,11 @@ below shares it, and none gets a fresh budget of its own.
   either limit, `conclusive` and `result` are `null`, and
   `GET /v1/erasures/{id}/verify` answers for that erasure.
 
-If the budget runs out in any of the first three steps, that step stops,
+If the budget runs out in any of the first four steps, that step stops,
 keeps its progress, and the pack is refused with `400` saying how far it got
-(for example `the ledger chain was verified through line N …`, or `N of M
-files of generation G were digested …`). A pack never carries a partial
+(for example `the ledger chain was verified through line N …`, `N entries of
+generation G's manifest … were taken in …`, or `N of M files of generation G
+were digested …`). A pack never carries a partial
 verification. The next request resumes where the step stopped, however long
 ago that was, so retrying completes the check even when it needs many
 budgets. The first pack after a server starts does the most of this work,
@@ -526,7 +568,11 @@ copy. It archives manifested files only.
   continues from (see [Bounds](#evidence-packs)). While packs redo a walk
   older than 60 seconds, a second walk is kept beside it. Packs also keep, in
   memory, a few hundred bytes per settled erasure (the index and the erasure
-  checks) and one record per manifested file (the file check).
+  checks) and one record per manifested file (the file check). While packs
+  take in a new generation's manifest, they also hold its bytes and a second
+  record per file. They keep up to one open file per append-only log, so a
+  log replaced by expiry or an erasure keeps its disk space until the next
+  pack checks that log.
 - **Anchor signatures are stored, never checked.** See
   [what it does not prove](#what-it-proves-and-what-it-does-not).
 - **A failed append is caught up, not retried immediately.** The next
