@@ -106,6 +106,12 @@ run and every payload together — so a run whose payloads cannot all be read
 within it is refused with `400` rather than allowed to run past it. A payload
 repeated across steps is probed for tenant reachability once per request.
 
+A model call that recorded `gen_ai.system_instructions` beside an offloaded
+`gen_ai.input.messages` is stored as both: the system message, then the
+reference — `[{"role": "system", …}, {"$payload": "sha256/…"}]` — so the
+digest covers the system prompt too. Resolved, the two combine as they would
+have inline: the system message, then the list's own messages.
+
 ## Replaying a run with zero model calls
 
 Replay re-executes your agent against its own recording. The agent runs for
@@ -153,7 +159,8 @@ offloaded, up to [`--tape-max-bytes`](../configuration.md#server-flags)
 between them. Recorded *requests* are not held — each is read, digested for
 strict matching, and dropped — so a long conversation whose prompt grows at
 every step costs the budget nothing for its prompts. A tool step whose value
-could not be read is listed in `unreadable_tool_steps` (see
+could not be read, or that recorded no result at all, is listed in
+`unreadable_tool_steps` (see
 [tools](#tools-still-execute-live--unless-you-replay-them-too)). A run with
 more than 20,000 spans is refused (`409`) rather than replayed as its
 beginning, which would end the agent's run early as if the recording stopped
@@ -210,8 +217,11 @@ and user messages — receives the recorded answer as an ordinary
 
 The model, `created` time, tool-call ids and token usage are the recording's.
 An id the recording did not carry (here, the response id) is made up from the
-replay id and the step. The agent then runs `get_weather` itself, sends the
-result back, and receives the recorded final answer.
+replay id and the step; a recording with no model gets the request's `model`
+back, or `"unknown"`. A model name or response id longer than 256 bytes —
+recorded or requested — is treated as absent: a stream repeats both in every
+chunk, and no provider's come close. The agent then runs `get_weather`
+itself, sends the result back, and receives the recorded final answer.
 
 **4. Check what was served.**
 
@@ -282,8 +292,11 @@ id, and each tool call's id, name and arguments, with JSON-shaped text read as
 JSON — digested, and compared with the recorded step. The recorded side is
 normalised the same way, so a run recorded with OTel `parts` messages, with
 raw provider-shaped messages, or with offloaded content compares by what it
-said rather than how its instrumentation spelled it. For the indexed layouts
-and native events the recorded digest is exactly the tape's `request_digest`.
+said rather than how its instrumentation spelled it. That includes
+`gen_ai.system_instructions` recorded beside an offloaded
+`gen_ai.input.messages`: the two are combined once the list is read, exactly
+as they would have been inline. For the indexed layouts and native events the
+recorded digest is exactly the tape's `request_digest`.
 
 A request that does not match is refused and **does not consume the step**:
 
@@ -337,11 +350,14 @@ the model steps; `410` when none is left. A step whose arguments or result was
 offloaded and could not be read — erased, swept by retention, or past
 `--tape-max-bytes` — is listed in the replay's `unreadable_tool_steps` and
 answered `409` with `"type": "tool_unreadable"` instead of a payload reference
-dressed up as the result; the step is not consumed, because moving past it
-would hand your harness the next step's result as this one's. Wiring it in is
-a harness decision — for example, a wrapper your tool dispatcher calls instead
-of the tool when a `REPLAY_ID` is set. Traza does not intercept tool
-execution.
+dressed up as the result; so is a step that recorded no result at all
+(content capture was off), instead of a `null` your harness would take for
+what the tool returned. A result recorded as empty — `""` or `null` — is a
+result, and is served as recorded. A refused step is not consumed, because
+moving past it would hand your harness the next step's result as this one's.
+Wiring it in is a harness decision — for example, a wrapper your tool
+dispatcher calls instead of the tool when a `REPLAY_ID` is set. Traza does not
+intercept tool execution.
 
 ### Erasure reaches replays
 
@@ -352,9 +368,13 @@ covers anything it holds — a span, trace or session its answers or tool
 records came from, their tenant, or a payload they referenced. If one does,
 the replay is withdrawn: its content is dropped, and that call and every
 later one answer `410` with `"type": "replay_erased"` and the erasure's id,
-until the replay would have expired. The check applies from the moment the
-erasure is recorded, before its purge runs, exactly as the store's own reads
-do; when nothing has been erased it is one comparison. Withdrawn content
+until the replay would have expired. A withdrawn replay frees its place
+among the live ones at once — an erasure does not lock a tenant out of
+replays for an hour — and withdrawn replays are bounded on their own: each
+tenant's share keeps at most 64 of them (the registry 1,024), and past that
+the one closest to expiring is forgotten, its id answering `404` from then
+on. The check applies from the moment the erasure is recorded, before its
+purge runs, exactly as the store's own reads do; when nothing has been erased it is one comparison. Withdrawn content
 leaves memory at the replay's next call — a replay nobody calls again keeps
 its copy until it expires, at most an hour later.
 
@@ -419,6 +439,14 @@ spans, and its outcome is `unknown` — how a run ended cannot be read from its
 beginning. A step's status is not compared: a step that errored with the same
 input and output digests as a successful one is `same` — read `errors` and
 the outcome for that.
+
+Reading both runs, extracting their steps and aligning them all spend the
+request's one [`--query-deadline-ms`](../configuration.md#server-flags)
+budget. The alignment is quadratic in steps — two 5,000-step runs that share
+nothing compare every pair — so it compares signatures as interned ids,
+whatever the length of the names inside them, and checks the budget as it
+goes; a pair it cannot align within the budget is refused with `400` rather
+than left running.
 
 ## Recall: has this been done before?
 
@@ -490,18 +518,35 @@ telemetry choose which recording its next run is fed. See the
   answer refuses the replay at creation, naming the step. An offloaded answer
   that cannot be read — erased, swept by retention, or past
   `--tape-max-bytes` — refuses it the same way (`409`), and the message says
-  which of those it was. A run longer than 20,000 spans is refused rather than
-  cut.
+  which of those it was. A tool step that recorded no result is refused by
+  `tools/next` rather than served as `null`. A run longer than 20,000 spans
+  is refused rather than cut.
 - **Only chat completions and messages are replayed.** The OpenAI Responses
   API, embeddings and legacy completions under the replay's base URL answer
   `400`.
 - **Ids the recording lacks are invented.** If a recording's tool calls carry
   no ids, the agent's follow-up request carries Traza's invented id where the
   recording carries none, so strict matching stops at the first tool result;
-  use loose mode for such recordings.
+  use loose mode for such recordings. A model name or response id over 256
+  bytes counts as lacking.
+- **Answers are decoded by where they were recorded.** An answer recorded as
+  text — the `llm.completion` attribute, or an OpenInference `output.value`
+  whose `output.mime_type` is not JSON — is served as that text even when it
+  reads as JSON (`{"content": "hi", "count": 2}` comes back whole, not as a
+  message saying "hi"). A message list (`gen_ai.output.messages`, the indexed
+  layouts, native events) is read as messages, and an OpenInference JSON
+  `output.value` as the provider's response body.
 - **JSON-shaped text comes back compact.** Tool-call arguments recorded as
   `{"city": "Paris"}` are served as `{"city":"Paris"}`, keys sorted; the
-  normalisation compares them as JSON, so this never causes a divergence.
+  normalisation compares them as JSON, so this never causes a divergence. The
+  same holds for an answer recorded as JSON-shaped text: it is served as the
+  same JSON, re-serialized.
+- **A served response is at most 64 MiB**, streamed or not. A stream repeats
+  fixed fields in every chunk and splits tool-call arguments into many, so a
+  recording of thousands of tiny tool calls can stream to hundreds of times
+  its size; a step that would render past the bound answers `409` with
+  `"type": "response_too_large"` and is not consumed (the same step unstreamed
+  may fit).
 - **Usage is passed through as recorded**, without converting between the
   providers' prompt-caching conventions.
 - **An Anthropic answer is one message**, so a recording holding several
@@ -512,18 +557,24 @@ telemetry choose which recording its next run is fed. See the
   questions.
 - **The registry is bounded, per tenant first.** One tenant's data — or the
   operator view, which counts as a share of its own — may be held by at most
-  64 live replays and 64 MiB of recorded content; the registry as a whole
-  holds at most 1,024 replays and 512 MiB, as the backstop behind every
-  share. Past a bound, creation answers `429` with `Retry-After`: for a share,
+  64 live replays and 64 MiB of memory; the registry as a whole holds at most
+  1,024 replays and 512 MiB, as the backstop behind every share. The memory
+  is counted generously and charged while the snapshot is built: answers,
+  tool records, model names, ids, tool names, what erasure is checked
+  against, collection overhead, and each replay's call log at its full
+  4,096-entry bound (about 96 KiB, so a share holds its 64 replays with room
+  to spare). Past a bound, creation answers `429` with `Retry-After`: for a share,
   the time until enough of *that share's* replays expire; for the whole
   registry, the same for unbound operators and a flat 60 seconds for bound
   credentials, which have no business learning when another tenant's replay
   expires. A live replay is never evicted to make room. A snapshot larger than
   a whole share can never be held and is refused with `409`, not told to
-  retry.
+  retry — as soon as building it passes the share, not after reading the
+  whole run into it.
 - **Erasure withdraws replays**, from the moment the erasure is recorded; see
   [above](#erasure-reaches-replays). A withdrawn replay's copy stays in memory
-  until its next call or its expiry.
+  until its next call or its expiry, and withdrawn replays are bounded like
+  live ones.
 - **Replays follow tenancy.** A replay created under a tenant can be used only
   by that tenant's credentials and unbound operators; one created from the
   operator view (no tenant) only by unbound operators. A foreign credential

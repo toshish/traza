@@ -22,7 +22,7 @@ use std::path::Path;
 use serde_json::{json, Value};
 
 use crate::auth::{Principal, Required, Scope};
-use crate::credentials::{CredentialStore, NewCredential, Revoked};
+use crate::credentials::{Caller, CredentialStore, NewCredential, Revoked};
 use crate::limits::{LimitsBook, TenantLimits};
 use crate::usage::UsageBook;
 use crate::{Error, Result, Store};
@@ -212,7 +212,8 @@ pub fn readiness() -> Value {
 /// the path is not one of them.
 ///
 /// `principal` is `None` in open mode (no credential configured anywhere),
-/// which is unbound admin by definition.
+/// which is unbound admin by definition — for as long as the store stays
+/// open, which the credential operations re-decide under their own lock.
 pub fn route(
     engine: &Store,
     method: &str,
@@ -229,7 +230,14 @@ pub fn route(
             if let Some(refusal) = require_unbound_admin(principal) {
                 return Some(refusal);
             }
-            admin(engine, method, &path["/v1/admin/".len()..], body, now_ns)
+            admin(
+                engine,
+                method,
+                &path["/v1/admin/".len()..],
+                body,
+                Caller::of(principal),
+                now_ns,
+            )
         }
         _ => None,
     }
@@ -292,7 +300,20 @@ fn usage(engine: &Store, query: &str, principal: Option<&Principal>) -> Reply {
 }
 
 /// The admin surfaces, `rest` being the path after `/v1/admin/`.
-fn admin(engine: &Store, method: &str, rest: &str, body: &[u8], now_ns: u64) -> Option<Reply> {
+///
+/// The credential operations hand the store the `caller` rather than
+/// trusting that open mode still holds: an open-mode request admitted from
+/// its head can arrive here after another request minted the first
+/// credential, and only the store can decide "still open" in the same step
+/// as the change (see [`Caller::Open`]).
+fn admin(
+    engine: &Store,
+    method: &str,
+    rest: &str,
+    body: &[u8],
+    caller: Caller,
+    now_ns: u64,
+) -> Option<Reply> {
     let segments: Vec<&str> = rest.split('/').collect();
     Some(match (method, segments.as_slice()) {
         ("POST", ["credentials"]) => {
@@ -300,20 +321,22 @@ fn admin(engine: &Store, method: &str, rest: &str, body: &[u8], now_ns: u64) -> 
                 Ok(request) => request,
                 Err(error) => return Some(Reply::error(400, error.to_string())),
             };
-            match engine.credentials().create(request, now_ns) {
+            match engine.credentials().create(request, caller, now_ns) {
                 Ok(created) => Reply::new(201, created.to_json()),
                 Err(error) => error_reply(error),
             }
         }
-        ("GET", ["credentials"]) => match engine.credentials().list() {
+        ("GET", ["credentials"]) => match engine.credentials().list(caller) {
             Ok(views) => Reply::new(200, json!({"credentials": views})),
             Err(error) => error_reply(error),
         },
-        ("POST", ["credentials", id, "revoke"]) => match engine.credentials().revoke(id, now_ns) {
-            Ok(Revoked::At(at)) => Reply::new(200, json!({"id": id, "revoked_at_ns": at})),
-            Ok(Revoked::Unknown) => Reply::error(404, format!("no credential with id {id}")),
-            Err(error) => error_reply(error),
-        },
+        ("POST", ["credentials", id, "revoke"]) => {
+            match engine.credentials().revoke(id, caller, now_ns) {
+                Ok(Revoked::At(at)) => Reply::new(200, json!({"id": id, "revoked_at_ns": at})),
+                Ok(Revoked::Unknown) => Reply::error(404, format!("no credential with id {id}")),
+                Err(error) => error_reply(error),
+            }
+        }
         (_, ["tenants", segment, "limits"]) => {
             let tenant = match tenant_segment(segment) {
                 Ok(tenant) => tenant,
@@ -384,6 +407,9 @@ fn error_reply(error: Error) -> Reply {
     match error {
         Error::Invalid(reason) => Reply::error(400, reason),
         Error::Conflict(reason) => Reply::error(409, reason),
+        // The gate's own 401 body: a request that lost the bootstrap is
+        // answered exactly as if it had arrived after it.
+        Error::Unauthenticated => Reply::error(401, "unauthorized"),
         other => Reply::error(503, other.to_string()),
     }
 }
@@ -619,6 +645,54 @@ mod tests {
         ] {
             assert!(!loopback_origin(origin), "{origin}");
         }
+    }
+
+    /// `principal: None` is what the server passes for a request it admitted
+    /// in open mode — decided from the request's head, which may have
+    /// arrived long before its body. If another request bootstraps the store
+    /// in between, the late one must not act as the open-mode admin it was
+    /// admitted as: it lost the bootstrap and must authenticate.
+    #[test]
+    fn an_open_mode_caller_cannot_act_once_the_store_enforces() {
+        let dir = std::env::temp_dir().join(format!(
+            "traza-platform-open-race-{}-{}",
+            std::process::id(),
+            crate::unix_now_ns()
+        ));
+        let engine = Store::open(&dir, crate::Config::default()).expect("opens");
+        let create = |body: &str| {
+            route(
+                &engine,
+                "POST",
+                "/v1/admin/credentials",
+                "",
+                body.as_bytes(),
+                None,
+            )
+            .expect("routed")
+        };
+        let first = create(r#"{"scope":"admin"}"#);
+        assert_eq!(first.status, 201, "{}", first.body);
+        let id = first.body["id"].as_str().expect("id").to_owned();
+
+        let late = create(r#"{"scope":"admin","token":"loser-supplied-0123456789abcdef"}"#);
+        assert_eq!(late.status, 401, "{}", late.body);
+        assert_eq!(late.body, json!({"error": "unauthorized"}));
+        for (method, path) in [
+            ("GET", "/v1/admin/credentials".to_owned()),
+            ("POST", format!("/v1/admin/credentials/{id}/revoke")),
+        ] {
+            let reply = route(&engine, method, &path, "", b"", None).expect("routed");
+            assert_eq!(reply.status, 401, "{method} {path}: {}", reply.body);
+        }
+        let listed = engine
+            .credentials()
+            .list(Caller::Authenticated)
+            .expect("lists");
+        assert_eq!(listed.len(), 1, "the loser created nothing");
+        assert_eq!(listed[0].revoked_at_ns, None, "and revoked nothing");
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

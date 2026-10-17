@@ -68,7 +68,9 @@ impl Reply {
 
     /// The server's uniform engine-error mapping: the caller's defects are
     /// 400, conflicts 409, an exhausted budget 400 (narrowing, not retrying,
-    /// is the remedy), anything else the store's 503.
+    /// is the remedy), anything else the store's 503. A run too long for a
+    /// rebuild to read whole is 400 too, as a too-broad query is on the
+    /// search route: retrying cannot help, and 503 would say it might.
     fn engine(error: Error) -> Self {
         match error {
             Error::Invalid(reason) => Self::error(400, reason),
@@ -78,6 +80,7 @@ impl Reply {
                 deadline_exceeded: true,
                 ..Self::error(400, error.to_string())
             },
+            error @ Error::QueryTooBroad(_) => Self::error(400, error.to_string()),
             other => Self::error(503, other.to_string()),
         }
     }
@@ -415,6 +418,19 @@ mod tests {
             json!({"error": "unknown query parameter: tenat"})
         );
         assert!(params("tenant=a&tenant=b", &["tenant"]).is_err());
+    }
+
+    #[test]
+    fn a_verdict_no_retry_can_produce_is_a_400_not_a_503() {
+        // What a hook keys on is "not 200"; what a client's retry policy
+        // keys on is the class, and neither of these heals with a retry.
+        for error in [
+            Error::DeadlineExceeded("rebuild".into()),
+            Error::QueryTooBroad("run too long to read whole".into()),
+        ] {
+            assert_eq!(Reply::engine(error).status, 400);
+        }
+        assert_eq!(Reply::engine(Error::LockPoisoned("x")).status, 503);
     }
 
     #[test]

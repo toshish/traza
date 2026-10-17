@@ -55,16 +55,28 @@ impl Store {
         Ok(admitting)
     }
 
-    /// Observes a batch the store has just acknowledged.
+    /// Observes a batch the store has just acknowledged; `spans[i]` was
+    /// stored at write revision `first_revision + i`.
     ///
     /// Runs after the batch is durable and published to the tail, with no
     /// engine lock held. It cannot fail the ingest — the batch is already
     /// acknowledged — so it returns what it saw rather than a `Result`, and it
     /// must be non-blocking and O(batch): every ingest waits for it before
-    /// its response is written.
-    pub(crate) fn observe_admitted(&self, spans: &[Arc<Span>]) -> Observed {
+    /// its response is written. Nor is it ordered: two batches writing the
+    /// same span are stored in revision order, but their observers run in
+    /// whichever order their fsyncs return, so an observer that keeps
+    /// per-span state must order versions by revision, not by arrival.
+    pub(crate) fn observe_admitted(&self, spans: &[Arc<Span>], first_revision: u64) -> Observed {
         Observed {
-            fuses: self.observe_fuses(spans),
+            fuses: self.observe_fuses(spans, first_revision),
         }
+    }
+
+    /// The write revision of the latest span version stored. Every version
+    /// at or below it is in the store — the buffer or a segment — for any
+    /// read that begins after this returns, because revisions are assigned
+    /// under the writer lock, with the upsert, and this reads under it too.
+    pub(crate) fn write_revision(&self) -> Result<u64> {
+        Ok(self.lock_writer()?.revision())
     }
 }

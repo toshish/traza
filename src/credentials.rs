@@ -9,7 +9,11 @@
 //!
 //! **Storage.** `credentials.jsonl` in the data directory: append-only
 //! `create` and `revoke` records, fsynced per write, a torn final append
-//! healed at open exactly as the annotation log heals one. The token itself
+//! healed at open exactly as the annotation log heals one. An append that
+//! fails while the server runs — a full disk, a failed fsync — is truncated
+//! away at once, so the log never holds a record its caller was told failed
+//! nor bytes the next record would land after; if even that fails, changes
+//! refuse until a restart heals the log. The token itself
 //! is never written — only its SHA-256 — so for a minted token (256 random
 //! bits) a copy of the data directory is not a copy of anyone's credentials.
 //! The digest is unsalted, which is sound only for high-entropy tokens: a
@@ -39,7 +43,11 @@
 //! server public" is not a failure mode anyone would choose. For the same
 //! reason the first API credential must be an unbound admin: anything else
 //! would switch enforcement on with no credential able to reach
-//! `/v1/admin/*`, a lockout only a restart with `TRAZA_TOKENS` undoes.
+//! `/v1/admin/*`, a lockout only a restart with `TRAZA_TOKENS` undoes. Open
+//! mode ends for requests already in flight too: one admitted while the
+//! store was open that reaches it after the first credential must
+//! authenticate ([`Caller::Open`]), so of two racing bootstraps exactly one
+//! creates anything.
 //!
 //! **Writers never stall readers on the disk.** Create and revoke serialize
 //! on a mutex of their own and append and fsync under it alone; the set's
@@ -216,6 +224,37 @@ pub struct CredentialView {
     pub source: Source,
 }
 
+/// How the caller of a credential operation got past authentication.
+///
+/// The HTTP gate decides from a request's head whether the store is open,
+/// and the head can arrive long before the body: a request admitted in open
+/// mode may reach the store after another one minted the first credential.
+/// So the store, not the gate, has the last word on whether open mode still
+/// holds — see [`Caller::Open`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Caller {
+    /// A credential the store authenticated — or the embedding process
+    /// itself, which needs none.
+    Authenticated,
+    /// Nothing: the store enforced nothing when the request was admitted.
+    /// Honoured only while it STILL enforces nothing, decided under the lock
+    /// the operation itself takes — for a create, the writer lock, so of two
+    /// bootstraps racing exactly one creates and the other is
+    /// [`Error::Unauthenticated`] and must come back with a credential.
+    Open,
+}
+
+impl Caller {
+    /// The caller behind an authenticated principal, or open mode when there
+    /// is none — the convention [`crate::platform::route`] receives.
+    pub fn of(principal: Option<&Principal>) -> Self {
+        match principal {
+            Some(_) => Self::Authenticated,
+            None => Self::Open,
+        }
+    }
+}
+
 /// The outcome of a revoke.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Revoked {
@@ -318,6 +357,21 @@ impl Inner {
     fn has_env(&self) -> bool {
         self.entries.iter().any(|entry| entry.source == Source::Env)
     }
+
+    /// See [`CredentialStore::enforced`].
+    fn enforced(&self) -> bool {
+        self.api_ever || self.has_env()
+    }
+
+    /// Refuses an open-mode caller once the store enforces. Checked under the
+    /// same lock as the step it guards, so "the store is still open" and the
+    /// step are one decision; see [`Caller::Open`].
+    fn admit(&self, caller: Caller) -> Result<()> {
+        if caller == Caller::Open && self.enforced() {
+            return Err(Error::Unauthenticated);
+        }
+        Ok(())
+    }
 }
 
 /// The credential set a server authenticates against.
@@ -329,8 +383,43 @@ pub struct CredentialStore {
     /// lock, append and fsync holding only this, and then apply its change
     /// under the write lock with no other writer having moved anything in
     /// between. Taken before `inner`, never after.
-    writer: Mutex<()>,
+    writer: Mutex<Writer>,
     inner: RwLock<Inner>,
+    #[cfg(test)]
+    faults: Mutex<Faults>,
+}
+
+/// What only the writer may read or change: the log's standing.
+#[derive(Debug, Default)]
+struct Writer {
+    /// Why the log can no longer be trusted to match memory: an append
+    /// failed and undoing it failed too, so its tail holds bytes nobody can
+    /// vouch for. Every later change refuses with this until a reopen heals
+    /// the tail and re-reads the log; reads go on answering from memory,
+    /// which holds exactly what was acknowledged.
+    failed: Option<String>,
+    /// Whether the log's directory entry is known durable. Set by the first
+    /// append that succeeds, whichever one created the file — inferring it
+    /// from "the file did not exist before this append" skipped the sync for
+    /// good once a failed append had created the file and been rolled back.
+    directory_synced: bool,
+}
+
+/// Failures a test injects into the next append, each consumed once.
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct Faults {
+    /// The next write stops after this many bytes and fails, as a full disk
+    /// does.
+    torn_write: Option<usize>,
+    /// The next fsync of the log fails, after its write landed whole.
+    sync: bool,
+    /// The next directory fsync fails.
+    directory_sync: bool,
+    /// The rollback of the next failed append fails too.
+    rollback: bool,
+    /// Directory fsyncs that succeeded, so a test can see one happen.
+    directory_syncs: u32,
 }
 
 impl CredentialStore {
@@ -347,8 +436,10 @@ impl CredentialStore {
         }
         Ok(Self {
             path,
-            writer: Mutex::new(()),
+            writer: Mutex::new(Writer::default()),
             inner: RwLock::new(inner),
+            #[cfg(test)]
+            faults: Mutex::new(Faults::default()),
         })
     }
 
@@ -407,7 +498,7 @@ impl CredentialStore {
     pub fn enforced(&self) -> bool {
         self.inner
             .read()
-            .map(|inner| inner.api_ever || inner.has_env())
+            .map(|inner| inner.enforced())
             // A poisoned lock fails CLOSED: enforcement on, and every lookup
             // below then refuses as unauthorized.
             .unwrap_or(true)
@@ -457,8 +548,10 @@ impl CredentialStore {
     /// a token already registered (live, expired, revoked, or in
     /// `TRAZA_TOKENS`) is [`Error::Conflict`] — a revoked token can never come
     /// back — and so is a first credential that is not an unbound admin (see
-    /// the module docs on posture).
-    pub fn create(&self, request: NewCredential, now_ns: u64) -> Result<Created> {
+    /// the module docs on posture). An open-mode `caller` creates only while
+    /// the store is still open, decided under the writer lock: one that lost
+    /// the bootstrap is [`Error::Unauthenticated`].
+    pub fn create(&self, request: NewCredential, caller: Caller, now_ns: u64) -> Result<Created> {
         let scope = Scope::parse(&request.scope).ok_or_else(|| {
             Error::Invalid(format!(
                 "scope must be ro, rw or admin (got {:?})",
@@ -501,10 +594,11 @@ impl CredentialStore {
         };
         let digest = sha256_hex(token.as_bytes());
 
-        let _writer = self.writer()?;
+        let mut writer = self.writer()?;
         let id = {
             let inner = self.read()?;
-            let first = !inner.api_ever && !inner.has_env();
+            inner.admit(caller)?;
+            let first = !inner.enforced();
             if first && (scope != Scope::Admin || request.tenant.is_some()) {
                 return Err(Error::Conflict(
                     "the first credential must be an unbound admin (scope \"admin\", no \
@@ -538,7 +632,7 @@ impl CredentialStore {
             created_at_ns: now_ns,
             expires_at_ns,
         };
-        self.append(&record)?;
+        self.append(&mut writer, &record)?;
         self.write()?.push(Entry {
             id: id.clone(),
             digest,
@@ -565,9 +659,12 @@ impl CredentialStore {
     }
 
     /// Every credential, environment ones first, then API ones in creation
-    /// order.
-    pub fn list(&self) -> Result<Vec<CredentialView>> {
+    /// order. An open-mode `caller` sees the (necessarily empty) list only
+    /// while the store is still open: once a credential exists, listing it
+    /// takes one.
+    pub fn list(&self, caller: Caller) -> Result<Vec<CredentialView>> {
         let inner = self.read()?;
+        inner.admit(caller)?;
         let mut views: Vec<CredentialView> = inner.entries.iter().map(Entry::view).collect();
         views.sort_by_key(|view| (view.source != Source::Env, view.created_at_ns));
         Ok(views)
@@ -581,11 +678,13 @@ impl CredentialStore {
     /// The token stops authenticating before this returns, once the revoke
     /// record is durable — so from the caller's next request on. A request
     /// racing the revoke itself may still be admitted, exactly as it would
-    /// have been had it arrived a moment earlier.
-    pub fn revoke(&self, id: &str, now_ns: u64) -> Result<Revoked> {
-        let _writer = self.writer()?;
+    /// have been had it arrived a moment earlier. An open-mode `caller` is
+    /// refused once the store enforces, as for [`Self::create`].
+    pub fn revoke(&self, id: &str, caller: Caller, now_ns: u64) -> Result<Revoked> {
+        let mut writer = self.writer()?;
         let position = {
             let inner = self.read()?;
+            inner.admit(caller)?;
             let Some(&position) = inner.by_id.get(id) else {
                 return Ok(Revoked::Unknown);
             };
@@ -600,20 +699,36 @@ impl CredentialStore {
             }
             position
         };
-        self.append(&Record::Revoke {
-            id: id.to_owned(),
-            revoked_at_ns: now_ns,
-        })?;
+        self.append(
+            &mut writer,
+            &Record::Revoke {
+                id: id.to_owned(),
+                revoked_at_ns: now_ns,
+            },
+        )?;
         // `position` is still this entry's: only a writer moves entries, and
         // this thread is the writer until it returns.
         self.write()?.entries[position].revoked_at_ns = Some(now_ns);
         Ok(Revoked::At(now_ns))
     }
 
-    fn append(&self, record: &Record) -> Result<()> {
+    /// Appends `record` durably, or leaves the log as it found it.
+    ///
+    /// A failed append is undone — truncated back to the length it started
+    /// at, and that fsynced — because what it leaves behind is worse than
+    /// nothing. A write torn by a full disk is bytes the NEXT append would
+    /// land after, turning a log of acknowledged records into one no restart
+    /// can read; a whole record whose fsync failed is a credential its
+    /// caller was told does not exist, which a retry with the same supplied
+    /// token would record a second time, and two records of one digest
+    /// refuse the open just the same. If the undo fails too, nobody can say
+    /// what the tail holds, and the store latches ([`Writer::failed`]).
+    fn append(&self, writer: &mut Writer, record: &Record) -> Result<()> {
+        if let Some(why) = &writer.failed {
+            return Err(Error::Io(io::Error::other(why.clone())));
+        }
         let mut line = serde_json::to_string(record)?;
         line.push('\n');
-        let created = !self.path.exists();
         let mut options = OpenOptions::new();
         options.create(true).append(true);
         // Owner-only from the moment it exists. The file holds digests, not
@@ -625,17 +740,82 @@ impl CredentialStore {
             options.mode(0o600);
         }
         let mut file = options.open(&self.path)?;
-        file.write_all(line.as_bytes())?;
-        file.sync_all()?;
-        if created {
-            if let Some(directory) = self.path.parent() {
-                crate::sync_directory(directory)?;
-            }
+        // Where this record starts. Nothing else moves the end of the file
+        // meanwhile: the directory lock keeps other processes out, and the
+        // writer mutex, which the caller holds, other threads.
+        let start = file.metadata()?.len();
+        let appended = self
+            .write_line(&mut file, line.as_bytes())
+            .and_then(|()| self.sync_log(&file))
+            .map_err(Error::from)
+            .and_then(|()| {
+                if writer.directory_synced {
+                    Ok(())
+                } else {
+                    self.sync_log_directory()
+                }
+            });
+        let Err(error) = appended else {
+            writer.directory_synced = true;
+            return Ok(());
+        };
+        if let Err(undo) = self.roll_back(&file, start) {
+            writer.failed = Some(format!(
+                "{}: an append failed ({error}) and truncating it away failed too ({undo}); \
+                 credentials cannot change until a restart heals and re-reads the log",
+                self.path.display()
+            ));
+        }
+        Err(error)
+    }
+
+    fn roll_back(&self, file: &File, length: u64) -> io::Result<()> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.faults().rollback) {
+            return Err(io::Error::other("injected: the rollback failed"));
+        }
+        file.set_len(length)?;
+        file.sync_all()
+    }
+
+    fn write_line(&self, file: &mut File, line: &[u8]) -> io::Result<()> {
+        #[cfg(test)]
+        if let Some(cut) = self.faults().torn_write.take() {
+            file.write_all(&line[..cut.min(line.len())])?;
+            return Err(io::Error::other("injected: the disk filled mid-write"));
+        }
+        file.write_all(line)
+    }
+
+    fn sync_log(&self, file: &File) -> io::Result<()> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.faults().sync) {
+            return Err(io::Error::other("injected: fsync failed"));
+        }
+        file.sync_all()
+    }
+
+    fn sync_log_directory(&self) -> Result<()> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.faults().directory_sync) {
+            return Err(io::Error::other("injected: directory fsync failed").into());
+        }
+        if let Some(directory) = self.path.parent() {
+            crate::sync_directory(directory)?;
+        }
+        #[cfg(test)]
+        {
+            self.faults().directory_syncs += 1;
         }
         Ok(())
     }
 
-    fn writer(&self) -> Result<std::sync::MutexGuard<'_, ()>> {
+    #[cfg(test)]
+    fn faults(&self) -> std::sync::MutexGuard<'_, Faults> {
+        self.faults.lock().expect("faults")
+    }
+
+    fn writer(&self) -> Result<std::sync::MutexGuard<'_, Writer>> {
         self.writer
             .lock()
             .map_err(|_| Error::LockPoisoned("credential writer"))
@@ -869,7 +1049,9 @@ mod tests {
         let dir = Dir::new();
         let store = CredentialStore::open(&dir.0).expect("opens");
         assert!(!store.enforced(), "an empty set is open mode");
-        store.create(request("admin"), 500).expect("bootstraps");
+        store
+            .create(request("admin"), Caller::Authenticated, 500)
+            .expect("bootstraps");
         assert!(
             store.enforced(),
             "the first credential turns enforcement on"
@@ -882,6 +1064,7 @@ mod tests {
                     label: Some("collector".into()),
                     ..NewCredential::default()
                 },
+                Caller::Authenticated,
                 1_000,
             )
             .expect("creates");
@@ -907,7 +1090,7 @@ mod tests {
         assert!(!on_disk.contains(&created.token), "{on_disk}");
         assert!(on_disk.contains(&sha256_hex(created.token.as_bytes())));
 
-        let listed = store.list().expect("lists");
+        let listed = store.list(Caller::Authenticated).expect("lists");
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].last_used_at_ns, None, "the admin was never used");
         assert_eq!(listed[1].last_used_at_ns, Some(2_000));
@@ -921,27 +1104,41 @@ mod tests {
         let dir = Dir::new();
         let (revoked, expiring, kept) = {
             let store = CredentialStore::open(&dir.0).expect("opens");
-            let revoked = store.create(request("admin"), 10).expect("creates");
+            let revoked = store
+                .create(request("admin"), Caller::Authenticated, 10)
+                .expect("creates");
             let expiring = store
                 .create(
                     NewCredential {
                         expires_in_seconds: Some(5),
                         ..request("ro")
                     },
+                    Caller::Authenticated,
                     10,
                 )
                 .expect("creates");
-            let kept = store.create(request("ro"), 10).expect("creates");
+            let kept = store
+                .create(request("ro"), Caller::Authenticated, 10)
+                .expect("creates");
             assert_eq!(
-                store.revoke(&revoked.id, 20).expect("revokes"),
+                store
+                    .revoke(&revoked.id, Caller::Authenticated, 20)
+                    .expect("revokes"),
                 Revoked::At(20)
             );
             assert_eq!(
-                store.revoke(&revoked.id, 30).expect("idempotent"),
+                store
+                    .revoke(&revoked.id, Caller::Authenticated, 30)
+                    .expect("idempotent"),
                 Revoked::At(20),
                 "a second revoke keeps the first instant"
             );
-            assert_eq!(store.revoke("cr_nope", 30).expect("ok"), Revoked::Unknown);
+            assert_eq!(
+                store
+                    .revoke("cr_nope", Caller::Authenticated, 30)
+                    .expect("ok"),
+                Revoked::Unknown
+            );
             (revoked, expiring, kept)
         };
         let store = CredentialStore::open(&dir.0).expect("reopens");
@@ -960,7 +1157,7 @@ mod tests {
             "expiry is exclusive of its instant"
         );
         assert!(store.authenticate(Some(&bearer(&kept.token)), now).is_ok());
-        let listed = store.list().expect("lists");
+        let listed = store.list(Caller::Authenticated).expect("lists");
         assert_eq!(listed[0].revoked_at_ns, Some(20));
         assert_eq!(listed[0].last_used_at_ns, None, "last use is memory only");
     }
@@ -969,8 +1166,12 @@ mod tests {
     fn revoking_everything_locks_the_store_rather_than_opening_it() {
         let dir = Dir::new();
         let store = CredentialStore::open(&dir.0).expect("opens");
-        let only = store.create(request("admin"), 1).expect("creates");
-        store.revoke(&only.id, 2).expect("revokes");
+        let only = store
+            .create(request("admin"), Caller::Authenticated, 1)
+            .expect("creates");
+        store
+            .revoke(&only.id, Caller::Authenticated, 2)
+            .expect("revokes");
         assert!(store.enforced());
         drop(store);
         let store = CredentialStore::open(&dir.0).expect("reopens");
@@ -985,7 +1186,9 @@ mod tests {
     fn supplied_tokens_are_validated_and_never_reused() {
         let dir = Dir::new();
         let store = CredentialStore::open(&dir.0).expect("opens");
-        store.create(request("admin"), 0).expect("bootstraps");
+        store
+            .create(request("admin"), Caller::Authenticated, 0)
+            .expect("bootstraps");
         let supplied = "control-plane-issued-0123456789";
         let created = store
             .create(
@@ -993,6 +1196,7 @@ mod tests {
                     token: Some(supplied.into()),
                     ..request("rw")
                 },
+                Caller::Authenticated,
                 1,
             )
             .expect("accepts a long enough token");
@@ -1003,18 +1207,22 @@ mod tests {
                 token: Some(supplied.into()),
                 ..request("ro")
             },
+            Caller::Authenticated,
             2,
         );
         assert!(
             matches!(duplicate, Err(Error::Conflict(_))),
             "{duplicate:?}"
         );
-        store.revoke(&created.id, 3).expect("revokes");
+        store
+            .revoke(&created.id, Caller::Authenticated, 3)
+            .expect("revokes");
         let again = store.create(
             NewCredential {
                 token: Some(supplied.into()),
                 ..request("ro")
             },
+            Caller::Authenticated,
             4,
         );
         assert!(
@@ -1032,6 +1240,7 @@ mod tests {
                     token: Some(bad.into()),
                     ..request("rw")
                 },
+                Caller::Authenticated,
                 5,
             );
             assert!(
@@ -1063,13 +1272,13 @@ mod tests {
                 "label",
             ),
         ] {
-            match store.create(bad, 6) {
+            match store.create(bad, Caller::Authenticated, 6) {
                 Err(Error::Invalid(message)) => assert!(message.contains(field), "{message}"),
                 other => panic!("{field}: {other:?}"),
             }
         }
         assert_eq!(
-            store.list().expect("lists").len(),
+            store.list(Caller::Authenticated).expect("lists").len(),
             2,
             "refusals write nothing"
         );
@@ -1090,14 +1299,19 @@ mod tests {
         let id = reader.credential.expect("has an id").id;
         assert_eq!(id, env_credential_id(&sha256_hex(b"env-reader-token")));
 
-        let api = store.create(request("rw"), 9).expect("creates");
-        let listed = store.list().expect("lists");
+        let api = store
+            .create(request("rw"), Caller::Authenticated, 9)
+            .expect("creates");
+        let listed = store.list(Caller::Authenticated).expect("lists");
         assert_eq!(
             listed.iter().map(|view| view.source).collect::<Vec<_>>(),
             vec![Source::Env, Source::Env, Source::Api]
         );
         assert_eq!(listed[0].prefix, "env-", "a quarter of a 16-char token");
-        assert!(matches!(store.revoke(&id, 10), Err(Error::Conflict(_))));
+        assert!(matches!(
+            store.revoke(&id, Caller::Authenticated, 10),
+            Err(Error::Conflict(_))
+        ));
         assert!(
             store
                 .create(
@@ -1105,6 +1319,7 @@ mod tests {
                         token: Some("env-reader-token-padded-out".into()),
                         ..request("rw")
                     },
+                    Caller::Authenticated,
                     11
                 )
                 .is_ok(),
@@ -1130,6 +1345,7 @@ mod tests {
                 token: Some(long_env.into()),
                 ..request("rw")
             },
+            Caller::Authenticated,
             14,
         );
         assert!(matches!(claimed, Err(Error::Conflict(_))), "{claimed:?}");
@@ -1140,7 +1356,10 @@ mod tests {
         let dir = Dir::new();
         let token = {
             let store = CredentialStore::open(&dir.0).expect("opens");
-            store.create(request("admin"), 1).expect("creates").token
+            store
+                .create(request("admin"), Caller::Authenticated, 1)
+                .expect("creates")
+                .token
         };
         let path = dir.0.join(LOG_NAME);
         let mut file = OpenOptions::new().append(true).open(&path).expect("log");
@@ -1151,11 +1370,11 @@ mod tests {
         let store = CredentialStore::open(&dir.0).expect("heals");
         assert!(store.authenticate(Some(&bearer(&token)), 2).is_ok());
         store
-            .create(request("ro"), 3)
+            .create(request("ro"), Caller::Authenticated, 3)
             .expect("appends after the heal");
         drop(store);
         let store = CredentialStore::open(&dir.0).expect("reopens cleanly");
-        assert_eq!(store.list().expect("lists").len(), 2);
+        assert_eq!(store.list(Caller::Authenticated).expect("lists").len(), 2);
         drop(store);
 
         let mut contents = fs::read(&path).expect("log");
@@ -1169,7 +1388,9 @@ mod tests {
     fn malformed_headers_never_authenticate() {
         let dir = Dir::new();
         let store = CredentialStore::open(&dir.0).expect("opens");
-        let created = store.create(request("admin"), 1).expect("creates");
+        let created = store
+            .create(request("admin"), Caller::Authenticated, 1)
+            .expect("creates");
         for header in [
             None,
             Some(created.token.clone()),
@@ -1195,6 +1416,87 @@ mod tests {
         assert_eq!(token_prefix("abc"), "");
     }
 
+    /// Open mode is the store's to decide, under the lock its step takes:
+    /// the first open-mode create bootstraps, and every open-mode call after
+    /// it — create, revoke, list — is refused and leaves no trace.
+    #[test]
+    fn an_open_mode_caller_is_honoured_only_while_the_store_is_open() {
+        let dir = Dir::new();
+        let store = CredentialStore::open(&dir.0).expect("opens");
+        assert_eq!(store.list(Caller::Open).expect("lists"), Vec::new());
+        assert_eq!(
+            store.revoke("cr_nope", Caller::Open, 1).expect("answers"),
+            Revoked::Unknown
+        );
+        let admin = store
+            .create(request("admin"), Caller::Open, 2)
+            .expect("bootstraps");
+        let lost = store.create(
+            NewCredential {
+                token: Some("lost-the-race-0123456789abcdef".into()),
+                ..request("admin")
+            },
+            Caller::Open,
+            3,
+        );
+        assert!(matches!(lost, Err(Error::Unauthenticated)), "{lost:?}");
+        assert!(matches!(
+            store.revoke(&admin.id, Caller::Open, 4),
+            Err(Error::Unauthenticated)
+        ));
+        assert!(matches!(
+            store.list(Caller::Open),
+            Err(Error::Unauthenticated)
+        ));
+        assert!(store
+            .authenticate(Some("Bearer lost-the-race-0123456789abcdef"), 5)
+            .is_err());
+        let listed = store.list(Caller::Authenticated).expect("lists");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].revoked_at_ns, None);
+
+        // With TRAZA_TOKENS the store enforces from the start, so no
+        // open-mode call is ever honoured.
+        let dir = Dir::new();
+        let store = CredentialStore::open(&dir.0).expect("opens");
+        let config = AuthConfig::parse("admin:env-operator-token").expect("parses");
+        store.install_env(&config, 1).expect("installs");
+        assert!(matches!(
+            store.create(request("admin"), Caller::Open, 2),
+            Err(Error::Unauthenticated)
+        ));
+    }
+
+    /// The race the rule exists for, run for real: many open-mode bootstraps
+    /// at once, released together. Exactly one creates anything, however
+    /// the threads interleave.
+    #[test]
+    fn of_racing_open_mode_bootstraps_exactly_one_creates() {
+        let dir = Dir::new();
+        let store = std::sync::Arc::new(CredentialStore::open(&dir.0).expect("opens"));
+        let racers = 8;
+        let start = std::sync::Arc::new(std::sync::Barrier::new(racers));
+        let outcomes: Vec<Result<Created>> = (0..racers)
+            .map(|_| {
+                let store = std::sync::Arc::clone(&store);
+                let start = std::sync::Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    store.create(request("admin"), Caller::Open, 1)
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|racer| racer.join().expect("joins"))
+            .collect();
+        let created = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
+        assert_eq!(created, 1, "{outcomes:?}");
+        assert!(outcomes
+            .iter()
+            .all(|outcome| matches!(outcome, Ok(_) | Err(Error::Unauthenticated))));
+        assert_eq!(store.list(Caller::Authenticated).expect("lists").len(), 1);
+    }
+
     #[test]
     fn the_first_credential_must_be_an_unbound_admin() {
         let dir = Dir::new();
@@ -1210,6 +1512,7 @@ mod tests {
                     tenant: tenant.map(str::to_owned),
                     ..request(scope)
                 },
+                Caller::Authenticated,
                 1,
             );
             match refused {
@@ -1227,13 +1530,16 @@ mod tests {
             !dir.0.join(LOG_NAME).exists(),
             "and writes nothing, so a later non-loopback start is still refused"
         );
-        store.create(request("admin"), 2).expect("bootstraps");
+        store
+            .create(request("admin"), Caller::Authenticated, 2)
+            .expect("bootstraps");
         store
             .create(
                 NewCredential {
                     tenant: Some("acme".into()),
                     ..request("ro")
                 },
+                Caller::Authenticated,
                 3,
             )
             .expect("after the first, anything an admin may grant");
@@ -1251,6 +1557,7 @@ mod tests {
                     tenant: Some("acme".into()),
                     ..request("rw")
                 },
+                Caller::Authenticated,
                 2,
             )
             .expect("not the first credential");
@@ -1272,14 +1579,18 @@ mod tests {
             shown.contains("<redacted>") && shown.contains("ops"),
             "{shown}"
         );
-        let created = store.create(asked, 1).expect("creates");
+        let created = store
+            .create(asked, Caller::Authenticated, 1)
+            .expect("creates");
         let shown = format!("{created:?}");
         assert!(!shown.contains(supplied), "{shown}");
         assert!(
             shown.contains(&created.prefix),
             "the prefix is fine: {shown}"
         );
-        let minted = store.create(request("ro"), 2).expect("mints");
+        let minted = store
+            .create(request("ro"), Caller::Authenticated, 2)
+            .expect("mints");
         let shown = format!("{:?}", Ok::<_, Error>(minted.clone()));
         assert!(!shown.contains(&minted.token), "{shown}");
         assert!(
@@ -1294,12 +1605,173 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = Dir::new();
         let store = CredentialStore::open(&dir.0).expect("opens");
-        store.create(request("admin"), 1).expect("creates");
+        store
+            .create(request("admin"), Caller::Authenticated, 1)
+            .expect("creates");
         let mode = fs::metadata(dir.0.join(LOG_NAME))
             .expect("log")
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600, "{mode:o}");
+    }
+
+    /// A full disk can stop a write part-way. Those bytes are not a record,
+    /// and the next append must not land after them: a create acknowledged
+    /// after the failure that no restart can read back is worse than the
+    /// failure itself.
+    #[test]
+    fn a_torn_append_is_rolled_back_so_later_writes_stay_readable() {
+        let dir = Dir::new();
+        let store = CredentialStore::open(&dir.0).expect("opens");
+        let admin = store
+            .create(request("admin"), Caller::Authenticated, 1)
+            .expect("bootstraps");
+        store.faults().torn_write = Some(17);
+        let failed = store.create(request("rw"), Caller::Authenticated, 2);
+        assert!(matches!(failed, Err(Error::Io(_))), "{failed:?}");
+        assert_eq!(
+            store.list(Caller::Authenticated).expect("lists").len(),
+            1,
+            "nothing joined"
+        );
+        let kept = store
+            .create(request("ro"), Caller::Authenticated, 3)
+            .expect("the store still writes");
+        assert_eq!(
+            store
+                .revoke(&admin.id, Caller::Authenticated, 4)
+                .expect("revokes"),
+            Revoked::At(4)
+        );
+        drop(store);
+
+        let store = CredentialStore::open(&dir.0).expect("every acknowledged record reads back");
+        let listed = store.list(Caller::Authenticated).expect("lists");
+        assert_eq!(
+            listed
+                .iter()
+                .map(|view| view.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![admin.id.as_str(), kept.id.as_str()]
+        );
+        assert_eq!(listed[0].revoked_at_ns, Some(4));
+        assert!(store.authenticate(Some(&bearer(&kept.token)), 5).is_ok());
+    }
+
+    /// A write that landed whole and then failed its fsync was reported as a
+    /// failure, so it must not be on disk either: the caller retrying with
+    /// the same supplied token would otherwise record that digest twice, and
+    /// the log would refuse to open.
+    #[test]
+    fn a_failed_fsync_is_rolled_back_so_a_retry_cannot_record_a_token_twice() {
+        let dir = Dir::new();
+        let store = CredentialStore::open(&dir.0).expect("opens");
+        let admin = store
+            .create(request("admin"), Caller::Authenticated, 1)
+            .expect("bootstraps");
+        let supplied = || NewCredential {
+            token: Some("control-plane-issued-0123456789".into()),
+            ..request("rw")
+        };
+        store.faults().sync = true;
+        assert!(store.create(supplied(), Caller::Authenticated, 2).is_err());
+        assert!(
+            store
+                .authenticate(Some("Bearer control-plane-issued-0123456789"), 2)
+                .is_err(),
+            "a failed create does not authenticate"
+        );
+        let created = store
+            .create(supplied(), Caller::Authenticated, 3)
+            .expect("the retry succeeds");
+
+        // A revoke whose fsync failed is rolled back the same way: the token
+        // still authenticates, exactly as the error said.
+        store.faults().sync = true;
+        assert!(store.revoke(&created.id, Caller::Authenticated, 4).is_err());
+        assert!(store.authenticate(Some(&bearer(&created.token)), 4).is_ok());
+        drop(store);
+
+        let store = CredentialStore::open(&dir.0).expect("reopens");
+        let listed = store.list(Caller::Authenticated).expect("lists");
+        assert_eq!(listed.len(), 2, "{listed:?}");
+        assert_eq!(listed[0].id, admin.id);
+        assert_eq!(listed[1].revoked_at_ns, None, "the failed revoke is gone");
+        assert!(store.authenticate(Some(&bearer(&created.token)), 5).is_ok());
+    }
+
+    /// When the rollback fails too, nobody knows what the log's tail holds,
+    /// so the store refuses every further change until a reopen heals and
+    /// re-reads it — reads keep working throughout.
+    #[test]
+    fn a_failed_rollback_latches_the_store_until_a_reopen_reconciles_it() {
+        let dir = Dir::new();
+        let store = CredentialStore::open(&dir.0).expect("opens");
+        let admin = store
+            .create(request("admin"), Caller::Authenticated, 1)
+            .expect("bootstraps");
+        {
+            let mut faults = store.faults();
+            faults.torn_write = Some(9);
+            faults.rollback = true;
+        }
+        assert!(store
+            .create(request("rw"), Caller::Authenticated, 2)
+            .is_err());
+        let latched = store.create(request("ro"), Caller::Authenticated, 3);
+        assert!(
+            matches!(&latched, Err(Error::Io(error)) if error.to_string().contains("restart")),
+            "{latched:?}"
+        );
+        assert!(
+            store.revoke(&admin.id, Caller::Authenticated, 3).is_err(),
+            "revokes refuse too"
+        );
+        assert!(store.authenticate(Some(&bearer(&admin.token)), 3).is_ok());
+        assert_eq!(store.list(Caller::Authenticated).expect("lists").len(), 1);
+        drop(store);
+
+        let store = CredentialStore::open(&dir.0).expect("the reopen heals the torn tail");
+        assert_eq!(store.list(Caller::Authenticated).expect("lists").len(), 1);
+        store
+            .create(request("ro"), Caller::Authenticated, 4)
+            .expect("and writes again");
+        drop(store);
+        assert_eq!(
+            CredentialStore::open(&dir.0)
+                .expect("reopens")
+                .list(Caller::Authenticated)
+                .expect("lists")
+                .len(),
+            2
+        );
+    }
+
+    /// The log's directory entry is made durable by the first append that
+    /// succeeds, not by the append that happened to create the file: if
+    /// that one failed, a later success must still sync the directory, or
+    /// every credential it acknowledged could vanish with the file.
+    #[test]
+    fn a_failed_first_append_leaves_the_directory_sync_to_the_next() {
+        let dir = Dir::new();
+        let store = CredentialStore::open(&dir.0).expect("opens");
+        store.faults().directory_sync = true;
+        assert!(store
+            .create(request("admin"), Caller::Authenticated, 1)
+            .is_err());
+        assert!(
+            !store.enforced(),
+            "the failed bootstrap left the store open"
+        );
+        assert!(!CredentialStore::has_api_credentials(&dir.0).expect("peeks"));
+        store
+            .create(request("admin"), Caller::Authenticated, 2)
+            .expect("bootstraps");
+        assert_eq!(store.faults().directory_syncs, 1);
+        store
+            .create(request("ro"), Caller::Authenticated, 3)
+            .expect("creates");
+        assert_eq!(store.faults().directory_syncs, 1, "once is enough");
     }
 
     /// A writer holds its mutex through the append's fsync; authentication
@@ -1311,14 +1783,19 @@ mod tests {
     fn authentication_never_waits_for_a_writer() {
         let dir = Dir::new();
         let store = std::sync::Arc::new(CredentialStore::open(&dir.0).expect("opens"));
-        let created = store.create(request("admin"), 1).expect("creates");
+        let created = store
+            .create(request("admin"), Caller::Authenticated, 1)
+            .expect("creates");
         let held = store.writer().expect("writer");
         let (send, receive) = std::sync::mpsc::channel();
         let reader = std::sync::Arc::clone(&store);
         let token = created.token.clone();
         std::thread::spawn(move || {
             let verdict = reader.authenticate(Some(&bearer(&token)), 2).is_ok();
-            let listed = reader.list().map(|views| views.len()).unwrap_or(0);
+            let listed = reader
+                .list(Caller::Authenticated)
+                .map(|views| views.len())
+                .unwrap_or(0);
             let _ = send.send((verdict, listed));
         });
         let answered = receive.recv_timeout(std::time::Duration::from_secs(30));

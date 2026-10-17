@@ -36,8 +36,13 @@ Read this section before relying on the ledger for anything.
   can recompute its `subject_digest` and find the entry, and the chain shows
   where it sits relative to the generations around it.
 - **A recorded erasure still holds.** Verification checks every ledgered
-  erasure's subject against the live tombstone log and names any that no
-  longer has a settled erasure there (see the restore bullet below).
+  erasure against the live tombstone log. Each entry needs a settled erasure
+  of its subject published by the entry's own `generation` or a later one,
+  and verification names any entry that has none (see the restore bullet
+  below).
+- **Every settled erasure was recorded.** Verification also checks the other
+  way: every settled erasure in the live tombstone log must have its entry,
+  matched by `erasure_id`, `subject_digest` and `generation`.
 
 **It does not prove:**
 
@@ -73,9 +78,13 @@ Read this section before relying on the ledger for anything.
   it was. The chain records the install as an ordinary `checkpoint` entry.
   Verification catches it only by comparing the ledgered erasure against the
   live tombstone log; it names the entry as no longer holding until the
-  erasure is re-applied. An erasure re-applied after such a restore gets a
-  new entry. Its `erasure_id` can repeat an earlier entry's (the tombstone log
-  was rewound), but its `generation` will not.
+  erasure is re-applied. Each entry is judged on its own. If a subject was
+  erased twice and the restored pin falls between the two erasures, the
+  first erasure is still settled, but it does not count for the second. The
+  second erasure's entry is named, because the data it removed is back. An
+  erasure re-applied after such a restore gets a new entry. Its `erasure_id`
+  can repeat an earlier entry's (the tombstone log was rewound), but its
+  `generation` will not.
 - **That other tenants learn nothing.** A tenant's evidence pack shows when
   other tenants' erasures were ledgered: each one is a stub with its `seq` and
   `at_ns`. `GET /v1/ledger/head`, open to bound credentials, also shows when
@@ -216,11 +225,19 @@ these checks:
    manifest digest.
 3. Re-digest every file the live manifest names. This is the same check as
    [`GET /v1/verify`](http-api.md#get-v1verify).
-4. Check that the subject of every erasure entry still has a settled erasure
-   in the live tombstone log. Restoring a pin taken before an erasure fails
+4. Check that every erasure entry still holds: the live tombstone log must
+   have a settled erasure of the same subject, published by the entry's
+   `generation` or a later one. Restoring a pin taken before an erasure fails
    this check, and the problem names the entry until the erasure is applied
    again.
-5. Report any ledger append that failed and has not been caught up
+5. Check that every settled erasure in the live tombstone log has its entry,
+   with the same `erasure_id`, `subject_digest` and `generation`. A crash
+   between an erasure's settle record and its entry leaves one missing
+   (`erasure 3 (trace subject, settled in generation 7) is not in the
+   ledger…`). So does a failed append. The next open ledgers it, and so does
+   the next checkpoint after a failed append. A live check does not count an
+   entry that is being appended while it runs as missing.
+6. Report any ledger append that failed and has not been caught up
    (`GET /v1/ledger/verify` only, since a fresh offline process has no record
    of a running server's failures).
 
@@ -244,10 +261,13 @@ live state.
 
 **What it costs.** The file check reads every manifested byte, so the cost
 grows with store size. It runs under the maintenance lock, so compaction,
-expiry and checkpoints wait for it to finish. Erasure and anchor appends do
-not wait: the chain is read only up to the tip as it stood when the check
-began, so an entry appended mid-check is left for the next check rather than
-read half-written.
+expiry and checkpoints wait for it to finish. The chain walk does not hold
+that lock. The chain is read only up to the tip as it stood when the check
+began, and nothing rewrites those bytes, so the walk runs after the lock is
+released. Erasure and anchor appends never wait. An entry appended mid-check
+is left for the next check rather than read half-written.
+`GET /v1/ledger/verify` always walks the whole chain and re-runs the file
+check.
 
 **After compaction or expiry.** Both replace segment files between
 checkpoints. Until the next checkpoint publishes, the live manifest can name
@@ -267,8 +287,12 @@ server owns it. It is read-only. It takes the directory lock and reads
 as they are. It runs no recovery and appends nothing, because appending is the
 very thing under examination. One consequence: on a store that crashed between
 publishing a generation and ledgering it, it exits `2` with the
-newer-than-the-chain problem above. Start the server (or open the store) once,
-and the generation is ledgered.
+newer-than-the-chain problem above. A crash between settling an erasure and
+ledgering it likewise exits `2`, with the not-in-the-ledger problem. Start the
+server (or open the store) once, and both are ledgered. A tombstone-log line
+that does not parse is skipped and counted as a problem, because the erasure
+it records could not be checked. The store itself refuses to open over such a
+line.
 
 ## Anchoring
 
@@ -355,16 +379,40 @@ otherwise name store-wide files. Problems about other tenants' erasures are
 withheld behind a count that does not say whose. `intact` is the store's
 verdict either way: a pack never reports a store intact when it isn't.
 
-**Bounds.** Activity comes from the same fold the analytics use, so the query
-deadline (`--query-deadline-ms`) applies. A window too large to fold within it
-answers `400` with no partial pack; narrow the window. At most 32 erasure
-receipts run per pack, and only while that same budget lasts. Past either
-limit, `conclusive` and `result` are `null`, and
-`GET /v1/erasures/{id}/verify` answers for that erasure. The pack's file
-verification may reuse a verification of the same live generation from the
-last 60 seconds, so that bound credentials cannot each force a full-store
-re-read; `verified_at_ns` says when the file check ran.
-`GET /v1/ledger/verify` never reuses a result.
+**Bounds.** Bound credentials can request packs, so a pack must not cost the
+whole chain or the whole store on every request. One query budget
+(`--query-deadline-ms`) covers the whole request: the chain walk, the
+activity fold and the erasure receipts share it, and none of them gets a fresh
+budget of its own.
+
+- **The chain walk** continues the last one rather than starting again at the
+  first entry, as long as that walk began within the last 60 seconds. A pack
+  normally walks only the entries appended since the previous pack (or
+  `GET /v1/ledger/verify`), and packs walk the chain from the start at most
+  once a minute, however often they are requested. If the budget runs out
+  mid-walk, the walk stops, keeps its progress, and the pack is refused with
+  `400` saying how far it got (`the ledger chain was verified through line
+  N …`). A pack never carries a partial verification. The next request
+  resumes where the walk stopped, so retrying completes the check, even on a
+  chain too long for one budget.
+- **The window's entries** are found from an index the walk keeps, so a pack
+  reads only those lines.
+- **Activity** comes from the same fold the analytics use. A window too large
+  to fold within the budget answers `400` with no partial pack; narrow the
+  window.
+- **Receipts:** at most 32 run per pack, and only while the budget lasts. Past
+  either limit, `conclusive` and `result` are `null`, and
+  `GET /v1/erasures/{id}/verify` answers for that erasure.
+- **The file check** may reuse a verification of the same live generation
+  from the last 60 seconds, so bound credentials cannot each force a
+  full-store re-read. `verified_at_ns` says when it ran. It is the one step
+  the budget does not cut short. A file check stopped halfway would have to
+  start over, and its cost depends on the store's size, not on anything the
+  request asked for.
+
+`GET /v1/ledger/verify` never reuses a result. The 60-second bound is also how
+long an edit to `ledger.jsonl` made under a running server could go unnoticed
+by packs; the operator's verification sees it at once.
 
 Distinct traces and sessions are counted by a 128-bit hash of the tenant and
 the id. An adversary who crafts colliding ids can make the count read low by
@@ -417,7 +465,10 @@ erasure holds the subject's data and the tombstone log from before the
 erasure. Restore it into the same directory and both come back, while the
 chain keeps the erasure's entry. Verification names that entry until you
 apply the erasure again. The re-application is ledgered as a new entry with
-the same subject, often the same `erasure_id`, and a later `generation`.
+the same subject, often the same `erasure_id`, and a later `generation`. The
+same holds when the pin falls between two erasures of one subject: only the
+later one is undone, and verification names its entry even though the
+earlier erasure is still settled.
 
 An object-storage archive published from a pin does not carry the ledger
 copy. It archives manifested files only.
@@ -434,7 +485,9 @@ copy. It archives manifested files only.
   to what the pack said, not to the counts being complete.
 - **No rotation.** The ledger grows by one line per published generation,
   forever. Every open reads it in full to find the tip and the erasures already
-  ledgered.
+  ledgered. Once a server has answered an evidence pack or a verification, it
+  also keeps about 48 bytes per entry in memory. That is the walk the next
+  pack continues from (see [Bounds](#evidence-packs)).
 - **Anchor signatures are stored, never checked.** See
   [what it does not prove](#what-it-proves-and-what-it-does-not).
 - **A failed append is caught up, not retried immediately.** The next

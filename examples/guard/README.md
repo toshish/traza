@@ -75,7 +75,7 @@ Configuration
 | `TRAZA_TOKEN` | none | Bearer token, when the server enforces auth. A `ro` token is enough for the gate; recording needs `rw`. It is passed to curl through a here-document, never on a command line. |
 | `TRAZA_TENANT` | the default tenant | The run's tenant, for an unbound token. A bound token is forced to its own. |
 | `TRAZA_RECORD_TOOL_INPUT` | off | `1` records each tool's full input on its span. By default only a SHA-256 of the canonical input is recorded — enough for repeat detection, without copying commands and file contents into the store. |
-| `TRAZA_FUSE_FAIL_CLOSED` | off | `1` blocks the tool call when Traza cannot answer. By default the hook fails open: an unreachable guard prints a warning and lets the call through. |
+| `TRAZA_FUSE_FAIL_CLOSED` | off | `1` blocks the tool call when Traza cannot answer — unreachable, or an error instead of a verdict, which is what the gate gives for a run it could read only part of and that part does not stop ([why](../../docs/guide/guard.md#what-is-durable-and-what-is-rebuilt)). By default the hook fails open: it prints a warning and lets the call through. |
 | `TRAZA_TIMEOUT` | `5` | Seconds to wait for Traza. |
 | `CLAUDE_SESSION_ID` | the hook input's `session_id` | The run id. |
 

@@ -8,7 +8,10 @@
 //!
 //! - `lifetime {spans, bytes, batches, rejected}` — since the counters began;
 //! - `month {window, spans, bytes}` — the current UTC calendar month, reset
-//!   when the month turns.
+//!   when the month turns. The month only ever moves forward: a batch whose
+//!   instant falls in a month older than one the book already counted in —
+//!   two batches crossing the boundary out of order, a wall clock stepped
+//!   back — is charged to the newer month, never resets it.
 //!
 //! `bytes` is each admitted span's JSON size after tenant stamping and BEFORE
 //! payload offload — what the client sent, in Traza's native encoding (an OTLP
@@ -45,7 +48,7 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::caps::{key_hash, Admitting};
+use crate::caps::Admitting;
 use crate::limits::{write_atomically, LimitsBook, TenantLimits};
 use crate::{Error, Result, Span, Store};
 
@@ -246,6 +249,31 @@ struct Inner {
     /// does not rewrite and fsync the file every tick.
     version: u64,
     persisted: u64,
+    /// The latest instant the book has accounted at. See [`Inner::clock`].
+    clock_ns: u64,
+}
+
+impl Inner {
+    /// The instant to account at, for a caller that read the clock at
+    /// `now_ns`: never earlier than one the book already accounted at.
+    ///
+    /// Every caller reads the clock before it takes this lock, so two
+    /// batches can reach it out of order across a month boundary — and a
+    /// wall clock can step back. Taken at face value, the late instant's
+    /// month would replace the newer month's counters with zeros, handing
+    /// back quota already spent. Clamped, it is charged to the month the
+    /// book is already in — the month it was acknowledged in.
+    fn clock(&mut self, now_ns: u64) -> u64 {
+        self.clock_ns = self.clock_ns.max(now_ns);
+        self.clock_ns
+    }
+
+    /// The instant and month a READ at `now_ns` answers for: the clamped
+    /// instant [`Self::clock`] would give, without moving the clock.
+    fn read_window(&self, now_ns: u64) -> (u64, String) {
+        let now_ns = self.clock_ns.max(now_ns);
+        (now_ns, month_window(now_ns).0)
+    }
 }
 
 /// Every tenant's counters, in memory, mirrored to `usage.json`.
@@ -283,12 +311,21 @@ impl UsageBook {
             Err(error) if error.kind() == io::ErrorKind::NotFound => BTreeMap::new(),
             Err(error) => return Err(error.into()),
         };
+        // The clock resumes at the start of the newest month already
+        // counted, so a restart on a clock that stepped back cannot wind
+        // that month back either.
+        let clock_ns = tenants
+            .values()
+            .filter_map(|counters| window_start(&counters.month.window))
+            .max()
+            .unwrap_or(0);
         Ok(Self {
             path,
             inner: Mutex::new(Inner {
                 tenants,
                 version: 0,
                 persisted: 0,
+                clock_ns,
             }),
             persist: Mutex::new(()),
         })
@@ -317,8 +354,10 @@ impl UsageBook {
         if limited.is_empty() {
             return Ok(());
         }
-        let (window, resets_at_ns) = month_window(now_ns);
         let mut inner = self.lock()?;
+        // Judged in the month the batch would be charged to.
+        let now_ns = inner.clock(now_ns);
+        let (window, resets_at_ns) = month_window(now_ns);
         let mut refusal = None;
         for (tenant, doc) in &limited {
             let (_, month_spans, month_bytes) = inner
@@ -377,20 +416,19 @@ impl UsageBook {
 
     /// Counts the spans a batch actually admitted.
     ///
-    /// `admitted` is an order-preserving subsequence of the batch `admitting`
-    /// measured — every span, unless a pending erasure dropped some — so the
-    /// measurements are re-aligned by walking both in order and matching
-    /// primary-key hashes. A span with no measurement (impossible unless the
-    /// hashes collide across a dropped span) is charged its stored size.
+    /// `admitting` measures exactly `admitted`, position by position: spans
+    /// a pending erasure dropped took their measurements with them
+    /// ([`Admitting::retain`]). A span without a measurement — impossible
+    /// unless that pairing broke — is charged its stored size rather than
+    /// nothing.
     pub(crate) fn record(&self, admitted: &[Arc<Span>], admitting: &Admitting, now_ns: u64) {
-        let mut measured = admitting.spans.iter();
+        debug_assert_eq!(admitted.len(), admitting.spans.len());
         let mut per_tenant: BTreeMap<&str, (u64, u64)> = BTreeMap::new();
-        for span in admitted {
-            let key = key_hash(&span.tenant, &span.trace_id, &span.span_id);
-            let bytes = measured
-                .by_ref()
-                .find(|entry| entry.key == key)
-                .map_or_else(|| crate::caps::json_len(span.as_ref()), |entry| entry.bytes);
+        for (index, span) in admitted.iter().enumerate() {
+            let bytes = admitting.spans.get(index).map_or_else(
+                || crate::caps::json_len(span.as_ref()),
+                |measured| measured.bytes,
+            );
             let slot = per_tenant.entry(span.tenant.as_str()).or_default();
             slot.0 += 1;
             slot.1 = slot.1.saturating_add(bytes);
@@ -398,13 +436,14 @@ impl UsageBook {
         if per_tenant.is_empty() {
             return;
         }
-        let (window, _) = month_window(now_ns);
         // A poisoned lock loses this batch's counts rather than failing an
         // ingest that is already acknowledged — the documented direction of
         // error is an undercount.
         let Ok(mut inner) = self.inner.lock() else {
             return;
         };
+        let now_ns = inner.clock(now_ns);
+        let (window, _) = month_window(now_ns);
         for (tenant, (spans, bytes)) in per_tenant {
             let counters = inner.tenants.entry(tenant.to_owned()).or_default();
             counters.roll(&window);
@@ -452,63 +491,69 @@ impl UsageBook {
     /// many tenants the store has), and names plus plain counts for all of
     /// them. Building, merging and sorting the rows happen after it is
     /// released.
+    ///
+    /// The report reads the month the book is in: `now_ns`, unless the book
+    /// has already accounted at a later instant ([`Inner::clock`]) — decided
+    /// under the same lock the counts are copied under, so the month and the
+    /// numbers agree. A report does not move the book's clock.
     pub(crate) fn report(
         &self,
         limits: &LimitsBook,
         tenant: Option<&str>,
         now_ns: u64,
     ) -> Result<UsageReport> {
-        let (window, _) = month_window(now_ns);
-        let row = |name: String, (lifetime, spans, bytes): Snapshot, doc: TenantLimits| {
-            let month = Month {
-                window: window.clone(),
-                spans,
-                bytes,
-            };
-            UsageRow {
-                state: state_of(&doc, &month),
-                tenant: name,
-                lifetime,
-                month,
-                limits: doc,
-            }
-        };
-        let tenants = match tenant {
+        // Limits first, under their own lock: the two locks are never held
+        // together.
+        let (mut docs, as_of_ns, window, counted) = match tenant {
             Some(tenant) => {
-                let doc = limits.get(tenant)?;
-                let counted = self
-                    .lock()?
-                    .tenants
-                    .get(tenant)
-                    .map(|counters| counters.snapshot(&window))
-                    .unwrap_or_default();
-                vec![row(tenant.to_owned(), counted, doc)]
+                let docs = BTreeMap::from([(tenant.to_owned(), limits.get(tenant)?)]);
+                let inner = self.lock()?;
+                let (as_of_ns, window) = inner.read_window(now_ns);
+                let counted = vec![(
+                    tenant.to_owned(),
+                    inner
+                        .tenants
+                        .get(tenant)
+                        .map(|counters| counters.snapshot(&window))
+                        .unwrap_or_default(),
+                )];
+                (docs, as_of_ns, window, counted)
             }
             None => {
-                let mut all_limits = limits.all()?;
-                let counted: Vec<(String, Snapshot)> = self
-                    .lock()?
+                let docs = limits.all()?;
+                let inner = self.lock()?;
+                let (as_of_ns, window) = inner.read_window(now_ns);
+                let counted: Vec<(String, Snapshot)> = inner
                     .tenants
                     .iter()
                     .map(|(name, counters)| (name.clone(), counters.snapshot(&window)))
                     .collect();
-                let mut merged: BTreeMap<String, Snapshot> = counted.into_iter().collect();
-                for name in all_limits.keys() {
-                    merged.entry(name.clone()).or_default();
-                }
-                merged
-                    .into_iter()
-                    .map(|(name, counted)| {
-                        let doc = all_limits.remove(&name).unwrap_or_default();
-                        row(name, counted, doc)
-                    })
-                    .collect()
+                (docs, as_of_ns, window, counted)
             }
         };
-        Ok(UsageReport {
-            as_of_ns: now_ns,
-            tenants,
-        })
+        let mut merged: BTreeMap<String, Snapshot> = counted.into_iter().collect();
+        for name in docs.keys() {
+            merged.entry(name.clone()).or_default();
+        }
+        let tenants = merged
+            .into_iter()
+            .map(|(name, (lifetime, spans, bytes))| {
+                let doc = docs.remove(&name).unwrap_or_default();
+                let month = Month {
+                    window: window.clone(),
+                    spans,
+                    bytes,
+                };
+                UsageRow {
+                    state: state_of(&doc, &month),
+                    tenant: name,
+                    lifetime,
+                    month,
+                    limits: doc,
+                }
+            })
+            .collect();
+        Ok(UsageReport { as_of_ns, tenants })
     }
 
     /// The per-tenant counters in Prometheus text. Like the report, it copies
@@ -609,6 +654,24 @@ pub(crate) fn month_window(now_ns: u64) -> (String, u64) {
     (format!("{year:04}-{month:02}"), resets_at_ns)
 }
 
+/// The first nanosecond of a `YYYY-MM` window — the inverse of
+/// [`month_window`] — or `None` for anything else, which a damaged or
+/// hand-edited counter file might hold and which then constrains nothing.
+fn window_start(window: &str) -> Option<u64> {
+    let (year, month) = window.split_once('-')?;
+    if year.len() != 4 || month.len() != 2 {
+        return None;
+    }
+    let year: i64 = year.parse().ok()?;
+    let month: u32 = month
+        .parse()
+        .ok()
+        .filter(|month| (1..=12).contains(month))?;
+    u64::try_from(crate::mcp::days_from_civil(year, month, 1))
+        .ok()?
+        .checked_mul(86_400 * 1_000_000_000)
+}
+
 /// A Prometheus label value, escaped. Tenant names cannot need it today — the
 /// charset is `[a-z0-9._-]` — but the exposition format is not the place to
 /// find out that changed.
@@ -695,13 +758,7 @@ mod tests {
 
     fn admitting(spans: &[Span], bytes: u64) -> Admitting {
         Admitting {
-            spans: spans
-                .iter()
-                .map(|span| Measured {
-                    key: key_hash(&span.tenant, &span.trace_id, &span.span_id),
-                    bytes,
-                })
-                .collect(),
+            spans: spans.iter().map(|_| Measured { bytes }).collect(),
         }
     }
 
@@ -726,6 +783,12 @@ mod tests {
         assert_eq!(crate::mcp::rfc3339(resets), "2027-01-01T00:00:00Z");
         assert_eq!(month_window(resets - 1).0, "2026-12");
         assert_eq!(month_window(resets).0, "2027-01");
+        // A window's start is the previous window's reset.
+        assert_eq!(window_start("2026-11"), Some(month_window(OCT_15).1));
+        assert_eq!(window_start("2027-01"), Some(resets));
+        for junk in ["", "2026-13", "2026-1", "26-11", "2026/11", "abcd-ef"] {
+            assert_eq!(window_start(junk), None, "{junk:?}");
+        }
     }
 
     #[test]
@@ -777,6 +840,73 @@ mod tests {
         let _ = fs::remove_dir_all(&path);
     }
 
+    /// Each caller reads the clock before it takes the counter lock, so two
+    /// batches can reach the lock out of order across a month boundary — and
+    /// a wall clock can step back. A late October instant must not wind
+    /// November's counters back to zero, nor read them as zero in a check:
+    /// the book's month only moves forward, across a reopen too.
+    #[test]
+    fn a_late_instant_from_an_older_month_never_winds_the_month_back() {
+        let path = dir();
+        let book = UsageBook::open(&path).expect("opens");
+        let limits = LimitsBook::open(&path).expect("opens");
+        limits
+            .set(
+                "acme",
+                TenantLimits {
+                    monthly_spans: Some(3),
+                    ..TenantLimits::default()
+                },
+            )
+            .expect("sets");
+        let november = month_window(OCT_15).1 + 1;
+        let two = [span("acme", "a"), span("acme", "b")];
+        book.record(&arcs(&two), &admitting(&two, 10), november);
+        let late = [span("acme", "c")];
+        book.record(&arcs(&late), &admitting(&late, 10), OCT_15);
+        let row = book
+            .report(&limits, Some("acme"), november)
+            .expect("reports")
+            .tenants
+            .remove(0);
+        assert_eq!(
+            (row.month.window.as_str(), row.month.spans, row.month.bytes),
+            ("2026-11", 3, 30),
+            "the late batch is charged to the month the book is in"
+        );
+        assert_eq!(row.lifetime.spans, 3);
+
+        let next = [span("acme", "d")];
+        let Err(Error::QuotaExceeded(refusal)) =
+            book.check(&limits, &next, &admitting(&next, 10), OCT_15)
+        else {
+            panic!("a stale instant still sees November's 3 of 3");
+        };
+        assert_eq!((refusal.window.as_str(), refusal.used), ("2026-11", 3));
+        assert_eq!(
+            refusal.resets_at_ns,
+            Some(month_window(november).1),
+            "and November's reset"
+        );
+
+        book.persist().expect("writes");
+        drop(book);
+        let book = UsageBook::open(&path).expect("reopens");
+        let older = [span("acme", "e")];
+        book.record(&arcs(&older), &admitting(&older, 10), OCT_15);
+        let row = book
+            .report(&limits, Some("acme"), OCT_15)
+            .expect("reports")
+            .tenants
+            .remove(0);
+        assert_eq!(
+            (row.month.window.as_str(), row.month.spans),
+            ("2026-11", 4),
+            "a reopened book resumes in the newest month it counted"
+        );
+        let _ = fs::remove_dir_all(&path);
+    }
+
     #[test]
     fn a_partly_suppressed_batch_is_charged_only_for_what_was_admitted() {
         let path = dir();
@@ -791,8 +921,10 @@ mod tests {
         for (index, entry) in measured.spans.iter_mut().enumerate() {
             entry.bytes = [10, 1_000, 30][index];
         }
-        let admitted = arcs(&[batch[0].clone(), batch[2].clone()]);
-        book.record(&admitted, &measured, OCT_15);
+        // Dropped the way ingest drops a covered span: with its measurement.
+        let mut admitted = batch.to_vec();
+        measured.retain(&mut admitted, |span| span.span_id != "dropped");
+        book.record(&arcs(&admitted), &measured, OCT_15);
         let row = book
             .report(&limits, Some("acme"), OCT_15)
             .expect("ok")
