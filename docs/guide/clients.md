@@ -75,6 +75,17 @@ token wherever the redirect points (Python's `urllib` copies the
 to `http`). Both clients raise a `TrazaError` with the `3xx` status and the
 `Location` in its message instead: configure the URL the redirect names.
 
+**A `request` path must start with `/`.** The path is appended to the
+client's URL rather than resolved against it, so a path prefix the URL carries
+behind a reverse proxy is kept. A path that does not start with `/` would
+continue the URL's host instead: `https://traza.example` and
+`.attacker.example/v1/whoami` make a request to another server, token
+included, with no redirect involved. Both clients refuse such a path before
+anything is sent — `ValueError` in Python, `TypeError` in TypeScript — and
+refuse a request URL whose scheme, host or port differs from the client's
+before attaching the token. This matters most to code that forwards a route
+it was handed.
+
 **Run ids are percent-encoded as one path segment.** They come from
 telemetry, so `/`, `?`, `#`, `%` and spaces are all expected; the tests use
 `team/a?x=1#frag %41`.
@@ -221,9 +232,12 @@ than skipping it. Answers the real server never gives — redirects, HTML
 pages, truncated bodies — come from a small canned-answer stub beside each
 suite, and the TypeScript suite also drives its own harness's failure paths
 (a server that never listens, exits first or cannot be executed), which must
-end the test process promptly rather than hang it. Both run in a few
-seconds. `./ci.sh` runs `scripts/check-sdk-metadata.py` and the Python suite
-after the demos, and the TypeScript suite when Node 20+ with npm is present.
+end the test process promptly rather than hang it. The Python suite runs its
+own module fixture in a child interpreter with a seed request refused, and
+again with the second server failing to start, and checks that no server or
+data directory outlives either. Both run in a few seconds. `./ci.sh` runs
+`scripts/check-sdk-metadata.py` and the Python suite after the demos, and the
+TypeScript suite when Node 20+ with npm is present.
 
 ## Limitations
 

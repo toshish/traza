@@ -380,9 +380,13 @@ class Client:
         """Send one request and return its parsed JSON body.
 
         The escape hatch for routes this client does not wrap: the same
-        credential, timeout and error mapping as every method above. ``path``
-        starts with ``/``; ``query`` values of ``None`` are left out. A
-        success whose body is not JSON raises :class:`~traza.TrazaError`.
+        credential, timeout and error mapping as every method above.
+        ``path`` is appended to the client's URL and must start with ``/``:
+        any other path would continue the URL's host (``.attacker.example``
+        names another server), so it raises ``ValueError`` before anything
+        is sent, as does a request URL whose scheme, host or port is not the
+        client's. ``query`` values of ``None`` are left out. A success whose
+        body is not JSON raises :class:`~traza.TrazaError`.
         """
         status, text = self._send(method, path, query, body, self.timeout if timeout is None else timeout)
         return self._parse(status, text)
@@ -436,11 +440,22 @@ class Client:
         body: Any,
         timeout: float,
     ) -> Tuple[int, str]:
+        # Appended, not resolved, so a reverse proxy's path prefix on the
+        # client's URL is kept. That makes a path not starting with "/" a
+        # continuation of the host: "https://traza.example" and
+        # ".attacker.example/v1/whoami" name another host, which the token
+        # would reach with no redirect involved. Both checks come before the
+        # token is attached; the second holds whatever builds the path.
+        if not path.startswith("/"):
+            raise ValueError(f'path must start with "/", got {path!r}')
         url = self.url + path
         if query:
             pairs = [(key, _query_value(value)) for key, value in query.items() if value is not None]
             if pairs:
                 url += "?" + urllib.parse.urlencode(pairs)
+        target, base = urllib.parse.urlsplit(url), urllib.parse.urlsplit(self.url)
+        if (target.scheme, target.netloc) != (base.scheme, base.netloc):
+            raise ValueError(f"{url!r} leaves the client's origin {base.scheme}://{base.netloc}")
         headers = {"Accept": "application/json", "User-Agent": f"traza-python/{__version__}"}
         data = None
         if body is not None:
