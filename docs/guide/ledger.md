@@ -81,6 +81,20 @@ Read this section before relying on the ledger for anything.
   `at_ns`. `GET /v1/ledger/head`, open to bound credentials, also shows when
   the chain grows. Neither shows whose erasure it was or what it covered.
 
+## See it run
+
+[`examples/prove/run.sh`](../../examples/prove/README.md) walks through this
+guide against a real server. It ingests and checkpoints, reads the head and
+the chain, verifies it with `GET /v1/ledger/verify`, and recomputes every head
+from `ledger.jsonl` with the [script below](#recomputing-the-heads-yourself).
+It records an anchor signed by a stand-in notary, erases a session and shows
+the erasure entry carrying a `subject_digest` that it recomputes — the
+session id appears nowhere in the file — and recomputes an evidence pack's
+digest with the [standard-library check](#evidence-packs). Then it stops the
+server, flips one byte in a sealed segment, and `traza-server verify
+--ledger` exits `2` naming the file. It takes about two seconds and exits
+non-zero if any claim fails.
+
 ## The chain
 
 Every entry has these common fields:
