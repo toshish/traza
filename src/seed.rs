@@ -23,15 +23,16 @@ const MS: u64 = 1_000_000;
 const SEC: u64 = 1_000_000_000;
 
 /// Deterministic PRNG (SplitMix64). A dependency-free generator keeps the
-/// corpus reproducible without pulling in `rand`.
-struct Rng(u64);
+/// corpus reproducible without pulling in `rand` — and the crate's own
+/// randomized tests with it.
+pub(crate) struct Rng(u64);
 
 impl Rng {
-    fn new(seed: u64) -> Self {
+    pub(crate) fn new(seed: u64) -> Self {
         Self(seed.wrapping_add(0x9e37_79b9_7f4a_7c15))
     }
 
-    fn next_u64(&mut self) -> u64 {
+    pub(crate) fn next_u64(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
         let mut z = self.0;
         z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -40,19 +41,19 @@ impl Rng {
     }
 
     /// Uniform in `lo..=hi`.
-    fn range(&mut self, lo: u64, hi: u64) -> u64 {
+    pub(crate) fn range(&mut self, lo: u64, hi: u64) -> u64 {
         if hi <= lo {
             return lo;
         }
         lo + self.next_u64() % (hi - lo + 1)
     }
 
-    fn pick<'a, T>(&mut self, items: &'a [T]) -> &'a T {
+    pub(crate) fn pick<'a, T>(&mut self, items: &'a [T]) -> &'a T {
         &items[(self.next_u64() % items.len() as u64) as usize]
     }
 
     /// True `percent` of the time.
-    fn chance(&mut self, percent: u64) -> bool {
+    pub(crate) fn chance(&mut self, percent: u64) -> bool {
         self.next_u64() % 100 < percent
     }
 }

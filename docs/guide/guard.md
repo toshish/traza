@@ -154,7 +154,13 @@ the one counted, whichever request's acknowledgement happens to be observed
 last — including while the run is being rebuilt from the store. And when one
 batch carries two versions of a span, only the later — the one the store
 keeps — is counted, at the place its own start time gives it among the
-batch's steps.
+batch's steps. A batch that re-sends several spans has every replaced
+contribution taken out before any replacement is counted, so it is never
+judged on new versions of some spans beside old versions of others: one
+that moves $5 of cost (or tokens, or a repeated step) from one span to
+another is judged on the totals the store's versions reach, never on one
+that counts the moved amount twice, and stops the run on a cumulative limit
+exactly when a replay of the store would.
 
 ## Policies
 
