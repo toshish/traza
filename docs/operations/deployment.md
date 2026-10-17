@@ -30,16 +30,38 @@ not just servers: the `seed --data-dir` tool and any process embedding the
 engine as a library count too.
 
 The lock records its owner's PID. If the owner dies without cleaning up —
-SIGKILL, OOM, power loss — the lock is **stale** and the next open reclaims it
-automatically. A lock naming a live process still rejects the open, and an
-unreadable lock file is treated as live: a false negative merely keeps the
+SIGKILL, OOM, power loss, and for the server any stop at all, since it has no
+graceful shutdown — the lock is **stale** and the next open reclaims it
+automatically.
+A lock is stale when the PID it names is not a running process — checked
+through `/proc` on Linux, which is why this works in the `FROM scratch`
+release image that has no `kill` binary, and with `kill -0` elsewhere — or
+when it names the opening process itself and that process does not already
+hold the directory. A lock naming another live process still rejects the open,
+as does a second open of the same directory from within one process. A lock
+whose owner cannot be checked (an unreadable file, or neither `/proc` nor
+`kill` available) is treated as live: a false negative merely keeps the
 conservative rejection, which never corrupts data.
+
+**Containers.** The release image's entrypoint makes the server PID 1 in its
+container, on every start. As PID 1 with no signal handler it ignores the
+SIGTERM that `docker stop` and `docker restart` send, so they end it with
+SIGKILL once the grace period expires and the lock stays behind, naming PID 1 —
+the PID the restarted server has again. That is the "names the opening process
+itself" case above: the restarted server reclaims the lock and opens normally,
+with no manual cleanup. Recreating the container on the same volume works the
+same way.
 
 Practical consequences:
 
 - Do not run two servers against one directory, and do not put a data directory
   on shared storage that two hosts can mount at once. The PID check is
   meaningless across hosts.
+- It is just as meaningless across containers, even on one host: each has its
+  own PID namespace, so two containers mounting one volume at the same time
+  are both PID 1, and the second reclaims the first's live lock. Have the
+  orchestrator stop the old container before it starts the new one — in
+  Kubernetes, `strategy: Recreate` rather than a rolling update.
 - To bulk-load with `seed --data-dir`, stop the server first; or leave it
   running and use `seed --url` to go through the API instead.
 - Scaling today is vertical; multi-node replication is not shipped behaviour.

@@ -858,6 +858,80 @@ fn stale_lock_reclaim_has_exactly_one_winner() {
 }
 
 #[test]
+fn a_stale_lock_naming_our_own_pid_is_reclaimed() {
+    // In a container the server is PID 1 on every start, and it has no
+    // graceful shutdown, so `docker restart` leaves a LOCK saying 1 for a
+    // server that is again 1. No other live process can have our PID, and
+    // this process does not hold the directory, so the lock is stale.
+    let dir = correctness_test_dir("own-pid-lock");
+    std::fs::write(dir.join("LOCK"), format!("{}\n", std::process::id()))
+        .expect("stale lock writes");
+    let store = Store::open(&dir, Config::default())
+        .expect("a lock naming our PID that this process does not hold is stale");
+
+    // Reclaiming it must not loosen the single-writer rule: the lock now
+    // names this process because this process holds it.
+    assert!(
+        matches!(
+            Store::open(&dir, Config::default()),
+            Err(Error::AlreadyOpen)
+        ),
+        "a second open in the holding process must still be refused"
+    );
+    drop(store);
+    let reopened = Store::open(&dir, Config::default()).expect("reopens after the drop");
+    drop(reopened);
+    std::fs::remove_dir_all(dir).expect("remove test directory");
+}
+
+#[test]
+fn a_second_open_in_this_process_is_refused_under_any_spelling() {
+    // This process's own locks are recognised by directory, so every
+    // spelling of one directory must be the same directory: a path that
+    // slipped past as "not held" would read the lock's PID — ours — as a
+    // predecessor's and reclaim a live store's lock.
+    let dir = correctness_test_dir("own-lock-alias");
+    let store = Store::open(&dir, Config::default()).expect("opens");
+    let link = dir.with_extension("link");
+    let _ = std::fs::remove_file(&link);
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&dir, &link).expect("symlink");
+    #[cfg(not(unix))]
+    let link = dir.clone();
+    for alias in [
+        dir.join("."),
+        link.clone(),
+        dir.join("..").join(dir.file_name().unwrap()),
+    ] {
+        assert!(
+            matches!(
+                Store::open(&alias, Config::default()),
+                Err(Error::AlreadyOpen)
+            ),
+            "{} is the open directory and must be refused",
+            alias.display()
+        );
+    }
+    drop(store);
+    let _ = std::fs::remove_file(&link);
+    std::fs::remove_dir_all(dir).expect("remove test directory");
+}
+
+#[test]
+fn a_lock_naming_a_pid_that_cannot_exist_is_reclaimed() {
+    // No kernel hands out this PID: Linux caps PIDs below 2^22 and the BSDs
+    // (macOS included) below 100,000. A reaped child's PID, which the test
+    // above uses, could in principle be reused before the open looks.
+    const NO_SUCH_PID: u32 = 1 << 22;
+    let dir = correctness_test_dir("no-such-pid-lock");
+    std::fs::write(dir.join("LOCK"), format!("{NO_SUCH_PID}\n")).expect("stale lock writes");
+    let store = Store::open(&dir, Config::default())
+        .expect("a lock naming a PID no process can have is stale");
+    drop(store);
+    std::fs::remove_dir_all(dir).expect("remove test directory");
+}
+
+#[test]
 fn ttl_zero_disables_expiration() {
     // Documented: zero disables TTL. Review finding: Some(0) computed a
     // cutoff of "now" and expired every existing span.

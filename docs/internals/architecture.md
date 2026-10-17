@@ -205,7 +205,9 @@ ended tidily".
 1. Create the directory if absent, then **acquire the directory lock**. One
    live `Store` per directory. A lock naming a PID that verifiably no longer
    exists is stale and reclaimed by exactly one winner through a sentinel file;
-   an unreadable or live lock rejects the open.
+   an unreadable or live lock rejects the open. A lock naming this process's
+   own PID is stale unless the process-wide registry of held directories says
+   this process holds it — a container's PID 1 restarted after an unclean stop.
 2. **Remove orphaned temp files** left by an interrupted segment write.
 3. **Finish interrupted compaction rewrites** from the supersede journal.
    Recovery follows the journal, never content.

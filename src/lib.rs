@@ -53,6 +53,7 @@ mod wal;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 use std::error::Error as StdError;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -1845,16 +1846,65 @@ struct SealOutcome {
     folded: Option<generation::FoldedThrough>,
 }
 
+/// Directories whose lock THIS process holds, by canonical path.
+///
+/// A lock file's PID cannot tell this process's own lock from one left by an
+/// earlier process that had the same PID, and that is not a curiosity: in a
+/// container the server is PID 1 on every start, so after an unclean stop
+/// the stale lock names the restarted server. No other live process can have
+/// our PID, so a lock naming it is ours exactly when this set says so.
+///
+/// Its mutex is held across every acquisition and release, which is what
+/// makes the set authoritative: no thread here can see a lock file naming
+/// this process while the set has yet to record it, or has already let it
+/// go.
+static HELD_DIRECTORIES: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+
+fn held_directories() -> MutexGuard<'static, BTreeSet<PathBuf>> {
+    // Every change is a single insert or remove, so a panic elsewhere cannot
+    // leave the set half-updated: a poisoned lock still guards a true set.
+    HELD_DIRECTORIES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[derive(Debug)]
 struct DirectoryLock {
     path: PathBuf,
+    /// The canonical directory, as recorded in [`HELD_DIRECTORIES`].
+    directory: PathBuf,
     _file: File,
 }
 
 impl DirectoryLock {
     fn acquire(path: PathBuf) -> Result<Self> {
-        match Self::try_create(&path) {
-            Ok(lock) => Ok(lock),
+        // Canonical, so every spelling of one directory — a symlink, a `.` —
+        // is the same entry. One that slipped past as "not held here" would
+        // read our own live lock as a predecessor's and reclaim it.
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let directory = fs::canonicalize(parent)?;
+        let mut held = held_directories();
+        if held.contains(&directory) {
+            return Err(Error::AlreadyOpen);
+        }
+        let file = Self::create_or_reclaim(&path)?;
+        held.insert(directory.clone());
+        Ok(Self {
+            path,
+            directory,
+            _file: file,
+        })
+    }
+
+    /// Creates the lock file, reclaiming a stale one. Called only from
+    /// [`Self::acquire`], holding [`HELD_DIRECTORIES`] with the directory
+    /// absent from it — which [`Self::owner_is_dead`] relies on.
+    fn create_or_reclaim(path: &Path) -> Result<File> {
+        match Self::try_create(path) {
+            Ok(file) => Ok(file),
             Err(Error::AlreadyOpen) => {
                 // The lock records its owner's PID. A crashed owner (killed
                 // server, OOM, power loss before unlink) must not wedge the
@@ -1867,14 +1917,14 @@ impl DirectoryLock {
                 // the race test). A reclamation sentinel closes it: exactly
                 // one reclaimer create_new-wins the sentinel, re-verifies
                 // staleness while holding it, and only then swaps the lock.
-                if Self::owner_is_dead(&path) && Self::reclaim_sentinel(&path) {
-                    let result = if Self::owner_is_dead(&path) {
-                        let _ = fs::remove_file(&path);
-                        Self::try_create(&path)
+                if Self::owner_is_dead(path) && Self::reclaim_sentinel(path) {
+                    let result = if Self::owner_is_dead(path) {
+                        let _ = fs::remove_file(path);
+                        Self::try_create(path)
                     } else {
                         Err(Error::AlreadyOpen)
                     };
-                    let _ = fs::remove_file(Self::sentinel_path(&path));
+                    let _ = fs::remove_file(Self::sentinel_path(path));
                     return result;
                 }
                 Err(Error::AlreadyOpen)
@@ -1883,7 +1933,7 @@ impl DirectoryLock {
         }
     }
 
-    fn try_create(path: &Path) -> Result<Self> {
+    fn try_create(path: &Path) -> Result<File> {
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         let mut file = match options.open(path) {
@@ -1903,10 +1953,7 @@ impl DirectoryLock {
             return Err(Error::Io(error));
         }
 
-        Ok(Self {
-            path: path.to_path_buf(),
-            _file: file,
-        })
+        Ok(file)
     }
 
     fn sentinel_path(path: &Path) -> PathBuf {
@@ -1951,8 +1998,12 @@ impl DirectoryLock {
     }
 
     /// True only when the lock file names a PID that verifiably no longer
-    /// exists. Unreadable or malformed lock files are treated as live: false
-    /// negatives merely keep the conservative rejection, never corrupt data.
+    /// exists. Unreadable or malformed lock files are treated as live, and so
+    /// is an owner whose liveness nothing here can decide: false negatives
+    /// merely keep the conservative rejection, never corrupt data.
+    ///
+    /// Only for [`Self::create_or_reclaim`], whose caller has established
+    /// that this process does not hold the directory.
     fn owner_is_dead(path: &Path) -> bool {
         let Ok(contents) = fs::read_to_string(path) else {
             return false;
@@ -1961,30 +2012,95 @@ impl DirectoryLock {
             return false;
         };
         if pid == std::process::id() {
-            return false;
+            // No other live process can have our PID, and this process does
+            // not hold the directory (see above), so the file was left by an
+            // earlier process that had it — a container's PID 1 restarted
+            // after an unclean stop. The same holds for a reclaim sentinel:
+            // acquisitions here are serialized, so none of ours is in flight.
+            return true;
         }
-        // Signal 0 probes existence without delivering anything. EPERM means
-        // the process exists but belongs to someone else — still live.
-        match std::process::Command::new("kill")
-            .arg("-0")
-            .arg(pid.to_string())
-            .output()
-        {
-            Ok(output) => {
-                !output.status.success() && {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    !stderr.contains("not permitted") && !stderr.contains("Operation not permitted")
-                }
-            }
-            Err(_) => false,
-        }
+        process_exists(pid) == Some(false)
     }
 }
 
 impl Drop for DirectoryLock {
     fn drop(&mut self) {
+        // Under the registry's lock, so an acquisition in this process never
+        // finds the file still naming us after the set has let it go: it
+        // would take that for a predecessor's stale lock and reclaim it, and
+        // this unlink would then delete its fresh one.
+        let mut held = held_directories();
         let _ = fs::remove_file(&self.path);
+        held.remove(&self.directory);
     }
+}
+
+/// Whether process `pid` exists, or `None` when nothing available can tell.
+fn process_exists(pid: u32) -> Option<bool> {
+    process_exists_with(Path::new("/proc"), "kill", pid)
+}
+
+/// [`process_exists`] with both of its probes named, so a test can take
+/// either away.
+///
+/// procfs first on Linux: the release image is `FROM scratch` and has no
+/// `kill` to run, while a container always mounts `/proc`. Elsewhere — and
+/// on a Linux without a usable procfs — `kill -0`.
+fn process_exists_with(proc_root: &Path, kill: &str, pid: u32) -> Option<bool> {
+    let procfs = if cfg!(target_os = "linux") {
+        process_exists_in_procfs(proc_root, pid)
+    } else {
+        None
+    };
+    procfs.or_else(|| process_exists_by_signal(kill, pid))
+}
+
+/// Answers from procfs's directory per process, or `None` when the answer
+/// would not be proof.
+///
+/// `self` tells a mounted procfs from the empty directory an unmounted
+/// `/proc` is. A directory present proves a process; an absent one proves
+/// none only when the mount lists every process, which `hidepid=invisible`
+/// (`2`) and `hidepid=ptraceable` (`4`) do not — they hide other users'.
+fn process_exists_in_procfs(proc_root: &Path, pid: u32) -> Option<bool> {
+    if !proc_root.join("self").is_dir() {
+        return None;
+    }
+    if proc_root.join(pid.to_string()).exists() {
+        return Some(true);
+    }
+    // Conservative across mounts: hiding on any procfs leaves this one's
+    // absence unproven, and a false "maybe" costs only the fallback.
+    let mounts = fs::read_to_string(proc_root.join("self/mounts")).ok()?;
+    let hides = mounts.lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        let fstype = fields.nth(2);
+        let options = fields.next().unwrap_or_default();
+        fstype == Some("proc")
+            && options.split(',').any(|option| {
+                matches!(
+                    option,
+                    "hidepid=2" | "hidepid=invisible" | "hidepid=4" | "hidepid=ptraceable"
+                )
+            })
+    });
+    (!hides).then_some(false)
+}
+
+/// `kill -0`: signal 0 probes existence without delivering anything. `None`
+/// when the command cannot run at all.
+fn process_exists_by_signal(kill: &str, pid: u32) -> Option<bool> {
+    let output = std::process::Command::new(kill)
+        .arg("-0")
+        .arg(pid.to_string())
+        .output()
+        .ok()?;
+    if output.status.success() {
+        return Some(true);
+    }
+    // EPERM means the process exists but belongs to someone else — still
+    // live.
+    Some(String::from_utf8_lossy(&output.stderr).contains("not permitted"))
 }
 
 /// A cached rollup, together with the identity of the segment it was built
@@ -8901,6 +9017,111 @@ mod planner_tests {
             select_probe(&seg, &absent, None, &metrics::Metrics::default())
                 .expect("plan")
                 .is_empty()
+        );
+    }
+}
+
+#[cfg(test)]
+mod directory_lock_tests {
+    use super::*;
+
+    /// Above every PID a kernel hands out: Linux caps PIDs below 2^22 and the
+    /// BSDs (macOS included) below 100,000.
+    const NO_SUCH_PID: u32 = 1 << 22;
+
+    fn scratch(label: &str) -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "traza-lock-{label}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("scratch directory");
+        dir
+    }
+
+    fn mount_proc(proc_root: &Path, options: &str) {
+        fs::write(
+            proc_root.join("self/mounts"),
+            format!(
+                "sysfs /sys sysfs ro,nosuid 0 0\nproc /proc proc rw,nosuid,nodev,noexec,{options} 0 0\n"
+            ),
+        )
+        .expect("mounts");
+    }
+
+    #[test]
+    fn procfs_answers_from_the_pid_directory() {
+        let proc_root = scratch("procfs");
+        // An unmounted /proc is an empty directory; only a mounted procfs has
+        // `self`, and without it absence proves nothing.
+        assert_eq!(process_exists_in_procfs(&proc_root, 42), None);
+        fs::create_dir_all(proc_root.join("self")).expect("self");
+        fs::create_dir_all(proc_root.join("42")).expect("pid directory");
+        mount_proc(&proc_root, "relatime");
+        assert_eq!(process_exists_in_procfs(&proc_root, 42), Some(true));
+        assert_eq!(process_exists_in_procfs(&proc_root, 43), Some(false));
+        // `noaccess` locks other users' directories but still lists them.
+        mount_proc(&proc_root, "relatime,hidepid=noaccess");
+        assert_eq!(process_exists_in_procfs(&proc_root, 43), Some(false));
+        // `invisible` (and `ptraceable`) hide them: a directory present still
+        // proves a process, an absent one no longer proves anything.
+        for hiding in [
+            "hidepid=invisible",
+            "hidepid=2",
+            "hidepid=ptraceable",
+            "hidepid=4",
+        ] {
+            mount_proc(&proc_root, hiding);
+            assert_eq!(
+                process_exists_in_procfs(&proc_root, 42),
+                Some(true),
+                "{hiding}"
+            );
+            assert_eq!(process_exists_in_procfs(&proc_root, 43), None, "{hiding}");
+        }
+        // Mount options that cannot be read cannot rule hiding out either.
+        fs::remove_file(proc_root.join("self/mounts")).expect("unmount");
+        assert_eq!(process_exists_in_procfs(&proc_root, 43), None);
+        let _ = fs::remove_dir_all(&proc_root);
+    }
+
+    #[test]
+    fn with_neither_procfs_nor_kill_liveness_is_undecided() {
+        // The FROM scratch release image on a host without procfs: nothing can
+        // tell, and an undecided owner must be kept, never reclaimed.
+        let empty = scratch("no-procfs");
+        assert_eq!(
+            process_exists_with(&empty, "/nonexistent/kill", NO_SUCH_PID),
+            None
+        );
+        let _ = fs::remove_dir_all(&empty);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kill_decides_where_it_can_run() {
+        assert_eq!(
+            process_exists_by_signal("kill", std::process::id()),
+            Some(true)
+        );
+        assert_eq!(process_exists_by_signal("kill", NO_SUCH_PID), Some(false));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_decides_from_proc_without_kill() {
+        // The release image is FROM scratch, so it has no `kill` to run; a
+        // container always mounts /proc, which must decide on its own.
+        let proc_root = Path::new("/proc");
+        assert_eq!(
+            process_exists_with(proc_root, "/nonexistent/kill", std::process::id()),
+            Some(true)
+        );
+        assert_eq!(
+            process_exists_with(proc_root, "/nonexistent/kill", NO_SUCH_PID),
+            Some(false)
         );
     }
 }
