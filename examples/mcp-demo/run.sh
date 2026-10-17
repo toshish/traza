@@ -18,7 +18,9 @@ cd "$root"
 
 server=./target/release/traza-server
 seed=./target/release/seed
-render="python3 $here/render.py"
+# A function, not a command kept in a string: expanding the string would
+# split "$here" wherever the checkout's path has a space.
+render() { python3 "$here/render.py" "$@"; }
 data=$(mktemp -d "${TMPDIR:-/tmp}/traza-mcp-demo.XXXXXX")
 port=${TRAZA_DEMO_PORT:-8123}
 pid=""
@@ -56,7 +58,7 @@ call() {
   dim "  → tools/call $1 $2"
   printf '\n'
   rpc "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"$1\",\"arguments\":$2}}" |
-    $render tool
+    render tool
 }
 
 # ------------------------------------------------------------------ setup
@@ -115,12 +117,12 @@ bold "▸ initialize"
 dim "  Version negotiation and capabilities: what a client sends first."
 printf '\n'
 rpc '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"mcp-demo","version":"1"}}}' |
-  $render initialize
+  render initialize
 
 bold "▸ tools/list"
 dim "  Only what this caller may actually call — a tool it would be refused on is never advertised."
 printf '\n'
-rpc '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | $render tools
+rpc '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | render tools
 
 # --------------------------------------------------------- investigation
 
@@ -138,7 +140,7 @@ call list_sessions '{"order_by":"tokens","limit":4}' \
 
 # One tool's output is the next tool's input: open the trace behind whatever
 # the worst signature turned out to be.
-trace=$(rpc '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"top_failures","arguments":{"limit":1}}}' | $render trace-id)
+trace=$(rpc '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"top_failures","arguments":{"limit":1}}}' | render trace-id)
 
 if [ -n "$trace" ]; then
   call get_trace "{\"trace_id\":\"$trace\"}" \
@@ -156,19 +158,19 @@ printf '\n'
 
 printf '  a service that does not exist — diagnosed, not answered with silence:\n'
 rpc '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"search_spans","arguments":{"service":"api"}}}' |
-  $render first-line
+  render first-line
 
 printf '\n  a date that is not on the calendar:\n'
 rpc '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"search_spans","arguments":{"since":"2026-02-31"}}}' |
-  $render whole-text
+  render whole-text
 
 printf '\n  a REST parameter name a model might reach for:\n'
 rpc '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"search_spans","arguments":{"attr.service":"checkout"}}}' |
-  $render whole-text
+  render whole-text
 
 printf '\n  writing, on a server started without --mcp-annotations:\n'
 rpc '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"record_annotation","arguments":{"trace_id":"t","name":"q","value":1}}}' |
-  $render rpc-error
+  render rpc-error
 
 printf '\n  a browser origin the operator did not name (DNS-rebinding defence):\n    '
 curl -sS -o /dev/null -w 'HTTP %{http_code}\n' -X POST "http://127.0.0.1:$port/v1/mcp" \
@@ -177,26 +179,26 @@ curl -sS -o /dev/null -w 'HTTP %{http_code}\n' -X POST "http://127.0.0.1:$port/v
 
 printf '\n  and how big a reply actually is, against the 32 KiB default ceiling:\n'
 rpc '{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"search_spans","arguments":{"limit":20}}}' |
-  $render size
+  render size
 
 # --------------------------------------------------- resources and prompts
 
 bold "▸ resources/list, resources/templates/list"
 dim "  Context a host can attach without a tool call. Templates address one trace, session or payload by id."
 printf '\n'
-rpc '{"jsonrpc":"2.0","id":10,"method":"resources/list"}' | $render resources
-rpc '{"jsonrpc":"2.0","id":11,"method":"resources/templates/list"}' | $render templates
+rpc '{"jsonrpc":"2.0","id":10,"method":"resources/list"}' | render resources
+rpc '{"jsonrpc":"2.0","id":11,"method":"resources/templates/list"}' | render templates
 
 bold "▸ prompts/list"
 dim "  Saved investigations. Most hosts surface these as slash commands."
 printf '\n'
-rpc '{"jsonrpc":"2.0","id":12,"method":"prompts/list"}' | $render prompts
+rpc '{"jsonrpc":"2.0","id":12,"method":"prompts/list"}' | render prompts
 
 bold "▸ prompts/get debug_failing_session"
 dim "  The plan, with this store's live overview attached as a resource."
 printf '\n'
 rpc '{"jsonrpc":"2.0","id":13,"method":"prompts/get","params":{"name":"debug_failing_session"}}' |
-  $render prompt
+  render prompt
 
 cat <<'CLOSING'
 

@@ -39,7 +39,9 @@ if [ -n "${TRAZA_BIN:-}" ]; then
 fi
 cd "$root"
 
-agent="python3 $here/agent.py"
+# A function, not a command kept in a string: expanding the string would
+# split "$here" wherever the checkout's path has a space.
+agent() { python3 "$here/agent.py" "$@"; }
 hook=$here/claude-code-hook.sh
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/traza-guard.XXXXXX")
 port=${TRAZA_DEMO_PORT:-8129}
@@ -151,7 +153,7 @@ echo
 code=$(post /v1/fuses/policies '{"name": "research", "match": {"service": "research-agent"},
   "limits": {"max_repeats": 4, "max_cost_usd": 0.035}, "action": "stop"}' "$tmp/policy.json")
 need "$code" 200 "creating the policy"
-$agent policy "$tmp/policy.json"
+agent policy "$tmp/policy.json"
 
 # ----------------------------------------------------------- 2 · the loop
 
@@ -161,10 +163,10 @@ dim "  same arguments — the shape of every runaway loop. Each failure goes bac
 dim "  into the prompt, so each attempt costs more than the last."
 echo
 rc=0
-$agent agent "$url" "$token" sess-loop summarise "$tmp/loop.json" "$tmp/pricing.json" \
+agent agent "$url" "$token" sess-loop summarise "$tmp/loop.json" "$tmp/pricing.json" \
   down 99 "$tmp/loop-" || rc=$?
 need "$rc" 3 "the looping agent should be halted by Traza (exit 3)"
-$agent stopped-on-ack "$tmp/loop-ack.json" "$tmp/loop.json" sess-loop 4
+agent stopped-on-ack "$tmp/loop-ack.json" "$tmp/loop.json" sess-loop 4
 echo
 dim "  The fourth identical call crossed the limit. Its spans were stored — a"
 dim "  verdict is never a refusal of the batch it rides on — and the agent heard"
@@ -177,7 +179,7 @@ dim "  GET /v1/fuses/runs/sess-loop — and each evidence span read back by id."
 echo
 code=$(get /v1/fuses/runs/sess-loop "$tmp/verdict.json")
 need "$code" 200 "reading the run's verdict"
-$agent verdict "$tmp/verdict.json" "$tmp/loop.json" "$url" "$token" 4
+agent verdict "$tmp/verdict.json" "$tmp/loop.json" "$url" "$token" 4
 
 # ----------------------------------------------------------- 4 · the gate
 
@@ -186,15 +188,15 @@ dim "  The agent is started again on the same run, as a supervisor restarting a"
 dim "  crashed worker would. Its first act is the pre-call check, and the check"
 dim "  refuses: the stop is sticky until someone resets the run."
 echo
-before=$($agent field "$tmp/verdict.json" usage steps)
+before=$(agent field "$tmp/verdict.json" usage steps)
 rc=0
-$agent agent "$url" "$token" sess-loop summarise "$tmp/loop.json" "$tmp/pricing.json" \
+agent agent "$url" "$token" sess-loop summarise "$tmp/loop.json" "$tmp/pricing.json" \
   down 99 "$tmp/loop-" || rc=$?
 need "$rc" 3 "the restarted agent should be refused at the gate"
-$agent gate "$tmp/loop-check.json" sticky
+agent gate "$tmp/loop-check.json" sticky
 code=$(get /v1/fuses/runs/sess-loop "$tmp/verdict2.json")
 need "$code" 200 "re-reading the run"
-after=$($agent field "$tmp/verdict2.json" usage steps)
+after=$(agent field "$tmp/verdict2.json" usage steps)
 need "$after" "$before" "the refused agent must not have recorded a step"
 echo "    steps recorded: $before before the attempt, $after after — nothing ran (asserted)"
 
@@ -205,21 +207,21 @@ dim "  A second run makes progress — distinct calls, every one succeeding. An"
 dim "  operator stops it between steps anyway: POST /v1/fuses/runs/{run}/trip."
 echo
 rc=0
-$agent agent "$url" "$token" sess-healthy research "$tmp/healthy.json" "$tmp/pricing.json" \
+agent agent "$url" "$token" sess-healthy research "$tmp/healthy.json" "$tmp/pricing.json" \
   up 2 "$tmp/healthy-" || rc=$?
 need "$rc" 4 "the healthy agent should pause after two steps"
 code=$(post /v1/fuses/runs/sess-healthy/trip '{"reason": "operator: hold for review of the research plan"}' \
   "$tmp/trip.json")
 need "$code" 200 "pulling the kill switch"
 echo "    trip →"
-$agent control "$tmp/trip.json" stop
+agent control "$tmp/trip.json" stop
 echo
 echo "    the agent resumes:"
 rc=0
-$agent agent "$url" "$token" sess-healthy research "$tmp/healthy.json" "$tmp/pricing.json" \
+agent agent "$url" "$token" sess-healthy research "$tmp/healthy.json" "$tmp/pricing.json" \
   up 99 "$tmp/healthy-" || rc=$?
 need "$rc" 3 "the killed run should be refused at the gate"
-$agent gate "$tmp/healthy-check.json" manual
+agent gate "$tmp/healthy-check.json" manual
 
 # ------------------------------------------- 6 · reset, then a grant
 
@@ -231,14 +233,14 @@ echo
 code=$(post /v1/fuses/runs/sess-loop/reset '{}' "$tmp/reset.json")
 need "$code" 200 "resetting the run"
 echo "    reset →"
-$agent control "$tmp/reset.json" warn
+agent control "$tmp/reset.json" warn
 echo
 echo "    the agent resumes, the upstream now answering:"
 rc=0
-$agent agent "$url" "$token" sess-loop summarise "$tmp/loop.json" "$tmp/pricing.json" \
+agent agent "$url" "$token" sess-loop summarise "$tmp/loop.json" "$tmp/pricing.json" \
   up 99 "$tmp/loop-" || rc=$?
 need "$rc" 3 "the next step should be refused on cost"
-$agent gate "$tmp/loop-check.json" hypothetical
+agent gate "$tmp/loop-check.json" hypothetical
 echo
 dim "  Someone with authority approves the spend: a reset with a grant raises"
 dim "  this one run's cost limit, over whatever its policy says."
@@ -246,14 +248,14 @@ echo
 code=$(post /v1/fuses/runs/sess-loop/reset '{"grant": {"max_cost_usd": 0.10}}' "$tmp/grant.json")
 need "$code" 200 "resetting with a grant"
 echo "    reset with grant →"
-$agent control "$tmp/grant.json" continue max_cost_usd=0.1
+agent control "$tmp/grant.json" continue max_cost_usd=0.1
 echo
 echo "    the agent resumes:"
-$agent agent "$url" "$token" sess-loop summarise "$tmp/loop.json" "$tmp/pricing.json" \
+agent agent "$url" "$token" sess-loop summarise "$tmp/loop.json" "$tmp/pricing.json" \
   up 99 "$tmp/loop-" || fail "the approved agent should finish its task"
 code=$(get /v1/fuses/runs/sess-loop "$tmp/final.json")
 need "$code" 200 "reading the finished run"
-$agent finished "$tmp/final.json" "$tmp/loop.json" 0.035 0.10
+agent finished "$tmp/final.json" "$tmp/loop.json" 0.035 0.10
 
 # -------------------------------------------------- 7 · the Claude Code hook
 
@@ -273,21 +275,21 @@ hook_call() { # hook_call EVENT TOOL_USE_ID — exit code is the hook's
 rc=0
 hook_call PreToolUse toolu_0 || rc=$?
 printf '    %-12s %-14s %-22s → ' PreToolUse 'Bash npm test' '(a fresh session)'
-$agent hook "$rc" "$tmp/hook.err" 0
+agent hook "$rc" "$tmp/hook.err" 0
 for n in 1 2 3; do
   rc=0
   hook_call PostToolUse "toolu_$n" || rc=$?
   printf '    %-12s %-14s %-22s → ' PostToolUse 'Bash npm test' "(records call $n of 3)"
   if [ "$n" -lt 3 ]; then
-    $agent hook "$rc" "$tmp/hook.err" 0
+    agent hook "$rc" "$tmp/hook.err" 0
   else
-    $agent hook "$rc" "$tmp/hook.err" 2 "max_repeats 3 reached" "already ran"
+    agent hook "$rc" "$tmp/hook.err" 2 "max_repeats 3 reached" "already ran"
   fi
 done
 rc=0
 hook_call PreToolUse toolu_4 || rc=$?
 printf '    %-12s %-14s %-22s → ' PreToolUse 'Bash npm test' '(the next call)'
-$agent hook "$rc" "$tmp/hook.err" 2 "Traza stopped run $session" "max_repeats 3 reached"
+agent hook "$rc" "$tmp/hook.err" 2 "Traza stopped run $session" "max_repeats 3 reached"
 echo
 dim "  Exit 2 is Claude Code's 'block this call': the stderr above is what the"
 dim "  model is shown, in place of the fourth test run."
@@ -300,7 +302,7 @@ dim "  dispatcher polling the feed would have seen it."
 echo
 code=$(get /v1/fuses/events "$tmp/events.json")
 need "$code" 200 "reading the event feed"
-$agent events "$tmp/events.json" "$session"
+agent events "$tmp/events.json" "$session"
 
 cat <<'CLOSING'
 

@@ -39,7 +39,9 @@ if [ -n "${TRAZA_BIN:-}" ]; then
 fi
 cd "$root"
 
-render="python3 $here/render.py"
+# A function, not a command kept in a string: expanding the string would
+# split "$here" wherever the checkout's path has a space.
+render() { python3 "$here/render.py" "$@"; }
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/traza-replay.XXXXXX")
 port=${TRAZA_DEMO_PORT:-8130}
 url=http://127.0.0.1:$port
@@ -171,14 +173,14 @@ echo
 start_model
 OPENAI_BASE_URL=$model_url OPENAI_API_KEY=standin-key TRAZA_RUN=weather-1 \
   python3 "$here/agent.py" "$tmp/recorded.json" || fail "the recording run failed"
-$render transcript "$tmp/recorded.json"
-recorded_calls=$($render count "$tmp/model.count")
+render transcript "$tmp/recorded.json"
+recorded_calls=$(render count "$tmp/model.count")
 need "$recorded_calls" 2 "the stand-in model should have answered two calls"
 echo
 echo "  the run's tape, GET /v1/tapes/weather-1:"
 code=$(get /v1/tapes/weather-1 "$tmp/tape.json")
 need "$code" 200 "reading the tape"
-$render tape "$tmp/tape.json"
+render tape "$tmp/tape.json"
 
 # ---------------------------------------------------------- 2 · replay
 
@@ -194,19 +196,19 @@ fi
 echo "    stand-in model stopped: $model_url now refuses connections (checked)"
 code=$(post /v1/replays '{"run": "weather-1"}' "$tmp/replay.json")
 need "$code" 201 "creating the replay"
-$render created "$tmp/replay.json"
+render created "$tmp/replay.json"
 replay_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "$tmp/replay.json")
 base=$url/v1/replays/$replay_id/openai/v1
 echo
 OPENAI_BASE_URL=$base OPENAI_API_KEY=$ro TRAZA_RUN=weather-1-replay \
   python3 "$here/agent.py" "$tmp/replayed.json" || fail "the replayed run failed"
-$render same "$tmp/recorded.json" "$tmp/replayed.json" "$base"
+render same "$tmp/recorded.json" "$tmp/replayed.json" "$base"
 code=$(get "/v1/replays/$replay_id" "$tmp/status.json")
 need "$code" 200 "reading the replay's status"
 echo
 echo "  GET /v1/replays/$replay_id:"
-$render served "$tmp/status.json" 2
-after_calls=$($render count "$tmp/model.count")
+render served "$tmp/status.json" 2
+after_calls=$(render count "$tmp/model.count")
 need "$after_calls" "$recorded_calls" "the stand-in model must not have been called during the replay"
 echo "    stand-in model calls: $recorded_calls while recording, $after_calls after the replay — zero"
 echo "    model calls were made; both answers came from the tape (asserted)"
@@ -227,7 +229,7 @@ WEATHER_PROMPT=v2 OPENAI_BASE_URL=$url/v1/replays/$replay2/openai/v1 OPENAI_API_
 need "$rc" 4 "the changed agent should be refused"
 code=$(get "/v1/replays/$replay2" "$tmp/status2.json")
 need "$code" 200 "reading the second replay's status"
-$render refused "$tmp/refused.json" "$tmp/status2.json"
+render refused "$tmp/refused.json" "$tmp/status2.json"
 
 # ------------------------------------------------------------ 4 · diff
 
@@ -240,17 +242,17 @@ start_model
 WEATHER_PROMPT=v2 OPENAI_BASE_URL=$model_url OPENAI_API_KEY=standin-key TRAZA_RUN=weather-2 \
   python3 "$here/agent.py" "$tmp/v2.json" || fail "the v2 run failed"
 stop_model
-$render transcript "$tmp/v2.json"
+render transcript "$tmp/v2.json"
 echo
 echo "  GET /v1/diff?a=weather-1&b=weather-1-replay"
 code=$(get '/v1/diff?a=weather-1&b=weather-1-replay' "$tmp/diff-replay.json")
 need "$code" 200 "diffing the replayed run"
-$render diff "$tmp/diff-replay.json" same
+render diff "$tmp/diff-replay.json" same
 echo
 echo "  GET /v1/diff?a=weather-1&b=weather-2"
 code=$(get '/v1/diff?a=weather-1&b=weather-2' "$tmp/diff-v2.json")
 need "$code" 200 "diffing the changed run"
-$render diff "$tmp/diff-v2.json" changed
+render diff "$tmp/diff-v2.json" changed
 
 cat <<'CLOSING'
 

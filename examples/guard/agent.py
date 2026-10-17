@@ -14,7 +14,8 @@ part under test, and it does what a real one should with run fuses:
 State lives in a JSON file, so the demo can stop the agent, act on the run
 from outside (a kill switch, a reset, a grant), and start it again where it
 left off. Exit codes: 0 finished, 3 halted by Traza, 4 paused at --max-steps,
-1 anything else.
+1 anything else — a redirect included: one is never followed, so the token
+goes only to the URL the agent was given.
 
 The other modes read one reply each and assert on it, kept out of run.sh for
 the reason the other demos keep render.py: quoting JSON inside `python3 -c`
@@ -54,6 +55,31 @@ def save(path, value):
         json.dump(value, handle)
 
 
+class RedirectRefused(Exception):
+    """A 3xx answered a request that carried the token."""
+
+
+class RefuseRedirects(urllib.request.HTTPRedirectHandler):
+    """Refuses every redirect instead of following it.
+
+    urllib copies a request's headers onto the redirected one, Authorization
+    included: to another host, and from https to plain http. Traza never
+    redirects its own routes, so a 3xx comes from something in front of it (a
+    proxy canonicalising a host or upgrading a scheme), and the token must not
+    follow it anywhere.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise RedirectRefused(
+            "%s answered %d, a redirect to %s: not followed, so the token goes only "
+            "to the URL the agent was given" % (req.full_url, code, newurl))
+
+
+# Built once: building an opener reads the proxy settings, which on macOS
+# asks the system configuration.
+OPENER = urllib.request.build_opener(RefuseRedirects)
+
+
 def request(url, token, method, path, body=None):
     """(status, Traza-Fuse header or None, parsed body, raw body)."""
     data = None if body is None else json.dumps(body).encode()
@@ -62,7 +88,7 @@ def request(url, token, method, path, body=None):
     if data is not None:
         req.add_header("Content-Type", "application/json")
     try:
-        with urllib.request.urlopen(req, timeout=10) as reply:
+        with OPENER.open(req, timeout=10) as reply:
             raw = reply.read().decode()
             return reply.status, reply.headers.get("Traza-Fuse"), json.loads(raw), raw
     except urllib.error.HTTPError as error:
@@ -422,6 +448,9 @@ MODES = {
 }
 
 if __name__ == "__main__":
-    if sys.argv[1] == "agent":
-        sys.exit(agent(sys.argv[2:]))
-    MODES[sys.argv[1]](*sys.argv[2:])
+    try:
+        if sys.argv[1] == "agent":
+            sys.exit(agent(sys.argv[2:]))
+        MODES[sys.argv[1]](*sys.argv[2:])
+    except RedirectRefused as refusal:
+        sys.exit("REFUSED: %s" % refusal)
