@@ -1955,10 +1955,15 @@ curl -X POST http://127.0.0.1:8080/v1/fuses/check \
 
 **Errors.** `400` for a body that does not parse, an empty, bare `trace:` or
 over-long run id, or a negative `est_cost_usd`; `400` if rebuilding the run
-exhausted `--query-deadline-ms` and nothing about it was in memory (a run
-under a parked policy stop or a kill switch still answers `stop`); `409` in
-the rare case that erasures kept overlapping the run's rebuild (each overlap
-discards what the rebuild read, so retry once they settle).
+exhausted `--query-deadline-ms` and what memory holds of it does not already
+stop it (a kill switch, a stop latched live or parked, or a `next` step past
+a limit on what is known still answers `stop`); `400` for a run with more
+than 100,000 stored spans whose earliest 100,000 — all a rebuild reads — do
+not stop it, since part of a run's history can establish a stop but never
+clear one (see [the guide](guard.md#what-is-durable-and-what-is-rebuilt));
+`409` in the rare case that erasures kept overlapping the run's rebuild
+(each overlap discards what the rebuild read, so retry once they settle).
+None of these is a verdict, so a hook that fails closed blocks on them.
 
 ### `GET /v1/fuses/runs/{run}`
 
@@ -2028,7 +2033,10 @@ streak and repeat counts, durably. **Body** (optional):
 merged over earlier grants; it takes the [policy limit](#post-v1fusespolicies)
 fields and the same validation. Cumulative usage is not reset, so a run still
 over a cumulative limit answers `stop` again at once. Answers the verdict
-document. **Errors** as for the trip: the same 10,000-run bound applies.
+document. **Errors** as for the trip: the same 10,000-run bound applies. And
+as for [the check](#post-v1fusescheck) when the run's verdict cannot be given
+afterwards — a rebuild out of time, or a run too long to read whole, that
+nothing stops once reset — in which case the reset is recorded all the same.
 
 ```sh
 curl -X POST http://127.0.0.1:8080/v1/fuses/runs/sess-7f3a/reset \
