@@ -125,6 +125,7 @@ const OI_TOOL_NAME: &str = "tool.name";
 const OI_AGENT_NAME: &str = "agent.name";
 const OI_INPUT_VALUE: &str = "input.value";
 const OI_OUTPUT_VALUE: &str = "output.value";
+const OI_OUTPUT_MIME_TYPE: &str = "output.mime_type";
 const OI_INPUT_MESSAGES_PREFIX: &str = "llm.input_messages.";
 const OI_OUTPUT_MESSAGES_PREFIX: &str = "llm.output_messages.";
 
@@ -602,8 +603,11 @@ impl StepFacts {
 /// message — `{"role": "system", "parts": […]}` when it is a list of parts (its
 /// OTel shape), `{"role": "system", "content": …}` otherwise — prepended to a
 /// message list, or forming one when there is no other request. A request that
-/// is not a list (an offloaded reference, a bare prompt string) is left as
-/// stored: there is no "first" to put it in.
+/// is not a list (an offloaded reference, a bare prompt string) becomes the
+/// second element of a two-element list after that system message: neither
+/// carrier is dropped, so the digest covers both, and once an offloaded list
+/// is resolved the two combine exactly as they would have inline (see
+/// [`crate::tape`]).
 ///
 /// **Digests** are the SHA-256 of the value's canonical JSON (object keys
 /// sorted bytewise, no whitespace), as lowercase hex — so the same messages
@@ -626,6 +630,59 @@ pub fn step_facts(span: &Span) -> StepFacts {
 /// needs both (and prices them) extracts once. Pricing cannot change a step
 /// fact: only `is_llm` and the model are read.
 pub(crate) fn step_facts_with(span: &Span, llm: &LlmFacts) -> StepFacts {
+    step_facts_detailed(span, llm).0
+}
+
+/// An llm request's two carriers as stored — its message list (or whatever
+/// stood in for one) and `gen_ai.system_instructions` — kept apart because at
+/// least one of them is an offloaded `$payload` reference, so how they
+/// combine depends on content that has not been read yet.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct RequestCarriers {
+    /// The message list as stored, if the span recorded one.
+    pub(crate) messages: Option<Value>,
+    /// The system instructions as stored.
+    pub(crate) system: Value,
+}
+
+/// Where an llm step's response was read from, which decides how a replay
+/// decodes it. An object-shaped value means different things by source:
+/// answer TEXT that happens to be JSON must come back as that text, while a
+/// provider's response body must be unwrapped. Guessing from the object's
+/// keys cannot tell `{"content": "hi", "count": 2}` the answer from
+/// `{"content": "hi"}` the message.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ResponseSource {
+    /// A message list: `gen_ai.output.messages`, an indexed layout, or native
+    /// events.
+    #[default]
+    Messages,
+    /// OpenInference's `output.value` with no text MIME type: the provider's
+    /// response body as the instrumentation serialized it.
+    Body,
+    /// The answer's text: the `llm.completion` attribute, or an
+    /// `output.value` whose `output.mime_type` says it is not JSON.
+    Text,
+}
+
+/// What a tape step needs from its span beyond [`StepFacts`].
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct StepExtras {
+    /// llm steps: the request's carriers, when combining them has to wait
+    /// for payload resolution ([`RequestCarriers`]).
+    pub(crate) request_carriers: Option<RequestCarriers>,
+    /// llm steps: which source the response came from.
+    pub(crate) response_source: ResponseSource,
+    /// Tool steps with no response: the value of the first response
+    /// attribute the span carried, when it carried one that reads as absent
+    /// (`null` or the empty string). It tells a result recorded as empty
+    /// from one that was never captured — the response is `None` for both.
+    pub(crate) empty_response: Option<Value>,
+}
+
+/// [`step_facts_with`] plus the [`StepExtras`] a tape step keeps, extracted
+/// together so neither repeats the other's work.
+pub(crate) fn step_facts_detailed(span: &Span, llm: &LlmFacts) -> (StepFacts, StepExtras) {
     let attributes = &span.attributes;
     let traceloop_kind =
         attr_str(attributes, TRACELOOP_SPAN_KIND).map(|kind| kind.to_ascii_lowercase());
@@ -635,17 +692,42 @@ pub(crate) fn step_facts_with(span: &Span, llm: &LlmFacts) -> StepFacts {
     let agent = step_agent(attributes, traceloop_kind.as_deref());
     let tool_call_id = attr_str(attributes, GEN_AI_TOOL_CALL_ID);
 
-    let request = step_request(span, kind);
+    let mut extras = StepExtras::default();
+    let request = match kind {
+        StepKind::Llm => {
+            let (messages, system) = llm_request_carriers(span);
+            // Offload replaces a whole attribute value, so a carrier is
+            // either inline or one reference — never inline with references
+            // inside it. Inline carriers are combined for good right here.
+            if let Some(system) = &system {
+                if is_payload_reference(system)
+                    || messages.as_ref().is_some_and(is_payload_reference)
+                {
+                    extras.request_carriers = Some(RequestCarriers {
+                        messages: messages.clone(),
+                        system: system.clone(),
+                    });
+                }
+            }
+            with_system_instructions(messages, system)
+        }
+        _ => step_request(span, kind),
+    };
     let response = match kind {
-        StepKind::Llm => llm_response(span),
-        StepKind::Tool => first_payload(
-            attributes,
-            &[
-                GEN_AI_TOOL_CALL_RESULT,
-                TRACELOOP_ENTITY_OUTPUT,
-                OI_OUTPUT_VALUE,
-            ],
-        ),
+        StepKind::Llm => llm_response_sourced(span).map(|(response, source)| {
+            extras.response_source = source;
+            response
+        }),
+        StepKind::Tool => {
+            let response = first_payload(attributes, TOOL_RESPONSE_KEYS);
+            if response.is_none() {
+                extras.empty_response = TOOL_RESPONSE_KEYS
+                    .iter()
+                    .find_map(|key| attributes.get(*key))
+                    .cloned();
+            }
+            response
+        }
         _ => first_payload(attributes, &[TRACELOOP_ENTITY_OUTPUT, OI_OUTPUT_VALUE]),
     };
     let request_digest = request.as_ref().map(value_digest);
@@ -659,7 +741,7 @@ pub(crate) fn step_facts_with(span: &Span, llm: &LlmFacts) -> StepFacts {
         request_digest.as_deref(),
     );
 
-    StepFacts {
+    let facts = StepFacts {
         kind,
         tool,
         agent,
@@ -669,8 +751,16 @@ pub(crate) fn step_facts_with(span: &Span, llm: &LlmFacts) -> StepFacts {
         request_digest,
         response_digest,
         fingerprint,
-    }
+    };
+    (facts, extras)
 }
+
+/// A tool step's response keys, in precedence order.
+const TOOL_RESPONSE_KEYS: &[&str] = &[
+    GEN_AI_TOOL_CALL_RESULT,
+    TRACELOOP_ENTITY_OUTPUT,
+    OI_OUTPUT_VALUE,
+];
 
 /// The fingerprint [`step_facts_with`] would report, computed from the
 /// request alone: the response is neither extracted nor digested, since the
@@ -826,6 +916,14 @@ fn step_kind(
 
 /// An llm step's input, per the request column of [`step_facts`].
 fn llm_request(span: &Span) -> Option<Value> {
+    let (messages, system) = llm_request_carriers(span);
+    with_system_instructions(messages, system)
+}
+
+/// An llm step's two request carriers as stored: the message list (or what
+/// stands in for one) by the request precedence, and
+/// `gen_ai.system_instructions`.
+fn llm_request_carriers(span: &Span) -> (Option<Value>, Option<Value>) {
     let attributes = &span.attributes;
     let messages = attributes
         .get(GEN_AI_INPUT_MESSAGES)
@@ -837,24 +935,55 @@ fn llm_request(span: &Span) -> Option<Value> {
     let system = attributes
         .get(GEN_AI_SYSTEM_INSTRUCTIONS)
         .and_then(payload_value);
-    with_system_instructions(messages, system)
+    (messages, system)
 }
 
-/// An llm step's output, per the response column of [`step_facts`].
-fn llm_response(span: &Span) -> Option<Value> {
+/// An llm step's output, per the response column of [`step_facts`], and
+/// which kind of source it came from.
+fn llm_response_sourced(span: &Span) -> Option<(Value, ResponseSource)> {
     let attributes = &span.attributes;
+    let messages = |value: Value| (value, ResponseSource::Messages);
     attributes
         .get(GEN_AI_OUTPUT_MESSAGES)
         .and_then(payload_value)
-        .or_else(|| indexed_messages(attributes, GEN_AI_COMPLETION_PREFIX, Layout::OpenLlmetry))
-        .or_else(|| indexed_messages(attributes, OI_OUTPUT_MESSAGES_PREFIX, Layout::OpenInference))
-        .or_else(|| first_payload(attributes, &[OI_OUTPUT_VALUE, LLM_COMPLETION]))
-        .or_else(|| event_messages(span, LLM_COMPLETION))
+        .map(messages)
+        .or_else(|| {
+            indexed_messages(attributes, GEN_AI_COMPLETION_PREFIX, Layout::OpenLlmetry)
+                .map(messages)
+        })
+        .or_else(|| {
+            indexed_messages(attributes, OI_OUTPUT_MESSAGES_PREFIX, Layout::OpenInference)
+                .map(messages)
+        })
+        .or_else(|| {
+            // OpenInference names the value's type: JSON is the provider's
+            // response body, anything else (`text/plain`) is the answer.
+            let source = match attr_str(attributes, OI_OUTPUT_MIME_TYPE) {
+                Some(mime) if !mime.to_ascii_lowercase().contains("json") => ResponseSource::Text,
+                _ => ResponseSource::Body,
+            };
+            attributes
+                .get(OI_OUTPUT_VALUE)
+                .and_then(payload_value)
+                .map(|value| (value, source))
+        })
+        .or_else(|| {
+            attributes
+                .get(LLM_COMPLETION)
+                .and_then(payload_value)
+                .map(|value| (value, ResponseSource::Text))
+        })
+        .or_else(|| event_messages(span, LLM_COMPLETION).map(messages))
 }
 
 /// Folds `gen_ai.system_instructions` into an llm request as its first
-/// message, per [`step_facts`].
-fn with_system_instructions(messages: Option<Value>, system: Option<Value>) -> Option<Value> {
+/// message, per [`step_facts`]. Applied to the carriers as stored, and again
+/// to them once resolved when either was offloaded ([`RequestCarriers`]), so
+/// a resolved request has the shape it would have had inline.
+pub(crate) fn with_system_instructions(
+    messages: Option<Value>,
+    system: Option<Value>,
+) -> Option<Value> {
     let Some(system) = system else {
         return messages;
     };
@@ -866,16 +995,29 @@ fn with_system_instructions(messages: Option<Value>, system: Option<Value>) -> O
         parts @ Value::Array(_) => message.insert("parts".to_owned(), parts),
         content => message.insert("content".to_owned(), content),
     };
-    match messages {
-        None => Some(Value::Array(vec![Value::Object(message)])),
+    let list = match messages {
+        None => vec![Value::Object(message)],
         Some(Value::Array(mut list)) => {
             list.insert(0, Value::Object(message));
-            Some(Value::Array(list))
+            list
         }
-        // Not a message list — reshaping it into one would invent a structure
-        // the span never recorded, so it stays as stored.
-        Some(other) => Some(other),
-    }
+        // Not a message list: an offloaded reference not yet read, or a bare
+        // prompt. Dropping the system instructions would lose part of what
+        // the model was given (and let two different requests digest alike),
+        // and reshaping the request into messages would invent structure the
+        // span never recorded — so it is kept whole, after them.
+        Some(other) => vec![Value::Object(message), other],
+    };
+    Some(Value::Array(list))
+}
+
+/// Whether `value` is an offloaded `$payload` reference, as the resolver
+/// reads one.
+fn is_payload_reference(value: &Value) -> bool {
+    value
+        .as_object()
+        .and_then(|object| object.get(crate::payload::PAYLOAD_KEY))
+        .is_some_and(Value::is_string)
 }
 
 /// The first of `keys` that holds a step input or output.
@@ -2005,19 +2147,102 @@ mod tests {
             alone.request,
             Some(json!([{"role": "system", "content": "be kind"}]))
         );
-        // A request that is not a list stays exactly as stored.
+        // A request that is not a list is kept whole, after them.
         let scalar = step(json!({
             "gen_ai.operation.name": "chat",
             "gen_ai.system_instructions": "be kind",
             "input.value": "plain prompt",
         }));
-        assert_eq!(scalar.request, Some(json!("plain prompt")));
+        assert_eq!(
+            scalar.request,
+            Some(json!([{"role": "system", "content": "be kind"}, "plain prompt"]))
+        );
         // System instructions belong to llm steps only.
         let tool = step(json!({
             "gen_ai.operation.name": "execute_tool",
             "gen_ai.system_instructions": "be kind",
         }));
         assert_eq!(tool.request, None);
+    }
+
+    #[test]
+    fn system_instructions_survive_a_request_that_is_not_a_list() {
+        // An offloaded message list is a reference until it is resolved;
+        // the system instructions recorded beside it must not be lost.
+        let reference = json!({"$payload": format!("sha256/{}", "a".repeat(64))});
+        let offloaded = step(json!({
+            "gen_ai.operation.name": "chat",
+            "gen_ai.system_instructions": "be kind",
+            "gen_ai.input.messages": reference.clone(),
+        }));
+        let request = offloaded.request.expect("request");
+        assert!(
+            request.to_string().contains("be kind"),
+            "system instructions dropped: {request}"
+        );
+        assert!(request.to_string().contains(&"a".repeat(64)), "{request}");
+        // So two such steps differing only in their system prompt differ.
+        let other = step(json!({
+            "gen_ai.operation.name": "chat",
+            "gen_ai.system_instructions": "be terse",
+            "gen_ai.input.messages": reference,
+        }));
+        assert_ne!(other.request_digest, offloaded.request_digest);
+    }
+
+    #[test]
+    fn step_extras_record_carriers_sources_and_empty_results() {
+        let extras = |attributes: Value| {
+            let span = span_named("op", attributes);
+            step_facts_detailed(&span, &facts(&span.attributes)).1
+        };
+        let reference = json!({"$payload": format!("sha256/{}", "b".repeat(64))});
+        // Carriers are kept apart only while one of them is a reference.
+        let deferred = extras(json!({"gen_ai.operation.name": "chat",
+            "gen_ai.system_instructions": "be kind", "gen_ai.input.messages": reference}));
+        assert_eq!(
+            deferred.request_carriers,
+            Some(RequestCarriers {
+                messages: Some(reference.clone()),
+                system: json!("be kind"),
+            })
+        );
+        let inline = extras(json!({"gen_ai.operation.name": "chat",
+            "gen_ai.system_instructions": "be kind", "gen_ai.prompt.0.content": "hi"}));
+        assert_eq!(inline.request_carriers, None);
+        // The response's source, by the precedence of the response column.
+        for (attributes, source) in [
+            (
+                json!({"gen_ai.operation.name": "chat", "gen_ai.completion.0.content": "a"}),
+                ResponseSource::Messages,
+            ),
+            (
+                json!({"gen_ai.operation.name": "chat", "output.value": "{\"choices\":[]}"}),
+                ResponseSource::Body,
+            ),
+            (
+                json!({"gen_ai.operation.name": "chat", "output.value": "{\"a\":1}",
+                       "output.mime_type": "text/plain"}),
+                ResponseSource::Text,
+            ),
+            (
+                json!({"gen_ai.operation.name": "chat", "llm.completion": "{\"a\":1}"}),
+                ResponseSource::Text,
+            ),
+        ] {
+            assert_eq!(
+                extras(attributes.clone()).response_source,
+                source,
+                "{attributes}"
+            );
+        }
+        // A tool result recorded empty is told from one never recorded.
+        let empty = extras(json!({"gen_ai.operation.name": "execute_tool",
+            "gen_ai.tool.name": "f", "gen_ai.tool.call.result": ""}));
+        assert_eq!(empty.empty_response, Some(json!("")));
+        let absent = extras(json!({"gen_ai.operation.name": "execute_tool",
+            "gen_ai.tool.name": "f"}));
+        assert_eq!(absent.empty_response, None);
     }
 
     #[test]
@@ -2097,8 +2322,6 @@ mod tests {
             "gen_ai.operation.name": "chat",
             "gen_ai.input.messages": reference.clone(),
             "gen_ai.output.messages": reference.clone(),
-            // Not prepended: an offloaded request is not a list.
-            "gen_ai.system_instructions": "be kind",
         }));
         assert_eq!(
             facts.request,
@@ -2111,6 +2334,18 @@ mod tests {
             "the content address, lowercased"
         );
         assert_eq!(facts.response_digest, facts.request_digest);
+        // Beside system instructions the reference is no longer the whole
+        // request, so the digest covers both (see the test below).
+        let instructed = step(json!({
+            "gen_ai.operation.name": "chat",
+            "gen_ai.input.messages": reference.clone(),
+            "gen_ai.system_instructions": "be kind",
+        }));
+        assert_eq!(
+            instructed.request,
+            Some(json!([{"role": "system", "content": "be kind"}, reference.clone()]))
+        );
+        assert_ne!(instructed.request_digest, facts.request_digest);
 
         // A redacted marker names its address too.
         let erased = step(json!({

@@ -210,6 +210,10 @@ was recorded; the OpenLLMetry and OpenInference layouts fold to that same
 shape. Native events become `[{role, content}]` in event order. On an llm step
 `gen_ai.system_instructions` becomes a leading `{"role": "system", …}` message
 when the input is a message list (or the whole input when there is none).
+When the input is not a list — an offloaded `$payload` reference, or a bare
+prompt — the input becomes `[{"role": "system", …}, <input as stored>]`, so
+neither is dropped and the digest covers both; a reader that resolves the
+reference combines the two as if neither had been offloaded.
 
 Each input and output has a **digest**: the SHA-256 of its canonical JSON
 (keys sorted, no whitespace), so the same messages sent with different key

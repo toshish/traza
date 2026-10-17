@@ -22,12 +22,29 @@
 //!
 //! Usage is a bounded in-memory cache over the store, folded from every
 //! acknowledged batch by the ingest observer — O(batch), with no lock held
-//! while a span's facts are extracted. Every run is rebuilt from the store
-//! the first time a verdict is asked for it, under the query deadline: the
-//! process cannot know whether a run had spans before it began following it
-//! (the run may predate a restart, or have been evicted), so it never assumes
-//! not. What spans cannot reconstruct — policies, manual trips, resets and
-//! grants — is durable in `fuses.jsonl` (see the `log` module).
+//! while a span's facts are extracted. A stop latches at the span that
+//! crosses a limit, live as in a rebuild's replay, so batching cannot hide a
+//! crossing; and since observers run after their writes in no fixed order,
+//! each span's contribution is ordered by the store's write revision, so a
+//! late observer cannot put back a version the store replaced. Every run is
+//! rebuilt from the store the first time a verdict is asked for it, under
+//! the query deadline: the process cannot know whether a run had spans
+//! before it began following it (the run may predate a restart, or have
+//! been evicted), so it never assumes not. What spans cannot reconstruct —
+//! policies, manual trips, resets and grants — is durable in `fuses.jsonl`
+//! (see the `log` module).
+//!
+//! # Part of a history answers only `stop`
+//!
+//! A rebuild that runs out of time, or a run longer than
+//! [`REBUILD_MAX_SPANS`], leaves the guard with part of a run's history at
+//! most: live state followed from some point, the earliest spans, or a
+//! parked stop alone. What part of a history used is a lower bound on what
+//! the run used, so a stop judged from it is exact and is answered; any
+//! other verdict judged from it would let a run go on that may be over its
+//! limit, so it is refused with an error instead — which a hook configured
+//! to fail closed refuses on, where a `200 continue` would have sailed
+//! through it.
 //!
 //! Live runs are bounded: at most [`FuseConfig::max_runs`], least recently
 //! active evicted first, idle ones dropped after six hours, and at most
@@ -80,14 +97,16 @@ use state::{Observation, RunState, Trip};
 
 use crate::{erasure, semconv, Deadline, Error, Result, Span, Store};
 
-/// Ceiling on span contributions held across every live run — each a 32-byte
+/// Ceiling on span contributions held across every live run — each a 40-byte
 /// record under an 8-byte key, before hash-table overhead. Past it, whole
 /// runs are evicted least-recently-active first; they rebuild from the store
 /// when next asked about.
 pub const MAX_TRACKED_SPANS: usize = 1_000_000;
 
 /// Most spans a rebuild reads for one run. A larger run is rebuilt from its
-/// earliest spans, and undercounts.
+/// earliest spans, which say only how much it used AT LEAST: it answers
+/// `stop` when they stop it, and otherwise [`Error::QueryTooBroad`], never a
+/// verdict that would let it go on.
 pub const REBUILD_MAX_SPANS: usize = 100_000;
 
 /// Longest run id the guard accepts or follows, in bytes. Every live run
@@ -458,6 +477,10 @@ pub(crate) struct Guard {
     /// swept, while the erasure is still pending.
     #[cfg(test)]
     after_forget: Mutex<Option<ForgetHook>>,
+    /// [`REBUILD_MAX_SPANS`], lowered by a test that needs a run longer than
+    /// a rebuild reads without ingesting a hundred thousand spans.
+    #[cfg(test)]
+    rebuild_max_spans: std::sync::atomic::AtomicUsize,
 }
 
 /// See [`Guard::after_forget`].
@@ -520,7 +543,17 @@ impl Guard {
             warnings: AtomicU64::new(0),
             #[cfg(test)]
             after_forget: Mutex::new(None),
+            #[cfg(test)]
+            rebuild_max_spans: std::sync::atomic::AtomicUsize::new(REBUILD_MAX_SPANS),
         }))
+    }
+
+    /// Most spans a rebuild reads: [`REBUILD_MAX_SPANS`].
+    fn rebuild_max_spans(&self) -> usize {
+        #[cfg(test)]
+        return self.rebuild_max_spans.load(Ordering::Relaxed);
+        #[cfg(not(test))]
+        REBUILD_MAX_SPANS
     }
 
     fn lock_state(&self) -> Result<MutexGuard<'_, State>> {
@@ -532,8 +565,9 @@ impl Guard {
     }
 
     /// Folds an acknowledged batch in and returns a signal for every run in
-    /// it whose verdict is not `continue`.
-    fn observe(&self, store: &Store, spans: &[Arc<Span>]) -> Vec<Signal> {
+    /// it whose verdict is not `continue`. `spans[i]` was stored at write
+    /// revision `first_revision + i`.
+    fn observe(&self, store: &Store, spans: &[Arc<Span>], first_revision: u64) -> Vec<Signal> {
         // A span a pending erasure covers is skipped: this batch may have
         // been acknowledged just before the erasure began, with this
         // observer running after the erasure already swept the guard.
@@ -541,8 +575,8 @@ impl Guard {
         // Extraction — facts, step kinds, fingerprint digests — happens with
         // no lock held, grouped by run in first-appearance order.
         let mut index: HashMap<RunKey, usize> = HashMap::new();
-        let mut groups: Vec<(RunKey, Vec<Observation>)> = Vec::new();
-        for span in spans {
+        let mut groups: Vec<Group> = Vec::new();
+        for (offset, span) in spans.iter().enumerate() {
             if mask
                 .as_deref()
                 .is_some_and(|mask| mask.covers_for_drop(span))
@@ -557,12 +591,17 @@ impl Guard {
                 tenant: span.tenant.clone(),
                 run,
             };
-            let observation = Observation::of(store, span);
+            let revision = first_revision.saturating_add(offset as u64);
+            let observation = Observation::of(store, span, revision);
             let slot = *index.entry(key.clone()).or_insert_with(|| {
-                groups.push((key, Vec::new()));
+                groups.push(Group {
+                    key,
+                    observations: Vec::new(),
+                    positions: HashMap::new(),
+                });
                 groups.len() - 1
             });
-            groups[slot].1.push(observation);
+            groups[slot].push(observation);
         }
         let now = unix_now_ns();
         // The observer cannot fail an acknowledged ingest; a poisoned state
@@ -571,7 +610,10 @@ impl Guard {
             return Vec::new();
         };
         let mut signals = Vec::new();
-        for (key, observations) in groups {
+        for Group {
+            key, observations, ..
+        } in groups
+        {
             if let Some((_, pending)) = state.rebuilding.get_mut(&key) {
                 pending.extend(observations.iter().cloned());
             } else if !state.runs.contains_key(&key)
@@ -589,16 +631,32 @@ impl Guard {
                 continue;
             }
             state.entry(&key, now);
-            let added = {
-                let run = state.runs.get_mut(&key).expect("entry just ensured");
+            let (added, latched) = {
+                // The fields apart, so the policy can be read while the run
+                // is folded — a fold checks for a stop after every span.
+                let State {
+                    runs,
+                    policies,
+                    controls,
+                    ..
+                } = &mut *state;
+                let run = runs.get_mut(&key).expect("entry just ensured");
+                let policies = policies.get(&key.tenant).map_or(&[][..], Vec::as_slice);
+                let controls = controls
+                    .get(&key.tenant)
+                    .and_then(|runs| runs.get(&key.run));
+                let limits = |service: &str| {
+                    stop_limits(policies, &self.config, &key.tenant, service, controls)
+                };
                 let before = run.tracked();
-                for observation in &observations {
-                    run.absorb(observation, false);
-                }
-                run.tracked() - before
+                let latched = run.fold(&observations, None, &limits, &|_| now);
+                (run.tracked() - before, latched)
             };
             state.tracked += added;
             let judged = self.settle(&mut state, &key, now);
+            if latched {
+                self.tripped(&key, &judged, now);
+            }
             if judged.verdict != Verdict::Continue {
                 signals.push(Signal {
                     tenant: key.tenant.clone(),
@@ -622,8 +680,7 @@ impl Guard {
         };
         if judged.new_trip.is_some() && run.trip.is_none() {
             run.trip = judged.new_trip.clone();
-            self.trips.fetch_add(1, Ordering::Relaxed);
-            self.announce(key, EventKind::Stop, &judged, now);
+            self.tripped(key, &judged, now);
         } else if judged.verdict == Verdict::Warn {
             // Announced when the level RISES: entering warn, and again when
             // a warn policy's limit is reached — the moment a stop policy
@@ -639,6 +696,13 @@ impl Guard {
         }
         state.reclass(key);
         judged
+    }
+
+    /// Counts and announces a policy stop just latched — by a settle, or by
+    /// a fold, mid-batch.
+    fn tripped(&self, key: &RunKey, judged: &Judgement, now: u64) {
+        self.trips.fetch_add(1, Ordering::Relaxed);
+        self.announce(key, EventKind::Stop, judged, now);
     }
 
     fn announce(&self, key: &RunKey, kind: EventKind, judged: &Judgement, now: u64) {
@@ -685,6 +749,90 @@ impl Guard {
         log.compact(&records)?;
         Ok(())
     }
+
+    /// The verdict document for `key` as `judged`, unless the run's state
+    /// was rebuilt from only its earliest spans and `judged` is not a stop:
+    /// what those spans used is a lower bound on what the run used, which
+    /// can establish that it must stop but never that it may go on.
+    fn answer(
+        &self,
+        state: &State,
+        key: &RunKey,
+        judged: Judgement,
+        source: Source,
+    ) -> Result<VerdictDoc> {
+        if judged.verdict != Verdict::Stop && state.runs.get(key).is_some_and(|run| run.truncated) {
+            let read = self.rebuild_max_spans();
+            return Err(Error::QueryTooBroad(format!(
+                "run `{}` has more than {read} stored spans, more than a rebuild reads; the \
+                 earliest {read} do not stop it and what it used beyond them is unknown, so it \
+                 gets no verdict short of a stop",
+                key.run
+            )));
+        }
+        Ok(state.doc(key, judged, source))
+    }
+}
+
+/// One run's share of an observed batch.
+struct Group {
+    key: RunKey,
+    observations: Vec<Observation>,
+    /// Where each span's observation sits in `observations`.
+    positions: HashMap<u64, usize>,
+}
+
+impl Group {
+    /// Adds one span's observation. A batch can carry two versions of a
+    /// span, and the store keeps the later, written over the earlier in
+    /// place — so here too: the run is folded with the version the store
+    /// kept, and a version it never kept cannot latch a stop on the way.
+    fn push(&mut self, observation: Observation) {
+        match self.positions.get(&observation.key()) {
+            Some(&position) => self.observations[position] = observation,
+            None => {
+                self.positions
+                    .insert(observation.key(), self.observations.len());
+                self.observations.push(observation);
+            }
+        }
+    }
+}
+
+/// The policy a run of `tenant` whose first span had `service` is held to,
+/// with the run's grant over its limits.
+fn in_force(
+    policies: &[FusePolicy],
+    config: &FuseConfig,
+    tenant: &str,
+    service: &str,
+    grant: Option<&Limits>,
+) -> policy::Resolved {
+    let mut resolved = policy::resolve(policies, config, tenant, service);
+    if let Some(grant) = grant {
+        resolved.limits = resolved.limits.overlaid(grant);
+    }
+    resolved
+}
+
+/// The limits a policy stop latches at for a run whose first span had
+/// `service`, or `None` when nothing can latch: under a `warn` policy, or
+/// while a kill switch stops the run — a manual stop is what it reports, so
+/// a policy stop latched beneath it would be counted and announced unseen,
+/// which a settle never does either.
+fn stop_limits(
+    policies: &[FusePolicy],
+    config: &FuseConfig,
+    tenant: &str,
+    service: &str,
+    controls: Option<&Controls>,
+) -> Option<Limits> {
+    if controls.is_some_and(|controls| controls.manual.is_some()) {
+        return None;
+    }
+    let grant = controls.and_then(|controls| controls.grant.as_ref());
+    let resolved = in_force(policies, config, tenant, service, grant);
+    (resolved.action == Action::Stop).then_some(resolved.limits)
 }
 
 /// Everything durable a rebuild's replay depends on besides the spans.
@@ -696,17 +844,24 @@ struct ReplayInputs {
 }
 
 impl ReplayInputs {
-    /// Replays `observations` (in step order) into a complete run state.
-    fn replay(&self, config: &FuseConfig, tenant: &str, observations: &[Observation]) -> RunState {
+    /// Replays `observations` (in step order) into a complete run state —
+    /// cut short when `truncated` says they are only the run's earliest.
+    fn replay(
+        &self,
+        config: &FuseConfig,
+        tenant: &str,
+        observations: &[Observation],
+        truncated: bool,
+    ) -> RunState {
         let resolve = |service: &str| {
-            let resolved = policy::resolve(&self.policies, config, tenant, service);
-            let limits = match &self.grant {
-                Some(grant) => resolved.limits.overlaid(grant),
-                None => resolved.limits,
-            };
-            (limits, resolved.action)
+            let resolved = in_force(&self.policies, config, tenant, service, self.grant.as_ref());
+            (resolved.limits, resolved.action)
         };
-        state::replay(observations, self.reset_at, &resolve)
+        let mut rebuilt = state::replay(observations, self.reset_at, &resolve);
+        if truncated {
+            rebuilt.cut_short();
+        }
+        rebuilt
     }
 }
 
@@ -732,8 +887,23 @@ struct Judgement {
 struct RebuildRead {
     /// The erasure epoch when the rebuild registered.
     epoch: u64,
-    /// The extracted spans, the replay inputs, and the replayed state.
-    replayed: Result<(Vec<Observation>, ReplayInputs, RunState)>,
+    /// The store's write revision before the rebuild registered: the read
+    /// holds every version stored at or below it, or a newer one.
+    floor: u64,
+    /// What the read found, or why it found nothing.
+    replayed: Result<Replayed>,
+}
+
+/// A rebuild's read of a run, replayed.
+struct Replayed {
+    /// The extracted spans, in step order.
+    observations: Vec<Observation>,
+    /// Whether they are only the run's earliest.
+    truncated: bool,
+    /// What they were replayed against.
+    inputs: ReplayInputs,
+    /// The replayed state.
+    state: RunState,
 }
 
 impl State {
@@ -1021,8 +1191,10 @@ impl State {
         self.admit_live(Arc::new(key.clone()), run, tick, now);
     }
 
-    /// Installs a rebuilt run in place of whatever was live or parked for it.
-    fn install(&mut self, key: &RunKey, mut run: RunState, now: u64) {
+    /// Installs a rebuilt run in place of whatever was live or parked for
+    /// it. Returns whether a stop the run already carried stands in place of
+    /// whatever stop the rebuilt state holds.
+    fn install(&mut self, key: &RunKey, mut run: RunState, now: u64) -> bool {
         let tick = self.bump();
         // What was announced live stands: a warn already sent stays sent,
         // and a stop observed live — or parked — stays sticky with the time
@@ -1036,10 +1208,23 @@ impl State {
         if let Some(parked) = self.unpark(key) {
             carried = carried.or(parked.trip);
         }
-        if carried.is_some() {
+        let stands = carried.is_some();
+        if stands {
             run.trip = carried;
         }
         self.admit_live(Arc::new(key.clone()), run, tick, now);
+        stands
+    }
+
+    /// [`stop_limits`] for `key`, under its tenant's policies and controls.
+    fn stop_limits(&self, config: &FuseConfig, key: &RunKey, service: &str) -> Option<Limits> {
+        stop_limits(
+            self.tenant_policies(&key.tenant),
+            config,
+            &key.tenant,
+            service,
+            self.controls_of(key),
+        )
     }
 
     /// Judges `key` without changing anything: the manual stop, then the
@@ -1064,17 +1249,15 @@ impl State {
             .as_deref()
             .or_else(|| parked.and_then(|parked| parked.service.as_deref()))
             .unwrap_or("");
-        let resolved = policy::resolve(
+        let grant = controls.and_then(|controls| controls.grant);
+        let resolved = in_force(
             self.tenant_policies(&key.tenant),
             config,
             &key.tenant,
             service,
+            grant.as_ref(),
         );
-        let grant = controls.and_then(|controls| controls.grant);
-        let limits = match &grant {
-            Some(grant) => resolved.limits.overlaid(grant),
-            None => resolved.limits,
-        };
+        let limits = resolved.limits;
         let mut judged = Judgement {
             policy: resolved.name.clone(),
             limits,
@@ -1284,9 +1467,10 @@ impl Store {
 
     /// Feeds an acknowledged batch to the run guard; the signals become
     /// [`crate::Admission::signals`]. Empty when fuses are disabled.
-    pub(crate) fn observe_fuses(&self, spans: &[Arc<Span>]) -> Vec<Signal> {
+    /// `spans[i]` was stored at write revision `first_revision + i`.
+    pub(crate) fn observe_fuses(&self, spans: &[Arc<Span>], first_revision: u64) -> Vec<Signal> {
         match &self.guard {
-            Some(guard) if !spans.is_empty() => guard.observe(self, spans),
+            Some(guard) if !spans.is_empty() => guard.observe(self, spans, first_revision),
             _ => Vec::new(),
         }
     }
@@ -1298,10 +1482,20 @@ impl Store {
     /// query deadline, and later ones are answered from memory; a run no span
     /// carries is a fresh run with zero usage — `continue`, since a fresh run
     /// is allowed to start — and is answered without holding any state for
-    /// it. If a rebuild fails (an exhausted deadline), a run with live state
-    /// is answered from it, marked `live`, and the rebuild is retried on the
-    /// next query. A rebuild an erasure overlapped is discarded and redone;
-    /// one that keeps being overlapped is a retryable [`Error::Conflict`].
+    /// it. A rebuild an erasure overlapped is discarded and redone; one that
+    /// keeps being overlapped is a retryable [`Error::Conflict`].
+    ///
+    /// Only a stop is ever answered from part of a run's history, because
+    /// what part of it says is a lower bound on what the run used: enough to
+    /// stop it, never enough to let it go on. So a rebuild that fails — an
+    /// exhausted deadline — answers `stop` when what memory holds already
+    /// stops the run (a kill switch, a stop latched live or parked, a next
+    /// step past a limit on what is known), marked `live`, and is otherwise
+    /// that error; it is retried on the next query either way. And a run
+    /// with more than [`REBUILD_MAX_SPANS`] stored spans, of which a rebuild
+    /// reads the earliest, answers `stop` when those already stop it and is
+    /// otherwise [`Error::QueryTooBroad`] — from then on, without reading
+    /// it again.
     pub fn fuse_verdict(&self, tenant: &str, run: &str) -> Result<VerdictDoc> {
         self.fuse_answer(tenant, run, None)
     }
@@ -1328,7 +1522,7 @@ impl Store {
                     state.entry(&key, now);
                     guard.settle(&mut state, &key, now);
                     let judged = state.judge(&guard.config, &key, next, now);
-                    return Ok(state.doc(&key, judged, Source::Live));
+                    return guard.answer(&state, &key, judged, Source::Live);
                 }
             }
             let read = self.fuse_rebuild_read(guard, &key)?;
@@ -1346,8 +1540,14 @@ impl Store {
     /// must not stall every ingest observer. Observations that land
     /// meanwhile are captured for the run and replayed over the result by
     /// [`Self::fuse_rebuild_install`], so nothing admitted during the read is
-    /// lost or counted twice.
+    /// lost or counted twice — and an observer that lands then for a version
+    /// stored before the read began, which the read already holds or holds a
+    /// newer version of, is not replayed over it (the floor).
     fn fuse_rebuild_read(&self, guard: &Guard, key: &RunKey) -> Result<RebuildRead> {
+        // Before registering: a version stored after this, but observed
+        // before the registration, lands in the live state the install
+        // replaces — and the read, which begins later, holds it.
+        let floor = self.write_revision()?;
         let epoch = {
             let mut state = guard.lock_state()?;
             state.rebuilding.entry(key.clone()).or_default().0 += 1;
@@ -1357,20 +1557,35 @@ impl Store {
         // work the budget exists to bound, not a free tail after the read.
         let deadline = self.query_deadline(Instant::now());
         let replayed = self
-            .run_spans(Some(&key.tenant), &key.run, REBUILD_MAX_SPANS, deadline)
+            .run_spans(
+                Some(&key.tenant),
+                &key.run,
+                guard.rebuild_max_spans(),
+                deadline,
+            )
             .and_then(|stored| {
                 let mut observations = Vec::with_capacity(stored.spans.len());
                 for (index, span) in stored.spans.iter().enumerate() {
                     if index % DEADLINE_STRIDE == 0 {
                         Deadline::check(deadline, 0)?;
                     }
-                    observations.push(Observation::of(self, span));
+                    observations.push(Observation::of(self, span, 0));
                 }
                 let inputs = guard.lock_state()?.replay_inputs(key);
-                let rebuilt = inputs.replay(&guard.config, &key.tenant, &observations);
-                Ok((observations, inputs, rebuilt))
+                let state =
+                    inputs.replay(&guard.config, &key.tenant, &observations, stored.truncated);
+                Ok(Replayed {
+                    observations,
+                    truncated: stored.truncated,
+                    inputs,
+                    state,
+                })
             });
-        Ok(RebuildRead { epoch, replayed })
+        Ok(RebuildRead {
+            epoch,
+            floor,
+            replayed,
+        })
     }
 
     /// A rebuild's second half: installs what was read and answers. `None`
@@ -1391,56 +1606,75 @@ impl Store {
         if state.erasure_epoch != read.epoch {
             return Ok(None);
         }
-        let (observations, inputs, mut rebuilt) = match read.replayed {
-            Ok(replayed) => replayed,
+        let installed_first = state.runs.get(key).is_some_and(|live| live.complete);
+        match read.replayed {
+            // A concurrent rebuild installed first; its answer stands,
+            // whatever this read found or failed to.
+            _ if installed_first => state.entry(key, now),
             Err(error) => {
-                // What memory holds still answers: live usage, or a stop
-                // that needs no usage to stand — parked, or a kill switch. A
-                // stopped run whose history is too long to read in time must
-                // still answer `stop`, not an error a hook may fail open on.
-                let manual = state
-                    .controls_of(key)
-                    .is_some_and(|controls| controls.manual.is_some());
-                if state.runs.contains_key(key) {
-                    state.entry(key, now);
-                } else if !state.parked.contains_key(key) && !manual {
+                // Memory alone is left, and what it holds of the run — live
+                // state followed from some point, or nothing but a parked
+                // stop or a kill switch — is part of its history at most. A
+                // stop judged from part stands, so a stopped run whose
+                // history is too long to read in time still answers `stop`,
+                // not an error a hook may fail open on. Anything else
+                // judged from part is no answer: the error, which a hook
+                // configured to fail closed refuses on.
+                let judged = state.judge(&guard.config, key, next, now);
+                if judged.verdict != Verdict::Stop {
                     return Err(error);
                 }
-                let judged = state.judge(&guard.config, key, next, now);
+                if state.runs.contains_key(key) {
+                    state.entry(key, now);
+                }
                 return Ok(Some(state.doc(key, judged, Source::Live)));
             }
-        };
-        if state.runs.get(key).is_some_and(|live| live.complete) {
-            // A concurrent rebuild installed first; its answer stands.
-            state.entry(key, now);
-        } else {
-            // A reset or a policy edit that landed during the replay changes
-            // what it must say. Rare, so the replay is simply redone.
-            let current = state.replay_inputs(key);
-            if current != inputs {
-                rebuilt = current.replay(&guard.config, &key.tenant, &observations);
-            }
-            for observation in &pending {
-                rebuilt.absorb(observation, false);
-            }
-            // Nothing stored, nothing arriving, nothing held: a fresh run,
-            // answered without installing anything. A question about a run
-            // that does not exist — any read-only caller can ask one — must
-            // not cost memory, or distinct made-up ids would be a leak.
-            let fresh = observations.is_empty()
-                && pending.is_empty()
-                && !state.runs.contains_key(key)
-                && !state.parked.contains_key(key)
-                && state.controls_of(key).is_none();
-            if !fresh {
-                state.install(key, rebuilt, now);
-                guard.settle(&mut state, key, now);
+            Ok(Replayed {
+                observations,
+                truncated,
+                inputs,
+                state: mut rebuilt,
+            }) => {
+                // A reset or a policy edit that landed during the replay
+                // changes what it must say. Rare, so the replay is redone.
+                let current = state.replay_inputs(key);
+                if current != inputs {
+                    rebuilt = current.replay(&guard.config, &key.tenant, &observations, truncated);
+                }
+                // What arrived during the read is folded over it — latching
+                // a stop it crosses, as live ingest does — except what was
+                // stored before the read began, which the read holds.
+                rebuilt.floor = read.floor;
+                let latched = {
+                    let limits = |service: &str| state.stop_limits(&guard.config, key, service);
+                    rebuilt.fold(&pending, None, &limits, &|_| now)
+                };
+                // Nothing stored, nothing arriving, nothing held: a fresh
+                // run, answered without installing anything. A question
+                // about a run that does not exist — any read-only caller can
+                // ask one — must not cost memory, or distinct made-up ids
+                // would be a leak.
+                let fresh = observations.is_empty()
+                    && pending.is_empty()
+                    && !state.runs.contains_key(key)
+                    && !state.parked.contains_key(key)
+                    && state.controls_of(key).is_none();
+                if !fresh {
+                    // A stop the run already carried — latched live from
+                    // the same arrivals, or parked — was announced when it
+                    // tripped; only one the arrivals latched first is new.
+                    let carried = state.install(key, rebuilt, now);
+                    let judged = guard.settle(&mut state, key, now);
+                    if latched && !carried {
+                        guard.tripped(key, &judged, now);
+                    }
+                }
             }
         }
         let judged = state.judge(&guard.config, key, next, now);
-        let doc = state.doc(key, judged, Source::Rebuilt);
+        let answer = guard.answer(&state, key, judged, Source::Rebuilt);
         state.evict(now, guard.config.max_runs, MAX_TRACKED_SPANS, Some(key));
-        Ok(Some(doc))
+        answer.map(Some)
     }
 
     /// Runs the guard holds — live ones, and stopped ones parked out of the
@@ -1941,8 +2175,15 @@ mod tests {
         }
 
         fn reopen(&mut self, fuses: FuseConfig) {
+            self.reopen_with(crate::Config {
+                fuses,
+                ..crate::Config::default()
+            });
+        }
+
+        fn reopen_with(&mut self, config: crate::Config) {
             drop(self.store.take());
-            self.store = Some(Self::reopen_at(&self.dir, fuses));
+            self.store = Some(Store::open(&self.dir, config).expect("opens"));
         }
     }
 
@@ -1986,6 +2227,29 @@ mod tests {
             action: Action::Stop,
             ..FuseConfig::default()
         }
+    }
+
+    /// A tool step of `run` with its own span clocks and status.
+    fn step_at(run: &str, id: &str, input: &str, start: u64, end: u64, status: &str) -> Span {
+        let mut span = tool_span(run, id, "search", input, start);
+        span.end_time_ns = end;
+        span.status = status.into();
+        span
+    }
+
+    /// An LLM step of `run` with a metered cost.
+    fn priced(run: &str, id: &str, cost: f64) -> Span {
+        let mut span = tool_span(run, id, "chat", "", 1);
+        span.attributes = match json!({
+            "session.id": run,
+            "gen_ai.operation.name": "chat",
+            "gen_ai.request.model": "m",
+            "llm.cost_usd": cost,
+        }) {
+            Value::Object(map) => map,
+            _ => Map::new(),
+        };
+        span
     }
 
     #[test]
@@ -2379,7 +2643,7 @@ mod tests {
         let fixture = TempStore::open("budget", FuseConfig::default());
         let store = fixture.store();
         let observation =
-            |run: &str, id: &str| Observation::of(store, &tool_span(run, id, "x", id, 1));
+            |run: &str, id: &str| Observation::of(store, &tool_span(run, id, "x", id, 1), 0);
         let mut state = State::default();
         for (run, spans) in [("stopped", 6), ("old", 3), ("new", 2)] {
             let key = RunKey::new("", run);
@@ -2516,6 +2780,7 @@ mod tests {
             let epoch = guard.lock_state().expect("state").erasure_epoch;
             let read = RebuildRead {
                 epoch,
+                floor: 0,
                 replayed: Err(Error::DeadlineExceeded("budget spent".into())),
             };
             let key = RunKey::new("", run);
@@ -2581,7 +2846,7 @@ mod tests {
         // The store is read; then, before the result is installed, the run's
         // session is erased.
         let read = store.fuse_rebuild_read(guard, &key).expect("reads");
-        assert!(matches!(&read.replayed, Ok((observations, _, _)) if observations.len() == 2));
+        assert!(matches!(&read.replayed, Ok(replayed) if replayed.observations.len() == 2));
         store
             .erase(erasure::Subject::Session {
                 session_id: "secret".into(),
@@ -2613,10 +2878,12 @@ mod tests {
             tool_span("late", "b", "search", "q", 2),
         ];
         store.ingest_batch(spans.clone()).expect("ingests");
+        // The batch's own revisions: its two spans were the last stored.
+        let first = store.write_revision().expect("revision") - 1;
         let late: Vec<Arc<Span>> = spans.into_iter().map(Arc::new).collect();
         let guard = store.guard().expect("guard");
         *guard.after_forget.lock().expect("hook") = Some(Box::new(move |store: &Store| {
-            store.observe_fuses(&late);
+            store.observe_fuses(&late, first);
         }));
         store
             .erase(erasure::Subject::Session {
@@ -2656,7 +2923,7 @@ mod tests {
         .into_iter()
         .map(Arc::new)
         .collect();
-        store.observe_fuses(&late);
+        store.observe_fuses(&late, store.write_revision().expect("revision") + 1);
         let state = store.guard().expect("guard").lock_state().expect("state");
         assert!(!state.runs.contains_key(&RunKey::new("", "erased")));
         assert!(state.runs.contains_key(&RunKey::new("", "kept")));
@@ -2968,5 +3235,347 @@ mod tests {
             listed(store, Some("acme"), RunListFilter::Stop),
             ["stopped"]
         );
+    }
+
+    #[test]
+    fn a_rebuild_that_read_only_part_of_a_run_answers_nothing_but_a_stop() {
+        // A rebuild reads a run's earliest spans only. What it read is a
+        // lower bound on the run's usage: enough to establish a stop, never
+        // enough to say the run may go on.
+        let fuses = stop_on(Limits {
+            max_steps: Some(6),
+            max_repeats: Some(3),
+            ..Limits::default()
+        });
+        let mut fixture = TempStore::open("truncated", fuses.clone());
+        let distinct = (0..7)
+            .map(|index| tool_span("long", &format!("s{index}"), "x", &index.to_string(), index))
+            .collect();
+        let looping = (0..7)
+            .map(|index| tool_span("loop", &format!("s{index}"), "x", "same", index))
+            .collect();
+        fixture.store().ingest_batch(distinct).expect("ingests");
+        fixture.store().ingest_batch(looping).expect("ingests");
+        fixture.reopen(fuses);
+        let store = fixture.store();
+        store
+            .guard()
+            .expect("guard")
+            .rebuild_max_spans
+            .store(4, Ordering::Relaxed);
+
+        // Four steps of seven read: under the limit of six, yet the run is
+        // past it. Asked again, it is answered from memory — the same way.
+        for _ in 0..2 {
+            match store.fuse_check("", "long", &NextStep::default()) {
+                Err(Error::QueryTooBroad(message)) => {
+                    assert!(message.contains("more than 4"), "{message}")
+                }
+                other => panic!("a partial history cannot clear a run: {other:?}"),
+            }
+        }
+        // The loop's first four spans already repeat three times: that stop
+        // is exact, since the replay of the whole run passes the same way.
+        let doc = store.fuse_verdict("", "loop").expect("a stop is answered");
+        assert_eq!(
+            (doc.verdict, doc.source, doc.tripped_by),
+            (Verdict::Stop, Source::Rebuilt, Some(TrippedBy::Policy))
+        );
+        // A kill switch needs no history; a reset brings the question back.
+        let doc = store.fuse_trip("", "long", "hold").expect("trips");
+        assert_eq!(doc.verdict, Verdict::Stop);
+        assert!(matches!(
+            store.fuse_reset("", "long", None),
+            Err(Error::QueryTooBroad(_))
+        ));
+    }
+
+    #[test]
+    fn a_rebuild_that_runs_out_of_time_answers_only_a_stop_memory_already_holds() {
+        let fuses = stop_on(Limits {
+            max_steps: Some(3),
+            max_cost_usd: Some(1.0),
+            ..Limits::default()
+        });
+        let mut fixture = TempStore::open("deadlinememory", fuses.clone());
+        // Enough history to stop the run, stored before a restart.
+        let history = (0..3)
+            .map(|index| tool_span("over", &format!("h{index}"), "x", &index.to_string(), index))
+            .collect();
+        fixture.store().ingest_batch(history).expect("ingests");
+        // A budget no rebuild can meet.
+        fixture.reopen_with(crate::Config {
+            fuses,
+            query_deadline: Some(Duration::ZERO),
+            ..crate::Config::default()
+        });
+        let store = fixture.store();
+        // One step after the restart: live state that knows of it alone.
+        store
+            .ingest_batch(vec![tool_span("over", "new", "x", "new", 10)])
+            .expect("ingests");
+        for answer in [
+            store.fuse_check("", "over", &NextStep::default()),
+            store.fuse_verdict("", "over"),
+        ] {
+            match answer {
+                Err(Error::DeadlineExceeded(_)) => {}
+                other => panic!("one step of four cannot clear the run: {other:?}"),
+            }
+        }
+        // What memory holds that does stop a run is answered: a next step
+        // that goes past a limit on what is known alone...
+        let pricey = NextStep {
+            est_cost_usd: Some(5.0),
+            ..NextStep::default()
+        };
+        let doc = store.fuse_check("", "over", &pricey).expect("checks");
+        assert_eq!((doc.verdict, doc.source), (Verdict::Stop, Source::Live));
+        // ...and a stop latched live.
+        let steps = ["a", "b", "c"]
+            .iter()
+            .enumerate()
+            .map(|(index, id)| tool_span("fresh", id, "x", id, index as u64))
+            .collect();
+        store.ingest_batch(steps).expect("ingests");
+        let doc = store
+            .fuse_check("", "fresh", &NextStep::default())
+            .expect("checks");
+        assert_eq!((doc.verdict, doc.source), (Verdict::Stop, Source::Live));
+    }
+
+    #[test]
+    fn a_threshold_crossed_and_cleared_within_one_batch_still_stops_the_run() {
+        // Replay latches a stop at the span that crosses a limit; live
+        // folding must too, or whether a run stops would depend on how its
+        // spans were batched — here, an error streak a success then ends.
+        let fuses = stop_on(Limits {
+            max_error_streak: Some(3),
+            ..Limits::default()
+        });
+        let mut fixture = TempStore::open("streakbatch", fuses.clone());
+        let store = fixture.store();
+        store
+            .ingest_batch(vec![step_at("r", "ok0", "0", 0, 10, "ok")])
+            .expect("ingests");
+        // Complete from here on: answered from memory, kept current by ingest.
+        let doc = store.fuse_verdict("", "r").expect("verdict");
+        assert_eq!(doc.source, Source::Rebuilt);
+        let admission = store
+            .ingest_batch(vec![
+                step_at("r", "e1", "1", 100, 110, "error"),
+                step_at("r", "e2", "2", 200, 210, "error"),
+                step_at("r", "e3", "3", 300, 310, "error"),
+                step_at("r", "ok4", "4", 400, 410, "ok"),
+            ])
+            .expect("ingests");
+        let stopped = ["max_error_streak 3 reached: 3 consecutive failed steps"];
+        assert_eq!(
+            admission
+                .signals
+                .iter()
+                .map(|signal| (signal.verdict, signal.reasons.clone()))
+                .collect::<Vec<_>>(),
+            [(Verdict::Stop, stopped.map(str::to_owned).to_vec())]
+        );
+        let live = store
+            .fuse_check("", "r", &NextStep::default())
+            .expect("checks");
+        assert_eq!((live.source, live.verdict), (Source::Live, Verdict::Stop));
+        assert_eq!(live.reasons, stopped);
+        assert_eq!(live.evidence[0].span_id, "e3", "the span that crossed");
+        assert_eq!(live.usage.error_streak, 0, "the success ended the streak");
+        // A restart replays the same spans to the same stop.
+        fixture.reopen(fuses);
+        let rebuilt = fixture.store().fuse_verdict("", "r").expect("verdict");
+        assert_eq!(
+            (rebuilt.source, rebuilt.verdict),
+            (Source::Rebuilt, Verdict::Stop)
+        );
+        assert_eq!(rebuilt.reasons, stopped);
+        assert_eq!(rebuilt.evidence[0].span_id, "e3");
+    }
+
+    #[test]
+    fn arrivals_during_a_rebuild_latch_the_stop_they_cross_once() {
+        // The stored history ends in two failures; while a rebuild reads it,
+        // a batch brings a third and then a success. Live state, which knows
+        // only the arrivals, sees one failure; the rebuilt run sees three.
+        let fuses = stop_on(Limits {
+            max_error_streak: Some(3),
+            ..Limits::default()
+        });
+        let mut fixture = TempStore::open("pendinglatch", fuses.clone());
+        fixture
+            .store()
+            .ingest_batch(vec![
+                step_at("r", "ok0", "0", 0, 10, "ok"),
+                step_at("r", "e1", "1", 100, 110, "error"),
+                step_at("r", "e2", "2", 200, 210, "error"),
+            ])
+            .expect("ingests");
+        fixture.reopen(fuses);
+        let store = fixture.store();
+        let guard = store.guard().expect("guard");
+        let key = RunKey::new("", "r");
+        let read = store.fuse_rebuild_read(guard, &key).expect("reads");
+        let admission = store
+            .ingest_batch(vec![
+                step_at("r", "e3", "3", 300, 310, "error"),
+                step_at("r", "ok4", "4", 400, 410, "ok"),
+            ])
+            .expect("ingests");
+        assert!(admission.signals.is_empty(), "{:?}", admission.signals);
+        let doc = store
+            .fuse_rebuild_install(guard, &key, read, None, unix_now_ns())
+            .expect("installs")
+            .expect("not overlapped");
+        assert_eq!(
+            (doc.verdict, doc.reasons.as_slice()),
+            (
+                Verdict::Stop,
+                &["max_error_streak 3 reached: 3 consecutive failed steps".to_owned()][..]
+            )
+        );
+        assert_eq!(doc.evidence[0].span_id, "e3");
+        let feed = store
+            .fuse_events(None, None, Duration::ZERO)
+            .expect("events");
+        let stops = feed
+            .events
+            .iter()
+            .filter(|event| event.kind == EventKind::Stop)
+            .count();
+        assert_eq!(stops, 1, "{:?}", feed.events);
+    }
+
+    #[test]
+    fn a_batch_carrying_two_versions_of_a_span_is_judged_on_the_one_stored() {
+        // The store keeps a batch's last version of a span, so that is the
+        // one the guard judges: an error the same batch then corrected never
+        // happened as far as the store — or a replay of it — can tell.
+        let fixture = TempStore::open(
+            "twoversions",
+            stop_on(Limits {
+                max_error_streak: Some(3),
+                ..Limits::default()
+            }),
+        );
+        let store = fixture.store();
+        store
+            .ingest_batch(vec![step_at("r", "ok0", "0", 0, 10, "ok")])
+            .expect("ingests");
+        store.fuse_verdict("", "r").expect("verdict");
+        let admission = store
+            .ingest_batch(vec![
+                step_at("r", "e1", "1", 100, 110, "error"),
+                step_at("r", "e2", "2", 200, 210, "error"),
+                step_at("r", "x", "3", 300, 310, "error"),
+                step_at("r", "x", "3", 300, 310, "ok"),
+            ])
+            .expect("ingests");
+        assert!(admission.signals.is_empty(), "{:?}", admission.signals);
+        let doc = store.fuse_verdict("", "r").expect("verdict");
+        assert_eq!(
+            (doc.verdict, doc.usage.errors, doc.usage.error_streak),
+            (Verdict::Continue, 2, 0)
+        );
+    }
+
+    #[test]
+    fn a_span_reingested_with_only_a_later_end_extends_the_runs_duration() {
+        let fuses = stop_on(Limits {
+            max_duration_seconds: Some(10),
+            ..Limits::default()
+        });
+        let mut fixture = TempStore::open("lateend", fuses.clone());
+        let store = fixture.store();
+        let second = 1_000_000_000;
+        store
+            .ingest_batch(vec![step_at("r", "a", "q", second, 2 * second, "ok")])
+            .expect("ingests");
+        let doc = store.fuse_verdict("", "r").expect("verdict");
+        assert_eq!(doc.verdict, Verdict::Continue);
+        // The same span, its contribution unchanged, now ending a minute in.
+        let admission = store
+            .ingest_batch(vec![step_at("r", "a", "q", second, 61 * second, "ok")])
+            .expect("ingests");
+        assert_eq!(
+            admission.signals.first().map(|signal| signal.verdict),
+            Some(Verdict::Stop),
+            "{:?}",
+            admission.signals
+        );
+        let live = store.fuse_verdict("", "r").expect("verdict");
+        assert_eq!(
+            (live.source, live.verdict, live.usage.duration_ns),
+            (Source::Live, Verdict::Stop, 60 * second)
+        );
+        assert_eq!(
+            live.reasons,
+            ["max_duration_seconds 10 reached: the run spans 60 s"]
+        );
+        fixture.reopen(fuses);
+        let rebuilt = fixture.store().fuse_verdict("", "r").expect("verdict");
+        assert_eq!(
+            (rebuilt.verdict, rebuilt.usage.duration_ns),
+            (Verdict::Stop, 60 * second)
+        );
+        assert_eq!(rebuilt.reasons, live.reasons);
+    }
+
+    #[test]
+    fn a_late_observer_cannot_put_back_a_version_the_store_replaced() {
+        // Two writers of one span: A's version is stored first, B's second,
+        // but A's observer runs last. The guard must hold what the store
+        // holds — B's — or a budget check trusts a cost the run no longer
+        // has.
+        let fixture = TempStore::open(
+            "lateobserver",
+            stop_on(Limits {
+                max_cost_usd: Some(10.0),
+                ..Limits::default()
+            }),
+        );
+        let store = fixture.store();
+        let older = Arc::new(priced("r", "call", 1.0));
+        store
+            .ingest_batch(vec![(*older).clone()])
+            .expect("A stores");
+        let a = store.write_revision().expect("revision");
+        store.fuse_verdict("", "r").expect("verdict");
+        store
+            .ingest_batch(vec![priced("r", "call", 6.0)])
+            .expect("B stores, and observes");
+        // A's observer, which happens to run last.
+        store.observe_fuses(&[Arc::clone(&older)], a);
+        let next = NextStep {
+            est_cost_usd: Some(5.0),
+            ..NextStep::default()
+        };
+        let doc = store.fuse_check("", "r", &next).expect("checks");
+        assert_eq!(doc.source, Source::Live);
+        assert!((doc.usage.cost_usd - 6.0).abs() < 1e-9, "{doc:?}");
+        assert_eq!(doc.verdict, Verdict::Stop, "$6 spent + $5 is past $10");
+
+        // An observer that late, landing while a rebuild reads the store, is
+        // not replayed over what the read found either.
+        let older = Arc::new(priced("late", "call", 1.0));
+        store
+            .ingest_batch(vec![(*older).clone()])
+            .expect("A stores");
+        let a = store.write_revision().expect("revision");
+        store
+            .ingest_batch(vec![priced("late", "call", 6.0)])
+            .expect("B stores, and observes");
+        let guard = store.guard().expect("guard");
+        let key = RunKey::new("", "late");
+        let read = store.fuse_rebuild_read(guard, &key).expect("reads");
+        store.observe_fuses(&[older], a);
+        let doc = store
+            .fuse_rebuild_install(guard, &key, read, None, unix_now_ns())
+            .expect("installs")
+            .expect("not overlapped");
+        assert!((doc.usage.cost_usd - 6.0).abs() < 1e-9, "{doc:?}");
     }
 }

@@ -48,6 +48,11 @@ const RESOLVE_CACHE_BYTES: usize = 8 * 1024 * 1024;
 /// be a recording with its beginning cut off.
 pub const MAX_TAPE_SPANS: usize = 20_000;
 
+/// Spans whose step facts are extracted between two deadline checks: few
+/// enough that a run of large spans cannot outrun its budget by much, many
+/// enough that the clock read is lost in the extraction work.
+const DEADLINE_CHECK_SPANS: usize = 16;
+
 /// Attribute keys whose values configure a model call rather than describe
 /// it: a change in any of them between two runs is a CONFIG change, not a
 /// different decision on the same input (see [`crate::diff`]).
@@ -150,6 +155,16 @@ pub(crate) struct StepDetail {
     /// The span's session id under the store's session precedence, which is
     /// what a session erasure matches.
     pub(crate) session: Option<String>,
+    /// An llm request's carriers kept apart until resolution
+    /// ([`semconv::RequestCarriers`]); [`Resolver::resolve_request`] combines
+    /// them.
+    pub(crate) request_carriers: Option<semconv::RequestCarriers>,
+    /// Where an llm response was read from, which decides how a replay
+    /// decodes it.
+    pub(crate) response_source: semconv::ResponseSource,
+    /// A tool response recorded as empty (`null` or `""`), which the
+    /// response field cannot tell from one never captured.
+    pub(crate) empty_response: Option<Value>,
 }
 
 /// A run read as a tape.
@@ -235,11 +250,9 @@ impl Store {
                 let mut budget = ResolveBudget::new(max_bytes);
                 let mut resolver = Resolver::new(self, tenant, deadline);
                 for step in &mut steps {
-                    for value in [&mut step.request, &mut step.response]
-                        .into_iter()
-                        .flatten()
-                    {
-                        resolver.resolve(value, &mut budget)?;
+                    resolver.resolve_request(step, &mut budget)?;
+                    if let Some(response) = step.response.as_mut() {
+                        resolver.resolve(response, &mut budget)?;
                     }
                 }
                 Some(budget.unresolved)
@@ -269,8 +282,14 @@ impl Store {
         let mut steps = Vec::new();
         let spans_truncated = run.truncated;
         let mut truncated = spans_truncated;
-        for span in &run.spans {
-            let (facts, llm) = self.step_facts(span);
+        for (examined, span) in run.spans.iter().enumerate() {
+            // Extraction reassembles and digests every value the read
+            // returned — work proportional to the run's bytes, done after
+            // the read's own checks — so it spends the same budget.
+            if examined % DEADLINE_CHECK_SPANS == 0 {
+                Deadline::check(deadline, 0)?;
+            }
+            let (facts, extras, llm) = self.step_facts_detailed(span);
             if !facts.kind.is_step() {
                 continue;
             }
@@ -278,7 +297,7 @@ impl Store {
                 truncated = true;
                 break;
             }
-            steps.push(tape_step(steps.len(), span, facts, llm));
+            steps.push(tape_step(steps.len(), span, facts, extras, llm));
         }
         Ok(RunTape {
             spans: run.spans,
@@ -338,6 +357,12 @@ impl Leftover {
     /// Whether anything stayed a reference.
     pub(crate) fn any(self) -> bool {
         self.past_budget || self.unreadable
+    }
+
+    /// Folds in what another resolution left.
+    pub(crate) fn merge(&mut self, other: Leftover) {
+        self.past_budget |= other.past_budget;
+        self.unreadable |= other.unreadable;
     }
 }
 
@@ -400,6 +425,35 @@ impl<'s> Resolver<'s> {
     ) -> Result<Leftover> {
         let mut leftover = Leftover::default();
         self.walk(value, budget, &mut leftover)?;
+        Ok(leftover)
+    }
+
+    /// Resolves `step`'s request — through its carriers when it has them
+    /// ([`StepDetail::request_carriers`]), which are resolved one by one
+    /// (system instructions first, the order they appear in the stored
+    /// request) and then combined by the same rule as inline carriers, so
+    /// an offloaded message list ends up with its system instructions in
+    /// front exactly as if it had never been offloaded.
+    pub(crate) fn resolve_request(
+        &mut self,
+        step: &mut TapeStep,
+        budget: &mut ResolveBudget,
+    ) -> Result<Leftover> {
+        let Some(semconv::RequestCarriers {
+            mut messages,
+            mut system,
+        }) = step.detail.request_carriers.take()
+        else {
+            return match step.request.as_mut() {
+                Some(request) => self.resolve(request, budget),
+                None => Ok(Leftover::default()),
+            };
+        };
+        let mut leftover = self.resolve(&mut system, budget)?;
+        if let Some(messages) = messages.as_mut() {
+            leftover.merge(self.resolve(messages, budget)?);
+        }
+        step.request = semconv::with_system_instructions(messages, Some(system));
         Ok(leftover)
     }
 
@@ -533,7 +587,13 @@ pub(crate) fn contains_reference(value: &Value) -> bool {
 }
 
 /// One span as a tape step.
-fn tape_step(index: usize, span: &Span, facts: StepFacts, llm: LlmFacts) -> TapeStep {
+fn tape_step(
+    index: usize,
+    span: &Span,
+    facts: StepFacts,
+    extras: semconv::StepExtras,
+    llm: LlmFacts,
+) -> TapeStep {
     let attributes = &span.attributes;
     let config = if facts.kind == StepKind::Llm {
         attributes
@@ -552,6 +612,9 @@ fn tape_step(index: usize, span: &Span, facts: StepFacts, llm: LlmFacts) -> Tape
         config,
         tenant: span.tenant.clone(),
         session: llm.session.clone(),
+        request_carriers: extras.request_carriers,
+        response_source: extras.response_source,
+        empty_response: extras.empty_response,
     };
     TapeStep {
         index,
@@ -890,6 +953,71 @@ pub(crate) mod tests {
         assert!(contains_reference(
             partial.steps[1].request.as_ref().expect("request")
         ));
+    }
+
+    #[test]
+    fn a_resolved_message_list_takes_its_system_instructions_as_inline() {
+        // Offloaded messages beside inline system instructions, and the
+        // reverse: once resolved, each request is exactly what it would have
+        // been had nothing been offloaded.
+        let config = crate::Config {
+            payload_threshold: Some(64),
+            ..crate::Config::default()
+        };
+        let fixture = TempStore::open("resolve-system", config);
+        let store = fixture.store();
+        let messages =
+            json!([{"role": "user", "parts": [{"type": "text", "content": "m".repeat(100)}]}]);
+        let parts = json!([{"type": "text", "content": "s".repeat(100)}]);
+        let short_messages =
+            json!([{"role": "user", "parts": [{"type": "text", "content": "hi"}]}]);
+        store
+            .ingest_batch(vec![
+                span(
+                    "t-sys",
+                    "long-messages",
+                    1,
+                    json!({"gen_ai.operation.name": "chat",
+                           "gen_ai.system_instructions": "Be brief.",
+                           "gen_ai.input.messages": messages.to_string()}),
+                ),
+                span(
+                    "t-sys",
+                    "long-system",
+                    2,
+                    json!({"gen_ai.operation.name": "chat",
+                           "gen_ai.system_instructions": parts.to_string(),
+                           "gen_ai.input.messages": short_messages.to_string()}),
+                ),
+            ])
+            .expect("ingests");
+        let stored = store
+            .tape(Some(""), "trace:t-sys", TapeOptions::default())
+            .expect("reads")
+            .expect("exists");
+        // Stored, both carriers are there, the offloaded one as a reference.
+        let first = stored.steps[0].request.as_ref().expect("request");
+        assert_eq!(first[0], json!({"role": "system", "content": "Be brief."}));
+        assert!(payload_reference(&first[1]).is_some(), "{first}");
+        let resolved = store
+            .tape(
+                Some(""),
+                "trace:t-sys",
+                TapeOptions {
+                    max_steps: 10,
+                    resolve: Some(1 << 20),
+                },
+            )
+            .expect("reads")
+            .expect("exists");
+        assert_eq!(resolved.resolved_partial, Some(false));
+        let mut inline_first = messages.as_array().unwrap().clone();
+        inline_first.insert(0, json!({"role": "system", "content": "Be brief."}));
+        assert_eq!(resolved.steps[0].request, Some(json!(inline_first)));
+        // The offloaded parts list is a parts message, as inline parts are.
+        let mut inline_second = short_messages.as_array().unwrap().clone();
+        inline_second.insert(0, json!({"role": "system", "parts": parts}));
+        assert_eq!(resolved.steps[1].request, Some(json!(inline_second)));
     }
 
     #[test]

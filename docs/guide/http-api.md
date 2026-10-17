@@ -50,6 +50,12 @@ you:
   unaffected, and once a credential exists the rule is not applied — a page
   cannot attach a bearer token it does not know. This `403` carries `next`
   rather than `required`: no grant is missing.
+- **Open mode ends for requests already in flight.** Authentication is
+  decided from a request's headers, before its body is read. A request whose
+  headers arrived while the store was open, but whose body arrived after the
+  store's first credential was minted, is authenticated again once its body
+  is in: without a credential it is `401`, exactly as if it had arrived after
+  the bootstrap. Of two bootstraps racing, exactly one creates a credential.
 - **Admin request bodies must be declared JSON.** A `POST` under `/v1/admin/`
   that carries a body must send `Content-Type: application/json`, or it is
   `415`. An HTML form cannot send that type, and a cross-site script cannot
@@ -91,10 +97,10 @@ coding (`br`, `deflate`, `zstd`, a doubled `gzip`), is `415`.
 | `200` | Success |
 | `201` | Created: a backup pin, a credential, a replay, a ledger anchor |
 | `400` | Malformed body, invalid parameter, a violated ingest invariant, or an exceeded admission cap |
-| `401` | Missing, malformed, unknown, expired, or revoked bearer token. Carries `WWW-Authenticate: Bearer` |
+| `401` | Missing, malformed, unknown, expired, or revoked bearer token — including a request admitted in open mode whose body arrived after the store's first credential. Carries `WWW-Authenticate: Bearer` |
 | `403` | Valid token without the grant this request needs — the body's `"required"` names it (`rw`, `admin`, `unbound`) — or a tenant-bound credential naming a foreign tenant; in open mode, also a browser request from a non-loopback page to an admin operation |
 | `404` | No such route, or the requested trace/session/payload/dataset/experiment/credential/replay does not exist. Cross-tenant reads answer `404`, never `403` — existence is a fact about another tenant |
-| `409` | A conflict a retry may resolve: a mutation for a tenant whose erasure is pending, a tombstoned parent version, a payload reference not in the store, a pin label already taken, a credential token already registered, an environment credential named for revocation, a first credential that is not an unbound admin, a `/v1/fuses/*` route on a server started with `--no-fuses`, an anchor whose `target_head` is not the recorded head. Also a run that cannot be replayed and a strict replay's divergence — see [replays](#post-v1replays) for which of those a retry cannot fix |
+| `409` | A conflict a retry may resolve: a mutation for a tenant whose erasure is pending, a tombstoned parent version, a payload reference not in the store, a pin label already taken, a credential token already registered, an environment credential named for revocation, a first credential that is not an unbound admin, a `/v1/fuses/*` route on a server started with `--no-fuses`, an anchor whose `target_head` is not the recorded head. Also a run that cannot be replayed, a strict replay's divergence, and a replayed answer too large to render — see [replays](#post-v1replays) for which of those a retry cannot fix |
 | `410` | A tombstoned dataset version: the content is withheld, the fact of the deletion is not. Also a replay that is exhausted or that an erasure withdrew |
 | `413` | A gzip body that decompresses past the 64 MiB body cap |
 | `415` | A `Content-Encoding` other than `gzip` on an ingest route, or any coding elsewhere; a `/v1/admin/` body not declared `application/json` |
@@ -1094,7 +1100,7 @@ tenant's credentials and unbound operators; one created from the operator view
 each tool step's arguments and result, resolved within `--tape-max-bytes`;
 recorded requests are resolved one at a time, digested for strict matching,
 and not held. `unreadable_tool_steps` lists the tape indices of tool steps
-whose value could not be resolved (see
+whose value could not be resolved, or that recorded no result at all (see
 [`tools/next`](#post-v1replaysidtoolsnext)).
 
 | Response | Cause |
@@ -1102,8 +1108,8 @@ whose value could not be resolved (see
 | `400 {"error":"…"}` | Missing `run`, unknown field, or a bad `mode` / `tenant` |
 | `403` | A bound credential named another tenant |
 | `404 {"error":"run not found"}` | No spans carry that run id in scope |
-| `409 {"error":"step 0 (llm:gpt-4o) recorded no response — …"}` | The run cannot be replayed: a model step with no recorded answer (content capture off); an offloaded answer that cannot be read, or that is past `--tape-max-bytes` (the message says which); in strict mode a request that cannot be read or was recorded as text rather than a message list; a run of more than 20,000 spans; or a snapshot larger than one tenant's whole share (64 MiB), which can never be held. The message names the step and the remedy. Carries `x-should-retry: false` |
-| `429` with `Retry-After` | No room now. Each tenant's data — and the operator view, as a share of its own — may be held by 64 live replays and 64 MiB of recorded content; the registry as a whole by 1,024 replays and 512 MiB. A full share answers with the seconds until enough of that share's replays expire. A full registry answers the same to unbound operators and a flat `60` to bound credentials, which do not learn when another tenant's replay expires. A live replay is never evicted |
+| `409 {"error":"step 0 (llm:gpt-4o) recorded no response — …"}` | The run cannot be replayed: a model step with no recorded answer (content capture off); an offloaded answer that cannot be read, or that is past `--tape-max-bytes` (the message says which); in strict mode a request that cannot be read or was recorded as text rather than a message list; a run of more than 20,000 spans; or a snapshot larger than one tenant's whole share (64 MiB), which can never be held — refused as soon as building it passes the share. The message names the step and the remedy. Carries `x-should-retry: false` |
+| `429` with `Retry-After` | No room now. Each tenant's data — and the operator view, as a share of its own — may be held by 64 live replays and 64 MiB of memory; the registry as a whole by 1,024 replays and 512 MiB. Memory is everything a replay retains, counted generously: answers, tool records, identifiers, erasure bookkeeping, collection overhead, and its call log at its 4,096-entry bound (about 96 KiB). A full share answers with the seconds until enough of that share's replays expire. A full registry answers the same to unbound operators and a flat `60` to bound credentials, which do not learn when another tenant's replay expires. A live replay is never evicted |
 
 ### `GET /v1/replays/{id}`
 
@@ -1121,7 +1127,9 @@ to 4,096 entries. `diverged` is the first divergence, `{"step",
 replay is `404 {"error":"replay not found"}`. A replay withdrawn by an
 erasure is `410 {"error":"…","type":"replay_erased","erasure":N}` on this and
 every route under it, from the moment the erasure is recorded until the
-replay would have expired.
+replay would have expired. A withdrawn replay takes no live replay's room;
+each share keeps at most 64 withdrawn replays (the registry 1,024), and past
+that forgets the one closest to expiring, whose id is then `404`.
 
 ### `POST /v1/replays/{id}/openai/v1/chat/completions`
 
@@ -1130,8 +1138,11 @@ step: set the SDK's base URL to the replay's `base_urls.openai`. The body is an
 ordinary chat-completions request. The answer is a `chat.completion` object —
 the recorded text, the recorded tool calls as `tool_calls` (arguments as a JSON
 string), the recorded finish reason translated into OpenAI's vocabulary, the
-recorded model and token usage. With `"stream": true` it is
-`text/event-stream`: `chat.completion.chunk` events, a usage chunk when
+recorded model and token usage. With no recorded model the request's `model` is
+echoed, or `"unknown"`; a model name or response id over 256 bytes, recorded or
+requested, counts as absent. An answer recorded as text is served as that text
+even when it reads as JSON. No response, streamed or not, exceeds 64 MiB. With
+`"stream": true` it is `text/event-stream`: `chat.completion.chunk` events, a usage chunk when
 `stream_options.include_usage` is set, then `data: [DONE]`. The stream is
 reconstructed from stored text in Traza's own chunking.
 
@@ -1147,6 +1158,7 @@ messages are compared — not the model or other parameters.
 | `400 {"error":{"type":"invalid_request_error",…}}` | The body is not a JSON object with a `messages` array; or a path other than `chat/completions` under the base URL |
 | `404 {"error":{"type":"not_found_error",…}}` | Unknown, expired or foreign replay |
 | `409 {"error":{"type":"replay_divergence","message","step","expected_digest","got_digest"}}` | Strict mode: the messages do not match recorded step `step`. The step is **not** consumed. Carries `x-should-retry: false` |
+| `409 {"error":{"type":"response_too_large","message","step","limit"}}` | The next recorded answer would render past 64 MiB in the asked-for shape — a stream can be many times its recording. The step is **not** consumed; the same step unstreamed may fit. Carries `x-should-retry: false` |
 | `410 {"error":{"type":"replay_exhausted","message","served"}}` | Every recorded model step has been served. Carries `x-should-retry: false` |
 | `410 {"error":{"type":"replay_erased","message","erasure"}}` | An erasure recorded after the replay was created covers content it held; the replay is withdrawn. Carries `x-should-retry: false` |
 
@@ -1199,7 +1211,7 @@ shape — `{"error": "<message>"}` with the machine-readable kind beside it as
 |---|---|
 | `400 {"error":"…"}` | A body that is not `{}` or `{"tool": "<name>"}` |
 | `404 {"error":"replay not found"}` | Unknown, expired or foreign replay |
-| `409 {"error":"…","type":"tool_unreadable","step"}` | The next tool step's arguments or result was offloaded and could not be resolved — erased, swept by retention, or past `--tape-max-bytes`. The step is **not** consumed. Carries `x-should-retry: false` |
+| `409 {"error":"…","type":"tool_unreadable","step"}` | The next tool step's arguments or result was offloaded and could not be resolved — erased, swept by retention, or past `--tape-max-bytes` — or it recorded no result at all (content capture off). A result recorded as `""` or `null` is served as recorded. The step is **not** consumed. Carries `x-should-retry: false` |
 | `410 {"error":"…","type":"replay_exhausted"}` | No unserved tool step (of that name) remains. Carries `x-should-retry: false` |
 | `410 {"error":"…","type":"replay_erased","erasure"}` | The replay was withdrawn by an erasure. Carries `x-should-retry: false` |
 
@@ -1231,7 +1243,10 @@ whose `gen_ai.request.*` parameters differ is `config`, and so is a model swap
 — two model calls naming different models in the same unaligned stretch are
 paired as one `config` change. A step only one run has is `structure`. Step
 status is not compared. `404 {"error":"run not found: <run>"}` names a run
-with no spans; `400` when `a` or `b` is missing.
+with no spans; `400` when `a` or `b` is missing, or when reading, extracting
+and aligning the two runs does not fit the request's one `--query-deadline-ms`
+budget — the alignment compares interned signatures and checks the budget as
+it goes, so long names cannot keep it running past it.
 
 ### `GET /v1/recall`
 
@@ -1734,7 +1749,7 @@ curl -H "Authorization: Bearer $ACME_TOKEN" http://localhost:8080/v1/usage
 | `lifetime.bytes` | Their size: each span's native JSON after tenant stamping and **before** payload offload — what the client sent, in Traza's encoding. An OTLP batch is charged its native-JSON size, not its protobuf wire size |
 | `lifetime.batches` | Ingest calls that admitted at least one of the tenant's spans |
 | `lifetime.rejected` | Spans refused by a quota or a pause. Admission-cap refusals (`400`) are not counted here |
-| `month.window` | The current UTC calendar month, `YYYY-MM` |
+| `month.window` | The current UTC calendar month, `YYYY-MM`. It only moves forward: a batch acknowledged across a month boundary out of order, or under a wall clock stepped back, is charged to the newest month already counted rather than resetting it |
 | `month.spans`, `month.bytes` | The same counts for that month; zero once it turns |
 | `limits` | The tenant's [limits document](#post-v1admintenantstenantlimits) (defaults when never set) |
 | `state` | `paused`; else `capped` when a monthly limit is reached; else `warning` at 80% or more of any monthly limit; else `ok` |
@@ -1829,7 +1844,11 @@ one exists, every request must authenticate. **The first credential must
 itself be an unbound `admin`** (`409` otherwise): any other would switch
 authentication on with no credential able to manage credentials. In open mode
 the request must not come from a non-loopback browser page (see
-[Conventions](#conventions)).
+[Conventions](#conventions)). **Exactly one bootstrap wins:** whether the
+store is still open is decided together with the create, so of two
+unauthenticated requests racing to mint the first credential one gets `201`
+and the other `401` — it creates nothing and must come back with a
+credential.
 
 ```sh
 curl -X POST http://localhost:8080/v1/admin/credentials \
@@ -1864,9 +1883,14 @@ later: at most a quarter of the token and never more than 12 characters —
 `409` when the token is already registered — live, expired, revoked, or in
 `TRAZA_TOKENS`: a token is never reused, so a revoked one cannot come back —
 or when the store has no credential yet and this one is not an unbound
-`admin`; `403` for anything but an unbound `admin`, and in open mode for a
+`admin`; `401` for an unauthenticated request that lost the bootstrap (above);
+`403` for anything but an unbound `admin`, and in open mode for a
 non-loopback browser `Origin`; `415` when the body is not declared
-`application/json`.
+`application/json`; `503` when the credential log could not be written. A
+failed write is truncated away before the `503`, so nothing was created and
+retrying the same request is safe; if even that truncation fails, every
+create and revoke answers `503` until the server restarts and heals the log,
+while authentication carries on unaffected.
 
 ### `GET /v1/admin/credentials`
 
@@ -1895,7 +1919,9 @@ Unbound `admin` only.
 
 **Errors.** `404` for an unknown id;
 `409 {"error":"env credentials are revoked by restarting without them"}` for
-an environment credential.
+an environment credential; `503` when the revoke record could not be written
+— undone, as for a create, so the token still authenticates and the revoke
+can be retried.
 
 ---
 
@@ -1955,10 +1981,15 @@ curl -X POST http://127.0.0.1:8080/v1/fuses/check \
 
 **Errors.** `400` for a body that does not parse, an empty, bare `trace:` or
 over-long run id, or a negative `est_cost_usd`; `400` if rebuilding the run
-exhausted `--query-deadline-ms` and nothing about it was in memory (a run
-under a parked policy stop or a kill switch still answers `stop`); `409` in
-the rare case that erasures kept overlapping the run's rebuild (each overlap
-discards what the rebuild read, so retry once they settle).
+exhausted `--query-deadline-ms` and what memory holds of it does not already
+stop it (a kill switch, a stop latched live or parked, or a `next` step past
+a limit on what is known still answers `stop`); `400` for a run with more
+than 100,000 stored spans whose earliest 100,000 — all a rebuild reads — do
+not stop it, since part of a run's history can establish a stop but never
+clear one (see [the guide](guard.md#what-is-durable-and-what-is-rebuilt));
+`409` in the rare case that erasures kept overlapping the run's rebuild
+(each overlap discards what the rebuild read, so retry once they settle).
+None of these is a verdict, so a hook that fails closed blocks on them.
 
 ### `GET /v1/fuses/runs/{run}`
 
@@ -2028,7 +2059,10 @@ streak and repeat counts, durably. **Body** (optional):
 merged over earlier grants; it takes the [policy limit](#post-v1fusespolicies)
 fields and the same validation. Cumulative usage is not reset, so a run still
 over a cumulative limit answers `stop` again at once. Answers the verdict
-document. **Errors** as for the trip: the same 10,000-run bound applies.
+document. **Errors** as for the trip: the same 10,000-run bound applies. And
+as for [the check](#post-v1fusescheck) when the run's verdict cannot be given
+afterwards — a rebuild out of time, or a run too long to read whole, that
+nothing stops once reset — in which case the reset is recorded all the same.
 
 ```sh
 curl -X POST http://127.0.0.1:8080/v1/fuses/runs/sess-7f3a/reset \
@@ -2378,10 +2412,11 @@ new id.
 
 Recomputes every head and link, checks that the latest checkpoint entry
 names the live generation's manifest digest, re-digests every file that
-manifest names (the [`GET /v1/verify`](#get-v1verify) check), checks that
-every ledgered erasure's subject still has a settled erasure in the live
-tombstone log, and reports any ledger append that failed and has not been
-caught up. Unbound credentials only. Always `200` — the verdict is the body:
+manifest names (the [`GET /v1/verify`](#get-v1verify) check), checks every
+ledgered erasure against the live tombstone log and every settled erasure in
+that log against the chain, and reports any ledger append that failed and has
+not been caught up. Unbound credentials only. Always `200` — the verdict is
+the body:
 
 ```json
 {"entries":5,"generation":{"files_verified":true,"id":3,"manifest_sha256":"97bcc77723139e1d84ac46f786ee85152e6be3ce0d35938d797c85b33429b983","matches_ledger":true,"verified_at_ns":1792061580401844000},"head":"34e64ba565ed353f7db1ab6f1e9611b8815053c45548c22b9827d2c3dfc415e5","intact":true,"problems":[]}
@@ -2389,16 +2424,23 @@ caught up. Unbound credentials only. Always `200` — the verdict is the body:
 
 `intact` requires every check to pass. `problems` names each break by entry
 — `seq 2: head does not match its contents (recorded 0dee…, recomputed
-9edc…)` — or by file, prefixed with the generation. A ledgered erasure whose
-subject the live tombstone log no longer records as erased (what restoring a
-pin from before the erasure does) is named by its entry until the erasure is
-re-applied. A live generation newer than the latest checkpoint entry is
-reported as not ledgered yet: a crash or a failed append between publishing
-and ledgering leaves exactly that, and the next open or checkpoint ledgers
-it. The file check reads every manifested byte under the maintenance lock,
-so it costs O(store) like `GET /v1/verify`; the chain is read up to a
-snapshot taken under that lock, so an erasure or anchor appended mid-check is
-left for the next one rather than read half-written. Compaction and expiry
+9edc…)` — or by file, prefixed with the generation. A ledgered erasure is
+named by its entry until it is re-applied if the live tombstone log has no
+settled erasure of its subject published by the entry's `generation` or
+later. Restoring a pin from before the erasure does that, even when an
+earlier erasure of the same subject is still settled. A settled erasure with
+no entry of the same `erasure_id`, `subject_digest` and `generation` is
+named as not in the ledger. A live generation newer than the latest
+checkpoint entry is reported as not ledgered yet. A crash or a failed append
+between publishing (or settling) and ledgering leaves either gap, and the
+next open, or the next checkpoint after a failed append, ledgers what is
+missing. An entry being appended while the check runs is not reported
+missing. The file check reads every manifested byte under the maintenance lock,
+so it costs O(store) like `GET /v1/verify`. The chain is read up to a snapshot
+taken under that lock and walked after the lock is released, so an erasure or
+anchor appended mid-check is left for the next one rather than read
+half-written. This route always walks the whole chain and re-runs the file
+check. Compaction and expiry
 replace files between checkpoints, so until the next checkpoint the live
 manifest can name files that are gone, reported as missing;
 `POST /v1/checkpoint` first for a clean check.
@@ -2413,8 +2455,9 @@ traza-server verify --ledger --data-dir /var/lib/traza [--json]
 Exits `0` when intact, `2` when anything is broken (every problem printed),
 `1` when it cannot verify at all — not a data directory, or owned by a live
 server. It never opens the store, so a store that crashed between publishing
-a generation and ledgering it exits `2` with the not-ledgered-yet problem
-until its next open ledgers the generation.
+a generation (or settling an erasure) and ledgering it exits `2` with the
+not-ledgered-yet (or not-in-the-ledger) problem until its next open ledgers
+it.
 
 ### `POST /v1/ledger/anchors`
 
@@ -2481,12 +2524,18 @@ Abbreviated (heads and entries elided):
 ```
 
 `digest` is the SHA-256 of the canonical JSON of every other field — what a
-notary signs. `activity` counts spans that started in the window and are
-still stored, from the same deadline-bounded fold as the analytics (a window
-too large for `--query-deadline-ms` answers `400`, never a partial pack).
-`erasures` lists those settled in the window with their receipt's
-`conclusive` and `result`; past 32 receipts or the query deadline both are
-`null`. `ledger.entries` holds entries whose `at_ns` is in the window, at
+notary signs. One `--query-deadline-ms` budget covers the whole pack. The
+chain walk continues the previous pack's (or verification's) walk when that
+walk began within the last 60 seconds, so a pack usually walks only what was
+appended since. If the budget runs out mid-walk, the pack answers `400`
+(`… the ledger chain was verified through line N …`); the walk keeps its
+progress, so a retry resumes and completes it. `activity` counts spans that
+started in the window and are still stored, from the same fold as the
+analytics, under the same budget (a window too large for it answers `400`,
+never a partial pack). `erasures` lists those settled in the window with
+their receipt's `conclusive` and `result`; past 32 receipts or the budget
+both are `null`. The file check, reused for 60 seconds, is the one step the
+budget does not cut short. `ledger.entries` holds entries whose `at_ns` is in the window, at
 most 10,000 (`entries_truncated` says whether more exist), and
 `ledger.entries_unreadable` counts the chain's lines the pack could not place
 (not a JSON object, or no integer `seq` or `at_ns`); the verification names

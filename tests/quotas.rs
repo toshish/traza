@@ -634,6 +634,62 @@ fn a_runtime_ttl_overrides_the_flags_for_its_tenant_only() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Duplicate primary keys are accepted in one batch, and a pending session
+/// erasure can suppress one copy while the other survives — the copies
+/// differ in their session attribute. The survivor must be charged ITS size,
+/// not the suppressed copy's: re-aligning the measurements by key cannot
+/// tell the two apart, so the charge has to travel with the span.
+#[test]
+fn a_suppressed_duplicate_key_never_lends_its_size_to_the_survivor() {
+    let dir = scratch_dir();
+    {
+        let store = Store::open(&dir, Config::default()).expect("opens");
+        drop(store);
+    }
+    // The crash state: a session erasure's intent recorded, its purge never
+    // run — so the mask covers session "doomed" at admission.
+    let intent = json!({
+        "op": "erase", "schema": 1, "id": 1, "requested_unix_ns": 123,
+        "subject": {"kind": "session", "session_id": "doomed"},
+        "span_keys": [], "payload_refs": [],
+    });
+    std::fs::write(dir.join("tombstones.jsonl"), format!("{intent}\n")).expect("plants");
+    let store = Store::open(&dir, Config::default()).expect("reopens");
+
+    let copy = |id: &str, session: &str, filler: usize| {
+        let mut span = old_span("", id);
+        span.attributes.insert("session.id".into(), json!(session));
+        span.attributes
+            .insert("note".into(), json!("x".repeat(filler)));
+        span
+    };
+    let sent = |span: &Span| serde_json::to_vec(span).expect("encodes").len() as u64;
+    let charged = |store: &Store| {
+        store.usage_report(Some("")).expect("reports").tenants[0]
+            .lifetime
+            .bytes
+    };
+
+    // A small suppressed copy ahead of a large survivor...
+    let (small, large) = (copy("s1", "doomed", 10), copy("s1", "kept", 5_000));
+    let admission = store
+        .ingest_batch(vec![small.clone(), large.clone()])
+        .expect("ingests");
+    assert_eq!((admission.accepted, admission.suppressed), (1, 1));
+    assert_eq!(charged(&store), sent(&large), "the survivor's own size");
+
+    // ...and a large suppressed copy ahead of a small survivor.
+    let (large, small) = (copy("s2", "doomed", 7_000), copy("s2", "kept", 20));
+    let before = charged(&store);
+    let admission = store
+        .ingest_batch(vec![large.clone(), small.clone()])
+        .expect("ingests");
+    assert_eq!((admission.accepted, admission.suppressed), (1, 1));
+    assert_eq!(charged(&store) - before, sent(&small));
+    drop(store);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn a_runtime_ttl_is_honoured_on_a_store_with_no_flags_at_all() {
     let dir = scratch_dir();
