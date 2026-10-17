@@ -682,12 +682,24 @@ impl Store {
         session_id: &str,
         deadline: Option<crate::Deadline>,
     ) -> Result<Vec<Span>> {
-        let candidates = self.query_attribute_union(
+        self.resolve_session_spans_at(tenant, session_id, deadline)
+            .map(|(spans, _)| spans)
+    }
+
+    /// [`Self::resolve_session_spans`], plus the write revision it read the
+    /// store at (see [`Store::trace_spans_at`]).
+    pub(crate) fn resolve_session_spans_at(
+        &self,
+        tenant: Option<&str>,
+        session_id: &str,
+        deadline: Option<crate::Deadline>,
+    ) -> Result<(Vec<Span>, u64)> {
+        let (candidates, revision) = self.query_attribute_union(
             &semconv::SESSION_KEYS,
             &session_values(session_id),
             deadline,
         )?;
-        Ok(narrow_to_session(candidates, tenant, session_id))
+        Ok((narrow_to_session(candidates, tenant, session_id), revision))
     }
 
     /// One session with its per-trace breakdown, or `None` when no span

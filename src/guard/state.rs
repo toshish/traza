@@ -4,7 +4,8 @@
 //! The fold is the same whether spans arrive one acknowledged batch at a
 //! time (live) or all at once from the store (a rebuild), so the two paths
 //! cannot drift apart in what they count — or in where a stop latches, which
-//! [`RunState::fold`] checks after every span on both. Each span's
+//! [`RunState::fold`] checks after every span on both, in step order and
+//! under the run's policy as the whole fold leaves it. Each span's
 //! contribution is kept as a small [`Mark`] under a hash of its id, which is
 //! what makes a re-ingested span an UPSERT here as it is in the store: a
 //! client retrying a batch the store already acknowledged changes nothing,
@@ -139,8 +140,8 @@ pub(crate) struct Observation {
     start_ns: u64,
     pub(crate) end_ns: u64,
     /// The store's write revision of this version of the span (see
-    /// `Store::write_revision`), or 0 for one a rebuild read from the store,
-    /// which is ordered by the rebuilt state's floor instead.
+    /// `Store::observe_admitted`), or 0 for one a rebuild read from the
+    /// store, which is ordered by the rebuilt state's floor instead.
     revision: u64,
 }
 
@@ -176,11 +177,6 @@ impl Observation {
     /// Whether the span is a step of its run.
     pub(crate) fn is_step(&self) -> bool {
         self.kind.is_step()
-    }
-
-    /// The span's key within its run ([`span_key`]).
-    pub(crate) fn key(&self) -> u64 {
-        self.key
     }
 
     fn span_ref(&self) -> SpanRef {
@@ -286,9 +282,10 @@ pub(crate) struct RunState {
     /// other verdict is not an answer.
     pub(crate) truncated: bool,
     /// Writes at or below this revision are already reflected here: the
-    /// state was rebuilt from a read that began after they were stored, so
-    /// an observer of one that runs only now has nothing to add — and its
-    /// version may be older than the one the read found.
+    /// state was rebuilt from a read of the store exactly as of it, so an
+    /// observer of one that runs only now has nothing to add — and its
+    /// version may be older than the one the read found. Writes above it
+    /// are in no read this state came from, so every one of them counts.
     pub(crate) floor: u64,
     /// A policy stop, sticky until reset.
     pub(crate) trip: Option<Trip>,
@@ -355,16 +352,10 @@ impl RunState {
     /// observers run in whichever order they finish, and the guard must end
     /// up holding what the store holds.
     pub(crate) fn absorb(&mut self, observation: &Observation, before_reset: bool) -> bool {
-        let ordered = observation.revision != 0;
-        if ordered && observation.revision <= self.floor {
+        if self.is_stale(observation) {
             return false;
         }
         let previous = self.marks.get(&observation.key).copied();
-        if let Some(previous) = previous {
-            if ordered && observation.revision <= previous.revision {
-                return false;
-            }
-        }
         // The span's clocks count whether or not its contribution changed:
         // an upsert that only moved a span's end still moves the run's.
         let clocked = self.clock(observation);
@@ -441,11 +432,7 @@ impl RunState {
     /// keeping each span's clocks to narrow them exactly would cost every
     /// mark another 16 bytes.
     fn clock(&mut self, observation: &Observation) -> bool {
-        // Strictly earlier only: among spans starting together, the first
-        // to arrive keeps the run's policy, so a retry cannot flip it.
-        if self.service.is_none() || observation.start_ns < self.first_start_ns {
-            self.service = Some(observation.service.clone());
-        }
+        self.take_service(observation);
         let moved =
             observation.start_ns < self.first_start_ns || observation.end_ns > self.last_end_ns;
         self.first_start_ns = self.first_start_ns.min(observation.start_ns);
@@ -453,22 +440,98 @@ impl RunState {
         moved
     }
 
-    /// Folds `observations` in order, latching a policy stop at the first
-    /// span whose absorption reaches a stop limit — checked after EVERY span,
-    /// live and in replay alike, so where a run stops depends on its spans
-    /// and not on how they were batched: a limit crossed and cleared again
-    /// within one batch (an error streak a success then ends) was crossed,
-    /// exactly as it is when the same spans arrive one per batch or are
-    /// replayed from the store. Returns whether this fold latched a stop.
+    /// Takes `observation`'s service as the run's — which picks its policy —
+    /// when it starts before every span absorbed so far, or is the first.
+    /// Strictly before: among spans starting together, the first to arrive
+    /// keeps the run's policy, so a retry cannot flip it.
+    fn take_service(&mut self, observation: &Observation) {
+        if self.service.is_none() || observation.start_ns < self.first_start_ns {
+            self.service = Some(observation.service.clone());
+        }
+    }
+
+    /// Whether `observation` is of a version older than one this state
+    /// already reflects — at or below the floor a rebuild set, or no newer
+    /// than the version of its span held — so that absorbing it must change
+    /// nothing. A version without a revision (a rebuild's read) never is.
+    fn is_stale(&self, observation: &Observation) -> bool {
+        observation.revision != 0
+            && (observation.revision <= self.floor
+                || self
+                    .marks
+                    .get(&observation.key)
+                    .is_some_and(|mark| observation.revision <= mark.revision))
+    }
+
+    /// What a fold absorbs of `observations`: one version per span — the
+    /// newest by write revision, which is the one the store kept — minus
+    /// any older than what this state already reflects, in step order
+    /// (`(start, trace, span)`, the order a replay reads the store in).
+    ///
+    /// Each version goes where its OWN start puts it: a newer version that
+    /// moved a span must not be judged at the older one's place, which the
+    /// store no longer has and a replay never sees. Input already in step
+    /// order with one version per span — a replay's — comes back as it went
+    /// in, in linear time.
+    fn in_step_order<'a>(&self, observations: &'a [Observation]) -> Vec<&'a Observation> {
+        let mut newest: HashMap<u64, usize> = HashMap::with_capacity(observations.len());
+        for (index, observation) in observations.iter().enumerate() {
+            if self.is_stale(observation) {
+                continue;
+            }
+            newest
+                .entry(observation.key)
+                .and_modify(|held| {
+                    if observation.revision >= observations[*held].revision {
+                        *held = index;
+                    }
+                })
+                .or_insert(index);
+        }
+        let mut ordered: Vec<&Observation> = observations
+            .iter()
+            .enumerate()
+            .filter(|(index, observation)| newest.get(&observation.key) == Some(index))
+            .map(|(_, observation)| observation)
+            .collect();
+        // Stable, and linear on input that is already sorted.
+        ordered.sort_by(|left, right| {
+            left.start_ns
+                .cmp(&right.start_ns)
+                .then_with(|| left.trace_id.cmp(&right.trace_id))
+                .then_with(|| left.span_id.cmp(&right.span_id))
+        });
+        ordered
+    }
+
+    /// Folds `observations` in step order, latching a policy stop at the
+    /// first span whose absorption reaches a stop limit — checked after
+    /// EVERY span, live and in replay alike, so where a run stops depends on
+    /// its spans and not on how they were batched: a limit crossed and
+    /// cleared again within one batch (an error streak a success then ends)
+    /// was crossed, exactly as it is when the same spans arrive one per
+    /// batch or are replayed from the store. Returns whether this fold
+    /// latched a stop.
+    ///
+    /// The observations may come in any order and carry several versions of
+    /// a span (a batch can, and what arrives during a rebuild spans several
+    /// batches): each span is folded once, as the store kept it, where step
+    /// order puts it ([`Self::in_step_order`]). And the run's policy is
+    /// settled before ANY of them is judged: it is the earliest span's, and
+    /// a root agent span, which ends and so arrives after its children,
+    /// often comes behind them in the same batch. Judging a child against
+    /// its own service's policy on the way to the root would latch a stop
+    /// the root's policy never allows and a replay — root first — never
+    /// latches.
     ///
     /// `reset_at` absorbs spans that ended at or before it as history the
     /// last reset cleared, which latches nothing (see [`replay`]).
     /// `stop_limits` gives the limits a stop latches at for a run whose
     /// first span had the given service — `None` when nothing can latch (a
     /// `warn` policy, or a kill switch already stopping the run) — and is
-    /// asked again only when the run's first span changes. `stamp` times a
-    /// latched stop: the server clock live, the crossing span's end in a
-    /// replay, which has no admission clock to offer.
+    /// asked at most once. `stamp` times a latched stop: the server clock
+    /// live, the crossing span's end in a replay, which has no admission
+    /// clock to offer.
     pub(crate) fn fold(
         &mut self,
         observations: &[Observation],
@@ -476,22 +539,21 @@ impl RunState {
         stop_limits: &dyn Fn(&str) -> Option<Limits>,
         stamp: &dyn Fn(&Observation) -> u64,
     ) -> bool {
-        let mut resolved: Option<(String, Option<Limits>)> = None;
+        let observations = self.in_step_order(observations);
+        // In step order nothing after the first starts before it, so the
+        // service it leaves the run with stands for the whole fold.
+        if let Some(first) = observations.first() {
+            self.take_service(first);
+        }
+        let mut resolved: Option<Option<Limits>> = None;
         let mut latched = false;
         for observation in observations {
             let before = reset_at.is_some_and(|reset| observation.end_ns <= reset);
             if !self.absorb(observation, before) || before || self.trip.is_some() {
                 continue;
             }
-            let service = self.service.as_deref().unwrap_or("");
-            let limits = match &resolved {
-                Some((cached, limits)) if cached == service => *limits,
-                _ => {
-                    let limits = stop_limits(service);
-                    resolved = Some((service.to_owned(), limits));
-                    limits
-                }
-            };
+            let limits =
+                *resolved.get_or_insert_with(|| stop_limits(self.service.as_deref().unwrap_or("")));
             let Some(limits) = limits else { continue };
             if !reaches(&self.measures(), &limits) {
                 continue;
@@ -1328,6 +1390,84 @@ mod tests {
         let mut open = RunState::new(true);
         assert!(!open.fold(&batch, None, &|_| None, &|_| 42));
         assert!(open.trip.is_none());
+    }
+
+    #[test]
+    fn a_fold_judges_each_span_once_at_its_stored_place_in_step_order() {
+        let streak = |_: &str| {
+            Some(Limits {
+                max_error_streak: Some(2),
+                ..Limits::default()
+            })
+        };
+        let at = |id: &str, start: u64, error: bool, revision: u64| {
+            let mut observation = obs(id, StepKind::Tool, Some(&format!("t#{id}")), error);
+            observation.start_ns = start;
+            observation.end_ns = start + 5;
+            observation.revision = revision;
+            observation
+        };
+        // A's second version, the one stored, moved it after the success:
+        // in step order no two failures are adjacent.
+        let batch = [
+            at("a", 10, true, 1),
+            at("b", 20, true, 2),
+            at("c", 30, false, 3),
+            at("a", 40, true, 4),
+        ];
+        let mut run = RunState::new(true);
+        assert!(!run.fold(&batch, None, &streak, &|_| 42));
+        let usage = run.usage();
+        assert_eq!((usage.errors, usage.error_streak, run.tracked()), (2, 1, 3));
+        // What arrives during a rebuild is gathered over several batches, so
+        // it is out of step order and the older version of a span can come
+        // last. Still one span, judged where the stored version puts it.
+        let gathered = [
+            at("c", 30, false, 3),
+            at("a", 40, true, 4),
+            at("b", 20, true, 2),
+            at("a", 10, true, 1),
+        ];
+        let mut run = RunState::new(true);
+        assert!(!run.fold(&gathered, None, &streak, &|_| 42));
+        let usage = run.usage();
+        assert_eq!((usage.errors, usage.error_streak, run.tracked()), (2, 1, 3));
+    }
+
+    #[test]
+    fn a_fold_takes_the_policy_of_its_earliest_span_before_judging_any() {
+        let at = |id: &str, service: &str, start: u64| {
+            let mut observation = step(id, &format!("tool:x#{id}"));
+            observation.service = service.into();
+            observation.start_ns = start;
+            observation.end_ns = start + 5;
+            observation
+        };
+        let asked = std::cell::RefCell::new(Vec::new());
+        let limits = |service: &str| {
+            asked.borrow_mut().push(service.to_owned());
+            Some(Limits {
+                max_steps: Some(if service == "root-svc" { 100 } else { 1 }),
+                ..Limits::default()
+            })
+        };
+        // Children first, then the root that started before them: the
+        // child service's one-step limit is never the run's.
+        let mut run = RunState::new(true);
+        let batch = [at("child", "child-svc", 20), at("root", "root-svc", 10)];
+        assert!(!run.fold(&batch, None, &limits, &|_| 42));
+        assert_eq!(run.service.as_deref(), Some("root-svc"));
+        // Likewise when the run already has spans, all of them later.
+        let mut run = RunState::new(true);
+        run.absorb(&at("early", "late-svc", 50), false);
+        let batch = [at("more", "late-svc", 60), at("root", "root-svc", 10)];
+        assert!(!run.fold(&batch, None, &limits, &|_| 42));
+        assert_eq!(run.service.as_deref(), Some("root-svc"));
+        let asked = asked.borrow();
+        assert!(
+            asked.iter().all(|service| service == "root-svc"),
+            "{asked:?}"
+        );
     }
 
     #[test]

@@ -24,15 +24,20 @@
 //! acknowledged batch by the ingest observer — O(batch), with no lock held
 //! while a span's facts are extracted. A stop latches at the span that
 //! crosses a limit, live as in a rebuild's replay, so batching cannot hide a
-//! crossing; and since observers run after their writes in no fixed order,
-//! each span's contribution is ordered by the store's write revision, so a
-//! late observer cannot put back a version the store replaced. Every run is
-//! rebuilt from the store the first time a verdict is asked for it, under
-//! the query deadline: the process cannot know whether a run had spans
-//! before it began following it (the run may predate a restart, or have
-//! been evicted), so it never assumes not. What spans cannot reconstruct —
-//! policies, manual trips, resets and grants — is durable in `fuses.jsonl`
-//! (see the `log` module).
+//! crossing; and a batch is folded the way a replay reads the store — one
+//! version per span, the one stored, in step order, under the policy of the
+//! earliest span the run and the batch hold between them — so batching
+//! cannot invent one either. Since observers run after their writes in no
+//! fixed order, each span's contribution is ordered by the store's write
+//! revision, so a late observer cannot put back a version the store
+//! replaced; and a rebuild's read reports the revision it saw the store at,
+//! so a late observer cannot put back a version older than the one the read
+//! found either. Every run is rebuilt from the store the first time a
+//! verdict is asked for it, under the query deadline: the process cannot
+//! know whether a run had spans before it began following it (the run may
+//! predate a restart, or have been evicted), so it never assumes not. What
+//! spans cannot reconstruct — policies, manual trips, resets and grants — is
+//! durable in `fuses.jsonl` (see the `log` module).
 //!
 //! # Part of a history answers only `stop`
 //!
@@ -476,16 +481,21 @@ pub(crate) struct Guard {
     /// ingest observer exactly where a late one would — after the guard was
     /// swept, while the erasure is still pending.
     #[cfg(test)]
-    after_forget: Mutex<Option<ForgetHook>>,
+    after_forget: Mutex<Option<StoreHook>>,
+    /// Runs once, as the next rebuild begins, before it registers: lets a
+    /// test land writes, and their observers, exactly where an ingest racing
+    /// the rebuild's start would.
+    #[cfg(test)]
+    rebuild_started: Mutex<Option<StoreHook>>,
     /// [`REBUILD_MAX_SPANS`], lowered by a test that needs a run longer than
     /// a rebuild reads without ingesting a hundred thousand spans.
     #[cfg(test)]
     rebuild_max_spans: std::sync::atomic::AtomicUsize,
 }
 
-/// See [`Guard::after_forget`].
+/// See [`Guard::after_forget`] and [`Guard::rebuild_started`].
 #[cfg(test)]
-type ForgetHook = Box<dyn FnOnce(&Store) + Send>;
+type StoreHook = Box<dyn FnOnce(&Store) + Send>;
 
 impl Guard {
     /// Opens the guard over `directory`, replaying `fuses.jsonl`; `None` when
@@ -544,6 +554,8 @@ impl Guard {
             #[cfg(test)]
             after_forget: Mutex::new(None),
             #[cfg(test)]
+            rebuild_started: Mutex::new(None),
+            #[cfg(test)]
             rebuild_max_spans: std::sync::atomic::AtomicUsize::new(REBUILD_MAX_SPANS),
         }))
     }
@@ -597,11 +609,10 @@ impl Guard {
                 groups.push(Group {
                     key,
                     observations: Vec::new(),
-                    positions: HashMap::new(),
                 });
                 groups.len() - 1
             });
-            groups[slot].push(observation);
+            groups[slot].observations.push(observation);
         }
         let now = unix_now_ns();
         // The observer cannot fail an acknowledged ingest; a poisoned state
@@ -610,10 +621,7 @@ impl Guard {
             return Vec::new();
         };
         let mut signals = Vec::new();
-        for Group {
-            key, observations, ..
-        } in groups
-        {
+        for Group { key, observations } in groups {
             if let Some((_, pending)) = state.rebuilding.get_mut(&key) {
                 pending.extend(observations.iter().cloned());
             } else if !state.runs.contains_key(&key)
@@ -774,29 +782,12 @@ impl Guard {
     }
 }
 
-/// One run's share of an observed batch.
+/// One run's share of an observed batch, in batch order. Two versions of a
+/// span may both be here; the fold keeps the one the store kept and judges
+/// it where its own start puts it ([`RunState::fold`]).
 struct Group {
     key: RunKey,
     observations: Vec<Observation>,
-    /// Where each span's observation sits in `observations`.
-    positions: HashMap<u64, usize>,
-}
-
-impl Group {
-    /// Adds one span's observation. A batch can carry two versions of a
-    /// span, and the store keeps the later, written over the earlier in
-    /// place — so here too: the run is folded with the version the store
-    /// kept, and a version it never kept cannot latch a stop on the way.
-    fn push(&mut self, observation: Observation) {
-        match self.positions.get(&observation.key()) {
-            Some(&position) => self.observations[position] = observation,
-            None => {
-                self.positions
-                    .insert(observation.key(), self.observations.len());
-                self.observations.push(observation);
-            }
-        }
-    }
 }
 
 /// The policy a run of `tenant` whose first span had `service` is held to,
@@ -887,9 +878,6 @@ struct Judgement {
 struct RebuildRead {
     /// The erasure epoch when the rebuild registered.
     epoch: u64,
-    /// The store's write revision before the rebuild registered: the read
-    /// holds every version stored at or below it, or a newer one.
-    floor: u64,
     /// What the read found, or why it found nothing.
     replayed: Result<Replayed>,
 }
@@ -900,6 +888,13 @@ struct Replayed {
     observations: Vec<Observation>,
     /// Whether they are only the run's earliest.
     truncated: bool,
+    /// The write revision the read saw the store at, taken atomically with
+    /// it: nothing stored after it is in the read, and a version stored at
+    /// or below it is either what the read found for its span or one the
+    /// store had already replaced by then. Not a revision taken before the
+    /// read: a version stored between the two would then pass for newer
+    /// than the read, which may hold a version newer still.
+    floor: u64,
     /// What they were replayed against.
     inputs: ReplayInputs,
     /// The replayed state.
@@ -1540,14 +1535,22 @@ impl Store {
     /// must not stall every ingest observer. Observations that land
     /// meanwhile are captured for the run and replayed over the result by
     /// [`Self::fuse_rebuild_install`], so nothing admitted during the read is
-    /// lost or counted twice — and an observer that lands then for a version
-    /// stored before the read began, which the read already holds or holds a
-    /// newer version of, is not replayed over it (the floor).
+    /// lost or counted twice — and one of a version the read already
+    /// reflects, which may be older than the version it found, is not
+    /// replayed over it (the floor).
     fn fuse_rebuild_read(&self, guard: &Guard, key: &RunKey) -> Result<RebuildRead> {
-        // Before registering: a version stored after this, but observed
-        // before the registration, lands in the live state the install
-        // replaces — and the read, which begins later, holds it.
-        let floor = self.write_revision()?;
+        #[cfg(test)]
+        if let Some(hook) = guard
+            .rebuild_started
+            .lock()
+            .ok()
+            .and_then(|mut hook| hook.take())
+        {
+            hook(self);
+        }
+        // Registered before the read begins, so every observation the read
+        // does not reflect is captured: one that landed earlier was of a
+        // version stored earlier still, which the read holds.
         let epoch = {
             let mut state = guard.lock_state()?;
             state.rebuilding.entry(key.clone()).or_default().0 += 1;
@@ -1557,13 +1560,13 @@ impl Store {
         // work the budget exists to bound, not a free tail after the read.
         let deadline = self.query_deadline(Instant::now());
         let replayed = self
-            .run_spans(
+            .run_spans_at(
                 Some(&key.tenant),
                 &key.run,
                 guard.rebuild_max_spans(),
                 deadline,
             )
-            .and_then(|stored| {
+            .and_then(|(stored, floor)| {
                 let mut observations = Vec::with_capacity(stored.spans.len());
                 for (index, span) in stored.spans.iter().enumerate() {
                     if index % DEADLINE_STRIDE == 0 {
@@ -1577,15 +1580,12 @@ impl Store {
                 Ok(Replayed {
                     observations,
                     truncated: stored.truncated,
+                    floor,
                     inputs,
                     state,
                 })
             });
-        Ok(RebuildRead {
-            epoch,
-            floor,
-            replayed,
-        })
+        Ok(RebuildRead { epoch, replayed })
     }
 
     /// A rebuild's second half: installs what was read and answers. `None`
@@ -1632,6 +1632,7 @@ impl Store {
             Ok(Replayed {
                 observations,
                 truncated,
+                floor,
                 inputs,
                 state: mut rebuilt,
             }) => {
@@ -1642,9 +1643,11 @@ impl Store {
                     rebuilt = current.replay(&guard.config, &key.tenant, &observations, truncated);
                 }
                 // What arrived during the read is folded over it — latching
-                // a stop it crosses, as live ingest does — except what was
-                // stored before the read began, which the read holds.
-                rebuilt.floor = read.floor;
+                // a stop it crosses, as live ingest does — except versions
+                // stored at or below the revision the read saw the store at,
+                // which the read reflects: what it found for such a span is
+                // that version or a newer one, never an older one.
+                rebuilt.floor = floor;
                 let latched = {
                     let limits = |service: &str| state.stop_limits(&guard.config, key, service);
                     rebuilt.fold(&pending, None, &limits, &|_| now)
@@ -2780,7 +2783,6 @@ mod tests {
             let epoch = guard.lock_state().expect("state").erasure_epoch;
             let read = RebuildRead {
                 epoch,
-                floor: 0,
                 replayed: Err(Error::DeadlineExceeded("budget spent".into())),
             };
             let key = RunKey::new("", run);
@@ -3577,5 +3579,242 @@ mod tests {
             .expect("installs")
             .expect("not overlapped");
         assert!((doc.usage.cost_usd - 6.0).abs() < 1e-9, "{doc:?}");
+    }
+
+    #[test]
+    fn a_version_stored_as_a_rebuild_begins_and_observed_late_cannot_replace_what_it_read() {
+        // A stores span X at $1 and B overwrites it at $6, both just as a
+        // rebuild of the run begins. B's observer runs at once; A's only
+        // once the rebuild has read the store, which holds B's version. A's
+        // late observation must not be replayed over it, or a budget check
+        // trusts $1 of a run that has spent $6.
+        let fixture = TempStore::open(
+            "rebuildrace",
+            stop_on(Limits {
+                max_cost_usd: Some(10.0),
+                ..Limits::default()
+            }),
+        );
+        let store = fixture.store();
+        let guard = store.guard().expect("guard");
+        let older = Arc::new(priced("r", "call", 1.0));
+        let stored = Arc::clone(&older);
+        *guard.rebuild_started.lock().expect("hook") = Some(Box::new(move |store: &Store| {
+            store
+                .ingest_batch(vec![(*stored).clone()])
+                .expect("A stores");
+            store
+                .ingest_batch(vec![priced("r", "call", 6.0)])
+                .expect("B stores, and observes");
+        }));
+        let key = RunKey::new("", "r");
+        let read = store.fuse_rebuild_read(guard, &key).expect("reads");
+        assert!(
+            guard.rebuild_started.lock().expect("hook").is_none(),
+            "it ran"
+        );
+        // A's revision: B's write was the last one, A's the one before it.
+        let a = store.write_revision().expect("revision") - 1;
+        store.observe_fuses(&[older], a);
+        let next = NextStep {
+            est_cost_usd: Some(5.0),
+            ..NextStep::default()
+        };
+        let doc = store
+            .fuse_rebuild_install(guard, &key, read, Some(&next), unix_now_ns())
+            .expect("installs")
+            .expect("not overlapped");
+        assert!((doc.usage.cost_usd - 6.0).abs() < 1e-9, "{doc:?}");
+        assert_eq!(doc.verdict, Verdict::Stop, "$6 spent + $5 is past $10");
+        // And so it stays, live.
+        let live = store.fuse_check("", "r", &next).expect("checks");
+        assert_eq!((live.source, live.verdict), (Source::Live, Verdict::Stop));
+    }
+
+    #[test]
+    fn arrivals_while_a_second_rebuild_is_in_flight_reach_the_installed_run() {
+        // Two questions about one run rebuild it at once, and the first to
+        // finish installs. What is ingested before the second finishes is
+        // captured for it AND folded into the installed run, so the second,
+        // finding the run installed and standing down, loses nothing.
+        let fixture = TempStore::open(
+            "tworebuilds",
+            stop_on(Limits {
+                max_cost_usd: Some(10.0),
+                ..Limits::default()
+            }),
+        );
+        let store = fixture.store();
+        store
+            .ingest_batch(vec![priced("r", "a", 4.0)])
+            .expect("ingests");
+        let guard = store.guard().expect("guard");
+        let key = RunKey::new("", "r");
+        let first = store.fuse_rebuild_read(guard, &key).expect("reads");
+        let second = store.fuse_rebuild_read(guard, &key).expect("reads");
+        store
+            .fuse_rebuild_install(guard, &key, first, None, unix_now_ns())
+            .expect("installs")
+            .expect("not overlapped");
+        store
+            .ingest_batch(vec![priced("r", "b", 4.0)])
+            .expect("ingests");
+        store
+            .fuse_rebuild_install(guard, &key, second, None, unix_now_ns())
+            .expect("installs")
+            .expect("not overlapped");
+        let next = NextStep {
+            est_cost_usd: Some(3.0),
+            ..NextStep::default()
+        };
+        let doc = store.fuse_check("", "r", &next).expect("checks");
+        assert_eq!(doc.source, Source::Live);
+        assert!((doc.usage.cost_usd - 8.0).abs() < 1e-9, "{doc:?}");
+        assert_eq!(doc.verdict, Verdict::Stop, "$8 spent + $3 is past $10");
+    }
+
+    #[test]
+    fn arrivals_during_a_rebuild_that_fails_are_kept_in_memory() {
+        // A rebuild that runs out of time leaves memory as the only answer.
+        // What was ingested while it read was folded live as well as
+        // captured, so memory holds it: here the two steps that take a run
+        // followed live to its limit.
+        let fuses = stop_on(Limits {
+            max_steps: Some(3),
+            ..Limits::default()
+        });
+        let mut fixture = TempStore::open("failedarrivals", fuses.clone());
+        fixture
+            .store()
+            .ingest_batch(vec![tool_span("r", "h0", "x", "h0", 0)])
+            .expect("ingests");
+        fixture.reopen_with(crate::Config {
+            fuses,
+            query_deadline: Some(Duration::ZERO),
+            ..crate::Config::default()
+        });
+        let store = fixture.store();
+        store
+            .ingest_batch(vec![tool_span("r", "n1", "x", "n1", 10)])
+            .expect("ingests");
+        let guard = store.guard().expect("guard");
+        let key = RunKey::new("", "r");
+        let read = store.fuse_rebuild_read(guard, &key).expect("registers");
+        assert!(read.replayed.is_err(), "no budget to read in");
+        store
+            .ingest_batch(vec![
+                tool_span("r", "n2", "x", "n2", 20),
+                tool_span("r", "n3", "x", "n3", 30),
+            ])
+            .expect("ingests");
+        let doc = store
+            .fuse_rebuild_install(guard, &key, read, None, unix_now_ns())
+            .expect("three steps known stop the run")
+            .expect("not overlapped");
+        assert_eq!(
+            (doc.verdict, doc.source, doc.usage.steps),
+            (Verdict::Stop, Source::Live, 3)
+        );
+    }
+
+    #[test]
+    fn a_root_later_in_a_batch_picks_the_policy_before_its_children_can_stop_the_run() {
+        // A root agent span ends, and so is exported, after its children:
+        // often in the same batch, behind them. The run is held to the
+        // root's policy from the start of that batch; a stricter policy of
+        // a child's service must not stop it on the way to the root, which
+        // a restart's replay, root first, never does.
+        let mut fixture = TempStore::open("rootlast", FuseConfig::default());
+        for (name, service, steps) in [("root", "root-svc", 100), ("child", "child-svc", 1)] {
+            fixture
+                .store()
+                .put_fuse_policy(PolicySpec {
+                    name: name.into(),
+                    matches: PolicyMatch {
+                        service: Some(service.into()),
+                    },
+                    limits: Limits {
+                        max_steps: Some(steps),
+                        ..Limits::default()
+                    },
+                    action: Action::Stop,
+                    ..PolicySpec::default()
+                })
+                .expect("policy");
+        }
+        let mut child = tool_span("nested", "child", "x", "1", 20);
+        child.service = "child-svc".into();
+        let mut root = tool_span("nested", "root", "plan", "", 10);
+        root.service = "root-svc".into();
+        root.attributes
+            .insert("gen_ai.operation.name".into(), json!("invoke_agent"));
+        root.end_time_ns = 50;
+        let admission = fixture
+            .store()
+            .ingest_batch(vec![child, root])
+            .expect("ingests");
+        assert!(admission.signals.is_empty(), "{:?}", admission.signals);
+        let doc = fixture.store().fuse_verdict("", "nested").expect("verdict");
+        assert_eq!(
+            (doc.policy.as_str(), doc.verdict, doc.usage.steps),
+            ("root", Verdict::Continue, 2)
+        );
+        fixture.reopen(FuseConfig::default());
+        let rebuilt = fixture.store().fuse_verdict("", "nested").expect("verdict");
+        assert_eq!(
+            (
+                rebuilt.policy.as_str(),
+                rebuilt.verdict,
+                rebuilt.usage.steps
+            ),
+            ("root", Verdict::Continue, 2)
+        );
+    }
+
+    #[test]
+    fn a_span_upserted_later_in_its_batch_is_judged_where_the_store_puts_it() {
+        // The store keeps a batch's last version of a span, and a replay
+        // reads it in step order — where its START puts it, which the newer
+        // version moved. Judged at the older version's place instead, the
+        // batch holds an error streak the store never does.
+        let fuses = stop_on(Limits {
+            max_error_streak: Some(2),
+            ..Limits::default()
+        });
+        let mut fixture = TempStore::open("movedupsert", fuses.clone());
+        let store = fixture.store();
+        store
+            .ingest_batch(vec![step_at("r", "ok0", "0", 0, 5, "ok")])
+            .expect("ingests");
+        store.fuse_verdict("", "r").expect("verdict");
+        let admission = store
+            .ingest_batch(vec![
+                step_at("r", "a", "1", 10, 15, "error"),
+                step_at("r", "b", "2", 20, 25, "error"),
+                step_at("r", "c", "3", 30, 35, "ok"),
+                step_at("r", "a", "1", 40, 45, "error"),
+            ])
+            .expect("ingests");
+        assert!(admission.signals.is_empty(), "{:?}", admission.signals);
+        let live = store.fuse_verdict("", "r").expect("verdict");
+        assert_eq!(
+            (
+                live.source,
+                live.verdict,
+                live.usage.errors,
+                live.usage.error_streak
+            ),
+            (Source::Live, Verdict::Continue, 2, 1)
+        );
+        fixture.reopen(fuses);
+        let rebuilt = fixture.store().fuse_verdict("", "r").expect("verdict");
+        assert_eq!(
+            (
+                rebuilt.verdict,
+                rebuilt.usage.errors,
+                rebuilt.usage.error_streak
+            ),
+            (Verdict::Continue, 2, 1)
+        );
     }
 }

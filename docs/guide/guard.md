@@ -132,8 +132,10 @@ extends the run's `duration_ns` (a re-sent span that ends *earlier* leaves
 it where it was: the bounds only widen, which errs toward the limit). When
 two requests write the same span concurrently, the version the store kept is
 the one counted, whichever request's acknowledgement happens to be observed
-last; and when one batch carries two versions of a span, only the later —
-the one the store keeps — is counted.
+last — including while the run is being rebuilt from the store. And when one
+batch carries two versions of a span, only the later — the one the store
+keeps — is counted, at the place its own start time gives it among the
+batch's steps.
 
 ## Policies
 
@@ -161,7 +163,12 @@ edit applies to live runs at once:
    run's first span (several: the most recently created). First by **start
    time**, not arrival: a root agent span ends, and so arrives, after its
    children, and the policy must not depend on which arrived first — a
-   rebuild, which reads spans in start order, picks the same one;
+   rebuild, which reads spans in start order, picks the same one. The
+   run's earliest span, counting a batch's own, is found before any span of
+   the batch is judged, so a root sent behind its children in the same
+   batch sets the policy they are judged under. A root arriving in a
+   *later* batch cannot lift a stop its children already latched under
+   their own policy (see [limitations](#limitations));
 2. else the tenant's policy named `default`;
 3. else the **global** policy from the server's
    [`--fuse-*` flags](../configuration.md#server-flags), reported as
@@ -189,7 +196,10 @@ A `stop` from a policy latches at the span that reaches the limit, wherever
 that span falls in a batch: three failed steps and then a successful one,
 sent together, stop a run held to `max_error_streak: 3` exactly as they
 would sent one at a time, or replayed from the store after a restart — the
-success ends the streak, not the stop. And it is sticky. Later spans of the
+success ends the streak, not the stop. A batch's spans are judged in the
+order a replay reads them — by start time, then trace and span id — not in
+the order they were sent (across batches, see
+[limitations](#limitations)). And it is sticky. Later spans of the
 run, a raised limit, a deleted policy, eviction from memory — none of them
 lift it (but see
 [what is durable](#what-is-durable-and-what-is-rebuilt) for the bound on
@@ -349,6 +359,16 @@ Stated plainly, so none of them is discovered in production:
 - **A run with no spans yet has no service**, so a check before its first
   span resolves the tenant's `default` (or the global) policy, not a
   service-matched one.
+- **Across batches, arrival order counts.** Within a batch, spans are
+  judged in step order under the policy of the earliest span known, as a
+  replay judges them; spans in later batches can only be judged as they
+  arrive. Children that reach a stop limit of their own service's policy in
+  a batch before their root's therefore stay stopped — sticky like any stop
+  — although a rebuild after a restart, reading the root first, judges them
+  under the root's policy. Likewise a failed step arriving after steps that
+  started later extends the error streak where it arrived, not where it
+  started. Where a run's services have different policies, keep the child
+  services' limits no stricter than the root's.
 - **After a restart or an eviction, ingest verdicts for a continuing run see
   only what arrived since**, until something asks for the run's verdict and
   it is rebuilt. The pre-call check is such a question, so an agent that
