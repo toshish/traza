@@ -72,10 +72,15 @@ impl Store {
         }
     }
 
-    /// The write revision of the latest span version stored. Every version
-    /// at or below it is in the store — the buffer or a segment — for any
-    /// read that begins after this returns, because revisions are assigned
-    /// under the writer lock, with the upsert, and this reads under it too.
+    /// The write revision of the latest span version stored, for tests that
+    /// name a revision to deliver an observation late.
+    ///
+    /// Test-only on purpose: a revision taken apart from a read cannot say
+    /// which versions the read holds — one stored between the two is in the
+    /// read or not depending on the interleaving. A reader that needs one
+    /// takes it with the read, under the same writer lock
+    /// ([`Store::trace_spans_at`]).
+    #[cfg(test)]
     pub(crate) fn write_revision(&self) -> Result<u64> {
         Ok(self.lock_writer()?.revision())
     }

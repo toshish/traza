@@ -62,23 +62,38 @@ impl Store {
         max_spans: usize,
         deadline: Option<Deadline>,
     ) -> Result<RunSpans> {
-        let mut spans = match semconv::run_trace_id(run_id) {
+        self.run_spans_at(tenant, run_id, max_spans, deadline)
+            .map(|(run, _)| run)
+    }
+
+    /// [`Self::run_spans`], plus the write revision it read the store at:
+    /// the run's spans are exactly those stored as of that revision (see
+    /// [`Store::trace_spans_at`]). The run guard needs it to tell which
+    /// observations a rebuild's read already reflects.
+    pub(crate) fn run_spans_at(
+        &self,
+        tenant: Option<&str>,
+        run_id: &str,
+        max_spans: usize,
+        deadline: Option<Deadline>,
+    ) -> Result<(RunSpans, u64)> {
+        let (mut spans, revision) = match semconv::run_trace_id(run_id) {
             Some("") => {
                 return Err(Error::Invalid(format!(
                     "run id `{run_id}` names no trace; expected `{}<trace_id>`",
                     semconv::TRACE_RUN_PREFIX
                 )))
             }
-            Some(trace_id) => self.trace_spans_in(tenant, trace_id, deadline)?,
+            Some(trace_id) => self.trace_spans_at(tenant, trace_id, deadline)?,
             None if run_id.is_empty() => {
                 return Err(Error::Invalid("run id is empty".to_owned()));
             }
-            None => self.resolve_session_spans(tenant, run_id, deadline)?,
+            None => self.resolve_session_spans_at(tenant, run_id, deadline)?,
         };
         spans.sort_by(compare_steps);
         let truncated = spans.len() > max_spans;
         spans.truncate(max_spans);
-        Ok(RunSpans { spans, truncated })
+        Ok((RunSpans { spans, truncated }, revision))
     }
 
     /// A span's step facts paired with its LLM facts, this store's pricing

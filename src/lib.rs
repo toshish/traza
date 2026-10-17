@@ -1681,7 +1681,8 @@ struct WriteBuffer {
     /// revision of the latest write. Assigned under the writer lock, it is
     /// the order the store kept versions of a span in, which observers that
     /// run after the lock is released cannot otherwise recover (see
-    /// [`Store::write_revision`]).
+    /// [`Store::observe_admitted`]); and a read taken under the same lock
+    /// can report exactly which versions it holds ([`Store::trace_spans_at`]).
     revision: u64,
 }
 
@@ -2834,9 +2835,25 @@ impl Store {
         trace_id: &str,
         deadline: Option<Deadline>,
     ) -> Result<Vec<Span>> {
+        self.trace_spans_at(tenant, trace_id, deadline)
+            .map(|(spans, _)| spans)
+    }
+
+    /// [`Self::trace_spans_in`], plus the write revision it read the store
+    /// at (see [`Store::observe_admitted`]). Taken under the writer lock the
+    /// whole walk holds, so the walk sees the store exactly as it stood at
+    /// that revision: every version stored at or below it, as later ones at
+    /// or below it replaced them, and nothing stored after it.
+    pub(crate) fn trace_spans_at(
+        &self,
+        tenant: Option<&str>,
+        trace_id: &str,
+        deadline: Option<Deadline>,
+    ) -> Result<(Vec<Span>, u64)> {
         let mask = self.erasure_mask();
         let writer = self.lock_writer()?;
         let segments = self.lock_segments()?;
+        let revision = writer.revision();
         let mut result = Vec::new();
 
         let in_scope = |span: &Span| tenant.map_or(true, |tenant| span.tenant.as_str() == tenant);
@@ -2893,7 +2910,7 @@ impl Store {
         sort_spans(&mut result);
         // Final check before a complete trace leaves; see `query_view_costed`.
         Deadline::check(deadline, segments_examined)?;
-        Ok(result)
+        Ok((result, revision))
     }
 
     /// Returns spans matching `filter`, ordered by Traza's stable span order.
@@ -2919,17 +2936,22 @@ impl Store {
     /// `values` lists the accepted encodings of one logical value (a session
     /// id may arrive as the string `"42"` or the number `42`), so the caller
     /// does not have to guess which JSON type a producer used.
+    ///
+    /// Returned with the write revision it read the store at, exactly as
+    /// [`Self::trace_spans_at`] reports one.
     pub(crate) fn query_attribute_union(
         &self,
         keys: &[&str],
         values: &[Value],
         deadline: Option<Deadline>,
-    ) -> Result<Vec<Span>> {
+    ) -> Result<(Vec<Span>, u64)> {
         let mask = self.erasure_mask();
         // Lock order: writer before segments (see Store field docs).
         let writer = self.lock_writer()?;
         let segments = self.lock_segments()?;
+        let revision = writer.revision();
         attribute_union_view(&writer, &segments, keys, values, mask.as_deref(), deadline)
+            .map(|spans| (spans, revision))
     }
 
     /// The configured compute budget anchored at `started`, or `None` when
