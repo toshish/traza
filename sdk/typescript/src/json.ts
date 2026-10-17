@@ -34,7 +34,7 @@ export class RawNumber {
  * throwing, so a nanosecond timestamp read from Traza can be sent back
  * exactly. Otherwise it follows `JSON.stringify`: `toJSON` is honoured,
  * `undefined` and functions are left out of objects (and are `null` in
- * arrays), and a non-finite number is `null`.
+ * arrays, as is a sparse array's hole), and a non-finite number is `null`.
  */
 export function stringifyJson(value: unknown): string {
   const text = write(value, false);
@@ -59,7 +59,14 @@ function write(value: unknown, inArray: boolean): string | undefined {
       return inArray ? "null" : undefined;
   }
   if (value === null) return "null";
-  if (Array.isArray(value)) return "[" + value.map((item) => write(item, true)).join(",") + "]";
+  if (Array.isArray(value)) {
+    // Every index, as JSON.stringify visits them: map() skips a sparse
+    // array's holes, writing [1, , 3] as "[1,,3]" (not JSON) and
+    // new Array(1) as "[]". A hole reads as undefined, which is null here.
+    const items: string[] = [];
+    for (let i = 0; i < value.length; i++) items.push(write(value[i], true) ?? "null");
+    return "[" + items.join(",") + "]";
+  }
   const parts: string[] = [];
   for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
     const text = write(item, false);

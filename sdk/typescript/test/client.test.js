@@ -850,5 +850,15 @@ describe("@trazadb/sdk against traza-server", () => {
       assert.equal(stringifyJson({ t: 1792061561108805000n, u: undefined, a: [undefined, 1] }), '{"t":1792061561108805000,"a":[null,1]}');
     });
 
+    it("writes a sparse array's holes as null, as JSON.stringify does", () => {
+      // Array.prototype.map skips holes: written that way, [1, , 3] came out
+      // as "[1,,3]", which no parser accepts, and new Array(2) as "[]", which
+      // drops elements an application sent.
+      const holes = [1, , 3];
+      assert.equal(stringifyJson(holes), "[1,null,3]");
+      assert.equal(stringifyJson(holes), JSON.stringify(holes));
+      assert.equal(stringifyJson(new Array(2)), "[null,null]");
+      assert.equal(stringifyJson({ steps: [, 7n] }), '{"steps":[null,7]}');
+    });
   });
 });
