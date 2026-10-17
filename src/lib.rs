@@ -1670,6 +1670,12 @@ struct WriteBuffer {
     /// against a bound measured in minutes, in the direction of a later, not
     /// earlier, seal.
     oldest_at: Option<Instant>,
+    /// Upserts over the buffer's life — never reset by a seal — so the
+    /// revision of the latest write. Assigned under the writer lock, it is
+    /// the order the store kept versions of a span in, which observers that
+    /// run after the lock is released cannot otherwise recover (see
+    /// [`Store::write_revision`]).
+    revision: u64,
 }
 
 impl WriteBuffer {
@@ -1687,6 +1693,7 @@ impl WriteBuffer {
             span.span_id.clone(),
         );
         self.upserts += 1;
+        self.revision += 1;
         if self.spans.is_empty() {
             self.oldest_at = Some(Instant::now());
         }
@@ -1704,6 +1711,11 @@ impl WriteBuffer {
             }
         }
         handle
+    }
+
+    /// The revision of the latest upsert; the next one takes this plus one.
+    fn revision(&self) -> u64 {
+        self.revision
     }
 
     fn len(&self) -> usize {
@@ -2566,6 +2578,7 @@ impl Store {
         let seal_must_wait;
         let admitted;
         let admitted_handles;
+        let first_revision;
         // Encode the log frame BEFORE taking the writer lock. Serializing a
         // batch is pure CPU proportional to its size, and doing it under the
         // lock made every concurrent ingest wait for it. Only the file write
@@ -2586,6 +2599,10 @@ impl Store {
                 );
             }
             admitted = spans.len() as u64;
+            // Span `i` of the batch is stored at `first_revision + i`: the
+            // order observers need to tell a newer version from an older one
+            // whose observer happens to run after it.
+            first_revision = writer.revision() + 1;
             admitted_handles = self.metrics.buffer_upsert.time(|| {
                 spans
                     .into_iter()
@@ -2641,7 +2658,7 @@ impl Store {
         self.tail.publish(&admitted_handles);
         // Observers see the same acknowledged batch the tail just did, for
         // the same reason: what they react to must be what the store kept.
-        let observed = self.observe_admitted(&admitted_handles);
+        let observed = self.observe_admitted(&admitted_handles, first_revision);
         // Usage is charged for the same acknowledged batch, at the sizes
         // admission measured before the offload rewrote the large values.
         self.record_usage(&admitted_handles, admitting);

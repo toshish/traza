@@ -3,12 +3,16 @@
 //!
 //! The fold is the same whether spans arrive one acknowledged batch at a
 //! time (live) or all at once from the store (a rebuild), so the two paths
-//! cannot drift apart in what they count. Each span's contribution is kept as
-//! a small [`Mark`] under a hash of its id, which is what makes a re-ingested
-//! span an UPSERT here as it is in the store: a client retrying a batch the
-//! store already acknowledged changes nothing, and a span re-sent with
-//! different content replaces its old contribution rather than adding a
-//! second one.
+//! cannot drift apart in what they count — or in where a stop latches, which
+//! [`RunState::fold`] checks after every span on both. Each span's
+//! contribution is kept as a small [`Mark`] under a hash of its id, which is
+//! what makes a re-ingested span an UPSERT here as it is in the store: a
+//! client retrying a batch the store already acknowledged changes nothing,
+//! and a span re-sent with different content replaces its old contribution
+//! rather than adding a second one. Each mark also carries the store's write
+//! revision of the version it came from, because observers run after their
+//! writes in no particular order: a version the store has since replaced
+//! must not replace the newer one here when its observer runs last.
 
 use std::collections::HashMap;
 
@@ -134,14 +138,20 @@ pub(crate) struct Observation {
     fingerprint: Option<String>,
     start_ns: u64,
     pub(crate) end_ns: u64,
+    /// The store's write revision of this version of the span (see
+    /// `Store::write_revision`), or 0 for one a rebuild read from the store,
+    /// which is ordered by the rebuilt state's floor instead.
+    revision: u64,
 }
 
 impl Observation {
     /// Reads one span: priced facts for tokens and cost, the step kind, and
     /// — for steps only — the fingerprint. Non-step spans never pay for a
     /// request digest they would not use, and no span pays for a response
-    /// digest: the fingerprint does not cover the response.
-    pub(crate) fn of(store: &Store, span: &Span) -> Self {
+    /// digest: the fingerprint does not cover the response. `revision` is
+    /// the write revision the version was stored at; 0 for a stored span a
+    /// rebuild read.
+    pub(crate) fn of(store: &Store, span: &Span, revision: u64) -> Self {
         let llm = store.facts(span);
         let kind = semconv::step_kind_with(span, &llm);
         let fingerprint = kind
@@ -159,12 +169,18 @@ impl Observation {
             fingerprint,
             start_ns: span.start_time_ns,
             end_ns: span.end_time_ns,
+            revision,
         }
     }
 
     /// Whether the span is a step of its run.
     pub(crate) fn is_step(&self) -> bool {
         self.kind.is_step()
+    }
+
+    /// The span's key within its run ([`span_key`]).
+    pub(crate) fn key(&self) -> u64 {
+        self.key
     }
 
     fn span_ref(&self) -> SpanRef {
@@ -210,6 +226,9 @@ struct Mark {
     /// usage but not toward the repeat table or the error streak, which a
     /// reset clears.
     before_reset: bool,
+    /// The write revision of the version this mark holds (0: read by a
+    /// rebuild). An observation of an older revision is stale.
+    revision: u64,
 }
 
 impl Mark {
@@ -257,10 +276,20 @@ pub(crate) struct RunState {
     top: Option<u64>,
     marks: HashMap<u64, Mark>,
     last_span: Option<SpanRef>,
-    /// Whether this state starts from the run's whole stored history (a
-    /// rebuild, or a first query that found nothing stored) rather than from
-    /// whatever this process happened to observe.
+    /// Whether this state starts from the run's stored history (a rebuild,
+    /// or a first query that found nothing stored) rather than from whatever
+    /// this process happened to observe.
     pub(crate) complete: bool,
+    /// Whether that history was cut short: the run held more spans than a
+    /// rebuild reads, so this state starts from its earliest ones only and
+    /// what it counts is a lower bound. A stop judged from it is exact; any
+    /// other verdict is not an answer.
+    pub(crate) truncated: bool,
+    /// Writes at or below this revision are already reflected here: the
+    /// state was rebuilt from a read that began after they were stored, so
+    /// an observer of one that runs only now has nothing to add — and its
+    /// version may be older than the one the read found.
+    pub(crate) floor: u64,
     /// A policy stop, sticky until reset.
     pub(crate) trip: Option<Trip>,
     /// The warn level last announced: 0 none, 1 approaching a limit, 2 a
@@ -293,6 +322,8 @@ impl RunState {
             marks: HashMap::new(),
             last_span: None,
             complete,
+            truncated: false,
+            floor: 0,
             trip: None,
             warn_level: 0,
             tick: 0,
@@ -318,8 +349,25 @@ impl RunState {
     /// `before_reset` absorbs a span as history the last reset cleared — a
     /// rebuild's spans that ended before it. A re-ingested span keeps the
     /// side of the reset its first version landed on.
+    ///
+    /// A version older than the one held — by write revision — changes
+    /// nothing: two writers of one span are stored in order, but their
+    /// observers run in whichever order they finish, and the guard must end
+    /// up holding what the store holds.
     pub(crate) fn absorb(&mut self, observation: &Observation, before_reset: bool) -> bool {
+        let ordered = observation.revision != 0;
+        if ordered && observation.revision <= self.floor {
+            return false;
+        }
         let previous = self.marks.get(&observation.key).copied();
+        if let Some(previous) = previous {
+            if ordered && observation.revision <= previous.revision {
+                return false;
+            }
+        }
+        // The span's clocks count whether or not its contribution changed:
+        // an upsert that only moved a span's end still moves the run's.
+        let clocked = self.clock(observation);
         let mark = Mark {
             kind: observation.kind,
             error: observation.error,
@@ -330,12 +378,19 @@ impl RunState {
                 .as_deref()
                 .map_or(0, fingerprint_key),
             before_reset: previous.map_or(before_reset, |previous| previous.before_reset),
+            revision: observation.revision,
         };
         if let Some(previous) = previous {
-            // A retried batch: the store upserted the same span to the same
-            // value, and so does this — not even the streak moves.
             if previous.same_as(&mark) {
-                return false;
+                // A retried batch: the store upserted the same span to the
+                // same value, and so does this — not even the streak moves.
+                // The revision still advances, so a version written between
+                // the two cannot pass for the newer one when it lands late.
+                self.marks.insert(observation.key, mark);
+                if clocked {
+                    self.last_span = Some(observation.span_ref());
+                }
+                return clocked;
             }
             self.subtract(&previous);
         }
@@ -372,16 +427,96 @@ impl RunState {
                 self.count_repeat(mark.fingerprint, fingerprint, observation);
             }
         }
+        self.last_span = Some(observation.span_ref());
+    }
+
+    /// Widens the run's span-clock bounds to cover one span, which takes the
+    /// run's policy when it starts earliest. Returns whether either bound
+    /// moved.
+    ///
+    /// Applied to every version of a span, apart from its contribution:
+    /// the contribution is deduplicated on what a mark holds, and a mark
+    /// holds no clocks. The bounds only ever widen — an upsert that narrowed
+    /// a span leaves them slightly wide, which errs toward the limit, where
+    /// keeping each span's clocks to narrow them exactly would cost every
+    /// mark another 16 bytes.
+    fn clock(&mut self, observation: &Observation) -> bool {
         // Strictly earlier only: among spans starting together, the first
         // to arrive keeps the run's policy, so a retry cannot flip it.
         if self.service.is_none() || observation.start_ns < self.first_start_ns {
             self.service = Some(observation.service.clone());
         }
-        // Span-clock bounds only ever widen: an upsert that narrowed a span
-        // would leave them slightly wide, which errs toward the limit.
+        let moved =
+            observation.start_ns < self.first_start_ns || observation.end_ns > self.last_end_ns;
         self.first_start_ns = self.first_start_ns.min(observation.start_ns);
         self.last_end_ns = self.last_end_ns.max(observation.end_ns);
-        self.last_span = Some(observation.span_ref());
+        moved
+    }
+
+    /// Folds `observations` in order, latching a policy stop at the first
+    /// span whose absorption reaches a stop limit — checked after EVERY span,
+    /// live and in replay alike, so where a run stops depends on its spans
+    /// and not on how they were batched: a limit crossed and cleared again
+    /// within one batch (an error streak a success then ends) was crossed,
+    /// exactly as it is when the same spans arrive one per batch or are
+    /// replayed from the store. Returns whether this fold latched a stop.
+    ///
+    /// `reset_at` absorbs spans that ended at or before it as history the
+    /// last reset cleared, which latches nothing (see [`replay`]).
+    /// `stop_limits` gives the limits a stop latches at for a run whose
+    /// first span had the given service — `None` when nothing can latch (a
+    /// `warn` policy, or a kill switch already stopping the run) — and is
+    /// asked again only when the run's first span changes. `stamp` times a
+    /// latched stop: the server clock live, the crossing span's end in a
+    /// replay, which has no admission clock to offer.
+    pub(crate) fn fold(
+        &mut self,
+        observations: &[Observation],
+        reset_at: Option<u64>,
+        stop_limits: &dyn Fn(&str) -> Option<Limits>,
+        stamp: &dyn Fn(&Observation) -> u64,
+    ) -> bool {
+        let mut resolved: Option<(String, Option<Limits>)> = None;
+        let mut latched = false;
+        for observation in observations {
+            let before = reset_at.is_some_and(|reset| observation.end_ns <= reset);
+            if !self.absorb(observation, before) || before || self.trip.is_some() {
+                continue;
+            }
+            let service = self.service.as_deref().unwrap_or("");
+            let limits = match &resolved {
+                Some((cached, limits)) if cached == service => *limits,
+                _ => {
+                    let limits = stop_limits(service);
+                    resolved = Some((service.to_owned(), limits));
+                    limits
+                }
+            };
+            let Some(limits) = limits else { continue };
+            if !reaches(&self.measures(), &limits) {
+                continue;
+            }
+            let assessment = self.assess(&limits, None);
+            if !assessment.reached.is_empty() {
+                self.trip = Some(Trip {
+                    at_ns: stamp(observation),
+                    evidence: self.trip_evidence(&assessment),
+                    reasons: assessment.reached,
+                });
+                latched = true;
+            }
+        }
+        latched
+    }
+
+    /// Marks this state as rebuilt from only the earliest of the run's
+    /// spans. Its counts stand as lower bounds, but the error streak is not
+    /// one: it counts the failures at the END of the run, which is exactly
+    /// the part that was not read, so it starts again from the spans that
+    /// arrive from here.
+    pub(crate) fn cut_short(&mut self) {
+        self.truncated = true;
+        self.error_streak = 0;
     }
 
     fn subtract(&mut self, mark: &Mark) {
@@ -571,29 +706,17 @@ pub(crate) fn replay(
     resolve: &dyn Fn(&str) -> (Limits, Action),
 ) -> RunState {
     let mut state = RunState::new(true);
-    let mut policy: Option<(Limits, Action)> = None;
-    for observation in observations {
-        let before = reset_at.is_some_and(|reset| observation.end_ns <= reset);
-        state.absorb(observation, before);
-        if before || state.trip.is_some() {
-            continue;
-        }
-        let (limits, action) =
-            *policy.get_or_insert_with(|| resolve(state.service.as_deref().unwrap_or("")));
-        if action == Action::Stop {
-            let assessment = state.assess(&limits, None);
-            if !assessment.reached.is_empty() {
-                state.trip = Some(Trip {
-                    at_ns: observation.end_ns,
-                    evidence: state.trip_evidence(&assessment),
-                    reasons: assessment.reached,
-                });
-            }
-        }
-    }
+    let stop_limits = |service: &str| {
+        let (limits, action) = resolve(service);
+        (action == Action::Stop).then_some(limits)
+    };
+    // In step order no span starts before the first, so the run's service —
+    // and with it the policy — is settled by the first span replayed.
+    state.fold(observations, reset_at, &stop_limits, &|observation| {
+        observation.end_ns
+    });
     if let (Some(reset), None) = (reset_at, state.trip.as_ref()) {
-        let (limits, action) =
-            policy.unwrap_or_else(|| resolve(state.service.as_deref().unwrap_or("")));
+        let (limits, action) = resolve(state.service.as_deref().unwrap_or(""));
         if action == Action::Stop {
             let assessment = state.assess(&limits, None);
             if !assessment.reached.is_empty() {
@@ -669,13 +792,52 @@ struct Finding {
 /// what keeps the pre-call answer and the post-acknowledgement one from
 /// disagreeing by one step.
 fn assess(measures: &Measures, limits: &Limits, next: Option<&NextStep>) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    for (dimension, limit, value, delta) in dimensions(measures, limits, next) {
+        let Some(limit) = limit else { continue };
+        let level = if value >= limit || (delta > 0.0 && value + delta > limit) {
+            Level::Reached
+        } else if value + delta >= limit * WARN_FRACTION {
+            Level::Approaching
+        } else {
+            continue;
+        };
+        findings.push(Finding {
+            dimension,
+            level,
+            limit,
+            value,
+            delta,
+        });
+    }
+    findings
+}
+
+/// Whether recorded usage has reached any present limit: [`assess`]'s
+/// `Reached` with no next step, without rendering a reason or allocating —
+/// a fold asks it after every span, and a run near its limits would
+/// otherwise format an `approaching` line per span only to drop it.
+fn reaches(measures: &Measures, limits: &Limits) -> bool {
+    dimensions(measures, limits, None)
+        .iter()
+        .any(|(_, limit, value, _)| limit.is_some_and(|limit| *value >= limit))
+}
+
+/// Every dimension with its limit, its recorded value and what `next` would
+/// add — the one list [`assess`] and [`reaches`] both read, so a limit added
+/// to one cannot be missing from the other.
+fn dimensions(
+    measures: &Measures,
+    limits: &Limits,
+    next: Option<&NextStep>,
+) -> [(Dimension, Option<f64>, f64, f64); 8] {
     let step = next.map_or(0.0, |_| 1.0);
     let (llm, tool) = match next {
         Some(next) if next.tool.is_some() => (0.0, 1.0),
         Some(_) => (1.0, 0.0),
         None => (0.0, 0.0),
     };
-    let checks = [
+    [
         (
             Dimension::Cost,
             limits.max_cost_usd,
@@ -724,26 +886,7 @@ fn assess(measures: &Measures, limits: &Limits, next: Option<&NextStep>) -> Vec<
             measures.error_streak as f64,
             0.0,
         ),
-    ];
-    let mut findings = Vec::new();
-    for (dimension, limit, value, delta) in checks {
-        let Some(limit) = limit else { continue };
-        let level = if value >= limit || (delta > 0.0 && value + delta > limit) {
-            Level::Reached
-        } else if value + delta >= limit * WARN_FRACTION {
-            Level::Approaching
-        } else {
-            continue;
-        };
-        findings.push(Finding {
-            dimension,
-            level,
-            limit,
-            value,
-            delta,
-        });
-    }
-    findings
+    ]
 }
 
 impl Finding {
@@ -838,6 +981,7 @@ mod tests {
             fingerprint: fingerprint.map(str::to_owned),
             start_ns: 1_000,
             end_ns: 2_000,
+            revision: 0,
         }
     }
 
@@ -1096,14 +1240,94 @@ mod tests {
             at("child", "child-svc", 10, 20),
         ];
         replay(&observations, Some(7), &resolve);
-        assert_eq!(resolved.borrow().as_slice(), ["root-svc"]);
+        // Asked during the fold and again for the reset's own check; both
+        // times for the first span's service.
+        let asked = resolved.borrow();
+        assert!(
+            !asked.is_empty() && asked.iter().all(|service| service == "root-svc"),
+            "{asked:?}"
+        );
     }
 
     #[test]
     fn a_span_contribution_stays_a_fixed_small_record() {
         // MAX_TRACKED_SPANS is documented in these terms; a field added to
-        // Mark has to be a decision about that bound, not a side effect.
-        assert_eq!(std::mem::size_of::<Mark>(), 32);
+        // Mark has to be a decision about that bound, not a side effect. The
+        // write revision took it from 32 to 40: without it a late observer
+        // can put back a version the store replaced.
+        assert_eq!(std::mem::size_of::<Mark>(), 40);
+    }
+
+    #[test]
+    fn an_older_version_observed_last_changes_nothing() {
+        let at = |revision: u64, error: bool, tokens: u64| {
+            let mut observation = obs("a", StepKind::Tool, Some("tool:x#1"), error);
+            observation.revision = revision;
+            observation.tokens = tokens;
+            observation
+        };
+        let mut run = RunState::new(true);
+        assert!(run.absorb(&at(7, true, 50), false), "the newer version");
+        assert!(!run.absorb(&at(5, false, 10), false), "the older, late");
+        let usage = run.usage();
+        assert_eq!((usage.tokens, usage.errors, usage.error_streak), (50, 1, 1));
+        // An unchanged retry still advances the revision, so the version
+        // written between it and the first cannot land after it.
+        assert!(!run.absorb(&at(9, true, 50), false));
+        assert!(!run.absorb(&at(8, false, 10), false));
+        assert_eq!(run.usage().tokens, 50);
+
+        // Below a rebuild's floor, nothing lands: the read already holds
+        // that version or a newer one — of this span or of one never seen.
+        run.floor = 20;
+        assert!(!run.absorb(&at(15, false, 99), false));
+        let mut unseen = obs("b", StepKind::Tool, Some("tool:x#2"), false);
+        unseen.revision = 12;
+        assert!(!run.absorb(&unseen, false));
+        assert_eq!((run.usage().tokens, run.tracked()), (50, 1));
+        assert!(run.absorb(&at(21, false, 10), false));
+        assert_eq!(run.usage().tokens, 10);
+    }
+
+    #[test]
+    fn a_reingested_span_that_only_moved_its_clocks_moves_the_runs() {
+        let mut run = RunState::new(true);
+        let first = obs("a", StepKind::Tool, Some("tool:x#1"), false);
+        assert!(run.absorb(&first, false));
+        assert_eq!(run.usage().duration_ns, 1_000);
+        let mut later = first.clone();
+        later.end_ns = 9_000;
+        assert!(run.absorb(&later, false), "the run's end moved");
+        assert_eq!((run.usage().duration_ns, run.usage().steps), (8_000, 1));
+        // Narrowing back is not undone — the bounds only widen — and is no
+        // change at all.
+        assert!(!run.absorb(&first, false));
+        assert_eq!(run.usage().duration_ns, 8_000);
+    }
+
+    #[test]
+    fn a_fold_latches_a_stop_crossed_mid_batch_and_cleared_by_its_end() {
+        let streak = |_: &str| {
+            Some(Limits {
+                max_error_streak: Some(2),
+                ..Limits::default()
+            })
+        };
+        let batch = [
+            obs("a", StepKind::Tool, Some("t#a"), true),
+            obs("b", StepKind::Tool, Some("t#b"), true),
+            obs("c", StepKind::Tool, Some("t#c"), false),
+        ];
+        let mut run = RunState::new(true);
+        assert!(run.fold(&batch, None, &streak, &|_| 42));
+        let trip = run.trip.clone().expect("latched");
+        assert_eq!((trip.at_ns, trip.evidence[0].span_id.as_str()), (42, "b"));
+        assert_eq!(run.usage().error_streak, 0, "the success ended it");
+        // Nothing latches twice, and nothing latches where nothing can.
+        assert!(!run.fold(&batch, None, &streak, &|_| 43));
+        let mut open = RunState::new(true);
+        assert!(!open.fold(&batch, None, &|_| None, &|_| 42));
+        assert!(open.trip.is_none());
     }
 
     #[test]
