@@ -394,6 +394,18 @@ Stated plainly, so none of them is discovered in production:
   started later extends the error streak where it arrived, not where it
   started. Where a run's services have different policies, keep the child
   services' limits no stricter than the root's.
+- **Concurrent re-sends that move usage between steps can stop a run on a
+  total it never held.** Within one batch the guard withdraws every replaced
+  version before landing the new ones, so a batch that moves cost from one
+  step to another is never judged half-moved. Two *separate* requests are
+  observed after their acknowledgements, in whichever order their threads
+  finish: if one request re-sends step A with less usage and a concurrent
+  one re-sends step B with more, the guard can briefly hold B's new usage
+  beside A's old and latch a stop on that sum, which neither the store nor a
+  rebuild ever sees. It takes concurrent re-ingestion of already-sent spans
+  of one run with different usage; ordinary first sends only add, and only
+  add once. Send such corrections in one batch, or reset the run if it
+  happens.
 - **After a restart or an eviction, ingest verdicts for a continuing run see
   only what arrived since**, until something asks for the run's verdict and
   it is rebuilt. The pre-call check is such a question, so an agent that
