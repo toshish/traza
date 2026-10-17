@@ -2412,10 +2412,11 @@ new id.
 
 Recomputes every head and link, checks that the latest checkpoint entry
 names the live generation's manifest digest, re-digests every file that
-manifest names (the [`GET /v1/verify`](#get-v1verify) check), checks that
-every ledgered erasure's subject still has a settled erasure in the live
-tombstone log, and reports any ledger append that failed and has not been
-caught up. Unbound credentials only. Always `200` — the verdict is the body:
+manifest names (the [`GET /v1/verify`](#get-v1verify) check), checks every
+ledgered erasure against the live tombstone log and every settled erasure in
+that log against the chain, and reports any ledger append that failed and has
+not been caught up. Unbound credentials only. Always `200` — the verdict is
+the body:
 
 ```json
 {"entries":5,"generation":{"files_verified":true,"id":3,"manifest_sha256":"97bcc77723139e1d84ac46f786ee85152e6be3ce0d35938d797c85b33429b983","matches_ledger":true,"verified_at_ns":1792061580401844000},"head":"34e64ba565ed353f7db1ab6f1e9611b8815053c45548c22b9827d2c3dfc415e5","intact":true,"problems":[]}
@@ -2423,16 +2424,23 @@ caught up. Unbound credentials only. Always `200` — the verdict is the body:
 
 `intact` requires every check to pass. `problems` names each break by entry
 — `seq 2: head does not match its contents (recorded 0dee…, recomputed
-9edc…)` — or by file, prefixed with the generation. A ledgered erasure whose
-subject the live tombstone log no longer records as erased (what restoring a
-pin from before the erasure does) is named by its entry until the erasure is
-re-applied. A live generation newer than the latest checkpoint entry is
-reported as not ledgered yet: a crash or a failed append between publishing
-and ledgering leaves exactly that, and the next open or checkpoint ledgers
-it. The file check reads every manifested byte under the maintenance lock,
-so it costs O(store) like `GET /v1/verify`; the chain is read up to a
-snapshot taken under that lock, so an erasure or anchor appended mid-check is
-left for the next one rather than read half-written. Compaction and expiry
+9edc…)` — or by file, prefixed with the generation. A ledgered erasure is
+named by its entry until it is re-applied if the live tombstone log has no
+settled erasure of its subject published by the entry's `generation` or
+later. Restoring a pin from before the erasure does that, even when an
+earlier erasure of the same subject is still settled. A settled erasure with
+no entry of the same `erasure_id`, `subject_digest` and `generation` is
+named as not in the ledger. A live generation newer than the latest
+checkpoint entry is reported as not ledgered yet. A crash or a failed append
+between publishing (or settling) and ledgering leaves either gap, and the
+next open, or the next checkpoint after a failed append, ledgers what is
+missing. An entry being appended while the check runs is not reported
+missing. The file check reads every manifested byte under the maintenance lock,
+so it costs O(store) like `GET /v1/verify`. The chain is read up to a snapshot
+taken under that lock and walked after the lock is released, so an erasure or
+anchor appended mid-check is left for the next one rather than read
+half-written. This route always walks the whole chain and re-runs the file
+check. Compaction and expiry
 replace files between checkpoints, so until the next checkpoint the live
 manifest can name files that are gone, reported as missing;
 `POST /v1/checkpoint` first for a clean check.
@@ -2447,8 +2455,9 @@ traza-server verify --ledger --data-dir /var/lib/traza [--json]
 Exits `0` when intact, `2` when anything is broken (every problem printed),
 `1` when it cannot verify at all — not a data directory, or owned by a live
 server. It never opens the store, so a store that crashed between publishing
-a generation and ledgering it exits `2` with the not-ledgered-yet problem
-until its next open ledgers the generation.
+a generation (or settling an erasure) and ledgering it exits `2` with the
+not-ledgered-yet (or not-in-the-ledger) problem until its next open ledgers
+it.
 
 ### `POST /v1/ledger/anchors`
 
@@ -2515,12 +2524,18 @@ Abbreviated (heads and entries elided):
 ```
 
 `digest` is the SHA-256 of the canonical JSON of every other field — what a
-notary signs. `activity` counts spans that started in the window and are
-still stored, from the same deadline-bounded fold as the analytics (a window
-too large for `--query-deadline-ms` answers `400`, never a partial pack).
-`erasures` lists those settled in the window with their receipt's
-`conclusive` and `result`; past 32 receipts or the query deadline both are
-`null`. `ledger.entries` holds entries whose `at_ns` is in the window, at
+notary signs. One `--query-deadline-ms` budget covers the whole pack. The
+chain walk continues the previous pack's (or verification's) walk when that
+walk began within the last 60 seconds, so a pack usually walks only what was
+appended since. If the budget runs out mid-walk, the pack answers `400`
+(`… the ledger chain was verified through line N …`); the walk keeps its
+progress, so a retry resumes and completes it. `activity` counts spans that
+started in the window and are still stored, from the same fold as the
+analytics, under the same budget (a window too large for it answers `400`,
+never a partial pack). `erasures` lists those settled in the window with
+their receipt's `conclusive` and `result`; past 32 receipts or the budget
+both are `null`. The file check, reused for 60 seconds, is the one step the
+budget does not cut short. `ledger.entries` holds entries whose `at_ns` is in the window, at
 most 10,000 (`entries_truncated` says whether more exist), and
 `ledger.entries_unreadable` counts the chain's lines the pack could not place
 (not a JSON object, or no integer `seq` or `at_ns`); the verification names
