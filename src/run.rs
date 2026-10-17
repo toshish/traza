@@ -93,6 +93,17 @@ impl Store {
         let llm = self.facts(span);
         (semconv::step_facts_with(span, &llm), llm)
     }
+
+    /// [`Self::step_facts`] plus what a tape step keeps beyond the facts
+    /// ([`semconv::StepExtras`]), from one extraction.
+    pub(crate) fn step_facts_detailed(
+        &self,
+        span: &Span,
+    ) -> (StepFacts, semconv::StepExtras, LlmFacts) {
+        let llm = self.facts(span);
+        let (facts, extras) = semconv::step_facts_detailed(span, &llm);
+        (facts, extras, llm)
+    }
 }
 
 /// Step order: `(start_time_ns, trace_id, span_id)`, then tenant.

@@ -1603,3 +1603,125 @@ fn mcp_tools_read_tapes_comparisons_and_recall_over_http() {
         "{recalled}"
     );
 }
+
+#[test]
+fn replays_serve_what_was_recorded_and_no_more() {
+    // A tiny offload threshold makes the long message list a payload file.
+    let server = Server::spawn(&["--payload-threshold-bytes", "64"]);
+    let question = format!("Summarise: {}", "x".repeat(120));
+    let messages = json!([{"role": "user", "parts": [{"type": "text", "content": question}]}]);
+    ingest(
+        &server,
+        vec![
+            // System instructions beside an offloaded message list.
+            native(
+                "tr-fidelity",
+                "llm-1",
+                None,
+                "chat",
+                0,
+                10,
+                json!({
+                    "gen_ai.operation.name": "chat",
+                    "gen_ai.system_instructions": "Be brief.",
+                    "gen_ai.input.messages": messages.to_string(),
+                    "gen_ai.completion.0.content": "Done.",
+                }),
+            ),
+            // A tool whose result was never captured.
+            native(
+                "tr-fidelity",
+                "tool-1",
+                None,
+                "fetch",
+                20,
+                30,
+                json!({
+                    "gen_ai.operation.name": "execute_tool", "gen_ai.tool.name": "fetch",
+                    "gen_ai.tool.call.arguments": "{\"u\":1}",
+                }),
+            ),
+            // Answer text that reads as a JSON message.
+            native(
+                "tr-fidelity",
+                "llm-2",
+                None,
+                "chat",
+                40,
+                50,
+                json!({
+                    "gen_ai.operation.name": "chat",
+                    "gen_ai.system_instructions": "Be brief.",
+                    "gen_ai.input.messages": messages.to_string(),
+                    "llm.completion": "{\"content\":\"hello\",\"count\":2}",
+                }),
+            ),
+        ],
+        None,
+    );
+    let created = create_replay(&server, json!({"run": "trace:tr-fidelity"}), &[]);
+    assert_eq!(created["unreadable_tool_steps"], json!([1]), "{created}");
+    let path = format!(
+        "{}/chat/completions",
+        created["base_urls"]["openai"].as_str().unwrap()
+    );
+
+    // The recorded system prompt is part of the recorded request.
+    let user = json!({"role": "user", "content": question});
+    let (status, refused) = send_json(
+        &server,
+        "POST",
+        &path,
+        Some(&json!({"model": "m", "messages": [user]})),
+        &openai_sdk("x"),
+    );
+    assert_eq!(status, 409, "{refused}");
+    assert_eq!(refused["error"]["type"], json!("replay_divergence"));
+    let asked = json!({"model": "m", "messages": [
+        {"role": "system", "content": "Be brief."}, user]});
+    let (status, answer) = send_json(&server, "POST", &path, Some(&asked), &openai_sdk("x"));
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(answer["choices"][0]["message"]["content"], json!("Done."));
+
+    // A model no provider would name is not echoed into every chunk.
+    let mut streamed = asked.clone();
+    streamed["stream"] = json!(true);
+    streamed["model"] = json!("m".repeat(64 * 1024));
+    let (status, _, body) = send(&server, "POST", &path, Some(&streamed), &openai_sdk("x"));
+    assert_eq!(status, 200, "{body}");
+    assert!(body.len() < 16 * 1024, "{} bytes", body.len());
+    let mut text = String::new();
+    for (_, data) in sse(&body) {
+        if data == "[DONE]" {
+            continue;
+        }
+        let event: Value = serde_json::from_str(&data).unwrap();
+        assert_eq!(event["model"], json!("unknown"));
+        text.push_str(
+            event["choices"][0]["delta"]["content"]
+                .as_str()
+                .unwrap_or_default(),
+        );
+    }
+    assert_eq!(
+        serde_json::from_str::<Value>(&text).unwrap(),
+        json!({"content": "hello", "count": 2}),
+        "the answer's text, not a message read out of it"
+    );
+
+    // The uncaptured tool result is refused, and stays refused.
+    let tools = format!("/v1/replays/{}/tools/next", created["id"].as_str().unwrap());
+    for _ in 0..2 {
+        let (status, headers, body) = send(&server, "POST", &tools, None, &[]);
+        assert_eq!(status, 409, "{body}");
+        assert_eq!(header(&headers, "x-should-retry"), Some("false"));
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["type"], json!("tool_unreadable"));
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|message| message.contains("recorded no result")),
+            "{body}"
+        );
+    }
+}

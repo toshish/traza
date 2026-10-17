@@ -24,8 +24,12 @@
 //!
 //! The first non-`same` entry is the run pair's FIRST DIVERGENCE, with a
 //! sentence saying what differed. Everything is computed from one read of each
-//! run under one compute budget.
+//! run under one compute budget, which the step extraction and the alignment
+//! spend too: the alignment is quadratic in steps, so it compares interned
+//! signatures rather than their (producer-sized) text, and checks the clock
+//! every table row.
 
+use std::collections::HashMap;
 use std::time::Instant;
 
 use serde::Serialize;
@@ -34,7 +38,7 @@ use serde_json::Value;
 use crate::attribution;
 use crate::semconv::StepKind;
 use crate::tape::{RunTape, TapeStep};
-use crate::{Result, Span, Store};
+use crate::{Deadline, Result, Span, Store};
 
 /// Steps compared per side. Past it the side is truncated to its earliest
 /// steps and the diff says so.
@@ -49,6 +53,9 @@ pub const MAX_DIFF_SPANS: usize = 50_000;
 /// above it, Hirschberg's linear-space recursion, so two 5,000-step runs cost
 /// tens of kilobytes of table rather than a hundred megabytes.
 const DIRECT_TABLE_CELLS: usize = 1 << 16;
+
+/// Signatures interned between two deadline checks.
+const DEADLINE_CHECK_STEPS: usize = 64;
 
 /// Hex characters of a digest quoted in an explanation.
 const DIGEST_PREVIEW: usize = 12;
@@ -204,8 +211,9 @@ impl Store {
     /// [`Store::get_run_in`]). `now_ns` dates the outcome rule — a run whose
     /// last span ended inside the idle window is still `unknown`.
     ///
-    /// Both runs are read under ONE compute budget. A run with no spans is
-    /// [`MissingRun`], naming it.
+    /// Both runs are read, and aligned, under ONE compute budget; past it the
+    /// diff is refused ([`crate::Error::DeadlineExceeded`]) wherever it had
+    /// got to. A run with no spans is [`MissingRun`], naming it.
     pub fn diff_runs(
         &self,
         tenant: Option<&str>,
@@ -238,7 +246,7 @@ impl Store {
         }
         let side_a = self.side(a, &left, now_ns);
         let side_b = self.side(b, &right, now_ns);
-        let aligned = align(&left.steps, &right.steps);
+        let aligned = align(&left.steps, &right.steps, deadline)?;
         let first_divergence = first_divergence(&aligned, &left.steps, &right.steps);
         let delta = Delta {
             cost_usd: side_b.cost_usd - side_a.cost_usd,
@@ -301,17 +309,10 @@ fn signed(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 
-/// Aligns two tapes and classifies every entry.
-fn align(a: &[TapeStep], b: &[TapeStep]) -> Vec<Aligned> {
-    let left: Vec<&str> = a
-        .iter()
-        .map(|step| step.detail.signature.as_str())
-        .collect();
-    let right: Vec<&str> = b
-        .iter()
-        .map(|step| step.detail.signature.as_str())
-        .collect();
-    let pairs = lcs_pairs(&left, &right);
+/// Aligns two tapes and classifies every entry, within `deadline`.
+fn align(a: &[TapeStep], b: &[TapeStep], deadline: Option<Deadline>) -> Result<Vec<Aligned>> {
+    let (left, right) = intern(a, b, deadline)?;
+    let pairs = lcs_pairs(&left, &right, deadline)?;
     let mut aligned = Vec::with_capacity(a.len().max(b.len()));
     let (mut next_a, mut next_b) = (0, 0);
     for (pa, pb) in pairs {
@@ -329,7 +330,42 @@ fn align(a: &[TapeStep], b: &[TapeStep]) -> Vec<Aligned> {
         next_b = pb + 1;
     }
     gap(a, b, next_a..a.len(), next_b..b.len(), &mut aligned);
-    aligned
+    Ok(aligned)
+}
+
+/// Both tapes' signatures as small integers, equal exactly when the
+/// signatures are equal.
+///
+/// Signatures carry producer-chosen names of any length, and the alignment
+/// compares them pairwise — up to a hundred million comparisons for two
+/// 5,000-step runs. Comparing strings there would cost the length of their
+/// common prefix every time; interning costs one hash of each signature, and
+/// leaves every comparison in the quadratic part constant-time.
+fn intern<'t>(
+    a: &'t [TapeStep],
+    b: &'t [TapeStep],
+    deadline: Option<Deadline>,
+) -> Result<(Vec<u32>, Vec<u32>)> {
+    let mut ids: HashMap<&'t str, u32> = HashMap::new();
+    let mut id_of = |step: &'t TapeStep| {
+        let next = ids.len() as u32;
+        *ids.entry(step.detail.signature.as_str()).or_insert(next)
+    };
+    let mut left = Vec::with_capacity(a.len());
+    let mut right = Vec::with_capacity(b.len());
+    for (count, step) in a.iter().enumerate() {
+        if count % DEADLINE_CHECK_STEPS == 0 {
+            Deadline::check(deadline, 0)?;
+        }
+        left.push(id_of(step));
+    }
+    for (count, step) in b.iter().enumerate() {
+        if count % DEADLINE_CHECK_STEPS == 0 {
+            Deadline::check(deadline, 0)?;
+        }
+        right.push(id_of(step));
+    }
+    Ok((left, right))
 }
 
 /// Why two steps with the same signature differ, or `None` when they do not.
@@ -542,12 +578,14 @@ fn config_differences(
 
 // ---------------------------------------------------------------- alignment
 
-/// The index pairs of a longest common subsequence of `a` and `b`, in order.
+/// The index pairs of a longest common subsequence of `a` and `b`, in order,
+/// or a deadline refusal: the quadratic part checks the clock once per table
+/// row, so it overruns its budget by one row at most.
 ///
 /// The common prefix and suffix are matched directly — two runs of the same
 /// agent usually share most of both, which leaves only the middle for the
 /// quadratic part — and the middle is aligned in linear space.
-fn lcs_pairs(a: &[&str], b: &[&str]) -> Vec<(usize, usize)> {
+fn lcs_pairs(a: &[u32], b: &[u32], deadline: Option<Deadline>) -> Result<Vec<(usize, usize)>> {
     let mut prefix = 0;
     while prefix < a.len() && prefix < b.len() && a[prefix] == b[prefix] {
         prefix += 1;
@@ -563,36 +601,36 @@ fn lcs_pairs(a: &[&str], b: &[&str]) -> Vec<(usize, usize)> {
     hirschberg(
         &a[prefix..a.len() - suffix],
         &b[prefix..b.len() - suffix],
-        prefix,
-        prefix,
+        (prefix, prefix),
+        deadline,
         &mut pairs,
-    );
+    )?;
     let (a_tail, b_tail) = (a.len() - suffix, b.len() - suffix);
     pairs.extend((0..suffix).map(|offset| (a_tail + offset, b_tail + offset)));
-    pairs
+    Ok(pairs)
 }
 
 /// Hirschberg's divide and conquer: split `a` in half, find where the two
 /// halves' LCS lengths against `b` sum to the maximum, and recurse on each
 /// side of that split. Linear space; ties take the earliest split, so the
-/// alignment is deterministic.
+/// alignment is deterministic. `offsets` are `a`'s and `b`'s positions in
+/// the whole tapes.
 fn hirschberg(
-    a: &[&str],
-    b: &[&str],
-    a_offset: usize,
-    b_offset: usize,
+    a: &[u32],
+    b: &[u32],
+    offsets: (usize, usize),
+    deadline: Option<Deadline>,
     out: &mut Vec<(usize, usize)>,
-) {
+) -> Result<()> {
     if a.is_empty() || b.is_empty() {
-        return;
+        return Ok(());
     }
     if a.len().saturating_mul(b.len()) <= DIRECT_TABLE_CELLS || a.len() == 1 {
-        direct(a, b, a_offset, b_offset, out);
-        return;
+        return direct(a, b, offsets, deadline, out);
     }
     let middle = a.len() / 2;
-    let forward = lcs_row(a[..middle].iter(), b.iter(), b.len());
-    let backward = lcs_row(a[middle..].iter().rev(), b.iter().rev(), b.len());
+    let forward = lcs_row(a[..middle].iter(), b.iter(), b.len(), deadline)?;
+    let backward = lcs_row(a[middle..].iter().rev(), b.iter().rev(), b.len(), deadline)?;
     let split = (0..=b.len())
         .max_by(|&left, &right| {
             let score = |j: usize| forward[j] + backward[b.len() - j];
@@ -601,26 +639,29 @@ fn hirschberg(
             score(left).cmp(&score(right)).then(right.cmp(&left))
         })
         .unwrap_or(0);
-    hirschberg(&a[..middle], &b[..split], a_offset, b_offset, out);
+    let (a_offset, b_offset) = offsets;
+    hirschberg(&a[..middle], &b[..split], offsets, deadline, out)?;
     hirschberg(
         &a[middle..],
         &b[split..],
-        a_offset + middle,
-        b_offset + split,
+        (a_offset + middle, b_offset + split),
+        deadline,
         out,
-    );
+    )
 }
 
 /// The last row of the LCS-length table: entry `j` is the LCS length of all
 /// of `a` against the first `j` items of `b`.
-fn lcs_row<'s, 'a: 's>(
-    a: impl Iterator<Item = &'s &'a str>,
-    b: impl Iterator<Item = &'s &'a str> + Clone,
+fn lcs_row<'s>(
+    a: impl Iterator<Item = &'s u32>,
+    b: impl Iterator<Item = &'s u32> + Clone,
     b_len: usize,
-) -> Vec<u32> {
+    deadline: Option<Deadline>,
+) -> Result<Vec<u32>> {
     let mut previous = vec![0u32; b_len + 1];
     let mut current = vec![0u32; b_len + 1];
     for left in a {
+        Deadline::check(deadline, 0)?;
         for (j, right) in b.clone().enumerate() {
             current[j + 1] = if left == right {
                 previous[j] + 1
@@ -630,14 +671,21 @@ fn lcs_row<'s, 'a: 's>(
         }
         std::mem::swap(&mut previous, &mut current);
     }
-    previous
+    Ok(previous)
 }
 
 /// The full table and its backtrack, for small subproblems.
-fn direct(a: &[&str], b: &[&str], a_offset: usize, b_offset: usize, out: &mut Vec<(usize, usize)>) {
+fn direct(
+    a: &[u32],
+    b: &[u32],
+    (a_offset, b_offset): (usize, usize),
+    deadline: Option<Deadline>,
+    out: &mut Vec<(usize, usize)>,
+) -> Result<()> {
     let width = b.len() + 1;
     let mut table = vec![0u32; (a.len() + 1) * width];
     for i in 1..=a.len() {
+        Deadline::check(deadline, 0)?;
         for j in 1..=b.len() {
             table[i * width + j] = if a[i - 1] == b[j - 1] {
                 table[(i - 1) * width + j - 1] + 1
@@ -661,6 +709,7 @@ fn direct(a: &[&str], b: &[&str], a_offset: usize, b_offset: usize, out: &mut Ve
     }
     pairs.reverse();
     out.extend(pairs);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -694,6 +743,42 @@ mod tests {
         assert_eq!(pairs.len(), lcs_length(a, b), "not a LONGEST subsequence");
     }
 
+    /// The signatures as the interner would number them.
+    fn ids<'s>(a: &[&'s str], b: &[&'s str]) -> (Vec<u32>, Vec<u32>) {
+        let mut ids: HashMap<&'s str, u32> = HashMap::new();
+        let mut id = |text: &&'s str| {
+            let next = ids.len() as u32;
+            *ids.entry(*text).or_insert(next)
+        };
+        let left = a.iter().map(&mut id).collect();
+        let right = b.iter().map(&mut id).collect();
+        (left, right)
+    }
+
+    /// [`lcs_pairs`] over signatures, with no deadline.
+    fn string_pairs(a: &[&str], b: &[&str]) -> Vec<(usize, usize)> {
+        let (left, right) = ids(a, b);
+        lcs_pairs(&left, &right, None).expect("no deadline to miss")
+    }
+
+    #[test]
+    fn the_alignment_stops_at_the_deadline_on_both_paths() {
+        let spent = Deadline::starting(Instant::now(), Some(std::time::Duration::ZERO));
+        // Nothing shared at either end, so the quadratic part runs: a small
+        // pair takes the direct table, a large one Hirschberg's rows.
+        for size in [10, 2000] {
+            let a: Vec<u32> = (0..size).collect();
+            let b: Vec<u32> = (size..2 * size).collect();
+            assert!(
+                matches!(
+                    lcs_pairs(&a, &b, spent),
+                    Err(crate::Error::DeadlineExceeded(_))
+                ),
+                "{size}"
+            );
+        }
+    }
+
     #[test]
     fn alignment_is_a_longest_common_subsequence_at_every_size() {
         let alphabet = ["llm:m", "tool:a", "tool:b", "agent:x", "tool:c"];
@@ -708,7 +793,7 @@ mod tests {
         for (left, right) in [(0, 5), (7, 0), (40, 37), (300, 280), (600, 650)] {
             let a: Vec<&str> = (0..left).map(|_| alphabet[next(alphabet.len())]).collect();
             let b: Vec<&str> = (0..right).map(|_| alphabet[next(alphabet.len())]).collect();
-            let pairs = lcs_pairs(&a, &b);
+            let pairs = string_pairs(&a, &b);
             assert_common_subsequence(&a, &b, &pairs);
         }
         // Large enough to take the Hirschberg path, with a shared prefix and
@@ -719,7 +804,7 @@ mod tests {
             a[index] = alphabet[next(alphabet.len())];
             b[index] = alphabet[next(alphabet.len())];
         }
-        let pairs = lcs_pairs(&a, &b);
+        let pairs = string_pairs(&a, &b);
         assert_common_subsequence(&a, &b, &pairs);
     }
 
@@ -950,6 +1035,52 @@ mod tests {
             );
             assert!(found.explanation.contains('…'), "{}", found.explanation);
         }
+    }
+
+    #[test]
+    fn alignment_spends_the_query_deadline_however_long_the_names() {
+        // Names of one length sharing all but their last bytes: every string
+        // comparison scans the whole name, and an alignment of two runs with
+        // nothing in common compares every pair — tens of millions of them,
+        // seconds past any budget when each scans 4 KiB. Whether a debug
+        // build finishes inside the budget or is refused at it, it must not
+        // run on far past it.
+        let budget = std::time::Duration::from_secs(2);
+        let config = crate::Config {
+            query_deadline: Some(budget),
+            durability: crate::Durability::Buffered,
+            ..crate::Config::default()
+        };
+        let fixture = TempStore::open("diff-deadline", config);
+        let store = fixture.store();
+        let prefix = "p".repeat(4096);
+        let steps = MAX_DIFF_STEPS as u64;
+        for side in ["a", "b"] {
+            let spans: Vec<crate::Span> = (0..steps)
+                .map(|index| {
+                    tool(
+                        &format!("long-{side}"),
+                        &format!("{index:05}"),
+                        index,
+                        &format!("{prefix}{side}{index:05}"),
+                        "{}",
+                    )
+                })
+                .collect();
+            store.ingest_batch(spans).expect("ingests");
+        }
+        let started = Instant::now();
+        let outcome = store.diff_runs(Some(""), "trace:long-a", "trace:long-b", NOW);
+        let elapsed = started.elapsed();
+        match outcome {
+            Ok(Ok(diff)) => assert_eq!(diff.aligned.len(), 2 * MAX_DIFF_STEPS),
+            Err(crate::Error::DeadlineExceeded(_)) => {}
+            other => panic!("expected a diff or a deadline refusal, got {other:?}"),
+        }
+        assert!(
+            elapsed < budget + std::time::Duration::from_secs(3),
+            "the diff ran {elapsed:?} against a {budget:?} budget"
+        );
     }
 
     #[test]
