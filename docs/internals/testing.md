@@ -130,6 +130,14 @@ socket; files that exercise the engine use `traza::Store` directly.
 | [`flight_recorder.rs`](../../tests/flight_recorder.rs) | 3 | The seams between those features: a quota refusal decided before the run guard sees a batch, an admitted batch both charged and judged, a runtime-minted credential driving a replay through `x-api-key` (and losing it on revocation), and every unbound-only surface refusing a bound credential with `required` named |
 | [`llm_semantics.rs`](../../tests/llm_semantics.rs) | 2 | Every query recipe in [`docs/llm-semantics.md`](../llm-semantics.md), through both ingest paths. The documentation's executable oracle |
 
+The client libraries carry suites of their own, in their own languages:
+[`sdk/python/tests`](../../sdk/python/tests/test_client.py) (`unittest`) and
+[`sdk/typescript/test`](../../sdk/typescript/test/client.test.js)
+(`node:test`, run against the compiled package). Each spawns the real
+`traza-server` — `$TRAZA_SERVER_BIN`, else `target/release/traza-server` —
+once open and once with `TRAZA_TOKENS`, and drives every client method against
+its responses; see [client libraries](../guide/clients.md#testing).
+
 Note two rows. `docs/llm-semantics.md` is tested — if you change a recipe
 there, change the test. And `tests/mcp.rs` guards claims the MCP guide makes in
 prose: that a truncated result always says so, that stored span text never
@@ -167,11 +175,13 @@ order:
 3. `cargo clippy --all-targets --all-features -- -D warnings`
 4. `cargo build --release`
 5. `cargo test`
-6. `cd ui && npm ci && npm test && npm run build`
+6. The client libraries' suites against the release binary, each skipped with
+   a message when its runtime (`python3`, Node 20+) is absent
+7. `cd ui && npm ci && npm test && npm run build`
 
 The dashboard is a first-class part of the product: a UI that does not build,
 or whose vitest suite fails, does not merge green. `TRAZA_SKIP_UI=1` skips
-step 6 for a deliberate Rust-only run — not for a merge.
+step 7 for a deliberate Rust-only run — not for a merge.
 
 The benchmarks are **not** part of `ci.sh`; run them when a change could
 plausibly move performance. See [benchmarking](benchmarking.md).

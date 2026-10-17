@@ -15,6 +15,7 @@ to the right document. Start with the row that matches what you are doing.
 | Stop a runaway agent run before its next step | [Run fuses](guide/guard.md) · [Claude Code hook](../examples/guard/README.md) |
 | Re-run a recorded agent run with zero model calls, or diff two runs | [Replay](guide/replay.md) |
 | Prove what the store committed, for an auditor or a notary | [Ledger and evidence packs](guide/ledger.md) |
+| Call the guard, replays, diff, recall or the ledger from Python or TypeScript | [Client libraries](guide/clients.md) |
 | Watch the claims proven live before reading further | [The demo tour](../examples/README.md) |
 | Navigate the trace browser | [Trace browser](guide/trace-browser.md) |
 | Deploy, tune, or operate a server | [Operations](#operators) |
@@ -52,6 +53,11 @@ Sending traces to Traza and getting answers back out.
   every published generation and erasure, verifying it with or without the
   server, external anchors, and the evidence pack a notary signs; with what
   it proves and what it does not.
+- **[Client libraries](guide/clients.md)** — the zero-dependency Python and
+  TypeScript clients for the routes an agent harness calls: the pre-call
+  guard and the rest of the run fuses, tapes and replays, diffs, recall, the
+  ledger head and evidence packs, and the OTLP exporter environment. Typed
+  clients, not instrumentation.
 - **[Trace browser](guide/trace-browser.md)** — what each view shows and how to
   move between them.
 

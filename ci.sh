@@ -64,6 +64,36 @@ else
   echo "ci: skipping the demos (python3 not found)"
 fi
 
+# ---------------------------------------------------------------- client libraries
+# sdk/python and sdk/typescript are typed clients for the agent-native routes,
+# and each suite spawns the release binary built above, so a change to a wire
+# shape a client reads fails here rather than in someone's agent. Pointed at
+# target/release on purpose, never at an exported TRAZA_SERVER_BIN: the gate
+# tests what it just built. Both suites together take seconds. The Python
+# client is standard library only, so python3 is all it needs; the TypeScript
+# suite needs Node 20+ and npm, to install its one dev dependency (tsc).
+sdk_server="$PWD/target/release/traza-server"
+if command -v python3 >/dev/null 2>&1; then
+  TRAZA_SERVER_BIN="$sdk_server" python3 -m unittest discover -s sdk/python/tests
+  echo "ci: python client tests ran"
+else
+  echo "ci: skipping the python client tests (python3 not found)"
+fi
+node_major=""
+if command -v node >/dev/null 2>&1; then
+  node_major=$(node --version | sed 's/^v//; s/\..*//')
+fi
+if [ -n "$node_major" ] && [ "$node_major" -ge 20 ] && command -v npm >/dev/null 2>&1; then
+  (
+    cd sdk/typescript
+    npm ci --no-audit --no-fund --loglevel=error
+    TRAZA_SERVER_BIN="$sdk_server" npm test --silent
+  )
+  echo "ci: typescript client tests ran"
+else
+  echo "ci: skipping the typescript client tests (Node 20+ with npm not found)"
+fi
+
 # ---------------------------------------------------------------- dashboard
 # Node is required: the dashboard is a first-class part of the product, and a
 # UI that does not build must not merge green. Set TRAZA_SKIP_UI=1 only for a
