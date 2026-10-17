@@ -150,6 +150,66 @@ describe('replay this run', () => {
   });
 });
 
+describe('replay this run, when the tape changes scope', () => {
+  // Scoping an unscoped tape to a tenant reads a different recording. A
+  // replay made of the old one, or still being made, describes that one: its
+  // environment lines beside the new tape's Python would hand over two
+  // recordings as one set of instructions.
+  const ACME = { ...replay, id: 'rp_acme_scoped' };
+  const rerenderWith = async (view, params) => {
+    view.rerender(<RunScreen runId="weather-9" go={vi.fn()} params={params} identity={OPEN} pushToast={vi.fn()} />);
+    await act(async () => { for (let i = 0; i < 4; i += 1) await Promise.resolve(); });
+  };
+
+  it('drops a replay made in the old scope', async () => {
+    const { view } = await show(new URLSearchParams());
+    await act(async () => { fireEvent.click(screen.getByText('Create replay')); });
+    expect(screen.getByTestId('replay-ready').textContent).toContain(replay.id);
+
+    await rerenderWith(view, new URLSearchParams('tenant=acme'));
+    expect(api.tape).toHaveBeenLastCalledWith('weather-9', expect.objectContaining({ tenant: 'acme' }), expect.anything());
+    expect(screen.queryByTestId('replay-ready')).toBeNull();
+    expect(view.container.textContent).not.toContain(replay.id);
+
+    // A replay made now is made in the new scope.
+    api.createReplay.mockResolvedValueOnce(ACME);
+    await act(async () => { fireEvent.click(screen.getByText('Create replay')); });
+    expect(api.createReplay).toHaveBeenLastCalledWith({ run: 'weather-9', mode: 'strict', tenant: 'acme' });
+    expect(screen.getByTestId('replay-ready').textContent).toContain(ACME.id);
+  });
+
+  it('discards a creation still pending when the scope changed', async () => {
+    let finish;
+    api.createReplay.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const { view } = await show(new URLSearchParams());
+    await act(async () => { fireEvent.click(screen.getByText('Create replay')); });
+    expect(screen.getByText('Creating…')).toBeTruthy();
+
+    await rerenderWith(view, new URLSearchParams('tenant=acme'));
+    await act(async () => { finish(replay); for (let i = 0; i < 4; i += 1) await Promise.resolve(); });
+    expect(screen.queryByTestId('replay-ready')).toBeNull();
+    expect(view.container.textContent).not.toContain(replay.id);
+    expect(screen.getByText('Create replay')).toBeTruthy();
+  });
+
+  it('stays with the tape on screen until the new scope’s tape arrives', async () => {
+    const { view } = await show(new URLSearchParams());
+    await act(async () => { fireEvent.click(screen.getByText('Create replay')); });
+    let arrive;
+    api.tape.mockImplementationOnce(() => new Promise((resolve) => { arrive = resolve; }));
+    await rerenderWith(view, new URLSearchParams('tenant=acme'));
+
+    // The unscoped tape is still the one shown, so its replay stays beside
+    // it, and one made now is of that recording — the Python under it is.
+    expect(screen.getByTestId('replay-ready').textContent).toContain(replay.id);
+    await act(async () => { fireEvent.click(screen.getByText('Create another')); });
+    expect(api.createReplay).toHaveBeenLastCalledWith({ run: 'weather-9', mode: 'strict' });
+
+    await act(async () => { arrive(tape); for (let i = 0; i < 4; i += 1) await Promise.resolve(); });
+    expect(screen.queryByTestId('replay-ready')).toBeNull();
+  });
+});
+
 describe('compare with…', () => {
   it('goes to the diff of this run against the one named', async () => {
     const { go } = await show();

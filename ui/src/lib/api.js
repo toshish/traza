@@ -17,7 +17,7 @@
 
 import { apiUrl } from './base.js';
 import {
-  blockAuth, getIdentity, isAuthBlocked, isOperatorPath, unblockAuth,
+  blockAuth, credentialChanged, getIdentity, isAuthBlocked, isOperatorPath,
 } from './session.js';
 
 const TOKEN_KEY = 'traza_token';
@@ -26,14 +26,17 @@ export function getToken() {
   try { return sessionStorage.getItem(TOKEN_KEY) || ''; } catch (e) { return ''; }
 }
 
-/** Stores (or clears) the bearer token and lifts the 401 block: a new
-    token, or deliberately none, is a new question for the server. */
+/** Stores (or clears) the bearer token, and in the same step starts a new
+    credential generation (see session.js): the identity is forgotten and the
+    401 block lifts. Synchronous on purpose — from the moment the token
+    changes, an operator surface is refused until the server has said who
+    the new token is. */
 export function setToken(token) {
   try {
     if (token) sessionStorage.setItem(TOKEN_KEY, token);
     else sessionStorage.removeItem(TOKEN_KEY);
   } catch (e) { /* storage unavailable: the token lives for this page only */ }
-  unblockAuth();
+  credentialChanged();
 }
 
 let unauthorizedHandler = null;
@@ -114,8 +117,10 @@ async function request(path, { method = 'GET', body, raw = false, signal } = {})
   // the dashboard makes: after a 401 nothing is re-sent until a token is set,
   // and only a credential the server has confirmed is an operator asks a
   // store-global surface — even a screen that forgot to check cannot leak the
-  // request. Before /v1/whoami has answered the credential is unknown, and
-  // unknown counts as no.
+  // request. Before /v1/whoami has answered for the token in use (on load,
+  // and again after every change) the credential is unknown, and unknown
+  // counts as no. The identity and the token are read together, with no
+  // await between them, so the token sent is the one the identity is about.
   if (isAuthBlocked()) throw unauthorized();
   const identity = getIdentity();
   if (isOperatorPath(path) && !(identity && identity.operator === true)) {

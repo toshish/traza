@@ -9,7 +9,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { api, onUnauthorized, setToken } from './api.js';
 import { apiBase, apiUrl, publicBase } from './base.js';
-import { isAuthBlocked, isOperatorPath, setIdentity } from './session.js';
+import { credentialGeneration, getIdentity, isAuthBlocked, isOperatorPath, setIdentity } from './session.js';
 
 function setBase(content) {
   let meta = document.querySelector('meta[name="traza-api-base"]');
@@ -155,6 +155,34 @@ describe('a 401 for an older token', () => {
     releases.forEach((release) => release());
     await Promise.all([first, second]);
     expect(seen).toEqual([undefined, 'Bearer trz_new']);
+  });
+});
+
+describe('a token change', () => {
+  it('forgets the identity in the same step, so an operator surface waits for the new whoami', async () => {
+    // The old answer said "operator" about the old token. Until the server
+    // has described the new one, nothing may be sent on its strength.
+    setIdentity({ auth: 'open', operator: true, scope: 'admin', tenant: null });
+    const calls = mockFetch(() => json(200, { credentials: [] }));
+    setToken('trz_tenant');
+    expect(getIdentity()).toBeNull();
+    await expect(api.credentials()).rejects.toMatchObject({ status: 403, required: 'unbound' });
+    await expect(api.metrics()).rejects.toMatchObject({ status: 403, required: 'unbound' });
+    expect(calls).toHaveLength(0);
+  });
+
+  it('does not take an answer about the token it replaced as the identity', async () => {
+    const asked = credentialGeneration();
+    setToken('trz_next');
+    expect(setIdentity({ auth: 'token', operator: true, scope: 'admin', tenant: null }, asked)).toBe(false);
+    expect(getIdentity()).toBeNull();
+    const calls = mockFetch(() => json(200, {}));
+    await expect(api.metrics()).rejects.toMatchObject({ status: 403 });
+    expect(calls).toHaveLength(0);
+    // An answer about the token in use is the identity.
+    expect(setIdentity({ auth: 'token', operator: true, scope: 'admin', tenant: null }, credentialGeneration())).toBe(true);
+    await api.metrics();
+    expect(calls.map((c) => c.url)).toEqual(['/v1/metrics.json']);
   });
 });
 

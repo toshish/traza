@@ -79,6 +79,15 @@ connection limit, a dropped connection), the page treats the credential as
 not an operator, and the rail reads `identity unknown`, while it asks again
 2, 5 and then every 15 seconds until it gets an answer.
 
+A token change — **Set token**, a [handoff link](#handing-a-token-over-in-the-url),
+or adopting the first credential minted on an open store — forgets the
+previous answer in the same step. Until `/v1/whoami` has answered for the new
+token the page is where it is on first load: every screen starts over, and no
+operator surface is asked with the new token, whatever the old one was. An
+answer that arrives for a token the page has since replaced is dropped, and so
+is an ingest sample: the rail's pulse and the header's count start over for
+the new credential rather than showing the old one's figures.
+
 - **The rail says who you are**: `tenant acme · rw` for a bound credential,
   `all tenants · wal` for an unbound one (the second figure is the store's
   durability mode, which only an operator may read), `open store` when no
@@ -363,7 +372,10 @@ messages through the OpenAI SDK — which a strict replay matches — and print
 the recorded answer. The key is written as `$TRAZA_TOKEN` (any non-empty
 value on an open server); the page never prints the token itself. **What has
 it served?** reads the replay's status: served, remaining, and the first
-divergence.
+divergence. The panel belongs to the tape on screen: when the tape is read in
+another tenant (**Scope**, or a changed `?tenant=`), the panel starts over as
+the new tape arrives, and a replay of the old recording — made, or still being
+made — is dropped rather than shown beside the new one.
 
 **Compare with…** takes another run id, with recent sessions offered as
 suggestions, and opens the diff.
@@ -509,7 +521,10 @@ credential is revoked by restarting without it.
 On an open store the screen says what minting does: the first credential must
 be an unbound `admin`, and from that request on every client must
 authenticate. The page adopts that first token at once — otherwise its own
-next poll would answer `401` over the one-time display — and says so.
+next poll would answer `401` over the one-time display — and says so. Adopting
+it is a token change like any other: the one-time display stays up while the
+page asks `/v1/whoami` about the new token, and the list is read with it once
+the server has confirmed an operator.
 
 ## Connect
 
