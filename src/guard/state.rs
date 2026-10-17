@@ -10,7 +10,10 @@
 //! what makes a re-ingested span an UPSERT here as it is in the store: a
 //! client retrying a batch the store already acknowledged changes nothing,
 //! and a span re-sent with different content replaces its old contribution
-//! rather than adding a second one. Each mark also carries the store's write
+//! rather than adding a second one — every contribution a fold replaces
+//! coming out before any replacement goes in, so no limit is judged on old
+//! versions of some spans beside new versions of others, a run the store
+//! never held. Each mark also carries the store's write
 //! revision of the version it came from, because observers run after their
 //! writes in no particular order: a version the store has since replaced
 //! must not replace the newer one here when its observer runs last.
@@ -228,6 +231,22 @@ struct Mark {
 }
 
 impl Mark {
+    /// `observation`'s contribution, on the given side of the last reset.
+    fn of(observation: &Observation, before_reset: bool) -> Self {
+        Self {
+            kind: observation.kind,
+            error: observation.error,
+            tokens: observation.tokens,
+            cost_usd: observation.cost_usd,
+            fingerprint: observation
+                .fingerprint
+                .as_deref()
+                .map_or(0, fingerprint_key),
+            before_reset,
+            revision: observation.revision,
+        }
+    }
+
     /// Whether this span counts in the repeat table.
     fn counted(&self) -> bool {
         !self.before_reset && self.kind.is_step() && self.fingerprint != 0
@@ -340,50 +359,69 @@ impl RunState {
         self.marks.len()
     }
 
-    /// Folds one span in, replacing the contribution of an earlier version
-    /// of the same span. Returns whether anything changed.
-    ///
-    /// `before_reset` absorbs a span as history the last reset cleared — a
-    /// rebuild's spans that ended before it. A re-ingested span keeps the
-    /// side of the reset its first version landed on.
-    ///
-    /// A version older than the one held — by write revision — changes
-    /// nothing: two writers of one span are stored in order, but their
-    /// observers run in whichever order they finish, and the guard must end
-    /// up holding what the store holds.
+    /// Folds one span in on its own — a fold of one, without the limit
+    /// checks: [`Self::withdraw`], then [`Self::land`]. Returns whether
+    /// anything changed.
+    #[cfg(test)]
     pub(crate) fn absorb(&mut self, observation: &Observation, before_reset: bool) -> bool {
         if self.is_stale(observation) {
             return false;
         }
+        let withdrawn = self.withdraw(observation);
+        self.land(observation, before_reset, withdrawn)
+    }
+
+    /// The first half of replacing the version of `observation`'s span held
+    /// here: takes that version's contribution out of the run's totals when
+    /// `observation` contributes something else, and says whether it did.
+    /// An identical version — a retried batch — leaves it in.
+    ///
+    /// The mark itself stays until [`Self::land`] puts the new version in,
+    /// which must follow for the same observation with what this returned:
+    /// the totals no longer count the mark, but its side of the reset is the
+    /// new version's too, and whether it had failed decides the streak.
+    fn withdraw(&mut self, observation: &Observation) -> bool {
+        match self.marks.get(&observation.key).copied() {
+            Some(previous) if !previous.same_as(&Mark::of(observation, previous.before_reset)) => {
+                self.subtract(&previous);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The second half: puts `observation`'s version of its span in, once
+    /// [`Self::withdraw`] has taken out whatever it replaces (`withdrawn`:
+    /// what that returned). Returns whether anything changed.
+    ///
+    /// `before_reset` puts a span in as history the last reset cleared — a
+    /// rebuild's spans that ended before it. A re-ingested span keeps the
+    /// side of the reset its first version landed on.
+    ///
+    /// Staleness is ruled out before either half ([`Self::is_stale`]): a
+    /// version older than the one held — by write revision — must change
+    /// nothing, because two writers of one span are stored in order but
+    /// their observers run in whichever order they finish, and the guard
+    /// must end up holding what the store holds.
+    fn land(&mut self, observation: &Observation, before_reset: bool, withdrawn: bool) -> bool {
         let previous = self.marks.get(&observation.key).copied();
         // The span's clocks count whether or not its contribution changed:
         // an upsert that only moved a span's end still moves the run's.
         let clocked = self.clock(observation);
-        let mark = Mark {
-            kind: observation.kind,
-            error: observation.error,
-            tokens: observation.tokens,
-            cost_usd: observation.cost_usd,
-            fingerprint: observation
-                .fingerprint
-                .as_deref()
-                .map_or(0, fingerprint_key),
-            before_reset: previous.map_or(before_reset, |previous| previous.before_reset),
-            revision: observation.revision,
-        };
-        if let Some(previous) = previous {
-            if previous.same_as(&mark) {
-                // A retried batch: the store upserted the same span to the
-                // same value, and so does this — not even the streak moves.
-                // The revision still advances, so a version written between
-                // the two cannot pass for the newer one when it lands late.
-                self.marks.insert(observation.key, mark);
-                if clocked {
-                    self.last_span = Some(observation.span_ref());
-                }
-                return clocked;
+        let mark = Mark::of(
+            observation,
+            previous.map_or(before_reset, |previous| previous.before_reset),
+        );
+        if previous.is_some() && !withdrawn {
+            // A retried batch: the store upserted the same span to the same
+            // value, and so does this — not even the streak moves. The
+            // revision still advances, so a version written between the two
+            // cannot pass for the newer one when it lands late.
+            self.marks.insert(observation.key, mark);
+            if clocked {
+                self.last_span = Some(observation.span_ref());
             }
-            self.subtract(&previous);
+            return clocked;
         }
         self.add(&mark, observation);
         if mark.kind.is_step() && !mark.before_reset {
@@ -524,6 +562,20 @@ impl RunState {
     /// the root's policy never allows and a replay — root first — never
     /// latches.
     ///
+    /// Every version a fold replaces is withdrawn from the totals before
+    /// ANY replacement goes in ([`Self::withdraw`], then [`Self::land`]).
+    /// Replaced one by one in step order, a batch that moves usage between
+    /// spans — $5 of cost from a later span to an earlier one, a
+    /// fingerprint from one step to another — would be judged, between the
+    /// two, on the earlier span's new version beside the later one's old
+    /// version: a run the store never held, at a total it never reached,
+    /// and a stop latched there is sticky. Withdrawn first, the totals only
+    /// climb through the fold and end exactly where the store's versions
+    /// put them, so cost, tokens, steps, LLM and tool calls and repeats
+    /// latch here exactly when a replay of the store would. The error
+    /// streak is not a total to withdraw from: it is judged span by span in
+    /// step order, each failure where its version puts it, as before.
+    ///
     /// `reset_at` absorbs spans that ended at or before it as history the
     /// last reset cleared, which latches nothing (see [`replay`]).
     /// `stop_limits` gives the limits a stop latches at for a run whose
@@ -545,11 +597,17 @@ impl RunState {
         if let Some(first) = observations.first() {
             self.take_service(first);
         }
+        // Staleness was ruled out by `in_step_order`, and each span is here
+        // once, so every withdrawal below is matched by one landing.
+        let withdrawn: Vec<bool> = observations
+            .iter()
+            .map(|observation| self.withdraw(observation))
+            .collect();
         let mut resolved: Option<Option<Limits>> = None;
         let mut latched = false;
-        for observation in observations {
+        for (observation, withdrawn) in observations.into_iter().zip(withdrawn) {
             let before = reset_at.is_some_and(|reset| observation.end_ns <= reset);
-            if !self.absorb(observation, before) || before || self.trip.is_some() {
+            if !self.land(observation, before, withdrawn) || before || self.trip.is_some() {
                 continue;
             }
             let limits =
@@ -1468,6 +1526,243 @@ mod tests {
             asked.iter().all(|service| service == "root-svc"),
             "{asked:?}"
         );
+    }
+
+    /// A version of span `id`, as an observer reads it (`revision` 0: as a
+    /// rebuild does).
+    fn version(
+        id: &str,
+        kind: StepKind,
+        fingerprint: Option<&str>,
+        start: u64,
+        cost: f64,
+        revision: u64,
+    ) -> Observation {
+        let mut observation = obs(id, kind, fingerprint, false);
+        observation.start_ns = start;
+        observation.end_ns = start + 5;
+        observation.cost_usd = cost;
+        observation.revision = revision;
+        observation
+    }
+
+    #[test]
+    fn a_batch_moving_cost_between_spans_is_never_judged_half_moved() {
+        let budget = Limits {
+            max_cost_usd: Some(10.0),
+            ..Limits::default()
+        };
+        let llm = |id: &str, start: u64, cost: f64, revision: u64| {
+            version(id, StepKind::Llm, None, start, cost, revision)
+        };
+        // A complete run at $7: B ($1) started first, A ($6) after it.
+        let mut run = replay(&[llm("b", 10, 1.0, 0), llm("a", 20, 6.0, 0)], None, &|_| {
+            (budget, Action::Stop)
+        });
+        assert!(run.trip.is_none());
+        // One batch moves $5 from A to B, sent A first. Step order judges B
+        // first; were B's $6 judged beside A's replaced $6, the run would
+        // stop at a $12 it never spent — the store went from $7 to $7.
+        let batch = [llm("a", 20, 1.0, 1), llm("b", 10, 6.0, 2)];
+        assert!(!run.fold(&batch, None, &|_| Some(budget), &|_| 42));
+        assert!(run.trip.is_none(), "{:?}", run.trip);
+        assert_eq!(run.usage().cost_usd, 7.0);
+    }
+
+    #[test]
+    fn a_batch_moving_a_repeat_between_spans_is_never_judged_half_moved() {
+        // X on a and b, Y on c and d; then one batch moves a to Y and c,
+        // which starts first, to X. Counting c's X beside a's replaced X
+        // makes three X; the store never held more than two of either.
+        let repeats = Limits {
+            max_repeats: Some(3),
+            ..Limits::default()
+        };
+        let tool = |id: &str, fingerprint: &str, start: u64, revision: u64| {
+            version(id, StepKind::Tool, Some(fingerprint), start, 0.0, revision)
+        };
+        let mut run = replay(
+            &[
+                tool("c", "tool:y#1", 10, 0),
+                tool("d", "tool:y#1", 15, 0),
+                tool("a", "tool:x#1", 20, 0),
+                tool("b", "tool:x#1", 25, 0),
+            ],
+            None,
+            &|_| (repeats, Action::Stop),
+        );
+        assert!(run.trip.is_none());
+        let batch = [tool("a", "tool:y#1", 20, 1), tool("c", "tool:x#1", 10, 2)];
+        assert!(!run.fold(&batch, None, &|_| Some(repeats), &|_| 42));
+        assert!(run.trip.is_none(), "{:?}", run.trip);
+        assert_eq!(run.usage().top_repeat.map(|top| top.count), Some(2));
+    }
+
+    #[test]
+    fn a_batch_of_replacements_still_judges_the_error_streak_step_by_step() {
+        let streak = |_: &str| {
+            Some(Limits {
+                max_error_streak: Some(2),
+                ..Limits::default()
+            })
+        };
+        let at = |id: &str, start: u64, error: bool, revision: u64| {
+            let mut observation = version(
+                id,
+                StepKind::Tool,
+                Some(&format!("t#{id}")),
+                start,
+                0.0,
+                revision,
+            );
+            observation.error = error;
+            observation
+        };
+        let mut run = replay(
+            &[
+                at("a", 10, false, 0),
+                at("b", 20, false, 0),
+                at("c", 30, false, 0),
+            ],
+            None,
+            &|_| (streak("").expect("limits"), Action::Stop),
+        );
+        // Re-sent so that a and b failed and c did not (with new content,
+        // so it is judged again rather than taken for a retry): in step
+        // order two failures are adjacent, which a replay of the store stops
+        // at too.
+        let mut c = at("c", 30, false, 1);
+        c.tokens = 20;
+        let batch = [c, at("b", 20, true, 2), at("a", 10, true, 3)];
+        assert!(run.fold(&batch, None, &streak, &|_| 42));
+        let trip = run.trip.clone().expect("latched");
+        assert_eq!(trip.evidence[0].span_id, "b");
+        assert_eq!(run.usage().error_streak, 0, "c's success ended it");
+    }
+
+    /// Random batches of upserts against a complete run, under every limit
+    /// a run can only climb toward within one fold — cost, tokens, steps,
+    /// LLM and tool calls, repeats: after each batch the live state counts
+    /// exactly what a fresh replay of the store's versions counts, and
+    /// latches a stop exactly when that replay does. A stop latched from a
+    /// state the store never held — old versions of some spans beside new
+    /// versions of others — fails it.
+    #[test]
+    fn random_upsert_batches_latch_exactly_what_a_replay_of_the_store_does() {
+        const KINDS: [StepKind; 4] = [
+            StepKind::Llm,
+            StepKind::Tool,
+            StepKind::Agent,
+            StepKind::Other,
+        ];
+        fn random(rng: &mut crate::seed::Rng, id: &str, revision: u64) -> Observation {
+            let kind = *rng.pick(&KINDS);
+            let fingerprint = format!("{kind}:f#{}", rng.range(0, 2));
+            let mut observation = version(
+                id,
+                kind,
+                kind.is_step().then_some(fingerprint.as_str()),
+                rng.range(0, 5) * 10,
+                // Whole dollars: every sum and difference is exact, so the
+                // live and replayed totals compare with `==`.
+                rng.range(0, 6) as f64,
+                revision,
+            );
+            observation.tokens = rng.range(0, 60);
+            observation.error = rng.chance(30);
+            observation
+        }
+        let mut rng = crate::seed::Rng::new(0x5eed_f01d);
+        let mut latches = 0;
+        for scenario in 0..3_000 {
+            let mut limits = Limits::default();
+            while limits == Limits::default() {
+                if rng.chance(40) {
+                    limits.max_cost_usd = Some(rng.range(4, 30) as f64);
+                }
+                if rng.chance(40) {
+                    limits.max_tokens = Some(rng.range(40, 300));
+                }
+                if rng.chance(40) {
+                    limits.max_steps = Some(rng.range(2, 6));
+                }
+                if rng.chance(40) {
+                    limits.max_llm_calls = Some(rng.range(2, 5));
+                }
+                if rng.chance(40) {
+                    limits.max_tool_calls = Some(rng.range(2, 5));
+                }
+                if rng.chance(40) {
+                    limits.max_repeats = Some(rng.range(2, 5));
+                }
+            }
+            let resolve = |_: &str| (limits, Action::Stop);
+            // What the store holds, by span id: each span's latest version,
+            // read back as a rebuild reads it.
+            let mut stored: HashMap<String, Observation> = HashMap::new();
+            let initial: Vec<Observation> = (0..rng.range(1, 6))
+                .map(|index| random(&mut rng, &format!("s{index}"), 0))
+                .collect();
+            for observation in &initial {
+                stored.insert(observation.span_id.clone(), observation.clone());
+            }
+            let mut live = replay(&initial, None, &resolve);
+            if live.trip.is_some() {
+                continue;
+            }
+            let mut revision = 0;
+            for round in 0..6 {
+                let mut batch: Vec<Observation> = (0..rng.range(1, 6))
+                    .map(|_| {
+                        revision += 1;
+                        let id = format!("s{}", rng.range(0, 5));
+                        random(&mut rng, &id, revision)
+                    })
+                    .collect();
+                for observation in &batch {
+                    let mut kept = observation.clone();
+                    kept.revision = 0;
+                    stored.insert(kept.span_id.clone(), kept);
+                }
+                // What a rebuild gathers is out of arrival order; the fold
+                // must not care.
+                if rng.chance(30) {
+                    for index in (1..batch.len()).rev() {
+                        batch.swap(index, rng.range(0, index as u64) as usize);
+                    }
+                }
+                let latched = live.fold(&batch, None, &|_| Some(limits), &|_| 1);
+                let held: Vec<Observation> = stored.values().cloned().collect();
+                let fresh = replay(&held, None, &resolve);
+                let counted = |usage: Usage| {
+                    (
+                        usage.cost_usd,
+                        usage.tokens,
+                        usage.steps,
+                        usage.llm_calls,
+                        usage.tool_calls,
+                        usage.errors,
+                        usage.top_repeat.map(|top| top.count),
+                    )
+                };
+                let context = format!("scenario {scenario}, batch {round}, {limits:?}");
+                assert_eq!(counted(live.usage()), counted(fresh.usage()), "{context}");
+                // Whether, not where: a replay crosses among ALL the run's
+                // spans in step order, live among this batch's on top of
+                // what came before, so the reason's figure can differ.
+                assert_eq!(
+                    latched,
+                    fresh.trip.is_some(),
+                    "{context}: live and a replay of the store disagree on a stop"
+                );
+                if latched {
+                    latches += 1;
+                    break;
+                }
+            }
+        }
+        // The property must have been exercised, not passed vacuously.
+        assert!(latches > 300, "only {latches} scenarios latched");
     }
 
     #[test]

@@ -845,6 +845,56 @@ fn a_crash_restart_rebuilds_runs_from_the_store_and_keeps_durable_controls() {
 }
 
 #[test]
+fn a_batch_moving_cost_between_spans_stops_nothing_live_or_after_a_restart() {
+    let mut server = Server::spawn(&["--fuse-max-cost-usd", "10", "--fuse-action", "stop"]);
+    let cost = |doc: &Value| doc["usage"]["cost_usd"].as_f64();
+    // A complete run at $7 of $10: B ($1) started first, A ($6) after.
+    ingest(
+        &server,
+        &json!([
+            llm_step("xfer", "b", 1.0, 10),
+            llm_step("xfer", "a", 6.0, 20)
+        ]),
+        &[],
+    );
+    let doc = verdict(&server, "/v1/fuses/runs/xfer", &[]);
+    assert_eq!(
+        (doc["source"].as_str(), doc["verdict"].as_str(), cost(&doc)),
+        (Some("rebuilt"), Some("continue"), Some(7.0)),
+        "{doc}"
+    );
+
+    // One batch re-sends both, moving $5 from A to B, A first. The store
+    // goes from $7 to $7 and never holds more.
+    let (status, header, body) = ingest(
+        &server,
+        &json!([
+            llm_step("xfer", "a", 1.0, 20),
+            llm_step("xfer", "b", 6.0, 10)
+        ]),
+        &[],
+    );
+    assert_eq!(status, 200, "{body}");
+    assert!(header.is_none() && body.get("fuses").is_none(), "{body}");
+    let doc = verdict(&server, "/v1/fuses/runs/xfer", &[]);
+    assert_eq!(
+        (doc["source"].as_str(), doc["verdict"].as_str(), cost(&doc)),
+        (Some("live"), Some("continue"), Some(7.0)),
+        "{doc}"
+    );
+    assert_eq!(doc["tripped_at_ns"], Value::Null, "{doc}");
+
+    // A replay of the store after a restart says the same.
+    server.restart();
+    let doc = verdict(&server, "/v1/fuses/runs/xfer", &[]);
+    assert_eq!(
+        (doc["source"].as_str(), doc["verdict"].as_str(), cost(&doc)),
+        (Some("rebuilt"), Some("continue"), Some(7.0)),
+        "{doc}"
+    );
+}
+
+#[test]
 fn no_fuses_turns_every_surface_off() {
     let server = Server::spawn(&[
         "--no-fuses",
