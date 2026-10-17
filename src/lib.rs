@@ -1088,7 +1088,8 @@ pub struct Admission {
     pub suppressed: usize,
     /// Run-guard signals the ingest observer raised for runs in this batch:
     /// one per run whose verdict is not [`guard::Verdict::Continue`]. Empty
-    /// when nothing was raised, which in this build is always.
+    /// when no run in the batch is at `warn` or `stop`, and always empty when
+    /// fuses are disabled (`Config::fuses.enabled == false`).
     pub signals: Vec<guard::Signal>,
 }
 

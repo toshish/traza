@@ -5,6 +5,453 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.27.0] - 2026-10-17
+
+The flight recorder release. Traza already kept what an agent did; this
+release lets the recording act, while a run is going and after it is over.
+A **run fuse** holds a run to limits on cost, tokens, steps, repeated calls
+and failure streaks, answers every ingest acknowledgement with a verdict, and
+offers a pre-call check that refuses a step before it starts. A recorded run
+**replays** through the agent's own OpenAI or Anthropic SDK with zero model
+calls, and two runs **diff** to the step where they parted. A hash-chained
+**ledger** over every published generation and erasure makes committed
+history tamper-evident against an anchor kept outside the store, and an
+evidence pack puts it in one digest for a notary. Underneath is what a shared,
+multi-tenant deployment needs: runtime credentials, tenant quotas and usage
+counters, admission caps, gzip bodies and health probes. Python and TypeScript
+clients, three new demos (nine in all), and five new dashboard screens round
+it out. There is no storage-format change. Several authorization defaults
+tighten, and the data-directory lock behaves differently in containers: read
+**Changed** and **Upgrade** before deploying over an existing setup.
+
+### Added
+
+- **Steps and runs.** Every span is now also read as a *step* of a *run*: its
+  step kind (`llm`, `tool`, `agent`, `retrieval`, `embedding`, `other`, from
+  `gen_ai.operation.name`, `openinference.span.kind` or `traceloop.span.kind`),
+  its tool, agent and tool-call id, its request and response as stored with a
+  canonical-JSON SHA-256 digest of each, and a `kind:name#hash` fingerprint
+  that two steps share exactly when they made the same call with the same
+  input. A run is the span's session id (`session.id`, then
+  `gen_ai.conversation.id`, then OpenLLMetry's association properties), else
+  `trace:<trace_id>`, within its tenant. Only `llm`, `tool` and `agent` spans
+  count as steps. The OpenInference keys Arize Phoenix emits
+  (`llm.model_name`, `llm.provider`, `llm.system`, `llm.token_count.*`,
+  `openinference.span.kind`) are recognized for analytics too, ranked after
+  every existing spelling so no span's previous answer changes; OpenInference
+  cache counters are deliberately not read, since its prompt count already
+  includes them. See
+  [LLM semantics § Steps and runs](docs/llm-semantics.md#steps-and-runs).
+
+- **Guard: run fuses.** [docs/guide/guard.md](docs/guide/guard.md). Eight
+  optional limits per run (`max_cost_usd`, `max_tokens`, `max_steps`,
+  `max_llm_calls`, `max_tool_calls`, `max_duration_seconds`, `max_repeats`,
+  `max_error_streak`) give it a verdict: `continue`, `warn` at 80% of any
+  limit, and at 100% the policy's action, where `stop` is sticky until reset.
+  A fuse is arithmetic over recorded spans; nothing calls a model.
+  - **Policies** per tenant (`POST /v1/fuses/policies`, `GET`, and
+    `POST /v1/fuses/policies/{id}/delete`): matched by the service of the
+    run's earliest-starting span, else the tenant's `default`, else the global
+    policy set by `--fuse-max-cost-usd`, `--fuse-max-tokens`,
+    `--fuse-max-steps`, `--fuse-max-duration-seconds`, `--fuse-max-repeats`
+    (default 12), `--fuse-max-error-streak` and `--fuse-action` (default
+    `warn`). Limits do not inherit between policies. Out of the box the global
+    policy warns at 12 repeats and stops nothing.
+  - **The acknowledgement carries the verdict.** `POST /v1/spans` answers a
+    `fuses` field and a `Traza-Fuse: stop; run=…` header naming the most
+    severe verdict in the batch; `POST /v1/traces` carries the header alone,
+    since OTLP's response has no place for it. The spans are stored either
+    way: a verdict is about the run's next step, never a refusal of the batch.
+  - **`POST /v1/fuses/check` is the pre-call gate**, and the only surface that
+    can refuse a step before it runs: the run's recorded usage plus one
+    hypothetical step with an optional `est_cost_usd`, `est_tokens` and
+    `tool`. It changes nothing and needs only the `ro` scope.
+  - The kill switch (`POST /v1/fuses/runs/{run}/trip`), reset with an
+    optional grant of absolute higher limits (`POST …/reset`; a reset never
+    refills cumulative usage), a run's verdict document
+    (`GET /v1/fuses/runs/{run}`), runs by verdict (`GET /v1/fuses/runs`), and
+    every transition — `warn`, `stop`, `manual_stop`, `reset` — by cursor from
+    a 4,096-event ring with a long-poll of up to 30 s
+    (`GET /v1/fuses/events`).
+  - Live state is a bounded cache folded on the ingest path —
+    `--fuse-max-runs` (default 100,000) runs, 1,000,000 span contributions,
+    six-hour idle eviction, stopped runs parked rather than forgotten — and a
+    run this process did not follow from its first step is rebuilt from the
+    store on the first question about it. Policies, kill switches, resets and
+    grants persist in `fuses.jsonl`, outside generations: a backup does not
+    carry it and a restore does not touch it. `--no-fuses` turns the observer
+    off entirely. Metrics: `traza_fuse_trips_total`,
+    `traza_fuse_warnings_total`, `traza_fuse_live_runs`.
+  - [`examples/guard/claude-code-hook.sh`](examples/guard/README.md#the-claude-code-hook):
+    a Claude Code PreToolUse gate that exits 2 with the reasons on a stop,
+    and an optional PostToolUse recorder that gives the step and repeat limits
+    something to count. It fails open unless `TRAZA_FUSE_FAIL_CLOSED=1`.
+  - What it cannot do, stated in the guide: a post-ack stop is at least one
+    step late, more with exporter batching; a step in flight is never
+    interrupted; the check sees recorded usage only, so parallel steps can all
+    pass it; across batches, arrival order counts; and concurrent re-sends
+    that move usage between steps of one run can latch a stop on a total the
+    store never held. See [limitations](docs/guide/guard.md#limitations).
+
+- **Replay: tapes, the replay proxy, diffs and recall.**
+  [docs/guide/replay.md](docs/guide/replay.md).
+  - `GET /v1/tapes/{run}`: a run's steps in start order with requests,
+    responses, digests, fingerprints and token counts, read from OTel GenAI,
+    OpenLLMetry, OpenInference and native layouts into one message shape.
+    `?resolve=true` inlines offloaded payloads up to `--tape-max-bytes`
+    (default 8 MiB) as a prefix, and says `resolved_partial` when it stops.
+  - `POST /v1/replays` snapshots a run (in memory, for one hour) and returns
+    base URLs for an OpenAI-compatible `…/openai/v1/chat/completions` and an
+    Anthropic-compatible `…/anthropic/v1/messages`. Set `OPENAI_BASE_URL` or
+    `ANTHROPIC_BASE_URL` to one and the agent's own code runs again with every
+    model answer served from the recording: zero model calls, and no outbound
+    request of any kind. `"stream": true` answers as server-sent events
+    rebuilt from the stored text. **Strict** mode, the default, refuses a
+    request whose normalised messages are not the recorded step's with
+    `409 replay_divergence`, naming the step, without consuming it, and with
+    `x-should-retry: false` so the SDKs do not retry; **loose** mode serves in
+    order and records whether each call matched. `GET /v1/replays/{id}` says
+    what was served. Any valid credential, `ro` included, may create and use
+    a replay, and on the routes under `/v1/replays/` only, the token may
+    arrive as `x-api-key`, so `ANTHROPIC_API_KEY` can hold it.
+  - `POST /v1/replays/{id}/tools/next` hands a harness the next recorded tool
+    result; otherwise tools run live, with their real side effects.
+  - `GET /v1/diff?a=&b=` aligns two runs by longest common subsequence over
+    `kind:name` signatures, classifies each aligned pair as `same` or changed
+    by `input`, `decision` or `config` (unaligned steps are `structure`), and
+    explains the first divergence, with cost, token, duration and error
+    deltas.
+  - `GET /v1/recall?q=` finds earlier runs whose recorded text holds every
+    word of the query, successful runs first, each with a skeleton of what it
+    did.
+  - Bounds: a run of more than 20,000 spans is refused for replay (`409`)
+    rather than replayed as its beginning; each tenant's share of the registry
+    holds 64 live replays and 64 MiB, the registry 1,024 and 512 MiB, past
+    which creation is `429` with `Retry-After`; a served response is at most
+    64 MiB. An erasure withdraws any replay holding what it covers
+    (`410 replay_erased`). Only chat completions and messages are replayed,
+    streams are not the provider's bytes, and strict mode compares messages
+    only, not the model or parameters. See
+    [limits](docs/guide/replay.md#limits-stated-plainly).
+
+- **Prove: the ledger and evidence packs.**
+  [docs/guide/ledger.md](docs/guide/ledger.md).
+  - `ledger.jsonl` in the data directory: an append-only SHA-256 hash chain
+    with one entry per published generation (`checkpoint`, carrying the
+    manifest's SHA-256), per settled erasure (`erasure`, carrying a SHA-256 of
+    the subject, never a trace, span or session id or a payload reference —
+    though a tenant subject's `tenant` field is the tenant's name — and a
+    random salt, so another tenant shown a stub of the entry cannot recompute
+    its head), and per external `anchor`, each head committing to the one
+    before:
+    `sha256("traza-ledger/1\n" + prev + "\n" + canonical_json(entry without head))`.
+    The guide's ten-line standard-library Python script recomputes every
+    head, and `tests/ledger.rs` runs it verbatim from the guide.
+  - `GET /v1/ledger` (paged; unbound credentials), `GET /v1/ledger/head` (any
+    `ro`, bound included), `GET /v1/ledger/verify` (unbound: recomputes every
+    head and link, checks the latest checkpoint names the live manifest,
+    re-digests every manifested file, and checks ledgered erasures against the
+    tombstone log in both directions), `POST /v1/ledger/anchors` (unbound
+    `admin`: stores a notary's countersignature over an earlier head, `409`
+    unless `target_head` is the head recorded at `target_seq`), and
+    `GET /v1/evidence` (any `ro`; a bound credential gets its own tenant's
+    pack, with other tenants' erasure entries as stubs it cannot recompute).
+  - `traza-server verify --ledger [--data-dir DIR] [--json]`: the same
+    verification offline and read-only, against a directory no live server
+    owns. Exits `0` intact, `2` broken, `1` when it cannot verify.
+  - A backup pin carries `pins/<label>/ledger.jsonl`, ending on the pinned
+    checkpoint. The erasure receipt gains a `ledger` domain, reported
+    `retained-by-design`.
+  - What it does not prove, stated before anything else in the guide: the
+    chain has no secret, so history is tamper-evident only against an anchor
+    you keep outside the store; anchor signatures are stored, never checked;
+    `at_ns` is the server's clock; restoring a pin taken before an erasure
+    undoes it, and verification then names the entry. The ledger never
+    rotates: a checkpoint entry is about 305 bytes, about 88 KB a day at the
+    five-minute checkpoint cadence. See
+    [limitations](docs/guide/ledger.md#limitations).
+
+- **Platform.**
+  - **Runtime credentials**: `POST /v1/admin/credentials` mints a token
+    (`trz_` and 64 hex digits, shown once) or registers a supplied
+    high-entropy one, with an optional label, tenant binding and expiry;
+    `GET /v1/admin/credentials` lists them and
+    `POST /v1/admin/credentials/{id}/revoke` revokes one, durably, from the
+    next request. Kept as SHA-256 digests in `credentials.jsonl` (mode
+    `0600`, fsynced per write, outside generations and pins), beside
+    `TRAZA_TOKENS` entries, which list as `source: "env"`. An open store is
+    closed by minting its first credential — which must be an unbound
+    `admin` — and stays closed across restarts; revoking every credential
+    locks the store rather than reopening it. See
+    [administration § Runtime credentials](docs/operations/administration.md#runtime-credentials).
+  - **Tenant limits**: `POST /v1/admin/tenants/{tenant}/limits` (and `GET`;
+    `_default` names the default tenant) replaces a tenant's
+    `monthly_spans`, `monthly_bytes`, `ingest_paused` and `ttl_seconds`,
+    durable in `limits.json`. The runtime TTL outranks `--tenant-ttl` and
+    `--ttl-seconds` and applies at the next minutely retention pass, with no
+    restart.
+  - **Usage counters**: per tenant, lifetime and current-UTC-month spans,
+    bytes (each span's native JSON before payload offload), batches and
+    refused spans, at `GET /v1/usage` in O(tenants); a bound credential sees
+    its own row. They are written to `usage.json` every five seconds by a
+    thread of their own and on every flush, so a crash undercounts by about
+    five seconds' worth and never overcounts. `/v1/metrics` gains
+    `traza_tenant_spans_ingested_total{tenant}` and
+    `traza_quota_rejected_total{tenant}`.
+  - **Quota enforcement**: a batch that would take its tenant past a monthly
+    limit, or any batch of a paused tenant, is refused whole with `429`,
+    `Retry-After` (the seconds to next month, `60` for a pause) and a body
+    naming the limit, the month's usage and when it resets — on native and
+    OTLP ingest alike. Reads, exports and erasure are never blocked. The
+    check reserves nothing, so batches admitted concurrently can overshoot a
+    limit by what was in flight. See
+    [administration § Quotas and usage](docs/operations/administration.md#quotas-and-usage).
+  - **Admission caps**, on by default: `--max-span-attributes` (1024),
+    `--max-attribute-key-bytes` (256), `--max-span-events` (1024),
+    `--max-span-bytes` (4 MiB, measured as stored, after payload offload) and
+    `--max-batch-spans` (100,000). A violating batch is refused whole with
+    `400` naming the cap and the span, before anything — a payload file
+    included — is written. `0` disables each.
+  - **Gzip request bodies**: `Content-Encoding: gzip` (or `x-gzip`) on
+    `POST /v1/spans` and `POST /v1/traces`, what an OTLP exporter sends with
+    compression on. The inflate is the crate's own, so this adds no
+    dependency; every member's CRC-32 and length are checked, and the
+    decompressed size is held to the 64 MiB body cap (`413` past it). Any
+    other coding, or gzip on another route, is `415`.
+  - **`GET /healthz`** (`{"status":"ok","version":"0.27.0"}`) and
+    **`GET /readyz`**, answered before the auth gate and left out of the
+    request metrics; **`GET /v1/whoami`** tells any caller what its own
+    credential is.
+  - **Operator hardening**: in open mode, admin operations refuse cross-site
+    browser requests (see Changed); a request admitted in open mode whose
+    body arrives after the first credential was minted is authenticated again
+    and answered `401`; of two bootstraps racing, exactly one creates a
+    credential; a failed append to the credential or fuse log is truncated
+    back out instead of being left for the next record to merge with; and a
+    non-loopback bind counts a runtime credential already in the data
+    directory as configured authentication.
+
+- **MCP: four read tools over runs.** `check_run_guard` (not listed under
+  `--no-fuses`), `get_run_tape`, `compare_runs` and `recall_runs`, with stored
+  text kept inside the untrusted-telemetry block as everywhere on that
+  surface. There is deliberately no replay tool: letting the model under test
+  create one would let stored telemetry choose which recording its next run
+  is fed. Sixteen tools in all: fourteen reads and the two gated writers. See
+  [the MCP guide](docs/guide/mcp.md#the-tools).
+
+- **Dashboard: five screens, and a tenant-aware page.**
+  [docs/guide/trace-browser.md](docs/guide/trace-browser.md).
+  - **Guard** (runs by verdict, usage against limits, reasons and evidence,
+    the kill switch, reset with a grant, policies and the global default),
+    **Run** (the tape with request and response previews and payload loading,
+    a replay with both SDKs' environment lines, compare-with), **Diff**
+    (aligned steps, the first divergence explained, totals and delta),
+    **Ledger** (head, verification, entries, anchors, and an evidence pack
+    saved as the server's exact bytes) and **Credentials** (mint with the
+    token shown once, list, revoke). Sessions and traces link to their run.
+  - The page asks `GET /v1/whoami` before anything that depends on it. A
+    tenant-bound credential never calls an operator surface — the API client
+    refuses those paths in the browser — reads its pulse and counts from its
+    own `GET /v1/usage` row, and is not offered Server, Store or Credentials.
+    After a `401` every poll stands down until a token is set, and a `403`
+    names the grant the server said was missing.
+  - A token can be handed over in the URL fragment (`#token=…`, or a route's
+    `token=` parameter), taken before the first render and on fragment
+    navigation, and removed from history with `history.replaceState`.
+  - `<meta name="traza-api-base">` in the built `index.html` prefixes every
+    request, stream, MCP call and copyable snippet, for a proxy that mounts
+    the store under a path; see
+    [deployment](docs/operations/deployment.md#serving-the-dashboard).
+
+- **Client libraries** in [`sdk/`](sdk/): `traza` for Python 3.9+ (standard
+  library only, typed dataclasses with `py.typed`, clean under
+  `mypy --strict`) and `@trazadb/sdk` for TypeScript (Node 20+, Deno, Bun,
+  edge runtimes and same-origin pages; no runtime dependencies; a lossless
+  JSON reader, so every `*_ns` arrives as a `bigint`). Both cover `whoami`
+  and `usage`; the fuse check and a `guard` that raises `FuseTripped` before
+  a stopped step starts; the other fuse routes and the event feed; tapes;
+  replays with absolute base URLs and an `env()` for the provider SDKs; diff;
+  recall; the ledger head; and evidence packs with digest verification —
+  plus the OTLP exporter environment. They are not instrumentation, they
+  refuse redirects rather than carry a token wherever a `3xx` points, and
+  they install from this repository; neither is published to a package
+  registry. Both carry the engine's version, and
+  `scripts/check-sdk-metadata.py` fails the gate on a mismatch. See
+  [docs/guide/clients.md](docs/guide/clients.md).
+
+- **Three demos: `guard`, `replay` and `prove`**, nine in the
+  [tour](examples/README.md) now. `guard` stops a looping agent between
+  steps, refuses its next step at the gate, trips a healthy run, approves
+  more budget with a grant and runs the Claude Code hook; `replay` records a
+  run, replays it through OpenAI-wire agent code with the stand-in model
+  switched off, has a changed prompt refused at step 0, and diffs it;
+  `prove` recomputes every ledger head with `hashlib`, records an anchor,
+  ledgers an erasure by digest, and has `verify --ledger` name one flipped
+  byte and exit `2`. Each runs in seconds and asserts its own claims.
+  `ci.sh` runs all nine from a checkout path containing a space, and points
+  the three new ones at the binary it just built rather than one inherited
+  from the caller's shell.
+
+### Changed
+
+- **`/v1/backups/*` needs an unbound `admin` credential.** A pin holds every
+  byte of its generation on disk until it is released, so taking one is a
+  capacity decision rather than a write. An `rw` token now gets
+  `403 {"error":"forbidden","required":"admin"}`, a bound one
+  `"required":"unbound"`. The pin still carries no `credentials.jsonl`,
+  `limits.json` or `usage.json`, and a restore leaves them as they are.
+- **Everything under `/v1/admin/` is unbound-admin only, by prefix.** The
+  gate refuses a bound or non-admin credential there before any route is
+  consulted, including paths that do not exist yet, so a route added under
+  the prefix later is denied before anyone remembers to list it. The new
+  `GET /v1/ledger`, `GET /v1/ledger/verify` and `POST /v1/ledger/anchors`
+  join the store-global operator surfaces a bound credential is refused.
+- **Every `403` from the auth gate carries `"required"`** — `"rw"`,
+  `"admin"` or `"unbound"`, the capability the credential lacked:
+  `{"error":"forbidden","required":"rw"}` where the body used to be
+  `{"error":"forbidden"}`, and the foreign-tenant refusal gains
+  `"required":"unbound"`. The `error` strings are unchanged. A `401` now also
+  covers expired and revoked tokens, with the same body as an unknown one.
+- **In open mode, admin operations refuse cross-site browser requests.**
+  With no credential configured, `POST /v1/erasures`, eval version
+  tombstones, `/v1/backups/*`, `POST /v1/ledger/anchors` and every path under
+  `/v1/admin/` answer a request whose `Origin` is not a loopback page with
+  `403 {"error":"origin not allowed: …","next":"…"}`; without that, any page
+  the operator visited could mint itself an admin credential with a plain
+  cross-site `POST`. Requests with no `Origin` (`curl`, scripts) and pages
+  served from loopback — the dashboard on its default bind — are unaffected,
+  and once a credential exists the rule no longer applies. A dashboard served
+  to a browser under another hostname cannot mint credentials on an open
+  store; configure one first.
+- **A `POST` with a body under `/v1/admin/` must declare
+  `Content-Type: application/json`**, or it is `415`. An HTML form cannot send
+  that type, and a cross-site script cannot without a CORS preflight this
+  server never approves.
+- **Admission caps are on by default**, for embedders too (`Config` defaults
+  to `Some` for each). A span with more than 1,024 attributes or events, a
+  key over 256 bytes, a stored size over 4 MiB, or a batch of more than
+  100,000 spans — all accepted before — is refused with `400`, and nothing
+  from its batch is stored.
+- **Run fuses are on by default.** Every acknowledged batch feeds the
+  observer, which follows runs from their first step and holds no state for
+  ordinary tracing traffic. The default global policy only warns (12
+  repeats), so no run is stopped unless someone configures a stop; ingest
+  responses can now carry a `fuses` field and a `Traza-Fuse` header.
+  `--no-fuses` (for an embedder, `config.fuses.enabled = false`) restores
+  ingest that does no fuse work.
+- **The retention pass runs every minute whether or not a flag configured a
+  window**, returning at once when none applies, so a runtime `ttl_seconds`
+  takes effect without a restart.
+- **The data-directory lock reclaims a lock left by an earlier process with
+  the opener's PID.** A lock naming the opening process's own PID is now
+  stale unless this process already holds the directory (a process-wide
+  registry of canonical paths decides, so a second open within one process
+  is still refused under any spelling of the path). On Linux, liveness is
+  read from `/proc/<pid>`, so it works in the `FROM scratch` release image,
+  which has no `kill`; elsewhere `kill -0`; an owner neither can check is
+  still treated as live. **This changes what two containers sharing one
+  volume do**: each is PID 1 in its own namespace, and where the second used
+  to refuse the first's lock — it named PID 1, its own PID, which read as
+  live — it now reclaims it, and both write one directory. Stop the old
+  container before the new one starts (in Kubernetes, `strategy: Recreate`,
+  not a rolling update). See
+  [deployment § One writer per data directory](docs/operations/deployment.md#one-writer-per-data-directory).
+- **Library surface.** `Admission` is no longer `Copy` and gains
+  `signals: Vec<guard::Signal>`, one per run in the batch whose verdict is
+  not `continue`. `Config` gains `max_span_attributes`,
+  `max_attribute_key_bytes`, `max_span_events`, `max_span_bytes`,
+  `max_batch_spans` (each `Option<usize>`) and `fuses: guard::FuseConfig`; a
+  `Config` built by struct literal must add them, `..Config::default()` need
+  not. `Error` gains `QuotaExceeded(usage::QuotaRefusal)` and
+  `Unauthenticated`, so an exhaustive `match` needs two more arms. New public
+  modules: `caps`, `credentials`, `diff`, `guard`, `gzip`, `ledger`,
+  `limits`, `platform`, `recall`, `replay`, `run`, `tape`, `usage`.
+- **The MCP surface grows from twelve tools to sixteen.** An `ro` token is
+  now offered fourteen read tools where it was offered ten; the two writers
+  are still listed only to an `rw` token on a server started with their
+  flag.
+- **The non-loopback refusal** names the new way out:
+  `configure TRAZA_TOKENS, create a runtime credential (POST /v1/admin/credentials on a loopback start), or pass --allow-unauthenticated-non-loopback explicitly`.
+  Running open on a network is now documented for what it is: the first
+  client to mint a credential owns the store, persistently.
+- **Ingest serializes every span once more before admitting it**, to
+  enforce the admission caps and to charge usage bytes, on the request's own
+  thread and outside every engine lock. The published ingest throughput
+  records predate this pass and have not been re-run; an interleaved
+  before/after run on a heavily loaded host could not separate its cost from
+  run-to-run noise, which is not the same as showing it costs nothing. See
+  [capacity](docs/operations/capacity.md). No performance figure in this
+  release is new.
+- Version metadata: the crate, the UI and both client libraries move to
+  0.27.0. The MSRV stays 1.81, and a default build still has three direct
+  dependencies.
+
+### Fixed
+
+- **A restarted container opens its store again.** The release image runs
+  the server as PID 1, which ignores the SIGTERM of `docker stop` and
+  `docker restart`, so SIGKILL left the lock behind naming PID 1 — the PID
+  the restarted server had again, which read as a live owner — and the store
+  refused to open on every start until the lock was removed by hand. Stale
+  locks of other PIDs were not reclaimed in that image either, because
+  liveness shelled out to a `kill` binary the `FROM scratch` image does not
+  have. Both are covered by the lock change above.
+- **Requests answered before the auth gate are consumed before they are
+  answered.** The dashboard shell and assets, the missing-build `404` and
+  the new probes never drained their request from the connection's buffer,
+  so on a kept-alive connection the same request was parsed and answered
+  again and again, up to the 100,000-requests-per-connection limit, and the
+  client's next request on that connection read a stale copy of the last
+  answer. A `HEAD` response also carried its body, which a client reads as
+  the start of the next response; it now sends the head only.
+- **Dashboard.** The theme follows the operating system's light or dark
+  preference until the toggle is used: the pre-paint script compared the
+  stored `"dark"` with `dark` and never matched, and the first visit stored
+  `light`, overruling the preference for good. Dialogs close on Escape, keep
+  `Tab` inside and return focus to what opened them; the rail and header
+  controls are real buttons; the time ruler fits its ticks to its width, so
+  labels no longer overprint; the hardcoded "1 node" is gone. Below 900px
+  the rail becomes a drawer, and below 700px grids reflow and wide tables
+  scroll inside their cards rather than widening the page.
+- **`tests/object_storage_transfer.rs` gives each test its own source
+  directory.** The name was the process id and the clock, which ticks in
+  microseconds on macOS, so two parallel tests could open the same directory
+  and one failed `AlreadyOpen` — 4 runs in 40, enough to break the
+  object-storage leg of `ci.sh`.
+- **Links to storage-comparison's removed projection section** in
+  `docs/segment-format.md` and `docs/internals/dependencies.md` point at
+  [where the savings come from](docs/storage-comparison.md#where-the-savings-come-from),
+  and the sentences around them say the projection lived on that page
+  before `94e7f86` rather than that it still does.
+
+### Upgrade
+
+- **No migration.** Segments, the write-ahead log and generation manifests
+  are written exactly as 0.26.0-preview.1 wrote them, so its data directory
+  opens as it is. New files appear beside them as they are first needed:
+  `ledger.jsonl` (at the first open, with a genesis entry and the live
+  generation's checkpoint), `fuses.jsonl`, `credentials.jsonl`,
+  `limits.json` and `usage.json`. All of them live outside generations; a
+  pin carries only the ledger's copy.
+- **Move backup jobs to an unbound `admin` token**, and anything that calls
+  `/v1/admin/*` with a bound or non-admin one. A client that compares a
+  `403` body exactly must accept the `required` key.
+- **Check producers against the admission caps.** A batch that used to land
+  and now gets `400` names the cap and the span; raise that cap, or set it to
+  `0` to disable it.
+- **Embedders** must add the new `Config` fields to struct literals, two
+  arms to exhaustive `Error` matches, and stop relying on `Admission` being
+  `Copy`.
+- **Containers**: a `docker restart` no longer needs the lock removed by
+  hand, but two containers must not mount one data volume at the same time —
+  nothing refuses the second any more.
+- **Rolling back to 0.26.0-preview.1** reads the same data, but that binary
+  knows nothing of the new files. It ignores `credentials.jsonl`, so a store
+  closed only by runtime credentials serves open again on loopback (and
+  refuses a non-loopback bind); keep `TRAZA_TOKENS` set if you may roll back.
+  Fuse policies, tenant limits and quotas likewise stop applying until 0.27.0
+  runs again.
+
 ## [0.26.0-preview.1] - 2026-09-06
 
 Preview: an object-storage snapshot archive behind the new, default-off
