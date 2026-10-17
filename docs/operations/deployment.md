@@ -160,6 +160,15 @@ build output carrying no data — while every `/v1` call it makes stays gated.
 Path traversal outside the build root is refused against the canonicalized
 root.
 
+**Behind a path prefix.** A proxy that mounts the store under a path
+(`https://host/x/org/project/` forwarding to the server's `/`) must also tell
+the page, or its `/v1/...` requests reach the proxy's own root. The built
+`index.html` carries `<meta name="traza-api-base" content="">`; set its
+`content` to the prefix (`/x/org/project`), by rewriting the tag as the proxy
+serves the page or by editing the built file, and every request the dashboard
+makes, and every snippet it offers, uses it. See
+[the trace browser](../guide/trace-browser.md#behind-a-path-prefix).
+
 ## Running as a service
 
 Traza needs no special privileges. Run it as an unprivileged user that owns the
