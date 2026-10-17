@@ -10,7 +10,7 @@
 
 import React from 'react';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, act, cleanup, screen } from '@testing-library/react';
+import { render, act, cleanup, fireEvent, screen, within } from '@testing-library/react';
 import { App } from './App.jsx';
 import { getToken, setToken } from './lib/api.js';
 import { setIdentity } from './lib/session.js';
@@ -225,5 +225,218 @@ describe('a whoami that fails for a reason other than 401', () => {
     // 0 s, then 2, 5 and 15 s apart: four asks in the first 30 seconds.
     expect(server.calls()).toBe(4);
     expect(nav()).not.toContain('Server');
+  });
+});
+
+describe('a credential change', () => {
+  // A gated server that answers by bearer token, and holds any request a test
+  // asks it to until released. What the page sends while an answer is still
+  // outstanding is the point: nothing may be sent with a new token on the
+  // strength of the old token's identity, and nothing the old token was
+  // answered may land after the change.
+  const OPERATOR = { auth: 'token', credential: { id: 'cr_ops', label: 'ops' }, operator: true, scope: 'admin', tenant: null };
+  const OPERATOR_B = { ...OPERATOR, credential: { id: 'cr_ops_b', label: 'ops b' } };
+  const GLOBEX = { auth: 'token', credential: { id: 'cr_globex', label: 'globex' }, operator: false, scope: 'ro', tenant: 'globex' };
+  const usageOf = (tenant, spans) => ({
+    as_of_ns: 1, tenants: [{ tenant, lifetime: { batches: 1, bytes: 1, rejected: 0, spans }, limits: {}, month: {}, state: 'ok' }],
+  });
+
+  function serveTokens(byToken) {
+    const calls = [];
+    const held = [];
+    const server = {
+      calls,
+      byToken,
+      /** `(call) => boolean`: which requests to hold. */
+      hold: () => false,
+      /** `(call) => Response | undefined`: a test's own route, asked first. */
+      route: () => undefined,
+      release(match = () => true) {
+        for (let i = 0; i < held.length;) {
+          if (match(held[i].call)) held.splice(i, 1)[0].answer();
+          else i += 1;
+        }
+      },
+      /** The paths of the calls made with `token`, in order. */
+      sentWith: (token) => calls.filter((c) => c.auth === 'Bearer ' + token).map((c) => c.path),
+    };
+    globalThis.fetch = vi.fn((url, init = {}) => {
+      const path = String(url).split('?')[0];
+      const call = { path, auth: (init.headers && init.headers.Authorization) || '', method: init.method || 'GET' };
+      calls.push(call);
+      // Answered when released, from the server's state then: a held reply
+      // carries whatever the credential's figures had become by that time.
+      const reply = () => {
+        const own = server.route(call);
+        if (own) return own;
+        const who = byToken[call.auth];
+        if (!who) return json(401, { error: 'unauthorized' });
+        if (path === '/v1/whoami') return json(200, who.whoami);
+        if (!who.whoami.operator && isOperatorPath(path)) return json(403, { error: 'forbidden', required: 'unbound' });
+        if (who[path]) return json(200, who[path]);
+        if (path === '/v1/usage') return json(200, usageBound);
+        if (path === '/v1/admin/credentials') return json(200, { credentials: [] });
+        return json(200, EMPTY[path] || {});
+      };
+      if (server.hold(call)) return new Promise((resolve) => held.push({ call, answer: () => resolve(reply()) }));
+      return Promise.resolve(reply());
+    });
+    return server;
+  }
+
+  async function navigateTo(hash) {
+    await act(async () => {
+      window.location.hash = hash;
+      window.dispatchEvent(new HashChangeEvent('hashchange'));
+    });
+    await settle(10);
+  }
+
+  const header = () => document.querySelector('header').textContent;
+
+  it('never sends a handed-off tenant token an operator surface, before or after its whoami', async () => {
+    // The reproduction: an operator on the dashboard follows a handoff link
+    // to an operator screen with a tenant-bound token.
+    const server = serveTokens({
+      'Bearer op-token': { whoami: OPERATOR },
+      'Bearer tenant-token': { whoami: whoamiBound },
+    });
+    setToken('op-token');
+    render(<App />);
+    await settle(0);
+    await settle(6000);
+    expect(server.sentWith('op-token')).toContain('/v1/metrics.json');
+
+    server.hold = (c) => c.path === '/v1/whoami' && c.auth === 'Bearer tenant-token';
+    await navigateTo('#/credentials?token=tenant-token');
+    await settle(6000);
+    expect(server.sentWith('tenant-token')[0]).toBe('/v1/whoami');
+    expect(server.sentWith('tenant-token').filter(isOperatorPath)).toEqual([]);
+
+    server.release();
+    await settle(6000);
+    expect(server.sentWith('tenant-token').filter(isOperatorPath)).toEqual([]);
+    expect(server.sentWith('tenant-token')).toContain('/v1/usage');
+    expect(document.querySelector('main').textContent).toMatch(/open to unbound credentials only/);
+    expect(screen.getByTestId('rail-scope').textContent).toContain('tenant acme');
+  });
+
+  it('asks who a new operator token is before sending it any operator surface', async () => {
+    // Operator to operator through the prompt: the old identity said
+    // "operator", but it said it about another credential.
+    const server = serveTokens({
+      'Bearer op-token': { whoami: OPERATOR },
+      'Bearer op-b': { whoami: OPERATOR_B },
+    });
+    setToken('op-token');
+    render(<App />);
+    await settle(0);
+    await settle(6000);
+
+    server.hold = (c) => c.path === '/v1/whoami' && c.auth === 'Bearer op-b';
+    fireEvent.click(screen.getByText('Set token', { selector: 'header button' }));
+    const dialog = screen.getByRole('dialog', { name: 'Set token' });
+    fireEvent.change(within(dialog).getByPlaceholderText('token'), { target: { value: 'op-b' } });
+    await act(async () => { fireEvent.click(within(dialog).getByText('Set token', { selector: 'button' })); });
+    await settle(6000);
+    // Tenant-scoped reads may go ahead, as they do on first load; an
+    // operator surface waits for the server to say this token is one.
+    expect(server.sentWith('op-b')).toContain('/v1/whoami');
+    expect(server.sentWith('op-b').filter(isOperatorPath)).toEqual([]);
+
+    server.release();
+    await settle(6000);
+    expect(server.sentWith('op-b')).toEqual(expect.arrayContaining(['/v1/metrics.json', '/v1/stats']));
+  });
+
+  it('drops an operator ingest sample that answers after the switch to a tenant', async () => {
+    const server = serveTokens({
+      'Bearer op-token': { whoami: OPERATOR },
+      'Bearer tenant-token': { whoami: whoamiBound },
+    });
+    setToken('op-token');
+    render(<App />);
+    await settle(0);
+    expect(header()).toContain('32 records');
+
+    // The next operator sample is in flight when the token changes.
+    server.hold = (c) => c.auth === 'Bearer op-token' && (c.path === '/v1/metrics.json' || c.path === '/v1/stats');
+    await settle(5000);
+    await navigateTo('#/overview?token=tenant-token');
+    await settle(10);
+    expect(header()).toContain('8 spans sent');
+
+    server.byToken['Bearer op-token']['/v1/stats'] = { record_count: 999, durability: 'wal' };
+    server.release();
+    await settle(10);
+    expect(header()).toContain('8 spans sent');
+    expect(header()).not.toContain('999');
+    expect(screen.getByTestId('rail-scope').textContent).toContain('tenant acme');
+  });
+
+  it("drops one tenant's ingest sample that answers after the switch to another tenant", async () => {
+    const server = serveTokens({
+      'Bearer tenant-token': { whoami: whoamiBound, '/v1/usage': usageOf('acme', 8) },
+      'Bearer globex-token': { whoami: GLOBEX, '/v1/usage': usageOf('globex', 5) },
+    });
+    setToken('tenant-token');
+    render(<App />);
+    await settle(0);
+    expect(header()).toContain('8 spans sent');
+
+    server.hold = (c) => c.auth === 'Bearer tenant-token' && c.path === '/v1/usage';
+    await settle(5000);
+    await navigateTo('#/overview?token=globex-token');
+    await settle(10);
+    expect(header()).toContain('5 spans sent');
+    expect(screen.getByTestId('rail-scope').textContent).toContain('tenant globex');
+
+    server.byToken['Bearer tenant-token']['/v1/usage'] = usageOf('acme', 999);
+    server.release();
+    await settle(10);
+    expect(header()).toContain('5 spans sent');
+    expect(header()).not.toContain('999');
+    expect(screen.getByTestId('rail-scope').textContent).toContain('tenant globex');
+  });
+
+  it('adopts the first token minted on an open store, and asks who it is before reading the list with it', async () => {
+    const server = serveTokens({ '': { whoami: whoamiOpen } });
+    const minted = {
+      id: 'cr_first', token: 'trz_first', prefix: 'trz_firs', scope: 'admin', tenant: null,
+      label: null, source: 'api', created_at_ns: 1, expires_at_ns: null,
+    };
+    server.route = (c) => {
+      if (c.path !== '/v1/admin/credentials' || c.method !== 'POST') return undefined;
+      // Minting closes the store: from here on only the new token works.
+      delete server.byToken[''];
+      server.byToken['Bearer trz_first'] = { whoami: OPERATOR };
+      return json(200, minted);
+    };
+    window.location.hash = '#/credentials';
+    render(<App />);
+    await settle(0);
+    await settle(10);
+
+    server.hold = (c) => c.path === '/v1/whoami' && c.auth === 'Bearer trz_first';
+    await act(async () => { fireEvent.click(screen.getByText('Mint')); });
+    await settle(6000);
+    expect(getToken()).toBe('trz_first');
+    expect(screen.getByTestId('minted-token').textContent).toContain('trz_first');
+    expect(server.sentWith('trz_first')[0]).toBe('/v1/whoami');
+    expect(server.sentWith('trz_first').filter(isOperatorPath)).toEqual([]);
+    expect(screen.queryByRole('dialog', { name: 'Set token' })).toBeNull();
+
+    server.release();
+    await settle(10);
+    expect(server.sentWith('trz_first')).toContain('/v1/admin/credentials');
+    // The one-time display survives the switch, and closing it is all Done
+    // does: the token was adopted, and asked about, when it was minted.
+    expect(screen.getByTestId('minted-token').textContent).toContain('trz_first');
+    const asked = server.sentWith('trz_first').filter((p) => p === '/v1/whoami').length;
+    fireEvent.click(screen.getByText('Done'));
+    await settle(10);
+    expect(screen.queryByTestId('minted-token')).toBeNull();
+    expect(server.sentWith('trz_first').filter((p) => p === '/v1/whoami').length).toBe(asked);
+    expect(getToken()).toBe('trz_first');
   });
 });

@@ -1,6 +1,6 @@
 import React from 'react';
 import { api, getToken, setToken, onUnauthorized } from './lib/api.js';
-import { setIdentity } from './lib/session.js';
+import { credentialGeneration, onCredentialChange, setIdentity } from './lib/session.js';
 import { useHashRoute, navigate, useKeys, usePoll, useStored, useSystemTheme } from './lib/route.js';
 import { NavRail, Header, SCREENS, OPERATOR_SCREENS, navFor } from './components/nav/Shell.jsx';
 import { CommandPalette } from './components/nav/CommandPalette.jsx';
@@ -31,7 +31,7 @@ import { GuardScreen } from './views/GuardScreen.jsx';
 import { RunScreen } from './views/RunScreen.jsx';
 import { DiffScreen } from './views/DiffScreen.jsx';
 import { LedgerScreen } from './views/LedgerScreen.jsx';
-import { CredentialsScreen } from './views/CredentialsScreen.jsx';
+import { CredentialsScreen, TokenOnce } from './views/CredentialsScreen.jsx';
 
 /** How many samples the rail's ingest sparkline keeps. At a 5s poll this is
     about two minutes of history — long enough to show a shape, short enough
@@ -43,8 +43,8 @@ const PULSE_SAMPLES = 28;
     limit), then at a pace that costs nothing. The last delay repeats. */
 const WHOAMI_RETRY_MS = [2000, 5000, 15000];
 
-/** Asks the server what the current credential is, once per token — and
-    again, with backoff, until it gets an answer.
+/** Asks the server what the current credential is, once per credential
+    generation — and again, with backoff, until it gets an answer.
 
     Everything tenant-aware hangs off this answer: which screens are offered,
     which surfaces are polled, what the rail says you are looking at. Until it
@@ -53,50 +53,60 @@ const WHOAMI_RETRY_MS = [2000, 5000, 15000];
     found out". The answer is also handed to the API client, which refuses
     operator paths for a non-operator itself.
 
+    Each answer is kept with the generation it was asked under, and only an
+    answer about the current generation is returned. Clearing the old one in
+    an effect left a render in between: screens mounted for the new token saw
+    the old token's "operator" and asked operator surfaces with the new one.
+    Tagged, the render that first sees a new generation already sees `null`.
+
     A failure that is not a 401 (the server restarting, a 503 at the
     connection limit, a dropped connection) says nothing about the
     credential. It is read as "not an operator" for as long as it lasts, but
     only that long: asking once and keeping the failure would leave an
     operator without its screens, polling the tenant surfaces, until somebody
     happened to change the token. */
-function useIdentity(authVersion) {
-  const [identity, setState] = React.useState(null);
+function useIdentity(generation) {
+  const [answer, setAnswer] = React.useState(null);
   React.useEffect(() => {
     let live = true;
     let timer = null;
     let failures = 0;
-    setState(null);
-    setIdentity(null);
-    const ask = () => api.whoami().then(
-      (who) => {
-        if (!live) return;
-        setIdentity(who);
-        setState(who);
-      },
-      (error) => {
-        if (!live) return;
-        if (error && error.status === 401) {
-          setState({ unauthorized: true });
-          return;
-        }
-        // Unknown is treated as "not an operator": the safe reading of a
-        // credential nobody has described is the one that never touches a
-        // store-global surface. Set once, so a retry that fails again does
-        // not hand every screen a new identity to re-render for.
-        if (failures === 0) {
-          const unknown = { auth: 'unknown', operator: false, scope: null, tenant: null, error };
-          setIdentity(unknown);
-          setState(unknown);
-        }
-        timer = setTimeout(ask, WHOAMI_RETRY_MS[Math.min(failures, WHOAMI_RETRY_MS.length - 1)]);
-        failures += 1;
-      },
-    );
+    const ask = () => {
+      // Read with the request, not taken from the render: the token whoami
+      // carries is the one current when it is sent, and the answer is about
+      // that token's generation.
+      const asked = credentialGeneration();
+      api.whoami().then(
+        (who) => {
+          if (!live || !setIdentity(who, asked)) return;
+          setAnswer({ generation: asked, identity: who });
+        },
+        (error) => {
+          if (!live) return;
+          if (error && error.status === 401) {
+            setAnswer({ generation: asked, identity: { unauthorized: true } });
+            return;
+          }
+          // Unknown is treated as "not an operator": the safe reading of a
+          // credential nobody has described is the one that never touches a
+          // store-global surface. Set once, so a retry that fails again does
+          // not hand every screen a new identity to re-render for.
+          if (failures === 0) {
+            const unknown = { auth: 'unknown', operator: false, scope: null, tenant: null, error };
+            if (setIdentity(unknown, asked)) setAnswer({ generation: asked, identity: unknown });
+          }
+          timer = setTimeout(ask, WHOAMI_RETRY_MS[Math.min(failures, WHOAMI_RETRY_MS.length - 1)]);
+          failures += 1;
+        },
+      );
+    };
     ask();
     return () => { live = false; clearTimeout(timer); };
-  }, [authVersion]);
-  return identity;
+  }, [generation]);
+  return answer && answer.generation === generation ? answer.identity : null;
 }
+
+const NO_PULSE = { rate: null, spark: [], live: false, durability: null, count: null };
 
 /** Watches ingest by differencing a counter.
 
@@ -107,60 +117,80 @@ function useIdentity(authVersion) {
     durability mode). A tenant-bound credential may not read either — they
     disclose co-tenants' volume — so it differences its own row of
     `/v1/usage` (spans its tenant has sent), which is also what its header
-    count shows. One small read every five seconds either way. */
-function useIngestPulse(identity, authVersion) {
-  const [pulse, setPulse] = React.useState({ rate: null, spark: [], live: false, durability: null, count: null });
-  const previous = React.useRef(null);
-  const mode = !identity || identity.unauthorized ? null : identity.operator ? 'operator' : 'tenant';
+    count shows. One small read every five seconds either way.
 
-  const sample = React.useCallback(async () => {
-    if (!mode) return;
-    try {
-      let admitted;
-      let count;
-      let durability = null;
-      if (mode === 'operator') {
-        const [metrics, stats] = await Promise.all([api.metrics(), api.stats()]);
-        admitted = metrics?.ingest?.spans_admitted ?? 0;
-        durability = stats.durability;
-        count = { value: stats.record_count, label: 'records', title: 'Records held by the store (GET /v1/stats)' };
-      } else {
-        const usage = await api.usage();
-        const rows = usage?.tenants || [];
-        const row = rows.find((r) => r.tenant === (identity.tenant || '')) || rows[0];
-        admitted = row?.lifetime?.spans ?? 0;
-        count = {
-          value: admitted, label: 'spans sent',
-          title: 'Spans this tenant has sent since its counters began (GET /v1/usage)',
-        };
-      }
-      const now = performance.now();
-      const last = previous.current;
-      previous.current = { admitted, at: now };
-      if (!last) {
-        setPulse((p) => ({ ...p, durability, count }));
-        return;
-      }
-      const seconds = Math.max(0.001, (now - last.at) / 1000);
-      const rate = Math.max(0, (admitted - last.admitted) / seconds);
-      setPulse((p) => ({
-        rate,
-        live: rate > 0,
-        durability,
-        count,
-        spark: [...p.spark, rate].slice(-PULSE_SAMPLES),
-      }));
-    } catch (e) { /* the rail goes quiet; screens surface their own errors */ }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mode, identity?.tenant]);
+    Every sample belongs to an epoch: one credential generation, read in one
+    mode, for one tenant. Resetting the figures on a change was not enough,
+    because a sample already in flight still landed afterwards — the header
+    of a tenant showing the operator's record count, or another tenant's
+    spans. A change now aborts the old epoch's reads, a sample that answers
+    anyway is dropped, and the figures carry their epoch, so a render under a
+    new one never shows the old one's. */
+function useIngestPulse(identity, generation) {
+  const mode = !identity || identity.unauthorized ? null : identity.operator ? 'operator' : 'tenant';
+  const tenant = (identity && identity.tenant) || '';
+  const epoch = `${generation}\u0000${mode}\u0000${tenant}`;
+  const [pulse, setPulse] = React.useState(() => ({ epoch, ...NO_PULSE }));
+  const sampler = React.useRef(null);
 
   React.useEffect(() => {
-    previous.current = null;
-    setPulse({ rate: null, spark: [], live: false, durability: null, count: null });
+    if (!mode) return undefined;
+    const controller = new AbortController();
+    const { signal } = controller;
+    // The previous reading, kept per epoch: a rate differenced across two
+    // credentials' counters would be a number about nobody.
+    let previous = null;
+    const sample = async () => {
+      try {
+        let admitted;
+        let count;
+        let durability = null;
+        if (mode === 'operator') {
+          const [metrics, stats] = await Promise.all([api.metrics(signal), api.stats(signal)]);
+          admitted = metrics?.ingest?.spans_admitted ?? 0;
+          durability = stats.durability;
+          count = { value: stats.record_count, label: 'records', title: 'Records held by the store (GET /v1/stats)' };
+        } else {
+          const usage = await api.usage(undefined, signal);
+          const rows = usage?.tenants || [];
+          const row = rows.find((r) => r.tenant === tenant) || rows[0];
+          admitted = row?.lifetime?.spans ?? 0;
+          count = {
+            value: admitted, label: 'spans sent',
+            title: 'Spans this tenant has sent since its counters began (GET /v1/usage)',
+          };
+        }
+        // An answer can win the race with the abort; it is still the old
+        // epoch's answer.
+        if (signal.aborted) return;
+        const now = performance.now();
+        const last = previous;
+        previous = { admitted, at: now };
+        if (!last) {
+          setPulse({ epoch, ...NO_PULSE, durability, count });
+          return;
+        }
+        const seconds = Math.max(0.001, (now - last.at) / 1000);
+        const rate = Math.max(0, (admitted - last.admitted) / seconds);
+        setPulse((p) => ({
+          epoch,
+          rate,
+          live: rate > 0,
+          durability,
+          count,
+          spark: [...(p.epoch === epoch ? p.spark : []), rate].slice(-PULSE_SAMPLES),
+        }));
+      } catch (e) { /* the rail goes quiet; screens surface their own errors */ }
+    };
+    sampler.current = sample;
     sample();
-  }, [sample, authVersion]);
-  usePoll(sample, 5000, Boolean(mode));
-  return pulse;
+    return () => {
+      controller.abort();
+      if (sampler.current === sample) sampler.current = null;
+    };
+  }, [epoch, mode, tenant]);
+  usePoll(() => { if (sampler.current) sampler.current(); }, 5000, Boolean(mode));
+  return pulse.epoch === epoch ? pulse : NO_PULSE;
 }
 
 export function App() {
@@ -170,7 +200,16 @@ export function App() {
   const [toasts, setToasts] = React.useState([]);
   const [tokenModal, setTokenModal] = React.useState(false);
   const [tokenDraft, setTokenDraft] = React.useState('');
-  const [authVersion, setAuthVersion] = React.useState(0);
+  // The credential generation, read from the store that setToken bumps rather
+  // than counted here: whoever changes the token — the prompt, a handoff
+  // link, the open-store bootstrap — this render follows it, and none of them
+  // has to remember to tell the app.
+  const generation = React.useSyncExternalStore(onCredentialChange, credentialGeneration);
+  // A credential just minted, shown once. Held here rather than by the
+  // Credentials screen: adopting the first token on an open store is a
+  // credential change, which remounts every screen, and the one-time display
+  // must survive it.
+  const [minted, setMinted] = React.useState(null);
   const [palette, setPalette] = React.useState(false);
   const [drawer, setDrawer] = React.useState(false);
   const [density, setDensity] = useStored('traza_density', 'comfortable');
@@ -210,22 +249,32 @@ export function App() {
     });
   }, []);
 
-  const identity = useIdentity(authVersion);
+  const identity = useIdentity(generation);
   const operator = Boolean(identity && identity.operator === true);
-  const pulse = useIngestPulse(identity, authVersion);
+  const pulse = useIngestPulse(identity, generation);
 
-  // After a new token is stored: close the prompt, re-arm it, and bump the
-  // version that re-asks whoami and remounts every screen under the token.
+  // After a new token is stored: close the prompt and re-arm it. Re-asking
+  // whoami and remounting every screen under the token follow from the
+  // generation, which setToken has already moved.
   function tokenChanged() {
     setTokenDraft('');
     setTokenModal(false);
     authFailed.current = false;
-    setAuthVersion((v) => v + 1);
   }
 
   const changeToken = (token) => {
     setToken(token);
     tokenChanged();
+  };
+
+  // On an open store the mint closed the store: every request from here on
+  // needs a token, and the only one that exists is the one just minted. It
+  // is adopted at once, or the next poll would answer 401 and open the prompt
+  // over the one-time display — and adopting it is a token change like any
+  // other: the screens wait for whoami before asking an operator surface.
+  const onMinted = (doc, { adopt = false } = {}) => {
+    setMinted(adopt ? { ...doc, adopted: true } : doc);
+    if (adopt) changeToken(doc.token);
   };
 
   const [head, second, third] = route.parts;
@@ -248,8 +297,10 @@ export function App() {
     if (event.key === 'Escape' && drawer) setDrawer(false);
   }, [go, drawer]);
 
-  const common = { pushToast, go, params: route.params, authVersion, identity };
-  const k = (name) => name + ':' + authVersion;
+  const common = { pushToast, go, params: route.params, identity };
+  // Every screen is remounted under a new credential: state built from one
+  // token's answers is not carried into another's.
+  const k = (name) => name + ':' + generation;
   let view;
   if (OPERATOR_SCREENS.has(screen) && !operator) {
     // Not offered in the rail, but a pasted link still lands here. Say why
@@ -287,7 +338,7 @@ export function App() {
       case 'server': view = <ServerScreen key={k('server')} {...common} />; break;
       case 'store': view = <StoreScreen key={k('store')} {...common} />; break;
       case 'ledger': view = <LedgerScreen key={k('ledger')} {...common} />; break;
-      case 'credentials': view = <CredentialsScreen key={k('credentials')} {...common} onUseToken={changeToken} />; break;
+      case 'credentials': view = <CredentialsScreen key={k('credentials')} {...common} onMinted={onMinted} />; break;
       case 'connect': view = <ConnectScreen key={k('connect')} {...common} />; break;
       case 'mcp': view = <McpScreen key={k('mcp')} {...common} />; break;
       default: view = <OverviewScreen key={k('overview')} {...common} />;
@@ -323,6 +374,9 @@ export function App() {
 
     <CommandPalette open={palette} onClose={() => setPalette(false)} nav={navFor(operator)}
       onNavigate={(parts) => go(parts)} />
+
+    <TokenOnce doc={minted} onClose={() => setMinted(null)}
+      onUse={(token) => { setMinted(null); changeToken(token); }} />
 
     <Modal open={tokenModal} title="Set token" onClose={() => setTokenModal(false)} footer={<>
       {getToken() ? <Button onClick={() => changeToken('')}>Clear token</Button> : null}

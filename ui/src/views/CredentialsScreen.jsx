@@ -1,5 +1,5 @@
 import React from 'react';
-import { api, setToken } from '../lib/api.js';
+import { api } from '../lib/api.js';
 import { useRead } from '../lib/route.js';
 import { fmtAgo, fmtTimeNs } from '../lib/format.js';
 import { Card, Chip, EmptyState, ErrorState, Mono, PanelHead, Skeleton } from '../components/primitives/Chrome.jsx';
@@ -29,9 +29,11 @@ export function credentialState(credential, nowNs = Date.now() * 1e6) {
 
 const STATE_TAG = { live: 'ok', revoked: 'error', expired: 'warn' };
 
-export function CredentialsScreen({ identity, pushToast, onUseToken }) {
+/** The screen. A minted credential goes to `onMinted(doc, {adopt})`, which
+    shows it once: the app holds that display, because adopting the first
+    token on an open store remounts this screen under the new credential. */
+export function CredentialsScreen({ identity, pushToast, onMinted }) {
   const list = useRead((signal) => api.credentials(signal), []);
-  const [minted, setMinted] = React.useState(null);
   const [revoking, setRevoking] = React.useState(null);
   const credentials = list.data?.credentials || [];
   const open = identity?.auth === 'open';
@@ -48,18 +50,12 @@ export function CredentialsScreen({ identity, pushToast, onUseToken }) {
     </Card> : null}
 
     <MintCard open={open} credentials={credentials} onMinted={(doc) => {
-      if (open) {
-        // The store closed with that request: every request from here on,
-        // this tab's polls included, needs a token, and the only one that
-        // exists is the one just minted. Using it at once keeps the next
-        // poll from answering 401 and covering the one-time display with a
-        // token prompt. The identity is refreshed when the dialog closes.
-        setToken(doc.token);
-        setMinted({ ...doc, adopted: true });
-      } else {
-        setMinted(doc);
-      }
-      list.reload();
+      // On an open store that request closed it, and the app adopts the new
+      // token: this screen is remounted under it and reads its list once
+      // whoami has confirmed an operator. Reloading here would ask an
+      // operator surface with a token nobody has described yet.
+      onMinted?.(doc, { adopt: open });
+      if (!open) list.reload();
     }} />
 
     <Card pad="0" style={{ overflow: 'hidden' }}>
@@ -80,9 +76,6 @@ export function CredentialsScreen({ identity, pushToast, onUseToken }) {
       </div>
     </Card>
 
-    <TokenOnce doc={minted}
-      onClose={() => { const adopted = minted?.adopted ? minted.token : null; setMinted(null); if (adopted) onUseToken?.(adopted); }}
-      onUse={(token) => { setMinted(null); onUseToken?.(token); }} />
     <RevokeModal credential={revoking} self={identity.credential?.id} onClose={() => setRevoking(null)}
       onRevoked={(credential) => {
         setRevoking(null);
@@ -188,7 +181,9 @@ function CredentialTable({ credentials, self, onRevoke }) {
   </div>;
 }
 
-function TokenOnce({ doc, onClose, onUse }) {
+/** A minted token, shown once. `doc.adopted` marks the first token on an
+    open store, which this tab switched to when it was minted. */
+export function TokenOnce({ doc, onClose, onUse }) {
   if (!doc) return null;
   return <Modal open title="Credential minted" width={600} onClose={onClose} footer={<>
     {doc.adopted ? null

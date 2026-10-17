@@ -54,9 +54,12 @@ export function RunScreen({ runId, go, params, identity, pushToast }) {
   const focus = focusStep != null && /^[0-9]+$/.test(focusStep) ? Number(focusStep) : null;
   const maxSteps = stepsToLoad(focus);
 
+  // Each tape is kept with the scope it was read in. While a new scope loads
+  // the old tape stays on screen, and the replay panel must describe the
+  // recording beside it, not the one the route has moved on to.
   const tape = useRead((signal) => api.tape(runId, {
     ...scope, resolve: resolve ? 'true' : undefined, max_steps: maxSteps,
-  }, signal), [runId, tenant, resolve, maxSteps]);
+  }, signal).then((body) => ({ body, runId, tenant })), [runId, tenant, resolve, maxSteps]);
   // The guard's verdict is context, not the point: a store started with
   // --no-fuses answers 409 here, and the tape stands on its own.
   const verdict = useRead((signal) => api.fuseRun(runId, scope, signal).catch(() => null), [runId, tenant],
@@ -82,8 +85,9 @@ export function RunScreen({ runId, go, params, identity, pushToast }) {
         : tape.error.next}
       onRetry={tape.reload} />;
   }
-  const data = tape.data;
-  if (!data) return null;
+  if (!tape.data) return null;
+  const shown = tape.data;
+  const data = shown.body;
   const totals = tapeTotals(data);
   const sessionLike = !runId.startsWith('trace:');
   const missing = focus != null && !data.steps.some((step) => step.index === focus);
@@ -141,7 +145,8 @@ export function RunScreen({ runId, go, params, identity, pushToast }) {
     <div className="tz-split" style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(320px, 420px)', gap: 14, alignItems: 'start' }}>
       <Tape steps={data.steps} totals={totals} go={go} focusStep={focusStep} />
       <div style={{ display: 'grid', gap: 14, minWidth: 0 }}>
-        <ReplayPanel runId={runId} tenant={tenant} tape={data} identity={identity} pushToast={pushToast} />
+        <ReplayPanel key={replayScopeKey(shown.runId, shown.tenant)} runId={shown.runId} tenant={shown.tenant}
+          tape={data} identity={identity} pushToast={pushToast} />
         <ComparePanel runId={runId} tenant={tenant} go={go} />
       </div>
     </div>
@@ -356,9 +361,21 @@ function PayloadValue({ reference }) {
   </div>;
 }
 
+/** Which recording a replay panel is about: a run read in one scope. An
+    absent tenant (every tenant's run of this id, the operator view) is a
+    different scope from `''` (the default tenant's), so they key apart. */
+function replayScopeKey(runId, tenant) {
+  return JSON.stringify([runId, tenant === undefined ? null : tenant]);
+}
+
 /** "Replay this run": snapshot the tape into a replay and hand over the two
     environment lines each SDK needs. Creating one is a read — it changes
-    nothing in the store — so any credential may, `ro` included. */
+    nothing in the store — so any credential may, `ro` included.
+
+    Rendered keyed by `replayScopeKey`, so a new run or tenant scope is a new
+    panel: a replay of the old recording is not kept beside the new tape, and
+    a creation or status read still in flight lands on the panel that asked —
+    gone — rather than restoring an obsolete replay into this one. */
 function ReplayPanel({ runId, tenant, tape, identity, pushToast }) {
   const [mode, setMode] = React.useState('strict');
   const [replay, setReplay] = React.useState(null);
