@@ -60,7 +60,9 @@
 //! - **Concurrent calls are served in arrival order.** An agent that issues
 //!   model calls in parallel gets the recorded steps in whatever order its
 //!   requests reach the server; strict mode will report the swap as a
-//!   divergence rather than silently mismatching answers to questions.
+//!   divergence rather than silently mismatching answers to questions. Calls
+//!   to one replay take turns, from reading its cursor to committing it, so
+//!   each served step is rendered once however many calls arrive together.
 //!
 //! The registry is bounded twice — per tenant ([`MAX_TENANT_REPLAYS`] replays,
 //! [`MAX_TENANT_BYTES`] of memory), so one credential cannot fill it for
@@ -82,7 +84,7 @@ use std::fmt;
 use std::hash::{BuildHasher, Hasher};
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
@@ -655,6 +657,11 @@ struct Replay {
     erasure_epoch: u64,
     /// Set when an erasure covered the replay and it was withdrawn.
     erased: Option<u64>,
+    /// Held by the one call consuming an llm step of this replay, from
+    /// reading the cursor to committing it. Rendering happens outside the
+    /// registry's lock, so without a turn of its own each concurrent call
+    /// would render the same step and all but one throw the work away.
+    serving: Arc<Mutex<()>>,
 }
 
 impl Replay {
@@ -814,6 +821,7 @@ impl Registry {
             coverage: snapshot.coverage,
             erasure_epoch,
             erased: None,
+            serving: Arc::new(Mutex::new(())),
         };
         let created = Created {
             id: id.clone(),
@@ -989,13 +997,19 @@ impl Registry {
     /// [`anthropic_request_digest`]), as `render` renders it — typically
     /// [`ServedStep::openai`] or [`ServedStep::anthropic`].
     ///
-    /// The step is consumed only once it has rendered: a rendering refused
-    /// as too large ([`ReplayError::ResponseTooLarge`]) leaves the cursor
-    /// where it was, as a divergence does. Rendering happens outside the
-    /// registry's lock, so a large answer does not stall every other replay;
-    /// a call that loses the step to a concurrent one meanwhile is served
-    /// the next step instead, compared afresh — the arrival order the module
-    /// documents.
+    /// The step is consumed only once it has rendered: a rendering that
+    /// fails — refused as too large ([`ReplayError::ResponseTooLarge`]), or
+    /// any error `render` returns — leaves the cursor where it was, as a
+    /// divergence does.
+    ///
+    /// Calls to one replay take turns: each holds the replay's serving lock
+    /// from reading the cursor to committing it, so every consumed step is
+    /// rendered exactly once, and a call that waited for its turn is
+    /// compared against the step after the one that was in flight — the
+    /// arrival order the module documents. Rendering happens outside the
+    /// registry's lock, so a large answer holds up calls to its own replay
+    /// only, never every other replay. An erasure recorded while a step
+    /// renders is caught at the commit, which drops the rendering unserved.
     pub fn next_llm<R>(
         &self,
         store: &Store,
@@ -1005,57 +1019,68 @@ impl Registry {
         now_ns: u64,
         render: impl Fn(&ServedStep) -> Result<R, ReplayError>,
     ) -> Result<R, ReplayError> {
-        loop {
-            let (served, cursor, matched) = {
-                let latest_erasure = store.erasures.latest_id()?;
-                let mut replays = self.lock();
-                let replay = self.live(&mut replays, store, latest_erasure, id, binding, now_ns)?;
-                let cursor = replay.served;
-                let Some(step) = replay.llm.get(cursor).cloned() else {
-                    return Err(ReplayError::Exhausted { served: cursor });
-                };
-                let matched = step.expected_digest.is_some() && step.expected_digest == got_digest;
-                if replay.mode == Mode::Strict && !matched {
-                    replay.record(step.step, false, now_ns);
-                    if replay.diverged.is_none() {
-                        replay.diverged = Some(Divergence {
-                            step: step.step,
-                            expected_digest: step.expected_digest.clone(),
-                            got_digest: got_digest.clone(),
-                        });
-                    }
-                    return Err(ReplayError::Diverged {
-                        step: step.step,
-                        expected_digest: step.expected_digest,
-                        got_digest,
-                    });
-                }
-                let served = ServedStep {
-                    replay: id.to_owned(),
-                    step: step.step,
-                    model: step.model,
-                    response_id: step.response_id,
-                    start_ns: step.start_ns,
-                    choices: step.choices,
-                    tokens: step.tokens,
-                    max_response_bytes: self.limits.max_response_bytes,
-                };
-                (served, cursor, matched)
-            };
-            let rendered = render(&served)?;
-            // Committed only if nothing changed meanwhile: an erasure
-            // recorded since withdraws the replay (and the rendering is
-            // dropped unserved), and another call may have taken the step.
+        let serving = {
             let latest_erasure = store.erasures.latest_id()?;
             let mut replays = self.lock();
             let replay = self.live(&mut replays, store, latest_erasure, id, binding, now_ns)?;
-            if replay.served != cursor {
-                continue;
+            Arc::clone(&replay.serving)
+        };
+        // A call that panicked holding the turn never committed, so the
+        // cursor it read is still the cursor: the turn is safe to take over.
+        let _turn = serving
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (served, cursor, matched) = {
+            // Checked afresh: the replay may have been withdrawn, or have
+            // expired, while this call waited for its turn.
+            let latest_erasure = store.erasures.latest_id()?;
+            let mut replays = self.lock();
+            let replay = self.live(&mut replays, store, latest_erasure, id, binding, now_ns)?;
+            let cursor = replay.served;
+            let Some(step) = replay.llm.get(cursor).cloned() else {
+                return Err(ReplayError::Exhausted { served: cursor });
+            };
+            let matched = step.expected_digest.is_some() && step.expected_digest == got_digest;
+            if replay.mode == Mode::Strict && !matched {
+                replay.record(step.step, false, now_ns);
+                if replay.diverged.is_none() {
+                    replay.diverged = Some(Divergence {
+                        step: step.step,
+                        expected_digest: step.expected_digest.clone(),
+                        got_digest: got_digest.clone(),
+                    });
+                }
+                return Err(ReplayError::Diverged {
+                    step: step.step,
+                    expected_digest: step.expected_digest,
+                    got_digest,
+                });
             }
-            replay.record(served.step, matched, now_ns);
-            replay.served += 1;
-            return Ok(rendered);
-        }
+            let served = ServedStep {
+                replay: id.to_owned(),
+                step: step.step,
+                model: step.model,
+                response_id: step.response_id,
+                start_ns: step.start_ns,
+                choices: step.choices,
+                tokens: step.tokens,
+                max_response_bytes: self.limits.max_response_bytes,
+            };
+            (served, cursor, matched)
+        };
+        let rendered = render(&served)?;
+        // An erasure recorded while the step rendered withdraws the replay
+        // here, and the rendering is dropped unserved.
+        let latest_erasure = store.erasures.latest_id()?;
+        let mut replays = self.lock();
+        let replay = self.live(&mut replays, store, latest_erasure, id, binding, now_ns)?;
+        debug_assert_eq!(
+            replay.served, cursor,
+            "only the call holding a replay's turn moves its cursor"
+        );
+        replay.record(served.step, matched, now_ns);
+        replay.served += 1;
+        Ok(rendered)
     }
 
     /// Serves the next unserved recorded tool step, or the next one named
@@ -1221,8 +1246,10 @@ enum RecordedRequest {
     Missing,
     /// It references a payload that could not be read.
     Unreadable,
-    /// It is not a message list (a bare-text prompt).
-    Text,
+    /// It is not a message list: a bare prompt (text, or a JSON object, with
+    /// or without system instructions before it), or a list holding
+    /// something other than messages.
+    BarePrompt,
     /// Its normalised digest.
     Digest(String),
 }
@@ -1251,6 +1278,23 @@ fn snapshot(
         out.coverage.add(&step);
         if step.kind == StepKind::Llm {
             let answer = match step.response.as_mut() {
+                // A text-bearing answer is held as the text it was written
+                // as — inline, or its payload's raw bytes — because the
+                // value rule's parse is lossy, and text may be served as is.
+                Some(response)
+                    if matches!(
+                        step.detail.response_source,
+                        ResponseSource::Text | ResponseSource::Body
+                    ) =>
+                {
+                    match step.detail.response_text.take() {
+                        Some(text) => {
+                            *response = Value::String(text);
+                            Leftover::default()
+                        }
+                        None => resolver.resolve_text(response, &mut retained)?,
+                    }
+                }
                 Some(response) => resolver.resolve(response, &mut retained)?,
                 None => Leftover::default(),
             };
@@ -1263,10 +1307,17 @@ fn snapshot(
                 let leftover =
                     resolver.resolve_request(&mut step, &mut ResolveBudget::new(usize::MAX))?;
                 let request = step.request.take().unwrap_or(Value::Null);
-                match (leftover.any(), recorded_digest(&request)) {
-                    (true, _) => RecordedRequest::Unreadable,
-                    (false, Some(digest)) => RecordedRequest::Digest(digest),
-                    (false, None) => RecordedRequest::Text,
+                if leftover.any() {
+                    RecordedRequest::Unreadable
+                } else if step.detail.bare_prompt {
+                    // Combined with system instructions a bare prompt sits
+                    // in a list, and its object may even read as a message;
+                    // it was still never sent as messages, so there is no
+                    // message list to compare a request against.
+                    RecordedRequest::BarePrompt
+                } else {
+                    recorded_digest(&request)
+                        .map_or(RecordedRequest::BarePrompt, RecordedRequest::Digest)
                 }
             };
             let llm = llm_snapshot(&step, mode, answer, request, &retained)?;
@@ -1346,6 +1397,10 @@ fn replay_overhead(run: &str, tenant: Option<&str>) -> usize {
         // The divergence's two digests, 64 hex characters each.
         + 2 * 64
         + MAX_RECORDED_CALLS * std::mem::size_of::<CallRecord>()
+        // The serving lock's shared allocation: two reference counts and
+        // the mutex.
+        + 2 * std::mem::size_of::<usize>()
+        + std::mem::size_of::<Mutex<()>>()
 }
 
 fn llm_snapshot(
@@ -1398,9 +1453,10 @@ fn llm_snapshot(
             "has a request that is an offloaded payload that could not be read — erased, or \
              swept by retention",
         ),
-        RecordedRequest::Text => (
+        RecordedRequest::BarePrompt => (
             None,
-            "recorded its request as text rather than a message list",
+            "recorded its request as a bare prompt (text or a JSON object), or as a list of \
+             something other than messages, rather than as a message list",
         ),
     };
     if mode == Mode::Strict && expected_digest.is_none() {
@@ -1556,6 +1612,17 @@ struct Normalised {
     tool_calls: Vec<[Option<Value>; 3]>,
 }
 
+impl Normalised {
+    /// Whether the message would write no attribute at all — and so digest
+    /// as if it were not there.
+    fn is_empty(&self) -> bool {
+        [&self.role, &self.content, &self.tool_call_id]
+            .into_iter()
+            .chain(self.tool_calls.iter().flatten())
+            .all(|field| !field.as_ref().is_some_and(present))
+    }
+}
+
 /// The digest of `messages` as a recorded request with these messages would
 /// carry it: written as OpenLLMetry's indexed `gen_ai.prompt.{i}.*`
 /// attributes and read back through [`semconv::step_facts`], so the value
@@ -1692,24 +1759,29 @@ fn parts_message(message: &Value, parts: &[Value]) -> Normalised {
 /// The normalised digest of a RECORDED request — `None` when it is not a
 /// message list, which strict mode cannot compare.
 ///
-/// A list holding anything but messages is not a message list: that is what
-/// a bare-text prompt recorded beside system instructions becomes
-/// ([`semconv::step_facts`]), and digesting only its messages would match a
-/// request that never carried the text.
+/// A list holding anything but messages is not a message list. Every element
+/// must be an object that says something the normalisation keeps — a role,
+/// content, a tool call or a tool result: an element that normalises to
+/// nothing (a JSON object prompt's own fields, keys no message has) would
+/// digest exactly as if it were absent, and a request that never carried it
+/// would match. Whether the list itself was sent as messages is the
+/// caller's to check ([`tape::StepDetail::bare_prompt`]).
 fn recorded_digest(request: &Value) -> Option<String> {
     let messages = request.as_array()?;
-    if !messages.iter().all(Value::is_object) {
-        return None;
+    let mut normalised = Vec::with_capacity(messages.len());
+    for message in messages {
+        if !message.is_object() {
+            return None;
+        }
+        let message = match message.get("parts").and_then(Value::as_array) {
+            Some(parts) if message.get("content").is_none() => parts_message(message, parts),
+            _ => normalised_message(message),
+        };
+        if message.is_empty() {
+            return None;
+        }
+        normalised.push(message);
     }
-    let normalised = messages
-        .iter()
-        .map(
-            |message| match message.get("parts").and_then(Value::as_array) {
-                Some(parts) if message.get("content").is_none() => parts_message(message, parts),
-                _ => normalised_message(message),
-            },
-        )
-        .collect();
     normalised_digest(normalised)
 }
 
@@ -1766,41 +1838,24 @@ pub fn anthropic_request_digest(body: &Value) -> Result<Option<String>, String> 
 ///
 /// Provenance decides rather than the value's keys, because a structured
 /// answer is free to use any key: `{"content": "hi", "count": 2}` recorded as
-/// the answer's text is not a message saying "hi".
+/// the answer's text is not a message saying "hi". A text-bearing answer
+/// arrives as the string it was recorded as (see [`snapshot`]), so text is
+/// served byte for byte, never rebuilt from what a JSON parse kept.
 fn recorded_choices(
     response: &Value,
     source: ResponseSource,
     finish_reasons: &[String],
 ) -> Vec<Choice> {
-    let mut choices = match response {
-        Value::Null => Vec::new(),
-        // JSON-shaped text was parsed by the value rule; it goes back to
-        // being the text it was.
-        _ if source == ResponseSource::Text => vec![text_choice(answer_text(response))],
-        Value::Array(items) if items.iter().all(is_message) && !items.is_empty() => items
-            .iter()
-            .filter(|message| !is_reasoning(message))
-            .map(message_choice)
-            .collect(),
-        Value::Object(object)
-            if source == ResponseSource::Body && object.contains_key("choices") =>
-        {
-            object
-                .get("choices")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .map(|choice| {
-                    let mut parsed = message_choice(choice.get("message").unwrap_or(&Value::Null));
-                    if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
-                        parsed.finish_reason = Some(reason.to_owned());
-                    }
-                    parsed
-                })
-                .collect()
+    let mut choices = match (source, response) {
+        (_, Value::Null) => Vec::new(),
+        (ResponseSource::Text, _) => vec![text_choice(answer_text(response))],
+        // A body is held as its text: read as JSON to find an envelope, and
+        // served as that same text when it holds none.
+        (ResponseSource::Body, Value::String(_)) => {
+            decoded(&semconv::field_value(response), source)
+                .unwrap_or_else(|| vec![text_choice(answer_text(response))])
         }
-        Value::Object(_) if is_message(response) => vec![message_choice(response)],
-        other => vec![text_choice(answer_text(other))],
+        _ => decoded(response, source).unwrap_or_else(|| vec![text_choice(answer_text(response))]),
     };
     for (index, choice) in choices.iter_mut().enumerate() {
         if choice.finish_reason.is_none() {
@@ -1808,6 +1863,43 @@ fn recorded_choices(
         }
     }
     choices
+}
+
+/// A message source's or provider body's value as choices: a message list, a
+/// provider envelope (a body's OpenAI `choices`), or one message — `None`
+/// when it is none of these, and so is served as text.
+fn decoded(value: &Value, source: ResponseSource) -> Option<Vec<Choice>> {
+    match value {
+        Value::Array(items) if items.iter().all(is_message) && !items.is_empty() => Some(
+            items
+                .iter()
+                .filter(|message| !is_reasoning(message))
+                .map(message_choice)
+                .collect(),
+        ),
+        Value::Object(object)
+            if source == ResponseSource::Body && object.contains_key("choices") =>
+        {
+            Some(
+                object
+                    .get("choices")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .map(|choice| {
+                        let mut parsed =
+                            message_choice(choice.get("message").unwrap_or(&Value::Null));
+                        if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+                            parsed.finish_reason = Some(reason.to_owned());
+                        }
+                        parsed
+                    })
+                    .collect(),
+            )
+        }
+        Value::Object(_) if is_message(value) => Some(vec![message_choice(value)]),
+        _ => None,
+    }
 }
 
 /// Whether a value from a message source or a provider body is shaped like a
@@ -1844,13 +1936,14 @@ fn text_choice(text: String) -> Choice {
     }
 }
 
-/// JSON-shaped text, written back as text: compact, keys in sorted order.
+/// A structured value as JSON text: compact, keys in sorted order.
 fn json_text(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_default()
 }
 
-/// A recorded value served as answer text: a string as it is, anything else
-/// (JSON text the value rule parsed) written back as JSON text.
+/// A recorded value served as answer text: a string as it is — answer text
+/// arrives as the string it was recorded as — and anything else, a value
+/// that was structured before it was ever text, as JSON text.
 fn answer_text(value: &Value) -> String {
     match value {
         Value::String(text) => text.clone(),
@@ -3838,6 +3931,249 @@ mod tests {
         assert_eq!(
             body["choices"][0]["message"]["content"],
             json!("from the body")
+        );
+    }
+
+    #[test]
+    fn answer_text_is_served_as_written_not_reserialized() {
+        // A 64-byte threshold offloads the long answers below.
+        let config = crate::Config {
+            payload_threshold: Some(64),
+            ..crate::Config::default()
+        };
+        let fixture = TempStore::open("replay-raw-text", config);
+        let store = fixture.store();
+        // Duplicate keys, spacing, key order and number spelling are all
+        // part of the text, and all lost by a parse and re-serialization.
+        let duplicate = "{\"content\":\"first\",\"content\":\"second\"}".to_owned();
+        let spelled = "{ \"b\": 1.50,\n  \"a\": [ 1e2 ] }".to_owned();
+        let long = format!("{{\"z\": \"{}\",  \"a\": 1.0}}", "x".repeat(100));
+        let body = "{\"score\": 1.50,  \"label\": \"ok\"}".to_owned();
+        let text = |answer: &str| {
+            json!({"gen_ai.operation.name": "chat", "llm.prompt": "hi",
+                                         "llm.completion": answer})
+        };
+        let openinference = |answer: &str, mime: Option<&str>| {
+            let mut attributes = json!({"openinference.span.kind": "LLM", "input.value": "hi",
+                                        "output.value": answer});
+            if let Some(mime) = mime {
+                attributes["output.mime_type"] = json!(mime);
+            }
+            attributes
+        };
+        let cases = [
+            ("t-dup", text(&duplicate), &duplicate),
+            ("t-spelled", text(&spelled), &spelled),
+            ("t-offloaded", text(&long), &long),
+            (
+                "t-oi-text",
+                openinference(&spelled, Some("text/plain")),
+                &spelled,
+            ),
+            // A provider body that holds no envelope is served as text too.
+            ("t-oi-body", openinference(&body, None), &body),
+            ("t-oi-body-offloaded", openinference(&long, None), &long),
+        ];
+        store
+            .ingest_batch(
+                cases
+                    .iter()
+                    .map(|(trace, attributes, _)| span(trace, "llm", 1, attributes.clone()))
+                    .collect(),
+            )
+            .expect("ingests");
+        let registry = Registry::default();
+        for (trace, _, answer) in &cases {
+            let id = registry
+                .create(
+                    store,
+                    Some(""),
+                    &format!("trace:{trace}"),
+                    Mode::Loose,
+                    1 << 20,
+                    NOW,
+                )
+                .expect("creates")
+                .id;
+            let served = registry
+                .next_llm(store, &id, Some(""), None, NOW, keep_step)
+                .expect("serves");
+            let openai: Value =
+                serde_json::from_slice(&served.openai(&json!({})).expect("renders").body).unwrap();
+            assert_eq!(
+                openai["choices"][0]["message"]["content"],
+                json!(answer),
+                "{trace}"
+            );
+            let anthropic: Value =
+                serde_json::from_slice(&served.anthropic(&json!({})).expect("renders").body)
+                    .unwrap();
+            assert_eq!(anthropic["content"][0]["text"], json!(answer), "{trace}");
+        }
+    }
+
+    #[test]
+    fn strict_replay_refuses_a_bare_prompt_beside_system_instructions() {
+        let config = crate::Config {
+            payload_threshold: Some(64),
+            ..crate::Config::default()
+        };
+        let fixture = TempStore::open("replay-bare-prompt", config);
+        let store = fixture.store();
+        let question = format!("What is 2+2? {}", "q".repeat(100));
+        let prompts = [
+            // A JSON object prompt, inline and offloaded.
+            ("t-object", json!({"question": "What is 2+2?"}).to_string()),
+            (
+                "t-object-offloaded",
+                json!({"question": question}).to_string(),
+            ),
+            // One that happens to read as a message is still not a list of
+            // them: what the agent sent is not known to be messages.
+            (
+                "t-message",
+                json!({"role": "user", "content": "What is 2+2?"}).to_string(),
+            ),
+            (
+                "t-message-offloaded",
+                json!({"role": "user", "content": question}).to_string(),
+            ),
+            // A list whose element is no message digests as if it were absent.
+            ("t-list", json!([{"question": "What is 2+2?"}]).to_string()),
+        ];
+        store
+            .ingest_batch(
+                prompts
+                    .iter()
+                    .map(|(trace, prompt)| {
+                        span(
+                            trace,
+                            "llm",
+                            1,
+                            json!({"gen_ai.operation.name": "chat",
+                                   "gen_ai.system_instructions": "Be brief.",
+                                   "input.value": prompt, "llm.completion": "4"}),
+                        )
+                    })
+                    .collect(),
+            )
+            .expect("ingests");
+        // The request the bug let through: the system message alone.
+        let system_only = openai_request_digest(&json!({"messages": [
+            {"role": "system", "content": "Be brief."}]}))
+        .expect("parses");
+        let registry = Registry::default();
+        for (trace, _) in &prompts {
+            let run = format!("trace:{trace}");
+            match registry.create(store, Some(""), &run, Mode::Strict, 1 << 20, NOW) {
+                Err(ReplayError::Unreplayable(message)) => {
+                    assert!(message.contains("loose"), "{trace}: {message}")
+                }
+                other => panic!("{trace}: expected a strict refusal, got {other:?}"),
+            }
+            let id = registry
+                .create(store, Some(""), &run, Mode::Loose, 1 << 20, NOW)
+                .expect("loose replays it")
+                .id;
+            registry
+                .next_llm(store, &id, Some(""), system_only.clone(), NOW, keep_step)
+                .expect("loose serves");
+            let status = registry.status(store, &id, Some(""), NOW).expect("live");
+            assert_eq!(status["calls"][0]["matched"], json!(false), "{trace}");
+        }
+    }
+
+    #[test]
+    fn concurrent_calls_render_each_consumed_step_once() {
+        const CALLS: usize = 8;
+        let fixture = TempStore::open("replay-concurrent", crate::Config::default());
+        let store = fixture.store();
+        store
+            .ingest_batch(
+                (0..CALLS)
+                    .map(|index| {
+                        span(
+                            "t-par",
+                            &format!("llm-{index}"),
+                            1 + index as u64,
+                            json!({"gen_ai.operation.name": "chat",
+                                   "gen_ai.prompt.0.content": format!("q{index}"),
+                                   "gen_ai.completion.0.content": format!("a{index}")}),
+                        )
+                    })
+                    .collect(),
+            )
+            .expect("ingests");
+        let registry = Registry::default();
+        let id = registry
+            .create(store, Some(""), "trace:t-par", Mode::Loose, 1 << 20, NOW)
+            .expect("creates")
+            .id;
+        // A failed rendering consumes nothing, and renders nothing twice.
+        assert!(matches!(
+            registry.next_llm(store, &id, Some(""), None, NOW, |_: &ServedStep| {
+                Err::<(), _>(ReplayError::Invalid("refused".to_owned()))
+            }),
+            Err(ReplayError::Invalid(_))
+        ));
+        let renders = AtomicU64::new(0);
+        let start = std::sync::Barrier::new(CALLS);
+        let served: Vec<usize> = std::thread::scope(|scope| {
+            let calls: Vec<_> = (0..CALLS)
+                .map(|_| {
+                    scope.spawn(|| {
+                        start.wait();
+                        registry
+                            .next_llm(store, &id, Some(""), None, NOW, |step: &ServedStep| {
+                                renders.fetch_add(1, Ordering::SeqCst);
+                                // Long enough that every call is in flight
+                                // before the first one commits — the overlap
+                                // in which an optimistic loser renders again.
+                                std::thread::sleep(Duration::from_millis(20));
+                                Ok(step.step)
+                            })
+                            .expect("serves")
+                    })
+                })
+                .collect();
+            calls
+                .into_iter()
+                .map(|call| call.join().expect("joins"))
+                .collect()
+        });
+        let mut steps = served.clone();
+        steps.sort_unstable();
+        assert_eq!(
+            steps,
+            (0..CALLS).collect::<Vec<_>>(),
+            "each step served once"
+        );
+        assert_eq!(
+            renders.load(Ordering::SeqCst),
+            CALLS as u64,
+            "each consumed step rendered once"
+        );
+        let status = registry.status(store, &id, Some(""), NOW).expect("live");
+        assert_eq!(status["served"], json!(CALLS));
+
+        // An erasure recorded while a step renders is caught at the commit:
+        // the rendering is dropped unserved and the replay withdrawn.
+        let erased = registry
+            .create(store, Some(""), "trace:t-par", Mode::Loose, 1 << 20, NOW)
+            .expect("creates")
+            .id;
+        let outcome = registry.next_llm(store, &erased, Some(""), None, NOW, |_: &ServedStep| {
+            store
+                .erase(Subject::Trace {
+                    trace_id: "t-par".to_owned(),
+                    tenant: String::new(),
+                })
+                .expect("erases");
+            Ok(())
+        });
+        assert!(
+            matches!(outcome, Err(ReplayError::Erased { .. })),
+            "{outcome:?}"
         );
     }
 }

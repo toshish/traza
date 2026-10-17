@@ -320,9 +320,16 @@ the same request cannot start matching.
 
 **Loose** mode (`{"run": "…", "mode": "loose"}`) serves the steps in order
 whatever is asked, and records whether each call matched. Use it when the
-recording cannot be compared — a model step whose prompt was recorded as bare
-text rather than a message list is refused in strict mode, naming the step —
-or when you want to drive an agent down the recorded path regardless.
+recording cannot be compared, or when you want to drive an agent down the
+recorded path regardless. A model step whose prompt was not recorded as a
+message list is refused in strict mode, naming the step: a bare prompt — text,
+or a JSON object such as a whole request body in OpenInference's
+`input.value` — inline or offloaded, with or without
+`gen_ai.system_instructions` beside it, even when the object reads like a
+message; and a list holding anything that is not a message (an element with
+no role, content, tool call or tool result), which would otherwise compare as
+if that element were not there. In loose mode such a step is served, and its
+calls are recorded as not matched.
 
 What strict mode compares is the **messages only** — not the model name,
 `tools`, temperature or any other parameter. A request with the recorded
@@ -440,13 +447,15 @@ beginning. A step's status is not compared: a step that errored with the same
 input and output digests as a successful one is `same` — read `errors` and
 the outcome for that.
 
-Reading both runs, extracting their steps and aligning them all spend the
-request's one [`--query-deadline-ms`](../configuration.md#server-flags)
-budget. The alignment is quadratic in steps — two 5,000-step runs that share
-nothing compare every pair — so it compares signatures as interned ids,
-whatever the length of the names inside them, and checks the budget as it
-goes; a pair it cannot align within the budget is refused with `400` rather
-than left running.
+Reading both runs, extracting their steps, aligning them, classifying each
+aligned pair and explaining the first divergence all spend the request's one
+[`--query-deadline-ms`](../configuration.md#server-flags) budget. The
+alignment is quadratic in steps — two 5,000-step runs that share nothing
+compare every pair — so it compares signatures as interned ids, whatever the
+length of the names inside them, and checks the budget as it goes; so does
+the classification, which compares each pair's configuration whole. A pair it
+cannot diff within the budget is refused with `400` rather than left running,
+and so is one whose diff finished after the budget ran out.
 
 ## Recall: has this been done before?
 
@@ -536,11 +545,14 @@ telemetry choose which recording its next run is fed. See the
   message saying "hi"). A message list (`gen_ai.output.messages`, the indexed
   layouts, native events) is read as messages, and an OpenInference JSON
   `output.value` as the provider's response body.
-- **JSON-shaped text comes back compact.** Tool-call arguments recorded as
+- **Answer text comes back as it was written.** An answer recorded as text is
+  served byte for byte, inline or offloaded — duplicate keys, spacing, key
+  order and the spelling of numbers included, even when it reads as JSON. So
+  is an OpenInference JSON `output.value` that holds no provider response
+  (no `choices`, not a message): it is served as its own text.
+- **JSON-shaped tool-call arguments come back compact.** Arguments recorded as
   `{"city": "Paris"}` are served as `{"city":"Paris"}`, keys sorted; the
-  normalisation compares them as JSON, so this never causes a divergence. The
-  same holds for an answer recorded as JSON-shaped text: it is served as the
-  same JSON, re-serialized.
+  normalisation compares them as JSON, so this never causes a divergence.
 - **A served response is at most 64 MiB**, streamed or not. A stream repeats
   fixed fields in every chunk and splits tool-call arguments into many, so a
   recording of thousands of tiny tool calls can stream to hundreds of times
@@ -554,7 +566,10 @@ telemetry choose which recording its next run is fed. See the
   in order.
 - **Concurrent model calls are served in arrival order.** Strict mode reports
   a swapped pair as a divergence rather than serving answers to the wrong
-  questions.
+  questions. Calls to one replay take turns, each from reading the next step
+  to consuming it, so every served answer is rendered once: a call waits
+  while an earlier call to the same replay renders, and calls to other
+  replays do not wait.
 - **The registry is bounded, per tenant first.** One tenant's data — or the
   operator view, which counts as a share of its own — may be held by at most
   64 live replays and 64 MiB of memory; the registry as a whole holds at most

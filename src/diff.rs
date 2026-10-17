@@ -24,10 +24,12 @@
 //!
 //! The first non-`same` entry is the run pair's FIRST DIVERGENCE, with a
 //! sentence saying what differed. Everything is computed from one read of each
-//! run under one compute budget, which the step extraction and the alignment
-//! spend too: the alignment is quadratic in steps, so it compares interned
-//! signatures rather than their (producer-sized) text, and checks the clock
-//! every table row.
+//! run under one compute budget, which every later phase spends too: the step
+//! extraction; the alignment, which is quadratic in steps, so it compares
+//! interned signatures rather than their (producer-sized) text, and checks the
+//! clock every table row; the classification, which compares producer-sized
+//! configurations pair by pair; and the explanation. A diff that finishes
+//! past the budget is refused like one stopped at it.
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -211,9 +213,10 @@ impl Store {
     /// [`Store::get_run_in`]). `now_ns` dates the outcome rule — a run whose
     /// last span ended inside the idle window is still `unknown`.
     ///
-    /// Both runs are read, and aligned, under ONE compute budget; past it the
-    /// diff is refused ([`crate::Error::DeadlineExceeded`]) wherever it had
-    /// got to. A run with no spans is [`MissingRun`], naming it.
+    /// Both runs are read, aligned, classified and explained under ONE
+    /// compute budget; past it the diff is refused
+    /// ([`crate::Error::DeadlineExceeded`]) wherever it had got to, finished
+    /// or not. A run with no spans is [`MissingRun`], naming it.
     pub fn diff_runs(
         &self,
         tenant: Option<&str>,
@@ -247,7 +250,7 @@ impl Store {
         let side_a = self.side(a, &left, now_ns);
         let side_b = self.side(b, &right, now_ns);
         let aligned = align(&left.steps, &right.steps, deadline)?;
-        let first_divergence = first_divergence(&aligned, &left.steps, &right.steps);
+        let first_divergence = first_divergence(&aligned, &left.steps, &right.steps, deadline)?;
         let delta = Delta {
             cost_usd: side_b.cost_usd - side_a.cost_usd,
             tokens: signed(side_b.tokens) - signed(side_a.tokens),
@@ -255,6 +258,10 @@ impl Store {
             errors: signed(side_b.errors as u64) - signed(side_a.errors as u64),
             steps: signed(side_b.steps as u64) - signed(side_a.steps as u64),
         };
+        // The budget bounds the answer, not only the stretches between
+        // checks: a diff that finished past it is refused like one stopped
+        // there.
+        Deadline::check(deadline, 0)?;
         Ok(Ok(RunDiff {
             a: side_a,
             b: side_b,
@@ -313,10 +320,28 @@ fn signed(value: u64) -> i64 {
 fn align(a: &[TapeStep], b: &[TapeStep], deadline: Option<Deadline>) -> Result<Vec<Aligned>> {
     let (left, right) = intern(a, b, deadline)?;
     let pairs = lcs_pairs(&left, &right, deadline)?;
+    assemble(a, b, &pairs, deadline)
+}
+
+/// The alignment's entries from its matched pairs: each pair classified, and
+/// the steps between pairs as config changes, deletions and insertions.
+///
+/// Spends the budget too, checked every [`DEADLINE_CHECK_STEPS`] entries:
+/// classifying a pair compares two whole configurations and every entry
+/// copies two fingerprints, all producer-sized, and a pair of runs whose
+/// signatures all match reaches this with no quadratic part — no table row
+/// at which the alignment checked the clock.
+fn assemble(
+    a: &[TapeStep],
+    b: &[TapeStep],
+    pairs: &[(usize, usize)],
+    deadline: Option<Deadline>,
+) -> Result<Vec<Aligned>> {
     let mut aligned = Vec::with_capacity(a.len().max(b.len()));
     let (mut next_a, mut next_b) = (0, 0);
-    for (pa, pb) in pairs {
-        gap(a, b, next_a..pa, next_b..pb, &mut aligned);
+    for &(pa, pb) in pairs {
+        gap(a, b, next_a..pa, next_b..pb, &mut aligned, deadline)?;
+        pace(&aligned, deadline)?;
         let why = classify(&a[pa], &b[pb]);
         aligned.push(Aligned {
             op: if why.is_some() { Op::Changed } else { Op::Same },
@@ -329,8 +354,24 @@ fn align(a: &[TapeStep], b: &[TapeStep], deadline: Option<Deadline>) -> Result<V
         next_a = pa + 1;
         next_b = pb + 1;
     }
-    gap(a, b, next_a..a.len(), next_b..b.len(), &mut aligned);
+    gap(
+        a,
+        b,
+        next_a..a.len(),
+        next_b..b.len(),
+        &mut aligned,
+        deadline,
+    )?;
     Ok(aligned)
+}
+
+/// Checks the budget once every [`DEADLINE_CHECK_STEPS`] entries of `out`,
+/// before the next one is built.
+fn pace(out: &[Aligned], deadline: Option<Deadline>) -> Result<()> {
+    if out.len() % DEADLINE_CHECK_STEPS == 0 {
+        Deadline::check(deadline, 0)?;
+    }
+    Ok(())
 }
 
 /// Both tapes' signatures as small integers, equal exactly when the
@@ -401,9 +442,11 @@ fn gap(
     left: std::ops::Range<usize>,
     right: std::ops::Range<usize>,
     out: &mut Vec<Aligned>,
-) {
+    deadline: Option<Deadline>,
+) -> Result<()> {
     let (mut i, mut j) = (left.start, right.start);
     while i < left.end || j < right.end {
+        pace(out, deadline)?;
         if i < left.end && j < right.end && model_swap(&a[i], &b[j]) {
             out.push(Aligned {
                 op: Op::Changed,
@@ -447,31 +490,39 @@ fn gap(
             j += 1;
         }
     }
+    Ok(())
 }
 
-/// The first entry that is not `same`, explained.
+/// The first entry that is not `same`, explained — within `deadline`, which
+/// the scan checks every [`DEADLINE_CHECK_STEPS`] entries and the
+/// explanation once more before it compares the two steps' configurations.
 fn first_divergence(
     aligned: &[Aligned],
     a: &[TapeStep],
     b: &[TapeStep],
-) -> Option<FirstDivergence> {
+    deadline: Option<Deadline>,
+) -> Result<Option<FirstDivergence>> {
     // The next index on each side, for an entry the side does not have.
     let (mut next_a, mut next_b) = (0, 0);
-    for entry in aligned {
+    for (count, entry) in aligned.iter().enumerate() {
+        if count % DEADLINE_CHECK_STEPS == 0 {
+            Deadline::check(deadline, 0)?;
+        }
         if entry.op != Op::Same {
+            Deadline::check(deadline, 0)?;
             let kind = entry.why.unwrap_or(DivergenceKind::Structure);
             let explanation = clip(&explain(entry, kind, a, b), MAX_EXPLANATION_CHARS);
-            return Some(FirstDivergence {
+            return Ok(Some(FirstDivergence {
                 a: entry.a.unwrap_or(next_a),
                 b: entry.b.unwrap_or(next_b),
                 kind,
                 explanation,
-            });
+            }));
         }
         next_a = entry.a.map_or(next_a, |index| index + 1);
         next_b = entry.b.map_or(next_b, |index| index + 1);
     }
-    None
+    Ok(None)
 }
 
 fn preview(digest: Option<&String>) -> String {
@@ -481,18 +532,50 @@ fn preview(digest: Option<&String>) -> String {
     )
 }
 
-/// `text`, cut to `max` characters with an ellipsis when longer.
+/// `text`, cut to `max` characters with an ellipsis when longer. Reads at
+/// most `max + 1` characters of it, however long it is.
 fn clip(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        return text.to_owned();
+    match text.char_indices().nth(max) {
+        None => text.to_owned(),
+        Some((cut, _)) => format!("{}…", &text[..cut]),
     }
-    let mut clipped: String = text.chars().take(max).collect();
-    clipped.push('…');
-    clipped
 }
 
 fn quote(text: &str) -> String {
     clip(text, QUOTED_CHARS)
+}
+
+/// `value` as compact JSON, quoted as [`quote`] quotes text — but serialized
+/// only as far as the quote shows. A configuration value is producer-sized;
+/// writing a megabyte of it out to keep eighty characters is work the
+/// budget would not see.
+fn quote_json(value: &Value) -> String {
+    /// Bytes enough for one character past the quote, at four bytes per
+    /// character, so a value that does not fit is always seen not to.
+    const PREFIX_BYTES: usize = (QUOTED_CHARS + 1) * 4;
+    struct Prefix(Vec<u8>);
+    impl std::io::Write for Prefix {
+        fn write(&mut self, piece: &[u8]) -> std::io::Result<usize> {
+            let room = PREFIX_BYTES - self.0.len();
+            if room == 0 {
+                // Stops the serializer: everything the quote shows is in.
+                return Err(std::io::Error::other("the quote is full"));
+            }
+            let taken = piece.len().min(room);
+            self.0.extend_from_slice(&piece[..taken]);
+            Ok(taken)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut prefix = Prefix(Vec::new());
+    // Its only error is the one `Prefix` raises once it holds enough.
+    let _ = serde_json::to_writer(&mut prefix, value);
+    // A cut through a character lands past what the quote shows, so the
+    // replacement character the lossy reading leaves there is clipped away.
+    quote(&String::from_utf8_lossy(&prefix.0))
 }
 
 fn explain(entry: &Aligned, kind: DivergenceKind, a: &[TapeStep], b: &[TapeStep]) -> String {
@@ -557,9 +640,7 @@ fn config_differences(
         .into_iter()
         .filter(|key| a.get(*key) != b.get(*key))
         .map(|key| {
-            let show = |value: Option<&Value>| {
-                value.map_or_else(|| "unset".to_owned(), |value| quote(&value.to_string()))
-            };
+            let show = |value: Option<&Value>| value.map_or_else(|| "unset".to_owned(), quote_json);
             format!(
                 "{} {} in a, {} in b",
                 quote(key),
@@ -1081,6 +1162,82 @@ mod tests {
             elapsed < budget + std::time::Duration::from_secs(3),
             "the diff ran {elapsed:?} against a {budget:?} budget"
         );
+    }
+
+    #[test]
+    fn classification_and_explanation_spend_the_deadline_too() {
+        // Two runs whose signatures all match: the alignment is their common
+        // prefix, with no quadratic part and so no table row to check the
+        // clock at. What follows it — classifying every pair, which compares
+        // whole producer-sized configurations, and explaining the first
+        // divergence — is work the budget must still bound.
+        let fixture = TempStore::open("diff-late-phases", crate::Config::default());
+        let store = fixture.store();
+        let blob = json!({"stop": ["s".repeat(4096)]});
+        for trace in ["late-a", "late-b"] {
+            let spans: Vec<crate::Span> = (0..200u64)
+                .map(|index| {
+                    let mut step = llm(trace, &format!("{index:03}"), index, "gpt-4o", "go", "ok");
+                    step.attributes
+                        .insert("gen_ai.request.response_format".into(), blob.clone());
+                    // The runs part at their last step, so there is a
+                    // divergence to explain.
+                    if trace == "late-b" && index == 199 {
+                        step.attributes
+                            .insert("gen_ai.request.temperature".into(), json!(1.0));
+                    }
+                    step
+                })
+                .collect();
+            store.ingest_batch(spans).expect("ingests");
+        }
+        let tape = |run: &str| {
+            store
+                .run_tape(Some(""), run, MAX_DIFF_SPANS, MAX_DIFF_STEPS, None)
+                .expect("reads")
+                .steps
+        };
+        let (a, b) = (tape("trace:late-a"), tape("trace:late-b"));
+        let (left, right) = intern(&a, &b, None).expect("no deadline to miss");
+        let pairs = lcs_pairs(&left, &right, None).expect("no deadline to miss");
+        assert_eq!(pairs.len(), a.len(), "every step aligns");
+
+        let spent = Deadline::starting(Instant::now(), Some(std::time::Duration::ZERO));
+        assert!(
+            matches!(
+                assemble(&a, &b, &pairs, spent),
+                Err(crate::Error::DeadlineExceeded(_))
+            ),
+            "classifying the pairs spends the budget"
+        );
+        let aligned = assemble(&a, &b, &pairs, None).expect("no deadline to miss");
+        assert!(
+            matches!(
+                first_divergence(&aligned, &a, &b, spent),
+                Err(crate::Error::DeadlineExceeded(_))
+            ),
+            "explaining the divergence spends the budget"
+        );
+        // With budget left, the same work gives the same answer as ever.
+        let found = first_divergence(&aligned, &a, &b, None)
+            .expect("no deadline to miss")
+            .expect("the runs part");
+        assert_eq!(
+            (found.kind, found.a, found.b),
+            (DivergenceKind::Config, 199, 199)
+        );
+    }
+
+    #[test]
+    fn config_values_are_quoted_without_serializing_them_whole() {
+        let huge = json!({"stop": ["é".repeat(1 << 20)]});
+        let quoted = quote_json(&huge);
+        assert_eq!(quoted.chars().count(), QUOTED_CHARS + 1, "{quoted}");
+        assert!(quoted.ends_with('…'), "{quoted}");
+        assert!(quoted.starts_with("{\"stop\":[\"éé"), "{quoted}");
+        // A value that fits is quoted whole, exactly as serialized.
+        assert_eq!(quote_json(&json!(0.5)), "0.5");
+        assert_eq!(quote_json(&json!({"a": [1, 2]})), "{\"a\":[1,2]}");
     }
 
     #[test]
