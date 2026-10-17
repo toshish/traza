@@ -1108,7 +1108,7 @@ whose value could not be resolved, or that recorded no result at all (see
 | `400 {"error":"…"}` | Missing `run`, unknown field, or a bad `mode` / `tenant` |
 | `403` | A bound credential named another tenant |
 | `404 {"error":"run not found"}` | No spans carry that run id in scope |
-| `409 {"error":"step 0 (llm:gpt-4o) recorded no response — …"}` | The run cannot be replayed: a model step with no recorded answer (content capture off); an offloaded answer that cannot be read, or that is past `--tape-max-bytes` (the message says which); in strict mode a request that cannot be read or was recorded as text rather than a message list; a run of more than 20,000 spans; or a snapshot larger than one tenant's whole share (64 MiB), which can never be held — refused as soon as building it passes the share. The message names the step and the remedy. Carries `x-should-retry: false` |
+| `409 {"error":"step 0 (llm:gpt-4o) recorded no response — …"}` | The run cannot be replayed: a model step with no recorded answer (content capture off); an offloaded answer that cannot be read, or that is past `--tape-max-bytes` (the message says which); in strict mode a request that cannot be read or was not recorded as a message list — a bare prompt (text or a JSON object, with or without system instructions beside it), or a list holding something other than messages; a run of more than 20,000 spans; or a snapshot larger than one tenant's whole share (64 MiB), which can never be held — refused as soon as building it passes the share. The message names the step and the remedy. Carries `x-should-retry: false` |
 | `429` with `Retry-After` | No room now. Each tenant's data — and the operator view, as a share of its own — may be held by 64 live replays and 64 MiB of memory; the registry as a whole by 1,024 replays and 512 MiB. Memory is everything a replay retains, counted generously: answers, tool records, identifiers, erasure bookkeeping, collection overhead, and its call log at its 4,096-entry bound (about 96 KiB). A full share answers with the seconds until enough of that share's replays expire. A full registry answers the same to unbound operators and a flat `60` to bound credentials, which do not learn when another tenant's replay expires. A live replay is never evicted |
 
 ### `GET /v1/replays/{id}`
@@ -1243,10 +1243,12 @@ whose `gen_ai.request.*` parameters differ is `config`, and so is a model swap
 — two model calls naming different models in the same unaligned stretch are
 paired as one `config` change. A step only one run has is `structure`. Step
 status is not compared. `404 {"error":"run not found: <run>"}` names a run
-with no spans; `400` when `a` or `b` is missing, or when reading, extracting
-and aligning the two runs does not fit the request's one `--query-deadline-ms`
-budget — the alignment compares interned signatures and checks the budget as
-it goes, so long names cannot keep it running past it.
+with no spans; `400` when `a` or `b` is missing, or when reading, extracting,
+aligning, classifying and explaining the two runs does not fit the request's
+one `--query-deadline-ms` budget — the alignment compares interned signatures
+and both it and the classification check the budget as they go, so neither
+long names nor large configurations can keep a diff running past it, and a
+diff that finishes after the budget ran out is refused too.
 
 ### `GET /v1/recall`
 

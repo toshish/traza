@@ -162,6 +162,12 @@ pub(crate) struct StepDetail {
     /// Where an llm response was read from, which decides how a replay
     /// decodes it.
     pub(crate) response_source: semconv::ResponseSource,
+    /// A text-bearing llm response's own string, when the value rule parsed
+    /// it ([`semconv::StepExtras::response_text`]).
+    pub(crate) response_text: Option<String>,
+    /// Whether an llm request's message carrier was a bare prompt rather
+    /// than a list ([`semconv::StepExtras::bare_prompt`]).
+    pub(crate) bare_prompt: bool,
     /// A tool response recorded as empty (`null` or `""`), which the
     /// response field cannot tell from one never captured.
     pub(crate) empty_response: Option<Value>,
@@ -366,6 +372,17 @@ impl Leftover {
     }
 }
 
+/// How a resolved payload's text becomes the value put in its reference's
+/// place.
+#[derive(Clone, Copy)]
+enum Reading {
+    /// By the value rule ([`semconv::field_value`]), as an inline value is
+    /// read: text holding a JSON object or array becomes that JSON.
+    Value,
+    /// As the text it is.
+    Text,
+}
+
 /// Payload resolution for ONE request: its tenant scope, its compute budget,
 /// and what it has already learned about each reference.
 ///
@@ -428,12 +445,36 @@ impl<'s> Resolver<'s> {
         Ok(leftover)
     }
 
+    /// Resolves a value that is wholly one `$payload` reference to the
+    /// payload's TEXT, as written — for an answer recorded as text, which
+    /// must come back byte for byte rather than through the JSON value rule
+    /// that [`Self::resolve`] applies. Charged, bounded and refused exactly
+    /// as [`Self::resolve`] is. Any other value is left as it is: offload
+    /// moves whole string attributes, so a text answer is either inline or
+    /// one reference.
+    pub(crate) fn resolve_text(
+        &mut self,
+        value: &mut Value,
+        budget: &mut ResolveBudget,
+    ) -> Result<Leftover> {
+        let mut leftover = Leftover::default();
+        if let Some(reference) = payload_reference(value) {
+            let reference = reference.to_owned();
+            if let Some(text) = self.inline(&reference, budget, &mut leftover, Reading::Text)? {
+                *value = text;
+            }
+        }
+        Ok(leftover)
+    }
+
     /// Resolves `step`'s request — through its carriers when it has them
     /// ([`StepDetail::request_carriers`]), which are resolved one by one
     /// (system instructions first, the order they appear in the stored
     /// request) and then combined by the same rule as inline carriers, so
     /// an offloaded message list ends up with its system instructions in
-    /// front exactly as if it had never been offloaded.
+    /// front exactly as if it had never been offloaded. Whether the message
+    /// carrier was a list is settled here too ([`StepDetail::bare_prompt`]),
+    /// since for an offloaded one only its content can say.
     pub(crate) fn resolve_request(
         &mut self,
         step: &mut TapeStep,
@@ -453,6 +494,9 @@ impl<'s> Resolver<'s> {
         if let Some(messages) = messages.as_mut() {
             leftover.merge(self.resolve(messages, budget)?);
         }
+        step.detail.bare_prompt = messages
+            .as_ref()
+            .is_some_and(|messages| !messages.is_array());
         step.request = semconv::with_system_instructions(messages, Some(system));
         Ok(leftover)
     }
@@ -464,25 +508,10 @@ impl<'s> Resolver<'s> {
         leftover: &mut Leftover,
     ) -> Result<()> {
         if let Some(reference) = payload_reference(value) {
-            if budget.exhausted {
-                budget.unresolved = true;
-                leftover.past_budget = true;
-                return Ok(());
-            }
             let reference = reference.to_owned();
-            let Some((resolved, size)) = self.read(&reference)? else {
-                budget.unresolved = true;
-                leftover.unreadable = true;
-                return Ok(());
-            };
-            if size > budget.remaining {
-                budget.exhausted = true;
-                budget.unresolved = true;
-                leftover.past_budget = true;
-                return Ok(());
+            if let Some(resolved) = self.inline(&reference, budget, leftover, Reading::Value)? {
+                *value = resolved;
             }
-            budget.remaining -= size;
-            *value = resolved;
             return Ok(());
         }
         match value {
@@ -501,6 +530,40 @@ impl<'s> Resolver<'s> {
         Ok(())
     }
 
+    /// What `reference` resolves to, read as `reading` says, charged to
+    /// `budget` — or `None`, with `leftover` saying why, when it has to stay
+    /// a reference.
+    fn inline(
+        &mut self,
+        reference: &str,
+        budget: &mut ResolveBudget,
+        leftover: &mut Leftover,
+        reading: Reading,
+    ) -> Result<Option<Value>> {
+        if budget.exhausted {
+            budget.unresolved = true;
+            leftover.past_budget = true;
+            return Ok(None);
+        }
+        let read = match reading {
+            Reading::Value => self.read(reference)?,
+            Reading::Text => self.read_raw(reference)?,
+        };
+        let Some((resolved, size)) = read else {
+            budget.unresolved = true;
+            leftover.unreadable = true;
+            return Ok(None);
+        };
+        if size > budget.remaining {
+            budget.exhausted = true;
+            budget.unresolved = true;
+            leftover.past_budget = true;
+            return Ok(None);
+        }
+        budget.remaining -= size;
+        Ok(Some(resolved))
+    }
+
     /// The value `reference` resolves to and its size in bytes, or `None`
     /// when its bytes cannot be read in scope.
     fn read(&mut self, reference: &str) -> Result<Option<(Value, usize)>> {
@@ -513,6 +576,34 @@ impl<'s> Resolver<'s> {
             }
             return Ok(Some((value.clone(), *size)));
         }
+        let Some(text) = self.read_text(reference)? else {
+            return Ok(None);
+        };
+        let size = text.len();
+        let value = semconv::field_value(&Value::String(text));
+        if self.cached_bytes.saturating_add(size) <= RESOLVE_CACHE_BYTES {
+            self.cached_bytes += size;
+            self.cache
+                .insert(reference.to_owned(), (value.clone(), size));
+        }
+        Ok(Some((value, size)))
+    }
+
+    /// [`Self::read`] without the value rule: the payload's text as a JSON
+    /// string. Not served from the cache, which holds parsed values — a text
+    /// answer is one step's own, rarely repeated, and its text cannot be
+    /// rebuilt from what a parse kept.
+    fn read_raw(&mut self, reference: &str) -> Result<Option<(Value, usize)>> {
+        Deadline::check(self.deadline, 0)?;
+        Ok(self.read_text(reference)?.map(|text| {
+            let size = text.len();
+            (Value::String(text), size)
+        }))
+    }
+
+    /// The text `reference` names, or `None` when its bytes cannot be read
+    /// in scope.
+    fn read_text(&mut self, reference: &str) -> Result<Option<String>> {
         let bytes = match self.readable.get(reference) {
             Some(false) => return Ok(None),
             // Reachability is already proven for this request; only the
@@ -538,14 +629,7 @@ impl<'s> Resolver<'s> {
             self.readable.insert(reference.to_owned(), false);
             return Ok(None);
         };
-        let size = text.len();
-        let value = semconv::field_value(&Value::String(text));
-        if self.cached_bytes.saturating_add(size) <= RESOLVE_CACHE_BYTES {
-            self.cached_bytes += size;
-            self.cache
-                .insert(reference.to_owned(), (value.clone(), size));
-        }
-        Ok(Some((value, size)))
+        Ok(Some(text))
     }
 }
 
@@ -614,6 +698,8 @@ fn tape_step(
         session: llm.session.clone(),
         request_carriers: extras.request_carriers,
         response_source: extras.response_source,
+        response_text: extras.response_text,
+        bare_prompt: extras.bare_prompt,
         empty_response: extras.empty_response,
     };
     TapeStep {
@@ -1084,6 +1170,78 @@ pub(crate) mod tests {
                 unreadable: true
             }
         );
+    }
+
+    #[test]
+    fn text_resolution_returns_a_payloads_text_as_written() {
+        let config = crate::Config {
+            payload_threshold: Some(64),
+            ..crate::Config::default()
+        };
+        let fixture = TempStore::open("resolve-text", config);
+        let store = fixture.store();
+        let written = format!("{{\"a\": 1,  \"a\": \"{}\"}}", "t".repeat(100));
+        store
+            .ingest_batch(vec![span(
+                "t-text",
+                "one",
+                1,
+                json!({"gen_ai.operation.name": "chat", "llm.prompt": "hi",
+                       "llm.completion": written}),
+            )])
+            .expect("ingests");
+        let stored = store
+            .tape(Some(""), "trace:t-text", TapeOptions::default())
+            .expect("reads")
+            .expect("exists");
+        let reference = stored.steps[0].response.clone().expect("response");
+        assert!(payload_reference(&reference).is_some());
+
+        let mut resolver = Resolver::new(store, Some(""), None);
+        let mut budget = ResolveBudget::new(1 << 20);
+        let mut value = reference.clone();
+        assert_eq!(
+            resolver
+                .resolve_text(&mut value, &mut budget)
+                .expect("resolves"),
+            Leftover::default()
+        );
+        assert_eq!(value, json!(written), "the text, not what a parse keeps");
+        assert_eq!(budget.spent(), written.len(), "charged as resolve charges");
+        // Bounded and refused as resolve is.
+        let mut value = reference.clone();
+        assert_eq!(
+            resolver
+                .resolve_text(&mut value, &mut ResolveBudget::new(10))
+                .expect("not an error"),
+            Leftover {
+                past_budget: true,
+                unreadable: false
+            }
+        );
+        assert_eq!(value, reference);
+        let mut gone = json!({"$payload": format!("sha256/{}", "0".repeat(64))});
+        assert!(
+            resolver
+                .resolve_text(&mut gone, &mut budget)
+                .expect("not an error")
+                .unreadable
+        );
+        let spent = crate::Deadline::starting(Instant::now(), Some(std::time::Duration::ZERO));
+        assert!(matches!(
+            Resolver::new(store, Some(""), spent)
+                .resolve_text(&mut reference.clone(), &mut ResolveBudget::new(1 << 20)),
+            Err(crate::Error::DeadlineExceeded(_))
+        ));
+        // Anything but a reference is left as it is.
+        let mut inline = json!({"a": 1});
+        assert_eq!(
+            resolver
+                .resolve_text(&mut inline, &mut budget)
+                .expect("no-op"),
+            Leftover::default()
+        );
+        assert_eq!(inline, json!({"a": 1}));
     }
 
     #[test]

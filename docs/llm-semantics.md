@@ -211,9 +211,11 @@ shape. Native events become `[{role, content}]` in event order. On an llm step
 `gen_ai.system_instructions` becomes a leading `{"role": "system", …}` message
 when the input is a message list (or the whole input when there is none).
 When the input is not a list — an offloaded `$payload` reference, or a bare
-prompt — the input becomes `[{"role": "system", …}, <input as stored>]`, so
-neither is dropped and the digest covers both; a reader that resolves the
-reference combines the two as if neither had been offloaded.
+prompt (text or a JSON object) — the input becomes
+`[{"role": "system", …}, <input as stored>]`, so neither is dropped and the
+digest covers both; a reader that resolves the reference combines the two as
+if neither had been offloaded. A bare prompt combined this way is still not a
+message list, which is why the replay proxy's strict mode refuses it.
 
 Each input and output has a **digest**: the SHA-256 of its canonical JSON
 (keys sorted, no whitespace), so the same messages sent with different key

@@ -603,11 +603,12 @@ impl StepFacts {
 /// message — `{"role": "system", "parts": […]}` when it is a list of parts (its
 /// OTel shape), `{"role": "system", "content": …}` otherwise — prepended to a
 /// message list, or forming one when there is no other request. A request that
-/// is not a list (an offloaded reference, a bare prompt string) becomes the
-/// second element of a two-element list after that system message: neither
-/// carrier is dropped, so the digest covers both, and once an offloaded list
-/// is resolved the two combine exactly as they would have inline (see
-/// [`crate::tape`]).
+/// is not a list (an offloaded reference, a bare prompt — text or a JSON
+/// object) becomes the second element of a two-element list after that system
+/// message: neither carrier is dropped, so the digest covers both, and once an
+/// offloaded list is resolved the two combine exactly as they would have
+/// inline (see [`crate::tape`]). A bare prompt combined this way is still not
+/// a message list, however much its object reads like a message.
 ///
 /// **Digests** are the SHA-256 of the value's canonical JSON (object keys
 /// sorted bytewise, no whitespace), as lowercase hex — so the same messages
@@ -673,6 +674,22 @@ pub(crate) struct StepExtras {
     pub(crate) request_carriers: Option<RequestCarriers>,
     /// llm steps: which source the response came from.
     pub(crate) response_source: ResponseSource,
+    /// llm steps whose response is text-bearing ([`ResponseSource::Text`]
+    /// or [`ResponseSource::Body`]): the attribute's own string, when the
+    /// value rule parsed it as JSON. Answer text has to come back as it was
+    /// written, and a parse loses what a re-serialization cannot restore —
+    /// a duplicate key, spacing, key order, a number's spelling. `None` when
+    /// the response already is that string, unparsed, or is an offloaded
+    /// reference (whose payload is read as raw text instead — see
+    /// [`crate::tape::Resolver::resolve_text`]).
+    pub(crate) response_text: Option<String>,
+    /// llm steps: whether what stood in for the message list was something
+    /// else — a bare prompt, text or a JSON object. Combined with system
+    /// instructions it becomes the second element of a list, which can then
+    /// look like messages without having been sent as messages. Known here
+    /// for an inline carrier; for an offloaded one, only once its payload is
+    /// read ([`crate::tape::Resolver::resolve_request`] settles it).
+    pub(crate) bare_prompt: bool,
     /// Tool steps with no response: the value of the first response
     /// attribute the span carried, when it carried one that reads as absent
     /// (`null` or the empty string). It tells a result recorded as empty
@@ -696,6 +713,9 @@ pub(crate) fn step_facts_detailed(span: &Span, llm: &LlmFacts) -> (StepFacts, St
     let request = match kind {
         StepKind::Llm => {
             let (messages, system) = llm_request_carriers(span);
+            extras.bare_prompt = messages
+                .as_ref()
+                .is_some_and(|messages| !messages.is_array() && !is_payload_reference(messages));
             // Offload replaces a whole attribute value, so a carrier is
             // either inline or one reference — never inline with references
             // inside it. Inline carriers are combined for good right here.
@@ -714,8 +734,9 @@ pub(crate) fn step_facts_detailed(span: &Span, llm: &LlmFacts) -> (StepFacts, St
         _ => step_request(span, kind),
     };
     let response = match kind {
-        StepKind::Llm => llm_response_sourced(span).map(|(response, source)| {
+        StepKind::Llm => llm_response_sourced(span).map(|(response, source, text)| {
             extras.response_source = source;
+            extras.response_text = text;
             response
         }),
         StepKind::Tool => {
@@ -938,11 +959,21 @@ fn llm_request_carriers(span: &Span) -> (Option<Value>, Option<Value>) {
     (messages, system)
 }
 
-/// An llm step's output, per the response column of [`step_facts`], and
-/// which kind of source it came from.
-fn llm_response_sourced(span: &Span) -> Option<(Value, ResponseSource)> {
+/// An llm step's output, per the response column of [`step_facts`], which
+/// kind of source it came from, and — for a text-bearing source — the string
+/// it was parsed from ([`StepExtras::response_text`]).
+fn llm_response_sourced(span: &Span) -> Option<(Value, ResponseSource, Option<String>)> {
     let attributes = &span.attributes;
-    let messages = |value: Value| (value, ResponseSource::Messages);
+    let messages = |value: Value| (value, ResponseSource::Messages, None);
+    let text_bearing = |key: &str, source: ResponseSource| {
+        let stored = attributes.get(key)?;
+        let value = payload_value(stored)?;
+        let text = match stored {
+            Value::String(text) if !value.is_string() => Some(text.clone()),
+            _ => None,
+        };
+        Some((value, source, text))
+    };
     attributes
         .get(GEN_AI_OUTPUT_MESSAGES)
         .and_then(payload_value)
@@ -962,17 +993,9 @@ fn llm_response_sourced(span: &Span) -> Option<(Value, ResponseSource)> {
                 Some(mime) if !mime.to_ascii_lowercase().contains("json") => ResponseSource::Text,
                 _ => ResponseSource::Body,
             };
-            attributes
-                .get(OI_OUTPUT_VALUE)
-                .and_then(payload_value)
-                .map(|value| (value, source))
+            text_bearing(OI_OUTPUT_VALUE, source)
         })
-        .or_else(|| {
-            attributes
-                .get(LLM_COMPLETION)
-                .and_then(payload_value)
-                .map(|value| (value, ResponseSource::Text))
-        })
+        .or_else(|| text_bearing(LLM_COMPLETION, ResponseSource::Text))
         .or_else(|| event_messages(span, LLM_COMPLETION).map(messages))
 }
 
@@ -1005,7 +1028,9 @@ pub(crate) fn with_system_instructions(
         // prompt. Dropping the system instructions would lose part of what
         // the model was given (and let two different requests digest alike),
         // and reshaping the request into messages would invent structure the
-        // span never recorded — so it is kept whole, after them.
+        // span never recorded — so it is kept whole, after them. The result
+        // can then look like a message list without being one, which is why
+        // the carrier's shape is kept beside it (`StepExtras::bare_prompt`).
         Some(other) => vec![Value::Object(message), other],
     };
     Some(Value::Array(list))
@@ -2243,6 +2268,78 @@ mod tests {
         let absent = extras(json!({"gen_ai.operation.name": "execute_tool",
             "gen_ai.tool.name": "f"}));
         assert_eq!(absent.empty_response, None);
+    }
+
+    #[test]
+    fn step_extras_keep_answer_text_and_say_when_a_prompt_is_bare() {
+        let extras = |attributes: Value| {
+            let span = span_named("op", attributes);
+            step_facts_detailed(&span, &facts(&span.attributes))
+        };
+        // Text the value rule parsed is kept as written, for the sources
+        // whose answer may be served as text; a message source never is.
+        let written = "{\"a\": 1, \"a\": 2}";
+        for (attributes, kept) in [
+            (
+                json!({"gen_ai.operation.name": "chat", "llm.completion": written}),
+                Some(written),
+            ),
+            (
+                json!({"gen_ai.operation.name": "chat", "output.value": written}),
+                Some(written),
+            ),
+            // Unparsed text is its own string already.
+            (
+                json!({"gen_ai.operation.name": "chat", "llm.completion": "plain"}),
+                None,
+            ),
+            (
+                json!({"gen_ai.operation.name": "chat", "gen_ai.output.messages": written}),
+                None,
+            ),
+        ] {
+            let (facts, extras) = extras(attributes.clone());
+            assert_eq!(extras.response_text.as_deref(), kept, "{attributes}");
+            // The response itself still follows the value rule.
+            if kept.is_some() {
+                assert_eq!(facts.response, Some(json!({"a": 2})), "{attributes}");
+            }
+        }
+        // A bare prompt — text or an object — is not a message list, with or
+        // without system instructions; a list, or a reference whose content
+        // is not read yet, is not known to be bare.
+        let reference = json!({"$payload": format!("sha256/{}", "c".repeat(64))});
+        for (attributes, bare) in [
+            (
+                json!({"gen_ai.operation.name": "chat", "llm.prompt": "hi"}),
+                true,
+            ),
+            (
+                json!({"gen_ai.operation.name": "chat", "gen_ai.system_instructions": "s",
+                       "input.value": "{\"role\":\"user\",\"content\":\"hi\"}"}),
+                true,
+            ),
+            (
+                json!({"gen_ai.operation.name": "chat", "gen_ai.system_instructions": "s",
+                       "gen_ai.prompt.0.content": "hi"}),
+                false,
+            ),
+            (
+                json!({"gen_ai.operation.name": "chat", "gen_ai.system_instructions": "s",
+                       "gen_ai.input.messages": reference}),
+                false,
+            ),
+            (
+                json!({"gen_ai.operation.name": "chat", "gen_ai.system_instructions": "s"}),
+                false,
+            ),
+        ] {
+            assert_eq!(
+                extras(attributes.clone()).1.bare_prompt,
+                bare,
+                "{attributes}"
+            );
+        }
     }
 
     #[test]
