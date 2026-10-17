@@ -56,7 +56,10 @@ only: it does not persist across a browser restart and is never written to
 **After a `401`, the page stops asking.** Every poll on the page stands down
 and every request is refused in the browser until a token is set, so a
 revoked or mistyped token produces one round of `401`s, not one every few
-seconds from each screen.
+seconds from each screen. Requests already in flight when the first `401`
+arrives still complete. Only a `401` for the token in use counts: one for a
+request sent with an earlier token, or with none, that comes back after a new
+token was set blocks nothing and opens no prompt.
 
 **A `403` names what was missing.** The server's refusal carries `required`
 (`rw`, `admin` or `unbound`), and the page says it: a read-only token on the
@@ -70,7 +73,11 @@ On load, and whenever the token changes, the page asks
 [`GET /v1/whoami`](http-api.md#get-v1whoami) and keeps the answer: the
 auth mode, the scope, the tenant binding, and whether the credential is an
 **operator** (unbound, or an open store). Everything tenant-aware follows from
-it, and nothing that depends on it runs until it has answered.
+it, and nothing that depends on it runs until it has answered. If it fails
+for a reason other than `401` (the server restarting, a `503` at the
+connection limit, a dropped connection), the page treats the credential as
+not an operator, and the rail reads `identity unknown`, while it asks again
+2, 5 and then every 15 seconds until it gets an answer.
 
 - **The rail says who you are**: `tenant acme · rw` for a bound credential,
   `all tenants · wal` for an unbound one (the second figure is the store's
@@ -100,13 +107,18 @@ server:
 | `#token=<t>` | The default screen, with `<t>` as the token |
 | `#/<route>?…&token=<t>&…` | That route, with `token` removed and every other parameter kept |
 
-`<t>` is percent-decoded. The token is read once, before the first render,
-stored exactly as **Set token** stores it, and removed from the address bar
-with `history.replaceState`, so it is not left in the current history entry
-or a bookmark. A `token` in the query string (before the `#`, which servers
-and proxies log) is ignored. The page that linked here may still hold the
-full URL in its own history; send handoff links over a channel you would
-send the token over.
+`<t>` is percent-decoded, and only that: a `+` stays a `+` in both forms, and
+the other route parameters are kept exactly as written. The token is taken
+before the first render, and again on every fragment navigation: a handoff
+link opened in a tab that already shows the dashboard changes only the
+fragment, so the page does not reload, and the token is taken then and
+treated as a token change. Either way it is stored exactly as **Set token**
+stores it and removed from the address bar with `history.replaceState`. That
+rewrites the current history entry, including the one a fragment navigation
+has just made, so neither it nor a bookmark keeps the token. A `token` in the
+query string (before the `#`, which servers and proxies log) is ignored. The
+page that linked here may still hold the full URL in its own history; send
+handoff links over a channel you would send the token over.
 
 ## Navigation
 
@@ -130,8 +142,19 @@ rail and the header's controls are real buttons, reachable by keyboard.
 
 Detail screens hang off those: `#/trace/<id>`, `#/sessions/<id>`,
 `#/run/<run>`, `#/conversation/traces/<id>`, `#/compare?a=…&b=…`,
-`#/diff?a=…&b=…`. A run screen of another tenant's run, opened by an
-operator, carries `?tenant=` in its route.
+`#/diff?a=…&b=…`.
+
+**A run's tenant travels in its route.** Links from Guard, a session or a
+trace to a run, from a run to its diff, and from a diff step to its tape carry
+`?tenant=<t>`, and `?tenant=` (empty) for the default tenant. The empty value
+matters: on the tape, diff and replay routes, naming no tenant is the operator
+view across every tenant, so a default-tenant `weather-7` opened without it
+would read every tenant's `weather-7` interleaved. The Sessions list links each
+session with its tenant for the same reason. A run opened without one (from
+the command palette, or a typed link) is read the way the server reads it:
+a tenant-bound credential sees its own tenant, and an operator sees a note
+that the tape spans every tenant, no guard verdict, and a field to name the
+tenant (empty: the default).
 
 **A query lives in the URL.** The Traces screen serializes its predicates,
 window, sort and limit into the hash, so the search that found the bug is a
@@ -236,7 +259,7 @@ export is the search rather than a retype.
   or an agent invocation (OTel GenAI, OpenLLMetry and OpenInference spans
   alike), and any span that failed.
 - **Run** opens the trace's run on its tape: the session its root span
-  carries, else `trace:<id>`.
+  carries, else `trace:<id>`, in the root span's tenant.
 
 The time ruler fits its tick count to its width, so its labels never overlap,
 however narrow the column.
@@ -264,17 +287,25 @@ answers "what was said".
 Sort by recency, cost, errors, length, or **cost per turn** — the efficiency
 figure a team is actually managing. Opening one shows the aggregate tiles and
 the per-trace breakdown, and **Run** opens it as a run: a session id is a run
-id.
+id. A session is one tenant's (`(tenant, session_id)` is its identity), so
+the list opens each in its own tenant and **Run** keeps it there.
 
 ## Guard
 
 `#/guard` — the runs the [run guard](guard.md) holds, from
 [`GET /v1/fuses/runs`](http-api.md#get-v1fusesruns), refreshed every five
-seconds. Chips filter by verdict (`stopped`, `warning`, `continuing`) with a
-count on each; an operator can narrow to one tenant. Stopped runs come first,
-then warnings, then the rest, each group most recently active first. The
-listing is the guard's memory: a run it is not following appears once
-something asks about it.
+seconds. The server lists runs most recently active first, and a stopped run
+takes no more steps, so past a page of busy runs it would drop off the end.
+The screen therefore asks the server three things: the stopped runs
+(`state=stop`), the warning runs (`state=warn`), and the most recently active
+runs, up to 200 each. The default view shows stopped runs first, then
+warnings, then the rest, each run once and each group most recently active
+first. Chips filter by verdict, with a count on each: `stopped` and `warning`
+are the server's own filters; `continuing` has no server filter, so it covers
+the continuing runs among the 200 most recently active. A count reads `200+`
+when there were more than the screen shows, and a line under the list says
+so. An operator can narrow to one tenant. The listing is the guard's memory:
+a run it is not following appears once something asks about it.
 
 Each run shows its verdict, its tenant (to an operator), the policy it is held
 to, when and how a stop tripped, any grant, and the reasons in the server's
@@ -318,8 +349,11 @@ messages as a transcript, tool arguments and results as JSON — with their
 digests, and a link to the span in its trace. An offloaded value shows its
 preview and loads on request; **Inline payloads** re-reads the tape with
 `resolve=true`, within the server's `--tape-max-bytes`, and says when some
-stayed references. A diff linking to a step opens the tape with that step
-open (`?step=`).
+stayed references. The screen reads at most 2,000 steps, and says when a tape
+is cut. A diff linking to a step opens the tape with that step open
+(`?step=`). A step past the first 2,000 is read in whole pages of 2,000, up
+to the server's 20,000, so the step is on the tape; a step the run does not
+have is named as missing, with the number of steps the tape does have.
 
 **Replay this run** creates a [replay](replay.md) (`strict` or `loose`) and
 shows what an agent needs to run against it: `OPENAI_BASE_URL` /
@@ -346,8 +380,10 @@ kind means, the server's explanation, and links to the step on each side.
 Below, every aligned pair with its op (`same`, `changed`, `insert`,
 `delete`), the step index on each side, both fingerprints with the part that
 differs drawn in the accent, and why; the first divergence's row is
-highlighted. Every step index opens that step on its run's tape. **Swap**
-reverses the comparison.
+highlighted. Every step index opens that step on its run's tape, in the
+tenant the diff was read in. **Swap** reverses the comparison. A diff with no
+tenant named reads, for an operator, every tenant's runs of those ids, and the
+page says so above the totals, with a field to name the tenant.
 
 ## Live tail
 
