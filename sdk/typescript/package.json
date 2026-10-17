@@ -1,0 +1,47 @@
+{
+  "name": "@trazadb/sdk",
+  "version": "0.27.0",
+  "description": "A typed client for TrazaDB's agent-native APIs: run fuses, replays, diffs, recall, and the ledger",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "tsc -p tsconfig.json && node --test test/client.test.js test/server.test.js",
+    "prepack": "tsc -p tsconfig.json"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3"
+  },
+  "keywords": [
+    "traza",
+    "agents",
+    "llm",
+    "observability",
+    "opentelemetry",
+    "replay"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/toshish/traza.git",
+    "directory": "sdk/typescript"
+  },
+  "homepage": "https://github.com/toshish/traza/blob/main/docs/guide/clients.md"
+}

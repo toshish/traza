@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "traza"
+version = "0.27.0"
+description = "A typed client for TrazaDB's agent-native APIs: run fuses, replays, diffs, recall, and the ledger"
+readme = "README.md"
+license = "Apache-2.0"
+# Copies of the repository's own, which Apache-2.0 4(a) and 4(d) require to
+# travel with a redistribution; scripts/check-sdk-metadata.py keeps them equal.
+license-files = ["LICENSE", "NOTICE"]
+requires-python = ">=3.9"
+# Deliberately empty: the client is urllib and json from the standard library.
+dependencies = []
+keywords = ["traza", "agents", "llm", "observability", "opentelemetry", "replay"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Typing :: Typed",
+]
+
+[project.urls]
+Homepage = "https://github.com/toshish/traza"
+Documentation = "https://github.com/toshish/traza/blob/main/docs/guide/clients.md"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+traza = ["py.typed"]
