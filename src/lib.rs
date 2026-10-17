@@ -2467,7 +2467,7 @@ impl Store {
         // Admission policy refuses here: the batch is known valid, and
         // nothing about it has been decided yet — no gate, no offload, no
         // log append — so a refusal is batch-atomic and leaves no trace.
-        let admitting = self.admission_check(&spans)?;
+        let mut admitting = self.admission_check(&spans)?;
         let sent = spans.len();
         let mut spans = spans;
 
@@ -2493,7 +2493,9 @@ impl Store {
         if let Some(mask) = &mask {
             // Covered spans are dropped BEFORE payload offloading, so a
             // suppressed span's oversized values never reach the filesystem.
-            spans.retain(|span| !mask.covers_for_drop(span));
+            // Their measurements are dropped with them, in the same pass, so
+            // usage charges every survivor its own size.
+            admitting.retain(&mut spans, |span| !mask.covers_for_drop(span));
         }
         if let Some(threshold) = self.config.payload_threshold {
             // Offloading consults the mask too: content whose hash IS a

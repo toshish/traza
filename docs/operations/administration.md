@@ -590,7 +590,10 @@ was in flight, after which the next batch is refused.
 **What the limits do not do.** They meter ingest, not storage: deleting data
 does not hand quota back (that is what [`GET /v1/tenants`](#tenant-accounting)
 measures), and there is no rate limit within a month. The month is the UTC
-calendar month; there is no per-tenant billing anchor.
+calendar month; there is no per-tenant billing anchor. It only moves
+forward: a batch acknowledged across the boundary out of order, or under a
+wall clock stepped back (across a restart too), is charged to the newest
+month already counted rather than resetting it.
 
 **Erasure leaves them.** A tenant [erasure](#erasure-deletion-with-a-receipt)
 removes the tenant's telemetry, not its accounting and access records: the

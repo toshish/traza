@@ -1740,7 +1740,7 @@ curl -H "Authorization: Bearer $ACME_TOKEN" http://localhost:8080/v1/usage
 | `lifetime.bytes` | Their size: each span's native JSON after tenant stamping and **before** payload offload — what the client sent, in Traza's encoding. An OTLP batch is charged its native-JSON size, not its protobuf wire size |
 | `lifetime.batches` | Ingest calls that admitted at least one of the tenant's spans |
 | `lifetime.rejected` | Spans refused by a quota or a pause. Admission-cap refusals (`400`) are not counted here |
-| `month.window` | The current UTC calendar month, `YYYY-MM` |
+| `month.window` | The current UTC calendar month, `YYYY-MM`. It only moves forward: a batch acknowledged across a month boundary out of order, or under a wall clock stepped back, is charged to the newest month already counted rather than resetting it |
 | `month.spans`, `month.bytes` | The same counts for that month; zero once it turns |
 | `limits` | The tenant's [limits document](#post-v1admintenantstenantlimits) (defaults when never set) |
 | `state` | `paused`; else `capped` when a monthly limit is reached; else `warning` at 80% or more of any monthly limit; else `ok` |
