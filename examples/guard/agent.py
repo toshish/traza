@@ -310,17 +310,23 @@ def verdict(path, state_path, url, token, repeats):
     print("            sum from the same file is $%.5f — equal (asserted)" % state["cost_usd"])
     must(doc["evidence"], "a stop should carry evidence")
     print("  evidence:")
+    statuses = {}
     for item in doc["evidence"]:
         status, _, trace, _ = request(url, token, "GET", "/v1/traces/" + item["trace_id"])
         must(status == 200, "evidence trace unreadable: %d" % status)
         span = [s for s in trace["spans"] if s["span_id"] == item["span_id"]]
         must(span, "evidence span %s is not in its trace" % item["span_id"])
         span = span[0]
+        statuses[item["span_id"]] = span["status"]
         note = span["attributes"].get("error.message") or span["attributes"].get(
             "gen_ai.request.model", "")
         print("    %s  %-22s status %-5s %s" % (item["span_id"], span["name"], span["status"], note))
-    must(any(item["span_id"] in state["tool_spans"] for item in doc["evidence"]),
-         "the evidence should point at a tool span the agent recorded")
+    # The stop's evidence is the span that crossed the limit — the last
+    # fetch_page the loop recorded — and it reads back as the failure it was.
+    last = state["tool_spans"][-1]
+    must(statuses.get(last) == "error",
+         "the evidence should be the loop's last tool span %s, status error: %s" % (last, statuses))
+    print("            %s is the loop's last fetch_page, read back failed (asserted)" % last)
 
 
 def gate(path, kind):
@@ -381,13 +387,26 @@ def hook(code, stderr_path, want_code, *want_text):
         print("        stderr: " + line)
 
 
-def events(path):
+def events(path, hook_run):
+    """The feed must hold every transition the beats above caused, in the
+    order they caused them, and nothing else."""
     doc = load(path)
-    kinds = [e["kind"] for e in doc["events"]]
-    for wanted in ("stop", "manual_stop", "reset"):
-        must(wanted in kinds, "the event feed should record a %s: %s" % (wanted, kinds))
     for event in doc["events"]:
         print("  %-11s %-16s %s" % (event["kind"], event["run"], "; ".join(event["reasons"])))
+    got = [(e["kind"], e["run"]) for e in doc["events"]]
+    wanted = [
+        ("stop", "sess-loop"),            # beat 2: max_repeats
+        ("manual_stop", "sess-healthy"),  # beat 5: the kill switch
+        ("reset", "sess-loop"),           # beat 6: the plain reset...
+        ("warn", "sess-loop"),            # ...which leaves 87% of the budget spent
+        ("reset", "sess-loop"),           # beat 6: the reset with a grant
+        ("stop", hook_run),               # beat 7: the hook's session
+    ]
+    must(got == wanted, "the event feed should be exactly %s, in order: %s" % (wanted, got))
+    grant = doc["events"][4]["reasons"]
+    must(any("grant" in reason for reason in grant), "the second reset should carry its grant: %s" % grant)
+    print()
+    print("  six transitions, in the order the beats above caused them (asserted)")
 
 
 MODES = {

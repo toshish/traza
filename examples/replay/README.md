@@ -36,14 +36,14 @@ is talking to. That is the point.
 | 1 · record | The agent runs against the stand-in model as session `weather-1`: a tool call, the tool, the answer. `GET /v1/tapes/weather-1` shows three steps — `llm`, `tool`, `llm` — with their digests; the workflow wrapper span is context, not a step. The stand-in counts two calls. |
 | 2 · replay | The stand-in is stopped, and the script checks its port now refuses connections. `POST /v1/replays` (with the `ro` token) snapshots the run; the same agent code runs with `OPENAI_BASE_URL` set to the replay's `base_urls.openai` and the `ro` token as its key. Asserted: both model answers and the final answer are identical to the recording; every model call the agent made went to the replay URL; `GET /v1/replays/{id}` reports `served 2`, `remaining 0`, both calls `matched`, `diverged null`; the stand-in's call count is unchanged. |
 | 3 · strict refusal | A fresh replay, and the agent with its v2 system prompt. The first call is refused `409` with `x-should-retry: false` and `{"error":{"type":"replay_divergence","step":0,…}}`, the expected and received digests beside it. The step is not consumed: the replay then reports `served 0`, `remaining 2`, `diverged` at step 0. |
-| 4 · diff | The stand-in is started again and the v2 prompt runs for real as `weather-2`. `GET /v1/diff?a=weather-1&b=weather-1-replay` — the replayed run, recorded as it ran in beat 2 — is `same` at every step, `first_divergence: null`. `GET /v1/diff?a=weather-1&b=weather-2` names the first divergence: step 0, kind `input`; the tool step in between is `same`, since the city did not change. |
+| 4 · diff | The stand-in is started again and the v2 prompt runs for real as `weather-2`. `GET /v1/diff?a=weather-1&b=weather-1-replay` — the replayed run, recorded as it ran in beat 2 — is `same` at every step, `first_divergence: null`. `GET /v1/diff?a=weather-1&b=weather-2` names the first divergence: step 0, kind `input`. Asserted: the steps align `changed`, `same`, `changed` — the system prompt is in both model calls' input, and the tool step in between is `same`, since the city did not change (its call id did, but an id is not part of a step's request digest). |
 
 ## Knobs
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `TRAZA_DEMO_PORT` | `8130` | Server port. The stand-in model takes an ephemeral port of its own |
-| `TRAZA_BIN` | `./target/release/traza-server` | The server binary; built with cargo when the default is missing |
+| `TRAZA_BIN` | `./target/release/traza-server` | The server binary: a path, taken from your current directory, or a command name on `PATH`. The default is built with cargo when missing |
 
 ## Honest caveats
 

@@ -100,12 +100,16 @@ tool until `max_repeats` stops it: the acknowledgement of the step that
 crossed the limit carries `Traza-Fuse: stop`, the verdict names the reason
 and points at the repeated span, and the pre-call check refuses the next
 step. The kill switch stops a second, healthy run. A reset of the first run
-answers `warn`, because it does not refill what the loop spent, and the next
-step's estimated cost is refused under `max_cost_usd`, priced from a
-`--pricing` file; a grant then approves the run to finish. The last beat runs
-the [Claude Code hook](../../examples/guard/README.md#the-claude-code-hook)
-against the same server. Every verdict, reason and cost it prints is the
-server's answer, and it exits non-zero if any of them is not what it claims.
+answers `warn`, because it does not refill what the loop spent, and the
+pre-call check refuses the next step under `max_cost_usd`: what the run has
+spent, priced by the server from a `--pricing` file, plus the agent's estimate
+for the step would pass the limit. A grant then approves the run to finish.
+The last beat runs the
+[Claude Code hook](../../examples/guard/README.md#the-claude-code-hook)
+against the same server. The verdicts, reasons, usage and run costs it prints
+are the server's answers. The per-step prices are the agent's own arithmetic
+on the same pricing file, and the demo asserts that the server's cost for the
+run equals their sum. It exits non-zero if any claim fails.
 
 ## Runs
 

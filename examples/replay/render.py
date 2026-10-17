@@ -137,6 +137,14 @@ def diff(path, expect):
         must(first["kind"] == "input" and first["a"] == 0 and first["b"] == 0,
              "expected an input divergence at step 0: %s" % first)
         print("    first_divergence: %s" % first["explanation"])
+        # The system prompt is in both model calls' input, so both change; the
+        # tool between them was asked for the same city and must align `same`
+        # — its call id differs between the runs, and an id is not part of a
+        # step's request digest.
+        ops = [row["op"] for row in doc["aligned"]]
+        must(ops == ["changed", "same", "changed"],
+             "expected changed, same, changed — the tool step unchanged: %s" % ops)
+        print("    the tool step in between: same — the city did not change (asserted)")
         print("    delta (b − a): %s" % json.dumps(doc["delta"], separators=(",", ":")))
 
 

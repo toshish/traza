@@ -19,9 +19,26 @@ set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 here=$root/examples/replay
+
+# TRAZA_BIN is the caller's, so it resolves before the cd below: a path from
+# the caller's directory, a bare name from PATH (where `cargo install` puts
+# traza-server).
+server=./target/release/traza-server
+if [ -n "${TRAZA_BIN:-}" ]; then
+  case $TRAZA_BIN in
+  /*) server=$TRAZA_BIN ;;
+  */*) dir=$(CDPATH= cd -- "$(dirname -- "$TRAZA_BIN")" 2>/dev/null && pwd) &&
+    server=$dir/$(basename -- "$TRAZA_BIN") || server= ;;
+  *) server=$(command -v "$TRAZA_BIN" 2>/dev/null) || server= ;;
+  esac
+  case $server in /*) ;; *) server= ;; esac # a builtin or an alias is no binary
+  [ -n "$server" ] && [ -f "$server" ] && [ -x "$server" ] || {
+    echo "TRAZA_BIN=$TRAZA_BIN is not an executable (a path, or a command on PATH)" >&2
+    exit 1
+  }
+fi
 cd "$root"
 
-server=${TRAZA_BIN:-./target/release/traza-server}
 render="python3 $here/render.py"
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/traza-replay.XXXXXX")
 port=${TRAZA_DEMO_PORT:-8130}
@@ -53,8 +70,14 @@ fail() { printf '\nFAILED: %s\n' "$*" >&2; exit 1; }
 
 # Process state, not kill -0: a child this shell has not reaped yet is a
 # zombie, kill -0 succeeds on it, and dash (Linux /bin/sh) reaps only at wait
-# points. Gone or Z means exited.
+# points. Gone or Z means exited. Slim container images ship no ps; there
+# kill -0 stands in, and a dead child that passes for alive costs only the
+# wait until the startup loop's timeout, never a hang or a wrong diagnosis.
 alive() {
+  if ! command -v ps >/dev/null 2>&1; then
+    kill -0 "$1" 2>/dev/null
+    return
+  fi
   case $(ps -o stat= -p "$1" 2>/dev/null | tr -d ' ') in '' | Z*) return 1 ;; esac
 }
 
@@ -94,7 +117,6 @@ stop_model() {
 # ------------------------------------------------------------------ setup
 
 if [ ! -x "$server" ]; then
-  [ -z "${TRAZA_BIN:-}" ] || fail "TRAZA_BIN=$TRAZA_BIN is not an executable"
   echo "building traza-server…"
   cargo build --release --bin traza-server
 fi
@@ -115,7 +137,10 @@ until grep -q 'listening on' "$tmp/server.log" 2>/dev/null &&
     fail "the server exited during startup — is port $port taken? (set TRAZA_DEMO_PORT)"
   }
   tries=$((tries + 1))
-  [ "$tries" -lt 40 ] || fail "the server did not come up on port $port (set TRAZA_DEMO_PORT)"
+  [ "$tries" -lt 40 ] || {
+    sed 's/^/  /' "$tmp/server.log" >&2
+    fail "the server did not come up on port $port (set TRAZA_DEMO_PORT)"
+  }
   sleep 0.25
 done
 # And it must be the server holding this run's tokens: a stranger cannot know them.

@@ -46,14 +46,14 @@ outside, and start it again where it left off.
 | 5 · the kill switch | A second, healthy run — distinct calls, all succeeding — takes two steps; `POST /v1/fuses/runs/sess-healthy/trip` stops it; its next pre-call check is refused with `manually tripped: …`. |
 | 6 · reset, then a grant | The upstream is fixed and the looping run reset. The reset answers `warn` — the loop spent 87% of the budget, and a reset does not refill it — so the next step's estimate is refused: `max_cost_usd 0.035 would be exceeded by the next step: $0.0306 spent + $0.01065 estimated`. A reset with `{"grant": {"max_cost_usd": 0.10}}` approves it; the agent finishes, past the policy's $0.035 and within the grant (asserted). |
 | 7 · Claude Code | `claude-code-hook.sh` fed the JSON Claude Code pipes to a hook: a fresh session's PreToolUse exits 0; three PostToolUse records of the same `npm test` stop the session (the third exits 2); the next PreToolUse exits 2 with the reason on stderr — what the model is shown instead of a fourth test run. |
-| 8 · the record | `GET /v1/fuses/events`: every transition above, in order, as an alert dispatcher polling the feed would see it. |
+| 8 · the record | `GET /v1/fuses/events`: every transition above, in order, as an alert dispatcher polling the feed would see it. Asserted: exactly six events — the loop's `stop`, the healthy run's `manual_stop`, the plain `reset` and the `warn` it leaves, the `reset` with its grant, and the hook session's `stop`. |
 
 ## Knobs
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `TRAZA_DEMO_PORT` | `8129` | Server port |
-| `TRAZA_BIN` | `./target/release/traza-server` | The server binary; built with cargo when the default is missing |
+| `TRAZA_BIN` | `./target/release/traza-server` | The server binary: a path, taken from your current directory, or a command name on `PATH`. The default is built with cargo when missing |
 
 ## Honest caveats
 
@@ -70,8 +70,10 @@ outside, and start it again where it left off.
 - **The hook's spans carry no cost or tokens**, so its session is held to the
   repeat limit only; beat 7 does not exercise cost limits through Claude Code.
 - The policy limits, prices and token counts are chosen so the beats land in
-  a few steps; the verdicts, reasons, costs and counts printed are the
-  server's own answers, asserted, not constants.
+  a few steps. The verdicts, reasons, usage counts and run costs printed are
+  the server's own answers, asserted, not constants. The per-step prices are
+  the agent's own arithmetic on the pricing file; what is asserted is that the
+  server's cost for the run equals their sum.
 
 ## Runtime
 
@@ -150,7 +152,7 @@ curl -X POST http://127.0.0.1:8080/v1/fuses/runs/$SESSION_ID/reset \
 |---|---|---|
 | `TRAZA_URL` | `http://127.0.0.1:8080` | The server. |
 | `TRAZA_TOKEN` | none | Bearer token, when the server enforces auth. A `ro` token is enough for the gate; recording needs `rw`. It is passed to curl through a here-document, never on a command line. |
-| `TRAZA_TENANT` | the default tenant | The run's tenant, for an unbound token. A bound token is forced to its own. |
+| `TRAZA_TENANT` | the default tenant | The run's tenant, for an unbound token. Leave it unset with a bound token, which always records and checks its own tenant: naming another is refused (`400` on recording, `403` at the gate), which the hook treats as Traza not answering. |
 | `TRAZA_RECORD_TOOL_INPUT` | off | `1` records each tool's full input on its span. By default only a SHA-256 of the canonical input is recorded — enough for repeat detection, without copying commands and file contents into the store. |
 | `TRAZA_FUSE_FAIL_CLOSED` | off | `1` blocks the tool call when Traza cannot answer — unreachable, or an error instead of a verdict, which is what the gate gives for a run it could read only part of and that part does not stop ([why](../../docs/guide/guard.md#what-is-durable-and-what-is-rebuilt)). By default the hook fails open: it prints a warning and lets the call through. |
 | `TRAZA_TIMEOUT` | `5` | Seconds to wait for Traza. |

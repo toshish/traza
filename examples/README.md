@@ -8,7 +8,8 @@ backing them. CI runs them all for the same reason.
 
 Each is one command from the repo root, works in a throwaway directory, and
 cleans up after itself. They build what they need on first run; `guard/`,
-`replay/` and `prove/` also run a prebuilt binary named by `TRAZA_BIN`.
+`replay/` and `prove/` also run a prebuilt binary named by `TRAZA_BIN` (a
+path, or a command on `PATH`).
 
 | Demo | The claim it proves | Runs for |
 |---|---|---|

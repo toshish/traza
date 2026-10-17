@@ -40,21 +40,32 @@ def canonical(value):
 # ---------------------------------------------------------------- ingest
 
 
+# What `ingest` sends, kept in one place because beat 5 checks the evidence
+# pack's activity counts against it: each conversation is its own session and
+# trace of SPANS_PER_SESSION spans, and one span of one of them is an error.
+SPANS_PER_SESSION = 4
+ERROR_AT = (2, 3)  # (conversation, span) of the one error span
+
+
+def conversations(subject):
+    return [(subject, "jane.doe@example.com asked to close her account"),
+            ("support-2207", "a customer asked about invoice 88-1"),
+            ("support-2208", "a customer reported a login loop")]
+
+
 def ingest(port, token, subject):
     """Three support conversations; one of them belongs to the data subject."""
     now = time.time_ns()
-    sessions = [(subject, "jane.doe@example.com asked to close her account"),
-                ("support-2207", "a customer asked about invoice 88-1"),
-                ("support-2208", "a customer reported a login loop")]
+    sessions = conversations(subject)
     spans = []
     for s, (session, question) in enumerate(sessions):
         trace = hashlib.sha256(session.encode()).hexdigest()[:32]
-        for i in range(4):
+        for i in range(SPANS_PER_SESSION):
             start = now + (s * 10 + i) * 1_000_000
             spans.append({
                 "trace_id": trace, "span_id": "%s-%d" % (trace[:8], i),
                 "name": "chat support-model", "service": "support-agent",
-                "status": "error" if (s, i) == (2, 3) else "ok",
+                "status": "error" if (s, i) == ERROR_AT else "ok",
                 "start_time_ns": start, "end_time_ns": start + 400_000,
                 "attributes": {
                     "session.id": session,
@@ -74,7 +85,8 @@ def ingest(port, token, subject):
     body = json.loads(raw)
     must(reply.status == 200 and body.get("accepted") == len(spans),
          "ingest answered %d: %s" % (reply.status, body))
-    print("  %d spans in 3 sessions → %d %s" % (len(spans), reply.status, raw.decode()))
+    print("  %d spans in %d sessions → %d %s"
+          % (len(spans), len(sessions), reply.status, raw.decode()))
 
 
 # ------------------------------------------------------------- the chain
@@ -263,16 +275,39 @@ def evidence(path, subject_id):
     digest = hashlib.sha256(canon(pack).encode()).hexdigest()
     must(digest == claimed, "evidence digest mismatch: recomputed %s, pack says %s" % (digest, claimed))
     must(pack["ledger"]["verification"]["intact"] is True, "the pack's verification is not intact")
-    must(subject_id not in text, "the erased session id appears in the evidence pack")
     activity = pack["activity"]
     print("    format %s · engine %s · ledger head seq %d · verification intact %s"
           % (pack["format"], pack["engine_version"], pack["ledger"]["head"]["seq"],
              json.dumps(pack["ledger"]["verification"]["intact"])))
-    print("    activity: spans %d · sessions %d · errors %d (the erased session is not counted)"
-          % (activity["spans"], activity["sessions"], activity["errors"]))
-    for item in pack["erasures"]:
-        print("    erasure %d: %s · result %s · conclusive %s" % (
-            item["id"], item["subject_kind"], item["result"], json.dumps(item["conclusive"])))
+    # Activity counts spans still stored, so the erased conversation must be
+    # gone from every count — measured against what `ingest` sent, not
+    # against what the server says it holds.
+    sessions = conversations(subject_id)
+    kept = [s for s, (session, _) in enumerate(sessions) if session != subject_id]
+    want = {"spans": SPANS_PER_SESSION * len(kept), "traces": len(kept),
+            "sessions": len(kept), "errors": sum(1 for s in kept if s == ERROR_AT[0])}
+    got = {key: activity[key] for key in want}
+    must(got == want, "activity should count only the %d conversations still stored: wanted %s, got %s"
+         % (len(kept), want, got))
+    print("    activity: spans %d · traces %d · sessions %d · errors %d — the %d conversations"
+          % (got["spans"], got["traces"], got["sessions"], got["errors"], len(kept)))
+    print("    still stored; the erased one's %d spans are in no count (asserted)" % SPANS_PER_SESSION)
+    erasures = pack["erasures"]
+    must(len(erasures) == 1, "the pack should list the one erasure: %s" % erasures)
+    item = erasures[0]
+    must((item["subject_kind"], item["result"], item["conclusive"]) == ("session", "erased", True),
+         "the erasure's receipt should be a conclusive `erased`: %s" % item)
+    print("    erasure %d: %s · result %s · conclusive %s (asserted)" % (
+        item["id"], item["subject_kind"], item["result"], json.dumps(item["conclusive"])))
+    # A pack is counts and digests, never ids: an auditor can be handed one
+    # without being handed whose sessions they were. That is a property of
+    # the format, not something the erasure did, so it is checked for every
+    # session, the two that were kept included.
+    named = [session for session, _ in sessions if session in text]
+    must(not named, "the evidence pack names sessions: %s" % named)
+    print("    none of the %d session ids occurs in the pack — it carries counts, not ids"
+          % len(sessions))
+    print("    (asserted)")
     print()
     print("    digest in the pack:   %s" % claimed)
     print("    recomputed (hashlib): %s — match (asserted)" % digest)
