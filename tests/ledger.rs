@@ -586,6 +586,7 @@ fn an_evidence_pack_recomputes_and_a_bound_tenant_sees_only_itself() {
             "digest",
             "engine_version",
             "erasures",
+            "erasures_truncated",
             "format",
             "generated_at_ns",
             "ledger",
@@ -612,7 +613,13 @@ fn an_evidence_pack_recomputes_and_a_bound_tenant_sees_only_itself() {
         json!({"ttl_seconds": 31536000, "source": "global"})
     );
     assert_eq!(pack["erasures"].as_array().expect("erasures").len(), 2);
+    assert_eq!(pack["erasures_truncated"], json!(false));
     assert_eq!(pack["ledger"]["verification"]["intact"], json!(true));
+    // When the walk the verification rests on began: during this test.
+    let walked_at = pack["ledger"]["verification"]["chain_verified_at_ns"]
+        .as_u64()
+        .expect("chain_verified_at_ns");
+    assert!(walked_at > 0 && walked_at <= now_ns(), "{walked_at}");
     assert_eq!(pack["ledger"]["entries_truncated"], json!(false));
     assert_eq!(pack["ledger"]["entries_unreadable"], json!(0));
     assert_digest(&pack);

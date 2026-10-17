@@ -243,11 +243,15 @@ these checks:
 
 ```json
 {"entries":5,"head":"34e6…","intact":true,"problems":[],
+ "chain_verified_at_ns":1792061580401790000,
  "generation":{"id":3,"manifest_sha256":"97bc…","matches_ledger":true,
                "files_verified":true,"verified_at_ns":1792061580401844000}}
 ```
 
-`intact` is true only when every check passes.
+`intact` is true only when every check passes. `chain_verified_at_ns` is
+when the walk of the chain began at its first entry, and `verified_at_ns` is
+when the file check ran. Both are the moment of the request here. In an
+evidence pack they can be earlier (see [Bounds](#evidence-packs)).
 
 **A live generation newer than the chain.** Suppose the latest checkpoint
 entry names an older generation than the live one. That is exactly what
@@ -351,7 +355,8 @@ above, has no secret.
 | `retention` | `{"ttl_seconds","source"}`: the window expiry applies to the tenant right now. `source` is `limits` (the tenant's runtime [limits document](http-api.md#post-v1admintenantstenantlimits)), `flag` (a `--tenant-ttl` override), `global` (`--ttl-seconds`) or `none`. `ttl_seconds` is `null` whenever data is kept forever. A whole-store pack reports the global window |
 | `usage` | The tenant's row from [`GET /v1/usage`](http-api.md#get-v1usage) — lifetime and month counters, limits, and quota state — as of generation. `null` in a whole-store pack |
 | `activity` | Spans, distinct traces, distinct sessions and errors among spans that **started** in the window and are still stored, plus `by_day` (`{"day","spans","errors","cost_usd"}` per UTC day) |
-| `erasures` | Erasures settled in the window: `{"id","subject_kind","published_at_ns","conclusive","result"}`, where `conclusive` and `result` are the [receipt's](http-api.md#get-v1erasuresidverify) own fields |
+| `erasures` | Erasures settled in the window, oldest first and at most 10,000: `{"id","subject_kind","published_at_ns","conclusive","result"}`, where `conclusive` and `result` are the [receipt's](http-api.md#get-v1erasuresidverify) own fields |
+| `erasures_truncated` | Whether more erasures were settled in the window than `erasures` lists. [`GET /v1/erasures`](http-api.md#get-v1erasures) lists them all |
 | `digest` | SHA-256 of the canonical JSON of every field above |
 
 **Scoping.** A credential bound to a tenant always gets its own tenant's pack.
@@ -380,39 +385,56 @@ withheld behind a count that does not say whose. `intact` is the store's
 verdict either way: a pack never reports a store intact when it isn't.
 
 **Bounds.** Bound credentials can request packs, so a pack must not cost the
-whole chain or the whole store on every request. One query budget
-(`--query-deadline-ms`) covers the whole request: the chain walk, the
-activity fold and the erasure receipts share it, and none of them gets a fresh
-budget of its own.
+whole chain, every erasure or the whole store on every request, and must not
+hold off checkpoints, compaction or erasures while it works. The server keeps
+what packs have checked, and each pack pays for what changed since the last.
+One query budget (`--query-deadline-ms`) covers the whole request. Every step
+below shares it, and none gets a fresh budget of its own.
 
-- **The chain walk** continues the last one rather than starting again at the
-  first entry, as long as that walk began within the last 60 seconds. A pack
-  normally walks only the entries appended since the previous pack (or
-  `GET /v1/ledger/verify`), and packs walk the chain from the start at most
-  once a minute, however often they are requested. If the budget runs out
-  mid-walk, the walk stops, keeps its progress, and the pack is refused with
-  `400` saying how far it got (`the ledger chain was verified through line
-  N …`). A pack never carries a partial verification. The next request
-  resumes where the walk stopped, so retrying completes the check, even on a
-  chain too long for one budget.
-- **The window's entries** are found from an index the walk keeps, so a pack
-  reads only those lines.
+- **Settled erasures** are read from the tombstone log once each, in the
+  order they settled, and indexed. A pack takes in only the ones settled since
+  the last pack.
+- **The chain walk** continues the last completed walk (a pack's, or
+  `GET /v1/ledger/verify`'s), so a pack normally walks only the entries
+  appended since. It runs without the lock that checkpoints, compaction and
+  erasures take. The erasure checks (steps 4 and 5 above) are kept with the
+  walk and take in only the entries and settled erasures new to it.
+- **The file check** digests files without that lock too, a budget at a time.
+  Each file is digested from one open handle, so a file the budget stopped
+  part-way through is continued, not started again. A new generation
+  re-digests only the files its checkpoint added or changed. The others keep
+  their last digest, and when it ran.
+- **The window's entries and erasures** are found by binary search in indexes
+  by time, so a pack reads only those lines.
 - **Activity** comes from the same fold the analytics use. A window too large
   to fold within the budget answers `400` with no partial pack; narrow the
   window.
 - **Receipts:** at most 32 run per pack, and only while the budget lasts. Past
   either limit, `conclusive` and `result` are `null`, and
   `GET /v1/erasures/{id}/verify` answers for that erasure.
-- **The file check** may reuse a verification of the same live generation
-  from the last 60 seconds, so bound credentials cannot each force a
-  full-store re-read. `verified_at_ns` says when it ran. It is the one step
-  the budget does not cut short. A file check stopped halfway would have to
-  start over, and its cost depends on the store's size, not on anything the
-  request asked for.
 
-`GET /v1/ledger/verify` never reuses a result. The 60-second bound is also how
-long an edit to `ledger.jsonl` made under a running server could go unnoticed
-by packs; the operator's verification sees it at once.
+If the budget runs out in any of the first three steps, that step stops,
+keeps its progress, and the pack is refused with `400` saying how far it got
+(for example `the ledger chain was verified through line N …`, or `N of M
+files of generation G were digested …`). A pack never carries a partial
+verification. The next request resumes where the step stopped, however long
+ago that was, so retrying completes the check even when it needs many
+budgets. The first pack after a server starts does the most of this work,
+because nothing has been checked yet.
+
+**How old a pack's checks can be.** Once a completed chain walk or a file's
+digest is more than 60 seconds old, packs start redoing it: a new walk from
+the first entry, and a fresh digest of each file, oldest first. Each pack
+spends what its budget has left after the pack is assembled, at most 250 ms,
+on that redo. Meanwhile packs still answer from the older result and say how
+old it is. `ledger.verification.chain_verified_at_ns` is when the walk the
+verification rests on began at the first entry. `ledger.verification.generation.verified_at_ns`
+is when the oldest file digest it rests on began. A redone walk is used once
+it is complete. So an edit made to `ledger.jsonl` or to a manifested file
+under a running server shows in packs once the redo reaches it. How long that
+takes depends on the chain's and the store's size and on how often packs are
+requested. `GET /v1/ledger/verify` never reuses a result and sees such an edit
+at once.
 
 Distinct traces and sessions are counted by a 128-bit hash of the tenant and
 the id. An adversary who crafts colliding ids can make the count read low by
@@ -486,8 +508,11 @@ copy. It archives manifested files only.
 - **No rotation.** The ledger grows by one line per published generation,
   forever. Every open reads it in full to find the tip and the erasures already
   ledgered. Once a server has answered an evidence pack or a verification, it
-  also keeps about 48 bytes per entry in memory. That is the walk the next
-  pack continues from (see [Bounds](#evidence-packs)).
+  also keeps about 48 bytes per entry in memory: the walk the next pack
+  continues from (see [Bounds](#evidence-packs)). While packs redo a walk
+  older than 60 seconds, a second walk is kept beside it. Packs also keep, in
+  memory, a few hundred bytes per settled erasure (the index and the erasure
+  checks) and one record per manifested file (the file check).
 - **Anchor signatures are stored, never checked.** See
   [what it does not prove](#what-it-proves-and-what-it-does-not).
 - **A failed append is caught up, not retried immediately.** The next

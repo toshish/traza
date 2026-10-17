@@ -85,7 +85,7 @@
 //! releasing that lock, and lets an evidence pack extend an earlier walk
 //! instead of starting again at byte 0.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -141,6 +141,14 @@ const EVIDENCE_MAX_RECEIPTS: usize = 32;
 #[cfg(test)]
 const EVIDENCE_MAX_RECEIPTS: usize = 1;
 
+/// Ceiling on the erasures one evidence pack lists. A pack past it says so
+/// (`erasures_truncated`); `GET /v1/erasures` lists them all. Lowered under
+/// test so the cap itself is exercised.
+#[cfg(not(test))]
+const EVIDENCE_MAX_ERASURES: usize = 10_000;
+#[cfg(test)]
+const EVIDENCE_MAX_ERASURES: usize = 4;
+
 /// Chain lines between deadline checks in a budgeted walk: the crate's
 /// usual interval, a line costing about what a decode does. Lowered under
 /// test so that a walk cut short at its first check is a short one.
@@ -149,17 +157,49 @@ const WALK_CHECK_INTERVAL: u64 = crate::DEADLINE_CHECK_INTERVAL as u64;
 #[cfg(test)]
 const WALK_CHECK_INTERVAL: u64 = 64;
 
-/// How long an evidence pack may reuse a file verification of the SAME live
-/// generation, and extend a chain walk rather than start one from byte 0.
+/// How old a COMPLETED check may be before evidence packs start redoing it:
+/// the chain walk from byte 0, and each manifested file's digest.
 /// Re-digesting every manifested byte is O(store) and re-walking the chain
 /// O(ledger); a pack is readable by bound (tenant) credentials, and without
-/// reuse each of their requests would buy both. With it, whatever the
-/// request rate, packs walk the chain from byte 0 at most once per window
-/// and each pack in between walks only what was appended since. The bound is
+/// reuse each of their requests would buy both. With it, a pack extends the
+/// last completed walk by what was appended since, and reuses each file's
+/// last digest while its manifest entry is unchanged.
+///
+/// It bounds completed results only. An UNFINISHED walk or digest is never
+/// discarded for its age — what it established is about a fixed prefix of
+/// an append-only file, or a file it holds open — or a check longer than
+/// this window, or retried across it, could never finish. And a completed
+/// result past the window is still served, with its age stated
+/// (`chain_verified_at_ns`, `verified_at_ns`), while packs redo it in the
+/// background of their own budgets ([`EVIDENCE_REFRESH_SLICE`]); that is
 /// what keeps a pack's checks recent: an edit to the disk under a running
-/// server shows in packs within a window. The pack reports when its file
-/// check ran (`verified_at_ns`), and `GET /v1/ledger/verify` never reuses.
+/// server shows in packs once the redo reaches it. `GET /v1/ledger/verify`
+/// never reuses.
 const EVIDENCE_VERIFY_REUSE: Duration = Duration::from_secs(60);
+
+/// The most a pack spends redoing checks past [`EVIDENCE_VERIFY_REUSE`],
+/// after the pack itself is assembled: whatever its budget has left, and
+/// never more than this, so a stale check is refreshed a slice per pack
+/// without any pack paying for the whole of it. Each slice makes some
+/// progress even when the budget is spent (one check interval), so the
+/// redo always advances.
+const EVIDENCE_REFRESH_SLICE: Duration = Duration::from_millis(250);
+
+/// Manifested bytes a pack's file check digests between budget checks, a
+/// file opened counting as [`FILE_OPEN_COST`] of them. Lowered under test,
+/// so a small store's check is cut short more than once.
+#[cfg(not(test))]
+const FILE_CHECK_BYTES: u64 = 8 * 1024 * 1024;
+#[cfg(test)]
+const FILE_CHECK_BYTES: u64 = 64 * 1024;
+
+/// What opening a file costs a pack's file check, in digested bytes, so a
+/// store of many small files still reaches its budget checks.
+const FILE_OPEN_COST: u64 = 16 * 1024;
+
+/// Settle records a pack takes in from the tombstone log per lock hold and
+/// budget check.
+const SETTLE_CHUNK: usize = WALK_CHECK_INTERVAL as usize;
 
 // ------------------------------------------------------------------ entries
 
@@ -402,23 +442,25 @@ pub(crate) struct Ledger {
     /// Held across an append's write and fsync, which is what serializes
     /// appends and gives every reader a length that ends on a whole line.
     tip: Mutex<Tip>,
-    /// The last file verification, for evidence packs to reuse briefly; see
-    /// [`EVIDENCE_VERIFY_REUSE`]. Leaf-level.
-    file_check: Mutex<Option<FileCheck>>,
-    /// The chain walk evidence packs extend; see [`Store::evidence`]. The
-    /// one ledger lock that is NOT leaf-level: a pack takes it BEFORE the
-    /// maintenance lock and holds it across its walk, which runs after the
-    /// maintenance lock is released. So packs walk one at a time, each from
+    /// What evidence packs keep between requests — the chain walks, the
+    /// erasure cross-check, the settled erasures taken in, the file check —
+    /// so each pack pays for what changed; see [`Store::evidence`]. The one
+    /// ledger lock that is NOT leaf-level: a pack takes it BEFORE the
+    /// maintenance lock and holds it across its work, which runs after the
+    /// maintenance lock is released. So packs work one at a time, each from
     /// where the last stopped, every snapshot is taken after the walk it
     /// extends was stored (a stored walk never runs past a later snapshot),
-    /// and no pack holds a checkpoint off while it walks. Nothing takes it
-    /// while holding another engine lock.
-    chain: Mutex<Option<CachedWalk>>,
+    /// and no pack holds a checkpoint off while it walks or digests. Nothing
+    /// takes it while holding another engine lock.
+    evidence: Mutex<Evidence>,
     /// Appends that failed since the ledger last caught up. Leaf-level.
     failures: Mutex<Failures>,
     /// Test-only pauses at points a race would otherwise have to be hit at.
     #[cfg(test)]
     hooks: Mutex<Hooks>,
+    /// Test-only: how far this ledger's clock runs ahead of the real one.
+    #[cfg(test)]
+    clock: Mutex<Duration>,
 }
 
 /// The mark [`Ledger::settling`] puts up, taken down on drop.
@@ -575,12 +617,11 @@ struct Failure {
     last_error: String,
 }
 
-/// One file verification result, kept for reuse.
+/// One file verification result, as a verification reports it.
 #[derive(Clone, Debug)]
 struct FileCheck {
-    generation: u64,
+    /// When the oldest digest it rests on began.
     at_ns: u64,
-    at: Instant,
     problems: Vec<String>,
 }
 
@@ -659,11 +700,12 @@ impl Ledger {
         let ledger = Self {
             path,
             tip: Mutex::new(tip),
-            file_check: Mutex::new(None),
-            chain: Mutex::new(None),
+            evidence: Mutex::new(Evidence::default()),
             failures: Mutex::new(Failures::default()),
             #[cfg(test)]
             hooks: Mutex::new(Hooks::default()),
+            #[cfg(test)]
+            clock: Mutex::new(Duration::ZERO),
         };
         if let Some(error) = heal_failure {
             ledger.note_failure("healing the final line at open", &error);
@@ -688,6 +730,33 @@ impl Ledger {
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Tip>> {
         self.tip.lock().map_err(|_| Error::LockPoisoned("ledger"))
+    }
+
+    /// The clock reuse windows are judged by: the real one, run ahead under
+    /// test so a window can be crossed without waiting it out.
+    fn now(&self) -> Instant {
+        #[cfg(test)]
+        if let Ok(offset) = self.clock.lock() {
+            return Instant::now() + *offset;
+        }
+        Instant::now()
+    }
+
+    /// Wall-clock nanoseconds on the same clock as [`Self::now`].
+    fn unix_now_ns(&self) -> u64 {
+        #[cfg(test)]
+        if let Ok(offset) = self.clock.lock() {
+            return crate::unix_now_ns().saturating_add(offset.as_nanos() as u64);
+        }
+        crate::unix_now_ns()
+    }
+
+    /// Runs this ledger's clock `by` further ahead.
+    #[cfg(test)]
+    fn advance_clock(&self, by: Duration) {
+        if let Ok(mut offset) = self.clock.lock() {
+            *offset += by;
+        }
     }
 
     fn lock_failures(&self) -> Result<std::sync::MutexGuard<'_, Failures>> {
@@ -888,21 +957,25 @@ impl Ledger {
         }
     }
 
-    /// Of `settled` — read from the tombstone log AFTER the snapshot whose
-    /// prefix is `length` bytes — the publications whose entry a
-    /// verification of that prefix must not call missing: appended past
-    /// it, or still being appended (marked [`Self::settling`]).
+    /// Of `settled` — publications whose settle records were read from the
+    /// tombstone log AFTER the snapshot whose prefix is `length` bytes, and
+    /// whose entries that prefix lacks — the ones a verification of that
+    /// prefix must not call missing: appended past it, or still being
+    /// appended (marked [`Self::settling`]).
     ///
     /// Read under one tip lock, and after the settlements, which is what
     /// makes it exact: an erasure whose settle the read saw had its mark up
     /// before the settle was written, and drops the mark only after its
-    /// append, so here it is either still marked or its entry's offset is
-    /// known (a failed append leaves neither, and stays reported).
-    fn landed_or_landing(&self, settled: &[Settled], length: u64) -> Result<HashSet<Publication>> {
+    /// append, so here — however much later — it is either still marked or
+    /// its entry's offset is known (a failed append leaves neither, and
+    /// stays reported).
+    fn landed_or_landing(
+        &self,
+        settled: impl Iterator<Item = Publication>,
+        length: u64,
+    ) -> Result<HashSet<Publication>> {
         let tip = self.lock()?;
         Ok(settled
-            .iter()
-            .map(Settled::publication)
             .filter(|publication| {
                 tip.settling.contains_key(&publication.0)
                     || tip
@@ -1091,22 +1164,43 @@ impl Ledger {
         Ok(true)
     }
 
-    fn lock_chain(&self) -> Result<std::sync::MutexGuard<'_, Option<CachedWalk>>> {
-        self.chain
+    fn lock_evidence(&self) -> Result<std::sync::MutexGuard<'_, Evidence>> {
+        self.evidence
             .lock()
-            .map_err(|_| Error::LockPoisoned("ledger chain walk"))
+            .map_err(|_| Error::LockPoisoned("ledger evidence state"))
     }
 
     /// Offers a complete walk from byte 0, begun at `started`, for evidence
-    /// packs to extend: kept when it is fresher than the one held. Its
-    /// length was a snapshot's, so it cannot run past a later snapshot.
-    fn offer_walk(&self, walk: ChainWalk, started: Instant) -> Result<()> {
+    /// packs to extend: kept when it is fresher than the one they serve,
+    /// and then a redo begun before it is dropped, since finishing it could
+    /// only give an older answer. Its length was a snapshot's, so it cannot
+    /// run past a later snapshot. Its cross-check is rebuilt by the next
+    /// pack, from memory: the walk keeps every erasure entry it read.
+    fn offer_walk(&self, walk: ChainWalk, started: Instant, started_at_ns: u64) -> Result<()> {
         if walk.missing {
             return Ok(());
         }
-        let mut chain = self.lock_chain()?;
-        if chain.as_ref().map_or(true, |held| held.started < started) {
-            *chain = Some(CachedWalk { walk, started });
+        let mut evidence = self.lock_evidence()?;
+        if evidence
+            .served
+            .as_ref()
+            .map_or(true, |held| held.started < started)
+        {
+            let target = walk.len;
+            evidence.served = Some(CachedWalk {
+                walk,
+                cross: CrossCheck::default(),
+                started,
+                started_at_ns,
+                target,
+            });
+            if evidence
+                .refresh
+                .as_ref()
+                .is_some_and(|refresh| refresh.started < started)
+            {
+                evidence.refresh = None;
+            }
         }
         Ok(())
     }
@@ -1153,7 +1247,12 @@ mod probe {
 
     thread_local! {
         static PARSED: Cell<u64> = const { Cell::new(0) };
+        static DIGESTED: Cell<u64> = const { Cell::new(0) };
+        static EXAMINED: Cell<u64> = const { Cell::new(0) };
+        static HASHED: Cell<u64> = const { Cell::new(0) };
+        static ALLOWANCE: Cell<Option<u64>> = const { Cell::new(None) };
         static ON_WALK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+        static ON_HASH: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
     }
 
     /// Counts one ledger line parsed.
@@ -1164,6 +1263,56 @@ mod probe {
     /// Ledger lines parsed on this thread so far.
     pub(super) fn parsed() -> u64 {
         PARSED.with(Cell::get)
+    }
+
+    /// Counts one settled erasure's subject digested for the cross-check.
+    pub(super) fn digested_one() {
+        DIGESTED.with(|digested| digested.set(digested.get() + 1));
+    }
+
+    /// Settled erasures digested on this thread so far.
+    pub(super) fn digested() -> u64 {
+        DIGESTED.with(Cell::get)
+    }
+
+    /// Counts one index entry looked at to find a pack's window — of the
+    /// chain or of the settled erasures — or one cross-check step.
+    pub(super) fn examined_one() {
+        EXAMINED.with(|examined| examined.set(examined.get() + 1));
+    }
+
+    /// Index entries looked at on this thread so far.
+    pub(super) fn examined() -> u64 {
+        EXAMINED.with(Cell::get)
+    }
+
+    /// Counts `bytes` of manifested files digested by a pack's file check.
+    pub(super) fn hashed(bytes: u64) {
+        HASHED.with(|hashed| hashed.set(hashed.get() + bytes));
+    }
+
+    /// Manifested bytes a pack's file check digested on this thread so far.
+    pub(super) fn hashed_bytes() -> u64 {
+        HASHED.with(Cell::get)
+    }
+
+    /// Lets the next `checks` budget checks on this thread pass whatever
+    /// the deadline says, and fails every one after them; `None` lifts the
+    /// limit. A budget that runs out at a chosen point, without a clock.
+    pub(super) fn allow(checks: Option<u64>) {
+        ALLOWANCE.with(|allowance| allowance.set(checks));
+    }
+
+    /// Spends one budget check: true when the allowance is used up.
+    pub(super) fn spent() -> bool {
+        ALLOWANCE.with(|allowance| match allowance.get() {
+            None => false,
+            Some(0) => true,
+            Some(left) => {
+                allowance.set(Some(left - 1));
+                false
+            }
+        })
     }
 
     /// Runs the hook set by [`on_walk`], once.
@@ -1177,6 +1326,35 @@ mod probe {
     pub(super) fn on_walk(hook: Box<dyn FnOnce()>) {
         ON_WALK.with(|slot| *slot.borrow_mut() = Some(hook));
     }
+
+    /// Runs the hook set by [`on_hash`], once.
+    pub(super) fn hashing() {
+        if let Some(hook) = ON_HASH.with(|slot| slot.borrow_mut().take()) {
+            hook();
+        }
+    }
+
+    /// Sets a hook for the next manifested file a pack's check digests on
+    /// this thread.
+    pub(super) fn on_hash(hook: Box<dyn FnOnce()>) {
+        ON_HASH.with(|slot| *slot.borrow_mut() = Some(hook));
+    }
+}
+
+/// Whether a budgeted step must stop here: its deadline has passed — or,
+/// under test, the thread's allowance of checks is spent (see
+/// `probe::allow`). Without a deadline, never: an unbudgeted step (the
+/// operator's verification, a store with no query budget) is never cut
+/// short.
+fn out_of_budget(deadline: Option<crate::Deadline>) -> bool {
+    if deadline.is_none() {
+        return false;
+    }
+    #[cfg(test)]
+    if probe::spent() {
+        return true;
+    }
+    crate::Deadline::check(deadline, 0).is_err()
 }
 
 /// The result of verifying the ledger and the live generation against it.
@@ -1191,6 +1369,12 @@ pub struct Verification {
     pub entries: u64,
     /// The recorded head of the last readable entry.
     pub head: Option<String>,
+    /// When the walk this verification rests on began at the chain's first
+    /// entry, nanoseconds since the Unix epoch: the age of its oldest
+    /// finding. An evidence pack extends an earlier walk by what was
+    /// appended since, so this can be well before the pack; a fresh
+    /// verification's is the moment it ran.
+    pub chain_verified_at_ns: u64,
     /// Every discrepancy, each naming the entry (`seq N`) or file it is about.
     pub problems: Vec<String>,
     /// The live generation, checked against the chain and against its files.
@@ -1227,7 +1411,9 @@ pub struct GenerationCheck {
     /// Whether every file the manifest names re-digests to its recorded
     /// digest (the same check as `GET /v1/verify`).
     pub files_verified: bool,
-    /// When the file check ran, nanoseconds since the Unix epoch.
+    /// When the file check ran, nanoseconds since the Unix epoch — for an
+    /// evidence pack, which re-digests files a budget at a time, when the
+    /// OLDEST file digest it rests on began.
     pub verified_at_ns: u64,
 }
 
@@ -1315,9 +1501,10 @@ fn yes_no(value: bool) -> &'static str {
 /// Sound because the file is append-only and nothing the store does
 /// rewrites bytes inside the chain's prefix: what a walk established about
 /// a prefix stays established, unless the disk is edited under a running
-/// server. That is why an evidence pack extends a walk only for a bounded
-/// time ([`EVIDENCE_VERIFY_REUSE`]) and the operator's verification always
-/// walks from byte 0.
+/// server. That is why evidence packs redo a completed walk from byte 0 once
+/// it is older than [`EVIDENCE_VERIFY_REUSE`], and the operator's
+/// verification always walks from byte 0. It is also why an UNFINISHED walk
+/// is never thrown away for its age: nothing it established has expired.
 ///
 /// Works on the generic JSON of each line, never a decoded [`Entry`]: a field
 /// added by hand must change the recomputed head, and decoding into a typed
@@ -1325,10 +1512,15 @@ fn yes_no(value: bool) -> &'static str {
 /// line says one, else by line number.
 #[derive(Clone, Debug)]
 struct ChainWalk {
-    /// Bytes walked: always the end of a newline-terminated line, so the
-    /// next line starts exactly here. An unterminated final line is taken
-    /// in only by [`Self::with_tail`], on a copy.
+    /// Bytes walked: the end of the last line taken in, so the next line
+    /// starts here — or, when that line lacked its newline
+    /// ([`Self::unterminated`]), one byte before it does.
     len: u64,
+    /// The last line taken in ended at the walk's target without a newline:
+    /// a final entry the open could not terminate. The next append writes
+    /// that newline first, and the next [`Self::advance`] steps over it
+    /// rather than read it as a blank line of its own.
+    unterminated: bool,
     line_number: u64,
     /// Entry lines walked, readable or not (blank lines excluded).
     entries: u64,
@@ -1348,39 +1540,139 @@ struct ChainWalk {
     /// be read — the chain cannot be followed across it, and reporting every
     /// later entry as broken would bury the one real finding.
     expected: Option<(u64, String)>,
-    /// Recorded heads by seq, for checking anchors, as [`head_key`]s: 32
+    /// Recorded heads by seq, for checking anchors, as [`hex_key`]s: 32
     /// bytes each rather than a 64-character string, because a cached walk
     /// keeps them for the life of the store. Only a contiguous prefix is
     /// kept, so a hand-edited huge seq cannot force a huge allocation.
-    heads: Vec<[u8; 32]>,
+    heads: Vec<Key>,
     genesis_seen: bool,
     /// Lines an evidence pack cannot place in a window: not a JSON object,
     /// or no integer `seq` or `at_ns`.
     unplaceable: u64,
-    /// `(at_ns, offset)` of every line a pack can place, in file order, so a
-    /// pack finds its window's entries without parsing the chain again.
-    placed: Vec<(u64, u64)>,
+    /// The byte offset of every line a pack can place, by its `at_ns`, so a
+    /// pack finds its window's entries by lookup, without parsing the chain
+    /// again or passing over the index.
+    times: TimeIndex,
     /// The ledger file did not exist when walked.
     missing: bool,
 }
 
-/// How far a budgeted [`ChainWalk::advance`] got.
+/// A head or a subject digest, as the walk and the cross-check keep them:
+/// see [`hex_key`].
+type Key = [u8; 32];
+
+/// Arrivals findable by time, each `(at_ns, key)` with `key` increasing in
+/// arrival order (a byte offset, a position).
+///
+/// Arrival order and time order almost always agree — `at_ns` is the wall
+/// clock at append, and appends are serialized — so an arrival no older than
+/// the last goes on the end of `sorted`, which then stays sorted both ways
+/// and answers a window with two binary searches. One that is older (the
+/// clock stepped back, or a hand-edited line) goes to `late`, where a window
+/// is a range query.
+#[derive(Clone, Debug, Default)]
+struct TimeIndex {
+    sorted: Vec<(u64, u64)>,
+    late: BTreeSet<(u64, u64)>,
+}
+
+impl TimeIndex {
+    fn push(&mut self, at_ns: u64, key: u64) {
+        match self.sorted.last() {
+            Some(&(last, _)) if at_ns < last => {
+                self.late.insert((at_ns, key));
+            }
+            _ => self.sorted.push((at_ns, key)),
+        }
+    }
+
+    /// The keys of arrivals with `at_ns` in `[since, until]` that `keep`
+    /// accepts, in arrival order, at most `cap` of them; and whether more
+    /// exist.
+    ///
+    /// O(log n) plus the window, for the arrivals in time order. The late
+    /// ones in the window are each looked at (keeping the `cap + 1` lowest
+    /// keys), under the deadline: they are rare, but a chain edited into
+    /// disorder could hold many, and finding them is not resumable work.
+    fn window(
+        &self,
+        since: u64,
+        until: u64,
+        cap: usize,
+        keep: impl Fn(u64) -> bool,
+        deadline: Option<crate::Deadline>,
+    ) -> Result<(Vec<u64>, bool)> {
+        let lower = self.sorted.partition_point(|&(at_ns, _)| {
+            #[cfg(test)]
+            probe::examined_one();
+            at_ns < since
+        });
+        let upper = lower
+            + self.sorted[lower..].partition_point(|&(at_ns, _)| {
+                #[cfg(test)]
+                probe::examined_one();
+                at_ns <= until
+            });
+        let mut late = std::collections::BinaryHeap::new();
+        for (looked, &(_, key)) in self.late.range((since, 0)..=(until, u64::MAX)).enumerate() {
+            #[cfg(test)]
+            probe::examined_one();
+            if looked > 0 && looked as u64 % WALK_CHECK_INTERVAL == 0 && out_of_budget(deadline) {
+                return Err(Error::DeadlineExceeded(format!(
+                    "{looked} entries recorded out of time order fall in the window, more than \
+                     the budget could look through; narrow the window or raise \
+                     --query-deadline-ms"
+                )));
+            }
+            if keep(key) {
+                late.push(key);
+                if late.len() > cap + 1 {
+                    late.pop();
+                }
+            }
+        }
+        let mut late = late.into_sorted_vec().into_iter().peekable();
+        let mut sorted = self.sorted[lower..upper]
+            .iter()
+            .map(|&(_, key)| key)
+            .filter(|key| keep(*key))
+            .peekable();
+        let mut keys = Vec::new();
+        while keys.len() <= cap {
+            let next = match (sorted.peek(), late.peek()) {
+                (Some(&left), Some(&right)) if right < left => late.next(),
+                (Some(_), _) => sorted.next(),
+                (None, _) => late.next(),
+            };
+            match next {
+                Some(key) => keys.push(key),
+                None => break,
+            }
+        }
+        let truncated = keys.len() > cap;
+        keys.truncate(cap);
+        Ok((keys, truncated))
+    }
+}
+
+/// How far a budgeted step — a chain walk, taking in settled erasures, the
+/// erasure cross-check, a file check — got.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Walked {
-    /// To the target: every newline-terminated line before it.
+    /// To its target.
     Reached,
-    /// The deadline passed first; the walk stopped on a line boundary and
-    /// resumes from there.
+    /// The deadline passed first; the step stopped where it can resume.
     OutOfBudget,
 }
 
-/// A recorded or claimed head, as the walk compares them: the 32 bytes a
-/// well-formed head spells, and for anything else the SHA-256 of its text.
-/// Equal keys mean equal strings — a malformed string colliding with a
-/// well-formed head would be a SHA-256 preimage — so comparing keys is
-/// comparing heads, at a third of the memory.
-fn head_key(text: &str) -> [u8; 32] {
-    fn decode(text: &str) -> Option<[u8; 32]> {
+/// A recorded or claimed head, or a subject digest, as the walk and the
+/// cross-check compare them: the 32 bytes a well-formed SHA-256 hex string
+/// spells, and for anything else the SHA-256 of its text. Equal keys mean
+/// equal strings — a malformed string colliding with a well-formed one
+/// would be a SHA-256 preimage — so comparing keys is comparing the
+/// strings, at a third of the memory.
+fn hex_key(text: &str) -> Key {
+    fn decode(text: &str) -> Option<Key> {
         if !is_sha256_hex(text) {
             return None;
         }
@@ -1399,10 +1691,20 @@ fn head_key(text: &str) -> [u8; 32] {
         .unwrap_or_default()
 }
 
+/// The lowercase hex a well-formed key was decoded from.
+fn key_hex(key: &Key) -> String {
+    use std::fmt::Write as _;
+    key.iter().fold(String::with_capacity(64), |mut hex, byte| {
+        let _ = write!(hex, "{byte:02x}");
+        hex
+    })
+}
+
 impl ChainWalk {
     fn new() -> Self {
         Self {
             len: 0,
+            unterminated: false,
             line_number: 0,
             entries: 0,
             head: None,
@@ -1413,16 +1715,20 @@ impl ChainWalk {
             heads: Vec::new(),
             genesis_seen: false,
             unplaceable: 0,
-            placed: Vec::new(),
+            times: TimeIndex::default(),
             missing: false,
         }
     }
 
     /// Walks on through byte `to` of the ledger at `path` (its end when
     /// `None`), checking the deadline every [`WALK_CHECK_INTERVAL`] lines,
-    /// so every call makes at least that much progress. An unterminated
-    /// final line is left for [`Self::with_tail`]. Returns the target, and
-    /// whether it was reached.
+    /// so every call makes at least that much progress. Returns the target,
+    /// and whether it was reached.
+    ///
+    /// A final line before `to` that lacks its newline is taken in all the
+    /// same — within a snapshot it is a complete entry the open could not
+    /// terminate — and marked, so the next call steps over the newline the
+    /// next append writes before its own line.
     fn advance(
         &mut self,
         path: &Path,
@@ -1443,6 +1749,14 @@ impl ChainWalk {
             Some(to) => to,
             None => file.metadata()?.len(),
         };
+        if self.unterminated && self.len < to {
+            file.seek(SeekFrom::Start(self.len))?;
+            let mut byte = [0_u8; 1];
+            if file.read(&mut byte)? == 1 && byte[0] == b'\n' {
+                self.len += 1;
+            }
+            self.unterminated = false;
+        }
         if self.len >= to {
             return Ok((to, Walked::Reached));
         }
@@ -1453,41 +1767,20 @@ impl ChainWalk {
         loop {
             line.clear();
             let read = reader.read_until(b'\n', &mut line)?;
-            if read == 0 || !line.ends_with(b"\n") {
+            if read == 0 {
                 return Ok((to, Walked::Reached));
             }
             self.feed(&line, self.len);
             self.len += read as u64;
+            if !line.ends_with(b"\n") {
+                self.unterminated = true;
+                return Ok((to, Walked::Reached));
+            }
             walked += 1;
-            if self.len < to
-                && walked % WALK_CHECK_INTERVAL == 0
-                && crate::Deadline::check(deadline, 0).is_err()
-            {
+            if self.len < to && walked % WALK_CHECK_INTERVAL == 0 && out_of_budget(deadline) {
                 return Ok((to, Walked::OutOfBudget));
             }
         }
-    }
-
-    /// This walk with the unterminated final line before `to` taken in, on a
-    /// copy, or `None` when there is none (the common case: a snapshot ends
-    /// on a newline, and only a newline the open could not write leaves
-    /// one). A copy because a walk past a line with no newline could not
-    /// resume: the next append writes that newline first.
-    fn with_tail(&self, path: &Path, to: u64) -> Result<Option<Self>> {
-        if self.missing || self.len >= to {
-            return Ok(None);
-        }
-        let mut file = File::open(path)?;
-        file.seek(SeekFrom::Start(self.len))?;
-        let mut tail = Vec::new();
-        file.take(to - self.len).read_to_end(&mut tail)?;
-        if tail.is_empty() {
-            return Ok(None);
-        }
-        let mut walk = self.clone();
-        walk.feed(&tail, self.len);
-        walk.len += tail.len() as u64;
-        Ok(Some(walk))
     }
 
     /// Checks one line starting at byte `offset`.
@@ -1520,7 +1813,7 @@ impl ChainWalk {
             return;
         };
         match entry.get("at_ns").and_then(Value::as_u64) {
-            Some(at_ns) => self.placed.push((at_ns, offset)),
+            Some(at_ns) => self.times.push(at_ns, offset),
             None => self.unplaceable += 1,
         }
         let name = format!("seq {seq}");
@@ -1569,7 +1862,7 @@ impl ChainWalk {
                     self.erasures.push(LedgeredErasure {
                         seq,
                         erasure_id,
-                        subject_digest: digest.to_owned(),
+                        subject_digest: hex_key(digest),
                         generation: entry.get("generation").and_then(Value::as_u64),
                         subject_kind: entry
                             .get("subject_kind")
@@ -1587,7 +1880,7 @@ impl ChainWalk {
         }
         let head = recorded_head.unwrap_or(recomputed);
         if seq == self.heads.len() as u64 {
-            self.heads.push(head_key(&head));
+            self.heads.push(hex_key(&head));
         }
         self.expected = Some((seq.saturating_add(1), head.clone()));
         self.head = Some(head);
@@ -1608,7 +1901,9 @@ impl ChainWalk {
     }
 }
 
-/// What [`Store::evidence`] takes from the chain.
+/// What [`Store::evidence`] takes from the state packs keep: everything that
+/// needs [`Ledger::evidence`] held, so the rest of the pack is assembled
+/// without it.
 struct EvidenceChain {
     /// The tip at the snapshot the walk ran to.
     head: LedgerHead,
@@ -1620,14 +1915,62 @@ struct EvidenceChain {
     window_truncated: bool,
     /// Lines of the chain a pack cannot place in any window.
     unplaceable: u64,
+    /// The erasures the pack lists, oldest first, at most
+    /// [`EVIDENCE_MAX_ERASURES`].
+    erasures: Vec<ListedErasure>,
+    /// More erasures fall in the window than `erasures` holds.
+    erasures_truncated: bool,
 }
 
-/// The walk the evidence packs extend, and when its walk from byte 0
-/// began — the moment its oldest finding was made.
+/// One erasure an evidence pack lists.
+struct ListedErasure {
+    id: u64,
+    subject_kind: &'static str,
+    published_at_ns: u64,
+}
+
+/// What evidence packs keep between requests; see [`Store::evidence`].
+#[derive(Debug, Default)]
+struct Evidence {
+    /// The live tombstone log's settle records taken in so far.
+    settles: SettleIndex,
+    /// The completed walk packs serve, extending it by what was appended
+    /// since; with its cross-check.
+    served: Option<CachedWalk>,
+    /// A walk from byte 0 under way: the first one, which a pack must
+    /// finish before it can answer, or the redo of a served walk past
+    /// [`EVIDENCE_VERIFY_REUSE`], which packs advance a slice at a time
+    /// while serving the older one. Never discarded for its age.
+    refresh: Option<CachedWalk>,
+    /// The file check, once a pack has read the live manifest.
+    files: Option<FileVerifier>,
+}
+
+/// A chain walk packs keep, with its cross-check and when its walk from
+/// byte 0 began — the moment its oldest finding was made.
 #[derive(Debug)]
 struct CachedWalk {
     walk: ChainWalk,
+    cross: CrossCheck,
+    /// On the ledger's clock ([`Ledger::now`]).
     started: Instant,
+    /// The same moment, nanoseconds since the Unix epoch, as packs report it.
+    started_at_ns: u64,
+    /// The prefix a walk under way must reach to be complete: fixed when it
+    /// began, so a walk slower than the appends still finishes.
+    target: u64,
+}
+
+impl CachedWalk {
+    fn new(target: u64, started: Instant, started_at_ns: u64) -> Self {
+        Self {
+            walk: ChainWalk::new(),
+            cross: CrossCheck::default(),
+            started,
+            started_at_ns,
+            target,
+        }
+    }
 }
 
 /// One erasure entry, as the cross-check needs it.
@@ -1635,7 +1978,7 @@ struct CachedWalk {
 struct LedgeredErasure {
     seq: u64,
     erasure_id: u64,
-    subject_digest: String,
+    subject_digest: Key,
     /// `None` when the entry lacks one; the body check reports that.
     generation: Option<u64>,
     subject_kind: String,
@@ -1647,11 +1990,301 @@ struct LedgeredErasure {
 /// whether or not it is terminated: a one-shot verification of the chain.
 fn verify_chain(path: &Path, length: Option<u64>) -> Result<ChainWalk> {
     let mut walk = ChainWalk::new();
-    let (to, _) = walk.advance(path, length, None)?;
-    Ok(match walk.with_tail(path, to)? {
-        Some(whole) => whole,
-        None => walk,
-    })
+    walk.advance(path, length, None)?;
+    Ok(walk)
+}
+
+/// One settle record as [`SettleIndex`] keeps it.
+#[derive(Clone, Debug)]
+struct IndexedSettle {
+    id: u64,
+    digest: Key,
+    /// The generation that published the deletion.
+    generation: u64,
+    settled_unix_ns: u64,
+    subject_kind: &'static str,
+    /// The subject's tenant, `None` for a store-global payload subject.
+    tenant: Option<String>,
+    /// A later position holds this erasure's current settle: it was
+    /// settled twice (two completions racing), and only the later counts.
+    superseded: bool,
+}
+
+/// A tombstone log's settle records, each taken in — its subject digested —
+/// once, in settle order (see [`erasure::ErasureLog::settlements`]), and
+/// findable by settle time. What the erasure cross-check and a pack's
+/// erasure listing read, so neither clones or re-digests the log per
+/// request.
+#[derive(Debug, Default)]
+struct SettleIndex {
+    entries: Vec<IndexedSettle>,
+    /// Each erasure's latest position, so a second settle of one erasure
+    /// supersedes the first.
+    latest: HashMap<u64, usize>,
+    /// Positions by settle time: every entry, and each tenant's.
+    all: TimeIndex,
+    tenants: HashMap<String, TimeIndex>,
+}
+
+impl SettleIndex {
+    /// The index of the settled erasures in `statuses`, for a log no live
+    /// store has open (nothing settles twice in what a replay reports).
+    fn from_statuses(statuses: &[erasure::ErasureStatus]) -> Self {
+        let mut index = Self::default();
+        for status in statuses {
+            if let Some(settle) = &status.settle {
+                index.push(&erasure::Settlement {
+                    id: status.erase.id,
+                    subject: status.erase.subject.clone(),
+                    generation: settle.generation,
+                    settled_unix_ns: settle.settled_unix_ns,
+                });
+            }
+        }
+        index
+    }
+
+    fn push(&mut self, settlement: &erasure::Settlement) {
+        #[cfg(test)]
+        probe::digested_one();
+        let position = self.entries.len();
+        if let Some(earlier) = self.latest.insert(settlement.id, position) {
+            self.entries[earlier].superseded = true;
+        }
+        let tenant = settlement.subject.tenant().map(str::to_owned);
+        self.all.push(settlement.settled_unix_ns, position as u64);
+        if let Some(tenant) = &tenant {
+            self.tenants
+                .entry(tenant.clone())
+                .or_default()
+                .push(settlement.settled_unix_ns, position as u64);
+        }
+        self.entries.push(IndexedSettle {
+            id: settlement.id,
+            digest: hex_key(&subject_digest(&settlement.subject)),
+            generation: settlement.generation,
+            settled_unix_ns: settlement.settled_unix_ns,
+            subject_kind: subject_kind(&settlement.subject),
+            tenant,
+            superseded: false,
+        });
+    }
+
+    /// Holds a position whose erasure has no settle now (see
+    /// [`erasure::ErasureLog::settlements`]): never current, so neither the
+    /// cross-check nor a listing reads it, but it keeps every later
+    /// position where the log's settle order has it.
+    fn push_gap(&mut self) {
+        self.entries.push(IndexedSettle {
+            id: 0,
+            digest: Key::default(),
+            generation: 0,
+            settled_unix_ns: 0,
+            subject_kind: "?",
+            tenant: None,
+            superseded: true,
+        });
+    }
+
+    /// Takes in `log`'s settle records through position `to`, a chunk at a
+    /// time — one lock hold each — checking the deadline between chunks.
+    fn sync(
+        &mut self,
+        log: &erasure::ErasureLog,
+        to: usize,
+        deadline: Option<crate::Deadline>,
+    ) -> Result<Walked> {
+        let mut first = true;
+        while self.entries.len() < to {
+            if !first && out_of_budget(deadline) {
+                return Ok(Walked::OutOfBudget);
+            }
+            first = false;
+            let from = self.entries.len();
+            let settlements = log.settlements(from, (from + SETTLE_CHUNK).min(to))?;
+            if settlements.is_empty() {
+                // The log holds fewer than `to`: nothing a caller reading its
+                // length first can ask for, but never spin on it.
+                break;
+            }
+            for settlement in &settlements {
+                match settlement {
+                    Some(settlement) => self.push(settlement),
+                    None => self.push_gap(),
+                }
+            }
+        }
+        Ok(Walked::Reached)
+    }
+
+    /// The current settles of `tenant`'s subjects (every subject, for
+    /// `None`) settled within `[since, until]`, oldest first, at most `cap`;
+    /// and whether more exist.
+    fn window(
+        &self,
+        tenant: Option<&str>,
+        since: u64,
+        until: u64,
+        cap: usize,
+        deadline: Option<crate::Deadline>,
+    ) -> Result<(Vec<&IndexedSettle>, bool)> {
+        let index = match tenant {
+            None => &self.all,
+            Some(tenant) => match self.tenants.get(tenant) {
+                Some(index) => index,
+                None => return Ok((Vec::new(), false)),
+            },
+        };
+        let current = |position: u64| !self.entries[position as usize].superseded;
+        let (positions, truncated) = index.window(since, until, cap, current, deadline)?;
+        Ok((
+            positions
+                .into_iter()
+                .map(|position| &self.entries[position as usize])
+                .collect(),
+            truncated,
+        ))
+    }
+}
+
+/// The erasure cross-check of one walk against the settled erasures, kept
+/// up to date as either grows, so a pack pays for what is new on each side
+/// rather than for every erasure ever settled and ledgered.
+///
+/// It holds, for what it has taken in, exactly what [`assemble`] reports:
+/// the erasure entries no settlement vouches for (`undone`) and the settled
+/// publications the walked chain lacks (`unledgered`). Both directions are
+/// monotone while a store is open — a live tombstone log only gains
+/// settles, so a subject's newest settled generation only rises, and a walk
+/// only gains entries — which is what lets each new settle or entry update
+/// them alone. The one change that is not monotone, an erasure settled a
+/// second time with a different generation (two completions of one erasure
+/// racing), starts the check over, from memory.
+#[derive(Clone, Debug, Default)]
+struct CrossCheck {
+    /// Erasure entries of the walk taken in: `walk.erasures[..entries]`.
+    entries: usize,
+    /// Settle-index positions taken in: `settles.entries[..settles]`.
+    settles: usize,
+    /// The settle taken in for each erasure id: `(digest, generation)`.
+    settled: HashMap<u64, (Key, u64)>,
+    /// The newest settled generation of each subject.
+    newest: HashMap<Key, u64>,
+    /// Every publication the walked chain ledgers:
+    /// `(erasure_id, subject_digest, generation)`.
+    ledgered: HashSet<(u64, Key, u64)>,
+    /// Entries no settlement vouches for, by subject: `(generation, index
+    /// into walk.erasures)`.
+    undone: HashMap<Key, Vec<(u64, usize)>>,
+    /// Settled publications the walked chain lacks, `(id, generation,
+    /// digest)`, with their settle-index positions.
+    unledgered: BTreeMap<(u64, u64, Key), usize>,
+}
+
+impl CrossCheck {
+    /// Takes in what `walk` and `settles` gained since the last call,
+    /// settles first, checking the deadline every [`WALK_CHECK_INTERVAL`]
+    /// steps.
+    fn sync(
+        &mut self,
+        walk: &ChainWalk,
+        settles: &SettleIndex,
+        deadline: Option<crate::Deadline>,
+    ) -> Walked {
+        let mut steps = 0_u64;
+        loop {
+            if self.settles < settles.entries.len() {
+                let entry = &settles.entries[self.settles];
+                if !entry.superseded && !self.settle(self.settles, entry) {
+                    *self = Self::default();
+                    continue;
+                }
+                self.settles += 1;
+            } else if self.entries < walk.erasures.len() {
+                self.ledger(self.entries, &walk.erasures[self.entries]);
+                self.entries += 1;
+            } else {
+                return Walked::Reached;
+            }
+            #[cfg(test)]
+            probe::examined_one();
+            steps += 1;
+            if steps % WALK_CHECK_INTERVAL == 0 && out_of_budget(deadline) {
+                return Walked::OutOfBudget;
+            }
+        }
+    }
+
+    /// Takes in the settle at `position`. False when it replaces a
+    /// different settle of the same erasure already taken in — which only
+    /// a check started over can follow.
+    fn settle(&mut self, position: usize, entry: &IndexedSettle) -> bool {
+        match self.settled.get(&entry.id) {
+            Some(&taken) if taken == (entry.digest, entry.generation) => return true,
+            Some(_) => return false,
+            None => {}
+        }
+        self.settled
+            .insert(entry.id, (entry.digest, entry.generation));
+        let newest = self.newest.entry(entry.digest).or_insert(0);
+        *newest = (*newest).max(entry.generation);
+        let newest = *newest;
+        if let Some(waiting) = self.undone.get_mut(&entry.digest) {
+            waiting.retain(|&(generation, _)| generation > newest);
+            if waiting.is_empty() {
+                self.undone.remove(&entry.digest);
+            }
+        }
+        if !self
+            .ledgered
+            .contains(&(entry.id, entry.digest, entry.generation))
+        {
+            self.unledgered
+                .insert((entry.id, entry.generation, entry.digest), position);
+        }
+        true
+    }
+
+    /// Takes in the erasure entry at `index` of the walk.
+    fn ledger(&mut self, index: usize, erasure: &LedgeredErasure) {
+        if let Some(generation) = erasure.generation {
+            self.ledgered
+                .insert((erasure.erasure_id, erasure.subject_digest, generation));
+            self.unledgered
+                .remove(&(erasure.erasure_id, generation, erasure.subject_digest));
+        }
+        let published = erasure.generation.unwrap_or(0);
+        if self
+            .newest
+            .get(&erasure.subject_digest)
+            .map_or(true, |newest| *newest < published)
+        {
+            self.undone
+                .entry(erasure.subject_digest)
+                .or_default()
+                .push((published, index));
+        }
+    }
+
+    /// The settled publications the walked chain lacks, as the tip keys
+    /// them, for [`Ledger::landed_or_landing`].
+    fn unledgered_publications(&self) -> impl Iterator<Item = Publication> + '_ {
+        self.unledgered
+            .keys()
+            .map(|(id, generation, digest)| (*id, key_hex(digest), *generation))
+    }
+
+    /// The undone entries' indexes into the walk's erasures: chain order.
+    fn undone_in_chain_order(&self) -> Vec<usize> {
+        let mut indexes: Vec<usize> = self
+            .undone
+            .values()
+            .flatten()
+            .map(|&(_, index)| index)
+            .collect();
+        indexes.sort_unstable();
+        indexes
+    }
 }
 
 /// The kind-specific checks: required fields present with the right types,
@@ -1659,7 +2292,7 @@ fn verify_chain(path: &Path, length: Option<u64>) -> Result<ChainWalk> {
 fn check_body(
     entry: &Map<String, Value>,
     seq: u64,
-    heads: &[[u8; 32]],
+    heads: &[Key],
     genesis_seen: &mut bool,
     problems: &mut Vec<String>,
 ) {
@@ -1706,7 +2339,7 @@ fn check_body(
         }
         Some("anchor") => match (number("target_seq"), text("target_head")) {
             (Some(target), Some(target_head)) if target < seq => match heads.get(target as usize) {
-                Some(head) if *head == head_key(target_head) => {}
+                Some(head) if *head == hex_key(target_head) => {}
                 Some(_) => problems.push(format!(
                     "{name}: anchors seq {target}, but its target_head is not the head \
                          recorded at seq {target}"
@@ -1725,45 +2358,14 @@ fn check_body(
     }
 }
 
-/// One settled erasure in a tombstone log — one publication — with what a
-/// problem about it must say.
-#[derive(Clone, Debug)]
-struct Settled {
-    id: u64,
-    subject_digest: String,
-    /// The settle record's generation: the one that published the deletion.
-    generation: u64,
-    subject_kind: &'static str,
-    /// The subject's tenant, `None` for a store-global payload subject.
-    tenant: Option<String>,
-}
-
-impl Settled {
-    fn publication(&self) -> Publication {
-        (self.id, self.subject_digest.clone(), self.generation)
-    }
-}
-
-/// Every SETTLED erasure in a tombstone log's statuses, in id order.
-fn settled_of(statuses: &[erasure::ErasureStatus]) -> Vec<Settled> {
-    statuses
-        .iter()
-        .filter_map(|status| {
-            let settle = status.settle.as_ref()?;
-            Some(Settled {
-                id: status.erase.id,
-                subject_digest: subject_digest(&status.erase.subject),
-                generation: settle.generation,
-                subject_kind: subject_kind(&status.erase.subject),
-                tenant: status.erase.subject.tenant().map(str::to_owned),
-            })
-        })
-        .collect()
-}
-
-/// What [`assemble`] checks a walked chain against: everything about the
-/// store that is not the chain — live, gathered around the snapshot that
-/// fixes the chain's prefix (see [`Store::live_facts`]).
+/// What [`assemble`] checks a walked chain against, beyond the cross-check:
+/// everything about the store that is not the chain — live, gathered around
+/// the snapshot that fixes the chain's prefix.
+///
+/// The settled erasures the cross-check took in were read AFTER that
+/// snapshot: an erasure entry is appended only once its settle is durable,
+/// so every erasure in the prefix has its settle there unless the log lost
+/// it.
 struct LiveFacts {
     /// The generation `CURRENT` names.
     generation: u64,
@@ -1772,26 +2374,30 @@ struct LiveFacts {
     manifest_sha256: String,
     /// The file check of that generation.
     files: FileCheck,
-    /// Every settled erasure in the live tombstone log, read AFTER the
-    /// chain's prefix was fixed: an erasure entry is appended only once its
-    /// settle is durable, so every erasure in the prefix has its settle
-    /// here unless the log lost it.
-    settled: Vec<Settled>,
-    /// Of `settled`, the publications whose entry is past the prefix or
-    /// being appended; see [`Ledger::landed_or_landing`]. Empty offline,
-    /// where nothing moves.
+    /// Of the settled publications the walked chain lacks, the ones whose
+    /// entry is past the prefix or being appended; see
+    /// [`Ledger::landed_or_landing`]. Empty offline, where nothing moves.
     landing: HashSet<Publication>,
     /// Lines of the tombstone log that did not parse, which the offline
     /// read skips (the open would refuse the log). Zero live.
     tombstones_unreadable: usize,
     /// An append failure not yet caught up, if any.
     failure: Option<Failure>,
+    /// When the walk began at byte 0; see
+    /// [`Verification::chain_verified_at_ns`].
+    chain_verified_at_ns: u64,
 }
 
-/// Checks a walked chain against the live facts. No I/O: the walk and the
-/// facts carry everything, which is what lets the walk run outside the
-/// maintenance lock the facts were gathered under.
-fn assemble(chain: &ChainWalk, live: &LiveFacts) -> Verification {
+/// Checks a walked chain, and its cross-check against `settles`, against
+/// the live facts. No I/O: the walk, the cross-check and the facts carry
+/// everything, which is what lets the walk run outside the maintenance lock
+/// the facts were gathered under.
+fn assemble(
+    chain: &ChainWalk,
+    cross: &CrossCheck,
+    settles: &SettleIndex,
+    live: &LiveFacts,
+) -> Verification {
     let generation = live.generation;
     let manifest_sha256 = live.manifest_sha256.clone();
     let mut problems = chain.problems();
@@ -1846,21 +2452,11 @@ fn assemble(chain: &ChainWalk, live: &LiveFacts) -> Verification {
     // install takes the next id past both stores), so a later one is a
     // re-application that deleted the subject again, rewound data
     // included; an earlier one deleted only what existed before this
-    // entry's own deletion did. In chain order, so the report reads that
-    // way.
-    let mut newest: HashMap<&str, u64> = HashMap::new();
-    for settled in &live.settled {
-        let generation = newest.entry(settled.subject_digest.as_str()).or_insert(0);
-        *generation = (*generation).max(settled.generation);
-    }
-    for erasure in &chain.erasures {
-        let published = erasure.generation.unwrap_or(0);
-        if newest
-            .get(erasure.subject_digest.as_str())
-            .is_some_and(|newest| *newest >= published)
-        {
-            continue;
-        }
+    // entry's own deletion did. The cross-check keeps exactly the entries
+    // that fail this (see `CrossCheck`); in chain order, so the report reads
+    // that way.
+    for index in cross.undone_in_chain_order() {
+        let erasure = &chain.erasures[index];
         let (described, since) = match erasure.generation {
             Some(generation) => (
                 format!(", published in generation {generation}"),
@@ -1882,33 +2478,19 @@ fn assemble(chain: &ChainWalk, live: &LiveFacts) -> Verification {
     // this gap — the checkpoint entry before it already matches `CURRENT`,
     // so nothing else notices — as does a failed append, until the next
     // open or (after a failure) checkpoint ledgers it. An entry past the
-    // prefix, or on its way, is not missing.
-    let ledgered: HashSet<(u64, &str, u64)> = chain
-        .erasures
-        .iter()
-        .filter_map(|erasure| {
-            Some((
-                erasure.erasure_id,
-                erasure.subject_digest.as_str(),
-                erasure.generation?,
-            ))
-        })
-        .collect();
-    for settled in &live.settled {
-        let key = (
-            settled.id,
-            settled.subject_digest.as_str(),
-            settled.generation,
-        );
-        if ledgered.contains(&key) || live.landing.contains(&settled.publication()) {
+    // prefix, or on its way, is not missing. In id order.
+    for (&(id, generation, digest), &position) in &cross.unledgered {
+        if live.landing.contains(&(id, key_hex(&digest), generation)) {
             continue;
         }
+        let settled = &settles.entries[position];
         problems.push(format!(
-            "erasure {} ({} subject, settled in generation {}) is not in the ledger. A crash \
-             or a failed ledger append between settling an erasure and ledgering it leaves \
-             exactly this, and opening the store (or, after a failed append, its next \
-             checkpoint) ledgers it; any other cause is a discrepancy to investigate",
-            settled.id, settled.subject_kind, settled.generation
+            "erasure {id} ({} subject, settled in generation {generation}) is not in the \
+             ledger. A crash or a failed ledger append between settling an erasure and \
+             ledgering it leaves exactly this, and opening the store (or, after a failed \
+             append, its next checkpoint) ledgers it; any other cause is a discrepancy to \
+             investigate",
+            settled.subject_kind
         ));
         scopes.push(Scope::Tenant(settled.tenant.clone()));
     }
@@ -1939,6 +2521,7 @@ fn assemble(chain: &ChainWalk, live: &LiveFacts) -> Verification {
         intact: problems.is_empty(),
         entries: chain.entries,
         head: chain.head.clone(),
+        chain_verified_at_ns: live.chain_verified_at_ns,
         problems,
         generation: GenerationCheck {
             id: generation,
@@ -1951,16 +2534,395 @@ fn assemble(chain: &ChainWalk, live: &LiveFacts) -> Verification {
     }
 }
 
-/// Re-digests every file generation `live`'s manifest names.
-fn check_files(directory: &Path, live: u64) -> Result<FileCheck> {
+/// Re-digests every file generation `live`'s manifest names, in one piece:
+/// the operator's check and the offline one.
+fn check_files(directory: &Path, live: u64, at_ns: u64) -> Result<FileCheck> {
     let manifest = generation::load_manifest(&generation::manifest_path(directory, live))?;
     let problems = generation::verify_against(directory, &manifest)?;
-    Ok(FileCheck {
-        generation: live,
-        at_ns: crate::unix_now_ns(),
-        at: Instant::now(),
-        problems,
-    })
+    Ok(FileCheck { at_ns, problems })
+}
+
+/// A pack's file check: the live generation's manifest, and for each file it
+/// names, when it was last re-digested and what that found.
+///
+/// Kept between packs and advanced a budget at a time, OFF the maintenance
+/// lock: only reading the manifest's bytes takes that lock (a checkpoint
+/// could otherwise sweep the manifest away mid-read). Each file is opened
+/// when its turn comes and digested from that handle, so a file part-way
+/// through when a budget runs out is continued over the same inode next
+/// time — whatever compaction or expiry has renamed over its path since —
+/// and what is digested is always one consistent file. Between files, the
+/// store may move; a file it removed or replaced before its turn reports
+/// missing or changed, as it would to a check under the lock run then (see
+/// [`Store::verify_ledger`] on files replaced between checkpoints).
+///
+/// A file is digested again once its last digest is older than
+/// [`EVIDENCE_VERIFY_REUSE`], oldest first, in the slices packs spend on
+/// refreshing; and a new generation carries over every file whose manifest
+/// entry is unchanged — path, length, digest and modification time — so a
+/// checkpoint costs the files it added, not the store.
+#[derive(Debug)]
+struct FileVerifier {
+    generation: u64,
+    manifest_sha256: String,
+    /// When the manifest was read, on the ledger's clock: read again once
+    /// older than the reuse window, or when the live generation moves.
+    read_at: Instant,
+    files: Vec<FileState>,
+    /// Files never digested against their current manifest entry.
+    unchecked: BTreeSet<usize>,
+    /// Files digested, by when that digest began: the first is the one due
+    /// next, and the oldest finding the check rests on.
+    by_age: BTreeSet<(Instant, usize)>,
+    /// Files whose last digest found a problem.
+    failing: BTreeSet<usize>,
+    /// The file being digested, held open across packs.
+    hashing: Option<Hashing>,
+}
+
+#[derive(Debug)]
+struct FileState {
+    entry: generation::ManifestFile,
+    checked: Option<FileChecked>,
+}
+
+/// One file's last digest: when it began, and what it found.
+#[derive(Clone, Debug)]
+struct FileChecked {
+    at: Instant,
+    at_ns: u64,
+    problem: Option<String>,
+}
+
+/// A digest under way.
+struct Hashing {
+    index: usize,
+    file: File,
+    hasher: payload::Sha256,
+    /// Bytes still to digest of an append-only log's manifested prefix;
+    /// `None` for a file read to its end.
+    remaining: Option<u64>,
+    at: Instant,
+    at_ns: u64,
+}
+
+impl std::fmt::Debug for Hashing {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Hashing")
+            .field("index", &self.index)
+            .field("remaining", &self.remaining)
+            .finish_non_exhaustive()
+    }
+}
+
+/// How starting a file's digest went.
+enum Begun {
+    /// Settled without digesting: missing, or the wrong length.
+    Found(Option<String>, Instant, u64),
+    Hashing(Hashing),
+}
+
+impl FileVerifier {
+    /// The check of generation `generation`'s manifest, from its `bytes`.
+    /// From `previous` it carries over every file whose entry is unchanged,
+    /// with what was found about it and when — and a digest under way, for
+    /// the same file — so moving to a new generation re-digests only what
+    /// the checkpoint changed. The same manifest read again keeps
+    /// everything.
+    fn load(generation: u64, bytes: &[u8], previous: Option<Self>, now: Instant) -> Result<Self> {
+        let manifest_sha256 = payload::sha256_hex(bytes);
+        if let Some(mut previous) = previous {
+            if previous.generation == generation && previous.manifest_sha256 == manifest_sha256 {
+                previous.read_at = now;
+                return Ok(previous);
+            }
+            return Self::carry(generation, manifest_sha256, bytes, Some(previous), now);
+        }
+        Self::carry(generation, manifest_sha256, bytes, None, now)
+    }
+
+    fn carry(
+        generation: u64,
+        manifest_sha256: String,
+        bytes: &[u8],
+        previous: Option<Self>,
+        now: Instant,
+    ) -> Result<Self> {
+        let manifest: generation::Manifest = serde_json::from_slice(bytes).map_err(|error| {
+            Error::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("the manifest of generation {generation} does not decode: {error}"),
+            ))
+        })?;
+        let (mut old, mut hashing) = match previous {
+            Some(previous) => (
+                previous
+                    .files
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, state)| (state.entry.path.clone(), (index, state)))
+                    .collect::<HashMap<_, _>>(),
+                previous.hashing,
+            ),
+            None => (HashMap::new(), None),
+        };
+        let mut verifier = Self {
+            generation,
+            manifest_sha256,
+            read_at: now,
+            files: Vec::with_capacity(manifest.files.len()),
+            unchecked: BTreeSet::new(),
+            by_age: BTreeSet::new(),
+            failing: BTreeSet::new(),
+            hashing: None,
+        };
+        for entry in manifest.files {
+            let index = verifier.files.len();
+            let carried = old.remove(&entry.path).filter(|(_, state)| {
+                state.entry.bytes == entry.bytes
+                    && state.entry.sha256 == entry.sha256
+                    && state.entry.modified_unix_ns == entry.modified_unix_ns
+            });
+            let checked = match carried {
+                Some((old_index, state)) => {
+                    if hashing
+                        .as_ref()
+                        .is_some_and(|hashing| hashing.index == old_index)
+                    {
+                        verifier.hashing = hashing.take().map(|mut hashing| {
+                            hashing.index = index;
+                            hashing
+                        });
+                    }
+                    state.checked
+                }
+                None => None,
+            };
+            match &checked {
+                Some(checked) => {
+                    verifier.by_age.insert((checked.at, index));
+                    if checked.problem.is_some() {
+                        verifier.failing.insert(index);
+                    }
+                }
+                None => {
+                    verifier.unchecked.insert(index);
+                }
+            }
+            verifier.files.push(FileState { entry, checked });
+        }
+        Ok(verifier)
+    }
+
+    /// Digests files until none is unchecked, or the budget is spent.
+    fn check_unchecked(
+        &mut self,
+        directory: &Path,
+        deadline: Option<crate::Deadline>,
+        ledger: &Ledger,
+    ) -> Result<Walked> {
+        let mut spent = 0_u64;
+        loop {
+            if self.unchecked.is_empty() {
+                return Ok(Walked::Reached);
+            }
+            let index = match &self.hashing {
+                Some(hashing) => hashing.index,
+                None => match self.unchecked.first() {
+                    Some(&index) => index,
+                    None => return Ok(Walked::Reached),
+                },
+            };
+            if self.check(index, directory, deadline, ledger, &mut spent)? == Walked::OutOfBudget {
+                // The budget may have run out just as the last file was
+                // recorded.
+                return Ok(match self.unchecked.is_empty() {
+                    true => Walked::Reached,
+                    false => Walked::OutOfBudget,
+                });
+            }
+        }
+    }
+
+    /// Digests again, oldest first, the files whose last digest is older
+    /// than the reuse window, until none is due or the budget is spent.
+    fn recheck_due(
+        &mut self,
+        directory: &Path,
+        deadline: Option<crate::Deadline>,
+        ledger: &Ledger,
+    ) -> Result<()> {
+        let now = ledger.now();
+        let mut spent = 0_u64;
+        loop {
+            let index = match &self.hashing {
+                Some(hashing) => hashing.index,
+                None => match self.by_age.first() {
+                    Some(&(at, index))
+                        if now.saturating_duration_since(at) > EVIDENCE_VERIFY_REUSE =>
+                    {
+                        index
+                    }
+                    _ => return Ok(()),
+                },
+            };
+            if self.check(index, directory, deadline, ledger, &mut spent)? == Walked::OutOfBudget {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Digests file `index` — continuing the digest under way when it is
+    /// that file's — to its end or until the budget is spent, and records
+    /// what it found. `spent` counts bytes since the last budget check,
+    /// across files.
+    fn check(
+        &mut self,
+        index: usize,
+        directory: &Path,
+        deadline: Option<crate::Deadline>,
+        ledger: &Ledger,
+        spent: &mut u64,
+    ) -> Result<Walked> {
+        let mut hashing = match self.hashing.take() {
+            Some(hashing) if hashing.index == index => hashing,
+            _ => {
+                *spent += FILE_OPEN_COST;
+                match self.begin(index, directory, ledger)? {
+                    Begun::Found(problem, at, at_ns) => {
+                        self.record(index, at, at_ns, problem);
+                        return Ok(self.budget_check(spent, deadline));
+                    }
+                    Begun::Hashing(hashing) => hashing,
+                }
+            }
+        };
+        let mut chunk = vec![0_u8; 64 * 1024];
+        loop {
+            let want = match hashing.remaining {
+                Some(0) => break,
+                Some(remaining) => chunk.len().min(remaining as usize),
+                None => chunk.len(),
+            };
+            let read = hashing.file.read(&mut chunk[..want])?;
+            if read == 0 {
+                if hashing.remaining.is_some() {
+                    let path = &self.files[index].entry.path;
+                    let problem = format!("{path}: ended before its manifested length");
+                    self.record(index, hashing.at, hashing.at_ns, Some(problem));
+                    return Ok(self.budget_check(spent, deadline));
+                }
+                break;
+            }
+            hashing.hasher.update(&chunk[..read]);
+            #[cfg(test)]
+            probe::hashed(read as u64);
+            if let Some(remaining) = &mut hashing.remaining {
+                *remaining -= read as u64;
+            }
+            *spent += read as u64;
+            if self.budget_check(spent, deadline) == Walked::OutOfBudget {
+                self.hashing = Some(hashing);
+                return Ok(Walked::OutOfBudget);
+            }
+        }
+        let entry = &self.files[index].entry;
+        let problem = (hashing.hasher.finalize_hex() != entry.sha256)
+            .then(|| format!("{}: digest mismatch", entry.path));
+        self.record(index, hashing.at, hashing.at_ns, problem);
+        Ok(Walked::Reached)
+    }
+
+    /// Checks the budget once `spent` reaches [`FILE_CHECK_BYTES`].
+    fn budget_check(&self, spent: &mut u64, deadline: Option<crate::Deadline>) -> Walked {
+        if *spent < FILE_CHECK_BYTES {
+            return Walked::Reached;
+        }
+        *spent = 0;
+        match out_of_budget(deadline) {
+            true => Walked::OutOfBudget,
+            false => Walked::Reached,
+        }
+    }
+
+    /// Opens file `index` and checks its length, as
+    /// [`generation::verify_against`] does: an append-only log may have
+    /// grown past its manifested length, and is digested over that prefix;
+    /// anything else must be exactly its manifested length.
+    fn begin(&self, index: usize, directory: &Path, ledger: &Ledger) -> Result<Begun> {
+        #[cfg(test)]
+        probe::hashing();
+        let entry = &self.files[index].entry;
+        let (at, at_ns) = (ledger.now(), ledger.unix_now_ns());
+        let path = directory.join(entry.path.replace('/', std::path::MAIN_SEPARATOR_STR));
+        let file = match File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(Begun::Found(
+                    Some(format!("{}: missing", entry.path)),
+                    at,
+                    at_ns,
+                ))
+            }
+            Err(error) => return Err(Error::Io(error)),
+        };
+        let length = file.metadata()?.len();
+        let append_only = generation::is_append_only(&entry.path);
+        if length != entry.bytes && !(append_only && length > entry.bytes) {
+            return Ok(Begun::Found(
+                Some(format!(
+                    "{}: {length} bytes on disk, {} in the manifest",
+                    entry.path, entry.bytes
+                )),
+                at,
+                at_ns,
+            ));
+        }
+        Ok(Begun::Hashing(Hashing {
+            index,
+            file,
+            hasher: payload::Sha256::new(),
+            remaining: append_only.then_some(entry.bytes),
+            at,
+            at_ns,
+        }))
+    }
+
+    fn record(&mut self, index: usize, at: Instant, at_ns: u64, problem: Option<String>) {
+        if let Some(previous) = &self.files[index].checked {
+            self.by_age.remove(&(previous.at, index));
+        }
+        self.unchecked.remove(&index);
+        match problem.is_some() {
+            true => self.failing.insert(index),
+            false => self.failing.remove(&index),
+        };
+        self.by_age.insert((at, index));
+        self.files[index].checked = Some(FileChecked { at, at_ns, problem });
+    }
+
+    /// Files digested against their current entry, of all the manifest
+    /// names.
+    fn progress(&self) -> (usize, usize) {
+        (self.files.len() - self.unchecked.len(), self.files.len())
+    }
+
+    /// The check as a verification reports it. Only meaningful once no file
+    /// is unchecked.
+    fn result(&self, now_ns: u64) -> FileCheck {
+        let problems = self
+            .failing
+            .iter()
+            .filter_map(|&index| self.files[index].checked.as_ref()?.problem.clone())
+            .collect();
+        let at_ns = self
+            .by_age
+            .first()
+            .and_then(|&(_, index)| self.files[index].checked.as_ref())
+            .map_or(now_ns, |checked| checked.at_ns);
+        FileCheck { at_ns, problems }
+    }
 }
 
 /// `traza-server verify --ledger`: verifies a data directory no live server
@@ -1989,23 +2951,27 @@ pub fn verify_offline(directory: &Path) -> Result<Verification> {
             directory.display()
         ))
     })?;
-    let files = check_files(directory, live)?;
+    let started_at_ns = crate::unix_now_ns();
+    let files = check_files(directory, live, started_at_ns)?;
     // The directory lock excludes every writer, so neither the chain nor the
     // tombstone log can move while they are read: the whole file is the
     // chain, the order of the reads does not matter, and no entry can be on
     // its way.
     let (statuses, tombstones_unreadable) = erasure::list_offline(directory)?;
+    let settles = SettleIndex::from_statuses(&statuses);
     let facts = LiveFacts {
         generation: live,
         manifest_sha256: manifest_digest(directory, live)?,
         files,
-        settled: settled_of(&statuses),
         landing: HashSet::new(),
         tombstones_unreadable,
         failure: None,
+        chain_verified_at_ns: started_at_ns,
     };
     let chain = verify_chain(&directory.join(LOG_NAME), None)?;
-    Ok(assemble(&chain, &facts))
+    let mut cross = CrossCheck::default();
+    cross.sync(&chain, &settles, None);
+    Ok(assemble(&chain, &cross, &settles, &facts))
 }
 
 // ------------------------------------------------------------------- store
@@ -2131,30 +3097,12 @@ impl Store {
     /// can name files that are gone until the next checkpoint publishes;
     /// those report as missing.
     ///
-    /// Never reuses an earlier walk or file check; its walk is offered to
-    /// the evidence packs, which may extend it (see [`Self::evidence`]).
+    /// Never reuses an earlier walk, file check or cross-check; its walk is
+    /// offered to the evidence packs, which may extend it (see
+    /// [`Self::evidence`]).
     pub fn verify_ledger(&self) -> Result<Verification> {
-        let started = Instant::now();
-        let (snapshot, facts) = self.live_facts(None)?;
-        let mut walk = ChainWalk::new();
-        let (to, _) = walk.advance(&self.ledger.path, Some(snapshot.len), None)?;
-        let verification = match walk.with_tail(&self.ledger.path, to)? {
-            Some(whole) => assemble(&whole, &facts),
-            None => assemble(&walk, &facts),
-        };
-        self.ledger.offer_walk(walk, started)?;
-        Ok(verification)
-    }
-
-    /// Everything a live verification checks the chain against, and the
-    /// snapshot that fixes the chain's prefix. What must agree with
-    /// `CURRENT` and the files — the snapshot, the live generation, its
-    /// manifest digest, the file check — is gathered under the maintenance
-    /// lock; the tombstone log only after it is released, since all that
-    /// read needs is to come after the snapshot. A file check of the same
-    /// live generation at most `reuse` old is reused; the manifest digest
-    /// and the tombstone log are always re-read.
-    fn live_facts(&self, reuse: Option<Duration>) -> Result<(Snapshot, LiveFacts)> {
+        let started = self.ledger.now();
+        let started_at_ns = self.ledger.unix_now_ns();
         let (snapshot, live, manifest_sha256, files) = {
             let _maintenance = self.lock_maintenance()?;
             // Under the maintenance lock, so no checkpoint entry can land
@@ -2162,29 +3110,7 @@ impl Store {
             // may, and the snapshot leaves them out.
             let snapshot = self.ledger.snapshot()?;
             let live = self.live_generation();
-            let cached = match reuse {
-                Some(reuse) => self
-                    .ledger
-                    .file_check
-                    .lock()
-                    .map_err(|_| Error::LockPoisoned("ledger file check"))?
-                    .clone()
-                    .filter(|check| check.generation == live && check.at.elapsed() <= reuse),
-                None => None,
-            };
-            let files = match cached {
-                Some(files) => files,
-                None => {
-                    let files = check_files(&self.directory, live)?;
-                    *self
-                        .ledger
-                        .file_check
-                        .lock()
-                        .map_err(|_| Error::LockPoisoned("ledger file check"))? =
-                        Some(files.clone());
-                    files
-                }
-            };
+            let files = check_files(&self.directory, live, started_at_ns)?;
             // With the generation it names: once the lock is released, a
             // checkpoint may publish a successor and sweep this one away.
             let manifest_sha256 = manifest_digest(&self.directory, live)?;
@@ -2192,21 +3118,29 @@ impl Store {
         };
         #[cfg(test)]
         self.ledger.run_hook(HookPoint::AfterSnapshot, self);
-        // Read after the snapshot: see `LiveFacts::settled`. Then which of
-        // them landed past the snapshot or are landing, read after the
-        // settlements: see `Ledger::landed_or_landing`.
-        let settled = settled_of(&self.erasures()?);
-        let landing = self.ledger.landed_or_landing(&settled, snapshot.len)?;
+        // Read after the snapshot: see `LiveFacts`.
+        let mut settles = SettleIndex::default();
+        settles.sync(&self.erasures, self.erasures.settled_count()?, None)?;
+        let mut walk = ChainWalk::new();
+        walk.advance(&self.ledger.path, Some(snapshot.len), None)?;
+        let mut cross = CrossCheck::default();
+        cross.sync(&walk, &settles, None);
+        // After the settlements: see `Ledger::landed_or_landing`.
+        let landing = self
+            .ledger
+            .landed_or_landing(cross.unledgered_publications(), snapshot.len)?;
         let facts = LiveFacts {
             generation: live,
             manifest_sha256,
             files,
-            settled,
             landing,
             tombstones_unreadable: 0,
             failure: self.ledger.outstanding_failure(),
+            chain_verified_at_ns: started_at_ns,
         };
-        Ok((snapshot, facts))
+        let verification = assemble(&walk, &cross, &settles, &facts);
+        self.ledger.offer_walk(walk, started, started_at_ns)?;
+        Ok(verification)
     }
 
     /// Appends an external notary's anchor, after checking its `target_head`
@@ -2238,28 +3172,41 @@ impl Store {
     /// global window and no usage row, since it is nobody's account.
     ///
     /// **What a pack costs.** Bound (tenant) credentials can ask for one, so
-    /// nothing in it may cost the whole chain or the whole store per
-    /// request, or hold off maintenance while it works:
+    /// nothing in it may cost the whole chain, every erasure or the whole
+    /// store per request, or hold off maintenance while it works. Packs keep
+    /// what they established between requests ([`Ledger::evidence`]) and
+    /// each pays for what changed:
     ///
     /// - ONE budget ([`crate::Config::query_deadline`], anchored here) for
-    ///   the chain walk, the activity fold and the receipts, so the request
-    ///   as a whole is bounded, not each step afresh. Past it the walk stops
-    ///   on a line boundary and keeps its progress, and the pack is refused
-    ///   with [`Error::DeadlineExceeded`] saying how far it got: a pack never
-    ///   carries a partial verification. The next request resumes the walk,
-    ///   so a chain longer than one budget is still verified, a budget at a
-    ///   time.
-    /// - The chain walk EXTENDS the last one — any pack's, or the operator's
-    ///   — when that walk began at most [`EVIDENCE_VERIFY_REUSE`] ago, so a
-    ///   request walks what was appended since rather than the chain from
-    ///   byte 0; and it runs after the maintenance lock is released, under
-    ///   only the lock that serializes packs' walks.
-    /// - The window's entries are found in the walk's index of where each
-    ///   line sits and when it was appended, and only those lines are read.
-    /// - The file check — O(store) — is reused for the same live generation
-    ///   for [`EVIDENCE_VERIFY_REUSE`], as before; it is the one step outside
-    ///   the budget, because a check cut short could only be thrown away,
-    ///   and its cost is the store's size, not anything the caller chose.
+    ///   every step — taking in settled erasures, the chain walk, the
+    ///   erasure cross-check, the file check, the window lookups, the
+    ///   activity fold and the receipts — so the request as a whole is
+    ///   bounded, not each step afresh. A step past it stops where it can
+    ///   resume, keeps its progress, and the pack is refused with
+    ///   [`Error::DeadlineExceeded`] saying how far it got: a pack never
+    ///   carries a partial verification. Retrying resumes it, so work longer
+    ///   than one budget still finishes, a budget at a time — however long
+    ///   that takes, since unfinished work is never discarded for its age.
+    /// - The settled erasures are taken in from the tombstone log's settle
+    ///   order once each — subject digested, indexed by settle time — so a
+    ///   pack reads only the ones settled since the last.
+    /// - The chain walk EXTENDS the last completed one — any pack's, or the
+    ///   operator's — by what was appended since, and it runs after the
+    ///   maintenance lock is released, under only the lock that serializes
+    ///   packs. The erasure cross-check is kept with the walk and takes in
+    ///   only the entries and settles new to it.
+    /// - The window's entries, and the window's erasures, are found by
+    ///   binary search in indexes by time; only those lines are read.
+    /// - The file check digests files off the maintenance lock, a budget at
+    ///   a time, continuing a file it was part-way through; a new
+    ///   generation re-digests only the files the checkpoint changed. See
+    ///   [`FileVerifier`].
+    /// - A completed walk or file digest older than
+    ///   [`EVIDENCE_VERIFY_REUSE`] is still served, with its age stated
+    ///   (`chain_verified_at_ns`, `verified_at_ns`), while each pack, once
+    ///   assembled, spends up to [`EVIDENCE_REFRESH_SLICE`] of what its
+    ///   budget has left redoing it: a fresh walk from byte 0 (served once
+    ///   complete), and the oldest file digests.
     pub fn evidence(
         &self,
         tenant: Option<&str>,
@@ -2268,7 +3215,7 @@ impl Store {
     ) -> Result<Value> {
         let started = Instant::now();
         let deadline = self.query_deadline(started);
-        let generated_at_ns = crate::unix_now_ns();
+        let generated_at_ns = self.ledger.unix_now_ns();
         let since = since_ns.unwrap_or(0);
         let until = until_ns.unwrap_or(generated_at_ns);
         if since > until {
@@ -2284,7 +3231,7 @@ impl Store {
             }
         }
 
-        let chain = self.evidence_chain(since, until, started, deadline)?;
+        let chain = self.evidence_chain(tenant, since, until, started, deadline)?;
         let verification = match tenant {
             Some(tenant) => chain.verification.scoped(tenant),
             None => chain.verification,
@@ -2314,84 +3261,229 @@ impl Store {
             "retention": self.retention_for(tenant)?,
             "usage": self.evidence_usage(tenant)?,
             "activity": self.evidence_activity(tenant, since, until, deadline)?,
-            "erasures": self.evidence_erasures(tenant, since, until, deadline)?,
+            "erasures": self.evidence_erasures(&chain.erasures, deadline)?,
+            "erasures_truncated": chain.erasures_truncated,
         });
         let digest = payload::sha256_hex(evals::canonical_json(&pack).as_bytes());
         if let Value::Object(map) = &mut pack {
             map.insert("digest".to_owned(), Value::String(digest));
         }
+        // Best effort, and after the pack is whole, so a redo can neither
+        // fail the pack nor take budget its own steps needed. Anything it
+        // trips over, the next pack's own steps meet and report.
+        let _ = self.evidence_refresh(deadline);
         Ok(pack)
     }
 
-    /// The chain half of a pack: the live facts under the maintenance lock,
-    /// then the walk — extended from the cached one when that is fresh
-    /// enough — outside it, under `deadline`; then the verification, and
-    /// where the window's entries sit. See [`Self::evidence`] for why each
-    /// step is shaped as it is.
+    /// Everything in a pack that needs [`Ledger::evidence`] held: under the
+    /// maintenance lock, only the snapshot, the live generation and — when
+    /// the generation moved or the last read is past the reuse window — the
+    /// manifest's bytes; then, outside it and under `deadline`, the settled
+    /// erasures taken in, the walk, its cross-check and the file check, each
+    /// resuming where the last pack left it; then the verification and the
+    /// window lookups. See [`Self::evidence`] for why each step is shaped as
+    /// it is.
     fn evidence_chain(
         &self,
+        tenant: Option<&str>,
         since: u64,
         until: u64,
         started: Instant,
         deadline: Option<crate::Deadline>,
     ) -> Result<EvidenceChain> {
-        // Before the maintenance lock: see `Ledger::chain`.
-        let mut held = self.ledger.lock_chain()?;
-        let (snapshot, facts) = self.live_facts(Some(EVIDENCE_VERIFY_REUSE))?;
-        let mut cached = match held.take() {
-            Some(cached)
-                if cached.started.elapsed() <= EVIDENCE_VERIFY_REUSE
-                    && cached.walk.len <= snapshot.len =>
-            {
-                cached
-            }
-            _ => CachedWalk {
-                walk: ChainWalk::new(),
-                started: Instant::now(),
-            },
+        let refused = |what: String| {
+            Error::DeadlineExceeded(format!(
+                "{} ms elapsed; {what} before the budget ran out. The check resumes from there \
+                 on the next request, so retrying completes it; or raise --query-deadline-ms",
+                started.elapsed().as_millis()
+            ))
         };
-        let (to, walked) = cached
+        // Before the maintenance lock: see `Ledger::evidence`.
+        let mut state = self.ledger.lock_evidence()?;
+        let state = &mut *state;
+        let now = self.ledger.now();
+        let (snapshot, live, manifest) = {
+            let _maintenance = self.lock_maintenance()?;
+            // Under the maintenance lock, so no checkpoint entry can land
+            // between this and reading `CURRENT`, and the manifest cannot be
+            // swept away mid-read; erasure and anchor appends may land, and
+            // the snapshot leaves them out.
+            let snapshot = self.ledger.snapshot()?;
+            let live = self.live_generation();
+            let reread = match &state.files {
+                Some(files) => {
+                    files.generation != live
+                        || now.saturating_duration_since(files.read_at) > EVIDENCE_VERIFY_REUSE
+                }
+                None => true,
+            };
+            let manifest = match reread {
+                true => Some(fs::read(generation::manifest_path(&self.directory, live))?),
+                false => None,
+            };
+            (snapshot, live, manifest)
+        };
+        #[cfg(test)]
+        self.ledger.run_hook(HookPoint::AfterSnapshot, self);
+        if let Some(bytes) = manifest {
+            state.files = Some(FileVerifier::load(live, &bytes, state.files.take(), now)?);
+        }
+
+        // The settled erasures, read after the snapshot: see `LiveFacts`.
+        let settled = self.erasures.settled_count()?;
+        if state.settles.sync(&self.erasures, settled, deadline)? == Walked::OutOfBudget {
+            return Err(refused(format!(
+                "{} of {settled} settled erasures were taken in for the ledger's erasure \
+                 cross-check",
+                state.settles.entries.len()
+            )));
+        }
+
+        // The walk: the served one, extended; or, before any walk has
+        // completed, the first one, which must finish before a pack can
+        // answer — however many requests and reuse windows that takes.
+        if state
+            .served
+            .as_ref()
+            .map_or(true, |served| served.walk.len > snapshot.len)
+        {
+            let refresh = state.refresh.get_or_insert_with(|| {
+                CachedWalk::new(snapshot.len, now, self.ledger.unix_now_ns())
+            });
+            let (to, walked) =
+                refresh
+                    .walk
+                    .advance(&self.ledger.path, Some(refresh.target), deadline)?;
+            if walked == Walked::OutOfBudget {
+                return Err(refused(format!(
+                    "the ledger chain was verified through line {} (byte {} of {to})",
+                    refresh.walk.line_number, refresh.walk.len
+                )));
+            }
+            state.served = state.refresh.take();
+        }
+        let Some(served) = state.served.as_mut() else {
+            return Err(Error::Invalid(
+                "no ledger walk to serve; this is a bug".to_owned(),
+            ));
+        };
+        let (to, walked) = served
             .walk
             .advance(&self.ledger.path, Some(snapshot.len), deadline)?;
         if walked == Walked::OutOfBudget {
-            let detail = format!(
-                "{} ms elapsed; the ledger chain was verified through line {} (byte {} of \
-                 {}) before the budget ran out. The check resumes from there on the next \
-                 request, so retrying completes it; or raise --query-deadline-ms",
-                started.elapsed().as_millis(),
-                cached.walk.line_number,
-                cached.walk.len,
-                to
-            );
-            *held = Some(cached);
-            return Err(Error::DeadlineExceeded(detail));
+            return Err(refused(format!(
+                "the ledger chain was verified through line {} (byte {} of {to})",
+                served.walk.line_number, served.walk.len
+            )));
         }
-        let tail = cached.walk.with_tail(&self.ledger.path, to)?;
-        let walk = tail.as_ref().unwrap_or(&cached.walk);
-        let verification = assemble(walk, &facts);
-        let mut window = Vec::new();
-        let mut window_truncated = false;
-        for &(at_ns, offset) in &walk.placed {
-            if at_ns < since || at_ns > until {
-                continue;
-            }
-            if window.len() == EVIDENCE_MAX_ENTRIES {
-                window_truncated = true;
-                break;
-            }
-            window.push(offset);
+        if served.cross.sync(&served.walk, &state.settles, deadline) == Walked::OutOfBudget {
+            return Err(refused(format!(
+                "the ledger's erasure cross-check took in {} of {} erasure entries and {} of {} \
+                 settled erasures",
+                served.cross.entries,
+                served.walk.erasures.len(),
+                served.cross.settles,
+                state.settles.entries.len()
+            )));
         }
-        let unplaceable = walk.unplaceable;
-        if !cached.walk.missing {
-            *held = Some(cached);
+        // After the settlements: see `Ledger::landed_or_landing`.
+        let landing = self
+            .ledger
+            .landed_or_landing(served.cross.unledgered_publications(), snapshot.len)?;
+
+        let Some(files) = state.files.as_mut() else {
+            return Err(Error::Invalid(
+                "no file check to report; this is a bug".to_owned(),
+            ));
+        };
+        if files.check_unchecked(&self.directory, deadline, &self.ledger)? == Walked::OutOfBudget {
+            let (done, total) = files.progress();
+            return Err(refused(format!(
+                "{done} of {total} files of generation {} were digested (a file part-way \
+                 through keeps its progress)",
+                files.generation
+            )));
         }
+        let facts = LiveFacts {
+            generation: live,
+            manifest_sha256: files.manifest_sha256.clone(),
+            files: files.result(self.ledger.unix_now_ns()),
+            landing,
+            tombstones_unreadable: 0,
+            failure: self.ledger.outstanding_failure(),
+            chain_verified_at_ns: served.started_at_ns,
+        };
+        let verification = assemble(&served.walk, &served.cross, &state.settles, &facts);
+        let (window, window_truncated) =
+            served
+                .walk
+                .times
+                .window(since, until, EVIDENCE_MAX_ENTRIES, |_| true, deadline)?;
+        let unplaceable = served.walk.unplaceable;
+        if served.walk.missing {
+            // Nothing to extend: the next pack looks for the file afresh.
+            state.served = None;
+        }
+        let (listed, erasures_truncated) =
+            state
+                .settles
+                .window(tenant, since, until, EVIDENCE_MAX_ERASURES, deadline)?;
+        let erasures = listed
+            .into_iter()
+            .map(|settle| ListedErasure {
+                id: settle.id,
+                subject_kind: settle.subject_kind,
+                published_at_ns: settle.settled_unix_ns,
+            })
+            .collect();
         Ok(EvidenceChain {
             head: snapshot.head,
             verification,
             window,
             window_truncated,
             unplaceable,
+            erasures,
+            erasures_truncated,
         })
+    }
+
+    /// Redoes checks past [`EVIDENCE_VERIFY_REUSE`] with what is left of a
+    /// pack's budget, at most [`EVIDENCE_REFRESH_SLICE`] of it: a walk from
+    /// byte 0 toward a fixed target (started once the served walk is past
+    /// the window, kept however long it takes, and served once it and its
+    /// cross-check are complete), then the files whose last digest is past
+    /// the window, oldest first. See [`Self::evidence`].
+    fn evidence_refresh(&self, deadline: Option<crate::Deadline>) -> Result<()> {
+        let slice = Some(crate::Deadline::capped(deadline, EVIDENCE_REFRESH_SLICE));
+        let mut state = self.ledger.lock_evidence()?;
+        let state = &mut *state;
+        let now = self.ledger.now();
+        let stale = state.served.as_ref().is_some_and(|served| {
+            now.saturating_duration_since(served.started) > EVIDENCE_VERIFY_REUSE
+        });
+        if stale && state.refresh.is_none() {
+            // Any snapshot is a prefix every later one extends.
+            let target = self.ledger.snapshot()?.len;
+            state.refresh = Some(CachedWalk::new(target, now, self.ledger.unix_now_ns()));
+        }
+        if let Some(refresh) = state.refresh.as_mut() {
+            let (_, walked) =
+                refresh
+                    .walk
+                    .advance(&self.ledger.path, Some(refresh.target), slice)?;
+            if walked == Walked::Reached
+                && refresh.cross.sync(&refresh.walk, &state.settles, slice) == Walked::Reached
+            {
+                let done = state.refresh.take();
+                if done.as_ref().is_some_and(|done| !done.walk.missing) {
+                    state.served = done;
+                }
+            }
+        }
+        if let Some(files) = state.files.as_mut() {
+            files.recheck_due(&self.directory, slice, &self.ledger)?;
+        }
+        Ok(())
     }
 
     /// The retention window that applies to `tenant`, and the layer that
@@ -2496,8 +3588,9 @@ impl Store {
         }))
     }
 
-    /// Erasures published (settled) in the window and visible to `tenant`,
-    /// each with its receipt's verdict while the receipt budget lasts.
+    /// The erasures a pack lists — published (settled) in its window,
+    /// visible to its tenant, found by [`SettleIndex::window`] — each with
+    /// its receipt's verdict while the receipt budget lasts.
     ///
     /// `conclusive` and `result` are the receipt's own fields; both are
     /// `null` for an erasure past [`EVIDENCE_MAX_RECEIPTS`] or past the
@@ -2506,29 +3599,18 @@ impl Store {
     /// than a slow one.
     fn evidence_erasures(
         &self,
-        tenant: Option<&str>,
-        since: u64,
-        until: u64,
+        listed: &[ListedErasure],
         deadline: Option<crate::Deadline>,
     ) -> Result<Vec<Value>> {
         let mut receipts = 0_usize;
-        let mut out = Vec::new();
-        for status in self.erasures()? {
-            let Some(settle) = &status.settle else {
-                continue;
-            };
-            if settle.settled_unix_ns < since || settle.settled_unix_ns > until {
-                continue;
-            }
-            if tenant.is_some() && status.erase.subject.tenant() != tenant {
-                continue;
-            }
+        let mut out = Vec::with_capacity(listed.len());
+        for erasure in listed {
             let in_budget =
                 receipts < EVIDENCE_MAX_RECEIPTS && crate::Deadline::check(deadline, 0).is_ok();
             let (conclusive, result) = match in_budget {
                 true => {
                     receipts += 1;
-                    let receipt = self.verify_erasure(status.erase.id)?;
+                    let receipt = self.verify_erasure(erasure.id)?;
                     (
                         Value::Bool(receipt.conclusive),
                         Value::String(receipt.result),
@@ -2537,9 +3619,9 @@ impl Store {
                 false => (Value::Null, Value::Null),
             };
             out.push(json!({
-                "id": status.erase.id,
-                "subject_kind": subject_kind(&status.erase.subject),
-                "published_at_ns": settle.settled_unix_ns,
+                "id": erasure.id,
+                "subject_kind": erasure.subject_kind,
+                "published_at_ns": erasure.published_at_ns,
                 "conclusive": conclusive,
                 "result": result,
             }));
@@ -3971,5 +5053,644 @@ mod tests {
             "past the receipt cap"
         );
         assert_eq!(erasures[1]["result"], Value::Null);
+    }
+
+    /// Records each of `subjects` as erased and then settled — published by
+    /// `generation`, settled at its own time — straight into the tombstone
+    /// log of a store that is not open, in one write: many settled erasures
+    /// without a purge and a checkpoint apiece. The next open ledgers them.
+    fn settle_erasures(dir: &Path, generation: u64, subjects: &[(erasure::Subject, u64)]) {
+        let path = dir.join(erasure::LOG_NAME);
+        let mut text = fs::read_to_string(&path).unwrap_or_default();
+        let mut id = text
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter_map(|record| record["id"].as_u64())
+            .max()
+            .unwrap_or(0);
+        for (subject, settled_at) in subjects {
+            id += 1;
+            let mut erase = serde_json::to_value(erasure::EraseRecord::new(
+                id,
+                settled_at - 1,
+                subject.clone(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ))
+            .expect("erase");
+            erase["op"] = json!("erase");
+            let mut settle = serde_json::to_value(erasure::SettleRecord {
+                schema: erasure::SettleRecord::schema_now(),
+                id,
+                settled_unix_ns: *settled_at,
+                generation,
+                spans_removed: 0,
+                spans_redacted: 0,
+                annotations_removed: 0,
+                payloads_removed: Vec::new(),
+                payloads_retained: Vec::new(),
+                eval_records_removed: 0,
+            })
+            .expect("settle");
+            settle["op"] = json!("settle");
+            for record in [erase, settle] {
+                text.push_str(&record.to_string());
+                text.push('\n');
+            }
+        }
+        fs::write(&path, text).expect("tombstones");
+    }
+
+    /// `count` trace subjects of `tenant`, settled 1,000 ns apart from `from`.
+    fn erased_traces(tenant: &str, count: u64, from: u64) -> Vec<(erasure::Subject, u64)> {
+        (0..count)
+            .map(|n| {
+                (
+                    trace_subject(&format!("{tenant}-t{n}"), tenant),
+                    from + n * 1_000,
+                )
+            })
+            .collect()
+    }
+
+    /// A query budget no request in these tests reaches, so budget checks
+    /// run — and `probe::allow` decides them.
+    fn budgeted() -> crate::Config {
+        crate::Config {
+            query_deadline: Some(Duration::from_secs(3600)),
+            ..crate::Config::default()
+        }
+    }
+
+    fn live_of(dir: &Path) -> u64 {
+        generation::read_current(dir)
+            .expect("CURRENT")
+            .expect("a published generation")
+    }
+
+    #[test]
+    fn an_unfinished_evidence_walk_finishes_across_the_reuse_window() {
+        // A chain longer than one budget, and every retry arriving after the
+        // reuse window has passed since the walk began. What the unfinished
+        // walk established is about a fixed prefix of an append-only file,
+        // and none of it goes stale while the walk is unfinished: retrying
+        // must finish it, and the pack must then say how old it is.
+        let dir = temp_dir("expiry");
+        drop(Store::open(&dir, crate::Config::default()).expect("open"));
+        grow_ledger(&dir, 1000);
+        let total = lines(&dir).len() as u64;
+        // A budget no request reaches: the probe's allowance is what cuts
+        // each walk short.
+        let store = Store::open(&dir, budgeted()).expect("reopen");
+        let checks = 2;
+        let bound = total / (WALK_CHECK_INTERVAL * checks) + 3;
+        let crossing = EVIDENCE_VERIFY_REUSE + Duration::from_secs(1);
+        let mut attempts = 0_u64;
+        let pack = loop {
+            attempts += 1;
+            assert!(
+                attempts <= bound,
+                "retrying never finished the walk: {attempts} attempts on {total} lines"
+            );
+            probe::allow(Some(checks));
+            let outcome = store.evidence(Some("acme"), None, None);
+            probe::allow(None);
+            match outcome {
+                Ok(pack) => break pack,
+                Err(Error::DeadlineExceeded(detail)) => {
+                    assert!(detail.contains("ledger chain"), "{detail}");
+                }
+                Err(other) => panic!("{other:?}"),
+            }
+            store.ledger.advance_clock(crossing);
+        };
+        assert!(attempts > 2, "the walk took several attempts: {attempts}");
+        let verification = &pack["ledger"]["verification"];
+        assert_eq!(verification["intact"], json!(true), "{verification}");
+        let generated = pack["generated_at_ns"].as_u64().expect("generated_at_ns");
+        let walked_from = verification["chain_verified_at_ns"]
+            .as_u64()
+            .expect("the pack says when the walk it rests on began");
+        let crossed = crossing.as_nanos() as u64 * (attempts - 1);
+        assert!(
+            generated.saturating_sub(walked_from) >= crossed,
+            "the walk began {} ns before the pack, across {} crossings of the window",
+            generated.saturating_sub(walked_from),
+            attempts - 1
+        );
+    }
+
+    #[test]
+    fn a_warm_evidence_pack_does_no_work_per_settled_erasure() {
+        // Every settled erasure is cross-checked against the chain, and a
+        // tenant can ask for a pack as often as it likes: the cross-check
+        // must cost what changed since the last pack, not every erasure the
+        // store ever settled.
+        let dir = temp_dir("many-erasures");
+        drop(Store::open(&dir, crate::Config::default()).expect("open"));
+        settle_erasures(&dir, live_of(&dir), &erased_traces("acme", 120, 1_000));
+        let store = Store::open(&dir, crate::Config::default()).expect("reopen");
+        let pack = store.evidence(Some("acme"), None, None).expect("cold pack");
+        let verification = &pack["ledger"]["verification"];
+        assert_eq!(verification["intact"], json!(true), "{verification}");
+
+        let since = store.ledger_head().expect("head").at_ns;
+        let (digested, examined) = (probe::digested(), probe::examined());
+        let pack = store
+            .evidence(Some("acme"), Some(since), None)
+            .expect("warm pack");
+        assert_eq!(pack["ledger"]["verification"]["intact"], json!(true));
+        assert_eq!(
+            probe::digested() - digested,
+            0,
+            "a warm pack digests no settled erasure again"
+        );
+        let examined = probe::examined() - examined;
+        assert!(
+            examined <= 64,
+            "nor looks at each of them: {examined} examined"
+        );
+
+        // One erasure more: the next pack takes in that one, and only it.
+        store.ingest(test_span("t-new", "acme")).expect("ingest");
+        store.erase(trace_subject("t-new", "acme")).expect("erase");
+        let digested = probe::digested();
+        let pack = store
+            .evidence(Some("acme"), Some(since), None)
+            .expect("pack");
+        let verification = &pack["ledger"]["verification"];
+        assert_eq!(verification["intact"], json!(true), "{verification}");
+        assert_eq!(probe::digested() - digested, 1);
+    }
+
+    #[test]
+    fn an_evidence_pack_indexes_settled_erasures_a_budget_at_a_time() {
+        // Taking the settled erasures in is budgeted like the chain walk, and
+        // keeps its progress: however many requests it takes, each settled
+        // erasure is digested once.
+        let dir = temp_dir("settle-budget");
+        drop(Store::open(&dir, crate::Config::default()).expect("open"));
+        let count = 150;
+        settle_erasures(&dir, live_of(&dir), &erased_traces("acme", count, 1_000));
+        let store = Store::open(&dir, budgeted()).expect("reopen");
+        let before = probe::digested();
+        let (mut refused, mut indexing) = (0_u64, 0_u64);
+        loop {
+            probe::allow(Some(0));
+            let outcome = store.evidence(Some("acme"), None, None);
+            probe::allow(None);
+            match outcome {
+                Ok(pack) => {
+                    let verification = &pack["ledger"]["verification"];
+                    assert_eq!(verification["intact"], json!(true), "{verification}");
+                    break;
+                }
+                Err(Error::DeadlineExceeded(detail)) => {
+                    refused += 1;
+                    if detail.contains("settled erasure") {
+                        indexing += 1;
+                        assert!(detail.contains("resumes"), "{detail}");
+                    }
+                }
+                Err(other) => panic!("{other:?}"),
+            }
+            assert!(refused < 100, "retrying finishes");
+        }
+        assert!(
+            indexing >= 2,
+            "{count} settled erasures took several budgets to take in: {indexing}"
+        );
+        assert_eq!(
+            probe::digested() - before,
+            count,
+            "each settled erasure digested once, however many requests it took"
+        );
+    }
+
+    #[test]
+    fn an_evidence_window_is_found_without_scanning_the_chain() {
+        // A window of a long chain — empty, or holding a few entries — is a
+        // lookup in the walk's index, not a pass over it.
+        let dir = temp_dir("window-index");
+        drop(Store::open(&dir, crate::Config::default()).expect("open"));
+        grow_ledger(&dir, 3000);
+        let at: Vec<u64> = lines(&dir)
+            .iter()
+            .map(|line| {
+                serde_json::from_str::<Value>(line).expect("entry")["at_ns"]
+                    .as_u64()
+                    .expect("at_ns")
+            })
+            .collect();
+        let store = Store::open(&dir, crate::Config::default()).expect("reopen");
+        store.evidence(Some("acme"), None, None).expect("cold pack");
+        for (since, until) in [(1, 2), (u64::MAX - 1, u64::MAX)] {
+            let before = probe::examined();
+            let pack = store
+                .evidence(Some("acme"), Some(since), Some(until))
+                .expect("pack");
+            let examined = probe::examined() - before;
+            assert!(
+                examined <= 64,
+                "an empty window is a lookup, not a scan: {examined} examined"
+            );
+            assert!(pack["ledger"]["entries"]
+                .as_array()
+                .expect("entries")
+                .is_empty());
+        }
+        let pack = store
+            .evidence(Some("acme"), Some(at[100]), Some(at[102]))
+            .expect("pack");
+        let seqs: Vec<u64> = pack["ledger"]["entries"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .map(|entry| entry["seq"].as_u64().expect("seq"))
+            .collect();
+        assert_eq!(seqs, [100, 101, 102]);
+    }
+
+    #[test]
+    fn the_erasures_a_pack_lists_are_found_by_index_and_capped() {
+        let dir = temp_dir("erasure-listing");
+        drop(Store::open(&dir, crate::Config::default()).expect("open"));
+        let mut subjects = erased_traces("acme", 10, 10_000);
+        subjects.extend(erased_traces("bigco", 5, 10_500));
+        settle_erasures(&dir, live_of(&dir), &subjects);
+        let store = Store::open(&dir, crate::Config::default()).expect("reopen");
+        let published = |pack: &Value| -> Vec<u64> {
+            pack["erasures"]
+                .as_array()
+                .expect("erasures")
+                .iter()
+                .map(|row| row["published_at_ns"].as_u64().expect("published_at_ns"))
+                .collect()
+        };
+
+        let pack = store.evidence(Some("acme"), None, None).expect("pack");
+        assert_eq!(
+            published(&pack),
+            (0..EVIDENCE_MAX_ERASURES as u64)
+                .map(|n| 10_000 + n * 1_000)
+                .collect::<Vec<_>>(),
+            "acme's, oldest first, up to the cap"
+        );
+        assert_eq!(pack["erasures_truncated"], json!(true));
+        let pack = store.evidence(None, None, None).expect("pack");
+        assert_eq!(published(&pack).len(), EVIDENCE_MAX_ERASURES);
+        assert_eq!(pack["erasures_truncated"], json!(true));
+
+        let pack = store
+            .evidence(Some("acme"), Some(12_000), Some(13_000))
+            .expect("pack");
+        assert_eq!(published(&pack), [12_000, 13_000]);
+        assert_eq!(pack["erasures_truncated"], json!(false));
+
+        let before = probe::examined();
+        let pack = store
+            .evidence(Some("acme"), Some(1_000_000), None)
+            .expect("pack");
+        assert!(published(&pack).is_empty());
+        let examined = probe::examined() - before;
+        assert!(
+            examined <= 64,
+            "a window holding none of them is a lookup: {examined} examined"
+        );
+    }
+
+    #[test]
+    fn a_cold_file_check_runs_off_the_maintenance_lock_and_resumes_where_it_stopped() {
+        // Re-digesting the store is O(store bytes). A pack must not do it
+        // while holding checkpoints, compaction and erasures off, nor in one
+        // unbudgeted piece: it digests a budget at a time, and a file left
+        // part-way through is continued, not started again.
+        let dir = temp_dir("file-walk");
+        let store = std::sync::Arc::new(Store::open(&dir, budgeted()).expect("open"));
+        for n in 0..400_u32 {
+            // Hex of distinct digests: about as incompressible as text gets.
+            let noise: String = (0..30_u32)
+                .map(|k| payload::sha256_hex(&[n.to_le_bytes(), k.to_le_bytes()].concat()))
+                .collect();
+            let span: crate::Span = serde_json::from_value(json!({
+                "trace_id": format!("t{n}"), "span_id": "s1", "name": "chat", "service": "svc",
+                "start_time_ns": 1_000u64 + u64::from(n), "end_time_ns": 2_000u64 + u64::from(n),
+                "attributes": {"noise": noise},
+            }))
+            .expect("span");
+            store.ingest(span).expect("ingest");
+        }
+        store.flush().expect("flush");
+        let live = store.checkpoint().expect("checkpoint");
+        let manifest =
+            generation::load_manifest(&generation::manifest_path(&dir, live)).expect("manifest");
+        let manifested: u64 = manifest.files.iter().map(|file| file.bytes).sum();
+        assert!(manifested > 4 * 64 * 1024, "{manifested} manifested bytes");
+
+        let seen = std::sync::Arc::new(Mutex::new(None));
+        let (probe_store, sink) = (std::sync::Arc::clone(&store), std::sync::Arc::clone(&seen));
+        probe::on_hash(Box::new(move || {
+            let free = probe_store.maintenance.try_lock().is_ok();
+            *sink.lock().expect("sink") = Some(free);
+        }));
+        let before = probe::hashed_bytes();
+        let mut cut_short = 0_u64;
+        loop {
+            probe::allow(Some(0));
+            let outcome = store.evidence(Some("acme"), None, None);
+            probe::allow(None);
+            match outcome {
+                Ok(pack) => {
+                    let verification = &pack["ledger"]["verification"];
+                    assert_eq!(verification["intact"], json!(true), "{verification}");
+                    break;
+                }
+                Err(Error::DeadlineExceeded(detail)) if detail.contains("files") => {
+                    cut_short += 1;
+                    assert!(detail.contains("resumes"), "{detail}");
+                }
+                Err(other) => panic!("{other:?}"),
+            }
+            assert!(cut_short < 1000, "retrying finishes");
+        }
+        assert!(
+            cut_short >= 2,
+            "the check was cut short and resumed: {cut_short}"
+        );
+        assert_eq!(
+            *seen.lock().expect("seen"),
+            Some(true),
+            "files were digested with the maintenance lock free"
+        );
+        assert_eq!(
+            probe::hashed_bytes() - before,
+            manifested,
+            "every manifested byte digested exactly once: nothing started over"
+        );
+    }
+
+    #[test]
+    fn a_time_index_finds_late_arrivals_in_arrival_order() {
+        // Keys arrive in order; times mostly do. The ones that do not —
+        // a clock stepping back — are found all the same, in arrival order.
+        let mut index = TimeIndex::default();
+        for (at_ns, key) in [(10, 0), (20, 1), (15, 2), (30, 3), (5, 4), (25, 5), (40, 6)] {
+            index.push(at_ns, key);
+        }
+        let window = |since, until, cap, keep: fn(u64) -> bool| {
+            index.window(since, until, cap, keep, None).expect("window")
+        };
+        assert_eq!(
+            window(0, 100, 10, |_| true),
+            (vec![0, 1, 2, 3, 4, 5, 6], false)
+        );
+        assert_eq!(window(12, 26, 10, |_| true), (vec![1, 2, 5], false));
+        assert_eq!(window(0, 100, 3, |_| true), (vec![0, 1, 2], true));
+        assert_eq!(window(0, 100, 3, |key| key != 1), (vec![0, 2, 3], true));
+        assert_eq!(window(41, 50, 10, |_| true), (Vec::new(), false));
+        assert_eq!(window(5, 5, 10, |_| true), (vec![4], false));
+    }
+
+    fn settlement(id: u64, trace: &str, generation: u64) -> erasure::Settlement {
+        erasure::Settlement {
+            id,
+            subject: trace_subject(trace, "acme"),
+            generation,
+            settled_unix_ns: id,
+        }
+    }
+
+    fn ledgered(seq: u64, id: u64, trace: &str, generation: u64) -> LedgeredErasure {
+        LedgeredErasure {
+            seq,
+            erasure_id: id,
+            subject_digest: hex_key(&subject_digest(&trace_subject(trace, "acme"))),
+            generation: Some(generation),
+            subject_kind: "trace".to_owned(),
+            tenant: Some("acme".to_owned()),
+        }
+    }
+
+    /// What a cross-check reports: the undone entries' seqs, in chain order,
+    /// and the unledgered settles' `(id, generation)`.
+    fn findings(cross: &CrossCheck, walk: &ChainWalk) -> (Vec<u64>, Vec<(u64, u64)>) {
+        (
+            cross
+                .undone_in_chain_order()
+                .into_iter()
+                .map(|index| walk.erasures[index].seq)
+                .collect(),
+            cross
+                .unledgered
+                .keys()
+                .map(|(id, generation, _)| (*id, *generation))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn a_cross_check_taken_in_piecemeal_agrees_with_one_taken_whole() {
+        // Kept up to date as settles and entries arrive — and started over
+        // when an erasure settles a second time — the cross-check must say
+        // exactly what one built from everything at once says, at every
+        // step.
+        let mut walk = ChainWalk::new();
+        let mut settles = SettleIndex::default();
+        let mut cross = CrossCheck::default();
+        let mut agree = |walk: &ChainWalk, settles: &SettleIndex, expected| {
+            assert_eq!(cross.sync(walk, settles, None), Walked::Reached);
+            let mut whole = CrossCheck::default();
+            assert_eq!(whole.sync(walk, settles, None), Walked::Reached);
+            assert_eq!(findings(&cross, walk), findings(&whole, walk));
+            assert_eq!(findings(&cross, walk), expected);
+        };
+        // Erasure 1 settled and ledgered: nothing to say.
+        settles.push(&settlement(1, "t1", 5));
+        walk.erasures.push(ledgered(3, 1, "t1", 5));
+        agree(&walk, &settles, (vec![], vec![]));
+        // Erasure 2 ledgered, its settle gone (a restore undid it); erasure
+        // 3 settled, its entry not yet in.
+        walk.erasures.push(ledgered(4, 2, "t2", 7));
+        settles.push(&settlement(3, "t3", 8));
+        agree(&walk, &settles, (vec![4], vec![(3, 8)]));
+        // t2 erased again, later: that vouches for the undone entry; its own
+        // entry is still to come.
+        settles.push(&settlement(4, "t2", 9));
+        agree(&walk, &settles, (vec![], vec![(3, 8), (4, 9)]));
+        walk.erasures.push(ledgered(5, 3, "t3", 8));
+        walk.erasures.push(ledgered(6, 4, "t2", 9));
+        agree(&walk, &settles, (vec![], vec![]));
+        // Erasure 1 settled a second time, later (two completions racing):
+        // the later settle is the one that counts, and lacks an entry.
+        settles.push(&settlement(1, "t1", 6));
+        agree(&walk, &settles, (vec![], vec![(1, 6)]));
+        // Erasure 3 settled a second time with an EARLIER generation: t3's
+        // newest settled generation falls below its entry's.
+        settles.push(&settlement(3, "t3", 2));
+        agree(&walk, &settles, (vec![5], vec![(1, 6), (3, 2)]));
+    }
+
+    #[test]
+    fn a_pack_and_the_operators_verification_agree_after_an_erasure_settles_twice() {
+        // The store-level face of the case above: the pack's kept
+        // cross-check, started over, says what a fresh verification says.
+        let dir = temp_dir("settled-twice");
+        let store = Store::open(&dir, crate::Config::default()).expect("open");
+        store.ingest(test_span("t1", "acme")).expect("ingest");
+        let erased = store.erase(trace_subject("t1", "acme")).expect("erase");
+        let pack = store.evidence(None, None, None).expect("pack");
+        assert_eq!(pack["ledger"]["verification"]["intact"], json!(true));
+        let mut again = erased.settle.clone().expect("settled");
+        again.generation += 100;
+        store.erasures.record_settle(again).expect("settle again");
+
+        let pack = store.evidence(None, None, None).expect("pack");
+        let operator = store.verify_ledger().expect("verify");
+        assert!(!operator.intact);
+        assert_eq!(
+            pack["ledger"]["verification"]["problems"],
+            json!(operator.problems),
+        );
+        assert!(
+            format!("{:?}", operator.problems).contains("is not in the ledger"),
+            "{:?}",
+            operator.problems
+        );
+    }
+
+    #[test]
+    fn a_stale_verification_is_served_with_its_age_while_packs_redo_it() {
+        // Past the reuse window a completed walk is still answered from —
+        // saying how old it is — while packs redo it from byte 0 a slice at
+        // a time; the redo, once complete, is what packs answer from. An
+        // edit under the running server shows then.
+        let dir = temp_dir("stale-served");
+        drop(Store::open(&dir, crate::Config::default()).expect("open"));
+        grow_ledger(&dir, 1000);
+        let store = Store::open(&dir, crate::Config::default()).expect("reopen");
+        let first = store.evidence(None, None, None).expect("pack");
+        let walked_at = first["ledger"]["verification"]["chain_verified_at_ns"].clone();
+        assert!(walked_at.is_u64());
+
+        // An entry the walk already passed, edited in place.
+        let path = dir.join(LOG_NAME);
+        let text = fs::read_to_string(&path).expect("ledger");
+        let edited = text.replacen("notary.example", "notary.exampl3", 1);
+        assert_eq!(edited.len(), text.len());
+        fs::write(&path, edited).expect("edit");
+        store
+            .ledger
+            .advance_clock(EVIDENCE_VERIFY_REUSE + Duration::from_secs(1));
+
+        let mut stale = 0_u64;
+        let redone = loop {
+            probe::allow(Some(2));
+            let pack = store.evidence(None, None, None);
+            probe::allow(None);
+            let pack = pack.expect("a stale walk is answered from, not refused");
+            let verification = pack["ledger"]["verification"].clone();
+            if verification["chain_verified_at_ns"] != walked_at {
+                break verification;
+            }
+            assert_eq!(verification["intact"], json!(true), "{verification}");
+            let generated = pack["generated_at_ns"].as_u64().expect("generated_at_ns");
+            let age = generated - walked_at.as_u64().expect("walked at");
+            assert!(
+                age > EVIDENCE_VERIFY_REUSE.as_nanos() as u64,
+                "the pack states the walk's age: {age} ns"
+            );
+            stale += 1;
+            assert!(stale < 100, "the redo finishes");
+        };
+        assert!(stale >= 2, "the redo took several packs: {stale}");
+        assert_eq!(redone["intact"], json!(false), "{redone}");
+        assert!(
+            redone["problems"]
+                .to_string()
+                .contains("head does not match"),
+            "{redone}"
+        );
+    }
+
+    #[test]
+    fn packs_redigest_files_past_the_window_and_only_what_a_checkpoint_changed() {
+        let dir = temp_dir("file-refresh");
+        drop(Store::open(&dir, crate::Config::default()).expect("open"));
+        settle_erasures(&dir, live_of(&dir), &erased_traces("acme", 3, 1_000));
+        let store = Store::open(&dir, crate::Config::default()).expect("reopen");
+        let manifest_of = |generation: u64| {
+            generation::load_manifest(&generation::manifest_path(&dir, generation))
+                .expect("manifest")
+        };
+        for trace in ["a1", "a2"] {
+            store.ingest(test_span(trace, "acme")).expect("ingest");
+        }
+        store.flush().expect("flush");
+        let first = manifest_of(store.checkpoint().expect("checkpoint"));
+        let before = probe::hashed_bytes();
+        let pack = store.evidence(Some("acme"), None, None).expect("pack");
+        assert_eq!(pack["ledger"]["verification"]["intact"], json!(true));
+        assert_eq!(
+            probe::hashed_bytes() - before,
+            first.files.iter().map(|file| file.bytes).sum::<u64>()
+        );
+
+        // A new generation: only what it added or changed is digested.
+        for trace in ["b1", "b2"] {
+            store.ingest(test_span(trace, "acme")).expect("ingest");
+        }
+        store.flush().expect("flush");
+        let second = manifest_of(store.checkpoint().expect("checkpoint"));
+        let changed: u64 = second
+            .files
+            .iter()
+            .filter(|file| {
+                !first.files.iter().any(|old| {
+                    old.path == file.path
+                        && old.bytes == file.bytes
+                        && old.sha256 == file.sha256
+                        && old.modified_unix_ns == file.modified_unix_ns
+                })
+            })
+            .map(|file| file.bytes)
+            .sum();
+        assert!(changed > 0);
+        let before = probe::hashed_bytes();
+        let pack = store.evidence(Some("acme"), None, None).expect("pack");
+        assert_eq!(pack["ledger"]["verification"]["intact"], json!(true));
+        assert_eq!(probe::hashed_bytes() - before, changed);
+
+        // A manifested file edited under the running server: a fresh digest
+        // stands until it is past the window; then the pack answers from it,
+        // saying how old it is, and redoes it — and the next pack has it.
+        let tombstones = dir.join(erasure::LOG_NAME);
+        let text = fs::read_to_string(&tombstones).expect("tombstones");
+        let edited = text.replacen("\"settled_unix_ns\":1000", "\"settled_unix_ns\":1001", 1);
+        assert_ne!(edited, text);
+        fs::write(&tombstones, edited).expect("edit");
+        let pack = store.evidence(Some("acme"), None, None).expect("pack");
+        assert_eq!(pack["ledger"]["verification"]["intact"], json!(true));
+        store
+            .ledger
+            .advance_clock(EVIDENCE_VERIFY_REUSE + Duration::from_secs(1));
+        let pack = store.evidence(Some("acme"), None, None).expect("pack");
+        let verification = &pack["ledger"]["verification"];
+        assert_eq!(verification["intact"], json!(true), "{verification}");
+        let age = pack["generated_at_ns"].as_u64().expect("generated_at_ns")
+            - verification["generation"]["verified_at_ns"]
+                .as_u64()
+                .expect("verified_at_ns");
+        assert!(age > EVIDENCE_VERIFY_REUSE.as_nanos() as u64, "{age}");
+        let pack = store.evidence(None, None, None).expect("pack");
+        let verification = &pack["ledger"]["verification"];
+        assert_eq!(verification["generation"]["files_verified"], json!(false));
+        assert!(
+            verification["problems"]
+                .to_string()
+                .contains(&format!("{}: digest mismatch", erasure::LOG_NAME)),
+            "{verification}"
+        );
     }
 }
