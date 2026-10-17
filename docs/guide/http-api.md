@@ -94,7 +94,7 @@ coding (`br`, `deflate`, `zstd`, a doubled `gzip`), is `415`.
 | `401` | Missing, malformed, unknown, expired, or revoked bearer token. Carries `WWW-Authenticate: Bearer` |
 | `403` | Valid token without the grant this request needs — the body's `"required"` names it (`rw`, `admin`, `unbound`) — or a tenant-bound credential naming a foreign tenant; in open mode, also a browser request from a non-loopback page to an admin operation |
 | `404` | No such route, or the requested trace/session/payload/dataset/experiment/credential/replay does not exist. Cross-tenant reads answer `404`, never `403` — existence is a fact about another tenant |
-| `409` | A conflict a retry may resolve: a mutation for a tenant whose erasure is pending, a tombstoned parent version, a payload reference not in the store, a pin label already taken, a credential token already registered, an environment credential named for revocation, a first credential that is not an unbound admin, a `/v1/fuses/*` route on a server started with `--no-fuses`, an anchor whose `target_head` is not the recorded head. Also a run that cannot be replayed and a strict replay's divergence — see [replays](#post-v1replays) for which of those a retry cannot fix |
+| `409` | A conflict a retry may resolve: a mutation for a tenant whose erasure is pending, a tombstoned parent version, a payload reference not in the store, a pin label already taken, a credential token already registered, an environment credential named for revocation, a first credential that is not an unbound admin, a `/v1/fuses/*` route on a server started with `--no-fuses`, an anchor whose `target_head` is not the recorded head. Also a run that cannot be replayed, a strict replay's divergence, and a replayed answer too large to render — see [replays](#post-v1replays) for which of those a retry cannot fix |
 | `410` | A tombstoned dataset version: the content is withheld, the fact of the deletion is not. Also a replay that is exhausted or that an erasure withdrew |
 | `413` | A gzip body that decompresses past the 64 MiB body cap |
 | `415` | A `Content-Encoding` other than `gzip` on an ingest route, or any coding elsewhere; a `/v1/admin/` body not declared `application/json` |
@@ -1094,7 +1094,7 @@ tenant's credentials and unbound operators; one created from the operator view
 each tool step's arguments and result, resolved within `--tape-max-bytes`;
 recorded requests are resolved one at a time, digested for strict matching,
 and not held. `unreadable_tool_steps` lists the tape indices of tool steps
-whose value could not be resolved (see
+whose value could not be resolved, or that recorded no result at all (see
 [`tools/next`](#post-v1replaysidtoolsnext)).
 
 | Response | Cause |
@@ -1102,8 +1102,8 @@ whose value could not be resolved (see
 | `400 {"error":"…"}` | Missing `run`, unknown field, or a bad `mode` / `tenant` |
 | `403` | A bound credential named another tenant |
 | `404 {"error":"run not found"}` | No spans carry that run id in scope |
-| `409 {"error":"step 0 (llm:gpt-4o) recorded no response — …"}` | The run cannot be replayed: a model step with no recorded answer (content capture off); an offloaded answer that cannot be read, or that is past `--tape-max-bytes` (the message says which); in strict mode a request that cannot be read or was recorded as text rather than a message list; a run of more than 20,000 spans; or a snapshot larger than one tenant's whole share (64 MiB), which can never be held. The message names the step and the remedy. Carries `x-should-retry: false` |
-| `429` with `Retry-After` | No room now. Each tenant's data — and the operator view, as a share of its own — may be held by 64 live replays and 64 MiB of recorded content; the registry as a whole by 1,024 replays and 512 MiB. A full share answers with the seconds until enough of that share's replays expire. A full registry answers the same to unbound operators and a flat `60` to bound credentials, which do not learn when another tenant's replay expires. A live replay is never evicted |
+| `409 {"error":"step 0 (llm:gpt-4o) recorded no response — …"}` | The run cannot be replayed: a model step with no recorded answer (content capture off); an offloaded answer that cannot be read, or that is past `--tape-max-bytes` (the message says which); in strict mode a request that cannot be read or was recorded as text rather than a message list; a run of more than 20,000 spans; or a snapshot larger than one tenant's whole share (64 MiB), which can never be held — refused as soon as building it passes the share. The message names the step and the remedy. Carries `x-should-retry: false` |
+| `429` with `Retry-After` | No room now. Each tenant's data — and the operator view, as a share of its own — may be held by 64 live replays and 64 MiB of memory; the registry as a whole by 1,024 replays and 512 MiB. Memory is everything a replay retains, counted generously: answers, tool records, identifiers, erasure bookkeeping, collection overhead, and its call log at its 4,096-entry bound (about 96 KiB). A full share answers with the seconds until enough of that share's replays expire. A full registry answers the same to unbound operators and a flat `60` to bound credentials, which do not learn when another tenant's replay expires. A live replay is never evicted |
 
 ### `GET /v1/replays/{id}`
 
@@ -1121,7 +1121,9 @@ to 4,096 entries. `diverged` is the first divergence, `{"step",
 replay is `404 {"error":"replay not found"}`. A replay withdrawn by an
 erasure is `410 {"error":"…","type":"replay_erased","erasure":N}` on this and
 every route under it, from the moment the erasure is recorded until the
-replay would have expired.
+replay would have expired. A withdrawn replay takes no live replay's room;
+each share keeps at most 64 withdrawn replays (the registry 1,024), and past
+that forgets the one closest to expiring, whose id is then `404`.
 
 ### `POST /v1/replays/{id}/openai/v1/chat/completions`
 
@@ -1130,8 +1132,11 @@ step: set the SDK's base URL to the replay's `base_urls.openai`. The body is an
 ordinary chat-completions request. The answer is a `chat.completion` object —
 the recorded text, the recorded tool calls as `tool_calls` (arguments as a JSON
 string), the recorded finish reason translated into OpenAI's vocabulary, the
-recorded model and token usage. With `"stream": true` it is
-`text/event-stream`: `chat.completion.chunk` events, a usage chunk when
+recorded model and token usage. With no recorded model the request's `model` is
+echoed, or `"unknown"`; a model name or response id over 256 bytes, recorded or
+requested, counts as absent. An answer recorded as text is served as that text
+even when it reads as JSON. No response, streamed or not, exceeds 64 MiB. With
+`"stream": true` it is `text/event-stream`: `chat.completion.chunk` events, a usage chunk when
 `stream_options.include_usage` is set, then `data: [DONE]`. The stream is
 reconstructed from stored text in Traza's own chunking.
 
@@ -1147,6 +1152,7 @@ messages are compared — not the model or other parameters.
 | `400 {"error":{"type":"invalid_request_error",…}}` | The body is not a JSON object with a `messages` array; or a path other than `chat/completions` under the base URL |
 | `404 {"error":{"type":"not_found_error",…}}` | Unknown, expired or foreign replay |
 | `409 {"error":{"type":"replay_divergence","message","step","expected_digest","got_digest"}}` | Strict mode: the messages do not match recorded step `step`. The step is **not** consumed. Carries `x-should-retry: false` |
+| `409 {"error":{"type":"response_too_large","message","step","limit"}}` | The next recorded answer would render past 64 MiB in the asked-for shape — a stream can be many times its recording. The step is **not** consumed; the same step unstreamed may fit. Carries `x-should-retry: false` |
 | `410 {"error":{"type":"replay_exhausted","message","served"}}` | Every recorded model step has been served. Carries `x-should-retry: false` |
 | `410 {"error":{"type":"replay_erased","message","erasure"}}` | An erasure recorded after the replay was created covers content it held; the replay is withdrawn. Carries `x-should-retry: false` |
 
@@ -1199,7 +1205,7 @@ shape — `{"error": "<message>"}` with the machine-readable kind beside it as
 |---|---|
 | `400 {"error":"…"}` | A body that is not `{}` or `{"tool": "<name>"}` |
 | `404 {"error":"replay not found"}` | Unknown, expired or foreign replay |
-| `409 {"error":"…","type":"tool_unreadable","step"}` | The next tool step's arguments or result was offloaded and could not be resolved — erased, swept by retention, or past `--tape-max-bytes`. The step is **not** consumed. Carries `x-should-retry: false` |
+| `409 {"error":"…","type":"tool_unreadable","step"}` | The next tool step's arguments or result was offloaded and could not be resolved — erased, swept by retention, or past `--tape-max-bytes` — or it recorded no result at all (content capture off). A result recorded as `""` or `null` is served as recorded. The step is **not** consumed. Carries `x-should-retry: false` |
 | `410 {"error":"…","type":"replay_exhausted"}` | No unserved tool step (of that name) remains. Carries `x-should-retry: false` |
 | `410 {"error":"…","type":"replay_erased","erasure"}` | The replay was withdrawn by an erasure. Carries `x-should-retry: false` |
 
@@ -1231,7 +1237,10 @@ whose `gen_ai.request.*` parameters differ is `config`, and so is a model swap
 — two model calls naming different models in the same unaligned stretch are
 paired as one `config` change. A step only one run has is `structure`. Step
 status is not compared. `404 {"error":"run not found: <run>"}` names a run
-with no spans; `400` when `a` or `b` is missing.
+with no spans; `400` when `a` or `b` is missing, or when reading, extracting
+and aligning the two runs does not fit the request's one `--query-deadline-ms`
+budget — the alignment compares interned signatures and checks the budget as
+it goes, so long names cannot keep it running past it.
 
 ### `GET /v1/recall`
 

@@ -44,7 +44,9 @@
 //! covers any span, trace, session, tenant or payload it holds, and if one
 //! does, the replay is withdrawn — its content dropped, every later call
 //! refused `410 replay_erased`. The check is an epoch comparison when nothing
-//! has been erased, so it costs a call nothing in the common case.
+//! has been erased, so it costs a call nothing in the common case. Withdrawn
+//! replays take no live replay's room, and are themselves bounded: past as
+//! many as a share may hold live, the one closest to expiring is forgotten.
 //!
 //! # What a replay does not do
 //!
@@ -61,15 +63,24 @@
 //!   divergence rather than silently mismatching answers to questions.
 //!
 //! The registry is bounded twice — per tenant ([`MAX_TENANT_REPLAYS`] replays,
-//! [`MAX_TENANT_BYTES`] of recorded content), so one credential cannot fill
-//! it for everybody, and as a whole ([`MAX_LIVE_REPLAYS`],
-//! [`MAX_REGISTRY_BYTES`]) as the backstop behind every share. Each replay
-//! lives [`REPLAY_TTL`] from creation, in memory only: a restart forgets every
-//! replay, and creating one again is a read of the store.
+//! [`MAX_TENANT_BYTES`] of memory), so one credential cannot fill it for
+//! everybody, and as a whole ([`MAX_LIVE_REPLAYS`], [`MAX_REGISTRY_BYTES`]) as
+//! the backstop behind every share. A replay's bytes are everything it
+//! retains, counted generously and charged while its snapshot is built, so a
+//! run too large for a share is refused before it is all in memory. Each
+//! replay lives [`REPLAY_TTL`] from creation, in memory only: a restart
+//! forgets every replay, and creating one again is a read of the store.
+//!
+//! A served answer is bounded too: no rendered response exceeds
+//! [`MAX_RESPONSE_BYTES`], and the identifiers a stream repeats in every
+//! chunk — the model and the response id — are served only up to
+//! [`MAX_IDENTIFIER_BYTES`], so no request can make the server buffer a
+//! multiple of its own size.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::{BuildHasher, Hasher};
+use std::io::{self, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -77,7 +88,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Map, Value};
 
 use crate::erasure::{EraseRecord, Subject};
-use crate::semconv::{self, StepKind};
+use crate::semconv::{self, ResponseSource, StepKind};
 use crate::tape::{self, Leftover, ResolveBudget, Resolver, TapeStep};
 use crate::{Deadline, Span, Store};
 
@@ -90,8 +101,10 @@ pub const REPLAY_TTL: Duration = Duration::from_secs(60 * 60);
 /// somebody's run halfway.
 pub const MAX_LIVE_REPLAYS: usize = 1024;
 
-/// Recorded content the registry holds across every live replay, measured as
-/// the serialized size of the answers and tool records each one snapshots.
+/// Memory the registry's live replays hold together: every allocation each
+/// one retains — answers, tool records, identifiers, what erasure is checked
+/// against, its call log at its full bound — with the collections' overhead,
+/// counted generously rather than measured.
 ///
 /// The count bound alone is not a memory bound: one replay of a long run with
 /// large completions can be thousands of times another. Half a gibibyte is
@@ -109,12 +122,32 @@ pub const MAX_REGISTRY_BYTES: usize = 512 * 1024 * 1024;
 /// itself is what refuses.
 pub const MAX_TENANT_REPLAYS: usize = 64;
 
-/// Recorded content one tenant's replays may hold together.
+/// Memory one tenant's replays may hold together, counted as
+/// [`MAX_REGISTRY_BYTES`] counts it.
 ///
 /// An eighth of the registry rather than a sixteenth, because a share is also
 /// the largest single replay that can ever exist: a long run with large
 /// answers has to fit in it whole.
 pub const MAX_TENANT_BYTES: usize = 64 * 1024 * 1024;
+
+/// The largest response one replayed call renders, streamed or not.
+///
+/// A stream repeats fixed fields in every chunk and splits tool-call
+/// arguments into many, so its size is not the recording's: an answer of a
+/// thousand tiny tool calls streams to hundreds of times its recorded bytes.
+/// The bound is the server's own request-body bound, and far above any
+/// answer a model gives; a step that would render larger is refused, and not
+/// consumed, before more than this is buffered.
+pub const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
+/// The longest model name or response id a replay serves.
+///
+/// Both are repeated in every chunk of an OpenAI stream, so one long enough
+/// would turn a small answer into gigabytes — and when the recording names no
+/// model, the request's own model is what would be echoed. No provider's
+/// model names or ids come near this; a longer one, recorded or requested, is
+/// served as if absent (an invented id, `unknown` for the model).
+pub const MAX_IDENTIFIER_BYTES: usize = 256;
 
 /// Calls one replay records for `GET /v1/replays/{id}`. A client stuck
 /// retrying a divergence must not grow a replay without bound; past this the
@@ -181,6 +214,8 @@ pub struct Limits {
     /// Spans a replayed run may have. A longer run is refused, never replayed
     /// as its beginning.
     pub max_spans: usize,
+    /// The largest response one call renders.
+    pub max_response_bytes: usize,
 }
 
 impl Default for Limits {
@@ -192,6 +227,7 @@ impl Default for Limits {
             max_live_per_tenant: MAX_TENANT_REPLAYS,
             max_bytes_per_tenant: MAX_TENANT_BYTES,
             max_spans: tape::MAX_TAPE_SPANS,
+            max_response_bytes: MAX_RESPONSE_BYTES,
         }
     }
 }
@@ -222,9 +258,19 @@ pub enum ReplayError {
     /// The snapshot is larger than one tenant's share of the registry, so it
     /// can never be held, however long the caller waits.
     TooLarge {
-        /// The snapshot's recorded content, in bytes.
+        /// What the snapshot held when it passed the share — at least this
+        /// many bytes, since building it stops there.
         bytes: usize,
         /// The most one tenant's replays may hold together.
+        limit: usize,
+    },
+    /// The next recorded answer would render to more than
+    /// [`Limits::max_response_bytes`] in the asked-for shape. The step is not
+    /// consumed.
+    ResponseTooLarge {
+        /// Its tape index.
+        step: usize,
+        /// The bound it would pass.
         limit: usize,
     },
     /// The run cannot be replayed as asked; the message says which step and
@@ -302,10 +348,16 @@ impl fmt::Display for ReplayError {
             } => f.write_str("the server's replay registry is full; retry once a replay expires"),
             Self::TooLarge { bytes, limit } => write!(
                 f,
-                "this run's replay would hold {} of recorded answers and tool records, more \
-                 than the {} one tenant's replays may hold together, so it can never be \
-                 created; retrying will not help",
+                "this run's replay would hold at least {} of recorded answers, tool records \
+                 and bookkeeping, more than the {} one tenant's replays may hold together, so \
+                 it can never be created; retrying will not help",
                 size(*bytes),
+                size(*limit)
+            ),
+            Self::ResponseTooLarge { step, limit } => write!(
+                f,
+                "recorded step {step} would render to more than {} in this shape, the most one \
+                 replayed response may be; the step is not consumed",
                 size(*limit)
             ),
             Self::Unreplayable(reason) | Self::Invalid(reason) => f.write_str(reason),
@@ -405,6 +457,8 @@ pub struct ServedStep {
     start_ns: u64,
     choices: Vec<Choice>,
     tokens: tape::StepTokens,
+    /// The most bytes a rendering may take ([`Limits::max_response_bytes`]).
+    max_response_bytes: usize,
 }
 
 /// A recorded tool step, as `tools/next` returns it.
@@ -416,7 +470,8 @@ pub struct ServedTool {
     pub tool: Option<String>,
     /// The recorded arguments, `null` when none were captured.
     pub arguments: Value,
-    /// The recorded result, `null` when none was captured.
+    /// The recorded result — `null` or `""` only when it was recorded so. A
+    /// step whose result was never captured is refused, not served.
     pub result: Value,
 }
 
@@ -503,22 +558,55 @@ struct Coverage {
     sessions: HashSet<(String, String)>,
     tenants: HashSet<String>,
     payloads: HashSet<String>,
+    /// Heap the strings inside the sets hold, kept as they are inserted so
+    /// the footprint is known at every step without walking the sets.
+    strings: usize,
 }
 
 impl Coverage {
     /// Records one snapshotted step, from its STORED values.
     fn add(&mut self, step: &TapeStep) {
         let tenant = &step.detail.tenant;
-        self.keys
-            .insert((tenant.clone(), step.trace_id.clone(), step.span_id.clone()));
-        self.traces.insert((tenant.clone(), step.trace_id.clone()));
+        let key = (tenant.clone(), step.trace_id.clone(), step.span_id.clone());
+        let held = key.0.heap() + key.1.heap() + key.2.heap();
+        if self.keys.insert(key) {
+            self.strings += held;
+        }
+        let trace = (tenant.clone(), step.trace_id.clone());
+        let held = trace.0.heap() + trace.1.heap();
+        if self.traces.insert(trace) {
+            self.strings += held;
+        }
         if let Some(session) = &step.detail.session {
-            self.sessions.insert((tenant.clone(), session.clone()));
+            let session = (tenant.clone(), session.clone());
+            let held = session.0.heap() + session.1.heap();
+            if self.sessions.insert(session) {
+                self.strings += held;
+            }
         }
-        self.tenants.insert(tenant.clone());
+        if self.tenants.insert(tenant.clone()) {
+            self.strings += tenant.len();
+        }
+        let mut references = HashSet::new();
         for value in [&step.request, &step.response].into_iter().flatten() {
-            tape::collect_references(value, &mut self.payloads);
+            tape::collect_references(value, &mut references);
         }
+        for reference in references {
+            let held = reference.heap();
+            if self.payloads.insert(reference) {
+                self.strings += held;
+            }
+        }
+    }
+
+    /// What the coverage holds: each set's table, and the strings in it.
+    fn heap(&self) -> usize {
+        set_heap(&self.keys)
+            + set_heap(&self.traces)
+            + set_heap(&self.sessions)
+            + set_heap(&self.tenants)
+            + set_heap(&self.payloads)
+            + self.strings
     }
 
     /// Whether `record`'s erasure covers anything this replay holds: by its
@@ -593,7 +681,8 @@ impl Replay {
 
     /// Drops everything the replay holds, keeping only what it takes to keep
     /// answering "erased" until it expires: its tenant (for visibility) and
-    /// its expiry. A withdrawn replay counts against no bound.
+    /// its expiry. A withdrawn replay counts against no live bound; withdrawn
+    /// replays have their own (see `forget_excess_withdrawn`).
     fn withdraw(&mut self, erasure: u64) {
         self.erased = Some(erasure);
         self.run = String::new();
@@ -638,6 +727,7 @@ impl Registry {
                 max_live_per_tenant: limits.max_live_per_tenant.max(1),
                 max_bytes_per_tenant: limits.max_bytes_per_tenant.max(1),
                 max_spans: limits.max_spans.max(1),
+                max_response_bytes: limits.max_response_bytes.max(1),
                 ..limits
             },
         }
@@ -663,7 +753,9 @@ impl Registry {
     /// in strict mode — a request is an offloaded payload that could not be
     /// read or is past the budget, or when strict mode has no recorded
     /// message list to compare against; refused too when the run has more
-    /// spans than [`Limits::max_spans`].
+    /// spans than [`Limits::max_spans`], and — as soon as building the
+    /// snapshot passes it — when the replay would hold more than a whole
+    /// share.
     pub fn create(
         &self,
         store: &Store,
@@ -696,7 +788,12 @@ impl Registry {
             )));
         }
         let steps = read.steps.len();
-        let snapshot = snapshot(store, tenant, deadline, read.steps, mode, tape_max_bytes)?;
+        let budget = SnapshotBudget {
+            tape_max_bytes,
+            overhead: replay_overhead(run_id, tenant),
+            share_bytes: self.share_bytes(),
+        };
+        let snapshot = snapshot(store, tenant, deadline, read.steps, mode, budget)?;
 
         let mut replays = self.lock();
         self.purge(&mut replays, now_ns);
@@ -748,7 +845,7 @@ impl Registry {
         now_ns: u64,
     ) -> Result<(), ReplayError> {
         let limits = &self.limits;
-        let share_bytes = limits.max_bytes_per_tenant.min(limits.max_bytes);
+        let share_bytes = self.share_bytes();
         if bytes > share_bytes {
             return Err(ReplayError::TooLarge {
                 bytes,
@@ -793,8 +890,47 @@ impl Registry {
         Ok(())
     }
 
+    /// The most one share may hold, which is also the largest replay.
+    fn share_bytes(&self) -> usize {
+        self.limits.max_bytes_per_tenant.min(self.limits.max_bytes)
+    }
+
     fn purge(&self, replays: &mut HashMap<String, Replay>, now_ns: u64) {
         replays.retain(|_, replay| replay.expires_at_ns > now_ns);
+    }
+
+    /// Forgets withdrawn replays past their bound, once `tenant`'s share has
+    /// had one withdrawn.
+    ///
+    /// A withdrawn replay counts against no bound — an erasure must not lock
+    /// a tenant out of replays for an hour — but it is still an entry every
+    /// call's purge walks, and creating, erasing and asking again would
+    /// otherwise pile them up without limit. So each share keeps as many
+    /// withdrawn replays as it may hold live ones, and the registry as many
+    /// as it may hold live in all; past that, the one closest to expiring —
+    /// with the least time left to answer `410` anyway — is forgotten, and
+    /// its id answers `404` from then on.
+    fn forget_excess_withdrawn(&self, replays: &mut HashMap<String, Replay>, tenant: Option<&str>) {
+        let mut forget = |share: Option<Option<&str>>, bound: usize| {
+            let mut withdrawn: Vec<(u64, String)> = replays
+                .iter()
+                .filter(|(_, replay)| {
+                    replay.erased.is_some()
+                        && share.map_or(true, |owner| replay.tenant.as_deref() == owner)
+                })
+                .map(|(id, replay)| (replay.expires_at_ns, id.clone()))
+                .collect();
+            let excess = withdrawn.len().saturating_sub(bound);
+            if excess == 0 {
+                return;
+            }
+            withdrawn.sort_unstable();
+            for (_, id) in withdrawn.into_iter().take(excess) {
+                replays.remove(&id);
+            }
+        };
+        forget(Some(tenant), self.limits.max_live_per_tenant);
+        forget(None, self.limits.max_live);
     }
 
     /// The live replay `id` as `binding` may see it, or why not — after
@@ -818,72 +954,108 @@ impl Registry {
         now_ns: u64,
     ) -> Result<&'r mut Replay, ReplayError> {
         self.purge(replays, now_ns);
-        let replay = replays
-            .get_mut(id)
-            .filter(|replay| replay.visible_to(binding))
-            .ok_or(ReplayError::NotFound)?;
-        if let Some(erasure) = replay.erased {
-            return Err(ReplayError::Erased { erasure });
-        }
-        if latest_erasure > replay.erasure_epoch {
-            let covering = store.erasures.first_since(replay.erasure_epoch, |record| {
-                replay.coverage.covers(record)
-            })?;
-            if let Some(erasure) = covering {
-                replay.withdraw(erasure);
+        let withdrawn = {
+            let replay = replays
+                .get_mut(id)
+                .filter(|replay| replay.visible_to(binding))
+                .ok_or(ReplayError::NotFound)?;
+            if let Some(erasure) = replay.erased {
                 return Err(ReplayError::Erased { erasure });
             }
-            replay.erasure_epoch = latest_erasure;
+            let mut withdrawn = None;
+            if latest_erasure > replay.erasure_epoch {
+                let covering = store.erasures.first_since(replay.erasure_epoch, |record| {
+                    replay.coverage.covers(record)
+                })?;
+                match covering {
+                    Some(erasure) => {
+                        replay.withdraw(erasure);
+                        withdrawn = Some((erasure, replay.tenant.clone()));
+                    }
+                    None => replay.erasure_epoch = latest_erasure,
+                }
+            }
+            withdrawn
+        };
+        if let Some((erasure, tenant)) = withdrawn {
+            self.forget_excess_withdrawn(replays, tenant.as_deref());
+            return Err(ReplayError::Erased { erasure });
         }
-        Ok(replay)
+        replays.get_mut(id).ok_or(ReplayError::NotFound)
     }
 
     /// Serves the next recorded llm step to a request whose messages
     /// normalise to `got_digest` ([`openai_request_digest`],
-    /// [`anthropic_request_digest`]).
-    pub fn next_llm(
+    /// [`anthropic_request_digest`]), as `render` renders it — typically
+    /// [`ServedStep::openai`] or [`ServedStep::anthropic`].
+    ///
+    /// The step is consumed only once it has rendered: a rendering refused
+    /// as too large ([`ReplayError::ResponseTooLarge`]) leaves the cursor
+    /// where it was, as a divergence does. Rendering happens outside the
+    /// registry's lock, so a large answer does not stall every other replay;
+    /// a call that loses the step to a concurrent one meanwhile is served
+    /// the next step instead, compared afresh — the arrival order the module
+    /// documents.
+    pub fn next_llm<R>(
         &self,
         store: &Store,
         id: &str,
         binding: Option<&str>,
         got_digest: Option<String>,
         now_ns: u64,
-    ) -> Result<ServedStep, ReplayError> {
-        let latest_erasure = store.erasures.latest_id()?;
-        let mut replays = self.lock();
-        let replay = self.live(&mut replays, store, latest_erasure, id, binding, now_ns)?;
-        let Some(step) = replay.llm.get(replay.served).cloned() else {
-            return Err(ReplayError::Exhausted {
-                served: replay.served,
-            });
-        };
-        let matched = step.expected_digest.is_some() && step.expected_digest == got_digest;
-        if replay.mode == Mode::Strict && !matched {
-            replay.record(step.step, false, now_ns);
-            if replay.diverged.is_none() {
-                replay.diverged = Some(Divergence {
+        render: impl Fn(&ServedStep) -> Result<R, ReplayError>,
+    ) -> Result<R, ReplayError> {
+        loop {
+            let (served, cursor, matched) = {
+                let latest_erasure = store.erasures.latest_id()?;
+                let mut replays = self.lock();
+                let replay = self.live(&mut replays, store, latest_erasure, id, binding, now_ns)?;
+                let cursor = replay.served;
+                let Some(step) = replay.llm.get(cursor).cloned() else {
+                    return Err(ReplayError::Exhausted { served: cursor });
+                };
+                let matched = step.expected_digest.is_some() && step.expected_digest == got_digest;
+                if replay.mode == Mode::Strict && !matched {
+                    replay.record(step.step, false, now_ns);
+                    if replay.diverged.is_none() {
+                        replay.diverged = Some(Divergence {
+                            step: step.step,
+                            expected_digest: step.expected_digest.clone(),
+                            got_digest: got_digest.clone(),
+                        });
+                    }
+                    return Err(ReplayError::Diverged {
+                        step: step.step,
+                        expected_digest: step.expected_digest,
+                        got_digest,
+                    });
+                }
+                let served = ServedStep {
+                    replay: id.to_owned(),
                     step: step.step,
-                    expected_digest: step.expected_digest.clone(),
-                    got_digest: got_digest.clone(),
-                });
+                    model: step.model,
+                    response_id: step.response_id,
+                    start_ns: step.start_ns,
+                    choices: step.choices,
+                    tokens: step.tokens,
+                    max_response_bytes: self.limits.max_response_bytes,
+                };
+                (served, cursor, matched)
+            };
+            let rendered = render(&served)?;
+            // Committed only if nothing changed meanwhile: an erasure
+            // recorded since withdraws the replay (and the rendering is
+            // dropped unserved), and another call may have taken the step.
+            let latest_erasure = store.erasures.latest_id()?;
+            let mut replays = self.lock();
+            let replay = self.live(&mut replays, store, latest_erasure, id, binding, now_ns)?;
+            if replay.served != cursor {
+                continue;
             }
-            return Err(ReplayError::Diverged {
-                step: step.step,
-                expected_digest: step.expected_digest,
-                got_digest,
-            });
+            replay.record(served.step, matched, now_ns);
+            replay.served += 1;
+            return Ok(rendered);
         }
-        replay.record(step.step, matched, now_ns);
-        replay.served += 1;
-        Ok(ServedStep {
-            replay: id.to_owned(),
-            step: step.step,
-            model: step.model,
-            response_id: step.response_id,
-            start_ns: step.start_ns,
-            choices: step.choices,
-            tokens: step.tokens,
-        })
     }
 
     /// Serves the next unserved recorded tool step, or the next one named
@@ -1015,7 +1187,32 @@ struct Snapshot {
     llm: Vec<LlmStep>,
     tools: Vec<ToolStep>,
     coverage: Coverage,
+    /// What the replay will hold in all: the snapshot's footprint plus the
+    /// replay's own overhead ([`replay_overhead`]).
     bytes: usize,
+}
+
+impl Snapshot {
+    /// The footprint so far, from `steps_heap` (the steps' own heap, summed
+    /// as they were added) and the collections' current capacities — so it
+    /// costs nothing to ask after every step.
+    fn footprint(&self, steps_heap: usize) -> usize {
+        self.llm.capacity() * std::mem::size_of::<LlmStep>()
+            + self.tools.capacity() * std::mem::size_of::<ToolStep>()
+            + steps_heap
+            + self.coverage.heap()
+    }
+}
+
+/// What a snapshot may spend.
+struct SnapshotBudget {
+    /// `--tape-max-bytes`: payload bytes the replay may resolve and retain.
+    tape_max_bytes: usize,
+    /// What the replay will hold besides its snapshot ([`replay_overhead`]).
+    overhead: usize,
+    /// A whole share: a snapshot past it can never be held, so building it
+    /// stops there.
+    share_bytes: usize,
 }
 
 /// What a recorded request came to, for strict matching.
@@ -1031,19 +1228,22 @@ enum RecordedRequest {
 }
 
 /// Builds a replay's llm and tool snapshots from a run's steps as stored,
-/// resolving what the replay will hold and refusing what cannot be replayed.
+/// resolving what the replay will hold and refusing what cannot be replayed —
+/// including, the moment its footprint passes a whole share, a snapshot that
+/// could never be held.
 fn snapshot(
     store: &Store,
     tenant: Option<&str>,
     deadline: Option<Deadline>,
     steps: Vec<TapeStep>,
     mode: Mode,
-    tape_max_bytes: usize,
+    budget: SnapshotBudget,
 ) -> Result<Snapshot, ReplayError> {
     let mut resolver = Resolver::new(store, tenant, deadline);
     // Only what the replay RETAINS is charged: answers and tool records.
-    let mut retained = ResolveBudget::new(tape_max_bytes);
+    let mut retained = ResolveBudget::new(budget.tape_max_bytes);
     let mut out = Snapshot::default();
+    let mut steps_heap = 0;
     for mut step in steps {
         if !matches!(step.kind, StepKind::Llm | StepKind::Tool) {
             continue;
@@ -1057,65 +1257,95 @@ fn snapshot(
             // Resolved on its own, digested, dropped: never retained, so
             // never charged. Its size is bounded by what ingest accepted for
             // one span, and its cost by the request's deadline.
-            let request = match step.request.take() {
-                None => RecordedRequest::Missing,
-                Some(mut request) => {
-                    let leftover =
-                        resolver.resolve(&mut request, &mut ResolveBudget::new(usize::MAX))?;
-                    match (leftover.any(), recorded_digest(&request)) {
-                        (true, _) => RecordedRequest::Unreadable,
-                        (false, Some(digest)) => RecordedRequest::Digest(digest),
-                        (false, None) => RecordedRequest::Text,
-                    }
+            let request = if step.request.is_none() {
+                RecordedRequest::Missing
+            } else {
+                let leftover =
+                    resolver.resolve_request(&mut step, &mut ResolveBudget::new(usize::MAX))?;
+                let request = step.request.take().unwrap_or(Value::Null);
+                match (leftover.any(), recorded_digest(&request)) {
+                    (true, _) => RecordedRequest::Unreadable,
+                    (false, Some(digest)) => RecordedRequest::Digest(digest),
+                    (false, None) => RecordedRequest::Text,
                 }
             };
-            out.llm
-                .push(llm_snapshot(&step, mode, answer, request, &retained)?);
+            let llm = llm_snapshot(&step, mode, answer, request, &retained)?;
+            steps_heap += llm.heap();
+            out.llm.push(llm);
         } else {
             let mut leftover = Leftover::default();
             for value in [&mut step.request, &mut step.response]
                 .into_iter()
                 .flatten()
             {
-                let left = resolver.resolve(value, &mut retained)?;
-                leftover.past_budget |= left.past_budget;
-                leftover.unreadable |= left.unreadable;
+                leftover.merge(resolver.resolve(value, &mut retained)?);
             }
-            let unreadable = match (leftover.unreadable, leftover.past_budget) {
-                (true, _) => Some(
+            // A result recorded as empty is a result; one never recorded —
+            // content capture was off — has nothing to serve, and serving
+            // `null` in its place would hand the harness an invented result.
+            let result = step.response.take().or(step.detail.empty_response.take());
+            let unreadable = match (leftover.unreadable, leftover.past_budget, &result) {
+                (true, _, _) => Some(
                     "its recorded arguments or result is an offloaded payload that could not \
                      be read — erased, or swept by retention"
                         .to_owned(),
                 ),
-                (false, true) => Some(format!(
+                (false, true, _) => Some(format!(
                     "its recorded arguments or result is an offloaded payload past \
                      --tape-max-bytes ({} of answers and tool records were resolved before \
                      it); raise --tape-max-bytes to replay it",
                     size(retained.spent())
                 )),
-                (false, false) => None,
+                (false, false, None) => Some(
+                    "it recorded no result — content capture was off when the run was \
+                     recorded (for OpenLLMetry, TRACELOOP_TRACE_CONTENT), so there is no \
+                     recorded result to serve"
+                        .to_owned(),
+                ),
+                (false, false, Some(_)) => None,
             };
-            out.tools.push(ToolStep {
+            let tool = ToolStep {
                 step: step.index,
-                tool: step.tool.clone(),
+                tool: step.tool.take(),
                 arguments: step.request.take().unwrap_or(Value::Null),
-                result: step.response.take().unwrap_or(Value::Null),
+                result: result.unwrap_or(Value::Null),
                 served: false,
                 unreadable,
+            };
+            steps_heap += tool.heap();
+            out.tools.push(tool);
+        }
+        let bytes = budget.overhead + out.footprint(steps_heap);
+        if bytes > budget.share_bytes {
+            return Err(ReplayError::TooLarge {
+                bytes,
+                limit: budget.share_bytes,
             });
         }
     }
-    out.bytes = out
-        .llm
-        .iter()
-        .map(|step| approximate_bytes(&step.choices))
-        .chain(
-            out.tools
-                .iter()
-                .map(|tool| value_bytes(&tool.arguments) + value_bytes(&tool.result) + 64),
-        )
-        .sum::<usize>();
+    // Growth left spare capacity behind; a snapshot is never added to again.
+    out.llm.shrink_to_fit();
+    out.tools.shrink_to_fit();
+    out.bytes = budget.overhead + out.footprint(steps_heap);
     Ok(out)
+}
+
+/// What a registered replay holds besides its snapshot: its registry entry
+/// and id, the run id it was asked for, its tenant, the divergence it may
+/// record and its call log — at its full bound, charged up front so that a
+/// replay's growth after admission can never take its share or the registry
+/// past their budgets.
+fn replay_overhead(run: &str, tenant: Option<&str>) -> usize {
+    // A hash map's slots hold entries inline and run up to half empty after
+    // the table grows.
+    2 * std::mem::size_of::<(String, Replay)>()
+        + "rp_".len()
+        + 32
+        + run.len()
+        + tenant.map_or(0, str::len)
+        // The divergence's two digests, 64 hex characters each.
+        + 2 * 64
+        + MAX_RECORDED_CALLS * std::mem::size_of::<CallRecord>()
 }
 
 fn llm_snapshot(
@@ -1149,7 +1379,11 @@ fn llm_snapshot(
             size(retained.spent())
         )));
     }
-    let choices = recorded_choices(response, &step.detail.finish_reasons);
+    let choices = recorded_choices(
+        response,
+        step.detail.response_source,
+        &step.detail.finish_reasons,
+    );
     if choices.is_empty() {
         return Err(ReplayError::Unreplayable(format!(
             "{}'s response holds no assistant message to replay",
@@ -1176,10 +1410,17 @@ fn llm_snapshot(
             label()
         )));
     }
+    // Identifiers a stream repeats in every chunk are kept only at a length
+    // a provider could have produced (see MAX_IDENTIFIER_BYTES).
+    let identifier = |value: &Option<String>| {
+        value
+            .clone()
+            .filter(|value| value.len() <= MAX_IDENTIFIER_BYTES)
+    };
     Ok(LlmStep {
         step: step.index,
-        model: step.model.clone(),
-        response_id: step.detail.response_id.clone(),
+        model: identifier(&step.model),
+        response_id: identifier(&step.detail.response_id),
         start_ns: step.start_ns,
         expected_digest,
         choices,
@@ -1187,24 +1428,95 @@ fn llm_snapshot(
     })
 }
 
-fn value_bytes(value: &Value) -> usize {
-    serde_json::to_vec(value).map_or(0, |bytes| bytes.len())
+// ---------------------------------------------------------------- footprint
+
+/// What a value a replay retains holds on the heap, counted generously: its
+/// allocations and the collection overhead around them. A value's inline
+/// size is charged by whatever holds it — the vector or table it sits in.
+trait Footprint {
+    fn heap(&self) -> usize;
 }
 
-fn approximate_bytes(choices: &[Choice]) -> usize {
-    choices
-        .iter()
-        .map(|choice| {
-            choice.text.as_ref().map_or(0, String::len)
-                + choice
-                    .calls
-                    .iter()
-                    .map(|call| call.name.len() + value_bytes(&call.arguments) + 32)
-                    .sum::<usize>()
-                + 64
-        })
-        .sum::<usize>()
-        + 256
+impl Footprint for String {
+    fn heap(&self) -> usize {
+        self.capacity()
+    }
+}
+
+impl<T: Footprint> Footprint for Option<T> {
+    fn heap(&self) -> usize {
+        self.as_ref().map_or(0, Footprint::heap)
+    }
+}
+
+impl<T: Footprint> Footprint for Vec<T> {
+    fn heap(&self) -> usize {
+        self.capacity() * std::mem::size_of::<T>() + self.iter().map(Footprint::heap).sum::<usize>()
+    }
+}
+
+impl Footprint for Value {
+    fn heap(&self) -> usize {
+        match self {
+            Value::Null | Value::Bool(_) | Value::Number(_) => 0,
+            Value::String(text) => text.heap(),
+            Value::Array(items) => items.heap(),
+            Value::Object(fields) => {
+                // A B-tree allocates a whole node however few entries it
+                // holds, and its nodes may run half empty after splitting.
+                const ENTRY: usize = std::mem::size_of::<String>() + std::mem::size_of::<Value>();
+                let nodes = match fields.len() {
+                    0 => 0,
+                    entries => (12 + 2 * entries) * ENTRY,
+                };
+                nodes
+                    + fields
+                        .iter()
+                        .map(|(key, value)| key.heap() + value.heap())
+                        .sum::<usize>()
+            }
+        }
+    }
+}
+
+impl Footprint for Call {
+    fn heap(&self) -> usize {
+        self.id.heap() + self.name.heap() + self.arguments.heap()
+    }
+}
+
+impl Footprint for Choice {
+    fn heap(&self) -> usize {
+        self.text.heap() + self.calls.heap() + self.finish_reason.heap()
+    }
+}
+
+impl Footprint for LlmStep {
+    fn heap(&self) -> usize {
+        self.model.heap()
+            + self.response_id.heap()
+            + self.expected_digest.heap()
+            + self.choices.heap()
+    }
+}
+
+impl Footprint for ToolStep {
+    fn heap(&self) -> usize {
+        self.tool.heap() + self.arguments.heap() + self.result.heap() + self.unreadable.heap()
+    }
+}
+
+/// A hash set's table: a slot and a control byte for every bucket (a power
+/// of two, kept at most seven-eighths full), plus one group of trailing
+/// control bytes. The elements' own heap is not included.
+fn set_heap<T>(set: &HashSet<T>) -> usize {
+    match set.capacity() {
+        0 => 0,
+        capacity => {
+            let buckets = (capacity * 8).div_ceil(7).next_power_of_two();
+            buckets * (std::mem::size_of::<T>() + 1) + 16
+        }
+    }
 }
 
 /// A fresh replay id: `rp_` and 32 hex characters.
@@ -1379,11 +1691,18 @@ fn parts_message(message: &Value, parts: &[Value]) -> Normalised {
 
 /// The normalised digest of a RECORDED request — `None` when it is not a
 /// message list, which strict mode cannot compare.
+///
+/// A list holding anything but messages is not a message list: that is what
+/// a bare-text prompt recorded beside system instructions becomes
+/// ([`semconv::step_facts`]), and digesting only its messages would match a
+/// request that never carried the text.
 fn recorded_digest(request: &Value) -> Option<String> {
     let messages = request.as_array()?;
+    if !messages.iter().all(Value::is_object) {
+        return None;
+    }
     let normalised = messages
         .iter()
-        .filter(|message| message.is_object())
         .map(
             |message| match message.get("parts").and_then(Value::as_array) {
                 Some(parts) if message.get("content").is_none() => parts_message(message, parts),
@@ -1439,38 +1758,49 @@ pub fn anthropic_request_digest(body: &Value) -> Result<Option<String>, String> 
 
 // --------------------------------------------------------- recorded answers
 
-/// The recorded answer as choices, whichever shape the instrumentation stored
-/// it in: the normalised message list (indexed layouts, native events), OTel
-/// `parts` messages, a raw provider response object (OpenAI `choices`,
-/// Anthropic `content` blocks), or plain text.
-fn recorded_choices(response: &Value, finish_reasons: &[String]) -> Vec<Choice> {
+/// The recorded answer as choices, decoded by where it was recorded
+/// (`source`): answer text is text whatever it looks like; a message source
+/// holds the normalised message list (indexed layouts, native events) or OTel
+/// `parts` messages; a provider body is a raw response object (OpenAI
+/// `choices`, Anthropic `content` blocks), or text when it is none.
+///
+/// Provenance decides rather than the value's keys, because a structured
+/// answer is free to use any key: `{"content": "hi", "count": 2}` recorded as
+/// the answer's text is not a message saying "hi".
+fn recorded_choices(
+    response: &Value,
+    source: ResponseSource,
+    finish_reasons: &[String],
+) -> Vec<Choice> {
     let mut choices = match response {
+        Value::Null => Vec::new(),
+        // JSON-shaped text was parsed by the value rule; it goes back to
+        // being the text it was.
+        _ if source == ResponseSource::Text => vec![text_choice(answer_text(response))],
         Value::Array(items) if items.iter().all(is_message) && !items.is_empty() => items
             .iter()
             .filter(|message| !is_reasoning(message))
             .map(message_choice)
             .collect(),
-        Value::Object(object) => {
-            if let Some(list) = object.get("choices").and_then(Value::as_array) {
-                list.iter()
-                    .map(|choice| {
-                        let mut parsed =
-                            message_choice(choice.get("message").unwrap_or(&Value::Null));
-                        if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
-                            parsed.finish_reason = Some(reason.to_owned());
-                        }
-                        parsed
-                    })
-                    .collect()
-            } else if is_message(response) {
-                vec![message_choice(response)]
-            } else {
-                vec![text_choice(json_text(response))]
-            }
+        Value::Object(object)
+            if source == ResponseSource::Body && object.contains_key("choices") =>
+        {
+            object
+                .get("choices")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .map(|choice| {
+                    let mut parsed = message_choice(choice.get("message").unwrap_or(&Value::Null));
+                    if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+                        parsed.finish_reason = Some(reason.to_owned());
+                    }
+                    parsed
+                })
+                .collect()
         }
-        Value::String(text) => vec![text_choice(text.clone())],
-        Value::Null => Vec::new(),
-        other => vec![text_choice(json_text(other))],
+        Value::Object(_) if is_message(response) => vec![message_choice(response)],
+        other => vec![text_choice(answer_text(other))],
     };
     for (index, choice) in choices.iter_mut().enumerate() {
         if choice.finish_reason.is_none() {
@@ -1480,9 +1810,9 @@ fn recorded_choices(response: &Value, finish_reasons: &[String]) -> Vec<Choice> 
     choices
 }
 
-/// Whether a recorded value is a message rather than JSON text an answer
-/// happened to be. A completion that read `[1, 2]` is parsed as JSON by the
-/// value rule, and must still be served as the text it was.
+/// Whether a value from a message source or a provider body is shaped like a
+/// message — a sanity check on those sources, never applied to answer text,
+/// whose shape says nothing about what it is.
 fn is_message(value: &Value) -> bool {
     value.as_object().is_some_and(|object| {
         [
@@ -1517,6 +1847,15 @@ fn text_choice(text: String) -> Choice {
 /// JSON-shaped text, written back as text: compact, keys in sorted order.
 fn json_text(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_default()
+}
+
+/// A recorded value served as answer text: a string as it is, anything else
+/// (JSON text the value rule parsed) written back as JSON text.
+fn answer_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        other => json_text(other),
+    }
 }
 
 /// Whether a list is a provider's content blocks (each an object with a
@@ -1618,7 +1957,46 @@ pub struct Rendered {
     pub body: Vec<u8>,
 }
 
+/// A response body being rendered, refusing any write that would take it
+/// past `limit` — so an oversized rendering is stopped before it is
+/// buffered, not measured after.
+struct Capped {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl Capped {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            limit,
+        }
+    }
+
+    /// One JSON value, serialized straight into the body.
+    fn json(&mut self, value: &Value) -> io::Result<()> {
+        serde_json::to_writer(&mut *self, value).map_err(io::Error::from)
+    }
+}
+
+impl Write for Capped {
+    fn write(&mut self, piece: &[u8]) -> io::Result<usize> {
+        if piece.len() > self.limit - self.bytes.len() {
+            return Err(io::Error::other("past the response bound"));
+        }
+        self.bytes.extend_from_slice(piece);
+        Ok(piece.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 impl ServedStep {
+    /// The recorded model, else the request's — only at a length a model
+    /// name could have, since a stream repeats it in every chunk and an
+    /// echoed one is the caller's to choose.
     fn model_or(&self, request: &Value) -> String {
         self.model
             .clone()
@@ -1626,9 +2004,31 @@ impl ServedStep {
                 request
                     .get("model")
                     .and_then(Value::as_str)
+                    .filter(|model| model.len() <= MAX_IDENTIFIER_BYTES)
                     .map(str::to_owned)
             })
             .unwrap_or_else(|| "unknown".to_owned())
+    }
+
+    /// The finished body, or the refusal for one past the bound. Writing
+    /// into memory fails only at the bound, and a `Value` always serializes,
+    /// so every error is the bound.
+    fn finish(
+        &self,
+        content_type: &'static str,
+        written: io::Result<()>,
+        out: Capped,
+    ) -> Result<Rendered, ReplayError> {
+        match written {
+            Ok(()) => Ok(Rendered {
+                content_type,
+                body: out.bytes,
+            }),
+            Err(_) => Err(ReplayError::ResponseTooLarge {
+                step: self.step,
+                limit: out.limit,
+            }),
+        }
     }
 
     /// A stable suffix for ids this replay invents: the replay's own id
@@ -1650,8 +2050,9 @@ impl ServedStep {
 
     /// The step as an OpenAI `ChatCompletion` — or, when the request asked to
     /// stream, as `chat.completion.chunk` server-sent events ending in
-    /// `data: [DONE]`.
-    pub fn openai(&self, request: &Value) -> Rendered {
+    /// `data: [DONE]`. Refused as [`ReplayError::ResponseTooLarge`] rather
+    /// than rendered past [`Limits::max_response_bytes`].
+    pub fn openai(&self, request: &Value) -> Result<Rendered, ReplayError> {
         let model = self.model_or(request);
         let id = self
             .response_id
@@ -1669,6 +2070,7 @@ impl ServedStep {
             usage["prompt_tokens_details"] = json!({"cached_tokens": cached});
         }
         let streaming = request.get("stream").and_then(Value::as_bool) == Some(true);
+        let mut out = Capped::new(self.max_response_bytes);
         if !streaming {
             let choices: Vec<Value> = self
                 .choices
@@ -1716,18 +2118,15 @@ impl ServedStep {
                 "usage": usage,
                 "system_fingerprint": null,
             });
-            return Rendered {
-                content_type: "application/json",
-                body: serde_json::to_vec(&body).unwrap_or_default(),
-            };
+            let written = out.json(&body);
+            return self.finish("application/json", written, out);
         }
 
         let include_usage = request
             .pointer("/stream_options/include_usage")
             .and_then(Value::as_bool)
             == Some(true);
-        let mut out = String::new();
-        let mut chunk = |choices: Value, usage_field: Option<Value>| {
+        let chunk = |out: &mut Capped, choices: Value, usage_field: Option<Value>| {
             let mut event = json!({
                 "id": id,
                 "object": "chat.completion.chunk",
@@ -1741,59 +2140,69 @@ impl ServedStep {
             if include_usage {
                 event["usage"] = usage_field.unwrap_or(Value::Null);
             }
-            out.push_str("data: ");
-            out.push_str(&serde_json::to_string(&event).unwrap_or_default());
-            out.push_str("\n\n");
+            out.write_all(b"data: ")?;
+            out.json(&event)?;
+            out.write_all(b"\n\n")
         };
-        for (index, choice) in self.choices.iter().enumerate() {
-            let delta_choice = |delta: Value, finish: Value| json!([{"index": index, "delta": delta, "logprobs": null, "finish_reason": finish}]);
-            let opening = if choice.calls.is_empty() || choice.text.is_some() {
-                json!({"role": "assistant", "content": "", "refusal": null})
-            } else {
-                json!({"role": "assistant", "content": null, "refusal": null})
-            };
-            chunk(delta_choice(opening, Value::Null), None);
-            if let Some(text) = &choice.text {
-                for piece in deltas(text) {
-                    chunk(delta_choice(json!({"content": piece}), Value::Null), None);
+        let stream = |out: &mut Capped| -> io::Result<()> {
+            for (index, choice) in self.choices.iter().enumerate() {
+                let delta_choice = |delta: Value, finish: Value| json!([{"index": index, "delta": delta, "logprobs": null, "finish_reason": finish}]);
+                let opening = if choice.calls.is_empty() || choice.text.is_some() {
+                    json!({"role": "assistant", "content": "", "refusal": null})
+                } else {
+                    json!({"role": "assistant", "content": null, "refusal": null})
+                };
+                chunk(out, delta_choice(opening, Value::Null), None)?;
+                if let Some(text) = &choice.text {
+                    for piece in deltas(text) {
+                        chunk(
+                            out,
+                            delta_choice(json!({"content": piece}), Value::Null),
+                            None,
+                        )?;
+                    }
                 }
-            }
-            for (position, call) in choice.calls.iter().enumerate() {
-                chunk(
-                    delta_choice(
-                        json!({"tool_calls": [{
-                            "index": position,
-                            "id": self.call_id(call, "call_", position),
-                            "type": "function",
-                            "function": {"name": call.name, "arguments": ""},
-                        }]}),
-                        Value::Null,
-                    ),
-                    None,
-                );
-                for piece in deltas(&openai_arguments(&call.arguments)) {
+                for (position, call) in choice.calls.iter().enumerate() {
                     chunk(
+                        out,
                         delta_choice(
                             json!({"tool_calls": [{
                                 "index": position,
-                                "function": {"arguments": piece},
+                                "id": self.call_id(call, "call_", position),
+                                "type": "function",
+                                "function": {"name": call.name, "arguments": ""},
                             }]}),
                             Value::Null,
                         ),
                         None,
-                    );
+                    )?;
+                    for piece in deltas(&openai_arguments(&call.arguments)) {
+                        chunk(
+                            out,
+                            delta_choice(
+                                json!({"tool_calls": [{
+                                    "index": position,
+                                    "function": {"arguments": piece},
+                                }]}),
+                                Value::Null,
+                            ),
+                            None,
+                        )?;
+                    }
                 }
+                chunk(
+                    out,
+                    delta_choice(json!({}), json!(openai_finish(choice))),
+                    None,
+                )?;
             }
-            chunk(delta_choice(json!({}), json!(openai_finish(choice))), None);
-        }
-        if include_usage {
-            chunk(json!([]), Some(usage));
-        }
-        out.push_str("data: [DONE]\n\n");
-        Rendered {
-            content_type: "text/event-stream",
-            body: out.into_bytes(),
-        }
+            if include_usage {
+                chunk(out, json!([]), Some(usage.clone()))?;
+            }
+            out.write_all(b"data: [DONE]\n\n")
+        };
+        let written = stream(&mut out);
+        self.finish("text/event-stream", written, out)
     }
 
     /// The step as an Anthropic `Message` — or, when the request asked to
@@ -1802,8 +2211,8 @@ impl ServedStep {
     ///
     /// Anthropic answers with one message, so a recording with several
     /// assistant messages is served as their texts concatenated and their
-    /// tool calls in order.
-    pub fn anthropic(&self, request: &Value) -> Rendered {
+    /// tool calls in order. Bounded as [`Self::openai`] is.
+    pub fn anthropic(&self, request: &Value) -> Result<Rendered, ReplayError> {
         let model = self.model_or(request);
         let id = self
             .response_id
@@ -1845,6 +2254,7 @@ impl ServedStep {
             }));
         }
         let streaming = request.get("stream").and_then(Value::as_bool) == Some(true);
+        let mut out = Capped::new(self.max_response_bytes);
         if !streaming {
             let body = json!({
                 "id": id,
@@ -1856,83 +2266,85 @@ impl ServedStep {
                 "stop_sequence": null,
                 "usage": usage,
             });
-            return Rendered {
-                content_type: "application/json",
-                body: serde_json::to_vec(&body).unwrap_or_default(),
-            };
+            let written = out.json(&body);
+            return self.finish("application/json", written, out);
         }
 
-        let mut out = String::new();
-        let mut event = |name: &str, data: Value| {
-            out.push_str("event: ");
-            out.push_str(name);
-            out.push_str("\ndata: ");
-            out.push_str(&serde_json::to_string(&data).unwrap_or_default());
-            out.push_str("\n\n");
+        let event = |out: &mut Capped, name: &str, data: Value| {
+            out.write_all(b"event: ")?;
+            out.write_all(name.as_bytes())?;
+            out.write_all(b"\ndata: ")?;
+            out.json(&data)?;
+            out.write_all(b"\n\n")
         };
-        let mut start_usage = usage.clone();
-        start_usage["output_tokens"] = json!(0);
-        event(
-            "message_start",
-            json!({"type": "message_start", "message": {
-                "id": id,
-                "type": "message",
-                "role": "assistant",
-                "model": model,
-                "content": [],
-                "stop_reason": null,
-                "stop_sequence": null,
-                "usage": start_usage,
-            }}),
-        );
-        for (index, block) in blocks.iter().enumerate() {
-            let (opening, pieces, delta_type, field) = match block["type"].as_str() {
-                Some("text") => (
-                    json!({"type": "text", "text": ""}),
-                    deltas(block["text"].as_str().unwrap_or_default()),
-                    "text_delta",
-                    "text",
-                ),
-                _ => {
-                    let mut opening = block.clone();
-                    opening["input"] = json!({});
-                    (
-                        opening,
-                        deltas(&json_text(&block["input"])),
-                        "input_json_delta",
-                        "partial_json",
-                    )
-                }
-            };
+        let stream = |out: &mut Capped| -> io::Result<()> {
+            let mut start_usage = usage.clone();
+            start_usage["output_tokens"] = json!(0);
             event(
-                "content_block_start",
-                json!({"type": "content_block_start", "index": index, "content_block": opening}),
-            );
-            for piece in pieces {
-                let mut delta = Map::new();
-                delta.insert("type".to_owned(), json!(delta_type));
-                delta.insert(field.to_owned(), json!(piece));
+                out,
+                "message_start",
+                json!({"type": "message_start", "message": {
+                    "id": id,
+                    "type": "message",
+                    "role": "assistant",
+                    "model": model,
+                    "content": [],
+                    "stop_reason": null,
+                    "stop_sequence": null,
+                    "usage": start_usage,
+                }}),
+            )?;
+            for (index, block) in blocks.iter().enumerate() {
+                let (opening, pieces, delta_type, field) = match block["type"].as_str() {
+                    Some("text") => (
+                        json!({"type": "text", "text": ""}),
+                        deltas(block["text"].as_str().unwrap_or_default()),
+                        "text_delta",
+                        "text",
+                    ),
+                    _ => {
+                        let mut opening = block.clone();
+                        opening["input"] = json!({});
+                        (
+                            opening,
+                            deltas(&json_text(&block["input"])),
+                            "input_json_delta",
+                            "partial_json",
+                        )
+                    }
+                };
                 event(
-                    "content_block_delta",
-                    json!({"type": "content_block_delta", "index": index, "delta": delta}),
-                );
+                    out,
+                    "content_block_start",
+                    json!({"type": "content_block_start", "index": index, "content_block": opening}),
+                )?;
+                for piece in pieces {
+                    let mut delta = Map::new();
+                    delta.insert("type".to_owned(), json!(delta_type));
+                    delta.insert(field.to_owned(), json!(piece));
+                    event(
+                        out,
+                        "content_block_delta",
+                        json!({"type": "content_block_delta", "index": index, "delta": delta}),
+                    )?;
+                }
+                event(
+                    out,
+                    "content_block_stop",
+                    json!({"type": "content_block_stop", "index": index}),
+                )?;
             }
             event(
-                "content_block_stop",
-                json!({"type": "content_block_stop", "index": index}),
-            );
-        }
-        event(
-            "message_delta",
-            json!({"type": "message_delta",
-                   "delta": {"stop_reason": stop_reason, "stop_sequence": null},
-                   "usage": {"output_tokens": self.tokens.output.unwrap_or(0)}}),
-        );
-        event("message_stop", json!({"type": "message_stop"}));
-        Rendered {
-            content_type: "text/event-stream",
-            body: out.into_bytes(),
-        }
+                out,
+                "message_delta",
+                json!({"type": "message_delta",
+                       "delta": {"stop_reason": stop_reason, "stop_sequence": null},
+                       "usage": {"output_tokens": self.tokens.output.unwrap_or(0)}}),
+            )?;
+            event(out, "message_stop", json!({"type": "message_stop"}))
+        };
+        let written = stream(&mut out);
+        self.finish("text/event-stream", written, out)
     }
 }
 
@@ -2028,6 +2440,11 @@ mod tests {
     use crate::tape::TapeOptions;
 
     const NOW: u64 = 1_800_000_000_000_000_000;
+
+    /// A `next_llm` renderer that keeps the served step itself.
+    fn keep_step(step: &ServedStep) -> Result<ServedStep, ReplayError> {
+        Ok(step.clone())
+    }
 
     fn openllmetry_run(store: &Store) {
         store
@@ -2212,7 +2629,14 @@ mod tests {
         let mut wrong = first_request();
         wrong["messages"][1]["content"] = json!("Weather in Rome?");
         let got = openai_request_digest(&wrong).expect("parses");
-        match registry.next_llm(store, &created.id, Some(""), got.clone(), NOW + 1) {
+        match registry.next_llm(
+            store,
+            &created.id,
+            Some(""),
+            got.clone(),
+            NOW + 1,
+            keep_step,
+        ) {
             Err(ReplayError::Diverged {
                 step,
                 expected_digest,
@@ -2232,10 +2656,13 @@ mod tests {
                 Some(""),
                 openai_request_digest(&first_request()).expect("parses"),
                 NOW + 2,
+                keep_step,
             )
             .expect("matches");
         assert_eq!(served.step, 0);
-        let body: Value = serde_json::from_slice(&served.openai(&first_request()).body).unwrap();
+        let body: Value =
+            serde_json::from_slice(&served.openai(&first_request()).expect("renders").body)
+                .unwrap();
         assert_eq!(body["id"], json!("chatcmpl-rec1"));
         assert_eq!(body["model"], json!("gpt-4o-2024-08-06"));
         assert_eq!(body["choices"][0]["finish_reason"], json!("tool_calls"));
@@ -2251,6 +2678,7 @@ mod tests {
                 Some(""),
                 openai_request_digest(&second_request()).expect("parses"),
                 NOW + 3,
+                keep_step,
             )
             .expect("matches");
         assert_eq!(
@@ -2258,7 +2686,7 @@ mod tests {
             "the tool step in between is not an llm step"
         );
 
-        match registry.next_llm(store, &created.id, Some(""), None, NOW + 4) {
+        match registry.next_llm(store, &created.id, Some(""), None, NOW + 4, keep_step) {
             Err(ReplayError::Exhausted { served }) => assert_eq!(served, 2),
             other => panic!("expected exhaustion, got {other:?}"),
         }
@@ -2288,7 +2716,14 @@ mod tests {
             .create(store, None, "run-1", Mode::Loose, 1 << 20, NOW)
             .expect("creates");
         let served = registry
-            .next_llm(store, &created.id, None, Some("0".repeat(64)), NOW)
+            .next_llm(
+                store,
+                &created.id,
+                None,
+                Some("0".repeat(64)),
+                NOW,
+                keep_step,
+            )
             .expect("loose serves anyway");
         assert_eq!(served.step, 0);
         let status = registry
@@ -2433,9 +2868,10 @@ mod tests {
             .create(store, Some(""), "trace:t3", Mode::Loose, 1 << 20, NOW)
             .expect("loose replays a text prompt");
         let served = registry
-            .next_llm(store, &loose.id, Some(""), None, NOW)
+            .next_llm(store, &loose.id, Some(""), None, NOW, keep_step)
             .expect("serves");
-        let body: Value = serde_json::from_slice(&served.anthropic(&json!({})).body).unwrap();
+        let body: Value =
+            serde_json::from_slice(&served.anthropic(&json!({})).expect("renders").body).unwrap();
         assert_eq!(body["content"], json!([{"type": "text", "text": "hello"}]));
         assert_eq!(body["stop_reason"], json!("end_turn"));
     }
@@ -2444,14 +2880,18 @@ mod tests {
     fn recorded_answers_read_every_shape() {
         let reasons = ["length".to_owned()];
         // Parsed JSON text is served as the text it was.
-        let json_answer = recorded_choices(&json!([1, 2]), &[]);
+        let json_answer = recorded_choices(&json!([1, 2]), ResponseSource::Text, &[]);
         assert_eq!(json_answer[0].text.as_deref(), Some("[1,2]"));
+        // And so is a list of non-messages, even from a message source.
+        let not_messages = recorded_choices(&json!([1, 2]), ResponseSource::Messages, &[]);
+        assert_eq!(not_messages[0].text.as_deref(), Some("[1,2]"));
         // OTel parts.
         let parts = recorded_choices(
             &json!([{"role": "assistant", "parts": [
                 {"type": "text", "content": "On it."},
                 {"type": "tool_call", "id": "c9", "name": "f", "arguments": {"x": 1}},
             ], "finish_reason": "tool_call"}]),
+            ResponseSource::Messages,
             &[],
         );
         assert_eq!(parts[0].text.as_deref(), Some("On it."));
@@ -2462,6 +2902,7 @@ mod tests {
             &json!({"choices": [{"message": {"role": "assistant", "content": "a"},
                                  "finish_reason": "stop"},
                                 {"message": {"role": "assistant", "content": "b"}}]}),
+            ResponseSource::Body,
             &reasons,
         );
         assert_eq!(raw.len(), 2);
@@ -2476,6 +2917,7 @@ mod tests {
             &json!({"type": "message", "role": "assistant", "stop_reason": "tool_use",
                     "content": [{"type": "tool_use", "id": "toolu_1", "name": "g",
                                  "input": {"q": "x"}}]}),
+            ResponseSource::Body,
             &[],
         );
         assert_eq!(anthropic[0].calls[0].arguments, json!({"q": "x"}));
@@ -2484,12 +2926,13 @@ mod tests {
             "tool_use"
         );
         // A finish reason recorded only as the span attribute fills in.
-        let text = recorded_choices(&json!("done"), &reasons);
+        let text = recorded_choices(&json!("done"), ResponseSource::Text, &reasons);
         assert_eq!(openai_finish(&text[0]), "length");
         // Reasoning messages are not part of the answer.
         let thinking = recorded_choices(
             &json!([{"role": "thinking", "content": "hmm"},
                     {"role": "assistant", "content": "yes"}]),
+            ResponseSource::Messages,
             &[],
         );
         assert_eq!(thinking.len(), 1);
@@ -2518,9 +2961,10 @@ mod tests {
                 output: Some(7),
                 ..tape::StepTokens::default()
             },
+            max_response_bytes: MAX_RESPONSE_BYTES,
         };
         let request = json!({"stream": true, "stream_options": {"include_usage": true}});
-        let openai = String::from_utf8(step.openai(&request).body).unwrap();
+        let openai = String::from_utf8(step.openai(&request).expect("renders").body).unwrap();
         assert!(openai.ends_with("data: [DONE]\n\n"));
         let mut text = String::new();
         let mut arguments = String::new();
@@ -2558,7 +3002,12 @@ mod tests {
         assert_eq!(finish.as_deref(), Some("tool_calls"));
         assert_eq!(usage.unwrap()["total_tokens"], json!(12));
 
-        let anthropic = String::from_utf8(step.anthropic(&json!({"stream": true})).body).unwrap();
+        let anthropic = String::from_utf8(
+            step.anthropic(&json!({"stream": true}))
+                .expect("renders")
+                .body,
+        )
+        .unwrap();
         let names: Vec<&str> = anthropic
             .lines()
             .filter_map(|line| line.strip_prefix("event: "))
@@ -2636,7 +3085,7 @@ mod tests {
         let (held, untouched, tools) = (create("run-1"), create("run-other"), create("run-1"));
         let request = openai_request_digest(&first_request()).expect("parses");
         registry
-            .next_llm(store, &held, Some(""), request.clone(), NOW)
+            .next_llm(store, &held, Some(""), request.clone(), NOW, keep_step)
             .expect("serves before the erasure");
 
         let status = store
@@ -2650,7 +3099,7 @@ mod tests {
         // Every route of a replay holding the session refuses from now on,
         // naming the erasure, and keeps refusing.
         for _ in 0..2 {
-            match registry.next_llm(store, &held, Some(""), request.clone(), NOW) {
+            match registry.next_llm(store, &held, Some(""), request.clone(), NOW, keep_step) {
                 Err(ReplayError::Erased { erasure: named }) => assert_eq!(named, erasure),
                 other => panic!("expected the replay withdrawn, got {other:?}"),
             }
@@ -2670,7 +3119,7 @@ mod tests {
         ));
         // A replay of other data keeps serving.
         registry
-            .next_llm(store, &untouched, Some(""), None, NOW)
+            .next_llm(store, &untouched, Some(""), None, NOW, keep_step)
             .expect("an unrelated replay is not withdrawn");
         // A replay created AFTER the erasure is new data, served normally —
         // and the run it names is gone, so there is nothing to create.
@@ -2741,7 +3190,7 @@ mod tests {
         for (id, binding) in [(&paid, Some("")), (&acme, Some("acme")), (&spanned, None)] {
             assert!(
                 matches!(
-                    registry.next_llm(store, id, binding, None, NOW),
+                    registry.next_llm(store, id, binding, None, NOW, keep_step),
                     Err(ReplayError::Erased { .. })
                 ),
                 "{id}"
@@ -2955,5 +3404,440 @@ mod tests {
         registry
             .create(store, Some(""), "trace:t-big", Mode::Loose, 1 << 20, NOW)
             .expect("a larger budget holds it");
+    }
+
+    // ------------------------------------------------- review regressions
+
+    /// A recorded answer with no recorded model, as the stream renders it.
+    fn modelless(text: String) -> ServedStep {
+        ServedStep {
+            replay: "rp_0123456789abcdef0123456789abcdef".into(),
+            step: 0,
+            model: None,
+            response_id: None,
+            start_ns: 1_700_000_000_000_000_000,
+            choices: vec![text_choice(text)],
+            tokens: tape::StepTokens::default(),
+            max_response_bytes: MAX_RESPONSE_BYTES,
+        }
+    }
+
+    #[test]
+    fn a_request_model_cannot_amplify_a_stream() {
+        // Every chunk repeats the model. Echoing a request's model of any
+        // length would make one request's bytes come back once per chunk.
+        let step = modelless("word ".repeat(820));
+        let stream = |request: Value| step.openai(&request).expect("renders").body;
+        let huge = stream(json!({"stream": true, "model": "m".repeat(64 * 1024)}));
+        let none = stream(json!({"stream": true}));
+        assert_eq!(huge, none, "a model no provider would name is not echoed");
+        assert!(none.len() < 128 * 1024, "{}", none.len());
+        // A model of a real length still is.
+        let named = String::from_utf8(stream(json!({"stream": true, "model": "gpt-4o"}))).unwrap();
+        assert!(named.contains("\"model\":\"gpt-4o\""));
+
+        // Nor is a recorded model or response id that long: the replay keeps
+        // neither, and serves an invented id and the request's model.
+        let fixture = TempStore::open("replay-identifiers", crate::Config::default());
+        let store = fixture.store();
+        store
+            .ingest_batch(vec![span(
+                "t-ids",
+                "llm",
+                1,
+                json!({"gen_ai.operation.name": "chat", "gen_ai.prompt.0.content": "hi",
+                       "gen_ai.request.model": "r".repeat(4096),
+                       "gen_ai.response.id": "i".repeat(4096),
+                       "gen_ai.completion.0.content": "ok"}),
+            )])
+            .expect("ingests");
+        let registry = Registry::default();
+        let id = registry
+            .create(store, Some(""), "trace:t-ids", Mode::Loose, 1 << 20, NOW)
+            .expect("creates")
+            .id;
+        let rendered = registry
+            .next_llm(store, &id, Some(""), None, NOW, |step: &ServedStep| {
+                step.openai(&json!({"model": "gpt-4o"}))
+            })
+            .expect("serves");
+        let body: Value = serde_json::from_slice(&rendered.body).unwrap();
+        assert_eq!(body["model"], json!("gpt-4o"));
+        assert!(
+            body["id"].as_str().unwrap().starts_with("chatcmpl-traza"),
+            "{}",
+            body["id"]
+        );
+    }
+
+    #[test]
+    fn a_response_past_its_bound_is_refused_without_consuming_the_step() {
+        let fixture = TempStore::open("replay-response-cap", crate::Config::default());
+        let store = fixture.store();
+        let answer = "token ".repeat(500);
+        store
+            .ingest_batch(vec![span(
+                "t-cap",
+                "llm",
+                1,
+                json!({"gen_ai.operation.name": "chat", "gen_ai.prompt.0.content": "hi",
+                       "gen_ai.completion.0.content": answer}),
+            )])
+            .expect("ingests");
+        // Room for the answer as one body, not for it chunked into a stream.
+        let registry = Registry::new(Limits {
+            max_response_bytes: 8 * 1024,
+            ..Limits::default()
+        });
+        let id = registry
+            .create(store, Some(""), "trace:t-cap", Mode::Loose, 1 << 20, NOW)
+            .expect("creates")
+            .id;
+        let render = |request: Value| move |step: &ServedStep| step.openai(&request);
+        for request in [
+            json!({"stream": true}),
+            json!({"stream": true, "stream_options": {"include_usage": true}}),
+        ] {
+            match registry.next_llm(store, &id, Some(""), None, NOW, render(request)) {
+                Err(error @ ReplayError::ResponseTooLarge { step: 0, limit }) => {
+                    assert_eq!(limit, 8 * 1024);
+                    assert!(error.to_string().contains("not consumed"), "{error}");
+                }
+                other => panic!("expected the stream refused, got {other:?}"),
+            }
+        }
+        let status = registry.status(store, &id, Some(""), NOW).expect("live");
+        assert_eq!(status["served"], json!(0), "nothing was consumed");
+        let rendered = registry
+            .next_llm(store, &id, Some(""), None, NOW, render(json!({})))
+            .expect("the same step, unstreamed, fits");
+        assert!(rendered.body.len() <= 8 * 1024);
+        let body: Value = serde_json::from_slice(&rendered.body).unwrap();
+        assert_eq!(body["choices"][0]["message"]["content"], json!(answer));
+        // The Anthropic stream is bounded the same way.
+        let anthropic = modelless(answer.clone());
+        let capped = ServedStep {
+            max_response_bytes: 4 * 1024,
+            ..anthropic
+        };
+        assert!(matches!(
+            capped.anthropic(&json!({"stream": true})),
+            Err(ReplayError::ResponseTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn everything_a_replay_retains_is_charged_to_its_share() {
+        let fixture = TempStore::open("replay-charges", crate::Config::default());
+        let store = fixture.store();
+        let mut spans = vec![span(
+            "t-names",
+            "llm",
+            1,
+            json!({"gen_ai.operation.name": "chat", "gen_ai.prompt.0.content": "hi",
+                   "gen_ai.completion.0.content": "ok"}),
+        )];
+        // Tiny records under long names: the names are what the replay holds.
+        for index in 0..40 {
+            spans.push(span(
+                "t-names",
+                &format!("tool-{index:02}"),
+                10 + index,
+                json!({"gen_ai.operation.name": "execute_tool",
+                       "gen_ai.tool.name": format!("{index:02}{}", "n".repeat(8 * 1024)),
+                       "gen_ai.tool.call.arguments": "{}", "gen_ai.tool.call.result": "ok"}),
+            ));
+        }
+        store.ingest_batch(spans).expect("ingests");
+        // Room for a replay's fixed costs (below) and 64 KiB more.
+        let calls = MAX_RECORDED_CALLS * std::mem::size_of::<CallRecord>();
+        let share = calls + 64 * 1024;
+        let registry = Registry::new(Limits {
+            max_bytes_per_tenant: share,
+            ..Limits::default()
+        });
+        match registry.create(store, Some(""), "trace:t-names", Mode::Loose, 1 << 20, NOW) {
+            Err(ReplayError::TooLarge { bytes, limit }) => {
+                assert_eq!(limit, share);
+                assert!(bytes > limit, "{bytes}");
+                // Building stopped once past the share, not at the end.
+                assert!(bytes < limit + 32 * 1024, "{bytes}");
+            }
+            other => panic!("320 KiB of tool names fit in 64 KiB: {other:?}"),
+        }
+        // The call log a replay may grow to is charged up front, so growth
+        // after admission cannot take a share past its budget.
+        store
+            .ingest_batch(vec![single("", "t-tiny", "s-tiny")])
+            .expect("ingests");
+        let tight = Registry::new(Limits {
+            max_bytes_per_tenant: calls,
+            ..Limits::default()
+        });
+        assert!(matches!(
+            tight.create(store, Some(""), "s-tiny", Mode::Loose, 1 << 20, NOW),
+            Err(ReplayError::TooLarge { .. })
+        ));
+        let roomy = Registry::new(Limits {
+            max_bytes_per_tenant: calls + 16 * 1024,
+            ..Limits::default()
+        });
+        roomy
+            .create(store, Some(""), "s-tiny", Mode::Loose, 1 << 20, NOW)
+            .expect("a one-step replay fits beside its call log");
+    }
+
+    #[test]
+    fn withdrawn_replays_are_bounded_too() {
+        let fixture = TempStore::open("replay-tombstones", crate::Config::default());
+        let store = fixture.store();
+        let registry = Registry::new(Limits {
+            max_live: 4,
+            max_live_per_tenant: 2,
+            ..Limits::default()
+        });
+        let mut withdrawn = Vec::new();
+        for round in 0..10u64 {
+            let at = NOW + round;
+            let session = format!("s-gone-{round}");
+            store
+                .ingest_batch(vec![single("", &format!("t-gone-{round}"), &session)])
+                .expect("ingests");
+            let id = registry
+                .create(store, Some(""), &session, Mode::Loose, 1 << 20, at)
+                .expect("a withdrawn replay frees its slot")
+                .id;
+            store
+                .erase(Subject::Session {
+                    session_id: session,
+                    tenant: String::new(),
+                })
+                .expect("erases");
+            assert!(matches!(
+                registry.status(store, &id, Some(""), at),
+                Err(ReplayError::Erased { .. })
+            ));
+            withdrawn.push(id);
+        }
+        let later = NOW + 10;
+        assert!(
+            registry.len(later) <= 4,
+            "{} entries for a share of two",
+            registry.len(later)
+        );
+        // The newest withdrawals still say why; the one closest to expiring
+        // is forgotten first.
+        for id in &withdrawn[8..] {
+            assert!(matches!(
+                registry.status(store, id, Some(""), later),
+                Err(ReplayError::Erased { .. })
+            ));
+        }
+        assert!(matches!(
+            registry.status(store, &withdrawn[0], Some(""), later),
+            Err(ReplayError::NotFound)
+        ));
+        // Withdrawn replays take no live replay's room.
+        store
+            .ingest_batch(vec![single("", "t-live", "s-live")])
+            .expect("ingests");
+        for _ in 0..2 {
+            registry
+                .create(store, Some(""), "s-live", Mode::Loose, 1 << 20, later)
+                .expect("the share's live slots are free");
+        }
+    }
+
+    #[test]
+    fn offloaded_messages_keep_their_separate_system_instructions() {
+        let config = crate::Config {
+            payload_threshold: Some(64),
+            ..crate::Config::default()
+        };
+        let fixture = TempStore::open("replay-system", config);
+        let store = fixture.store();
+        let question = format!("Summarise: {}", "x".repeat(120));
+        let messages = json!([{"role": "user", "parts": [{"type": "text", "content": question}]}]);
+        store
+            .ingest_batch(vec![span(
+                "t-sys",
+                "llm",
+                1,
+                json!({"gen_ai.operation.name": "chat",
+                       "gen_ai.system_instructions": "Be brief.",
+                       "gen_ai.input.messages": serde_json::to_string(&messages).unwrap(),
+                       "gen_ai.completion.0.content": "Done."}),
+            )])
+            .expect("ingests");
+        let registry = Registry::default();
+        let id = registry
+            .create(store, Some(""), "trace:t-sys", Mode::Strict, 1 << 20, NOW)
+            .expect("creates")
+            .id;
+        let without = openai_request_digest(&json!({"messages": [
+            {"role": "user", "content": question}]}))
+        .expect("parses");
+        assert!(
+            matches!(
+                registry.next_llm(store, &id, Some(""), without, NOW, keep_step),
+                Err(ReplayError::Diverged { .. })
+            ),
+            "a request without the recorded system prompt is a different request"
+        );
+        let with = openai_request_digest(&json!({"messages": [
+            {"role": "system", "content": "Be brief."},
+            {"role": "user", "content": question}]}))
+        .expect("parses");
+        registry
+            .next_llm(store, &id, Some(""), with, NOW, keep_step)
+            .expect("the request as recorded matches");
+    }
+
+    #[test]
+    fn a_tool_result_never_captured_is_refused_not_served_as_null() {
+        let fixture = TempStore::open("replay-uncaptured", crate::Config::default());
+        let store = fixture.store();
+        store
+            .ingest_batch(vec![
+                span(
+                    "t-cap",
+                    "llm",
+                    1,
+                    json!({"gen_ai.operation.name": "chat", "gen_ai.prompt.0.content": "hi",
+                           "gen_ai.completion.0.content": "ok"}),
+                ),
+                // Content capture off: the call is recorded, its result not.
+                span(
+                    "t-cap",
+                    "blind",
+                    2,
+                    json!({"gen_ai.operation.name": "execute_tool",
+                           "gen_ai.tool.name": "fetch", "gen_ai.tool.call.arguments": "{\"u\":1}"}),
+                ),
+                // A result recorded as empty is a result.
+                span(
+                    "t-cap",
+                    "empty",
+                    3,
+                    json!({"gen_ai.operation.name": "execute_tool",
+                           "gen_ai.tool.name": "clear", "gen_ai.tool.call.result": ""}),
+                ),
+                span(
+                    "t-cap",
+                    "null",
+                    4,
+                    json!({"gen_ai.operation.name": "execute_tool",
+                           "gen_ai.tool.name": "reset", "gen_ai.tool.call.result": null}),
+                ),
+            ])
+            .expect("ingests");
+        let registry = Registry::default();
+        let created = registry
+            .create(store, Some(""), "trace:t-cap", Mode::Loose, 1 << 20, NOW)
+            .expect("creates");
+        assert_eq!(created.unreadable_tool_steps, [1]);
+        for _ in 0..2 {
+            match registry.next_tool(store, &created.id, Some(""), Some("fetch"), NOW) {
+                Err(ReplayError::ToolUnreadable {
+                    step: 1, reason, ..
+                }) => {
+                    assert!(reason.contains("recorded no result"), "{reason}")
+                }
+                other => panic!("expected the uncaptured result refused, got {other:?}"),
+            }
+        }
+        let empty = registry
+            .next_tool(store, &created.id, Some(""), Some("clear"), NOW)
+            .expect("an empty result is served");
+        assert_eq!(empty.result, json!(""));
+        let null = registry
+            .next_tool(store, &created.id, Some(""), Some("reset"), NOW)
+            .expect("a null result is served");
+        assert_eq!(null.result, Value::Null);
+    }
+
+    #[test]
+    fn answer_text_that_reads_as_json_is_served_as_that_text() {
+        let fixture = TempStore::open("replay-provenance", crate::Config::default());
+        let store = fixture.store();
+        let answers = [
+            "{\"content\":\"hello\",\"count\":2}",
+            "{\"choices\":[{\"message\":{\"content\":\"x\"}}]}",
+            "{\"role\":\"user\"}",
+        ];
+        let mut spans: Vec<Span> = answers
+            .iter()
+            .enumerate()
+            .map(|(index, answer)| {
+                span(
+                    &format!("t-text-{index}"),
+                    "llm",
+                    1,
+                    json!({"gen_ai.operation.name": "chat", "llm.prompt": "hi",
+                           "llm.completion": answer}),
+                )
+            })
+            .collect();
+        // OpenInference says which `output.value` is text.
+        spans.push(span(
+            "t-text-oi",
+            "llm",
+            1,
+            json!({"openinference.span.kind": "LLM", "input.value": "hi",
+                   "output.value": answers[0], "output.mime_type": "text/plain"}),
+        ));
+        store.ingest_batch(spans).expect("ingests");
+        let registry = Registry::default();
+        let traces = ["t-text-0", "t-text-1", "t-text-2", "t-text-oi"];
+        for (trace, answer) in traces.iter().zip(answers.iter().chain([&answers[0]])) {
+            let id = registry
+                .create(
+                    store,
+                    Some(""),
+                    &format!("trace:{trace}"),
+                    Mode::Loose,
+                    1 << 20,
+                    NOW,
+                )
+                .expect("creates")
+                .id;
+            let served = registry
+                .next_llm(store, &id, Some(""), None, NOW, keep_step)
+                .expect("serves");
+            let body: Value =
+                serde_json::from_slice(&served.openai(&json!({})).expect("renders").body).unwrap();
+            let text = body["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap_or("");
+            assert_eq!(
+                serde_json::from_str::<Value>(text).ok(),
+                serde_json::from_str::<Value>(answer).ok(),
+                "{trace}: served {text:?}"
+            );
+        }
+        // An OpenInference JSON body is still the provider's envelope.
+        store
+            .ingest_batch(vec![span(
+                "t-body",
+                "llm",
+                1,
+                json!({"openinference.span.kind": "LLM", "input.value": "hi",
+                       "output.mime_type": "application/json",
+                       "output.value": "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"from the body\"}}]}"}),
+            )])
+            .expect("ingests");
+        let id = registry
+            .create(store, Some(""), "trace:t-body", Mode::Loose, 1 << 20, NOW)
+            .expect("creates")
+            .id;
+        let served = registry
+            .next_llm(store, &id, Some(""), None, NOW, keep_step)
+            .expect("serves");
+        let body: Value =
+            serde_json::from_slice(&served.openai(&json!({})).expect("renders").body).unwrap();
+        assert_eq!(
+            body["choices"][0]["message"]["content"],
+            json!("from the body")
+        );
     }
 }
