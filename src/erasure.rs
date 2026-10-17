@@ -837,6 +837,66 @@ struct Inner {
     mask: Option<Arc<Mask>>,
 }
 
+/// Folds one replayed record into the log's state: the one replay rule,
+/// shared by [`ErasureLog::open`] and [`list_offline`] so the two can never
+/// disagree about what a log says.
+fn replay(records: &mut BTreeMap<u64, (EraseRecord, Option<SettleRecord>)>, record: LogRecord) {
+    match record {
+        LogRecord::Erase(erase) => {
+            records.insert(erase.id, (erase, None));
+        }
+        LogRecord::Settle(settle) => {
+            // A settle for an unknown id is tolerated: it can only be
+            // produced by a log manually spliced together, and dropping it
+            // is safer than inventing an intent.
+            if let Some(entry) = records.get_mut(&settle.id) {
+                entry.1 = Some(settle);
+            }
+        }
+        LogRecord::Note(note) => {
+            if let Some(entry) = records.get_mut(&note.id) {
+                entry.0.payload_refs.extend(note.payload_refs);
+                entry.0.payload_refs.sort();
+                entry.0.payload_refs.dedup();
+            }
+        }
+    }
+}
+
+/// Every erasure the tombstone log in `directory` records, replayed exactly
+/// as [`ErasureLog::open`] replays it, but read-only — no heal, no append —
+/// for the offline ledger verification, which must examine a store without
+/// changing it. Also returns how many interior lines did not parse: where
+/// the open would refuse the log, this reports the count so the caller can
+/// say that what those lines recorded went unchecked. An unterminated
+/// final line that does not parse is a torn append — what the open heals
+/// away — and is neither replayed nor counted.
+pub(crate) fn list_offline(directory: &Path) -> Result<(Vec<ErasureStatus>, usize)> {
+    let contents = match fs::read(directory.join(LOG_NAME)) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
+        Err(error) => return Err(error.into()),
+    };
+    let mut records = BTreeMap::new();
+    let mut unreadable = 0_usize;
+    let mut lines = contents.split_inclusive(|byte| *byte == b'\n').peekable();
+    while let Some(line) = lines.next() {
+        if line.iter().all(|byte| byte.is_ascii_whitespace()) {
+            continue;
+        }
+        match serde_json::from_slice::<LogRecord>(line) {
+            Ok(record) => replay(&mut records, record),
+            Err(_) if lines.peek().is_none() && !line.ends_with(b"\n") => {}
+            Err(_) => unreadable += 1,
+        }
+    }
+    let statuses = records
+        .into_values()
+        .map(|(erase, settle)| ErasureStatus { erase, settle })
+        .collect();
+    Ok((statuses, unreadable))
+}
+
 impl Inner {
     fn rebuild_mask(&mut self) {
         let pending: Vec<EraseRecord> = self
@@ -871,26 +931,9 @@ impl ErasureLog {
                     continue;
                 }
                 match serde_json::from_slice::<LogRecord>(line) {
-                    Ok(LogRecord::Erase(erase)) => {
+                    Ok(record) => {
                         valid_len = valid_len.saturating_add(line.len() as u64);
-                        inner.records.insert(erase.id, (erase, None));
-                    }
-                    Ok(LogRecord::Settle(settle)) => {
-                        valid_len = valid_len.saturating_add(line.len() as u64);
-                        if let Some(entry) = inner.records.get_mut(&settle.id) {
-                            entry.1 = Some(settle);
-                        }
-                        // A settle for an unknown id is tolerated: it can only
-                        // be produced by a log manually spliced together, and
-                        // dropping it is safer than inventing an intent.
-                    }
-                    Ok(LogRecord::Note(note)) => {
-                        valid_len = valid_len.saturating_add(line.len() as u64);
-                        if let Some(entry) = inner.records.get_mut(&note.id) {
-                            entry.0.payload_refs.extend(note.payload_refs);
-                            entry.0.payload_refs.sort();
-                            entry.0.payload_refs.dedup();
-                        }
+                        replay(&mut inner.records, record);
                     }
                     Err(_) if lines.peek().is_none() && !terminated => {
                         let file = OpenOptions::new().write(true).open(&path)?;

@@ -990,6 +990,93 @@ fn verify_ledger_offline_names_an_undone_erasure_and_the_crash_window() {
     assert_eq!(verdict.status.code(), Some(0), "{verdict:?}");
 }
 
+#[test]
+fn verify_ledger_offline_tells_each_publication_of_a_subject_apart() {
+    // One subject erased twice with a pin in between, then that pin
+    // restored: the first erasure still holds, the second does not, and the
+    // verdict must not let the first stand in for the second. Then the crash
+    // window between an erasure's settle and its ledger entry, with nothing
+    // but the tombstone log to say the entry is missing.
+    let dir = TempDir::new("cli-repeat");
+    let path = dir.0.to_str().expect("utf8 path").to_owned();
+    let open = || traza::Store::open(&dir.0, traza::Config::default()).expect("open");
+    let erase = |store: &traza::Store| {
+        store
+            .erase(traza::erasure::Subject::Trace {
+                trace_id: "t1".to_owned(),
+                tenant: String::new(),
+            })
+            .expect("erase")
+    };
+    let ingest = |store: &traza::Store, span_id: &str| {
+        let mut value = span("t1", 1_000, json!({}));
+        value["span_id"] = json!(span_id);
+        let span: traza::Span = serde_json::from_value(value).expect("span");
+        store.ingest(span).expect("ingest");
+    };
+    let second_generation = {
+        let store = open();
+        ingest(&store, "s1");
+        erase(&store);
+        ingest(&store, "s2");
+        store.pin_generation("between").expect("pin");
+        erase(&store)
+            .settle
+            .expect("settled")
+            .generation
+            .to_string()
+    };
+    let verdict = cli(&["verify", "--ledger", "--data-dir", &path]);
+    assert_eq!(verdict.status.code(), Some(0), "{verdict:?}");
+
+    drop(
+        traza::Store::restore(&dir.0, dir.0.join("pins/between"), traza::Config::default())
+            .expect("restore"),
+    );
+    let verdict = cli(&["verify", "--ledger", "--data-dir", &path]);
+    assert_eq!(verdict.status.code(), Some(2), "{verdict:?}");
+    let stdout = String::from_utf8_lossy(&verdict.stdout);
+    let undone: Vec<&str> = stdout
+        .lines()
+        .filter(|line| line.contains("holds no settled erasure of that subject"))
+        .collect();
+    assert_eq!(undone.len(), 1, "{stdout}");
+    assert!(
+        undone[0].contains(&format!(
+            "erasure 2 (trace subject, published in generation {second_generation})"
+        )),
+        "{stdout}"
+    );
+
+    erase(&open());
+    let verdict = cli(&["verify", "--ledger", "--data-dir", &path]);
+    assert_eq!(verdict.status.code(), Some(0), "{verdict:?}");
+
+    // Only the final erasure entry lost: the checkpoint before it still
+    // matches CURRENT.
+    let ledger = dir.0.join("ledger.jsonl");
+    let text = std::fs::read_to_string(&ledger).expect("ledger");
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(lines[lines.len() - 1].contains("\"kind\":\"erasure\""));
+    std::fs::write(&ledger, lines[..lines.len() - 1].join("\n") + "\n").expect("truncate");
+    let verdict = cli(&["verify", "--ledger", "--data-dir", &path, "--json"]);
+    assert_eq!(verdict.status.code(), Some(2), "{verdict:?}");
+    let report: Value = serde_json::from_slice(&verdict.stdout).expect("json report");
+    assert_eq!(
+        report["generation"]["matches_ledger"],
+        json!(true),
+        "{report}"
+    );
+    let problems = report["problems"].to_string();
+    assert!(
+        problems.contains("is not in the ledger") && problems.contains("opening the store"),
+        "{report}"
+    );
+    drop(open());
+    let verdict = cli(&["verify", "--ledger", "--data-dir", &path]);
+    assert_eq!(verdict.status.code(), Some(0), "{verdict:?}");
+}
+
 /// The `python` blocks of `docs/guide/ledger.md`, in order.
 fn documented_scripts() -> Vec<String> {
     let guide =

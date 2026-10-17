@@ -36,8 +36,13 @@ Read this section before relying on the ledger for anything.
   can recompute its `subject_digest` and find the entry, and the chain shows
   where it sits relative to the generations around it.
 - **A recorded erasure still holds.** Verification checks every ledgered
-  erasure's subject against the live tombstone log and names any that no
-  longer has a settled erasure there (see the restore bullet below).
+  erasure against the live tombstone log. Each entry needs a settled erasure
+  of its subject published by the entry's own `generation` or a later one,
+  and verification names any entry that has none (see the restore bullet
+  below).
+- **Every settled erasure was recorded.** Verification also checks the other
+  way: every settled erasure in the live tombstone log must have its entry,
+  matched by `erasure_id`, `subject_digest` and `generation`.
 
 **It does not prove:**
 
@@ -73,9 +78,13 @@ Read this section before relying on the ledger for anything.
   it was. The chain records the install as an ordinary `checkpoint` entry.
   Verification catches it only by comparing the ledgered erasure against the
   live tombstone log; it names the entry as no longer holding until the
-  erasure is re-applied. An erasure re-applied after such a restore gets a
-  new entry. Its `erasure_id` can repeat an earlier entry's (the tombstone log
-  was rewound), but its `generation` will not.
+  erasure is re-applied. Each entry is judged on its own. If a subject was
+  erased twice and the restored pin falls between the two erasures, the
+  first erasure is still settled, but it does not count for the second. The
+  second erasure's entry is named, because the data it removed is back. An
+  erasure re-applied after such a restore gets a new entry. Its `erasure_id`
+  can repeat an earlier entry's (the tombstone log was rewound), but its
+  `generation` will not.
 - **That other tenants learn nothing.** A tenant's evidence pack shows when
   other tenants' erasures were ledgered: each one is a stub with its `seq` and
   `at_ns`. `GET /v1/ledger/head`, open to bound credentials, also shows when
@@ -216,11 +225,19 @@ these checks:
    manifest digest.
 3. Re-digest every file the live manifest names. This is the same check as
    [`GET /v1/verify`](http-api.md#get-v1verify).
-4. Check that the subject of every erasure entry still has a settled erasure
-   in the live tombstone log. Restoring a pin taken before an erasure fails
+4. Check that every erasure entry still holds: the live tombstone log must
+   have a settled erasure of the same subject, published by the entry's
+   `generation` or a later one. Restoring a pin taken before an erasure fails
    this check, and the problem names the entry until the erasure is applied
    again.
-5. Report any ledger append that failed and has not been caught up
+5. Check that every settled erasure in the live tombstone log has its entry,
+   with the same `erasure_id`, `subject_digest` and `generation`. A crash
+   between an erasure's settle record and its entry leaves one missing
+   (`erasure 3 (trace subject, settled in generation 7) is not in the
+   ledger…`). So does a failed append. The next open ledgers it, and so does
+   the next checkpoint after a failed append. A live check does not count an
+   entry that is being appended while it runs as missing.
+6. Report any ledger append that failed and has not been caught up
    (`GET /v1/ledger/verify` only, since a fresh offline process has no record
    of a running server's failures).
 
@@ -267,8 +284,12 @@ server owns it. It is read-only. It takes the directory lock and reads
 as they are. It runs no recovery and appends nothing, because appending is the
 very thing under examination. One consequence: on a store that crashed between
 publishing a generation and ledgering it, it exits `2` with the
-newer-than-the-chain problem above. Start the server (or open the store) once,
-and the generation is ledgered.
+newer-than-the-chain problem above. A crash between settling an erasure and
+ledgering it likewise exits `2`, with the not-in-the-ledger problem. Start the
+server (or open the store) once, and both are ledgered. A tombstone-log line
+that does not parse is skipped and counted as a problem, because the erasure
+it records could not be checked. The store itself refuses to open over such a
+line.
 
 ## Anchoring
 
@@ -417,7 +438,10 @@ erasure holds the subject's data and the tombstone log from before the
 erasure. Restore it into the same directory and both come back, while the
 chain keeps the erasure's entry. Verification names that entry until you
 apply the erasure again. The re-application is ledgered as a new entry with
-the same subject, often the same `erasure_id`, and a later `generation`.
+the same subject, often the same `erasure_id`, and a later `generation`. The
+same holds when the pin falls between two erasures of one subject: only the
+later one is undone, and verification names its entry even though the
+earlier erasure is still settled.
 
 An object-storage archive published from a pin does not carry the ledger
 copy. It archives manifested files only.

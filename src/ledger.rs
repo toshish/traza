@@ -391,6 +391,60 @@ pub(crate) struct Ledger {
     file_check: Mutex<Option<FileCheck>>,
     /// Appends that failed since the ledger last caught up. Leaf-level.
     failures: Mutex<Failures>,
+    /// Test-only pauses at points a race would otherwise have to be hit at.
+    #[cfg(test)]
+    hooks: Mutex<Hooks>,
+}
+
+/// The mark [`Ledger::settling`] puts up, taken down on drop.
+pub(crate) struct Settling<'a> {
+    ledger: &'a Ledger,
+    id: u64,
+    marked: bool,
+}
+
+impl Drop for Settling<'_> {
+    fn drop(&mut self) {
+        if !self.marked {
+            return;
+        }
+        if let Ok(mut tip) = self.ledger.lock() {
+            if let Some(count) = tip.settling.get_mut(&self.id) {
+                *count -= 1;
+                if *count == 0 {
+                    tip.settling.remove(&self.id);
+                }
+            }
+        }
+    }
+}
+
+/// A test hook: runs once, at its point, with the store.
+#[cfg(test)]
+type Hook = Box<dyn FnOnce(&Store) + Send>;
+
+/// Where a test hook runs.
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum HookPoint {
+    /// In `complete_erasure`, between the settle record and the entry.
+    AfterSettle,
+    /// In a live verification, just after its snapshot was taken.
+    AfterSnapshot,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct Hooks {
+    after_settle: Option<Hook>,
+    after_snapshot: Option<Hook>,
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for Hooks {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Hooks")
+    }
 }
 
 #[derive(Debug, Default)]
@@ -411,13 +465,23 @@ struct Tip {
     /// The final entry is complete but lacks its newline, because adding one
     /// at open failed: the next append writes it first.
     unterminated: bool,
-    /// `(erasure_id, subject_digest, generation)` of every erasure entry —
-    /// one publication of one erasure. The digest guards against an id
-    /// reused by another store's lineage (a restore of its backup into this
+    /// Every erasure entry — one publication of one erasure, keyed by
+    /// `(erasure_id, subject_digest, generation)` — with the byte offset
+    /// just past its line. The digest guards against an id reused by
+    /// another store's lineage (a restore of its backup into this
     /// directory); the generation tells a re-application after a rollback
-    /// restore from the publication already ledgered.
-    erasures: HashSet<(u64, String, u64)>,
+    /// restore from the publication already ledgered; the offset tells a
+    /// live verification whether the entry is inside the prefix it read or
+    /// landed after it.
+    erasures: HashMap<Publication, u64>,
+    /// Erasures between their settle record and their entry, with how many
+    /// completions of each are in that window; see [`Ledger::settling`].
+    settling: HashMap<u64, u32>,
 }
+
+/// One publication of one erasure, as the ledger keys it:
+/// `(erasure_id, subject_digest, generation)`.
+type Publication = (u64, String, u64);
 
 impl Tip {
     /// Takes in one entry whose line ends at byte `end` of the file.
@@ -443,7 +507,8 @@ impl Tip {
                 ..
             } => {
                 self.erasures
-                    .insert((*erasure_id, subject_digest.clone(), *generation));
+                    .entry((*erasure_id, subject_digest.clone(), *generation))
+                    .or_insert(end);
             }
             Body::Anchor { .. } => {}
         }
@@ -571,6 +636,8 @@ impl Ledger {
             tip: Mutex::new(tip),
             file_check: Mutex::new(None),
             failures: Mutex::new(Failures::default()),
+            #[cfg(test)]
+            hooks: Mutex::new(Hooks::default()),
         };
         if let Some(error) = heal_failure {
             ledger.note_failure("healing the final line at open", &error);
@@ -742,7 +809,7 @@ impl Ledger {
         let mut tip = self.lock()?;
         if tip
             .erasures
-            .contains(&(erasure_id, digest.clone(), generation))
+            .contains_key(&(erasure_id, digest.clone(), generation))
         {
             return Ok(None);
         }
@@ -769,6 +836,67 @@ impl Ledger {
             }
         }
         Ok(())
+    }
+
+    /// Marks erasure `id` as settling until the guard drops. Taken before
+    /// its settle record is written and dropped after its entry's append
+    /// returned, so for the whole window in which the tombstone log can
+    /// hold the settle while the chain lacks the entry, a live verification
+    /// can tell an entry on its way from a missing one.
+    ///
+    /// Never fails: the erasure must settle whatever the ledger does. With
+    /// the tip lock poisoned nothing is marked, and the verification that
+    /// would consult the mark fails on the same lock.
+    fn settling(&self, id: u64) -> Settling<'_> {
+        let marked = match self.lock() {
+            Ok(mut tip) => {
+                *tip.settling.entry(id).or_insert(0) += 1;
+                true
+            }
+            Err(_) => false,
+        };
+        Settling {
+            ledger: self,
+            id,
+            marked,
+        }
+    }
+
+    /// Of `settled` — read from the tombstone log AFTER the snapshot whose
+    /// prefix is `length` bytes — the publications whose entry a
+    /// verification of that prefix must not call missing: appended past
+    /// it, or still being appended (marked [`Self::settling`]).
+    ///
+    /// Read under one tip lock, and after the settlements, which is what
+    /// makes it exact: an erasure whose settle the read saw had its mark up
+    /// before the settle was written, and drops the mark only after its
+    /// append, so here it is either still marked or its entry's offset is
+    /// known (a failed append leaves neither, and stays reported).
+    fn landed_or_landing(&self, settled: &[Settled], length: u64) -> Result<HashSet<Publication>> {
+        let tip = self.lock()?;
+        Ok(settled
+            .iter()
+            .map(Settled::publication)
+            .filter(|publication| {
+                tip.settling.contains_key(&publication.0)
+                    || tip
+                        .erasures
+                        .get(publication)
+                        .is_some_and(|end| *end > length)
+            })
+            .collect())
+    }
+
+    /// Runs the test hook installed for this point, if any.
+    #[cfg(test)]
+    fn run_hook(&self, point: HookPoint, store: &Store) {
+        let hook = self.hooks.lock().ok().and_then(|mut hooks| match point {
+            HookPoint::AfterSettle => hooks.after_settle.take(),
+            HookPoint::AfterSnapshot => hooks.after_snapshot.take(),
+        });
+        if let Some(hook) = hook {
+            hook(store);
+        }
     }
 
     /// Appends an anchor after checking it names a real head.
@@ -943,8 +1071,8 @@ impl Ledger {
 pub struct Verification {
     /// True when every head recomputes and links, the latest checkpoint names
     /// the live generation's manifest, every manifested file verifies, every
-    /// ledgered erasure still holds in the live tombstone log, and no ledger
-    /// append is outstanding.
+    /// ledgered erasure still holds in the live tombstone log, every settled
+    /// erasure there is ledgered, and no ledger append is outstanding.
     pub intact: bool,
     /// Entry lines in the ledger, readable or not.
     pub entries: u64,
@@ -1074,17 +1202,22 @@ struct ChainReport {
     head: Option<String>,
     /// `(seq, generation, manifest_sha256)` of the last checkpoint entry.
     last_checkpoint: Option<(u64, u64, String)>,
-    /// The latest erasure entry per subject digest, for the cross-check
-    /// against the live tombstone log.
-    erasures: HashMap<String, LedgeredErasure>,
+    /// Every erasure entry, in chain order, for the cross-check against the
+    /// live tombstone log. Every one, not the latest per subject: each is
+    /// its own publication, and an older one cannot vouch for a newer one
+    /// of the same subject (see [`assemble`]).
+    erasures: Vec<LedgeredErasure>,
     problems: Vec<String>,
 }
 
 /// One erasure entry, as the cross-check needs it.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct LedgeredErasure {
     seq: u64,
     erasure_id: u64,
+    subject_digest: String,
+    /// `None` when the entry lacks one; the body check reports that.
+    generation: Option<u64>,
     subject_kind: String,
     tenant: Option<String>,
 }
@@ -1182,22 +1315,21 @@ fn verify_chain(path: &Path, length: Option<u64>) -> Result<ChainReport> {
                     entry.get("subject_digest").and_then(Value::as_str),
                     entry.get("erasure_id").and_then(Value::as_u64),
                 ) {
-                    report.erasures.insert(
-                        digest.to_owned(),
-                        LedgeredErasure {
-                            seq,
-                            erasure_id,
-                            subject_kind: entry
-                                .get("subject_kind")
-                                .and_then(Value::as_str)
-                                .unwrap_or("?")
-                                .to_owned(),
-                            tenant: entry
-                                .get("tenant")
-                                .and_then(Value::as_str)
-                                .map(str::to_owned),
-                        },
-                    );
+                    report.erasures.push(LedgeredErasure {
+                        seq,
+                        erasure_id,
+                        subject_digest: digest.to_owned(),
+                        generation: entry.get("generation").and_then(Value::as_u64),
+                        subject_kind: entry
+                            .get("subject_kind")
+                            .and_then(Value::as_str)
+                            .unwrap_or("?")
+                            .to_owned(),
+                        tenant: entry
+                            .get("tenant")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                    });
                 }
             }
             _ => {}
@@ -1286,56 +1418,40 @@ fn check_body(
     }
 }
 
-/// Subject digests of every SETTLED erasure in a tombstone log's statuses.
-fn settled_subjects(statuses: &[erasure::ErasureStatus]) -> HashSet<String> {
-    statuses
-        .iter()
-        .filter(|status| status.settle.is_some())
-        .map(|status| subject_digest(&status.erase.subject))
-        .collect()
+/// One settled erasure in a tombstone log — one publication — with what a
+/// problem about it must say.
+#[derive(Clone, Debug)]
+struct Settled {
+    id: u64,
+    subject_digest: String,
+    /// The settle record's generation: the one that published the deletion.
+    generation: u64,
+    subject_kind: &'static str,
+    /// The subject's tenant, `None` for a store-global payload subject.
+    tenant: Option<String>,
 }
 
-/// [`settled_subjects`] read straight from `directory`'s tombstone log,
-/// without opening it: the offline verification must not heal or append.
-/// Lines that do not parse are skipped — a damaged tombstone log is the
-/// file check's to report, and a skipped settle can only add a problem
-/// here, never hide one.
-fn settled_subjects_offline(directory: &Path) -> Result<HashSet<String>> {
-    let contents = match fs::read(directory.join(erasure::LOG_NAME)) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(HashSet::new()),
-        Err(error) => return Err(Error::Io(error)),
-    };
-    let mut subjects: HashMap<u64, String> = HashMap::new();
-    let mut settled: HashSet<u64> = HashSet::new();
-    for line in contents.split(|byte| *byte == b'\n') {
-        let Ok(Value::Object(record)) = serde_json::from_slice::<Value>(line) else {
-            continue;
-        };
-        let Some(id) = record.get("id").and_then(Value::as_u64) else {
-            continue;
-        };
-        match record.get("op").and_then(Value::as_str) {
-            Some("erase") => {
-                let subject = record
-                    .get("subject")
-                    .cloned()
-                    .and_then(|subject| serde_json::from_value::<erasure::Subject>(subject).ok());
-                if let Some(subject) = subject {
-                    subjects.insert(id, subject_digest(&subject));
-                }
-            }
-            Some("settle") => {
-                settled.insert(id);
-            }
-            _ => {}
-        }
+impl Settled {
+    fn publication(&self) -> Publication {
+        (self.id, self.subject_digest.clone(), self.generation)
     }
-    Ok(subjects
-        .into_iter()
-        .filter(|(id, _)| settled.contains(id))
-        .map(|(_, digest)| digest)
-        .collect())
+}
+
+/// Every SETTLED erasure in a tombstone log's statuses, in id order.
+fn settled_of(statuses: &[erasure::ErasureStatus]) -> Vec<Settled> {
+    statuses
+        .iter()
+        .filter_map(|status| {
+            let settle = status.settle.as_ref()?;
+            Some(Settled {
+                id: status.erase.id,
+                subject_digest: subject_digest(&status.erase.subject),
+                generation: settle.generation,
+                subject_kind: subject_kind(&status.erase.subject),
+                tenant: status.erase.subject.tenant().map(str::to_owned),
+            })
+        })
+        .collect()
 }
 
 /// What [`assemble`] checks the chain against, besides the files.
@@ -1344,11 +1460,18 @@ struct LiveFacts<'a> {
     generation: u64,
     /// The file check of that generation.
     files: &'a FileCheck,
-    /// Subject digests of every settled erasure in the live tombstone log,
-    /// read AFTER the chain's prefix was fixed: an erasure entry is appended
-    /// only once its settle is durable, so every erasure in the prefix is
-    /// already in this set unless the log lost it.
-    settled: &'a HashSet<String>,
+    /// Every settled erasure in the live tombstone log, read AFTER the
+    /// chain's prefix was fixed: an erasure entry is appended only once its
+    /// settle is durable, so every erasure in the prefix has its settle
+    /// here unless the log lost it.
+    settled: &'a [Settled],
+    /// Of `settled`, the publications whose entry is past the prefix or
+    /// being appended; see [`Ledger::landed_or_landing`]. Empty offline,
+    /// where nothing moves.
+    landing: &'a HashSet<Publication>,
+    /// Lines of the tombstone log that did not parse, which the offline
+    /// read skips (the open would refuse the log). Zero live.
+    tombstones_unreadable: usize,
     /// An append failure not yet caught up, if any.
     failure: Option<Failure>,
 }
@@ -1400,23 +1523,91 @@ fn assemble(directory: &Path, length: Option<u64>, live: LiveFacts<'_>) -> Resul
     // Every ledgered erasure must still hold. The tombstone log never
     // rotates, so the one ordinary way for a settled erasure to leave it is
     // a restore of a pin taken before it — which also brings the subject's
-    // data back, and is exactly what an auditor must not miss. Ordered by
-    // seq so the report reads in chain order.
-    let mut undone: Vec<&LedgeredErasure> = chain
-        .erasures
-        .iter()
-        .filter(|(digest, _)| !live.settled.contains(digest.as_str()))
-        .map(|(_, erasure)| erasure)
-        .collect();
-    undone.sort_by_key(|erasure| erasure.seq);
-    for erasure in undone {
+    // data back, and is exactly what an auditor must not miss.
+    //
+    // Publication by publication, not subject by subject: erase a subject,
+    // let new data for it arrive, pin, erase it again, restore the pin —
+    // the first erasure is still settled, the second is gone, and so is
+    // what it removed. An entry holds only while the live log has a
+    // settled erasure of its subject published by the SAME generation or a
+    // later one. Generations are never reused within a data directory (an
+    // install takes the next id past both stores), so a later one is a
+    // re-application that deleted the subject again, rewound data
+    // included; an earlier one deleted only what existed before this
+    // entry's own deletion did. In chain order, so the report reads that
+    // way.
+    let mut newest: HashMap<&str, u64> = HashMap::new();
+    for settled in live.settled {
+        let generation = newest.entry(settled.subject_digest.as_str()).or_insert(0);
+        *generation = (*generation).max(settled.generation);
+    }
+    for erasure in &chain.erasures {
+        let published = erasure.generation.unwrap_or(0);
+        if newest
+            .get(erasure.subject_digest.as_str())
+            .is_some_and(|newest| *newest >= published)
+        {
+            continue;
+        }
+        let (described, since) = match erasure.generation {
+            Some(generation) => (
+                format!(", published in generation {generation}"),
+                format!(" published in generation {generation} or later"),
+            ),
+            None => (String::new(), String::new()),
+        };
         problems.push(format!(
-            "seq {}: erasure {} ({} subject) is ledgered, but the live tombstone log holds no \
-             settled erasure of that subject. Restoring a pin taken before an erasure undoes \
-             it and brings the subject's data back; re-apply the erasure",
+            "seq {}: erasure {} ({} subject{described}) is ledgered, but the live tombstone log \
+             holds no settled erasure of that subject{since}. Restoring a pin taken before an \
+             erasure undoes it and brings the subject's data back; re-apply the erasure",
             erasure.seq, erasure.erasure_id, erasure.subject_kind
         ));
         scopes.push(Scope::Tenant(erasure.tenant.clone()));
+    }
+
+    // And the other way: every settled erasure must be in the chain. The
+    // crash window between a settle record and its entry leaves exactly
+    // this gap — the checkpoint entry before it already matches `CURRENT`,
+    // so nothing else notices — as does a failed append, until the next
+    // open or (after a failure) checkpoint ledgers it. An entry past the
+    // prefix, or on its way, is not missing.
+    let ledgered: HashSet<(u64, &str, u64)> = chain
+        .erasures
+        .iter()
+        .filter_map(|erasure| {
+            Some((
+                erasure.erasure_id,
+                erasure.subject_digest.as_str(),
+                erasure.generation?,
+            ))
+        })
+        .collect();
+    for settled in live.settled {
+        let key = (
+            settled.id,
+            settled.subject_digest.as_str(),
+            settled.generation,
+        );
+        if ledgered.contains(&key) || live.landing.contains(&settled.publication()) {
+            continue;
+        }
+        problems.push(format!(
+            "erasure {} ({} subject, settled in generation {}) is not in the ledger. A crash \
+             or a failed ledger append between settling an erasure and ledgering it leaves \
+             exactly this, and opening the store (or, after a failed append, its next \
+             checkpoint) ledgers it; any other cause is a discrepancy to investigate",
+            settled.id, settled.subject_kind, settled.generation
+        ));
+        scopes.push(Scope::Tenant(settled.tenant.clone()));
+    }
+    if live.tombstones_unreadable > 0 {
+        problems.push(format!(
+            "{}: {} line(s) do not parse, so the erasures they record were not checked \
+             against the ledger (the store refuses to open over them)",
+            erasure::LOG_NAME,
+            live.tombstones_unreadable
+        ));
+        scopes.push(Scope::Store);
     }
 
     if let Some(failure) = &live.failure {
@@ -1489,8 +1680,10 @@ pub fn verify_offline(directory: &Path) -> Result<Verification> {
     let files = check_files(directory, live)?;
     // The directory lock excludes every writer, so neither the chain nor the
     // tombstone log can move while they are read: the whole file is the
-    // chain, and the order of the two reads does not matter.
-    let settled = settled_subjects_offline(directory)?;
+    // chain, the order of the two reads does not matter, and no entry can
+    // be on its way.
+    let (statuses, tombstones_unreadable) = erasure::list_offline(directory)?;
+    let settled = settled_of(&statuses);
     assemble(
         directory,
         None,
@@ -1498,6 +1691,8 @@ pub fn verify_offline(directory: &Path) -> Result<Verification> {
             generation: live,
             files: &files,
             settled: &settled,
+            landing: &HashSet::new(),
+            tombstones_unreadable,
             failure: None,
         },
     )
@@ -1550,6 +1745,19 @@ impl Store {
         }
     }
 
+    /// Marks erasure `erasure_id` as between its settle record and its
+    /// entry until the guard drops; see [`Ledger::settling`]. Taken before
+    /// the settle is written, dropped after [`Self::ledger_erasure`].
+    pub(crate) fn ledger_settling(&self, erasure_id: u64) -> Settling<'_> {
+        self.ledger.settling(erasure_id)
+    }
+
+    /// Runs the test hook between an erasure's settle and its entry.
+    #[cfg(test)]
+    pub(crate) fn ledger_after_settle_hook(&self) {
+        self.ledger.run_hook(HookPoint::AfterSettle, self);
+    }
+
     /// Copies the ledger into a pin of `generation` being built, beside its
     /// manifest: the chain through that generation's checkpoint entry, and
     /// nothing after it. Copies nothing when that entry's append failed —
@@ -1598,7 +1806,8 @@ impl Store {
     /// Verifies the whole chain, checks that the latest checkpoint entry
     /// names the live generation's manifest, re-digests every file that
     /// manifest names, checks every ledgered erasure still holds in the live
-    /// tombstone log, and reports any ledger append not yet caught up.
+    /// tombstone log and every settled erasure there is ledgered, and
+    /// reports any ledger append not yet caught up.
     ///
     /// O(store bytes), like [`Self::verify_generation`], and under the same
     /// maintenance lock: no compaction, expiry or checkpoint can move files
@@ -1646,8 +1855,13 @@ impl Store {
                 files
             }
         };
-        // Read after the snapshot: see `LiveFacts::settled`.
-        let settled = settled_subjects(&self.erasures()?);
+        #[cfg(test)]
+        self.ledger.run_hook(HookPoint::AfterSnapshot, self);
+        // Read after the snapshot: see `LiveFacts::settled`. Then which of
+        // them landed past the snapshot or are landing, read after the
+        // settlements: see `Ledger::landed_or_landing`.
+        let settled = settled_of(&self.erasures()?);
+        let landing = self.ledger.landed_or_landing(&settled, snapshot.len)?;
         let verification = assemble(
             &self.directory,
             Some(snapshot.len),
@@ -1655,6 +1869,8 @@ impl Store {
                 generation: live,
                 files: &files,
                 settled: &settled,
+                landing: &landing,
+                tombstones_unreadable: 0,
                 failure: self.ledger.outstanding_failure(),
             },
         )?;
@@ -2663,6 +2879,211 @@ mod tests {
                 .count(),
             4
         );
+    }
+
+    #[test]
+    fn an_older_erasure_does_not_vouch_for_a_newer_one_a_restore_undid() {
+        // The same subject erased twice, with a pin in between: restoring
+        // that pin undoes the SECOND erasure only. The first is still
+        // settled in the restored tombstone log, and the subject is the
+        // same — but it published before the data the second one removed
+        // was even ingested, so it cannot stand in for it.
+        let dir = temp_dir("repeat");
+        let later_span = || -> crate::Span {
+            serde_json::from_value(json!({
+                "trace_id": "t1", "span_id": "s2", "name": "chat", "service": "svc",
+                "start_time_ns": 3_000u64, "end_time_ns": 4_000u64, "$tenant": "acme",
+            }))
+            .expect("span")
+        };
+        let second = {
+            let store = Store::open(&dir, crate::Config::default()).expect("open");
+            store.ingest(test_span("t1", "acme")).expect("ingest");
+            store.erase(trace_subject("t1", "acme")).expect("erase");
+            store
+                .ingest(later_span())
+                .expect("ingest after the erasure");
+            store.pin_generation("between").expect("pin");
+            let second = store.erase(trace_subject("t1", "acme")).expect("erase");
+            let verification = store.verify_ledger().expect("verify");
+            assert!(verification.intact, "{verification:?}");
+            second
+        };
+
+        let store = Store::restore(&dir, dir.join("pins/between"), crate::Config::default())
+            .expect("restore");
+        assert_eq!(
+            store.get_trace_in(Some("acme"), "t1").expect("trace").len(),
+            1,
+            "the data the second erasure removed is back"
+        );
+        let verification = store.verify_ledger().expect("verify");
+        assert!(!verification.intact, "{verification:?}");
+        let second_seq = store
+            .ledger_entries(None, MAX_PAGE)
+            .expect("entries")
+            .into_iter()
+            .find(|entry| {
+                entry["kind"] == "erasure"
+                    && entry["generation"]
+                        == json!(second.settle.as_ref().expect("settled").generation)
+            })
+            .and_then(|entry| entry["seq"].as_u64())
+            .expect("the second erasure's entry");
+        let undone: Vec<&String> = verification
+            .problems
+            .iter()
+            .filter(|problem| problem.contains("holds no settled erasure"))
+            .collect();
+        assert_eq!(undone.len(), 1, "{:?}", verification.problems);
+        assert!(
+            undone[0].starts_with(&format!("seq {second_seq}: erasure 2 ")),
+            "{undone:?}"
+        );
+
+        // Re-applied, it holds again, and a reopen re-ledgers nothing.
+        store.erase(trace_subject("t1", "acme")).expect("re-erase");
+        let verification = store.verify_ledger().expect("verify");
+        assert!(verification.intact, "{verification:?}");
+        let erasures = |store: &Store| {
+            kinds(store)
+                .iter()
+                .filter(|kind| *kind == "erasure")
+                .count()
+        };
+        assert_eq!(erasures(&store), 3);
+        drop(store);
+        let store = Store::open(&dir, crate::Config::default()).expect("reopen");
+        assert_eq!(erasures(&store), 3);
+        assert!(store.verify_ledger().expect("verify").intact);
+    }
+
+    #[test]
+    fn a_settled_erasure_missing_from_the_chain_is_named() {
+        // The crash window between an erasure's settle record and its
+        // ledger entry, as the files show it: everything durable, the entry
+        // absent, and the checkpoint entry before it matching CURRENT — so
+        // nothing but the tombstone log itself says an entry is missing.
+        let dir = temp_dir("unledgered");
+        let erased = {
+            let store = Store::open(&dir, crate::Config::default()).expect("open");
+            store.ingest(test_span("t1", "acme")).expect("ingest");
+            store.erase(trace_subject("t1", "acme")).expect("erase")
+        };
+        let all = lines(&dir);
+        assert!(all[all.len() - 1].contains("\"kind\":\"erasure\""));
+        fs::write(dir.join(LOG_NAME), all[..all.len() - 1].join("\n") + "\n").expect("truncate");
+
+        let verification = verify_offline(&dir).expect("verify");
+        assert!(!verification.intact, "{verification:?}");
+        assert!(verification.generation.matches_ledger);
+        let missing: Vec<&String> = verification
+            .problems
+            .iter()
+            .filter(|problem| problem.contains("is not in the ledger"))
+            .collect();
+        assert_eq!(missing.len(), 1, "{:?}", verification.problems);
+        let settled_in = erased.settle.as_ref().expect("settled").generation;
+        assert!(
+            missing[0].starts_with(&format!(
+                "erasure {} (trace subject, settled in generation {settled_in})",
+                erased.erase.id
+            )),
+            "{missing:?}"
+        );
+        // It is acme's erasure: acme's pack names it, another tenant's
+        // withholds it.
+        let mut scoped = verification.clone();
+        scoped = scoped.scoped("bigco");
+        assert!(!format!("{:?}", scoped.problems).contains("is not in the ledger"));
+
+        // Opening the store ledgers it, and the verdict is clean again.
+        drop(Store::open(&dir, crate::Config::default()).expect("reopen"));
+        let verification = verify_offline(&dir).expect("verify");
+        assert!(verification.intact, "{verification:?}");
+    }
+
+    fn set_hook(store: &Store, point: HookPoint, hook: Hook) {
+        let mut hooks = store.ledger.hooks.lock().expect("hooks");
+        match point {
+            HookPoint::AfterSettle => hooks.after_settle = Some(hook),
+            HookPoint::AfterSnapshot => hooks.after_snapshot = Some(hook),
+        }
+    }
+
+    #[test]
+    fn a_verification_between_a_settle_and_its_entry_does_not_call_the_entry_missing() {
+        // Live, the settle record is durable a moment before the entry is
+        // appended; a verification landing in that moment must not report
+        // the entry missing, as it would for one a crash lost.
+        let dir = temp_dir("settle-window");
+        let store = Store::open(&dir, crate::Config::default()).expect("open");
+        store.ingest(test_span("t1", "acme")).expect("ingest");
+        let seen = std::sync::Arc::new(Mutex::new(None));
+        let sink = std::sync::Arc::clone(&seen);
+        set_hook(
+            &store,
+            HookPoint::AfterSettle,
+            Box::new(move |store: &Store| {
+                let settled = store.erasures().expect("erasures")[0].settle.is_some();
+                let verification = store.verify_ledger().expect("verify");
+                *sink.lock().expect("sink") = Some((settled, verification));
+            }),
+        );
+        store.erase(trace_subject("t1", "acme")).expect("erase");
+        let (settled, verification) = seen.lock().expect("seen").take().expect("hook ran");
+        assert!(settled, "the hook ran after the settle record");
+        assert!(verification.intact, "{verification:?}");
+        assert!(store.verify_ledger().expect("verify").intact);
+    }
+
+    #[test]
+    fn an_entry_appended_after_the_snapshot_is_not_called_missing() {
+        // The other half of the window: the settle and the entry both land
+        // between a verification's snapshot and its read of the tombstone
+        // log. The entry is past the prefix the verification reads, so the
+        // prefix lacks it — and it is not missing.
+        let dir = temp_dir("settle-after-snapshot");
+        let store = Store::open(&dir, crate::Config::default()).expect("open");
+        store.ingest(test_span("t1", "acme")).expect("ingest");
+        let (parked_tx, parked_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        set_hook(
+            &store,
+            HookPoint::AfterSettle,
+            Box::new(move |_: &Store| {
+                parked_tx.send(()).expect("parked");
+                release_rx.recv().expect("released");
+            }),
+        );
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                store.erase(trace_subject("t1", "acme")).expect("erase");
+                done_tx.send(()).expect("done");
+            });
+            // The erasure is parked between its settle and its entry, its
+            // checkpoint done and no lock held. Verify, and let it finish
+            // after the snapshot and before the tombstone log is read.
+            parked_rx.recv().expect("parked");
+            let before = store.ledger_head().expect("head");
+            set_hook(
+                &store,
+                HookPoint::AfterSnapshot,
+                Box::new(move |_: &Store| {
+                    release_tx.send(()).expect("release");
+                    done_rx.recv().expect("erasure finished");
+                }),
+            );
+            let verification = store.verify_ledger().expect("verify");
+            assert_eq!(
+                verification.head.as_deref(),
+                Some(before.head.as_str()),
+                "the entry is past the snapshot"
+            );
+            assert!(verification.intact, "{verification:?}");
+        });
+        assert!(store.verify_ledger().expect("verify").intact);
     }
 
     #[test]

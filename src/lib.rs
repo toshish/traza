@@ -6513,6 +6513,10 @@ impl Store {
             payloads_retained,
             eval_records_removed,
         };
+        // From before the settle is written until its entry is appended, a
+        // live ledger verification that finds the settle without the entry
+        // knows the entry is on its way rather than missing.
+        let settling = self.ledger_settling(record.id);
         {
             let _gate = self
                 .erasure_gate
@@ -6520,10 +6524,13 @@ impl Store {
                 .map_err(|_| Error::LockPoisoned("erasure gate"))?;
             self.erasures.record_settle(settle.clone())?;
         }
+        #[cfg(test)]
+        self.ledger_after_settle_hook();
         // Ledgered once the settle is durable; a crash in between is healed
         // by the next open's reconcile. Never fails the erasure: it is
         // settled and its barrier lifted, whatever the ledger does.
         self.ledger_erasure(record.id, subject, generation);
+        drop(settling);
         self.metrics.erasures_settled.increment();
         self.metrics.erasure_spans_removed.add(spans_removed as u64);
         self.metrics.erasure.record(elapsed_nanos(&erasing));
