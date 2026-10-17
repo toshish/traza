@@ -2402,9 +2402,11 @@ between publishing (or settling) and ledgering leaves either gap, and the
 next open, or the next checkpoint after a failed append, ledgers what is
 missing. An entry being appended while the check runs is not reported
 missing. The file check reads every manifested byte under the maintenance lock,
-so it costs O(store) like `GET /v1/verify`; the chain is read up to a
-snapshot taken under that lock, so an erasure or anchor appended mid-check is
-left for the next one rather than read half-written. Compaction and expiry
+so it costs O(store) like `GET /v1/verify`. The chain is read up to a snapshot
+taken under that lock and walked after the lock is released, so an erasure or
+anchor appended mid-check is left for the next one rather than read
+half-written. This route always walks the whole chain and re-runs the file
+check. Compaction and expiry
 replace files between checkpoints, so until the next checkpoint the live
 manifest can name files that are gone, reported as missing;
 `POST /v1/checkpoint` first for a clean check.
@@ -2488,12 +2490,18 @@ Abbreviated (heads and entries elided):
 ```
 
 `digest` is the SHA-256 of the canonical JSON of every other field — what a
-notary signs. `activity` counts spans that started in the window and are
-still stored, from the same deadline-bounded fold as the analytics (a window
-too large for `--query-deadline-ms` answers `400`, never a partial pack).
-`erasures` lists those settled in the window with their receipt's
-`conclusive` and `result`; past 32 receipts or the query deadline both are
-`null`. `ledger.entries` holds entries whose `at_ns` is in the window, at
+notary signs. One `--query-deadline-ms` budget covers the whole pack. The
+chain walk continues the previous pack's (or verification's) walk when that
+walk began within the last 60 seconds, so a pack usually walks only what was
+appended since. If the budget runs out mid-walk, the pack answers `400`
+(`… the ledger chain was verified through line N …`); the walk keeps its
+progress, so a retry resumes and completes it. `activity` counts spans that
+started in the window and are still stored, from the same fold as the
+analytics, under the same budget (a window too large for it answers `400`,
+never a partial pack). `erasures` lists those settled in the window with
+their receipt's `conclusive` and `result`; past 32 receipts or the budget
+both are `null`. The file check, reused for 60 seconds, is the one step the
+budget does not cut short. `ledger.entries` holds entries whose `at_ns` is in the window, at
 most 10,000 (`entries_truncated` says whether more exist), and
 `ledger.entries_unreadable` counts the chain's lines the pack could not place
 (not a JSON object, or no integer `seq` or `at_ns`); the verification names

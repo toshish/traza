@@ -2241,7 +2241,10 @@ pub struct Store {
     /// erasures, or annotations, and never while holding any of them.
     erasure_gate: std::sync::RwLock<()>,
     /// The hash chain over published generations and erasures, outside
-    /// every generation. See [`ledger`]; its lock is leaf-level.
+    /// every generation. See [`ledger`]. Its locks are leaf-level but one:
+    /// the lock serializing evidence packs' chain walks, which a pack takes
+    /// BEFORE `maintenance` and holds while it walks after releasing
+    /// `maintenance`, and which nothing takes while holding an engine lock.
     ledger: ledger::Ledger,
     next_segment: AtomicU64,
     /// Present unless durability is [`Durability::Buffered`]. Guards the gap
@@ -3823,13 +3826,20 @@ impl Store {
     /// [`SnapshotView`], whose cost is one copy of the bounded write buffer
     /// and one `Arc` clone per segment. That also makes the answer coherent:
     /// a fold sees one instant of the store rather than a moving one.
-    pub fn fold_spans(
+    pub fn fold_spans(&self, filter: &SpanFilter, visit: impl FnMut(&Span)) -> Result<QueryCost> {
+        self.fold_spans_under(filter, self.query_deadline(Instant::now()), visit)
+    }
+
+    /// [`Self::fold_spans`] under a budget the caller anchored — for a
+    /// request whose fold is one step of several sharing one budget (an
+    /// evidence pack), so the fold gets what is left, not a fresh one.
+    pub(crate) fn fold_spans_under(
         &self,
         filter: &SpanFilter,
+        deadline: Option<Deadline>,
         mut visit: impl FnMut(&Span),
     ) -> Result<QueryCost> {
         let started = std::time::Instant::now();
-        let deadline = self.query_deadline(started);
         let mut cost = QueryCost::default();
         if let Some(session_id) = &filter.session {
             // A session unions several attribute keys, which no single index

@@ -79,12 +79,15 @@
 //! **One snapshot per answer.** Every reader — a page, a verification, an
 //! evidence pack, a pin's copy — reads a prefix of the file whose length was
 //! taken under the tip lock, never the file to its end: erasure and anchor
-//! appends are not serialized by the maintenance lock a verification holds,
-//! and reading to EOF could take in half a line mid-append.
+//! appends are not serialized by the maintenance lock a verification takes,
+//! and reading to EOF could take in half a line mid-append. The same fixed,
+//! never-rewritten prefix is what lets a verification walk the chain after
+//! releasing that lock, and lets an evidence pack extend an earlier walk
+//! instead of starting again at byte 0.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -138,10 +141,23 @@ const EVIDENCE_MAX_RECEIPTS: usize = 32;
 #[cfg(test)]
 const EVIDENCE_MAX_RECEIPTS: usize = 1;
 
+/// Chain lines between deadline checks in a budgeted walk: the crate's
+/// usual interval, a line costing about what a decode does. Lowered under
+/// test so that a walk cut short at its first check is a short one.
+#[cfg(not(test))]
+const WALK_CHECK_INTERVAL: u64 = crate::DEADLINE_CHECK_INTERVAL as u64;
+#[cfg(test)]
+const WALK_CHECK_INTERVAL: u64 = 64;
+
 /// How long an evidence pack may reuse a file verification of the SAME live
-/// generation. Re-digesting every manifested byte is O(store); a pack is
-/// readable by bound (tenant) credentials, and without reuse each of their
-/// requests would buy a full-store re-read. The pack reports when its file
+/// generation, and extend a chain walk rather than start one from byte 0.
+/// Re-digesting every manifested byte is O(store) and re-walking the chain
+/// O(ledger); a pack is readable by bound (tenant) credentials, and without
+/// reuse each of their requests would buy both. With it, whatever the
+/// request rate, packs walk the chain from byte 0 at most once per window
+/// and each pack in between walks only what was appended since. The bound is
+/// what keeps a pack's checks recent: an edit to the disk under a running
+/// server shows in packs within a window. The pack reports when its file
 /// check ran (`verified_at_ns`), and `GET /v1/ledger/verify` never reuses.
 const EVIDENCE_VERIFY_REUSE: Duration = Duration::from_secs(60);
 
@@ -389,6 +405,15 @@ pub(crate) struct Ledger {
     /// The last file verification, for evidence packs to reuse briefly; see
     /// [`EVIDENCE_VERIFY_REUSE`]. Leaf-level.
     file_check: Mutex<Option<FileCheck>>,
+    /// The chain walk evidence packs extend; see [`Store::evidence`]. The
+    /// one ledger lock that is NOT leaf-level: a pack takes it BEFORE the
+    /// maintenance lock and holds it across its walk, which runs after the
+    /// maintenance lock is released. So packs walk one at a time, each from
+    /// where the last stopped, every snapshot is taken after the walk it
+    /// extends was stored (a stored walk never runs past a later snapshot),
+    /// and no pack holds a checkpoint off while it walks. Nothing takes it
+    /// while holding another engine lock.
+    chain: Mutex<Option<CachedWalk>>,
     /// Appends that failed since the ledger last caught up. Leaf-level.
     failures: Mutex<Failures>,
     /// Test-only pauses at points a race would otherwise have to be hit at.
@@ -635,6 +660,7 @@ impl Ledger {
             path,
             tip: Mutex::new(tip),
             file_check: Mutex::new(None),
+            chain: Mutex::new(None),
             failures: Mutex::new(Failures::default()),
             #[cfg(test)]
             hooks: Mutex::new(Hooks::default()),
@@ -1022,6 +1048,8 @@ impl Ledger {
             if line.iter().all(u8::is_ascii_whitespace) {
                 continue;
             }
+            #[cfg(test)]
+            probe::parsed_one();
             let entry = match serde_json::from_slice::<Value>(&line) {
                 Ok(Value::Object(map)) => Some(map),
                 _ => None,
@@ -1062,9 +1090,94 @@ impl Ledger {
         generation::copy_prefix(&self.path, target, end)?;
         Ok(true)
     }
+
+    fn lock_chain(&self) -> Result<std::sync::MutexGuard<'_, Option<CachedWalk>>> {
+        self.chain
+            .lock()
+            .map_err(|_| Error::LockPoisoned("ledger chain walk"))
+    }
+
+    /// Offers a complete walk from byte 0, begun at `started`, for evidence
+    /// packs to extend: kept when it is fresher than the one held. Its
+    /// length was a snapshot's, so it cannot run past a later snapshot.
+    fn offer_walk(&self, walk: ChainWalk, started: Instant) -> Result<()> {
+        if walk.missing {
+            return Ok(());
+        }
+        let mut chain = self.lock_chain()?;
+        if chain.as_ref().map_or(true, |held| held.started < started) {
+            *chain = Some(CachedWalk { walk, started });
+        }
+        Ok(())
+    }
+
+    /// The JSON object on each line that starts at one of `offsets` (in
+    /// ascending order; every one a line a walk placed, so inside the
+    /// chain's prefix and ending in a newline). Reads those lines and no
+    /// others.
+    fn read_lines_at(&self, offsets: &[u64]) -> Result<Vec<Value>> {
+        if offsets.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut reader = BufReader::new(File::open(&self.path)?);
+        let mut position = 0_u64;
+        let mut line = Vec::new();
+        let mut out = Vec::with_capacity(offsets.len());
+        for &offset in offsets {
+            // Contiguous lines — the usual window — read straight on; a gap
+            // costs one seek.
+            if offset != position {
+                reader.seek(SeekFrom::Start(offset))?;
+            }
+            line.clear();
+            position = offset + reader.read_until(b'\n', &mut line)? as u64;
+            #[cfg(test)]
+            probe::parsed_one();
+            if let Ok(value @ Value::Object(_)) = serde_json::from_slice::<Value>(&line) {
+                out.push(value);
+            }
+        }
+        Ok(out)
+    }
 }
 
 // ------------------------------------------------------------ verification
+
+/// Test-only accounting of the chain work a request does, on the thread
+/// that does it: lines of the ledger parsed, and a hook at the start of
+/// each chain walk. Thread-local because every reader runs on its caller's
+/// thread, which keeps parallel tests from counting each other's work.
+#[cfg(test)]
+mod probe {
+    use std::cell::{Cell, RefCell};
+
+    thread_local! {
+        static PARSED: Cell<u64> = const { Cell::new(0) };
+        static ON_WALK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+
+    /// Counts one ledger line parsed.
+    pub(super) fn parsed_one() {
+        PARSED.with(|parsed| parsed.set(parsed.get() + 1));
+    }
+
+    /// Ledger lines parsed on this thread so far.
+    pub(super) fn parsed() -> u64 {
+        PARSED.with(Cell::get)
+    }
+
+    /// Runs the hook set by [`on_walk`], once.
+    pub(super) fn walking() {
+        if let Some(hook) = ON_WALK.with(|slot| slot.borrow_mut().take()) {
+            hook();
+        }
+    }
+
+    /// Sets a hook for the next chain walk on this thread.
+    pub(super) fn on_walk(hook: Box<dyn FnOnce()>) {
+        ON_WALK.with(|slot| *slot.borrow_mut() = Some(hook));
+    }
+}
 
 /// The result of verifying the ledger and the live generation against it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -1195,10 +1308,31 @@ fn yes_no(value: bool) -> &'static str {
     }
 }
 
-/// What walking the chain found.
-#[derive(Debug, Default)]
-struct ChainReport {
+/// A walk of the chain that can be resumed: everything checking the first
+/// `len` bytes established, so checking a longer prefix starts where this
+/// one stopped instead of at byte 0.
+///
+/// Sound because the file is append-only and nothing the store does
+/// rewrites bytes inside the chain's prefix: what a walk established about
+/// a prefix stays established, unless the disk is edited under a running
+/// server. That is why an evidence pack extends a walk only for a bounded
+/// time ([`EVIDENCE_VERIFY_REUSE`]) and the operator's verification always
+/// walks from byte 0.
+///
+/// Works on the generic JSON of each line, never a decoded [`Entry`]: a field
+/// added by hand must change the recomputed head, and decoding into a typed
+/// struct would silently drop it. Problems name the entry by `seq` where the
+/// line says one, else by line number.
+#[derive(Clone, Debug)]
+struct ChainWalk {
+    /// Bytes walked: always the end of a newline-terminated line, so the
+    /// next line starts exactly here. An unterminated final line is taken
+    /// in only by [`Self::with_tail`], on a copy.
+    len: u64,
+    line_number: u64,
+    /// Entry lines walked, readable or not (blank lines excluded).
     entries: u64,
+    /// The recorded head of the last readable entry.
     head: Option<String>,
     /// `(seq, generation, manifest_sha256)` of the last checkpoint entry.
     last_checkpoint: Option<(u64, u64, String)>,
@@ -1207,107 +1341,224 @@ struct ChainReport {
     /// its own publication, and an older one cannot vouch for a newer one
     /// of the same subject (see [`assemble`]).
     erasures: Vec<LedgeredErasure>,
-    problems: Vec<String>,
+    /// Problems found so far; [`Self::problems`] adds the ones only the
+    /// whole walk can state.
+    found: Vec<String>,
+    /// What the next entry must say, or `None` after a line that could not
+    /// be read — the chain cannot be followed across it, and reporting every
+    /// later entry as broken would bury the one real finding.
+    expected: Option<(u64, String)>,
+    /// Recorded heads by seq, for checking anchors, as [`head_key`]s: 32
+    /// bytes each rather than a 64-character string, because a cached walk
+    /// keeps them for the life of the store. Only a contiguous prefix is
+    /// kept, so a hand-edited huge seq cannot force a huge allocation.
+    heads: Vec<[u8; 32]>,
+    genesis_seen: bool,
+    /// Lines an evidence pack cannot place in a window: not a JSON object,
+    /// or no integer `seq` or `at_ns`.
+    unplaceable: u64,
+    /// `(at_ns, offset)` of every line a pack can place, in file order, so a
+    /// pack finds its window's entries without parsing the chain again.
+    placed: Vec<(u64, u64)>,
+    /// The ledger file did not exist when walked.
+    missing: bool,
 }
 
-/// One erasure entry, as the cross-check needs it.
-#[derive(Clone, Debug)]
-struct LedgeredErasure {
-    seq: u64,
-    erasure_id: u64,
-    subject_digest: String,
-    /// `None` when the entry lacks one; the body check reports that.
-    generation: Option<u64>,
-    subject_kind: String,
-    tenant: Option<String>,
+/// How far a budgeted [`ChainWalk::advance`] got.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Walked {
+    /// To the target: every newline-terminated line before it.
+    Reached,
+    /// The deadline passed first; the walk stopped on a line boundary and
+    /// resumes from there.
+    OutOfBudget,
 }
 
-/// Recomputes every head in the first `length` bytes of the ledger at `path`
-/// (the whole file when `None`) and checks each link.
-///
-/// Works on the generic JSON of each line, never a decoded [`Entry`]: a field
-/// added by hand must change the recomputed head, and decoding into a typed
-/// struct would silently drop it. Problems name the entry by `seq` where the
-/// line says one, else by line number.
-fn verify_chain(path: &Path, length: Option<u64>) -> Result<ChainReport> {
-    let mut report = ChainReport::default();
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            report.problems.push(format!("{LOG_NAME} is missing"));
-            return Ok(report);
+/// A recorded or claimed head, as the walk compares them: the 32 bytes a
+/// well-formed head spells, and for anything else the SHA-256 of its text.
+/// Equal keys mean equal strings — a malformed string colliding with a
+/// well-formed head would be a SHA-256 preimage — so comparing keys is
+/// comparing heads, at a third of the memory.
+fn head_key(text: &str) -> [u8; 32] {
+    fn decode(text: &str) -> Option<[u8; 32]> {
+        if !is_sha256_hex(text) {
+            return None;
         }
-        Err(error) => return Err(Error::Io(error)),
-    };
-    let mut reader = BufReader::new(file.take(length.unwrap_or(u64::MAX)));
-    let mut line = Vec::new();
-    let mut line_number = 0_u64;
-    // What the next entry must say, or `None` after a line that could not be
-    // read — the chain cannot be followed across it, and reporting every
-    // later entry as broken would bury the one real finding.
-    let mut expected: Option<(u64, String)> = Some((0, GENESIS_PREV.to_owned()));
-    // Recorded heads by seq, for checking anchors; only a contiguous prefix
-    // is kept, so a hand-edited huge seq cannot force a huge allocation.
-    let mut heads: Vec<String> = Vec::new();
-    let mut genesis_seen = false;
-    loop {
-        line.clear();
-        if reader.read_until(b'\n', &mut line)? == 0 {
-            break;
+        let mut bytes = [0_u8; 32];
+        for (byte, pair) in bytes.iter_mut().zip(text.as_bytes().chunks_exact(2)) {
+            let nibble = |digit: u8| match digit {
+                b'0'..=b'9' => digit - b'0',
+                _ => digit - b'a' + 10,
+            };
+            *byte = (nibble(pair[0]) << 4) | nibble(pair[1]);
         }
-        line_number += 1;
+        Some(bytes)
+    }
+    decode(text)
+        .or_else(|| decode(&payload::sha256_hex(text.as_bytes())))
+        .unwrap_or_default()
+}
+
+impl ChainWalk {
+    fn new() -> Self {
+        Self {
+            len: 0,
+            line_number: 0,
+            entries: 0,
+            head: None,
+            last_checkpoint: None,
+            erasures: Vec::new(),
+            found: Vec::new(),
+            expected: Some((0, GENESIS_PREV.to_owned())),
+            heads: Vec::new(),
+            genesis_seen: false,
+            unplaceable: 0,
+            placed: Vec::new(),
+            missing: false,
+        }
+    }
+
+    /// Walks on through byte `to` of the ledger at `path` (its end when
+    /// `None`), checking the deadline every [`WALK_CHECK_INTERVAL`] lines,
+    /// so every call makes at least that much progress. An unterminated
+    /// final line is left for [`Self::with_tail`]. Returns the target, and
+    /// whether it was reached.
+    fn advance(
+        &mut self,
+        path: &Path,
+        to: Option<u64>,
+        deadline: Option<crate::Deadline>,
+    ) -> Result<(u64, Walked)> {
+        #[cfg(test)]
+        probe::walking();
+        let mut file = match File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.missing = true;
+                return Ok((self.len, Walked::Reached));
+            }
+            Err(error) => return Err(Error::Io(error)),
+        };
+        let to = match to {
+            Some(to) => to,
+            None => file.metadata()?.len(),
+        };
+        if self.len >= to {
+            return Ok((to, Walked::Reached));
+        }
+        file.seek(SeekFrom::Start(self.len))?;
+        let mut reader = BufReader::new(file.take(to - self.len));
+        let mut line = Vec::new();
+        let mut walked = 0_u64;
+        loop {
+            line.clear();
+            let read = reader.read_until(b'\n', &mut line)?;
+            if read == 0 || !line.ends_with(b"\n") {
+                return Ok((to, Walked::Reached));
+            }
+            self.feed(&line, self.len);
+            self.len += read as u64;
+            walked += 1;
+            if self.len < to
+                && walked % WALK_CHECK_INTERVAL == 0
+                && crate::Deadline::check(deadline, 0).is_err()
+            {
+                return Ok((to, Walked::OutOfBudget));
+            }
+        }
+    }
+
+    /// This walk with the unterminated final line before `to` taken in, on a
+    /// copy, or `None` when there is none (the common case: a snapshot ends
+    /// on a newline, and only a newline the open could not write leaves
+    /// one). A copy because a walk past a line with no newline could not
+    /// resume: the next append writes that newline first.
+    fn with_tail(&self, path: &Path, to: u64) -> Result<Option<Self>> {
+        if self.missing || self.len >= to {
+            return Ok(None);
+        }
+        let mut file = File::open(path)?;
+        file.seek(SeekFrom::Start(self.len))?;
+        let mut tail = Vec::new();
+        file.take(to - self.len).read_to_end(&mut tail)?;
+        if tail.is_empty() {
+            return Ok(None);
+        }
+        let mut walk = self.clone();
+        walk.feed(&tail, self.len);
+        walk.len += tail.len() as u64;
+        Ok(Some(walk))
+    }
+
+    /// Checks one line starting at byte `offset`.
+    fn feed(&mut self, line: &[u8], offset: u64) {
+        #[cfg(test)]
+        probe::parsed_one();
+        self.line_number += 1;
+        let line_number = self.line_number;
         if line.iter().all(u8::is_ascii_whitespace) {
-            report.problems.push(format!("line {line_number}: blank"));
-            continue;
+            self.found.push(format!("line {line_number}: blank"));
+            return;
         }
-        report.entries += 1;
-        let entry = match serde_json::from_slice::<Value>(&line) {
+        self.entries += 1;
+        let entry = match serde_json::from_slice::<Value>(line) {
             Ok(Value::Object(map)) => map,
             _ => {
-                report.problems.push(format!(
+                self.found.push(format!(
                     "line {line_number}: not a JSON object; the chain cannot be followed past it"
                 ));
-                expected = None;
-                continue;
+                self.expected = None;
+                self.unplaceable += 1;
+                return;
             }
         };
         let Some(seq) = entry.get("seq").and_then(Value::as_u64) else {
-            report
-                .problems
+            self.found
                 .push(format!("line {line_number}: no integer seq"));
-            expected = None;
-            continue;
+            self.expected = None;
+            self.unplaceable += 1;
+            return;
         };
+        match entry.get("at_ns").and_then(Value::as_u64) {
+            Some(at_ns) => self.placed.push((at_ns, offset)),
+            None => self.unplaceable += 1,
+        }
         let name = format!("seq {seq}");
         let recorded_head = entry.get("head").and_then(Value::as_str).map(str::to_owned);
         let prev = entry.get("prev").and_then(Value::as_str);
-        if let Some((want_seq, want_prev)) = &expected {
+        if let Some((want_seq, want_prev)) = &self.expected {
             if seq != *want_seq {
-                report.problems.push(format!(
+                self.found.push(format!(
                     "{name} (line {line_number}): out of order, seq {want_seq} was expected"
                 ));
             } else if prev != Some(want_prev.as_str()) {
-                report.problems.push(format!(
+                self.found.push(format!(
                     "{name}: prev does not match the head of the entry before it"
                 ));
             }
         }
         let recomputed = compute_head(prev.unwrap_or(""), &Value::Object(entry.clone()));
         match &recorded_head {
-            None => report.problems.push(format!("{name}: no head")),
-            Some(head) if *head != recomputed => report.problems.push(format!(
+            None => self.found.push(format!("{name}: no head")),
+            Some(head) if *head != recomputed => self.found.push(format!(
                 "{name}: head does not match its contents (recorded {head}, recomputed {recomputed})"
             )),
             Some(_) => {}
         }
-        check_body(&entry, seq, &heads, &mut genesis_seen, &mut report.problems);
+        check_body(
+            &entry,
+            seq,
+            &self.heads,
+            &mut self.genesis_seen,
+            &mut self.found,
+        );
         match entry.get("kind").and_then(Value::as_str) {
             Some("checkpoint") => {
                 if let (Some(generation), Some(manifest)) = (
                     entry.get("generation").and_then(Value::as_u64),
                     entry.get("manifest_sha256").and_then(Value::as_str),
                 ) {
-                    report.last_checkpoint = Some((seq, generation, manifest.to_owned()));
+                    self.last_checkpoint = Some((seq, generation, manifest.to_owned()));
                 }
             }
             Some("erasure") => {
@@ -1315,7 +1566,7 @@ fn verify_chain(path: &Path, length: Option<u64>) -> Result<ChainReport> {
                     entry.get("subject_digest").and_then(Value::as_str),
                     entry.get("erasure_id").and_then(Value::as_u64),
                 ) {
-                    report.erasures.push(LedgeredErasure {
+                    self.erasures.push(LedgeredErasure {
                         seq,
                         erasure_id,
                         subject_digest: digest.to_owned(),
@@ -1335,16 +1586,72 @@ fn verify_chain(path: &Path, length: Option<u64>) -> Result<ChainReport> {
             _ => {}
         }
         let head = recorded_head.unwrap_or(recomputed);
-        if seq == heads.len() as u64 {
-            heads.push(head.clone());
+        if seq == self.heads.len() as u64 {
+            self.heads.push(head_key(&head));
         }
-        expected = Some((seq.saturating_add(1), head.clone()));
-        report.head = Some(head);
+        self.expected = Some((seq.saturating_add(1), head.clone()));
+        self.head = Some(head);
     }
-    if !genesis_seen {
-        report.problems.push("no genesis entry at seq 0".to_owned());
+
+    /// Every problem the walk found, plus those only a whole walk states.
+    fn problems(&self) -> Vec<String> {
+        let mut problems = Vec::with_capacity(self.found.len() + 1);
+        if self.missing {
+            problems.push(format!("{LOG_NAME} is missing"));
+            return problems;
+        }
+        problems.extend(self.found.iter().cloned());
+        if !self.genesis_seen {
+            problems.push("no genesis entry at seq 0".to_owned());
+        }
+        problems
     }
-    Ok(report)
+}
+
+/// What [`Store::evidence`] takes from the chain.
+struct EvidenceChain {
+    /// The tip at the snapshot the walk ran to.
+    head: LedgerHead,
+    verification: Verification,
+    /// Byte offsets of the window's entries, in file order, at most
+    /// [`EVIDENCE_MAX_ENTRIES`].
+    window: Vec<u64>,
+    /// More entries fall in the window than `window` holds.
+    window_truncated: bool,
+    /// Lines of the chain a pack cannot place in any window.
+    unplaceable: u64,
+}
+
+/// The walk the evidence packs extend, and when its walk from byte 0
+/// began — the moment its oldest finding was made.
+#[derive(Debug)]
+struct CachedWalk {
+    walk: ChainWalk,
+    started: Instant,
+}
+
+/// One erasure entry, as the cross-check needs it.
+#[derive(Clone, Debug)]
+struct LedgeredErasure {
+    seq: u64,
+    erasure_id: u64,
+    subject_digest: String,
+    /// `None` when the entry lacks one; the body check reports that.
+    generation: Option<u64>,
+    subject_kind: String,
+    tenant: Option<String>,
+}
+
+/// Walks the first `length` bytes of the ledger at `path` (the whole file
+/// when `None`) from byte 0, with no budget, the final line included
+/// whether or not it is terminated: a one-shot verification of the chain.
+fn verify_chain(path: &Path, length: Option<u64>) -> Result<ChainWalk> {
+    let mut walk = ChainWalk::new();
+    let (to, _) = walk.advance(path, length, None)?;
+    Ok(match walk.with_tail(path, to)? {
+        Some(whole) => whole,
+        None => walk,
+    })
 }
 
 /// The kind-specific checks: required fields present with the right types,
@@ -1352,7 +1659,7 @@ fn verify_chain(path: &Path, length: Option<u64>) -> Result<ChainReport> {
 fn check_body(
     entry: &Map<String, Value>,
     seq: u64,
-    heads: &[String],
+    heads: &[[u8; 32]],
     genesis_seen: &mut bool,
     problems: &mut Vec<String>,
 ) {
@@ -1399,7 +1706,7 @@ fn check_body(
         }
         Some("anchor") => match (number("target_seq"), text("target_head")) {
             (Some(target), Some(target_head)) if target < seq => match heads.get(target as usize) {
-                Some(head) if head == target_head => {}
+                Some(head) if *head == head_key(target_head) => {}
                 Some(_) => problems.push(format!(
                     "{name}: anchors seq {target}, but its target_head is not the head \
                          recorded at seq {target}"
@@ -1454,21 +1761,26 @@ fn settled_of(statuses: &[erasure::ErasureStatus]) -> Vec<Settled> {
         .collect()
 }
 
-/// What [`assemble`] checks the chain against, besides the files.
-struct LiveFacts<'a> {
+/// What [`assemble`] checks a walked chain against: everything about the
+/// store that is not the chain — live, gathered around the snapshot that
+/// fixes the chain's prefix (see [`Store::live_facts`]).
+struct LiveFacts {
     /// The generation `CURRENT` names.
     generation: u64,
+    /// SHA-256 of its manifest, read with it: once the lock is released a
+    /// checkpoint may publish a successor and sweep this one away.
+    manifest_sha256: String,
     /// The file check of that generation.
-    files: &'a FileCheck,
+    files: FileCheck,
     /// Every settled erasure in the live tombstone log, read AFTER the
     /// chain's prefix was fixed: an erasure entry is appended only once its
     /// settle is durable, so every erasure in the prefix has its settle
     /// here unless the log lost it.
-    settled: &'a [Settled],
+    settled: Vec<Settled>,
     /// Of `settled`, the publications whose entry is past the prefix or
     /// being appended; see [`Ledger::landed_or_landing`]. Empty offline,
     /// where nothing moves.
-    landing: &'a HashSet<Publication>,
+    landing: HashSet<Publication>,
     /// Lines of the tombstone log that did not parse, which the offline
     /// read skips (the open would refuse the log). Zero live.
     tombstones_unreadable: usize,
@@ -1476,13 +1788,13 @@ struct LiveFacts<'a> {
     failure: Option<Failure>,
 }
 
-/// Verifies the first `length` bytes of the ledger in `directory` (all of it
-/// when `None`) against the live facts.
-fn assemble(directory: &Path, length: Option<u64>, live: LiveFacts<'_>) -> Result<Verification> {
-    let chain = verify_chain(&directory.join(LOG_NAME), length)?;
+/// Checks a walked chain against the live facts. No I/O: the walk and the
+/// facts carry everything, which is what lets the walk run outside the
+/// maintenance lock the facts were gathered under.
+fn assemble(chain: &ChainWalk, live: &LiveFacts) -> Verification {
     let generation = live.generation;
-    let manifest_sha256 = manifest_digest(directory, generation)?;
-    let mut problems = chain.problems;
+    let manifest_sha256 = live.manifest_sha256.clone();
+    let mut problems = chain.problems();
     let matches_ledger = match &chain.last_checkpoint {
         Some((_, ledgered, digest)) if *ledgered == generation && *digest == manifest_sha256 => {
             true
@@ -1537,7 +1849,7 @@ fn assemble(directory: &Path, length: Option<u64>, live: LiveFacts<'_>) -> Resul
     // entry's own deletion did. In chain order, so the report reads that
     // way.
     let mut newest: HashMap<&str, u64> = HashMap::new();
-    for settled in live.settled {
+    for settled in &live.settled {
         let generation = newest.entry(settled.subject_digest.as_str()).or_insert(0);
         *generation = (*generation).max(settled.generation);
     }
@@ -1582,7 +1894,7 @@ fn assemble(directory: &Path, length: Option<u64>, live: LiveFacts<'_>) -> Resul
             ))
         })
         .collect();
-    for settled in live.settled {
+    for settled in &live.settled {
         let key = (
             settled.id,
             settled.subject_digest.as_str(),
@@ -1623,10 +1935,10 @@ fn assemble(directory: &Path, length: Option<u64>, live: LiveFacts<'_>) -> Resul
         problems.push(format!("generation {generation}: {problem}"));
         scopes.push(Scope::File);
     }
-    Ok(Verification {
+    Verification {
         intact: problems.is_empty(),
         entries: chain.entries,
-        head: chain.head,
+        head: chain.head.clone(),
         problems,
         generation: GenerationCheck {
             id: generation,
@@ -1636,7 +1948,7 @@ fn assemble(directory: &Path, length: Option<u64>, live: LiveFacts<'_>) -> Resul
             verified_at_ns: live.files.at_ns,
         },
         scopes,
-    })
+    }
 }
 
 /// Re-digests every file generation `live`'s manifest names.
@@ -1680,22 +1992,20 @@ pub fn verify_offline(directory: &Path) -> Result<Verification> {
     let files = check_files(directory, live)?;
     // The directory lock excludes every writer, so neither the chain nor the
     // tombstone log can move while they are read: the whole file is the
-    // chain, the order of the two reads does not matter, and no entry can
-    // be on its way.
+    // chain, the order of the reads does not matter, and no entry can be on
+    // its way.
     let (statuses, tombstones_unreadable) = erasure::list_offline(directory)?;
-    let settled = settled_of(&statuses);
-    assemble(
-        directory,
-        None,
-        LiveFacts {
-            generation: live,
-            files: &files,
-            settled: &settled,
-            landing: &HashSet::new(),
-            tombstones_unreadable,
-            failure: None,
-        },
-    )
+    let facts = LiveFacts {
+        generation: live,
+        manifest_sha256: manifest_digest(directory, live)?,
+        files,
+        settled: settled_of(&statuses),
+        landing: HashSet::new(),
+        tombstones_unreadable,
+        failure: None,
+    };
+    let chain = verify_chain(&directory.join(LOG_NAME), None)?;
+    Ok(assemble(&chain, &facts))
 }
 
 // ------------------------------------------------------------------- store
@@ -1809,51 +2119,76 @@ impl Store {
     /// tombstone log and every settled erasure there is ledgered, and
     /// reports any ledger append not yet caught up.
     ///
-    /// O(store bytes), like [`Self::verify_generation`], and under the same
-    /// maintenance lock: no compaction, expiry or checkpoint can move files
-    /// or the chain's checkpoint entries mid-check. Erasure and anchor
-    /// appends do not take that lock; the chain is read up to a snapshot
-    /// taken under it, so they land past what is checked. Note that
-    /// compaction and expiry replace files BETWEEN checkpoints, so the live
-    /// manifest can name files that are gone until the next checkpoint
-    /// publishes; those report as missing.
+    /// The file check is O(store bytes), like [`Self::verify_generation`],
+    /// and runs under the same maintenance lock: no compaction, expiry or
+    /// checkpoint can move files or the chain's checkpoint entries
+    /// mid-check. The chain is walked whole, from byte 0 and with no
+    /// budget, AFTER that lock is released: it is read up to a snapshot
+    /// taken under the lock, and nothing rewrites bytes inside that prefix,
+    /// so the walk needs no lock at all — and erasure and anchor appends,
+    /// which never took it, land past what is checked. Note that compaction
+    /// and expiry replace files BETWEEN checkpoints, so the live manifest
+    /// can name files that are gone until the next checkpoint publishes;
+    /// those report as missing.
+    ///
+    /// Never reuses an earlier walk or file check; its walk is offered to
+    /// the evidence packs, which may extend it (see [`Self::evidence`]).
     pub fn verify_ledger(&self) -> Result<Verification> {
-        self.verify_snapshot(None)
-            .map(|(verification, _)| verification)
+        let started = Instant::now();
+        let (snapshot, facts) = self.live_facts(None)?;
+        let mut walk = ChainWalk::new();
+        let (to, _) = walk.advance(&self.ledger.path, Some(snapshot.len), None)?;
+        let verification = match walk.with_tail(&self.ledger.path, to)? {
+            Some(whole) => assemble(&whole, &facts),
+            None => assemble(&walk, &facts),
+        };
+        self.ledger.offer_walk(walk, started)?;
+        Ok(verification)
     }
 
-    /// [`Self::verify_ledger`], reusing a file check of the same live
-    /// generation that is at most `reuse` old, and returning the snapshot
-    /// the chain was read up to. The chain, the manifest digest and the
-    /// tombstone log are always re-read.
-    fn verify_snapshot(&self, reuse: Option<Duration>) -> Result<(Verification, Snapshot)> {
-        let _maintenance = self.lock_maintenance()?;
-        // Under the maintenance lock, so no checkpoint entry can land between
-        // this and reading `CURRENT`; erasure and anchor appends may, and
-        // the snapshot leaves them out.
-        let snapshot = self.ledger.snapshot()?;
-        let live = self.live_generation();
-        let cached = match reuse {
-            Some(reuse) => self
-                .ledger
-                .file_check
-                .lock()
-                .map_err(|_| Error::LockPoisoned("ledger file check"))?
-                .clone()
-                .filter(|check| check.generation == live && check.at.elapsed() <= reuse),
-            None => None,
-        };
-        let files = match cached {
-            Some(files) => files,
-            None => {
-                let files = check_files(&self.directory, live)?;
-                *self
+    /// Everything a live verification checks the chain against, and the
+    /// snapshot that fixes the chain's prefix. What must agree with
+    /// `CURRENT` and the files — the snapshot, the live generation, its
+    /// manifest digest, the file check — is gathered under the maintenance
+    /// lock; the tombstone log only after it is released, since all that
+    /// read needs is to come after the snapshot. A file check of the same
+    /// live generation at most `reuse` old is reused; the manifest digest
+    /// and the tombstone log are always re-read.
+    fn live_facts(&self, reuse: Option<Duration>) -> Result<(Snapshot, LiveFacts)> {
+        let (snapshot, live, manifest_sha256, files) = {
+            let _maintenance = self.lock_maintenance()?;
+            // Under the maintenance lock, so no checkpoint entry can land
+            // between this and reading `CURRENT`; erasure and anchor appends
+            // may, and the snapshot leaves them out.
+            let snapshot = self.ledger.snapshot()?;
+            let live = self.live_generation();
+            let cached = match reuse {
+                Some(reuse) => self
                     .ledger
                     .file_check
                     .lock()
-                    .map_err(|_| Error::LockPoisoned("ledger file check"))? = Some(files.clone());
-                files
-            }
+                    .map_err(|_| Error::LockPoisoned("ledger file check"))?
+                    .clone()
+                    .filter(|check| check.generation == live && check.at.elapsed() <= reuse),
+                None => None,
+            };
+            let files = match cached {
+                Some(files) => files,
+                None => {
+                    let files = check_files(&self.directory, live)?;
+                    *self
+                        .ledger
+                        .file_check
+                        .lock()
+                        .map_err(|_| Error::LockPoisoned("ledger file check"))? =
+                        Some(files.clone());
+                    files
+                }
+            };
+            // With the generation it names: once the lock is released, a
+            // checkpoint may publish a successor and sweep this one away.
+            let manifest_sha256 = manifest_digest(&self.directory, live)?;
+            (snapshot, live, manifest_sha256, files)
         };
         #[cfg(test)]
         self.ledger.run_hook(HookPoint::AfterSnapshot, self);
@@ -1862,19 +2197,16 @@ impl Store {
         // settlements: see `Ledger::landed_or_landing`.
         let settled = settled_of(&self.erasures()?);
         let landing = self.ledger.landed_or_landing(&settled, snapshot.len)?;
-        let verification = assemble(
-            &self.directory,
-            Some(snapshot.len),
-            LiveFacts {
-                generation: live,
-                files: &files,
-                settled: &settled,
-                landing: &landing,
-                tombstones_unreadable: 0,
-                failure: self.ledger.outstanding_failure(),
-            },
-        )?;
-        Ok((verification, snapshot))
+        let facts = LiveFacts {
+            generation: live,
+            manifest_sha256,
+            files,
+            settled,
+            landing,
+            tombstones_unreadable: 0,
+            failure: self.ledger.outstanding_failure(),
+        };
+        Ok((snapshot, facts))
     }
 
     /// Appends an external notary's anchor, after checking its `target_head`
@@ -1904,6 +2236,30 @@ impl Store {
     /// A tenant's pack carries that tenant's usage row and the retention
     /// window expiry actually applies to it; a whole-store pack carries the
     /// global window and no usage row, since it is nobody's account.
+    ///
+    /// **What a pack costs.** Bound (tenant) credentials can ask for one, so
+    /// nothing in it may cost the whole chain or the whole store per
+    /// request, or hold off maintenance while it works:
+    ///
+    /// - ONE budget ([`crate::Config::query_deadline`], anchored here) for
+    ///   the chain walk, the activity fold and the receipts, so the request
+    ///   as a whole is bounded, not each step afresh. Past it the walk stops
+    ///   on a line boundary and keeps its progress, and the pack is refused
+    ///   with [`Error::DeadlineExceeded`] saying how far it got: a pack never
+    ///   carries a partial verification. The next request resumes the walk,
+    ///   so a chain longer than one budget is still verified, a budget at a
+    ///   time.
+    /// - The chain walk EXTENDS the last one — any pack's, or the operator's
+    ///   — when that walk began at most [`EVIDENCE_VERIFY_REUSE`] ago, so a
+    ///   request walks what was appended since rather than the chain from
+    ///   byte 0; and it runs after the maintenance lock is released, under
+    ///   only the lock that serializes packs' walks.
+    /// - The window's entries are found in the walk's index of where each
+    ///   line sits and when it was appended, and only those lines are read.
+    /// - The file check — O(store) — is reused for the same live generation
+    ///   for [`EVIDENCE_VERIFY_REUSE`], as before; it is the one step outside
+    ///   the budget, because a check cut short could only be thrown away,
+    ///   and its cost is the store's size, not anything the caller chose.
     pub fn evidence(
         &self,
         tenant: Option<&str>,
@@ -1911,6 +2267,7 @@ impl Store {
         until_ns: Option<u64>,
     ) -> Result<Value> {
         let started = Instant::now();
+        let deadline = self.query_deadline(started);
         let generated_at_ns = crate::unix_now_ns();
         let since = since_ns.unwrap_or(0);
         let until = until_ns.unwrap_or(generated_at_ns);
@@ -1927,42 +2284,18 @@ impl Store {
             }
         }
 
-        let (verification, snapshot) = self.verify_snapshot(Some(EVIDENCE_VERIFY_REUSE))?;
+        let chain = self.evidence_chain(since, until, started, deadline)?;
         let verification = match tenant {
-            Some(tenant) => verification.scoped(tenant),
-            None => verification,
+            Some(tenant) => chain.verification.scoped(tenant),
+            None => chain.verification,
         };
-        let head = snapshot.head;
-        let mut entries = Vec::new();
-        let mut entries_truncated = false;
-        // Lines the pack cannot place in the window: not a JSON object, or
-        // no integer seq or at_ns. Counted, never silently dropped, so a
-        // damaged chain's pack does not read as complete; the verification
-        // names each one.
-        let mut entries_unreadable = 0_u64;
-        self.ledger.scan_lines(snapshot.len, |entry| {
-            let Some(entry) = entry else {
-                entries_unreadable += 1;
-                return true;
-            };
-            let (Some(_), Some(at)) = (
-                entry.get("seq").and_then(Value::as_u64),
-                entry.get("at_ns").and_then(Value::as_u64),
-            ) else {
-                entries_unreadable += 1;
-                return true;
-            };
-            if at < since || at > until {
-                return true;
-            }
-            // Past the cap the scan goes on, counting: `entries_unreadable`
-            // covers the whole chain, not just the part that fit.
-            match entries.len() == EVIDENCE_MAX_ENTRIES {
-                true => entries_truncated = true,
-                false => entries.push(scope_entry(Value::Object(entry), tenant)),
-            }
-            true
-        })?;
+        let head = chain.head;
+        let entries: Vec<Value> = self
+            .ledger
+            .read_lines_at(&chain.window)?
+            .into_iter()
+            .map(|entry| scope_entry(entry, tenant))
+            .collect();
 
         let mut pack = json!({
             "format": EVIDENCE_FORMAT,
@@ -1974,20 +2307,91 @@ impl Store {
             "ledger": {
                 "head": head,
                 "entries": entries,
-                "entries_truncated": entries_truncated,
-                "entries_unreadable": entries_unreadable,
+                "entries_truncated": chain.window_truncated,
+                "entries_unreadable": chain.unplaceable,
                 "verification": verification,
             },
             "retention": self.retention_for(tenant)?,
             "usage": self.evidence_usage(tenant)?,
-            "activity": self.evidence_activity(tenant, since, until)?,
-            "erasures": self.evidence_erasures(tenant, since, until, started)?,
+            "activity": self.evidence_activity(tenant, since, until, deadline)?,
+            "erasures": self.evidence_erasures(tenant, since, until, deadline)?,
         });
         let digest = payload::sha256_hex(evals::canonical_json(&pack).as_bytes());
         if let Value::Object(map) = &mut pack {
             map.insert("digest".to_owned(), Value::String(digest));
         }
         Ok(pack)
+    }
+
+    /// The chain half of a pack: the live facts under the maintenance lock,
+    /// then the walk — extended from the cached one when that is fresh
+    /// enough — outside it, under `deadline`; then the verification, and
+    /// where the window's entries sit. See [`Self::evidence`] for why each
+    /// step is shaped as it is.
+    fn evidence_chain(
+        &self,
+        since: u64,
+        until: u64,
+        started: Instant,
+        deadline: Option<crate::Deadline>,
+    ) -> Result<EvidenceChain> {
+        // Before the maintenance lock: see `Ledger::chain`.
+        let mut held = self.ledger.lock_chain()?;
+        let (snapshot, facts) = self.live_facts(Some(EVIDENCE_VERIFY_REUSE))?;
+        let mut cached = match held.take() {
+            Some(cached)
+                if cached.started.elapsed() <= EVIDENCE_VERIFY_REUSE
+                    && cached.walk.len <= snapshot.len =>
+            {
+                cached
+            }
+            _ => CachedWalk {
+                walk: ChainWalk::new(),
+                started: Instant::now(),
+            },
+        };
+        let (to, walked) = cached
+            .walk
+            .advance(&self.ledger.path, Some(snapshot.len), deadline)?;
+        if walked == Walked::OutOfBudget {
+            let detail = format!(
+                "{} ms elapsed; the ledger chain was verified through line {} (byte {} of \
+                 {}) before the budget ran out. The check resumes from there on the next \
+                 request, so retrying completes it; or raise --query-deadline-ms",
+                started.elapsed().as_millis(),
+                cached.walk.line_number,
+                cached.walk.len,
+                to
+            );
+            *held = Some(cached);
+            return Err(Error::DeadlineExceeded(detail));
+        }
+        let tail = cached.walk.with_tail(&self.ledger.path, to)?;
+        let walk = tail.as_ref().unwrap_or(&cached.walk);
+        let verification = assemble(walk, &facts);
+        let mut window = Vec::new();
+        let mut window_truncated = false;
+        for &(at_ns, offset) in &walk.placed {
+            if at_ns < since || at_ns > until {
+                continue;
+            }
+            if window.len() == EVIDENCE_MAX_ENTRIES {
+                window_truncated = true;
+                break;
+            }
+            window.push(offset);
+        }
+        let unplaceable = walk.unplaceable;
+        if !cached.walk.missing {
+            *held = Some(cached);
+        }
+        Ok(EvidenceChain {
+            head: snapshot.head,
+            verification,
+            window,
+            window_truncated,
+            unplaceable,
+        })
     }
 
     /// The retention window that applies to `tenant`, and the layer that
@@ -2030,10 +2434,17 @@ impl Store {
     }
 
     /// Spans, traces, sessions and errors started in the window, with a
-    /// per-UTC-day breakdown, from one deadline-bounded fold. Distinct traces
-    /// and sessions are counted by a 128-bit hash of `(tenant, id)`, which
-    /// keeps a large window's memory at 16 bytes per distinct id.
-    fn evidence_activity(&self, tenant: Option<&str>, since: u64, until: u64) -> Result<Value> {
+    /// per-UTC-day breakdown, from one fold under the pack's `deadline`.
+    /// Distinct traces and sessions are counted by a 128-bit hash of
+    /// `(tenant, id)`, which keeps a large window's memory at 16 bytes per
+    /// distinct id.
+    fn evidence_activity(
+        &self,
+        tenant: Option<&str>,
+        since: u64,
+        until: u64,
+        deadline: Option<crate::Deadline>,
+    ) -> Result<Value> {
         fn key(tenant: &str, id: &str) -> crate::hash::Hash128 {
             crate::hash::hash_attribute(tenant, id)
         }
@@ -2049,7 +2460,7 @@ impl Store {
         let mut traces = HashSet::new();
         let mut sessions = HashSet::new();
         let mut by_day: BTreeMap<String, (u64, u64, f64)> = BTreeMap::new();
-        self.fold_spans(&filter, |span| {
+        self.fold_spans_under(&filter, deadline, |span| {
             spans += 1;
             traces.insert(key(&span.tenant, &span.trace_id));
             let facts = self.facts(span);
@@ -2089,16 +2500,17 @@ impl Store {
     /// each with its receipt's verdict while the receipt budget lasts.
     ///
     /// `conclusive` and `result` are the receipt's own fields; both are
-    /// `null` for an erasure past [`EVIDENCE_MAX_RECEIPTS`] or past the query
-    /// deadline, which the pack states rather than guesses.
+    /// `null` for an erasure past [`EVIDENCE_MAX_RECEIPTS`] or past the
+    /// pack's `deadline`, which the pack states rather than guesses. A
+    /// receipt already begun runs to its end: a partial receipt is worse
+    /// than a slow one.
     fn evidence_erasures(
         &self,
         tenant: Option<&str>,
         since: u64,
         until: u64,
-        started: Instant,
+        deadline: Option<crate::Deadline>,
     ) -> Result<Vec<Value>> {
-        let budget = self.config.query_deadline;
         let mut receipts = 0_usize;
         let mut out = Vec::new();
         for status in self.erasures()? {
@@ -2111,8 +2523,8 @@ impl Store {
             if tenant.is_some() && status.erase.subject.tenant() != tenant {
                 continue;
             }
-            let in_budget = receipts < EVIDENCE_MAX_RECEIPTS
-                && budget.map_or(true, |budget| started.elapsed() < budget);
+            let in_budget =
+                receipts < EVIDENCE_MAX_RECEIPTS && crate::Deadline::check(deadline, 0).is_ok();
             let (conclusive, result) = match in_budget {
                 true => {
                     receipts += 1;
@@ -2402,7 +2814,7 @@ mod tests {
             .is_none());
 
         let report = verify_chain(&dir.join(LOG_NAME), None).expect("verify");
-        assert!(report.problems.is_empty(), "{:?}", report.problems);
+        assert!(report.problems().is_empty(), "{:?}", report.problems());
         assert_eq!(report.entries, 3);
         assert_eq!(report.head.as_deref(), Some(head.head.as_str()));
         assert_eq!(report.last_checkpoint, Some((2, 2, digest(2))));
@@ -2439,7 +2851,7 @@ mod tests {
         assert_eq!(ledger.head().expect("head").seq, 1);
         ledger.record_checkpoint(2, digest(2)).expect("cp");
         let report = verify_chain(&dir.join(LOG_NAME), None).expect("verify");
-        assert!(report.problems.is_empty(), "{:?}", report.problems);
+        assert!(report.problems().is_empty(), "{:?}", report.problems());
         assert_eq!(report.entries, 3);
     }
 
@@ -2456,15 +2868,15 @@ mod tests {
         fs::write(dir.join(LOG_NAME), all.join("\n") + "\n").expect("write");
 
         let report = verify_chain(&dir.join(LOG_NAME), None).expect("verify");
-        assert_eq!(report.problems.len(), 1, "{:?}", report.problems);
-        assert!(report.problems[0].starts_with("seq 1: head does not match"));
+        assert_eq!(report.problems().len(), 1, "{:?}", report.problems());
+        assert!(report.problems()[0].starts_with("seq 1: head does not match"));
 
         // A store opened over the damage keeps working: it appends after the
         // last readable entry, and the damage stays reported.
         let ledger = Ledger::open(&dir).expect("open over damage");
         ledger.record_checkpoint(3, digest(3)).expect("cp");
         let report = verify_chain(&dir.join(LOG_NAME), None).expect("verify");
-        assert_eq!(report.problems.len(), 1, "{:?}", report.problems);
+        assert_eq!(report.problems().len(), 1, "{:?}", report.problems());
     }
 
     #[test]
@@ -2478,9 +2890,12 @@ mod tests {
         fs::write(dir.join(LOG_NAME), all.join("\n") + "\n").expect("write");
         let report = verify_chain(&dir.join(LOG_NAME), None).expect("verify");
         assert!(
-            report.problems.iter().any(|p| p.starts_with("seq 1: head")),
+            report
+                .problems()
+                .iter()
+                .any(|p| p.starts_with("seq 1: head")),
             "{:?}",
-            report.problems
+            report.problems()
         );
     }
 
@@ -2498,11 +2913,11 @@ mod tests {
         let report = verify_chain(&dir.join(LOG_NAME), None).expect("verify");
         assert!(
             report
-                .problems
+                .problems()
                 .iter()
                 .any(|p| p.starts_with("seq 3 (line 3): out of order")),
             "{:?}",
-            report.problems
+            report.problems()
         );
     }
 
@@ -2552,7 +2967,7 @@ mod tests {
             .anchor(request(tip.seq, &tip.head))
             .expect("anchor the tip");
         let report = verify_chain(&dir.join(LOG_NAME), None).expect("verify");
-        assert!(report.problems.is_empty(), "{:?}", report.problems);
+        assert!(report.problems().is_empty(), "{:?}", report.problems());
     }
 
     #[test]
@@ -3227,7 +3642,7 @@ mod tests {
         let text = fs::read_to_string(dir.join(LOG_NAME)).expect("read");
         assert!(!text.contains("anch"), "{text}");
         let report = verify_chain(&dir.join(LOG_NAME), None).expect("verify");
-        assert!(report.problems.is_empty(), "{:?}", report.problems);
+        assert!(report.problems().is_empty(), "{:?}", report.problems());
     }
 
     #[test]
@@ -3297,6 +3712,221 @@ mod tests {
         assert_eq!(
             fs::read(&again).expect("again"),
             fs::read(&target).expect("copy")
+        );
+    }
+
+    /// Appends `count` valid anchor entries (each over the genesis head) to
+    /// the ledger of a store that is not open, in one write: a long chain
+    /// without one fsync per entry.
+    fn grow_ledger(dir: &Path, count: u64) {
+        let all = lines(dir);
+        let genesis: Value = serde_json::from_str(&all[0]).expect("genesis");
+        let last: Value = serde_json::from_str(all.last().expect("an entry")).expect("entry");
+        let mut seq = last["seq"].as_u64().expect("seq");
+        let mut prev = last["head"].as_str().expect("head").to_owned();
+        let at_ns = last["at_ns"].as_u64().expect("at_ns");
+        let mut text = String::new();
+        for n in 0..count {
+            seq += 1;
+            let mut entry = json!({
+                "seq": seq, "kind": "anchor", "at_ns": at_ns + n + 1, "prev": prev,
+                "target_seq": 0, "target_head": genesis["head"],
+                "authority": "notary.example", "anchored_at_ns": 42,
+                "signature": "c2ln", "public_key": "a2V5",
+            });
+            let head = compute_head(&prev, &entry);
+            entry["head"] = json!(head);
+            text.push_str(&entry.to_string());
+            text.push('\n');
+            prev = head;
+        }
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(dir.join(LOG_NAME))
+            .expect("ledger");
+        file.write_all(text.as_bytes()).expect("grow");
+    }
+
+    #[test]
+    fn an_evidence_pack_extends_the_verified_chain_instead_of_rewalking_it() {
+        // A tenant's pack is the bound-credential path to a verification;
+        // each one re-walking and re-hashing the whole chain would make the
+        // chain's length the price of every request. What a request pays
+        // for is what is new since the last pack.
+        let dir = temp_dir("incremental");
+        drop(Store::open(&dir, crate::Config::default()).expect("open"));
+        grow_ledger(&dir, 3000);
+        let store = Store::open(&dir, crate::Config::default()).expect("reopen");
+        let recent = |store: &Store| store.ledger_head().expect("head").at_ns;
+
+        let before = probe::parsed();
+        let pack = store.evidence(Some("acme"), None, None).expect("pack");
+        assert!(
+            probe::parsed() - before >= 3000,
+            "the first pack walks it all"
+        );
+        assert_eq!(pack["ledger"]["verification"]["intact"], json!(true));
+
+        let before = probe::parsed();
+        let since = recent(&store);
+        let pack = store
+            .evidence(Some("acme"), Some(since), None)
+            .expect("pack");
+        let parsed = probe::parsed() - before;
+        assert!(
+            parsed <= 2,
+            "nothing new: no chain line is re-walked, and only the window's lines are \
+             read ({parsed} parsed)"
+        );
+        assert_eq!(pack["ledger"]["verification"]["intact"], json!(true));
+        assert_eq!(
+            pack["ledger"]["entries"].as_array().expect("entries").len(),
+            1
+        );
+
+        // One anchor appended: one line walked, and the window holds it.
+        let tip = store.ledger_head().expect("head");
+        store
+            .anchor_ledger(anchor_request(tip.seq, &tip.head, None))
+            .expect("anchor");
+        let before = probe::parsed();
+        let pack = store
+            .evidence(Some("acme"), Some(recent(&store)), None)
+            .expect("pack");
+        assert!(probe::parsed() - before <= 2);
+        assert_eq!(pack["ledger"]["verification"]["intact"], json!(true));
+        assert_eq!(
+            pack["ledger"]["head"]["seq"],
+            json!(tip.seq + 1),
+            "the pack covers the new entry"
+        );
+
+        // The operator's verification never reuses: the whole chain.
+        let before = probe::parsed();
+        assert!(store.verify_ledger().expect("verify").intact);
+        assert!(probe::parsed() - before >= 3000);
+    }
+
+    #[test]
+    fn an_evidence_pack_stops_its_chain_walk_at_the_deadline_and_resumes_there() {
+        // A budget that is spent before the request begins: every budgeted
+        // step stops at its first check. The chain walk must be one of
+        // them — and must keep its progress, or a chain too long for one
+        // budget could never be verified at all.
+        let dir = temp_dir("deadline");
+        drop(Store::open(&dir, crate::Config::default()).expect("open"));
+        grow_ledger(&dir, 1000);
+        let total = lines(&dir).len() as u64;
+        let config = crate::Config {
+            query_deadline: Some(Duration::ZERO),
+            ..crate::Config::default()
+        };
+        let store = Store::open(&dir, config).expect("reopen");
+        let mut cut_short = 0_u64;
+        loop {
+            let before = probe::parsed();
+            let outcome = store.evidence(Some("acme"), None, None);
+            let parsed = probe::parsed() - before;
+            match outcome {
+                Err(Error::DeadlineExceeded(detail)) if detail.contains("ledger chain") => {
+                    cut_short += 1;
+                    assert!(
+                        parsed <= WALK_CHECK_INTERVAL,
+                        "one interval, then the check stops it: {parsed} parsed"
+                    );
+                    assert!(
+                        detail.contains("resumes"),
+                        "the refusal says the work is kept: {detail}"
+                    );
+                }
+                other => {
+                    // The walk is done; the activity fold is the next step
+                    // over budget.
+                    assert!(
+                        matches!(other, Err(Error::DeadlineExceeded(_))),
+                        "{other:?}"
+                    );
+                    break;
+                }
+            }
+            assert!(
+                cut_short <= total / WALK_CHECK_INTERVAL + 1,
+                "each request continues where the last stopped"
+            );
+        }
+        assert!(
+            cut_short >= total / WALK_CHECK_INTERVAL,
+            "the walk was cut short at every check: {cut_short} of {total} lines"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_resumed_walk_reads_a_final_line_again_once_its_newline_lands() {
+        // The one snapshot that does not end on a newline: a final entry the
+        // open could not terminate. A pack takes that line in on a copy and
+        // keeps its walk short of it, because the next append writes the
+        // missing newline first — a walk kept past the line would read that
+        // newline as a blank line of its own.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("unterminated");
+        drop(Store::open(&dir, crate::Config::default()).expect("open"));
+        let path = dir.join(LOG_NAME);
+        let text = fs::read_to_string(&path).expect("ledger");
+        fs::write(&path, text.trim_end_matches('\n')).expect("unterminate");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).expect("chmod");
+        if OpenOptions::new().append(true).open(&path).is_ok() {
+            eprintln!(
+                "SKIPPED: this user can write a read-only file (root?); \
+                 the unterminated final line was not exercised"
+            );
+            return;
+        }
+        let store = Store::open(&dir, crate::Config::default()).expect("reopen");
+        let damage_free = |pack: &Value| {
+            let problems = pack["ledger"]["verification"]["problems"].to_string();
+            !problems.contains("blank") && !problems.contains("not a JSON object")
+        };
+        let pack = store.evidence(None, None, None).expect("pack");
+        assert!(damage_free(&pack), "{pack}");
+        assert_eq!(
+            pack["ledger"]["entries"].as_array().expect("entries").len(),
+            2
+        );
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("chmod");
+        store.checkpoint().expect("checkpoint");
+        let pack = store.evidence(None, None, None).expect("pack");
+        assert!(damage_free(&pack), "{pack}");
+        assert_eq!(
+            pack["ledger"]["verification"]["intact"],
+            json!(true),
+            "{pack}"
+        );
+        assert_eq!(
+            pack["ledger"]["entries"].as_array().expect("entries").len(),
+            3
+        );
+    }
+
+    #[test]
+    fn an_evidence_chain_walk_holds_no_maintenance_lock() {
+        // The walk reads an immutable prefix; nothing about it needs
+        // checkpoints, compaction or expiry held off — so a long chain must
+        // not hold them off either.
+        let dir = temp_dir("unlocked-walk");
+        let store = std::sync::Arc::new(Store::open(&dir, crate::Config::default()).expect("open"));
+        let seen = std::sync::Arc::new(Mutex::new(None));
+        let (probe_store, sink) = (std::sync::Arc::clone(&store), std::sync::Arc::clone(&seen));
+        probe::on_walk(Box::new(move || {
+            let free = probe_store.maintenance.try_lock().is_ok();
+            *sink.lock().expect("sink") = Some(free);
+        }));
+        store.evidence(Some("acme"), None, None).expect("pack");
+        assert_eq!(
+            *seen.lock().expect("seen"),
+            Some(true),
+            "the walk ran, with the maintenance lock free"
         );
     }
 

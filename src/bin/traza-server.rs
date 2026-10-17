@@ -2109,7 +2109,9 @@ fn engine_error(
         // An exhausted compute budget is the caller's to narrow, the same
         // rule as a too-broad sort: 503 would tell the client to retry with
         // backoff, and retrying an over-budget query without narrowing
-        // cannot help. Counted here — the one chokepoint every deadline 400
+        // cannot help. (An evidence pack's chain walk is the one exception:
+        // it keeps its progress, so a retry does help, and its message says
+        // so.) Counted here — the one chokepoint every deadline 400
         // passes through — so the metric covers every route that inherits
         // this mapping.
         error @ traza::Error::DeadlineExceeded(_) => {

@@ -261,10 +261,13 @@ live state.
 
 **What it costs.** The file check reads every manifested byte, so the cost
 grows with store size. It runs under the maintenance lock, so compaction,
-expiry and checkpoints wait for it to finish. Erasure and anchor appends do
-not wait: the chain is read only up to the tip as it stood when the check
-began, so an entry appended mid-check is left for the next check rather than
-read half-written.
+expiry and checkpoints wait for it to finish. The chain walk does not hold
+that lock. The chain is read only up to the tip as it stood when the check
+began, and nothing rewrites those bytes, so the walk runs after the lock is
+released. Erasure and anchor appends never wait. An entry appended mid-check
+is left for the next check rather than read half-written.
+`GET /v1/ledger/verify` always walks the whole chain and re-runs the file
+check.
 
 **After compaction or expiry.** Both replace segment files between
 checkpoints. Until the next checkpoint publishes, the live manifest can name
@@ -376,16 +379,40 @@ otherwise name store-wide files. Problems about other tenants' erasures are
 withheld behind a count that does not say whose. `intact` is the store's
 verdict either way: a pack never reports a store intact when it isn't.
 
-**Bounds.** Activity comes from the same fold the analytics use, so the query
-deadline (`--query-deadline-ms`) applies. A window too large to fold within it
-answers `400` with no partial pack; narrow the window. At most 32 erasure
-receipts run per pack, and only while that same budget lasts. Past either
-limit, `conclusive` and `result` are `null`, and
-`GET /v1/erasures/{id}/verify` answers for that erasure. The pack's file
-verification may reuse a verification of the same live generation from the
-last 60 seconds, so that bound credentials cannot each force a full-store
-re-read; `verified_at_ns` says when the file check ran.
-`GET /v1/ledger/verify` never reuses a result.
+**Bounds.** Bound credentials can request packs, so a pack must not cost the
+whole chain or the whole store on every request. One query budget
+(`--query-deadline-ms`) covers the whole request: the chain walk, the
+activity fold and the erasure receipts share it, and none of them gets a fresh
+budget of its own.
+
+- **The chain walk** continues the last one rather than starting again at the
+  first entry, as long as that walk began within the last 60 seconds. A pack
+  normally walks only the entries appended since the previous pack (or
+  `GET /v1/ledger/verify`), and packs walk the chain from the start at most
+  once a minute, however often they are requested. If the budget runs out
+  mid-walk, the walk stops, keeps its progress, and the pack is refused with
+  `400` saying how far it got (`the ledger chain was verified through line
+  N …`). A pack never carries a partial verification. The next request
+  resumes where the walk stopped, so retrying completes the check, even on a
+  chain too long for one budget.
+- **The window's entries** are found from an index the walk keeps, so a pack
+  reads only those lines.
+- **Activity** comes from the same fold the analytics use. A window too large
+  to fold within the budget answers `400` with no partial pack; narrow the
+  window.
+- **Receipts:** at most 32 run per pack, and only while the budget lasts. Past
+  either limit, `conclusive` and `result` are `null`, and
+  `GET /v1/erasures/{id}/verify` answers for that erasure.
+- **The file check** may reuse a verification of the same live generation
+  from the last 60 seconds, so bound credentials cannot each force a
+  full-store re-read. `verified_at_ns` says when it ran. It is the one step
+  the budget does not cut short. A file check stopped halfway would have to
+  start over, and its cost depends on the store's size, not on anything the
+  request asked for.
+
+`GET /v1/ledger/verify` never reuses a result. The 60-second bound is also how
+long an edit to `ledger.jsonl` made under a running server could go unnoticed
+by packs; the operator's verification sees it at once.
 
 Distinct traces and sessions are counted by a 128-bit hash of the tenant and
 the id. An adversary who crafts colliding ids can make the count read low by
@@ -458,7 +485,9 @@ copy. It archives manifested files only.
   to what the pack said, not to the counts being complete.
 - **No rotation.** The ledger grows by one line per published generation,
   forever. Every open reads it in full to find the tip and the erasures already
-  ledgered.
+  ledgered. Once a server has answered an evidence pack or a verification, it
+  also keeps about 48 bytes per entry in memory. That is the walk the next
+  pack continues from (see [Bounds](#evidence-packs)).
 - **Anchor signatures are stored, never checked.** See
   [what it does not prove](#what-it-proves-and-what-it-does-not).
 - **A failed append is caught up, not retried immediately.** The next
