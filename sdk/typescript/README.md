@@ -25,8 +25,8 @@ From this repository:
 
 ```sh
 cd sdk/typescript
-npm ci && npm pack          # builds dist/ and writes trazadb-sdk-0.27.0.tgz
-cd /your/app && npm install /path/to/traza/sdk/typescript/trazadb-sdk-0.27.0.tgz
+npm ci && npm pack          # builds dist/ and writes trazadb-sdk-<version>.tgz
+cd /your/app && npm install /path/to/traza/sdk/typescript/trazadb-sdk-*.tgz
 ```
 
 Connecting
@@ -42,10 +42,16 @@ await traza.whoami(); // { auth: "open", scope: "admin", tenant: null, operator:
 ```
 
 `token` is sent as `Authorization: Bearer`; leave it out for an open server.
-`tenant` scopes every call that takes one, for an unbound credential; a bound
-credential is held to its own tenant by the server whatever you send. The
-token is a private field: `console.log(traza)` and `JSON.stringify(traza)`
-never show it.
+The client follows no redirect (it asks `fetch` for `redirect: "manual"`), so
+the token goes only to the URL you give it: a `3xx` (from a proxy upgrading
+the scheme, say) rejects with a `TrazaError` naming the `Location`. `tenant`
+scopes every call that takes one, for an unbound credential. A bound
+credential can leave it out (the server scopes it to its own tenant) or name
+its own tenant; naming any other is refused with `AuthError` (`403`), and
+that includes `""`, the default tenant. `fromEnv()` treats a variable set to
+the empty string as unset, as the shell hook does, so a stray
+`TRAZA_TENANT=` names no tenant. The token is a private field:
+`console.log(traza)` and `JSON.stringify(traza)` never show it.
 
 **Timestamps are `bigint`.** Every `*_ns` field is Unix nanoseconds — around
 1.8e18, far past what a JavaScript number holds exactly — so the client reads
@@ -120,8 +126,10 @@ ordinary answer, with `verdict.reasons`, `verdict.usage` and `verdict.limits`.
 
 **If Traza cannot be reached**, the guard throws `TrazaError` (with
 `status: null`): running unguarded is a decision, so it is not made for you.
-`{ failOpen: true, onError }` makes it — the guard resolves `null` and the step
-runs.
+The same goes for an answer the guard cannot act on — a proxy's HTML page, a
+body cut short, JSON without a `continue`, `warn` or `stop` verdict — which
+is a `TrazaError` too. `{ failOpen: true, onError }` makes the decision for
+all of them: the guard resolves `null` and the step runs.
 
 ### Operating fuses
 
@@ -140,14 +148,18 @@ await traza.deletePolicy("fp_58ed88d43fc762ba");
 
 ```ts
 const controller = new AbortController();
-const stream = traza.events({ follow: true, waitMs: 25_000, signal: controller.signal });
+const stream = traza.events({ follow: true, signal: controller.signal }); // every read long-polls (25 s)
 for await (const event of stream) {
   if (event.kind === "stop" || event.kind === "manual_stop") await pageOncall(event.run, event.reasons);
   await saveCursor(stream.cursor); // resume later with traza.events({ after: cursor })
 }
 ```
 
-Without `follow`, iteration ends at the first read that returns nothing.
+A following stream's `waitMs` defaults to 25,000 (`FOLLOW_WAIT_MS`) and may
+be anything from 1 to 30,000; `{ follow: true, waitMs: 0 }` throws a
+`RangeError`, because it would ask again the instant each empty read came
+back. Without `follow`, `waitMs` defaults to 0 and iteration ends at the
+first read that returns nothing.
 `stream.gap` turns true if the server could no longer honour your cursor —
 the feed is a ring of 4,096 events, and a restart empties it. Aborting the
 signal ends a long-poll at once with the signal's `AbortError`.
@@ -224,13 +236,20 @@ OpenLLMetry run with `openai` 6.49.0, and the Anthropic route with
 `@anthropic-ai/sdk` 0.129.0
 (`new Anthropic({ baseURL: replay.anthropicBaseUrl, apiKey })`).
 
-- `replay.env()` gives `OPENAI_BASE_URL`, `OPENAI_API_KEY`,
+- `replay.env({ apiKey })` gives `OPENAI_BASE_URL`, `OPENAI_API_KEY`,
   `ANTHROPIC_BASE_URL` and `ANTHROPIC_API_KEY` as absolute URLs, for an agent
   process that builds its client from the environment:
-  `spawn("node", ["agent.js"], { env: { ...process.env, ...replay.env() } })`.
-  The keys are your Traza token (the Anthropic SDK's `x-api-key` is accepted on
-  the replay routes); on an open server a placeholder stands in, because the
-  SDKs refuse to start without a key.
+  `spawn("node", ["agent.js"], { env: { ...process.env, ...replay.env({ apiKey: agentKey }) } })`.
+  The keys are `apiKey`, else your client's Traza token (the Anthropic SDK's
+  `x-api-key` is accepted on the replay routes); on an open server a
+  placeholder stands in, because the SDKs refuse to start without a key.
+- **Hand the agent its own key.** Every library in the agent process can read
+  what `env()` exports, and one that reads `OPENAI_API_KEY` but ignores
+  `OPENAI_BASE_URL` sends it to the real provider. If your client holds an
+  operator token, mint a dedicated `ro` credential bound to the run's tenant,
+  create the replay under that tenant (`new Client(url, { token, tenant: "acme" })`),
+  and pass the `ro` token as `apiKey` (in the loop above, as the OpenAI
+  client's `apiKey`). Any credential of the replay's tenant may consume it.
 - **Tools still run live** unless your harness takes their results from
   `nextTool()`, which resolves `null` once no recorded tool step is left.
 - In strict mode a request whose messages differ from the recording is refused
@@ -302,7 +321,7 @@ Errors
 
 | Class | When |
 |---|---|
-| `TrazaError` | Any refusal, and `status: null` when no response arrived (unreachable, timed out). `status`, `message`, `type` (e.g. `replay_divergence`), `body`, `retryable` |
+| `TrazaError` | Any refusal, and `status: null` when no response arrived (unreachable, timed out). Also a redirect (its `3xx` status; none is followed) and an answer that cannot be read — not JSON, not the object the route answers, cut short — with the text that arrived on `body`. `status`, `message`, `type` (e.g. `replay_divergence`), `body`, `retryable` |
 | `AuthError` | `401`, or `403` with `required` naming the missing grant (`rw`, `admin`, `unbound`) |
 | `NotFound` | `404` — another tenant's object included |
 | `Conflict` | `409` — a run that cannot be replayed, a strict divergence, `--no-fuses` |
@@ -329,4 +348,8 @@ package. The suite starts two real servers on ephemeral ports — one open,
 one with `TRAZA_TOKENS` — and runs every method against their responses,
 including a fuse stop throwing `FuseTripped`, a replay consumed over the
 OpenAI and Anthropic routes with plain `fetch`, an aborted long-poll, a quota
-refusal, and an evidence pack's digest. It takes a second or two.
+refusal, and an evidence pack's digest. Redirects and unreadable answers,
+which the real server never sends, come from a canned-answer stub
+(`test/stub.js`), and `test/server.test.js` checks that the harness itself
+fails fast — no hung process, no server or directory left behind — when the
+server never comes up. It takes a second or two.

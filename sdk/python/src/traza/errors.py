@@ -29,13 +29,17 @@ __all__ = [
 
 
 class TrazaError(Exception):
-    """A request the server refused, or one that never reached it.
+    """A request the server refused, one that never reached it, or one whose
+    answer could not be read.
 
     ``status`` is the HTTP status, or ``None`` when no response arrived
-    (connection refused, DNS failure, timeout). ``type`` is the
-    machine-readable kind some routes send beside the message, such as
-    ``replay_divergence`` or ``replay_exhausted``. ``body`` is the parsed
-    JSON body, or the raw text when it was not JSON.
+    (connection refused, DNS failure, timeout) or its status line could not
+    be read. A redirect is one of these too, with its 3xx status: the client
+    follows none. ``type`` is the machine-readable kind some routes send
+    beside the message, such as ``replay_divergence`` or
+    ``replay_exhausted``. ``body`` is the parsed JSON body, or the raw text
+    when it was not JSON (an unreadable answer such as a proxy's HTML page
+    carries the text that arrived).
     """
 
     def __init__(

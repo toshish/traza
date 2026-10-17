@@ -70,15 +70,15 @@ fi
 # shape a client reads fails here rather than in someone's agent. Pointed at
 # target/release on purpose, never at an exported TRAZA_SERVER_BIN: the gate
 # tests what it just built. Both suites together take seconds. The Python
-# client is standard library only, so python3 is all it needs; the TypeScript
-# suite needs Node 20+ and npm, to install its one dev dependency (tsc).
+# client is standard library only, and python3 is already required above, so
+# its suite always runs; the TypeScript suite needs Node 20+ and npm, to
+# install its one dev dependency (tsc), and is skipped without them.
+# The metadata check comes first: a version bump that missed a client, or a
+# stale LICENSE or NOTICE copy, is named there rather than discovered later.
+python3 scripts/check-sdk-metadata.py
 sdk_server="$PWD/target/release/traza-server"
-if command -v python3 >/dev/null 2>&1; then
-  TRAZA_SERVER_BIN="$sdk_server" python3 -m unittest discover -s sdk/python/tests
-  echo "ci: python client tests ran"
-else
-  echo "ci: skipping the python client tests (python3 not found)"
-fi
+TRAZA_SERVER_BIN="$sdk_server" python3 -m unittest discover -s sdk/python/tests
+echo "ci: python client tests ran"
 node_major=""
 if command -v node >/dev/null 2>&1; then
   node_major=$(node --version | sed 's/^v//; s/\..*//')

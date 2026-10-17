@@ -20,13 +20,13 @@ import {
   QuotaExceeded,
   RawNumber,
   TrazaError,
-  VERSION,
   otelEnv,
   parseJson,
   stringifyJson,
   verifyEvidenceDigest,
 } from "../dist/index.js";
 import { startServer } from "./server.js";
+import { response, startStub } from "./stub.js";
 
 // 2026-01-01T00:00:00Z, as exact bigint nanoseconds: old enough that every
 // seeded run reads as finished.
@@ -333,6 +333,55 @@ describe("@trazadb/sdk against traza-server", () => {
       assert.ok(Date.now() - began >= 250);
     });
 
+    it("a following stream long-polls unless told how long to wait", async () => {
+      // A stub that answers every read at once with an empty page, as a quiet
+      // feed would after its wait, and refuses the fifth so the endless
+      // stream ends. Every read a follower makes must ask the server to hold
+      // it open: with wait_ms=0 it would poll as fast as the network allows.
+      const stub = await startStub(() =>
+        stub.requests.length > 4
+          ? response(500, '{"error":"enough"}')
+          : response(200, '{"events":[],"next":"1.0"}', { "Content-Type": "application/json" }),
+      );
+      try {
+        await assert.rejects(
+          (async () => {
+            for await (const _ of new Client(stub.url).events({ follow: true })) assert.fail("the stub sends no events");
+          })(),
+          TrazaError,
+        );
+        assert.deepEqual(stub.requests.map((r) => r.query.wait_ms), Array(5).fill("25000"));
+        assert.deepEqual(stub.requests.map((r) => r.query.after), [undefined, "1.0", "1.0", "1.0", "1.0"]);
+      } finally {
+        await stub.close();
+      }
+
+      // A wait the caller names is kept; one that cannot wait is refused,
+      // since following with it would be the same busy loop.
+      const refusing = await startStub(() => response(500, "{}"));
+      try {
+        await assert.rejects(
+          (async () => {
+            for await (const _ of new Client(refusing.url).events({ follow: true, waitMs: 300 }));
+          })(),
+          TrazaError,
+        );
+        assert.equal(refusing.requests[0].query.wait_ms, "300");
+      } finally {
+        await refusing.close();
+      }
+      assert.throws(() => new Client(open.url).events({ follow: true, waitMs: 0 }), RangeError);
+
+      // Without follow a read drains what is there and ends, so no wait.
+      const draining = await startStub(() => response(200, '{"events":[]}'));
+      try {
+        for await (const _ of new Client(draining.url).events()) assert.fail("no event expected");
+        assert.equal(draining.requests[0].query.wait_ms, "0");
+      } finally {
+        await draining.close();
+      }
+    });
+
     it("an aborted long-poll rejects with the caller's AbortError", async () => {
       const controller = new AbortController();
       const began = Date.now();
@@ -469,6 +518,28 @@ describe("@trazadb/sdk against traza-server", () => {
       assert.equal(message.body.stop_reason, "tool_use");
       assert.deepEqual(message.body.content[0].input, { city: "Oslo" });
     });
+
+    it("env can hand the agent its own key", async () => {
+      // The operator creates the replay under the run's tenant, and the agent
+      // process gets a bound reader's key instead of the operator's: every
+      // library in that process can read what env() exports.
+      await new Client(auth.url, { token: ACME_RW }).request("POST", "/v1/spans", {
+        body: weatherRun("acme-env", "c4".repeat(16), "Bergen"),
+      });
+      const replay = await new Client(auth.url, { token: ADMIN, tenant: "acme" }).replay("acme-env");
+      const env = replay.env({ apiKey: ACME_RO });
+      assert.equal(env.OPENAI_API_KEY, ACME_RO);
+      assert.equal(env.ANTHROPIC_API_KEY, ACME_RO);
+      assert.ok(!Object.values(env).includes(ADMIN));
+      assert.equal(env.OPENAI_BASE_URL, replay.openaiBaseUrl);
+      const answer = await postJson(`${env.OPENAI_BASE_URL}/chat/completions`, openaiRequest("Bergen"), {
+        authorization: `Bearer ${env.OPENAI_API_KEY}`,
+      });
+      assert.equal(answer.status, 200);
+      assert.equal(answer.body.choices[0].finish_reason, "tool_calls");
+      // Without a key the client's own credential stands in, as before.
+      assert.equal(replay.env().OPENAI_API_KEY, ADMIN);
+    });
   });
 
   describe("diff and recall", () => {
@@ -507,7 +578,9 @@ describe("@trazadb/sdk against traza-server", () => {
       await client.request("POST", "/v1/checkpoint");
       const pack = await client.evidence();
       assert.equal(pack.format, "traza-evidence/1");
-      assert.equal(pack.engine_version, VERSION);
+      // The engine's version, whatever this package's is: the two are kept in
+      // step by scripts/check-sdk-metadata.py at the bump, not here.
+      assert.match(pack.engine_version, /^\d+\.\d+\.\d+/);
       assert.ok(pack.activity.spans >= 8);
       assert.equal(pack.ledger.verification.intact, true);
       assert.equal(await pack.verifyDigest(), true);
@@ -623,6 +696,86 @@ describe("@trazadb/sdk against traza-server", () => {
     });
   });
 
+  describe("transport", () => {
+    it("a redirect is refused and the token goes nowhere", async () => {
+      // Something in front of Traza (a proxy upgrading the scheme or
+      // canonicalising the host) redirects. Traza never redirects its own
+      // routes, so the client follows none, whatever its fetch would do.
+      const elsewhere = await startStub(() => response(200, "{}"));
+      try {
+        const location = `http://127.0.0.1:${elsewhere.port}/steal`;
+        for (const status of [301, 302, 303, 307, 308]) {
+          const front = await startStub(() => response(status, "moved", { Location: location }));
+          try {
+            const client = new Client(front.url, { token: "trz_secret_token_0123456789" });
+            for (const call of [() => client.ledgerHead(), () => client.check("r1")]) {
+              await assert.rejects(call(), (error) => {
+                assert.ok(error instanceof TrazaError, String(error));
+                assert.equal(error.status, status);
+                assert.ok(error.message.includes(location), error.message);
+                return true;
+              });
+            }
+            assert.equal(front.requests.length, 2);
+          } finally {
+            await front.close();
+          }
+        }
+        assert.deepEqual(elsewhere.requests, [], "nothing followed the redirect");
+      } finally {
+        await elsewhere.close();
+      }
+    });
+
+    it("an unreadable answer is a TrazaError, and failOpen covers it", async () => {
+      // A reverse proxy's sign-in page, a captive portal, a JSON value that is
+      // not the object the route answers, a check with no verdict, a body cut
+      // short, a status line that is not HTTP: each is an answer the guard
+      // cannot act on, so it must fail closed by default and open when asked,
+      // exactly like an unreachable server.
+      const json = { "Content-Type": "application/json" };
+      const answers = {
+        html: response(200, "<html>Sign in</html>", { "Content-Type": "text/html" }),
+        array: response(200, "[]", json),
+        empty: response(200),
+        "no verdict": response(200, '{"run":"r1"}', json),
+        "unknown verdict": response(200, '{"run":"r1","verdict":"maybe"}', json),
+        truncated: Buffer.from('HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{"verd'),
+        "garbage status": Buffer.from("HELLO\r\n\r\n"),
+      };
+      for (const [name, raw] of Object.entries(answers)) {
+        const stub = await startStub(() => raw);
+        try {
+          const client = new Client(stub.url, { timeoutMs: 5000 });
+          await assert.rejects(client.guard("r1"), (error) => {
+            assert.ok(error instanceof TrazaError, `${name}: ${error}`);
+            return true;
+          });
+          const seen = [];
+          assert.equal(await client.guard("r1", { failOpen: true, onError: (error) => seen.push(error) }), null, name);
+          assert.equal(seen.length, 1, name);
+          assert.ok(seen[0] instanceof TrazaError, name);
+        } finally {
+          await stub.close();
+        }
+      }
+      // When the status is known it is kept, with the text that arrived.
+      const stub = await startStub(() => answers.html);
+      try {
+        await assert.rejects(new Client(stub.url).ledgerHead(), (error) => {
+          assert.ok(error instanceof TrazaError, String(error));
+          assert.equal(error.status, 200);
+          assert.equal(error.body, "<html>Sign in</html>");
+          return true;
+        });
+        await assert.rejects(new Client(stub.url).request("GET", "/v1/anything"), TrazaError);
+        await assert.rejects(new Client(stub.url).evidence(), TrazaError);
+      } finally {
+        await stub.close();
+      }
+    });
+  });
+
   describe("configuration and JSON", () => {
     it("fromEnv, and the token never printed", () => {
       const client = Client.fromEnv({ TRAZA_URL: "http://h:1/", TRAZA_TOKEN: "secret-token", TRAZA_TENANT: "acme" });
@@ -632,6 +785,19 @@ describe("@trazadb/sdk against traza-server", () => {
       assert.ok(!inspect(client).includes("secret-token"));
       assert.ok(!JSON.stringify(client).includes("secret-token"));
       assert.throws(() => new Client("127.0.0.1:8080"), TypeError);
+    });
+
+    it("an empty TRAZA_TENANT is unset", async () => {
+      // As the shell hook reads it: `TRAZA_TENANT=` left in a profile must
+      // not name the default tenant, which a bound credential is refused (and
+      // which would narrow an unbound one's reads to it).
+      const client = Client.fromEnv({ TRAZA_URL: auth.url, TRAZA_TOKEN: ACME_RO, TRAZA_TENANT: "" });
+      assert.equal(client.tenant, undefined);
+      assert.equal((await client.check("r1")).tenant, "acme");
+      // An explicit "" still names the default tenant, which this credential
+      // may not ask about.
+      await assert.rejects(new Client(auth.url, { token: ACME_RO, tenant: "" }).check("r1"), AuthError);
+      assert.equal(Client.fromEnv({ TRAZA_TENANT: "" }).tenant, undefined);
     });
 
     it("reads nanoseconds and large integers exactly, payloads as JSON.parse does", () => {

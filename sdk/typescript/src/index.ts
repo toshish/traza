@@ -17,7 +17,7 @@
  * @module
  */
 
-export { Client, EventStream, Replay } from "./client.js";
+export { Client, EventStream, FOLLOW_WAIT_MS, Replay } from "./client.js";
 export type {
   CallOptions,
   CheckOptions,

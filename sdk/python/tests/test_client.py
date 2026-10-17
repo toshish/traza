@@ -22,8 +22,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from _server import Server  # noqa: E402
+from _stub import Stub, response  # noqa: E402
 
-import traza  # noqa: E402
 from traza import (  # noqa: E402
     AuthError,
     Client,
@@ -337,6 +337,37 @@ class Fuses(unittest.TestCase):
         self.assertEqual(list(quiet), [])
         self.assertGreaterEqual(time.monotonic() - began, 0.25)
 
+    def test_a_following_stream_long_polls_unless_told_how_long_to_wait(self):
+        # A stub that answers every read at once with an empty page, as a
+        # quiet feed would after its wait, and refuses the fifth so the
+        # endless stream ends. Every read a follower makes must ask the server
+        # to hold it open: with wait_ms=0 it would poll as fast as the network
+        # allows (thousands of requests a second against a real server).
+        def answer(request):
+            if len(stub.requests) > 4:
+                return response(500, b'{"error":"enough"}')
+            return response(200, b'{"events":[],"next":"1.0"}', {"Content-Type": "application/json"})
+
+        with Stub(answer) as stub:
+            with self.assertRaises(TrazaError):
+                for _ in Client(stub.url).events(follow=True):
+                    self.fail("the stub sends no events")
+            self.assertEqual([r.query["wait_ms"] for r in stub.requests], ["25000"] * 5)
+            self.assertEqual([r.query.get("after") for r in stub.requests], [None] + ["1.0"] * 4)
+
+        # A wait the caller names is kept; one that cannot wait is refused,
+        # since following with it would be the same busy loop.
+        with Stub(lambda request: response(500, b"{}")) as stub:
+            with self.assertRaises(TrazaError):
+                list(Client(stub.url).events(follow=True, wait_ms=300))
+            self.assertEqual(stub.requests[0].query["wait_ms"], "300")
+        with self.assertRaises(ValueError):
+            Client(OPEN.url).events(follow=True, wait_ms=0)
+        # Without follow a read drains what is there and ends, so no wait.
+        with Stub(lambda request: response(200, b'{"events":[]}')) as stub:
+            self.assertEqual(list(Client(stub.url).events()), [])
+            self.assertEqual(stub.requests[0].query["wait_ms"], "0")
+
     def test_a_run_id_is_one_path_segment_whatever_it_contains(self):
         # Run ids come from telemetry: `/`, `?`, `#`, `%` and spaces must all
         # arrive as one percent-encoded segment.
@@ -464,6 +495,25 @@ class TapesAndReplays(unittest.TestCase):
         with self.assertRaises(NotFound, msg="another tenant's replay is a 404"):
             Client(AUTH.url, token=BETA_RO)._replay_status(replay.id)
 
+    def test_env_can_hand_the_agent_its_own_key(self):
+        # The operator creates the replay under the run's tenant, and the
+        # agent process gets a bound reader's key instead of the operator's:
+        # every library in that process can read what env() exports.
+        Client(AUTH.url, token=ACME_RW).request("POST", "/v1/spans", body=weather_run("acme-env", "c4" * 16, "Bergen"))
+        replay = Client(AUTH.url, token=ADMIN, tenant="acme").replay("acme-env")
+        env = replay.env(api_key=ACME_RO)
+        self.assertEqual((env["OPENAI_API_KEY"], env["ANTHROPIC_API_KEY"]), (ACME_RO, ACME_RO))
+        self.assertNotIn(ADMIN, env.values())
+        self.assertEqual(env["OPENAI_BASE_URL"], replay.openai_base_url)
+        status, answer = post_json(
+            env["OPENAI_BASE_URL"] + "/chat/completions", openai_request("Bergen"),
+            {"Authorization": "Bearer " + env["OPENAI_API_KEY"]},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(answer["choices"][0]["finish_reason"], "tool_calls")
+        # Without a key the client's own credential stands in, as before.
+        self.assertEqual(replay.env()["OPENAI_API_KEY"], ADMIN)
+
 
 class DiffAndRecall(unittest.TestCase):
     def test_diff_names_the_first_divergence(self):
@@ -503,7 +553,9 @@ class Ledger(unittest.TestCase):
         client.request("POST", "/v1/checkpoint")
         pack = client.evidence()
         self.assertEqual(pack.format, "traza-evidence/1")
-        self.assertEqual(pack.engine_version, traza.__version__)
+        # The engine's version, whatever this package's is: the two are kept
+        # in step by scripts/check-sdk-metadata.py at the bump, not here.
+        self.assertRegex(pack.engine_version, r"^\d+\.\d+\.\d+")
         self.assertIsNone(pack.tenant)
         self.assertGreaterEqual(pack.activity.spans, 8)
         self.assertTrue(pack.ledger["verification"]["intact"])
@@ -614,6 +666,65 @@ class OtelEnv(unittest.TestCase):
         self.assertEqual(row.lifetime.spans, 1)
 
 
+class Transport(unittest.TestCase):
+    def test_a_redirect_is_refused_and_the_token_goes_nowhere(self):
+        # Something in front of Traza (a proxy upgrading the scheme or
+        # canonicalising the host) redirects to another origin. urllib would
+        # follow with every header the request carried, Authorization too.
+        with Stub(lambda request: response(200, b"{}")) as elsewhere:
+            location = f"http://localhost:{elsewhere.port}/steal"
+            for status in (301, 302, 303, 307, 308):
+                with Stub(lambda request: response(status, b"moved", {"Location": location})) as front:
+                    client = Client(front.url, token="trz_secret_token_0123456789")
+                    for call in (client.ledger_head, lambda: client.check("r1")):
+                        with self.assertRaises(TrazaError) as caught:
+                            call()
+                        self.assertEqual(caught.exception.status, status)
+                        self.assertIn(location, str(caught.exception))
+                    self.assertEqual(len(front.requests), 2)
+            self.assertEqual(elsewhere.requests, [], "nothing followed the redirect")
+
+    def test_an_unreadable_answer_is_a_traza_error_and_fail_open_covers_it(self):
+        # A reverse proxy's sign-in page, a captive portal, a JSON value that
+        # is not the object the route answers, a check with no verdict, a body
+        # cut short, a status line that is not HTTP: each is an answer the
+        # guard cannot act on, so it must fail closed by default and open
+        # when asked, exactly like an unreachable server.
+        json_type = {"Content-Type": "application/json"}
+        answers = {
+            "html": response(200, b"<html>Sign in</html>", {"Content-Type": "text/html"}),
+            "array": response(200, b"[]", json_type),
+            "empty": response(200),
+            "no verdict": response(200, b'{"run":"r1"}', json_type),
+            "unknown verdict": response(200, b'{"run":"r1","verdict":"maybe"}', json_type),
+            "not utf-8": response(200, b'{"verdict":"\xff"}', json_type),
+            "truncated": b'HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{"verd',
+            "garbage status": b"HELLO\r\n\r\n",
+        }
+        for name, raw in answers.items():
+            with self.subTest(name), Stub(lambda request, raw=raw: raw) as stub:
+                client = Client(stub.url, timeout=5)
+                with self.assertRaises(TrazaError):
+                    with client.guard("r1"):
+                        self.fail("a fail-closed guard ran its body")
+                ran = []
+                with client.guard("r1", fail_open=True) as guard:
+                    ran.append("body")
+                self.assertEqual(ran, ["body"])
+                self.assertIsNone(guard.verdict)
+                self.assertIsInstance(guard.error, TrazaError)
+        # When the status is known it is kept, with the text that arrived.
+        with Stub(lambda request: answers["html"]) as stub:
+            with self.assertRaises(TrazaError) as caught:
+                Client(stub.url).ledger_head()
+            self.assertEqual(caught.exception.status, 200)
+            self.assertEqual(caught.exception.body, "<html>Sign in</html>")
+            with self.assertRaises(TrazaError):
+                Client(stub.url).request("GET", "/v1/anything")
+            with self.assertRaises(TrazaError):
+                Client(stub.url).evidence()
+
+
 class Configuration(unittest.TestCase):
     def test_from_env_and_repr(self):
         client = Client.from_env({"TRAZA_URL": "http://h:1/", "TRAZA_TOKEN": "secret", "TRAZA_TENANT": "acme"})
@@ -621,6 +732,19 @@ class Configuration(unittest.TestCase):
         self.assertNotIn("secret", repr(client))
         with self.assertRaises(ValueError):
             Client("127.0.0.1:8080")
+
+    def test_an_empty_tenant_variable_is_unset(self):
+        # As the shell hook reads it: `TRAZA_TENANT=` left in a profile must
+        # not name the default tenant, which a bound credential is refused
+        # (and which would narrow an unbound one's reads to it).
+        client = Client.from_env({"TRAZA_URL": AUTH.url, "TRAZA_TOKEN": ACME_RO, "TRAZA_TENANT": ""})
+        self.assertIsNone(client.tenant)
+        self.assertEqual(client.check("r1").tenant, "acme")
+        # An explicit "" still names the default tenant, which this
+        # credential may not ask about.
+        with self.assertRaises(AuthError):
+            Client(AUTH.url, token=ACME_RO, tenant="").check("r1")
+        self.assertIsNone(Client.from_env({"TRAZA_TENANT": ""}).tenant)
 
 
 if __name__ == "__main__":

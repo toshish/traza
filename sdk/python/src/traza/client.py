@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import http.client
 import inspect
 import json
 import os
@@ -16,7 +17,7 @@ import socket
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Tuple, TypeVar, Union
+from typing import IO, Any, Callable, Dict, Iterator, List, Mapping, Optional, Tuple, TypeVar, Union
 
 from . import __version__
 from .errors import FuseTripped, TrazaError, error_from_response
@@ -39,11 +40,42 @@ from .models import (
     decode,
 )
 
-__all__ = ["Client", "Guard", "EventStream"]
+__all__ = ["Client", "Guard", "EventStream", "FOLLOW_WAIT_MS"]
 
 F = TypeVar("F", bound=Callable[..., Any])
 
 LimitsLike = Union[Limits, Mapping[str, Any]]
+
+#: How long each read of a following event stream is held open when the
+#: caller names no wait. Under the server's 30 s ceiling, and under the 30 to
+#: 60 s idle timeouts common in reverse proxies and load balancers, so a quiet
+#: read is answered by Traza rather than cut off by something in between.
+FOLLOW_WAIT_MS = 25_000
+
+_VERDICTS = ("continue", "warn", "stop")
+
+
+class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
+    """Turns every 3xx into an error instead of following it.
+
+    urllib copies a request's headers onto the redirected one, Authorization
+    included: to another host, and from https to plain http. Traza never
+    redirects its own routes, so a 3xx comes from something in front of it (a
+    proxy canonicalising a host or upgrading a scheme), and the token must not
+    follow it anywhere. Declining here hands the 3xx to the default error
+    handler, which raises it as an ``HTTPError`` for :meth:`Client._send`.
+    """
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: IO[bytes],
+        code: int,
+        msg: str,
+        headers: http.client.HTTPMessage,
+        newurl: str,
+    ) -> Optional[urllib.request.Request]:
+        return None
 
 
 class Client:
@@ -51,12 +83,13 @@ class Client:
 
     ``url`` is the server's base URL (``http://127.0.0.1:8080``, or the
     prefix a reverse proxy serves it under). ``token`` is sent as
-    ``Authorization: Bearer``; leave it out for an open server. ``tenant``
-    scopes every call that takes one, for an unbound credential; a bound
-    credential is held to its own tenant by the server whatever is sent, and
-    naming another is refused with :class:`~traza.AuthError`. ``""`` names
-    the default tenant. ``timeout`` is in seconds, per request; a long-poll
-    adds its own wait on top.
+    ``Authorization: Bearer``; leave it out for an open server. A redirect is
+    never followed, so the token goes only to ``url``. ``tenant`` scopes
+    every call that takes one, for an unbound credential. A bound credential
+    can leave it out (the server scopes it to its own tenant) or name its own
+    tenant; naming any other, ``""`` included, is refused with
+    :class:`~traza.AuthError`. ``""`` names the default tenant. ``timeout``
+    is in seconds, per request; a long-poll adds its own wait on top.
     """
 
     def __init__(
@@ -73,12 +106,18 @@ class Client:
         self.token = token or None
         self.tenant = tenant
         self.timeout = timeout
+        # Built once per client rather than per call: building one reads the
+        # proxy settings, which on macOS asks the system configuration.
+        self._opener = urllib.request.build_opener(_RefuseRedirects)
 
     @classmethod
     def from_env(cls, environ: Optional[Mapping[str, str]] = None) -> "Client":
         """A client from ``TRAZA_URL``, ``TRAZA_TOKEN`` and ``TRAZA_TENANT``.
 
-        The same variables the Claude Code hook in ``examples/guard`` reads.
+        The same variables the Claude Code hook in ``examples/guard`` reads,
+        read the way it reads them: a variable set to the empty string is
+        unset. ``TRAZA_TENANT=`` left in a profile therefore does not name
+        the default tenant, which a bound credential would be refused.
         ``TRAZA_TOKEN`` (singular) is a client's bearer token; it is not the
         server's ``TRAZA_TOKENS`` list.
         """
@@ -86,7 +125,7 @@ class Client:
         return cls(
             url=env.get("TRAZA_URL") or "http://127.0.0.1:8080",
             token=env.get("TRAZA_TOKEN") or None,
-            tenant=env.get("TRAZA_TENANT"),
+            tenant=env.get("TRAZA_TENANT") or None,
         )
 
     def __repr__(self) -> str:
@@ -97,7 +136,7 @@ class Client:
 
     def whoami(self) -> Identity:
         """What the calling credential is: scope, binding, operator or not."""
-        return decode(Identity, self.request("GET", "/v1/whoami"))
+        return decode(Identity, self._object("GET", "/v1/whoami"))
 
     def usage(self) -> UsageReport:
         """Ingest counters, limits and quota state, per tenant.
@@ -105,7 +144,7 @@ class Client:
         A bound credential gets its own row. An unbound one gets every tenant
         with counters or limits, or only the client's ``tenant`` when set.
         """
-        return decode(UsageReport, self.request("GET", "/v1/usage", query=self._tenant_query()))
+        return decode(UsageReport, self._object("GET", "/v1/usage", query=self._tenant_query()))
 
     # ------------------------------------------------------------ fuses
 
@@ -122,7 +161,9 @@ class Client:
         added to the run's recorded usage hypothetically, with the estimates,
         and a step that would go past a ``stop`` limit answers ``stop``.
         Nothing about the run changes. A ``stop`` is a normal answer here,
-        not an exception; :meth:`guard` is the form that raises.
+        not an exception; :meth:`guard` is the form that raises. An answer
+        that names no verdict (``continue``, ``warn`` or ``stop``) raises
+        :class:`~traza.TrazaError` rather than passing for ``continue``.
         """
         nxt: Dict[str, Any] = {}
         if est_cost_usd is not None:
@@ -134,7 +175,7 @@ class Client:
         body: Dict[str, Any] = {"run": run, "next": nxt}
         if self.tenant is not None:
             body["tenant"] = self.tenant
-        return decode(Verdict, self.request("POST", "/v1/fuses/check", body=body))
+        return decode(Verdict, self._object("POST", "/v1/fuses/check", body=body, verdict=True))
 
     def guard(
         self,
@@ -153,10 +194,12 @@ class Client:
 
         As a decorator ``run`` may be a callable, called with the decorated
         function's arguments to name the run — for a graph node whose run id
-        lives in its state. With ``fail_open=True`` a server that cannot be
-        reached (or refuses the check) lets the step run and leaves the error
-        on ``.error``; by default the error propagates, because silently
-        running unguarded is a decision the caller should make.
+        lives in its state. With ``fail_open=True`` a check that cannot be
+        answered (an unreachable server, a refused check, or an answer that
+        is not a verdict, such as a proxy's HTML page) lets the step run and
+        leaves the error on ``.error``; by default the error propagates,
+        because silently running unguarded is a decision the caller should
+        make.
         """
         return Guard(self, run, est_cost_usd, est_tokens, tool, fail_open)
 
@@ -166,7 +209,7 @@ class Client:
         The first question about a run rebuilds it from stored spans
         (``source == "rebuilt"``). A run no span carries is ``continue``.
         """
-        return decode(Verdict, self.request("GET", "/v1/fuses/runs/" + _segment(run), query=self._tenant_query()))
+        return decode(Verdict, self._object("GET", "/v1/fuses/runs/" + _segment(run), query=self._tenant_query()))
 
     def runs(self, state: str = "active", limit: Optional[int] = None) -> List[Verdict]:
         """Runs the guard holds, most recently active first.
@@ -178,7 +221,7 @@ class Client:
         query["state"] = state
         if limit is not None:
             query["limit"] = limit
-        page = self.request("GET", "/v1/fuses/runs", query=query)
+        page = self._object("GET", "/v1/fuses/runs", query=query)
         return [decode(Verdict, item) for item in page.get("runs", [])]
 
     def trip(self, run: str, reason: Optional[str] = None) -> Verdict:
@@ -190,7 +233,7 @@ class Client:
         body = {"reason": reason} if reason is not None else {}
         return decode(
             Verdict,
-            self.request("POST", "/v1/fuses/runs/" + _segment(run) + "/trip", query=self._tenant_query(), body=body),
+            self._object("POST", "/v1/fuses/runs/" + _segment(run) + "/trip", query=self._tenant_query(), body=body),
         )
 
     def reset(self, run: str, grant: Optional[LimitsLike] = None) -> Verdict:
@@ -204,12 +247,12 @@ class Client:
         body = {"grant": _limits(grant)} if grant is not None else {}
         return decode(
             Verdict,
-            self.request("POST", "/v1/fuses/runs/" + _segment(run) + "/reset", query=self._tenant_query(), body=body),
+            self._object("POST", "/v1/fuses/runs/" + _segment(run) + "/reset", query=self._tenant_query(), body=body),
         )
 
     def policies(self) -> Policies:
         """The stored fuse policies and the server's global default."""
-        return decode(Policies, self.request("GET", "/v1/fuses/policies", query=self._tenant_query()))
+        return decode(Policies, self._object("GET", "/v1/fuses/policies", query=self._tenant_query()))
 
     def put_policy(
         self,
@@ -230,23 +273,29 @@ class Client:
             body["match"] = {"service": service}
         if self.tenant is not None:
             body["tenant"] = self.tenant
-        return decode(Policy, self.request("POST", "/v1/fuses/policies", body=body))
+        return decode(Policy, self._object("POST", "/v1/fuses/policies", body=body))
 
     def delete_policy(self, policy_id: str) -> Policy:
         """Delete a policy by id; returns the policy as it was."""
-        answer = self.request("POST", "/v1/fuses/policies/" + _segment(policy_id) + "/delete")
+        answer = self._object("POST", "/v1/fuses/policies/" + _segment(policy_id) + "/delete")
         return decode(Policy, answer.get("policy") or {})
 
-    def events(self, after: Optional[str] = None, wait_ms: int = 0, follow: bool = False) -> "EventStream":
+    def events(
+        self, after: Optional[str] = None, wait_ms: Optional[int] = None, follow: bool = False
+    ) -> "EventStream":
         """Verdict transitions, by cursor.
 
         Iterate the result for :class:`~traza.models.FuseEvent` objects.
         Iteration ends at the first read that returns nothing — with
-        ``wait_ms=0`` that drains what the server retains; with a wait, after
-        ``wait_ms`` without an event — unless ``follow`` is set, which polls
-        forever. The stream's ``cursor`` is the position to resume from with
-        ``after=``, and ``gap`` turns true when the server could no longer
-        honour a cursor (events may have been missed).
+        ``wait_ms=0`` (the default) that drains what the server retains; with
+        a wait, after ``wait_ms`` without an event — unless ``follow`` is set,
+        which reads forever. Every read of a following stream is a long-poll:
+        ``wait_ms`` defaults to :data:`FOLLOW_WAIT_MS` (25 s), and
+        ``follow=True`` with ``wait_ms=0`` is refused with ``ValueError``,
+        because it would poll as fast as the network allows. The stream's
+        ``cursor`` is the position to resume from with ``after=``, and
+        ``gap`` turns true when the server could no longer honour a cursor
+        (events may have been missed).
         """
         return EventStream(self, after, wait_ms, follow)
 
@@ -263,7 +312,7 @@ class Client:
             query["resolve"] = "true"
         if max_steps is not None:
             query["max_steps"] = max_steps
-        return decode(Tape, self.request("GET", "/v1/tapes/" + _segment(run), query=query))
+        return decode(Tape, self._object("GET", "/v1/tapes/" + _segment(run), query=query))
 
     def replay(self, run: str, mode: str = "strict") -> Replay:
         """Snapshot ``run`` into a replay that serves its model answers back.
@@ -276,7 +325,7 @@ class Client:
         body: Dict[str, Any] = {"run": run, "mode": mode}
         if self.tenant is not None:
             body["tenant"] = self.tenant
-        replay = decode(Replay, self.request("POST", "/v1/replays", body=body))
+        replay = decode(Replay, self._object("POST", "/v1/replays", body=body))
         replay._client = self
         return replay
 
@@ -284,7 +333,7 @@ class Client:
         """Align two runs' steps and name the first place they diverge."""
         query = self._tenant_query()
         query.update({"a": a, "b": b})
-        return decode(Diff, self.request("GET", "/v1/diff", query=query))
+        return decode(Diff, self._object("GET", "/v1/diff", query=query))
 
     def recall(self, query: str, outcome: str = "any", limit: int = 5) -> Recall:
         """Earlier runs whose recorded text holds every word of ``query``.
@@ -294,13 +343,13 @@ class Client:
         """
         params = self._tenant_query()
         params.update({"q": query, "outcome": outcome, "limit": limit})
-        return decode(Recall, self.request("GET", "/v1/recall", query=params))
+        return decode(Recall, self._object("GET", "/v1/recall", query=params))
 
     # ------------------------------------------------------------ ledger
 
     def ledger_head(self) -> LedgerHead:
         """The ledger's tip: what to anchor with an external notary."""
-        return decode(LedgerHead, self.request("GET", "/v1/ledger/head"))
+        return decode(LedgerHead, self._object("GET", "/v1/ledger/head"))
 
     def evidence(self, since: Optional[int] = None, until: Optional[int] = None) -> EvidencePack:
         """The evidence pack for a window of Unix nanoseconds.
@@ -313,8 +362,8 @@ class Client:
             query["since"] = since
         if until is not None:
             query["until"] = until
-        text = self._send("GET", "/v1/evidence", query, None, self.timeout)
-        pack = decode(EvidencePack, json.loads(text))
+        status, text = self._send("GET", "/v1/evidence", query, None, self.timeout)
+        pack = decode(EvidencePack, self._as_object(status, text))
         pack._text = text
         return pack
 
@@ -332,10 +381,52 @@ class Client:
 
         The escape hatch for routes this client does not wrap: the same
         credential, timeout and error mapping as every method above. ``path``
-        starts with ``/``; ``query`` values of ``None`` are left out.
+        starts with ``/``; ``query`` values of ``None`` are left out. A
+        success whose body is not JSON raises :class:`~traza.TrazaError`.
         """
-        text = self._send(method, path, query, body, self.timeout if timeout is None else timeout)
-        return json.loads(text) if text else None
+        status, text = self._send(method, path, query, body, self.timeout if timeout is None else timeout)
+        return self._parse(status, text)
+
+    def _object(
+        self,
+        method: str,
+        path: str,
+        query: Optional[Mapping[str, Any]] = None,
+        body: Any = None,
+        timeout: Optional[float] = None,
+        verdict: bool = False,
+    ) -> Dict[str, Any]:
+        """:meth:`request` for a route that answers a JSON object.
+
+        With ``verdict`` the object must also name a verdict the guard knows:
+        an answer it cannot act on must not read as ``continue``.
+        """
+        status, text = self._send(method, path, query, body, self.timeout if timeout is None else timeout)
+        return self._as_object(status, text, verdict)
+
+    def _as_object(self, status: int, text: str, verdict: bool = False) -> Dict[str, Any]:
+        value = self._parse(status, text)
+        if not isinstance(value, dict):
+            raise self._unreadable(status, text, "expected a JSON object, got " + _json_kind(value))
+        if verdict and value.get("verdict") not in _VERDICTS:
+            raise self._unreadable(status, text, "it names no verdict (continue, warn or stop)")
+        return value
+
+    def _parse(self, status: int, text: str) -> Any:
+        if not text:
+            return None
+        try:
+            return json.loads(text)
+        except ValueError as error:
+            raise self._unreadable(status, text, "not JSON") from error
+
+    def _unreadable(self, status: Optional[int], body: Any, why: str) -> TrazaError:
+        # A reverse proxy's sign-in or maintenance page, a captive portal, a
+        # body cut short: an answer arrived, but not one Traza gave. It is a
+        # TrazaError like a refused or unreachable request, so a fail-open
+        # guard and code that rides out an unavailable server treat it alike
+        # instead of meeting an exception they never expected.
+        return TrazaError(f"unreadable answer from {self.url}: {why}", status=status, body=body)
 
     def _send(
         self,
@@ -344,7 +435,7 @@ class Client:
         query: Optional[Mapping[str, Any]],
         body: Any,
         timeout: float,
-    ) -> str:
+    ) -> Tuple[int, str]:
         url = self.url + path
         if query:
             pairs = [(key, _query_value(value)) for key, value in query.items() if value is not None]
@@ -358,20 +449,43 @@ class Client:
         if self.token:
             headers["Authorization"] = "Bearer " + self.token
         req = urllib.request.Request(url, data=data, method=method, headers=headers)
+        status = 0  # until a status line has been read
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as response:
+            with self._opener.open(req, timeout=timeout) as response:
+                status = int(response.status)
                 raw: bytes = response.read()
-                return raw.decode("utf-8")
         except urllib.error.HTTPError as error:
-            raw = error.read() if error.fp is not None else b""
-            raise error_from_response(error.code, error.reason or "", dict(error.headers.items()), raw) from None
+            names = {name.lower(): value for name, value in error.headers.items()}
+            if 300 <= error.code < 400:
+                error.close()
+                location = names.get("location", "an unnamed location")
+                raise TrazaError(
+                    f"{self.url} answered {error.code}, a redirect to {location}; the client follows no "
+                    "redirect, so its token goes only to the URL it was given: configure the final URL",
+                    status=error.code,
+                    headers=names,
+                ) from None
+            try:
+                raw = error.read() if error.fp is not None else b""
+            except (OSError, http.client.HTTPException):
+                raw = b""
+            raise error_from_response(error.code, error.reason or "", names, raw) from None
         except urllib.error.URLError as error:
             raise TrazaError(f"could not reach {self.url}: {error.reason}") from error
         except (socket.timeout, TimeoutError) as error:
             raise TrazaError(f"no answer from {self.url} within {timeout} s") from error
+        except http.client.HTTPException as error:
+            # A status line that is not HTTP, a body shorter than its
+            # Content-Length, an over-long header. Not OSError, so without
+            # this arm it would escape as a type no caller expects.
+            raise self._unreadable(status or None, None, f"{type(error).__name__}: {error}") from error
         except OSError as error:
             # A connection reset mid-response, after urlopen returned.
             raise TrazaError(f"connection to {self.url} failed: {error}") from error
+        try:
+            return status, raw.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise self._unreadable(status, raw, "not UTF-8") from error
 
     def _tenant_query(self) -> Dict[str, Any]:
         return {"tenant": self.tenant} if self.tenant is not None else {}
@@ -379,12 +493,12 @@ class Client:
     # Called by Replay, which holds a reference to the client that made it.
 
     def _replay_status(self, replay_id: str) -> ReplayStatus:
-        return decode(ReplayStatus, self.request("GET", "/v1/replays/" + _segment(replay_id)))
+        return decode(ReplayStatus, self._object("GET", "/v1/replays/" + _segment(replay_id)))
 
     def _replay_next_tool(self, replay_id: str, name: Optional[str]) -> Optional[ToolStep]:
         body = {"tool": name} if name is not None else {}
         try:
-            answer = self.request("POST", "/v1/replays/" + _segment(replay_id) + "/tools/next", body=body)
+            answer = self._object("POST", "/v1/replays/" + _segment(replay_id) + "/tools/next", body=body)
         except TrazaError as error:
             # Running out of recorded tool steps is how a harness's loop ends,
             # not a failure; a withdrawn replay (also 410) still raises.
@@ -477,9 +591,15 @@ class Guard:
 class EventStream:
     """An iterable over fuse events. See :meth:`Client.events`."""
 
-    def __init__(self, client: Client, after: Optional[str], wait_ms: int, follow: bool) -> None:
+    def __init__(self, client: Client, after: Optional[str], wait_ms: Optional[int], follow: bool) -> None:
+        if wait_ms is None:
+            wait_ms = FOLLOW_WAIT_MS if follow else 0
         if not 0 <= wait_ms <= 30000:
             raise ValueError("wait_ms must be between 0 and 30000")
+        if follow and wait_ms == 0:
+            # Every empty read would be followed at once by the next one:
+            # thousands of requests a second, each on a new connection.
+            raise ValueError("follow needs a long-poll: give wait_ms > 0, or leave it out for 25000")
         self.client = client
         #: Where the next read starts; pass it back as ``after=`` to resume.
         self.cursor = after
@@ -498,7 +618,7 @@ class EventStream:
             # timeout must outlast it or every quiet poll would read as an
             # unreachable server.
             timeout = self.client.timeout + self.wait_ms / 1000
-            page = self.client.request("GET", "/v1/fuses/events", query=query, timeout=timeout)
+            page = self.client._object("GET", "/v1/fuses/events", query=query, timeout=timeout)
             if page.get("gap"):
                 self.gap = True
             events = page.get("events") or []
@@ -522,6 +642,18 @@ def _segment(value: str) -> str:
     if not isinstance(value, str) or not value:
         raise ValueError("expected a non-empty string")
     return urllib.parse.quote(value, safe="")
+
+
+def _json_kind(value: Any) -> str:
+    if value is None:
+        return "nothing"
+    if isinstance(value, list):
+        return "an array"
+    if isinstance(value, str):
+        return "a string"
+    if isinstance(value, bool):
+        return "a boolean"
+    return "a number"
 
 
 def _query_value(value: Any) -> str:

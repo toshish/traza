@@ -406,16 +406,23 @@ class Replay:
         """The absolute base URL for the Anthropic SDK (``…/anthropic``)."""
         return self._absolute("anthropic")
 
-    def env(self) -> Dict[str, str]:
+    def env(self, api_key: Optional[str] = None) -> Dict[str, str]:
         """The environment that points both providers' SDKs at this replay.
 
-        The API keys are the client's Traza token: the OpenAI SDK sends it as
-        a bearer token and the Anthropic SDK as ``x-api-key``, which Traza
-        accepts on the replay routes. On an open server any non-empty key
-        works, and the SDKs refuse to start without one, so a placeholder
-        stands in.
+        The API keys are ``api_key`` when given, else the client's Traza
+        token: the OpenAI SDK sends it as a bearer token and the Anthropic
+        SDK as ``x-api-key``, which Traza accepts on the replay routes. On an
+        open server any non-empty key works, and the SDKs refuse to start
+        without one, so a placeholder stands in.
+
+        Whatever key this returns, every library in the process that gets
+        the environment can read it, and one that reads ``OPENAI_API_KEY``
+        but ignores ``OPENAI_BASE_URL`` sends it to the real provider. When
+        the client holds an operator's token, pass a dedicated ``ro``
+        credential bound to the run's tenant as ``api_key``: any valid
+        credential of the replay's tenant may consume it.
         """
-        key = self._require_client().token or "traza-open"
+        key = api_key or self._require_client().token or "traza-open"
         return {
             "OPENAI_BASE_URL": self.openai_base_url,
             "OPENAI_API_KEY": key,

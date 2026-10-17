@@ -37,9 +37,15 @@ traza = Client.from_env()   # TRAZA_URL, TRAZA_TOKEN, TRAZA_TENANT
 ```
 
 `token` is sent as `Authorization: Bearer`; leave it out for an open server.
-`tenant` scopes every call that takes one, for an unbound credential. A bound
-credential is held to its own tenant by the server whatever you send. The
-`repr` of a client never shows the token.
+The client follows no redirect, so the token goes only to the URL you give
+it: a `3xx` (from a proxy upgrading the scheme, say) raises `TrazaError` with
+the `Location` in its message. `tenant` scopes every call that takes one, for
+an unbound credential. A bound credential can leave it out (the server scopes
+it to its own tenant) or name its own tenant; naming any other is refused
+with `AuthError` (`403`), and that includes `""`, the default tenant.
+`from_env()` treats a variable set to the empty string as unset, as the shell
+hook does, so a stray `TRAZA_TENANT=` names no tenant. The `repr` of a client
+never shows the token.
 
 ```python
 >>> traza.whoami()
@@ -118,8 +124,10 @@ verdict.usage.cost_usd, verdict.limits.max_cost_usd
 
 **If Traza cannot be reached**, the guard raises `TrazaError` (with
 `status=None`): running unguarded is a decision, so it is not made for you.
-`guard(run, fail_open=True)` makes it — the body runs and the error is left on
-the guard's `.error`.
+The same goes for an answer the guard cannot act on — a proxy's HTML page, a
+body cut short, JSON without a `continue`, `warn` or `stop` verdict — which
+is a `TrazaError` too. `guard(run, fail_open=True)` makes the decision for
+all of them: the body runs and the error is left on the guard's `.error`.
 
 ### Operating fuses
 
@@ -140,14 +148,17 @@ Limits can be a dict or a `traza.Limits`. Trip, reset and policy writes need an
 ### Watching the event feed
 
 ```python
-stream = traza.events(follow=True, wait_ms=25_000)   # long-polls; never ends
+stream = traza.events(follow=True)    # every read long-polls (25 s); never ends
 for event in stream:
     if event.kind in ("stop", "manual_stop"):
         page_oncall(event.run, event.reasons)
     save_cursor(stream.cursor)        # resume later with traza.events(after=cursor)
 ```
 
-Without `follow`, iteration ends at the first read that returns nothing.
+A following stream's `wait_ms` defaults to 25,000 and may be anything from 1
+to 30,000; `follow=True, wait_ms=0` raises `ValueError`, because it would ask
+again the instant each empty read came back. Without `follow`, `wait_ms`
+defaults to 0 and iteration ends at the first read that returns nothing.
 `stream.gap` turns true if the server could no longer honour your cursor —
 the feed is a ring of 4,096 events, and a restart empties it.
 
@@ -216,13 +227,20 @@ print(replay.status())        # served=2, remaining=0, diverged=None, …
 That loop was run as written against a recorded OpenLLMetry run, with
 `openai` 2.33 and, through `replay.anthropic_base_url`, `anthropic` 0.97.
 
-- `replay.env()` gives `OPENAI_BASE_URL`, `OPENAI_API_KEY`,
+- `replay.env(api_key=None)` gives `OPENAI_BASE_URL`, `OPENAI_API_KEY`,
   `ANTHROPIC_BASE_URL` and `ANTHROPIC_API_KEY` as absolute URLs, for an agent
   that builds its own client from the environment:
-  `subprocess.run(["python", "agent.py"], env={**os.environ, **replay.env()})`.
-  The keys are your Traza token (the Anthropic SDK's `x-api-key` is accepted on
-  the replay routes); on an open server a placeholder stands in, because the
-  SDKs refuse to start without a key.
+  `subprocess.run(["python", "agent.py"], env={**os.environ, **replay.env(api_key=agent_key)})`.
+  The keys are `api_key`, else your client's Traza token (the Anthropic SDK's
+  `x-api-key` is accepted on the replay routes); on an open server a
+  placeholder stands in, because the SDKs refuse to start without a key.
+- **Hand the agent its own key.** Every library in the agent process can read
+  what `env()` exports, and one that reads `OPENAI_API_KEY` but ignores
+  `OPENAI_BASE_URL` sends it to the real provider. If your client holds an
+  operator token, mint a dedicated `ro` credential bound to the run's tenant,
+  create the replay under that tenant (`Client(..., tenant="acme")`), and
+  pass the `ro` token as `api_key` (in the loop above, as the OpenAI
+  client's `api_key`). Any credential of the replay's tenant may consume it.
 - **Tools still run live** unless your harness takes their results from
   `next_tool()`, which returns `None` once no recorded tool step is left.
 - In strict mode a request whose messages differ from the recording is refused
@@ -292,7 +310,7 @@ Errors
 
 | Exception | When |
 |---|---|
-| `TrazaError` | Any refusal, and `status=None` when no response arrived. `.status`, `.message`, `.type` (e.g. `replay_divergence`), `.body`, `.retryable` |
+| `TrazaError` | Any refusal, and `status=None` when no response arrived. Also a redirect (its `3xx` status; none is followed) and an answer that cannot be read — not JSON, not the object the route answers, cut short — with the text that arrived on `.body`. `.status`, `.message`, `.type` (e.g. `replay_divergence`), `.body`, `.retryable` |
 | `AuthError` | `401`, or `403` with `.required` naming the missing grant (`rw`, `admin`, `unbound`) |
 | `NotFound` | `404` — another tenant's object included |
 | `Conflict` | `409` — a run that cannot be replayed, a strict divergence, `--no-fuses` |
@@ -316,4 +334,5 @@ The suite starts two real servers on ephemeral ports — one open, one with
 `TRAZA_TOKENS` — and runs every method against their responses, including a
 fuse stop raising `FuseTripped`, a replay consumed over the OpenAI and
 Anthropic routes with plain `urllib`, a quota refusal, and an evidence pack's
-digest. It takes a second or two.
+digest. Redirects and unreadable answers, which the real server never sends,
+come from a canned-answer stub (`tests/_stub.py`). It takes a few seconds.

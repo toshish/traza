@@ -51,13 +51,20 @@ class Server:
         # stderr goes to a file rather than a pipe: nothing drains a pipe once
         # the port is read, and a server blocked on a full pipe looks hung.
         self._stderr = open(self._stderr_path, "wb")
-        self.process = subprocess.Popen(
-            [str(server_binary()), "--data-dir", store, "--host", "127.0.0.1", "--port", "0", *(args or [])],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=self._stderr,
-            env=child_env,
-        )
+        try:
+            self.process = subprocess.Popen(
+                [str(server_binary()), "--data-dir", store, "--host", "127.0.0.1", "--port", "0", *(args or [])],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=self._stderr,
+                env=child_env,
+            )
+        except BaseException:
+            # No binary, or one that cannot be executed: nothing to stop,
+            # but the directory and the log handle are already there.
+            self._stderr.close()
+            shutil.rmtree(self.data_dir, ignore_errors=True)
+            raise
         self.port = self._wait_for_port()
         self.url = f"http://127.0.0.1:{self.port}"
 

@@ -29,6 +29,7 @@ python3 scripts/test-release-channel.py                    # stable and preview 
 python3 scripts/test-rust-notices.py                       # notice collection checks
 python3 scripts/generate-rust-notices.py --check            # locked dependency notices
 python3 scripts/test-object-s3.py                         # authenticated disposable S3 backend
+python3 scripts/check-sdk-metadata.py                      # client versions and license copies match the engine's
 python3 -m unittest discover -s sdk/python/tests           # Python client, against the release binary
 (cd sdk/typescript && npm ci && npm test)                  # TypeScript client, likewise
 (cd ui && npm ci && npm test && npm run build)             # dashboard

@@ -28,45 +28,66 @@ export function serverBinary() {
   return path;
 }
 
-/** Starts a server; resolves `{ url, port, stderr(), stop() }`. */
-export async function startServer({ args = [], env = {} } = {}) {
+/**
+ * Starts a server; resolves `{ url, port, stderr(), stop() }`. On any failure
+ * to come up it rejects only after the child is gone and its directory
+ * removed: a live child, or its open stderr pipe, would keep the test
+ * process from exiting and turn a failure into a CI job that hangs until
+ * its timeout.
+ */
+export async function startServer({ args = [], env = {}, startupTimeoutMs = 15_000 } = {}) {
+  const binary = serverBinary();
   const dir = mkdtempSync(join(tmpdir(), "traza-sdk-ts-"));
   const childEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("TRAZA_")));
   Object.assign(childEnv, env);
-  const child = spawn(
-    serverBinary(),
-    ["--data-dir", join(dir, "store"), "--host", "127.0.0.1", "--port", "0", ...args],
-    { stdio: ["ignore", "ignore", "pipe"], env: childEnv },
-  );
+  const child = spawn(binary, ["--data-dir", join(dir, "store"), "--host", "127.0.0.1", "--port", "0", ...args], {
+    stdio: ["ignore", "ignore", "pipe"],
+    env: childEnv,
+  });
   let stderr = "";
   let exited = false;
+  let spawnError;
   // The listener keeps draining stderr after the port is read: a server
   // blocked on a full pipe looks hung.
   child.stderr.setEncoding("utf8");
   child.stderr.on("data", (chunk) => {
     stderr += chunk;
   });
+  // A binary that cannot be executed (EACCES, ENOENT) never spawns: Node
+  // reports it as an 'error' event, which unhandled would crash the process,
+  // and 'close' (stdio drained) rather than 'exit' is the one sure to follow.
+  child.on("error", (error) => {
+    spawnError = error;
+  });
   const exit = new Promise((resolveExit) => {
-    child.on("exit", () => {
+    child.on("close", () => {
       exited = true;
       resolveExit();
     });
   });
-  const port = await new Promise((resolvePort, reject) => {
-    const timer = setTimeout(() => reject(new Error(`traza-server did not report a port within 15 s:\n${stderr}`)), 15_000);
+  const fail = async (message) => {
+    if (!exited) {
+      child.kill("SIGKILL");
+      await exit;
+    }
+    rmSync(dir, { recursive: true, force: true });
+    throw new Error(message);
+  };
+  const port = await new Promise((resolvePort) => {
+    const began = Date.now();
     const poll = setInterval(() => {
       const match = LISTENING.exec(stderr);
-      if (match) {
-        clearTimeout(timer);
+      if (match || exited || Date.now() - began > startupTimeoutMs) {
         clearInterval(poll);
-        resolvePort(Number(match[1]));
-      } else if (exited) {
-        clearTimeout(timer);
-        clearInterval(poll);
-        reject(new Error(`traza-server exited before listening:\n${stderr}`));
+        resolvePort(match ? Number(match[1]) : null);
       }
     }, 10);
   });
+  if (port === null) {
+    if (spawnError) await fail(`could not start traza-server at ${binary}: ${spawnError.message}`);
+    if (exited) await fail(`traza-server exited before listening:\n${stderr}`);
+    await fail(`traza-server did not report a port within ${startupTimeoutMs / 1000} s:\n${stderr}`);
+  }
   return {
     port,
     url: `http://127.0.0.1:${port}`,

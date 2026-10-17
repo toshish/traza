@@ -35,17 +35,25 @@ export type FetchLike = (input: string, init: RequestInit) => Promise<Response>;
 
 /** Options for {@link Client}. */
 export interface ClientOptions {
-  /** Sent as `Authorization: Bearer`; leave it out for an open server. */
+  /**
+   * Sent as `Authorization: Bearer`; leave it out for an open server. A
+   * redirect is never followed, so the token goes only to the client's URL.
+   */
   token?: string;
   /**
    * Scopes every call that takes a tenant, for an unbound credential. A bound
-   * credential is held to its own tenant whatever is sent, and naming
-   * another is refused. `""` names the default tenant.
+   * credential can leave it out (the server scopes it to its own tenant) or
+   * name its own tenant; naming any other, `""` included, is refused with
+   * {@link AuthError}. `""` names the default tenant.
    */
   tenant?: string;
   /** Per request, in milliseconds. Default 10000. A long-poll adds its wait. */
   timeoutMs?: number;
-  /** A `fetch` to use instead of the global one. */
+  /**
+   * A `fetch` to use instead of the global one. It is called with
+   * `redirect: "manual"`; one that follows redirects regardless would carry
+   * the token wherever they point.
+   */
   fetch?: FetchLike;
 }
 
@@ -67,7 +75,8 @@ export interface CheckOptions extends CallOptions {
 /** Options for {@link Client.guard} and {@link Client.guarded}. */
 export interface GuardOptions extends CheckOptions {
   /**
-   * When the check cannot be answered (unreachable server, refused check),
+   * When the check cannot be answered (an unreachable server, a refused
+   * check, or an answer that is not a verdict, such as a proxy's HTML page),
    * let the step run instead of throwing. Off by default: running unguarded
    * is a decision the caller should make, not a silent fallback.
    */
@@ -80,11 +89,25 @@ export interface GuardOptions extends CheckOptions {
 export interface EventOptions extends CallOptions {
   /** The cursor to read after; absent reads everything the server retains. */
   after?: string;
-  /** How long each read waits for an event when none is there, 0–30000 ms. */
+  /**
+   * How long each read waits for an event when none is there, 0–30000 ms.
+   * Defaults to 0 (drain and end), or to {@link FOLLOW_WAIT_MS} when
+   * following; `follow` with `waitMs: 0` throws a `RangeError`.
+   */
   waitMs?: number;
-  /** Keep polling forever instead of ending at the first empty read. */
+  /** Keep reading forever, each read a long-poll, instead of ending at the first empty read. */
   follow?: boolean;
 }
+
+/**
+ * How long each read of a following event stream is held open when the
+ * caller names no wait. Under the server's 30 s ceiling, and under the 30 to
+ * 60 s idle timeouts common in reverse proxies and load balancers, so a quiet
+ * read is answered by Traza rather than cut off by something in between.
+ */
+export const FOLLOW_WAIT_MS = 25_000;
+
+const VERDICTS: readonly unknown[] = ["continue", "warn", "stop"];
 
 /** Options for {@link Client.request}. */
 export interface RequestOptions extends CallOptions {
@@ -98,8 +121,17 @@ export interface RequestOptions extends CallOptions {
 
 const DEFAULT_URL = "http://127.0.0.1:8080";
 
+// Replay and EventStream read through Client's private transport. A static
+// block is the one place outside Client's own methods that can reach a
+// private member, so it hands this module (and nothing it exports) a way in.
+let readObject: <T>(client: Client, method: string, path: string, options: RequestOptions) => Promise<T>;
+
 /** A client for one Traza server. */
 export class Client {
+  static {
+    readObject = (client, method, path, options) => client.#object(method, path, options);
+  }
+
   /** The server's base URL, without a trailing slash. */
   readonly url: string;
   readonly tenant: string | undefined;
@@ -128,15 +160,18 @@ export class Client {
 
   /**
    * A client from `TRAZA_URL`, `TRAZA_TOKEN` and `TRAZA_TENANT` — the
-   * variables the Claude Code hook in `examples/guard` reads. Defaults to
-   * `process.env` where there is one.
+   * variables the Claude Code hook in `examples/guard` reads, read the way it
+   * reads them: a variable set to the empty string is unset, so
+   * `TRAZA_TENANT=` left in a profile does not name the default tenant, which
+   * a bound credential would be refused. Defaults to `process.env` where
+   * there is one.
    */
   static fromEnv(env?: Record<string, string | undefined>): Client {
     const source =
       env ?? (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env ?? {};
     return new Client(source.TRAZA_URL || DEFAULT_URL, {
       token: source.TRAZA_TOKEN || undefined,
-      tenant: source.TRAZA_TENANT,
+      tenant: source.TRAZA_TENANT || undefined,
     });
   }
 
@@ -149,7 +184,7 @@ export class Client {
 
   /** What the calling credential is: scope, binding, operator or not. */
   whoami(options: CallOptions = {}): Promise<Identity> {
-    return this.request<Identity>("GET", "/v1/whoami", options);
+    return this.#object<Identity>("GET", "/v1/whoami", options);
   }
 
   /**
@@ -157,7 +192,7 @@ export class Client {
    * gets its own row; an unbound one every tenant, or the client's tenant.
    */
   usage(options: CallOptions = {}): Promise<UsageReport> {
-    return this.request<UsageReport>("GET", "/v1/usage", { ...options, query: this.#tenantQuery() });
+    return this.#object<UsageReport>("GET", "/v1/usage", { ...options, query: this.#tenantQuery() });
   }
 
   // ---------------------------------------------------------- fuses
@@ -167,7 +202,9 @@ export class Client {
    * or a call of `tool` — is added to the run's recorded usage
    * hypothetically, with the estimates; a step that would go past a `stop`
    * limit answers `stop`. Nothing about the run changes, and a `stop` is a
-   * normal answer here: {@link guard} is the form that throws.
+   * normal answer here: {@link guard} is the form that throws. An answer that
+   * names no verdict (`continue`, `warn` or `stop`) rejects with
+   * {@link TrazaError} rather than passing for `continue`.
    */
   check(run: string, options: CheckOptions = {}): Promise<Verdict> {
     const next: Record<string, unknown> = {};
@@ -176,7 +213,7 @@ export class Client {
     if (options.tool !== undefined) next.tool = options.tool;
     const body: Record<string, unknown> = { run, next };
     if (this.tenant !== undefined) body.tenant = this.tenant;
-    return this.request<Verdict>("POST", "/v1/fuses/check", { signal: options.signal, body });
+    return this.#object<Verdict>("POST", "/v1/fuses/check", { signal: options.signal, body }, true);
   }
 
   /**
@@ -229,7 +266,7 @@ export class Client {
    * carries is `continue`.
    */
   runVerdict(run: string, options: CallOptions = {}): Promise<Verdict> {
-    return this.request<Verdict>("GET", `/v1/fuses/runs/${segment(run)}`, {
+    return this.#object<Verdict>("GET", `/v1/fuses/runs/${segment(run)}`, {
       ...options,
       query: this.#tenantQuery(),
     });
@@ -242,7 +279,7 @@ export class Client {
   async runs(
     options: CallOptions & { state?: "active" | "warn" | "stop"; limit?: number } = {},
   ): Promise<Verdict[]> {
-    const page = await this.request<{ runs: Verdict[] }>("GET", "/v1/fuses/runs", {
+    const page = await this.#object<{ runs: Verdict[] }>("GET", "/v1/fuses/runs", {
       signal: options.signal,
       query: { ...this.#tenantQuery(), state: options.state ?? "active", limit: options.limit },
     });
@@ -255,7 +292,7 @@ export class Client {
    * personal data out of it. Needs an `rw` credential.
    */
   trip(run: string, options: CallOptions & { reason?: string } = {}): Promise<Verdict> {
-    return this.request<Verdict>("POST", `/v1/fuses/runs/${segment(run)}/trip`, {
+    return this.#object<Verdict>("POST", `/v1/fuses/runs/${segment(run)}/trip`, {
       signal: options.signal,
       query: this.#tenantQuery(),
       body: options.reason === undefined ? {} : { reason: options.reason },
@@ -269,7 +306,7 @@ export class Client {
    * limits to the absolute values named.
    */
   reset(run: string, options: CallOptions & { grant?: Limits } = {}): Promise<Verdict> {
-    return this.request<Verdict>("POST", `/v1/fuses/runs/${segment(run)}/reset`, {
+    return this.#object<Verdict>("POST", `/v1/fuses/runs/${segment(run)}/reset`, {
       signal: options.signal,
       query: this.#tenantQuery(),
       body: options.grant === undefined ? {} : { grant: options.grant },
@@ -278,7 +315,7 @@ export class Client {
 
   /** The stored fuse policies and the server's global default. */
   policies(options: CallOptions = {}): Promise<Policies> {
-    return this.request<Policies>("GET", "/v1/fuses/policies", { ...options, query: this.#tenantQuery() });
+    return this.#object<Policies>("GET", "/v1/fuses/policies", { ...options, query: this.#tenantQuery() });
   }
 
   /**
@@ -297,12 +334,12 @@ export class Client {
     };
     if (policy.service !== undefined) body.match = { service: policy.service };
     if (this.tenant !== undefined) body.tenant = this.tenant;
-    return this.request<Policy>("POST", "/v1/fuses/policies", { signal: options.signal, body });
+    return this.#object<Policy>("POST", "/v1/fuses/policies", { signal: options.signal, body });
   }
 
   /** Deletes a policy by id; resolves the policy as it was. */
   async deletePolicy(id: string, options: CallOptions = {}): Promise<Policy> {
-    const answer = await this.request<{ deleted: boolean; policy: Policy }>(
+    const answer = await this.#object<{ deleted: boolean; policy: Policy }>(
       "POST",
       `/v1/fuses/policies/${segment(id)}/delete`,
       options,
@@ -334,7 +371,7 @@ export class Client {
    * `--tape-max-bytes`.
    */
   tape(run: string, options: CallOptions & { resolve?: boolean; maxSteps?: number } = {}): Promise<Tape> {
-    return this.request<Tape>("GET", `/v1/tapes/${segment(run)}`, {
+    return this.#object<Tape>("GET", `/v1/tapes/${segment(run)}`, {
       signal: options.signal,
       query: { ...this.#tenantQuery(), resolve: options.resolve ? "true" : undefined, max_steps: options.maxSteps },
     });
@@ -349,13 +386,13 @@ export class Client {
   async replay(run: string, options: CallOptions & { mode?: "strict" | "loose" } = {}): Promise<Replay> {
     const body: Record<string, unknown> = { run, mode: options.mode ?? "strict" };
     if (this.tenant !== undefined) body.tenant = this.tenant;
-    const document = await this.request<ReplayDocument>("POST", "/v1/replays", { signal: options.signal, body });
+    const document = await this.#object<ReplayDocument>("POST", "/v1/replays", { signal: options.signal, body });
     return new Replay(this, document);
   }
 
   /** Aligns two runs' steps and names the first place they diverge. */
   diff(a: string, b: string, options: CallOptions = {}): Promise<Diff> {
-    return this.request<Diff>("GET", "/v1/diff", { signal: options.signal, query: { ...this.#tenantQuery(), a, b } });
+    return this.#object<Diff>("GET", "/v1/diff", { signal: options.signal, query: { ...this.#tenantQuery(), a, b } });
   }
 
   /**
@@ -366,7 +403,7 @@ export class Client {
     query: string,
     options: CallOptions & { outcome?: "any" | "success" | "failure"; limit?: number } = {},
   ): Promise<Recall> {
-    return this.request<Recall>("GET", "/v1/recall", {
+    return this.#object<Recall>("GET", "/v1/recall", {
       signal: options.signal,
       query: { ...this.#tenantQuery(), q: query, outcome: options.outcome ?? "any", limit: options.limit ?? 5 },
     });
@@ -376,7 +413,7 @@ export class Client {
 
   /** The ledger's tip: what to anchor with an external notary. */
   ledgerHead(options: CallOptions = {}): Promise<LedgerHead> {
-    return this.request<LedgerHead>("GET", "/v1/ledger/head", options);
+    return this.#object<LedgerHead>("GET", "/v1/ledger/head", options);
   }
 
   /**
@@ -387,11 +424,11 @@ export class Client {
   async evidence(
     options: CallOptions & { since?: bigint | number; until?: bigint | number } = {},
   ): Promise<EvidencePack> {
-    const text = await this.#send("GET", "/v1/evidence", {
+    const { status, text } = await this.#send("GET", "/v1/evidence", {
       signal: options.signal,
       query: { ...this.#tenantQuery(), since: options.since, until: options.until },
     });
-    const pack = parseJson(text) as EvidencePack;
+    const pack = this.#asObject(status, text) as unknown as EvidencePack;
     Object.defineProperty(pack, "verifyDigest", { value: () => verifyEvidenceDigest(text), enumerable: false });
     return pack;
   }
@@ -401,14 +438,55 @@ export class Client {
   /**
    * Sends one request and resolves its parsed JSON body: the escape hatch for
    * routes this client does not wrap, with the same credential, timeout and
-   * error mapping as every method above.
+   * error mapping as every method above. A success whose body is not JSON
+   * rejects with {@link TrazaError}.
    */
   async request<T = unknown>(method: string, path: string, options: RequestOptions = {}): Promise<T> {
-    const text = await this.#send(method, path, options);
-    return (text ? parseJson(text) : null) as T;
+    const { status, text } = await this.#send(method, path, options);
+    return this.#parse(status, text) as T;
   }
 
-  async #send(method: string, path: string, options: RequestOptions): Promise<string> {
+  /**
+   * {@link request} for a route that answers a JSON object. With `verdict`
+   * the object must also name a verdict the guard knows: an answer it cannot
+   * act on must not read as `continue`.
+   */
+  async #object<T>(method: string, path: string, options: RequestOptions, verdict = false): Promise<T> {
+    const { status, text } = await this.#send(method, path, options);
+    return this.#asObject(status, text, verdict) as T;
+  }
+
+  #asObject(status: number, text: string, verdict = false): Record<string, unknown> {
+    const value = this.#parse(status, text);
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+      throw this.#unreadable(status, text, `expected a JSON object, got ${jsonKind(value)}`);
+    }
+    const object = value as Record<string, unknown>;
+    if (verdict && !VERDICTS.includes(object.verdict)) {
+      throw this.#unreadable(status, text, "it names no verdict (continue, warn or stop)");
+    }
+    return object;
+  }
+
+  #parse(status: number, text: string): unknown {
+    if (!text) return null;
+    try {
+      return parseJson(text);
+    } catch (error) {
+      throw this.#unreadable(status, text, "not JSON", error);
+    }
+  }
+
+  #unreadable(status: number, body: string, why: string, cause?: unknown): TrazaError {
+    // A reverse proxy's sign-in or maintenance page, a captive portal: an
+    // answer arrived, but not one Traza gave. It is a TrazaError like a
+    // refused or unreachable request, so a fail-open guard and code that
+    // rides out an unavailable server treat it alike instead of meeting an
+    // error they never expected.
+    return new TrazaError(`unreadable answer from ${this.url}: ${why}`, { status, body, cause });
+  }
+
+  async #send(method: string, path: string, options: RequestOptions): Promise<{ status: number; text: string }> {
     let url = this.url + path;
     const query = new URLSearchParams();
     for (const [key, value] of Object.entries(options.query ?? {})) {
@@ -436,7 +514,12 @@ export class Client {
     try {
       let response: Response;
       try {
-        response = await fetcher(url, { method, headers, body, signal: deadline.signal });
+        // "manual": Traza never redirects its own routes, so a 3xx comes from
+        // something in front of it (a proxy canonicalising a host or
+        // upgrading a scheme). Following it would carry the token along in a
+        // same-origin hop, and in any fetch that does not strip it across
+        // origins as the platform's does.
+        response = await fetcher(url, { method, headers, body, signal: deadline.signal, redirect: "manual" });
       } catch (error) {
         throw this.#transportError(error, options.signal, deadline.timedOut(), timeoutMs);
       }
@@ -446,14 +529,23 @@ export class Client {
       } catch (error) {
         throw this.#transportError(error, options.signal, deadline.timedOut(), timeoutMs);
       }
-      if (!response.ok) {
-        const names: Record<string, string> = {};
-        response.headers.forEach((value, name) => {
-          names[name.toLowerCase()] = value;
-        });
-        throw errorFromResponse(response.status, response.statusText, names, text);
+      const names: Record<string, string> = {};
+      response.headers.forEach((value, name) => {
+        names[name.toLowerCase()] = value;
+      });
+      // A browser hides a manual redirect behind an opaque response with
+      // status 0 and no headers; elsewhere it is the 3xx itself.
+      if (response.type === "opaqueredirect" || (response.status >= 300 && response.status < 400)) {
+        const location = names.location ?? "an unnamed location";
+        const status = response.status ? `${response.status}, ` : "";
+        throw new TrazaError(
+          `${this.url} answered ${status}a redirect to ${location}; the client follows no redirect, ` +
+            "so its token goes only to the URL it was given: configure the final URL",
+          { status: response.status || null, headers: names },
+        );
       }
-      return text;
+      if (!response.ok) throw errorFromResponse(response.status, response.statusText, names, text);
+      return { status: response.status, text };
     } finally {
       deadline.dispose();
     }
@@ -517,13 +609,20 @@ export class Replay implements ReplayDocument {
 
   /**
    * The environment that points both providers' SDKs at this replay. The
-   * keys are the client's Traza token (the OpenAI SDK sends it as a bearer
-   * token, the Anthropic SDK as `x-api-key`, which the replay routes accept);
-   * on an open server any non-empty key works and the SDKs refuse to start
-   * without one, so a placeholder stands in.
+   * keys are `apiKey` when given, else the client's Traza token (the OpenAI
+   * SDK sends it as a bearer token, the Anthropic SDK as `x-api-key`, which
+   * the replay routes accept); on an open server any non-empty key works and
+   * the SDKs refuse to start without one, so a placeholder stands in.
+   *
+   * Whatever key this returns, every library in the process that gets the
+   * environment can read it, and one that reads `OPENAI_API_KEY` but ignores
+   * `OPENAI_BASE_URL` sends it to the real provider. When the client holds an
+   * operator's token, pass a dedicated `ro` credential bound to the run's
+   * tenant as `apiKey`: any valid credential of the replay's tenant may
+   * consume it.
    */
-  env(): ReplayEnv {
-    const key = this.#client.token ?? "traza-open";
+  env(options: { apiKey?: string } = {}): ReplayEnv {
+    const key = options.apiKey || this.#client.token || "traza-open";
     return {
       OPENAI_BASE_URL: this.openaiBaseUrl,
       OPENAI_API_KEY: key,
@@ -534,7 +633,7 @@ export class Replay implements ReplayDocument {
 
   /** What the replay has served so far, and its first divergence. */
   status(options: CallOptions = {}): Promise<ReplayStatus> {
-    return this.#client.request<ReplayStatus>("GET", `/v1/replays/${segment(this.id)}`, options);
+    return readObject<ReplayStatus>(this.#client, "GET", `/v1/replays/${segment(this.id)}`, options);
   }
 
   /**
@@ -545,7 +644,7 @@ export class Replay implements ReplayDocument {
    */
   async nextTool(tool?: string, options: CallOptions = {}): Promise<ToolStep | null> {
     try {
-      return await this.#client.request<ToolStep>("POST", `/v1/replays/${segment(this.id)}/tools/next`, {
+      return await readObject<ToolStep>(this.#client, "POST", `/v1/replays/${segment(this.id)}/tools/next`, {
         signal: options.signal,
         body: tool === undefined ? {} : { tool },
       });
@@ -570,18 +669,25 @@ export class EventStream implements AsyncIterable<FuseEvent> {
   readonly #signal: AbortSignal | undefined;
 
   constructor(client: Client, options: EventOptions) {
-    const waitMs = options.waitMs ?? 0;
+    const follow = options.follow ?? false;
+    const waitMs = options.waitMs ?? (follow ? FOLLOW_WAIT_MS : 0);
     if (!(waitMs >= 0 && waitMs <= 30_000)) throw new RangeError("waitMs must be between 0 and 30000");
+    // Every empty read would be followed at once by the next one: a request
+    // loop as fast as the network allows.
+    if (follow && waitMs === 0) {
+      throw new RangeError("follow needs a long-poll: give waitMs > 0, or leave it out for 25000");
+    }
     this.#client = client;
     this.cursor = options.after;
     this.#waitMs = waitMs;
-    this.#follow = options.follow ?? false;
+    this.#follow = follow;
     this.#signal = options.signal;
   }
 
   async *[Symbol.asyncIterator](): AsyncGenerator<FuseEvent, void, undefined> {
     for (;;) {
-      const page = await this.#client.request<{ events: FuseEvent[]; next?: string; gap?: boolean }>(
+      const page = await readObject<{ events?: FuseEvent[]; next?: string; gap?: boolean }>(
+        this.#client,
         "GET",
         "/v1/fuses/events",
         {
@@ -598,7 +704,8 @@ export class EventStream implements AsyncIterable<FuseEvent> {
         },
       );
       if (page.gap) this.gap = true;
-      for (const event of page.events) {
+      const events = page.events ?? [];
+      for (const event of events) {
         // Advanced before the yield, so a consumer that breaks out early
         // resumes just past the last event it was handed.
         this.cursor = event.cursor;
@@ -607,9 +714,15 @@ export class EventStream implements AsyncIterable<FuseEvent> {
       // `next` can be past the last event: it also skips events a tenant
       // filter hid, so a filtered reader keeps pace.
       if (page.next !== undefined) this.cursor = page.next;
-      if (page.events.length === 0 && !this.#follow) return;
+      if (events.length === 0 && !this.#follow) return;
     }
   }
+}
+
+function jsonKind(value: unknown): string {
+  if (value === null) return "nothing";
+  if (Array.isArray(value)) return "an array";
+  return `a ${typeof value === "bigint" ? "number" : typeof value}`;
 }
 
 /** Percent-encodes one path segment: a run id may contain `/`. */

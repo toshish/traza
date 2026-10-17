@@ -18,8 +18,10 @@ what was recorded and acts on the answer. The one place they touch
 instrumentation is `otel_env` / `otelEnv`, which writes the exporter's
 environment variables.
 
-Both are versioned with the engine (0.27.0) and tested against the
-`traza-server` binary built from the same tree.
+Both carry the engine's version number, and are tested against the
+`traza-server` binary built from the same tree. A version bump that misses
+one of them fails the gate (`scripts/check-sdk-metadata.py`, which also holds
+each package's copy of `LICENSE` and `NOTICE` to the repository's).
 
 ## What they cover
 
@@ -36,7 +38,7 @@ Both are versioned with the engine (0.27.0) and tested against the
 | `policies()`, `put_policy(…)`, `delete_policy(id)` | `policies()`, `putPolicy(…)`, `deletePolicy(id)` | [`/v1/fuses/policies`](http-api.md#post-v1fusespolicies) |
 | `events(after, wait_ms, follow)` — an iterator | `events({after, waitMs, follow})` — an async iterable | [`GET /v1/fuses/events`](http-api.md#get-v1fusesevents) |
 | `tape(run, resolve)` | `tape(run, {resolve})` | [`GET /v1/tapes/{run}`](http-api.md#get-v1tapesrun) |
-| `replay(run, mode)` → `.openai_base_url`, `.anthropic_base_url`, `.env()`, `.status()`, `.next_tool(name)` | `replay(run, {mode})` → `.openaiBaseUrl`, `.anthropicBaseUrl`, `.env()`, `.status()`, `.nextTool(name)` | [`/v1/replays`](http-api.md#post-v1replays) |
+| `replay(run, mode)` → `.openai_base_url`, `.anthropic_base_url`, `.env(api_key)`, `.status()`, `.next_tool(name)` | `replay(run, {mode})` → `.openaiBaseUrl`, `.anthropicBaseUrl`, `.env({apiKey})`, `.status()`, `.nextTool(name)` | [`/v1/replays`](http-api.md#post-v1replays) |
 | `diff(a, b)` | `diff(a, b)` | [`GET /v1/diff`](http-api.md#get-v1diff) |
 | `recall(query, outcome, limit)` | `recall(query, {outcome, limit})` | [`GET /v1/recall`](http-api.md#get-v1recall) |
 | `ledger_head()` | `ledgerHead()` | [`GET /v1/ledger/head`](http-api.md#get-v1ledgerhead) |
@@ -55,11 +57,23 @@ client's credential and error mapping.
 `tenant` is sent wherever a route takes one — as `?tenant=` on reads and the
 single-run fuse routes, and as a `tenant` body field on the fuse check,
 policies and replay creation — and nowhere else, because the server refuses
-unknown query parameters. A bound credential is held to its own tenant by
-the server whatever is sent. Both clients build from `TRAZA_URL`,
-`TRAZA_TOKEN` and `TRAZA_TENANT` (`Client.from_env()` / `Client.fromEnv()`),
-the variables the [Claude Code hook](../../examples/guard/README.md) reads,
-and neither prints its token in a `repr` or a `console.log`.
+unknown query parameters. A bound credential can leave `tenant` unset (the
+server scopes it to its own tenant) or name its own tenant; **naming any
+other is refused with `403`**, and that includes `""`, which names the
+default tenant. Both clients build from `TRAZA_URL`, `TRAZA_TOKEN` and
+`TRAZA_TENANT` (`Client.from_env()` / `Client.fromEnv()`), the variables the
+[Claude Code hook](../../examples/guard/README.md) reads, and read them the
+way it does: a variable set to the empty string counts as unset, so a stray
+`TRAZA_TENANT=` does not turn every call of a bound credential into a `403`.
+Neither client prints its token in a `repr` or a `console.log`.
+
+**Redirects are refused, not followed.** Traza never redirects its own
+routes, so a `3xx` comes from something in front of it — a proxy upgrading
+`http` to `https`, or canonicalising a host name. Following it would send the
+token wherever the redirect points (Python's `urllib` copies the
+`Authorization` header onto the next request, across hosts and from `https`
+to `http`). Both clients raise a `TrazaError` with the `3xx` status and the
+`Location` in its message instead: configure the URL the redirect names.
 
 **Run ids are percent-encoded as one path segment.** They come from
 telemetry, so `/`, `?`, `#`, `%` and spaces are all expected; the tests use
@@ -69,7 +83,11 @@ telemetry, so `/`, `?`, `#`, `%` and spaces are all expected; the tests use
 grant), `404` is `NotFound`, `409` is `Conflict`, `410` is `Gone`, `429` is
 `QuotaExceeded` (with `Retry-After` in seconds, and the `quota` object for a
 quota or pause), and anything else is `TrazaError`, the base of them all. A
-request that gets no response is a `TrazaError` with no status. The machine
+request that gets no response is a `TrazaError` with no status. So is an
+answer that arrives but cannot be read — a body that is not JSON (a reverse
+proxy's sign-in page, a captive portal), JSON that is not the object the
+route answers, a body cut short, a status line that is not HTTP — with the
+status when one was read and the text that arrived on `.body`. The machine
 kind some routes send (`replay_divergence`, `tool_unreadable`, …) is on
 `.type`, and `retryable` is false when the server said `x-should-retry:
 false`. Neither client retries on its own.
@@ -100,10 +118,24 @@ Two choices are the caller's, not the client's:
 - **The run id** must be the session id the agent's instrumentation records
   (`session.id`, `gen_ai.conversation.id`, or OpenLLMetry's association
   property), or the guard and the spans describe different runs.
-- **An unreachable server raises by default.** `fail_open=True` (Python) or
-  `failOpen: true` (TypeScript) lets the step run instead. Running unguarded
-  is a decision someone should make; the shell hook in `examples/guard` makes
-  the opposite default for an interactive tool, and says so.
+- **A check that cannot be answered raises by default** — an unreachable
+  server, a refused check, or an answer that is not a verdict (anything but
+  a JSON object whose `verdict` is `continue`, `warn` or `stop`).
+  `fail_open=True` (Python) or `failOpen: true` (TypeScript) lets the step
+  run instead, in every one of those cases. Running unguarded is a decision
+  someone should make; the shell hook in `examples/guard` makes the opposite
+  default for an interactive tool, and says so.
+
+## The event feed
+
+`events()` reads [`GET /v1/fuses/events`](http-api.md#get-v1fusesevents) by
+cursor. Without `follow` it drains what the server retains and ends at the
+first empty read (`wait_ms` / `waitMs` defaults to 0). With `follow` it reads
+forever, and **every read is a long-poll**: the wait defaults to 25 s
+(`FOLLOW_WAIT_MS`), under both the server's 30 s ceiling and the idle
+timeouts common in proxies, and a wait of 0 is refused (`ValueError` /
+`RangeError`), because each empty read would be followed at once by the next
+— thousands of requests a second against a quiet feed.
 
 ## Replays
 
@@ -112,10 +144,23 @@ the client's own URL with the server's `base_urls` path appended. They are
 concatenated rather than resolved, so a client configured with a reverse
 proxy's path prefix keeps it. `env()` returns `OPENAI_BASE_URL`,
 `OPENAI_API_KEY`, `ANTHROPIC_BASE_URL` and `ANTHROPIC_API_KEY`; the keys are
-the client's token, which the replay routes accept as a bearer token or as
-the Anthropic SDK's `x-api-key`. On an open server the keys are a placeholder,
-because both provider SDKs refuse to start without one and the server accepts
-any.
+the `api_key` / `apiKey` passed to it, else the client's own token, which the
+replay routes accept as a bearer token or as the Anthropic SDK's `x-api-key`.
+On an open server the keys are a placeholder, because both provider SDKs
+refuse to start without one and the server accepts any.
+
+**Mind which credential `env()` hands out.** Every library in the process that
+receives the environment can read the key, and one that reads
+`OPENAI_API_KEY` but builds its own base URL (or ignores `OPENAI_BASE_URL`)
+sends it to the real provider. If the client holds an operator's token — the
+one that trips runs and writes policies — do not export it. Mint a dedicated
+`ro` credential bound to the run's tenant
+([`POST /v1/admin/credentials`](http-api.md#post-v1admincredentials)), create
+the replay under that tenant (a client with `tenant` set, or the bound
+credential itself), and pass the `ro` token as `api_key` / `apiKey`. Any valid
+credential of the replay's tenant may consume it; a replay created from the
+operator view, with no tenant, answers only unbound operators
+([replays follow tenancy](replay.md)).
 
 `next_tool()` / `nextTool()` returns the next recorded tool result, and
 `None` / `null` when none is left: running out is how a harness's loop ends.
@@ -172,8 +217,13 @@ Each suite spawns `traza-server` — `$TRAZA_SERVER_BIN`, else
 `target/release/traza-server` — twice on ephemeral loopback ports, one open
 and one with `TRAZA_TOKENS`, each with a private data directory and every
 inherited `TRAZA_*` variable removed. A missing binary fails the suite rather
-than skipping it. Both run in a few seconds, and `./ci.sh` runs them after the
-demos when `python3` and Node 20+ are present.
+than skipping it. Answers the real server never gives — redirects, HTML
+pages, truncated bodies — come from a small canned-answer stub beside each
+suite, and the TypeScript suite also drives its own harness's failure paths
+(a server that never listens, exits first or cannot be executed), which must
+end the test process promptly rather than hang it. Both run in a few
+seconds. `./ci.sh` runs `scripts/check-sdk-metadata.py` and the Python suite
+after the demos, and the TypeScript suite when Node 20+ with npm is present.
 
 ## Limitations
 

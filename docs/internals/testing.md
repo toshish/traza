@@ -136,7 +136,9 @@ The client libraries carry suites of their own, in their own languages:
 (`node:test`, run against the compiled package). Each spawns the real
 `traza-server` — `$TRAZA_SERVER_BIN`, else `target/release/traza-server` —
 once open and once with `TRAZA_TOKENS`, and drives every client method against
-its responses; see [client libraries](../guide/clients.md#testing).
+its responses. What the real server never sends — redirects, HTML pages,
+truncated bodies — comes from a canned-answer stub beside each suite; see
+[client libraries](../guide/clients.md#testing).
 
 Note two rows. `docs/llm-semantics.md` is tested — if you change a recipe
 there, change the test. And `tests/mcp.rs` guards claims the MCP guide makes in
@@ -175,8 +177,11 @@ order:
 3. `cargo clippy --all-targets --all-features -- -D warnings`
 4. `cargo build --release`
 5. `cargo test`
-6. The client libraries' suites against the release binary, each skipped with
-   a message when its runtime (`python3`, Node 20+) is absent
+6. The client libraries: `scripts/check-sdk-metadata.py` (their versions match
+   `Cargo.toml`, their `LICENSE` and `NOTICE` copies match the root's), then
+   their suites against the release binary. The Python suite always runs
+   (`python3` is already required); the TypeScript suite is skipped with a
+   message when Node 20+ with npm is absent
 7. `cd ui && npm ci && npm test && npm run build`
 
 The dashboard is a first-class part of the product: a UI that does not build,
