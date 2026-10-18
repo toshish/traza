@@ -82,6 +82,30 @@ fn repeats_fold_into_buckets_and_paths_stop_at_their_depth() {
 }
 
 #[test]
+fn a_path_read_in_part_is_judged_on_what_was_read_never_called_novel() {
+    let (fixture, now) = seeded("fold-token", crate::Config::default(), false);
+    let store = fixture.store();
+    let build = store
+        .fate
+        .get_or_build(store, &BuildKey::of(Some(""), None, None), now, None)
+        .expect("builds");
+    let cohort = build.cohort("", "support-agent").expect("cohort");
+    let partial = ["llm:gpt-4o".to_owned(), FOLD_TOKEN.to_owned()];
+    let walked = walk(&build, cohort, &partial, None);
+    assert_eq!(walked.matched.len(), 2);
+    assert!(walked.stopped.is_none());
+    let judged = judge(&build, cohort, &partial, None, DEFAULT_VERDICT_SUPPORT);
+    assert_eq!(judged.verdict, ForesightVerdict::OnTrack);
+    assert_eq!(judged.node.map(|(_, counts)| counts.visits), Some(180));
+    // A token no run took at that point is new, though.
+    let novel = ["llm:gpt-4o".to_owned(), "tool:summon".to_owned()];
+    assert_eq!(
+        judge(&build, cohort, &novel, None, DEFAULT_VERDICT_SUPPORT).verdict,
+        ForesightVerdict::Novel
+    );
+}
+
+#[test]
 fn long_names_are_cut_at_a_character_boundary() {
     let long = format!("tool:{}", "é".repeat(200));
     let cut = stem(&long);
@@ -907,6 +931,48 @@ fn predictive_limits_act_on_checks_from_a_cached_map_only() {
         .reasons
         .last()
         .is_some_and(|reason| reason.contains("this path and then called tool:issue_refund")));
+    // The interval's upper bound is what is compared, not the estimate: at
+    // odds of 0.55, 15 of 30 (50%, upper bound 66.8%) is not confident
+    // enough to stop anything.
+    let warn_policy = |odds: f64| {
+        store
+            .put_fuse_policy(crate::guard::PolicySpec {
+                name: "support".into(),
+                matches: crate::guard::PolicyMatch {
+                    service: Some("support-agent".into()),
+                },
+                limits: crate::guard::Limits {
+                    min_success_odds: Some(odds),
+                    ..crate::guard::Limits::default()
+                },
+                action: Action::Warn,
+                ..crate::guard::PolicySpec::default()
+            })
+            .expect("policy")
+    };
+    warn_policy(0.55);
+    let hesitant = check("live-healthy-0", Some("issue_refund"));
+    assert_eq!(hesitant.verdict, Verdict::Continue);
+    assert!(hesitant.foresight.as_ref().is_some_and(|f| !f.raised));
+    // And a warn policy warns rather than stops.
+    warn_policy(0.7);
+    let warned = check("live-healthy-0", Some("issue_refund"));
+    assert_eq!(warned.verdict, Verdict::Warn);
+    assert!(warned.foresight.as_ref().is_some_and(|f| f.raised));
+    store
+        .put_fuse_policy(crate::guard::PolicySpec {
+            name: "support".into(),
+            matches: crate::guard::PolicyMatch {
+                service: Some("support-agent".into()),
+            },
+            limits: crate::guard::Limits {
+                min_success_odds: Some(0.7),
+                ..crate::guard::Limits::default()
+            },
+            action: Action::Stop,
+            ..crate::guard::PolicySpec::default()
+        })
+        .expect("policy");
     // One step recorded is fewer than the default three: no foresight stop
     // however poor the odds (98 of 180 is below 0.7).
     let early = check("live-early-0", None);
@@ -952,6 +1018,27 @@ fn predictive_limits_act_on_checks_from_a_cached_map_only() {
     // A policy without the limit never reads foresight at all.
     let plain = store.fuse_verdict("", "trace:nothing").expect("verdict");
     assert!(plain.foresight.is_none());
+}
+
+#[test]
+fn cached_foresight_never_builds_on_the_request_path() {
+    let (fixture, _) = seeded("cached-foresight", crate::Config::default(), true);
+    let store = fixture.store();
+    let cold = store.foresee_cached("", "live-doomed-0", 30);
+    assert_eq!(cold.verdict, ForesightVerdict::InsufficientHistory);
+    assert!(cold.map_built_at_ns.is_none());
+    assert!(
+        store.fate.lock().expect("lock").entries.is_empty(),
+        "nothing was built on the request path"
+    );
+    assert_eq!(store.maintain_fate().expect("warms"), 1);
+    let warm = store.foresee_cached("", "live-doomed-0", 30);
+    assert_eq!(warm.verdict, ForesightVerdict::LikelyFailure);
+    assert_eq!((warm.support, warm.successes), (50, 5));
+    assert!(
+        !warm.raised,
+        "raising is the fuse's decision, not foresight's"
+    );
 }
 
 #[test]

@@ -2399,6 +2399,9 @@ fn walk(
         });
         match next.filter(|&child| counts(child).visits > 0) {
             Some(child) => matched.push(child),
+            // A path read only in part ends in the fold token: what follows
+            // is unknown, not new, so the walk ends where the reading did.
+            None if token == FOLD_TOKEN => break,
             None => {
                 return Walked {
                     matched,
@@ -2715,6 +2718,16 @@ impl Store {
             Some(error) => Err(error),
             None => Ok(built),
         }
+    }
+
+    /// Foresight for one run of `tenant` read from a CACHED map only — the
+    /// answer a predictive fuse acts on, for a surface that must never build
+    /// a map on its request path (a live-runs listing, say). Reads the run's
+    /// spans under the query deadline; with no map cached, or a run that
+    /// cannot be read in time, the verdict is `insufficient_history` and a
+    /// background build is requested ([`Self::maintain_fate`]).
+    pub fn foresee_cached(&self, tenant: &str, run: &str, min_support: u64) -> GuardForesight {
+        self.fate_for_guard(tenant, run, min_support.max(1), None, Instant::now())
     }
 
     /// Drops every cached map: called by every erasure.
