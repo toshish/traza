@@ -209,6 +209,7 @@ impl Store {
         let steer = self.steer()?;
         let mut page = self.guard_live_page(tenant, limit, self.config.steer.live_window)?;
         fill_pending(steer, &mut page.runs)?;
+        self.fill_live_foresight(&mut page.runs);
         Ok(page)
     }
 
@@ -232,8 +233,14 @@ impl Store {
             wait,
         )?;
         match &mut update {
-            LiveUpdate::Snapshot(page) => fill_pending(steer, &mut page.runs)?,
-            LiveUpdate::Changed(runs) => fill_pending(steer, runs)?,
+            LiveUpdate::Snapshot(page) => {
+                fill_pending(steer, &mut page.runs)?;
+                self.fill_live_foresight(&mut page.runs);
+            }
+            LiveUpdate::Changed(runs) => {
+                fill_pending(steer, runs)?;
+                self.fill_live_foresight(runs);
+            }
             LiveUpdate::Idle => {}
         }
         Ok(update)

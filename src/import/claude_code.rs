@@ -81,6 +81,16 @@ pub(crate) struct ClaudeCode {
     goal_set: bool,
     any_span: bool,
     delta: Vec<Value>,
+    /// The conversation this transcript is (`gen_ai.conversation.id`): the
+    /// session for a main transcript, `<session>/<agent id>` for a
+    /// sub-agent's.
+    conversation: String,
+    /// Whether the next model call starts its conversation over — the first
+    /// after a compaction — so its input is its whole context, not a delta.
+    restart: bool,
+    /// Whether the held delta starts with a compaction summary, which a
+    /// compaction boundary recorded after it must not clear.
+    summary_held: bool,
     /// message id → llm span id.
     messages: HashMap<String, String>,
     /// Content blocks already folded into each response, by digest, so a
@@ -107,6 +117,10 @@ impl ClaudeCode {
             (Mode::Agent { .. }, false) => Some(path.with_extension("meta.json")),
             _ => None,
         };
+        let conversation = match &mode {
+            Mode::Main => session.clone(),
+            Mode::Agent { agent_id, .. } => format!("{session}/{agent_id}"),
+        };
         let agent_name = match &mode {
             Mode::Main => SOURCE.as_str().to_owned(),
             Mode::Agent { agent_type, .. } => {
@@ -128,6 +142,9 @@ impl ClaudeCode {
             goal_set: false,
             any_span: false,
             delta: Vec::new(),
+            conversation,
+            restart: false,
+            summary_held: false,
             messages: HashMap::new(),
             seen_blocks: HashSet::new(),
             tools: HashMap::new(),
@@ -392,6 +409,13 @@ impl ClaudeCode {
             } else {
                 "user/meta"
             });
+            if compact {
+                // The conversation starts over from the summary: what was
+                // held for the next call was summarized away with the rest.
+                self.delta.clear();
+                self.restart = true;
+                self.summary_held = true;
+            }
             if interrupt {
                 if let Some(id) = self.turn.clone() {
                     if let Some(span) = self.spans.get_mut(&id, end) {
@@ -501,11 +525,15 @@ impl ClaudeCode {
                     }
                 }
                 let input = std::mem::take(&mut self.delta);
-                let (tenant, trace, base, agent) = (
+                // A delta of its conversation, unless it starts it over.
+                let delta = !std::mem::take(&mut self.restart);
+                self.summary_held = false;
+                let (tenant, trace, base, agent, conversation) = (
                     self.tenant.clone(),
                     self.trace.clone(),
                     self.base.clone(),
                     self.agent_name.clone(),
+                    self.conversation.clone(),
                 );
                 let name = format!("chat {}", model.unwrap_or("unknown"));
                 let made = self.spans.touch(&id, end, || {
@@ -520,6 +548,11 @@ impl ClaudeCode {
                     }
                     a.insert("gen_ai.response.id".into(), json!(message_id));
                     a.insert("gen_ai.agent.name".into(), json!(agent));
+                    a.insert(
+                        crate::xray::CONVERSATION_ATTRIBUTE.into(),
+                        json!(conversation),
+                    );
+                    a.insert(crate::xray::INPUT_DELTA_ATTRIBUTE.into(), json!(delta));
                     if !input.is_empty() {
                         a.insert("gen_ai.input.messages".into(), Value::Array(input));
                     }
@@ -702,19 +735,27 @@ impl ClaudeCode {
                 .filter_map(|(key, value)| Some((key.to_owned(), value?.clone())))
                 .collect(),
             }),
-            "compact_boundary" => Some(Event {
-                name: "claude_code.compaction".into(),
-                timestamp_ns: at,
-                attributes: record
-                    .get("compactMetadata")
-                    .and_then(Value::as_object)
-                    .map(|meta| {
-                        meta.iter()
-                            .filter(|(_, value)| !value.is_object() && !value.is_array())
-                            .map(|(key, value)| (key.clone(), value.clone()))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
+            "compact_boundary" => Some({
+                // Claude Code writes the boundary just before the summary; a
+                // summary already held (the other order) is kept.
+                if !self.summary_held {
+                    self.delta.clear();
+                }
+                self.restart = true;
+                Event {
+                    name: "claude_code.compaction".into(),
+                    timestamp_ns: at,
+                    attributes: record
+                        .get("compactMetadata")
+                        .and_then(Value::as_object)
+                        .map(|meta| {
+                            meta.iter()
+                                .filter(|(_, value)| !value.is_object() && !value.is_array())
+                                .map(|(key, value)| (key.clone(), value.clone()))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                }
             }),
             _ => None,
         };

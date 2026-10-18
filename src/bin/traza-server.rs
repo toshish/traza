@@ -1138,6 +1138,10 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
         ));
     }
 
+    // Live runs keep their behaviour paths for foresight, which reads only
+    // cached Fate Maps: with the cache off, nothing would read them.
+    fuses.live_paths = !fate.cache_ttl.is_zero();
+
     Ok(Some(Options {
         data_dir,
         host,

@@ -254,6 +254,15 @@ when it beats the current rate. From the corpus's novel run:
 live). `min_support=` sets the support a verdict needs. A run no span carries
 is `404`.
 
+### On the live view
+
+[`GET /v1/runs/live`](http-api.md#get-v1runslive), its stream and the MCP
+`list_live_runs` tool carry each running run's foresight — verdict, success
+rate, interval and support — read from the run guard's memory and the cached
+map, so a dashboard can rank what is running now by how runs like it have
+ended. See [steer](steer.md#foresight-on-live-runs) for how it is kept
+current.
+
 ## Predictive fuses
 
 A [fuse policy](guard.md#policies) may set three more limits:

@@ -133,6 +133,12 @@ pub struct LiveRun {
     pub policy: String,
     /// Nudges queued for the run and not yet delivered or expired.
     pub pending_nudges: usize,
+    /// How earlier runs that took this run's path ended, from the run's
+    /// behaviour path in memory and its tenant's cached Fate Map; absent when
+    /// no whole path is held for the run (see
+    /// [`Store::fill_live_foresight`](crate::Store)).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub foresight: Option<crate::fate::LiveForesight>,
 }
 
 /// A listing of live runs.
@@ -233,6 +239,7 @@ impl State {
             reasons: judged.reasons,
             policy: judged.policy,
             pending_nudges: 0,
+            foresight: None,
         }
     }
 

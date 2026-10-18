@@ -45,8 +45,10 @@ live.
 | `started_ns` | The run's first span's start. |
 | `steps`, `cost_usd`, `tokens`, `errors`, `verdict`, `reasons`, `policy` | As the [guard](guard.md#runs) counts and judges them. |
 | `pending_nudges` | Nudges queued and not yet delivered or expired. |
+| `foresight` | How earlier runs of its agent that took the same path ended — a verdict, the success rate with its 95% interval, and how many runs that is — read from memory; see [foresight on live runs](#foresight-on-live-runs). |
 
-The listing is built from the guard's live state alone — no store read.
+The listing is built from the guard's live state alone — no store read,
+except the one-time read that gives a run its foresight (below).
 Runs are indexed by change, across tenants and per tenant; a listing walks
 from the newest change, stops at its `limit` (default 100, at most 1,000) or
 at the first change older than the window, and skips on the way runs that
@@ -68,6 +70,36 @@ following after a restart lists with the usage seen since, exactly like
 with no span yet holds no guard state, so it is not listed until its first
 span arrives, however often it checks. Stopped runs evicted from memory
 (*parked*) are not live.
+
+### Foresight on live runs
+
+Each live run carries its [foresight](foresight.md#foresight-for-one-run):
+
+```json
+"foresight": {"base_rate": 0.5444, "ci95": [0.0435, 0.2136],
+              "map_built_at_ns": 1792312576819863000, "p_success": 0.1,
+              "support": 50, "verdict": "likely_failure"}
+```
+
+— this run's path so far was taken by 50 earlier runs of its agent, and 5 of
+them succeeded, against 54% for the agent overall. It is counted from
+history, never predicted by a model. The guard keeps every live run's
+behaviour path — its earliest 192 steps, 48 bytes each, inside the guard's
+span budget — and the tenant's [Fate Map](foresight.md#the-fate-map) is the
+cached one the predictive fuses read, so the verdict costs a walk of the path
+down the map: no store read. Verdicts are judged at the predictive fuses'
+default support of 30 runs; with fewer, or no map cached yet, the verdict is
+`insufficient_history`.
+
+Two things put a run's foresight off for a moment. A listing that finds no
+map cached asks the background builder for one, so the first look at a
+tenant shows no verdicts and the next ones, a build later, do. And a run the
+guard has followed only since it came into memory — never asked about — may
+be a tail of a longer run, so it is read whole from the store first, as a
+verdict query reads it: at most 8 such runs per listing, newest first, once
+each while they stay in memory. Runs that check before every step (the hook
+pack, the SDK guards) are already whole. `--fate-cache-seconds 0` turns all
+of this off: no paths are kept, and no row has `foresight`.
 
 ### The stream
 

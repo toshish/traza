@@ -327,8 +327,9 @@ twenty reads, then — and a call naming either is refused.
 `list_live_runs` is [`GET /v1/runs/live`](http-api.md#get-v1runslive): the
 runs active now, most recently changed first, each with its agent, the step
 it is on (a step a pre-call check named and no span has recorded yet is
-marked pending), its usage, verdict and waiting nudges, as text and as
-`structuredContent`. It takes `limit` (default 20, at most 200) and, for an
+marked pending), its usage, verdict, [foresight](steer.md#foresight-on-live-runs)
+— a verdict and success rate the server counted from earlier runs, never a
+model's prediction — and waiting nudges, as text and as `structuredContent`. It takes `limit` (default 20, at most 200) and, for an
 unbound credential, `tenant`. `run_topology` is
 [`GET /v1/runs/{run}/topology`](http-api.md#get-v1runsruntopology) rendered:
 the run's agents, which delegated to which, the ping-pong pairs (control

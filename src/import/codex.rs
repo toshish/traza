@@ -157,6 +157,9 @@ pub(crate) struct Codex {
     awaiting_usage: Vec<String>,
     last_total: Option<String>,
     delta: Vec<Value>,
+    /// Whether the next model call starts its conversation over — the first
+    /// after a compaction — so its input is its whole context, not a delta.
+    restart: bool,
     calls: HashMap<String, String>,
     last_input_at: Option<u64>,
     /// The latest timestamp seen: the oldest builds wrote item lines with
@@ -233,6 +236,7 @@ impl Codex {
             awaiting_usage: Vec::new(),
             last_total: None,
             delta: Vec::new(),
+            restart: false,
             calls: HashMap::new(),
             last_input_at: None,
             last_at: None,
@@ -395,13 +399,16 @@ impl Codex {
         );
         let started = self.last_input_at.filter(|t| *t <= at).unwrap_or(at);
         let input = std::mem::take(&mut self.delta);
-        let (tenant, trace, base, agent, provider, model) = (
+        // A delta of its thread's conversation, unless it starts it over.
+        let delta = !std::mem::take(&mut self.restart);
+        let (tenant, trace, base, agent, provider, model, thread) = (
             self.tenant.clone(),
             self.trace.clone(),
             self.base.clone(),
             self.agent_name.clone(),
             self.provider.clone(),
             self.model.clone(),
+            self.thread.clone(),
         );
         self.spans.touch(&id, end, || {
             let name = format!("chat {}", model.as_deref().unwrap_or("unknown"));
@@ -414,6 +421,8 @@ impl Codex {
                 a.insert("gen_ai.request.model".into(), json!(model));
             }
             a.insert("gen_ai.agent.name".into(), json!(agent));
+            a.insert(crate::xray::CONVERSATION_ATTRIBUTE.into(), json!(thread));
+            a.insert(crate::xray::INPUT_DELTA_ATTRIBUTE.into(), json!(delta));
             if !input.is_empty() {
                 a.insert("gen_ai.input.messages".into(), Value::Array(input));
             }
@@ -1024,6 +1033,7 @@ impl Codex {
                 }
             }
             "ContextCompaction" => {
+                self.compacted(None, stats);
                 if let Some(id) = self.current_container() {
                     if let Some(span) = self.spans.get_mut(&id, end) {
                         span.events.push(Event {
@@ -1037,6 +1047,39 @@ impl Codex {
             "CommandExecution" | "FileChange" | "McpToolCall" | "WebSearch" | "Extension"
             | "ImageView" | "DynamicToolCall" => self.replay_tool(kind, item, at, end, stats),
             _ => {}
+        }
+    }
+
+    /// The thread's conversation was compacted: the next model call starts
+    /// it over, from the replacement history when the record carries one
+    /// (its messages become that call's input, its whole context as far as
+    /// the rollout says), else from what follows.
+    fn compacted(&mut self, payload: Option<&Value>, stats: &mut FileStats) {
+        self.delta.clear();
+        self.restart = true;
+        let Some(history) = payload
+            .and_then(|payload| payload.get("replacement_history"))
+            .and_then(Value::as_array)
+        else {
+            return;
+        };
+        for item in history {
+            if str_field(item, "type") != Some("message") {
+                continue;
+            }
+            let (texts, images) = message_texts(item.get("content"));
+            let role = match str_field(item, "role") {
+                Some("user") => "user",
+                Some("assistant") => "assistant",
+                _ => "system",
+            };
+            let mut parts = vec![
+                json!({"type": "text", "content": bounded(&texts.join("\n"), MAX_PART_BYTES)}),
+            ];
+            for _ in 0..images {
+                parts.push(json!({"type": "image", "omitted": true}));
+            }
+            self.push_delta(json!({"role": role, "parts": parts}), stats);
         }
     }
 
@@ -1227,6 +1270,7 @@ impl Converter for Codex {
             (Some("compacted"), _, Some(at)) => {
                 stats.record("compacted");
                 self.close_response();
+                self.compacted(record.get("payload"), stats);
                 if let Some(id) = self.current_container() {
                     if let Some(span) = self.spans.get_mut(&id, end) {
                         span.events.push(Event {

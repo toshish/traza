@@ -341,6 +341,14 @@ pub struct FuseConfig {
     /// Most live runs held in memory; past it the least recently active is
     /// evicted and rebuilt from the store when next asked about.
     pub max_runs: usize,
+    /// Whether every live run keeps its behaviour path — its earliest steps'
+    /// signatures (see [`crate::fate::LivePath`]), counted against the span
+    /// budget — so foresight on the live view and the predictive fuses reads
+    /// a run's path from memory. When off, only runs a predictive policy
+    /// (`min_success_odds`) could govern keep one. On by default;
+    /// `traza-server` turns it off with the Fate Map cache
+    /// (`--fate-cache-seconds 0`), since nothing would read the paths.
+    pub live_paths: bool,
 }
 
 impl Default for FuseConfig {
@@ -357,6 +365,7 @@ impl Default for FuseConfig {
             },
             action: Action::Warn,
             max_runs: DEFAULT_MAX_RUNS,
+            live_paths: true,
         }
     }
 }

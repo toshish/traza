@@ -243,6 +243,18 @@ characters of the input digest when there is an input; for example
 `tool:web_search#50951da9bae64397`. Two steps with the same fingerprint made
 the same call with the same input.
 
+### Conversations recorded as deltas
+
+| Attribute | Meaning |
+|---|---|
+| `gen_ai.conversation.id` | The conversation (thread) a model call belongs to. The [context X-Ray and Cache Autopsy](guide/xray.md#conversations-recorded-as-deltas) pair a call only with calls of its own conversation — the nearest earlier one, whatever they share. |
+| `traza.input.delta` | Traza extension, a boolean (or exactly `"true"`). `true`: the call's input holds only the messages sent since its conversation's previous call, and its whole context is that call's context, then that call's output, then this input. Absent or `false`: the input is the whole context (the default, and the first call after a compaction). |
+
+The [recorders](guide/recorders.md) set both on every model call they
+convert, since a transcript records each message once. Nothing else reads
+`traza.input.delta`: a tape, a replay and a diff show a call's input as
+recorded.
+
 ### Run identity
 
 A span's **run** is its session id (the session precedence above), else

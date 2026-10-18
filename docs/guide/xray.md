@@ -236,6 +236,55 @@ reached — the dropped chunk is marked `"unverified": true`: it may have been
 changed rather than lost. `xray_step` counts only verified losses as lost
 instructions.
 
+## Conversations recorded as deltas
+
+Some recorders write each model call's *new* messages only, not its whole
+context again — a transcript of a long session would otherwise grow with the
+square of its length. The [recorders](recorders.md) do this for Claude Code
+and Codex, and mark it on every model call:
+
+- `gen_ai.conversation.id` names the conversation the call belongs to: the
+  session for a main transcript, `<session>/<agent id>` for a Claude Code
+  sub-agent, the thread for Codex.
+- `traza.input.delta: true` says the call's `gen_ai.input.messages` holds only
+  the messages sent since the conversation's previous call. The first call
+  after a compaction is marked `false`: it starts over, and its input is all
+  it saw.
+
+The X-Ray and the Cache Autopsy read such a call as the **whole context it
+was**: the conversation's previous context, then what that call answered,
+then the call's own messages — rebuilt by reading the run's model calls in
+step order. An X-Ray of the fortieth call of a Claude Code session shows the
+task, every answer and every tool result of the forty, with each chunk's
+provenance and age, not the one tool result the transcript recorded for it.
+A call whose delta is empty (a retry) is the conversation so far plus the
+last answer. Any other producer can use the same two attributes.
+
+A call that names a conversation **pairs with the nearest earlier call of
+that conversation**, whatever the two share, and never with a call of
+another conversation (or of none). After a compaction that is the call it
+compacted — so `dropped_since_previous` lists everything the compaction took,
+the instructions flagged — and the autopsy calls it `new_context`,
+`rewritten`. A sub-agent's first call is the first of its own conversation.
+
+Bounds and what they cost: one request keeps at most 64 conversations'
+running contexts and 64 MiB of their chunk text; past either the least
+recently continued conversation is dropped, and a later delta call of it is
+reported with its context unavailable (*could not be rebuilt*) rather than
+as a context it was not. A rebuilt context is held to the 2,000-chunk bound
+like any other (`chunks_truncated`). The X-Ray reads the run's earlier calls
+twice when it rebuilds — once in order to rebuild the call and the comparison
+window, once as recorded for provenance — inside the same query deadline and
+payload budgets. A delta call past the read limit is X-rayed alone and says
+its context is partial.
+
+What a transcript does not record, the rebuilt context cannot show: Claude
+Code and Codex transcripts carry neither the system prompt nor the tool
+definitions, so a rebuilt context is the conversation only. A `stable`
+verdict therefore says the *recorded* prefix held; when the provider reports
+no cache read for such a call, the autopsy counts it among `disagreements` —
+the unrecorded part changed, or the cache entry was evicted.
+
 ## Cache Autopsy
 
 ```sh
@@ -293,11 +342,17 @@ the previous 32 model calls of the same tenant:
 - When both calls name an agent — `gen_ai.agent.name` on the call, else the
   name of the nearest enclosing agent step — calls of **different agents never
   pair**.
+- When a call names its conversation (`gen_ai.conversation.id`), none of the
+  above applies: its predecessor is the nearest earlier call of the same
+  conversation, and nothing else ([conversations recorded as
+  deltas](#conversations-recorded-as-deltas)).
 
 A call with no predecessor is `new_context`. The explanation says which case
-it is: *the first model call of the run*, or *no earlier call among the
+it is: *the first model call of the run*, *no earlier call among the
 previous 32 shares this call's leading chunks or half of its chunks* — a new
-conversation, or one whose previous call lies further back. If a nearer
+conversation, or one whose previous call lies further back — or, for a call
+that names its conversation, *no earlier call among the previous 32 belongs
+to this call's conversation*. If a nearer
 earlier call of the tenant could not be read (not recorded, or offloaded and
 unresolvable) before any qualifying one was found, the verdict is `unknown`
 rather than a pairing across the gap.

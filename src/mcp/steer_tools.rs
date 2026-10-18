@@ -74,10 +74,12 @@ pub(super) fn definitions(fuses: bool) -> Vec<Tool> {
             "List the runs that are live now",
             "Agent runs with recent activity — a span arriving or a pre-call check — most \
              recently changed first, each with its agent, the step it is on, its steps, \
-             cost, tokens and errors, its guard verdict, and how many nudges from a human are \
-             waiting for it. From the server's live state: nothing here was re-read from \
-             storage, and a run the server began following mid-way shows what it has seen \
-             since.",
+             cost, tokens and errors, its guard verdict, its foresight (how earlier runs of \
+             its agent that took the same path ended: a verdict and a success rate, counted \
+             from history, never predicted by a model), and how many nudges from a human are \
+             waiting for it. From the server's live state: a run the server began following \
+             mid-way shows what it has seen since, and has foresight once it has been read \
+             whole.",
             json!({
                 "type": "object",
                 "properties": {
@@ -373,7 +375,7 @@ fn live_row(run: &LiveRun) -> String {
         None => String::new(),
     };
     format!(
-        "run {} (tenant {}) · agent {} · {} · {} · ${:.4} · {} tok · {}{current}{}{}",
+        "run {} (tenant {}) · agent {} · {} · {} · ${:.4} · {} tok · {}{current}{}{}{}",
         sanitize(&run.run),
         tenant_label(&run.tenant),
         sanitize(run.agent.as_deref().unwrap_or("?")),
@@ -387,11 +389,29 @@ fn live_row(run: &LiveRun) -> String {
         } else {
             String::new()
         },
+        foresight_note(run.foresight.as_ref()),
         run.reasons
             .first()
             .map(|reason| format!(" · {}", sanitize(reason)))
             .unwrap_or_default(),
     )
+}
+
+/// ` · foresight at_risk: 12% of 50 runs on its path succeeded`, or
+/// nothing when the run has no foresight.
+fn foresight_note(foresight: Option<&crate::fate::LiveForesight>) -> String {
+    let Some(foresight) = foresight else {
+        return String::new();
+    };
+    match foresight.p_success {
+        Some(rate) => format!(
+            " · foresight {}: {:.0}% of {} on its path succeeded",
+            foresight.verdict.as_str(),
+            rate * 100.0,
+            count(foresight.support, "run")
+        ),
+        None => format!(" · foresight {}", foresight.verdict.as_str()),
+    }
 }
 
 fn live_structured(run: &LiveRun) -> Value {
@@ -410,6 +430,12 @@ fn live_structured(run: &LiveRun) -> Value {
             "kind": step.kind,
             "name": step.name.as_deref().map(json_safe),
             "pending": step.pending,
+        })),
+        "foresight": run.foresight.as_ref().map(|foresight| json!({
+            "verdict": foresight.verdict,
+            "p_success": foresight.p_success,
+            "ci95": foresight.ci95,
+            "support": foresight.support,
         })),
     })
 }

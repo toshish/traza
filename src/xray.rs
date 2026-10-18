@@ -79,6 +79,22 @@ use crate::{Deadline, Result, Span, Store};
 use autopsy::{Comparison, Context, TextPool};
 use chunk::{Piece, TOOLS_ROLE};
 
+/// The attribute naming the conversation a model call belongs to (the
+/// OpenTelemetry GenAI `gen_ai.conversation.id`). Calls that carry one pair
+/// only with calls of the same conversation, and with the nearest earlier
+/// one of it always — even when nothing they hold is shared, which is what
+/// a compaction looks like.
+pub const CONVERSATION_ATTRIBUTE: &str = "gen_ai.conversation.id";
+
+/// The attribute that says a model call recorded only what it added to its
+/// conversation: `true` means its `gen_ai.input.messages` holds the messages
+/// sent since the conversation's previous call ([`CONVERSATION_ATTRIBUTE`]),
+/// and its context is that call's context, then that call's output, then
+/// these. The recorders ([`crate::import`]) write transcripts this way —
+/// each call's whole context again would grow a session quadratically —
+/// and mark the first call after a compaction `false`: it starts over.
+pub const INPUT_DELTA_ATTRIBUTE: &str = "traza.input.delta";
+
 /// Default steps after which an unreferenced tool result is stale
 /// (`--xray-stale-steps`).
 pub const DEFAULT_STALE_STEPS: usize = 20;
@@ -149,6 +165,20 @@ const PREVIEW_CHARS: usize = 120;
 
 /// Ancestors walked looking for the agent step a model call runs under.
 const MAX_AGENT_DEPTH: usize = 64;
+
+/// Conversations whose running context one request keeps while it rebuilds
+/// delta-recorded calls ([`INPUT_DELTA_ATTRIBUTE`]); past it the least
+/// recently continued one is dropped, and a later call of it is read as
+/// unavailable rather than as a context it was not.
+pub const MAX_THREADS: usize = 64;
+
+/// Chunk text those running contexts hold at most, across conversations.
+pub const MAX_THREAD_BYTES: usize = 64 * 1024 * 1024;
+
+/// Conversations remembered as dropped, so a later call of one is not taken
+/// for a conversation's first; past it, a delta call of any conversation
+/// not being kept is read as unavailable.
+const MAX_LOST_THREADS: usize = 4_096;
 
 /// How a calibration ratio is clamped: an estimate off by more than four
 /// times either way says the estimate is not about the same text.
@@ -833,6 +863,178 @@ fn read_call(
     })
 }
 
+/// The conversation a model call names ([`CONVERSATION_ATTRIBUTE`]), if any.
+fn conversation_of(span: &Span) -> Option<String> {
+    span.attributes
+        .get(CONVERSATION_ATTRIBUTE)
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(|id| chunk::clip(id, MAX_CONVERSATION_ID_CHARS))
+}
+
+/// Characters of a conversation id kept: ids are producer text.
+const MAX_CONVERSATION_ID_CHARS: usize = 256;
+
+/// Whether a model call recorded only what it added to its conversation
+/// ([`INPUT_DELTA_ATTRIBUTE`]): the boolean `true`, or exactly `"true"`.
+fn is_delta(span: &Span) -> bool {
+    match span.attributes.get(INPUT_DELTA_ATTRIBUTE) {
+        Some(Value::Bool(delta)) => *delta,
+        Some(Value::String(delta)) => delta == "true",
+        _ => false,
+    }
+}
+
+/// Why a delta-recorded call's context could not be rebuilt.
+const NOT_REBUILT: &str =
+    "could not be rebuilt: it recorded only what it added, and its conversation's earlier \
+     context was not kept";
+
+/// Why a delta-recorded call X-rayed alone shows only part of its context.
+const DELTA_ALONE: &str =
+    "was recorded as a delta of its conversation, whose earlier calls lie past the read";
+
+/// One conversation's running context: its latest call's whole context and
+/// what that call answered.
+struct Thread {
+    context: Vec<Piece>,
+    truncated: bool,
+    unavailable: Option<&'static str>,
+    response: Vec<Piece>,
+    bytes: usize,
+    used: u64,
+}
+
+/// The running contexts of the delta-recorded conversations of one read
+/// ([`INPUT_DELTA_ATTRIBUTE`]), so a model call that recorded only what it
+/// added to its conversation is read as the whole context it was: its
+/// conversation's previous context, then what that call answered, then its
+/// own messages. Fed every model call of a run in step order. Bounded by
+/// [`MAX_THREADS`] conversations and [`MAX_THREAD_BYTES`] of their text.
+#[derive(Default)]
+struct Threads {
+    running: HashMap<(String, String), Thread>,
+    bytes: usize,
+    clock: u64,
+    /// Conversations dropped for room: a later delta call of one cannot be
+    /// rebuilt.
+    lost: HashSet<(String, String)>,
+    lost_overflow: bool,
+}
+
+impl Threads {
+    /// Folds one call's read into its conversation, returning the read with
+    /// its whole context. A call naming no conversation is returned as it
+    /// is; so is a delta call opening its conversation, whose delta is all
+    /// there was.
+    fn fold(&mut self, span: &Span, mut read: Read) -> Read {
+        let Some(conversation) = conversation_of(span) else {
+            return read;
+        };
+        let key = (span.tenant.clone(), conversation);
+        self.clock += 1;
+        if is_delta(span) {
+            match self.running.get(&key) {
+                Some(thread) => {
+                    let is_definition = |piece: &&Piece| piece.role.as_deref() == Some(TOOLS_ROLE);
+                    let own = &read.context.list;
+                    let own_definitions = own.iter().take_while(is_definition).count();
+                    let base_definitions = thread.context.iter().take_while(is_definition).count();
+                    // Its own definitions when it recorded any, else its
+                    // conversation's; then the conversation, the answer to
+                    // its last call, and what this call added.
+                    let definitions = if own_definitions > 0 {
+                        &own[..own_definitions]
+                    } else {
+                        &thread.context[..base_definitions]
+                    };
+                    let mut list: Vec<Piece> = definitions
+                        .iter()
+                        .chain(&thread.context[base_definitions..])
+                        .chain(&thread.response)
+                        .chain(&own[own_definitions..])
+                        .take(MAX_CONTEXT_CHUNKS + 1)
+                        .cloned()
+                        .collect();
+                    let mut truncated = thread.truncated || read.context.truncated;
+                    if list.len() > MAX_CONTEXT_CHUNKS {
+                        list.truncate(MAX_CONTEXT_CHUNKS);
+                        truncated = true;
+                    }
+                    read.context.list = list;
+                    read.context.truncated = truncated;
+                    // A delta that added nothing is not an unrecorded one.
+                    read.unavailable = match read.unavailable {
+                        Some("was not recorded") => thread.unavailable,
+                        own => own.or(thread.unavailable),
+                    };
+                }
+                None if self.lost_overflow || self.lost.contains(&key) => {
+                    read.unavailable = read.unavailable.or(Some(NOT_REBUILT));
+                }
+                None => {}
+            }
+        }
+        self.keep(key, &read);
+        read
+    }
+
+    /// Keeps `read` as its conversation's running context, dropping the
+    /// least recently continued conversations past the bounds.
+    fn keep(&mut self, key: (String, String), read: &Read) {
+        if let Some(old) = self.running.remove(&key) {
+            self.bytes -= old.bytes;
+        }
+        let bytes: usize = read
+            .context
+            .list
+            .iter()
+            .chain(&read.response)
+            .map(|piece| piece.text.len())
+            .sum();
+        while !self.running.is_empty()
+            && (self.running.len() >= MAX_THREADS
+                || self.bytes.saturating_add(bytes) > MAX_THREAD_BYTES)
+        {
+            let oldest = self
+                .running
+                .iter()
+                .min_by_key(|(_, thread)| thread.used)
+                .map(|(key, _)| key.clone())
+                .expect("not empty");
+            if let Some(gone) = self.running.remove(&oldest) {
+                self.bytes -= gone.bytes;
+            }
+            self.forget(oldest);
+        }
+        if bytes > MAX_THREAD_BYTES {
+            self.forget(key);
+            return;
+        }
+        self.lost.remove(&key);
+        self.bytes += bytes;
+        self.running.insert(
+            key,
+            Thread {
+                context: read.context.list.clone(),
+                truncated: read.context.truncated,
+                unavailable: read.unavailable,
+                response: read.response.clone(),
+                bytes,
+                used: self.clock,
+            },
+        );
+    }
+
+    fn forget(&mut self, key: (String, String)) {
+        if self.lost.len() < MAX_LOST_THREADS {
+            self.lost.insert(key);
+        } else {
+            self.lost_overflow = true;
+        }
+    }
+}
+
 /// The name a step goes by: tool, model, agent, else span name.
 fn step_name(step: &TapeStep) -> String {
     step.tool
@@ -916,14 +1118,21 @@ fn cache_step(store: &Store, verdict: Verdict<'_>, ttl_ns: u64, pool: &TextPool)
         )),
         (None, Ok(None)) => Comparison {
             cause: Cause::NewContext,
-            explanation: if seen_before {
+            explanation: if !seen_before {
+                "the first model call of the run: there was no earlier prompt to cache".to_owned()
+            } else if context.conversation.is_some() {
+                format!(
+                    "no earlier call among the previous {RECENT_CONTEXTS} belongs to this call's \
+                     conversation (gen_ai.conversation.id): the first call of a new \
+                     conversation (a sub-agent, say), or one whose previous call lies further \
+                     back"
+                )
+            } else {
                 format!(
                     "no earlier call among the previous {RECENT_CONTEXTS} shares this call's \
                      leading chunks or half of its chunks: a new conversation (a sub-agent, \
                      say), or one whose previous call lies further back"
                 )
-            } else {
-                "the first model call of the run: there was no earlier prompt to cache".to_owned()
             },
             ..unpaired(String::new())
         },
@@ -1360,19 +1569,6 @@ impl Store {
         let tenant_scope = span.tenant.clone();
         let mut resolver = Resolver::new(self, Some(&tenant_scope), deadline);
         let mut target_budget = ResolveBudget::new(limits.read_bytes);
-        let read = read_call(
-            target_entry,
-            &mut resolver,
-            &mut target_budget,
-            options.resolve,
-            true,
-        )?;
-        let pieces = read.context.list;
-        let contents: HashSet<u128> = pieces.iter().map(|piece| piece.content).collect();
-        // The call's own texts are held first and never released: its
-        // previews and diffs matter most.
-        let mut pool = TextPool::new(limits.pool_bytes);
-        pool.hold(&pieces);
 
         let target_index = target.unwrap_or(0);
         let history: &[Paired<'_>] = match target {
@@ -1393,17 +1589,76 @@ impl Store {
             .collect();
         let mut history_budget = ResolveBudget::new(limits.read_bytes);
         let mut window_reads: HashMap<usize, Read> = HashMap::new();
-        for &index in &window {
-            Deadline::check(deadline, 0)?;
-            let call = read_call(
-                &history[index],
+        // A run whose calls recorded only what each added to its
+        // conversation is read in step order instead, every call folded into
+        // its conversation, so the call and the window are read as the whole
+        // contexts they were; older calls are read again below, as recorded,
+        // for provenance and staleness.
+        let threaded = history
+            .iter()
+            .any(|entry| entry.step.kind == StepKind::Llm && is_delta(entry.span));
+        let mut read = if threaded {
+            let wanted: HashSet<usize> = window.iter().copied().collect();
+            let mut threads = Threads::default();
+            let mut target_read = None;
+            for (index, entry) in history.iter().enumerate() {
+                if entry.step.kind != StepKind::Llm {
+                    continue;
+                }
+                Deadline::check(deadline, 0)?;
+                let budget = if index == target_index {
+                    &mut target_budget
+                } else {
+                    &mut history_budget
+                };
+                let call = read_call(entry, &mut resolver, budget, options.resolve, true)?;
+                let call = threads.fold(entry.span, call);
+                if index == target_index {
+                    target_read = Some(call);
+                } else if wanted.contains(&index) {
+                    window_reads.insert(index, call);
+                }
+            }
+            match target_read {
+                Some(read) => read,
+                None => read_call(
+                    target_entry,
+                    &mut resolver,
+                    &mut target_budget,
+                    options.resolve,
+                    true,
+                )?,
+            }
+        } else {
+            let read = read_call(
+                target_entry,
                 &mut resolver,
-                &mut history_budget,
+                &mut target_budget,
                 options.resolve,
                 true,
             )?;
-            window_reads.insert(index, call);
+            for &index in &window {
+                Deadline::check(deadline, 0)?;
+                let call = read_call(
+                    &history[index],
+                    &mut resolver,
+                    &mut history_budget,
+                    options.resolve,
+                    true,
+                )?;
+                window_reads.insert(index, call);
+            }
+            read
+        };
+        if target.is_none() && is_delta(&span) {
+            read.unavailable = read.unavailable.or(Some(DELTA_ALONE));
         }
+        let pieces = read.context.list;
+        let contents: HashSet<u128> = pieces.iter().map(|piece| piece.content).collect();
+        // The call's own texts are held first and never released: its
+        // previews and diffs matter most.
+        let mut pool = TextPool::new(limits.pool_bytes);
+        pool.hold(&pieces);
 
         // The history, oldest first, up to and including the call.
         let mut provenance: HashMap<u128, usize> = HashMap::new();
@@ -1488,7 +1743,8 @@ impl Store {
                             call.context.truncated,
                             call.unavailable,
                         )
-                        .with_agent(agents.of(entry.span));
+                        .with_agent(agents.of(entry.span))
+                        .with_conversation(conversation_of(entry.span));
                         context.held = pool.hold(&call.context.list);
                         recent.push_back(context);
                     }
@@ -1671,7 +1927,8 @@ impl Store {
             read.context.truncated,
             read.unavailable,
         )
-        .with_agent(agents.of(&span));
+        .with_agent(agents.of(&span))
+        .with_conversation(conversation_of(&span));
         let found = autopsy::predecessor(&current, recent.iter(), &pool);
         let mut previous = None;
         let mut dropped = Vec::new();
@@ -1893,6 +2150,7 @@ impl Store {
         let mut unresolved = false;
         let mut pool = TextPool::new(limits.pool_bytes);
         let mut recent: VecDeque<Context> = VecDeque::new();
+        let mut threads = Threads::default();
         let mut tenants_seen: HashSet<&str> = HashSet::new();
         let mut steps = Vec::new();
         let mut truncated = tape.truncated;
@@ -1909,7 +2167,18 @@ impl Store {
             // Each call gets its own budget, out of what the request has
             // left: one giant call cannot starve the calls after it.
             let mut budget = ResolveBudget::new(limits.read_bytes.min(read_left));
-            let read = read_call(entry, &mut resolver, &mut budget, options.resolve, false)?;
+            // A call of a named conversation is read with its answer, which
+            // the conversation's next call continues from when that call
+            // recorded only what it added (see [`Threads`]).
+            let conversation = conversation_of(entry.span);
+            let read = read_call(
+                entry,
+                &mut resolver,
+                &mut budget,
+                options.resolve,
+                conversation.is_some(),
+            )?;
+            let read = threads.fold(entry.span, read);
             read_left -= budget.spent();
             unresolved |= budget.unresolved;
             let mut context = Context::new(
@@ -1920,7 +2189,8 @@ impl Store {
                 read.context.truncated,
                 read.unavailable,
             )
-            .with_agent(agents.of(entry.span));
+            .with_agent(agents.of(entry.span))
+            .with_conversation(conversation);
             context.held = pool.hold(&read.context.list);
             let llm = self.facts(entry.span);
             let seen_before = !tenants_seen.insert(entry.span.tenant.as_str());

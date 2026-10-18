@@ -210,6 +210,36 @@ content index. Their HTTP routes are in
 and their MCP tools in [`src/mcp/replay_tools.rs`](../../src/mcp/replay_tools.rs).
 Documented in [the replay guide](../guide/replay.md).
 
+### v0.28: foresight, steering, recorders, X-Ray, radar, TQL, forks
+
+Each is a module with its HTTP handlers beside it (or in a route file under
+[`src/bin/traza-server/`](../../src/bin/traza-server)) and its MCP tool in
+[`src/mcp/`](../../src/mcp):
+
+- [`src/fate.rs`](../../src/fate.rs) and [`src/fate/`](../../src/fate) — the
+  Fate Map, foresight for one run, the predictive fuse limits, and the live
+  view's foresight ([foresight guide](../guide/foresight.md)).
+- [`src/steer.rs`](../../src/steer.rs), [`src/steer/`](../../src/steer) and
+  [`src/guard/live.rs`](../../src/guard/live.rs) — live runs and their stream,
+  nudges (`steer.jsonl`), run topology and handoff cycles
+  ([steer guide](../guide/steer.md)).
+- [`src/import/`](../../src/import), [`src/blame.rs`](../../src/blame.rs) and
+  [`src/zstd.rs`](../../src/zstd.rs) — the Claude Code and Codex recorders,
+  Agent Blame, and the std-only Zstandard decoder for compressed rollouts
+  ([recorders guide](../guide/recorders.md)).
+- [`src/xray.rs`](../../src/xray.rs) and [`src/xray/`](../../src/xray) — the
+  context X-Ray, delta-recorded conversations rebuilt, and the Cache Autopsy
+  ([X-Ray guide](../guide/xray.md)).
+- [`src/radar.rs`](../../src/radar.rs) and [`src/radar/`](../../src/radar) —
+  configuration fingerprints, change points and their statistics
+  ([radar guide](../guide/radar.md)).
+- [`src/tql.rs`](../../src/tql.rs) and [`src/tql/`](../../src/tql) — the TQL
+  parser, regex subset, NFA matcher, work meter and detector library
+  ([TQL guide](../guide/tql.md)).
+- [`src/fork.rs`](../../src/fork.rs) — fork listings and golden runs; replay
+  edits and live points live in [`src/replay.rs`](../../src/replay.rs)
+  ([fork guide](../guide/fork.md)).
+
 ## Ingest surfaces
 
 ### [`src/otlp.rs`](../../src/otlp.rs)
@@ -270,7 +300,7 @@ declared JSON.
 ### [`src/mcp.rs`](../../src/mcp.rs)
 
 The Model Context Protocol surface: JSON-RPC framing, `initialize` and version
-negotiation, the sixteen tool schemas and handlers, five resources and three URI
+negotiation, the tool schemas and handlers (the v0.28 tools in `src/mcp/`), five resources and three URI
 templates, four prompts, and the renderers that turn spans into something a
 context window can hold. Tool handlers call `Store` directly — never back
 through HTTP — so the module works with no listener in the process at all,

@@ -2836,10 +2836,21 @@ curl http://127.0.0.1:8080/v1/runs/live
 | `steps`, `cost_usd`, `tokens`, `errors` | Usage as the guard counts it |
 | `verdict`, `reasons`, `policy` | The guard's verdict now |
 | `pending_nudges` | Nudges queued and not yet delivered or expired |
+| `foresight` | `{verdict, p_success, ci95, support, base_rate, map_built_at_ns?}`: how earlier runs of its agent that took the same path ended, as [`GET /v1/fate/runs/{run}`](#get-v1faterunsrun) judges it at the predictive fuses' default support of 30 — `on_track`, `at_risk`, `likely_failure`, `novel` or `insufficient_history` (no map cached yet). Absent while the server holds no whole path for the run; see below |
 
 `truncated` is `true` when more runs were live than `limit`. A run is listed
 with what this process has seen of it; a run with no span yet, and a stopped
 run evicted from memory, are not listed.
+
+`foresight` is read from memory: the run's behaviour path the guard keeps
+(its earliest 192 steps) and the tenant's cached [Fate Map](foresight.md). A
+listing asks for the map when none is cached, so foresight appears within a
+background build of the view being opened. A run the guard has followed only
+since it came into memory — never asked about — is first read whole from the
+store, as a verdict query would read it, at most 8 such runs per request
+(newest first); the rest list without `foresight` until a later request
+reaches them. With `--fate-cache-seconds 0` no path is kept and no row has
+`foresight`. Example: `"foresight":{"base_rate":0.5444,"ci95":[0.0435,0.2136],"map_built_at_ns":1792312576819863000,"p_success":0.1,"support":50,"verdict":"likely_failure"}`.
 
 ### `GET /v1/runs/live/stream`
 
@@ -3279,7 +3290,7 @@ Abbreviated (heads and entries elided):
                        {"cost_usd":1.5e+20,"day":"2023-11-15","errors":1,"spans":1}],
              "errors":1,"sessions":1,"spans":2,"traces":2},
  "digest":"a621ab3b040e67bd6f8899c3654dea99b4e42b5ad56e9259a701fad9837c6bf9",
- "engine_version":"0.27.0",
+ "engine_version":"0.28.0",
  "erasures":[{"conclusive":true,"id":1,"published_at_ns":1792061585528589000,"result":"erased","subject_kind":"session"}],
  "erasures_truncated":false,
  "format":"traza-evidence/1","generated_at_ns":1792061592996325000,
@@ -3347,7 +3358,7 @@ orchestrator probing them holds no credential — and not counted in the request
 metrics. `GET` only; any other method goes through the gate like any request.
 
 ```json
-{"status":"ok","version":"0.27.0"}
+{"status":"ok","version":"0.28.0"}
 ```
 
 ```json
@@ -3442,8 +3453,8 @@ Streamable HTTP transport, one message per request. **Served only when the
 server was started with `--mcp`**; otherwise every method answers `404` with
 the flag named.
 
-This route is documented in full in **[the MCP guide](mcp.md)** — its seventeen
-tools, five resources, three templates and four prompts, and what each returns.
+This route is documented in full in **[the MCP guide](mcp.md)** — its
+twenty-four tools, five resources, three templates and four prompts, and what each returns.
 What belongs here is the transport contract:
 
 | Condition | Response |

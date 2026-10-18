@@ -1325,3 +1325,277 @@ fn a_span_too_large_for_the_store_is_trimmed_not_refused() {
     sink.finish().expect("closes");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The text parts of a span's `gen_ai.input.messages`, in order.
+fn input_texts(span: &Span) -> Vec<String> {
+    attr(span, "gen_ai.input.messages")
+        .as_array()
+        .map(|messages| {
+            messages
+                .iter()
+                .flat_map(|message| message["parts"].as_array().cloned().unwrap_or_default())
+                .filter_map(|part| part["content"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn every_model_call_names_its_conversation_and_records_a_delta_of_it() {
+    // A main transcript is the session's conversation; a sub-agent's is its
+    // own, so the X-Ray rebuilds each from its own calls and never pairs a
+    // sub-agent's call with its parent's.
+    let (main, _) = claude(&cc_main());
+    let (agent, _) = claude(&cc_agent());
+    let chats = |spans: &[Span]| -> Vec<Span> {
+        spans
+            .iter()
+            .filter(|span| operation(span) == Some("chat"))
+            .cloned()
+            .collect()
+    };
+    let (main, agent) = (chats(&main), chats(&agent));
+    assert!(
+        main.len() >= 4 && agent.len() == 2,
+        "{} {}",
+        main.len(),
+        agent.len()
+    );
+    for span in &main {
+        assert_eq!(attr(span, crate::xray::CONVERSATION_ATTRIBUTE), &json!(S1));
+        assert_eq!(attr(span, crate::xray::INPUT_DELTA_ATTRIBUTE), &json!(true));
+    }
+    for span in &agent {
+        assert_eq!(
+            attr(span, crate::xray::CONVERSATION_ATTRIBUTE),
+            &json!(format!("{S1}/a1b2c3"))
+        );
+        assert_eq!(attr(span, crate::xray::INPUT_DELTA_ATTRIBUTE), &json!(true));
+    }
+    // Codex: each thread is its own conversation.
+    let ancestry = codex::Ancestry::default();
+    let (parent, _) = codex_with(&codex_parent(), &ancestry);
+    let threads: std::collections::BTreeSet<String> = chats(&parent)
+        .iter()
+        .map(|span| {
+            assert_eq!(attr(span, crate::xray::INPUT_DELTA_ATTRIBUTE), &json!(true));
+            attr(span, crate::xray::CONVERSATION_ATTRIBUTE)
+                .as_str()
+                .expect("named")
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(threads.into_iter().collect::<Vec<_>>(), [A.to_owned()]);
+}
+
+/// A Claude Code transcript with a compaction in the middle; `summary_first`
+/// writes the summary before the boundary instead of after it.
+fn compacted_transcript(dir: &Path, summary_first: bool) -> PathBuf {
+    let path = dir.join(format!("{S2}.jsonl"));
+    let record = |uuid: &str, second: u32, body: Value| -> String {
+        let mut record = json!({
+            "parentUuid": null, "isSidechain": false, "cwd": "/tmp/demo-shop",
+            "sessionId": S2, "version": "2.1.0", "uuid": uuid,
+            "timestamp": format!("2026-01-05T12:00:{second:02}.000Z"),
+        });
+        for (key, value) in body.as_object().expect("object") {
+            record[key] = value.clone();
+        }
+        record.to_string()
+    };
+    let reply = |id: &str, text: &str| {
+        json!({"type": "assistant", "message": {
+            "id": id, "type": "message", "role": "assistant",
+            "model": "claude-sonnet-4-5-20250929",
+            "content": [{"type": "text", "text": text}],
+            "usage": {"input_tokens": 5, "output_tokens": 5}}})
+    };
+    let boundary = record(
+        "b1",
+        10,
+        json!({"type": "system", "subtype": "compact_boundary",
+               "compactMetadata": {"trigger": "auto", "preTokens": 150000}}),
+    );
+    let summary = record(
+        "s1",
+        11,
+        json!({"type": "user", "isCompactSummary": true,
+               "message": {"role": "user", "content": "Summary: the login test was rewritten."}}),
+    );
+    let mut lines = vec![
+        record(
+            "u1",
+            0,
+            json!({"type": "user", "message": {"role": "user",
+                   "content": "Never touch the migrations folder"}}),
+        ),
+        record("a1", 2, reply("msg_a", "Understood.")),
+        record(
+            "u2",
+            4,
+            json!({"type": "user", "message": {"role": "user", "content": "Fix the login test"}}),
+        ),
+    ];
+    if summary_first {
+        lines.extend([summary, boundary]);
+    } else {
+        lines.extend([boundary, summary]);
+    }
+    lines.extend([
+        record(
+            "u3",
+            20,
+            json!({"type": "user", "message": {"role": "user", "content": "Now run it"}}),
+        ),
+        record("a2", 22, reply("msg_b", "It passes.")),
+        record(
+            "u4",
+            30,
+            json!({"type": "user", "message": {"role": "user", "content": "Thanks"}}),
+        ),
+        record("a3", 32, reply("msg_c", "You're welcome.")),
+    ]);
+    std::fs::write(&path, lines.join("\n") + "\n").expect("writes");
+    path
+}
+
+#[test]
+fn the_first_call_after_a_compaction_starts_its_conversation_over() {
+    for summary_first in [false, true] {
+        let dir = scratch("compaction");
+        let path = compacted_transcript(&dir, summary_first);
+        let (spans, stats) = claude(&path);
+        let (before, after, later) = (
+            llm(&spans, S2, "msg_a"),
+            llm(&spans, S2, "msg_b"),
+            llm(&spans, S2, "msg_c"),
+        );
+        assert_eq!(
+            attr(&before, crate::xray::INPUT_DELTA_ATTRIBUTE),
+            &json!(true)
+        );
+        // The call after the compaction holds its whole context — the summary
+        // and what followed — and nothing from before the boundary: "Fix the
+        // login test" was summarized away with the rest.
+        assert_eq!(
+            attr(&after, crate::xray::INPUT_DELTA_ATTRIBUTE),
+            &json!(false),
+            "summary first: {summary_first}"
+        );
+        assert_eq!(
+            input_texts(&after),
+            ["Summary: the login test was rewritten.", "Now run it"],
+            "summary first: {summary_first}"
+        );
+        // The next call is a delta of the restarted conversation again.
+        assert_eq!(
+            attr(&later, crate::xray::INPUT_DELTA_ATTRIBUTE),
+            &json!(true)
+        );
+        assert_eq!(input_texts(&later), ["Thanks"]);
+        assert_eq!(stats.records.get("system/compact_boundary"), Some(&1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn a_codex_compaction_restarts_from_its_replacement_history() {
+    let dir = scratch("codex-compaction");
+    let rollout = dir.join(format!("rollout-2025-06-03T08-00-00-{C}.jsonl"));
+    let line = |second: u32, kind: &str, payload: Value| -> String {
+        json!({"timestamp": format!("2025-06-03T08:00:{second:02}.000Z"),
+               "type": kind, "payload": payload})
+        .to_string()
+    };
+    let user = |text: &str| {
+        json!({"type": "message", "role": "user",
+               "content": [{"type": "input_text", "text": text}]})
+    };
+    let answer = |text: &str| {
+        json!({"type": "message", "role": "assistant", "phase": "final_answer",
+               "content": [{"type": "output_text", "text": text}]})
+    };
+    let tokens = |input: u64| {
+        json!({"type": "token_count", "info": {"total_token_usage": {
+            "input_tokens": input, "cached_input_tokens": 0, "output_tokens": 10,
+            "reasoning_output_tokens": 0, "total_tokens": input + 10},
+            "last_token_usage": {"input_tokens": input, "cached_input_tokens": 0,
+            "output_tokens": 10, "reasoning_output_tokens": 0, "total_tokens": input + 10}}})
+    };
+    let lines = [
+        line(
+            0,
+            "session_meta",
+            json!({"id": C, "timestamp": "2025-06-03T08:00:00.000Z", "cwd": "/tmp/demo-api",
+                   "originator": "codex_cli_rs", "cli_version": "0.150.0",
+                   "model_provider": "openai"}),
+        ),
+        line(
+            1,
+            "event_msg",
+            json!({"type": "task_started", "turn_id": "t1"}),
+        ),
+        line(
+            1,
+            "turn_context",
+            json!({"turn_id": "t1", "cwd": "/tmp/demo-api", "model": "gpt-5-codex"}),
+        ),
+        line(2, "response_item", user("Keep the public API stable")),
+        line(3, "response_item", answer("Noted.")),
+        line(3, "event_msg", tokens(100)),
+        line(
+            4,
+            "event_msg",
+            json!({"type": "task_complete", "turn_id": "t1"}),
+        ),
+        line(
+            5,
+            "compacted",
+            json!({"message": "", "replacement_history": [
+                user("Summary: the API is frozen."),
+                {"type": "reasoning", "summary": []},
+            ]}),
+        ),
+        line(
+            6,
+            "event_msg",
+            json!({"type": "task_started", "turn_id": "t2"}),
+        ),
+        line(
+            6,
+            "turn_context",
+            json!({"turn_id": "t2", "cwd": "/tmp/demo-api", "model": "gpt-5-codex"}),
+        ),
+        line(7, "response_item", user("Add a health route")),
+        line(8, "response_item", answer("Added.")),
+        line(8, "event_msg", tokens(250)),
+        line(
+            9,
+            "event_msg",
+            json!({"type": "task_complete", "turn_id": "t2"}),
+        ),
+    ];
+    std::fs::write(&rollout, lines.join("\n") + "\n").expect("writes");
+    let ancestry = codex::Ancestry::default();
+    let (spans, stats) = codex_with(&rollout, &ancestry);
+    let chats: Vec<&Span> = spans
+        .iter()
+        .filter(|span| operation(span) == Some("chat"))
+        .collect();
+    assert_eq!(chats.len(), 2, "{stats:?}");
+    let (first, second) = (chats[0], chats[1]);
+    assert_eq!(
+        attr(first, crate::xray::INPUT_DELTA_ATTRIBUTE),
+        &json!(true)
+    );
+    assert_eq!(
+        attr(second, crate::xray::INPUT_DELTA_ATTRIBUTE),
+        &json!(false)
+    );
+    assert_eq!(
+        input_texts(second),
+        ["Summary: the API is frozen.", "Add a health route"]
+    );
+    assert_eq!(attr(second, crate::xray::CONVERSATION_ATTRIBUTE), &json!(C));
+    let _ = std::fs::remove_dir_all(&dir);
+}

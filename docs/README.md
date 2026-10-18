@@ -17,6 +17,10 @@ to the right document. Start with the row that matches what you are doing.
 | Re-run a recorded agent run with zero model calls, or diff two runs | [Replay](guide/replay.md) · [demo](../examples/replay/README.md) |
 | See which paths an agent's runs take and how each ends; foresee a live run's fate; stop a run whose path has always failed | [Foresight](guide/foresight.md) |
 | Record every Claude Code and Codex session with zero setup, or ask which agent step wrote a line of code | [Recorders and Agent Blame](guide/recorders.md) |
+| See exactly what a model saw at one step, where each part came from, and why its prompt cache broke | [Context X-Ray and Cache Autopsy](guide/xray.md) |
+| Find out what changed in an agent — a prompt, a tool, a model, a version — and whether it made things worse | [Change radar](guide/radar.md) |
+| Find every run whose steps did something — like a regex over behaviour — or run the built-in detectors | [TQL and detectors](guide/tql.md) |
+| Branch a recorded run at any step, edit an answer and go live; test agents against golden runs | [Fork and rewind](guide/fork.md) |
 | Prove what the store committed, for an auditor or a notary | [Ledger and evidence packs](guide/ledger.md) · [demo](../examples/prove/README.md) |
 | Call the guard, replays, diff, recall or the ledger from Python or TypeScript | [Client libraries](guide/clients.md) |
 | Watch the claims proven live before reading further | [The demo tour](../examples/README.md) |
@@ -42,7 +46,7 @@ Sending traces to Traza and getting answers back out.
   attributes Traza recognizes, sessions, token and cost analytics, prompt and
   completion payloads, span links, and query recipes.
 - **[MCP server](guide/mcp.md)** — the Model Context Protocol endpoint: its
-  seventeen tools, its resources and prompts, how results are bounded for a
+  twenty-four tools, its resources and prompts, how results are bounded for a
   context window, and the untrusted-content boundary stored span text is held
   behind.
 - **[Run fuses](guide/guard.md)** — per-run limits on cost, tokens, steps,
@@ -54,6 +58,9 @@ Sending traces to Traza and getting answers back out.
   forks and hotspots, the map's own calibration; foresight for one run with
   its verdict and what earlier runs did next; and predictive fuses that stop a
   run whose path has historically failed.
+- **[Steer](guide/steer.md)** — the runs live now with their foresight,
+  nudging or vetoing a running agent before its next step, how a run's agents
+  handed work around, and a fuse limit on agents ping-ponging.
 - **[Replay](guide/replay.md)** — a run read as a tape, replaying it through
   the OpenAI or Anthropic SDK with zero model calls, diffing two runs, and
   recalling earlier runs that did the same thing.
@@ -65,6 +72,20 @@ Sending traces to Traza and getting answers back out.
   claude-code|codex` turns coding-agent transcripts into runs (live with
   `--watch`), and `traza-server blame` names the step, prompt and model that
   introduced a line of code.
+- **[Context X-Ray and Cache Autopsy](guide/xray.md)** — one model call's
+  context window as chunks, with provenance, stale tool results, duplicates
+  and compaction loss; and why each call's prompt cache held or broke, the
+  volatile token named and the loss priced.
+- **[Change radar](guide/radar.md)** — change points in each agent's system
+  prompt, tools, models, parameters and versions, and shifts in its behaviour
+  with no configuration change, each with before/after deltas, p-values and
+  a verdict.
+- **[TQL and detectors](guide/tql.md)** — a pattern language over a run's
+  steps, compiled to an NFA, and the built-in detector library (test
+  tampering, give-up loops, edit thrash, ping-pong and more).
+- **[Fork and rewind](guide/fork.md)** — a replay that serves edited answers
+  and goes live after a chosen step, the forks of a run diffed against it,
+  golden runs and tape tests from Python and TypeScript.
 - **[Client libraries](guide/clients.md)** — the zero-dependency Python and
   TypeScript clients for the routes an agent harness calls: the pre-call
   guard and the rest of the run fuses, tapes and replays, diffs, recall, the

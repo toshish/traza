@@ -760,6 +760,29 @@ pub struct GuardForesight {
     pub map_built_at_ns: Option<u64>,
 }
 
+/// Foresight as the live view shows it beside each live run
+/// ([`Store::foresee_live`]): numbers and a verdict, no text.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct LiveForesight {
+    /// The verdict.
+    pub verdict: ForesightVerdict,
+    /// Success rate of earlier runs that took this run's path.
+    pub p_success: Option<f64>,
+    /// Its 95% Wilson interval.
+    pub ci95: Option<[f64; 2]>,
+    /// Runs behind it.
+    pub support: u64,
+    /// The cohort's base rate.
+    pub base_rate: Option<f64>,
+    /// When the map was built; absent when none was cached.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub map_built_at_ns: Option<u64>,
+}
+
+/// Runs one live-view call rebuilds from the store at most, so they have a
+/// whole path to read foresight from ([`Store::fill_live_foresight`]).
+pub const LIVE_FORESIGHT_REBUILDS: usize = 8;
+
 /// What to render of a map.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MapRequest {
@@ -3609,6 +3632,79 @@ impl Store {
         self.fate_for_guard(tenant, run, min_support.max(1), None, Instant::now())
     }
 
+    /// Foresight for a live run from memory alone — the run guard's
+    /// behaviour path for it and the tenant's cached map — or `None` when
+    /// the guard keeps no whole path for the run (fuses off, live paths off
+    /// and no predictive policy, or a run followed only since it last came
+    /// into memory, which nothing has asked about yet). With no map cached
+    /// the verdict is `insufficient_history`, and a background build is
+    /// requested ([`Self::maintain_fate`]). Never reads the store.
+    pub fn foresee_live(&self, tenant: &str, run: &str, min_support: u64) -> Option<LiveForesight> {
+        let reading = self.fuse_behaviour(tenant, run)?;
+        let out = GuardForesight {
+            verdict: ForesightVerdict::InsufficientHistory,
+            p_success: None,
+            ci95: None,
+            support: 0,
+            successes: 0,
+            base_rate: None,
+            matched_depth: 0,
+            next_tool: None,
+            raised: false,
+            explanation: String::new(),
+            map_built_at_ns: None,
+        };
+        let key = BuildKey::of(Some(tenant), None, None);
+        let judged = match self.fate.peek_or_why(&key) {
+            Ok(build) => {
+                let out = GuardForesight {
+                    map_built_at_ns: Some(build.built_at_ns),
+                    ..out
+                };
+                self.judge_reading(out, &build, tenant, run, min_support.max(1), None, reading)
+            }
+            Err(_) => out,
+        };
+        Some(LiveForesight {
+            verdict: judged.verdict,
+            p_success: judged.p_success,
+            ci95: judged.ci95,
+            support: judged.support,
+            base_rate: judged.base_rate,
+            map_built_at_ns: judged.map_built_at_ns,
+        })
+    }
+
+    /// Fills the live view's rows with their foresight ([`Self::foresee_live`],
+    /// at the predictive fuses' default support). Each tenant listed with no
+    /// map cached has one requested from the background builder, so a live
+    /// view gains foresight within a build of being opened. A row whose run
+    /// the guard holds only as followed since it came into memory is first
+    /// rebuilt from the store — the read any question about a run makes,
+    /// once per run while it stays in memory — at most
+    /// [`LIVE_FORESIGHT_REBUILDS`] per call, newest first, and only for a
+    /// tenant with a map cached; the rest list without foresight until a
+    /// later call reaches them.
+    pub(crate) fn fill_live_foresight(&self, rows: &mut [crate::steer::LiveRun]) {
+        let mut rebuilds = 0;
+        let mut cached: HashMap<String, bool> = HashMap::new();
+        for row in rows {
+            let has_map = *cached.entry(row.tenant.clone()).or_insert_with(|| {
+                // Peeking asks for a build when there is none to serve.
+                let key = BuildKey::of(Some(&row.tenant), None, None);
+                self.fate.peek_or_why(&key).is_ok()
+            });
+            let mut foresight = self.foresee_live(&row.tenant, &row.run, DEFAULT_VERDICT_SUPPORT);
+            if foresight.is_none() && has_map && rebuilds < LIVE_FORESIGHT_REBUILDS {
+                rebuilds += 1;
+                if self.fuse_verdict(&row.tenant, &row.run).is_ok() {
+                    foresight = self.foresee_live(&row.tenant, &row.run, DEFAULT_VERDICT_SUPPORT);
+                }
+            }
+            row.foresight = foresight;
+        }
+    }
+
     /// Drops every cached map: called by every erasure.
     pub(crate) fn forget_fate(&self) {
         self.fate.invalidate();
@@ -3688,6 +3784,22 @@ impl Store {
                 reading
             }
         };
+        self.judge_reading(out, &build, tenant, run, min_support, next_tool, reading)
+    }
+
+    /// Judges a run's `reading` against `build`, into `out`: the half of a
+    /// fuse's foresight past finding the map and the path.
+    #[allow(clippy::too_many_arguments)]
+    fn judge_reading(
+        &self,
+        mut out: GuardForesight,
+        build: &Build,
+        tenant: &str,
+        run: &str,
+        min_support: u64,
+        next_tool: Option<&str>,
+        reading: Reading,
+    ) -> GuardForesight {
         let Some(cohort) = build.cohort_by_key(tenant, reading.agent_key) else {
             out.explanation = match &reading.agent {
                 Some(agent) => {
@@ -3700,13 +3812,13 @@ impl Store {
             return out;
         };
         let view = View::of(cohort, run);
-        let mut judged = judge(&build, &view, &reading.probe(), min_support);
+        let mut judged = judge(build, &view, &reading.probe(), min_support);
         // The step about to be taken, when the check names its tool: judged
         // with it appended, if runs that took it are known; otherwise it adds
         // no evidence and the path so far is what is judged.
         if let Some(tool) = next_tool.filter(|_| reading.complete) {
             let hypothetical = judge(
-                &build,
+                build,
                 &view,
                 &reading.with_next_tool(tool).probe(),
                 min_support,

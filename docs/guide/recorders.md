@@ -47,7 +47,7 @@ derived from data both sides of it hold.
 |---|---|---|
 | a session | the run: every span carries `session.id` (Claude Code's `sessionId`; for Codex, the root thread id) | `traza.source`, `code.project` (the session's working directory), `service.version` (the tool's version), `vcs.ref.head.name`; `service` is `claude-code` or `codex` |
 | a user prompt | a `turn` span (not a step) | event `gen_ai.user.message` with the prompt as `content`; the session's first prompt, cut to 200 characters, is also `session.goal`; status is that of the turn's last model call |
-| a model response | an llm step, child of its turn | `gen_ai.operation.name=chat`, `gen_ai.provider.name` (`anthropic`, `openai`), `gen_ai.request.model`, `gen_ai.usage.input_tokens` / `output_tokens` / `cache_read.input_tokens` / `cache_creation.input_tokens`, `gen_ai.input.messages` (the conversation since the previous response), `gen_ai.output.messages` (text, reasoning, tool calls) |
+| a model response | an llm step, child of its turn | `gen_ai.operation.name=chat`, `gen_ai.provider.name` (`anthropic`, `openai`), `gen_ai.request.model`, `gen_ai.usage.input_tokens` / `output_tokens` / `cache_read.input_tokens` / `cache_creation.input_tokens`, `gen_ai.input.messages` (the conversation since the previous response), `gen_ai.output.messages` (text, reasoning, tool calls), `gen_ai.conversation.id` (the session; `<session>/<agent id>` for a Claude Code sub-agent; the thread for Codex) and `traza.input.delta` (`true`: the input is what was added since the conversation's previous call; `false` on the first call after a compaction, whose input — the summary and what followed, or Codex's replacement history — is all it saw) |
 | a tool call and its result | a tool step, child of the response that asked for it | `gen_ai.tool.name`, `gen_ai.tool.call.id`, `gen_ai.tool.call.arguments` (kept as JSON), `gen_ai.tool.call.result`; status `error` when Claude Code marks the result an error or a Codex command exits non-zero (`process.exit.code`); `traza.edit=true` on a Codex call that applies a patch through a general tool (an older build's `shell ["apply_patch", …]`), so blame can find it without reading every command |
 | a sub-agent | an agent step, `gen_ai.operation.name=invoke_agent` | `gen_ai.agent.name` (Claude Code's `agentType`, Codex's `agent_role`); a Claude Code sub-agent is a child of the `Agent`/`Task` tool call that spawned it and its own calls are its children |
 | an API error Claude Code synthesized | a failed llm step | `error.type`; the model is the one the session was using |
@@ -83,6 +83,38 @@ or fields are replaced by a marker saying how many were not kept, and the span
 is counted in `spans_trimmed`. Without it, a response of hundreds of large
 parts overran a server's 4 MiB `max-span-bytes` cap and was refused whole (on
 one real Codex history, one span of 894,000).
+
+## What the recorded runs answer
+
+An imported session is a run like any other, so every read built on runs
+works on it with nothing else set up. On the synthetic fixtures in
+`tests/fixtures/import/` (`tests/cross_feature.rs` holds these assertions):
+
+- **[Foresight](foresight.md).** The sessions of one tool are one cohort —
+  agent `claude-code` or `codex`, a sub-agent's steps part of its session's
+  path — so
+  `GET /v1/fate/map?agent=claude-code` shows which first moves of past
+  sessions ended well, and `GET /v1/fate/runs/{session}` reads a live
+  session against them.
+- **[Context X-Ray and Cache Autopsy](xray.md).** Each call's context is
+  rebuilt from the conversation's recorded deltas: an X-Ray shows the whole
+  conversation the model saw, with each tool result traced to the tool step
+  that returned it, and the autopsy pairs each call with its conversation's
+  previous one — a break after a long pause reads `ttl_expired`, priced when
+  the pricing table names cache rates.
+- **[TQL and the detectors](tql.md).** Tool names, arguments and error
+  statuses are the steps' own, so `test[error] ..> edit` and the
+  `unverified_finish` detector find the session that edited code after a
+  failing test and stopped without running it again.
+- **[Agent Blame](#agent-blame)**, below, and **[run topology](steer.md#topology)**:
+  a Claude Code sub-agent is a handoff from `claude-code` and back.
+- **[The change radar](radar.md)** reads `service.version`, so a tool upgrade
+  is a change point.
+- **[Live runs and the hook pack](steer.md).** A session imported with
+  `--watch` is live while it runs; with the
+  [Claude Code hook pack](../../examples/claude-code/README.md) installed, its
+  run is the same session id, so the pre-call gate, nudges and foresight all
+  apply to it.
 
 ## Importing again is safe
 
@@ -308,16 +340,25 @@ shells no longer candidates by name, 44,796 of them are.
 - **Rewrites.** Transcripts only ever grow, so a file is re-examined only when
   its size moves (a stat per file per poll); one rewritten in place to exactly
   its old size is not noticed.
-- **Prices.** Pricing applies the input and output rates to
-  `gen_ai.usage.input_tokens` and `output_tokens`; cache counters are recorded
-  but not priced separately yet, and the error runs in **both directions**.
-  Anthropic's `input_tokens` is the uncached remainder, so cache reads and
-  writes go unpriced and a cache-heavy Claude Code session's derived cost is
-  **understated**. OpenAI's `input_tokens` *includes* the cached part, so cached
-  input is charged at the full input rate and a cache-heavy Codex session's
-  derived cost is **overstated** — with 80% of the prompt cached at a 90%
-  discount, the input share comes out about 3.6 times the real figure, and
+- **Prices.** The cache counters are priced only when the
+  [pricing table](../configuration.md#model-pricing) names a model's
+  `cache_read_per_mtok` and `cache_write_per_mtok`: then a Claude Code call's
+  cache reads and writes are charged at their own rates on top of its
+  uncached input, and a Codex call's cached input is carved out of its input
+  at the cache rate (see [pricing cached tokens](xray.md#pricing-cached-tokens)).
+  Without them the error runs in **both directions**: Anthropic's
+  `input_tokens` is the uncached remainder, so cache reads and writes go
+  unpriced and a cache-heavy Claude Code session's derived cost is
+  **understated**; OpenAI's `input_tokens` *includes* the cached part, so
+  cached input is charged at the full input rate and a cache-heavy Codex
+  session's derived cost is **overstated** — with 80% of the prompt cached at a
+  90% discount, the input share comes out about 3.6 times the real figure, and
   approaches 10 times as the cached share nears all of it.
+- **What a transcript leaves out.** Neither tool writes its system prompt or
+  tool definitions into the transcript, so the [context X-Ray](xray.md),
+  which rebuilds each call's context from the conversation's recorded deltas,
+  shows the conversation only, and the Cache Autopsy judges the recorded part
+  of the prefix.
 - **Counting.** A session rollup's `llm_calls` counts every span carrying
   `gen_ai.operation.name`, tool and agent spans included (Traza's existing rule
   for GenAI spans); a [tape](replay.md) counts steps exactly.

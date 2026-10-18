@@ -1578,3 +1578,263 @@ fn the_store_default_threshold_follows_the_config() {
         DEFAULT_STALE_STEPS
     );
 }
+
+/// A model call that recorded only what it added to `conversation`
+/// ([`INPUT_DELTA_ATTRIBUTE`]) — or, with `delta` false, its whole context —
+/// as the recorders write transcripts.
+fn delta_llm(
+    id: &str,
+    start: u64,
+    conversation: &str,
+    delta: bool,
+    input: Value,
+    output: Value,
+) -> Span {
+    let mut span = llm("d1", id, start, input, output);
+    span.attributes
+        .insert(CONVERSATION_ATTRIBUTE.into(), json!(conversation));
+    span.attributes
+        .insert(INPUT_DELTA_ATTRIBUTE.into(), json!(delta));
+    span
+}
+
+/// A main conversation that reads a file, a helper conversation in between,
+/// and the main one carrying on: every call recorded as a delta.
+fn delta_run() -> Vec<Span> {
+    vec![
+        delta_llm(
+            "m0",
+            100,
+            "main",
+            true,
+            json!([msg("system", SYSTEM), msg("user", TASK)]),
+            json!([call("c1", "read_file", json!({"path": "parser.rs"}))]),
+        ),
+        tool(
+            "d1",
+            "t1",
+            200,
+            "read_file",
+            "c1",
+            json!({"path": "parser.rs"}),
+            READ,
+        ),
+        delta_llm(
+            "m2",
+            300,
+            "main",
+            true,
+            json!([result("c1", READ)]),
+            json!([msg("assistant", "Asking a helper about zeta_marker_one")]),
+        ),
+        delta_llm(
+            "h0",
+            400,
+            "helper",
+            true,
+            json!([msg("user", "Where is zeta_marker_one defined?")]),
+            json!([msg("assistant", "In parser.rs")]),
+        ),
+        delta_llm(
+            "m4",
+            500,
+            "main",
+            true,
+            json!([msg("user", "The helper says parser.rs")]),
+            json!([msg("assistant", "Fixed.")]),
+        ),
+        // Nothing new since m4 (a retry): an empty delta, not an unrecorded
+        // context.
+        delta_llm(
+            "m5",
+            600,
+            "main",
+            true,
+            Value::Null,
+            json!([msg("assistant", "Fixed.")]),
+        ),
+    ]
+}
+
+#[test]
+fn a_delta_recorded_conversation_is_read_as_the_whole_context_it_was() {
+    let fixture = TempStore::open("xray-delta", crate::Config::default());
+    let mut spans = delta_run();
+    // An empty delta is recorded with no input at all, as the recorders do.
+    spans[5].attributes.remove("gen_ai.input.messages");
+    fixture.store().ingest_batch(spans).expect("ingests");
+    let xray = xray_of(fixture.store(), Some(""), "tr-d1", "m4", options(20));
+    let chunks: Vec<(&str, &str)> = xray
+        .chunks
+        .iter()
+        .map(|chunk| (chunk.role.as_deref().unwrap_or("-"), chunk.preview.as_str()))
+        .collect();
+    // The main conversation's calls, their answers and what each added, in
+    // order — and nothing of the helper's, which ran in between.
+    assert_eq!(
+        chunks,
+        [
+            ("system", SYSTEM),
+            ("user", TASK),
+            ("assistant", "read_file({\"path\":\"parser.rs\"})"),
+            ("tool", READ),
+            ("assistant", "Asking a helper about zeta_marker_one"),
+            ("user", "The helper says parser.rs"),
+        ]
+    );
+    assert_eq!(xray.context_unavailable, None);
+    // Provenance reaches back through the conversation: the result came from
+    // the tool step, the task from the first call.
+    let from = |index: usize| {
+        xray.chunks[index]
+            .introduced_by
+            .clone()
+            .expect("introduced")
+    };
+    assert_eq!((from(1).step_index, from(3).step_index), (0, 1));
+    assert_eq!(from(3).kind, StepKind::Tool);
+    // Its predecessor is the main conversation's previous call, not the
+    // helper's nearer one, and nothing was lost.
+    let previous = xray.previous.clone().expect("previous");
+    assert_eq!(previous.step_index, 2);
+    assert_eq!(previous.shared_chunks, 4, "the whole of step 2's context");
+    assert!(xray.dropped_since_previous.is_empty());
+    assert_eq!(xray.cache.cause, Cause::Stable);
+
+    // An empty delta is the conversation so far plus the last answer.
+    let retry = xray_of(fixture.store(), Some(""), "tr-d1", "m5", options(20));
+    assert_eq!(retry.context_unavailable, None);
+    assert_eq!(retry.chunks.len(), 7);
+    assert_eq!(retry.chunks[6].preview, "Fixed.");
+
+    // The autopsy pairs each call within its conversation the same way.
+    let autopsy = fixture
+        .store()
+        .cache_autopsy(Some(""), "d1", AutopsyOptions::default())
+        .expect("reads")
+        .expect("found");
+    let verdicts: Vec<(Option<usize>, Option<usize>, Cause)> = autopsy
+        .steps
+        .iter()
+        .map(|step| (step.step_index, step.previous_step_index, step.cause))
+        .collect();
+    assert_eq!(
+        verdicts,
+        [
+            (Some(0), None, Cause::NewContext),
+            (Some(2), Some(0), Cause::Stable),
+            (Some(3), None, Cause::NewContext),
+            (Some(4), Some(2), Cause::Stable),
+            (Some(5), Some(4), Cause::Stable),
+        ]
+    );
+    assert!(
+        autopsy.steps[2].explanation.contains("conversation"),
+        "{}",
+        autopsy.steps[2].explanation
+    );
+}
+
+#[test]
+fn a_restarted_conversation_pairs_with_the_call_it_compacted_and_names_the_loss() {
+    let fixture = TempStore::open("xray-delta-restart", crate::Config::default());
+    let rule = "Never touch the migrations folder";
+    fixture
+        .store()
+        .ingest_batch(vec![
+            delta_llm(
+                "c0",
+                100,
+                "main",
+                true,
+                json!([msg("system", SYSTEM), msg("user", rule)]),
+                json!([msg("assistant", "Understood.")]),
+            ),
+            delta_llm(
+                "c1",
+                200,
+                "main",
+                true,
+                json!([msg("user", "Fix the login test")]),
+                json!([msg("assistant", "Done.")]),
+            ),
+            // After a compaction the recorders mark the call `false`: its
+            // input is all it saw — and shares nothing with what came before.
+            delta_llm(
+                "c2",
+                300,
+                "main",
+                false,
+                json!([msg("user", "Summary: the login test was fixed.")]),
+                json!([msg("assistant", "Next?")]),
+            ),
+        ])
+        .expect("ingests");
+    let xray = xray_of(fixture.store(), Some(""), "tr-d1", "c2", options(20));
+    assert_eq!(xray.chunks.len(), 1);
+    assert_eq!(
+        xray.previous
+            .as_ref()
+            .map(|p| (p.step_index, p.shared_chunks)),
+        Some((1, 0)),
+        "linked by its conversation, though nothing is shared"
+    );
+    let lost: Vec<(&str, &str)> = xray
+        .dropped_since_previous
+        .iter()
+        .map(|dropped| (dropped.kind, dropped.preview.as_deref().unwrap_or("")))
+        .collect();
+    assert_eq!(
+        lost,
+        [
+            ("instruction", SYSTEM),
+            ("instruction", rule),
+            ("other", "Understood."),
+            ("instruction", "Fix the login test"),
+        ]
+    );
+    assert_eq!(xray.cache.cause, Cause::NewContext);
+    let divergence = xray.cache.first_divergent_chunk.clone().expect("diverged");
+    assert_eq!(divergence.change, Change::Rewritten);
+}
+
+#[test]
+fn threads_are_bounded_and_a_dropped_conversation_is_not_rebuilt_from_nothing() {
+    let read_of = |text: &str| Read {
+        context: chunk::context_pieces(Some(&json!([msg("user", text)])), &[], MAX_CONTEXT_CHUNKS),
+        response: chunk::response_pieces(&json!([msg("assistant", "ok")]), MAX_CONTEXT_CHUNKS).list,
+        unavailable: None,
+    };
+    let span_of =
+        |conversation: &str| delta_llm("x", 1, conversation, true, Value::Null, Value::Null);
+    let mut threads = Threads::default();
+    // One more conversation than are kept: the first, least recently
+    // continued, is dropped.
+    for index in 0..=MAX_THREADS {
+        let read = threads.fold(&span_of(&format!("c{index}")), read_of("hello"));
+        assert_eq!(read.context.list.len(), 1);
+    }
+    assert_eq!(threads.running.len(), MAX_THREADS);
+    // Its next delta cannot be rebuilt, and says so rather than passing for
+    // its whole context.
+    let read = threads.fold(&span_of("c0"), read_of("again"));
+    assert_eq!(read.unavailable, Some(NOT_REBUILT));
+    // A kept one continues: its context, its answer, then the new message.
+    let read = threads.fold(&span_of(&format!("c{MAX_THREADS}")), read_of("again"));
+    assert_eq!(read.unavailable, None);
+    let texts: Vec<&str> = read.context.list.iter().map(|p| p.text.as_str()).collect();
+    assert_eq!(texts, ["hello", "ok", "again"]);
+    // A call naming no conversation passes through untouched.
+    let mut plain = span_of("c1");
+    plain.attributes.remove(CONVERSATION_ATTRIBUTE);
+    let read = threads.fold(&plain, read_of("solo"));
+    assert_eq!(read.context.list.len(), 1);
+    // The text bound holds too: one conversation larger than every bound
+    // is never kept, so its next call is not rebuilt.
+    let mut huge = Threads::default();
+    let big = "x".repeat(MAX_THREAD_BYTES + 1);
+    huge.fold(&span_of("big"), read_of(&big));
+    assert!(huge.running.is_empty() && huge.bytes == 0);
+    let read = huge.fold(&span_of("big"), read_of("next"));
+    assert_eq!(read.unavailable, Some(NOT_REBUILT));
+}

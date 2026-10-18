@@ -107,8 +107,8 @@ use crate::{erasure, semconv, Deadline, Error, Result, Span, Store};
 
 /// Ceiling on span contributions held across every live run — each a 40-byte
 /// record under an 8-byte key, before hash-table overhead — plus the steps of
-/// the behaviour paths kept for runs under a predictive policy (48 bytes
-/// each, at most the earliest 192 per run; see [`crate::fate`]).
+/// the runs' behaviour paths (48 bytes each, at most the earliest 192 per
+/// run; see [`crate::fate`] and [`FuseConfig::live_paths`]).
 /// Past it, whole runs are evicted least-recently-active first; they rebuild
 /// from the store when next asked about.
 pub const MAX_TRACKED_SPANS: usize = 1_000_000;
@@ -873,13 +873,16 @@ fn stop_limits(
     (resolved.action == Action::Stop).then_some(resolved.limits)
 }
 
-/// Whether a run of a tenant with `policies` keeps its behaviour path for
-/// the predictive fuses ([`crate::fate::LivePath`]): when a policy that
-/// could govern it — the global one, any of the tenant's, or the run's
-/// grant — sets `min_success_odds`. Decided when the run's state starts; a
-/// run that started before such a policy existed is read from the store.
+/// Whether a run of a tenant with `policies` keeps its behaviour path
+/// ([`crate::fate::LivePath`]): every run when [`FuseConfig::live_paths`]
+/// is on (the default), so the live view shows foresight; otherwise when a
+/// policy that could govern it — the global one, any of the tenant's, or
+/// the run's grant — sets `min_success_odds`, for the predictive fuses.
+/// Decided when the run's state starts; a run that started before such a
+/// policy existed is read from the store.
 fn follows_behaviour(policies: &[FusePolicy], config: &FuseConfig, grant: Option<&Limits>) -> bool {
-    config.limits.min_success_odds.is_some()
+    config.live_paths
+        || config.limits.min_success_odds.is_some()
         || grant.is_some_and(|grant| grant.min_success_odds.is_some())
         || policies
             .iter()
@@ -3933,8 +3936,15 @@ mod tests {
                 state.runs.values().map(RunState::tracked).sum::<usize>(),
             )
         };
-        // No predictive limit: no path is kept, and nothing is spent on one.
-        let plain = TempStore::open("behaviour-off", FuseConfig::default());
+        // No predictive limit and live paths off: no path is kept, and
+        // nothing is spent on one.
+        let plain = TempStore::open(
+            "behaviour-off",
+            FuseConfig {
+                live_paths: false,
+                ..FuseConfig::default()
+            },
+        );
         plain
             .store()
             .ingest_batch(vec![tool_span("r", "a", "search", "1", 10)])
@@ -3949,6 +3959,7 @@ mod tests {
                     min_success_odds: Some(0.5),
                     ..Limits::default()
                 },
+                live_paths: false,
                 ..FuseConfig::default()
             },
         );

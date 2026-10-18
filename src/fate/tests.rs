@@ -1726,3 +1726,107 @@ fn calibration_scores_a_run_only_on_what_it_had_done_by_then() {
     let skill = depth1.skill.expect("a skill");
     assert!((0.4..0.6).contains(&skill), "{depth1:?}");
 }
+
+#[test]
+fn the_live_view_shows_foresight_from_memory_and_completes_a_bounded_few_runs() {
+    let fixture = TempStore::open("live-view", crate::Config::default());
+    let store = fixture.store();
+    let now = now();
+    // The completed history first, then the runs still in flight: the
+    // live view lists the most recently changed first.
+    let (live, done): (Vec<Span>, Vec<Span>) =
+        corpus(now, "", true).into_iter().partition(|span| {
+            span.attributes
+                .get("session.id")
+                .and_then(Value::as_str)
+                .is_some_and(|run| run.starts_with("live-"))
+        });
+    store.ingest_batch(done).expect("ingests");
+    store.ingest_batch(live).expect("ingests");
+    let listing = || store.live_runs(Some(""), 6).expect("lists").runs;
+    let foresight_of = |rows: &[crate::steer::LiveRun], run: &str| {
+        rows.iter()
+            .find(|row| row.run == run)
+            .unwrap_or_else(|| panic!("{run} not listed"))
+            .foresight
+            .clone()
+    };
+    // No map yet: nothing to read foresight against, and nothing rebuilt —
+    // but opening the view asked for the map.
+    let first = listing();
+    assert_eq!(first.len(), 6);
+    assert!(first.iter().all(|row| row.foresight.is_none()), "{first:?}");
+    assert_eq!(
+        store.maintain_fate().expect("warms"),
+        1,
+        "the view asked for one map"
+    );
+    // With the map cached, the runs are read whole — at most the bound per
+    // call — and their foresight comes from the guard's paths.
+    let second = listing();
+    assert_eq!(
+        second.iter().filter(|row| row.foresight.is_some()).count(),
+        LIVE_FORESIGHT_REBUILDS.min(6)
+    );
+    let doomed = foresight_of(&second, "live-doomed-0").expect("foresight");
+    assert_eq!(doomed.verdict, ForesightVerdict::LikelyFailure);
+    assert_eq!((doomed.support, doomed.p_success), (50, Some(0.1)));
+    assert_eq!(doomed.ci95, Some(wilson_pair(5, 50)));
+    let novel = foresight_of(&second, "live-novel-0").expect("foresight");
+    assert_eq!(novel.verdict, ForesightVerdict::Novel);
+    // The same answer /v1/fate/runs gives from the store.
+    let stored = store
+        .foresee("", "live-doomed-0", DEFAULT_VERDICT_SUPPORT, now)
+        .expect("reads")
+        .expect("found");
+    assert_eq!(
+        (stored.verdict, stored.support, stored.p_success),
+        (doomed.verdict, doomed.support, doomed.p_success)
+    );
+    // Read whole, a run is answered from memory from then on: a step that
+    // lands moves its foresight with no store read.
+    let reads = store.fate.run_reads.load(Ordering::Relaxed);
+    let mut refund = synthetic_run(
+        "live-healthy-0",
+        "support-agent",
+        &["tool:issue_refund"],
+        now - 1_000_000_000,
+        false,
+    );
+    refund[0].span_id = "second-refund".into();
+    store.ingest_batch(refund).expect("ingests");
+    let third = listing();
+    let healthy = foresight_of(&third, "live-healthy-0").expect("foresight");
+    assert_eq!((healthy.support, healthy.p_success), (30, Some(0.5)));
+    assert_eq!(store.fate.run_reads.load(Ordering::Relaxed), reads);
+
+    // Past the bound, the rest wait for a later call; every call completes
+    // at most the bound.
+    let wide = store.live_runs(Some(""), 200).expect("lists").runs;
+    let with = wide.iter().filter(|row| row.foresight.is_some()).count();
+    assert!(with <= 6 + LIVE_FORESIGHT_REBUILDS, "{with}");
+    let again = store.live_runs(Some(""), 200).expect("lists").runs;
+    let more = again.iter().filter(|row| row.foresight.is_some()).count();
+    assert_eq!(more, (with + LIVE_FORESIGHT_REBUILDS).min(again.len()));
+
+    // With live paths off and no predictive policy, the guard keeps no path
+    // to read from, and the view says nothing rather than reading the store.
+    let quiet = TempStore::open(
+        "live-view-off",
+        crate::Config {
+            fuses: crate::guard::FuseConfig {
+                live_paths: false,
+                ..crate::guard::FuseConfig::default()
+            },
+            ..crate::Config::default()
+        },
+    );
+    quiet
+        .store()
+        .ingest_batch(corpus(now, "", true))
+        .expect("ingests");
+    let _ = quiet.store().live_runs(Some(""), 6).expect("lists");
+    quiet.store().maintain_fate().expect("warms");
+    let rows = quiet.store().live_runs(Some(""), 6).expect("lists").runs;
+    assert!(rows.iter().all(|row| row.foresight.is_none()), "{rows:?}");
+}

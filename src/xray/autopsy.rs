@@ -178,6 +178,10 @@ pub(crate) struct Context {
     /// The agent the call belongs to, when the trace names one: calls of
     /// two differently named agents never pair.
     pub(crate) agent: Option<String>,
+    /// The conversation the call names (`gen_ai.conversation.id`), when it
+    /// names one: such a call pairs only within its conversation, and with
+    /// the nearest earlier call of it always.
+    pub(crate) conversation: Option<String>,
     pub(crate) start_ns: u64,
     pub(crate) chunks: Vec<Kept>,
     /// Content digests present.
@@ -235,6 +239,7 @@ impl Context {
             step_index,
             tenant: tenant.to_owned(),
             agent: None,
+            conversation: None,
             start_ns,
             chunks,
             contents,
@@ -248,6 +253,12 @@ impl Context {
     /// The same context, attributed to `agent`.
     pub(crate) fn with_agent(mut self, agent: Option<String>) -> Self {
         self.agent = agent;
+        self
+    }
+
+    /// The same context, in `conversation`.
+    pub(crate) fn with_conversation(mut self, conversation: Option<String>) -> Self {
+        self.conversation = conversation;
         self
     }
 
@@ -346,6 +357,26 @@ pub(crate) fn predecessor<'r>(
             if theirs != ours {
                 continue;
             }
+        }
+        // A named conversation links its calls outright: the nearest earlier
+        // call of it is the predecessor whatever the two share — after a
+        // compaction, nothing — and a call of another conversation, or of
+        // none, never is.
+        if candidate.conversation.is_some() || current.conversation.is_some() {
+            if candidate.conversation != current.conversation {
+                continue;
+            }
+            if let Some(reason) = candidate.unavailable {
+                return Err((candidate.step_index, reason));
+            }
+            let (_, bridged) = leading_match(candidate, current, pool);
+            let shared = bridged
+                + candidate
+                    .chunks
+                    .iter()
+                    .filter(|chunk| current.contents.contains(&chunk.content))
+                    .count();
+            return Ok(Some((candidate, shared)));
         }
         if let Some(reason) = candidate.unavailable {
             match best {

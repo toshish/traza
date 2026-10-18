@@ -240,16 +240,20 @@ path moves on to better odds — and it **never warns at 80%**. The verdict
 document carries the run's `foresight` whenever the policy sets the limit.
 The whole model is in [the foresight guide](foresight.md#predictive-fuses).
 
-**Its memory.** For a run under a policy that sets `min_success_odds`, the
-guard keeps the run's behaviour path beside its usage: the earliest 192
-steps, 48 bytes each, maintained as usage is — each version of a span that
-lands replaces the last, a rebuild replays it, eviction and erasure drop it —
-and counted against the same 1,000,000-record budget as span contributions
-(so such runs are evicted somewhat sooner). The check reads that path from
-memory rather than reading the run back from the store. A run whose state
-started before any such policy existed keeps no path until the guard next
-rebuilds it, and is read from the store meanwhile. Runs under no predictive
-policy keep nothing extra.
+**Its memory.** The guard keeps every live run's behaviour path beside its
+usage — what the predictive limits judge, and what the
+[live view](steer.md#foresight-on-live-runs) shows foresight from: the
+earliest 192 steps, 48 bytes each, maintained as usage is — each version of
+a span that lands replaces the last, a rebuild replays it, eviction and
+erasure drop it — and counted against the same 1,000,000-record budget as
+span contributions (so step-heavy runs are evicted somewhat sooner than
+they would be without it). The check reads that path from memory rather than
+reading the run back from the store. `--fate-cache-seconds 0` stops keeping
+paths, since no map would read them; an embedder sets
+`FuseConfig::live_paths` to `false` for the same, after which only runs a
+predictive policy could govern keep one. A run whose state started before
+paths were kept keeps none until the guard next rebuilds it, and is read
+from the store meanwhile.
 
 ## Stopping and resetting
 
@@ -292,7 +296,8 @@ Live usage is an in-memory cache over the store, folded from every
 acknowledged batch on the ingest path. It is bounded, with no exceptions: at
 most `--fuse-max-runs` live runs (default 100,000, shared by every tenant),
 at most 1,000,000 span contributions across them (each a 40-byte record under
-an 8-byte key, before hash-table overhead), least recently active evicted
+an 8-byte key, before hash-table overhead; the steps of the runs' behaviour
+paths count against it too), least recently active evicted
 first, and any run idle for six hours evicted. A run is followed from its
 **first step**: a trace of HTTP and database spans costs the observer a read
 of each span and holds no state. A run id longer than 1,024 bytes is not
