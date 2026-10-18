@@ -301,7 +301,9 @@ Each change also carries:
 
 - `detail`, which depends on the dimension:
   - for a **system prompt**, the first differing stretch of the masked text
-    (≤ 80 characters a side, with a little context and the character offset);
+    (≤ 80 characters a side, with a little context and the character offset).
+    When the run carries a set of prompts (a planner and an executor, say)
+    and exactly one of them changed, the diff is of that one;
   - for a **tool catalog**, the tools added and removed, or
     `definitions_changed` when the names are the same;
   - for **sampling parameters**, the keys that differ;

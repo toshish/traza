@@ -1010,13 +1010,36 @@ impl Context<'_> {
         text
     }
 
-    /// The sample of a combo that is one value.
-    fn sample(&self, dimension: Dimension, combo: u32) -> Option<&Sample> {
+    /// The samples a change between two combos can be shown with: the
+    /// value each side does not share with the other, when exactly one
+    /// value changed. A single-valued run changes its one value; a
+    /// multi-agent run whose executor prompt changed keeps its planner prompt
+    /// on both sides, and the executor's two prompts are what differ.
+    fn changed_samples(
+        &self,
+        dimension: Dimension,
+        from: u32,
+        to: u32,
+    ) -> (Option<&Sample>, Option<&Sample>) {
         let index = dimension.index();
-        let (members, overflow) = self.combos[index].members.get(combo as usize)?;
-        match (members.as_slice(), overflow) {
-            ([only], false) => self.tables.values[index].sample(*only),
-            _ => None,
+        let members = |combo: u32| {
+            self.combos[index]
+                .members
+                .get(combo as usize)
+                .filter(|(_, overflow)| !overflow)
+                .map(|(members, _)| members)
+        };
+        let (Some(old), Some(new)) = (members(from), members(to)) else {
+            return (None, None);
+        };
+        let removed: Vec<u32> = old.iter().copied().filter(|id| !new.contains(id)).collect();
+        let added: Vec<u32> = new.iter().copied().filter(|id| !old.contains(id)).collect();
+        match (removed.as_slice(), added.as_slice()) {
+            ([before], [after]) => (
+                self.tables.values[index].sample(*before),
+                self.tables.values[index].sample(*after),
+            ),
+            _ => (None, None),
         }
     }
 }
@@ -1813,14 +1836,14 @@ fn build_change(
             let (from, to, rows) = path_detail(&before, &after, context);
             (from, to, Some(json!({ "paths": rows })))
         }
-        dimension => (
-            context.display(dimension, change.from),
-            context.display(dimension, change.to),
-            value_detail(
-                context.sample(dimension, change.from),
-                context.sample(dimension, change.to),
-            ),
-        ),
+        dimension => {
+            let (before, after) = context.changed_samples(dimension, change.from, change.to);
+            (
+                context.display(dimension, change.from),
+                context.display(dimension, change.to),
+                value_detail(before, after),
+            )
+        }
     };
     Change {
         at_ns: runs[onset].start_ns,
@@ -2990,6 +3013,68 @@ mod tests {
             version.runs_after, 48,
             "runs 61..=119 less the 11 stragglers"
         );
+        // A canary carries the new value, but ran before the change: it is
+        // downstream of nothing. A straggler after it is not downstream
+        // either: it still carries the old value.
+        for run in ["run-030", "run-065"] {
+            let placed = ChangeQuery {
+                run: Some(run.to_owned()),
+                ..query()
+            };
+            let context = store
+                .changes(None, &placed, NOW)
+                .expect("analyses")
+                .run
+                .expect("placed");
+            assert!(context.downstream_of.is_empty(), "{run}: {context:#?}");
+        }
+    }
+
+    #[test]
+    fn a_multi_agent_prompt_change_diffs_the_prompt_that_changed() {
+        // Every run has a planner call and an executor call with different
+        // system prompts; only the executor's changes.
+        let fixture = TempStore::open("radar-multi", crate::Config::default());
+        let store = fixture.store();
+        let mut spans = Vec::new();
+        for index in 0..120u64 {
+            let mut run = RunSpec {
+                tenant: "",
+                id: format!("run-{index:03}"),
+                start: BASE + index * MINUTE,
+                prompt: "You plan the work.",
+                version: "1.0",
+                tools: &["search"],
+                failed: false,
+                environment: None,
+            }
+            .spans();
+            let executor = if index < 60 {
+                "You execute. Use the search tool."
+            } else {
+                "You execute. Use the browse tool."
+            };
+            if let Some(last) = run.last_mut() {
+                last.attributes.insert(
+                    "gen_ai.input.messages".to_owned(),
+                    json!(json!([{"role": "system", "content": executor}]).to_string()),
+                );
+            }
+            spans.extend(run);
+        }
+        store.ingest_batch(spans).expect("ingests");
+        let report = store.changes(None, &query(), NOW).expect("analyses");
+        let prompt = find(&report, Dimension::SystemPrompt).expect("found");
+        assert!(
+            prompt.from.contains(" + ") && prompt.to.contains(" + "),
+            "a set"
+        );
+        let diff = &prompt
+            .detail
+            .as_ref()
+            .expect("the changed member is diffed")["diff"];
+        assert_eq!(diff["before"], "search");
+        assert_eq!(diff["after"], "browse");
     }
 
     #[test]
