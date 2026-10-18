@@ -46,6 +46,7 @@ live.
 | `steps`, `cost_usd`, `tokens`, `errors`, `verdict`, `reasons`, `policy` | As the [guard](guard.md#runs) counts and judges them. |
 | `pending_nudges` | Nudges queued and not yet delivered or expired. |
 | `foresight` | How earlier runs of its agent that took the same path ended — a verdict, the success rate with its 95% interval, and how many runs that is — read from memory; see [foresight on live runs](#foresight-on-live-runs). |
+| `foresight_deferred` | `true` when the row lacks `foresight` only because the one-time read that would give it foresight was not made by this request (see [below](#foresight-on-live-runs)); absent otherwise. |
 
 The listing is built from the guard's live state alone — no store read,
 except the one-time read that gives a run its foresight (below).
@@ -62,7 +63,8 @@ What it costs ingest: for each run a batch touches, the run is re-stamped —
 one removal and one insertion in each of the two change indexes and an
 atomic store, under the guard's state lock the fold already holds — and each
 step span's agent and label are read beside the fingerprint the guard
-already extracts (copied only when longer than 160 characters, to cut).
+already extracts (copied only when longer than 160 characters, to cut), the
+agent's whole name digested once to tell it from others.
 
 **What it shows is what this process has seen.** A run the server began
 following after a restart lists with the usage seen since, exactly like
@@ -97,20 +99,38 @@ tenant shows no verdicts and the next ones, a build later, do. And a run the
 guard has followed only since it came into memory — never asked about — may
 be a tail of a longer run, so it is read whole from the store first, as a
 verdict query reads it: at most 8 such runs per listing, newest first, once
-each while they stay in memory. Runs that check before every step (the hook
-pack, the SDK guards) are already whole. `--fate-cache-seconds 0` turns all
-of this off: no paths are kept, and no row has `foresight`.
+each while they stay in memory. Those reads share the listing's one
+`--query-deadline-ms` budget — a stream update has one of its own — so a
+listing spends one budget on them, not one per read: once it is spent no
+read starts, and a read it cut short ends the reading. A run whose read
+failed is not read again for 60 seconds (at most 1,024 runs are remembered
+so; an erasure forgets them), so polling does not repeat a read that cannot
+finish. Every row that needed a read this request did not make says so with
+`"foresight_deferred": true`, and lists without `foresight` until a later
+request reads it. Runs that check before every step (the hook pack, the SDK
+guards) are already whole. `--fate-cache-seconds 0` turns all of this off:
+no paths are kept, and no row has `foresight`.
 
 ### The stream
 
 `GET /v1/runs/live/stream` is the same view as server-sent events: an
 `event: snapshot` carrying the listing first (up to 256 runs), then `event: run` with one
 run's row each time that run changes, and a `: tick` comment after 15
-seconds of quiet. Updates are coalesced — at most one batch per 250 ms, a
-run that changed several times appearing once with its latest state. When
-more than 256 runs change at once, or an erasure sweeps the view, the stream
-sends a fresh `snapshot` that replaces everything the client holds.
-Reconnecting starts from a snapshot; there is no resume cursor.
+seconds of quiet. When a run whose row the client holds leaves the view, the
+stream says so with `event: removed` — `{"run", "tenant", "reason"}`, the
+reason `evicted` (the guard let go of it to stay inside `--fuse-max-runs`,
+its span budget, or after six idle hours; a stopped run is parked) or
+`expired` (its last activity fell out of `--live-window-seconds`, sent within
+about 200 ms of it doing so, with no other change needed) — so a client that
+applies every event holds exactly the rows the listing has. Removals come
+before the update's `run` events: a run evicted and back again within one
+update is removed, then sent anew. Updates are coalesced — at most one batch
+per 250 ms, a run that changed several times appearing once with its latest
+state. When more than 256 runs change at once, an erasure sweeps the view,
+the client would hold more than 4,096 rows, or more than 1,024 runs were
+evicted since the stream last looked, the stream sends a fresh `snapshot`
+that replaces everything the client holds. Reconnecting starts from a
+snapshot; there is no resume cursor.
 
 ```
 event: snapshot
@@ -118,7 +138,15 @@ data: {"runs":[{"agent":"triage",…,"run":"swarm-1",…}],"truncated":false,"wi
 
 event: run
 data: {"agent":"triage",…,"current":{"kind":"tool","name":"refund_order","pending":true,"started_ns":1792297739658473000},…}
+
+event: removed
+data: {"reason":"expired","run":"swarm-0","tenant":""}
 ```
+
+To tell its client what left, a stream remembers the rows it sent and has
+not removed — about 64 bytes each beside the run ids the guard already
+holds, at most 4,096 a stream — and the guard remembers the last 1,024 runs
+it evicted, for the streams still behind them. Both are memory only.
 
 A stream follows the guard's change feed by reading an atomic counter every
 200 ms, taking no lock until something changed. One server serves at most 64
@@ -197,16 +225,23 @@ outside the generation layout: backups do not carry it.
 | Message | 1 to 4,096 bytes | `400` |
 | `ttl_seconds` | 1 to 604,800 (7 days); default 3,600 | `400`; an expired nudge is never delivered |
 | Pending nudges per run | 32 | `409` |
+| Blocks one delivery's hold vetoes with | 32 | the newest kept: those just delivered, then the latest still holding |
 | Nudges kept per run | 64 | delivered and expired ones dropped, oldest first |
-| What one tenant's nudges cost | 4 MiB | its delivered and expired nudges are dropped, oldest first; when only pending ones are left, `409` |
-| What every tenant's nudges cost | 32 MiB | anyone's delivered and expired nudges are dropped, oldest first; when only pending ones are left, `409` |
+| What one tenant's nudges cost | 4 MiB | its delivered and expired nudges are dropped, oldest first; when only pending ones (and holding blocks) are left, `409` |
+| What every tenant's nudges cost | 32 MiB | anyone's delivered and expired nudges are dropped, oldest first; when only pending ones (and holding blocks) are left, `409` |
 
 A nudge costs its message, id, run id and tenant plus 512 bytes for its
 place in memory and its indexes — so a tenant holds a few hundred nudges at
 the longest message, a few thousand short ones. Delivered and expired
 nudges are history, kept for `GET /v1/runs/{run}/nudges` and dropped first;
-pending ones are never dropped to make room. The file holds at most about
-twice what memory does before it is rewritten.
+pending ones are never dropped to make room, and neither is a delivered
+`block` whose two-second hold is still in force — it is the veto the run's
+checks are being answered with, and dropping it would let the next call of
+its batch through. A run's 32 pending nudges and 32 holding blocks together
+never exceed the 64 it keeps, so the per-run bound always holds; a budget
+that only holding blocks keep full refuses with `409` for at most those two
+seconds. The file holds at most about twice what memory does before it is
+rewritten.
 
 **No check waits on another run's nudges.** The nudges in memory and the
 log on disk have separate locks: queueing, delivering, forgetting and
@@ -266,7 +301,14 @@ Bounded: at most 50,000 spans are read (the earliest, in step order —
 1,024 handoff pairs, 256 cycle pairs and 500 turns of the sequence — the
 lists largest first, each with its own flag (`nodes_truncated`,
 `edges_truncated`, `handoffs_truncated`, `cycles_truncated`,
-`sequence_truncated`). Agent names are cut at 160 characters. Every pass
+`sequence_truncated`). Agents and services are told apart by their whole
+names: two agents whose names share their first 160 characters are two
+nodes, take turns, and make cycles, and an unnamed span in a service whose
+name merely starts like its parent's is its own actor. A name longer than
+160 characters *renders* as its first 160, `…#`, and 16 hex digits of a
+digest of the whole name (`<first 160 characters>…#3f9c0a1b2c3d4e5f`), so two cut names
+still render apart; the guard's stop reasons render them the same way.
+Every pass
 over the spans is linear or a sort, and each checks `--query-deadline-ms`
 as it goes: past the deadline the request is refused with `400`, not
 answered late. The topology reads the store, so it works under
@@ -305,12 +347,16 @@ test holds it to a full recount of the store after every batch.
 
 What it costs: about a hundred bytes of guard memory per named step beside
 its span contribution — every named step is a span the guard's
-1,000,000-contribution bound already counts — plus the name of each
-distinct agent a held step names, up to 160 characters, at most 256 names a
-run. A name is dropped when the last step naming it is, so a run never
-holds more names than named steps; a span re-sent under ever new agent
-names holds one. Past 256 distinct agents, the rest render as
-`agent#<hex>`.
+1,000,000-contribution bound already counts — plus the rendered name of
+each distinct agent a held step names, up to 160 characters and the digest
+of a cut one, at most 256 names a run. A name is dropped when the last step
+naming it is, so a run never holds more names than named steps; a span
+re-sent under ever new agent names holds one. Past 256 distinct agents, the
+rest render as `agent#<hex>`. Agents are told apart by a 64-bit digest of
+the whole name under keys drawn at random when the server starts, so nobody
+writing telemetry can choose two names the guard confuses; when two pairs
+tie for the most cycles, which one a stop names may differ after a restart,
+the count never.
 
 ## Tenancy
 
@@ -332,7 +378,9 @@ frame (see [MCP](mcp.md)):
 
 - **`run_topology`** — a run's agents, delegations, ping-pong pairs and
   turns. When a list was cut, the headline says so (`more than 256
-  agents`, and which lists show only their largest entries).
+  agents`, and which lists show only their largest entries). The headline
+  is the server's own words and counts; the run id and tenant, which
+  whoever wrote the telemetry chose, are the frame's first row.
 - **`list_live_runs`** — the live listing; listed only when the guard is on.
 
 ## Limitations
@@ -353,8 +401,8 @@ frame (see [MCP](mcp.md)):
 - **The live view is per process and partial after a restart.** It is built
   from memory; a run followed since some point shows what arrived since,
   and live state is never shared across replicas.
-- **The stream polls.** Changes reach a stream within about 200 ms, plus the
-  250 ms coalescing; a stream has no resume cursor.
+- **The stream polls.** Changes and removals reach a stream within about
+  200 ms, plus the 250 ms coalescing; a stream has no resume cursor.
 - **Handoff cycles count named agents only.** A run whose agents are told
   apart only by service name gets service nodes and delegation edges in its
   topology but no turns, no cycles, and nothing for `max_handoff_cycles` to

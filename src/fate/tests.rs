@@ -1727,6 +1727,106 @@ fn calibration_scores_a_run_only_on_what_it_had_done_by_then() {
     assert!((0.4..0.6).contains(&skill), "{depth1:?}");
 }
 
+/// One live listing spends one query budget on the reads that give its
+/// rows foresight — not a fresh budget per read — and reads nothing once
+/// that budget is spent.
+#[test]
+fn a_live_listing_spends_one_budget_on_its_foresight_reads() {
+    let fixture = TempStore::open(
+        "live-budget",
+        crate::Config {
+            query_deadline: Some(std::time::Duration::from_nanos(1)),
+            ..crate::Config::default()
+        },
+    );
+    let store = fixture.store();
+    let now = now();
+    let (live, done): (Vec<Span>, Vec<Span>) =
+        corpus(now, "", true).into_iter().partition(|span| {
+            span.attributes
+                .get("session.id")
+                .and_then(Value::as_str)
+                .is_some_and(|run| run.starts_with("live-"))
+        });
+    store.ingest_batch(done).expect("ingests");
+    store.ingest_batch(live).expect("ingests");
+    let _ = store.live_runs(Some(""), 6).expect("lists");
+    assert_eq!(store.maintain_fate().expect("warms"), 1, "a map to read");
+    let before = store.guard_rebuild_reads();
+    let rows = store.live_runs(Some(""), 6).expect("lists").runs;
+    let reads = store.guard_rebuild_reads() - before;
+    assert!(
+        reads <= 1,
+        "a listing whose budget is spent starts {reads} reads, each with a budget of its own"
+    );
+    assert_eq!(rows.len(), 6);
+    assert!(rows.iter().all(|row| row.foresight.is_none()), "{rows:?}");
+    assert!(
+        rows.iter().all(|row| row.foresight_deferred),
+        "every row it left unread says so: {rows:?}"
+    );
+}
+
+/// A read that ran a listing out of its budget ends the listing's reads —
+/// the rows it did not reach say so — and is not retried by the next
+/// listing, which reads the others instead.
+#[test]
+fn a_live_read_that_ran_out_of_budget_is_not_retried_by_every_listing() {
+    let budget = std::time::Duration::from_millis(1_000);
+    let fixture = TempStore::open(
+        "live-backoff",
+        crate::Config {
+            query_deadline: Some(budget),
+            ..crate::Config::default()
+        },
+    );
+    let store = fixture.store();
+    let now = now();
+    let (live, done): (Vec<Span>, Vec<Span>) =
+        corpus(now, "", true).into_iter().partition(|span| {
+            span.attributes
+                .get("session.id")
+                .and_then(Value::as_str)
+                .is_some_and(|run| run.starts_with("live-"))
+        });
+    store.ingest_batch(done).expect("ingests");
+    store.ingest_batch(live).expect("ingests");
+    let _ = store.live_runs(Some(""), 6).expect("lists");
+    assert_eq!(store.maintain_fate().expect("warms"), 1, "a map to read");
+    // The first read outlasts the listing's whole budget.
+    store.guard_on_next_rebuild(Box::new(move |_| {
+        std::thread::sleep(budget + std::time::Duration::from_millis(200));
+    }));
+    let before = store.guard_rebuild_reads();
+    let first = store.live_runs(Some(""), 6).expect("lists").runs;
+    assert_eq!(
+        store.guard_rebuild_reads() - before,
+        1,
+        "one read, then none"
+    );
+    assert!(
+        first
+            .iter()
+            .all(|row| row.foresight.is_none() && row.foresight_deferred),
+        "{first:?}"
+    );
+    let slow = first[0].run.clone();
+    // The next listing skips the read that failed and makes the rest.
+    let before = store.guard_rebuild_reads();
+    let second = store.live_runs(Some(""), 6).expect("lists").runs;
+    assert_eq!(store.guard_rebuild_reads() - before, 5, "{second:?}");
+    for row in &second {
+        if row.run == slow {
+            assert!(row.foresight.is_none() && row.foresight_deferred, "{row:?}");
+        } else {
+            assert!(
+                row.foresight.is_some() && !row.foresight_deferred,
+                "{row:?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn the_live_view_shows_foresight_from_memory_and_completes_a_bounded_few_runs() {
     let fixture = TempStore::open("live-view", crate::Config::default());

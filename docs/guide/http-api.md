@@ -2837,6 +2837,7 @@ curl http://127.0.0.1:8080/v1/runs/live
 | `verdict`, `reasons`, `policy` | The guard's verdict now |
 | `pending_nudges` | Nudges queued and not yet delivered or expired |
 | `foresight` | `{verdict, p_success, ci95, support, base_rate, map_built_at_ns?}`: how earlier runs of its agent that took the same path ended, as [`GET /v1/fate/runs/{run}`](#get-v1faterunsrun) judges it at the predictive fuses' default support of 30 — `on_track`, `at_risk`, `likely_failure`, `novel` or `insufficient_history` (no map cached yet). Absent while the server holds no whole path for the run; see below |
+| `foresight_deferred` | `true` when the row lacks `foresight` only because the read that would give it foresight was not made by this request; absent otherwise. See below |
 
 `truncated` is `true` when more runs were live than `limit`. A run is listed
 with what this process has seen of it; a run with no span yet, and a stopped
@@ -2848,8 +2849,11 @@ listing asks for the map when none is cached, so foresight appears within a
 background build of the view being opened. A run the guard has followed only
 since it came into memory — never asked about — is first read whole from the
 store, as a verdict query would read it, at most 8 such runs per request
-(newest first); the rest list without `foresight` until a later request
-reaches them. With `--fate-cache-seconds 0` no path is kept and no row has
+(newest first), all under the request's one `--query-deadline-ms` budget:
+once it is spent no read starts, and a read it cut short ends the reading. A
+run whose read failed is not read again for 60 seconds. Rows a request did
+not read carry `"foresight_deferred": true` and list without `foresight`
+until a later request reads them. With `--fate-cache-seconds 0` no path is kept and no row has
 `foresight`. Example: `"foresight":{"base_rate":0.5444,"ci95":[0.0435,0.2136],"map_built_at_ns":1792312576819863000,"p_success":0.1,"support":50,"verdict":"likely_failure"}`.
 
 ### `GET /v1/runs/live/stream`
@@ -2858,8 +2862,15 @@ The live runs as server-sent events, held open until the client leaves.
 **Query:** `tenant`, as above. First `event: snapshot`, whose data is the
 `GET /v1/runs/live` document with a limit of 256; then `event: run` with one run's row each time
 that run changes, coalesced to at most one batch per 250 ms; and a `: tick`
-comment after 15 seconds of quiet. When more than 256 runs change at once, or
-an erasure sweeps the view, a new `snapshot` replaces everything before it.
+comment after 15 seconds of quiet. When a run whose row the client holds
+leaves the view, `event: removed` says so — `{"run", "tenant", "reason"}`,
+the reason `evicted` (the guard let go of it: `--fuse-max-runs`, its span
+budget, six idle hours) or `expired` (no activity within
+`--live-window-seconds`) — ahead of the update's `run` events, so a client
+applying every event holds exactly the listing's rows. When more than 256
+runs change at once, an erasure sweeps the view, the client would hold more
+than 4,096 rows, or more than 1,024 runs were evicted since the stream last
+looked, a new `snapshot` replaces everything before it.
 A reconnecting client starts again from a snapshot. At most 64 streams at
 once, and at most 8 per scope — one tenant, or the every-tenant view of an
 unbound credential: one more is `409`.
@@ -2888,7 +2899,8 @@ run id; `403` for a bound credential naming another tenant (or a `ro` one,
 with `"required": "rw"`); `409` when the run already has 32 pending nudges,
 when the tenant's nudges already cost 4 MiB (or every tenant's 32 MiB) and
 only pending ones are left to drop — delivered and expired ones are dropped,
-oldest first, to make room — while an erasure covering the run is pending,
+oldest first, to make room, except a `block` whose two-second hold is still
+vetoing its run's checks — while an erasure covering the run is pending,
 or under `--no-fuses`. Any `rw` credential can queue a nudge; its text
 reaches the agent as written.
 
@@ -2916,8 +2928,10 @@ earliest are read). Lists are cut at 256 nodes, 1,024 edges, 1,024 handoff
 pairs, 256 cycle pairs and 500 turns, largest first, each with its own flag:
 `nodes_truncated`, `edges_truncated`, `handoffs_truncated`,
 `cycles_truncated`, `sequence_truncated`. Every pass over the spans checks
-the deadline, not just the read. An unknown run is an empty graph. The
-definitions are in the [guide](steer.md#topology).
+the deadline, not just the read. Agents and services are told apart by their
+whole names; a name longer than 160 characters renders as its first 160,
+`…#` and 16 hex digits of a digest of the whole name. An unknown run is an
+empty graph. The definitions are in the [guide](steer.md#topology).
 
 ```json
 {"cycles":[{"agents":["billing","triage"],"count":1,"example":{"span_id":"a3","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736"},"first_ns":1792000004000000000,"last_ns":1792000004000000000},{"agents":["triage","billing"],"count":1,"example":{"span_id":"a2","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736"},"first_ns":1792000003000000000,"last_ns":1792000003000000000}],"cycles_truncated":false,"edges":[{"count":2,"errors":0,"first_ns":1792000002000000000,"from":"support-app","last_ns":1792000004000000000,"to":"billing"},{"count":2,"errors":0,"first_ns":1792000001000000000,"from":"support-app","last_ns":1792000003000000000,"to":"triage"}],"edges_truncated":false,"handoffs":[{"count":2,"from":"triage","to":"billing"},{"count":1,"from":"billing","to":"triage"}],"handoffs_truncated":false,"nodes":[{"agent":"billing","cost_usd":0.0,"errors":0,"first_ns":1792000002000000000,"last_ns":1792000004500000000,"llm_calls":2,"named":true,"spans":4,"steps":4,"tokens":920,"tool_calls":0},{"agent":"triage","cost_usd":0.0,"errors":0,"first_ns":1792000001000000000,"last_ns":1792000003500000000,"llm_calls":2,"named":true,"spans":4,"steps":4,"tokens":920,"tool_calls":0},{"agent":"support-app","cost_usd":0.0,"errors":0,"first_ns":1792000000000000000,"last_ns":1792000060000000000,"llm_calls":0,"named":false,"spans":1,"steps":0,"tokens":0,"tool_calls":0}],"nodes_truncated":false,"run":"sess-42","sequence":["triage","billing","triage","billing"],"sequence_truncated":false,"spans_read":9,"tenant":"","truncated":false}

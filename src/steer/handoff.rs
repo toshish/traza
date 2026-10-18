@@ -28,24 +28,32 @@
 //! is what the topology computes from the store, so the guard and the
 //! topology cannot disagree about a run they both see whole.
 
+use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::Hash;
 use std::ops::Bound::{self, Excluded, Included, Unbounded};
+use std::sync::OnceLock;
 
 /// A step's place in step order: its start time, then a key for its
 /// identity that breaks ties between steps starting together.
 pub(crate) type Position = (u64, u64);
 
-/// Longest agent name kept, in characters; a longer one is cut with `…`.
-/// Names come from telemetry, and a reason line or a topology node is not
-/// the place for an unbounded one.
+/// Longest agent name shown whole, in characters. A longer one renders as
+/// its first this many characters, `…#`, and 16 hex digits of a digest of
+/// the WHOLE name, so two long names that share their first characters
+/// still render apart. Names come from telemetry, and a reason line or a
+/// topology node is not the place for an unbounded one — but a rendering
+/// is only ever a label: agents and services are told apart by their whole
+/// names.
 pub const MAX_AGENT_NAME_CHARS: usize = 160;
 
-/// Agent names one tracker keeps for rendering. Past it, an agent renders
+/// Agent labels one tracker keeps for rendering. Past it, an agent renders
 /// as `agent#<hex>` — still distinct, never unbounded.
 const MAX_NAMES: usize = 256;
 
-/// `name`, cut to [`MAX_AGENT_NAME_CHARS`].
+/// `name`, cut to [`MAX_AGENT_NAME_CHARS`] with `…`: for display text that
+/// names nothing a count or a comparison depends on (a step's tool or
+/// model). An agent or a service renders by [`agent_label`].
 pub(crate) fn clip_name(name: &str) -> String {
     match name.char_indices().nth(MAX_AGENT_NAME_CHARS) {
         Some((end, _)) => format!("{}…", &name[..end]),
@@ -62,12 +70,68 @@ pub(crate) fn clip_owned(mut name: String) -> String {
     name
 }
 
-/// A non-zero 64-bit key for an agent name.
+/// How an agent — or a service standing in for one — named `name` renders:
+/// the whole name when it is at most [`MAX_AGENT_NAME_CHARS`] characters,
+/// else its first that many, `…#`, and 16 hex digits of the persisted hash
+/// of the whole name, the same on every server and across restarts.
+/// Distinct names render apart unless someone forges a digest collision,
+/// which can confuse a reader but never a count: nothing is told apart by
+/// its label.
+pub(crate) fn agent_label(name: &str) -> String {
+    match name.char_indices().nth(MAX_AGENT_NAME_CHARS) {
+        Some((end, _)) => {
+            let digest = crate::hash::hash128(name.as_bytes());
+            let hex: String = digest.as_bytes()[..8]
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            format!("{}…#{hex}", &name[..end])
+        }
+        None => name.to_owned(),
+    }
+}
+
+/// A non-zero 64-bit key for an agent: the identity the handoff sequence
+/// and the topology tell agents apart by. A digest of the WHOLE name —
+/// never of its rendering, which two names can share — under SipHash keys
+/// drawn at random once per process, so nobody who writes telemetry can
+/// choose two names that collide (the persisted hash's keys are public;
+/// see [`crate::hash`]). Never persisted, nor compared across processes.
 pub(crate) fn agent_key(name: &str) -> u64 {
-    let digest = crate::hash::hash128(name.as_bytes());
-    let mut low = [0u8; 8];
-    low.copy_from_slice(&digest.as_bytes()[..8]);
-    u64::from_le_bytes(low).max(1)
+    use std::hash::BuildHasher as _;
+    static KEYS: OnceLock<RandomState> = OnceLock::new();
+    KEYS.get_or_init(RandomState::new).hash_one(name).max(1)
+}
+
+/// An agent — or a service standing in for one — as it is told apart and
+/// as it renders.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AgentName {
+    /// [`agent_key`] of the whole name: the identity.
+    pub(crate) key: u64,
+    /// [`agent_label`] of the whole name: display only.
+    pub(crate) label: String,
+}
+
+impl AgentName {
+    /// The agent named `name`.
+    pub(crate) fn of(name: &str) -> Self {
+        Self {
+            key: agent_key(name),
+            label: agent_label(name),
+        }
+    }
+
+    /// [`Self::of`] an owned name: no copy when it renders whole.
+    pub(crate) fn of_owned(name: String) -> Self {
+        let key = agent_key(&name);
+        let label = if name.char_indices().nth(MAX_AGENT_NAME_CHARS).is_some() {
+            agent_label(&name)
+        } else {
+            name
+        };
+        Self { key, label }
+    }
 }
 
 /// `agents` with consecutive repeats merged: the turns.
@@ -105,10 +169,12 @@ pub(crate) fn cycles_in<T: Eq + Hash + Clone>(turns: &[T]) -> HashMap<(T, T), u6
 }
 
 /// The handoff sequence of one run, kept current incrementally; see the
-/// module docs. Holds about a hundred bytes per named step, plus the name
-/// of each distinct agent a held step names — at most [`MAX_NAMES`] names
-/// of at most [`MAX_AGENT_NAME_CHARS`] characters, and never more names
-/// than held steps: a name goes when the last step naming it does.
+/// module docs. Agents are told apart by [`agent_key`] of their whole
+/// names. Holds about a hundred bytes per named step, plus the label of
+/// each distinct agent a held step names — at most [`MAX_NAMES`] labels,
+/// each at most [`MAX_AGENT_NAME_CHARS`] characters and a digest, and never
+/// more labels than held steps: a label goes when the last step naming it
+/// does.
 #[derive(Debug, Default)]
 pub(crate) struct HandoffTracker {
     /// Named steps by position: their agent.
@@ -123,7 +189,7 @@ pub(crate) struct HandoffTracker {
     ranked: BTreeSet<(u64, u64, u64)>,
     /// Held steps per agent key.
     agents: HashMap<u64, u32>,
-    /// Agent names by key, at most [`MAX_NAMES`], each of an agent some
+    /// Agent labels by key, at most [`MAX_NAMES`], each of an agent some
     /// held step names.
     names: HashMap<u64, String>,
 }
@@ -146,10 +212,10 @@ impl HandoffTracker {
         self.at.contains_key(&span)
     }
 
-    /// Places the step under `span` at `position`, naming agent `name`, in
-    /// place of wherever it was. A no-op when nothing changes.
-    pub(crate) fn upsert(&mut self, span: u64, position: Position, name: &str) {
-        let agent = agent_key(name);
+    /// Places the step under `span` at `position`, naming the agent `name`,
+    /// in place of wherever it was. A no-op when nothing changes.
+    pub(crate) fn upsert(&mut self, span: u64, position: Position, name: &AgentName) {
+        let agent = name.key;
         if self.holds_as(span, position, agent) {
             return;
         }
@@ -162,7 +228,7 @@ impl HandoffTracker {
         }
         *self.agents.entry(agent).or_default() += 1;
         if !self.names.contains_key(&agent) && self.names.len() < MAX_NAMES {
-            self.names.insert(agent, clip_name(name));
+            self.names.insert(agent, name.label.clone());
         }
         let (low, high) = self.anchors(position);
         let before = self.window(low, high);
@@ -245,7 +311,9 @@ impl HandoffTracker {
 
     /// The largest cycle count, with its pair `(returned to, returned
     /// from)`; ties go to the larger keys, so the answer depends on the
-    /// steps held and never on the order they arrived in.
+    /// steps held and never on the order they arrived in. Keys are drawn
+    /// per process ([`agent_key`]), so after a restart a tie between two
+    /// pairs may name the other one; the count is the same.
     pub(crate) fn top(&self) -> Option<(u64, u64, u64)> {
         self.ranked
             .iter()
@@ -253,7 +321,7 @@ impl HandoffTracker {
             .map(|(count, to, from)| (*count, *to, *from))
     }
 
-    /// The name of agent `key`, or `agent#<hex>` past the name bound.
+    /// The label of agent `key`, or `agent#<hex>` past the label bound.
     pub(crate) fn name(&self, key: u64) -> String {
         self.names
             .get(&key)
@@ -330,6 +398,11 @@ mod tests {
         turns_of(names.iter().map(|name| (*name).to_owned()))
     }
 
+    /// Upserts the step under `span`, naming the agent `name`.
+    fn put(tracker: &mut HandoffTracker, span: u64, position: Position, name: &str) {
+        tracker.upsert(span, position, &AgentName::of(name));
+    }
+
     #[test]
     fn cycles_count_returns_per_ordered_pair() {
         let supervisor = turns(&["S", "W", "S", "W", "S", "W", "S"]);
@@ -368,7 +441,12 @@ mod tests {
         let mut tracker = HandoffTracker::default();
         // S W S W S, delivered last-first.
         for (index, agent) in ["S", "W", "S", "W", "S"].iter().enumerate().rev() {
-            tracker.upsert(index as u64, (index as u64 * 10, index as u64), agent);
+            put(
+                &mut tracker,
+                index as u64,
+                (index as u64 * 10, index as u64),
+                agent,
+            );
         }
         let (count, to, from) = tracker.top().expect("cycles");
         assert_eq!(count, 2);
@@ -379,14 +457,14 @@ mod tests {
         assert_eq!(tracker.counts(), brute(&tracker));
         // A step landing inside W's second turn splits nothing (same agent);
         // one of another agent splits it.
-        tracker.upsert(100, (31, 100), "W");
+        put(&mut tracker, 100, (31, 100), "W");
         assert_eq!(tracker.counts(), brute(&tracker));
-        tracker.upsert(101, (32, 101), "X");
+        put(&mut tracker, 101, (32, 101), "X");
         assert_eq!(tracker.counts(), brute(&tracker));
         // Moving a step and renaming it are replacements.
-        tracker.upsert(101, (5, 101), "X");
+        put(&mut tracker, 101, (5, 101), "X");
         assert_eq!(tracker.counts(), brute(&tracker));
-        tracker.upsert(101, (5, 101), "S");
+        put(&mut tracker, 101, (5, 101), "S");
         assert_eq!(tracker.counts(), brute(&tracker));
         for span in [0, 1, 2, 3, 4, 100, 101] {
             tracker.remove(span);
@@ -411,7 +489,7 @@ mod tests {
                     // Few distinct starts, so ties break on the span key.
                     let start = rng.range(0, spans * 2);
                     let agent = *rng.pick(&agents);
-                    tracker.upsert(span, (start, span), agent);
+                    put(&mut tracker, span, (start, span), agent);
                 }
                 assert_eq!(tracker.counts(), brute(&tracker), "round {round}");
                 let expected_top = brute(&tracker)
@@ -437,11 +515,16 @@ mod tests {
     fn names_are_clipped_and_bounded() {
         let long = "x".repeat(400);
         let mut tracker = HandoffTracker::default();
-        tracker.upsert(1, (1, 1), &long);
+        put(&mut tracker, 1, (1, 1), &long);
         let key = agent_key(&long);
-        assert_eq!(tracker.name(key).chars().count(), MAX_AGENT_NAME_CHARS + 1);
+        assert_eq!(tracker.name(key), agent_label(&long));
+        assert_eq!(
+            tracker.name(key).chars().count(),
+            MAX_AGENT_NAME_CHARS + "…#".chars().count() + 16
+        );
         for index in 0..(MAX_NAMES as u64 + 10) {
-            tracker.upsert(
+            put(
+                &mut tracker,
                 10 + index,
                 (10 + index, 10 + index),
                 &format!("agent-{index}"),
@@ -454,18 +537,52 @@ mod tests {
         assert_eq!(clip_owned("short".to_owned()), "short");
     }
 
+    /// Two agents whose names share their first [`MAX_AGENT_NAME_CHARS`]
+    /// characters are two agents — the cycle between them counts — and
+    /// their labels, cut, still differ; a label is the same every time.
+    #[test]
+    fn agents_are_told_apart_by_their_whole_names() {
+        let pad = "x".repeat(MAX_AGENT_NAME_CHARS);
+        let (a, b) = (format!("{pad}A"), format!("{pad}B"));
+        assert_ne!(agent_key(&a), agent_key(&b));
+        assert_eq!(agent_key(&a), agent_key(&a.clone()));
+        assert_ne!(agent_label(&a), agent_label(&b));
+        assert_eq!(agent_label(&a), agent_label(&a.clone()));
+        assert!(agent_label(&a).starts_with(&format!("{pad}…#")));
+        assert_eq!(agent_label(&pad), pad, "a name that fits is itself");
+        for name in [&a, &pad] {
+            assert_eq!(AgentName::of_owned(name.clone()), AgentName::of(name));
+        }
+        let mut tracker = HandoffTracker::default();
+        for (index, name) in [&a, &b, &a, &b, &a].iter().enumerate() {
+            let at = index as u64;
+            put(&mut tracker, at, (at, at), name);
+        }
+        let (count, to, from) = tracker.top().expect("cycles");
+        assert_eq!(count, 2);
+        assert_eq!(
+            (tracker.name(to), tracker.name(from)),
+            (agent_label(&a), agent_label(&b))
+        );
+    }
+
     /// One span re-sent under ever new agent names holds one step, and so
     /// one name: a name goes when the last step naming it does.
     #[test]
     fn names_never_outnumber_held_steps() {
         let mut tracker = HandoffTracker::default();
         for index in 0..(MAX_NAMES * 2) {
-            tracker.upsert(7, (100, 7), &format!("renamed-{index}-{}", "x".repeat(150)));
+            put(
+                &mut tracker,
+                7,
+                (100, 7),
+                &format!("renamed-{index}-{}", "x".repeat(150)),
+            );
             assert_eq!(tracker.names.len(), 1, "after {index} renames");
             assert_eq!(tracker.agents.len(), 1);
         }
-        tracker.upsert(8, (200, 8), "other");
-        tracker.upsert(9, (300, 9), "other");
+        put(&mut tracker, 8, (200, 8), "other");
+        put(&mut tracker, 9, (300, 9), "other");
         assert_eq!(tracker.names.len(), 2);
         tracker.remove(8);
         assert_eq!(tracker.name(agent_key("other")), "other", "still named");

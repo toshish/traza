@@ -29,7 +29,12 @@
 //!   its message, id, run id and tenant plus [`NUDGE_OVERHEAD_BYTES`]. Past
 //!   either, delivered and expired nudges are dropped oldest first (the
 //!   tenant's own for its budget, anyone's for the store's); when only
-//!   pending ones are left to drop, a new nudge is refused with `409`.
+//!   pending ones are left to drop, a new nudge is refused with `409`;
+//! - a block whose hold is still in force is a veto the run's checks are
+//!   answered with, so neither the per-run trim nor a budget drops it until
+//!   its hold ends; a hold keeps at most [`MAX_HOLD_BLOCKS`] blocks, so a
+//!   run's pending nudges and holding blocks together never exceed what it
+//!   keeps.
 //!
 //! # Two locks
 //!
@@ -86,6 +91,14 @@ pub const NUDGE_OVERHEAD_BYTES: usize = 512;
 /// deliberate step — after a model call that reads the refusal — is judged
 /// by the guard again.
 pub const BLOCK_HOLD_MS: u64 = 2_000;
+
+/// Most blocks one hold keeps vetoing with: the newest, those just
+/// delivered first. A run's pending nudges and its holding blocks together
+/// are never more than it keeps, so neither the per-run trim nor a byte
+/// budget ever has to drop a veto in force.
+pub const MAX_HOLD_BLOCKS: usize = MAX_PENDING_PER_RUN;
+
+const _: () = assert!(MAX_PENDING_PER_RUN + MAX_HOLD_BLOCKS <= MAX_KEPT_PER_RUN);
 
 /// How long a nudge waits for a check when the request names no
 /// `ttl_seconds`: an hour.
@@ -259,6 +272,17 @@ impl RunNudges {
             .filter(|nudge| nudge.status(now) == NudgeStatus::Pending)
             .count()
     }
+
+    /// Whether `nudge` may be dropped to make room at `now`: it is settled
+    /// — delivered or expired — and not a block of a hold still in force,
+    /// which is a veto the run's checks are still answered with.
+    fn droppable(&self, nudge: &Nudge, now: u64) -> bool {
+        nudge.status(now) != NudgeStatus::Pending
+            && !self
+                .hold
+                .as_ref()
+                .is_some_and(|hold| now < hold.until_ns && hold.ids.contains(&nudge.id))
+    }
 }
 
 /// Every tenant's nudges in memory, with what they cost and an index by
@@ -354,7 +378,9 @@ impl Book {
     }
 
     /// Drops the run's delivered and expired nudges, oldest first, beyond
-    /// [`MAX_KEPT_PER_RUN`].
+    /// [`MAX_KEPT_PER_RUN`] — never a block of a hold still in force. That
+    /// always suffices: a run holds at most [`MAX_PENDING_PER_RUN`] pending
+    /// nudges and a hold at most [`MAX_HOLD_BLOCKS`] blocks.
     fn trim_run(&mut self, tenant: &str, run: &str, now: u64) {
         let Some(held) = self.run(tenant, run) else {
             return;
@@ -363,7 +389,7 @@ impl Book {
         let doomed: Vec<String> = held
             .nudges
             .iter()
-            .filter(|nudge| nudge.status(now) != NudgeStatus::Pending)
+            .filter(|nudge| held.droppable(nudge, now))
             .take(excess)
             .map(|nudge| nudge.id.clone())
             .collect();
@@ -374,7 +400,8 @@ impl Book {
 
     /// The settled nudges to drop, oldest first, so that one costing `cost`
     /// fits `tenant`'s budget and the store's; a conflict, dropping
-    /// nothing, when pending nudges are all that would be left to drop.
+    /// nothing, when pending nudges and the blocks of holds still in force
+    /// are all that would be left to drop.
     fn room_for(&self, tenant: &str, cost: usize, now: u64) -> Result<Vec<Victim>> {
         let spent = self.by_tenant.get(tenant).copied().unwrap_or(0);
         let tenant_need = (spent + cost).saturating_sub(self.budget.tenant_bytes);
@@ -390,13 +417,15 @@ impl Book {
             if !own && total_freed >= total_need {
                 continue;
             }
-            let Some(nudge) = self
-                .run(owner, run)
-                .and_then(|held| held.nudges.iter().find(|nudge| &nudge.id == id))
-            else {
+            let Some((held, nudge)) = self.run(owner, run).and_then(|held| {
+                held.nudges
+                    .iter()
+                    .find(|nudge| &nudge.id == id)
+                    .map(|nudge| (held, nudge))
+            }) else {
                 continue;
             };
-            if nudge.status(now) == NudgeStatus::Pending {
+            if !held.droppable(nudge, now) {
                 continue;
             }
             let freed = nudge.cost();
@@ -409,15 +438,16 @@ impl Book {
         if tenant_freed < tenant_need {
             return Err(Error::Conflict(format!(
                 "this tenant's nudges already cost the most Traza keeps for one tenant \
-                 ({} bytes), and all that could make room are pending; wait for them to be \
-                 delivered or to expire",
+                 ({} bytes), and all that could make room are pending, or blocks whose veto \
+                 still holds; wait for them to be delivered or to expire",
                 self.budget.tenant_bytes
             )));
         }
         if total_freed < total_need {
             return Err(Error::Conflict(format!(
                 "this server's nudges already cost the most it keeps ({} bytes), and all that \
-                 could make room are pending; wait for them to be delivered or to expire",
+                 could make room are pending, or blocks whose veto still holds; wait for them \
+                 to be delivered or to expire",
                 self.budget.total_bytes
             )));
         }
@@ -468,7 +498,8 @@ impl Book {
 
     /// Marks `ids` of the run delivered at `now` and returns them, followed
     /// by the blocks of a hold still in force; a block among them (re)starts
-    /// the hold.
+    /// the hold, with at most [`MAX_HOLD_BLOCKS`] blocks — those just
+    /// delivered, then the newest carried.
     fn mark_delivered(&mut self, tenant: &str, run: &str, ids: &[String], now: u64) -> Vec<Nudge> {
         let mut delivered = Vec::with_capacity(ids.len());
         let Some(held) = self.runs.get_mut(tenant).and_then(|runs| runs.get_mut(run)) else {
@@ -488,6 +519,7 @@ impl Book {
                 .iter()
                 .chain(&carried)
                 .filter(|nudge| nudge.kind == NudgeKind::Block)
+                .take(MAX_HOLD_BLOCKS)
                 .map(|nudge| nudge.id.clone())
                 .collect();
             if let Some(held) = self.runs.get_mut(tenant).and_then(|runs| runs.get_mut(run)) {
@@ -1008,6 +1040,94 @@ mod tests {
         let (total, a) = nudges.spent("a");
         assert!(total <= budget.total_bytes && a <= budget.tenant_bytes);
         assert!(nudges.list("a", "r0").expect("lists").is_empty());
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// A delivered block still holding is a veto in force: a byte budget's
+    /// eviction may not take it to make room, or the next check of its
+    /// batch goes through. Once its hold is over it is history like any
+    /// other.
+    #[test]
+    fn a_holding_block_is_never_evicted_to_make_room() {
+        let path = dir("hold-budget");
+        let each = cost("a", "r0", 100);
+        let budget = Budget {
+            tenant_bytes: each * 2,
+            total_bytes: each * 8,
+        };
+        let nudges = Nudges::open_with(&path, 1, budget).expect("opens");
+        let message = "m".repeat(100);
+        let block = nudges
+            .create("a", "r0", &spec(NudgeKind::Block, &message), 10, &free())
+            .expect("queues");
+        let advice = spec(NudgeKind::Advice, &message);
+        nudges
+            .create("a", "r1", &advice, 11, &free())
+            .expect("fits");
+        let at = 1_000 * MS;
+        assert_eq!(
+            nudges.deliver("a", "r0", at).expect("delivers")[0].id,
+            block.id
+        );
+        // The tenant is full, and its one settled nudge is the block, still
+        // holding: nothing may make room.
+        match nudges.create("a", "r2", &advice, at + 1, &free()) {
+            Err(Error::Conflict(message)) => {
+                assert!(message.contains("veto"), "{message}")
+            }
+            other => panic!("the holding block must not be dropped, got {other:?}"),
+        }
+        let held = nudges.deliver("a", "r0", at + 2).expect("holds");
+        let ids: Vec<&str> = held.iter().map(|nudge| nudge.id.as_str()).collect();
+        assert_eq!(ids, [block.id.as_str()], "the batch's next check is vetoed");
+        // Its hold over, the block is history and makes room.
+        nudges
+            .create("a", "r2", &advice, at + BLOCK_HOLD_MS * MS, &free())
+            .expect("the block's hold is over");
+        assert!(nudges.list("a", "r0").expect("lists").is_empty());
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// The per-run trim spares a holding block too, and the hold's own
+    /// size is bounded, so a run still keeps at most [`MAX_KEPT_PER_RUN`].
+    #[test]
+    fn a_holding_block_outlives_the_per_run_trim_and_holds_stay_bounded() {
+        let path = dir("hold-trim");
+        let nudges = Nudges::open(&path, 1).expect("opens");
+        let block = nudges
+            .create("", "r", &spec(NudgeKind::Block, "halt"), 10, &free())
+            .expect("queues");
+        let at = 1_000 * MS;
+        nudges.deliver("", "r", at).expect("delivers");
+        // Within the hold, the run's history fills past what it keeps.
+        for index in 0..MAX_KEPT_PER_RUN as u64 {
+            let now = at + 1 + index * 2;
+            nudges
+                .create("", "r", &spec(NudgeKind::Advice, "x"), now, &free())
+                .expect("queues");
+            let delivered = nudges.deliver("", "r", now + 1).expect("delivers");
+            assert!(
+                delivered.iter().any(|nudge| nudge.id == block.id),
+                "check {index} is still vetoed: {delivered:?}"
+            );
+            assert!(nudges.list("", "r").expect("lists").len() <= MAX_KEPT_PER_RUN);
+        }
+        // Blocks delivered while a hold is in force join it — up to the
+        // hold's bound, the newest kept — and the run stays inside its own.
+        let later = at + 10 * BLOCK_HOLD_MS * MS;
+        for round in 0..3_u64 {
+            let now = later + round * 1_000;
+            for index in 0..MAX_PENDING_PER_RUN as u64 {
+                nudges
+                    .create("", "r", &spec(NudgeKind::Block, "no"), now + index, &free())
+                    .expect("queues");
+            }
+            let delivered = nudges.deliver("", "r", now + 500).expect("delivers");
+            assert!(delivered.len() <= MAX_PENDING_PER_RUN + MAX_HOLD_BLOCKS);
+            assert!(nudges.list("", "r").expect("lists").len() <= MAX_KEPT_PER_RUN);
+            let held = nudges.deliver("", "r", now + 501).expect("holds");
+            assert_eq!(held.len(), MAX_HOLD_BLOCKS, "round {round}");
+        }
         let _ = std::fs::remove_dir_all(&path);
     }
 

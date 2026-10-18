@@ -337,8 +337,9 @@ returning to an agent straight from the one it handed off to, counted per
 direction) and the turns in order; when a list was cut, the headline says
 so (`more than 256 agents`, and which lists show only their largest
 entries) rather than reporting the cut count as the run's. Agent names, run
-ids, tool names and reasons are telemetry and render inside the telemetry
-block. **There is no nudge tool**, in either direction: an agent hears
+ids, tenant names, tool names and reasons are telemetry and render inside
+the telemetry block — the run and its tenant as the block's first row — and
+the headline holds only the server's own words and counts. **There is no nudge tool**, in either direction: an agent hears
 nudges through its pre-call check — a nudge read here would be consumed, or
 not, depending on which surface asked first — and queueing one is an
 operator's act, not one stored telemetry should be able to talk a model

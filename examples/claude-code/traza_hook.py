@@ -10,7 +10,10 @@ hooks reference, https://code.claude.com/docs/en/hooks:
 
   PreToolUse    asks Traza's pre-call gate (POST /v1/fuses/check) whether
                 this session's run may take the step. A `stop` verdict
-                denies the call, with the reason shown to Claude:
+                denies the call, with the reason shown to Claude — the
+                stop's recorded reasons (they carry tool and agent names
+                from telemetry) inside the delimited untrusted-telemetry
+                block, the hook's own words outside it:
                   {"hookSpecificOutput": {"hookEventName": "PreToolUse",
                    "permissionDecision": "deny",
                    "permissionDecisionReason": "..."}}
@@ -186,10 +189,40 @@ def printable(text, limit):
     return cleaned.replace("</traza:", "<\\/traza:")
 
 
-def clip_context(text):
-    if len(text) <= MAX_CONTEXT_CHARS:
+def clip_context(text, limit=MAX_CONTEXT_CHARS):
+    if len(text) <= limit:
         return text
-    return text[:MAX_CONTEXT_CHARS] + "… (%d more characters)" % (len(text) - MAX_CONTEXT_CHARS)
+    return text[:limit] + "… (%d more characters)" % (len(text) - limit)
+
+
+def framed(head, rows, tail=""):
+    """`head`, then `rows` inside the delimited untrusted-telemetry block,
+    then `tail`, in at most MAX_CONTEXT_CHARS. `head` and `tail` are this
+    hook's own words — the only text Claude reads as the hook speaking — and
+    `head` ends with TELEMETRY_PREAMBLE; every row is recorded text already
+    made printable(). Rows are cut whole, from the end, inside the block,
+    never through its closing delimiter."""
+    room = MAX_CONTEXT_CHARS - len(head) - len(TELEMETRY_OPEN) - len(TELEMETRY_CLOSE) - len(tail) - 64
+    kept, used = [], 0
+    for row in rows:
+        if used + len(row) + 1 > room:
+            kept.append("(%d more left out)" % (len(rows) - len(kept)))
+            break
+        kept.append(row)
+        used += len(row) + 1
+    return "\n".join([head, TELEMETRY_OPEN] + kept + [TELEMETRY_CLOSE] + ([tail] if tail else []))
+
+
+def reason_rows(reasons):
+    """A stop's reasons as rows for the telemetry block: they carry
+    recorded text — a step's tool name, an agent's name, a kill switch's
+    reason — so each is made printable, one per row."""
+    rows = ["- " + printable(reason, 1000) for reason in reasons or []]
+    return rows or ["- no reason given"]
+
+
+# What a stop's reasons are introduced with, ahead of their block.
+REASONS_FOLLOW = "The reasons Traza recorded follow. " + TELEMETRY_PREAMBLE
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -268,20 +301,22 @@ def pre_tool_use(config, hook):
     advice = [str(n.get("message", "")) for n in nudges if n.get("kind") == "advice"]
     label = printable(run, 120)
     if verdict == "stop":
+        queued = "\nAdvice nudges queued with it:\n%s" % quoted(advice) if advice else ""
         if blocks:
             reason = (
                 "Traza blocked this tool call: a block nudge queued in Traza for run %s "
                 "vetoes it:\n%s" % (label, quoted(blocks))
             )
+            deny(clip_context(reason + queued))
         else:
-            reasons = "; ".join(str(r) for r in doc.get("reasons") or []) or "no reason given"
-            reason = (
-                "Traza stopped run %s: %s. Its limits allow no further steps, so this "
-                "call was not made; the user can reset the run in Traza." % (label, reasons)
+            # The reasons are recorded telemetry: they go inside the block,
+            # and everything outside it is this hook's own words.
+            head = (
+                "Traza stopped run %s. Its limits allow no further steps, so this call was "
+                "not made; the user can reset the run in Traza." % label
             )
-        if advice:
-            reason += "\nAdvice nudges queued with it:\n%s" % quoted(advice)
-        deny(clip_context(reason))
+            head += clip_context(queued, MAX_CONTEXT_CHARS // 2) + "\n" + REASONS_FOLLOW
+            deny(framed(head, reason_rows(doc.get("reasons"))))
     elif advice:
         add_context(
             "PreToolUse",
@@ -320,17 +355,7 @@ def session_start(config, hook):
         % (len(runs), "" if len(runs) == 1 else "s", printable(query, 80), TELEMETRY_PREAMBLE)
     )
     tail = "A run's full steps are at GET /v1/tapes/<run> on the Traza server."
-    # Cut inside the block, whole rows at a time, never through its closing
-    # delimiter.
-    room = MAX_CONTEXT_CHARS - len(head) - len(TELEMETRY_OPEN) - len(TELEMETRY_CLOSE) - len(tail) - 64
-    kept, used = [], 0
-    for row in rows:
-        if used + len(row) + 1 > room:
-            kept.append("(%d more runs left out)" % (len(rows) - len(kept)))
-            break
-        kept.append(row)
-        used += len(row) + 1
-    add_context("SessionStart", "\n".join([head, TELEMETRY_OPEN] + kept + [TELEMETRY_CLOSE, tail]))
+    add_context("SessionStart", framed(head, rows, tail))
 
 
 def step_kinds(skeleton):
@@ -415,12 +440,11 @@ def post_tool_use(config, hook, failed):
     doc = call(config, "POST", "/v1/spans", [span])
     for signal in doc.get("fuses") or []:
         if isinstance(signal, dict) and signal.get("run") == run and signal.get("verdict") == "stop":
-            reasons = "; ".join(str(r) for r in signal.get("reasons") or [])
-            emit({
-                "decision": "block",
-                "reason": "Traza stopped run %s: %s. This tool call already ran; the next one "
-                          "will be refused." % (printable(run, 120), reasons),
-            })
+            head = (
+                "Traza stopped run %s. This tool call already ran; the next one will be "
+                "refused.\n%s" % (printable(run, 120), REASONS_FOLLOW)
+            )
+            emit({"decision": "block", "reason": framed(head, reason_rows(signal.get("reasons")))})
             return
 
 

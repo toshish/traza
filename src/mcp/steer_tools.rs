@@ -203,10 +203,12 @@ fn render_topology(topology: &Topology, max_bytes: usize) -> String {
             cut.push(format!("the {limit} largest {list}"));
         }
     }
+    // The headline is the server's own words and counts only: the run id
+    // and the tenant were chosen by whoever wrote the telemetry, so they
+    // render in the frame, as its first row.
     let head = format!(
-        "Run {} (tenant {}): {} across {}, {} between them, {} between named agents{}.{}{}",
-        sanitize(&topology.run),
-        tenant_label(&topology.tenant),
+        "The run's topology (the run is named in the first row below): {} across {}, {} \
+         between them, {} between named agents{}.{}{}",
         count(topology.spans_read as u64, "span"),
         at_least(topology.nodes.len(), topology.nodes_truncated, "agent"),
         at_least(
@@ -247,7 +249,11 @@ fn render_topology(topology: &Topology, max_bytes: usize) -> String {
             ""
         },
     );
-    let mut rows = Vec::new();
+    let mut rows = vec![format!(
+        "run {} (tenant {})",
+        sanitize(&topology.run),
+        tenant_label(&topology.tenant)
+    )];
     for node in &topology.nodes {
         rows.push(format!(
             "agent {}{} · {} · {} ({} LLM, {} tool) · {} · ${:.4} · {} tok · {}",
@@ -348,7 +354,10 @@ fn list_live_runs(
     let structured: Vec<Value> = page.runs.iter().map(live_structured).collect();
     let notes = vec![
         "Verdicts are the run guard's: continue, warn (near a limit) or stop. 'pending' is \
-         the step a pre-call check asked about with no span recorded since. Nudges are \
+         the step a pre-call check asked about with no span recorded since. 'foresight not \
+         read yet' marks a run whose one-time read for foresight this call did not make — \
+         past the reads one call makes, past its time budget, or soon after a read of it \
+         failed; a later call makes it. Nudges are \
          delivered to the run through its next pre-call check, never through MCP."
             .to_owned(),
     ];
@@ -389,7 +398,11 @@ fn live_row(run: &LiveRun) -> String {
         } else {
             String::new()
         },
-        foresight_note(run.foresight.as_ref()),
+        if run.foresight_deferred {
+            " · foresight not read yet".to_owned()
+        } else {
+            foresight_note(run.foresight.as_ref())
+        },
         run.reasons
             .first()
             .map(|reason| format!(" · {}", sanitize(reason)))
@@ -437,5 +450,6 @@ fn live_structured(run: &LiveRun) -> Value {
             "ci95": foresight.ci95,
             "support": foresight.support,
         })),
+        "foresight_deferred": run.foresight_deferred,
     })
 }
