@@ -63,13 +63,21 @@ function write(value: unknown, inArray: boolean): string | undefined {
     // Every index, as JSON.stringify visits them: map() skips a sparse
     // array's holes, writing [1, , 3] as "[1,,3]" (not JSON) and
     // new Array(1) as "[]". A hole reads as undefined, which is null here.
+    // The length is read once, as JSON.stringify reads it: an element's
+    // toJSON may push onto this array, and following the live length would
+    // never finish.
     const items: string[] = [];
-    for (let i = 0; i < value.length; i++) items.push(write(value[i], true) ?? "null");
+    const length = value.length;
+    for (let i = 0; i < length; i++) items.push(write(value[i], true) ?? "null");
     return "[" + items.join(",") + "]";
   }
+  // The keys are taken once and each member read as it is written, as
+  // JSON.stringify does: a toJSON hook's change to a later member is what
+  // goes out, and a member it deletes is left out.
+  const object = value as Record<string, unknown>;
   const parts: string[] = [];
-  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
-    const text = write(item, false);
+  for (const key of Object.keys(object)) {
+    const text = write(object[key], false);
     if (text !== undefined) parts.push(JSON.stringify(key) + ":" + text);
   }
   return "{" + parts.join(",") + "}";

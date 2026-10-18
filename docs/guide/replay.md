@@ -606,7 +606,9 @@ telemetry choose which recording its next run is fed. See the
   replays do not wait. Waiting does not stretch the replay's hour: a call
   whose turn comes after the replay expired is refused `404` without being
   rendered, and an answer that finishes rendering after it is dropped
-  unserved, so no step is consumed past `expires_at_ns`.
+  unserved, so no step is consumed past `expires_at_ns`. A call's time runs
+  from when the server read its request line and headers, so a slow upload
+  or a large body to parse counts against the hour too.
 - **The registry is bounded, per tenant first.** One tenant's data — or the
   operator view, which counts as a share of its own — may be held by at most
   64 live replays and 64 MiB of memory; the registry as a whole holds at most

@@ -221,6 +221,19 @@ const EVIDENCE_MAX_PROBLEMS: usize = 4;
 /// a pack can look, budget or none.
 const EVIDENCE_MAX_ROUNDS: u32 = 8;
 
+/// Provisional file problems a pack confirms per hold of the maintenance
+/// lock — one metadata read each — with a budget check between holds (see
+/// [`FileVerifier::confirm`]). Lowered under test so a few problems take
+/// several holds.
+#[cfg(not(test))]
+const CONFIRM_BATCH: usize = 256;
+#[cfg(test)]
+const CONFIRM_BATCH: usize = 16;
+
+/// Files' states a replaced file check frees between budget checks (see
+/// [`Evidence::reclaim`]).
+const RECLAIM_CHUNK: usize = WALK_CHECK_INTERVAL as usize;
+
 // ------------------------------------------------------------------ entries
 
 /// What one entry records, by `kind`.
@@ -1222,6 +1235,15 @@ impl Ledger {
             return Ok(());
         }
         let mut evidence = self.lock_evidence()?;
+        // Packs answer for a pinned snapshot until one does, and a walk past
+        // it cannot serve that shorter prefix: they keep the walk they have.
+        if evidence
+            .pin
+            .as_ref()
+            .is_some_and(|pin| pin.snapshot.len < walk.len)
+        {
+            return Ok(());
+        }
         if evidence
             .served
             .as_ref()
@@ -1296,6 +1318,65 @@ mod probe {
         static ON_HASH: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
         static MANIFESTED: Cell<u64> = const { Cell::new(0) };
         static ON_MANIFEST: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+        static CONFIRMED: Cell<u64> = const { Cell::new(0) };
+        static FREED: Cell<u64> = const { Cell::new(0) };
+        static FREED_UNDER_MAINTENANCE: Cell<u64> = const { Cell::new(0) };
+        static DISPLACED: Cell<u64> = const { Cell::new(0) };
+        static HOLDING_MAINTENANCE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Counts one provisional file problem looked at again to confirm it.
+    pub(super) fn confirmed_one() {
+        CONFIRMED.with(|confirmed| confirmed.set(confirmed.get() + 1));
+    }
+
+    /// Provisional file problems looked at again on this thread so far.
+    pub(super) fn confirmations() -> u64 {
+        CONFIRMED.with(Cell::get)
+    }
+
+    /// Counts one file's state in a pack's file check freed, and whether a
+    /// pack on this thread held the maintenance lock as it was.
+    pub(super) fn freed_file() {
+        FREED.with(|freed| freed.set(freed.get() + 1));
+        if HOLDING_MAINTENANCE.with(Cell::get) {
+            FREED_UNDER_MAINTENANCE.with(|freed| freed.set(freed.get() + 1));
+        }
+    }
+
+    /// Files' states freed on this thread so far: in all, and while a pack
+    /// held the maintenance lock.
+    pub(super) fn freed_files() -> (u64, u64) {
+        (
+            FREED.with(Cell::get),
+            FREED_UNDER_MAINTENANCE.with(Cell::get),
+        )
+    }
+
+    /// Counts `states` files' states of a manifest load the store published
+    /// past, handed on to be freed later.
+    pub(super) fn displaced(states: u64) {
+        DISPLACED.with(|displaced| displaced.set(displaced.get() + states));
+    }
+
+    /// Files' states of displaced manifest loads on this thread so far.
+    pub(super) fn displaced_states() -> u64 {
+        DISPLACED.with(Cell::get)
+    }
+
+    /// Marks this thread as holding the maintenance lock for a pack until
+    /// the returned guard drops.
+    pub(super) fn holding_maintenance() -> Holding {
+        HOLDING_MAINTENANCE.with(|held| held.set(true));
+        Holding
+    }
+
+    pub(super) struct Holding;
+
+    impl Drop for Holding {
+        fn drop(&mut self) {
+            HOLDING_MAINTENANCE.with(|held| held.set(false));
+        }
     }
 
     /// Counts one manifest entry a pack's file check took in.
@@ -1938,6 +2019,9 @@ impl ChainWalk {
 /// needs [`Ledger::evidence`] held, so the rest of the pack is assembled
 /// without it.
 struct EvidenceChain {
+    /// The snapshot's length and the generation the pack answers for: the
+    /// [`Pin`] it lets go of once the pack is whole, when it is that one.
+    target: (u64, u64),
     /// The tip at the snapshot the walk ran to.
     head: LedgerHead,
     verification: Verification,
@@ -1983,32 +2067,79 @@ struct Evidence {
     /// it is about read again past [`EVIDENCE_VERIFY_REUSE`], which packs
     /// advance a slice at a time while answering from `files`.
     loading: Option<ManifestLoad>,
+    /// What packs answer for while a pack that had to take a new
+    /// generation's manifest in is unanswered; see [`Pin`].
+    pin: Option<Pin>,
+    /// File checks replaced or dropped, freed a budget at a time by
+    /// [`Self::reclaim`] rather than whole where they were let go.
+    retired: Vec<FileVerifier>,
+}
+
+/// The snapshot and live generation a pack took when it found it had to
+/// take that generation's manifest in, which packs answer for until one
+/// does.
+///
+/// A pack answers for one consistent pair — the chain's prefix and the
+/// generation its last checkpoint entry names — and a manifest too long for
+/// one budget is taken in across requests. Snapshotting afresh on each
+/// retry let a checkpoint landing between any two of them make the load
+/// about a generation no longer live, and starting over on the new one met
+/// the next checkpoint the same way: however many retries a client made, a
+/// store checkpointing as often as that never produced a pack. Kept
+/// instead, the load finishes — its manifest is an open handle, immutable
+/// — and the pack answers for the pair as it stood, which its head
+/// (`ledger.head`) states.
+///
+/// Let go when a pack answers; when a confirmation finds, with another
+/// generation live, a problem's path missing or holding a file other than
+/// the one the pinned generation names (the store may have swept or
+/// replaced it, so the problem cannot be answered for: the next round takes
+/// the generation live then — see [`FileVerifier::confirm`]); when its
+/// manifest does not decode; and once its manifest is in and it is older
+/// than [`EVIDENCE_VERIFY_REUSE`], so a pack is never about a chain much
+/// older than that window — what remains carries over to the next
+/// generation by unchanged manifest entry. Damage the store did not do
+/// leaves the file the pinned generation named where it was, so it is
+/// answered for under the pin however often the store checkpoints.
+#[derive(Debug)]
+struct Pin {
+    snapshot: Snapshot,
+    generation: u64,
+    /// When it was taken, on the ledger's clock.
+    at: Instant,
 }
 
 impl Evidence {
     /// Holding the maintenance lock: opens the live generation's manifest
     /// when packs need it read — no file check of `live` yet, or one read
     /// longer ago than the reuse window — unless that read is under way. A
-    /// read of any other generation is dropped: the store moved past it.
-    fn open_manifest(&mut self, directory: &Path, live: u64, now: Instant) -> Result<()> {
+    /// read of any other generation is displaced, the store having moved
+    /// past it, and returned: for the caller to [`Self::retire_load`] once
+    /// the lock is released, since what it decoded is a state per file.
+    fn open_manifest(
+        &mut self,
+        directory: &Path,
+        live: u64,
+        now: Instant,
+    ) -> Result<Option<ManifestLoad>> {
         if let Some(load) = &self.loading {
             if load.generation == live && !load.stale_failure(now) {
-                return Ok(());
+                return Ok(None);
             }
-            self.loading = None;
         }
         let due = self.files.as_ref().map_or(true, |files| {
             files.generation != live
                 || now.saturating_duration_since(files.read_at) > EVIDENCE_VERIFY_REUSE
         });
-        if due {
-            self.loading = Some(ManifestLoad::open(directory, live, now)?);
-        }
-        Ok(())
+        let opened = match due {
+            true => Some(ManifestLoad::open(directory, live, now)?),
+            false => None,
+        };
+        Ok(std::mem::replace(&mut self.loading, opened))
     }
 
     /// Advances the manifest under way, and installs its check once it is
-    /// taken in.
+    /// taken in; the check it replaces is retired.
     fn load_manifest(&mut self, deadline: Option<crate::Deadline>) -> Result<Walked> {
         let Some(load) = self.loading.as_mut() else {
             return Ok(Walked::Reached);
@@ -2017,9 +2148,59 @@ impl Evidence {
             return Ok(Walked::OutOfBudget);
         }
         if let Some(load) = self.loading.take() {
-            self.files = load.finish(self.files.take());
+            let (files, replaced) = load.finish(self.files.take());
+            self.files = files;
+            self.retired.extend(replaced);
         }
         Ok(Walked::Reached)
+    }
+
+    /// Lets go of a load the store moved past: what it decoded joins the
+    /// checks [`Self::reclaim`] frees, and the rest — its bytes, one
+    /// allocation, and its handle — goes now.
+    fn retire_load(&mut self, load: ManifestLoad) {
+        match load.stage {
+            LoadStage::Decoding { built, .. } | LoadStage::Done(built) => {
+                #[cfg(test)]
+                probe::displaced(built.files.len() as u64);
+                self.retired.push(built);
+            }
+            LoadStage::Reading { .. } | LoadStage::Unchanged | LoadStage::Failed(_) => {}
+        }
+    }
+
+    /// Frees retired file checks, [`RECLAIM_CHUNK`] files' states between
+    /// budget checks, until none is left or the budget is spent — one chunk
+    /// at least, so retries free them all.
+    ///
+    /// A check holds a state per manifested file, freed one allocation at a
+    /// time: dropped whole where it was let go, a large store's check is
+    /// work no budget sees, and where that is under the maintenance lock,
+    /// work checkpoints, compaction and expiry wait for.
+    fn reclaim(&mut self, deadline: Option<crate::Deadline>) {
+        while let Some(check) = self.retired.last_mut() {
+            if check.shed(RECLAIM_CHUNK) {
+                self.retired.pop();
+            }
+            if self.retired.is_empty() || out_of_budget(deadline) {
+                return;
+            }
+        }
+    }
+
+    /// Lets go of the [`Pin`] once its manifest is in and it is older than
+    /// the reuse window; whether it did.
+    fn release_stale_pin(&mut self, now: Instant) -> bool {
+        let stale = self.pin.as_ref().is_some_and(|pin| {
+            self.files
+                .as_ref()
+                .is_some_and(|files| files.generation == pin.generation)
+                && now.saturating_duration_since(pin.at) > EVIDENCE_VERIFY_REUSE
+        });
+        if stale {
+            self.pin = None;
+        }
+        stale
     }
 }
 
@@ -2905,10 +3086,13 @@ impl Seen {
 /// nothing), a check under the lock would find the same, and the problem
 /// stands — as `GET /v1/ledger/verify` reports a file compaction removed
 /// before the next checkpoint. If the path holds another file now, that file
-/// is digested. If another generation is live, the pack takes that one in
-/// and checks what it changed: the store moved past the files it was
-/// reading. A file that verifies needs no second look — its bytes digested
-/// to the manifested digest.
+/// is digested. If another generation is live, the problem stands only on
+/// the file this generation names — the one read, with its manifested
+/// length and modification time ([`named_by`]); a path missing or holding
+/// another file may be what the store swept or replaced since, so the pack
+/// takes the live generation in and checks what it changed: the store moved
+/// past the files it was reading. A file that verifies needs no second look
+/// — its bytes digested to the manifested digest.
 ///
 /// A file is digested again once its last digest is older than
 /// [`EVIDENCE_VERIFY_REUSE`], oldest first, in the slices packs spend on
@@ -2950,6 +3134,13 @@ struct FileVerifier {
 struct FileState {
     entry: generation::ManifestFile,
     checked: Option<FileChecked>,
+}
+
+#[cfg(test)]
+impl Drop for FileState {
+    fn drop(&mut self) {
+        probe::freed_file();
+    }
 }
 
 /// One file's last digest: when it began, what it found, and the file it
@@ -3058,8 +3249,23 @@ enum Confirmed {
     /// Some path holds another file now (or a file now, or none): those
     /// files are to be digested again.
     Changed,
-    /// Another generation is live.
+    /// Another generation is live, and a path is missing or holds a file
+    /// other than the one the checked generation names: the store may have
+    /// swept or replaced it since.
     Moved,
+}
+
+/// Whether `metadata` is of the file `entry` names, by the identity a
+/// checkpoint trusts to carry a digest over ([`generation::digest_engine`]):
+/// the manifested length and modification time. Every file the store
+/// replaces arrives by a rename with a new modification time, and an
+/// append changes both, so a file that still has them is the one the
+/// manifest named, unchanged by the store. Never where the manifest
+/// recorded no time.
+fn named_by(entry: &generation::ManifestFile, metadata: &fs::Metadata) -> bool {
+    entry.modified_unix_ns != 0
+        && metadata.len() == entry.bytes
+        && generation::modified_unix_ns(metadata) == entry.modified_unix_ns
 }
 
 /// Whether two manifest entries describe one file unchanged: path, length,
@@ -3146,16 +3352,13 @@ impl FileVerifier {
     /// holds open: its digest under way, when that file's entry is
     /// unchanged, and each append-only log's digested prefix, which a
     /// longer manifested prefix of the same log continues (see [`Prefix`]).
-    /// A handful of files, each found by path.
-    fn adopt(&mut self, previous: FileVerifier) {
-        let FileVerifier {
-            files,
-            hashing,
-            prefixes,
-            ..
-        } = previous;
-        let mut prefixes: Vec<(usize, Prefix)> = prefixes.into_iter().collect();
-        if let Some(hashing) = hashing {
+    /// A handful of files, each found by path. The rest of `previous`, a
+    /// state per file, is left for the caller to retire.
+    fn adopt(&mut self, previous: &mut FileVerifier) {
+        let files = &previous.files;
+        let mut prefixes: Vec<(usize, Prefix)> =
+            std::mem::take(&mut previous.prefixes).into_iter().collect();
+        if let Some(hashing) = previous.hashing.take() {
             let old = &files[hashing.index].entry;
             match self.find(&old.path) {
                 Some(index) if unchanged(old, &self.files[index].entry) => {
@@ -3488,25 +3691,50 @@ impl FileVerifier {
         !self.provisional.is_empty()
     }
 
-    /// Settles each provisional problem against what is there now. Called
-    /// holding the maintenance lock, so nothing replaces a file meanwhile;
-    /// `live` is the generation `CURRENT` names. One metadata read per
-    /// provisional problem, each found by a digest a budget paid for.
-    fn confirm(&mut self, directory: &Path, live: u64) -> Result<Confirmed> {
-        if live != self.generation {
-            return Ok(Confirmed::Moved);
-        }
+    /// Settles up to `batch` provisional problems, in path order, against
+    /// what is there now; the rest wait for the next call. Called holding
+    /// the maintenance lock, so nothing replaces a file meanwhile; `live` is
+    /// the generation `CURRENT` names. One metadata read per problem, each
+    /// found by a digest a budget paid for — but problems found over many
+    /// requests all wait for this, so a hold settles a batch of them, never
+    /// however many accumulated.
+    ///
+    /// With another generation live, a problem is settled only on the file
+    /// this generation names ([`named_by`]): a pack answers for the
+    /// generation it snapshotted however far the store moves meanwhile
+    /// ([`Pin`]), and that file is the one it named whichever is live. A
+    /// path missing, or holding any other file, may be the store's own doing
+    /// since — a sweep, a rewrite renamed over it — and then the store moved
+    /// past this generation.
+    fn confirm(&mut self, directory: &Path, live: u64, batch: usize) -> Result<Confirmed> {
+        let superseded = live != self.generation;
         let mut changed = false;
-        let provisional: Vec<usize> = self.provisional.iter().copied().collect();
-        for index in provisional {
-            let path = directory.join(
-                self.files[index]
-                    .entry
-                    .path
-                    .replace('/', std::path::MAIN_SEPARATOR_STR),
-            );
-            let now = Seen::at(&path)?;
-            let holds = self.files[index]
+        // Each one settled leaves the set, held or forgotten, so the next
+        // is always the first.
+        for _ in 0..batch {
+            let Some(&index) = self.provisional.first() else {
+                break;
+            };
+            #[cfg(test)]
+            probe::confirmed_one();
+            let state = &self.files[index];
+            let path = directory.join(state.entry.path.replace('/', std::path::MAIN_SEPARATOR_STR));
+            let metadata = match fs::metadata(&path) {
+                Ok(metadata) => Some(metadata),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Err(error) => return Err(Error::Io(error)),
+            };
+            if superseded
+                && !metadata
+                    .as_ref()
+                    .is_some_and(|metadata| named_by(&state.entry, metadata))
+            {
+                return Ok(Confirmed::Moved);
+            }
+            let now = metadata
+                .as_ref()
+                .map_or(Seen::Missing, |metadata| Seen::File(file_id(metadata)));
+            let holds = state
                 .checked
                 .as_ref()
                 .is_some_and(|checked| checked.seen.same(now));
@@ -3553,6 +3781,31 @@ impl FileVerifier {
             failing: self.failing.len(),
         }
     }
+
+    /// Frees the states of up to `count` of this check's files, last first,
+    /// and as many entries of each of its indexes; true once nothing of it
+    /// is left but its shell. For a check being disposed of
+    /// ([`Evidence::reclaim`]): what is left is no longer a check.
+    fn shed(&mut self, count: usize) -> bool {
+        self.files.truncate(self.files.len().saturating_sub(count));
+        for _ in 0..count {
+            let popped = self.unchecked.pop_last().is_some()
+                | self.by_age.pop_last().is_some()
+                | self.failing.pop_last().is_some()
+                | self.provisional.pop_last().is_some();
+            if !popped {
+                break;
+            }
+        }
+        // Open files, a handful: see `adopt`.
+        self.hashing = None;
+        self.prefixes.clear();
+        self.files.is_empty()
+            && self.unchecked.is_empty()
+            && self.by_age.is_empty()
+            && self.failing.is_empty()
+            && self.provisional.is_empty()
+    }
 }
 
 /// A generation's manifest being taken in, a budget at a time and off the
@@ -3567,8 +3820,9 @@ impl FileVerifier {
 /// Reading and digesting the bytes, decoding an entry per file and carrying
 /// over what was known about each are O(files): each stops at the budget,
 /// resumes where it stopped on the next pack, and takes each entry in once.
-/// What it cannot outlast is the live generation moving on first: the next
-/// manifest is another file, which packs then take in instead.
+/// A load packs must finish before they can answer is kept to its
+/// generation however far the store moves meanwhile ([`Pin`]), so it always
+/// finishes.
 struct ManifestLoad {
     generation: u64,
     /// When the manifest was opened, on the ledger's clock.
@@ -3725,23 +3979,31 @@ impl ManifestLoad {
         }
     }
 
-    /// The check this load produced, to replace `previous`: `previous`
-    /// itself when the manifest is the one it holds, else the new check,
-    /// with the files `previous` holds open taken over. `previous` when the
-    /// load is not finished.
-    fn finish(self, previous: Option<FileVerifier>) -> Option<FileVerifier> {
+    /// The check this load produced, to replace `previous`, and the check it
+    /// replaces, to be retired: `previous` itself and nothing when the
+    /// manifest is the one it holds, else the new check — with the files
+    /// `previous` holds open taken over — and `previous`. `previous` and
+    /// nothing when the load is not finished.
+    fn finish(
+        self,
+        previous: Option<FileVerifier>,
+    ) -> (Option<FileVerifier>, Option<FileVerifier>) {
         match self.stage {
-            LoadStage::Unchanged => previous.map(|mut previous| {
-                previous.read_at = self.opened;
-                previous
-            }),
+            LoadStage::Unchanged => (
+                previous.map(|mut previous| {
+                    previous.read_at = self.opened;
+                    previous
+                }),
+                None,
+            ),
             LoadStage::Done(mut built) => {
-                if let Some(previous) = previous {
-                    built.adopt(previous);
-                }
-                Some(built)
+                let replaced = previous.map(|mut previous| {
+                    built.adopt(&mut previous);
+                    previous
+                });
+                (Some(built), replaced)
             }
-            _ => previous,
+            _ => (previous, None),
         }
     }
 
@@ -4219,13 +4481,23 @@ impl Store {
     ///   binary search in indexes by time; only those lines are read.
     /// - A new generation's manifest is taken in off the maintenance lock,
     ///   from a handle opened under it, a budget at a time ([`ManifestLoad`]).
+    ///   Until a pack answers, packs answer for the snapshot and generation
+    ///   that load began on, however many generations the store publishes
+    ///   meanwhile, so the load finishes ([`Pin`]); the pack's head says
+    ///   which snapshot that was.
     /// - The file check digests files off the maintenance lock, a budget at
     ///   a time, continuing a file it was part-way through; a new
     ///   generation re-digests only the files the checkpoint changed, and
     ///   an append-only log only what was appended. A problem found off the
-    ///   lock is confirmed under it before it is reported, and a pack whose
-    ///   generation the store published past mid-check checks the new one.
-    ///   See [`FileVerifier`].
+    ///   lock is confirmed under it before it is reported — a batch of
+    ///   [`CONFIRM_BATCH`] per hold, with the budget checked between holds.
+    ///   With the store published past the pack's generation mid-check, a
+    ///   problem stands on the file that generation names, still where it
+    ///   was; one the store may have swept or replaced sends the pack to the
+    ///   new generation. See [`FileVerifier`].
+    /// - A file check replaced by the next generation's is freed a budget's
+    ///   share at a time, never whole and never under the maintenance lock
+    ///   ([`Evidence::reclaim`]).
     /// - The verification names at most [`EVIDENCE_MAX_PROBLEMS`] problems
     ///   of each kind its reader may see and counts the rest
     ///   (`problems_truncated`), from indexes kept with the cross-check, so
@@ -4261,6 +4533,7 @@ impl Store {
         }
 
         let chain = self.evidence_chain(tenant, since, until, started, deadline)?;
+        let target = chain.target;
         let verification = chain.verification;
         let head = chain.head;
         let entries: Vec<Value> = self
@@ -4294,6 +4567,19 @@ impl Store {
         if let Value::Object(map) = &mut pack {
             map.insert("digest".to_owned(), Value::String(digest));
         }
+        // Answered: the next pack takes the store as it is then. Only now,
+        // so a pack refused after its chain — the activity, the erasures —
+        // is retried against the same pair rather than a newer one.
+        {
+            let mut state = self.ledger.lock_evidence()?;
+            let answered = state
+                .pin
+                .as_ref()
+                .is_some_and(|pin| (pin.snapshot.len, pin.generation) == target);
+            if answered {
+                state.pin = None;
+            }
+        }
         // Best effort, and after the pack is whole, so a redo can neither
         // fail the pack nor take budget its own steps needed. Anything it
         // trips over, the next pack's own steps meet and report.
@@ -4301,20 +4587,25 @@ impl Store {
         Ok(pack)
     }
 
-    /// Everything in a pack that needs [`Ledger::evidence`] held. Under the
-    /// maintenance lock, only the snapshot, the live generation and — when
-    /// the file check is of another generation, or its manifest was read
-    /// longer ago than the reuse window — opening the manifest. Then,
-    /// outside it and under `deadline`, the settled erasures taken in, the
-    /// walk, its cross-check, the manifest and the file check, each resuming
-    /// where the last pack left it. Then, only when the file check found a
-    /// problem off the lock, a second hold of it to confirm the problem (see
-    /// [`FileVerifier`]); a confirmation that finds the store moved —
-    /// another generation live, or a path holding another file — runs the
-    /// steps again from a new snapshot, each continuing from what is kept,
-    /// at most [`EVIDENCE_MAX_ROUNDS`] times. Then the verification and the
-    /// window lookups. See [`Self::evidence`] for why each step is shaped as
-    /// it is.
+    /// Everything in a pack that needs [`Ledger::evidence`] held. First, a
+    /// share of freeing what earlier packs replaced ([`Evidence::reclaim`]).
+    /// Then, under the maintenance lock, only the snapshot, the live
+    /// generation and — when the file check is of another generation, or
+    /// its manifest was read longer ago than the reuse window — opening the
+    /// manifest; or, while an earlier pack's manifest load is unanswered,
+    /// that pack's snapshot and generation instead ([`Pin`]). Then, outside
+    /// it and under `deadline`, the settled erasures taken in, the walk, its
+    /// cross-check, the manifest and the file check, each resuming where the
+    /// last pack left it. Then, only when the file check found a problem
+    /// off the lock, holds of it to confirm the problems, a batch per hold
+    /// with the budget checked between (see [`FileVerifier`]); a
+    /// confirmation that finds the store moved — a path holding another
+    /// file, or with another generation live, missing or holding a file
+    /// other than the one the checked generation names — runs the steps
+    /// again, from a new snapshot when the generation moved, each
+    /// continuing from what is kept, at most [`EVIDENCE_MAX_ROUNDS`] times.
+    /// Then the verification and the window lookups. See [`Self::evidence`]
+    /// for why each step is shaped as it is.
     fn evidence_chain(
         &self,
         tenant: Option<&str>,
@@ -4333,21 +4624,34 @@ impl Store {
         // Before the maintenance lock: see `Ledger::evidence`.
         let mut state = self.ledger.lock_evidence()?;
         let state = &mut *state;
+        // Whatever is left is the next pack's to free: running out here
+        // leaves this one's own steps their one interval each.
+        state.reclaim(deadline);
         let mut round = 0_u32;
         let (snapshot, live, landing) = loop {
             round += 1;
             let now = self.ledger.now();
-            let (snapshot, live) = {
-                let _maintenance = self.lock_maintenance()?;
-                // Under the maintenance lock, so no checkpoint entry can land
-                // between this and reading `CURRENT`, and no sweep can remove
-                // the manifest before it is open; erasure and anchor appends
-                // may land, and the snapshot leaves them out.
-                let snapshot = self.ledger.snapshot()?;
-                let live = self.live_generation();
-                state.open_manifest(&self.directory, live, now)?;
-                (snapshot, live)
+            state.release_stale_pin(now);
+            let (snapshot, live, displaced) = match &state.pin {
+                Some(pin) => (pin.snapshot.clone(), pin.generation, None),
+                None => {
+                    let _maintenance = self.lock_maintenance()?;
+                    #[cfg(test)]
+                    let _held = probe::holding_maintenance();
+                    // Under the maintenance lock, so no checkpoint entry can
+                    // land between this and reading `CURRENT`, and no sweep
+                    // can remove the manifest before it is open; erasure and
+                    // anchor appends may land, and the snapshot leaves them
+                    // out.
+                    let snapshot = self.ledger.snapshot()?;
+                    let live = self.live_generation();
+                    let displaced = state.open_manifest(&self.directory, live, now)?;
+                    (snapshot, live, displaced)
+                }
             };
+            if let Some(displaced) = displaced {
+                state.retire_load(displaced);
+            }
             #[cfg(test)]
             self.ledger.run_hook(HookPoint::AfterSnapshot, self);
 
@@ -4411,22 +4715,43 @@ impl Store {
             }
 
             // The live generation's manifest, when the file check is not of
-            // it yet: a pack answers for the generation it snapshotted. And
-            // one read again that does not decode is reported, as reading
-            // it would report it, rather than answered past.
+            // it yet: a pack answers for the generation it snapshotted, and
+            // until one does, packs answer for that pair ([`Pin`]). And one
+            // read again that does not decode is reported, as reading it
+            // would report it, rather than answered past.
             let required = state
                 .files
                 .as_ref()
                 .map_or(true, |files| files.generation != live);
             let failed = state.loading.as_ref().is_some_and(ManifestLoad::failed);
-            if (required || failed) && state.load_manifest(deadline)? == Walked::OutOfBudget {
-                let progress = state
-                    .loading
-                    .as_ref()
-                    .map_or_else(String::new, ManifestLoad::progress);
-                return Err(refused(format!(
-                    "{progress} (read from a handle kept open, so it keeps its progress)"
-                )));
+            if required && state.pin.is_none() {
+                state.pin = Some(Pin {
+                    snapshot: snapshot.clone(),
+                    generation: live,
+                    at: now,
+                });
+            }
+            if required || failed {
+                let loaded = state.load_manifest(deadline).inspect_err(|_| {
+                    // Its manifest does not decode, or cannot be read: the
+                    // next pack takes the generation live then.
+                    state.pin = None;
+                })?;
+                if loaded == Walked::OutOfBudget {
+                    let progress = state
+                        .loading
+                        .as_ref()
+                        .map_or_else(String::new, ManifestLoad::progress);
+                    return Err(refused(format!(
+                        "{progress} (read from a handle kept open, so it keeps its progress)"
+                    )));
+                }
+                // A load that outlasted the window, finished at last: the
+                // pair it pinned is too old to answer for, and the store as
+                // it is now inherits its file digests by unchanged entry.
+                if state.release_stale_pin(self.ledger.now()) {
+                    continue;
+                }
             }
             let Some(files) = state
                 .files
@@ -4448,10 +4773,38 @@ impl Store {
                 )));
             }
             if files.unconfirmed() {
-                let confirmed = {
-                    let _maintenance = self.lock_maintenance()?;
-                    files.confirm(&self.directory, self.live_generation())?
-                };
+                // A batch per hold, the budget checked between holds: the
+                // problems confirmed so far stay confirmed, and the rest wait
+                // for the next request.
+                let mut confirmed = Confirmed::Held;
+                while files.unconfirmed() {
+                    let batch = {
+                        let _maintenance = self.lock_maintenance()?;
+                        #[cfg(test)]
+                        let _held = probe::holding_maintenance();
+                        files.confirm(&self.directory, self.live_generation(), CONFIRM_BATCH)?
+                    };
+                    if batch == Confirmed::Moved {
+                        confirmed = batch;
+                        break;
+                    }
+                    if batch == Confirmed::Changed {
+                        confirmed = batch;
+                    }
+                    if files.unconfirmed() && out_of_budget(deadline) {
+                        let remaining = files.provisional.len();
+                        return Err(refused(format!(
+                            "{remaining} file problem(s) found off the maintenance lock were \
+                             still to be confirmed against the store as it is now"
+                        )));
+                    }
+                }
+                if confirmed == Confirmed::Moved {
+                    // What it found missing or replaced may be what the
+                    // store swept or rewrote since: the pinned pair cannot
+                    // be answered for.
+                    state.pin = None;
+                }
                 if confirmed != Confirmed::Held {
                     if round >= EVIDENCE_MAX_ROUNDS {
                         return Err(Error::Conflict(format!(
@@ -4516,6 +4869,7 @@ impl Store {
             })
             .collect();
         Ok(EvidenceChain {
+            target: (snapshot.len, live),
             head: snapshot.head,
             verification,
             window,
@@ -4542,8 +4896,12 @@ impl Store {
             now.saturating_duration_since(served.started) > EVIDENCE_VERIFY_REUSE
         });
         if stale && state.refresh.is_none() {
-            // Any snapshot is a prefix every later one extends.
-            let target = self.ledger.snapshot()?.len;
+            // Any snapshot is a prefix every later one extends — but none
+            // past a pinned one, which packs answer for until one does.
+            let mut target = self.ledger.snapshot()?.len;
+            if let Some(pin) = &state.pin {
+                target = target.min(pin.snapshot.len);
+            }
             state.refresh = Some(CachedWalk::new(target, now, self.ledger.unix_now_ns()));
         }
         if let Some(refresh) = state.refresh.as_mut() {
@@ -4566,6 +4924,7 @@ impl Store {
         if let Some(files) = state.files.as_mut() {
             files.recheck_due(&self.directory, slice, &self.ledger)?;
         }
+        state.reclaim(slice);
         loaded.map(drop)
     }
 
@@ -6825,19 +7184,9 @@ mod tests {
         let dir = temp_dir("manifest-budget");
         let store = std::sync::Arc::new(Store::open(&dir, budgeted()).expect("open"));
         let count = 5 * WALK_CHECK_INTERVAL;
-        for n in 0..count {
-            let path = dir
-                .join("payloads")
-                .join(format!("{:02x}", n % 256))
-                .join(format!("{n:08}.bin"));
-            fs::create_dir_all(path.parent().expect("parent")).expect("dir");
-            fs::write(&path, n.to_le_bytes()).expect("payload");
-        }
+        write_payloads(&dir, count);
         let live = store.checkpoint().expect("checkpoint");
-        let manifested = generation::load_manifest(&generation::manifest_path(&dir, live))
-            .expect("manifest")
-            .files
-            .len() as u64;
+        let manifested = manifested_files(&dir, live);
         assert!(manifested >= count, "{manifested} manifested files");
 
         let seen = std::sync::Arc::new(Mutex::new(None));
@@ -6881,6 +7230,577 @@ mod tests {
             *seen.lock().expect("seen"),
             Some(true),
             "the manifest was read with the maintenance lock free"
+        );
+    }
+
+    /// Writes `count` payload files into `dir`'s payload tree, for the next
+    /// checkpoint to manifest; returns their paths.
+    fn write_payloads(dir: &Path, count: u64) -> Vec<PathBuf> {
+        (0..count)
+            .map(|n| {
+                let path = dir
+                    .join("payloads")
+                    .join(format!("{:02x}", n % 256))
+                    .join(format!("{n:08}.bin"));
+                fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+                fs::write(&path, n.to_le_bytes()).expect("payload");
+                path
+            })
+            .collect()
+    }
+
+    /// How many files generation `generation`'s manifest names.
+    fn manifested_files(dir: &Path, generation: u64) -> u64 {
+        generation::load_manifest(&generation::manifest_path(dir, generation))
+            .expect("manifest")
+            .files
+            .len() as u64
+    }
+
+    /// One pack whose every budget check fails, so each of its steps makes
+    /// its one check interval of progress and no more.
+    fn starved_pack(store: &Store, tenant: Option<&str>) -> Result<Value> {
+        probe::allow(Some(0));
+        let outcome = store.evidence(tenant, None, None);
+        probe::allow(None);
+        outcome
+    }
+
+    #[test]
+    fn a_manifest_longer_than_a_budget_is_taken_in_with_a_checkpoint_between_every_retry() {
+        // A manifest that takes several budgets to take in, and a checkpoint
+        // publishing between every retry: nothing changed, just another
+        // generation live each time. A load restarted for each newer
+        // generation never finished — every retry read a new manifest from
+        // its first byte and was refused, and however many retries the
+        // client made, no pack came of them. The load keeps the generation
+        // and snapshot it began on until it is done, and the pack answers
+        // for that consistent pair.
+        let dir = temp_dir("manifest-churn");
+        let store = Store::open(&dir, budgeted()).expect("open");
+        write_payloads(&dir, 5 * WALK_CHECK_INTERVAL);
+        let first = store.checkpoint().expect("checkpoint");
+        let manifested = manifested_files(&dir, first);
+        let head_then = store.ledger_head().expect("head");
+
+        let before = probe::manifest_entries();
+        let mut refused = 0_u64;
+        let pack = loop {
+            match starved_pack(&store, Some("acme")) {
+                Ok(pack) => break pack,
+                Err(Error::DeadlineExceeded(detail)) => {
+                    refused += 1;
+                    assert!(detail.contains("resumes"), "{detail}");
+                }
+                Err(other) => panic!("{other:?}"),
+            }
+            assert!(
+                refused < 200,
+                "retrying finishes, though every retry finds another generation live"
+            );
+            store.checkpoint().expect("checkpoint");
+        };
+        assert!(
+            refused > 1,
+            "the manifest took {refused} refusals, not several"
+        );
+        assert!(store.live_generation() > first + 1, "generations moved on");
+        let verification = &pack["ledger"]["verification"];
+        assert_eq!(verification["intact"], json!(true), "{verification}");
+        assert_eq!(
+            verification["generation"]["id"],
+            json!(first),
+            "the pack answers for the generation its load began on"
+        );
+        assert_eq!(verification["generation"]["matches_ledger"], json!(true));
+        assert_eq!(
+            pack["ledger"]["head"]["seq"],
+            json!(head_then.seq),
+            "and for the chain as it stood then"
+        );
+        assert_eq!(
+            probe::manifest_entries() - before,
+            manifested,
+            "each entry of that manifest taken in once"
+        );
+
+        // Done, the next pack is about the generation live now.
+        let pack = store.evidence(Some("acme"), None, None).expect("pack");
+        let verification = &pack["ledger"]["verification"];
+        assert_eq!(verification["intact"], json!(true), "{verification}");
+        assert_eq!(
+            verification["generation"]["id"],
+            json!(store.live_generation())
+        );
+        assert_eq!(
+            pack["ledger"]["head"]["seq"],
+            json!(store.ledger_head().expect("head").seq)
+        );
+    }
+
+    #[test]
+    fn a_pinned_pack_past_the_reuse_window_answers_for_the_store_as_it_is() {
+        // The pair a pack pinned to take its manifest in is answered for
+        // however long that takes — but once the manifest is in and the pin
+        // is older than the reuse window, a pack about a chain that old is
+        // not worth finishing: the next round snapshots afresh, carrying
+        // over every file digest by unchanged entry, and answers for the
+        // generation live then.
+        let dir = temp_dir("pin-age");
+        let store = Store::open(&dir, budgeted()).expect("open");
+        write_payloads(&dir, 5 * WALK_CHECK_INTERVAL);
+        let first = store.checkpoint().expect("checkpoint");
+        let taken_in = format!("files of generation {first} were digested");
+        let mut refused = 0_u64;
+        loop {
+            match starved_pack(&store, None) {
+                Err(Error::DeadlineExceeded(detail)) if detail.contains(&taken_in) => break,
+                Err(Error::DeadlineExceeded(_)) => refused += 1,
+                other => panic!("the manifest is in before the files: {other:?}"),
+            }
+            assert!(refused < 100, "the manifest is taken in");
+            store.checkpoint().expect("checkpoint");
+        }
+        store.checkpoint().expect("checkpoint");
+        store
+            .ledger
+            .advance_clock(EVIDENCE_VERIFY_REUSE + Duration::from_secs(1));
+        let pack = loop {
+            match starved_pack(&store, None) {
+                Ok(pack) => break pack,
+                Err(Error::DeadlineExceeded(_)) => refused += 1,
+                Err(other) => panic!("{other:?}"),
+            }
+            assert!(refused < 1000, "retrying finishes");
+        };
+        let verification = &pack["ledger"]["verification"];
+        assert_eq!(verification["intact"], json!(true), "{verification}");
+        assert_eq!(
+            verification["generation"]["id"],
+            json!(store.live_generation()),
+            "the stale pin was let go"
+        );
+        assert_eq!(
+            pack["ledger"]["head"]["seq"],
+            json!(store.ledger_head().expect("head").seq)
+        );
+    }
+
+    #[test]
+    fn a_pinned_load_that_outlasts_the_reuse_window_answers_for_the_store_as_it_is_once_in() {
+        // The pin's age is weighed only once its manifest is in — and a pack
+        // whose own budget finishes a load begun more than the window ago
+        // must weigh it then, not answer for a pair that old because the
+        // load was still under way when the pack began.
+        let dir = temp_dir("pin-outlasted");
+        let store = Store::open(&dir, budgeted()).expect("open");
+        write_payloads(&dir, 5 * WALK_CHECK_INTERVAL);
+        let first = store.checkpoint().expect("checkpoint");
+        match starved_pack(&store, None) {
+            Err(Error::DeadlineExceeded(detail))
+                if detail.contains(&format!("generation {first}'s manifest")) => {}
+            other => panic!("refused part-way through the manifest: {other:?}"),
+        }
+        store.checkpoint().expect("checkpoint");
+        store
+            .ledger
+            .advance_clock(EVIDENCE_VERIFY_REUSE + Duration::from_secs(1));
+
+        let pack = store.evidence(None, None, None).expect("pack");
+        let verification = &pack["ledger"]["verification"];
+        assert_eq!(verification["intact"], json!(true), "{verification}");
+        assert_eq!(
+            verification["generation"]["id"],
+            json!(store.live_generation()),
+            "the pin was let go once its load was in"
+        );
+        assert_eq!(
+            pack["ledger"]["head"]["seq"],
+            json!(store.ledger_head().expect("head").seq)
+        );
+    }
+
+    /// A store with a long chain and a first pack done, and since then a
+    /// generation of many files published, for the next pack to take in.
+    fn long_chain_store(label: &str) -> Store {
+        let dir = temp_dir(label);
+        drop(Store::open(&dir, budgeted()).expect("open"));
+        grow_ledger(&dir, 3000);
+        let store = Store::open(&dir, budgeted()).expect("reopen");
+        store.evidence(None, None, None).expect("a first pack");
+        write_payloads(&dir, 5 * WALK_CHECK_INTERVAL);
+        store.checkpoint().expect("checkpoint");
+        store
+    }
+
+    /// One starved pack, refused part-way through the new generation's
+    /// manifest, so packs are pinned; the pinned snapshot's length.
+    fn pin_with_a_starved_pack(store: &Store) -> u64 {
+        match starved_pack(store, None) {
+            Err(Error::DeadlineExceeded(detail)) if detail.contains("manifest") => {}
+            other => panic!("refused part-way through the manifest: {other:?}"),
+        }
+        let state = store.ledger.lock_evidence().expect("evidence");
+        state.pin.as_ref().expect("pinned").snapshot.len
+    }
+
+    /// Appends `count` anchors to `store`'s chain, as a notary would.
+    fn anchor_tip(store: &Store, count: u64) {
+        for _ in 0..count {
+            let tip = store.ledger_head().expect("head");
+            store
+                .anchor_ledger(anchor_request(tip.seq, &tip.head, None))
+                .expect("anchor");
+        }
+    }
+
+    /// The walk packs serve: how far it reaches, and when it began.
+    fn served_walk(store: &Store) -> (u64, Instant) {
+        let state = store.ledger.lock_evidence().expect("evidence");
+        let served = state.served.as_ref().expect("a served walk");
+        (served.walk.len, served.started)
+    }
+
+    #[test]
+    fn the_operators_walk_past_a_pinned_snapshot_is_not_served_to_packs_answering_for_it() {
+        // `GET /v1/ledger/verify` offers its walk for packs to extend. While
+        // packs answer for a pinned snapshot, a walk past it cannot serve
+        // that shorter prefix: taken anyway, the next pinned pack found its
+        // walk past the snapshot and walked the chain again from byte 0.
+        let store = long_chain_store("pin-verify");
+        let pinned = pin_with_a_starved_pack(&store);
+        anchor_tip(&store, 3);
+        assert!(store.verify_ledger().expect("verify").intact);
+        let (reach, _) = served_walk(&store);
+        assert!(
+            reach <= pinned,
+            "served a walk to byte {reach}, past {pinned}"
+        );
+
+        let before = probe::parsed();
+        let pack = store.evidence(None, None, None).expect("pack");
+        let parsed = probe::parsed() - before;
+        assert!(parsed < 100, "the pinned pack walked {parsed} lines again");
+        let verification = &pack["ledger"]["verification"];
+        assert_eq!(verification["intact"], json!(true), "{verification}");
+    }
+
+    #[test]
+    fn a_walk_redone_while_a_pin_is_held_reaches_no_further_than_its_snapshot() {
+        // A walk past the reuse window is redone from byte 0 in requests'
+        // refresh slices, and served once complete. One begun while a pin is
+        // held — by another request's slice — and aimed at the store's tip
+        // cannot serve the pinned snapshot: the next pinned pack found its
+        // walk past the snapshot and walked the chain again from byte 0.
+        let store = long_chain_store("pin-refresh");
+        store
+            .ledger
+            .advance_clock(EVIDENCE_VERIFY_REUSE + Duration::from_secs(1));
+        let pinned = pin_with_a_starved_pack(&store);
+        anchor_tip(&store, 3);
+        let (_, stale) = served_walk(&store);
+        for _ in 0..100 {
+            store.evidence_refresh(None).expect("refresh");
+            let redone = store
+                .ledger
+                .lock_evidence()
+                .expect("evidence")
+                .refresh
+                .is_none();
+            if redone && served_walk(&store).1 > stale {
+                break;
+            }
+        }
+        let (reach, started) = served_walk(&store);
+        assert!(started > stale, "the stale walk was redone");
+        assert!(
+            reach <= pinned,
+            "served a walk to byte {reach}, past {pinned}"
+        );
+
+        let before = probe::parsed();
+        let pack = store.evidence(None, None, None).expect("pack");
+        let parsed = probe::parsed() - before;
+        assert!(parsed < 100, "the pinned pack walked {parsed} lines again");
+        let verification = &pack["ledger"]["verification"];
+        assert_eq!(verification["intact"], json!(true), "{verification}");
+    }
+
+    /// Damages `path` in place the way a checkpoint cannot see: other bytes,
+    /// the same length, and the modification time put back, so every later
+    /// checkpoint carries its manifested digest over.
+    fn tamper_unseen(path: &Path) {
+        let modified = fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .expect("mtime");
+        let mut bytes = fs::read(path).expect("read");
+        bytes[0] ^= 0xff;
+        fs::write(path, &bytes).expect("tamper");
+        File::options()
+            .write(true)
+            .open(path)
+            .and_then(|file| file.set_modified(modified))
+            .expect("restore mtime");
+    }
+
+    #[test]
+    fn a_damaged_store_that_checkpoints_between_every_retry_still_gets_its_pack() {
+        // One payload damaged where checkpoints cannot see it, a manifest
+        // longer than a budget, and a checkpoint between every retry. The
+        // pack is pinned to the generation its load began on; but its damage
+        // was confirmed only while that generation was live, so with another
+        // live by then, the confirmation let the pin go, the next round
+        // pinned the newest generation and its manifest load began again,
+        // and the next confirmation met the next checkpoint: no pack, ever,
+        // for the store a pack is most needed for. The damaged file is the
+        // one the pinned generation named — same length and modification
+        // time, and nothing has replaced it since it was read — so the
+        // problem stands for that generation whichever is live.
+        let dir = temp_dir("damaged-churn");
+        let store = Store::open(&dir, budgeted()).expect("open");
+        let paths = write_payloads(&dir, 5 * WALK_CHECK_INTERVAL);
+        let first = store.checkpoint().expect("checkpoint");
+        tamper_unseen(&paths[7]);
+        let damaged = "payloads/07/00000007.bin: digest mismatch";
+
+        let mut refused = 0_u64;
+        let pack = loop {
+            match starved_pack(&store, None) {
+                Ok(pack) => break pack,
+                Err(Error::DeadlineExceeded(detail)) => {
+                    refused += 1;
+                    assert!(detail.contains("resumes"), "{detail}");
+                }
+                Err(other) => panic!("{other:?}"),
+            }
+            assert!(
+                refused < 200,
+                "retrying finishes, though every retry finds another generation live"
+            );
+            store.checkpoint().expect("checkpoint");
+        };
+        assert!(store.live_generation() > first + 1, "generations moved on");
+        let verification = &pack["ledger"]["verification"];
+        assert_eq!(verification["intact"], json!(false), "{verification}");
+        assert_eq!(verification["generation"]["id"], json!(first));
+        assert_eq!(verification["generation"]["files_verified"], json!(false));
+        assert!(
+            verification["problems"].to_string().contains(damaged),
+            "{verification}"
+        );
+
+        // The next pack is about the generation live now, which names the
+        // same file under the same entry: the damage carries over.
+        let pack = store.evidence(None, None, None).expect("pack");
+        let verification = &pack["ledger"]["verification"];
+        assert_eq!(
+            verification["generation"]["id"],
+            json!(store.live_generation())
+        );
+        assert!(
+            verification["problems"].to_string().contains(damaged),
+            "{verification}"
+        );
+    }
+
+    #[test]
+    fn many_file_problems_are_confirmed_a_bounded_batch_per_maintenance_hold() {
+        // Many manifested files removed by hand. Budget-limited packs find
+        // them missing a few at a time, each problem provisional until it is
+        // confirmed holding the maintenance lock. Once the last file was
+        // checked, one request confirmed every problem the earlier ones had
+        // found, in one hold, with no budget check — however many there
+        // were. Confirmation is a batch per hold, with the budget checked
+        // between holds and the rest kept for the next request.
+        let dir = temp_dir("confirm-batches");
+        let store = Store::open(&dir, budgeted()).expect("open");
+        let paths = write_payloads(&dir, 5 * WALK_CHECK_INTERVAL);
+        store.checkpoint().expect("checkpoint");
+        for path in &paths {
+            fs::remove_file(path).expect("remove");
+        }
+        let (mut most, mut refused) = (0_u64, 0_u64);
+        let pack = loop {
+            let confirmed = probe::confirmations();
+            let outcome = starved_pack(&store, None);
+            most = most.max(probe::confirmations() - confirmed);
+            match outcome {
+                Ok(pack) => break pack,
+                Err(Error::DeadlineExceeded(detail)) => {
+                    refused += 1;
+                    assert!(detail.contains("resumes"), "{detail}");
+                }
+                Err(other) => panic!("{other:?}"),
+            }
+            assert!(refused < 1000, "retrying finishes");
+        };
+        assert!(
+            most <= CONFIRM_BATCH as u64,
+            "one request confirmed {most} problems, past a batch of {CONFIRM_BATCH}"
+        );
+        let verification = &pack["ledger"]["verification"];
+        assert_eq!(verification["intact"], json!(false), "{verification}");
+        assert_eq!(verification["generation"]["files_verified"], json!(false));
+        assert!(
+            verification["problems"]
+                .to_string()
+                .contains(&format!("({} in all)", paths.len())),
+            "every removed file counted: {verification}"
+        );
+    }
+
+    #[test]
+    fn a_replaced_file_check_is_freed_a_budget_at_a_time_off_the_maintenance_lock() {
+        // A file check holds a state per manifested file. Replacing the
+        // check with the next generation's freed the old one whole, in one
+        // unbudgeted piece. The store publishing again while that
+        // generation's manifest is part-way in changes nothing here: the
+        // load is kept to its generation (see `Pin`), and the check it
+        // replaces is freed in chunks all the same. For a load the store
+        // does displace, see the test after this one.
+        let dir = temp_dir("reclaim");
+        let store = Store::open(&dir, budgeted()).expect("open");
+        write_payloads(&dir, 5 * WALK_CHECK_INTERVAL);
+        let first = store.checkpoint().expect("checkpoint");
+        let manifested = manifested_files(&dir, first);
+        store.evidence(None, None, None).expect("a first pack");
+
+        // The next generation's manifest, a budget's share of it taken in;
+        // then the store publishes again before the next pack.
+        let second = store.checkpoint().expect("checkpoint");
+        assert!(manifested_files(&dir, second) >= manifested);
+        assert!(matches!(
+            starved_pack(&store, None),
+            Err(Error::DeadlineExceeded(_))
+        ));
+        store.checkpoint().expect("checkpoint");
+
+        let (freed_before, _) = probe::freed_files();
+        let (mut most, mut refused) = (0_u64, 0_u64);
+        loop {
+            let (freed, _) = probe::freed_files();
+            let outcome = starved_pack(&store, None);
+            most = most.max(probe::freed_files().0 - freed);
+            match outcome {
+                Ok(_) => break,
+                Err(Error::DeadlineExceeded(_)) => refused += 1,
+                Err(other) => panic!("{other:?}"),
+            }
+            assert!(refused < 1000, "retrying finishes");
+        }
+        // Whatever is left of the replaced check goes in later packs' time.
+        for _ in 0..1000 {
+            if probe::freed_files().0 - freed_before >= manifested {
+                break;
+            }
+            let (freed, _) = probe::freed_files();
+            let _ = starved_pack(&store, None);
+            most = most.max(probe::freed_files().0 - freed);
+        }
+        assert_eq!(
+            probe::freed_files().1,
+            0,
+            "a file check was freed holding the maintenance lock"
+        );
+        assert!(
+            probe::freed_files().0 - freed_before >= manifested,
+            "the replaced check is freed in the end"
+        );
+        assert!(
+            most <= 2 * RECLAIM_CHUNK as u64,
+            "one request freed {most} files' states of a {manifested}-file check"
+        );
+    }
+
+    #[test]
+    fn a_load_the_store_published_past_is_freed_a_budget_at_a_time_off_the_maintenance_lock() {
+        // A load no pack waits on — the live manifest read again past the
+        // reuse window, a refresh slice at a time — is displaced when the
+        // store publishes before it is done, and what it decoded is a state
+        // per file. It is displaced holding the maintenance lock, and dropped
+        // there it is work checkpoints, compaction and expiry wait for: it
+        // goes with the checks freed a budget at a time, off the lock.
+        let dir = temp_dir("displaced");
+        let store = Store::open(&dir, budgeted()).expect("open");
+        write_payloads(&dir, 5 * WALK_CHECK_INTERVAL);
+        let first = store.checkpoint().expect("checkpoint");
+        let manifested = manifested_files(&dir, first);
+        store.evidence(None, None, None).expect("a first pack");
+
+        // Read again, a manifest is decoded only when its bytes are not the
+        // ones the check holds: here, edited in place, its entries written
+        // out again in another layout.
+        let path = generation::manifest_path(&dir, first);
+        let bytes = fs::read(&path).expect("manifest");
+        let value: Value = serde_json::from_slice(&bytes).expect("decodes");
+        let mut edited = serde_json::to_vec_pretty(&value).expect("encode");
+        if edited == bytes {
+            edited = serde_json::to_vec(&value).expect("encode");
+        }
+        fs::write(&path, edited).expect("edit");
+
+        // Past the window, packs answer from the check they hold and spend
+        // their refresh slices reading it again: a budget's share of it.
+        store
+            .ledger
+            .advance_clock(EVIDENCE_VERIFY_REUSE + Duration::from_secs(1));
+        let taken = probe::manifest_entries();
+        let mut answered = 0;
+        while probe::manifest_entries() == taken {
+            if starved_pack(&store, None).is_ok() {
+                answered += 1;
+            }
+            assert!(answered < 100, "a pack's refresh slice reads the manifest");
+        }
+        let decoded = probe::manifest_entries() - taken;
+        assert!(
+            decoded < manifested,
+            "the read is part-way: {decoded} of {manifested} entries"
+        );
+
+        // The store publishes; the next pack displaces the read.
+        store.checkpoint().expect("checkpoint");
+        let (displaced_before, (freed_before, _)) =
+            (probe::displaced_states(), probe::freed_files());
+        let (mut most, mut refused) = (0_u64, 0_u64);
+        loop {
+            let (freed, _) = probe::freed_files();
+            let outcome = starved_pack(&store, None);
+            most = most.max(probe::freed_files().0 - freed);
+            match outcome {
+                Ok(_) => break,
+                Err(Error::DeadlineExceeded(_)) => refused += 1,
+                Err(other) => panic!("{other:?}"),
+            }
+            assert!(refused < 1000, "retrying finishes");
+        }
+        assert_eq!(
+            probe::freed_files().1,
+            0,
+            "a file check was freed holding the maintenance lock"
+        );
+        assert_eq!(
+            probe::displaced_states() - displaced_before,
+            decoded,
+            "the read part-way through was displaced, and handed on to be freed"
+        );
+        // The displaced read, and the check the new generation replaced.
+        for _ in 0..1000 {
+            if probe::freed_files().0 - freed_before >= manifested + decoded {
+                break;
+            }
+            let (freed, _) = probe::freed_files();
+            let _ = starved_pack(&store, None);
+            most = most.max(probe::freed_files().0 - freed);
+        }
+        assert!(
+            probe::freed_files().0 - freed_before >= manifested + decoded,
+            "both are freed in the end"
+        );
+        assert_eq!(probe::freed_files().1, 0);
+        assert!(
+            most <= 2 * RECLAIM_CHUNK as u64,
+            "one request freed {most} files' states"
         );
     }
 
@@ -7150,8 +8070,10 @@ mod tests {
         // An append-only log too long to digest in one budget, and before
         // every retry an append and a checkpoint: each new manifest names a
         // longer prefix of the same file. Together the retries digest more
-        // than enough, so they must finish — the digest of the prefix already
-        // read continues into the longer one rather than starting over.
+        // than enough, so they must finish — the pack answers for the
+        // generation its check began on (see `Pin`), each of its manifested
+        // bytes digested once. And the next generation's check continues the
+        // log's digest where that one stopped, rather than starting over.
         let dir = temp_dir("append-retries");
         let store = Store::open(&dir, budgeted()).expect("open");
         let note = |n: u64, size: usize| -> crate::annotations::Annotation {
@@ -7164,24 +8086,29 @@ mod tests {
         for n in 0..notes {
             store.annotate(note(n, 64 * 1024)).expect("annotate");
         }
-        store.checkpoint().expect("checkpoint");
+        let manifest_of = |generation: u64| {
+            generation::load_manifest(&generation::manifest_path(&dir, generation))
+                .expect("manifest")
+        };
+        let first = store.checkpoint().expect("checkpoint");
+        // Read now: checkpoints sweep the manifests of older generations.
+        let checked = manifest_of(first);
         let before = probe::hashed_bytes();
         let bound = notes * 64 * 1024 / (FILE_CHECK_BYTES - FILE_OPEN_COST) + 10;
         let mut attempts = 0_u64;
-        loop {
+        let answered = loop {
             attempts += 1;
             assert!(
                 attempts <= bound,
                 "retrying never finished the file check: {attempts} attempts"
             );
-            probe::allow(Some(0));
-            let outcome = store.evidence(None, None, None);
-            probe::allow(None);
-            match outcome {
+            match starved_pack(&store, None) {
                 Ok(pack) => {
                     let verification = &pack["ledger"]["verification"];
                     assert_eq!(verification["intact"], json!(true), "{verification}");
-                    break;
+                    break verification["generation"]["id"]
+                        .as_u64()
+                        .expect("generation");
                 }
                 Err(Error::DeadlineExceeded(detail)) => {
                     assert!(detail.contains("resumes"), "{detail}");
@@ -7190,15 +8117,44 @@ mod tests {
             }
             store.annotate(note(1_000 + attempts, 100)).expect("append");
             store.checkpoint().expect("checkpoint");
-        }
+        };
         assert!(attempts > 2, "the log took several budgets: {attempts}");
-        let manifest =
-            generation::load_manifest(&generation::manifest_path(&dir, store.live_generation()))
-                .expect("manifest");
+        assert_eq!(answered, first, "the generation the check began on");
         assert_eq!(
             probe::hashed_bytes() - before,
-            manifest.files.iter().map(|file| file.bytes).sum::<u64>(),
+            checked.files.iter().map(|file| file.bytes).sum::<u64>(),
             "every manifested byte digested once: no prefix was read twice"
+        );
+
+        // The generation live now: an unchanged entry costs nothing, a log
+        // only what was appended past the prefix already digested, and any
+        // other changed file its whole length.
+        let live = store.live_generation();
+        assert!(live > answered, "the store moved on while the check ran");
+        let owed: u64 = manifest_of(live)
+            .files
+            .iter()
+            .map(
+                |file| match checked.files.iter().find(|old| old.path == file.path) {
+                    Some(old) if unchanged(old, file) => 0,
+                    Some(old)
+                        if generation::is_append_only(&file.path) && old.bytes <= file.bytes =>
+                    {
+                        file.bytes - old.bytes
+                    }
+                    _ => file.bytes,
+                },
+            )
+            .sum();
+        let before = probe::hashed_bytes();
+        let pack = store.evidence(None, None, None).expect("pack");
+        let verification = &pack["ledger"]["verification"];
+        assert_eq!(verification["intact"], json!(true), "{verification}");
+        assert_eq!(verification["generation"]["id"], json!(live));
+        assert_eq!(
+            probe::hashed_bytes() - before,
+            owed,
+            "the log's digest continued across generations"
         );
     }
 
@@ -7226,8 +8182,8 @@ mod tests {
         for entry in entries {
             built.push(entry, previous.as_ref());
         }
-        if let Some(previous) = previous {
-            built.adopt(previous);
+        if let Some(mut previous) = previous {
+            built.adopt(&mut previous);
         }
         built
     }
@@ -7276,14 +8232,24 @@ mod tests {
         assert!(files.unconfirmed());
 
         // Another generation is live: nothing is confirmed about this one.
-        assert_eq!(files.confirm(&dir, 8).expect("confirm"), Confirmed::Moved);
+        assert_eq!(
+            files.confirm(&dir, 8, CONFIRM_BATCH).expect("confirm"),
+            Confirmed::Moved
+        );
         assert!(files.unconfirmed());
 
         // segment-1 replaced since it was read: digested again, and it
-        // verifies; segment-3 is still missing, which stands.
+        // verifies; segment-3 is still missing, which stands. A batch of one
+        // settles one problem, in path order, and leaves the other waiting.
         rename_over(&dir, "segment-1.seg", b"replacement");
-        assert_eq!(files.confirm(&dir, 7).expect("confirm"), Confirmed::Changed);
+        assert_eq!(
+            files.confirm(&dir, 7, 1).expect("confirm"),
+            Confirmed::Changed
+        );
         assert_eq!(files.unchecked.len(), 1);
+        assert!(files.unconfirmed(), "segment-3 waits for the next batch");
+        assert_eq!(files.confirm(&dir, 7, 1).expect("confirm"), Confirmed::Held);
+        assert!(!files.unconfirmed());
         check(&mut files);
         assert!(!files.unconfirmed());
         let problems = files.result(0).problems;
@@ -7294,12 +8260,139 @@ mod tests {
         fs::write(dir.join("segment-2.seg"), b"in*act").expect("edit");
         files.forget(segment);
         check(&mut files);
-        assert_eq!(files.confirm(&dir, 7).expect("confirm"), Confirmed::Held);
+        assert_eq!(
+            files.confirm(&dir, 7, CONFIRM_BATCH).expect("confirm"),
+            Confirmed::Held
+        );
         let problems = files.result(0).problems;
         assert_eq!(
             problems,
             ["segment-2.seg: digest mismatch", "segment-3.seg: missing"],
             "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn with_another_generation_live_a_problem_stands_only_on_the_file_its_generation_named() {
+        // A pack answers for the generation it snapshotted however far the
+        // store moves meanwhile, so a problem with that generation is
+        // confirmed with another live: it stands on the file the generation
+        // named — the one read, still with its manifested length and
+        // modification time — and on nothing the store may have swept or
+        // replaced since.
+        let dir = temp_dir("confirm-superseded");
+        let ledger = Ledger::open(&dir).expect("ledger");
+        let names = [
+            "segment-1.seg",
+            "segment-2.seg",
+            "segment-3.seg",
+            "segment-4.seg",
+        ];
+        let mut entries = Vec::new();
+        for name in names {
+            let path = dir.join(name);
+            fs::write(&path, b"original").expect("write");
+            let mut entry = entry_of(&dir, name);
+            entry.modified_unix_ns =
+                generation::modified_unix_ns(&fs::metadata(&path).expect("metadata"));
+            entries.push(entry);
+        }
+        let modified = |name: &str| fs::metadata(dir.join(name)).expect("file").modified();
+        let set_modified = |name: &str, at: std::time::SystemTime| {
+            File::options()
+                .write(true)
+                .open(dir.join(name))
+                .and_then(|file| file.set_modified(at))
+                .expect("set mtime");
+        };
+        let mut files = verifier_of(7, entries, None, &ledger);
+        let check = |files: &mut FileVerifier| {
+            assert_eq!(
+                files.check_unchecked(&dir, None, &ledger).expect("check"),
+                Walked::Reached
+            );
+        };
+        let recheck = |files: &mut FileVerifier, name: &str| {
+            let index = files.find(name).expect("manifested");
+            files.forget(index);
+            check(files);
+        };
+
+        // Damage no checkpoint sees: edited in place, length and
+        // modification time put back. Generation 7 named this file.
+        tamper_unseen(&dir.join("segment-1.seg"));
+        check(&mut files);
+        assert_eq!(
+            files.confirm(&dir, 8, CONFIRM_BATCH).expect("confirm"),
+            Confirmed::Held
+        );
+        assert!(!files.unconfirmed());
+
+        // Rewritten and renamed over its path, as expiry rewrites a segment:
+        // the same length, a new modification time. Nothing stands for
+        // generation 7 — though with it still live, the file read is what a
+        // check under the lock would find.
+        let at = modified("segment-2.seg").expect("mtime");
+        rename_over(&dir, "segment-2.seg", b"rewrite!");
+        set_modified("segment-2.seg", at + Duration::from_secs(1));
+        recheck(&mut files, "segment-2.seg");
+        assert_eq!(
+            files.confirm(&dir, 8, CONFIRM_BATCH).expect("confirm"),
+            Confirmed::Moved
+        );
+        assert!(files.unconfirmed(), "nothing settled about segment-2");
+        assert_eq!(
+            files.confirm(&dir, 7, CONFIRM_BATCH).expect("confirm"),
+            Confirmed::Held
+        );
+
+        // Removed, as a sweep removes a segment no later generation names.
+        fs::remove_file(dir.join("segment-3.seg")).expect("remove");
+        recheck(&mut files, "segment-3.seg");
+        assert_eq!(
+            files.confirm(&dir, 8, CONFIRM_BATCH).expect("confirm"),
+            Confirmed::Moved
+        );
+        assert_eq!(
+            files.confirm(&dir, 7, CONFIRM_BATCH).expect("confirm"),
+            Confirmed::Held
+        );
+
+        // Read while another file was there, and since put back as the one
+        // generation 7 named: that file is digested, and it verifies.
+        let at = modified("segment-4.seg").expect("mtime");
+        rename_over(&dir, "segment-4.seg", b"damaged!");
+        recheck(&mut files, "segment-4.seg");
+        rename_over(&dir, "segment-4.seg", b"original");
+        set_modified("segment-4.seg", at);
+        assert_eq!(
+            files.confirm(&dir, 8, CONFIRM_BATCH).expect("confirm"),
+            Confirmed::Changed
+        );
+        check(&mut files);
+        assert!(!files.unconfirmed());
+
+        let problems = files.result(0).problems;
+        assert_eq!(
+            problems,
+            [
+                "segment-1.seg: digest mismatch",
+                "segment-2.seg: digest mismatch",
+                "segment-3.seg: missing"
+            ],
+            "{problems:?}"
+        );
+
+        // A manifest that recorded no modification time names no file by
+        // it: nothing is settled about such a generation once it is not
+        // live.
+        let segment = files.find("segment-1.seg").expect("segment-1");
+        files.files[segment].entry.modified_unix_ns = 0;
+        files.forget(segment);
+        check(&mut files);
+        assert_eq!(
+            files.confirm(&dir, 8, CONFIRM_BATCH).expect("confirm"),
+            Confirmed::Moved
         );
     }
 
@@ -7363,8 +8456,8 @@ mod tests {
             {}
             Ok(built
                 .files
-                .into_iter()
-                .map(|state| state.entry.path)
+                .iter()
+                .map(|state| state.entry.path.clone())
                 .collect())
         };
         let file = |path: &str| json!({"path": path, "bytes": 1, "sha256": digest(1), "modified_unix_ns": 5});

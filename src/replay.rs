@@ -77,7 +77,10 @@
 //! reaches the replay, not the time its request arrived — once more when its
 //! turn comes and again when it commits — so a call that waited past the
 //! expiry is refused without rendering, and a rendering that finishes past
-//! it is dropped unserved.
+//! it is dropped unserved. That time is the request's [`Arrival`] advanced
+//! by the monotonic time spent since, so what a request costs before it
+//! reaches the registry — its body arriving, being parsed and digested —
+//! counts too.
 //!
 //! A served answer is bounded too: no rendered response exceeds
 //! [`MAX_RESPONSE_BYTES`], and the identifiers a stream repeats in every
@@ -880,19 +883,72 @@ impl Replay {
     }
 }
 
-/// Monotonic time as a registry reads it: real elapsed time in service, a
-/// hand-moved reading in tests — so a test can hold a call across a replay's
-/// expiry without sleeping through a TTL.
-type Clock = Arc<dyn Fn() -> Duration + Send + Sync>;
-
-/// The registry's clock in service: time elapsed since the registry was made.
-fn monotonic() -> Clock {
-    let origin = Instant::now();
-    Arc::new(move || origin.elapsed())
+/// When a request arrived: its Unix time and, when it was captured where the
+/// request came in, the monotonic instant read with it.
+///
+/// A registry call is judged at its arrival advanced by the monotonic time
+/// spent since. An arrival captured with [`Arrival::now`] as the request
+/// comes in — the server takes one as soon as a request's head is read —
+/// makes everything the request costs before it reaches the registry count
+/// toward the expiry too: its body arriving, being decoded, parsed and
+/// digested. Without that, a request arriving a moment before its replay
+/// expired could spend longer than its replay had left on getting to the
+/// registry, and be served after the expiry its creation response stated.
+///
+/// A bare Unix time converts into an arrival too ([`From<u64>`]), whose
+/// monotonic clock starts when the registry call does: right for a caller
+/// with no work between taking the time and calling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Arrival {
+    unix_ns: u64,
+    instant: Option<Instant>,
 }
 
-/// A registry call's place in time: the Unix time its caller handed it — when
-/// the request arrived — and the registry clock's reading then.
+impl Arrival {
+    /// Now: the Unix time and the monotonic instant, read together.
+    pub fn now() -> Self {
+        Self::at(crate::mcp::unix_nanos_now(), Instant::now())
+    }
+
+    /// An arrival at Unix time `unix_ns`, which was `instant` on the
+    /// monotonic clock.
+    pub fn at(unix_ns: u64, instant: Instant) -> Self {
+        Self {
+            unix_ns,
+            instant: Some(instant),
+        }
+    }
+
+    /// The arrival's Unix time, in nanoseconds.
+    pub fn unix_ns(self) -> u64 {
+        self.unix_ns
+    }
+}
+
+impl From<u64> for Arrival {
+    /// An arrival at Unix time `unix_ns`, timed from when the registry call
+    /// that takes it begins.
+    fn from(unix_ns: u64) -> Self {
+        Self {
+            unix_ns,
+            instant: None,
+        }
+    }
+}
+
+/// Monotonic time as a registry reads it: the real clock in service, a
+/// hand-moved reading in tests — so a test can hold a call across a replay's
+/// expiry without sleeping through a TTL.
+type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
+
+/// The registry's clock in service.
+fn monotonic() -> Clock {
+    Arc::new(Instant::now)
+}
+
+/// A registry call's place in time: the Unix time it arrived at, and the
+/// monotonic instant of that arrival — the one its [`Arrival`] carried, or
+/// the registry clock's reading as the call began when it carried none.
 ///
 /// A call can wait after it arrives: for the registry's lock, and in
 /// [`Registry::next_llm`] for its replay's turn while an earlier call renders.
@@ -904,7 +960,7 @@ fn monotonic() -> Clock {
 #[derive(Clone, Copy)]
 struct CallTime {
     arrived_ns: u64,
-    began: Duration,
+    began: Instant,
 }
 
 /// The in-memory registry of live replays.
@@ -953,18 +1009,19 @@ impl Registry {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// A call that arrived at `now_ns`, starting its clock.
-    fn arrived(&self, now_ns: u64) -> CallTime {
+    /// A call that arrived at `arrival`, timed from the arrival's own instant
+    /// or, when it carries none, from now.
+    fn arrived(&self, arrival: Arrival) -> CallTime {
         CallTime {
-            arrived_ns: now_ns,
-            began: (self.clock)(),
+            arrived_ns: arrival.unix_ns,
+            began: arrival.instant.unwrap_or_else(|| (self.clock)()),
         }
     }
 
     /// The Unix time `call` has reached: its arrival, advanced by the time it
     /// has spent since.
     fn now(&self, call: CallTime) -> u64 {
-        let spent = (self.clock)().saturating_sub(call.began);
+        let spent = (self.clock)().saturating_duration_since(call.began);
         call.arrived_ns
             .saturating_add(u64::try_from(spent.as_nanos()).unwrap_or(u64::MAX))
     }
@@ -991,6 +1048,9 @@ impl Registry {
     /// spans than [`Limits::max_spans`], and — as soon as building the
     /// snapshot passes it — when the replay would hold more than a whole
     /// share.
+    ///
+    /// The replay lives [`Limits::ttl`] from `arrived` ([`Arrival`]), the
+    /// time its creation response states.
     pub fn create(
         &self,
         store: &Store,
@@ -998,7 +1058,7 @@ impl Registry {
         run_id: &str,
         mode: Mode,
         tape_max_bytes: usize,
-        now_ns: u64,
+        arrived: impl Into<Arrival>,
     ) -> Result<Created, ReplayError> {
         self.create_fork(
             store,
@@ -1007,7 +1067,7 @@ impl Registry {
             mode,
             &ForkSpec::default(),
             tape_max_bytes,
-            now_ns,
+            arrived,
         )
     }
 
@@ -1031,8 +1091,9 @@ impl Registry {
         mode: Mode,
         fork: &ForkSpec,
         tape_max_bytes: usize,
-        now_ns: u64,
+        arrived: impl Into<Arrival>,
     ) -> Result<Created, ReplayError> {
+        let call = self.arrived(arrived.into());
         // Edited answers decoded first: a malformed one is the caller's
         // mistake and should not cost a store read.
         let mut plan = Plan {
@@ -1051,7 +1112,6 @@ impl Registry {
             };
             plan.edits.insert(edit.step, edited);
         }
-        let call = self.arrived(now_ns);
         // Cheap refusal first: a full share should not cost a store read.
         {
             let (mut replays, at_ns) = self.lock_at(call);
@@ -1115,7 +1175,7 @@ impl Registry {
             run: run_id.to_owned(),
             tenant: tenant.map(str::to_owned),
             mode,
-            expires_at_ns: now_ns.saturating_add(ttl_ns),
+            expires_at_ns: call.arrived_ns.saturating_add(ttl_ns),
             llm: snapshot.llm,
             tools: snapshot.tools,
             served: 0,
@@ -1329,22 +1389,23 @@ impl Registry {
     /// only, never every other replay. An erasure recorded while a step
     /// renders is caught at the commit, which drops the rendering unserved.
     ///
-    /// Expiry is judged afresh at every check — when the call arrives, when
-    /// its turn comes and at the commit — by `now_ns` advanced by the time
-    /// the call has spent. A call whose turn comes after the replay expired
-    /// is refused ([`ReplayError::NotFound`]) without rendering, and a
-    /// rendering that finishes after it is dropped unserved: no step is
-    /// consumed past the expiry the creation response stated.
+    /// Expiry is judged afresh at every check — when the call reaches the
+    /// registry, when its turn comes and at the commit — by `arrived`
+    /// advanced by the time spent since ([`Arrival`]). A call whose turn
+    /// comes after the replay expired is refused ([`ReplayError::NotFound`])
+    /// without rendering, and a rendering that finishes after it is dropped
+    /// unserved: no step is consumed past the expiry the creation response
+    /// stated.
     pub fn next_llm<R>(
         &self,
         store: &Store,
         id: &str,
         binding: Option<&str>,
         got_digest: Option<String>,
-        now_ns: u64,
+        arrived: impl Into<Arrival>,
         render: impl Fn(&ServedStep) -> Result<R, ReplayError>,
     ) -> Result<R, ReplayError> {
-        let call = self.arrived(now_ns);
+        let call = self.arrived(arrived.into());
         let serving = {
             let latest_erasure = store.erasures.latest_id()?;
             let (mut replays, now_ns) = self.lock_at(call);
@@ -1439,9 +1500,9 @@ impl Registry {
         id: &str,
         binding: Option<&str>,
         tool: Option<&str>,
-        now_ns: u64,
+        arrived: impl Into<Arrival>,
     ) -> Result<ServedTool, ReplayError> {
-        let call = self.arrived(now_ns);
+        let call = self.arrived(arrived.into());
         let latest_erasure = store.erasures.latest_id()?;
         let (mut replays, now_ns) = self.lock_at(call);
         let replay = self.live(&mut replays, store, latest_erasure, id, binding, now_ns)?;
@@ -1526,9 +1587,9 @@ impl Registry {
         step: usize,
         request: &Value,
         provider: Provider,
-        now_ns: u64,
+        arrived: impl Into<Arrival>,
     ) -> Option<Value> {
-        let call = self.arrived(now_ns);
+        let call = self.arrived(arrived.into());
         let got_digest = provider.request_digest(request).ok().flatten();
         let origin = {
             let latest_erasure = store.erasures.latest_id().ok()?;
@@ -1588,9 +1649,9 @@ impl Registry {
         store: &Store,
         id: &str,
         binding: Option<&str>,
-        now_ns: u64,
+        arrived: impl Into<Arrival>,
     ) -> Result<Value, ReplayError> {
-        let call = self.arrived(now_ns);
+        let call = self.arrived(arrived.into());
         let latest_erasure = store.erasures.latest_id()?;
         let (mut replays, now_ns) = self.lock_at(call);
         let replay = self.live(&mut replays, store, latest_erasure, id, binding, now_ns)?;
@@ -5021,11 +5082,7 @@ mod tests {
             }
         };
         for first_renders in [false, true] {
-            let elapsed = Arc::new(AtomicU64::new(0));
-            let clock: Clock = {
-                let elapsed = Arc::clone(&elapsed);
-                Arc::new(move || Duration::from_nanos(elapsed.load(Ordering::SeqCst)))
-            };
+            let (clock, elapsed) = hand_clock();
             let registry = Registry::with_clock(
                 Limits {
                     ttl,
@@ -5103,6 +5160,104 @@ mod tests {
                 "{case}: the expired replay is still held"
             );
         }
+    }
+
+    #[test]
+    fn time_spent_before_the_registry_counts_toward_the_expiry() {
+        // A request arrives a second before its replay expires and then
+        // spends two seconds being read, parsed and digested before it
+        // reaches the registry. The route took the arrival time first, but
+        // the registry started its own clock only on entry, so those two
+        // seconds were missing from every check: the call was served a
+        // second after the expiry the creation response stated.
+        let fixture = TempStore::open("replay-preprocessing-expiry", crate::Config::default());
+        let store = fixture.store();
+        store
+            .ingest_batch(vec![
+                span(
+                    "t-pre",
+                    "llm-0",
+                    1,
+                    json!({"gen_ai.operation.name": "chat",
+                           "gen_ai.prompt.0.content": "q",
+                           "gen_ai.completion.0.content": "a"}),
+                ),
+                span(
+                    "t-pre",
+                    "tool-0",
+                    2,
+                    json!({"gen_ai.operation.name": "execute_tool",
+                           "gen_ai.tool.name": "search",
+                           "gen_ai.tool.call.arguments": "{}",
+                           "gen_ai.tool.call.result": "{}"}),
+                ),
+            ])
+            .expect("ingests");
+        let ttl = Duration::from_secs(10);
+        let (clock, elapsed) = hand_clock();
+        let registry = Registry::with_clock(
+            Limits {
+                ttl,
+                ..Limits::default()
+            },
+            Arc::clone(&clock),
+        );
+        let id = registry
+            .create(store, Some(""), "trace:t-pre", Mode::Loose, 1 << 20, NOW)
+            .expect("creates")
+            .id;
+        // Taken where the request came in, as the server takes it once the
+        // request's head is read.
+        let arrival_ns = NOW + ttl.as_nanos() as u64 - 1_000_000_000;
+        let arrival = Arrival::at(arrival_ns, clock());
+        elapsed.fetch_add(2_000_000_000, Ordering::SeqCst);
+        // A bare Unix time is timed from the call, so it still sees the
+        // replay a second short of its expiry: what the boundary's instant
+        // adds is exactly the time spent before the call.
+        assert!(
+            registry.status(store, &id, Some(""), arrival_ns).is_ok(),
+            "a bare arrival time is judged from the call"
+        );
+
+        let rendered = AtomicU64::new(0);
+        let served = registry.next_llm(store, &id, Some(""), None, arrival, |step: &ServedStep| {
+            rendered.fetch_add(1, Ordering::SeqCst);
+            Ok(step.step)
+        });
+        assert!(
+            matches!(served, Err(ReplayError::NotFound)),
+            "a call that reached the registry after the expiry was served: {served:?}"
+        );
+        assert_eq!(rendered.load(Ordering::SeqCst), 0, "it rendered a step");
+        for (what, outcome) in [
+            (
+                "a tool call",
+                registry
+                    .next_tool(store, &id, Some(""), None, arrival)
+                    .map(|_| ()),
+            ),
+            (
+                "a status read",
+                registry.status(store, &id, Some(""), arrival).map(|_| ()),
+            ),
+        ] {
+            assert!(
+                matches!(outcome, Err(ReplayError::NotFound)),
+                "{what} that reached the registry after the expiry was answered: {outcome:?}"
+            );
+        }
+    }
+
+    /// A registry clock moved by hand: it reads a fixed origin plus the
+    /// nanoseconds in the returned counter.
+    fn hand_clock() -> (Clock, Arc<AtomicU64>) {
+        let origin = Instant::now();
+        let elapsed = Arc::new(AtomicU64::new(0));
+        let clock: Clock = {
+            let elapsed = Arc::clone(&elapsed);
+            Arc::new(move || origin + Duration::from_nanos(elapsed.load(Ordering::SeqCst)))
+        };
+        (clock, elapsed)
     }
 
     // ------------------------------------------------------------- forks
