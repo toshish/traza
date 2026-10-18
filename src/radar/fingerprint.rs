@@ -7,7 +7,7 @@
 //! | `tool_catalog` | `gen_ai.tool.definitions` → indexed `llm.request.functions.{i}.*` → indexed `llm.tools.{i}.tool.json_schema` → a provider request body's `tools` | SHA-256 of the definitions' canonical JSON, sorted, 16 hex |
 //! | `model_requested` | `gen_ai.request.model` → `llm.model` → `llm.model_name` | the value |
 //! | `model_returned` | `gen_ai.response.model` | the value |
-//! | `params` | every `gen_ai.request.*` key but the model, and `llm.invocation_parameters` (its `model` key dropped) — the keys a run diff calls `config` | `key=value` pairs in key order |
+//! | `params` | every `gen_ai.request.*` key but the model, and `llm.invocation_parameters` (its `model` key dropped) — the keys a run diff calls `config` | the canonical JSON of the typed parameters (shown as `key=value` pairs in key order, each value as JSON) |
 //! | `service_version` | `service.version` (any span) | the value |
 //! | `sdk_version` | `telemetry.sdk.name` / `telemetry.sdk.version` (any span) | `name/version` |
 //!
@@ -66,8 +66,8 @@ pub(crate) enum Sample {
     Text(String),
     /// A tool catalog's tool names, sorted, at most [`MAX_CATALOG_NAMES`].
     Names(Vec<String>),
-    /// Sampling parameters, key → compact value.
-    Params(BTreeMap<String, String>),
+    /// Sampling parameters, key → typed value (cut short when long).
+    Params(BTreeMap<String, Value>),
 }
 
 /// One dimension's value for one step.
@@ -169,13 +169,18 @@ fn model_requested(attributes: &Map<String, Value>) -> Option<String> {
         .find_map(|key| attr_str(attributes, key))
 }
 
-/// The sampling parameters, as `key=value` pairs in key order.
+/// The sampling parameters, typed. Their identity is the canonical JSON of
+/// the typed map — keys sorted, strings quoted and escaped, numbers kept
+/// numbers — so `{"stop": "END, temperature=0.7"}` and
+/// `{"stop": "END", "temperature": 0.7}` are two configurations, as are
+/// `1` and `"1"`. What a reader sees is made separately: `key=value` pairs
+/// in key order, each value as JSON, cut short past [`MAX_VALUE_CHARS`].
 fn params(attributes: &Map<String, Value>) -> Option<Fingerprint> {
-    let mut pairs: BTreeMap<String, String> = BTreeMap::new();
+    let mut typed: Map<String, Value> = Map::new();
     for (key, value) in attributes {
         if let Some(name) = key.strip_prefix(crate::tape::CONFIG_PREFIX) {
             if name != "model" && !value.is_null() {
-                pairs.insert(name.to_owned(), compact(value));
+                typed.insert(name.to_owned(), value.clone());
             }
         }
     }
@@ -184,42 +189,62 @@ fn params(attributes: &Map<String, Value>) -> Option<Fingerprint> {
             Value::Object(map) => {
                 for (name, value) in map {
                     if name != "model" && !value.is_null() {
-                        pairs.entry(name).or_insert_with(|| compact(&value));
+                        typed.entry(name).or_insert(value);
                     }
                 }
             }
             Value::Null => {}
             other => {
-                pairs
+                typed
                     .entry("invocation_parameters".to_owned())
-                    .or_insert_with(|| compact(&other));
+                    .or_insert(other);
             }
         }
     }
-    if pairs.is_empty() {
+    if typed.is_empty() {
         return None;
     }
-    let text = pairs
+    let mut sorted: Vec<(&String, &Value)> = typed.iter().collect();
+    sorted.sort_by(|a, b| a.0.cmp(b.0));
+    let text = sorted
         .iter()
-        .map(|(key, value)| format!("{key}={value}"))
+        .map(|(key, value)| format!("{key}={}", crate::evals::canonical_json(value)))
         .collect::<Vec<_>>()
         .join(", ");
-    let mut fingerprint = Fingerprint::value(&text);
-    fingerprint.sample = Some(Sample::Params(
-        pairs
-            .into_iter()
-            .map(|(key, value)| (key, clip(&value, MAX_VALUE_CHARS)))
-            .collect(),
-    ));
-    Some(fingerprint)
+    let sample = sorted
+        .iter()
+        .map(|(key, value)| ((*key).clone(), sample_value(value)))
+        .collect();
+    Some(Fingerprint {
+        key: crate::evals::canonical_json(&Value::Object(typed)),
+        display: clip(&text, MAX_VALUE_CHARS),
+        sample: Some(Sample::Params(sample)),
+    })
 }
 
-/// A parameter value as text: a string as itself, anything else as its
-/// canonical JSON.
-fn compact(value: &Value) -> String {
+/// A parameter value as a change's detail shows it: typed, a string cut to
+/// [`MAX_VALUE_CHARS`] characters, and an array or object whose JSON is
+/// longer than that as the cut JSON text.
+fn sample_value(value: &Value) -> Value {
     match value {
-        Value::String(text) => text.clone(),
-        other => crate::evals::canonical_json(other),
+        Value::String(text) => Value::String(clip(text, MAX_VALUE_CHARS)),
+        other => {
+            let text = crate::evals::canonical_json(other);
+            if text.chars().count() <= MAX_VALUE_CHARS {
+                other.clone()
+            } else {
+                Value::String(clip(&text, MAX_VALUE_CHARS))
+            }
+        }
+    }
+}
+
+/// The bytes a sampled parameter value holds: a string's own, anything
+/// else's JSON.
+pub(crate) fn sample_value_bytes(value: &Value) -> usize {
+    match value {
+        Value::String(text) => text.len(),
+        other => crate::evals::canonical_json(other).len(),
     }
 }
 
@@ -845,6 +870,33 @@ mod tests {
             Some("opentelemetry/1.27.0".to_owned())
         );
         assert_eq!(environment(&span.attributes), Some("prod".to_owned()));
+    }
+
+    #[test]
+    fn parameters_are_identified_by_their_typed_values_not_their_text() {
+        let params = |attributes: Value| {
+            dimension(&llm_span(attributes), Dimension::Params).expect("parameters")
+        };
+        // A string that spells out another parameter is not that parameter.
+        let spelled = params(json!({"gen_ai.request.stop": "END, temperature=0.7"}));
+        let two = params(json!({
+            "gen_ai.request.stop": "END",
+            "gen_ai.request.temperature": 0.7,
+        }));
+        assert_ne!(spelled.key, two.key);
+        assert_ne!(spelled.display, two.display, "nor is it shown as one");
+        // A number and the string of its digits are two values.
+        let number = params(json!({"gen_ai.request.n": 1}));
+        let digits = params(json!({"gen_ai.request.n": "1"}));
+        assert_ne!(number.key, digits.key);
+        assert_ne!(number.display, digits.display);
+        assert_ne!(number.sample, digits.sample, "and a diff can say so");
+        // The same typed map is one identity, wherever it was recorded.
+        let blob = params(json!({
+            "llm.invocation_parameters": "{\"temperature\":0.7,\"stop\":\"END\"}",
+        }));
+        assert_eq!(blob.key, two.key);
+        assert_eq!(blob.display, two.display);
     }
 
     #[test]

@@ -19,7 +19,10 @@
 //! every key). Values are compared by a 64-bit digest; their text is kept
 //! only to be shown, in bounded tables.
 //! A run carrying several values of one dimension — a planner model and an
-//! executor model — has the SET of them as its value.
+//! executor model — has the SET of them as its value. A run holds at most
+//! [`MAX_RUN_VALUES`] of them; one that carried more has an INCOMPLETE set,
+//! which says nothing certain about what it ran on, so it is left out of
+//! that dimension's change detection and of its changes' sides.
 //!
 //! Runs are grouped into **cohorts** by `(tenant, agent)`, where the agent is
 //! the first step's agent name ([`semconv::step_facts`]) or else the run's
@@ -54,7 +57,8 @@
 //!
 //! A dimension where more than half the runs carry a value no other run
 //! shares — typically a prompt embedding something per-request that masking
-//! did not catch — or that has more than [`MAX_CHANGES_PER_DIMENSION`]
+//! did not catch — or where more than half the runs carrying it have an
+//! incomplete set, or that has more than [`MAX_CHANGES_PER_DIMENSION`]
 //! change points is **volatile**, and is reported as such instead of being
 //! searched.
 //!
@@ -84,16 +88,20 @@
 //! the session idle window of the earlier of now and `until`) are left out:
 //! their cost and steps may be partial. Rates (error rate: runs with at least
 //! one error span; success rate: runs that ended success, of those that
-//! ended at all) use the pooled two-proportion z-test; cost, steps and
-//! duration use Welch's t-test on the logarithm (cost over priced runs only;
-//! steps and duration as `ln(1+x)`), so one runaway run does not decide a
-//! verdict. Holm's correction holds the family-wise error rate across a
-//! change's five tests at 5%. The verdict is `regression` when a quality
-//! metric (error or success rate) got significantly worse — or, with quality
-//! unchanged, an efficiency metric did — `improvement` symmetrically,
-//! `neutral` when nothing is significant, and `insufficient_data` with fewer
-//! than [`MIN_RUNS_PER_SIDE`] runs on a side; `decided_by` says which kind of
-//! metric decided. Changes are ranked by verdict (regressions first), then
+//! ended at all) use the pooled two-proportion z-test, or Fisher's exact test
+//! when an expected cell count is below 5 (where the normal approximation
+//! overstates significance); cost, steps and duration use Welch's t-test on
+//! the logarithm (cost over priced runs only; steps and duration as
+//! `ln(1+x)`), so one runaway run does not decide a verdict. A metric takes
+//! part in the verdict only when its own test had [`MIN_RUNS_PER_SIDE`]
+//! observations on each side — runs that ended, for the success rate; priced
+//! runs, for cost — and is reported either way. Holm's correction holds the
+//! family-wise error rate across a change's tests at 5%. The verdict is
+//! `regression` when a quality metric (error or success rate) got
+//! significantly worse — or, with quality unchanged, an efficiency metric
+//! did — `improvement` symmetrically, `neutral` when nothing is significant,
+//! and `insufficient_data` with fewer than [`MIN_RUNS_PER_SIDE`] runs on a
+//! side; `decided_by` says which kind of metric decided. Changes are ranked by verdict (regressions first), then
 //! quality-decided before efficiency-decided, then by effect size (Cohen's h
 //! for rates, Cohen's d — capped at 4 — for log-scale means), then newest.
 //!
@@ -203,8 +211,9 @@ pub const VERDICT_ALPHA: f64 = 0.05;
 /// Earliest steps kept per run — enough for the top-level path.
 pub const MAX_RUN_STEPS: usize = 32;
 
-/// Distinct values of one dimension kept per run; a run carrying more is
-/// shown with a trailing ` + …`.
+/// Distinct values of one dimension a run holds. A run carrying more has an
+/// incomplete set: it is shown as the values it holds and a trailing ` + …`,
+/// and left out of that dimension's change detection.
 pub const MAX_RUN_VALUES: usize = 4;
 
 /// Distinct values per dimension one analysis keeps a display name (and a
@@ -237,6 +246,8 @@ const MAX_TOOLS_PER_RUN: usize = 64;
 const MAX_ENVIRONMENTS_PER_RUN: usize = 4;
 /// llm steps extracted between the read's own deadline checks.
 const EXTRACTION_CHECK_INTERVAL: usize = 64;
+/// Values the analysis reads between two checks of its deadline.
+const PACE_CHECK_WORK: usize = 1 << 16;
 const TOOL_MIX_ROWS: usize = 8;
 const PATH_ROWS: usize = 5;
 const EXAMPLE_RUNS: usize = 3;
@@ -480,7 +491,10 @@ pub struct RateDelta {
     pub before: Option<f64>,
     /// The rate on the new side.
     pub after: Option<f64>,
-    /// Two-proportion z-test, two-sided; `null` when it cannot be computed.
+    /// Two-sided: the pooled two-proportion z-test, or Fisher's exact test
+    /// when an expected cell count is below 5; `null` when it cannot be
+    /// computed. Reported even when a side has too few runs rated for the
+    /// metric to take part in the verdict.
     pub p_value: Option<f64>,
     /// Runs rated on the old side.
     pub n_before: usize,
@@ -497,7 +511,8 @@ pub struct MeanDelta {
     pub after: Option<f64>,
     /// `after / before`, when `before` is positive.
     pub ratio: Option<f64>,
-    /// Welch's t-test on the log scale, two-sided.
+    /// Welch's t-test on the log scale, two-sided. For cost, over the priced
+    /// runs only.
     pub p_value: Option<f64>,
     /// Runs measured on the old side.
     pub n_before: usize,
@@ -734,7 +749,7 @@ fn sample_bytes(sample: &Sample) -> usize {
         Sample::Names(names) => names.iter().map(String::len).sum(),
         Sample::Params(params) => params
             .iter()
-            .map(|(key, value)| key.len() + value.len())
+            .map(|(key, value)| key.len() + fingerprint::sample_value_bytes(value))
             .sum(),
     }
 }
@@ -828,7 +843,17 @@ impl Tables {
     }
 }
 
-/// A run's distinct values of one dimension.
+/// A run's distinct values of one dimension, as a function of the set alone
+/// — never of the order its spans were read in, which batching can change.
+///
+/// It holds the [`MAX_RUN_VALUES`] smallest digests seen, sorted, and
+/// `overflow` says the run carried more. Both are exact: a value not held
+/// was refused or evicted only once more than [`MAX_RUN_VALUES`] distinct
+/// values had arrived, and the held ones only ever get smaller, so a repeat
+/// of it is never mistaken for a newcomer. A set that overflowed is
+/// INCOMPLETE: which values the run carried is not known, so the analysis
+/// leaves the run out of that dimension (see [`analyse`]); what it holds is
+/// kept only to be shown.
 #[derive(Clone, Debug, Default)]
 struct ValueSet {
     ids: Vec<u64>,
@@ -837,14 +862,18 @@ struct ValueSet {
 
 impl ValueSet {
     fn add(&mut self, id: u64) {
-        if self.ids.contains(&id) {
+        let Err(at) = self.ids.binary_search(&id) else {
+            return;
+        };
+        if self.ids.len() < MAX_RUN_VALUES {
+            self.ids.insert(at, id);
             return;
         }
-        if self.ids.len() >= MAX_RUN_VALUES {
-            self.overflow = true;
-            return;
+        self.overflow = true;
+        if at < self.ids.len() {
+            self.ids.pop();
+            self.ids.insert(at, id);
         }
-        self.ids.push(id);
     }
 }
 
@@ -1202,10 +1231,17 @@ struct ComboTable {
 }
 
 impl ComboTable {
+    /// Whether `combo` is a run's whole set, not an overflowed one's first
+    /// values.
+    fn complete(&self, combo: u32) -> bool {
+        self.members
+            .get(combo as usize)
+            .is_some_and(|(_, overflow)| !overflow)
+    }
+
     fn intern(&mut self, set: &ValueSet) -> u32 {
-        let mut ids = set.ids.clone();
-        ids.sort_unstable();
-        let key = (ids, set.overflow);
+        // Held sorted already (see `ValueSet`).
+        let key = (set.ids.clone(), set.overflow);
         if let Some(&id) = self.ids.get(&key) {
             return id;
         }
@@ -1579,10 +1615,10 @@ fn analyse_window(
         runs.sort_by(|a, b| a.start_ns.cmp(&b.start_ns).then_with(|| a.run.cmp(&b.run)));
         runs_scanned += runs.len();
         let context = context_for(runs[0].tenant_id);
-        let mut changes = analyse(&cohort_tenant, &agent, &runs, &context, deadline)?;
+        let (mut changes, targets) = analyse(&cohort_tenant, &agent, &runs, &context, deadline)?;
         if let Some(view) = named.filter(|view| view.tenant == cohort_tenant && view.agent == agent)
         {
-            run = Some(run_context(view, &changes, &context));
+            run = Some(run_context(view, &changes, &targets, &context));
         }
         changes.unnamed = context.unnamed.get() || runs.iter().any(|run| run.unnamed_path);
         truncated |= changes.unnamed;
@@ -1627,8 +1663,16 @@ fn analyse_window(
 
 /// One run placed on its agent's timeline: its fingerprint, and the latest
 /// change point of each dimension that introduced the value it carries and
-/// started at or before it. Regressions first.
-fn run_context(view: &RunView, agent: &AgentChanges, context: &Context<'_>) -> RunContext {
+/// started at or before it. Regressions first. `targets` holds, per change
+/// of `agent`, the identity of the value it introduced: carrying is decided
+/// by identity, because two values can share a display (a value past
+/// [`fingerprint::MAX_VALUE_CHARS`] is shown cut short).
+fn run_context(
+    view: &RunView,
+    agent: &AgentChanges,
+    targets: &[Option<u32>],
+    context: &Context<'_>,
+) -> RunContext {
     let mut fingerprint = BTreeMap::new();
     for dimension in Dimension::CONFIG {
         if let Some(combo) = view.values[dimension.index()] {
@@ -1640,13 +1684,14 @@ fn run_context(view: &RunView, agent: &AgentChanges, context: &Context<'_>) -> R
     }
     fingerprint.insert("path".to_owned(), context.paths.name(view.path).to_owned());
     let mut latest: BTreeMap<Dimension, &Change> = BTreeMap::new();
-    for change in &agent.changes {
+    for (change, target) in agent.changes.iter().zip(targets) {
         if change.at_ns > view.start_ns {
             continue;
         }
-        let carries = match change.dimension {
-            Dimension::Behavior => true,
-            dimension => fingerprint.get(dimension.as_str()) == Some(&change.to),
+        let carries = match (change.dimension, target) {
+            (Dimension::Behavior, _) => true,
+            (dimension, Some(combo)) => view.values[dimension.index()] == Some(*combo),
+            (_, None) => false,
         };
         if carries
             && latest
@@ -1786,24 +1831,69 @@ fn share(values: &[u32], value: u32) -> f64 {
     values.iter().filter(|v| **v == value).count() as f64 / values.len() as f64
 }
 
-/// What the dominance walk proposes: switches `(onset, from, to, detected)`
-/// — `detected` the index at which the newcomer became dominant — and the
-/// walk's final incumbent with its run count.
+/// Work counted against a query deadline: every loop of the analysis over a
+/// cohort's runs reports the values it reads, and the deadline is checked
+/// whenever another [`PACE_CHECK_WORK`] of them have been read — so no loop,
+/// whatever its length, runs far past the budget.
+struct Pace {
+    deadline: Option<Deadline>,
+    /// Values read so far.
+    work: usize,
+    /// The work at which the deadline is checked next (the first report
+    /// checks it).
+    next_check: usize,
+}
+
+impl Pace {
+    fn new(deadline: Option<Deadline>) -> Self {
+        Self {
+            deadline,
+            work: 0,
+            next_check: 0,
+        }
+    }
+
+    /// Reports `units` more values read; refused once the deadline passed.
+    fn add(&mut self, units: usize) -> Result<()> {
+        self.work = self.work.saturating_add(units);
+        if self.work >= self.next_check {
+            Deadline::check(self.deadline, 0)?;
+            self.next_check = self.work.saturating_add(PACE_CHECK_WORK);
+        }
+        Ok(())
+    }
+}
+
+/// A proposed switch, `(onset, from, to, detected)`: `detected` is the index
+/// at which the newcomer became dominant.
+type Switch = (usize, u32, u32, usize);
+
+/// What the dominance walk proposes: its switches, and the walk's final
+/// incumbent with its run count.
 struct Walk {
-    switches: Vec<(usize, u32, u32, usize)>,
+    switches: Vec<Switch>,
     current: Option<u32>,
     current_runs: usize,
 }
 
 /// The dominance walk of the module docs, which proposes change points.
-fn dominance_walk(values: &[u32], window: usize) -> Walk {
+///
+/// Linear in runs: each run updates the window's counts and the running
+/// totals of every value seen so far, so restoring an incumbent after a
+/// withdrawn excursion reads its total instead of recounting the prefix; a
+/// proposal reads at most two windows more. The walk reports what it reads
+/// to `pace` as it goes, so a long sequence stops at the deadline, not after
+/// it. Both maps hold at most one entry per distinct value in `values`.
+fn dominance_walk(values: &[u32], window: usize, pace: &mut Pace) -> Result<Walk> {
     let mut counts: HashMap<u32, usize> = HashMap::new();
+    let mut totals: HashMap<u32, usize> = HashMap::new();
     let mut current: Option<u32> = None;
     let mut current_runs = 0usize;
-    let mut switches: Vec<(usize, u32, u32, usize)> = Vec::new();
+    let mut switches: Vec<Switch> = Vec::new();
     let margin = (window / 10).max(2);
     for (index, &value) in values.iter().enumerate() {
         *counts.entry(value).or_insert(0) += 1;
+        *totals.entry(value).or_insert(0) += 1;
         if index >= window {
             let gone = values[index - window];
             if let Some(count) = counts.get_mut(&gone) {
@@ -1816,6 +1906,7 @@ fn dominance_walk(values: &[u32], window: usize) -> Walk {
         if Some(value) == current {
             current_runs += 1;
         }
+        pace.add(1 + counts.len())?;
         let length = (index + 1).min(window);
         // The leader: most runs in the window; ties keep the incumbent, then
         // the smallest id, so the walk is deterministic.
@@ -1826,9 +1917,11 @@ fn dominance_walk(values: &[u32], window: usize) -> Walk {
         }) else {
             continue;
         };
+        // Every run of a value up to here: what a restored incumbent holds.
+        let so_far = |value: u32| totals.get(&value).copied().unwrap_or(0);
         let Some(incumbent) = current else {
             current = Some(leader);
-            current_runs = values[..=index].iter().filter(|v| **v == leader).count();
+            current_runs = so_far(leader);
             continue;
         };
         if leader == incumbent || lead * 2 < length {
@@ -1844,6 +1937,7 @@ fn dominance_walk(values: &[u32], window: usize) -> Walk {
             .iter()
             .filter(|v| **v == leader)
             .count();
+        pace.add(2 * length)?;
         if switches.is_empty() && current_runs < MIN_ESTABLISHED_RUNS {
             // Still settling: the first value never established itself.
             current = Some(leader);
@@ -1855,7 +1949,7 @@ fn dominance_walk(values: &[u32], window: usize) -> Walk {
                 // An excursion that came back within a window: withdrawn.
                 switches.pop();
                 current = Some(leader);
-                current_runs = values[..=index].iter().filter(|v| **v == leader).count();
+                current_runs = so_far(leader);
                 continue;
             }
         }
@@ -1863,11 +1957,11 @@ fn dominance_walk(values: &[u32], window: usize) -> Walk {
         current = Some(leader);
         current_runs = leader_runs;
     }
-    Walk {
+    Ok(Walk {
         switches,
         current,
         current_runs,
-    }
+    })
 }
 
 /// Whether a proposed switch is a change rather than a mixture's noise.
@@ -1885,7 +1979,7 @@ fn dominance_walk(values: &[u32], window: usize) -> Walk {
 /// history before it belongs to an older value.
 fn confirmed(
     values: &[u32],
-    (onset, from, to, detected): (usize, u32, u32, usize),
+    (onset, from, to, detected): Switch,
     window: usize,
     floor: usize,
 ) -> bool {
@@ -1914,11 +2008,13 @@ fn confirmed(
 
 /// Change points in one dimension's value sequence: `(onset, from, to)`,
 /// per the module's rule. Pure, so the rule is testable on its own.
-fn change_points(values: &[u32], window: usize) -> Vec<(usize, u32, u32)> {
-    let walk = dominance_walk(values, window);
+fn change_points(values: &[u32], window: usize, pace: &mut Pace) -> Result<Vec<(usize, u32, u32)>> {
+    let walk = dominance_walk(values, window, pace)?;
     let mut points: Vec<(usize, u32, u32)> = Vec::new();
     let mut floor = 0;
     for &switch in &walk.switches {
+        // A confirmation reads at most a window either side.
+        pace.add(2 * window)?;
         if confirmed(values, switch, window, floor) {
             points.push((switch.0, switch.1, switch.2));
             floor = switch.0;
@@ -1930,6 +2026,7 @@ fn change_points(values: &[u32], window: usize) -> Vec<(usize, u32, u32)> {
     // change an operator asks about.
     if let (Some(incumbent), Some(&last)) = (walk.current, values.last()) {
         let tail = values.iter().rev().take_while(|v| **v == last).count();
+        pace.add(tail + window)?;
         let onset = values.len() - tail;
         let before = &values[onset.saturating_sub(window)..onset];
         if last != incumbent
@@ -1940,7 +2037,7 @@ fn change_points(values: &[u32], window: usize) -> Vec<(usize, u32, u32)> {
             points.push((onset, incumbent, last));
         }
     }
-    points
+    Ok(points)
 }
 
 /// The split inside `[start, end]` that best separates `old` (before) from
@@ -2187,17 +2284,40 @@ fn analyse(
     runs: &[&RunView],
     context: &Context<'_>,
     deadline: Option<Deadline>,
-) -> Result<AgentChanges> {
+) -> Result<(AgentChanges, Vec<Option<u32>>)> {
     let mut raw: Vec<RawChange> = Vec::new();
     let mut volatile = Vec::new();
     let mut current = BTreeMap::new();
+    let mut pace = Pace::new(deadline);
     for dimension in Dimension::CONFIG {
         let index = dimension.index();
+        // The sequence, the volatility count and the current value: three
+        // reads of the cohort's runs.
+        pace.add(3 * runs.len())?;
+        // A run whose set overflowed is no evidence of what it ran on: two
+        // runs on the same five models would hold different first fours, and
+        // an edit to a fifth would go unseen. It is left out of the
+        // dimension, as a run carrying none of it is.
+        let mut incomplete = 0usize;
         let sequence: Vec<(usize, u32)> = runs
             .iter()
             .enumerate()
-            .filter_map(|(position, run)| run.values[index].map(|combo| (position, combo)))
+            .filter_map(|(position, run)| {
+                let combo = run.values[index]?;
+                if context.combos[index].complete(combo) {
+                    Some((position, combo))
+                } else {
+                    incomplete += 1;
+                    None
+                }
+            })
             .collect();
+        if incomplete > sequence.len() {
+            // Most of its runs carry more values than a run holds: too
+            // varied per run to search.
+            volatile.push(dimension);
+            continue;
+        }
         if sequence.is_empty() {
             continue;
         }
@@ -2213,7 +2333,7 @@ fn analyse(
                 context.display(dimension, now),
             );
         }
-        let points = change_points(&values, window);
+        let points = change_points(&values, window, &mut pace)?;
         if points.len() > MAX_CHANGES_PER_DIMENSION {
             // A configuration that changes this often is a per-run value
             // with a slower rhythm, not a history of deploys.
@@ -2229,7 +2349,6 @@ fn analyse(
                 shift: None,
             });
         }
-        Deadline::check(deadline, 0)?;
     }
     let paths: Vec<u32> = runs.iter().map(|run| run.path).collect();
     let config_onsets: Vec<usize> = raw.iter().map(|change| change.onset).collect();
@@ -2246,19 +2365,26 @@ fn analyse(
     raw.sort_by(|a, b| a.onset.cmp(&b.onset).then(a.dimension.cmp(&b.dimension)));
     let onsets: Vec<usize> = raw.iter().map(|change| change.onset).collect();
 
-    let mut built: Vec<(Change, Vec<u32>, Vec<u32>)> = Vec::with_capacity(raw.len());
+    let mut built: Vec<Built> = Vec::with_capacity(raw.len());
     for position in 0..raw.len() {
         Deadline::check(deadline, 0)?;
         built.push(build_change(position, &raw, &onsets, runs, context));
     }
-    built.sort_by(|a, b| rank(&a.0, &b.0));
+    built.sort_by(|a, b| rank(&a.change, &b.change));
     let truncated = built.len() > MAX_CHANGES_PER_AGENT;
     built.truncate(MAX_CHANGES_PER_AGENT);
     // The path shift across each reported configuration change: a fixed
     // split (the change's own), so its permutation test needs no correction
     // — and it is run only for the changes reported.
     let mut changes = Vec::with_capacity(built.len());
-    for (mut change, left, right) in built {
+    let mut targets = Vec::with_capacity(built.len());
+    for Built {
+        mut change,
+        left,
+        right,
+        target,
+    } in built
+    {
         if change.behavior_shift.is_none()
             && left.len() >= MIN_RUNS_PER_SIDE
             && right.len() >= MIN_RUNS_PER_SIDE
@@ -2278,9 +2404,10 @@ fn analyse(
             });
         }
         changes.push(change);
+        targets.push(target);
     }
     let summary = summarize(agent, runs.len(), &changes, &volatile);
-    Ok(AgentChanges {
+    let timeline = AgentChanges {
         agent: agent.to_owned(),
         tenant: tenant.to_owned(),
         runs: runs.len(),
@@ -2292,7 +2419,20 @@ fn analyse(
         changes,
         truncated,
         unnamed: false,
-    })
+    };
+    Ok((timeline, targets))
+}
+
+/// A change point as built, before ranking.
+struct Built {
+    change: Change,
+    /// The two sides' paths, nearest the change, for the shift test.
+    left: Vec<u32>,
+    right: Vec<u32>,
+    /// The identity of the value the change introduced (`None` for
+    /// behaviour): the change's `to` is only its display, which two values
+    /// can share, so a run is placed downstream by this.
+    target: Option<u32>,
 }
 
 /// One change point with its sides, deltas, verdict and detail — and the
@@ -2305,7 +2445,7 @@ fn build_change(
     onsets: &[usize],
     runs: &[&RunView],
     context: &Context<'_>,
-) -> (Change, Vec<u32>, Vec<u32>) {
+) -> Built {
     let change = &raw[position];
     let onset = change.onset;
     // Co-changes are neighbours in onset order.
@@ -2357,6 +2497,7 @@ fn build_change(
         .map(|run| run.path)
         .collect();
 
+    let target = (change.dimension != Dimension::Behavior).then_some(change.to);
     let (from, to, detail) = match change.dimension {
         Dimension::Behavior => {
             let (from, to, rows) = path_detail(&before, &after, context);
@@ -2371,7 +2512,7 @@ fn build_change(
             )
         }
     };
-    let change = Change {
+    let built = Change {
         at_ns: runs[onset].start_ns,
         dimension: change.dimension,
         from,
@@ -2400,7 +2541,12 @@ fn build_change(
                 .collect(),
         },
     };
-    (change, left, right)
+    Built {
+        change: built,
+        left,
+        right,
+        target,
+    }
 }
 
 /// One metric's test, for the verdict.
@@ -2440,19 +2586,21 @@ fn deltas(
         n_after: after.len(),
         ..RateDelta::default()
     };
-    if let Some(test) = stats::two_proportion(e1, before.len(), e2, after.len()) {
+    if let Some(test) = stats::proportions(e1, before.len(), e2, after.len()) {
         error_rate.p_value = Some(test.p_value);
         let (b, a) = (
             error_rate.before.unwrap_or(0.0),
             error_rate.after.unwrap_or(0.0),
         );
-        tests.push(MetricTest {
-            p_value: test.p_value,
-            worse: a > b,
-            effect: stats::cohens_h(b, a),
-            quality: true,
-            phrase: format!("error rate {} → {}", percent(b), percent(a)),
-        });
+        if judged(before.len(), after.len()) {
+            tests.push(MetricTest {
+                p_value: test.p_value,
+                worse: a > b,
+                effect: stats::cohens_h(b, a),
+                quality: true,
+                phrase: format!("error rate {} → {}", percent(b), percent(a)),
+            });
+        }
     }
     // Success rate: of the runs that ended at all.
     let decided = |side: &[&RunView]| {
@@ -2474,19 +2622,23 @@ fn deltas(
         n_after: d2,
         ..RateDelta::default()
     };
-    if let Some(test) = stats::two_proportion(s1, d1, s2, d2) {
+    if let Some(test) = stats::proportions(s1, d1, s2, d2) {
         success_rate.p_value = Some(test.p_value);
         let (b, a) = (
             success_rate.before.unwrap_or(0.0),
             success_rate.after.unwrap_or(0.0),
         );
-        tests.push(MetricTest {
-            p_value: test.p_value,
-            worse: a < b,
-            effect: stats::cohens_h(b, a),
-            quality: true,
-            phrase: format!("success rate {} → {}", percent(b), percent(a)),
-        });
+        // Only the runs that ended are rated: sixty runs a side can hold one
+        // that ended, and one is no evidence about a rate.
+        if judged(d1, d2) {
+            tests.push(MetricTest {
+                p_value: test.p_value,
+                worse: a < b,
+                effect: stats::cohens_h(b, a),
+                quality: true,
+                phrase: format!("success rate {} → {}", percent(b), percent(a)),
+            });
+        }
     }
     // Cost: means over every run; the test over priced runs, on the log.
     let costs = |side: &[&RunView]| side.iter().map(|run| run.cost).collect::<Vec<f64>>();
@@ -2589,15 +2741,28 @@ fn mean_delta(
     };
     if let Some(test) = stats::welch(log_before, log_after) {
         delta.p_value = Some(test.p_value);
-        tests.push(MetricTest {
-            p_value: test.p_value,
-            worse: test.statistic > 0.0,
-            effect: stats::cohens_d(log_before, log_after),
-            quality: false,
-            phrase: phrase(b.unwrap_or(0.0), a.unwrap_or(0.0)),
-        });
+        // The test's own samples decide eligibility: cost is tested over
+        // priced runs only, which can be far fewer than the side.
+        if judged(log_before.len(), log_after.len()) {
+            tests.push(MetricTest {
+                p_value: test.p_value,
+                worse: test.statistic > 0.0,
+                effect: stats::cohens_d(log_before, log_after),
+                quality: false,
+                phrase: phrase(b.unwrap_or(0.0), a.unwrap_or(0.0)),
+            });
+        }
     }
     delta
+}
+
+/// Whether a metric measured on `before` and `after` observations takes part
+/// in the verdict: at least [`MIN_RUNS_PER_SIDE`] of them on each side — the
+/// same bar the verdict sets on the sides themselves, applied to the
+/// observations the metric's test actually used. A metric short of it is
+/// still reported, p-value and all, for a reader to weigh.
+fn judged(before: usize, after: usize) -> bool {
+    before >= MIN_RUNS_PER_SIDE && after >= MIN_RUNS_PER_SIDE
 }
 
 fn tool_mix(before: &[&RunView], after: &[&RunView], context: &Context<'_>) -> Vec<ToolShare> {
@@ -4439,7 +4604,7 @@ mod tests {
         ] {
             for _ in 0..sequences {
                 let values: Vec<u32> = (0..runs).map(|_| seeded.pick(weights)).collect();
-                let points = change_points(&values, detection_window(runs));
+                let points = found(&values, detection_window(runs));
                 if !points.is_empty() {
                     alarmed.push((runs, points));
                 }
@@ -4722,42 +4887,36 @@ mod tests {
         let ones = |n: usize, value: u32| vec![value; n];
         let concat = |parts: &[Vec<u32>]| parts.concat();
         // A clean switch is placed at its first run.
-        assert_eq!(
-            change_points(&concat(&[ones(30, 0), ones(30, 1)]), 8),
-            [(30, 0, 1)]
-        );
+        assert_eq!(found(&concat(&[ones(30, 0), ones(30, 1)]), 8), [(30, 0, 1)]);
         // Two in a row.
         assert_eq!(
-            change_points(&concat(&[ones(30, 0), ones(30, 1), ones(30, 2)]), 10),
+            found(&concat(&[ones(30, 0), ones(30, 1), ones(30, 2)]), 10),
             [(30, 0, 1), (60, 1, 2)]
         );
         // A 5% canary never becomes dominant.
         let canary: Vec<u32> = (0..100).map(|i| u32::from(i % 20 == 0)).collect();
-        assert!(change_points(&canary, 12).is_empty());
+        assert!(found(&canary, 12).is_empty());
         // An even A/B split is not a change either.
         let split: Vec<u32> = (0..100).map(|i| i % 2).collect();
-        assert!(change_points(&split, 12).is_empty());
+        assert!(found(&split, 12).is_empty());
         // An excursion that comes back within a window is withdrawn.
         let excursion = concat(&[ones(40, 0), ones(6, 1), ones(40, 0)]);
         assert!(
-            change_points(&excursion, 10).is_empty(),
+            found(&excursion, 10).is_empty(),
             "{:?}",
-            change_points(&excursion, 10)
+            found(&excursion, 10)
         );
         // A first value that never established itself is settling.
         assert_eq!(
-            change_points(&concat(&[ones(1, 5), ones(30, 0), ones(30, 1)]), 8),
+            found(&concat(&[ones(1, 5), ones(30, 0), ones(30, 1)]), 8),
             [(31, 0, 1)]
         );
         // A fresh value holding every run at the end is a change before it
         // fills half a window; two runs are not enough to say so.
-        assert_eq!(
-            change_points(&concat(&[ones(60, 0), ones(5, 1)]), 20),
-            [(60, 0, 1)]
-        );
-        assert!(change_points(&concat(&[ones(60, 0), ones(2, 1)]), 20).is_empty());
+        assert_eq!(found(&concat(&[ones(60, 0), ones(5, 1)]), 20), [(60, 0, 1)]);
+        assert!(found(&concat(&[ones(60, 0), ones(2, 1)]), 20).is_empty());
         assert!(
-            change_points(&concat(&[ones(60, 0), ones(4, 1), ones(1, 0)]), 20).is_empty(),
+            found(&concat(&[ones(60, 0), ones(4, 1), ones(1, 0)]), 20).is_empty(),
             "not if the last run went back"
         );
         // Nor when the value was common all along: three in a row at the end
@@ -4765,15 +4924,15 @@ mod tests {
         let mut split_tail: Vec<u32> = (0..200).map(|i| i % 2).collect();
         split_tail.extend([0, 1, 1, 1]);
         assert!(
-            change_points(&split_tail, 50).is_empty(),
+            found(&split_tail, 50).is_empty(),
             "{:?}",
-            change_points(&split_tail, 50)
+            found(&split_tail, 50)
         );
         // A rollout that ramps up is placed where the new value took over.
         let mut ramp = ones(40, 0);
         ramp.extend((0..20).map(|i| u32::from(i % 4 == 0)));
         ramp.extend(ones(40, 1));
-        let points = change_points(&ramp, 12);
+        let points = found(&ramp, 12);
         assert_eq!(points.len(), 1, "{points:?}");
         assert!((40..=62).contains(&points[0].0), "{points:?}");
         // A rollout that held a half-and-half stage for a while is a change
@@ -4781,7 +4940,7 @@ mod tests {
         let mut staged = ones(200, 0);
         staged.extend((0..100).map(|i| i % 2));
         staged.extend(ones(200, 1));
-        let points = change_points(&staged, 50);
+        let points = found(&staged, 50);
         assert_eq!(points.len(), 1, "{points:?}");
         assert_eq!((points[0].1, points[0].2), (0, 1));
         assert!((200..=300).contains(&points[0].0), "{points:?}");
@@ -4790,19 +4949,19 @@ mod tests {
         let mut short = ones(30, 0);
         short.extend((0..10).map(|i| i % 2));
         short.extend(ones(30, 1));
-        assert_eq!(change_points(&short, 8).len(), 1, "a takeover all the same");
+        assert_eq!(found(&short, 8).len(), 1, "a takeover all the same");
         // A mixture that was always there, then a deploy of a third value.
         let mixed: Vec<u32> = (0..300).map(|i| i % 2).collect();
         let mut deployed = mixed.clone();
         deployed.extend(ones(200, 2));
-        let points = change_points(&deployed, 50);
+        let points = found(&deployed, 50);
         assert_eq!(points.len(), 1, "{points:?}");
         assert_eq!((points[0].0, points[0].2), (300, 2));
         // A deploy that left more than a fifth of runs on the old value is
         // a mixture, not a change: the radar reports takeovers.
         let mut lingering = ones(200, 0);
         lingering.extend((0..200).map(|i| u32::from(i % 3 != 0)));
-        assert!(change_points(&lingering, 50).is_empty());
+        assert!(found(&lingering, 50).is_empty());
     }
 
     #[test]
@@ -4899,5 +5058,509 @@ mod tests {
             windowed.body["since_ns"],
             json!(5_000_000_000_000_000_000u64 - DEFAULT_WINDOW_NS)
         );
+    }
+
+    /// One single-step run of `service` on `version`, declaring `outcome`
+    /// when given, its one span failing when `failed`.
+    fn versioned_run(
+        service: &str,
+        id: &str,
+        start: u64,
+        version: &str,
+        outcome: Option<&str>,
+        failed: bool,
+    ) -> Vec<Span> {
+        let mut spans = simple_run(service, id, start, "m", "Prompt.", 0, failed);
+        for span in &mut spans {
+            span.attributes
+                .insert("service.version".to_owned(), json!(version));
+            if let Some(outcome) = outcome {
+                span.attributes
+                    .insert(semconv::OUTCOME_KEYS[0].to_owned(), json!(outcome));
+            }
+        }
+        spans
+    }
+
+    /// The service-version change of `agent`.
+    fn version_change<'r>(report: &'r ChangeReport, agent: &str) -> &'r Change {
+        report
+            .agents
+            .iter()
+            .find(|cohort| cohort.agent == agent)
+            .and_then(|cohort| {
+                cohort
+                    .changes
+                    .iter()
+                    .find(|change| change.dimension == Dimension::ServiceVersion)
+            })
+            .unwrap_or_else(|| panic!("{agent}'s deploy is found: {report:#?}"))
+    }
+
+    #[test]
+    fn a_rate_is_judged_on_its_own_runs_and_exactly_when_its_cells_are_sparse() {
+        let fixture = TempStore::open("radar-sparse-rates", crate::Config::default());
+        let store = fixture.store();
+        let mut spans = Vec::new();
+        // 60 finished runs a side, but almost none declared an outcome the
+        // radar knows: one success before, ten failures after, every other
+        // run "escalated" (an outcome, but neither success nor failure).
+        for index in 0..120u64 {
+            let (version, outcome) = match index {
+                0 => ("1.0", "success"),
+                1..=59 => ("1.0", "escalated"),
+                60..=69 => ("2.0", "failure"),
+                _ => ("2.0", "escalated"),
+            };
+            spans.extend(versioned_run(
+                "declaring-bot",
+                &format!("declaring-{index:03}"),
+                BASE + index * MINUTE,
+                version,
+                Some(outcome),
+                false,
+            ));
+        }
+        // 20 runs a side, no error before and six after: every expected
+        // cell count of the table is at least 5 only on one diagonal.
+        for index in 0..40u64 {
+            spans.extend(versioned_run(
+                "erring-bot",
+                &format!("erring-{index:03}"),
+                BASE + index * MINUTE,
+                if index < 20 { "1.0" } else { "2.0" },
+                None,
+                (20..26).contains(&index),
+            ));
+        }
+        store.ingest_batch(spans).expect("ingests");
+        let report = store.changes(None, &query(), NOW).expect("analyses");
+
+        let declaring = version_change(&report, "declaring-bot");
+        assert_eq!((declaring.runs_before, declaring.runs_after), (60, 60));
+        let success = &declaring.deltas.success_rate;
+        assert_eq!((success.n_before, success.n_after), (1, 10));
+        // scipy.stats.fisher_exact([[1, 0], [0, 10]]).pvalue == 1/11; the
+        // z-test says 0.00091 of the same table.
+        let p = success.p_value.expect("reported");
+        assert!((p - 1.0 / 11.0).abs() < 1e-9, "{p}");
+        assert_eq!(
+            declaring.verdict,
+            Verdict::Neutral,
+            "one run before is no evidence about a success rate: {declaring:#?}"
+        );
+
+        let erring = version_change(&report, "erring-bot");
+        assert_eq!((erring.runs_before, erring.runs_after), (20, 20));
+        // scipy.stats.fisher_exact([[0, 20], [6, 14]]).pvalue; the z-test's
+        // 0.0079 would pass Holm's 0.05/4 and call this a regression.
+        let p = erring.deltas.error_rate.p_value.expect("reported");
+        assert!((p - 0.020_196_020_196_020_2).abs() < 1e-9, "{p}");
+        assert_eq!(erring.verdict, Verdict::Neutral, "{erring:#?}");
+    }
+
+    /// Change points of `values`, with no deadline.
+    fn found(values: &[u32], window: usize) -> Vec<(usize, u32, u32)> {
+        change_points(values, window, &mut Pace::new(None)).expect("no deadline")
+    }
+
+    /// Blocks of 30 runs on one value, then 30 on the other, alternating:
+    /// with a 50-run window every block is an excursion the walk proposes
+    /// and then withdraws.
+    fn alternating_blocks(runs: usize) -> Vec<u32> {
+        (0..runs).map(|index| ((index / 30) % 2) as u32).collect()
+    }
+
+    #[test]
+    fn the_dominance_walk_is_linear_in_runs() {
+        let work = |runs: usize| {
+            let mut pace = Pace::new(None);
+            change_points(&alternating_blocks(runs), MAX_DETECTION_WINDOW, &mut pace)
+                .expect("no deadline");
+            pace.work
+        };
+        let (single, double) = (work(20_000), work(40_000));
+        // Twice the runs, about twice the work: rescanning the prefix on
+        // every withdrawal made it four times.
+        assert!(
+            double <= single * 9 / 4,
+            "{single} values read for 20k runs, {double} for 40k"
+        );
+        // And a small multiple of the window per run.
+        assert!(
+            double <= 2 * MAX_DETECTION_WINDOW * 40_000,
+            "{double} values read for 40k runs"
+        );
+    }
+
+    #[test]
+    fn the_dominance_walk_stops_at_the_deadline_not_after_it() {
+        let spent = Some(Deadline::capped(None, std::time::Duration::ZERO));
+        let mut pace = Pace::new(spent);
+        let values = alternating_blocks(200_000);
+        assert!(matches!(
+            change_points(&values, MAX_DETECTION_WINDOW, &mut pace),
+            Err(Error::DeadlineExceeded(_))
+        ));
+        assert!(
+            pace.work <= PACE_CHECK_WORK,
+            "refused only after reading {} values",
+            pace.work
+        );
+    }
+
+    /// The dominance walk as first written, which recounted the restored
+    /// incumbent over the whole prefix on every withdrawal: the oracle the
+    /// linear walk must agree with exactly.
+    fn rescanning_walk(values: &[u32], window: usize) -> (Vec<Switch>, Option<u32>, usize) {
+        let mut counts: HashMap<u32, usize> = HashMap::new();
+        let mut current: Option<u32> = None;
+        let mut current_runs = 0usize;
+        let mut switches: Vec<Switch> = Vec::new();
+        let margin = (window / 10).max(2);
+        for (index, &value) in values.iter().enumerate() {
+            *counts.entry(value).or_insert(0) += 1;
+            if index >= window {
+                let gone = values[index - window];
+                if let Some(count) = counts.get_mut(&gone) {
+                    *count -= 1;
+                    if *count == 0 {
+                        counts.remove(&gone);
+                    }
+                }
+            }
+            if Some(value) == current {
+                current_runs += 1;
+            }
+            let length = (index + 1).min(window);
+            let Some((&leader, &lead)) = counts.iter().max_by(|a, b| {
+                a.1.cmp(b.1)
+                    .then_with(|| (Some(*a.0) == current).cmp(&(Some(*b.0) == current)))
+                    .then_with(|| b.0.cmp(a.0))
+            }) else {
+                continue;
+            };
+            let Some(incumbent) = current else {
+                current = Some(leader);
+                current_runs = values[..=index].iter().filter(|v| **v == leader).count();
+                continue;
+            };
+            if leader == incumbent || lead * 2 < length {
+                continue;
+            }
+            let held = counts.get(&incumbent).copied().unwrap_or(0);
+            if lead < held + margin {
+                continue;
+            }
+            let start = index + 1 - length;
+            let onset = refine(values, start, index, incumbent, leader);
+            let leader_runs = values[onset..=index]
+                .iter()
+                .filter(|v| **v == leader)
+                .count();
+            if switches.is_empty() && current_runs < MIN_ESTABLISHED_RUNS {
+                current = Some(leader);
+                current_runs = leader_runs;
+                continue;
+            }
+            if let Some(&(last_onset, last_from, last_to, _)) = switches.last() {
+                if last_to == incumbent
+                    && last_from == leader
+                    && onset.abs_diff(last_onset) < window
+                {
+                    switches.pop();
+                    current = Some(leader);
+                    current_runs = values[..=index].iter().filter(|v| **v == leader).count();
+                    continue;
+                }
+            }
+            switches.push((onset, incumbent, leader, index));
+            current = Some(leader);
+            current_runs = leader_runs;
+        }
+        (switches, current, current_runs)
+    }
+
+    #[test]
+    fn the_linear_walk_proposes_exactly_what_the_rescanning_walk_did() {
+        let mut seeded = Seeded(0x5eed_0004);
+        let mut sequences: Vec<(Vec<u32>, usize)> = vec![
+            (alternating_blocks(3_000), MAX_DETECTION_WINDOW),
+            (alternating_blocks(500), 12),
+        ];
+        for (runs, weights) in [
+            (400, &[0.5, 0.5][..]),
+            (1_000, &[0.7, 0.3][..]),
+            (2_000, &[0.34, 0.33, 0.33][..]),
+            (300, &[0.9, 0.05, 0.05][..]),
+        ] {
+            for _ in 0..4 {
+                let values: Vec<u32> = (0..runs).map(|_| seeded.pick(weights)).collect();
+                sequences.push((values, detection_window(runs)));
+            }
+        }
+        // Eras with excursions and returns, drawn at random.
+        for _ in 0..8 {
+            let mut values = Vec::new();
+            while values.len() < 1_500 {
+                let value = seeded.pick(&[0.4, 0.3, 0.2, 0.1]);
+                let length = 1 + (seeded.next() % 80) as usize;
+                values.extend(std::iter::repeat(value).take(length));
+            }
+            for window in [MIN_DETECTION_WINDOW, 20, MAX_DETECTION_WINDOW] {
+                sequences.push((values.clone(), window));
+            }
+        }
+        for (values, window) in sequences {
+            let walk = dominance_walk(&values, window, &mut Pace::new(None)).expect("no deadline");
+            assert_eq!(
+                (walk.switches, walk.current, walk.current_runs),
+                rescanning_walk(&values, window),
+                "window {window}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rollout_between_parameter_sets_that_read_alike_is_a_change() {
+        // `stop` once spelled out a temperature; then the temperature became
+        // a parameter of its own. Joined as text, both read
+        // `stop=END, temperature=0.7`.
+        let fixture = TempStore::open("radar-params-typed", crate::Config::default());
+        let store = fixture.store();
+        let mut spans = Vec::new();
+        for index in 0..120u64 {
+            let mut run = simple_run(
+                "tuned-bot",
+                &format!("tuned-{index:03}"),
+                BASE + index * MINUTE,
+                "m",
+                "Prompt.",
+                0,
+                index >= 60 && index % 5 < 2,
+            );
+            let attributes = &mut run[0].attributes;
+            if index < 60 {
+                attributes.insert(
+                    "gen_ai.request.stop".to_owned(),
+                    json!("END, temperature=0.7"),
+                );
+            } else {
+                attributes.insert("gen_ai.request.stop".to_owned(), json!("END"));
+                attributes.insert("gen_ai.request.temperature".to_owned(), json!(0.7));
+            }
+            spans.extend(run);
+        }
+        store.ingest_batch(spans).expect("ingests");
+        let report = store.changes(None, &query(), NOW).expect("analyses");
+        let params = find(&report, Dimension::Params).expect("the rollout is on the timeline");
+        assert_eq!(params.at_ns, BASE + 60 * MINUTE);
+        assert_ne!(params.from, params.to, "and reads as two values");
+        assert_eq!(params.verdict, Verdict::Regression);
+        let changed = &params.detail.as_ref().expect("a detail")["changed"];
+        assert_eq!(
+            changed,
+            &json!([
+                {"key": "stop", "before": "END, temperature=0.7", "after": "END"},
+                {"key": "temperature", "before": null, "after": 0.7},
+            ])
+        );
+    }
+
+    #[test]
+    fn a_run_value_set_does_not_depend_on_the_order_its_values_arrived() {
+        let ids: Vec<u64> = ["a", "b", "c", "d", "e"]
+            .iter()
+            .map(|v| digest(v))
+            .collect();
+        let set = |order: &mut dyn Iterator<Item = &u64>| {
+            let mut set = ValueSet::default();
+            for &id in order {
+                set.add(id);
+                set.add(id);
+            }
+            set
+        };
+        let forward = set(&mut ids.iter());
+        let backward = set(&mut ids.iter().rev());
+        assert_eq!(
+            (&forward.ids, forward.overflow),
+            (&backward.ids, backward.overflow)
+        );
+        assert!(forward.overflow, "five values do not fit four");
+        assert_eq!(forward.ids.len(), MAX_RUN_VALUES);
+        // A set that fits is held whole, whatever its order.
+        let fits = set(&mut ids[..MAX_RUN_VALUES].iter());
+        let reversed = set(&mut ids[..MAX_RUN_VALUES].iter().rev());
+        assert_eq!((&fits.ids, fits.overflow), (&reversed.ids, false));
+    }
+
+    /// One run of `service` making one model call per entry of `models`, in
+    /// that order, ten ns apart.
+    fn fanout_run(service: &str, id: &str, start: u64, models: &[&str]) -> Vec<Span> {
+        models
+            .iter()
+            .enumerate()
+            .map(|(index, model)| Span {
+                trace_id: format!("trace-{id}"),
+                span_id: format!("llm-{index}"),
+                tenant: String::new(),
+                parent_span_id: None,
+                name: "chat".to_owned(),
+                start_time_ns: start + index as u64 * 10,
+                end_time_ns: start + index as u64 * 10 + 5,
+                status: "ok".to_owned(),
+                service: service.to_owned(),
+                attributes: json!({
+                    "session.id": id,
+                    "gen_ai.operation.name": "chat",
+                    "gen_ai.request.model": model,
+                })
+                .as_object()
+                .cloned()
+                .unwrap_or_default(),
+                events: Vec::new(),
+                links: Vec::new(),
+                extra: Map::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_run_with_more_values_than_it_holds_is_not_evidence_of_a_change() {
+        let fixture = TempStore::open("radar-overflow", crate::Config::default());
+        let store = fixture.store();
+        let models = ["model-a", "model-b", "model-c", "model-d", "model-e"];
+        let reversed: Vec<&str> = models.iter().rev().copied().collect();
+        let mut spans = Vec::new();
+        for index in 0..120u64 {
+            // The same five models in every run; only the order they are
+            // called (and read) in changes, at run 60.
+            let order: &[&str] = if index < 60 { &models } else { &reversed };
+            spans.extend(fanout_run(
+                "fanout-bot",
+                &format!("fanout-{index:03}"),
+                BASE + index * MINUTE,
+                order,
+            ));
+            // Another agent moves from one model to another at run 60; every
+            // tenth of its runs fans out to all five as well.
+            let single = [if index < 60 { "model-a" } else { "model-b" }];
+            let calls: &[&str] = if index % 10 == 5 { order } else { &single };
+            spans.extend(fanout_run(
+                "mixed-bot",
+                &format!("mixed-{index:03}"),
+                BASE + index * MINUTE + 1,
+                calls,
+            ));
+        }
+        store.ingest_batch(spans).expect("ingests");
+        let report = store.changes(None, &query(), NOW).expect("analyses");
+        let mixed = report
+            .agents
+            .iter()
+            .find(|agent| agent.agent == "mixed-bot")
+            .expect("mixed-bot");
+        let moved = mixed
+            .changes
+            .iter()
+            .find(|change| change.dimension == Dimension::ModelRequested)
+            .expect("the complete runs still show the move");
+        assert_eq!(
+            (moved.from.as_str(), moved.to.as_str()),
+            ("model-a", "model-b")
+        );
+        assert_eq!(
+            (moved.runs_before, moved.runs_after),
+            (54, 54),
+            "the fanned-out runs are on neither side"
+        );
+        assert!(mixed.volatile.is_empty(), "{:?}", mixed.volatile);
+        let agent = report
+            .agents
+            .iter()
+            .find(|agent| agent.agent == "fanout-bot")
+            .expect("fanout-bot");
+        assert!(
+            !agent
+                .changes
+                .iter()
+                .any(|change| change.dimension == Dimension::ModelRequested),
+            "the configuration did not change: {:#?}",
+            agent.changes
+        );
+        assert!(
+            agent.volatile.contains(&Dimension::ModelRequested),
+            "every run's set is incomplete, so the dimension is not searched: {:?}",
+            agent.volatile
+        );
+        // A placed run still shows what it holds, and that it holds more.
+        let placed = ChangeQuery {
+            run: Some("fanout-070".to_owned()),
+            ..query()
+        };
+        let run = store
+            .changes(None, &placed, NOW)
+            .expect("analyses")
+            .run
+            .expect("placed");
+        assert!(
+            run.fingerprint["model_requested"].ends_with(" + …"),
+            "{:?}",
+            run.fingerprint
+        );
+    }
+
+    #[test]
+    fn a_straggler_is_placed_by_the_value_it_ran_on_not_by_how_it_reads() {
+        // Two model ids that differ only past the 160 characters a value is
+        // shown by: compared by digest, shown alike.
+        let prefix = "p".repeat(170);
+        let (old, new) = (format!("{prefix}-old"), format!("{prefix}-new"));
+        let fixture = TempStore::open("radar-straggler", crate::Config::default());
+        let store = fixture.store();
+        let mut spans = Vec::new();
+        for index in 0..120u64 {
+            // Run 90 is a straggler still on the old model.
+            let model = if index < 60 || index == 90 {
+                &old
+            } else {
+                &new
+            };
+            spans.extend(simple_run(
+                "long-bot",
+                &format!("long-{index:03}"),
+                BASE + index * MINUTE,
+                model,
+                "Prompt.",
+                0,
+                false,
+            ));
+        }
+        store.ingest_batch(spans).expect("ingests");
+        let report = store.changes(None, &query(), NOW).expect("analyses");
+        let change = find(&report, Dimension::ModelRequested).expect("the switch is found");
+        assert_eq!(change.at_ns, BASE + 60 * MINUTE);
+        assert_eq!(change.from, change.to, "the two values read alike");
+        let placed = |run: &str| {
+            let question = ChangeQuery {
+                run: Some(run.to_owned()),
+                ..query()
+            };
+            let run = store
+                .changes(None, &question, NOW)
+                .expect("analyses")
+                .run
+                .expect("placed");
+            run.downstream_of
+                .iter()
+                .map(|change| change.dimension)
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            !placed("long-090").contains(&Dimension::ModelRequested),
+            "the straggler ran on the old model"
+        );
+        assert!(placed("long-091").contains(&Dimension::ModelRequested));
     }
 }

@@ -1711,7 +1711,7 @@ When none of the window's 363 spans belongs to that agent, the answer is:
 | `spans_scanned` | integer | Spans read |
 | `runs_scanned` | integer | Agent runs analysed, across the cohorts reported |
 | `truncated` | boolean | The run cap or the 100-cohort cap applied, or some agent is `unnamed` |
-| `agents[]` | array | One cohort per `(tenant, agent)`, cohorts with a regression first: `agent`, `tenant`, `runs`, `first_run_ns`, `last_run_ns`, `summary` (one sentence), `current` (each dimension's dominant value over the latest runs), `volatile` (dimensions too varied to search), `changes[]`, `truncated` (more than 40 changes), and `unnamed` (some value, tool or path step is shown as `#` and a 16-hex digest because its name did not fit the bounded name tables; it was still compared exactly) |
+| `agents[]` | array | One cohort per `(tenant, agent)`, cohorts with a regression first: `agent`, `tenant`, `runs`, `first_run_ns`, `last_run_ns`, `summary` (one sentence), `current` (each dimension's dominant value over the latest runs), `volatile` (dimensions too varied to search: most runs carry a value no other run shares, or more than four values of it, or it has more than 100 change points), `changes[]`, `truncated` (more than 40 changes), and `unnamed` (some value, tool or path step is shown as `#` and a 16-hex digest because its name did not fit the bounded name tables; it was still compared exactly) |
 | `changes[].at_ns` | integer | Start of the first run on the new value |
 | `changes[].dimension` | string | `system_prompt`, `tool_catalog`, `model_requested`, `model_returned`, `params`, `service_version`, `sdk_version` or `behavior` |
 | `changes[].from`, `.to` | string | The old and new values: 16-hex digests for prompts and catalogs, otherwise the value (a set of values is joined with ` + `). For `behavior`, the most common top-level path on each side |
@@ -1723,14 +1723,18 @@ When none of the window's 363 spans belongs to that agent, the answer is:
 | `changes[].explanation` | string | The metrics behind the verdict, with their p-values |
 | `changes[].co_changes` | array | Other dimensions that changed within two runs |
 | `changes[].behavior_shift` | object, optional | `js_distance` and `p_value` between the two sides' path distributions. For a `behavior` change, measured on the half of the runs that did not choose the split, with the p-value Bonferroni-corrected |
-| `changes[].detail` | object, optional | For a system prompt, `diff` (`offset`, `context`, `before`, `after`). For a catalog, `added`, `removed` and `definitions_changed`. For params, `changed[]` (`key`, `before`, `after`). For behaviour, `paths[]` |
+| `changes[].detail` | object, optional | For a system prompt, `diff` (`offset`, `context`, `before`, `after`). For a catalog, `added`, `removed` and `definitions_changed`. For params, `changed[]` (`key`, `before`, `after`, the values as typed JSON). For behaviour, `paths[]` |
 | `changes[].example_runs` | object | `before` and `after`: up to three run ids each, nearest the change |
-| `run` | object, with `run=` only | `run`, `tenant`, `agent`, `start_ns`, `outcome`, `errored`, `fingerprint` (each dimension's value for this run, plus `path`), and `downstream_of[]`. For each dimension, `downstream_of` holds the latest change point at or before the run whose new value the run carries, regressions first: `dimension`, `at_ns`, `to`, `verdict`, `explanation` |
+| `run` | object, with `run=` only | `run`, `tenant`, `agent`, `start_ns`, `outcome`, `errored`, `fingerprint` (each dimension's value for this run, plus `path`), and `downstream_of[]`. For each dimension, `downstream_of` holds the latest change point at or before the run whose new value the run carries (compared by the value's digest, not by its displayed text), regressions first: `dimension`, `at_ns`, `to`, `verdict`, `explanation` |
 
-Rate p-values come from the pooled two-proportion z-test. Mean p-values come
-from Welch's t-test on a log scale: cost over priced runs, steps and duration
-as `ln(1+x)`. Holm's correction at 5% across the five tests of a change
-decides the verdict. A verdict needs at least 10 finished runs on each side.
+Rate p-values come from the pooled two-proportion z-test, or from Fisher's
+exact test when an expected cell count of the rate's 2×2 table is below 5.
+Mean p-values come from Welch's t-test on a log scale: cost over priced runs,
+steps and duration as `ln(1+x)`. Holm's correction at 5% across a change's
+tests (up to five) decides the verdict. A verdict needs at least 10 finished
+runs on each side, and a metric counts toward it only when its own test had
+10 observations on each side (runs that ended, for `success_rate`; priced
+runs, for `cost_per_run`); a metric short of that is still reported.
 
 A bound credential reads its own tenant, and naming another is `403`.
 Unknown or repeated parameters are `400`, and so are a non-integer

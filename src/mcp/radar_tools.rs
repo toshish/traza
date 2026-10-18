@@ -215,11 +215,12 @@ pub(super) fn call(
          runs (at least half of a sliding window); 'behavior' means the agent's top-level \
          paths shifted with no configuration change. Deltas compare finished runs just \
          before with just after; p-values are two-sided (two-proportion z-test for rates, \
-         Welch's t-test on the log scale for cost, steps and duration), Holm-corrected for \
-         the verdict. This is correlation in time, not proof of cause: changes listed \
-         together happened together, and the radar cannot tell which of them did it. Open \
-         an example run with get_run_tape, or compare a before run with an after run with \
-         compare_runs."
+         Fisher's exact test when a rate's table is sparse, Welch's t-test on the log scale \
+         for cost, steps and duration), Holm-corrected for the verdict, and a metric with \
+         fewer than 10 observations on a side is reported but does not count. This is \
+         correlation in time, not proof of cause: changes listed together happened \
+         together, and the radar cannot tell which of them did it. Open an example run \
+         with get_run_tape, or compare a before run with an after run with compare_runs."
             .to_owned(),
     ];
     if report.agents.iter().any(|agent| agent.unnamed) {
@@ -466,9 +467,11 @@ fn detail_line(detail: &Value) -> Option<String> {
         let parts: Vec<String> = changed
             .iter()
             .map(|entry| {
+                // Parameter values are typed: each is shown as its JSON, so
+                // `"1"` and `1` read differently, as they are compared.
                 let side = |value: &Value| match value {
                     Value::Null => "unset".to_owned(),
-                    other => text(other),
+                    other => sanitize(crate::evals::canonical_json(other)),
                 };
                 format!(
                     "{} {} → {}",
@@ -853,5 +856,19 @@ mod tests {
             None,
         );
         assert_eq!(backwards["isError"], json!(true), "{backwards}");
+    }
+
+    #[test]
+    fn changed_parameters_read_as_their_typed_values() {
+        let detail = json!({"changed": [
+            {"key": "stop", "before": "END, temperature=0.7", "after": "END"},
+            {"key": "temperature", "before": null, "after": 0.7},
+            {"key": "n", "before": "1", "after": 1},
+        ]});
+        assert_eq!(
+            detail_line(&detail).expect("a line"),
+            "parameters: stop \"END, temperature=0.7\" → \"END\"; temperature unset → 0.7; \
+             n \"1\" → 1"
+        );
     }
 }

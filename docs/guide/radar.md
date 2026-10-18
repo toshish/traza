@@ -118,9 +118,15 @@ curl 'http://127.0.0.1:8080/v1/changes?run=ticket-076'
 top-level `path`. `downstream_of` lists, for each dimension, the latest
 change point at or before the run's start whose new value the run carries,
 regressions first. A run that still carries an old value (a straggler on the
-previous version) is not downstream of that change. For a `behavior` change,
-any run that started after it counts as downstream. `downstream_of` is empty
-when the run used values older than every change in the window.
+previous version) is not downstream of that change. "Carries" compares the
+value's identity (its digest), not the text shown: two values longer than
+160 characters that differ only past them read alike in `fingerprint` and in
+a change's `from` and `to`, but a straggler on one is never placed
+downstream of a change to the other. A run whose set of values is
+incomplete (more than four values of a dimension) is downstream of no change
+of that dimension. For a `behavior` change, any run that started after it
+counts as downstream. `downstream_of` is empty when the run used values
+older than every change in the window.
 
 A run that is not among the window's agent runs gets `404`. A run that is,
 but that `agent=` or `environment=` excludes, gets `400` saying which filter
@@ -135,19 +141,34 @@ every read. A run that carries several values of one dimension (a planner
 model and an executor model, say) has the set of them as its value, shown
 joined with ` + `.
 
+A run holds at most four distinct values of a dimension. A run that carried
+more has an **incomplete** set: which values it ran on is not fully known,
+so it is left out of that dimension's change detection and of the sides of
+its changes, as a run that carries none of the dimension is. Which four it
+holds depends only on the set, never on the order its spans were read, and
+it is shown as those four and ` + …`. Holding the first four read instead
+would make two runs on the same five models look like different
+configurations whenever their spans arrived in a different order, and would
+miss an edit to the fifth.
+
 | Dimension | Read from (first present wins) | Shown as |
 |---|---|---|
 | `system_prompt` | The request's `system` and `developer` messages, with `gen_ai.system_instructions` folded in (the [step request](../llm-semantics.md#input-and-output) precedence: `gen_ai.input.messages`, indexed `gen_ai.prompt.{i}.*`, OpenInference `llm.input_messages.*`, …). When the request is a provider body (OpenInference `input.value`), its top-level `system` and its `messages` | 16 hex characters of SHA-256 over the text, volatile tokens masked |
 | `tool_catalog` | `gen_ai.tool.definitions`, else indexed `llm.request.functions.{i}.*` (OpenLLMetry), else indexed `llm.tools.{i}.tool.json_schema` (OpenInference), else a provider request body's `tools` | 16 hex characters of SHA-256 over the definitions' canonical JSON, sorted, so their order does not matter |
 | `model_requested` | `gen_ai.request.model`, else `llm.model`, else `llm.model_name` | the value |
 | `model_returned` | `gen_ai.response.model` | the value |
-| `params` | Every `gen_ai.request.*` key except the model, plus `llm.invocation_parameters` without its `model` key. These are the keys a [run diff](http-api.md#get-v1diff) calls `config` | `key=value` pairs in key order |
+| `params` | Every `gen_ai.request.*` key except the model, plus `llm.invocation_parameters` without its `model` key. These are the keys a [run diff](http-api.md#get-v1diff) calls `config` | `key=value` pairs in key order, each value as JSON (strings quoted), for example `max_tokens=1024, stop="END"` |
 | `service_version` | `service.version`, on any span of the run | the value |
 | `sdk_version` | `telemetry.sdk.name` and `telemetry.sdk.version`, on any span | `name/version` |
 | `behavior` | The run's top-level path (see below), when no configuration change explains a shift | the most common path on each side |
 
 The first five are read from model-call steps. A value longer than 160
-characters is identified by its digest and shown cut short.
+characters is identified by its digest and shown cut short. Sampling
+parameters are identified by the canonical JSON of the typed parameters
+(keys sorted, strings quoted and escaped), never by the text shown: a `stop`
+string that spells out `END, temperature=0.7` is a different configuration
+from a `stop` of `END` beside a `temperature` of 0.7, and `1` differs from
+`"1"`.
 
 Runs are compared by a 64-bit digest of each value, never by its text, so
 the number of distinct values cannot hide a change. The text is kept only to
@@ -174,9 +195,10 @@ Some edge cases:
 - A dimension where more than half of at least 20 runs carry a value that no
   other run shares is **volatile**: it is listed in the agent's `volatile`
   array and not searched. This usually means a prompt embeds something per
-  request that the masking above does not catch. A dimension with more than
-  100 change points in the window is listed as volatile too: a value that
-  changes that often is not a history of deploys.
+  request that the masking above does not catch. A dimension where more than
+  half of the runs carrying it have an incomplete set (above) is listed as
+  volatile too, and so is a dimension with more than 100 change points in
+  the window: a value that changes that often is not a history of deploys.
 
 ### Agents
 
@@ -324,8 +346,8 @@ points.
 
 | Delta | Per run | Test |
 |---|---|---|
-| `error_rate` | at least one span with status `error` | pooled two-proportion z-test |
-| `success_rate` | ended `success`, of the runs that ended at all ([outcome](../llm-semantics.md#session-outcome-and-goal--traza-extensions): declared, else the last span to end) | pooled two-proportion z-test |
+| `error_rate` | at least one span with status `error` | pooled two-proportion z-test, or Fisher's exact test when the table is sparse |
+| `success_rate` | ended `success`, of the runs that ended at all ([outcome](../llm-semantics.md#session-outcome-and-goal--traza-extensions): declared, else the last span to end) | pooled two-proportion z-test, or Fisher's exact test when the table is sparse |
 | `cost_per_run` | cost in USD, metered or [priced](../configuration.md#model-pricing) | Welch's t-test on `ln(cost)` over priced runs |
 | `steps_per_run` | llm, tool and agent spans | Welch's t-test on `ln(1 + steps)` |
 | `duration_ns_per_run` | first start to last end | Welch's t-test on `ln(1 + milliseconds)` |
@@ -336,13 +358,28 @@ is `after / before`. Each delta also reports how many runs it counted on
 each side (`n_before`, `n_after`). The mean tests run on a log scale, so a
 single runaway run cannot decide a verdict. When no run on either side is
 priced, the cost delta is reported empty rather than as a confident zero.
-The p-values come from in-module implementations of the normal and
-Student-t distributions, checked in tests against SciPy reference values.
+
+A rate's z-test leans on the normal approximation, which overstates
+significance when the table is sparse: one success of one run before
+against none of ten after is p = 0.0009 by the z-test, and 1/11 exactly.
+So when any expected cell count of a rate's 2×2 table is below 5 (Cochran's
+rule), the rate is tested by Fisher's exact test instead. The p-values come
+from in-module implementations of the normal and Student-t distributions and
+of Fisher's test, checked in tests against SciPy reference values.
+
+A metric takes part in the verdict only when **its own test** had at least
+10 observations on each side. For error rate, steps and duration that is
+every finished run. For success rate it is only the runs that ended (a run
+that declared an outcome Traza does not recognize, such as `escalated`, did
+not end in success or failure), and for cost only the priced runs; sixty
+finished runs a side can still hold a single rated one. A metric short of
+the bar is still reported, with its counts (`n_before`, `n_after`) and
+p-value, for you to weigh.
 
 Holm's correction holds the family-wise error rate at 5% across a change's
 tests: up to five, since a test is left out when it cannot be computed (no
-priced runs, or no variation at all). The verdict follows these rules, in
-order:
+priced runs, or no variation at all) or is short of the bar above. The
+verdict follows these rules, in order:
 
 1. `insufficient_data`: fewer than 10 finished runs on either side. The
    deltas are still reported for you to weigh.
@@ -380,7 +417,8 @@ Each change also carries:
     and exactly one of them changed, the diff is of that one;
   - for a **tool catalog**, the tools added and removed, or
     `definitions_changed` when the names are the same;
-  - for **sampling parameters**, the keys that differ;
+  - for **sampling parameters**, the keys that differ, with their values
+    as typed JSON (a long value cut short);
   - for **behaviour**, the five paths whose share moved most.
 - `example_runs`, the three runs nearest the change on each side.
 
@@ -404,7 +442,7 @@ most recent runs) and `summary`, a one-sentence headline.
 | Runs analysed | `--radar-max-runs` (default 20,000): the newest agent runs, by the start of their first step. Past it, `truncated: true` and `covered_since_ns` say where the analysed window starts. Every agent run whose first step starts at or after that point is read in full |
 | Memory per run held | Typically about a kilobyte; at most about 6 KB. Ids are clipped to 128 bytes, names to 256, declared outcomes to 32, and lists are capped as below |
 | Earliest steps kept per run | 32 (enough for the top-level path) |
-| Values per dimension per run | 4 (then `+ …`) |
+| Values per dimension per run | 4. A run that carried more is shown with `+ …` and left out of that dimension's change detection |
 | Tool counts per run | 64 tools |
 | Display names | 2,048 values per dimension, at most 256 of them from one tenant's service; 8,192 step and tool names, at most 1,024 per service. A value past these is still compared exactly, and shown as `#` and its digest (`unnamed: true`) |
 | Diff samples | 1 MiB per dimension (prompt texts up to 4 KB each, catalog tool names, parameters) |
@@ -443,9 +481,12 @@ extracts each kept run's model-call configuration: it parses, masks and
 digests each model call's messages, which is most of the work. The read
 checks the deadline every 64 such extractions, so a window of very large
 requests cannot overshoot it by much. The analysis is linear in runs, plus
-the permutation tests in the table above. A window that cannot be read
-within the deadline is refused, not cut short, so narrow `since` and
-`until`. Naming an `agent` does not make the read cheaper, because a run's
+the permutation tests in the table above: the change-point walk reads each
+run once and at most two windows more per proposal, however many
+excursions come and go, and it checks the deadline every 65,536 values it
+reads, so a large `--radar-max-runs` cannot carry it far past the budget. A
+window that cannot be read or analysed within the deadline is refused, not
+cut short, so narrow `since` and `until`. Naming an `agent` does not make the read cheaper, because a run's
 agent is only known after it has been read.
 
 **Measured cost.** On an Apple M1 Max with a release build, on a laptop
@@ -477,9 +518,10 @@ binding.
   several things changed at once, `co_changes` lists them all, because the
   radar cannot tell which one did it.
 - **The tests assume runs are independent.** A burst of retries of one task
-  is not independent, and inflates significance. The normal approximation of
-  the z-test is weak for very small or very lopsided samples, which is part
-  of why a verdict needs 10 runs on each side.
+  is not independent, and inflates significance. Sparse rate tables are
+  tested exactly (see above), and every metric needs 10 observations of its
+  own on each side to count, but Welch's test still assumes roughly normal
+  log-scale values, which a side of 10 runs cannot check.
 - **Many changes are many tests.** Holm's correction covers the tests of one
   change, not the whole timeline. Across dozens of change points, expect
   an occasional false verdict.
