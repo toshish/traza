@@ -422,12 +422,65 @@ before deploying over an existing setup.
   (`foresee_run`, `list_live_runs`, `run_topology`, `blame_line`,
   `xray_step`, `what_changed`, `find_behavior`, `list_forks`), so an `ro`
   token is offered twenty-two. See [the MCP guide](docs/guide/mcp.md#the-tools).
+- **`max_repeats` counts within a window of the run's latest steps.** A
+  step fingerprint repeats when it occurs that often among the run's last
+  `repeat_window_steps` steps (default 50, at most 1,000; a policy field, a
+  grant field and `--fuse-repeat-window-steps` for the global policy), not
+  over the whole run — so the global default no longer warns on every long
+  interactive session (one real session took the same screenshot 32 times
+  over three days), while a tight loop still trips. A warning clears once
+  the loop leaves the window; a stop latches where a window first filled,
+  live and in a rebuild alike, whatever order the spans arrived in. The
+  reason now reads `… repeated 4 times in the last 50 steps`, and
+  `usage.top_repeat` carries `window_steps`. Each span contribution the
+  guard holds grew from 40 to 48 bytes (its start, to rebuild the window in
+  step order), and each run keeps at most its latest 1,000 steps, 24 bytes
+  each, for the count. See [run fuses](docs/guide/guard.md#repeats-count-within-a-window).
+- **TQL's `edit_thrash` means thrash, and `context_blowup` stays inside one
+  conversation.** On coding agents `edit_thrash` fired on any five edits of
+  a file in ten steps — what writing a feature looks like (24 of 57 real
+  runs, 23 of them successful) — and `context_blowup` compared a
+  sub-agent's small first call with the main thread's next one (half of
+  905 real hits). `edit_thrash` now needs, within 30 steps, one file's edits
+  undoing and redoing each other (text written, removed, written again), the
+  file rewritten whole back to an earlier version, or three edits each
+  followed by a failing test with no pass between; it is `medium`, `low` in
+  a run that succeeded (`severity_if_succeeded` in `GET /v1/detectors`;
+  findings rate a detector's row by its runs and give each example its own
+  `severity`). `context_blowup` compares calls of one
+  `gen_ai.conversation.id`, else of one agent, and only calls naming
+  neither with each other. Three TQL fields say so: `conversation`, and an
+  edit's `added` and `removed` text, read as Agent Blame reads edits and
+  whitespace-normalised. See [TQL](docs/guide/tql.md#the-detector-library).
+- **A session's turns are its prompts where a recorder marks them.**
+  `GET /v1/sessions` and `/v1/sessions/{id}` carry `turn_count` — the turn
+  spans `traza-server import` writes, one per user prompt, else the
+  session's traces — and `turns_from` (`prompts` or `traces`). The rollup
+  sidecars carry the prompt count, so they move to format 6 and are rebuilt
+  once from their segments.
+- **A tape step's tokens carry `context`**: the context the engine reads
+  (input plus cache read and write for a provider whose input leaves the
+  cache out, input alone for one whose input includes it, `null` when that
+  cannot be told), so a cached Anthropic call no longer reads as an input of
+  2. Both client libraries read it.
+- **The Cache Autopsy gains a cause, `partial_hit`**, and `by_cause` lists
+  it. A call past the assumed TTL whose provider read only part of the
+  predecessor's reported context — a long-lived system prompt kept warm
+  while the conversation after it expired — was `stable` with nothing lost
+  when it read at least half. It now counts what was not served as lost;
+  only a read of all of it is `stable`. See
+  [the X-Ray guide](docs/guide/xray.md#causes).
 - **Library surface.** `Config` gains `fate: fate::FateConfig`,
   `steer: steer::SteerConfig` and `xray_stale_steps: usize`;
   `guard::FuseConfig` gains `live_paths: bool`; `guard::Limits` gains
-  `min_success_odds`, `foresight_min_support`, `foresight_after_steps` and
-  `max_handoff_cycles`; `pricing::Rate` gains `cache_read_per_mtok` and
-  `cache_write_per_mtok`. A struct literal must add them;
+  `min_success_odds`, `foresight_min_support`, `foresight_after_steps`,
+  `max_handoff_cycles` and `repeat_window_steps`; `guard::TopRepeat` gains
+  `window_steps`; `tql::Detector` gains `severity_if_succeeded` and
+  `tql::RunMatch` `severity`; `tape::StepTokens` gains `context`;
+  `analytics::SessionSummary` gains `turn_count` and `turns_from`;
+  `xray::Cause` gains `PartialHit`; `pricing::Rate` gains
+  `cache_read_per_mtok` and `cache_write_per_mtok`. A struct literal must
+  add them, and a `match` on `Cause` the new variant;
   `..Default::default()` need not. New public modules: `blame`, `fate`,
   `fork`, `import`, `radar`, `steer`, `tql`, `xray`, `zstd`.
 - **`GET /v1/annotations` and experiment scores spend the query budget.**
@@ -436,10 +489,11 @@ before deploying over an existing setup.
   it could not run out before. With a `limit` the walk holds at most that
   many annotations, the newest, and annotations a pending erasure withholds
   no longer take places within it.
-- **`traza-server --help`** lists fifty-five flags, nine of them new:
+- **`traza-server --help`** lists fifty-six flags, ten of them new:
   `--fate-max-runs`, `--fate-max-nodes`, `--fate-cache-seconds`,
   `--fate-tenant-maps`, `--fate-build-seconds`, `--fuse-max-handoff-cycles`,
-  `--live-window-seconds`, `--xray-stale-steps` and `--radar-max-runs`; and
+  `--fuse-repeat-window-steps`, `--live-window-seconds`,
+  `--xray-stale-steps` and `--radar-max-runs`; and
   two subcommands, `import` and `blame`. See
   [configuration](docs/configuration.md).
 - **Docs**: the ingest guide said other resource attributes were "merged
@@ -583,11 +637,50 @@ before deploying over an existing setup.
   continue, which the agent took for a release, so it never abandoned and
   could fill the fleet. One deadline now covers the refused step, and a
   release counts only when the check lets the step go.
+- **Foresight for one run answers to the query deadline.** `foresee` read
+  every span of a run, computed its outcome over all of them and judged it
+  without consulting the deadline after the read, so a long run could
+  answer well past `--query-deadline-ms`. The read now checks the deadline
+  every 1,024 spans and around the outcome, and the answer is checked once
+  more before it is returned; a predictive fuse's read that runs out of time
+  says so instead of judging.
+- **Dashboard: a session's turns are its prompts.** The Sessions list and a
+  session's page counted traces as turns, so every imported Claude Code or
+  Codex session — one trace however many prompts it held — showed one turn
+  and a cost per turn equal to its whole cost, and the "longest" and "worst
+  cost/turn" sorts ranked by the same count. Both now read `turn_count`, and
+  each count says on hover which it is; a session's per-trace table heads its
+  rows "trace" when its turns are prompts.
+- **Dashboard: a tape step's input counts what it read from the cache.** The
+  run tape showed Anthropic's `input_tokens`, which leaves cached tokens out,
+  so a call that read 40,000 tokens from the cache read "2 / 555". A step now
+  shows its whole input — the server's `context` figure, under the engine's
+  provider rule — with its parts on hover. Where the provider's convention is
+  not known the reported input stands, and the hover says why.
+- **Dashboard: the Fate Map tells apart two branches that read the same.**
+  Siblings with one text (a tool literally named `x×2` beside `x` called
+  twice) shared a React key: React warned of duplicate keys, clicking the
+  second opened the first, and folding one folded both. Each branch is now
+  keyed by its place among its siblings; a fatal fork or hotspot entry opens
+  the branch whose figures it gives, and a link naming a path by its text
+  still opens the first.
+- **Dashboard: the Run screen's foresight waits for its own run.** Moving to
+  the same run in another tenant kept the other tenant's verdict, odds and
+  path in the foresight panel until the new answer arrived. Each answer is
+  now kept with the run, tenant and credential it was asked for and shown
+  only beside that run; a late answer for the earlier scope changes nothing.
+- **Dashboard: a Fate Map still drawn opens its own tenant's runs.**
+  Switching Foresight to another tenant kept the first tenant's map on screen
+  while the second's loaded, but its example runs and "Diff success vs
+  failure" opened the first tenant's run ids under the second tenant. They
+  now carry the tenant the drawn map was read in.
 
 ### Upgrade
 
 - **No migration.** Segments, the write-ahead log, generation manifests and
-  every file 0.27.0 wrote are read as they are. One new file appears beside
+  every file 0.27.0 wrote are read as they are; the derived analytics
+  sidecars (`*.rollup`) move to format 6 and are rebuilt once, from their
+  segments, on first read. One new file appears beside
   them when it is first needed: `steer.jsonl`, the nudge log, which like
   `fuses.jsonl` lives outside generations, so a backup does not carry it.
   `traza-server import` keeps its progress on the importing machine, in
@@ -599,6 +692,13 @@ before deploying over an existing setup.
 - **Leave `next` out of checks that are not the agent's own.** A monitoring
   script that sends `next` to `POST /v1/fuses/check` would take the run's
   nudges; without it the check is a verdict read and takes nothing.
+- **Repeat limits count within 50 steps.** A policy that relied on
+  `max_repeats` counting a fingerprint over the whole run sets
+  `repeat_window_steps` (up to 1,000); a monitor that matched the reason
+  text exactly sees `… repeated N times in the last W steps`. `edit_thrash`
+  and `context_blowup` find fewer, better runs, and the Cache Autopsy may
+  report `partial_hit` where it said `stable`: findings and saved queries
+  compared across the upgrade will differ.
 - **Expect five more attributes on OTLP spans** whose resource sets them. A
   consumer that compares a span's attribute set exactly will see them.
 - **Embedders** must add the new `Config`, `FuseConfig`, `Limits` and
@@ -606,8 +706,8 @@ before deploying over an existing setup.
 - **Rolling back to 0.27.0** reads the same data, ignores `steer.jsonl` and
   the import state, and stops delivering nudges. But it **refuses to start**
   on a `fuses.jsonl` that holds any policy, reset or grant naming
-  `min_success_odds`, `foresight_min_support`, `foresight_after_steps` or
-  `max_handoff_cycles` — deleting the policy is not enough, since the log
+  `min_success_odds`, `foresight_min_support`, `foresight_after_steps`,
+  `max_handoff_cycles` or `repeat_window_steps` — deleting the policy is not enough, since the log
   keeps the record until it is next rewritten. Either remove the lines
   that name them from `fuses.jsonl` while no server holds the directory, or
   start 0.27.0 with `--no-fuses`, under which it neither reads nor writes
