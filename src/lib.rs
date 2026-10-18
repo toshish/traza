@@ -46,6 +46,7 @@ pub mod segment;
 pub mod semconv;
 pub mod tail;
 pub mod tape;
+pub mod tql;
 pub mod ui;
 pub mod usage;
 mod wal;

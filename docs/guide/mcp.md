@@ -114,7 +114,7 @@ over `curl`.
 
 ## The tools
 
-Sixteen tools: fourteen reads and two gated writers. They are shaped like the
+Seventeen tools: fifteen reads and two gated writers. They are shaped like the
 questions somebody asks at 2am, not like the route index — two routes may serve
 one tool, and one route may serve two. Most of them describe what is in the
 store; `diagnose_session` and `compare_runs` are the ones that answer a
@@ -136,6 +136,7 @@ question about it.
 | `get_run_tape` | What did this run do, step by step? |
 | `compare_runs` | **Where did this run part from that one, and why?** |
 | `recall_runs` | Has this been done before, and how did it go? |
+| `find_behavior` | **Which runs did *this*?** — a behaviour pattern, or a named detector |
 | `record_annotation` | Attach a note or rating to a trace or span (**`rw` token + `--mcp-annotations`**) |
 | `promote_failures_to_dataset` | Turn this run's failures into a regression dataset (**`rw` token + `--mcp-promote`**) |
 
@@ -144,13 +145,13 @@ host asks for approval before each call:
 
 | Tool | `readOnlyHint` | `destructiveHint` | `idempotentHint` | `openWorldHint` |
 |---|---|---|---|---|
-| the fourteen readers | `true` | — | — | `false` |
+| the fifteen readers | `true` | — | — | `false` |
 | `record_annotation` | `false` | `false` | `false` | `false` |
 | `promote_failures_to_dataset` | `false` | `false` | `false` | `false` |
 
 **Absent annotations are not neutral.** Every hint defaults to the pessimistic
 answer — not read-only, potentially destructive, open world — so a server that
-omits them advertises fourteen read tools as though each might delete something and
+omits them advertises fifteen read tools as though each might delete something and
 call out to the internet. A host that gates on that asks for confirmation on
 every call, and one running non-interactively, with nobody to ask, declines
 them. `destructiveHint` and `idempotentHint` are meaningful only when
@@ -219,7 +220,7 @@ stopped agent cannot talk its way past its own fuse. It answers what is
 recorded, which is the pre-call check without an estimate; an agent wanting
 to price its next step uses
 [`POST /v1/fuses/check`](http-api.md#post-v1fusescheck). On a server started
-with `--no-fuses` it is not listed — thirteen reads, then — and a call naming it
+with `--no-fuses` it is not listed — fourteen reads, then — and a call naming it
 is refused as invalid params.
 
 **The eval entities are not on this surface.** Datasets, versions, examples,
@@ -234,6 +235,43 @@ neither field — it takes `trace_id`, `span_id`, `name`, `value` and `comment`,
 and refuses anything else. Scoring an experiment means
 `POST /v1/annotations` with `experiment_id` and `example_id` set. The bundled
 dashboard has the same limit.
+
+### `find_behavior`
+
+**Which runs did *this*?** `find_behavior` runs a [TQL](tql.md) pattern — a
+regex whose letters are steps — over the most recent runs, or one of the
+[detectors](tql.md#the-detector-library): `test_tampering`,
+`hallucinated_tool`, `give_up_loop`, `edit_thrash`, `ping_pong`,
+`context_blowup`, `retry_without_change`, `tool_error_streak`,
+`unverified_finish`. It is the same search as
+[`GET /v1/trajectories/search`](http-api.md#get-v1trajectoriessearch).
+
+| Argument | Means |
+|---|---|
+| `query` | a TQL pattern, e.g. `test[error] ..> edit[file~"test"] ..> test[not error]` |
+| `detector` | a detector's name, instead of `query` |
+| `since`, `until` | the window (default: the last 30 days), in the forms [below](#arguments) |
+| `agent` | only runs of this agent |
+| `outcome` | `any` (default), `success`, `failure`, `abandoned`, `unknown` |
+| `limit` | runs to return, default 10, at most 50 |
+
+With neither `query` nor `detector` it lists the library — each detector's
+title, summary and pattern — so an agent can read a pattern and adapt it;
+with both it is refused. Each match renders as one row inside the telemetry
+block: the run id, how it ended, its agent, the occurrence count, the matched
+steps (`#3 tool:Edit`, numbered as in `get_run_tape`) and captured values —
+all of which are producer data. `structuredContent` carries the matches as
+the HTTP route shapes them, every string made JSON-safe. A query that does not
+parse is a tool error with the query and a caret under the column, which a
+model can fix and retry from.
+
+One deliberate difference from the other tools' deadline rule: the scan reads
+runs newest first, so where the compute budget runs out it returns what it
+found, with a headline that says `STOPPED EARLY`, how many candidate runs
+were left unchecked — those runs are all older than every run it did check —
+and the `until` to call again with to continue (`next_until_ns` in structured
+content).
+Enumerating the window is still all-or-nothing.
 
 ### Arguments
 
@@ -291,7 +329,7 @@ so a tool composed of several folds — `describe_store` runs half a dozen —
 can spend several budgets end to end.
 
 `list_sessions`, `diagnose_session`, `analyze_cost`, `check_run_guard`,
-`compare_runs` and `recall_runs` additionally return `structuredContent` against a declared
+`compare_runs`, `recall_runs` and `find_behavior` additionally return `structuredContent` against a declared
 `outputSchema`, because their answers are small, genuinely tabular or
 record-shaped, and the thing a client is most likely to chart or act on.
 Everything else is text only — for span data the compact rendering is strictly

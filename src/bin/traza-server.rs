@@ -68,6 +68,9 @@ use traza::{CompactionConfig, Config, Durability, Profile, Span, SpanCursor, Spa
 // Tapes, replays, diffs and recall: their routes live beside this file.
 #[path = "traza-server/replay_routes.rs"]
 mod replay_routes;
+// Trajectory queries and the detector library.
+#[path = "traza-server/tql_routes.rs"]
+mod tql_routes;
 
 const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 // Headers get a far tighter budget than bodies: without one, a 64 MiB
@@ -188,6 +191,7 @@ impl RouteClass {
             ("GET", "/v1/annotations") => Self::Lookup,
             ("GET", path) if path.starts_with("/v1/tapes/") => Self::Lookup,
             ("GET", "/v1/diff" | "/v1/recall") => Self::Stats,
+            ("GET", path) if tql_routes::handles(path) => Self::Stats,
             _ => Self::Other,
         }
     }
@@ -2310,6 +2314,17 @@ fn serve_request(
             path,
             query,
             &request.body,
+            engine,
+            metrics,
+            principal,
+        );
+    }
+    if tql_routes::handles(path) {
+        return tql_routes::serve(
+            responder,
+            &request.method,
+            path,
+            query,
             engine,
             metrics,
             principal,
