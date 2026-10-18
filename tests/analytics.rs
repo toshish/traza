@@ -1451,3 +1451,80 @@ fn a_sparse_rewrite_pays_one_probe_not_a_walk_across_the_segments_between() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// A recorder's turn span: one per user prompt (see `traza import`).
+fn turn_span(trace_id: &str, span_id: &str, session: &str, start_ns: u64) -> Span {
+    serde_json::from_value(json!({
+        "trace_id": trace_id, "span_id": span_id, "name": "turn",
+        "service": "claude-code", "start_time_ns": start_ns, "end_time_ns": start_ns + 1_000,
+        "attributes": {"session.id": session, "traza.source": "claude-code"}
+    }))
+    .expect("span")
+}
+
+#[test]
+fn a_sessions_turns_are_its_prompts_where_a_recorder_marks_them_else_its_traces() {
+    let dir = test_dir("turns");
+    let config = Config {
+        compaction: None,
+        ..Config::default()
+    };
+    let check = |store: &Store, when: &str| {
+        let sessions = store
+            .sessions(None, None, 10, traza::analytics::SessionOrder::Recent)
+            .expect("lists");
+        let session = |id: &str| {
+            sessions
+                .iter()
+                .find(|session| session.session_id == id)
+                .unwrap_or_else(|| panic!("{id} missing {when}: {sessions:?}"))
+        };
+        // An imported session: one trace, three prompts.
+        let imported = session("imported");
+        assert_eq!(imported.trace_count, 1, "{when}");
+        assert_eq!(imported.turn_count, 3, "{when}");
+        let wire = serde_json::to_value(imported).expect("serializes");
+        assert_eq!(wire["turns_from"], json!("prompts"), "{when}");
+        // Any other producer: a turn is a trace, and it says so.
+        let plain = session("plain");
+        assert_eq!((plain.trace_count, plain.turn_count), (2, 2), "{when}");
+        let wire = serde_json::to_value(plain).expect("serializes");
+        assert_eq!(wire["turns_from"], json!("traces"), "{when}");
+        // A span merely named `turn` by someone else is not a prompt.
+        let named = session("named");
+        assert_eq!(named.turn_count, 1, "{when}");
+        // The detail says the same.
+        let detail = store.session("imported").expect("queries").expect("exists");
+        assert_eq!(detail.summary.turn_count, 3, "{when}");
+    };
+    {
+        let store = Store::open(&dir, config.clone()).expect("opens");
+        store
+            .ingest(turn_span("ti", "turn-1", "imported", 1_000))
+            .expect("ingests");
+        store
+            .ingest(llm_span("ti", "c1", "imported", "m", 1_100, 10, 10, 0.01))
+            .expect("ingests");
+        store
+            .ingest(turn_span("ti", "turn-2", "imported", 2_000))
+            .expect("ingests");
+        store.flush().expect("seals the first two prompts");
+        store
+            .ingest(turn_span("ti", "turn-3", "imported", 3_000))
+            .expect("ingests");
+        store
+            .ingest(llm_span("tp1", "c1", "plain", "m", 1_000, 1, 1, 0.0))
+            .expect("ingests");
+        store
+            .ingest(llm_span("tp2", "c1", "plain", "m", 2_000, 1, 1, 0.0))
+            .expect("ingests");
+        let mut named = llm_span("tn", "c1", "named", "m", 1_000, 1, 1, 0.0);
+        named.name = "turn".into();
+        store.ingest(named).expect("ingests");
+        check(&store, "across a segment and the buffer");
+        store.flush().expect("seals the rest");
+    }
+    // Reopened, the counts come back from the rollup sidecars.
+    let store = Store::open(&dir, config).expect("reopens");
+    check(&store, "after a reopen");
+}

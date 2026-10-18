@@ -847,7 +847,7 @@ it does for spans.
 **Response `200`.**
 
 ```json
-{"sessions":[{"completion_tokens":88,"cost_usd":0.0031,"error_count":0,"first_start_ns":1700000001000000000,"last_end_ns":1700000001900000000,"llm_calls":1,"prompt_tokens":412,"session_attribute":"gen_ai.conversation.id","session_id":"chat-4711","span_count":1,"total_tokens":500,"trace_count":1}]}
+{"sessions":[{"completion_tokens":88,"cost_usd":0.0031,"error_count":0,"first_start_ns":1700000001000000000,"last_end_ns":1700000001900000000,"llm_calls":1,"prompt_tokens":412,"session_attribute":"gen_ai.conversation.id","session_id":"chat-4711","span_count":1,"total_tokens":500,"trace_count":1,"turn_count":1,"turns_from":"traces"}]}
 ```
 
 | Field | Type | Description |
@@ -857,6 +857,8 @@ it does for spans.
 | `session_attribute` | string | Which recognized key grouped this session |
 | `first_start_ns` / `last_end_ns` | integer | Activity window |
 | `trace_count` | integer | Distinct traces containing session spans |
+| `turn_count` | integer | The session's turns: its user prompts where Traza's [recorders](recorders.md) marked them (one `turn` span per prompt, carrying `traza.source`), else its traces — one trace per turn, the common convention |
+| `turns_from` | string | What `turn_count` counted: `prompts` or `traces` |
 | `span_count` | integer | Spans carrying this session id |
 | `llm_calls` | integer | Spans recognized as LLM calls |
 | `prompt_tokens` / `completion_tokens` / `total_tokens` | integer | Token sums |
@@ -878,7 +880,7 @@ is two different sessions.
 `traces`:
 
 ```json
-{"completion_tokens":88,"cost_usd":0.0031,"error_count":0,"first_start_ns":1700000001000000000,"last_end_ns":1700000001900000000,"llm_calls":1,"prompt_tokens":412,"session_attribute":"gen_ai.conversation.id","session_id":"chat-4711","span_count":1,"total_tokens":500,"trace_count":1,"traces":[{"cost_usd":0.0031,"error_count":0,"first_start_ns":1700000001000000000,"last_end_ns":1700000001900000000,"root_name":"openai.chat","span_count":1,"total_tokens":500,"trace_id":"trace-2"}]}
+{"completion_tokens":88,"cost_usd":0.0031,"error_count":0,"first_start_ns":1700000001000000000,"last_end_ns":1700000001900000000,"llm_calls":1,"prompt_tokens":412,"session_attribute":"gen_ai.conversation.id","session_id":"chat-4711","span_count":1,"total_tokens":500,"trace_count":1,"turn_count":1,"turns_from":"traces","traces":[{"cost_usd":0.0031,"error_count":0,"first_start_ns":1700000001000000000,"last_end_ns":1700000001900000000,"root_name":"openai.chat","span_count":1,"total_tokens":500,"trace_id":"trace-2"}]}
 ```
 
 Each entry of `traces` carries `trace_id`, `root_name` (the name of the

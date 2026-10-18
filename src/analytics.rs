@@ -65,6 +65,12 @@ pub struct SessionSummary {
     pub last_end_ns: u64,
     /// Number of distinct traces containing session spans.
     pub trace_count: usize,
+    /// The session's turns: its user prompts where a recorder marked them
+    /// (see [`marks_a_turn`]), else its traces — one trace per turn, the
+    /// common convention. `turns_from` says which.
+    pub turn_count: usize,
+    /// What `turn_count` counted.
+    pub turns_from: TurnsFrom,
     /// Total spans carrying this session id.
     pub span_count: usize,
     /// Spans recognized as LLM calls (any `llm.*` usage attribute present).
@@ -91,6 +97,35 @@ pub struct SessionSummary {
     pub cost_unpriced_calls: usize,
     /// Spans with status `error`.
     pub error_count: usize,
+}
+
+/// What a session's `turn_count` counted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TurnsFrom {
+    /// User prompts: the turn spans Traza's recorders write, one per prompt.
+    Prompts,
+    /// Traces: the producer marks no prompts, so each trace counts as one.
+    Traces,
+}
+
+/// Whether `span` marks one user prompt: the `turn` span Traza's transcript
+/// recorders (`traza-server import`) write per prompt, told by its operation
+/// name and the `traza.source` attribute they stamp on every span.
+/// A span some other producer happens to name `turn` carries no
+/// `traza.source` and is not one.
+pub fn marks_a_turn(span: &Span) -> bool {
+    span.name == crate::import::TURN_SPAN_NAME && span.attributes.contains_key("traza.source")
+}
+
+/// A session's turns and what they counted: its marked prompts when it has
+/// any, else its traces.
+fn turns_of(prompts: u64, traces: usize) -> (usize, TurnsFrom) {
+    match usize::try_from(prompts) {
+        Ok(prompts) if prompts > 0 => (prompts, TurnsFrom::Prompts),
+        Ok(_) => (traces, TurnsFrom::Traces),
+        Err(_) => (usize::MAX, TurnsFrom::Prompts),
+    }
 }
 
 /// One trace inside a session detail view.
@@ -352,6 +387,8 @@ pub(crate) struct SessionCounters {
     pub(crate) first_start_ns: u64,
     pub(crate) last_end_ns: u64,
     pub(crate) traces: HashSet<String>,
+    /// Spans that mark a user prompt ([`marks_a_turn`]).
+    pub(crate) turns: u64,
     /// The recognized session key that grouped this session; the
     /// highest-precedence key seen wins when spans differ (see [`prefer_key`]).
     pub(crate) session_key: Option<&'static str>,
@@ -366,6 +403,9 @@ impl SessionCounters {
             self.last_end_ns = span.end_time_ns;
         }
         self.traces.insert(span.trace_id.clone());
+        if marks_a_turn(span) {
+            self.turns = self.turns.saturating_add(1);
+        }
         self.session_key = prefer_key(self.session_key, facts.session_key);
         self.counters.absorb(span, facts);
     }
@@ -378,6 +418,7 @@ impl SessionCounters {
             self.last_end_ns = other.last_end_ns;
         }
         self.traces.extend(other.traces.iter().cloned());
+        self.turns = self.turns.saturating_add(other.turns);
         self.session_key = prefer_key(self.session_key, other.session_key);
         self.counters.merge(&other.counters);
     }
@@ -628,24 +669,29 @@ impl Store {
         })?;
         let mut sessions: Vec<SessionSummary> = merged
             .into_iter()
-            .map(|((tenant, session_id), entry)| SessionSummary {
-                session_id,
-                tenant,
-                session_attribute: entry.attribute(),
-                first_start_ns: entry.first_start_ns,
-                last_end_ns: entry.last_end_ns,
-                trace_count: entry.traces.len(),
-                span_count: entry.counters.spans,
-                llm_calls: entry.counters.llm_calls,
-                prompt_tokens: entry.counters.prompt_tokens,
-                completion_tokens: entry.counters.completion_tokens,
-                total_tokens: entry.counters.total_tokens,
-                cost_usd: entry.counters.cost_usd,
-                cost_derived_usd: entry.counters.cost_derived_usd,
-                cost_metered_calls: entry.counters.cost_metered_calls,
-                cost_derived_calls: entry.counters.cost_derived_calls,
-                cost_unpriced_calls: entry.counters.cost_unpriced_calls,
-                error_count: entry.counters.errors,
+            .map(|((tenant, session_id), entry)| {
+                let (turn_count, turns_from) = turns_of(entry.turns, entry.traces.len());
+                SessionSummary {
+                    session_id,
+                    tenant,
+                    session_attribute: entry.attribute(),
+                    first_start_ns: entry.first_start_ns,
+                    last_end_ns: entry.last_end_ns,
+                    trace_count: entry.traces.len(),
+                    turn_count,
+                    turns_from,
+                    span_count: entry.counters.spans,
+                    llm_calls: entry.counters.llm_calls,
+                    prompt_tokens: entry.counters.prompt_tokens,
+                    completion_tokens: entry.counters.completion_tokens,
+                    total_tokens: entry.counters.total_tokens,
+                    cost_usd: entry.counters.cost_usd,
+                    cost_derived_usd: entry.counters.cost_derived_usd,
+                    cost_metered_calls: entry.counters.cost_metered_calls,
+                    cost_derived_calls: entry.counters.cost_derived_calls,
+                    cost_unpriced_calls: entry.counters.cost_unpriced_calls,
+                    error_count: entry.counters.errors,
+                }
             })
             .collect();
         // The (tenant, session id) pair breaks every tie, so a page is
@@ -773,6 +819,7 @@ impl Store {
             })
             .collect();
         trace_rows.sort_by_key(|row| row.first_start_ns);
+        let (turn_count, turns_from) = turns_of(session.turns, session.traces.len());
         Ok(Some(SessionDetail {
             summary: SessionSummary {
                 session_id: session_id.to_owned(),
@@ -781,6 +828,8 @@ impl Store {
                 first_start_ns: session.first_start_ns,
                 last_end_ns: session.last_end_ns,
                 trace_count: session.traces.len(),
+                turn_count,
+                turns_from,
                 span_count: session.counters.spans,
                 llm_calls: session.counters.llm_calls,
                 prompt_tokens: session.counters.prompt_tokens,
