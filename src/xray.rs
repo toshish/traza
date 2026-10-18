@@ -49,7 +49,8 @@
 //! **Bounds.** One request reads its run under the store's snapshot, erasure
 //! and tenant rules ([`crate::run`]), inside the query deadline, and keeps
 //! [`MAX_TAPE_SPANS`] of its spans — its first, or for an X-Ray of a call
-//! past them the ones that end at the call; resolves at most [`MAX_READ_BYTES`] of offloaded
+//! past them the ones that end at the call; resolves at most
+//! [`MAX_READ_BYTES`] of offloaded
 //! payload content for the call itself and as much again for its history
 //! (the comparison window first), or that much per call and
 //! [`MAX_AUTOPSY_READ_BYTES`] across an autopsy; splits one context into at
