@@ -19,6 +19,7 @@ count the model calls it answered even after it is stopped.
 import hashlib
 import json
 import os
+import socketserver
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -87,9 +88,18 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
+class Server(HTTPServer):
+    def server_bind(self):
+        # HTTPServer.server_bind asks for the address's fully qualified name,
+        # a reverse lookup of 127.0.0.1 that has outlasted the demo's whole
+        # startup wait on a macOS CI runner; nothing here uses it.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
+
 if __name__ == "__main__":
     port_file, COUNT_FILE = sys.argv[1], sys.argv[2]
-    server = HTTPServer(("127.0.0.1", 0), Handler)
+    server = Server(("127.0.0.1", 0), Handler)
     # Written to a temporary name and renamed, so the demo never reads half a port.
     with open(port_file + ".tmp", "w") as handle:
         handle.write(str(server.server_address[1]))

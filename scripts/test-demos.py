@@ -20,6 +20,7 @@ import json
 import os
 from pathlib import Path
 import re
+import socketserver
 import subprocess
 import sys
 import tempfile
@@ -40,6 +41,15 @@ def load(name, path):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+class Loopback(http.server.ThreadingHTTPServer):
+    def server_bind(self):
+        # HTTPServer.server_bind asks for the address's fully qualified name,
+        # a reverse lookup that costs seconds per server on a macOS CI runner;
+        # nothing here uses it.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 
 
 class Server:
@@ -67,7 +77,7 @@ class Server:
             def log_message(self, *args):
                 pass
 
-        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.httpd = Loopback(("127.0.0.1", 0), Handler)
         self.port = self.httpd.server_port
         self.url = "http://127.0.0.1:%d" % self.port
 

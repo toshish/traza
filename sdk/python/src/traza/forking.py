@@ -59,6 +59,7 @@ import http.client
 import json
 import os
 import secrets
+import socketserver
 import ssl
 import threading
 import time
@@ -579,6 +580,17 @@ class Fork:
         return f"Fork(parent={self.parent!r}, at_step={self.at_step}, id={self.id!r}, live={self.is_live})"
 
 
+class _SwitchServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def server_bind(self) -> None:
+        # HTTPServer.server_bind asks for the address's fully qualified name,
+        # a reverse lookup that can stall a fork's start on a slow resolver;
+        # nothing here uses it.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
+
 class _Switch:
     """The loopback server that forwards a fork's model calls: to the replay
     until it answers ``replay_live``, to the real provider after."""
@@ -586,8 +598,7 @@ class _Switch:
     def __init__(self, fork: Fork) -> None:
         self.fork = fork
         self.secret = _SECRET_PREFIX + secrets.token_urlsafe(32)
-        server = ThreadingHTTPServer(("127.0.0.1", 0), _SwitchHandler)
-        server.daemon_threads = True
+        server = _SwitchServer(("127.0.0.1", 0), _SwitchHandler)
         server.switch = self  # type: ignore[attr-defined]
         self._server = server
         self.url = f"http://127.0.0.1:{server.server_address[1]}"
