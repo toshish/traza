@@ -25,7 +25,7 @@ also run a prebuilt binary named by `TRAZA_BIN` (a path, or a command on
 | [`prove/`](prove/README.md) | A hash chain over everything committed, recomputed with `hashlib`; an anchor; an erasure ledgered by digest, not by name; one flipped byte named offline, exit 2 | ~2 s |
 | [`foresight/`](foresight/README.md) | A run's fate, read from every run before it: the Fate Map's fatal fork with its Wilson interval, a live run called likely to fail before it has failed, a predictive fuse stopping it at the pre-call check while a healthy run goes through, and the map's own calibration | ~2 s |
 | [`coding-agents/`](coding-agents/README.md) | Claude Code and Codex transcripts imported with no setup: cost per sub-agent, the cache autopsy, an X-Ray of the instruction a compaction dropped, a test edited to pass found by a detector, lines blamed to the session, step and prompt that wrote them, and `--watch` following a live transcript | ~3 s |
-| [`mission-control/`](mission-control/README.md) | Live agent runs you can steer: foresight ranking the runs likely to fail, a run held by its history, a nudge the agent hears at its next check, an approval with lower odds, the kill switch, agents bouncing a ticket stopped at three handoff cycles, and a fork at an edited tool result | ~20 s, then until Ctrl-C |
+| [`mission-control/`](mission-control/README.md) | Live agent runs you can steer: foresight ranking the runs likely to fail, a run held by its history, a nudge the agent hears at its next check, an approval with lower odds, the kill switch, agents bouncing a ticket stopped at three handoff cycles, and a fork at an edited tool result | ~30 s of checks, then until Ctrl-C |
 
 Pick by what you came to see:
 

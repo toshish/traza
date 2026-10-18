@@ -787,9 +787,18 @@ introduced says what blame cannot see.
 ## Live tail
 
 `#/tail` — spans as they land, with a pause bar and the arrival rate beside
-them. Polling is incremental: each tick asks only for spans newer than the
-last one seen, so the cost of watching is proportional to what arrived rather
-than to what is on screen. Pausing buffers and tells you how many are waiting.
+them. It follows [`GET /v1/tail`](http-api.md#get-v1tail) over one held
+connection, read with `fetch` so the token travels as a header, in admission
+order — so a span that started long before it arrived still shows up — and a
+reconnect resumes from the last cursor rather than replaying the screen. An
+idle tail costs one parked connection and the server's heartbeat. The service
+filter applies once typing settles, and **errors only** filters on status.
+Pausing buffers what arrives (up to the 300 rows the table holds) and tells
+you how many are waiting. What overflows the buffer, and admissions the
+server dropped before the page could read them, are counted in a warning
+chip rather than skipped silently; after a gap in the server's admissions
+the view starts over from the live edge instead of splicing the break
+closed.
 
 ## Analytics
 
