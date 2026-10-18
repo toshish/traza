@@ -1,0 +1,563 @@
+//! The statistics the change radar's verdicts rest on, from first principles.
+//!
+//! No dependency is allowed (doctrine: serde, serde_json and lz4_flex only),
+//! so every distribution function a p-value needs is implemented here and
+//! pinned by tests against published reference values (computed with SciPy
+//! 1.14; each test names its value):
+//!
+//! - the standard normal CDF, through `erfc` by the Chebyshev fit of
+//!   *Numerical Recipes* (§6.2) — fractional error below 1.2e-7 everywhere,
+//!   tails included, which is what a p-value of 1e-9 needs and what the
+//!   common Abramowitz–Stegun 7.1.26 fit (absolute error 1.5e-7) does not
+//!   give;
+//! - Student's t two-sided tail, as the regularized incomplete beta function
+//!   `I_x(ν/2, 1/2)` with `x = ν/(ν+t²)`, evaluated by Lentz's continued
+//!   fraction, with `ln Γ` by the Lanczos approximation (g = 7, n = 9);
+//! - the two-proportion z-test (pooled), Welch's unequal-variance t-test with
+//!   Welch–Satterthwaite degrees of freedom, Holm's step-down correction, and
+//!   the Jensen–Shannon distance (base 2, so it lies in `[0, 1]`).
+//!
+//! Every function returns `None` rather than a number when its inputs cannot
+//! support one — an empty side, no variation at all — because a p-value
+//! computed from nothing is the most convincing kind of wrong answer.
+
+use std::collections::HashMap;
+use std::hash::Hash;
+
+/// Standard normal cumulative distribution function `Φ(x)`.
+pub(crate) fn normal_cdf(x: f64) -> f64 {
+    0.5 * erfc(-x / std::f64::consts::SQRT_2)
+}
+
+/// Two-sided tail probability of a standard normal statistic `z`:
+/// `2·Φ(−|z|)`, computed from the lower tail directly so it keeps its
+/// relative accuracy far out (no `1 − 0.999999…` cancellation).
+pub(crate) fn normal_two_sided(z: f64) -> f64 {
+    if z.is_nan() {
+        return 1.0;
+    }
+    (2.0 * normal_cdf(-z.abs())).min(1.0)
+}
+
+/// The complementary error function, *Numerical Recipes* `erfcc`: fractional
+/// error below 1.2e-7 for every real argument.
+fn erfc(x: f64) -> f64 {
+    let z = x.abs();
+    let t = 1.0 / (1.0 + 0.5 * z);
+    let poly = -z * z - 1.265_512_23
+        + t * (1.000_023_68
+            + t * (0.374_091_96
+                + t * (0.096_784_18
+                    + t * (-0.186_288_06
+                        + t * (0.278_868_07
+                            + t * (-1.135_203_98
+                                + t * (1.488_515_87 + t * (-0.822_152_23 + t * 0.170_872_77))))))));
+    let value = t * poly.exp();
+    if x >= 0.0 {
+        value
+    } else {
+        2.0 - value
+    }
+}
+
+/// `ln Γ(x)` for `x > 0`, Lanczos (g = 7, n = 9): about 15 significant
+/// digits over the range the t distribution uses.
+pub(crate) fn ln_gamma(x: f64) -> f64 {
+    const COEFFICIENTS: [f64; 9] = [
+        0.999_999_999_999_809_9,
+        676.520_368_121_885_1,
+        -1_259.139_216_722_402_8,
+        771.323_428_777_653_1,
+        -176.615_029_162_140_6,
+        12.507_343_278_686_905,
+        -0.138_571_095_265_720_12,
+        9.984_369_578_019_572e-6,
+        1.505_632_735_149_311_6e-7,
+    ];
+    if x < 0.5 {
+        // Reflection: Γ(x)Γ(1−x) = π / sin(πx).
+        let pi = std::f64::consts::PI;
+        return (pi / (pi * x).sin()).ln() - ln_gamma(1.0 - x);
+    }
+    let x = x - 1.0;
+    let mut sum = COEFFICIENTS[0];
+    for (index, coefficient) in COEFFICIENTS.iter().enumerate().skip(1) {
+        sum += coefficient / (x + index as f64);
+    }
+    let t = x + 7.5;
+    0.5 * (2.0 * std::f64::consts::PI).ln() + (x + 0.5) * t.ln() - t + sum.ln()
+}
+
+/// The regularized incomplete beta function `I_x(a, b)` for `a, b > 0` and
+/// `0 ≤ x ≤ 1` (*Numerical Recipes* `betai`, continued fraction by Lentz).
+pub(crate) fn incomplete_beta(a: f64, b: f64, x: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    if x >= 1.0 {
+        return 1.0;
+    }
+    let front =
+        (ln_gamma(a + b) - ln_gamma(a) - ln_gamma(b) + a * x.ln() + b * (1.0 - x).ln()).exp();
+    // The continued fraction converges fast for x < (a+1)/(a+b+2); past it
+    // the symmetry I_x(a,b) = 1 − I_{1−x}(b,a) is used instead.
+    if x < (a + 1.0) / (a + b + 2.0) {
+        front * beta_fraction(a, b, x) / a
+    } else {
+        1.0 - front * beta_fraction(b, a, 1.0 - x) / b
+    }
+}
+
+/// The continued fraction of [`incomplete_beta`], by the modified Lentz
+/// method. It converges in O(√max(a,b)) terms — about 700 for a million
+/// degrees of freedom — so the cap only bounds the loop.
+fn beta_fraction(a: f64, b: f64, x: f64) -> f64 {
+    const TINY: f64 = 1e-300;
+    const EPSILON: f64 = 1e-15;
+    let qab = a + b;
+    let qap = a + 1.0;
+    let qam = a - 1.0;
+    let mut c = 1.0;
+    let mut d = 1.0 - qab * x / qap;
+    if d.abs() < TINY {
+        d = TINY;
+    }
+    d = 1.0 / d;
+    let mut h = d;
+    for m in 1..=20_000 {
+        let m = f64::from(m);
+        let m2 = 2.0 * m;
+        let aa = m * (b - m) * x / ((qam + m2) * (a + m2));
+        d = 1.0 + aa * d;
+        if d.abs() < TINY {
+            d = TINY;
+        }
+        c = 1.0 + aa / c;
+        if c.abs() < TINY {
+            c = TINY;
+        }
+        d = 1.0 / d;
+        h *= d * c;
+        let aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2));
+        d = 1.0 + aa * d;
+        if d.abs() < TINY {
+            d = TINY;
+        }
+        c = 1.0 + aa / c;
+        if c.abs() < TINY {
+            c = TINY;
+        }
+        d = 1.0 / d;
+        let step = d * c;
+        h *= step;
+        if (step - 1.0).abs() < EPSILON {
+            break;
+        }
+    }
+    h
+}
+
+/// Two-sided tail probability of Student's t with `df` degrees of freedom:
+/// `P(|T| ≥ |t|) = I_{ν/(ν+t²)}(ν/2, 1/2)`.
+pub(crate) fn student_t_two_sided(t: f64, df: f64) -> f64 {
+    if t.is_nan() || df.is_nan() || df <= 0.0 {
+        return 1.0;
+    }
+    if t.is_infinite() {
+        return 0.0;
+    }
+    let x = df / (df + t * t);
+    incomplete_beta(df / 2.0, 0.5, x).clamp(0.0, 1.0)
+}
+
+/// A two-sample test's result.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct TestResult {
+    /// The statistic (z or t), signed `after − before`.
+    pub(crate) statistic: f64,
+    /// Two-sided p-value.
+    pub(crate) p_value: f64,
+}
+
+/// The pooled two-proportion z-test of `x1/n1` (before) against `x2/n2`
+/// (after). `None` when a side is empty or there is no variation at all
+/// (every run on both sides the same), where the test has no denominator.
+pub(crate) fn two_proportion(x1: usize, n1: usize, x2: usize, n2: usize) -> Option<TestResult> {
+    if n1 == 0 || n2 == 0 {
+        return None;
+    }
+    let (n1f, n2f) = (n1 as f64, n2 as f64);
+    let pooled = (x1 + x2) as f64 / (n1f + n2f);
+    let variance = pooled * (1.0 - pooled) * (1.0 / n1f + 1.0 / n2f);
+    if variance <= 0.0 {
+        return None;
+    }
+    let z = (x2 as f64 / n2f - x1 as f64 / n1f) / variance.sqrt();
+    Some(TestResult {
+        statistic: z,
+        p_value: normal_two_sided(z),
+    })
+}
+
+/// Mean and sample variance (n − 1 denominator).
+pub(crate) fn mean_variance(values: &[f64]) -> Option<(f64, f64)> {
+    if values.is_empty() {
+        return None;
+    }
+    let n = values.len() as f64;
+    let mean = values.iter().sum::<f64>() / n;
+    if values.len() < 2 {
+        return Some((mean, 0.0));
+    }
+    let variance = values.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / (n - 1.0);
+    Some((mean, variance))
+}
+
+/// Welch's unequal-variance t-test of `after` against `before`, with
+/// Welch–Satterthwaite degrees of freedom. `None` with fewer than two values
+/// on a side. Two sides with no variance at all are `p = 1` when their means
+/// agree and `p = 0` when they do not: a deterministic difference.
+pub(crate) fn welch(before: &[f64], after: &[f64]) -> Option<TestResult> {
+    if before.len() < 2 || after.len() < 2 {
+        return None;
+    }
+    let (m1, v1) = mean_variance(before)?;
+    let (m2, v2) = mean_variance(after)?;
+    let (n1, n2) = (before.len() as f64, after.len() as f64);
+    let se2 = v1 / n1 + v2 / n2;
+    if se2 <= 0.0 {
+        let p_value = if (m2 - m1).abs() <= f64::EPSILON * m1.abs().max(m2.abs()).max(1.0) {
+            1.0
+        } else {
+            0.0
+        };
+        let statistic = if p_value == 1.0 {
+            0.0
+        } else {
+            (m2 - m1).signum() * f64::INFINITY
+        };
+        return Some(TestResult { statistic, p_value });
+    }
+    let t = (m2 - m1) / se2.sqrt();
+    let df = se2 * se2 / ((v1 / n1).powi(2) / (n1 - 1.0) + (v2 / n2).powi(2) / (n2 - 1.0));
+    Some(TestResult {
+        statistic: t,
+        p_value: student_t_two_sided(t, df),
+    })
+}
+
+/// Cohen's h between two proportions, signed `after − before`.
+pub(crate) fn cohens_h(before: f64, after: f64) -> f64 {
+    2.0 * after.clamp(0.0, 1.0).sqrt().asin() - 2.0 * before.clamp(0.0, 1.0).sqrt().asin()
+}
+
+/// Cohen's d between two samples (pooled standard deviation), signed
+/// `after − before`; `0` when there is no spread to scale by.
+pub(crate) fn cohens_d(before: &[f64], after: &[f64]) -> f64 {
+    let (Some((m1, v1)), Some((m2, v2))) = (mean_variance(before), mean_variance(after)) else {
+        return 0.0;
+    };
+    let (n1, n2) = (before.len() as f64, after.len() as f64);
+    let pooled = if n1 + n2 > 2.0 {
+        (((n1 - 1.0) * v1 + (n2 - 1.0) * v2) / (n1 + n2 - 2.0)).sqrt()
+    } else {
+        0.0
+    };
+    if pooled > 0.0 {
+        (m2 - m1) / pooled
+    } else if (m2 - m1).abs() > 0.0 {
+        // No spread but a difference: as large an effect as can be stated.
+        (m2 - m1).signum() * 10.0
+    } else {
+        0.0
+    }
+}
+
+/// Holm's step-down procedure: which of `p_values` are significant with the
+/// family-wise error rate held at `alpha`. Order-preserving.
+pub(crate) fn holm(p_values: &[f64], alpha: f64) -> Vec<bool> {
+    let mut order: Vec<usize> = (0..p_values.len()).collect();
+    order.sort_by(|&a, &b| {
+        p_values[a]
+            .partial_cmp(&p_values[b])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.cmp(&b))
+    });
+    let tests = p_values.len();
+    let mut significant = vec![false; tests];
+    for (rank, &index) in order.iter().enumerate() {
+        if p_values[index] <= alpha / (tests - rank) as f64 {
+            significant[index] = true;
+        } else {
+            break;
+        }
+    }
+    significant
+}
+
+/// Jensen–Shannon distance (the square root of the divergence, base 2)
+/// between two empirical distributions given as counts with their totals.
+/// `0` for identical distributions, `1` for disjoint ones; `None` when either
+/// side is empty.
+pub(crate) fn js_distance<K: Eq + Hash>(
+    left: &HashMap<K, usize>,
+    left_total: usize,
+    right: &HashMap<K, usize>,
+    right_total: usize,
+) -> Option<f64> {
+    if left_total == 0 || right_total == 0 {
+        return None;
+    }
+    let (lt, rt) = (left_total as f64, right_total as f64);
+    let mut divergence = 0.0;
+    let term = |p: f64, m: f64| if p > 0.0 { p * (p / m).log2() } else { 0.0 };
+    for (key, &count) in left {
+        let p = count as f64 / lt;
+        let q = right.get(key).copied().unwrap_or(0) as f64 / rt;
+        let m = 0.5 * (p + q);
+        divergence += 0.5 * term(p, m) + 0.5 * term(q, m);
+    }
+    for (key, &count) in right {
+        if left.contains_key(key) {
+            continue;
+        }
+        let q = count as f64 / rt;
+        divergence += 0.5 * term(q, 0.5 * q);
+    }
+    Some(divergence.clamp(0.0, 1.0).sqrt())
+}
+
+/// [`js_distance`] over two slices of labels.
+pub(crate) fn js_of<K: Eq + Hash + Copy>(left: &[K], right: &[K]) -> Option<f64> {
+    js_distance(&counts(left), left.len(), &counts(right), right.len())
+}
+
+/// Occurrences of each label.
+pub(crate) fn counts<K: Eq + Hash + Copy>(labels: &[K]) -> HashMap<K, usize> {
+    let mut counts = HashMap::new();
+    for label in labels {
+        *counts.entry(*label).or_insert(0) += 1;
+    }
+    counts
+}
+
+/// A deterministic permutation test of a Jensen–Shannon distance: the share
+/// of `permutations` random relabellings of `left ++ right` whose distance is
+/// at least `observed`, as `(1 + hits) / (1 + permutations)` — never zero,
+/// and with resolution `1 / (1 + permutations)`.
+///
+/// The generator (xorshift64*) is seeded by the caller, so the same data and
+/// seed give the same p-value on every run and every machine: a verdict that
+/// changed between two identical requests would be worse than none.
+pub(crate) fn js_permutation_p<K: Eq + Hash + Copy>(
+    left: &[K],
+    right: &[K],
+    observed: f64,
+    permutations: usize,
+    seed: u64,
+) -> f64 {
+    let mut pooled: Vec<K> = left.iter().chain(right).copied().collect();
+    let split = left.len();
+    let mut state = seed | 1;
+    let mut next = move || {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        state.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    };
+    let mut hits = 0usize;
+    for _ in 0..permutations {
+        for index in (1..pooled.len()).rev() {
+            let other = (next() % (index as u64 + 1)) as usize;
+            pooled.swap(index, other);
+        }
+        let distance = js_of(&pooled[..split], &pooled[split..]).unwrap_or(0.0);
+        if distance >= observed - 1e-12 {
+            hits += 1;
+        }
+    }
+    (1 + hits) as f64 / (1 + permutations) as f64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn close(actual: f64, expected: f64, relative: f64) {
+        let error = ((actual - expected) / expected).abs();
+        assert!(
+            error <= relative,
+            "{actual} vs {expected}: relative error {error:e} > {relative:e}"
+        );
+    }
+
+    #[test]
+    fn the_normal_cdf_matches_published_values() {
+        // The fit's stated bound is a fractional error below 1.2e-7.
+        close(normal_cdf(0.0), 0.5, 1.2e-7);
+        close(normal_cdf(1.959964), 0.975_000_000_9, 1e-7);
+        close(normal_cdf(-1.0), 0.158_655_253_931_457_07, 2e-7);
+        close(normal_cdf(3.0), 0.998_650_101_968_369_9, 1e-7);
+        // Far tails keep their RELATIVE accuracy, which is what a small
+        // p-value needs.
+        close(normal_cdf(-6.0), 9.865_876_450_376_944e-10, 2e-7);
+        close(normal_two_sided(5.0), 5.733_031_437_583_869e-7, 2e-7);
+        close(normal_two_sided(8.0), 1.244_192_114_854_348e-15, 2e-7);
+        close(normal_two_sided(-1.959964), 0.05, 2e-7);
+        assert_eq!(normal_two_sided(0.0), 1.0);
+    }
+
+    #[test]
+    fn ln_gamma_and_the_incomplete_beta_match_published_values() {
+        close(ln_gamma(0.5), 0.572_364_942_924_700_4, 1e-12);
+        close(ln_gamma(10.0), 12.801_827_480_081_467, 1e-12);
+        close(ln_gamma(100.5), 361.435_540_467_767_7, 1e-12);
+        close(ln_gamma(1e-3), 6.907_178_885_383_854, 1e-10);
+        close(incomplete_beta(2.0, 3.0, 0.4), 0.5248, 1e-10);
+        close(
+            incomplete_beta(0.5, 0.5, 0.1),
+            0.204_832_764_699_133_45,
+            1e-10,
+        );
+        close(
+            incomplete_beta(5.0, 0.5, 0.9),
+            0.316_642_915_020_012_2,
+            1e-10,
+        );
+        assert_eq!(incomplete_beta(2.0, 2.0, 0.0), 0.0);
+        assert_eq!(incomplete_beta(2.0, 2.0, 1.0), 1.0);
+    }
+
+    #[test]
+    fn student_t_tails_match_published_values() {
+        // (df, t, two-sided p) from scipy.stats.t.sf.
+        for (df, t, p) in [
+            (1.0, 1.0, 0.5),
+            (10.0, 2.228139, 0.049_999_987_452_882_53),
+            (30.0, 2.042272, 0.050_000_048_004_615_03),
+            (5.0, 4.032143, 0.009_999_999_837_548_53),
+            (2.0, 4.302653, 0.049_999_994_182_204_47),
+            (10.0, 2.0, 0.073_388_034_770_740_39),
+            (3.7, 1.5, 0.213_598_169_202_013_3),
+            (1e6, 1.96, 0.049_996_067_585_269_78),
+            (24.9, 2.46, 0.021_185_467_288_960_63),
+            (1.0, 50.0, 0.012_730_698_201_945_594),
+            (200.0, 0.1, 0.920_444_492_504_320_9),
+        ] {
+            close(student_t_two_sided(t, df), p, 1e-8);
+            close(student_t_two_sided(-t, df), p, 1e-8);
+        }
+        assert_eq!(student_t_two_sided(f64::INFINITY, 3.0), 0.0);
+        assert_eq!(student_t_two_sided(1.0, 0.0), 1.0);
+    }
+
+    #[test]
+    fn welch_matches_scipy_on_the_textbook_samples() {
+        // The two worked examples of Welch's test (Wikipedia), checked with
+        // scipy.stats.ttest_ind(equal_var=False).
+        let a1 = [
+            27.5, 21.0, 19.0, 23.6, 17.0, 17.9, 16.9, 20.1, 21.9, 22.6, 23.1, 19.6, 19.0, 21.7,
+            21.4,
+        ];
+        let a2 = [
+            27.1, 22.0, 20.8, 23.4, 23.4, 23.5, 25.8, 22.0, 24.8, 20.2, 21.9, 22.1, 22.9, 20.5,
+            24.4,
+        ];
+        let result = welch(&a1, &a2).expect("computes");
+        close(result.statistic, 2.455_356_398_286_006, 1e-12);
+        close(result.p_value, 0.021_378_001_462_866_985, 1e-8);
+        let b1 = [17.2, 20.9, 22.6, 18.1, 21.7, 21.4, 23.5, 24.2, 14.7, 21.8];
+        let b2 = [
+            21.5, 22.8, 21.0, 23.0, 21.6, 23.6, 22.5, 20.7, 23.4, 21.8, 20.7, 21.7, 21.5, 22.5,
+            23.6, 21.5, 22.5, 23.5, 21.5, 21.8,
+        ];
+        let result = welch(&b1, &b2).expect("computes");
+        close(result.statistic, 1.565_433_523_598_503_7, 1e-12);
+        close(result.p_value, 0.148_841_696_605_328_34, 1e-8);
+        // Degenerate sides.
+        assert_eq!(welch(&[1.0], &[1.0, 2.0]), None);
+        assert_eq!(
+            welch(&[2.0, 2.0], &[2.0, 2.0]).map(|r| r.p_value),
+            Some(1.0)
+        );
+        assert_eq!(
+            welch(&[2.0, 2.0], &[3.0, 3.0]).map(|r| r.p_value),
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn the_two_proportion_test_matches_scipy() {
+        let result = two_proportion(30, 100, 45, 100).expect("computes");
+        close(result.statistic, 2.190_890_230_020_664_7, 1e-12);
+        close(result.p_value, 0.028_459_736_916_310_555, 1e-7);
+        let result = two_proportion(4, 120, 16, 85).expect("computes");
+        close(result.statistic, 3.682_417_871_161_343, 1e-12);
+        close(result.p_value, 0.000_231_032_308_566_074_1, 2e-7);
+        assert_eq!(two_proportion(0, 10, 0, 10), None, "no variation");
+        assert_eq!(two_proportion(10, 10, 10, 10), None, "no variation");
+        assert_eq!(two_proportion(1, 0, 1, 10), None, "an empty side");
+    }
+
+    #[test]
+    fn holm_controls_the_family_and_preserves_order() {
+        assert_eq!(holm(&[0.01, 0.04, 0.03], 0.05), [true, false, false]);
+        assert_eq!(holm(&[0.001, 0.012, 0.02], 0.05), [true, true, true]);
+        assert_eq!(holm(&[0.2, 0.001], 0.05), [false, true]);
+        assert!(holm(&[], 0.05).is_empty());
+    }
+
+    #[test]
+    fn effect_sizes_are_signed_after_minus_before() {
+        assert!(cohens_h(0.04, 0.19) > 0.0);
+        assert!((cohens_h(0.5, 0.5)).abs() < 1e-12);
+        assert!(cohens_d(&[1.0, 2.0, 3.0], &[4.0, 5.0, 6.0]) > 0.0);
+        assert!(cohens_d(&[4.0, 5.0, 6.0], &[1.0, 2.0, 3.0]) < 0.0);
+        assert_eq!(cohens_d(&[2.0, 2.0], &[2.0, 2.0]), 0.0);
+    }
+
+    #[test]
+    fn jensen_shannon_matches_scipy() {
+        let a = counts(&["p", "p", "p", "p", "p"]);
+        let b = counts(&["p", "p", "p", "q", "q"]);
+        // scipy.spatial.distance.jensenshannon([1,0],[0.6,0.4], base=2)
+        close(
+            js_distance(&a, 5, &b, 5).expect("both sides"),
+            0.486_264_123_352_759_76,
+            1e-12,
+        );
+        assert_eq!(js_of(&[1, 1], &[2, 2]), Some(1.0), "disjoint");
+        assert_eq!(js_of(&[1, 2], &[2, 1]), Some(0.0), "identical");
+        // jensenshannon([0.5,0.5,0],[0.1,0.2,0.7], base=2)
+        let left = [0, 1, 0, 1, 0, 1, 0, 1, 0, 1];
+        let right = [0, 1, 1, 2, 2, 2, 2, 2, 2, 2];
+        close(
+            js_of(&left, &right).expect("both"),
+            0.709_155_183_656_703_5,
+            1e-12,
+        );
+        assert_eq!(js_of::<u8>(&[], &[1]), None);
+    }
+
+    #[test]
+    fn the_permutation_test_is_deterministic_and_discriminating() {
+        let same: Vec<u8> = (0..40).map(|i| (i % 3) as u8).collect();
+        let observed = js_of(&same[..20], &same[20..]).unwrap_or(0.0);
+        let p = js_permutation_p(&same[..20], &same[20..], observed, 199, 7);
+        assert!(p > 0.2, "no shift: p={p}");
+        assert_eq!(
+            p,
+            js_permutation_p(&same[..20], &same[20..], observed, 199, 7),
+            "same seed, same answer"
+        );
+        let left = vec![0u8; 20];
+        let right = vec![1u8; 20];
+        let observed = js_of(&left, &right).unwrap_or(0.0);
+        let p = js_permutation_p(&left, &right, observed, 199, 7);
+        assert_eq!(
+            p,
+            1.0 / 200.0,
+            "a total shift is as significant as 199 draws can say"
+        );
+    }
+}

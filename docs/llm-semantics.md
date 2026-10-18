@@ -371,7 +371,10 @@ The same attributes flow through `POST /v1/traces`: OTLP `intValue`
 attributes become numbers, `doubleValue` stays a double, string values stay
 strings, and events map to span events — so OpenLLMetry / OTel GenAI
 instrumentation lands queryable without translation. `service.name` on the
-OTLP resource becomes the span's service. gRPC is not served; use the
+OTLP resource becomes the span's service. `service.version`,
+`deployment.environment(.name)` and `telemetry.sdk.name`/`version` on the
+resource are copied onto each span as attributes, which is where the
+[change radar](guide/radar.md) reads deploys from. gRPC is not served; use the
 `http/protobuf` exporter setting every OTel SDK supports.
 
 The complete OTLP field mapping is in [ingest](guide/ingest.md#otlp-mapping).

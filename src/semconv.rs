@@ -885,6 +885,39 @@ pub(crate) fn step_kind_with(span: &Span, llm: &LlmFacts) -> StepKind {
     step_kind(&span.attributes, traceloop_kind.as_deref(), llm)
 }
 
+/// A step's kind, its signature — `"{kind}:{name}"`, the fingerprint without
+/// its request hash ([`StepFacts::signature`]) — and its agent name, without
+/// extracting or digesting its request and response.
+///
+/// For a caller that reads every step of a time window (the change radar,
+/// [`crate::radar`]), where a SHA-256 of every request and response would be
+/// the dominant cost and is never used. Built from the same helpers as
+/// [`step_facts_with`], so the two cannot disagree.
+pub(crate) fn step_identity_with(
+    span: &Span,
+    llm: &LlmFacts,
+) -> (StepKind, String, Option<String>) {
+    let attributes = &span.attributes;
+    let traceloop_kind =
+        attr_str(attributes, TRACELOOP_SPAN_KIND).map(|kind| kind.to_ascii_lowercase());
+    let kind = step_kind(attributes, traceloop_kind.as_deref(), llm);
+    let tool = match kind {
+        StepKind::Tool => step_tool(attributes, traceloop_kind.as_deref()),
+        _ => None,
+    };
+    let agent = step_agent(attributes, traceloop_kind.as_deref());
+    let signature = step_fingerprint(span, kind, tool.as_deref(), agent.as_deref(), llm, None);
+    (kind, signature, agent)
+}
+
+/// An llm step's request exactly as [`step_facts`] reads it — the message
+/// list by the request precedence, `gen_ai.system_instructions` folded in as
+/// its first message — without digesting it. Stored values: an offloaded
+/// carrier is its `$payload` reference.
+pub(crate) fn llm_request_of(span: &Span) -> Option<Value> {
+    llm_request(span)
+}
+
 /// The kind precedence documented on [`step_facts`].
 fn step_kind(
     attributes: &Map<String, Value>,

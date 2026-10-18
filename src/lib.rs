@@ -37,6 +37,7 @@ pub mod otlp_pb;
 pub mod payload;
 pub mod platform;
 pub mod pricing;
+pub mod radar;
 pub mod recall;
 pub mod replay;
 mod rollup_file;

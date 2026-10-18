@@ -44,6 +44,9 @@ use crate::{semconv, Error, Span, SpanCursor, SpanFilter, SpanSort, Store};
 // get_run_tape, compare_runs and recall_runs live beside this file.
 mod replay_tools;
 
+// what_changed (the change radar) lives beside this file too.
+mod radar_tools;
+
 /// The MCP endpoint path served by `traza-server`.
 pub const ENDPOINT: &str = "/v1/mcp";
 
@@ -628,6 +631,7 @@ impl<'a> Server<'a> {
             );
         }
         tools.extend(replay_tools::definitions());
+        tools.extend(radar_tools::definitions());
         if self.annotation_tool_available(access) {
             tools.push(tool(
                 "record_annotation",
@@ -749,6 +753,9 @@ impl<'a> Server<'a> {
             }
             name if replay_tools::handles(name) => {
                 replay_tools::call(self, name, arguments, &context)
+            }
+            name if radar_tools::handles(name) => {
+                radar_tools::call(self, name, arguments, &context)
             }
             "record_annotation" if self.annotation_tool_available(context.access) => {
                 self.record_annotation(arguments, context)

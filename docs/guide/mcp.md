@@ -136,6 +136,7 @@ question about it.
 | `get_run_tape` | What did this run do, step by step? |
 | `compare_runs` | **Where did this run part from that one, and why?** |
 | `recall_runs` | Has this been done before, and how did it go? |
+| `what_changed` | **What changed in this agent, and did it make things worse?** |
 | `record_annotation` | Attach a note or rating to a trace or span (**`rw` token + `--mcp-annotations`**) |
 | `promote_failures_to_dataset` | Turn this run's failures into a regression dataset (**`rw` token + `--mcp-promote`**) |
 
@@ -144,13 +145,13 @@ host asks for approval before each call:
 
 | Tool | `readOnlyHint` | `destructiveHint` | `idempotentHint` | `openWorldHint` |
 |---|---|---|---|---|
-| the fourteen readers | `true` | — | — | `false` |
+| every read tool | `true` | — | — | `false` |
 | `record_annotation` | `false` | `false` | `false` | `false` |
 | `promote_failures_to_dataset` | `false` | `false` | `false` | `false` |
 
 **Absent annotations are not neutral.** Every hint defaults to the pessimistic
 answer — not read-only, potentially destructive, open world — so a server that
-omits them advertises fourteen read tools as though each might delete something and
+omits them advertises its read tools as though each might delete something and
 call out to the internet. A host that gates on that asks for confirmation on
 every call, and one running non-interactively, with nobody to ask, declines
 them. `destructiveHint` and `idempotentHint` are meaningful only when
@@ -205,6 +206,25 @@ The reasoning behind these is worth knowing:
   deliberately no tool that creates a replay: a replay serves model answers to
   an agent harness, and letting the model under test create one would let
   stored telemetry choose which recording its next run is fed.
+- **`what_changed` before reading individual runs when an agent that used to
+  work is failing.** It runs the [change radar](radar.md) over the agent's
+  runs (default: the last 30 days) and returns a ranked timeline of change
+  points: a system prompt edit (with the edited text), tools added or
+  removed, a different requested or returned model, new sampling parameters,
+  a new service or SDK version, or a `behavior` change, where the agent's
+  paths shifted with no configuration change at all. Each change reports how
+  error rate, success rate, cost and steps moved across it, with p-values and
+  a verdict, regressions first. It also names example runs on each side,
+  which you can open with `get_run_tape` or compare with `compare_runs`. It
+  takes `agent`, `environment`, `since`, `until` and `limit` (changes per
+  agent, default 5, at most 20). With `run_id`, it also places that run on
+  its agent's timeline: its configuration, and the change points it ran
+  downstream of (for example, "this failed run used the system prompt
+  introduced by Tuesday's regression"). It returns `structuredContent` with
+  each agent's summary, current configuration and top changes, plus `run`
+  when one was named. Agent names,
+  values, prompt text, tool names and run ids render inside the telemetry
+  block.
 
 **`check_run_guard` reads a run's [fuse](guard.md) verdict** — `continue`,
 `warn` or `stop` — with its reasons, policy, limits and usage: the same
@@ -291,7 +311,7 @@ so a tool composed of several folds — `describe_store` runs half a dozen —
 can spend several budgets end to end.
 
 `list_sessions`, `diagnose_session`, `analyze_cost`, `check_run_guard`,
-`compare_runs` and `recall_runs` additionally return `structuredContent` against a declared
+`compare_runs`, `recall_runs` and `what_changed` additionally return `structuredContent` against a declared
 `outputSchema`, because their answers are small, genuinely tabular or
 record-shaped, and the thing a client is most likely to chart or act on.
 Everything else is text only — for span data the compact rendering is strictly
