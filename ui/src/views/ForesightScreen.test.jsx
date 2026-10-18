@@ -16,6 +16,7 @@ import novel from '../test/fixtures/insight/fate_run_novel.json';
 import missing from '../test/fixtures/insight/fate_map_missing.json';
 import ccPruned from '../test/fixtures/insight/fate_map_cc_pruned.json';
 import supportDepth2 from '../test/fixtures/insight/fate_map_support_depth2.json';
+import miniMap from '../test/fixtures/insight/fate_map_mini.json';
 
 const RUNS = { 'live-doomed-0': doomed, 'live-healthy-0': healthy, 'live-novel-0': novel };
 
@@ -99,7 +100,11 @@ describe('the cohorts and the map', () => {
     expect(go).toHaveBeenCalledWith(['diff'], { a: 'search_loop-9', b: 'search_loop-0', tenant: '' });
     // The search is the cohort's: its agent, in its tenant.
     fireEvent.click(screen.getByText('Find these runs'));
-    expect(go).toHaveBeenCalledWith(['behaviors'], { q: '^llm("gpt-4o") -> tool("search_orders"){3,5}', agent: 'support-agent', tenant: '' });
+    expect(go).toHaveBeenCalledWith(['behaviors'], {
+      q: '^llm[signature="llm:gpt-4o"] -> tool[signature="tool:search_orders"]{3,5}$'
+        + ' | ^llm[signature="llm:gpt-4o"] -> tool[signature="tool:search_orders"]{3,5} -> step[signature!="tool:search_orders"]',
+      agent: 'support-agent', tenant: '',
+    });
     fireEvent.click(screen.getByText('search_loop-0'));
     expect(go).toHaveBeenCalledWith(['run', 'search_loop-0'], { tenant: '' });
   });
@@ -109,7 +114,17 @@ describe('the cohorts and the map', () => {
     const { go } = await show('agent=support-agent&task=dd8fe599d8750716&node=' + encodeURIComponent('llm:gpt-4o'));
     expect(screen.getByTestId('node-panel').textContent).toContain('searches every task of support-agent');
     fireEvent.click(screen.getByText('Find these runs'));
-    expect(go).toHaveBeenCalledWith(['behaviors'], { q: '^llm("gpt-4o")', agent: 'support-agent', tenant: '' });
+    expect(go).toHaveBeenCalledWith(['behaviors'], {
+      q: '^llm[signature="llm:gpt-4o"]$ | ^llm[signature="llm:gpt-4o"] -> step[signature!="llm:gpt-4o"]', agent: 'support-agent', tenant: '',
+    });
+  });
+
+  it('offers no search for a node another branch reads the same as', async () => {
+    // A tool literally named search×2, called once, beside search called twice.
+    api.fateMap.mockResolvedValueOnce(miniMap);
+    await show('agent=mini-agent&node=' + encodeURIComponent('llm:gpt-4o-mini\u0001tool:search×2'));
+    expect(screen.getByTestId('node-panel').textContent).toContain('runs through here1');
+    expect(screen.queryByText('Find these runs')).toBeNull();
   });
 
   it("states the map's own score, and what it means", async () => {
@@ -228,6 +243,44 @@ describe('a run on its map', () => {
     await show('run=live-healthy-0&tenant=&agent=researcher');
     expect(screen.getByTestId('run-foresight').textContent).toContain('This run belongs to support-agent; the map shown is researcher.');
     expect(document.body.textContent).not.toContain('THIS RUN');
+  });
+});
+
+describe('when the route moves on while an answer is on its way', () => {
+  const rerender = async (view, query) => {
+    view.rerender(<ForesightScreen go={vi.fn()} params={new URLSearchParams(query)} identity={OPEN} pushToast={vi.fn()} />);
+    await act(async () => { for (let i = 0; i < 6; i += 1) await Promise.resolve(); });
+  };
+
+  it('shows no verdict under the run now named until that run\'s own answer arrives', async () => {
+    const { view } = await show('run=live-doomed-0&tenant=');
+    expect(screen.getByTestId('run-foresight').textContent).toContain('likely failure');
+    let arrive;
+    api.fateRun.mockImplementationOnce(() => new Promise((resolve) => { arrive = resolve; }));
+    await rerender(view, 'run=live-healthy-0&tenant=');
+    expect(api.fateRun).toHaveBeenLastCalledWith('live-healthy-0', { tenant: '' }, expect.anything());
+    // live-doomed-0's verdict, odds and path are not live-healthy-0's.
+    expect(document.body.textContent).not.toContain('likely failure');
+    expect(document.body.textContent).not.toContain('5 of 50 times');
+    expect(document.body.textContent).not.toContain('THIS RUN');
+    await act(async () => { arrive(healthy); for (let i = 0; i < 6; i += 1) await Promise.resolve(); });
+    const banner = screen.getByTestId('run-foresight').textContent;
+    expect(banner).toContain('live-healthy-0');
+    expect(banner).toContain('on track');
+  });
+
+  it('reads the map\'s skill only off the build the run was judged against, not the one still drawn', async () => {
+    const { view } = await show('run=live-doomed-0&tenant=&window=7d');
+    // A 7-day map is not the build foresight judged the run against.
+    expect(screen.queryByTestId('run-skill')).toBeNull();
+    let arrive;
+    api.fateMap.mockImplementationOnce(() => new Promise((resolve) => { arrive = resolve; }));
+    await rerender(view, 'run=live-doomed-0&tenant=');
+    // The 7-day map is still drawn while the default window's loads; its
+    // calibration is not the one the verdict is read against.
+    expect(screen.queryByTestId('run-skill')).toBeNull();
+    await act(async () => { arrive(supportMap); for (let i = 0; i < 6; i += 1) await Promise.resolve(); });
+    expect(screen.getByTestId('run-skill').textContent).toContain('skill 21% at depth 2');
   });
 });
 

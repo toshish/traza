@@ -42,7 +42,11 @@ The links point at the dashboard, a built artifact the server serves from
 - **Two policies.** `support-agent` runs stop when their path's odds fall
   below 0.3 (`min_success_odds`, a predictive fuse); `support-app` runs stop
   at three handoff cycles (`max_handoff_cycles`). A stopped agent waits 90
-  seconds for someone to release it, then abandons the run.
+  seconds for someone to release it, then abandons the run. One deadline
+  covers the refused step however often the check refuses it, and the agent
+  counts itself released only when the check lets that step go: its verdict
+  read judges the path so far, without the step, so a stop on the step alone
+  reads `continue` there and is no release.
 
 ## The beats
 

@@ -354,7 +354,18 @@ clock, and nothing it sends says what time it is there, so the page bounds
 its estimate with what the rows prove: no activity is in the server's future,
 every run listed is inside the live window, and a run whose activity moved
 since the page last looked moved within that time. The estimate follows a
-server clock behind the browser's as readily as one ahead of it.
+server clock behind the browser's as readily as one ahead of it. A run the
+page did not hold counts as having just moved only while the page holds
+every live run: after a cut snapshot, or once the page has let runs go, a
+row it has not seen may be an old run a nudge or a verdict sent again, its
+activity minutes old, and it only bounds the estimate.
+
+**How many it holds.** The snapshot carries the 256 most recently changed
+runs, and the page keeps at most 1,000, letting the least recently active go
+past that. While either leaves runs out, every figure on the page is of the
+runs it holds: the live-run count carries a `+` (`1,000+`), and a line says
+so — for runs the page let go, how many, until the server says they left the
+view or a fresh snapshot covers every run.
 
 **Each run** shows its id (a link to its tape, in its tenant), its agent, its
 tenant to an operator, the step it is on — kind and name; when a pre-call
@@ -383,10 +394,13 @@ listing, so a run it holds shows nothing but a pending step. When a named
 step has been pending for four seconds the page asks the run's verdict
 ([`GET /v1/fuses/runs/{run}`](http-api.md#get-v1fusesrunsrun), a read from
 memory that is neither activity nor a change, and never takes the run's
-nudges), at most four runs every three seconds — runs never asked first, then
-the longest waiting — and each at most once per ten seconds or per move it
-makes. A run whose verdict is `stop` is shown as **held**, with the verdict's
-reasons.
+nudges), every three seconds and never more than four reads in flight at
+once — runs never asked first, then the longest waiting — and each at most
+once per ten seconds or per move it makes. A slow answer holds the next
+round back rather than piling reads up behind it. A run whose verdict is
+`stop` is shown as **held**, with the verdict's reasons. What the page
+learned about a run goes when the run leaves the view, a read still in
+flight about it included; if it comes back, it is asked again.
 
 That verdict judges the path so far. The check judged the path with the
 named step added — the tool it names, the cost it estimates, a block nudge
@@ -527,7 +541,10 @@ after the step unless told to let the recording play on. **Rewind** instead
 replays the steps before this one exactly and goes live from it (a live point
 alone). Matching before the cut is `strict` or `loose`. JSON that does not
 parse is refused before anything is sent; the server's own refusals are shown
-as it words them. The answer carries the fork's id, its cut and its live
+as it words them. A draft belongs to the tape it was opened from: when the
+route moves to the same run in another tenant (back and forward do), the
+editor closes, and a creation still on its way is never shown in a draft
+for the other tenant. The answer carries the fork's id, its cut and its live
 point, the environment for a harness of your own — the replay's base URLs,
 its key, and the `TRAZA_FORK_*` values and `traza.fork.*` attributes the
 forked run's spans must carry under a session id of their own — then the same
@@ -641,9 +658,17 @@ entropy, the comparison with its siblings, and what was pruned. Clicking opens
 it in the panel under the map (`?node=` in the route) with its example runs,
 **Diff success vs failure** (the newest success and failure through the node,
 in [Diff](#diff)) and **Find these runs**, which opens [Behaviors](#behaviors)
-with the TQL that matches the path — each token an atom, its repeat bucket a
-count, anchored at the run's first step — searching the cohort's agent in the
-map's tenant. A search cannot narrow to one task, so on a task sub-cohort's
+with the TQL that matches the node's runs — each token matched by its exact
+step signature (`tool[signature="tool:search"]`, so `Search` is not
+`search`), its repeat bucket a count, anchored at the run's first step, and
+the last token held to its bucket (the run ends there or does something
+else next, so six searches are not found under `×3-5`) — searching the
+cohort's agent in the map's tenant. The map names a step by its text, so a
+tool literally called `search×2` and called once reads like `search` called
+twice: where two branches under one node read the same, or a name itself
+contains `×`, the panel offers no search rather than one that may mean the
+other branch; a lone `x×2` is read as `x` twice. Nor is one offered for the
+`…` fold node. A search cannot narrow to one task, so on a task sub-cohort's
 map the panel says the search covers every task of the agent.
 Double-clicking folds a branch. Below sit the fatal forks and hotspots (each
 opens its node) and **How good is this map**: Brier score, baseline and skill
@@ -669,7 +694,11 @@ only the part of the run's path it draws, places nothing on an ancestor, and
 the banner says how far it got, with **Draw it** to set the depth or support
 that draws the run's node. The run is read in the tenant the route names; an
 operator who names none gets a field to name it instead, since the route
-would read the default tenant's run of that id.
+would read the default tenant's run of that id. When the route names another
+run, the banner waits for that run's own answer rather than showing the last
+run's verdict under the new name, and the map waits with it, since the run
+decides its cohort. The skill is read only off the map asked for: while
+another window's map is still drawn, none is given.
 
 ## X-Ray
 
@@ -706,7 +735,10 @@ window** as one bar, every chunk as wide as its estimated tokens in the order
 the model read it. Fill says the kind (instructions darkest, the model's own
 words lightest, tool definitions outlined), stale tool results are hatched,
 repeats carry a warning tick, and hovering a chunk lights every chunk the same
-step introduced in the accent. Under the bar, chips total the context by the
+step introduced in the accent. Every chunk keeps a mark at least two pixels
+wide, so a context of thousands of chunks (2,000 are about 6,000 px) is wider
+than the card: the bar then scrolls sideways, `first read` and `last read`
+travel with it, and nothing is cut off. Under the bar, chips total the context by the
 step that introduced it — "step 7 Read 34%" — and narrow the chunk list to
 one step. The chunk list gives each chunk's kind, tokens, the step that
 introduced it (linked to that step on the tape), its age and its preview;
@@ -738,7 +770,8 @@ named by the value the change set up (the most readable of co-changed
 values, a version before a digest) with its error rate and the finished runs
 it counts — the side of the change that opens the stretch, which stops at the
 next change point — tinted by that change's verdict, and a marker per change
-point. An agent with more than 40 changes lists only the highest-ranked, and
+point, which jumps to that change's card — its own tenant's, when an operator
+sees two tenants' agents of one name. An agent with more than 40 changes lists only the highest-ranked, and
 the unlisted ones still bound their neighbours' sides, so its stretches carry
 no rate. A change card gives the
 verdict, what decided it (quality or efficiency), the dimension and its

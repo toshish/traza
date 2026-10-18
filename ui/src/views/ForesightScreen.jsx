@@ -61,7 +61,14 @@ export function ForesightScreen({ go, params, identity }) {
   };
 
   const cohorts = useRead((signal) => api.fateCohorts({ since }, signal), [since]);
-  const foresight = useRead((signal) => api.fateRun(run, scope, signal), [run, tenant, oneTenant], { skip: !run || !oneTenant });
+  // Each answer is kept with the run it was asked for. A read keeps its last
+  // answer while the next one loads, and the route can move from one run to
+  // another without the screen remounting: the run named now must never be
+  // shown another run's verdict, odds or path, nor its map be chosen by them.
+  const runRead = useRead((signal) => api.fateRun(run, scope, signal).then((body) => ({ body, run, tenant })),
+    [run, tenant, oneTenant], { skip: !run || !oneTenant });
+  const runAnswer = runRead.data && runRead.data.run === run && runRead.data.tenant === tenant ? runRead.data.body : null;
+  const foresight = { ...runRead, data: runAnswer };
   // The run names its agent; a map opened from a run follows it.
   const runAgent = foresight.data && foresight.data.agent;
   const shownAgent = agent || runAgent || (cohorts.data && cohorts.data.cohorts && cohorts.data.cohorts[0] && cohorts.data.cohorts[0].agent) || '';
@@ -78,10 +85,17 @@ export function ForesightScreen({ go, params, identity }) {
   // whether the run can be read at all.
   const runSettled = !run || (oneTenant ? Boolean(foresight.data || foresight.error) : identity != null);
   const ready = Boolean((cohorts.data || cohorts.error) && runSettled);
-  const map = useRead((signal) => api.fateMap({
+  // The map too is kept with what it was asked for: while another loads, the
+  // one on screen is still drawn, but nothing about the run — its skill at
+  // the default window above all — is read off a build it was not judged
+  // against.
+  const mapKey = JSON.stringify([shownAgent, task, since, depth, minSupport, shownTenant]);
+  const mapRead = useRead((signal) => api.fateMap({
     agent: shownAgent, task: task || undefined, since, depth, min_support: minSupport,
     ...tenantParams(shownTenant),
-  }, signal), [shownAgent, task, since, depth, minSupport, shownTenant], { skip: !shownAgent || !ready });
+  }, signal).then((body) => ({ body, key: mapKey })), [mapKey], { skip: !shownAgent || !ready });
+  const map = { ...mapRead, data: mapRead.data ? mapRead.data.body : null };
+  const mapCurrent = Boolean(mapRead.data && mapRead.data.key === mapKey);
 
   const [collapsed, setCollapsed] = React.useState(() => new Set());
   React.useEffect(() => { setCollapsed(new Set()); }, [shownAgent, task, since, depth, minSupport]);
@@ -113,7 +127,7 @@ export function ForesightScreen({ go, params, identity }) {
   const drawChanges = drawRunChanges(highlight, data, DEPTH_CHOICES);
   // The map's own score at the depth the run was judged, read only off the
   // build the run was judged against: its cohort, the default window.
-  const runSkill = sameCohort && windowId === DEFAULT_WINDOW ? { calibration: data.calibration } : null;
+  const runSkill = sameCohort && mapCurrent && windowId === DEFAULT_WINDOW ? { calibration: data.calibration } : null;
 
   const pickCohort = (c) => {
     const changes = { agent: c.agent, task: c.task || null, node: null, tenant: operator ? (c.tenant || '') : null };
@@ -238,7 +252,7 @@ function MapBody({ map, data, shownAgent, task, windowId, highlight, activeKey, 
     </Card>
 
     <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: 14, alignItems: 'start' }}>
-      <NodePanel node={activeNode} nodeKey={activeKey} base={data.base_rate} go={go} tenant={tenant} windowId={windowId}
+      <NodePanel node={activeNode} nodeKey={activeKey} root={data.root} base={data.base_rate} go={go} tenant={tenant} windowId={windowId}
         folded={collapsed.has(activeKey)} onToggle={onToggle} searchScope={searchScope} task={data.task} agent={data.agent} />
       <ForksCard forks={data.fatal_forks} base={data.base_rate} onSelect={onSelect} />
       <CalibrationCard calibration={data.calibration} />
@@ -263,14 +277,15 @@ export function boundsCaveats(data) {
 
 /** The selected node: its figures, its example runs, and what to do next
     with them. */
-function NodePanel({ node, nodeKey, base, go, tenant, windowId, folded, onToggle, searchScope, task, agent }) {
+function NodePanel({ node, nodeKey, root, base, go, tenant, windowId, folded, onToggle, searchScope, task, agent }) {
   if (!node) return <Card><PanelHead title="Node" /><div style={{ fontSize: 12, color: 'var(--ink-muted)' }}>Click a node of the map.</div></Card>;
   const path = nodeKey ? nodeKey.split('\u0001') : [];
   const means = nodeMeans(node);
   const examples = node.example_runs || [];
   const success = examples.find((e) => e.outcome === 'success');
   const failure = examples.find((e) => e.outcome === 'failure') || examples.find((e) => e.outcome === 'abandoned');
-  const tql = pathToTql(path);
+  // Not offered where the map's text cannot say which branch it means.
+  const tql = pathToTql(path, root);
   const runParams = tenant !== undefined ? { tenant } : undefined;
   return <Card data-testid="node-panel">
     <PanelHead title={path.length ? 'Node' : 'Start'} note={path.length ? `depth ${node.depth}` : 'every run of the cohort'} />

@@ -491,3 +491,67 @@ describe('review follow-ups', () => {
     expect(row('tkt-4173').querySelector('[role="row"]').getAttribute('aria-expanded')).toBe('false');
   });
 });
+
+describe('astra review fixes', () => {
+  const verdictReads = (server, run) => server.calls.filter((c) => c.path === `/v1/fuses/runs/${run}` && c.method === 'GET');
+
+  it('marks the summary partial once the page has let runs go, and never states a short count as the whole', async () => {
+    const server = serve();
+    // Only the run with a nudge waiting is drawn: the summary is the point.
+    await show(RW, new URLSearchParams('filter=nudged'));
+    expect(screen.queryByTestId('live-partial')).toBeNull();
+    const template = listing.runs.find((r) => r.run === 'tkt-4173');
+    let frames = '';
+    for (let i = 0; i < 1001; i += 1) {
+      frames += `event: run\ndata: ${JSON.stringify({ ...template, run: `bulk-${i}`, last_activity_ns: CAPTURE_NS + (i + 1) * 1e6 })}\n\n`;
+    }
+    await act(async () => { server.streams[0].push(frames); });
+    await settle(10);
+    // 1,001 runs streamed in beside the snapshot's: the page holds 1,000.
+    expect(screen.getByText('1,000+')).toBeTruthy();
+    expect(screen.getByTestId('live-partial').textContent).toMatch(/1,000/);
+  });
+
+  it('keeps at most four verdict reads in flight, however many runs wait and however long the reads take', async () => {
+    const server = serve();
+    const never = deferred();
+    server.gate = (c) => (/^\/v1\/fuses\/runs\/[^/]+$/.test(c.path) ? never.promise : null);
+    await show();
+    // Twelve more runs that asked about a step a minute ago and took none.
+    const asked = listing.runs.find((r) => r.run === 'tkt-4162');
+    let frames = '';
+    for (let i = 0; i < 12; i += 1) frames += `event: run\ndata: ${JSON.stringify({ ...asked, run: `wait-${i}` })}\n\n`;
+    await act(async () => { server.streams[0].push(frames); });
+    try {
+      for (let i = 0; i < 14; i += 1) await settle(3000);
+      const reads = new Set(server.calls.filter((c) => /^\/v1\/fuses\/runs\/[^/]+$/.test(c.path)).map((c) => c.path));
+      expect(reads.size).toBeGreaterThan(0);
+      expect(reads.size).toBeLessThanOrEqual(4);
+    } finally {
+      // Let the reads finish, so none is left in flight for a later test to join.
+      never.release();
+      await settle(10);
+    }
+  });
+
+  it('forgets what it learned about a run that left the view, and asks again if it comes back', async () => {
+    const server = serve();
+    await show();
+    await settle(3100);
+    await settle(10);
+    expect(row('tkt-4162').dataset.guard).toBe('held');
+    expect(verdictReads(server, 'tkt-4162')).toHaveLength(1);
+    await act(async () => { server.streams[0].push('event: removed\ndata: {"reason":"evicted","run":"tkt-4162","tenant":""}\n\n'); });
+    await settle(3000);
+    expect(row('tkt-4162')).toBeUndefined();
+    // Back, unchanged: what was known about it went when it left.
+    const back = listing.runs.find((r) => r.run === 'tkt-4162');
+    await act(async () => { server.streams[0].push(`event: run\ndata: ${JSON.stringify(back)}\n\n`); });
+    await settle(10);
+    expect(row('tkt-4162').dataset.guard).toBe('waiting');
+    await settle(3100);
+    await settle(10);
+    expect(verdictReads(server, 'tkt-4162')).toHaveLength(2);
+    expect(row('tkt-4162').dataset.guard).toBe('held');
+  });
+});

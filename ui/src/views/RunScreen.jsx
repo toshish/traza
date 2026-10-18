@@ -70,10 +70,16 @@ export function RunScreen({ runId, go, params, identity, pushToast }) {
   // --no-fuses answers 409 here, and the tape stands on its own.
   const verdict = useRead((signal) => api.fuseRun(runId, scope, signal).catch(() => null), [runId, tenant],
     { skip: !oneTenant });
-  // The step a fork is being made from, and a count of forks made here, so
-  // the listing reads again after one.
+  // The fork being drafted — the run, tenant and step it was opened on, held
+  // together — and a count of forks made here, so the listing reads again
+  // after one. A draft belongs to the tape it was opened from: back and
+  // forward keep this screen mounted while the route moves to the same run
+  // in another tenant, and an edit made against one tenant's step must
+  // never be sent as another's.
   const [forking, setForking] = React.useState(null);
   const [forked, setForked] = React.useState(0);
+  const shownScope = tape.data ? replayScopeKey(tape.data.runId, tape.data.tenant) : null;
+  React.useEffect(() => { setForking(null); }, [shownScope]);
 
   const setParam = (key, value) => {
     const next = new URLSearchParams(params);
@@ -101,6 +107,9 @@ export function RunScreen({ runId, go, params, identity, pushToast }) {
   const totals = tapeTotals(data);
   const sessionLike = !runId.startsWith('trace:');
   const missing = focus != null && !data.steps.some((step) => step.index === focus);
+  // Shown only beside the tape it was drafted from, in the render before the
+  // effect above closes it too.
+  const draft = forking && replayScopeKey(forking.run, forking.tenant) === shownScope ? forking : null;
 
   return <div style={{ display: 'grid', gap: 14, maxWidth: 1700 }}>
     <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
@@ -154,7 +163,8 @@ export function RunScreen({ runId, go, params, identity, pushToast }) {
     </div> : null}
 
     <div className="tz-split" style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(320px, 420px)', gap: 14, alignItems: 'start' }}>
-      <Tape steps={data.steps} totals={totals} go={go} focusStep={focusStep} onFork={setForking}
+      <Tape steps={data.steps} totals={totals} go={go} focusStep={focusStep}
+        onFork={(step) => setForking({ run: shown.runId, tenant: shown.tenant, step })}
         onXray={(index) => go(['xray', runId], { ...(scope || {}), step: String(index) })} />
       <div style={{ display: 'grid', gap: 14, minWidth: 0 }}>
         <RunForesight runId={runId} tenant={tenant} oneTenant={oneTenant} identityKnown={identity != null} go={go} />
@@ -168,8 +178,11 @@ export function RunScreen({ runId, go, params, identity, pushToast }) {
       </div>
     </div>
 
-    <ForkModal run={shown.runId} tenant={shown.tenant} step={forking} identity={identity}
-      onClose={() => setForking(null)} onCreated={() => setForked((n) => n + 1)} />
+    {/* Remounted for each draft, so a creation still pending from an earlier
+        one — in this tenant or another — lands in nothing on screen. */}
+    {draft ? <ForkModal key={replayScopeKey(draft.run, draft.tenant) + '#' + draft.step.index} run={draft.run}
+      tenant={draft.tenant} step={draft.step} identity={identity}
+      onClose={() => setForking(null)} onCreated={() => setForked((n) => n + 1)} /> : null}
   </div>;
 }
 

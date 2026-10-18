@@ -5194,31 +5194,41 @@ mod tests {
             ])
             .expect("ingests");
         let ttl = Duration::from_secs(10);
-        let (clock, elapsed) = hand_clock();
-        let registry = Registry::with_clock(
-            Limits {
-                ttl,
-                ..Limits::default()
-            },
-            Arc::clone(&clock),
-        );
-        let id = registry
-            .create(store, Some(""), "trace:t-pre", Mode::Loose, 1 << 20, NOW)
-            .expect("creates")
-            .id;
         // Taken where the request came in, as the server takes it once the
         // request's head is read.
         let arrival_ns = NOW + ttl.as_nanos() as u64 - 1_000_000_000;
-        let arrival = Arrival::at(arrival_ns, clock());
-        elapsed.fetch_add(2_000_000_000, Ordering::SeqCst);
-        // A bare Unix time is timed from the call, so it still sees the
-        // replay a second short of its expiry: what the boundary's instant
-        // adds is exactly the time spent before the call.
-        assert!(
-            registry.status(store, &id, Some(""), arrival_ns).is_ok(),
-            "a bare arrival time is judged from the call"
-        );
+        // Each method is held to the expiry against a replay of its own, in a
+        // registry of its own: any call that reaches a registry purges what
+        // has expired, so a method asked after another would find its replay
+        // already gone, and answer "not found" whether or not it counted the
+        // time spent before the call.
+        let fresh = |what: &str| {
+            let (clock, elapsed) = hand_clock();
+            let registry = Registry::with_clock(
+                Limits {
+                    ttl,
+                    ..Limits::default()
+                },
+                Arc::clone(&clock),
+            );
+            let id = registry
+                .create(store, Some(""), "trace:t-pre", Mode::Loose, 1 << 20, NOW)
+                .expect("creates")
+                .id;
+            let arrival = Arrival::at(arrival_ns, clock());
+            elapsed.fetch_add(2_000_000_000, Ordering::SeqCst);
+            // A bare Unix time is timed from the call, so it still sees the
+            // replay a second short of its expiry — the replay is there right
+            // up to the check below, and what the boundary's instant adds is
+            // exactly the time spent before the call.
+            assert!(
+                registry.status(store, &id, Some(""), arrival_ns).is_ok(),
+                "{what}: a bare arrival time is judged from the call"
+            );
+            (registry, id, arrival)
+        };
 
+        let (registry, id, arrival) = fresh("a model call");
         let rendered = AtomicU64::new(0);
         let served = registry.next_llm(store, &id, Some(""), None, arrival, |step: &ServedStep| {
             rendered.fetch_add(1, Ordering::SeqCst);
@@ -5226,26 +5236,23 @@ mod tests {
         });
         assert!(
             matches!(served, Err(ReplayError::NotFound)),
-            "a call that reached the registry after the expiry was served: {served:?}"
+            "a model call that reached the registry after the expiry was served: {served:?}"
         );
         assert_eq!(rendered.load(Ordering::SeqCst), 0, "it rendered a step");
-        for (what, outcome) in [
-            (
-                "a tool call",
-                registry
-                    .next_tool(store, &id, Some(""), None, arrival)
-                    .map(|_| ()),
-            ),
-            (
-                "a status read",
-                registry.status(store, &id, Some(""), arrival).map(|_| ()),
-            ),
-        ] {
-            assert!(
-                matches!(outcome, Err(ReplayError::NotFound)),
-                "{what} that reached the registry after the expiry was answered: {outcome:?}"
-            );
-        }
+
+        let (registry, id, arrival) = fresh("a tool call");
+        let tool = registry.next_tool(store, &id, Some(""), None, arrival);
+        assert!(
+            matches!(tool, Err(ReplayError::NotFound)),
+            "a tool call that reached the registry after the expiry was answered: {tool:?}"
+        );
+
+        let (registry, id, arrival) = fresh("a status read");
+        let status = registry.status(store, &id, Some(""), arrival);
+        assert!(
+            matches!(status, Err(ReplayError::NotFound)),
+            "a status read that reached the registry after the expiry was answered: {status:?}"
+        );
     }
 
     /// A registry clock moved by hand: it reads a fixed origin plus the

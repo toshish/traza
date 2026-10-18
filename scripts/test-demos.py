@@ -92,6 +92,90 @@ def run_agent(path, *args, env=None):
                           text=True, timeout=30)
 
 
+class MissionControlHolds(unittest.TestCase):
+    """A Mission Control agent the pre-call check refuses waits for release
+    under ONE deadline, and counts a release only when the check lets the
+    step it was refused go ahead.
+
+    The check judges the path with the next step added; the verdict read
+    the agent polls while it holds judges the path so far. A stop on the
+    step alone — a predictive limit judging the named tool, a block nudge —
+    leaves the verdict read saying continue, which is no release."""
+
+    HOLD = 90
+
+    def setUp(self):
+        self.agents = load("mission_agents", ROOT / "examples/mission-control/agents.py")
+        clock = self.clock = [1_000_000.0]
+        limit = clock[0] + 10 * self.HOLD
+
+        class Overran(Exception):
+            pass
+
+        def sleep(seconds):
+            clock[0] += max(seconds, 0.001)
+            if clock[0] > limit:
+                raise Overran("still holding after %d s of a %d s hold" % (clock[0] - 1_000_000, self.HOLD))
+
+        self.agents.time = type("FakeTime", (), {"time": staticmethod(lambda: clock[0]), "sleep": staticmethod(sleep)})
+        self.agents.say = lambda *parts: None
+        self.agents.warn = lambda *parts: None
+
+    def api(self, check, verdict):
+        """A server whose check answers `check(n)` to its nth call and whose
+        verdict read answers `verdict(seconds since the start)`."""
+        clock, start = self.clock, self.clock[0]
+
+        class Api:
+            checks = 0
+            reads = 0
+            spans = []
+
+            def post(self, path, body):
+                if path == "/v1/fuses/check":
+                    Api.checks += 1
+                    stop = check(Api.checks)
+                    return 200, {"verdict": "stop" if stop else "continue",
+                                 "reasons": ["foresight: the named step's odds are 4%"] if stop else [], "nudges": []}
+                Api.spans.extend(body.get("spans", []))
+                return 200, {}
+
+            def get(self, path):
+                Api.reads += 1
+                return 200, {"verdict": verdict(clock[0] - start)}
+
+        return Api()
+
+    def test_a_stop_on_the_next_step_alone_abandons_at_the_deadline(self):
+        for kind in ("Run", "TeamRun"):
+            with self.subTest(kind=kind):
+                start = self.clock[0]
+                api = self.api(check=lambda n: True, verdict=lambda elapsed: "continue")
+                run = getattr(self.agents, kind)(api, "run-" + kind, "refund" if kind == "Run" else "handoff", 1.0, self.HOLD)
+                run.work()
+                self.assertEqual(run.outcome, "abandoned")
+                self.assertEqual(run.position, 0, "it took a step the check refused")
+                self.assertEqual(run.released, 0, "a verdict read of the path so far is not a release")
+                self.assertEqual(len(run.stops), 1, "one refused step is one hold")
+                self.assertLessEqual(self.clock[0] - start, self.HOLD + 5)
+                self.assertFalse(run.holding)
+
+    def test_a_release_is_counted_when_the_check_lets_the_step_go(self):
+        # Stopped for the path so far (the verdict read says stop too) until
+        # someone resets the run 20 s in; the check then lets the step go.
+        released_at = 20
+        api = self.api(check=lambda n: n == 1 or self.clock[0] - start < released_at,
+                       verdict=lambda elapsed: "stop" if elapsed < released_at else "continue")
+        start = self.clock[0]
+        run = self.agents.Run(api, "run-released", "refund", 1.0, self.HOLD)
+        run.work()
+        self.assertEqual(run.released, 1)
+        self.assertEqual(len(run.stops), 1)
+        self.assertEqual(run.position, len(run.steps))
+        self.assertIn(run.outcome, ("success", "failure"))
+        self.assertFalse(run.holding)
+
+
 class RedirectsAreRefused(unittest.TestCase):
     """Every authenticated request a demo agent makes refuses a 3xx: the
     token reaches only the URL the agent was configured with."""
