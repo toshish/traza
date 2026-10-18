@@ -109,6 +109,14 @@ impl Store {
         (semconv::step_facts_with(span, &llm), llm)
     }
 
+    /// [`Self::step_facts`] without the request's and response's digests
+    /// ([`semconv::step_facts_undigested`]): for a reader that digests only
+    /// the steps it must.
+    pub(crate) fn step_facts_undigested(&self, span: &Span) -> (StepFacts, LlmFacts) {
+        let llm = self.facts(span);
+        (semconv::step_facts_undigested(span, &llm), llm)
+    }
+
     /// [`Self::step_facts`] plus what a tape step keeps beyond the facts
     /// ([`semconv::StepExtras`]), from one extraction.
     pub(crate) fn step_facts_detailed(

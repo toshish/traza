@@ -63,7 +63,7 @@ derived from data both sides of it hold.
 | Transcript | Span | Notable attributes |
 |---|---|---|
 | a session | the run: every span carries `session.id` (Claude Code's `sessionId`; for Codex, the root thread id) | `traza.source`, `code.project` (the session's working directory), `service.version` (the tool's version), `vcs.ref.head.name`; `service` is `claude-code` or `codex` |
-| a user prompt | a `turn` span (not a step) | event `gen_ai.user.message` with the prompt as `content`; the session's first prompt, cut to 200 characters, is also `session.goal`; status is that of the turn's last model call |
+| a user prompt | a `turn` span (not a step) | event `gen_ai.user.message` with the prompt as `content`; the session's first prompt, cut to 200 characters, is also `session.goal` — less any `<system-reminder>` blocks a harness put ahead of the person's words (a prompt that is only such blocks sets none); status is that of the turn's last model call |
 | a model response | an llm step, child of its turn | `gen_ai.operation.name=chat`, `gen_ai.provider.name` (`anthropic`, `openai`), `gen_ai.request.model`, `gen_ai.usage.input_tokens` / `output_tokens` / `cache_read.input_tokens` / `cache_creation.input_tokens`, `gen_ai.input.messages` (the conversation since the previous response), `gen_ai.output.messages` (text, reasoning, tool calls), `gen_ai.conversation.id` (the session; `<session>/<agent id>` for a Claude Code sub-agent; the thread for Codex) and `traza.input.delta` (`true`: the input is what was added since the conversation's previous call; `false` on the first call after a compaction, whose input — the summary and what followed, or Codex's replacement history — is all it saw) |
 | a tool call and its result | a tool step, child of the response that asked for it | `gen_ai.tool.name`, `gen_ai.tool.call.id`, `gen_ai.tool.call.arguments` (kept as JSON), `gen_ai.tool.call.result`; status `error` when Claude Code marks the result an error or a Codex command exits non-zero (`process.exit.code`), `ok` once a result says otherwise, and none while no result was recorded (a call that never returned claims no outcome); `traza.edit=true` on a Codex call that applies a patch through a general tool (an older build's `shell ["apply_patch", …]`), so blame can find it without reading every command |
 | a sub-agent | an agent step, `gen_ai.operation.name=invoke_agent` | `gen_ai.agent.name` (Claude Code's `agentType`, Codex's `agent_role`); a Claude Code sub-agent is a child of the `Agent`/`Task` tool call that spawned it and its own calls are its children |
@@ -216,11 +216,16 @@ credential, and — for a batch import — an unreachable server or an exhausted
 quota, stop the import with the server's own words. The exit code is 0, 3 when
 some spans or files were refused, and 2 when the import could not run.
 
-`--since 7d` only reads sessions with a file modified that recently, and reads
-such a session whole: a Claude Code transcript with every sub-agent file of its
-session, a Codex rollout with the rollouts of its parent threads (as far as the
-rollouts on disk tell) — so an `Agent` call keeps its agent and a sub-agent
-thread its root. `--project-filter SUBSTR` only reads sessions whose file path
+`--since 7d` only reads sessions active that recently, and reads such a
+session whole. A Claude Code transcript is judged by its newest timestamped
+record, not by its modification time alone: Claude Code appends untimestamped
+bookkeeping (the last prompt, a title, a mode) to transcripts it has not run for
+months, so a file modified today may hold a session from last quarter. A file
+whose records cannot tell (none within 8 MiB of its end carries a time) and a
+Codex rollout are judged by when they were modified. A session is read whole:
+a Claude Code transcript with every sub-agent file of its session, a Codex
+rollout with the rollouts of its parent threads (as far as the rollouts on disk
+tell) — so an `Agent` call keeps its agent and a sub-agent thread its root. `--project-filter SUBSTR` only reads sessions whose file path
 or working directory contains it. `--json` prints the counts as JSON:
 
 ```json

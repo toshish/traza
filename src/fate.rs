@@ -3356,12 +3356,26 @@ impl LivePath {
 
 /// A run's stored spans read the way a build reads them, and how the run
 /// has ended so far (`unknown` while it may go on).
-fn read_spans(spans: &[Span], truncated: bool, now_ns: u64) -> (Reading, Outcome) {
+///
+/// `spans` are the run's spans in step order: every one of them when
+/// `read_whole`, else only its earliest (the read was cut, so its end is
+/// not known and the outcome is `unknown`). The path is read from the
+/// earliest `max_spans` of them; the outcome and the step count from all —
+/// a whole read of a long run costs the same either way, and its outcome is
+/// what the map counted it as.
+fn read_spans(
+    spans: &[Span],
+    max_spans: usize,
+    read_whole: bool,
+    now_ns: u64,
+) -> (Reading, Outcome) {
+    let truncated = !read_whole || spans.len() > max_spans;
+    let (head, rest) = spans.split_at(spans.len().min(max_spans));
     let mut steps: Vec<(StepOrder, String, Option<String>)> = Vec::new();
     // The earliest span as a build picks it: by order, then by its
     // service's key, whatever order the store returned the spans in.
     let mut earliest: Option<((OrderKey, u64), &str)> = None;
-    for span in spans {
+    for span in head {
         let key = order_key(span);
         if earliest.map_or(true, |((first, _), _)| key <= first) {
             let candidate = (key, stem_key(&stem_cow(&span.service)));
@@ -3391,13 +3405,18 @@ fn read_spans(spans: &[Span], truncated: bool, now_ns: u64) -> (Reading, Outcome
             .or_else(|| earliest.map(|(_, service)| service.to_owned()))
             .unwrap_or_default(),
     );
-    let total = steps.len();
+    // Past the head only the count is wanted: no signature is built.
+    let beyond = rest
+        .iter()
+        .filter(|span| semconv::step_kind_with(span, &semconv::facts(&span.attributes)).is_step())
+        .count();
+    let total = steps.len() + beyond;
     let complete = !truncated && total <= RUN_STEP_WINDOW;
     steps.truncate(RUN_STEP_WINDOW);
-    let outcome = if truncated {
-        Outcome::Unknown
-    } else {
+    let outcome = if read_whole {
         attribution::session_outcome(spans, now_ns, crate::mcp::SESSION_IDLE_NS).outcome
+    } else {
+        Outcome::Unknown
     };
     let groups = groups(steps.into_iter().map(|(_, signature, _)| signature))
         .into_iter()
@@ -3854,13 +3873,18 @@ impl Store {
         validate_run(run)?;
         let min_support = min_support.max(1);
         let deadline = self.query_deadline(Instant::now());
-        let read = self.run_spans(Some(tenant), run, FORESIGHT_RUN_SPANS, deadline)?;
+        // The whole run: resolving it reads every span before any cap would
+        // keep the earliest, so keeping all of them costs memory the read
+        // already spent — and the run's end, which decides its outcome, is
+        // among the latest.
+        let read = self.run_spans(Some(tenant), run, usize::MAX, deadline)?;
         if read.spans.is_empty() {
             return Ok(None);
         }
         let key = BuildKey::of(Some(tenant), None, None);
         let build = self.fate.get_or_build(self, &key, now_ns, deadline)?;
-        let (reading, outcome) = read_spans(&read.spans, read.truncated, now_ns);
+        let (reading, outcome) = read_spans(&read.spans, FORESIGHT_RUN_SPANS, true, now_ns);
+        let partial = read.spans.len() > FORESIGHT_RUN_SPANS;
         let agent = reading.agent.clone().unwrap_or_default();
         let mut foresight = Foresight {
             run: run.to_owned(),
@@ -3882,7 +3906,7 @@ impl Store {
             outcome,
             cohort_runs: 0,
             excluded_self: false,
-            partial: read.truncated,
+            partial,
             last_open: false,
             min_support,
             map_built_at_ns: Some(build.built_at_ns),
@@ -4125,8 +4149,12 @@ impl Store {
                     out.explanation = "the run has no recorded steps yet".to_owned();
                     return out;
                 }
-                let (mut reading, _) =
-                    read_spans(&read.spans, read.truncated, crate::mcp::unix_nanos_now());
+                let (mut reading, _) = read_spans(
+                    &read.spans,
+                    FORESIGHT_RUN_SPANS,
+                    !read.truncated,
+                    crate::mcp::unix_nanos_now(),
+                );
                 reading.live = true;
                 reading
             }

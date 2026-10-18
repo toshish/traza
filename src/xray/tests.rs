@@ -1239,6 +1239,55 @@ fn the_autopsy_names_causes_volatile_tokens_and_cost() {
 }
 
 #[test]
+fn a_cache_the_provider_served_did_not_expire_whatever_ttl_was_assumed() {
+    // The last call of `cache_run` comes ten minutes after its predecessor,
+    // past the assumed five-minute TTL, with its prefix intact. When the
+    // provider reports reading that prefix from its cache, the cache lived
+    // longer than assumed (Claude Code and Codex both run caches longer
+    // than five minutes): nothing was lost, and nothing contradicts the
+    // provider. A real coding-agent store showed this on 15 of 25 such
+    // verdicts of one session, millions of tokens counted lost that the
+    // provider had served.
+    let served = |read: u64| {
+        let mut spans = cache_run("claude-x");
+        let last = spans.last_mut().expect("four calls");
+        last.attributes
+            .insert("gen_ai.usage.cache_read.input_tokens".into(), json!(read));
+        let fixture = TempStore::open("xray-ttl-served", priced_config());
+        fixture.store().ingest_batch(spans).expect("ingests");
+        fixture
+            .store()
+            .cache_autopsy(Some(""), "s3", AutopsyOptions::default())
+            .expect("reads")
+            .expect("found")
+    };
+    // The predecessor reported a 900-token context; 850 of it read now.
+    let autopsy = served(850);
+    let last = &autopsy.steps[3];
+    assert_eq!(last.cause, Cause::Stable, "{}", last.explanation);
+    assert_eq!(last.est_tokens_lost, 0);
+    assert_eq!(last.est_cost_lost_usd, Some(0.0));
+    assert_eq!(last.gap_ns, Some(600 * SECOND));
+    assert!(
+        last.explanation.contains("past the 5 min 0 s TTL assumed")
+            && last.explanation.contains("read 850"),
+        "{}",
+        last.explanation
+    );
+    assert_eq!(autopsy.summary.by_cause["ttl_expired"], 0);
+    assert_eq!(autopsy.summary.breaks, 1, "only the timestamp edit");
+    assert_eq!(
+        autopsy.summary.disagreements, 1,
+        "only the stable call with no read: the served one agrees"
+    );
+    // A read of a small part — what a longer-lived system prompt alone
+    // would be — leaves the conversation's prefix expired.
+    let autopsy = served(100);
+    assert_eq!(autopsy.steps[3].cause, Cause::TtlExpired);
+    assert!(autopsy.steps[3].est_tokens_lost > 0);
+}
+
+#[test]
 fn an_unpriced_model_reports_tokens_but_no_money() {
     let fixture = TempStore::open("xray-unpriced", priced_config());
     fixture
@@ -1505,7 +1554,7 @@ fn a_step_of_a_run_is_xrayed_from_one_read() {
 }
 
 #[test]
-fn a_call_past_the_read_limit_reports_no_step_index_anywhere() {
+fn a_call_xrayed_alone_reports_no_step_index_anywhere() {
     let fixture = TempStore::open("xray-fallback", crate::Config::default());
     fixture.store().ingest_batch(agent_run()).expect("ingests");
     let store = fixture.store();
@@ -1513,7 +1562,8 @@ fn a_call_past_the_read_limit_reports_no_step_index_anywhere() {
         .xray_target(Some(""), "tr-s1", "l6", None)
         .expect("reads")
         .expect("found");
-    // As if the call lay past the read: its step is not in the tape.
+    // As if the call were not among its run's spans: its step is not in
+    // the tape, so it is X-rayed alone.
     target.tape.steps.retain(|step| step.span_id != "l6");
     let xray = store
         .xray_in(target, None, options(20), Limits::DEFAULT)
@@ -1654,6 +1704,137 @@ fn delta_run() -> Vec<Span> {
             json!([msg("assistant", "Fixed.")]),
         ),
     ]
+}
+
+#[test]
+fn a_late_call_of_a_long_session_is_read_with_the_history_nearest_it() {
+    // A coding-agent session longer than one read: two calls, twenty
+    // thousand spans of other work, then a call that carries on the main
+    // conversation, a compaction that starts it over, a call after it, and
+    // a helper conversation that opens late. Every call is a delta. The
+    // late calls used to be X-rayed alone — no step index, no context —
+    // which made the X-Ray useless for the latest calls of exactly the
+    // sessions worth X-raying.
+    let fixture = TempStore::open("xray-long", crate::Config::default());
+    let mut spans = vec![
+        delta_llm(
+            "m0",
+            100,
+            "main",
+            true,
+            json!([msg("system", SYSTEM), msg("user", TASK)]),
+            json!([msg("assistant", "Reading")]),
+        ),
+        delta_llm(
+            "m1",
+            200,
+            "main",
+            true,
+            json!([msg("user", "go on")]),
+            json!([msg("assistant", "Going")]),
+        ),
+    ];
+    let filler = MAX_TAPE_SPANS;
+    for index in 0..filler {
+        spans.push(span(
+            "tr-d1",
+            &format!("f{index:05}"),
+            300 + index as u64 * 10,
+            json!({"session.id": "d1"}),
+        ));
+    }
+    let late = 300 + filler as u64 * 10;
+    spans.extend([
+        delta_llm(
+            "m2",
+            late,
+            "main",
+            true,
+            json!([msg("user", "still going")]),
+            json!([msg("assistant", "Compacting")]),
+        ),
+        delta_llm(
+            "m3",
+            late + 10,
+            "main",
+            false,
+            json!([
+                msg("system", SYSTEM),
+                msg("user", "Summary: the parser bug")
+            ]),
+            json!([msg("assistant", "Resuming")]),
+        ),
+        delta_llm(
+            "h0",
+            late + 20,
+            "helper",
+            true,
+            json!([msg("user", "Where is zeta_marker_one defined?")]),
+            json!([msg("assistant", "In parser.rs")]),
+        ),
+        delta_llm(
+            "m4",
+            late + 30,
+            "main",
+            true,
+            json!([msg("user", "after the compaction")]),
+            json!([msg("assistant", "Fixed.")]),
+        ),
+    ]);
+    fixture.store().ingest_batch(spans).expect("ingests");
+
+    // After the compaction the context is rebuilt whole, its indices are
+    // the run's, and its history before the read is said to be unread.
+    let xray = xray_of(fixture.store(), Some(""), "tr-d1", "m4", options(20));
+    assert_eq!(xray.context_unavailable, None, "{xray:?}");
+    let chunks: Vec<&str> = xray
+        .chunks
+        .iter()
+        .map(|chunk| chunk.preview.as_str())
+        .collect();
+    assert_eq!(
+        chunks,
+        [
+            SYSTEM,
+            "Summary: the parser bug",
+            "Resuming",
+            "after the compaction"
+        ]
+    );
+    assert_eq!(xray.step_index, Some(5), "m0 m1 m2 m3 h0 before it");
+    assert_eq!(xray.previous.as_ref().map(|p| p.step_index), Some(3));
+    assert_eq!(xray.cache.step_index, Some(5));
+    assert_eq!(xray.cache.previous_step_index, Some(3));
+    assert_eq!(
+        xray.chunks[3].introduced_by.as_ref().map(|i| i.step_index),
+        Some(5)
+    );
+    assert!(xray.provenance_partial);
+    // The same call by its step.
+    let by_step = fixture
+        .store()
+        .xray_step(Some(""), "d1", 5, options(20))
+        .expect("reads")
+        .expect("found");
+    assert_eq!(by_step.span, xray.span);
+    assert_eq!(by_step.chunks.len(), 4);
+    // A conversation that opened inside the read is read as it was.
+    let helper = xray_of(fixture.store(), Some(""), "tr-d1", "h0", options(20));
+    assert_eq!(helper.context_unavailable, None);
+    assert_eq!(helper.step_index, Some(4));
+    // Before the compaction, the main conversation's earlier calls lie
+    // before the read: said so, never passed off as its whole context.
+    let before = xray_of(fixture.store(), Some(""), "tr-d1", "m2", options(20));
+    assert_eq!(before.context_unavailable, Some(BEGAN_BEFORE_READ));
+    assert_eq!(before.step_index, Some(2));
+    // A step past the run's end names how many there are.
+    assert!(matches!(
+        fixture.store().xray_step(Some(""), "d1", 9, options(20)),
+        Ok(Err(XrayMiss::NoStep {
+            steps: 6,
+            more: false
+        }))
+    ));
 }
 
 #[test]

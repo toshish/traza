@@ -317,8 +317,11 @@ as a context it was not. A rebuilt context is held to the 2,000-chunk bound
 like any other (`chunks_truncated`). The X-Ray reads the run's earlier calls
 twice when it rebuilds — once in order to rebuild the call and the comparison
 window, once as recorded for provenance — inside the same query deadline and
-payload budgets. A delta call past the read limit is X-rayed alone and says
-its context is partial. Measured on one real Claude Code session of 1,482
+payload budgets. A call past a run's first 20,000 spans is read with the
+20,000 spans that end at it (below): a conversation already under way before
+them is rebuilt from its first compaction inside them on, and a delta call of
+it before that compaction says it *could not be rebuilt*, its conversation
+having begun before the spans read. Measured on one real Claude Code session of 1,482
 model calls (26 MB of transcript, release build, a laptop): the X-Ray of its
 last call rebuilt 1,002 chunks in 0.5 s, and the autopsy of all 1,482 calls
 took 1.4 s, finding its two compactions as `rewritten`.
@@ -411,7 +414,7 @@ identity; `prefix_chunks_shared` is how far they agree.
 |---|---|---|
 | `stable` | The predecessor's whole context is an unchanged prefix of this one, within the TTL | — |
 | | A **new turn**: everything up to the predecessor's last chunk is unchanged, this call puts new content (or an edit at its very end) in that chunk's place, and nothing the predecessor had follows — a stateless pipeline's next input, a replaced last message. The cache served all it could | `replaced` or `edited` |
-| `ttl_expired` | The prefix is intact (or a new turn), but the TTL had passed since the predecessor began | — or `replaced` / `edited` |
+| `ttl_expired` | The prefix is intact (or a new turn), but the TTL had passed since the predecessor began — unless the provider reports having served it (below), which makes the call `stable` | — or `replaced` / `edited` |
 | `volatile_content` | A chunk inside the prefix changed in place — the same role and kind, at most a tenth of its text differing, verified on both texts — with content the predecessor had after the change | `edited` |
 | | A chunk inside the prefix was swapped for different content while what followed it survives (or its text was not kept, so an edit could not be confirmed) | `replaced` |
 | | A new chunk sits ahead of content the predecessor already had | `inserted` |
@@ -443,6 +446,17 @@ low end of OpenAI's — and `ttl_seconds=` sets it per request (up to a day) for
 deployments on longer-lived caches. `gap_ns` is the time since the predecessor
 *began*, which is when its prompt entered the cache. A structural divergence
 outranks an expired TTL as the cause; the explanation mentions both.
+
+The TTL is an assumption; the provider's report is evidence. When the prefix
+was carried intact past the TTL and the call reports reading at least half of
+what its predecessor reported as its whole context from the cache — both
+counts in the provider's own tokens — the cache plainly outlived the
+assumption: the verdict is `stable`, nothing is counted lost, and the
+explanation says the cache outlived the assumed TTL. Real producers run longer
+caches than five minutes: on one real Claude Code session, 15 of the 25 calls
+a five-minute TTL called expired had read their whole prefix from the cache.
+A smaller read (a long-lived system prompt alone, say) leaves `ttl_expired`
+standing, and no structural verdict ever yields to a reported count.
 
 ### The volatile token
 
@@ -489,9 +503,11 @@ so a total is never silently an undercount.
 every verdict. `summary.disagreements` counts calls where the two contradict
 each other: a `stable` prefix with no cache read reported (the provider did not
 cache — no cache breakpoint set, or a prefix below its minimum cacheable
-length), or a read reported where nothing could have been served (a TTL
-longer than the one assumed). The autopsy does not explain these away; it
-counts them, and `summary.disagreement_advice` lists what to check.
+length), or a read reported where nothing could have been served. The
+autopsy does not explain these away; it counts them, and
+`summary.disagreement_advice` lists what to check. The one report it acts on
+is a read of most of an intact prefix past the assumed TTL (above): that call
+is `stable`, and agrees with the provider.
 
 ## Pricing cached tokens
 
@@ -554,9 +570,13 @@ anything.
   attributes, a provider body's `tools`) are compared in canonical key order,
   so a key-order change in them is invisible; text-recorded arguments and
   definitions keep their bytes, offloaded or not.
-- **Bounds.** One request reads its run's first 20,000 spans; a call past that
-  is X-rayed alone (`step_index: null` here and in `cache`,
-  `provenance_partial: true`, cache `unknown`). A context is split into at most
+- **Bounds.** One request reads 20,000 of its run's spans: the first 20,000,
+  or — for a call past them, such as the latest call of a long session — the
+  20,000 that end at it. Its `step_index` (and every index it names) still
+  counts the whole run's steps, and `provenance_partial` is `true`: a chunk
+  first seen before those spans is not traced to its step. (A call that is
+  not among its run's spans at all is X-rayed alone: `step_index: null` here
+  and in `cache`, cache `unknown`.) A context is split into at most
   2,000 chunks (`chunks_truncated` on the X-Ray, on a verdict when either
   context compared was cut, and on the autopsy; past the cut nothing is taken
   to match or to be missing — see [Causes](#causes) and

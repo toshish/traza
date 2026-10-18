@@ -133,6 +133,9 @@ pub(crate) struct Step<'a> {
     calls: OnceCell<Vec<String>>,
     edit: OnceCell<bool>,
     test: OnceCell<bool>,
+    /// The request digest and fingerprint, computed on first use: the facts
+    /// may come without them ([`crate::semconv::step_facts_undigested`]).
+    digested: OnceCell<(Option<String>, String)>,
 }
 
 /// A model call's tool catalog.
@@ -179,6 +182,13 @@ impl<'a> Step<'a> {
 
     pub(crate) fn start_ns(&self) -> u64 {
         self.span.start_time_ns
+    }
+
+    /// The step's request digest and fingerprint, digested once.
+    fn digested(&self) -> &(Option<String>, String) {
+        self.digested.get_or_init(|| {
+            crate::semconv::request_digest_and_fingerprint(self.span, &self.facts, &self.llm)
+        })
     }
 
     fn args_text(&self) -> Option<&str> {
@@ -339,8 +349,8 @@ impl<'a> Step<'a> {
                 .and_then(|value| navigate(value, path))
                 .map_or(Val::Missing, json_val),
             Field::File => Val::List(Cow::Borrowed(self.files())),
-            Field::Digest => text(self.facts.request_digest.as_deref()),
-            Field::Fingerprint => text(Some(&self.facts.fingerprint)),
+            Field::Digest => text(self.digested().0.as_deref()),
+            Field::Fingerprint => text(Some(&self.digested().1)),
             Field::Signature => text(Some(self.facts.signature())),
             Field::Calls => match self.facts.kind {
                 StepKind::Llm => Val::List(Cow::Borrowed(self.calls())),
@@ -863,6 +873,7 @@ pub(crate) fn build_steps<'a>(
             calls: OnceCell::new(),
             edit: OnceCell::new(),
             test: OnceCell::new(),
+            digested: OnceCell::new(),
         });
     }
     Deadline::check(deadline, 0)?;
@@ -1485,6 +1496,47 @@ pub(crate) mod tests {
 
     pub(crate) fn is_test(step: &Step<'_>) -> bool {
         step.is_test(&mut Meter::new(None)).expect("no deadline")
+    }
+
+    #[test]
+    fn digests_are_computed_only_for_the_steps_a_pattern_asks_about() {
+        let spans = vec![
+            bash(0, json!("cargo test")),
+            step_span(
+                1,
+                "llm",
+                "gpt-4o",
+                "ok",
+                json!({"gen_ai.input.messages": [{"role": "user", "content": "x".repeat(4096)}]}),
+            ),
+        ];
+        let undigested = |span: &Span| {
+            let llm = crate::semconv::facts(&span.attributes);
+            (crate::semconv::step_facts_undigested(span, &llm), llm)
+        };
+        let lazy = build_steps(&spans, undigested, None).expect("builds");
+        let eager = steps(&spans);
+        for (lazy, eager) in lazy.iter().zip(&eager) {
+            // Nothing is digested by building the steps, nor by reading a
+            // field that is not a digest.
+            assert!(lazy.facts.request_digest.is_none());
+            assert_eq!(
+                field_of(lazy, &Field::Signature),
+                field_of(eager, &Field::Signature)
+            );
+            assert!(lazy.digested.get().is_none());
+            // Asked for, the digest and fingerprint are the eager ones.
+            assert!(eager.facts.request_digest.is_some());
+            assert_eq!(
+                field_of(lazy, &Field::Digest),
+                field_of(eager, &Field::Digest)
+            );
+            assert_eq!(
+                field_of(lazy, &Field::Fingerprint),
+                field_of(eager, &Field::Fingerprint)
+            );
+            assert!(lazy.digested.get().is_some());
+        }
     }
 
     fn field_of(step: &Step<'_>, field: &Field) -> String {

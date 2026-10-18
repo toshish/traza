@@ -49,6 +49,33 @@ describe('the session list', () => {
   });
 });
 
+describe('a session nothing priced', () => {
+  // A coding-agent transcript records tokens but no cost, and with no
+  // pricing table nothing derives one: cost reads "—", and so must cost per
+  // turn — `0.00000` would say the session was free.
+  it('shows no cost per turn in the list or on the session', async () => {
+    render(<SessionsScreen go={vi.fn()} params={new URLSearchParams()} />);
+    await flush();
+    const row = screen.getAllByRole('link').find((node) => node.textContent.startsWith('weather-7'));
+    expect(row.textContent).not.toContain('0.00000');
+    cleanup();
+    render(<SessionScreen sessionId="weather-7" go={vi.fn()} params={new URLSearchParams('tenant=')} />);
+    await flush();
+    const card = screen.getByText('cost / turn').parentElement;
+    expect(card.textContent).toBe('cost / turn—');
+  });
+
+  it('still divides a priced cost by the turns', async () => {
+    api.session.mockResolvedValueOnce({
+      session_id: 'paid', trace_count: 4, span_count: 8, llm_calls: 4, total_tokens: 900,
+      cost_usd: 0.02, cost_metered_calls: 4, error_count: 0, first_start_ns: 1, last_end_ns: 2, traces: [],
+    });
+    render(<SessionScreen sessionId="paid" go={vi.fn()} params={new URLSearchParams('tenant=')} />);
+    await flush();
+    expect(screen.getByText('cost / turn').parentElement.textContent).toBe('cost / turn0.00500');
+  });
+});
+
 describe('one session', () => {
   it('reads the session in the tenant its route names, and opens the run there', async () => {
     const go = vi.fn();

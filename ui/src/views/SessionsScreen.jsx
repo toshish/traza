@@ -90,7 +90,7 @@ export function SessionsScreen({ go }) {
         <Num muted>{fmtNum(session.llm_calls)}</Num>
         <Num>{fmtNum(session.total_tokens)}</Num>
         <Num accent={!cost.estimated} muted={cost.estimated} title={cost.title}>{cost.text}</Num>
-        <Num muted>{session.trace_count
+        <Num muted>{session.trace_count && cost.priced
           ? (cost.estimated ? '~' : '') + (session.cost_usd / session.trace_count).toFixed(5)
           : '—'}</Num>
         <Num tone={session.error_count ? 'var(--error)' : 'var(--ink-faint)'}>{session.error_count}</Num>
@@ -147,7 +147,8 @@ export function SessionScreen({ sessionId, go, params }) {
         ['LLM calls', fmtNum(data.llm_calls)],
         ['tokens', fmtNum(data.total_tokens)],
         ['cost USD', fmtCostProvenance(data).text],
-        ['cost / turn', data.trace_count
+        // Nothing priced is no figure, per turn as in total.
+        ['cost / turn', data.trace_count && fmtCostProvenance(data).priced
           ? (fmtCostProvenance(data).estimated ? '~' : '') + (data.cost_usd / data.trace_count).toFixed(5)
           : '—'],
         ['errors', fmtNum(data.error_count)],

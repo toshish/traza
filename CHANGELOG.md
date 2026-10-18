@@ -490,7 +490,66 @@ before deploying over an existing setup.
   token (a handoff link followed before the mint answered) no longer shows
   its secret over the new session, and a secret on display no longer
   outlives the switch. Leaving the Live tail (or any streaming screen) no
-  longer throws an unhandled "signal is aborted" error.
+  longer throws an unhandled "signal is aborted" error. A session nothing
+  priced — a coding-agent transcript, with no pricing table — shows "—"
+  for its cost per turn, as for its cost, not `0.00000`.
+- **Foresight on a long session keeps its outcome.** `GET /v1/fate/runs/{run}`
+  (and MCP `foresee_run`) read a run of more than 20,000 spans from its
+  earliest 20,000 only, so a finished coding-agent session that long came
+  back `"outcome": "unknown"` with a step count capped at what was read —
+  while the same answer said the run had been left out of its map as a
+  completed one. The run is now read whole: its path still comes from its
+  earliest 20,000 spans (`partial`), but its outcome and `steps` cover every
+  span, as the map's fold always did.
+- **`import --since` selects sessions that ran recently, not files that
+  were touched.** Claude Code appends untimestamped bookkeeping (the last
+  prompt, a title, a mode) to transcripts it has not run for months, which
+  moves their modification time: on one real machine a third of the
+  transcripts modified in the last two weeks had not recorded a turn in five
+  to thirteen weeks, so `--since 14d` imported 57 sessions of which 49 had
+  no span in the last 30 days — and every 30-day surface (the Fate Map,
+  TQL, findings) then saw only the 8 that did. A Claude Code file now counts
+  as recent by its newest timestamped record, found by reading backwards
+  from its end (at most 8 MiB, past bookkeeping and an unfinished line); a
+  file whose records cannot tell, and a Codex rollout (which timestamps
+  every record it writes), are still judged by when they were modified.
+- **TQL searches, detector findings and recall stop hashing every step.**
+  Each read every candidate run's steps with their request and response
+  SHA-256s — over a coding agent's runs, a digest of every model call's
+  whole conversation — though only a pattern naming `digest` or
+  `fingerprint` reads one, and recall reads neither. On a real store of 57
+  coding-agent sessions (89,777 spans) that was most of the time: a search
+  took 4.8–12.5 s and the whole detector library 9.6 s. A step's digest is
+  now computed when a pattern first reads it, and recall summarises runs
+  from their step signatures alone: searches take 2.4–3.6 s, findings 4.1 s
+  and recall 1.2–3.4 s on the same store (release build, a laptop).
+- **The Cache Autopsy believes a provider that served the prefix.** An
+  intact prefix past the assumed five-minute TTL was always `ttl_expired`,
+  its whole prefix counted lost, even when the provider reported reading it
+  from cache — counted as a disagreement but kept in every total. Claude
+  Code runs longer caches: on one real session 24 of its 25 expired
+  verdicts reported a cache read, 15 of them of the whole prefix, and its
+  "9.2 million tokens lost" were two-thirds served. A call that reports
+  reading at least half of what its predecessor reported as its context is
+  now `stable`, nothing lost, its explanation saying the cache outlived the
+  assumed TTL; a smaller read (a long-lived system prompt alone) leaves the
+  verdict standing, and no structural verdict yields to a reported count.
+- **The X-Ray reads a long session's latest calls.** A run read its first
+  20,000 spans, and a call past them was X-rayed alone — no step index, no
+  predecessor and, for Claude Code and Codex transcripts (recorded as
+  deltas), no context at all: exactly the latest calls of the sessions
+  worth X-raying. Such a call is now read with the 20,000 spans that end at
+  it: its indices count the whole run, and a conversation already under way
+  before those spans is rebuilt from its first compaction inside them (a
+  delta call before that says its conversation began before the read).
+  `xray_step` reaches any step of a run, not only those in its first read.
+- **An imported session's goal is what the person asked.** A harness that
+  opens a Claude Code session's first prompt with a `<system-reminder>`
+  block (a worktree launcher, a workflow) made that boilerplate the
+  session's `session.goal` — the text every run surface shows, and the
+  value the Fate Map hashes into a task, so every such session joined one
+  task. The goal now skips leading reminder blocks, and a prompt that is
+  nothing else sets none.
 
 ### Upgrade
 

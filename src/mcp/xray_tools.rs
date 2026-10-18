@@ -162,7 +162,7 @@ fn render(xray: &XRay, max_bytes: usize) -> String {
         ),
     };
     let at = xray.step_index.map_or_else(
-        || "a step past the run's read limit".to_owned(),
+        || "a step X-rayed alone, outside its run".to_owned(),
         |i| format!("step {i}"),
     );
     // Only a loss checked against every possible edit, in a context read

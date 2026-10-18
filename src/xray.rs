@@ -47,8 +47,10 @@
 //! counted (no media, no unrecorded tool definitions, nothing cut).
 //!
 //! **Bounds.** One request reads its run under the store's snapshot, erasure
-//! and tenant rules ([`crate::run`]), inside the query deadline, at most
-//! [`MAX_TAPE_SPANS`] spans; resolves at most [`MAX_READ_BYTES`] of offloaded
+//! and tenant rules ([`crate::run`]), inside the query deadline, and keeps
+//! [`MAX_TAPE_SPANS`] of its spans — its first, or for an X-Ray of a call
+//! past them the ones that end at the call; resolves at most
+//! [`MAX_READ_BYTES`] of offloaded
 //! payload content for the call itself and as much again for its history
 //! (the comparison window first), or that much per call and
 //! [`MAX_AUTOPSY_READ_BYTES`] across an autopsy; splits one context into at
@@ -269,9 +271,10 @@ pub enum XrayMiss {
     NoRun,
     /// The run has no step at that index.
     NoStep {
-        /// Steps read.
+        /// Steps the run has.
         steps: usize,
-        /// Whether the run is longer than one read, so more steps exist.
+        /// Whether more steps may exist than were counted (never, now that
+        /// the whole run is counted; kept for the wire).
         more: bool,
     },
     /// The span is a step of another kind; the X-Ray reads model calls.
@@ -470,7 +473,7 @@ pub struct Duplicate {
 /// One model call's cache verdict.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct CacheStep {
-    /// Its tape index; `null` for a call past the run's read limit.
+    /// Its tape index; `null` only for a call X-rayed alone.
     pub step_index: Option<usize>,
     /// Its span.
     pub span: SpanRef,
@@ -679,8 +682,10 @@ pub struct XRay {
     pub tenant: String,
     /// The call.
     pub span: SpanRef,
-    /// Its tape index; `null` when the run is longer than one read and the
-    /// call lies past it.
+    /// Its tape index, counted over the whole run — a call past the run's
+    /// first [`MAX_TAPE_SPANS`] spans is read with the spans that end at it;
+    /// `null` only when the call is not among its run's spans, and is
+    /// X-rayed alone.
     pub step_index: Option<usize>,
     /// The model it named.
     pub model: Option<String>,
@@ -741,6 +746,36 @@ pub struct XRay {
     /// Some chunk text was not kept for lack of room: a preview or diff is
     /// `null`, and a lost chunk may be `unverified`.
     pub texts_partial: bool,
+}
+
+impl XRay {
+    /// Adds `by` to every tape index the X-Ray names: it was read from a
+    /// tape that begins `by` steps into its run.
+    fn offset_steps(&mut self, by: usize) {
+        let shift = |index: &mut usize| *index += by;
+        if let Some(index) = self.step_index.as_mut() {
+            shift(index);
+        }
+        if let Some(previous) = self.previous.as_mut() {
+            shift(&mut previous.step_index);
+        }
+        for chunk in self.chunks.iter_mut().chain(self.response.iter_mut()) {
+            if let Some(introduced) = chunk.introduced_by.as_mut() {
+                shift(&mut introduced.step_index);
+            }
+        }
+        for dropped in &mut self.dropped_since_previous {
+            if let Some(introduced) = dropped.introduced_by.as_mut() {
+                shift(&mut introduced.step_index);
+            }
+        }
+        if let Some(index) = self.cache.step_index.as_mut() {
+            shift(index);
+        }
+        if let Some(index) = self.cache.previous_step_index.as_mut() {
+            shift(index);
+        }
+    }
 }
 
 /// A step paired with its span.
@@ -1014,9 +1049,15 @@ const NOT_REBUILT: &str =
     "could not be rebuilt: it recorded only what it added, and its conversation's earlier \
      context was not kept";
 
+/// Why a delta-recorded call read from a tape that ends at a long run's
+/// later call could not be rebuilt: its conversation began before the tape.
+const BEGAN_BEFORE_READ: &str =
+    "could not be rebuilt: it recorded only what it added, and its conversation began before \
+     the 20,000 spans read for it (it is rebuilt from its next compaction on)";
+
 /// Why a delta-recorded call X-rayed alone shows only part of its context.
 const DELTA_ALONE: &str =
-    "was recorded as a delta of its conversation, whose earlier calls lie past the read";
+    "was recorded as a delta of its conversation, whose earlier calls were not found in its run";
 
 /// One conversation's running context: its latest call's whole context and
 /// what that call answered — each with what of it could not be read, which
@@ -1046,6 +1087,9 @@ struct Threads {
     /// Conversations dropped for room: a later delta call of one cannot be
     /// rebuilt.
     lost: HashSet<(String, String)>,
+    /// Conversations already under way before the calls read began: a
+    /// delta call of one cannot be rebuilt until it starts over.
+    before: HashSet<(String, String)>,
     lost_overflow: bool,
 }
 
@@ -1114,6 +1158,9 @@ impl Threads {
                 }
                 None if self.lost_overflow || self.lost.contains(&key) => {
                     read.unavailable = read.unavailable.or(Some(NOT_REBUILT));
+                }
+                None if self.before.contains(&key) => {
+                    read.unavailable = read.unavailable.or(Some(BEGAN_BEFORE_READ));
                 }
                 None => {}
             }
@@ -1222,7 +1269,7 @@ fn round_usd(value: f64) -> f64 {
 /// predecessor found.
 struct Verdict<'c> {
     step: &'c TapeStep,
-    /// The call's tape index; `None` past the read limit.
+    /// The call's tape index; `None` for a call X-rayed alone.
     step_index: Option<usize>,
     llm: &'c LlmFacts,
     context: &'c Context,
@@ -1291,7 +1338,9 @@ fn cache_step(store: &Store, verdict: Verdict<'_>, ttl_ns: u64, pool: &TextPool)
                 .calibratable
                 .then(|| calibration(llm, est_tokens))
                 .flatten();
-            autopsy::compare(previous, context, gap, ttl_ns, pool, applied.unwrap_or(1.0))
+            let compared =
+                autopsy::compare(previous, context, gap, ttl_ns, pool, applied.unwrap_or(1.0));
+            served_past_ttl(compared, llm, previous.reported_context)
         }
     };
     let est_tokens_lost = comparison.est_tokens_lost;
@@ -1323,6 +1372,51 @@ fn cache_step(store: &Store, verdict: Verdict<'_>, ttl_ns: u64, pool: &TextPool)
         est_tokens_lost,
         calibration: applied,
         est_cost_lost_usd,
+    }
+}
+
+/// Of what the predecessor reported as its context, the share this call
+/// must report reading from the cache for an expired-TTL verdict to yield
+/// to the provider.
+const SERVED_SHARE: f64 = 0.5;
+
+/// An expired-TTL verdict the provider's own report refutes, made `stable`.
+///
+/// The TTL is an assumption (`ttl_seconds`, five minutes unless asked), not
+/// something a trace records — and real producers run longer caches: Claude
+/// Code's and Codex's outlive five minutes. When the predecessor's context
+/// was carried intact and this call reports reading at least
+/// [`SERVED_SHARE`] of what the predecessor reported as its context, both
+/// counts from the provider's own tokenizer, the cache plainly held: the
+/// prefix was served and nothing was lost. A smaller read — a long-lived
+/// system prompt alone, say — leaves the verdict standing. Only the TTL
+/// verdict yields: what the recording shows changed is never overruled.
+fn served_past_ttl(
+    comparison: autopsy::Comparison,
+    llm: &LlmFacts,
+    reported: Option<u64>,
+) -> autopsy::Comparison {
+    let (Some(read), Some(reported)) = (llm.cache_read_tokens, reported) else {
+        return comparison;
+    };
+    if comparison.cause != Cause::TtlExpired
+        || reported == 0
+        || (read as f64) < reported as f64 * SERVED_SHARE
+    {
+        return comparison;
+    }
+    let explanation = format!(
+        "{} assumed — yet the provider read {} tokens from its cache, of the {} the previous \
+         call reported: the cache outlived the assumed TTL, and the prefix was served",
+        comparison.explanation,
+        autopsy::thousands(read),
+        autopsy::thousands(reported)
+    );
+    autopsy::Comparison {
+        cause: Cause::Stable,
+        est_tokens_lost: 0,
+        explanation,
+        ..comparison
     }
 }
 
@@ -1557,8 +1651,25 @@ fn origin(
 pub(crate) struct Target {
     span: Span,
     run: String,
+    /// The run's first [`MAX_TAPE_SPANS`] spans, or — for a call past them
+    /// — the [`MAX_TAPE_SPANS`] spans that end at it.
     tape: RunTape,
+    /// Steps of the run before the tape's first: what its indices are
+    /// offset by.
+    step_offset: usize,
+    /// The conversations (tenant, digest) that had a model call before the
+    /// tape began: a delta call of one cannot be rebuilt until its
+    /// conversation starts over inside the tape.
+    earlier: HashSet<(String, String)>,
 }
+
+/// A tape placed around an X-Ray's call: the tape, the steps of the run
+/// before it, and the conversations under way before it (as on [`Target`]).
+type Placed = (RunTape, usize, HashSet<(String, String)>);
+
+/// Spans examined between two deadline checks while counting the steps
+/// before a tape that ends at its call.
+const COUNT_CHECK_SPANS: usize = 256;
 
 impl Store {
     /// The stale threshold this store's X-Rays default to
@@ -1630,14 +1741,62 @@ impl Store {
             return Ok(Err(XrayMiss::NotAnLlmStep(facts.kind)));
         }
         let run = semconv::run_id(&span.attributes, &span.trace_id);
-        let tape = self.run_tape(
-            Some(&span.tenant),
-            &run,
-            MAX_TAPE_SPANS,
-            MAX_TAPE_SPANS,
-            deadline,
-        )?;
-        Ok(Ok(Target { span, run, tape }))
+        let read = self.run_spans(Some(&span.tenant), &run, usize::MAX, deadline)?;
+        let at = read
+            .spans
+            .iter()
+            .position(|stored| stored.trace_id == span.trace_id && stored.span_id == span.span_id);
+        let (tape, step_offset, earlier) = self.tape_around(read.spans, at, deadline)?;
+        Ok(Ok(Target {
+            span,
+            run,
+            tape,
+            step_offset,
+            earlier,
+        }))
+    }
+
+    /// The tape an X-Ray of the call at position `at` of `spans` (a whole
+    /// run, in step order) reads: the run's first [`MAX_TAPE_SPANS`] spans
+    /// when the call lies among them — or when it is not among `spans` at
+    /// all, and is X-rayed alone — else the [`MAX_TAPE_SPANS`] spans that
+    /// end at the call, so a long session's latest calls are read with the
+    /// history nearest them rather than alone. Returns the tape, the steps
+    /// before it, and the conversations that had a model call before it.
+    fn tape_around(
+        &self,
+        mut spans: Vec<Span>,
+        at: Option<usize>,
+        deadline: Option<Deadline>,
+    ) -> Result<Placed> {
+        let Some(at) = at.filter(|at| *at >= MAX_TAPE_SPANS) else {
+            let truncated = spans.len() > MAX_TAPE_SPANS;
+            spans.truncate(MAX_TAPE_SPANS);
+            let tape = self.tape_of(spans, truncated, MAX_TAPE_SPANS, deadline)?;
+            return Ok((tape, 0, HashSet::new()));
+        };
+        let start = at + 1 - MAX_TAPE_SPANS;
+        let mut step_offset = 0;
+        let mut earlier = HashSet::new();
+        for (examined, span) in spans[..start].iter().enumerate() {
+            if examined % COUNT_CHECK_SPANS == 0 {
+                Deadline::check(deadline, 0)?;
+            }
+            let kind = semconv::step_kind_with(span, &self.facts(span));
+            if kind.is_step() {
+                step_offset += 1;
+            }
+            if kind == StepKind::Llm {
+                if let Some(conversation) = conversation_of(span) {
+                    earlier.insert((span.tenant.clone(), conversation));
+                }
+            }
+        }
+        spans.truncate(at + 1);
+        let window = spans.split_off(start);
+        drop(spans);
+        let tape = self.tape_of(window, true, MAX_TAPE_SPANS, deadline)?;
+        Ok((tape, step_offset, earlier))
     }
 
     /// Step `step` of `run_id` and its run.
@@ -1648,37 +1807,51 @@ impl Store {
         step: usize,
         deadline: Option<Deadline>,
     ) -> Result<std::result::Result<Target, XrayMiss>> {
-        let tape = self.run_tape(tenant, run_id, MAX_TAPE_SPANS, MAX_TAPE_SPANS, deadline)?;
-        if tape.spans.is_empty() {
+        let read = self.run_spans(tenant, run_id, usize::MAX, deadline)?;
+        if read.spans.is_empty() {
             return Ok(Err(XrayMiss::NoRun));
         }
         if tenant.is_none() {
             let tenants: HashSet<&str> =
-                tape.spans.iter().map(|span| span.tenant.as_str()).collect();
+                read.spans.iter().map(|span| span.tenant.as_str()).collect();
             if tenants.len() > 1 {
                 return Ok(Err(XrayMiss::AmbiguousTenant(tenants.len())));
             }
         }
-        let Some(found) = tape.steps.get(step) else {
+        // Step `step` of the whole run, wherever it lies.
+        let mut seen = 0;
+        let mut found = None;
+        for (position, span) in read.spans.iter().enumerate() {
+            if position % COUNT_CHECK_SPANS == 0 {
+                Deadline::check(deadline, 0)?;
+            }
+            let kind = semconv::step_kind_with(span, &self.facts(span));
+            if !kind.is_step() {
+                continue;
+            }
+            if seen == step {
+                found = Some((position, kind));
+                break;
+            }
+            seen += 1;
+        }
+        let Some((at, kind)) = found else {
             return Ok(Err(XrayMiss::NoStep {
-                steps: tape.steps.len(),
-                more: tape.truncated,
+                steps: seen,
+                more: false,
             }));
         };
-        if found.kind != StepKind::Llm {
-            return Ok(Err(XrayMiss::NotAnLlmStep(found.kind)));
+        if kind != StepKind::Llm {
+            return Ok(Err(XrayMiss::NotAnLlmStep(kind)));
         }
-        let span = pair(&tape.steps, &tape.spans)
-            .into_iter()
-            .find(|entry| entry.step.index == step)
-            .map(|entry| entry.span.clone());
-        let Some(span) = span else {
-            return Ok(Err(XrayMiss::NoSpan));
-        };
+        let span = read.spans[at].clone();
+        let (tape, step_offset, earlier) = self.tape_around(read.spans, Some(at), deadline)?;
         Ok(Ok(Target {
             span,
             run: run_id.to_owned(),
             tape,
+            step_offset,
+            earlier,
         }))
     }
 
@@ -1690,14 +1863,21 @@ impl Store {
         options: XrayOptions,
         limits: Limits,
     ) -> Result<std::result::Result<XRay, XrayMiss>> {
-        let Target { span, run, tape } = target;
+        let Target {
+            span,
+            run,
+            tape,
+            step_offset,
+            earlier,
+        } = target;
         let (_, _, llm) = self.step_facts_detailed(&span);
         let paired = pair(&tape.steps, &tape.spans);
         let agents = Agents::new(&tape.steps, &tape.spans);
         let target = paired.iter().position(|entry| {
             entry.step.trace_id == span.trace_id && entry.step.span_id == span.span_id
         });
-        // Past the read, the call is X-rayed alone, without its history.
+        // Not among its run's spans (a run id its spans do not read back
+        // to), the call is X-rayed alone, without its history.
         let fallback = match target {
             Some(_) => None,
             None => {
@@ -1748,6 +1928,10 @@ impl Store {
         let mut read = if threaded {
             let wanted: HashSet<usize> = window.iter().copied().collect();
             let mut threads = Threads::default();
+            // A conversation already under way when the tape began has its
+            // earlier calls outside it: a delta call of it cannot be rebuilt
+            // until the conversation starts over (a compaction) in the tape.
+            threads.before.extend(earlier);
             let mut target_read = None;
             for (index, entry) in history.iter().enumerate() {
                 if entry.step.kind != StepKind::Llm {
@@ -1817,7 +2001,8 @@ impl Store {
 
         // The history, oldest first, up to and including the call.
         let mut provenance: HashMap<u128, usize> = HashMap::new();
-        let mut provenance_partial = target.is_none();
+        // Past the run's beginning, the history before the tape is unread.
+        let mut provenance_partial = target.is_none() || step_offset > 0;
         let mut call_steps: HashMap<String, Vec<usize>> = HashMap::new();
         let mut first_said: HashMap<u64, usize> = HashMap::new();
         let mut said_overflow = false;
@@ -1907,7 +2092,8 @@ impl Store {
                             call.context_unavailable(),
                         )
                         .with_agent(agents.of(entry.span))
-                        .with_conversation(conversation_of(entry.span));
+                        .with_conversation(conversation_of(entry.span))
+                        .with_reported(self.facts(entry.span).context_tokens());
                         context.held = pool.hold(&call.context.list);
                         recent.push_back(context);
                     }
@@ -2107,7 +2293,8 @@ impl Store {
             context_unavailable,
         )
         .with_agent(agents.of(&span))
-        .with_conversation(conversation_of(&span));
+        .with_conversation(conversation_of(&span))
+        .with_reported(llm.context_tokens());
         let found = autopsy::predecessor(&current, recent.iter(), &pool);
         let mut previous = None;
         let mut dropped = Vec::new();
@@ -2229,8 +2416,8 @@ impl Store {
             // No history was read, so "no predecessor" would be a claim
             // about steps nobody looked at.
             cache.cause = Cause::Unknown;
-            cache.explanation = "this call lies past the run's read limit, so the calls before \
-                                 it were not read and its predecessor is unknown"
+            cache.explanation = "this call was not found among its run's spans, so the calls \
+                                 before it were not read and its predecessor is unknown"
                 .to_owned();
             cache.est_tokens_lost = 0;
             cache.calibration = None;
@@ -2260,7 +2447,7 @@ impl Store {
         // An answer finished past the budget is refused like one stopped at
         // it: the budget is the request's, not each loop's.
         Deadline::check(deadline, 0)?;
-        Ok(Ok(XRay {
+        let mut xray = XRay {
             run,
             tenant: span.tenant.clone(),
             span: SpanRef {
@@ -2292,7 +2479,11 @@ impl Store {
             resolved_partial,
             provenance_partial,
             texts_partial: pool.overflowed,
-        }))
+        };
+        if step_offset > 0 {
+            xray.offset_steps(step_offset);
+        }
+        Ok(Ok(xray))
     }
 
     /// The Cache Autopsy of `run_id` under `tenant` (the scoping of
@@ -2364,6 +2555,7 @@ impl Store {
             let read = threads.fold(entry.span, read);
             read_left -= budget.spent();
             unresolved |= budget.unresolved;
+            let llm = self.facts(entry.span);
             let mut context = Context::new(
                 entry.step.index,
                 &entry.span.tenant,
@@ -2373,9 +2565,9 @@ impl Store {
                 read.context_unavailable(),
             )
             .with_agent(agents.of(entry.span))
-            .with_conversation(conversation);
+            .with_conversation(conversation)
+            .with_reported(llm.context_tokens());
             context.held = pool.hold(&read.context.list);
-            let llm = self.facts(entry.span);
             let seen_before = !tenants_seen.insert(entry.span.tenant.as_str());
             let found = autopsy::predecessor(&context, recent.iter(), &pool);
             steps.push(cache_step(
