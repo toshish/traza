@@ -490,7 +490,9 @@ before deploying over an existing setup.
   token (a handoff link followed before the mint answered) no longer shows
   its secret over the new session, and a secret on display no longer
   outlives the switch. Leaving the Live tail (or any streaming screen) no
-  longer throws an unhandled "signal is aborted" error.
+  longer throws an unhandled "signal is aborted" error. A session nothing
+  priced — a coding-agent transcript, with no pricing table — shows "—"
+  for its cost per turn, as for its cost, not `0.00000`.
 - **Foresight on a long session keeps its outcome.** `GET /v1/fate/runs/{run}`
   (and MCP `foresee_run`) read a run of more than 20,000 spans from its
   earliest 20,000 only, so a finished coding-agent session that long came
