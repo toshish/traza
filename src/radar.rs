@@ -241,6 +241,8 @@ const MAX_TOOLS_PER_RUN: usize = 64;
 const MAX_ENVIRONMENTS_PER_RUN: usize = 4;
 /// llm steps extracted between the read's own deadline checks.
 const EXTRACTION_CHECK_INTERVAL: usize = 64;
+/// Values the analysis reads between two checks of its deadline.
+const PACE_CHECK_WORK: usize = 1 << 16;
 const TOOL_MIX_ROWS: usize = 8;
 const PATH_ROWS: usize = 5;
 const EXAMPLE_RUNS: usize = 3;
@@ -1794,24 +1796,69 @@ fn share(values: &[u32], value: u32) -> f64 {
     values.iter().filter(|v| **v == value).count() as f64 / values.len() as f64
 }
 
-/// What the dominance walk proposes: switches `(onset, from, to, detected)`
-/// — `detected` the index at which the newcomer became dominant — and the
-/// walk's final incumbent with its run count.
+/// Work counted against a query deadline: every loop of the analysis over a
+/// cohort's runs reports the values it reads, and the deadline is checked
+/// whenever another [`PACE_CHECK_WORK`] of them have been read — so no loop,
+/// whatever its length, runs far past the budget.
+struct Pace {
+    deadline: Option<Deadline>,
+    /// Values read so far.
+    work: usize,
+    /// The work at which the deadline is checked next (the first report
+    /// checks it).
+    next_check: usize,
+}
+
+impl Pace {
+    fn new(deadline: Option<Deadline>) -> Self {
+        Self {
+            deadline,
+            work: 0,
+            next_check: 0,
+        }
+    }
+
+    /// Reports `units` more values read; refused once the deadline passed.
+    fn add(&mut self, units: usize) -> Result<()> {
+        self.work = self.work.saturating_add(units);
+        if self.work >= self.next_check {
+            Deadline::check(self.deadline, 0)?;
+            self.next_check = self.work.saturating_add(PACE_CHECK_WORK);
+        }
+        Ok(())
+    }
+}
+
+/// A proposed switch, `(onset, from, to, detected)`: `detected` is the index
+/// at which the newcomer became dominant.
+type Switch = (usize, u32, u32, usize);
+
+/// What the dominance walk proposes: its switches, and the walk's final
+/// incumbent with its run count.
 struct Walk {
-    switches: Vec<(usize, u32, u32, usize)>,
+    switches: Vec<Switch>,
     current: Option<u32>,
     current_runs: usize,
 }
 
 /// The dominance walk of the module docs, which proposes change points.
-fn dominance_walk(values: &[u32], window: usize) -> Walk {
+///
+/// Linear in runs: each run updates the window's counts and the running
+/// totals of every value seen so far, so restoring an incumbent after a
+/// withdrawn excursion reads its total instead of recounting the prefix; a
+/// proposal reads at most two windows more. The walk reports what it reads
+/// to `pace` as it goes, so a long sequence stops at the deadline, not after
+/// it. Both maps hold at most one entry per distinct value in `values`.
+fn dominance_walk(values: &[u32], window: usize, pace: &mut Pace) -> Result<Walk> {
     let mut counts: HashMap<u32, usize> = HashMap::new();
+    let mut totals: HashMap<u32, usize> = HashMap::new();
     let mut current: Option<u32> = None;
     let mut current_runs = 0usize;
-    let mut switches: Vec<(usize, u32, u32, usize)> = Vec::new();
+    let mut switches: Vec<Switch> = Vec::new();
     let margin = (window / 10).max(2);
     for (index, &value) in values.iter().enumerate() {
         *counts.entry(value).or_insert(0) += 1;
+        *totals.entry(value).or_insert(0) += 1;
         if index >= window {
             let gone = values[index - window];
             if let Some(count) = counts.get_mut(&gone) {
@@ -1824,6 +1871,7 @@ fn dominance_walk(values: &[u32], window: usize) -> Walk {
         if Some(value) == current {
             current_runs += 1;
         }
+        pace.add(1 + counts.len())?;
         let length = (index + 1).min(window);
         // The leader: most runs in the window; ties keep the incumbent, then
         // the smallest id, so the walk is deterministic.
@@ -1834,9 +1882,11 @@ fn dominance_walk(values: &[u32], window: usize) -> Walk {
         }) else {
             continue;
         };
+        // Every run of a value up to here: what a restored incumbent holds.
+        let so_far = |value: u32| totals.get(&value).copied().unwrap_or(0);
         let Some(incumbent) = current else {
             current = Some(leader);
-            current_runs = values[..=index].iter().filter(|v| **v == leader).count();
+            current_runs = so_far(leader);
             continue;
         };
         if leader == incumbent || lead * 2 < length {
@@ -1852,6 +1902,7 @@ fn dominance_walk(values: &[u32], window: usize) -> Walk {
             .iter()
             .filter(|v| **v == leader)
             .count();
+        pace.add(2 * length)?;
         if switches.is_empty() && current_runs < MIN_ESTABLISHED_RUNS {
             // Still settling: the first value never established itself.
             current = Some(leader);
@@ -1863,7 +1914,7 @@ fn dominance_walk(values: &[u32], window: usize) -> Walk {
                 // An excursion that came back within a window: withdrawn.
                 switches.pop();
                 current = Some(leader);
-                current_runs = values[..=index].iter().filter(|v| **v == leader).count();
+                current_runs = so_far(leader);
                 continue;
             }
         }
@@ -1871,11 +1922,11 @@ fn dominance_walk(values: &[u32], window: usize) -> Walk {
         current = Some(leader);
         current_runs = leader_runs;
     }
-    Walk {
+    Ok(Walk {
         switches,
         current,
         current_runs,
-    }
+    })
 }
 
 /// Whether a proposed switch is a change rather than a mixture's noise.
@@ -1893,7 +1944,7 @@ fn dominance_walk(values: &[u32], window: usize) -> Walk {
 /// history before it belongs to an older value.
 fn confirmed(
     values: &[u32],
-    (onset, from, to, detected): (usize, u32, u32, usize),
+    (onset, from, to, detected): Switch,
     window: usize,
     floor: usize,
 ) -> bool {
@@ -1922,11 +1973,13 @@ fn confirmed(
 
 /// Change points in one dimension's value sequence: `(onset, from, to)`,
 /// per the module's rule. Pure, so the rule is testable on its own.
-fn change_points(values: &[u32], window: usize) -> Vec<(usize, u32, u32)> {
-    let walk = dominance_walk(values, window);
+fn change_points(values: &[u32], window: usize, pace: &mut Pace) -> Result<Vec<(usize, u32, u32)>> {
+    let walk = dominance_walk(values, window, pace)?;
     let mut points: Vec<(usize, u32, u32)> = Vec::new();
     let mut floor = 0;
     for &switch in &walk.switches {
+        // A confirmation reads at most a window either side.
+        pace.add(2 * window)?;
         if confirmed(values, switch, window, floor) {
             points.push((switch.0, switch.1, switch.2));
             floor = switch.0;
@@ -1938,6 +1991,7 @@ fn change_points(values: &[u32], window: usize) -> Vec<(usize, u32, u32)> {
     // change an operator asks about.
     if let (Some(incumbent), Some(&last)) = (walk.current, values.last()) {
         let tail = values.iter().rev().take_while(|v| **v == last).count();
+        pace.add(tail + window)?;
         let onset = values.len() - tail;
         let before = &values[onset.saturating_sub(window)..onset];
         if last != incumbent
@@ -1948,7 +2002,7 @@ fn change_points(values: &[u32], window: usize) -> Vec<(usize, u32, u32)> {
             points.push((onset, incumbent, last));
         }
     }
-    points
+    Ok(points)
 }
 
 /// The split inside `[start, end]` that best separates `old` (before) from
@@ -2199,8 +2253,12 @@ fn analyse(
     let mut raw: Vec<RawChange> = Vec::new();
     let mut volatile = Vec::new();
     let mut current = BTreeMap::new();
+    let mut pace = Pace::new(deadline);
     for dimension in Dimension::CONFIG {
         let index = dimension.index();
+        // The sequence, the volatility count and the current value: three
+        // reads of the cohort's runs.
+        pace.add(3 * runs.len())?;
         let sequence: Vec<(usize, u32)> = runs
             .iter()
             .enumerate()
@@ -2221,7 +2279,7 @@ fn analyse(
                 context.display(dimension, now),
             );
         }
-        let points = change_points(&values, window);
+        let points = change_points(&values, window, &mut pace)?;
         if points.len() > MAX_CHANGES_PER_DIMENSION {
             // A configuration that changes this often is a per-run value
             // with a slower rhythm, not a history of deploys.
@@ -2237,7 +2295,6 @@ fn analyse(
                 shift: None,
             });
         }
-        Deadline::check(deadline, 0)?;
     }
     let paths: Vec<u32> = runs.iter().map(|run| run.path).collect();
     let config_onsets: Vec<usize> = raw.iter().map(|change| change.onset).collect();
@@ -4466,7 +4523,7 @@ mod tests {
         ] {
             for _ in 0..sequences {
                 let values: Vec<u32> = (0..runs).map(|_| seeded.pick(weights)).collect();
-                let points = change_points(&values, detection_window(runs));
+                let points = found(&values, detection_window(runs));
                 if !points.is_empty() {
                     alarmed.push((runs, points));
                 }
@@ -4749,42 +4806,36 @@ mod tests {
         let ones = |n: usize, value: u32| vec![value; n];
         let concat = |parts: &[Vec<u32>]| parts.concat();
         // A clean switch is placed at its first run.
-        assert_eq!(
-            change_points(&concat(&[ones(30, 0), ones(30, 1)]), 8),
-            [(30, 0, 1)]
-        );
+        assert_eq!(found(&concat(&[ones(30, 0), ones(30, 1)]), 8), [(30, 0, 1)]);
         // Two in a row.
         assert_eq!(
-            change_points(&concat(&[ones(30, 0), ones(30, 1), ones(30, 2)]), 10),
+            found(&concat(&[ones(30, 0), ones(30, 1), ones(30, 2)]), 10),
             [(30, 0, 1), (60, 1, 2)]
         );
         // A 5% canary never becomes dominant.
         let canary: Vec<u32> = (0..100).map(|i| u32::from(i % 20 == 0)).collect();
-        assert!(change_points(&canary, 12).is_empty());
+        assert!(found(&canary, 12).is_empty());
         // An even A/B split is not a change either.
         let split: Vec<u32> = (0..100).map(|i| i % 2).collect();
-        assert!(change_points(&split, 12).is_empty());
+        assert!(found(&split, 12).is_empty());
         // An excursion that comes back within a window is withdrawn.
         let excursion = concat(&[ones(40, 0), ones(6, 1), ones(40, 0)]);
         assert!(
-            change_points(&excursion, 10).is_empty(),
+            found(&excursion, 10).is_empty(),
             "{:?}",
-            change_points(&excursion, 10)
+            found(&excursion, 10)
         );
         // A first value that never established itself is settling.
         assert_eq!(
-            change_points(&concat(&[ones(1, 5), ones(30, 0), ones(30, 1)]), 8),
+            found(&concat(&[ones(1, 5), ones(30, 0), ones(30, 1)]), 8),
             [(31, 0, 1)]
         );
         // A fresh value holding every run at the end is a change before it
         // fills half a window; two runs are not enough to say so.
-        assert_eq!(
-            change_points(&concat(&[ones(60, 0), ones(5, 1)]), 20),
-            [(60, 0, 1)]
-        );
-        assert!(change_points(&concat(&[ones(60, 0), ones(2, 1)]), 20).is_empty());
+        assert_eq!(found(&concat(&[ones(60, 0), ones(5, 1)]), 20), [(60, 0, 1)]);
+        assert!(found(&concat(&[ones(60, 0), ones(2, 1)]), 20).is_empty());
         assert!(
-            change_points(&concat(&[ones(60, 0), ones(4, 1), ones(1, 0)]), 20).is_empty(),
+            found(&concat(&[ones(60, 0), ones(4, 1), ones(1, 0)]), 20).is_empty(),
             "not if the last run went back"
         );
         // Nor when the value was common all along: three in a row at the end
@@ -4792,15 +4843,15 @@ mod tests {
         let mut split_tail: Vec<u32> = (0..200).map(|i| i % 2).collect();
         split_tail.extend([0, 1, 1, 1]);
         assert!(
-            change_points(&split_tail, 50).is_empty(),
+            found(&split_tail, 50).is_empty(),
             "{:?}",
-            change_points(&split_tail, 50)
+            found(&split_tail, 50)
         );
         // A rollout that ramps up is placed where the new value took over.
         let mut ramp = ones(40, 0);
         ramp.extend((0..20).map(|i| u32::from(i % 4 == 0)));
         ramp.extend(ones(40, 1));
-        let points = change_points(&ramp, 12);
+        let points = found(&ramp, 12);
         assert_eq!(points.len(), 1, "{points:?}");
         assert!((40..=62).contains(&points[0].0), "{points:?}");
         // A rollout that held a half-and-half stage for a while is a change
@@ -4808,7 +4859,7 @@ mod tests {
         let mut staged = ones(200, 0);
         staged.extend((0..100).map(|i| i % 2));
         staged.extend(ones(200, 1));
-        let points = change_points(&staged, 50);
+        let points = found(&staged, 50);
         assert_eq!(points.len(), 1, "{points:?}");
         assert_eq!((points[0].1, points[0].2), (0, 1));
         assert!((200..=300).contains(&points[0].0), "{points:?}");
@@ -4817,19 +4868,19 @@ mod tests {
         let mut short = ones(30, 0);
         short.extend((0..10).map(|i| i % 2));
         short.extend(ones(30, 1));
-        assert_eq!(change_points(&short, 8).len(), 1, "a takeover all the same");
+        assert_eq!(found(&short, 8).len(), 1, "a takeover all the same");
         // A mixture that was always there, then a deploy of a third value.
         let mixed: Vec<u32> = (0..300).map(|i| i % 2).collect();
         let mut deployed = mixed.clone();
         deployed.extend(ones(200, 2));
-        let points = change_points(&deployed, 50);
+        let points = found(&deployed, 50);
         assert_eq!(points.len(), 1, "{points:?}");
         assert_eq!((points[0].0, points[0].2), (300, 2));
         // A deploy that left more than a fifth of runs on the old value is
         // a mixture, not a change: the radar reports takeovers.
         let mut lingering = ones(200, 0);
         lingering.extend((0..200).map(|i| u32::from(i % 3 != 0)));
-        assert!(change_points(&lingering, 50).is_empty());
+        assert!(found(&lingering, 50).is_empty());
     }
 
     #[test]
@@ -5025,5 +5076,167 @@ mod tests {
         let p = erring.deltas.error_rate.p_value.expect("reported");
         assert!((p - 0.020_196_020_196_020_2).abs() < 1e-9, "{p}");
         assert_eq!(erring.verdict, Verdict::Neutral, "{erring:#?}");
+    }
+
+    /// Change points of `values`, with no deadline.
+    fn found(values: &[u32], window: usize) -> Vec<(usize, u32, u32)> {
+        change_points(values, window, &mut Pace::new(None)).expect("no deadline")
+    }
+
+    /// Blocks of 30 runs on one value, then 30 on the other, alternating:
+    /// with a 50-run window every block is an excursion the walk proposes
+    /// and then withdraws.
+    fn alternating_blocks(runs: usize) -> Vec<u32> {
+        (0..runs).map(|index| ((index / 30) % 2) as u32).collect()
+    }
+
+    #[test]
+    fn the_dominance_walk_is_linear_in_runs() {
+        let work = |runs: usize| {
+            let mut pace = Pace::new(None);
+            change_points(&alternating_blocks(runs), MAX_DETECTION_WINDOW, &mut pace)
+                .expect("no deadline");
+            pace.work
+        };
+        let (single, double) = (work(20_000), work(40_000));
+        // Twice the runs, about twice the work: rescanning the prefix on
+        // every withdrawal made it four times.
+        assert!(
+            double <= single * 9 / 4,
+            "{single} values read for 20k runs, {double} for 40k"
+        );
+        // And a small multiple of the window per run.
+        assert!(
+            double <= 2 * MAX_DETECTION_WINDOW * 40_000,
+            "{double} values read for 40k runs"
+        );
+    }
+
+    #[test]
+    fn the_dominance_walk_stops_at_the_deadline_not_after_it() {
+        let spent = Some(Deadline::capped(None, std::time::Duration::ZERO));
+        let mut pace = Pace::new(spent);
+        let values = alternating_blocks(200_000);
+        assert!(matches!(
+            change_points(&values, MAX_DETECTION_WINDOW, &mut pace),
+            Err(Error::DeadlineExceeded(_))
+        ));
+        assert!(
+            pace.work <= PACE_CHECK_WORK,
+            "refused only after reading {} values",
+            pace.work
+        );
+    }
+
+    /// The dominance walk as first written, which recounted the restored
+    /// incumbent over the whole prefix on every withdrawal: the oracle the
+    /// linear walk must agree with exactly.
+    fn rescanning_walk(values: &[u32], window: usize) -> (Vec<Switch>, Option<u32>, usize) {
+        let mut counts: HashMap<u32, usize> = HashMap::new();
+        let mut current: Option<u32> = None;
+        let mut current_runs = 0usize;
+        let mut switches: Vec<Switch> = Vec::new();
+        let margin = (window / 10).max(2);
+        for (index, &value) in values.iter().enumerate() {
+            *counts.entry(value).or_insert(0) += 1;
+            if index >= window {
+                let gone = values[index - window];
+                if let Some(count) = counts.get_mut(&gone) {
+                    *count -= 1;
+                    if *count == 0 {
+                        counts.remove(&gone);
+                    }
+                }
+            }
+            if Some(value) == current {
+                current_runs += 1;
+            }
+            let length = (index + 1).min(window);
+            let Some((&leader, &lead)) = counts.iter().max_by(|a, b| {
+                a.1.cmp(b.1)
+                    .then_with(|| (Some(*a.0) == current).cmp(&(Some(*b.0) == current)))
+                    .then_with(|| b.0.cmp(a.0))
+            }) else {
+                continue;
+            };
+            let Some(incumbent) = current else {
+                current = Some(leader);
+                current_runs = values[..=index].iter().filter(|v| **v == leader).count();
+                continue;
+            };
+            if leader == incumbent || lead * 2 < length {
+                continue;
+            }
+            let held = counts.get(&incumbent).copied().unwrap_or(0);
+            if lead < held + margin {
+                continue;
+            }
+            let start = index + 1 - length;
+            let onset = refine(values, start, index, incumbent, leader);
+            let leader_runs = values[onset..=index]
+                .iter()
+                .filter(|v| **v == leader)
+                .count();
+            if switches.is_empty() && current_runs < MIN_ESTABLISHED_RUNS {
+                current = Some(leader);
+                current_runs = leader_runs;
+                continue;
+            }
+            if let Some(&(last_onset, last_from, last_to, _)) = switches.last() {
+                if last_to == incumbent
+                    && last_from == leader
+                    && onset.abs_diff(last_onset) < window
+                {
+                    switches.pop();
+                    current = Some(leader);
+                    current_runs = values[..=index].iter().filter(|v| **v == leader).count();
+                    continue;
+                }
+            }
+            switches.push((onset, incumbent, leader, index));
+            current = Some(leader);
+            current_runs = leader_runs;
+        }
+        (switches, current, current_runs)
+    }
+
+    #[test]
+    fn the_linear_walk_proposes_exactly_what_the_rescanning_walk_did() {
+        let mut seeded = Seeded(0x5eed_0004);
+        let mut sequences: Vec<(Vec<u32>, usize)> = vec![
+            (alternating_blocks(3_000), MAX_DETECTION_WINDOW),
+            (alternating_blocks(500), 12),
+        ];
+        for (runs, weights) in [
+            (400, &[0.5, 0.5][..]),
+            (1_000, &[0.7, 0.3][..]),
+            (2_000, &[0.34, 0.33, 0.33][..]),
+            (300, &[0.9, 0.05, 0.05][..]),
+        ] {
+            for _ in 0..4 {
+                let values: Vec<u32> = (0..runs).map(|_| seeded.pick(weights)).collect();
+                sequences.push((values, detection_window(runs)));
+            }
+        }
+        // Eras with excursions and returns, drawn at random.
+        for _ in 0..8 {
+            let mut values = Vec::new();
+            while values.len() < 1_500 {
+                let value = seeded.pick(&[0.4, 0.3, 0.2, 0.1]);
+                let length = 1 + (seeded.next() % 80) as usize;
+                values.extend(std::iter::repeat(value).take(length));
+            }
+            for window in [MIN_DETECTION_WINDOW, 20, MAX_DETECTION_WINDOW] {
+                sequences.push((values.clone(), window));
+            }
+        }
+        for (values, window) in sequences {
+            let walk = dominance_walk(&values, window, &mut Pace::new(None)).expect("no deadline");
+            assert_eq!(
+                (walk.switches, walk.current, walk.current_runs),
+                rescanning_walk(&values, window),
+                "window {window}"
+            );
+        }
     }
 }

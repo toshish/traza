@@ -458,9 +458,12 @@ extracts each kept run's model-call configuration: it parses, masks and
 digests each model call's messages, which is most of the work. The read
 checks the deadline every 64 such extractions, so a window of very large
 requests cannot overshoot it by much. The analysis is linear in runs, plus
-the permutation tests in the table above. A window that cannot be read
-within the deadline is refused, not cut short, so narrow `since` and
-`until`. Naming an `agent` does not make the read cheaper, because a run's
+the permutation tests in the table above: the change-point walk reads each
+run once and at most two windows more per proposal, however many
+excursions come and go, and it checks the deadline every 65,536 values it
+reads, so a large `--radar-max-runs` cannot carry it far past the budget. A
+window that cannot be read or analysed within the deadline is refused, not
+cut short, so narrow `since` and `until`. Naming an `agent` does not make the read cheaper, because a run's
 agent is only known after it has been read.
 
 **Measured cost.** On an Apple M1 Max with a release build, on a laptop
