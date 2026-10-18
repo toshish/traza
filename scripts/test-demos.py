@@ -7,9 +7,11 @@ a user would.
   host, and from https to plain http. A proxy answering 302 in front of
   Traza or a model provider would hand the token to wherever it pointed.
 - ci.sh runs the demos as merge gates. An exported TRAZA_BIN naming an older
-  install would point three of them at that binary instead of the one just
-  built, so they could pass while the branch was broken. And a script that
-  splits its own path on spaces works from every checkout without one.
+  install would point several of them at that binary instead of the one just
+  built, so they could pass while the branch was broken; an exported
+  TRAZA_SEED_BIN would do the same to the corpus foresight writes. And a
+  script that splits its own path on spaces works from every checkout
+  without one.
 """
 
 import http.server
@@ -22,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -162,6 +165,45 @@ class RedirectsAreRefused(unittest.TestCase):
                                      "Bearer " + TOKEN)
                     self.assert_refused(result, location, elsewhere)
 
+    def test_the_foresight_harness_and_the_watch_poller_refuse(self):
+        foresight = load("foresight_agent", ROOT / "examples/foresight/agent.py")
+        coding = load("coding_agents_render", ROOT / "examples/coding-agents/render.py")
+        calls = {
+            "foresight check": lambda url: foresight.request(url, TOKEN, "POST", "/v1/fuses/check",
+                                                             {"run": "r1"}),
+            "foresight read": lambda url: foresight.request(url, TOKEN, "GET", "/v1/fate/runs/r1"),
+            "watch poll": lambda url: coding.request(url, TOKEN, "/v1/tapes/r1"),
+        }
+        with Server(200) as elsewhere:
+            location = "http://localhost:%d/elsewhere" % elsewhere.port
+            for status in STATUSES:
+                with Server(status, {"Location": location}, b"moved") as front:
+                    for name, call in calls.items():
+                        with self.subTest(status=status, call=name):
+                            try:
+                                call(front.url)
+                                refusal = "answered, not refused"
+                            except Exception as error:  # the refusal's type is the module's own
+                                refusal = str(error)
+                            followed = list(elsewhere.requests)
+                            elsewhere.requests.clear()
+                            self.assertEqual(followed, [], "a redirect was followed, token and all")
+                            self.assertIn(location, refusal)
+                    self.assertEqual(len(front.requests), len(calls))
+                    for sent in front.requests:
+                        self.assertEqual(sent["headers"].get("Authorization"), "Bearer " + TOKEN)
+
+    def test_the_foresight_agent_and_the_watch_poller_stop_with_a_message(self):
+        with Server(200) as elsewhere, tempfile.TemporaryDirectory() as tmp:
+            location = "http://localhost:%d/elsewhere" % elsewhere.port
+            with Server(302, {"Location": location}, b"moved") as front:
+                result = run_agent(ROOT / "examples/foresight/agent.py", "run", front.url, TOKEN,
+                                   "r1", "doomed", Path(tmp) / "state.json", Path(tmp) / "out-")
+                self.assert_refused(result, location, elsewhere)
+                result = run_agent(ROOT / "examples/coding-agents/render.py", "arrived", front.url,
+                                   TOKEN, "r1", 1, "%.6f" % time.time(), Path(tmp) / "tape.json")
+                self.assert_refused(result, location, elsewhere)
+
     def test_no_demo_sends_a_token_through_the_default_opener(self):
         # The default opener follows redirects. A demo that builds requests
         # with urllib and sets Authorization must send them through its own.
@@ -179,42 +221,53 @@ class CiRunsTheDemos(unittest.TestCase):
                           re.MULTILINE | re.DOTALL)
         self.assertIsNotNone(block, "ci.sh has no examples section")
         demos = sorted(path.parent.name for path in ROOT.glob("examples/*/run.sh"))
-        honours = {d for d in demos if "TRAZA_BIN" in (ROOT / "examples" / d / "run.sh").read_text()}
+        def reading(variable):
+            return {d for d in demos if variable in (ROOT / "examples" / d / "run.sh").read_text()}
+
+        honours, seeds = reading("TRAZA_BIN"), reading("TRAZA_SEED_BIN")
         self.assertTrue(honours, "no demo reads TRAZA_BIN; this test would check nothing")
+        self.assertTrue(seeds, "no demo reads TRAZA_SEED_BIN; this test would check nothing")
         with tempfile.TemporaryDirectory() as tmp:
             checkout = Path(tmp) / "checkout"
             log = Path(tmp) / "ran.log"
-            # Each stub records how it was invoked and the file TRAZA_BIN
-            # named, resolved while it runs: ci.sh removes its symlink on exit.
-            record = ("import os, sys; name, invoked, binary = sys.argv[1:]; "
+            # Each stub records how it was invoked and the files TRAZA_BIN and
+            # TRAZA_SEED_BIN named, resolved while it runs: ci.sh removes its
+            # symlink on exit.
+            record = ("import os, sys; name, invoked, *binaries = sys.argv[1:]; "
                       "open(os.environ['TRAZA_TEST_LOG'], 'a').write('\\t'.join("
-                      "[name, invoked, binary and os.path.realpath(binary)]) + '\\n')")
+                      "[name, invoked] + [b and os.path.realpath(b) for b in binaries]) + '\\n')")
             for demo in demos:
                 stub = checkout / "examples" / demo / "run.sh"
                 stub.parent.mkdir(parents=True)
-                stub.write_text('#!/bin/sh\nexec "%s" -I -c "%s" %s "$0" "${TRAZA_BIN-}"\n'
-                                % (sys.executable, record, demo))
+                stub.write_text('#!/bin/sh\nexec "%s" -I -c "%s" %s "$0" "${TRAZA_BIN-}" '
+                                '"${TRAZA_SEED_BIN-}"\n' % (sys.executable, record, demo))
                 stub.chmod(0o755)
             built = checkout / "target/release/traza-server"
             built.parent.mkdir(parents=True)
             built.write_text("")
+            seed = checkout / "target/release/seed"
+            seed.write_text("")
             scratch = Path(tmp) / "tmp"
             scratch.mkdir()
             # What a developer's shell might export: an older install.
-            stale = Path(tmp) / "old-release/traza-server"
+            stale = Path(tmp) / "old-release"
             subprocess.run(["bash", "-c", "set -euo pipefail\n" + block.group(1)], cwd=checkout,
-                           env=dict(os.environ, TRAZA_BIN=str(stale), TRAZA_TEST_LOG=str(log),
+                           env=dict(os.environ, TRAZA_BIN=str(stale / "traza-server"),
+                                    TRAZA_SEED_BIN=str(stale / "seed"), TRAZA_TEST_LOG=str(log),
                                     TMPDIR=str(scratch)),
                            check=True, capture_output=True, timeout=60)
             rows = [line.split("\t") for line in log.read_text().splitlines()]
-            self.assertEqual(sorted(name for name, _, _ in rows), demos,
+            self.assertEqual(sorted(row[0] for row in rows), demos,
                              "every demo with a run.sh runs, once")
-            for name, invoked, traza_bin in rows:
+            for name, invoked, traza_bin, seed_bin in rows:
                 with self.subTest(demo=name):
                     self.assertIn(" ", invoked, "a checkout path with a space is never exercised")
                     if name in honours:
                         self.assertEqual(traza_bin, os.path.realpath(built),
                                          "TRAZA_BIN must name the binary just built")
+                    if name in seeds:
+                        self.assertEqual(seed_bin, os.path.realpath(seed),
+                                         "TRAZA_SEED_BIN must name the seed just built")
             self.assertEqual(os.listdir(scratch), [], "ci.sh left its spaced path behind")
 
 

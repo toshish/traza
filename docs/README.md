@@ -15,11 +15,11 @@ to the right document. Start with the row that matches what you are doing.
 | Stop a runaway agent run before its next step | [Run fuses](guide/guard.md) · [demo](../examples/guard/README.md) · [Claude Code hook pack](../examples/claude-code/README.md) |
 | Watch live runs, nudge or veto a running agent, see how its agents hand off | [Steer](guide/steer.md) · [Claude Code hook pack](../examples/claude-code/README.md) |
 | Re-run a recorded agent run with zero model calls, or diff two runs | [Replay](guide/replay.md) · [demo](../examples/replay/README.md) |
-| See which paths an agent's runs take and how each ends; foresee a live run's fate; stop a run whose path has always failed | [Foresight](guide/foresight.md) |
-| Record every Claude Code and Codex session with zero setup, or ask which agent step wrote a line of code | [Recorders and Agent Blame](guide/recorders.md) |
-| See exactly what a model saw at one step, where each part came from, and why its prompt cache broke | [Context X-Ray and Cache Autopsy](guide/xray.md) |
+| See which paths an agent's runs take and how each ends; foresee a live run's fate; stop a run whose path has always failed | [Foresight](guide/foresight.md) · [demo](../examples/foresight/README.md) |
+| Record every Claude Code and Codex session with zero setup, or ask which agent step wrote a line of code | [Recorders and Agent Blame](guide/recorders.md) · [demo](../examples/coding-agents/README.md) |
+| See exactly what a model saw at one step, where each part came from, and why its prompt cache broke | [Context X-Ray and Cache Autopsy](guide/xray.md) · [demo](../examples/coding-agents/README.md) |
 | Find out what changed in an agent — a prompt, a tool, a model, a version — and whether it made things worse | [Change radar](guide/radar.md) |
-| Find every run whose steps did something — like a regex over behaviour — or run the built-in detectors | [TQL and detectors](guide/tql.md) |
+| Find every run whose steps did something — like a regex over behaviour — or run the built-in detectors | [TQL and detectors](guide/tql.md) · [demo](../examples/coding-agents/README.md) |
 | Branch a recorded run at any step, edit an answer and go live; test agents against golden runs | [Fork and rewind](guide/fork.md) |
 | Prove what the store committed, for an auditor or a notary | [Ledger and evidence packs](guide/ledger.md) · [demo](../examples/prove/README.md) |
 | Call the guard, replays, diff, recall or the ledger from Python or TypeScript | [Client libraries](guide/clients.md) |

@@ -88,6 +88,16 @@ why the provider's cache served nothing. (`calibration` is `null` here: the
 agent uses a tool whose definition the span did not record, so the provider's
 96 tokens cover text the estimate cannot see, and the raw estimate stands.)
 
+## See it run
+
+[`examples/coding-agents/run.sh`](../../examples/coding-agents/README.md)
+runs both routes on [imported](recorders.md) Claude Code transcripts. The
+autopsy of one session names an expired TTL, priced, and a `/compact`
+(`new_context`, `rewritten`); the X-Ray of the call before the compaction
+lists its chunks with the step each came from, and the X-Ray of the call
+after it lists, under `dropped_since_previous`, the instruction the
+compaction took.
+
 ## The context window as chunks
 
 The request a step recorded (its [input](../llm-semantics.md#input-and-output),

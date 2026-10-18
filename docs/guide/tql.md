@@ -26,6 +26,7 @@ in the [HTTP API reference](http-api.md#trajectory-queries-and-detectors); the
 agent-facing tool is [`find_behavior`](mcp.md#find_behavior).
 
 - [See it in thirty seconds](#see-it-in-thirty-seconds)
+- [See it run](#see-it-run)
 - [Steps](#steps)
 - [Atoms](#atoms)
 - [Predicates](#predicates)
@@ -122,6 +123,17 @@ Always URL-encode the query (`curl -G --data-urlencode`). An unencoded `+`
 arrives as a space, so `tool(bash)+` would be read as `tool(bash)`; the
 response's `query` field shows the pattern exactly as it was read, so a
 surprise is visible.
+
+## See it run
+
+[`examples/coding-agents/run.sh`](../../examples/coding-agents/README.md)
+runs the detector library over [imported](recorders.md) Claude Code and
+Codex sessions: `test_tampering` finds the session that failed a test,
+edited the test's expectation and passed, and `unverified_finish` the
+sessions that stopped after an edit without running the tests — one of
+which stops matching once `--watch` delivers its test run. A query of its
+own, `edit[file~"(^|/)migrations/"]`, finds the migration written after a
+compaction.
 
 ## Steps
 
