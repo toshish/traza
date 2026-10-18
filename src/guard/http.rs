@@ -159,12 +159,16 @@ fn check(store: &Store, query: &str, body: &[u8], bound: Option<&str>) -> Routed
         None => store.fuse_verdict(&tenant, &request.run),
     }
     .map_err(Reply::engine)?;
-    // The run is active, and on the step it asked about (the live view).
-    store.guard_note_check(&tenant, &request.run, request.next.as_ref());
-    // Pending nudges ride this verdict, delivered once; a `block` vetoes
-    // this step (see `crate::steer::check_reply`).
-    let body =
-        crate::steer::check_reply(store, &tenant, &request.run, &doc).map_err(Reply::engine)?;
+    // A pre-call check — one naming its next step — is activity, and the
+    // run is on that step (the live view); one without is a verdict read.
+    let pre_step = request.next.is_some();
+    if let Some(next) = &request.next {
+        store.guard_note_check(&tenant, &request.run, next);
+    }
+    // Pending nudges ride a pre-call check's verdict, delivered once; a
+    // `block` vetoes this step (see `crate::steer::check_reply`).
+    let body = crate::steer::check_reply(store, &tenant, &request.run, &doc, pre_step)
+        .map_err(Reply::engine)?;
     // Always 200 when there is a verdict to give: the verdict is the answer,
     // and a pre-call hook should not have to tell "stop" from a failure by
     // status code.

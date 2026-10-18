@@ -12,9 +12,10 @@
 //!   and the nudges waiting for it: [`Store::live_runs`], and a stream of
 //!   their changes, [`Store::live_wait`]. Built from guard live state alone.
 //! - **Nudges** — a human's advice to a running agent, or a veto of its next
-//!   step, delivered once through the run's next `POST /v1/fuses/check`
-//!   ([`Store::create_nudge`]; the delivery rules are in the `nudges`
-//!   module, and [`check_reply`] is where a check carries them).
+//!   step, delivered once through the run's next pre-call check — a
+//!   `POST /v1/fuses/check` naming its `next` step ([`Store::create_nudge`];
+//!   the delivery rules are in the `nudges` module, and [`check_reply`] is
+//!   where a check carries them).
 //! - **Topology** — a run's agents, who delegated to whom, who handed
 //!   control to whom, and where two agents passed it back and forth
 //!   ([`Store::run_topology`]). The guard's `max_handoff_cycles` limit holds
@@ -29,9 +30,9 @@ pub mod http;
 mod nudges;
 mod topology;
 
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -39,12 +40,13 @@ use serde_json::{json, Value};
 pub use crate::guard::{LiveCursor, LivePage, LiveRun, LiveStep, LiveUpdate};
 pub use handoff::MAX_AGENT_NAME_CHARS;
 pub use nudges::{
-    Nudge, NudgeKind, NudgeSpec, NudgeStatus, DEFAULT_NUDGE_TTL_SECONDS, MAX_KEPT_PER_RUN,
-    MAX_NUDGED_RUNS_PER_TENANT, MAX_NUDGE_BYTES, MAX_NUDGE_TTL_SECONDS, MAX_PENDING_PER_RUN,
+    Nudge, NudgeKind, NudgeSpec, NudgeStatus, BLOCK_HOLD_MS, DEFAULT_NUDGE_TTL_SECONDS,
+    MAX_HELD_NUDGE_BYTES, MAX_KEPT_PER_RUN, MAX_NUDGE_BYTES, MAX_NUDGE_TTL_SECONDS,
+    MAX_PENDING_PER_RUN, MAX_TENANT_NUDGE_BYTES, NUDGE_OVERHEAD_BYTES,
 };
 pub use topology::{
     Topology, TopologyCycle, TopologyEdge, TopologyHandoff, TopologyNode, MAX_CYCLES, MAX_EDGES,
-    MAX_NODES, MAX_SEQUENCE, MAX_TOPOLOGY_SPANS,
+    MAX_HANDOFFS, MAX_NODES, MAX_SEQUENCE, MAX_TOPOLOGY_SPANS,
 };
 
 use crate::guard::{Verdict, VerdictDoc};
@@ -55,6 +57,10 @@ pub const DEFAULT_LIVE_WINDOW_SECONDS: u64 = 900;
 
 /// Most live-run streams one server serves at once; one more is refused.
 pub const MAX_LIVE_STREAMS: usize = 64;
+
+/// Most of those one scope — one tenant, or every tenant — may hold, so a
+/// single tenant's credential cannot take every slot.
+pub const MAX_LIVE_STREAMS_PER_SCOPE: usize = 8;
 
 /// Most runs one stream update carries as changes; more changing at once
 /// restarts the stream from a listing instead.
@@ -76,11 +82,19 @@ impl Default for SteerConfig {
     }
 }
 
-/// What steering keeps beside the guard: the nudges and their log, and a
-/// count of live streams being served.
+/// Live streams being served: in all, and per scope (a tenant, or `None`
+/// for every tenant).
+#[derive(Debug, Default)]
+struct Streams {
+    total: usize,
+    by_scope: HashMap<Option<String>, usize>,
+}
+
+/// What steering keeps beside the guard: the nudges and their log, and the
+/// live streams being served.
 pub(crate) struct Steer {
-    book: Mutex<nudges::Book>,
-    streams: AtomicUsize,
+    nudges: nudges::Nudges,
+    streams: Mutex<Streams>,
 }
 
 impl Steer {
@@ -91,25 +105,32 @@ impl Steer {
             return Ok(None);
         }
         Ok(Some(Self {
-            book: Mutex::new(nudges::Book::open(directory, unix_now_ns())?),
-            streams: AtomicUsize::new(0),
+            nudges: nudges::Nudges::open(directory, unix_now_ns())?,
+            streams: Mutex::new(Streams::default()),
         }))
-    }
-
-    fn lock_book(&self) -> Result<MutexGuard<'_, nudges::Book>> {
-        self.book.lock().map_err(|_| Error::LockPoisoned("nudges"))
     }
 }
 
-/// A live stream's claim on one of [`MAX_LIVE_STREAMS`] slots, released on
-/// drop.
+/// A live stream's claim on one of [`MAX_LIVE_STREAMS`] slots — and one of
+/// its scope's [`MAX_LIVE_STREAMS_PER_SCOPE`] — released on drop.
 pub struct LiveStreamSlot<'a> {
-    streams: &'a AtomicUsize,
+    streams: &'a Mutex<Streams>,
+    scope: Option<String>,
 }
 
 impl Drop for LiveStreamSlot<'_> {
     fn drop(&mut self) {
-        self.streams.fetch_sub(1, Ordering::AcqRel);
+        // A poisoned lock means a panic mid-count; the slot stays taken,
+        // which errs toward refusing a stream, never toward too many.
+        if let Ok(mut streams) = self.streams.lock() {
+            streams.total = streams.total.saturating_sub(1);
+            if let Some(held) = streams.by_scope.get_mut(&self.scope) {
+                *held = held.saturating_sub(1);
+                if *held == 0 {
+                    streams.by_scope.remove(&self.scope);
+                }
+            }
+        }
     }
 }
 
@@ -135,22 +156,20 @@ impl Store {
     /// Queues a nudge for `run` within `tenant` (empty: the default
     /// tenant), durably, for its next pre-call check to deliver. A run need
     /// not have started: a nudge can wait for its first check. Refused with
-    /// a conflict while an erasure covering the run is pending.
+    /// a conflict while an erasure covering the run is pending — asked
+    /// under the nudge log's lock, which the erasure's own forgetting takes
+    /// too, so no nudge queued during an erasure outlives it.
     pub fn create_nudge(&self, tenant: &str, run: &str, spec: &NudgeSpec) -> Result<Nudge> {
         let steer = self.steer()?;
         crate::guard::validate_tenant(tenant)?;
         crate::guard::validate_run(run)?;
-        if self
-            .erasure_mask()
-            .is_some_and(|mask| mask.covers_run(tenant, run))
-        {
-            return Err(Error::Conflict(format!(
-                "an erasure covering run `{run}` is pending; nudge it once the erasure settles"
-            )));
-        }
+        let covered = || {
+            self.erasure_mask()
+                .is_some_and(|mask| mask.covers_run(tenant, run))
+        };
         let nudge = steer
-            .lock_book()?
-            .create(tenant, run, spec, unix_now_ns())?;
+            .nudges
+            .create(tenant, run, spec, unix_now_ns(), &covered)?;
         self.guard_touch_live(tenant, run);
         Ok(nudge)
     }
@@ -161,17 +180,22 @@ impl Store {
         let steer = self.steer()?;
         crate::guard::validate_tenant(tenant)?;
         crate::guard::validate_run(run)?;
-        Ok(steer.lock_book()?.list(tenant, run))
+        steer.nudges.list(tenant, run)
     }
 
     /// Delivers `run`'s pending nudges: marks them delivered, durably, and
-    /// returns them; see [`check_reply`].
+    /// returns them, followed by the blocks of a delivery still holding;
+    /// see [`check_reply`].
     pub(crate) fn deliver_nudges(&self, tenant: &str, run: &str) -> Result<Vec<Nudge>> {
         let Some(steer) = self.steer.as_ref() else {
             return Ok(Vec::new());
         };
-        let delivered = steer.lock_book()?.deliver(tenant, run, unix_now_ns())?;
-        if !delivered.is_empty() {
+        let now = unix_now_ns();
+        let delivered = steer.nudges.deliver(tenant, run, now)?;
+        if delivered
+            .iter()
+            .any(|nudge| nudge.delivered_at_ns == Some(now))
+        {
             self.guard_touch_live(tenant, run);
         }
         Ok(delivered)
@@ -215,22 +239,40 @@ impl Store {
         Ok(update)
     }
 
-    /// Claims one of [`MAX_LIVE_STREAMS`] stream slots; a conflict when all
-    /// are taken or steering is off.
-    pub fn live_stream_slot(&self) -> Result<LiveStreamSlot<'_>> {
+    /// Claims one of [`MAX_LIVE_STREAMS`] stream slots for a stream of
+    /// `scope` (a tenant, or `None` for every tenant), which may hold at
+    /// most [`MAX_LIVE_STREAMS_PER_SCOPE`] of them; a conflict when either
+    /// is full or steering is off.
+    pub fn live_stream_slot(&self, scope: Option<&str>) -> Result<LiveStreamSlot<'_>> {
         let steer = self.steer()?;
-        let taken = steer.streams.fetch_add(1, Ordering::AcqRel);
-        let slot = LiveStreamSlot {
-            streams: &steer.streams,
-        };
-        if taken >= MAX_LIVE_STREAMS {
-            drop(slot);
+        let mut streams = steer
+            .streams
+            .lock()
+            .map_err(|_| Error::LockPoisoned("live streams"))?;
+        let scope = scope.map(str::to_owned);
+        if streams.total >= MAX_LIVE_STREAMS {
             return Err(Error::Conflict(format!(
                 "this server is already serving {MAX_LIVE_STREAMS} live-run streams; close one, \
                  or poll GET /v1/runs/live"
             )));
         }
-        Ok(slot)
+        if streams.by_scope.get(&scope).copied().unwrap_or(0) >= MAX_LIVE_STREAMS_PER_SCOPE {
+            return Err(Error::Conflict(format!(
+                "{} already has {MAX_LIVE_STREAMS_PER_SCOPE} live-run streams open; close one, \
+                 or poll GET /v1/runs/live",
+                if scope.is_some() {
+                    "this tenant"
+                } else {
+                    "the every-tenant view"
+                }
+            )));
+        }
+        streams.total += 1;
+        *streams.by_scope.entry(scope.clone()).or_default() += 1;
+        Ok(LiveStreamSlot {
+            streams: &steer.streams,
+            scope,
+        })
     }
 
     /// The activity window of the live view.
@@ -245,16 +287,16 @@ impl Store {
         let Some(steer) = self.steer.as_ref() else {
             return Ok(());
         };
-        let mut book = steer.lock_book()?;
+        let nudges = &steer.nudges;
         match subject {
             erasure::Subject::Session { session_id, tenant } => {
-                book.forget(tenant, Some(session_id))
+                nudges.forget(tenant, Some(session_id))
             }
-            erasure::Subject::Trace { trace_id, tenant } => book.forget(
+            erasure::Subject::Trace { trace_id, tenant } => nudges.forget(
                 tenant,
                 Some(&format!("{}{trace_id}", crate::semconv::TRACE_RUN_PREFIX)),
             ),
-            erasure::Subject::Tenant { tenant } => book.forget(tenant, None),
+            erasure::Subject::Tenant { tenant } => nudges.forget(tenant, None),
             _ => Ok(()),
         }
     }
@@ -265,31 +307,44 @@ fn fill_pending(steer: &Steer, runs: &mut [LiveRun]) -> Result<()> {
     if runs.is_empty() {
         return Ok(());
     }
-    let now = unix_now_ns();
-    let book = steer.lock_book()?;
-    for run in runs {
-        run.pending_nudges = book.pending(&run.tenant, &run.run, now);
+    let counts = steer.nudges.pending_each(
+        runs.iter()
+            .map(|run| (run.tenant.as_str(), run.run.as_str())),
+        unix_now_ns(),
+    )?;
+    for (run, count) in runs.iter_mut().zip(counts) {
+        run.pending_nudges = count;
     }
     Ok(())
 }
 
 /// The body `POST /v1/fuses/check` answers: the verdict document `doc`,
-/// plus every nudge pending for the run — delivered now, durably, so each
-/// reaches exactly one check — as `"nudges": [{id, kind, message}]`.
+/// plus — on a pre-call check (`pre_step`: the request named its `next`
+/// step) — every nudge pending for the run, delivered now, durably, so each
+/// is delivered at most once, as `"nudges": [{id, kind, message}]`. A check
+/// naming no next step is a verdict read: it delivers nothing and answers
+/// `"nudges": []`, so a probe or a dashboard cannot take an agent's nudges.
 ///
 /// A `block` nudge is a human veto: the answer is `stop`, with the blocking
 /// messages as its first reasons (the guard's own follow, if it said `stop`
 /// too), and nothing about the run's fuse changes — no trip, no event, no
-/// sticky stop — so the run's next check is judged by the guard as usual.
-/// If the delivery cannot be recorded, the check fails and every nudge
-/// stays pending.
+/// sticky stop. Every pre-call check of the run in the [`BLOCK_HOLD_MS`]
+/// after the delivery is vetoed the same way, carrying the same block nudge
+/// again, so the parallel tool calls of one batch are all refused; after
+/// that the guard judges the run as usual. If the delivery cannot be
+/// recorded, the check fails and every nudge stays pending.
 pub(crate) fn check_reply(
     store: &Store,
     tenant: &str,
     run: &str,
     doc: &VerdictDoc,
+    pre_step: bool,
 ) -> Result<Value> {
-    let delivered = store.deliver_nudges(tenant, run)?;
+    let delivered = if pre_step {
+        store.deliver_nudges(tenant, run)?
+    } else {
+        Vec::new()
+    };
     let mut body = serde_json::to_value(doc)?;
     let blocks: Vec<String> = delivered
         .iter()
@@ -327,10 +382,33 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("dir");
         let store = Store::open(&dir, crate::Config::default()).expect("opens");
-        let mut slots: Vec<LiveStreamSlot<'_>> = (0..MAX_LIVE_STREAMS)
-            .map(|_| store.live_stream_slot().expect("a free slot"))
+        // One scope holds at most its share; the rest stay open to others.
+        let mut slots: Vec<LiveStreamSlot<'_>> = (0..MAX_LIVE_STREAMS_PER_SCOPE)
+            .map(|_| store.live_stream_slot(Some("acme")).expect("a free slot"))
             .collect();
-        match store.live_stream_slot() {
+        match store.live_stream_slot(Some("acme")) {
+            Err(Error::Conflict(message)) => assert!(
+                message.contains("this tenant already has 8 live-run streams"),
+                "{message}"
+            ),
+            other => panic!(
+                "acme's ninth stream must be refused, got {:?}",
+                other.is_ok()
+            ),
+        }
+        slots.pop();
+        slots.push(
+            store
+                .live_stream_slot(Some("acme"))
+                .expect("a released slot is free again"),
+        );
+        let mut opened = 0;
+        while slots.len() < MAX_LIVE_STREAMS {
+            let scope = format!("t{}", opened / MAX_LIVE_STREAMS_PER_SCOPE);
+            slots.push(store.live_stream_slot(Some(&scope)).expect("a free slot"));
+            opened += 1;
+        }
+        match store.live_stream_slot(None) {
             Err(Error::Conflict(message)) => {
                 assert!(message.contains("64 live-run streams"), "{message}")
             }
@@ -338,19 +416,14 @@ mod tests {
         }
         slots.pop();
         let again = store
-            .live_stream_slot()
+            .live_stream_slot(None)
             .expect("a released slot is free again");
         drop(again);
         drop(slots);
-        assert_eq!(
-            store
-                .steer()
-                .expect("steer")
-                .streams
-                .load(Ordering::Acquire),
-            0,
-            "every slot released"
-        );
+        let streams = store.steer().expect("steer").streams.lock().expect("lock");
+        assert_eq!(streams.total, 0, "every slot released");
+        assert!(streams.by_scope.is_empty(), "{:?}", streams.by_scope);
+        drop(streams);
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
     }

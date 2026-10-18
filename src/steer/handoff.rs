@@ -53,6 +53,15 @@ pub(crate) fn clip_name(name: &str) -> String {
     }
 }
 
+/// [`clip_name`] of an owned name, in place: no copy when it fits.
+pub(crate) fn clip_owned(mut name: String) -> String {
+    if let Some((end, _)) = name.char_indices().nth(MAX_AGENT_NAME_CHARS) {
+        name.truncate(end);
+        name.push('…');
+    }
+    name
+}
+
 /// A non-zero 64-bit key for an agent name.
 pub(crate) fn agent_key(name: &str) -> u64 {
     let digest = crate::hash::hash128(name.as_bytes());
@@ -73,23 +82,33 @@ pub(crate) fn turns_of<T: PartialEq>(agents: impl IntoIterator<Item = T>) -> Vec
     turns
 }
 
-/// The cycles in `turns` (consecutive entries distinct, as [`turns_of`]
-/// makes them): for every `i` with `turns[i] == turns[i + 2]`, one for the
-/// ordered pair `(turns[i], turns[i + 1])`.
+/// Where `turns` (consecutive entries distinct, as [`turns_of`] makes them)
+/// returns control: every `i` with `turns[i] == turns[i + 2]`, a cycle of
+/// the ordered pair `(turns[i], turns[i + 1])`, in order. One pass.
+pub(crate) fn returns<T: Eq>(turns: &[T]) -> impl Iterator<Item = usize> + '_ {
+    turns
+        .windows(3)
+        .enumerate()
+        .filter(|(_, window)| window[0] == window[2] && window[0] != window[1])
+        .map(|(index, _)| index)
+}
+
+/// The cycles in `turns`, counted per ordered pair: see [`returns`].
 pub(crate) fn cycles_in<T: Eq + Hash + Clone>(turns: &[T]) -> HashMap<(T, T), u64> {
     let mut cycles: HashMap<(T, T), u64> = HashMap::new();
-    for window in turns.windows(3) {
-        if window[0] == window[2] && window[0] != window[1] {
-            *cycles
-                .entry((window[0].clone(), window[1].clone()))
-                .or_default() += 1;
-        }
+    for index in returns(turns) {
+        *cycles
+            .entry((turns[index].clone(), turns[index + 1].clone()))
+            .or_default() += 1;
     }
     cycles
 }
 
 /// The handoff sequence of one run, kept current incrementally; see the
-/// module docs. Holds about a hundred bytes per named step.
+/// module docs. Holds about a hundred bytes per named step, plus the name
+/// of each distinct agent a held step names — at most [`MAX_NAMES`] names
+/// of at most [`MAX_AGENT_NAME_CHARS`] characters, and never more names
+/// than held steps: a name goes when the last step naming it does.
 #[derive(Debug, Default)]
 pub(crate) struct HandoffTracker {
     /// Named steps by position: their agent.
@@ -102,7 +121,10 @@ pub(crate) struct HandoffTracker {
     cycles: HashMap<(u64, u64), u64>,
     /// The same counts, ordered, so the largest is the last.
     ranked: BTreeSet<(u64, u64, u64)>,
-    /// Agent names by key, at most [`MAX_NAMES`].
+    /// Held steps per agent key.
+    agents: HashMap<u64, u32>,
+    /// Agent names by key, at most [`MAX_NAMES`], each of an agent some
+    /// held step names.
     names: HashMap<u64, String>,
 }
 
@@ -132,14 +154,15 @@ impl HandoffTracker {
             return;
         }
         self.remove(span);
-        if self.names.len() < MAX_NAMES || self.names.contains_key(&agent) {
-            self.names.entry(agent).or_insert_with(|| clip_name(name));
-        }
         // A position already taken by another span (a hash collision of two
         // span keys starting together) keeps the step it has: the tracker
         // never holds two steps at one place.
         if self.steps.contains_key(&position) {
             return;
+        }
+        *self.agents.entry(agent).or_default() += 1;
+        if !self.names.contains_key(&agent) && self.names.len() < MAX_NAMES {
+            self.names.insert(agent, clip_name(name));
         }
         let (low, high) = self.anchors(position);
         let before = self.window(low, high);
@@ -186,6 +209,13 @@ impl HandoffTracker {
         let Some(agent) = self.steps.remove(&position) else {
             return;
         };
+        if let Some(held) = self.agents.get_mut(&agent) {
+            *held -= 1;
+            if *held == 0 {
+                self.agents.remove(&agent);
+                self.names.remove(&agent);
+            }
+        }
         if self.turns.remove(&position).is_some() {
             let previous = self
                 .steps
@@ -392,6 +422,13 @@ mod tests {
                 // Turns are exactly the agent changes of the steps.
                 let starts: Vec<u64> = tracker.turns.values().copied().collect();
                 assert_eq!(starts, turns_of(tracker.steps.values().copied()));
+                // Names and their counts are exactly those of held steps.
+                let mut held: HashMap<u64, u32> = HashMap::new();
+                for agent in tracker.steps.values() {
+                    *held.entry(*agent).or_default() += 1;
+                }
+                assert_eq!(tracker.agents, held, "round {round}");
+                assert!(tracker.names.keys().all(|key| held.contains_key(key)));
             }
         }
     }
@@ -413,5 +450,27 @@ mod tests {
         assert!(tracker.names.len() <= MAX_NAMES);
         let unnamed = agent_key(&format!("agent-{}", MAX_NAMES + 5));
         assert!(tracker.name(unnamed).starts_with("agent#"));
+        assert_eq!(clip_owned(long.clone()), clip_name(&long));
+        assert_eq!(clip_owned("short".to_owned()), "short");
+    }
+
+    /// One span re-sent under ever new agent names holds one step, and so
+    /// one name: a name goes when the last step naming it does.
+    #[test]
+    fn names_never_outnumber_held_steps() {
+        let mut tracker = HandoffTracker::default();
+        for index in 0..(MAX_NAMES * 2) {
+            tracker.upsert(7, (100, 7), &format!("renamed-{index}-{}", "x".repeat(150)));
+            assert_eq!(tracker.names.len(), 1, "after {index} renames");
+            assert_eq!(tracker.agents.len(), 1);
+        }
+        tracker.upsert(8, (200, 8), "other");
+        tracker.upsert(9, (300, 9), "other");
+        assert_eq!(tracker.names.len(), 2);
+        tracker.remove(8);
+        assert_eq!(tracker.name(agent_key("other")), "other", "still named");
+        tracker.remove(9);
+        tracker.remove(7);
+        assert!(tracker.names.is_empty() && tracker.agents.is_empty());
     }
 }

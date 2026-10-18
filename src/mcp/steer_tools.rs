@@ -167,25 +167,76 @@ fn run_topology(
     )))
 }
 
+/// `count(listed, noun)`, or "more than N nouns" when the list was cut.
+fn at_least(listed: usize, cut: bool, noun: &str) -> String {
+    if cut {
+        format!("more than {}", count(listed as u64, noun))
+    } else {
+        count(listed as u64, noun)
+    }
+}
+
 fn render_topology(topology: &Topology, max_bytes: usize) -> String {
     let top = topology.cycles.first();
+    let mut cut: Vec<String> = Vec::new();
+    for (truncated, list, limit) in [
+        (topology.nodes_truncated, "agents", topology.nodes.len()),
+        (
+            topology.edges_truncated,
+            "delegation paths",
+            topology.edges.len(),
+        ),
+        (
+            topology.handoffs_truncated,
+            "handoff pairs",
+            topology.handoffs.len(),
+        ),
+        (
+            topology.cycles_truncated,
+            "ping-pong pairs",
+            topology.cycles.len(),
+        ),
+    ] {
+        if truncated {
+            cut.push(format!("the {limit} largest {list}"));
+        }
+    }
     let head = format!(
-        "Run {} (tenant {}): {} across {}, {} between them, {} between named agents{}.{}",
+        "Run {} (tenant {}): {} across {}, {} between them, {} between named agents{}.{}{}",
         sanitize(&topology.run),
         tenant_label(&topology.tenant),
         count(topology.spans_read as u64, "span"),
-        count(topology.nodes.len() as u64, "agent"),
-        count(topology.edges.len() as u64, "delegation path"),
-        count(
-            topology.handoffs.iter().map(|handoff| handoff.count).sum(),
-            "handoff"
+        at_least(topology.nodes.len(), topology.nodes_truncated, "agent"),
+        at_least(
+            topology.edges.len(),
+            topology.edges_truncated,
+            "delegation path"
         ),
+        if topology.handoffs_truncated {
+            format!(
+                "at least {}",
+                count(
+                    topology.handoffs.iter().map(|handoff| handoff.count).sum(),
+                    "handoff"
+                )
+            )
+        } else {
+            count(
+                topology.handoffs.iter().map(|handoff| handoff.count).sum(),
+                "handoff",
+            )
+        },
         match top {
             Some(cycle) => format!(
                 "; the most frequent ping-pong returned control {} (see the rows)",
                 count(cycle.count, "time")
             ),
             None => "; no ping-pong".to_owned(),
+        },
+        if cut.is_empty() {
+            String::new()
+        } else {
+            format!(" Lists were cut: only {} are listed.", cut.join(", "))
         },
         if topology.truncated {
             " TRUNCATED: the run has more spans than one topology reads; this describes its \

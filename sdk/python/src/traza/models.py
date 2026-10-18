@@ -31,7 +31,9 @@ __all__ = [
     "UsageReport",
     "SpanRef",
     "TopRepeat",
+    "HandoffCycle",
     "RunUsage",
+    "DeliveredNudge",
     "Limits",
     "Verdict",
     "PolicyMatch",
@@ -158,6 +160,15 @@ class TopRepeat:
 
 
 @dataclass
+class HandoffCycle:
+    """Control returning to one named agent straight from another."""
+
+    #: The agent control returned to, then the agent it returned from.
+    agents: List[str] = field(default_factory=list)
+    count: Optional[int] = None
+
+
+@dataclass
 class RunUsage:
     steps: Optional[int] = None
     llm_calls: Optional[int] = None
@@ -168,6 +179,20 @@ class RunUsage:
     error_streak: Optional[int] = None
     duration_ns: Optional[int] = None
     top_repeat: Optional[TopRepeat] = None
+    #: The most frequent handoff cycle since the last reset; ``None`` when
+    #: control never returned to a named agent.
+    top_handoff_cycle: Optional[HandoffCycle] = None
+
+
+@dataclass
+class DeliveredNudge:
+    """A nudge a pre-call check delivered: ``advice`` for the agent to hear,
+    or a ``block`` that vetoed the step it asked about."""
+
+    id: Optional[str] = None
+    #: ``advice`` or ``block``.
+    kind: Optional[str] = None
+    message: Optional[str] = None
 
 
 @dataclass
@@ -182,6 +207,7 @@ class Limits:
     max_duration_seconds: Optional[int] = None
     max_repeats: Optional[int] = None
     max_error_streak: Optional[int] = None
+    max_handoff_cycles: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """The limits that are set, as the wire spells them."""
@@ -209,11 +235,20 @@ class Verdict:
     evidence: List[SpanRef] = field(default_factory=list)
     #: ``live`` from memory, ``rebuilt`` when answering read stored spans.
     source: Optional[str] = None
+    #: The nudges this answer delivered — :meth:`Client.check` only. Each is
+    #: delivered once: the check that carries it consumes it, so read them
+    #: here (or pass ``on_nudges`` to :meth:`Client.guard`).
+    nudges: List[DeliveredNudge] = field(default_factory=list)
     raw: Dict[str, Any] = _raw()
 
     @property
     def stopped(self) -> bool:
         return self.verdict == "stop"
+
+    @property
+    def advice(self) -> List[str]:
+        """The messages of the ``advice`` nudges this answer delivered."""
+        return [nudge.message or "" for nudge in self.nudges if nudge.kind == "advice"]
 
     @property
     def warned(self) -> bool:

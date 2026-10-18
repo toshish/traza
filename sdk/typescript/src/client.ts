@@ -12,6 +12,7 @@ import { errorFromResponse, FuseTripped, TrazaError } from "./errors.js";
 import { verifyEvidenceDigest } from "./evidence.js";
 import { parseJson, stringifyJson } from "./json.js";
 import type {
+  DeliveredNudge,
   Diff,
   EvidencePack,
   FuseEvent,
@@ -83,6 +84,13 @@ export interface GuardOptions extends CheckOptions {
   failOpen?: boolean;
   /** Called with the error a fail-open guard swallowed. */
   onError?: (error: TrazaError) => void;
+  /**
+   * Called with the nudges the check delivered, when there are any, before
+   * the guard resolves — or throws {@link FuseTripped} for a `block`. Each
+   * nudge is delivered once, so this is how a guarded step hands a
+   * person's advice to its model.
+   */
+  onNudges?: (nudges: DeliveredNudge[]) => void;
 }
 
 /** Options for {@link Client.events}. */
@@ -240,6 +248,7 @@ export class Client {
       }
       throw error;
     }
+    if (verdict.nudges && verdict.nudges.length > 0) options.onNudges?.(verdict.nudges);
     if (verdict.verdict === "stop") throw new FuseTripped(verdict);
     return verdict;
   }

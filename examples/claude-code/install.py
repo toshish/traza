@@ -11,17 +11,23 @@ What it does, and nothing else:
 1. copies traza_hook.py to <claude dir>/hooks/traza/ — `.claude/` in the
    project, or `~/.claude/` with --user — so the settings never point into
    a Traza checkout that may move;
-2. writes <claude dir>/hooks/traza/config.json with the options given here
-   (the URL, the tenant, a token FILE's path — never a token itself);
+2. writes <claude dir>/hooks/traza/config.json: the configuration already
+   there, changed only by the options given on this run (the URL, the
+   tenant, a token FILE's path — never a token itself). Re-running with one
+   option changes that option and keeps the rest; --reset starts from the
+   defaults instead;
 3. merges a `hooks` block into <claude dir>/settings.json (or
-   settings.local.json with --local): PreToolUse and SessionStart, plus
-   PostToolUse and PostToolUseFailure with --record-tools. Every other
-   setting and every other hook is kept as it was; an earlier Traza entry is
-   replaced, so running it twice changes nothing. The previous file is kept
-   beside it as <file>.traza-backup.
+   settings.local.json with --local): PreToolUse, SessionStart unless recall
+   is off, and PostToolUse and PostToolUseFailure when tool recording is on
+   — as the merged configuration says. Every other setting and every other
+   hook is kept as it was; an earlier Traza entry is replaced, so running it
+   twice changes nothing. The settings as they were before Traza's first
+   install are kept beside them as <file>.traza-backup, and a later run
+   never overwrites that copy with settings Traza already changed.
 
 A settings file that is not valid JSON is refused, never overwritten.
---dry-run prints the merged settings instead of writing anything.
+--dry-run prints the merged settings and configuration instead of writing
+anything.
 
 The hook contract this targets is https://code.claude.com/docs/en/hooks.
 Standard library only; Python 3.8 or later.
@@ -102,6 +108,74 @@ def merged(settings, events, command):
     return result
 
 
+def has_ours(settings):
+    """Whether `settings` already carries a Traza handler."""
+    hooks = settings.get("hooks") if isinstance(settings, dict) else None
+    if not isinstance(hooks, dict):
+        return False
+    for groups in hooks.values():
+        for group in groups if isinstance(groups, list) else []:
+            handlers = group.get("hooks") if isinstance(group, dict) else None
+            if isinstance(handlers, list) and any(is_ours(handler) for handler in handlers):
+                return True
+    return False
+
+
+def read_config(path):
+    """The configuration an earlier run wrote, or nothing."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            stored = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return stored if isinstance(stored, dict) else {}
+
+
+def configured(stored, options):
+    """`stored` changed by the options given on this run, and nothing else.
+    An empty --url, --tenant, --token-file or --recall-query removes it."""
+    config = {} if options.reset else dict(stored)
+
+    def put(key, value):
+        if value in (None, ""):
+            config.pop(key, None)
+        else:
+            config[key] = value
+
+    if options.url is not None:
+        put("url", options.url)
+    if options.tenant is not None:
+        put("tenant", options.tenant)
+    if options.token_file is not None:
+        put("token_file", os.path.abspath(os.path.expanduser(options.token_file))
+            if options.token_file else "")
+    if options.recall_query is not None:
+        put("recall_query", options.recall_query)
+    # Switches: given, they set the value; absent, the stored one stands.
+    # Defaults are left out of the file, so the hook's defaults apply.
+    for key, on, off, default in (
+        ("fail_closed", options.fail_closed, options.fail_open, False),
+        ("recall", options.recall, options.no_recall, True),
+        ("recall_steps", options.recall_steps, options.no_recall_steps, False),
+        ("record_tools", options.record_tools, options.no_record_tools, False),
+    ):
+        if on or off:
+            value = bool(on)
+            if value == default:
+                config.pop(key, None)
+            else:
+                config[key] = value
+    return config
+
+
+def switched_on(config, key, default):
+    """A switch as the hook reads it: a boolean, or a string such as "1"."""
+    value = config.get(key, default)
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
 def write_atomically(path, text):
     staged = path + ".traza-tmp"
     with open(staged, "w", encoding="utf-8") as handle:
@@ -122,17 +196,34 @@ def main(argv=None):
     parser.add_argument("--url", help="the Traza server (default http://127.0.0.1:8080)")
     parser.add_argument("--tenant", help="the runs' tenant, for an unbound token")
     parser.add_argument("--token-file", help="a file holding the bearer token (never the token)")
-    parser.add_argument("--fail-closed", action="store_true",
+    closed = parser.add_mutually_exclusive_group()
+    closed.add_argument("--fail-closed", action="store_true",
                         help="deny tool calls when Traza cannot answer (default: let them through)")
-    parser.add_argument("--no-recall", action="store_true",
+    closed.add_argument("--fail-open", action="store_true",
+                        help="let tool calls through when Traza cannot answer (the default)")
+    recall = parser.add_mutually_exclusive_group()
+    recall.add_argument("--recall", action="store_true",
+                        help="a SessionStart summary of earlier runs (the default)")
+    recall.add_argument("--no-recall", action="store_true",
                         help="no SessionStart summary of earlier runs")
     parser.add_argument("--recall-query", help="words earlier runs must contain (default: the "
                                                 "project directory's name)")
-    parser.add_argument("--record-tools", action="store_true",
+    names = parser.add_mutually_exclusive_group()
+    names.add_argument("--recall-steps", action="store_true",
+                       help="name earlier runs' steps in the summary (recorded telemetry text)")
+    names.add_argument("--no-recall-steps", action="store_true",
+                       help="step counts by kind only (the default)")
+    record = parser.add_mutually_exclusive_group()
+    record.add_argument("--record-tools", action="store_true",
                         help="also record each tool call as a span (only without another recorder)")
+    record.add_argument("--no-record-tools", action="store_true",
+                        help="do not record tool calls (the default)")
+    parser.add_argument("--reset", action="store_true",
+                        help="start from the defaults, not the configuration an earlier run wrote")
     parser.add_argument("--python", default="python3", help="the interpreter hooks run under")
     parser.add_argument("--uninstall", action="store_true", help="remove the Traza hooks")
-    parser.add_argument("--dry-run", action="store_true", help="print the merged settings only")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="print the merged settings and configuration only")
     options = parser.parse_args(argv)
 
     if options.user:
@@ -141,6 +232,7 @@ def main(argv=None):
         claude_dir = os.path.join(os.path.abspath(options.project or "."), ".claude")
     settings_path = os.path.join(claude_dir, "settings.local.json" if options.local else "settings.json")
     hooks_dir = os.path.join(claude_dir, "hooks", "traza")
+    config_path = os.path.join(hooks_dir, "config.json")
 
     settings = {}
     if os.path.exists(settings_path):
@@ -155,24 +247,31 @@ def main(argv=None):
             sys.stderr.write("%s is not a JSON object; nothing was changed\n" % settings_path)
             return 2
 
+    config = configured(read_config(config_path), options)
     events = []
     if not options.uninstall:
         events.append("PreToolUse")
-        if not options.no_recall:
+        if switched_on(config, "recall", True):
             events.append("SessionStart")
-        if options.record_tools:
+        if switched_on(config, "record_tools", False):
             events.extend(["PostToolUse", "PostToolUseFailure"])
     command = command_for(claude_dir, options.user, options.python)
     result = merged(settings, events, command)
     text = json.dumps(result, indent=2, ensure_ascii=False) + "\n"
+    config_text = json.dumps(config, indent=2, sort_keys=True) + "\n"
 
     if options.dry_run:
         sys.stdout.write(text)
+        if not options.uninstall:
+            sys.stdout.write("%s:\n%s" % (config_path, config_text))
         return 0
 
     os.makedirs(claude_dir, exist_ok=True)
-    if os.path.exists(settings_path):
-        shutil.copy2(settings_path, settings_path + ".traza-backup")
+    backup = settings_path + ".traza-backup"
+    if os.path.exists(settings_path) and (not has_ours(settings) or not os.path.exists(backup)):
+        # The settings as they were before Traza: a later run, reading
+        # settings Traza already changed, must not replace that copy.
+        shutil.copy2(settings_path, backup)
     write_atomically(settings_path, text)
 
     if options.uninstall:
@@ -184,22 +283,7 @@ def main(argv=None):
     target = os.path.join(hooks_dir, MARKER)
     shutil.copy2(os.path.join(here, MARKER), target)
     os.chmod(target, 0o755)
-    config = {}
-    if options.url:
-        config["url"] = options.url
-    if options.tenant:
-        config["tenant"] = options.tenant
-    if options.token_file:
-        config["token_file"] = os.path.abspath(os.path.expanduser(options.token_file))
-    if options.fail_closed:
-        config["fail_closed"] = True
-    if options.no_recall:
-        config["recall"] = False
-    if options.recall_query:
-        config["recall_query"] = options.recall_query
-    if options.record_tools:
-        config["record_tools"] = True
-    write_atomically(os.path.join(hooks_dir, "config.json"), json.dumps(config, indent=2) + "\n")
+    write_atomically(config_path, config_text)
     print("installed the Traza hooks (%s) into %s" % (", ".join(events), settings_path))
     print("hook script and config: %s" % hooks_dir)
     return 0

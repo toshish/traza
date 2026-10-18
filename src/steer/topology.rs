@@ -21,16 +21,19 @@
 //!
 //! Bounded: at most [`MAX_TOPOLOGY_SPANS`] spans are read (the earliest, in
 //! step order — `truncated` says so), and the answer keeps at most
-//! [`MAX_NODES`] nodes, [`MAX_EDGES`] edges, [`MAX_CYCLES`] cycles and
-//! [`MAX_SEQUENCE`] turns of the sequence, the largest first, each list
-//! saying when it was cut.
+//! [`MAX_NODES`] nodes, [`MAX_EDGES`] edges, [`MAX_HANDOFFS`] handoff pairs,
+//! [`MAX_CYCLES`] cycle pairs and [`MAX_SEQUENCE`] turns of the sequence —
+//! the lists the largest first, each with its own `*_truncated` flag. Every
+//! pass over the spans is linear (or `n log n`, sorting) and checks the
+//! query deadline as it goes, so the whole answer, not just the read,
+//! honours `--query-deadline-ms`.
 
 use std::collections::HashMap;
 use std::time::Instant;
 
 use serde::Serialize;
 
-use super::handoff::{self, clip_name, cycles_in};
+use super::handoff::{self, clip_name};
 use crate::guard::SpanRef;
 use crate::semconv::{self, StepKind};
 use crate::{Deadline, Result, Store};
@@ -44,14 +47,26 @@ pub const MAX_NODES: usize = 256;
 /// Most edges returned.
 pub const MAX_EDGES: usize = 1024;
 
+/// Most handoff pairs returned.
+pub const MAX_HANDOFFS: usize = 1024;
+
 /// Most cycle pairs returned.
 pub const MAX_CYCLES: usize = 256;
 
 /// Most turns of the handoff sequence returned.
 pub const MAX_SEQUENCE: usize = 500;
 
-/// Spans extracted between deadline checks.
+/// Items handled between deadline checks, in every pass.
 const DEADLINE_STRIDE: usize = 1024;
+
+/// Errs once `deadline` has passed, looking at the clock once per
+/// [`DEADLINE_STRIDE`] items.
+fn pace(deadline: Option<Deadline>, item: usize) -> Result<()> {
+    if item % DEADLINE_STRIDE == 0 {
+        Deadline::check(deadline, 0)?;
+    }
+    Ok(())
+}
 
 /// One agent of a run.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -141,12 +156,16 @@ pub struct Topology {
     pub edges_truncated: bool,
     /// Turn-to-turn handoffs between named agents, most frequent first.
     pub handoffs: Vec<TopologyHandoff>,
+    /// Whether handoffs were cut to [`MAX_HANDOFFS`] pairs.
+    pub handoffs_truncated: bool,
     /// The handoff sequence: one entry per turn, in order.
     pub sequence: Vec<String>,
     /// Whether the sequence was cut to [`MAX_SEQUENCE`] turns.
     pub sequence_truncated: bool,
     /// Ping-pong: returns per ordered pair, most first.
     pub cycles: Vec<TopologyCycle>,
+    /// Whether cycles were cut to [`MAX_CYCLES`] pairs.
+    pub cycles_truncated: bool,
     /// Spans read.
     pub spans_read: usize,
     /// Whether the run had more than [`MAX_TOPOLOGY_SPANS`] spans, so all
@@ -183,9 +202,7 @@ impl Store {
         }
         let mut reduced = Vec::with_capacity(stored.spans.len());
         for (position, span) in stored.spans.iter().enumerate() {
-            if position % DEADLINE_STRIDE == 0 {
-                Deadline::check(deadline, 0)?;
-            }
+            pace(deadline, position)?;
             let llm = self.facts(span);
             let parent = span
                 .parent_span_id
@@ -206,17 +223,20 @@ impl Store {
                 span_id: span.span_id.clone(),
             });
         }
-        Deadline::check(deadline, 0)?;
-        Ok(assemble(run, tenant, &reduced, stored.truncated))
+        assemble(run, tenant, &reduced, stored.truncated, deadline)
     }
 }
 
 /// Every span's agent: named, else its parent's within one service, else
-/// its service. Resolved without recursion, and a parent loop in malformed
-/// telemetry ends at the span that closes it.
-fn agents_of(spans: &[Reduced]) -> Vec<(String, bool)> {
+/// its service. Resolved without recursion in one pass — each span is
+/// walked through once, its chain marked with the walk that visits it — and
+/// a parent loop in malformed telemetry ends at the span that closes it.
+fn agents_of(spans: &[Reduced], deadline: Option<Deadline>) -> Result<Vec<(String, bool)>> {
     let mut resolved: Vec<Option<(String, bool)>> = vec![None; spans.len()];
+    // The walk (its starting span) that last visited each span.
+    let mut visited: Vec<usize> = vec![usize::MAX; spans.len()];
     for start in 0..spans.len() {
+        pace(deadline, start)?;
         if resolved[start].is_some() {
             continue;
         }
@@ -231,11 +251,10 @@ fn agents_of(spans: &[Reduced]) -> Vec<(String, bool)> {
             if let Some(agent) = &span.agent {
                 break (agent.clone(), true);
             }
+            visited[at] = start;
             match span.parent {
                 Some(parent)
-                    if spans[parent].service == span.service
-                        && !chain.contains(&parent)
-                        && parent != start =>
+                    if spans[parent].service == span.service && visited[parent] != start =>
                 {
                     chain.push(at);
                     at = parent;
@@ -248,17 +267,24 @@ fn agents_of(spans: &[Reduced]) -> Vec<(String, bool)> {
             resolved[link] = Some(found.clone());
         }
     }
-    resolved
+    Ok(resolved
         .into_iter()
         .map(|agent| agent.unwrap_or_default())
-        .collect()
+        .collect())
 }
 
-fn assemble(run: &str, tenant: &str, spans: &[Reduced], truncated: bool) -> Topology {
-    let agents = agents_of(spans);
+fn assemble(
+    run: &str,
+    tenant: &str,
+    spans: &[Reduced],
+    truncated: bool,
+    deadline: Option<Deadline>,
+) -> Result<Topology> {
+    let agents = agents_of(spans, deadline)?;
 
     let mut nodes: HashMap<&str, TopologyNode> = HashMap::new();
-    for (span, (agent, named)) in spans.iter().zip(&agents) {
+    for (item, (span, (agent, named))) in spans.iter().zip(&agents).enumerate() {
+        pace(deadline, item)?;
         let node = nodes.entry(agent.as_str()).or_insert_with(|| TopologyNode {
             agent: agent.clone(),
             named: false,
@@ -295,6 +321,7 @@ fn assemble(run: &str, tenant: &str, spans: &[Reduced], truncated: bool) -> Topo
 
     let mut edges: HashMap<(&str, &str), TopologyEdge> = HashMap::new();
     for (position, span) in spans.iter().enumerate() {
+        pace(deadline, position)?;
         let Some(parent) = span.parent else { continue };
         let (from, to) = (agents[parent].0.as_str(), agents[position].0.as_str());
         if from == to {
@@ -339,17 +366,20 @@ fn assemble(run: &str, tenant: &str, spans: &[Reduced], truncated: bool) -> Topo
             )
         })
         .collect();
-    named.sort();
+    Deadline::check(deadline, 0)?;
+    named.sort_unstable();
     // Turns: the agent, and the span that opened the turn.
     let mut turns: Vec<(&str, usize)> = Vec::new();
-    for (_, position) in &named {
+    for (item, (_, position)) in named.iter().enumerate() {
+        pace(deadline, item)?;
         let agent = spans[*position].agent.as_deref().unwrap_or_default();
         if turns.last().map(|(last, _)| *last) != Some(agent) {
             turns.push((agent, *position));
         }
     }
     let mut handoffs: HashMap<(&str, &str), u64> = HashMap::new();
-    for pair in turns.windows(2) {
+    for (item, pair) in turns.windows(2).enumerate() {
+        pace(deadline, item)?;
         *handoffs.entry((pair[0].0, pair[1].0)).or_default() += 1;
     }
     let mut handoffs: Vec<TopologyHandoff> = handoffs
@@ -360,43 +390,50 @@ fn assemble(run: &str, tenant: &str, spans: &[Reduced], truncated: bool) -> Topo
             count,
         })
         .collect();
+    Deadline::check(deadline, 0)?;
     handoffs.sort_by(|left, right| {
         right
             .count
             .cmp(&left.count)
             .then_with(|| (&left.from, &left.to).cmp(&(&right.from, &right.to)))
     });
+    let handoffs_truncated = handoffs.len() > MAX_HANDOFFS;
+    handoffs.truncate(MAX_HANDOFFS);
 
+    // Cycles, exactly as `handoff::cycles_in` counts them, with each pair's
+    // earliest and latest return found in the same single pass.
     let names: Vec<&str> = turns.iter().map(|(agent, _)| *agent).collect();
-    let counts = cycles_in(&names);
-    let mut cycles: Vec<TopologyCycle> = Vec::with_capacity(counts.len());
-    for ((to, from), count) in counts {
-        let returns: Vec<usize> = names
-            .windows(3)
-            .enumerate()
-            .filter(|(_, window)| window[0] == to && window[1] == from && window[2] == to)
-            .map(|(index, _)| turns[index + 2].1)
-            .collect();
-        let (Some(first), Some(last)) = (returns.first(), returns.last()) else {
-            continue;
-        };
-        cycles.push(TopologyCycle {
+    let mut found: HashMap<(&str, &str), (u64, usize, usize)> = HashMap::new();
+    for (item, index) in handoff::returns(&names).enumerate() {
+        pace(deadline, item)?;
+        let opened = turns[index + 2].1;
+        let entry = found
+            .entry((names[index], names[index + 1]))
+            .or_insert((0, opened, opened));
+        entry.0 += 1;
+        entry.2 = opened;
+    }
+    let mut cycles: Vec<TopologyCycle> = found
+        .into_iter()
+        .map(|((to, from), (count, first, last))| TopologyCycle {
             agents: [to.to_owned(), from.to_owned()],
             count,
-            first_ns: spans[*first].start_ns,
-            last_ns: spans[*last].start_ns,
+            first_ns: spans[first].start_ns,
+            last_ns: spans[last].start_ns,
             example: SpanRef {
-                trace_id: spans[*last].trace_id.clone(),
-                span_id: spans[*last].span_id.clone(),
+                trace_id: spans[last].trace_id.clone(),
+                span_id: spans[last].span_id.clone(),
             },
-        });
-    }
+        })
+        .collect();
+    Deadline::check(deadline, 0)?;
     cycles.sort_by(|left, right| {
         right
             .count
             .cmp(&left.count)
             .then_with(|| left.agents.cmp(&right.agents))
     });
+    let cycles_truncated = cycles.len() > MAX_CYCLES;
     cycles.truncate(MAX_CYCLES);
 
     let sequence_truncated = names.len() > MAX_SEQUENCE;
@@ -405,8 +442,9 @@ fn assemble(run: &str, tenant: &str, spans: &[Reduced], truncated: bool) -> Topo
         .take(MAX_SEQUENCE)
         .map(|name| (*name).to_owned())
         .collect();
+    Deadline::check(deadline, 0)?;
 
-    Topology {
+    Ok(Topology {
         run: run.to_owned(),
         tenant: tenant.to_owned(),
         nodes,
@@ -414,12 +452,14 @@ fn assemble(run: &str, tenant: &str, spans: &[Reduced], truncated: bool) -> Topo
         edges,
         edges_truncated,
         handoffs,
+        handoffs_truncated,
         sequence,
         sequence_truncated,
         cycles,
+        cycles_truncated,
         spans_read: spans.len(),
         truncated,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -459,7 +499,11 @@ mod tests {
             span("db", Some(3), None, "search-svc", StepKind::Other, 4),
             span("orphan", None, None, "app", StepKind::Llm, 5),
         ];
-        let agents: Vec<String> = agents_of(&spans).into_iter().map(|(a, _)| a).collect();
+        let agents: Vec<String> = agents_of(&spans, None)
+            .expect("resolves")
+            .into_iter()
+            .map(|(a, _)| a)
+            .collect();
         assert_eq!(
             agents,
             [
@@ -471,7 +515,7 @@ mod tests {
                 "app"
             ]
         );
-        let topology = assemble("r", "", &spans, false);
+        let topology = assemble("r", "", &spans, false, None).expect("assembles");
         assert_eq!(topology.edges.len(), 1, "{:?}", topology.edges);
         assert_eq!(
             (
@@ -502,7 +546,7 @@ mod tests {
             span("a", Some(1), None, "svc", StepKind::Other, 0),
             span("b", Some(0), None, "svc", StepKind::Other, 1),
         ];
-        let agents = agents_of(&spans);
+        let agents = agents_of(&spans, None).expect("resolves");
         assert_eq!(agents.len(), 2);
         assert!(agents.iter().all(|(agent, named)| agent == "svc" && !named));
     }
@@ -532,7 +576,7 @@ mod tests {
                 start + 1,
             ));
         }
-        let topology = assemble("r", "", &spans, false);
+        let topology = assemble("r", "", &spans, false, None).expect("assembles");
         assert_eq!(topology.sequence, order);
         assert_eq!(topology.cycles.len(), 2);
         assert_eq!(
@@ -557,5 +601,130 @@ mod tests {
         );
         // Every agent span hangs off the unnamed root: app → agent edges.
         assert!(topology.edges.iter().all(|edge| edge.from == "app"));
+        assert!(!topology.handoffs_truncated && !topology.cycles_truncated);
+    }
+
+    #[test]
+    fn every_pass_honours_the_query_deadline() {
+        let spans: Vec<Reduced> = (0..10)
+            .map(|index| {
+                span(
+                    &format!("s{index}"),
+                    None,
+                    Some(if index % 2 == 0 { "a" } else { "b" }),
+                    "app",
+                    StepKind::Agent,
+                    index,
+                )
+            })
+            .collect();
+        let spent = Deadline::capped(None, std::time::Duration::ZERO);
+        match assemble("r", "", &spans, false, Some(spent)) {
+            Err(crate::Error::DeadlineExceeded(_)) => {}
+            other => panic!("a spent deadline must refuse, got {:?}", other.map(|_| ())),
+        }
+        assert!(matches!(
+            agents_of(&spans, Some(spent)),
+            Err(crate::Error::DeadlineExceeded(_))
+        ));
+        let roomy = Deadline::capped(None, std::time::Duration::from_secs(60));
+        assert!(assemble("r", "", &spans, false, Some(roomy)).is_ok());
+    }
+
+    /// The one-pass cycle summary agrees with rescanning the sequence for
+    /// every pair, as the pass it replaced did.
+    #[test]
+    fn cycles_agree_with_a_rescan_of_the_sequence() {
+        let mut rng = crate::seed::Rng::new(0x7090_109e);
+        let agents = ["a", "b", "c", "d"];
+        for round in 0..300 {
+            let spans: Vec<Reduced> = (0..rng.range(1, 40))
+                .map(|index| {
+                    span(
+                        &format!("s{index}"),
+                        None,
+                        Some(*rng.pick(&agents)),
+                        "app",
+                        StepKind::Agent,
+                        rng.range(0, 30),
+                    )
+                })
+                .collect();
+            let topology = assemble("r", "", &spans, false, None).expect("assembles");
+            let names: Vec<&str> = topology.sequence.iter().map(String::as_str).collect();
+            let counts = handoff::cycles_in(&names);
+            assert_eq!(topology.cycles.len(), counts.len(), "round {round}");
+            for cycle in &topology.cycles {
+                let (to, from) = (cycle.agents[0].as_str(), cycle.agents[1].as_str());
+                assert_eq!(cycle.count, counts[&(to, from)], "round {round}");
+                // The start of each return's opening step, rescanned.
+                let mut ordered: Vec<&Reduced> = spans.iter().collect();
+                ordered.sort_by_key(|span| {
+                    (
+                        span.start_ns,
+                        crate::guard::span_key(&span.trace_id, &span.span_id),
+                    )
+                });
+                let mut turns: Vec<&Reduced> = Vec::new();
+                for span in ordered {
+                    if turns.last().map(|last| &last.agent) != Some(&span.agent) {
+                        turns.push(span);
+                    }
+                }
+                let returns: Vec<&Reduced> = turns
+                    .windows(3)
+                    .filter(|window| {
+                        window[0].agent.as_deref() == Some(to)
+                            && window[1].agent.as_deref() == Some(from)
+                            && window[2].agent.as_deref() == Some(to)
+                    })
+                    .map(|window| window[2])
+                    .collect();
+                let (first, last) = (returns[0], returns[returns.len() - 1]);
+                assert_eq!(
+                    (
+                        cycle.first_ns,
+                        cycle.last_ns,
+                        cycle.example.span_id.as_str()
+                    ),
+                    (first.start_ns, last.start_ns, last.span_id.as_str()),
+                    "round {round}"
+                );
+            }
+        }
+    }
+
+    /// The shape that made the old cycle summary quadratic — one agent
+    /// returning from tens of thousands of distinct others, with long names
+    /// — is one linear pass, well inside a deadline, and every list says it
+    /// was cut.
+    #[test]
+    fn an_adversarial_run_is_assembled_in_linear_time() {
+        let pad = "p".repeat(150);
+        let spans: Vec<Reduced> = (0..MAX_TOPOLOGY_SPANS)
+            .map(|index| {
+                let agent = if index % 2 == 0 {
+                    format!("hub-{pad}")
+                } else {
+                    format!("{pad}-{index}")
+                };
+                span(
+                    &format!("s{index}"),
+                    None,
+                    Some(agent.as_str()),
+                    "app",
+                    StepKind::Agent,
+                    index as u64,
+                )
+            })
+            .collect();
+        let deadline = Deadline::capped(None, std::time::Duration::from_secs(10));
+        let topology =
+            assemble("r", "", &spans, false, Some(deadline)).expect("well inside the deadline");
+        assert_eq!(topology.cycles.len(), MAX_CYCLES);
+        assert!(topology.cycles_truncated && topology.handoffs_truncated);
+        assert!(topology.nodes_truncated && topology.sequence_truncated);
+        assert_eq!(topology.handoffs.len(), MAX_HANDOFFS);
+        assert!(topology.cycles.iter().all(|cycle| cycle.count == 1));
     }
 }

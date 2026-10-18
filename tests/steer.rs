@@ -80,7 +80,7 @@ fn nudge(server: &Server, path: &str, body: &Value, auth: &[(&str, &str)]) -> (u
 }
 
 #[test]
-fn a_nudge_rides_the_next_check_once_and_a_block_vetoes_one_step() {
+fn a_nudge_rides_the_next_pre_call_check_once_and_a_block_vetoes_its_batch() {
     let server = Server::spawn(&[]);
     let (status, advice) = nudge(
         &server,
@@ -121,6 +121,23 @@ fn a_nudge_rides_the_next_check_once_and_a_block_vetoes_one_step() {
         &json!({"message": "Do not refund over $500.", "kind": "block", "ttl_seconds": 60}),
         &[],
     );
+    // A check naming no next step is a verdict read: it takes nothing, so a
+    // probe or a dashboard cannot consume the agent's nudges.
+    let probe = check(&server, &json!({"run": "sess-1"}), &[]);
+    assert_eq!(
+        (probe["verdict"].as_str(), &probe["nudges"]),
+        (Some("continue"), &json!([])),
+        "{probe}"
+    );
+    let (_, listed) = server.json("GET", "/v1/runs/sess-1/nudges", None, &[]);
+    assert!(
+        listed["nudges"]
+            .as_array()
+            .expect("nudges")
+            .iter()
+            .all(|nudge| nudge["status"] == "pending"),
+        "{listed}"
+    );
 
     let delivered = check(
         &server,
@@ -141,8 +158,27 @@ fn a_nudge_rides_the_next_check_once_and_a_block_vetoes_one_step() {
         (&Value::Null, &Value::Null),
         "a veto is not a fuse stop"
     );
-    // Once: the next check carries nothing and the run was never stopped.
-    let next = check(&server, &json!({"run": "sess-1"}), &[]);
+    // The other calls of the batch the veto landed in, checking right
+    // behind it, are refused by the same block — the advice is not
+    // delivered again.
+    let sibling = check(
+        &server,
+        &json!({"run": "sess-1", "next": {"tool": "refund"}}),
+        &[],
+    );
+    assert_eq!(
+        (sibling["verdict"].as_str(), &sibling["nudges"]),
+        (
+            Some("stop"),
+            &json!([{"id": block["id"], "kind": "block",
+                     "message": "Do not refund over $500."}])
+        ),
+        "{sibling}"
+    );
+    // Once the hold is over, the next step is the guard's again: nothing is
+    // delivered twice and the run was never stopped.
+    wait_past_hold(&server, "sess-1");
+    let next = check(&server, &json!({"run": "sess-1", "next": {}}), &[]);
     assert_eq!(
         (next["verdict"].as_str(), &next["nudges"]),
         (Some("continue"), &json!([]))
@@ -183,13 +219,80 @@ fn a_nudge_rides_the_next_check_once_and_a_block_vetoes_one_step() {
         &json!({"message": "Wrap up.", "kind": "block"}),
         &[],
     );
-    let both = check(&server, &json!({"run": "sess-1"}), &[]);
+    let both = check(&server, &json!({"run": "sess-1", "next": {}}), &[]);
     assert_eq!(
         both["reasons"],
         json!(["Wrap up.", "manually tripped: runaway"]),
         "{both}"
     );
     assert_eq!(both["tripped_by"], "manual");
+}
+
+/// Sleeps until every block delivered to `run` has stopped holding.
+fn wait_past_hold(server: &Server, run: &str) {
+    let (_, listed) = server.json("GET", &format!("/v1/runs/{run}/nudges"), None, &[]);
+    let last = listed["nudges"]
+        .as_array()
+        .expect("nudges")
+        .iter()
+        .filter_map(|nudge| nudge["delivered_at_ns"].as_u64())
+        .max()
+        .expect("a delivery");
+    let until = u128::from(last) + 2_000 * 1_000_000 + 50_000_000;
+    while std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos()
+        < until
+    {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn a_block_refuses_every_parallel_call_of_the_batch_it_lands_in() {
+    let server = Server::spawn(&[]);
+    let (status, block) = nudge(
+        &server,
+        "/v1/runs/batch/nudges",
+        &json!({"message": "Do not refund anyone today.", "kind": "block"}),
+        &[],
+    );
+    assert_eq!(status, 201, "{block}");
+    // Three refund calls of one model turn, checked together.
+    let gate = std::sync::Barrier::new(3);
+    let answers: Vec<Value> = std::thread::scope(|scope| {
+        let calls: Vec<_> = (0..3)
+            .map(|index| {
+                let (server, gate) = (&server, &gate);
+                scope.spawn(move || {
+                    gate.wait();
+                    check(
+                        server,
+                        &json!({"run": "batch", "next": {"tool": format!("refund_{index}")}}),
+                        &[],
+                    )
+                })
+            })
+            .collect();
+        calls
+            .into_iter()
+            .map(|call| call.join().expect("a check"))
+            .collect()
+    });
+    for answer in &answers {
+        assert_eq!(answer["verdict"], "stop", "{answer}");
+        assert_eq!(
+            answer["reasons"],
+            json!(["Do not refund anyone today."]),
+            "{answer}"
+        );
+        assert_eq!(answer["nudges"][0]["id"], block["id"], "{answer}");
+    }
+    // Delivered once, whichever check delivered it.
+    let (_, listed) = server.json("GET", "/v1/runs/batch/nudges", None, &[]);
+    assert_eq!(listed["nudges"].as_array().map(Vec::len), Some(1));
+    assert_eq!(listed["nudges"][0]["status"], "delivered");
 }
 
 #[test]
@@ -201,7 +304,7 @@ fn nudges_and_their_delivery_survive_a_crash() {
         &json!({"message": "first", "kind": "advice"}),
         &[],
     );
-    check(&server, &json!({"run": "r"}), &[]);
+    check(&server, &json!({"run": "r", "next": {}}), &[]);
     let (_, second) = nudge(
         &server,
         "/v1/runs/r/nudges",
@@ -220,7 +323,7 @@ fn nudges_and_their_delivery_survive_a_crash() {
         statuses,
         [(&first["id"], "delivered"), (&second["id"], "pending")]
     );
-    let delivered = check(&server, &json!({"run": "r"}), &[]);
+    let delivered = check(&server, &json!({"run": "r", "next": {}}), &[]);
     assert_eq!(
         delivered["nudges"],
         json!([{"id": second["id"], "kind": "block", "message": "second"}]),
@@ -314,7 +417,7 @@ fn nudges_are_bounded_and_refuse_what_they_cannot_mean() {
     {
         std::thread::sleep(Duration::from_millis(50));
     }
-    let late = check(&server, &json!({"run": "brief"}), &[]);
+    let late = check(&server, &json!({"run": "brief", "next": {}}), &[]);
     assert_eq!(
         (late["verdict"].as_str(), &late["nudges"]),
         (Some("continue"), &json!([]))
@@ -360,13 +463,13 @@ fn nudges_are_tenant_scoped_and_bound_credentials_see_only_their_own() {
     assert_eq!(status, 403);
     let (_, theirs) = server.json("GET", "/v1/runs/shared/nudges", None, &globex);
     assert_eq!(theirs["nudges"], json!([]));
-    let globex_check = check(&server, &json!({"run": "shared"}), &globex);
+    let globex_check = check(&server, &json!({"run": "shared", "next": {}}), &globex);
     assert_eq!(
         (globex_check["verdict"].as_str(), &globex_check["nudges"]),
         (Some("continue"), &json!([]))
     );
     // The agent's read-only token receives its tenant's nudge.
-    let acme_check = check(&server, &json!({"run": "shared"}), &acme_ro);
+    let acme_check = check(&server, &json!({"run": "shared", "next": {}}), &acme_ro);
     assert_eq!(acme_check["verdict"], "stop");
     assert_eq!(acme_check["nudges"][0]["message"], "acme only");
     // An unbound operator names the tenant.
@@ -517,7 +620,10 @@ fn live_runs_show_what_each_active_run_is_doing() {
     std::thread::sleep(Duration::from_millis(2_300));
     server.json("GET", "/v1/fuses/runs/newer", None, &[]);
     assert_eq!(runs_of(&live(&server, "", &[])), Vec::<String>::new());
+    // A check naming no next step is a verdict read too.
     check(&server, &json!({"run": "newer"}), &[]);
+    assert_eq!(runs_of(&live(&server, "", &[])), Vec::<String>::new());
+    check(&server, &json!({"run": "newer", "next": {}}), &[]);
     assert_eq!(runs_of(&live(&server, "", &[])), ["newer"]);
     // A run with no span yet holds no state and is not live, however it asks.
     check(
@@ -664,6 +770,49 @@ fn the_live_stream_sends_a_snapshot_then_each_change() {
     assert!(status.starts_with("HTTP/1.1 403"), "{status}");
 }
 
+/// The status line of a live-stream request with `token`.
+fn stream_status(server: &Server, token: &str) -> (String, BufReader<TcpStream>) {
+    let mut stream = TcpStream::connect(("127.0.0.1", server.port)).expect("connects");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .expect("timeout");
+    write!(
+        stream,
+        "GET /v1/runs/live/stream HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\n\r\n"
+    )
+    .expect("sends");
+    let mut reader = BufReader::new(stream);
+    let mut status = String::new();
+    reader.read_line(&mut status).expect("status line");
+    (status, reader)
+}
+
+#[test]
+fn one_tenant_cannot_take_every_live_stream() {
+    let server = Server::spawn_with_env(
+        &[],
+        &[("TRAZA_TOKENS", "ro@acme:acme-ro,ro@globex:globex-ro")],
+    );
+    let mut held = Vec::new();
+    for _ in 0..8 {
+        let (status, reader) = stream_status(&server, "acme-ro");
+        assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+        held.push(reader);
+    }
+    let (status, mut refused) = stream_status(&server, "acme-ro");
+    assert!(status.starts_with("HTTP/1.1 409"), "acme's ninth: {status}");
+    let mut body = String::new();
+    while refused.read_line(&mut body).is_ok_and(|read| read > 0) {}
+    assert!(
+        body.contains("this tenant already has 8 live-run streams open"),
+        "{body}"
+    );
+    // Another tenant's viewer is not locked out by acme's.
+    let (status, _globex) = stream_status(&server, "globex-ro");
+    assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+    drop(held);
+}
+
 #[test]
 fn topology_shows_delegations_handoffs_and_ping_pong() {
     let server = Server::spawn(&[]);
@@ -702,6 +851,16 @@ fn topology_shows_delegations_handoffs_and_ping_pong() {
             {"from": "triage", "to": "billing", "count": 2},
         ])
     );
+    // Every capped list says whether it was cut.
+    for flag in [
+        "nodes_truncated",
+        "edges_truncated",
+        "handoffs_truncated",
+        "sequence_truncated",
+        "cycles_truncated",
+    ] {
+        assert_eq!(topology[flag], false, "{flag}: {topology}");
+    }
     // The unnamed root is its service; each agent span is a delegation from
     // it, and each LLM call belongs to the agent around it.
     assert_eq!(
@@ -938,4 +1097,29 @@ fn mcp_shows_live_runs_and_topology_inside_the_telemetry_frame() {
     assert!(text.starts_with("1 run live in the last 15m"), "{text}");
     let unknown = mcp_call(&server, "list_live_runs", json!({"state": "stop"}));
     assert_eq!(unknown["isError"], true);
+    // A run with more agents than the answer keeps says so in the head,
+    // rather than reporting the cut count as the run's.
+    let crowd: Vec<Value> = (0..300)
+        .map(|index| {
+            step(
+                "crowd",
+                "t-crowd",
+                &format!("a{index}"),
+                None,
+                Some(&format!("agent-{index:03}")),
+                base + index * NS,
+            )
+        })
+        .collect();
+    ingest(&server, &json!(crowd), &[]);
+    let result = mcp_call(&server, "run_topology", json!({"run_id": "crowd"}));
+    let text = result["content"][0]["text"].as_str().expect("text");
+    assert!(
+        text.starts_with("Run crowd (tenant default): 300 spans across more than 256 agents"),
+        "{text}"
+    );
+    assert!(
+        text.contains("only the 256 largest agents"),
+        "the cut is named: {text}"
+    );
 }

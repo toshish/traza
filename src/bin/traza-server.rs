@@ -188,6 +188,11 @@ impl RouteClass {
             }
             ("GET", "/v1/annotations") => Self::Lookup,
             ("GET", path) if path.starts_with("/v1/tapes/") => Self::Lookup,
+            // A run read by id, as a tape is; the live listing is answered
+            // from memory alone, as the fuse routes in `other` are.
+            ("GET", path) if path.starts_with("/v1/runs/") && path.ends_with("/topology") => {
+                Self::Lookup
+            }
             ("GET", "/v1/diff" | "/v1/recall") => Self::Stats,
             _ => Self::Other,
         }
@@ -3522,7 +3527,7 @@ fn serve_request(
                 Ok(tenant) => tenant,
                 Err(reply) => return responder.json(reply.status, reply.body),
             };
-            let slot = match engine.live_stream_slot() {
+            let slot = match engine.live_stream_slot(tenant.as_deref()) {
                 Ok(slot) => slot,
                 Err(error) => return engine_error(responder, metrics, error),
             };
@@ -4712,6 +4717,21 @@ mod tests {
         parse_args(&args)
             .expect("parses")
             .expect("not a help invocation")
+    }
+
+    #[test]
+    fn steering_routes_land_in_the_class_their_work_belongs_to() {
+        for (method, path, class) in [
+            ("GET", "/v1/runs/sess-1/topology", RouteClass::Lookup),
+            ("GET", "/v1/runs/trace%3Aabc/topology", RouteClass::Lookup),
+            ("GET", "/v1/tapes/sess-1", RouteClass::Lookup),
+            ("GET", "/v1/runs/live/stream", RouteClass::Stream),
+            ("GET", "/v1/runs/live", RouteClass::Other),
+            ("GET", "/v1/runs/sess-1/nudges", RouteClass::Other),
+            ("POST", "/v1/runs/sess-1/nudges", RouteClass::Other),
+        ] {
+            assert_eq!(RouteClass::of(method, path), class, "{method} {path}");
+        }
     }
 
     #[test]

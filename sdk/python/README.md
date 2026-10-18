@@ -190,6 +190,16 @@ It checks only. The pack's optional `PostToolUse` recorder also records each
 call as a span, which is what gives the session's step and repeat limits
 something to count.
 
+**A check delivers the run's nudges.** `Client.check` — and every guard,
+which calls it — is a pre-call check, so it also carries the run's pending
+[nudges](../../docs/guide/steer.md#nudges), once: they are marked delivered
+on the server whether or not the caller reads them. Read them on the answer
+(`verdict.nudges`, `verdict.advice` for the advice messages), or pass
+`on_nudges` to `guard` to have them handed over before the step runs — a
+`block` nudge raises `FuseTripped` after the callback. Anything that checks
+a run with this client consumes its nudges, so give the agent's run id to
+the agent alone.
+
 Replaying a run with zero model calls
 -------------------------------------
 

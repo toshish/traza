@@ -341,8 +341,10 @@ What a restart loses, and what it does not:
 
 - **[Live runs](steer.md#live-runs)** — `GET /v1/runs/live` and its stream
   — show the runs working now, with the step each is on and its verdict, from
-  this same live state; and a person can [nudge](steer.md#nudges) a run, or
-  veto its next step, through the pre-call check it already makes.
+  this same live state; and an operator can [nudge](steer.md#nudges) a run,
+  or veto its next step, through the pre-call check it already makes — a
+  check naming its `next` step; one without is a verdict read and takes no
+  nudge.
 - **The [event feed](http-api.md#get-v1fusesevents)** records every
   transition as it happens — a run entering `warn`, a policy `stop`, a
   `manual_stop`, a `reset` — in a ring of 4,096, read by cursor with an

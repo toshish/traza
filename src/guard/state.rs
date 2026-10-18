@@ -185,8 +185,8 @@ impl Observation {
         let (agent, label) = if kind.is_step() {
             let (agent, label) = semconv::step_labels_with(span, &llm, kind);
             (
-                agent.as_deref().map(handoff::clip_name),
-                Some(handoff::clip_name(&label)),
+                agent.map(handoff::clip_owned),
+                Some(handoff::clip_owned(label)),
             )
         } else {
             (None, None)

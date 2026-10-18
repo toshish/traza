@@ -8,8 +8,8 @@ run. Steering puts a person in that loop:
   step each is on, what it has spent, and its verdict, as a listing and as a
   stream.
 - **[Nudges](#nudges)** — words for a running agent, or a veto of its next
-  step, delivered once, through the check the agent already makes before
-  each step.
+  step, delivered once, through the pre-call check the agent already makes
+  before each step.
 - **[Topology](#topology)** — which agents a run involved, who delegated to
   whom, who handed control to whom, and where two agents bounced it back and
   forth; and a [fuse limit](#handoff-cycles-as-a-fuse-limit) on that
@@ -31,10 +31,12 @@ curl http://127.0.0.1:8080/v1/runs/live
 ```
 
 A run is **live** while its last **activity** — a span arriving, or a
-pre-call check — is within `--live-window-seconds` (default 900). Runs are
-listed most recently *changed* first: a change is activity, a verdict that
-moved, or a nudge queued or delivered. Reading a run's verdict is neither, so
-a dashboard polling a run cannot keep it live.
+pre-call check (a `POST /v1/fuses/check` naming the `next` step) — is within
+`--live-window-seconds` (default 900). Runs are listed most recently
+*changed* first: a change is activity, a verdict that moved, or a nudge
+queued or delivered. Reading a run's verdict — a check naming no `next`
+step included — is neither, so a dashboard polling a run cannot keep it
+live.
 
 | Field | What it is |
 |---|---|
@@ -44,13 +46,21 @@ a dashboard polling a run cannot keep it live.
 | `steps`, `cost_usd`, `tokens`, `errors`, `verdict`, `reasons`, `policy` | As the [guard](guard.md#runs) counts and judges them. |
 | `pending_nudges` | Nudges queued and not yet delivered or expired. |
 
-The listing is built from the guard's live state alone — no store read — and
-costs what it returns: runs are indexed by change, across tenants and per
-tenant, so it walks from the newest and stops at its `limit` (default 100,
-at most 1,000) or at the first change older than the window. What the view
-needs beside the guard's own state — each live run's agent name, its
+The listing is built from the guard's live state alone — no store read.
+Runs are indexed by change, across tenants and per tenant; a listing walks
+from the newest change, stops at its `limit` (default 100, at most 1,000) or
+at the first change older than the window, and skips on the way runs that
+changed within the window without activity in it (a verdict that moved, a
+nudge) — so it reads at most every run the guard holds, never more. What the
+view needs beside the guard's own state — each live run's agent name, its
 earliest and latest step, the step a check named — is a few hundred bytes
 per live run, under the guard's `--fuse-max-runs` bound.
+
+What it costs ingest: for each run a batch touches, the run is re-stamped —
+one removal and one insertion in each of the two change indexes and an
+atomic store, under the guard's state lock the fold already holds — and each
+step span's agent and label are read beside the fingerprint the guard
+already extracts (copied only when longer than 160 characters, to cut).
 
 **What it shows is what this process has seen.** A run the server began
 following after a restart lists with the usage seen since, exactly like
@@ -79,9 +89,11 @@ data: {"agent":"triage",…,"current":{"kind":"tool","name":"refund_order","pend
 ```
 
 A stream follows the guard's change feed by reading an atomic counter every
-200 ms; ingest adds one atomic store per run it touches and nothing else.
-One server serves at most 64 streams at once — the 65th is refused with
-`409` — and each holds one connection.
+200 ms, taking no lock until something changed. One server serves at most 64
+streams at once, and one scope — a tenant, or the every-tenant view of an
+unbound credential — at most 8 of them, so one tenant's credential cannot
+take every slot; past either, the stream is refused with `409`. Each holds
+one connection.
 
 ## Nudges
 
@@ -90,12 +102,14 @@ curl -X POST http://127.0.0.1:8080/v1/runs/sess-42/nudges \
   -d '{"message": "Hold refunds over $500 for a human.", "kind": "block", "ttl_seconds": 600}'
 ```
 
-A nudge is a person's message to one run, queued until the run's next
-[pre-call check](guard.md#the-ack-is-the-brake--and-it-brakes-the-next-step).
-That check carries every pending nudge in a new `nudges` field —
+A nudge is a message to one run, queued until the run's next
+[pre-call check](guard.md#the-ack-is-the-brake--and-it-brakes-the-next-step)
+— a `POST /v1/fuses/check` that names the step it is about to take
+(`"next": {...}`, `{}` for an LLM call; the hook pack and both SDKs always
+send it). That check carries every pending nudge in a new `nudges` field —
 `[{"id", "kind", "message"}]`, in the order they were queued — and marks
-them delivered, durably, before it answers. Each nudge reaches **at most
-one** check.
+them delivered, durably, before it answers. Each nudge is delivered **at
+most once**.
 
 ```json
 {"evidence":[],"grant":null,"limits":{"max_cost_usd":2.0,"max_handoff_cycles":2},"nudges":[{"id":"nd_394a4ad29672c47e","kind":"advice","message":"Billing owns refunds; do not hand them back to triage."},{"id":"nd_e03d16ad2736feaa","kind":"block","message":"Hold refunds over $500 for a human."}],"policy":"support","reasons":["Hold refunds over $500 for a human."],"run":"sess-42","source":"rebuilt","tenant":"","tripped_at_ns":null,"tripped_by":null,"usage":{…},"verdict":"stop"}
@@ -104,16 +118,33 @@ one** check.
 - **`advice`** — words for the agent. The verdict is the guard's own.
 - **`block`** — a veto. The check that delivers it answers `stop`, with the
   blocking messages as its first reasons (the guard's own follow when it
-  said `stop` too). Nothing about the fuse changes: no trip, no event, no
-  sticky stop. So it vetoes the one step that was asked about, and the next
-  check is the guard's again. To stop a run until someone resets it, use the
+  said `stop` too). So does every other pre-call check of the run in the
+  **two seconds** after (`BLOCK_HOLD_MS`), carrying the same block nudge
+  again (same `id`; it is still delivered once): an agent that issues a
+  batch of tool calls checks them together, or one right after another as
+  each refused call is skipped, and a veto must refuse the batch, not
+  whichever call asked first. Nothing about the fuse changes: no trip, no
+  event, no sticky stop, so after the hold the guard judges the run as
+  usual. To stop a run until someone resets it, use the
   [kill switch](guard.md#stopping-and-resetting).
 
-Only `POST /v1/fuses/check` delivers. The verdict route
-(`GET /v1/fuses/runs/{run}`) and the MCP `check_run_guard` tool do not: an
-agent's hook and a dashboard reading the same run must not race for its
-nudges. There is no MCP tool to read or queue nudges, deliberately — an
-agent hears nudges through its check, and queueing one is a person's act.
+Only a pre-call check delivers. A check naming no `next` step is a verdict
+read: it answers `"nudges": []` and leaves every nudge pending, as the
+verdict route (`GET /v1/fuses/runs/{run}`) and the MCP `check_run_guard`
+tool do — so a monitoring script or a dashboard probing a run cannot take
+the agent's nudges. Any caller that sends `next` for the run does consume
+them, `ro` tokens included (the agent's own token is usually `ro`): give the
+check's credential only to the agent. There is no MCP tool to read or queue
+nudges, deliberately — an agent hears nudges through its check, and
+queueing one is an operator's act.
+
+**Who can queue one.** Creating a nudge needs `rw` — the same scope a
+telemetry collector holds. So a nudge is operator text, not proof that a
+person wrote it: the hook pack relays nudges as *queued in Traza*, and the
+SDKs hand them to the caller (`Verdict.nudges` and `on_nudges` in Python,
+`verdict.nudges` and `onNudges` in TypeScript) to frame as it sees fit.
+Keep `rw` credentials away from anyone you would not let instruct your
+agents.
 
 `GET /v1/runs/{run}/nudges` lists a run's nudges, each with `status`:
 `pending`, `delivered` (with `delivered_at_ns`) or `expired`.
@@ -135,12 +166,31 @@ outside the generation layout: backups do not carry it.
 | `ttl_seconds` | 1 to 604,800 (7 days); default 3,600 | `400`; an expired nudge is never delivered |
 | Pending nudges per run | 32 | `409` |
 | Nudges kept per run | 64 | delivered and expired ones dropped, oldest first |
-| Runs with nudges per tenant | 10,000 | the history of the run nudged longest ago with nothing pending is dropped; when every run has something pending, `409` |
+| What one tenant's nudges cost | 4 MiB | its delivered and expired nudges are dropped, oldest first; when only pending ones are left, `409` |
+| What every tenant's nudges cost | 32 MiB | anyone's delivered and expired nudges are dropped, oldest first; when only pending ones are left, `409` |
+
+A nudge costs its message, id, run id and tenant plus 512 bytes for its
+place in memory and its indexes — so a tenant holds a few hundred nudges at
+the longest message, a few thousand short ones. Delivered and expired
+nudges are history, kept for `GET /v1/runs/{run}/nudges` and dropped first;
+pending ones are never dropped to make room. The file holds at most about
+twice what memory does before it is rewritten.
+
+**No check waits on another run's nudges.** The nudges in memory and the
+log on disk have separate locks: queueing, delivering, forgetting and
+rewriting hold the log's across their write and fsync, and take the memory
+lock only for in-memory work (a rewrite, only to copy out what it will
+write). A pre-call check with nothing pending — almost every check — takes
+the memory lock for one lookup and answers; it never waits on a write, an
+fsync or a rewrite.
 
 A run need not have started: a nudge can wait for its first check. An
 [erasure](http-api.md#post-v1erasures) of a run's session or trace, or of its
 tenant, removes its nudges and rewrites `steer.jsonl` without them; while
-such an erasure is pending, nudging the run is refused with `409`.
+such an erasure is pending, nudging the run is refused with `409`. That
+refusal is decided under the nudge log's lock, which the erasure's own
+removal takes too, so a nudge queued while an erasure starts is either
+refused or removed by it — never left behind.
 
 Messages are operator text and are delivered to the agent as written.
 Keep personal data out of them as you would out of a kill-switch reason.
@@ -169,7 +219,7 @@ deadline:
   handed off to — turns `A, B, A` — counted per ordered pair.
 
 ```json
-{"cycles":[{"agents":["billing","triage"],"count":1,"example":{"span_id":"a3","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736"},"first_ns":1792000004000000000,"last_ns":1792000004000000000},{"agents":["triage","billing"],"count":1,"example":{"span_id":"a2","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736"},"first_ns":1792000003000000000,"last_ns":1792000003000000000}],"edges":[{"count":2,"errors":0,"first_ns":1792000002000000000,"from":"support-app","last_ns":1792000004000000000,"to":"billing"},{"count":2,"errors":0,"first_ns":1792000001000000000,"from":"support-app","last_ns":1792000003000000000,"to":"triage"}],"edges_truncated":false,"handoffs":[{"count":2,"from":"triage","to":"billing"},{"count":1,"from":"billing","to":"triage"}],"nodes":[{"agent":"billing",…,"named":true,"spans":4,"steps":4,…},{"agent":"triage",…},{"agent":"support-app",…,"named":false,…}],"nodes_truncated":false,"run":"sess-42","sequence":["triage","billing","triage","billing"],"sequence_truncated":false,"spans_read":9,"tenant":"","truncated":false}
+{"cycles":[{"agents":["billing","triage"],"count":1,"example":{"span_id":"a3","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736"},"first_ns":1792000004000000000,"last_ns":1792000004000000000},{"agents":["triage","billing"],"count":1,"example":{"span_id":"a2","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736"},"first_ns":1792000003000000000,"last_ns":1792000003000000000}],"cycles_truncated":false,"edges":[{"count":2,"errors":0,"first_ns":1792000002000000000,"from":"support-app","last_ns":1792000004000000000,"to":"billing"},{"count":2,"errors":0,"first_ns":1792000001000000000,"from":"support-app","last_ns":1792000003000000000,"to":"triage"}],"edges_truncated":false,"handoffs":[{"count":2,"from":"triage","to":"billing"},{"count":1,"from":"billing","to":"triage"}],"handoffs_truncated":false,"nodes":[{"agent":"billing",…,"named":true,"spans":4,"steps":4,…},{"agent":"triage",…},{"agent":"support-app",…,"named":false,…}],"nodes_truncated":false,"run":"sess-42","sequence":["triage","billing","triage","billing"],"sequence_truncated":false,"spans_read":9,"tenant":"","truncated":false}
 ```
 
 Why per ordered pair: a supervisor that sends work to one worker three times
@@ -181,9 +231,14 @@ worker ever gets control straight back.
 
 Bounded: at most 50,000 spans are read (the earliest, in step order —
 `truncated` says so), and the answer keeps at most 256 nodes, 1,024 edges,
-256 cycle pairs and 500 turns of the sequence, the largest first, each list
-saying when it was cut. Agent names are cut at 160 characters. The topology
-reads the store, so it works under `--no-fuses` too.
+1,024 handoff pairs, 256 cycle pairs and 500 turns of the sequence — the
+lists largest first, each with its own flag (`nodes_truncated`,
+`edges_truncated`, `handoffs_truncated`, `cycles_truncated`,
+`sequence_truncated`). Agent names are cut at 160 characters. Every pass
+over the spans is linear or a sort, and each checks `--query-deadline-ms`
+as it goes: past the deadline the request is refused with `400`, not
+answered late. The topology reads the store, so it works under
+`--no-fuses` too.
 
 ## Handoff cycles as a fuse limit
 
@@ -214,10 +269,16 @@ The guard keeps the sequence incrementally, exact under steps arriving in
 any order and re-sent spans that move or rename a step: a change can only
 alter the turns beside it, so each is recounted over a window of at most
 nine turns, in O(log n). A rebuild replays the same fold, and a randomized
-test holds it to a full recount of the store after every batch. Each named
-step costs about a hundred bytes of guard memory beside its span
-contribution, and is bounded with it: every named step is a span the guard's
-1,000,000-contribution bound already counts.
+test holds it to a full recount of the store after every batch.
+
+What it costs: about a hundred bytes of guard memory per named step beside
+its span contribution — every named step is a span the guard's
+1,000,000-contribution bound already counts — plus the name of each
+distinct agent a held step names, up to 160 characters, at most 256 names a
+run. A name is dropped when the last step naming it is, so a run never
+holds more names than named steps; a span re-sent under ever new agent
+names holds one. Past 256 distinct agents, the rest render as
+`agent#<hex>`.
 
 ## Tenancy
 
@@ -238,7 +299,8 @@ Two read tools, both rendering telemetry inside the untrusted-content
 frame (see [MCP](mcp.md)):
 
 - **`run_topology`** — a run's agents, delegations, ping-pong pairs and
-  turns.
+  turns. When a list was cut, the headline says so (`more than 256
+  agents`, and which lists show only their largest entries).
 - **`list_live_runs`** — the live listing; listed only when the guard is on.
 
 ## Limitations
@@ -248,8 +310,14 @@ frame (see [MCP](mcp.md)):
   (a timeout, a crashed client) loses the nudge with it, though it still lists
   as delivered. An agent that never checks never hears its nudges, and one
   that is not taking steps hears them only at its next one.
-- **A veto blocks one step.** A `block` nudge stops the step that was asked
-  about; the agent may try another. Use the kill switch to stop the run.
+- **A veto blocks a two-second window, not a turn.** A `block` refuses every
+  pre-call check of the run for two seconds after it is delivered: the
+  calls of a batch checked together or back to back. A later call of the
+  same batch that waits behind a long-running one gets past it, and an
+  agent that tries again within the window meets the same veto. Traza sees
+  no model turns, only checks. Use the kill switch to stop the run.
+- **A nudge's author is a credential, not a person.** Any `rw` credential
+  can queue one, and its text reaches the agent as written.
 - **The live view is per process and partial after a restart.** It is built
   from memory; a run followed since some point shows what arrived since,
   and live state is never shared across replicas.

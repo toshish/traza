@@ -1978,14 +1978,18 @@ about the run changes — `usage` is what it has recorded, and a hypothetical
 stop has no `tripped_by` — and a stop is still a `200`: the verdict is the
 answer. A run with no spans is a fresh run with zero usage.
 
-The check also delivers the run's pending [nudges](#post-v1runsrunnudges),
-once: `nudges` lists them, `[{"id", "kind", "message"}]` in the order they
-were queued (empty when there are none), and they are marked delivered,
-durably, before the answer is sent. A `block` nudge makes this answer `stop`
-with the blocking messages as its first reasons, without tripping the fuse —
-no `tripped_by`, no event — so it vetoes this one step. If the delivery
-cannot be recorded the check is `503` and the nudges stay pending. The
-verdict route below does not deliver.
+A check that names its `next` step — a pre-call check — also delivers the
+run's pending [nudges](#post-v1runsrunnudges), once: `nudges` lists them,
+`[{"id", "kind", "message"}]` in the order they were queued (empty when
+there are none), and they are marked delivered, durably, before the answer
+is sent. A `block` nudge makes this answer `stop` with the blocking messages
+as its first reasons, without tripping the fuse — no `tripped_by`, no event
+— and every pre-call check of the run in the two seconds after answers the
+same, carrying the same block nudge again, so the parallel calls of one
+batch are all vetoed. If the delivery cannot be recorded the check is `503`
+and the nudges stay pending. A check naming no `next` step is a verdict
+read: it answers `"nudges": []`, delivers nothing and is not activity for
+the [live view](#get-v1runslive); neither is the verdict route below.
 
 ```sh
 curl -X POST http://127.0.0.1:8080/v1/fuses/check \
@@ -2185,9 +2189,9 @@ are `400`.
 
 ### `GET /v1/runs/live`
 
-Runs with activity — a span arriving, or a pre-call check — within
-`--live-window-seconds` (default 900), most recently changed first, from the
-guard's live state alone. **Query:** `tenant` (unbound credentials: one
+Runs with activity — a span arriving, or a pre-call check (one naming
+`next`) — within `--live-window-seconds` (default 900), most recently
+changed first, from the guard's live state alone. **Query:** `tenant` (unbound credentials: one
 tenant; absent: every tenant), `limit` (default 100, at most 1,000).
 
 ```sh
@@ -2222,7 +2226,8 @@ that run changes, coalesced to at most one batch per 250 ms; and a `: tick`
 comment after 15 seconds of quiet. When more than 256 runs change at once, or
 an erasure sweeps the view, a new `snapshot` replaces everything before it.
 A reconnecting client starts again from a snapshot. At most 64 streams at
-once: one more is `409`.
+once, and at most 8 per scope — one tenant, or the every-tenant view of an
+unbound credential: one more is `409`.
 
 ### `POST /v1/runs/{run}/nudges`
 
@@ -2246,8 +2251,11 @@ curl -X POST http://127.0.0.1:8080/v1/runs/sess-42/nudges \
 `ttl_seconds`, a missing or unknown `kind`, an unknown field, or an invalid
 run id; `403` for a bound credential naming another tenant (or a `ro` one,
 with `"required": "rw"`); `409` when the run already has 32 pending nudges,
-when the tenant has pending nudges for 10,000 runs, while an erasure covering
-the run is pending, or under `--no-fuses`.
+when the tenant's nudges already cost 4 MiB (or every tenant's 32 MiB) and
+only pending ones are left to drop — delivered and expired ones are dropped,
+oldest first, to make room — while an erasure covering the run is pending,
+or under `--no-fuses`. Any `rw` credential can queue a nudge; its text
+reaches the agent as written.
 
 ### `GET /v1/runs/{run}/nudges`
 
@@ -2269,16 +2277,19 @@ transitions between named agents), `sequence` (one entry per turn), `cycles`
 (`{agents: [returned_to, returned_from], count, first_ns, last_ns, example}`:
 control returning to an agent straight from the one it handed off to),
 `spans_read`, and `truncated` when the run has more than 50,000 spans (the
-earliest are read). Lists are cut at 256 nodes, 1,024 edges, 256 cycles and
-500 turns, largest first, each with its own `*_truncated` flag. An unknown
-run is an empty graph. The definitions are in the [guide](steer.md#topology).
+earliest are read). Lists are cut at 256 nodes, 1,024 edges, 1,024 handoff
+pairs, 256 cycle pairs and 500 turns, largest first, each with its own flag:
+`nodes_truncated`, `edges_truncated`, `handoffs_truncated`,
+`cycles_truncated`, `sequence_truncated`. Every pass over the spans checks
+the deadline, not just the read. An unknown run is an empty graph. The
+definitions are in the [guide](steer.md#topology).
 
 ```json
-{"cycles":[{"agents":["billing","triage"],"count":1,"example":{"span_id":"a3","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736"},"first_ns":1792000004000000000,"last_ns":1792000004000000000},{"agents":["triage","billing"],"count":1,"example":{"span_id":"a2","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736"},"first_ns":1792000003000000000,"last_ns":1792000003000000000}],"edges":[{"count":2,"errors":0,"first_ns":1792000002000000000,"from":"support-app","last_ns":1792000004000000000,"to":"billing"},{"count":2,"errors":0,"first_ns":1792000001000000000,"from":"support-app","last_ns":1792000003000000000,"to":"triage"}],"edges_truncated":false,"handoffs":[{"count":2,"from":"triage","to":"billing"},{"count":1,"from":"billing","to":"triage"}],"nodes":[{"agent":"billing","cost_usd":0.0,"errors":0,"first_ns":1792000002000000000,"last_ns":1792000004500000000,"llm_calls":2,"named":true,"spans":4,"steps":4,"tokens":920,"tool_calls":0},{"agent":"triage","cost_usd":0.0,"errors":0,"first_ns":1792000001000000000,"last_ns":1792000003500000000,"llm_calls":2,"named":true,"spans":4,"steps":4,"tokens":920,"tool_calls":0},{"agent":"support-app","cost_usd":0.0,"errors":0,"first_ns":1792000000000000000,"last_ns":1792000060000000000,"llm_calls":0,"named":false,"spans":1,"steps":0,"tokens":0,"tool_calls":0}],"nodes_truncated":false,"run":"sess-42","sequence":["triage","billing","triage","billing"],"sequence_truncated":false,"spans_read":9,"tenant":"","truncated":false}
+{"cycles":[{"agents":["billing","triage"],"count":1,"example":{"span_id":"a3","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736"},"first_ns":1792000004000000000,"last_ns":1792000004000000000},{"agents":["triage","billing"],"count":1,"example":{"span_id":"a2","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736"},"first_ns":1792000003000000000,"last_ns":1792000003000000000}],"cycles_truncated":false,"edges":[{"count":2,"errors":0,"first_ns":1792000002000000000,"from":"support-app","last_ns":1792000004000000000,"to":"billing"},{"count":2,"errors":0,"first_ns":1792000001000000000,"from":"support-app","last_ns":1792000003000000000,"to":"triage"}],"edges_truncated":false,"handoffs":[{"count":2,"from":"triage","to":"billing"},{"count":1,"from":"billing","to":"triage"}],"handoffs_truncated":false,"nodes":[{"agent":"billing","cost_usd":0.0,"errors":0,"first_ns":1792000002000000000,"last_ns":1792000004500000000,"llm_calls":2,"named":true,"spans":4,"steps":4,"tokens":920,"tool_calls":0},{"agent":"triage","cost_usd":0.0,"errors":0,"first_ns":1792000001000000000,"last_ns":1792000003500000000,"llm_calls":2,"named":true,"spans":4,"steps":4,"tokens":920,"tool_calls":0},{"agent":"support-app","cost_usd":0.0,"errors":0,"first_ns":1792000000000000000,"last_ns":1792000060000000000,"llm_calls":0,"named":false,"spans":1,"steps":0,"tokens":0,"tool_calls":0}],"nodes_truncated":false,"run":"sess-42","sequence":["triage","billing","triage","billing"],"sequence_truncated":false,"spans_read":9,"tenant":"","truncated":false}
 ```
 
-**Errors.** `400` for an invalid run id or tenant, or when the read
-exhausted `--query-deadline-ms`.
+**Errors.** `400` for an invalid run id or tenant, or when the read or the
+graph's assembly exhausted `--query-deadline-ms`.
 
 ## Erasure
 

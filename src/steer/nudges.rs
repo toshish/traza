@@ -3,11 +3,13 @@
 //!
 //! An operator watching a run queues a nudge — `advice` the agent should
 //! hear, or a `block` that vetoes its next step — and the run's next
-//! pre-call check (`POST /v1/fuses/check`) carries every pending nudge in
-//! its verdict and marks them delivered, durably, before it answers: each
-//! nudge reaches at most one check. A `block` makes that one check answer
-//! `stop` with the human's message as the reason, without tripping the fuse,
-//! so the step after it is judged by the guard as usual.
+//! pre-call check (`POST /v1/fuses/check` naming its `next` step) carries
+//! every pending nudge in its verdict and marks them delivered, durably,
+//! before it answers: each nudge is delivered at most once. A `block` makes
+//! that check answer `stop` with the human's message as the reason, without
+//! tripping the fuse — and so does every other pre-call check of the run in
+//! the [`BLOCK_HOLD_MS`] after it, so the parallel tool calls of the batch
+//! the veto lands in are all refused, not just the first to ask.
 //!
 //! # Durable, bounded, erasable
 //!
@@ -16,23 +18,39 @@
 //! delivery, a torn final line healed at open, damage anywhere else refusing
 //! startup, rewritten to the surviving state when at least half its lines
 //! are superseded. Like `fuses.jsonl` it is operator state outside the
-//! generation layout: a backup does not carry it. Bounds, all per tenant:
+//! generation layout: a backup does not carry it. Bounds:
 //!
 //! - a message is 1 to [`MAX_NUDGE_BYTES`] bytes;
 //! - a run holds at most [`MAX_PENDING_PER_RUN`] pending nudges (one more is
 //!   `409`) and keeps at most [`MAX_KEPT_PER_RUN`] in all, delivered and
 //!   expired ones dropped oldest first;
-//! - a tenant holds nudges for at most [`MAX_NUDGED_RUNS_PER_TENANT`] runs:
-//!   past it, the history of the run nudged longest ago with nothing pending
-//!   is dropped, and when every run has something pending, a new one is
-//!   refused with `409`.
+//! - a tenant's nudges cost at most [`MAX_TENANT_NUDGE_BYTES`], and every
+//!   tenant's together at most [`MAX_HELD_NUDGE_BYTES`] — a nudge costing
+//!   its message, id, run id and tenant plus [`NUDGE_OVERHEAD_BYTES`]. Past
+//!   either, delivered and expired nudges are dropped oldest first (the
+//!   tenant's own for its budget, anyone's for the store's); when only
+//!   pending ones are left to drop, a new nudge is refused with `409`.
+//!
+//! # Two locks
+//!
+//! The book (memory) and the log (disk) have a lock each. Every change —
+//! queueing, delivering, forgetting, compacting — takes the log lock first
+//! and holds it across its I/O, so changes are serialized and the file and
+//! memory never disagree; the book lock is only ever held for in-memory
+//! work, never across a write or an fsync. A pre-call check with nothing to
+//! deliver takes the book lock alone for one lookup, so no agent's check
+//! waits behind another run's delivery or a compaction.
 //!
 //! An erasure of a run's session or trace, or of its tenant, removes its
-//! nudges and rewrites the log without them.
+//! nudges and rewrites the log without them. Whether an erasure covers a run
+//! is asked while the log lock is held, which is what keeps a nudge queued
+//! during an erasure from surviving it: the erasure installs its mask before
+//! it forgets, and forgetting takes the same lock.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
 
@@ -51,8 +69,23 @@ pub const MAX_PENDING_PER_RUN: usize = 32;
 /// Most nudges one run keeps, pending or not.
 pub const MAX_KEPT_PER_RUN: usize = 64;
 
-/// Most runs one tenant holds nudges for.
-pub const MAX_NUDGED_RUNS_PER_TENANT: usize = 10_000;
+/// What one tenant's nudges may cost together, in bytes (see
+/// [`NUDGE_OVERHEAD_BYTES`]): 4 MiB.
+pub const MAX_TENANT_NUDGE_BYTES: usize = 4 << 20;
+
+/// What every tenant's nudges may cost together, in bytes: 32 MiB.
+pub const MAX_HELD_NUDGE_BYTES: usize = 32 << 20;
+
+/// What a nudge costs beyond its message, id, run id and tenant: its
+/// timestamps, its place in the indexes and their copies of its keys.
+pub const NUDGE_OVERHEAD_BYTES: usize = 512;
+
+/// How long a delivered `block` keeps vetoing the run's pre-call checks, in
+/// milliseconds: long enough to cover the parallel tool calls of the batch
+/// it landed in, which check together; short enough that the agent's next
+/// deliberate step — after a model call that reads the refusal — is judged
+/// by the guard again.
+pub const BLOCK_HOLD_MS: u64 = 2_000;
 
 /// How long a nudge waits for a check when the request names no
 /// `ttl_seconds`: an hour.
@@ -68,7 +101,8 @@ pub enum NudgeKind {
     /// Words for the agent; its next step proceeds.
     Advice,
     /// A veto: the check that delivers it answers `stop`, with the message
-    /// as the reason. It vetoes that one step; it does not trip the fuse.
+    /// as the reason, and so does every check of the run for
+    /// [`BLOCK_HOLD_MS`] after. It does not trip the fuse.
     Block,
 }
 
@@ -114,6 +148,15 @@ impl Nudge {
             None if now >= self.expires_at_ns => NudgeStatus::Expired,
             None => NudgeStatus::Pending,
         }
+    }
+
+    /// What it counts against the budgets.
+    fn cost(&self) -> usize {
+        NUDGE_OVERHEAD_BYTES
+            + self.message.len()
+            + self.id.len()
+            + self.run.len()
+            + self.tenant.len()
     }
 }
 
@@ -176,10 +219,37 @@ pub(crate) enum Record {
     },
 }
 
-/// One run's nudges, in the order they were queued.
+/// The byte budgets a book enforces; [`Budget::STORE`] outside tests.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Budget {
+    /// Per tenant.
+    pub(crate) tenant_bytes: usize,
+    /// Across every tenant.
+    pub(crate) total_bytes: usize,
+}
+
+impl Budget {
+    /// The documented bounds.
+    pub(crate) const STORE: Self = Self {
+        tenant_bytes: MAX_TENANT_NUDGE_BYTES,
+        total_bytes: MAX_HELD_NUDGE_BYTES,
+    };
+}
+
+/// The blocks a delivery made, still vetoing the run's checks until
+/// `until_ns`. Memory only: a restart forgets a hold of a few seconds.
+#[derive(Clone, Debug)]
+struct Hold {
+    until_ns: u64,
+    ids: Vec<String>,
+}
+
+/// One run's nudges, in the order they were queued, and the hold of its
+/// latest blocking delivery.
 #[derive(Clone, Debug, Default)]
 struct RunNudges {
     nudges: Vec<Nudge>,
+    hold: Option<Hold>,
 }
 
 impl RunNudges {
@@ -189,88 +259,277 @@ impl RunNudges {
             .filter(|nudge| nudge.status(now) == NudgeStatus::Pending)
             .count()
     }
-
-    /// The latest time anything happened to the run's nudges.
-    fn last_ns(&self) -> u64 {
-        self.nudges
-            .iter()
-            .map(|nudge| nudge.delivered_at_ns.unwrap_or(nudge.created_at_ns))
-            .max()
-            .unwrap_or(0)
-    }
-
-    /// Drops delivered and expired nudges, oldest first, beyond the bound.
-    fn trim(&mut self, now: u64) {
-        let mut excess = self.nudges.len().saturating_sub(MAX_KEPT_PER_RUN);
-        if excess == 0 {
-            return;
-        }
-        self.nudges.retain(|nudge| {
-            if excess > 0 && nudge.status(now) != NudgeStatus::Pending {
-                excess -= 1;
-                return false;
-            }
-            true
-        });
-    }
 }
 
-/// Every tenant's nudges, and the log that makes them durable. One lock
-/// covers both: a nudge is queued or delivered rarely, and a check with
-/// nothing pending holds it for one map lookup.
-pub(crate) struct Book {
+/// Every tenant's nudges in memory, with what they cost and an index by
+/// age for dropping the oldest. Never touched across I/O.
+struct Book {
     runs: HashMap<String, HashMap<String, RunNudges>>,
-    log: FuseLog<Record>,
+    /// Every held nudge by `(created_at_ns, id)`: its tenant and run.
+    order: BTreeMap<(u64, String), (String, String)>,
+    /// What every held nudge costs together.
+    held: usize,
+    /// The same, per tenant; tenants holding nothing are absent.
+    by_tenant: HashMap<String, usize>,
+    budget: Budget,
 }
+
+/// A nudge to drop to make room: its tenant, run and id.
+type Victim = (String, String, String);
 
 impl Book {
-    /// Opens `steer.jsonl` in `directory` and replays it.
-    pub(crate) fn open(directory: &Path, now: u64) -> Result<Self> {
-        let (log, records) = FuseLog::<Record>::open_named(directory, LOG_NAME)?;
-        let mut book = Self {
+    fn new(budget: Budget) -> Self {
+        Self {
             runs: HashMap::new(),
-            log,
-        };
-        for record in records {
-            book.apply(record);
+            order: BTreeMap::new(),
+            held: 0,
+            by_tenant: HashMap::new(),
+            budget,
         }
-        for runs in book.runs.values_mut() {
-            for nudges in runs.values_mut() {
-                nudges.trim(now);
+    }
+
+    fn run(&self, tenant: &str, run: &str) -> Option<&RunNudges> {
+        self.runs.get(tenant).and_then(|runs| runs.get(run))
+    }
+
+    /// Adds `nudge`, or replaces the one held under its id.
+    fn insert(&mut self, nudge: Nudge) {
+        let (tenant, run) = (nudge.tenant.clone(), nudge.run.clone());
+        if let Some(index) = self
+            .run(&tenant, &run)
+            .and_then(|held| held.nudges.iter().position(|held| held.id == nudge.id))
+        {
+            self.remove_at(&tenant, &run, index);
+        }
+        let cost = nudge.cost();
+        self.held += cost;
+        *self.by_tenant.entry(tenant.clone()).or_default() += cost;
+        self.order.insert(
+            (nudge.created_at_ns, nudge.id.clone()),
+            (tenant.clone(), run.clone()),
+        );
+        self.runs
+            .entry(tenant)
+            .or_default()
+            .entry(run)
+            .or_default()
+            .nudges
+            .push(nudge);
+    }
+
+    /// Removes the nudge at `index` of the run's list, and the run (and its
+    /// tenant) when nothing is left.
+    fn remove_at(&mut self, tenant: &str, run: &str, index: usize) -> Option<Nudge> {
+        let runs = self.runs.get_mut(tenant)?;
+        let held = runs.get_mut(run)?;
+        if index >= held.nudges.len() {
+            return None;
+        }
+        let nudge = held.nudges.remove(index);
+        if held.nudges.is_empty() {
+            runs.remove(run);
+            if runs.is_empty() {
+                self.runs.remove(tenant);
             }
         }
-        book.trim_tenants(now);
-        book.compact_if_due()?;
-        Ok(book)
+        self.order.remove(&(nudge.created_at_ns, nudge.id.clone()));
+        let cost = nudge.cost();
+        self.held = self.held.saturating_sub(cost);
+        if let Some(spent) = self.by_tenant.get_mut(tenant) {
+            *spent = spent.saturating_sub(cost);
+            if *spent == 0 {
+                self.by_tenant.remove(tenant);
+            }
+        }
+        Some(nudge)
+    }
+
+    fn remove_id(&mut self, tenant: &str, run: &str, id: &str) {
+        if let Some(index) = self
+            .run(tenant, run)
+            .and_then(|held| held.nudges.iter().position(|nudge| nudge.id == id))
+        {
+            self.remove_at(tenant, run, index);
+        }
+    }
+
+    /// Drops the run's delivered and expired nudges, oldest first, beyond
+    /// [`MAX_KEPT_PER_RUN`].
+    fn trim_run(&mut self, tenant: &str, run: &str, now: u64) {
+        let Some(held) = self.run(tenant, run) else {
+            return;
+        };
+        let excess = held.nudges.len().saturating_sub(MAX_KEPT_PER_RUN);
+        let doomed: Vec<String> = held
+            .nudges
+            .iter()
+            .filter(|nudge| nudge.status(now) != NudgeStatus::Pending)
+            .take(excess)
+            .map(|nudge| nudge.id.clone())
+            .collect();
+        for id in doomed {
+            self.remove_id(tenant, run, &id);
+        }
+    }
+
+    /// The settled nudges to drop, oldest first, so that one costing `cost`
+    /// fits `tenant`'s budget and the store's; a conflict, dropping
+    /// nothing, when pending nudges are all that would be left to drop.
+    fn room_for(&self, tenant: &str, cost: usize, now: u64) -> Result<Vec<Victim>> {
+        let spent = self.by_tenant.get(tenant).copied().unwrap_or(0);
+        let tenant_need = (spent + cost).saturating_sub(self.budget.tenant_bytes);
+        let total_need = (self.held + cost).saturating_sub(self.budget.total_bytes);
+        let mut victims = Vec::new();
+        let (mut tenant_freed, mut total_freed) = (0, 0);
+        for ((_, id), (owner, run)) in &self.order {
+            if tenant_freed >= tenant_need && total_freed >= total_need {
+                break;
+            }
+            let own = owner == tenant;
+            // Only the tenant's own budget is short: others' nudges cannot help.
+            if !own && total_freed >= total_need {
+                continue;
+            }
+            let Some(nudge) = self
+                .run(owner, run)
+                .and_then(|held| held.nudges.iter().find(|nudge| &nudge.id == id))
+            else {
+                continue;
+            };
+            if nudge.status(now) == NudgeStatus::Pending {
+                continue;
+            }
+            let freed = nudge.cost();
+            total_freed += freed;
+            if own {
+                tenant_freed += freed;
+            }
+            victims.push((owner.clone(), run.clone(), id.clone()));
+        }
+        if tenant_freed < tenant_need {
+            return Err(Error::Conflict(format!(
+                "this tenant's nudges already cost the most Traza keeps for one tenant \
+                 ({} bytes), and all that could make room are pending; wait for them to be \
+                 delivered or to expire",
+                self.budget.tenant_bytes
+            )));
+        }
+        if total_freed < total_need {
+            return Err(Error::Conflict(format!(
+                "this server's nudges already cost the most it keeps ({} bytes), and all that \
+                 could make room are pending; wait for them to be delivered or to expire",
+                self.budget.total_bytes
+            )));
+        }
+        Ok(victims)
+    }
+
+    /// Drops settled nudges, oldest first, until every budget holds (after
+    /// a replay, whose log may hold what was dropped at run time). Pending
+    /// nudges are kept even past a budget: they were accepted.
+    fn fit_budgets(&mut self, now: u64) {
+        let tenants: Vec<String> = self.by_tenant.keys().cloned().collect();
+        for tenant in tenants {
+            if let Ok(victims) = self.room_for(&tenant, 0, now) {
+                for (owner, run, id) in victims {
+                    self.remove_id(&owner, &run, &id);
+                }
+            }
+        }
+    }
+
+    /// The ids of the run's pending nudges at `now`, in queue order.
+    fn due(&self, tenant: &str, run: &str, now: u64) -> Vec<String> {
+        self.run(tenant, run)
+            .map(|held| {
+                held.nudges
+                    .iter()
+                    .filter(|nudge| nudge.status(now) == NudgeStatus::Pending)
+                    .map(|nudge| nudge.id.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The blocks of the run's hold at `now`, other than `except`.
+    fn held_blocks(&self, tenant: &str, run: &str, now: u64, except: &[String]) -> Vec<Nudge> {
+        let Some(held) = self.run(tenant, run) else {
+            return Vec::new();
+        };
+        let Some(hold) = held.hold.as_ref().filter(|hold| now < hold.until_ns) else {
+            return Vec::new();
+        };
+        held.nudges
+            .iter()
+            .filter(|nudge| hold.ids.contains(&nudge.id) && !except.contains(&nudge.id))
+            .cloned()
+            .collect()
+    }
+
+    /// Marks `ids` of the run delivered at `now` and returns them, followed
+    /// by the blocks of a hold still in force; a block among them (re)starts
+    /// the hold.
+    fn mark_delivered(&mut self, tenant: &str, run: &str, ids: &[String], now: u64) -> Vec<Nudge> {
+        let mut delivered = Vec::with_capacity(ids.len());
+        let Some(held) = self.runs.get_mut(tenant).and_then(|runs| runs.get_mut(run)) else {
+            return delivered;
+        };
+        for nudge in &mut held.nudges {
+            if ids.contains(&nudge.id) && nudge.delivered_at_ns.is_none() {
+                nudge.delivered_at_ns = Some(now);
+                delivered.push(nudge.clone());
+            }
+        }
+        let fresh_ids: Vec<String> = delivered.iter().map(|nudge| nudge.id.clone()).collect();
+        // A hold still in force keeps vetoing beside what was just delivered.
+        let carried = self.held_blocks(tenant, run, now, &fresh_ids);
+        if delivered.iter().any(|nudge| nudge.kind == NudgeKind::Block) {
+            let blocks: Vec<String> = delivered
+                .iter()
+                .chain(&carried)
+                .filter(|nudge| nudge.kind == NudgeKind::Block)
+                .map(|nudge| nudge.id.clone())
+                .collect();
+            if let Some(held) = self.runs.get_mut(tenant).and_then(|runs| runs.get_mut(run)) {
+                held.hold = Some(Hold {
+                    until_ns: now.saturating_add(BLOCK_HOLD_MS * 1_000_000),
+                    ids: blocks,
+                });
+            }
+        }
+        delivered.extend(carried);
+        delivered
+    }
+
+    /// The records that reproduce the state, for a rewrite.
+    fn records(&self) -> Vec<Record> {
+        self.order
+            .iter()
+            .filter_map(|((_, id), (tenant, run))| {
+                self.run(tenant, run)
+                    .and_then(|held| held.nudges.iter().find(|nudge| &nudge.id == id))
+            })
+            .map(|nudge| Record::Nudge {
+                nudge: nudge.clone(),
+            })
+            .collect()
     }
 
     fn apply(&mut self, record: Record) {
         match record {
-            Record::Nudge { nudge } => {
-                let nudges = &mut self
-                    .runs
-                    .entry(nudge.tenant.clone())
-                    .or_default()
-                    .entry(nudge.run.clone())
-                    .or_default()
-                    .nudges;
-                match nudges.iter_mut().find(|held| held.id == nudge.id) {
-                    Some(held) => *held = nudge,
-                    None => nudges.push(nudge),
-                }
-            }
+            Record::Nudge { nudge } => self.insert(nudge),
             Record::Deliver {
                 tenant,
                 run,
                 ids,
                 at_ns,
             } => {
-                if let Some(nudges) = self
+                if let Some(held) = self
                     .runs
                     .get_mut(&tenant)
                     .and_then(|runs| runs.get_mut(&run))
                 {
-                    for nudge in &mut nudges.nudges {
+                    for nudge in &mut held.nudges {
                         if ids.contains(&nudge.id) && nudge.delivered_at_ns.is_none() {
                             nudge.delivered_at_ns = Some(at_ns);
                         }
@@ -280,81 +539,103 @@ impl Book {
         }
     }
 
-    /// Brings every tenant within [`MAX_NUDGED_RUNS_PER_TENANT`] after a
-    /// replay, dropping the runs nudged longest ago with nothing pending.
-    fn trim_tenants(&mut self, now: u64) {
-        for runs in self.runs.values_mut() {
-            while runs.len() > MAX_NUDGED_RUNS_PER_TENANT {
-                let Some(oldest) = oldest_settled(runs, now) else {
-                    break;
-                };
-                runs.remove(&oldest);
-            }
+    /// Removes one run's nudges, or a whole tenant's.
+    fn forget(&mut self, tenant: &str, run: Option<&str>) {
+        let runs: Vec<String> = match (run, self.runs.get(tenant)) {
+            (Some(run), _) => vec![run.to_owned()],
+            (None, Some(runs)) => runs.keys().cloned().collect(),
+            (None, None) => Vec::new(),
+        };
+        for run in runs {
+            while self.remove_at(tenant, &run, 0).is_some() {}
         }
     }
+}
 
-    /// The records that reproduce the state, for a rewrite.
-    fn records(&self) -> Vec<Record> {
-        let mut nudges: Vec<&Nudge> = self
+/// Every tenant's nudges and the log that makes them durable; see the
+/// module docs for the locking.
+pub(crate) struct Nudges {
+    log: Mutex<FuseLog<Record>>,
+    book: Mutex<Book>,
+}
+
+impl Nudges {
+    /// Opens `steer.jsonl` in `directory` and replays it.
+    pub(crate) fn open(directory: &Path, now: u64) -> Result<Self> {
+        Self::open_with(directory, now, Budget::STORE)
+    }
+
+    /// [`Self::open`], with `budget` in place of the documented one.
+    pub(crate) fn open_with(directory: &Path, now: u64, budget: Budget) -> Result<Self> {
+        let (mut log, records) = FuseLog::<Record>::open_named(directory, LOG_NAME)?;
+        let mut book = Book::new(budget);
+        for record in records {
+            book.apply(record);
+        }
+        let runs: Vec<(String, String)> = book
             .runs
-            .values()
-            .flat_map(HashMap::values)
-            .flat_map(|run| run.nudges.iter())
+            .iter()
+            .flat_map(|(tenant, runs)| runs.keys().map(move |run| (tenant.clone(), run.clone())))
             .collect();
-        nudges.sort_by(|left, right| {
-            (left.created_at_ns, &left.id).cmp(&(right.created_at_ns, &right.id))
-        });
-        nudges
-            .into_iter()
-            .map(|nudge| Record::Nudge {
-                nudge: nudge.clone(),
-            })
-            .collect()
-    }
-
-    fn compact_if_due(&mut self) -> Result<()> {
-        if self.log.compaction_due() {
-            let records = self.records();
-            self.log.compact(&records)?;
+        for (tenant, run) in runs {
+            book.trim_run(&tenant, &run, now);
         }
-        Ok(())
+        book.fit_budgets(now);
+        if log.compaction_due() {
+            log.compact(&book.records())?;
+        }
+        Ok(Self {
+            log: Mutex::new(log),
+            book: Mutex::new(book),
+        })
     }
 
-    /// Queues a nudge for `run`, durably.
+    fn lock_log(&self) -> Result<MutexGuard<'_, FuseLog<Record>>> {
+        self.log
+            .lock()
+            .map_err(|_| Error::LockPoisoned("nudge log"))
+    }
+
+    fn lock_book(&self) -> Result<MutexGuard<'_, Book>> {
+        self.book.lock().map_err(|_| Error::LockPoisoned("nudges"))
+    }
+
+    /// After a durable change, with the log lock held: compacts the log when
+    /// enough of it is superseded, the records staged under the book lock
+    /// and written after it is released. Best effort: the change is already
+    /// durable, and a failed compaction leaves a valid log that the next
+    /// change compacts again — failing the request instead would lose a
+    /// delivered nudge, or invite a duplicate.
+    fn compact_if_due(&self, log: &mut FuseLog<Record>) {
+        if !log.compaction_due() {
+            return;
+        }
+        let Ok(book) = self.lock_book() else {
+            return;
+        };
+        let records = book.records();
+        drop(book);
+        let _ = log.compact(&records);
+    }
+
+    /// Queues a nudge for `run`, durably. `covered` says whether a pending
+    /// erasure covers the run; it is asked with the log lock held, so an
+    /// erasure either sees this nudge and forgets it or is seen by it.
     pub(crate) fn create(
-        &mut self,
+        &self,
         tenant: &str,
         run: &str,
         spec: &NudgeSpec,
         now: u64,
+        covered: &dyn Fn() -> bool,
     ) -> Result<Nudge> {
         spec.validate()?;
-        let pending = self
-            .runs
-            .get(tenant)
-            .and_then(|runs| runs.get(run))
-            .map_or(0, |nudges| nudges.pending(now));
-        if pending >= MAX_PENDING_PER_RUN {
+        let mut log = self.lock_log()?;
+        if covered() {
             return Err(Error::Conflict(format!(
-                "run `{run}` already has {MAX_PENDING_PER_RUN} pending nudges; wait for its next \
-                 check to deliver them, or for them to expire"
+                "an erasure covering run `{run}` is pending; nudge it once the erasure settles"
             )));
         }
-        let make_room = match self.runs.get(tenant) {
-            Some(runs) if !runs.contains_key(run) && runs.len() >= MAX_NUDGED_RUNS_PER_TENANT => {
-                match oldest_settled(runs, now) {
-                    Some(oldest) => Some(oldest),
-                    None => {
-                        return Err(Error::Conflict(format!(
-                            "this tenant already has pending nudges for \
-                             {MAX_NUDGED_RUNS_PER_TENANT} runs; wait for them to be delivered \
-                             or to expire"
-                        )))
-                    }
-                }
-            }
-            _ => None,
-        };
         let ttl = spec.ttl_seconds.unwrap_or(DEFAULT_NUDGE_TTL_SECONDS);
         let nudge = Nudge {
             id: nudge_id(tenant, run, now),
@@ -366,101 +647,110 @@ impl Book {
             expires_at_ns: now.saturating_add(ttl.saturating_mul(1_000_000_000)),
             delivered_at_ns: None,
         };
-        self.log.append(&Record::Nudge {
+        let victims = {
+            let book = self.lock_book()?;
+            let pending = book.run(tenant, run).map_or(0, |held| held.pending(now));
+            if pending >= MAX_PENDING_PER_RUN {
+                return Err(Error::Conflict(format!(
+                    "run `{run}` already has {MAX_PENDING_PER_RUN} pending nudges; wait for its \
+                     next check to deliver them, or for them to expire"
+                )));
+            }
+            book.room_for(tenant, nudge.cost(), now)?
+        };
+        // Every change holds the log lock, so the book cannot move between
+        // the plan above and its application below.
+        log.append(&Record::Nudge {
             nudge: nudge.clone(),
         })?;
-        let runs = self.runs.entry(tenant.to_owned()).or_default();
-        if let Some(oldest) = make_room {
-            runs.remove(&oldest);
+        {
+            let mut book = self.lock_book()?;
+            for (owner, held_run, id) in victims {
+                book.remove_id(&owner, &held_run, &id);
+            }
+            book.insert(nudge.clone());
+            book.trim_run(tenant, run, now);
         }
-        let nudges = runs.entry(run.to_owned()).or_default();
-        nudges.nudges.push(nudge.clone());
-        nudges.trim(now);
-        self.compact_if_due()?;
+        self.compact_if_due(&mut log);
         Ok(nudge)
     }
 
     /// `run`'s nudges, in the order they were queued.
-    pub(crate) fn list(&self, tenant: &str, run: &str) -> Vec<Nudge> {
-        self.runs
-            .get(tenant)
-            .and_then(|runs| runs.get(run))
-            .map(|nudges| nudges.nudges.clone())
-            .unwrap_or_default()
+    pub(crate) fn list(&self, tenant: &str, run: &str) -> Result<Vec<Nudge>> {
+        Ok(self
+            .lock_book()?
+            .run(tenant, run)
+            .map(|held| held.nudges.clone())
+            .unwrap_or_default())
     }
 
-    /// Nudges pending for `run` at `now`.
-    pub(crate) fn pending(&self, tenant: &str, run: &str, now: u64) -> usize {
-        self.runs
-            .get(tenant)
-            .and_then(|runs| runs.get(run))
-            .map_or(0, |nudges| nudges.pending(now))
+    /// Nudges pending at `now` for each `(tenant, run)`, under one
+    /// acquisition of the book.
+    pub(crate) fn pending_each<'a>(
+        &self,
+        runs: impl IntoIterator<Item = (&'a str, &'a str)>,
+        now: u64,
+    ) -> Result<Vec<usize>> {
+        let book = self.lock_book()?;
+        Ok(runs
+            .into_iter()
+            .map(|(tenant, run)| book.run(tenant, run).map_or(0, |held| held.pending(now)))
+            .collect())
     }
 
     /// Delivers `run`'s pending nudges: marks them delivered, durably, and
-    /// returns them in the order they were queued. Nothing pending costs a
-    /// lookup and writes nothing. If the delivery record cannot be written,
-    /// nothing is delivered and the nudges stay pending.
-    pub(crate) fn deliver(&mut self, tenant: &str, run: &str, now: u64) -> Result<Vec<Nudge>> {
-        let Some(nudges) = self.runs.get_mut(tenant).and_then(|runs| runs.get_mut(run)) else {
-            return Ok(Vec::new());
-        };
-        let due: Vec<String> = nudges
-            .nudges
-            .iter()
-            .filter(|nudge| nudge.status(now) == NudgeStatus::Pending)
-            .map(|nudge| nudge.id.clone())
-            .collect();
-        if due.is_empty() {
-            return Ok(Vec::new());
+    /// returns them in the order they were queued — followed by the blocks
+    /// of a delivery in the last [`BLOCK_HOLD_MS`], which still veto. With
+    /// nothing pending this takes the book lock for one lookup and writes
+    /// nothing. If the delivery cannot be written, nothing is delivered and
+    /// the nudges stay pending.
+    pub(crate) fn deliver(&self, tenant: &str, run: &str, now: u64) -> Result<Vec<Nudge>> {
+        {
+            let book = self.lock_book()?;
+            if book.due(tenant, run, now).is_empty() {
+                return Ok(book.held_blocks(tenant, run, now, &[]));
+            }
         }
-        self.log.append(&Record::Deliver {
+        let mut log = self.lock_log()?;
+        // Another check may have delivered them while this one waited.
+        let due = {
+            let book = self.lock_book()?;
+            let due = book.due(tenant, run, now);
+            if due.is_empty() {
+                return Ok(book.held_blocks(tenant, run, now, &[]));
+            }
+            due
+        };
+        log.append(&Record::Deliver {
             tenant: tenant.to_owned(),
             run: run.to_owned(),
             ids: due.clone(),
             at_ns: now,
         })?;
-        let mut delivered = Vec::with_capacity(due.len());
-        if let Some(nudges) = self.runs.get_mut(tenant).and_then(|runs| runs.get_mut(run)) {
-            for nudge in &mut nudges.nudges {
-                if due.contains(&nudge.id) {
-                    nudge.delivered_at_ns = Some(now);
-                    delivered.push(nudge.clone());
-                }
-            }
-        }
-        self.compact_if_due()?;
+        let delivered = self.lock_book()?.mark_delivered(tenant, run, &due, now);
+        self.compact_if_due(&mut log);
         Ok(delivered)
     }
 
     /// Removes the nudges of one run (`Some(run)`) or of the whole tenant,
     /// and rewrites the log from what remains — always, since superseded
     /// lines can name the subject when memory no longer does.
-    pub(crate) fn forget(&mut self, tenant: &str, run: Option<&str>) -> Result<()> {
-        match run {
-            Some(run) => {
-                if let Some(runs) = self.runs.get_mut(tenant) {
-                    runs.remove(run);
-                    if runs.is_empty() {
-                        self.runs.remove(tenant);
-                    }
-                }
-            }
-            None => {
-                self.runs.remove(tenant);
-            }
-        }
-        let records = self.records();
-        self.log.rewrite(&records)
+    pub(crate) fn forget(&self, tenant: &str, run: Option<&str>) -> Result<()> {
+        let mut log = self.lock_log()?;
+        let records = {
+            let mut book = self.lock_book()?;
+            book.forget(tenant, run);
+            book.records()
+        };
+        log.rewrite(&records)
     }
-}
 
-/// The run nudged longest ago with nothing pending, if any.
-fn oldest_settled(runs: &HashMap<String, RunNudges>, now: u64) -> Option<String> {
-    runs.iter()
-        .filter(|(_, nudges)| nudges.pending(now) == 0)
-        .min_by(|left, right| (left.1.last_ns(), left.0).cmp(&(right.1.last_ns(), right.0)))
-        .map(|(run, _)| run.clone())
+    /// What the held nudges cost: across every tenant, and `tenant`'s.
+    #[cfg(test)]
+    fn spent(&self, tenant: &str) -> (usize, usize) {
+        let book = self.lock_book().expect("book");
+        (book.held, book.by_tenant.get(tenant).copied().unwrap_or(0))
+    }
 }
 
 /// A fresh nudge id: `nd_` and 16 hex characters, unique per process and
@@ -480,6 +770,10 @@ fn nudge_id(tenant: &str, run: &str, now: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    const MS: u64 = 1_000_000;
 
     fn dir(label: &str) -> std::path::PathBuf {
         let nonce = std::time::SystemTime::now()
@@ -502,29 +796,42 @@ mod tests {
         }
     }
 
+    fn free() -> impl Fn() -> bool {
+        || false
+    }
+
     #[test]
     fn a_nudge_is_delivered_once_and_survives_a_restart_as_delivered() {
         let path = dir("once");
-        let mut book = Book::open(&path, 1).expect("opens");
-        let advice = book
-            .create("", "run-1", &spec(NudgeKind::Advice, "use the cache"), 10)
+        let nudges = Nudges::open(&path, 1).expect("opens");
+        let advice = nudges
+            .create(
+                "",
+                "run-1",
+                &spec(NudgeKind::Advice, "use the cache"),
+                10,
+                &free(),
+            )
             .expect("queues");
         assert!(advice.id.starts_with("nd_") && advice.id.len() == 19);
         assert_eq!(
             advice.expires_at_ns,
             10 + DEFAULT_NUDGE_TTL_SECONDS * 1_000_000_000
         );
-        assert_eq!(book.pending("", "run-1", 11), 1);
-        let delivered = book.deliver("", "run-1", 20).expect("delivers");
+        assert_eq!(
+            nudges.pending_each([("", "run-1")], 11).expect("counts"),
+            [1]
+        );
+        let delivered = nudges.deliver("", "run-1", 20).expect("delivers");
         assert_eq!(delivered.len(), 1);
         assert_eq!(delivered[0].delivered_at_ns, Some(20));
         assert!(
-            book.deliver("", "run-1", 21).expect("nothing").is_empty(),
+            nudges.deliver("", "run-1", 21).expect("nothing").is_empty(),
             "a nudge reaches one check"
         );
-        drop(book);
-        let book = Book::open(&path, 30).expect("reopens");
-        let listed = book.list("", "run-1");
+        drop(nudges);
+        let nudges = Nudges::open(&path, 30).expect("reopens");
+        let listed = nudges.list("", "run-1").expect("lists");
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].status(30), NudgeStatus::Delivered);
         assert_eq!(listed[0].delivered_at_ns, Some(20));
@@ -532,24 +839,64 @@ mod tests {
     }
 
     #[test]
+    fn a_block_vetoes_every_check_of_its_batch_and_then_lets_go() {
+        let path = dir("hold");
+        let nudges = Nudges::open(&path, 1).expect("opens");
+        let block = nudges
+            .create("", "r", &spec(NudgeKind::Block, "no refunds"), 10, &free())
+            .expect("queues");
+        let advice = nudges
+            .create("", "r", &spec(NudgeKind::Advice, "be brief"), 11, &free())
+            .expect("queues");
+        let at = 1_000 * MS;
+        let first = nudges.deliver("", "r", at).expect("delivers");
+        let ids: Vec<&str> = first.iter().map(|nudge| nudge.id.as_str()).collect();
+        assert_eq!(ids, [block.id.as_str(), advice.id.as_str()]);
+        // The batch's other checks: the block again, never the advice.
+        for later in [at, at + 1, at + BLOCK_HOLD_MS * MS - 1] {
+            let held = nudges.deliver("", "r", later).expect("holds");
+            assert_eq!(held.len(), 1, "at {later}: {held:?}");
+            assert_eq!(held[0].id, block.id);
+            assert_eq!(held[0].delivered_at_ns, Some(at), "delivered once");
+        }
+        assert!(
+            nudges
+                .deliver("", "r", at + BLOCK_HOLD_MS * MS)
+                .expect("lets go")
+                .is_empty(),
+            "the next step after the hold is the guard's again"
+        );
+        // Advice alone holds nothing.
+        nudges
+            .create("", "q", &spec(NudgeKind::Advice, "x"), 10, &free())
+            .expect("queues");
+        assert_eq!(nudges.deliver("", "q", at).expect("delivers").len(), 1);
+        assert!(nudges.deliver("", "q", at + 1).expect("none").is_empty());
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
     fn expired_nudges_are_not_delivered() {
         let path = dir("expiry");
-        let mut book = Book::open(&path, 1).expect("opens");
+        let nudges = Nudges::open(&path, 1).expect("opens");
         let short = NudgeSpec {
             ttl_seconds: Some(1),
             ..spec(NudgeKind::Block, "stop")
         };
-        book.create("", "r", &short, 0).expect("queues");
+        nudges.create("", "r", &short, 0, &free()).expect("queues");
         let later = 2_000_000_000;
-        assert!(book.deliver("", "r", later).expect("none").is_empty());
-        assert_eq!(book.list("", "r")[0].status(later), NudgeStatus::Expired);
+        assert!(nudges.deliver("", "r", later).expect("none").is_empty());
+        assert_eq!(
+            nudges.list("", "r").expect("lists")[0].status(later),
+            NudgeStatus::Expired
+        );
         let _ = std::fs::remove_dir_all(&path);
     }
 
     #[test]
     fn bounds_are_enforced_and_say_why() {
         let path = dir("bounds");
-        let mut book = Book::open(&path, 1).expect("opens");
+        let nudges = Nudges::open(&path, 1).expect("opens");
         for (bad, needle) in [
             (spec(NudgeKind::Advice, "   "), "must not be empty"),
             (
@@ -564,66 +911,286 @@ mod tests {
                 "ttl_seconds must be 1",
             ),
         ] {
-            match book.create("", "r", &bad, 1) {
+            match nudges.create("", "r", &bad, 1, &free()) {
                 Err(Error::Invalid(message)) => assert!(message.contains(needle), "{message}"),
                 other => panic!("expected {needle}, got {other:?}"),
             }
         }
-        book.create(
-            "",
-            "r",
-            &spec(NudgeKind::Advice, &"x".repeat(MAX_NUDGE_BYTES)),
-            1,
-        )
-        .expect("exactly the cap fits");
+        nudges
+            .create(
+                "",
+                "r",
+                &spec(NudgeKind::Advice, &"x".repeat(MAX_NUDGE_BYTES)),
+                1,
+                &free(),
+            )
+            .expect("exactly the cap fits");
         for _ in 1..MAX_PENDING_PER_RUN {
-            book.create("", "r", &spec(NudgeKind::Advice, "x"), 1)
+            nudges
+                .create("", "r", &spec(NudgeKind::Advice, "x"), 1, &free())
                 .expect("queues");
         }
-        match book.create("", "r", &spec(NudgeKind::Advice, "x"), 1) {
+        match nudges.create("", "r", &spec(NudgeKind::Advice, "x"), 1, &free()) {
             Err(Error::Conflict(message)) => assert!(message.contains("32 pending"), "{message}"),
             other => panic!("the 33rd pending nudge must be refused, got {other:?}"),
         }
         // Delivered ones make room, and history stays bounded.
-        book.deliver("", "r", 2).expect("delivers");
-        for _ in 0..(MAX_KEPT_PER_RUN * 2) {
-            book.create("", "r", &spec(NudgeKind::Advice, "x"), 3)
+        nudges.deliver("", "r", 2).expect("delivers");
+        for round in 0..(MAX_KEPT_PER_RUN as u64 * 2) {
+            let at = 10_000 * MS * (round + 1);
+            nudges
+                .create("", "r", &spec(NudgeKind::Advice, "x"), at, &free())
                 .expect("queues");
-            book.deliver("", "r", 4).expect("delivers");
+            nudges.deliver("", "r", at + 1).expect("delivers");
         }
-        assert!(book.list("", "r").len() <= MAX_KEPT_PER_RUN);
+        assert!(nudges.list("", "r").expect("lists").len() <= MAX_KEPT_PER_RUN);
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// A nudge of `bytes` message bytes for run `run` costs this much.
+    fn cost(tenant: &str, run: &str, bytes: usize) -> usize {
+        NUDGE_OVERHEAD_BYTES + bytes + 19 + run.len() + tenant.len()
+    }
+
+    #[test]
+    fn byte_budgets_drop_settled_history_first_and_refuse_only_pending() {
+        let path = dir("budget");
+        let each = cost("a", "r0", 100);
+        let budget = Budget {
+            tenant_bytes: each * 4,
+            total_bytes: each * 6,
+        };
+        let nudges = Nudges::open_with(&path, 1, budget).expect("opens");
+        let message = "m".repeat(100);
+        let advice = spec(NudgeKind::Advice, &message);
+        // Four pending nudges fill tenant a.
+        for index in 0..4 {
+            nudges
+                .create("a", &format!("r{index}"), &advice, 10 + index, &free())
+                .expect("fits");
+        }
+        assert_eq!(nudges.spent("a"), (each * 4, each * 4));
+        match nudges.create("a", "r4", &advice, 20, &free()) {
+            Err(Error::Conflict(message)) => {
+                assert!(message.contains("for one tenant"), "{message}")
+            }
+            other => panic!("a fifth pending nudge must be refused, got {other:?}"),
+        }
+        // Delivered, they are history, and the oldest makes room.
+        nudges.deliver("a", "r0", 30).expect("delivers");
+        nudges
+            .create("a", "r4", &advice, 40, &free())
+            .expect("the oldest settled nudge made room");
+        assert!(nudges.list("a", "r0").expect("lists").is_empty());
+        assert_eq!(nudges.list("a", "r1").expect("lists").len(), 1);
+        assert_eq!(nudges.spent("a").1, each * 4);
+        // Tenant b fits its own budget until the store's runs out: two more.
+        for index in 0..2 {
+            nudges
+                .create("b", &format!("r{index}"), &advice, 50 + index, &free())
+                .expect("fits the store");
+        }
+        match nudges.create("b", "r2", &advice, 60, &free()) {
+            Err(Error::Conflict(message)) => assert!(message.contains("this server"), "{message}"),
+            other => panic!("the store's budget must refuse, got {other:?}"),
+        }
+        // Another tenant's settled history makes room for the store's.
+        nudges.deliver("a", "r1", 70).expect("delivers");
+        nudges
+            .create("b", "r2", &advice, 80, &free())
+            .expect("a's delivered nudge made room");
+        assert!(nudges.list("a", "r1").expect("lists").is_empty());
+        let (total, _) = nudges.spent("b");
+        assert!(total <= budget.total_bytes, "{total}");
+        // A replay of the log, which still holds what was dropped, fits too.
+        drop(nudges);
+        let nudges = Nudges::open_with(&path, 90, budget).expect("reopens");
+        let (total, a) = nudges.spent("a");
+        assert!(total <= budget.total_bytes && a <= budget.tenant_bytes);
+        assert!(nudges.list("a", "r0").expect("lists").is_empty());
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn random_changes_keep_the_accounting_exact() {
+        let path = dir("accounting");
+        let budget = Budget {
+            tenant_bytes: cost("t0", "r0", 40) * 6,
+            total_bytes: cost("t0", "r0", 40) * 10,
+        };
+        let nudges = Nudges::open_with(&path, 1, budget).expect("opens");
+        let mut rng = crate::seed::Rng::new(0x0ddb_0d6e);
+        let mut now = 10;
+        for _ in 0..250 {
+            now += rng.range(1, 3) * 1_000 * MS;
+            let tenant = format!("t{}", rng.range(0, 2));
+            let run = format!("r{}", rng.range(0, 3));
+            match rng.range(0, 9) {
+                0..=4 => {
+                    let message = "z".repeat(rng.range(1, 40) as usize);
+                    let kind = if rng.chance(30) {
+                        NudgeKind::Block
+                    } else {
+                        NudgeKind::Advice
+                    };
+                    let ttl = Some(rng.range(1, 4));
+                    let _ = nudges.create(
+                        &tenant,
+                        &run,
+                        &NudgeSpec {
+                            message,
+                            kind,
+                            ttl_seconds: ttl,
+                        },
+                        now,
+                        &free(),
+                    );
+                }
+                5..=7 => {
+                    nudges.deliver(&tenant, &run, now).expect("delivers");
+                }
+                8 => nudges.forget(&tenant, Some(&run)).expect("forgets"),
+                _ => nudges.forget(&tenant, None).expect("forgets"),
+            }
+            let book = nudges.lock_book().expect("book");
+            let mut total = 0;
+            let mut by_tenant: HashMap<String, usize> = HashMap::new();
+            let mut count = 0;
+            for (tenant, runs) in &book.runs {
+                for held in runs.values() {
+                    assert!(!held.nudges.is_empty(), "no empty runs are kept");
+                    assert!(held.nudges.len() <= MAX_KEPT_PER_RUN);
+                    for nudge in &held.nudges {
+                        total += nudge.cost();
+                        *by_tenant.entry(tenant.clone()).or_default() += nudge.cost();
+                        count += 1;
+                    }
+                }
+            }
+            assert_eq!(book.held, total);
+            assert_eq!(book.by_tenant, by_tenant);
+            assert_eq!(book.order.len(), count);
+            assert!(book.held <= budget.total_bytes);
+        }
         let _ = std::fs::remove_dir_all(&path);
     }
 
     #[test]
     fn forgetting_rewrites_the_log_without_the_subject() {
         let path = dir("forget");
-        let mut book = Book::open(&path, 1).expect("opens");
-        book.create("acme", "secret-session", &spec(NudgeKind::Advice, "a"), 1)
+        let nudges = Nudges::open(&path, 1).expect("opens");
+        nudges
+            .create(
+                "acme",
+                "secret-session",
+                &spec(NudgeKind::Advice, "a"),
+                1,
+                &free(),
+            )
             .expect("queues");
-        book.create("acme", "kept", &spec(NudgeKind::Advice, "b"), 1)
+        nudges
+            .create("acme", "kept", &spec(NudgeKind::Advice, "b"), 1, &free())
             .expect("queues");
-        book.create("other", "x", &spec(NudgeKind::Advice, "c"), 1)
+        nudges
+            .create("other", "x", &spec(NudgeKind::Advice, "c"), 1, &free())
             .expect("queues");
-        book.forget("acme", Some("secret-session"))
+        nudges
+            .forget("acme", Some("secret-session"))
             .expect("forgets");
         let text = std::fs::read_to_string(path.join(LOG_NAME)).expect("reads");
         assert!(!text.contains("secret-session"), "{text}");
         assert!(text.contains("kept"));
-        book.forget("acme", None).expect("forgets the tenant");
+        nudges.forget("acme", None).expect("forgets the tenant");
         let text = std::fs::read_to_string(path.join(LOG_NAME)).expect("reads");
         assert!(!text.contains("\"acme\""), "{text}");
-        assert_eq!(book.list("other", "x").len(), 1);
+        assert_eq!(nudges.list("other", "x").expect("lists").len(), 1);
+        assert_eq!(nudges.spent("acme").1, 0);
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// An erasure installing its mask and forgetting the run right after a
+    /// nudge's check of the mask found nothing: the forget must still take
+    /// the nudge, because it cannot run until the nudge is written.
+    #[test]
+    fn a_nudge_racing_an_erasure_does_not_survive_it() {
+        let path = dir("race");
+        let nudges = Arc::new(Nudges::open(&path, 1).expect("opens"));
+        let masked = Arc::new(AtomicBool::new(false));
+        let eraser: std::sync::Mutex<Option<std::thread::JoinHandle<()>>> =
+            std::sync::Mutex::new(None);
+        let covered = || {
+            let seen = masked.load(Ordering::SeqCst);
+            // The erasure lands now: mask, then forget, on its own thread.
+            let (nudges, masked) = (Arc::clone(&nudges), Arc::clone(&masked));
+            let handle = std::thread::spawn(move || {
+                masked.store(true, Ordering::SeqCst);
+                nudges.forget("acme", Some("doomed")).expect("forgets");
+            });
+            // Long enough for the forget to finish if nothing holds it back.
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            *eraser.lock().expect("eraser") = Some(handle);
+            seen
+        };
+        nudges
+            .create(
+                "acme",
+                "doomed",
+                &spec(NudgeKind::Advice, "secret"),
+                10,
+                &covered,
+            )
+            .expect("queued before the erasure saw it");
+        let handle = eraser.lock().expect("eraser").take().expect("erasure ran");
+        handle.join().expect("the erasure finishes");
+        assert!(
+            nudges.list("acme", "doomed").expect("lists").is_empty(),
+            "the erasure took the nudge from memory"
+        );
+        let text = std::fs::read_to_string(path.join(LOG_NAME)).expect("reads");
+        assert!(!text.contains("secret"), "and from disk: {text}");
+        // With the mask in place, a new nudge is refused.
+        match nudges.create("acme", "doomed", &spec(NudgeKind::Advice, "x"), 20, &|| {
+            masked.load(Ordering::SeqCst)
+        }) {
+            Err(Error::Conflict(message)) => assert!(message.contains("erasure"), "{message}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// A check with nothing to deliver never waits on the log: it answers
+    /// while another thread holds the log lock (a delivery's fsync, a
+    /// compaction).
+    #[test]
+    fn a_check_with_nothing_pending_does_not_wait_on_the_log() {
+        let path = dir("fast");
+        let nudges = Arc::new(Nudges::open(&path, 1).expect("opens"));
+        let log = nudges.lock_log().expect("log");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let checker = Arc::clone(&nudges);
+        let handle = std::thread::spawn(move || {
+            let answer = checker.deliver("", "idle", 5).expect("answers");
+            sender.send(answer.len()).expect("sends");
+        });
+        let answered = receiver.recv_timeout(std::time::Duration::from_secs(5));
+        drop(log);
+        handle.join().expect("joins");
+        assert_eq!(
+            answered,
+            Ok(0),
+            "the idle check answered under the log lock"
+        );
         let _ = std::fs::remove_dir_all(&path);
     }
 
     #[test]
     fn a_torn_final_line_is_healed_at_open() {
         let path = dir("torn");
-        let mut book = Book::open(&path, 1).expect("opens");
-        book.create("", "r", &spec(NudgeKind::Advice, "whole"), 1)
+        let nudges = Nudges::open(&path, 1).expect("opens");
+        nudges
+            .create("", "r", &spec(NudgeKind::Advice, "whole"), 1, &free())
             .expect("queues");
-        drop(book);
+        drop(nudges);
         use std::io::Write as _;
         let mut file = std::fs::OpenOptions::new()
             .append(true)
@@ -631,8 +1198,8 @@ mod tests {
             .expect("opens the log");
         file.write_all(b"{\"op\":\"nudge\",\"nud").expect("tears");
         drop(file);
-        let book = Book::open(&path, 2).expect("heals the torn tail");
-        assert_eq!(book.list("", "r").len(), 1);
+        let nudges = Nudges::open(&path, 2).expect("heals the torn tail");
+        assert_eq!(nudges.list("", "r").expect("lists").len(), 1);
         let _ = std::fs::remove_dir_all(&path);
     }
 }

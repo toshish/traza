@@ -279,7 +279,7 @@ hook_call() { # hook_call EVENT TOOL_USE_ID — exit code is the hook's
 }
 rc=0
 hook_call PreToolUse toolu_0 || rc=$?
-printf '    %-12s %-14s %-24s → ' PreToolUse 'Bash npm test' '(a person left a note)'
+printf '    %-12s %-14s %-24s → ' PreToolUse 'Bash npm test' '(a nudge is queued)'
 agent hook "$rc" "$tmp/hook.out" context "run one test file at a time"
 for n in 1 2 3; do
   rc=0

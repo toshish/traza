@@ -1,18 +1,27 @@
 //! The live view: runs with recent activity, most recently changed first,
 //! and the change feed a stream of them follows.
 //!
-//! Built from the guard's live state alone — never a store fold — so a
-//! listing costs what it returns. Every live run carries a position in a
-//! change order, re-stamped whenever something a viewer would see changes:
-//! a span arrives, a pre-call check asks about its next step, its verdict
-//! class moves, a nudge is queued or delivered. An index by that position,
-//! across every tenant and per tenant, answers "newest first" by walking
-//! from its end, and "what changed since position p" by walking from p.
+//! Built from the guard's live state alone — never a store fold. Every live
+//! run carries a position in a change order, re-stamped whenever something
+//! a viewer would see changes: a span arrives, a pre-call check asks about
+//! its next step, its verdict class moves, a nudge is queued or delivered.
+//! An index by that position, across every tenant and per tenant, answers
+//! "newest first" by walking from its end, and "what changed since position
+//! p" by walking from p. A listing walks the runs changed within the window,
+//! newest first, until it has `limit` rows: it skips runs that changed
+//! recently without activity (a verdict that moved, a nudge), so it reads at
+//! most every run the guard holds, never the store.
+//!
+//! The re-stamp is what the view costs ingest: per run a batch touches, one
+//! removal and one insertion in each of the two indexes and an atomic
+//! store, under the guard's state lock the fold already holds — plus, per
+//! step span, the step's agent and label, read beside its fingerprint.
 //!
 //! **Activity** is narrower than change: a span arriving, or a pre-call
-//! check. A run is live while its last activity is within the window the
-//! caller names (`--live-window-seconds`). A verdict read is neither, so a
-//! dashboard polling a run cannot keep it live.
+//! check (one naming its `next` step). A run is live while its last
+//! activity is within the window the caller names
+//! (`--live-window-seconds`). A verdict read — a check naming no next step
+//! included — is neither, so a dashboard polling a run cannot keep it live.
 //!
 //! What the view shows is what this process has seen: a run followed from
 //! some point after a restart lists with the usage seen since, like
@@ -33,8 +42,8 @@ use crate::semconv::StepKind;
 use crate::{Result, Store};
 
 /// How often a waiting stream looks for changes. A change reaches a
-/// stream within this, at the cost of one atomic read per look — the feed
-/// puts nothing on the ingest path beyond an atomic store per run touched.
+/// stream within this, at the cost of one atomic read per look; waiting
+/// streams take no lock until something changed.
 const POLL: Duration = Duration::from_millis(200);
 
 /// Live runs by change position: across every tenant, and per tenant.
@@ -373,11 +382,11 @@ impl Store {
         ))
     }
 
-    /// Records that `run` asked the pre-call gate about its next step: it
-    /// is active, and — with `next` — that step is what it is on until a
-    /// span arrives. Nothing for a run the guard holds no live state for (a
-    /// run with no span yet costs no memory, however often it asks).
-    pub(crate) fn guard_note_check(&self, tenant: &str, run: &str, next: Option<&NextStep>) {
+    /// Records that `run` asked the pre-call gate about its `next` step: it
+    /// is active, and that step is what it is on until a span arrives.
+    /// Nothing for a run the guard holds no live state for (a run with no
+    /// span yet costs no memory, however often it asks).
+    pub(crate) fn guard_note_check(&self, tenant: &str, run: &str, next: &NextStep) {
         let Some(guard) = self.guard.as_ref() else {
             return;
         };
@@ -392,18 +401,16 @@ impl Store {
         let Some(live) = state.runs.get_mut(&key) else {
             return;
         };
-        if let Some(next) = next {
-            live.pending = Some(LiveStep {
-                kind: if next.tool.is_some() {
-                    StepKind::Tool
-                } else {
-                    StepKind::Llm
-                },
-                name: next.tool.as_deref().map(crate::steer::handoff::clip_name),
-                started_ns: now,
-                pending: true,
-            });
-        }
+        live.pending = Some(LiveStep {
+            kind: if next.tool.is_some() {
+                StepKind::Tool
+            } else {
+                StepKind::Llm
+            },
+            name: next.tool.as_deref().map(crate::steer::handoff::clip_name),
+            started_ns: now,
+            pending: true,
+        });
         state.live_touch(&key, now, true);
     }
 

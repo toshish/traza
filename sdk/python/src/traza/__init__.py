@@ -27,6 +27,7 @@ from .errors import (  # noqa: E402
     TrazaError,
 )
 from .models import (  # noqa: E402
+    DeliveredNudge,
     Diff,
     EvidencePack,
     FuseEvent,
@@ -60,6 +61,7 @@ __all__ = [
     "Gone",
     "QuotaExceeded",
     "FuseTripped",
+    "DeliveredNudge",
     "Diff",
     "EvidencePack",
     "FuseEvent",
