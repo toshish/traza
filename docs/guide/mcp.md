@@ -215,7 +215,10 @@ answers: the run's behaviour path so far, the share of the agent's completed
 runs that took the same path and succeeded — with its 95% interval and how
 many runs that is — a verdict (`on_track`, `at_risk`, `likely_failure`,
 `novel`, `insufficient_history`), where the run left the known paths, and what
-earlier runs did next from here and how that went for them. The headline is
+earlier runs did next from here and how that went for them. A run still
+going is compared with every run that repeated its last step at least as
+often (it may yet repeat it), and the text says so; an option that is the
+same step again reads "again". The headline is
 only numbers and verdict words the server computed; the run id, the agent and
 every token of the path — tool and model names from the telemetry — and the
 explanation that quotes them render inside the telemetry block, and are made
@@ -237,7 +240,9 @@ recorded, which is the pre-call check without an estimate; an agent wanting
 to price its next step uses
 [`POST /v1/fuses/check`](http-api.md#post-v1fusescheck). When the run's policy
 sets a [predictive limit](foresight.md#predictive-fuses), the verdict carries
-the run's `foresight` too, and a foresight stop reads as any other reason. On
+the run's `foresight` too, and a foresight stop reads as any other reason;
+in `structuredContent` the reasons and the foresight's explanation and next
+tool are made JSON-safe, as `foresee_run` makes the same text. On
 a server started with `--no-fuses` it is not listed — fourteen reads, then —
 and a call naming it is refused as invalid params.
 

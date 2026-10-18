@@ -65,7 +65,10 @@ so a loop is one shape, not a tree that grows a level per iteration. A path
 holds at most 64 tokens; anything deeper ends in a terminal `…` token. A run
 read only in part — more than 192 steps, or past a build's bounds — ends in
 `…` too, after dropping its last token (whose repeat bucket might be larger
-than what was read).
+than what was read). Tokens are matched by step and bucket, never by their
+text, so a tool literally named `x×2` is not the same branch as `x` called
+twice. Names longer than 160 bytes — tool, model and agent names alike — are
+cut there (ending in `…`) the same way everywhere they are read.
 
 ## Cohorts
 
@@ -102,9 +105,11 @@ counted** (the six live runs above). The base rate is
 curl 'http://127.0.0.1:8080/v1/fate/map?agent=support-agent'
 ```
 
-The answer is the cohort's counts, what bounded the build, the window, a
-self-assessment (`calibration`), summaries of its fatal forks and hotspots,
-and the tree under `root`. One node — the search loop — trimmed of nothing:
+The answer is the cohort's counts, what bounded the build, the window, the
+tree's size (`nodes_total`, `nodes_shown`, and `nodes_capped` when the node
+bound cut this cohort's tree), a self-assessment (`calibration`), summaries
+of its fatal forks and hotspots, and the tree under `root`. One node — the
+search loop — with its children elided:
 
 ```json
 {"abandoned":5,"children":[…],"ci95":[0.0435,0.2136],"cost_usd_sum":0.2,"depth":2,"duration_ns_sum":249849000000,"ended":0,"entropy":0.0,"example_runs":[{"outcome":"success","run":"search_loop-9"},{"outcome":"failure","run":"search_loop-0"},{"outcome":"abandoned","run":"search_loop-8"}],"failure":40,"fatal_fork":true,"fork":{"gap":0.6154,"p_value":2.2114329254814858e-14,"siblings_success_rate":0.7154,"siblings_visits":130},"hotspot":false,"lift":0.1837,"p_fail_given_here":0.8,"success":5,"success_rate":0.1,"token":"tool:search_orders×3-5","visits":50}
@@ -154,25 +159,32 @@ highest-entropy nodes, with their most common next tokens:
 ### How good is this map? `calibration`
 
 A prediction is only worth what it has been worth. Every map scores its own
-foresight: each completed run is predicted at several depths — by the node
-its path reached, from the **half of the cohort it is not in** (two-fold
-cross-validation, split by a hash of the run id), or by that half's base rate
-when the node holds fewer than ten runs of it — and the predictions are
-scored against how the runs ended:
+foresight: each completed run is predicted at several depths, from the
+**half of the cohort it is not in** (two-fold cross-validation, split by a
+hash of the run id), and the predictions are scored against how the runs
+ended. A run is predicted at depth *d* **only from what it had done by
+then** — as live foresight would have seen it at the last step of its *d*-th
+token, when that step might still repeat: from the runs of the other half
+that reached the same point with the same step repeated at least as often
+(the open group's pooling, [below](#foresight-for-one-run)), or by that
+half's base rate when fewer than ten of them did:
 
 ```json
-"calibration":{"depths":[{"baseline_brier":0.2514,"brier":0.2514,"covered":180,"depth":1,"runs":180,"skill":0.0},{"baseline_brier":0.2514,"brier":0.1727,"covered":180,"depth":2,"runs":180,"skill":0.3128},{"baseline_brier":0.2514,"brier":0.1727,"covered":180,"depth":3,"runs":180,"skill":0.3128},{"baseline_brier":0.2365,"brier":0.1923,"covered":130,"depth":5,"runs":130,"skill":0.1869}],"reliability":[{"high":0.1,"low":0.0,"observed":0.12,"predicted":0.08,"runs":25},{"high":0.2,"low":0.1,"observed":0.08,"predicted":0.12,"runs":25},{"high":0.7,"low":0.6,"observed":0.6,"predicted":0.6,"runs":40},{"high":0.8,"low":0.7,"observed":0.8222,"predicted":0.7111,"runs":45},{"high":0.9,"low":0.8,"observed":0.7111,"predicted":0.8222,"runs":45}]}
+"calibration":{"depths":[{"baseline_brier":0.2514,"brier":0.2514,"covered":180,"depth":1,"runs":180,"skill":0.0},{"baseline_brier":0.2514,"brier":0.1998,"covered":180,"depth":2,"runs":180,"skill":0.2053},{"baseline_brier":0.2514,"brier":0.1727,"covered":180,"depth":3,"runs":180,"skill":0.3128},{"baseline_brier":0.2365,"brier":0.1923,"covered":130,"depth":5,"runs":130,"skill":0.1869}],"reliability":[{"high":0.1,"low":0.0,"observed":0.12,"predicted":0.08,"runs":25},{"high":0.2,"low":0.1,"observed":0.08,"predicted":0.12,"runs":25},{"high":0.7,"low":0.6,"observed":0.6,"predicted":0.6,"runs":40},{"high":0.8,"low":0.7,"observed":0.8222,"predicted":0.7111,"runs":45},{"high":0.9,"low":0.8,"observed":0.7111,"predicted":0.8222,"runs":45}]}
 ```
 
 `brier` is the mean squared error of the predictions; `baseline_brier` the
 same for the base rate alone; `skill = 1 − brier / baseline_brier` is how much
 better than "assume the average" the map does. Here every run's first step is
-the same, so depth 1 knows nothing (`skill` 0); the branch is chosen at depth
-2, and from there the map removes 31% of the base rate's error. `reliability`
-bins depth-3 predictions in tenths: when the map said about 10%, about 10% of
-those runs succeeded. **Read `skill` before trusting a verdict**: an agent
-whose outcome does not depend on its path will show `skill` near zero at
-every depth, and its foresight is then no better than its base rate.
+the same, so depth 1 knows nothing (`skill` 0). The branch is chosen at depth
+2, but only partly visible there: a run that has searched once cannot yet
+tell a single search from the start of a loop, so the map removes 21% of the
+base rate's error at depth 2 and 31% at depth 3, once the search is behind
+the run. `reliability` bins depth-3 predictions in tenths: when the map said
+about 10%, about 10% of those runs succeeded. **Read `skill` before trusting
+a verdict**: an agent whose outcome does not depend on its path will show
+`skill` near zero at every depth, and its foresight is then no better than
+its base rate.
 
 ### Parameters
 
@@ -188,13 +200,33 @@ curl 'http://127.0.0.1:8080/v1/fate/runs/live-doomed-0'
 ```
 
 ```json
-{"agent":"support-agent","base_rate":0.5444,"ci95":[0.0435,0.2136],"cohort_runs":180,"excluded_self":false,"explanation":"runs that took this path succeeded 5 of 50 times (10.0%, 95% CI 4.3–21.4%); the agent's overall success rate is 54%","map_built_at_ns":1792298124721544000,"matched_depth":2,"min_support":30,"next":[{"ci95":[0.0435,0.2136],"success_rate":0.1,"token":"llm:gpt-4o","visits":50}],"node":{"abandoned":5,"ci95":[0.0435,0.2136],"cost_usd_avg":0.004,"depth":2,"failure":40,"lift":0.1837,"p_fail_given_here":0.8,"success":5,"success_rate":0.1,"token":"tool:search_orders×3-5","visits":50},"outcome":"unknown","p_success":0.1,"partial":false,"path":["llm:gpt-4o","tool:search_orders×3-5"],"run":"live-doomed-0","steps":5,"support":50,"tenant":"","verdict":"likely_failure"}
+{"agent":"support-agent","base_rate":0.5444,"ci95":[0.0435,0.2136],"cohort_runs":180,"excluded_self":false,"explanation":"runs that took this path succeeded 5 of 50 times (10.0%, 95% CI 4.3–21.4%); the agent's overall success rate is 54%","last_open":true,"map_built_at_ns":1792303815044948000,"matched_depth":2,"min_support":30,"next":[{"ci95":[0.0435,0.2136],"success_rate":0.1,"token":"llm:gpt-4o","visits":50}],"node":{"abandoned":5,"ci95":[0.0435,0.2136],"cost_usd_avg":0.004,"depth":2,"failure":40,"lift":0.1837,"p_fail_given_here":0.8,"pooled":["tool:search_orders×3-5"],"success":5,"success_rate":0.1,"token":"tool:search_orders×3-5","visits":50},"outcome":"unknown","p_success":0.1,"partial":false,"path":["llm:gpt-4o","tool:search_orders×3-5"],"run":"live-doomed-0","steps":5,"support":50,"tenant":"","verdict":"likely_failure"}
 ```
 
 The run's path is read from its stored spans exactly as a build reads runs,
 and walked down its agent's map over the last 30 days. **A completed run is
 left out of the statistics it is judged by** (`excluded_self: true`) — a
-run's own outcome is not evidence about itself. The verdict:
+run's own outcome is not evidence about itself.
+
+**A live run's last step is still open.** A run that may still go on has
+not finished its last token: having issued one refund, it may yet issue a
+second. Comparing it only with the runs that stopped at one refund would be
+knowing what it does next, and would flatter it. So a live run is compared
+with **every run that repeated its last step at least as often** at that
+point — the sibling tokens of the same step in its own bucket and every
+longer one, pooled (`node.pooled`, and `last_open: true`). The corpus's
+healthy run has issued one refund:
+
+```json
+{"agent":"support-agent","base_rate":0.5444,"ci95":[0.6695,0.842],"cohort_runs":180,"excluded_self":false,"explanation":"runs that took this path succeeded 69 of 90 times (76.7%, 95% CI 66.9–84.2%); the agent's overall success rate is 54%","last_open":true,"map_built_at_ns":1792303815044948000,"matched_depth":4,"min_support":30,"next":[{"ci95":[0.7985,0.9534],"success_rate":0.9,"token":"llm:gpt-4o","visits":60},{"ci95":[0.3315,0.6685],"repeat":true,"success_rate":0.5,"token":"tool:issue_refund","visits":30}],"node":{"abandoned":0,"ci95":[0.6695,0.842],"cost_usd_avg":0.006,"depth":4,"failure":21,"lift":1.4082,"p_fail_given_here":0.2333,"pooled":["tool:issue_refund","tool:issue_refund×2"],"success":69,"success_rate":0.7667,"token":"tool:issue_refund","visits":90},"outcome":"unknown","p_success":0.7667,"partial":false,"path":["llm:gpt-4o","tool:search_orders","llm:gpt-4o","tool:issue_refund"],"recommended_next":"llm:gpt-4o","run":"live-healthy-0","steps":4,"support":90,"tenant":"","verdict":"on_track"}
+```
+
+69 of 90: the 54 of 60 that stopped at one refund and the 15 of 30 that
+issued a second — not the 54 of 60 a look at how the run's refunds ended
+would claim. `next` says what those runs did next: 60 went back to the model
+(90% succeeded), 30 issued the refund again (`"repeat": true`, 50%) — so the
+step that did best from here, `recommended_next`, is to move on. A completed
+run (`last_open: false`) is judged at its own node. The verdict:
 
 | Verdict | When |
 |---|---|
@@ -204,13 +236,15 @@ run's own outcome is not evidence about itself. The verdict:
 | `at_risk` | The upper bound is below the agent's base rate: runs on this path do measurably worse than the agent's average |
 | `on_track` | Neither |
 
-`p_success`, `ci95`, `support` and `node` describe the deepest node the path
-matched — for `novel`, the point where the run left the known paths. `next`
-lists what earlier runs did next from there (children with at least three
-runs, most common first, each with its rate and interval), and
-`recommended_next` names the next step whose runs did best — the highest
-Wilson lower bound among children with at least `min_support` runs — when it
-beats the current node's rate. From the corpus's novel run:
+`p_success`, `ci95`, `support` and `node` describe where the path matched —
+the deepest node, or a live run's pooled siblings; for `novel`, the point
+where the run left the known paths. `next` lists what earlier runs did next
+from there (options with at least three runs, most common first, each with
+its rate and interval; for an open last group, the children of its own
+bucket's node plus, marked `repeat`, the runs that made the same call
+again), and `recommended_next` names the option whose runs did best — the
+highest Wilson lower bound among options with at least `min_support` runs —
+when it beats the current rate. From the corpus's novel run:
 
 ```json
 {"divergence":{"common_next":["tool:search_orders","tool:search_orders×3-5","tool:lookup_customer"],"depth":1,"took":"tool:delete_database"},"explanation":"no earlier run of this agent took `tool:delete_database` at this point; the 180 runs that got here went on with `tool:search_orders`, `tool:search_orders×3-5`, `tool:lookup_customer`","recommended_next":"tool:search_orders","verdict":"novel", …}
@@ -238,27 +272,35 @@ reason:
 ```sh
 curl -X POST http://127.0.0.1:8080/v1/fuses/policies -d '{
   "name": "support", "match": {"service": "support-agent"},
-  "limits": {"min_success_odds": 0.5}, "action": "stop"}'
+  "limits": {"min_success_odds": 0.7}, "action": "stop"}'
 curl -X POST http://127.0.0.1:8080/v1/fuses/check -d '{"run": "live-doomed-0"}'
 ```
 
 ```json
-{"evidence":[],"foresight":{"base_rate":0.5444,"ci95":[0.0435,0.2136],"explanation":"runs that took this path succeeded 5 of 50 times (10.0%, 95% CI 4.3–21.4%); the agent's overall success rate is 54%","map_built_at_ns":1792298124721544000,"matched_depth":2,"p_success":0.1,"raised":true,"successes":5,"support":50,"verdict":"likely_failure"},"grant":null,"limits":{"min_success_odds":0.5},"policy":"support","reasons":["foresight: runs that took this path succeeded 5 of 50 times (≤21.4%)"],"run":"live-doomed-0","source":"rebuilt","tenant":"","tripped_at_ns":null,"tripped_by":null,"usage":{"cost_usd":0.002,"duration_ns":4326000000,"error_streak":0,"errors":3,"llm_calls":1,"steps":5,"tokens":690,"tool_calls":4,"top_repeat":null},"verdict":"stop"}
+{"evidence":[],"foresight":{"base_rate":0.5444,"ci95":[0.0435,0.2136],"explanation":"runs that took this path succeeded 5 of 50 times (10.0%, 95% CI 4.3–21.4%); the agent's overall success rate is 54%","map_built_at_ns":1792303815044948000,"matched_depth":2,"p_success":0.1,"raised":true,"successes":5,"support":50,"verdict":"likely_failure"},"grant":null,"limits":{"min_success_odds":0.7},"policy":"support","reasons":["foresight: runs that took this path succeeded 5 of 50 times (≤21.4%)"],"run":"live-doomed-0","source":"rebuilt","tenant":"","tripped_at_ns":null,"tripped_by":null,"usage":{"cost_usd":0.002,"duration_ns":4326000000,"error_streak":0,"errors":3,"llm_calls":1,"steps":5,"tokens":690,"tool_calls":4,"top_repeat":null},"verdict":"stop"}
 ```
 
 The upper bound, not the estimate, is compared, so a fuse acts only when the
 history is strong enough to be confident — 0 of 3 runs never stops anything.
+The fuse reads the run as still going (the check is about its next step), so
+its last step is always open, as above.
 
 **The step about to happen.** When the check names the next step's tool
 (`"next": {"tool": "issue_refund"}`), the path is judged *with that step
-appended* — repeat buckets included — if earlier runs took it from here. So
-the corpus's healthy run, on the clean-refund path, answers `continue`; the
-same check naming a second `issue_refund` answers `stop` under
-`min_success_odds: 0.7`, with `"next_tool": "issue_refund"` and the reason
-`foresight: runs that took this path and then called tool:issue_refund
-succeeded 15 of 30 times (≤66.8%)`. A step no earlier run took adds no
-evidence, and the path so far is judged instead. (An LLM step's model is not
-part of the check, so only a tool can be judged ahead.)
+appended* — one more of the last token's step, or a new open token — if
+earlier runs took it from here. So the corpus's healthy run (69 of 90, upper
+bound 84.2%) answers `continue` under `min_success_odds: 0.7`; the same check
+naming a second `issue_refund` answers `stop`:
+
+```json
+{"evidence":[],"foresight":{"base_rate":0.5444,"ci95":[0.3315,0.6685],"explanation":"if it calls tool:issue_refund next: runs that took this path succeeded 15 of 30 times (50.0%, 95% CI 33.2–66.8%); the agent's overall success rate is 54%","map_built_at_ns":1792303815044948000,"matched_depth":4,"next_tool":"issue_refund","p_success":0.5,"raised":true,"successes":15,"support":30,"verdict":"on_track"},"grant":null,"limits":{"min_success_odds":0.7},"policy":"support","reasons":["foresight: runs that took this path and then called tool:issue_refund succeeded 15 of 30 times (≤66.8%)"],"run":"live-healthy-0","source":"live","tenant":"","tripped_at_ns":null,"tripped_by":null,"usage":{"cost_usd":0.004,"duration_ns":4266000000,"error_streak":0,"errors":0,"llm_calls":2,"steps":4,"tokens":1460,"tool_calls":2,"top_repeat":{"count":2,"example":{"span_id":"000000000000df03","trace_id":"cbf29ce48422232500000000000000df"},"fingerprint":"llm:gpt-4o"}},"verdict":"stop"}
+```
+
+(The foresight `verdict` is `on_track` — 66.8% is above the agent's 54% —
+while the policy's odds of 0.7 still raise its action: the verdict compares
+with the agent, the limit with the policy.) A step no earlier run took adds
+no evidence, and the path so far is judged instead. An LLM step's model is
+not part of the check, so only a tool can be judged ahead.
 
 **Where it is evaluated, and where it is not.** On the pre-call check
 (`POST /v1/fuses/check`) and on verdict queries (`GET /v1/fuses/runs/{run}`,
@@ -266,16 +308,31 @@ MCP `check_run_guard`) — never on ingest, so an acknowledgement never carries
 a foresight stop, and not in the `GET /v1/fuses/runs` listing, which is
 answered from memory alone. A run already stopped is not foreseen.
 
-**A cached map only.** The check walks a cached map — an O(depth) lookup —
-plus one read of the run's spans under what is left of the request's
-`--query-deadline-ms` budget. It never builds a map. With none cached, it
-answers `"foresight": {"verdict": "insufficient_history", …}` (no stop) and
-asks for one; `traza-server` builds requested maps on a background thread
-every two seconds, each under the query deadline, and a map is served to the
-fuses for up to twice `--fate-cache-seconds` while a fresh one is built. So a
-server's first checks after start see no foresight for a few seconds. If the
-run cannot be read within the budget, the answer is likewise no foresight
-stop, never a refusal: missing evidence is not evidence of failure.
+**From memory, against a cached map.** The run guard keeps, for every run
+under a policy that sets `min_success_odds`, the run's behaviour path — its
+earliest 192 steps, by key — beside its usage, maintained as usage is: every
+version of a span that lands replaces the last, a rebuild from the store
+replays it whole, and eviction or erasure takes it away. The check reads
+that path from memory and walks it down a cached map: time proportional to
+the path, never a read of the run from the store. (A run whose guard state
+started before such a policy existed, or that the guard does not hold whole,
+is read from the store instead, under what is left of the request's
+`--query-deadline-ms` budget.) The check never builds a map. With none
+cached, it answers `"foresight": {"verdict": "insufficient_history", …}` (no
+stop) and asks for one; `traza-server` builds requested maps on a background
+thread every two seconds, two at a time, each under `--fate-build-seconds`
+(default 120, never less than the query deadline), and a map is served to
+the fuses for up to twice `--fate-cache-seconds` while a fresh one is built.
+So a server's first checks after start see no foresight for a few seconds. A
+background build that runs out of time is retried, after a minute (or a cache
+lifetime), over **half** its window — down to under two days — and widened
+again a step once a build finishes with three quarters of its budget to
+spare; meanwhile the fuse's foresight says why it has none:
+`"foresight is unavailable: the last background build of this tenant's Fate
+Map ran out of time; it is retried over a shorter window, the last 15.0
+days"`. Every build is counted in `traza_fate_builds_total{result="ok"|"failed"}`.
+If the run cannot be read, the answer is likewise no foresight stop, never a
+refusal: missing evidence is not evidence of failure.
 
 **Not latched.** A foresight stop is a prediction, made again at every
 question: it has no `tripped_by`, is not announced on the event feed, and
@@ -287,24 +344,29 @@ run go on against its history, reset it with a grant of lower odds:
 ## Bounds, cache and erasure
 
 A build reads every span in its window — the cost of any whole-window
-aggregation — under `--query-deadline-ms`; a window too large to read in time
-answers `400` and the advice to narrow it with `since=`/`until=`. Everything a
-build holds is bounded, and a build that meets a bound says so
+aggregation. A request's build runs under `--query-deadline-ms`; a window too
+large to read in time answers `400` and the advice to narrow it with
+`since=`/`until=`. A background build for the fuses runs under
+`--fate-build-seconds` and narrows itself when it runs out (above).
+Everything a build holds is bounded, and a build that meets a bound says so
 (`truncated: true`, and which in `bounds`):
 
 | Bound | Default | Past it |
 |---|---|---|
 | Completed runs per cohort map (`--fate-max-runs`) | 20,000 | The oldest are dropped (`runs_dropped`) |
-| Runs the fold tracks per build | 4 × `--fate-max-runs` | The window is **narrowed** to its most recent part that fits (`window_narrowed`, `window.since_ns`), so a map keeps the newest runs, not whichever the fold met first; past four narrowing attempts, further runs are skipped (`spans_skipped`) |
+| Runs the fold tracks per build, across every agent of the build (each holding its run id, at most 1 KiB, and a fixed-size record) | 4 × `--fate-max-runs` | The window is **narrowed** to its most recent part that fits (`window_narrowed`, `window.since_ns`), so a map keeps the newest runs, not whichever the fold met first; past four narrowing attempts, further runs are skipped (`spans_skipped`). The bound is the build's, not an agent's: one busy agent narrows the window for every agent of its tenant |
 | Step records held per build (32 bytes each) | 2,097,152 (64 MiB) | As for runs |
 | Steps read per run | 192, the earliest | The path ends in `…` (`runs_partial`) |
-| Tree nodes per build, across its cohorts (`--fate-max-nodes`) | 50,000 | Nodes are created shallowest first and most visited first, so the bound cuts the long tail of deep, rare paths (`node_cap`, and `cut` on the nodes it cut below) |
+| Tree nodes per build, across its cohorts (`--fate-max-nodes`) | 50,000 | Nodes are created **level by level across every cohort** — each depth, most visited first, before any cohort's next depth — so the bound cuts the long tail of deep, rare paths and no busy agent can leave another agent of the tenant a bare root (`node_cap` for the build, `nodes_capped` for a cohort it cut, and `cut` on the nodes it cut below) |
 | Distinct step signatures, and distinct path tokens, per build | 20,000 each | The path ends in `…` before the first one past it (`signature_cap`) |
-| Bytes of a name kept in a token | 160 | Cut, ending in `…` |
+| Bytes of a name kept (tool, model, agent, service) | 160 | Cut, ending in `…` |
 | Cohorts per build | 256, the largest | Dropped (`cohorts_dropped`) |
 | Tasks listed per cohort | 32, with at least 3 runs | Not listed |
 | Distinct agent and service names per build | 4,096 | The spans are skipped (`spans_skipped`) |
-| Cached builds | 8 | Least recently used evicted — explicit `since`/`until` windows before the default window the predictive fuses read |
+| Builds running at once, across keys | 2 | A third waits, under its own deadline, for one to finish |
+| Cached tenant maps — each tenant's default-window build, the one its fuses read (`--fate-tenant-maps`) | 32 | The least recently used tenant's is rebuilt when next asked for. No other request can evict from this pool |
+| Other cached builds — a task, an explicit window, the operator view | 8 | Least recently used evicted, among these only |
+| Behaviour path a fuse keeps per live run (48 bytes a step) | 192 steps, the earliest | The path past them is unknown and reads as partial; the steps count against the run guard's span budget ([guard](guard.md)) |
 
 Builds are cached for `--fate-cache-seconds` (default 300) per tenant,
 window and task, and built once however many requests ask at the same
@@ -351,7 +413,25 @@ Stated plainly:
   them.
 - **Step order on ties.** Steps are ordered by start time, then by the first
   eight bytes of their trace and span ids — the canonical order on everything
-  but a tie of start time and both prefixes.
+  but a tie of start time and both prefixes. Likewise the span that ended
+  last (which decides an undeclared outcome) is chosen by end time and the
+  ids' first eight bytes, then by a hash of both ids.
+- **Buckets blur an open group.** A live run's last step is pooled with
+  every bucket that can hold its count, but a bucket does not keep exact
+  counts: a run on its fourth search is pooled with the `×3-5` runs that
+  stopped at three, as well as those that went on.
+- **The fuse reads every run as live.** It is asked about a next step, so
+  even a run that has ended has its last step pooled; `/v1/fate/runs/{run}`
+  judges a completed run at its own node.
+- **The run-tracking bound is the build's.** One busy agent that fills it
+  narrows the window for every agent of its tenant (`window_narrowed` says
+  so); a quiet agent's map then holds fewer runs than the full window would.
+- **A run older than its predictive policy** keeps no behaviour path in the
+  guard until the guard next rebuilds it (its first verdict query or check
+  does), and is read from the store meanwhile.
+- **Background builds wait their turn.** The warmer builds two requested
+  maps per two-second tick, one after another, each up to
+  `--fate-build-seconds`; a slow tenant's build delays the next tenant's.
 - **Calibration is noisier than the map.** It predicts each run from half
   the cohort, so a small cohort's `skill` moves with the split.
 - **A completed run straddling a rebuild.** Leave-one-out takes out what a

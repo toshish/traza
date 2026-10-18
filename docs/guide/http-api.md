@@ -1311,7 +1311,9 @@ alone runs to now).
 
 A build reads every span of its window under `--query-deadline-ms`; one that
 runs out answers `400` naming `since=`/`until=` as the remedy. Builds are
-cached for `--fate-cache-seconds` and dropped by any erasure. Each answer
+cached for `--fate-cache-seconds` (each tenant's default-window build in a
+pool of `--fate-tenant-maps` that no other request evicts from, everything
+else in eight slots) and dropped by any erasure. Each answer
 carries `bounds`, what the build met — `spans_read`, `runs_tracked`,
 `spans_skipped`, `runs_partial`, `runs_dropped`, `cohorts_dropped`,
 `node_cap`, `signature_cap`, `window_narrowed` — and `truncated`, whether any
@@ -1359,12 +1361,15 @@ One agent's Fate Map.
 **Response:** `tenant`, `agent`, `task`?, `runs`, `success`, `failure`,
 `abandoned`, `unknown`, `base_rate`, `truncated`, `bounds`, `window`,
 `built_at_ns`, `depth`, `min_support`, `nodes_total` (in the cohort's tree),
-`nodes_shown`, `fatal_forks` (at most 10 within `depth`, most significant
-first: `{path, visits, success_rate, fork}`), `hotspots` (at most 10:
-`{path, visits, entropy, next}`), `calibration` (`depths`: per depth `{depth,
-runs, covered, brier, baseline_brier, skill}`; `reliability`: depth-3
-predictions binned in tenths `{low, high, runs, predicted, observed}`), and
-`root`, the tree. Each node:
+`nodes_shown`, `nodes_capped` (whether `--fate-max-nodes` cut this cohort's
+tree; nodes are created level by level across the build's cohorts),
+`fatal_forks` (at most 10 within `depth`, most significant first: `{path,
+visits, success_rate, fork}`), `hotspots` (at most 10: `{path, visits,
+entropy, next}`), `calibration` (`depths`: per depth `{depth, runs, covered,
+brier, baseline_brier, skill}`, each run predicted at the last step of its
+*d*-th token from the other half's runs that repeated that step at least as
+often; `reliability`: depth-3 predictions binned in tenths `{low, high,
+runs, predicted, observed}`), and `root`, the tree. Each node:
 
 | Field | Type | Description |
 |---|---|---|
@@ -1405,8 +1410,12 @@ One node of the answer, the search loop:
 ### `GET /v1/fate/runs/{run}`
 
 Foresight for one run: its path so far, walked down its agent's map over the
-last 30 days, the run itself left out when it is in the map. `?tenant=`,
-`?min_support=` (runs that must share the path before a verdict, default 30).
+last 30 days, the run itself left out when it is in the map. A run that may
+still go on (`outcome` `unknown`) has its **last token open**: it may yet
+repeat that step, so it is compared with every run that repeated it at least
+as often at that point — the sibling tokens of the same step in its bucket
+and every longer one, pooled. `?tenant=`, `?min_support=` (runs that must
+share the path before a verdict, default 30).
 
 | Field | Type | Description |
 |---|---|---|
@@ -1414,14 +1423,15 @@ last 30 days, the run itself left out when it is in the map. `?tenant=`,
 | `path` | string[] | Its behaviour tokens so far |
 | `steps` | integer | Steps recorded |
 | `matched_depth` | integer | Path tokens found in the map |
-| `node` | object \| null | The deepest matched node, the run left out: `token`, `depth`, `visits`, `success`, `failure`, `abandoned`, `success_rate`, `ci95`, `p_fail_given_here`, `lift`, `cost_usd_avg` |
-| `p_success`, `ci95`, `support` | | That node's success rate, interval and visits |
+| `last_open` | boolean | Whether the last token was judged open (pooled) |
+| `node` | object \| null | Where the path matched, the run left out: `token`, `depth`, `visits`, `success`, `failure`, `abandoned`, `success_rate`, `ci95`, `p_fail_given_here`, `lift`, `cost_usd_avg`, and — for an open last token — `pooled`, the tokens whose runs are counted |
+| `p_success`, `ci95`, `support` | | Its success rate, interval and visits |
 | `base_rate` | number \| null | The cohort's success rate, the run left out |
 | `verdict` | string | `on_track`, `at_risk` (interval's upper bound below the base rate), `likely_failure` (upper bound below 50%), `novel` (a step no earlier run took at that point), `insufficient_history` |
 | `explanation` | string | The verdict in one sentence |
 | `divergence` | object | For `novel`: `{depth, took, common_next}` |
-| `next` | object[] | What runs did next from the node: `{token, visits, success_rate, ci95}`, children with at least 3 runs, most common first, at most 5 |
-| `recommended_next` | string | The child with the highest Wilson lower bound among those with `min_support` runs, when that bound beats the node's rate |
+| `next` | object[] | What runs did next from there: `{token, visits, success_rate, ci95, repeat?}`, options with at least 3 runs, most common first, at most 5. For an open last token, `repeat: true` marks the runs that made the same call again |
+| `recommended_next` | string | The option with the highest Wilson lower bound among those with `min_support` runs, when that bound beats the current rate |
 | `outcome` | string | How the run has ended so far: `unknown` while live |
 | `cohort_runs` | integer | Completed runs in the cohort, the run left out |
 | `excluded_self` | boolean | Whether the run was in the map and taken out of it |
@@ -1430,11 +1440,11 @@ last 30 days, the run itself left out when it is in the map. `?tenant=`,
 | `map_built_at_ns` | integer | When the map was built |
 
 ```sh
-curl 'http://127.0.0.1:8080/v1/fate/runs/live-doomed-0'
+curl 'http://127.0.0.1:8080/v1/fate/runs/live-healthy-0'
 ```
 
 ```json
-{"agent":"support-agent","base_rate":0.5444,"ci95":[0.0435,0.2136],"cohort_runs":180,"excluded_self":false,"explanation":"runs that took this path succeeded 5 of 50 times (10.0%, 95% CI 4.3–21.4%); the agent's overall success rate is 54%","map_built_at_ns":1792298124721544000,"matched_depth":2,"min_support":30,"next":[{"ci95":[0.0435,0.2136],"success_rate":0.1,"token":"llm:gpt-4o","visits":50}],"node":{"abandoned":5,"ci95":[0.0435,0.2136],"cost_usd_avg":0.004,"depth":2,"failure":40,"lift":0.1837,"p_fail_given_here":0.8,"success":5,"success_rate":0.1,"token":"tool:search_orders×3-5","visits":50},"outcome":"unknown","p_success":0.1,"partial":false,"path":["llm:gpt-4o","tool:search_orders×3-5"],"run":"live-doomed-0","steps":5,"support":50,"tenant":"","verdict":"likely_failure"}
+{"agent":"support-agent","base_rate":0.5444,"ci95":[0.6695,0.842],"cohort_runs":180,"excluded_self":false,"explanation":"runs that took this path succeeded 69 of 90 times (76.7%, 95% CI 66.9–84.2%); the agent's overall success rate is 54%","last_open":true,"map_built_at_ns":1792303815044948000,"matched_depth":4,"min_support":30,"next":[{"ci95":[0.7985,0.9534],"success_rate":0.9,"token":"llm:gpt-4o","visits":60},{"ci95":[0.3315,0.6685],"repeat":true,"success_rate":0.5,"token":"tool:issue_refund","visits":30}],"node":{"abandoned":0,"ci95":[0.6695,0.842],"cost_usd_avg":0.006,"depth":4,"failure":21,"lift":1.4082,"p_fail_given_here":0.2333,"pooled":["tool:issue_refund","tool:issue_refund×2"],"success":69,"success_rate":0.7667,"token":"tool:issue_refund","visits":90},"outcome":"unknown","p_success":0.7667,"partial":false,"path":["llm:gpt-4o","tool:search_orders","llm:gpt-4o","tool:issue_refund"],"recommended_next":"llm:gpt-4o","run":"live-healthy-0","steps":4,"support":90,"tenant":"","verdict":"on_track"}
 ```
 
 **Errors.** `400` for an empty or over-long (1,024 bytes) run id,
@@ -2109,7 +2119,7 @@ fields are `400`.
 | `tripped_by` | string \| null | `policy` or `manual`, for a recorded stop |
 | `evidence` | object[] | `{trace_id, span_id}` of the span that tripped a stop, and of the repeated step when repeats are a reason |
 | `source` | string | `live` from memory, `rebuilt` when answering read the run's stored spans |
-| `foresight` | object | Present when the policy sets `min_success_odds` and the run is not already stopped: `verdict`, `p_success`, `ci95`, `support`, `successes`, `base_rate`, `matched_depth`, `next_tool` (when the check's next tool was judged), `raised` (whether it raised the policy's action), `explanation`, `map_built_at_ns` (absent when no map was cached). See [predictive fuses](foresight.md#predictive-fuses) |
+| `foresight` | object | Present when the policy sets `min_success_odds` and the run is not already stopped: `verdict`, `p_success`, `ci95`, `support`, `successes`, `base_rate`, `matched_depth`, `next_tool` (when the check's next tool was judged), `raised` (whether it raised the policy's action), `explanation` (with no map cached: that one is being built, or why the last background build failed), `map_built_at_ns` (absent when no map was cached). The run is read as live — its last token open — from the behaviour path the guard keeps. See [predictive fuses](foresight.md#predictive-fuses) |
 
 ### `POST /v1/fuses/check`
 
@@ -2793,7 +2803,10 @@ with usage counters: `traza_tenant_spans_ingested_total` and
 `traza_quota_rejected_total` (the [`/v1/usage`](#get-v1usage) lifetime
 counters).
 The run guard adds `traza_fuse_trips_total`, `traza_fuse_warnings_total` and
-`traza_fuse_live_runs`, unlabelled (absent under `--no-fuses`).
+`traza_fuse_live_runs`, unlabelled (absent under `--no-fuses`). The Fate Map
+adds `traza_fate_builds_total`, labelled `result="ok"` or `result="failed"`
+(request and background builds alike), and the gauge
+`traza_fate_cached_builds` ([foresight](foresight.md#predictive-fuses)).
 
 **Errors.** None — the route always renders.
 

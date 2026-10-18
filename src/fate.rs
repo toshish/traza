@@ -69,21 +69,28 @@
 //! A fuse policy may set `min_success_odds`: on the pre-call check and on
 //! verdict queries — never on ingest — a run whose foresight has the support
 //! and an upper bound below the odds is given the policy's action. That path
-//! reads only a CACHED map; a cold cache answers `insufficient_history`, and
-//! the map is built off the request path by [`Store::maintain_fate`].
+//! reads the run's behaviour from the run guard's memory (its live path) and
+//! walks it down a CACHED map, in time proportional to the path; a cold
+//! cache answers `insufficient_history`, and the map is built off the
+//! request path by [`Store::maintain_fate`], under its own budget
+//! ([`FateConfig::build_budget`]) and over a narrower window after one that
+//! ran out of time.
 //!
 //! # Bounds
 //!
 //! Every structure here is built from tenant data, so every one is bounded:
 //! runs per cohort ([`FateConfig::max_runs`]), nodes per build
-//! ([`FateConfig::max_nodes`]), runs tracked by the fold, step records held
-//! by it ([`MAX_STEP_RECORDS`]), steps read per run ([`RUN_STEP_WINDOW`]),
-//! distinct signatures, cohorts, cached builds ([`CACHE_ENTRIES`]) — and a
-//! build that meets a bound says so (`truncated`). Builds run under the
-//! query deadline. Builds are tenant-scoped (the operator view, with no
-//! tenant, keeps tenants apart in its cohorts), cached for
-//! [`FateConfig::cache_ttl`], and every cached build is dropped by any
-//! erasure: a map must not keep a run the store no longer holds.
+//! ([`FateConfig::max_nodes`], spent level by level across cohorts), runs
+//! tracked by the fold (each a fixed-size record and its run id), step
+//! records held by it ([`MAX_STEP_RECORDS`]), steps read per run
+//! ([`RUN_STEP_WINDOW`]), distinct signatures, names cut to
+//! [`MAX_NAME_BYTES`], cohorts, cached builds ([`FateConfig::tenant_maps`]
+//! tenant maps and [`CACHE_ENTRIES`] others), builds running at once — and a
+//! build that meets a bound says so (`truncated`). Builds run under a
+//! deadline. Builds are tenant-scoped (the operator view, with no tenant,
+//! keeps tenants apart in its cohorts), cached for [`FateConfig::cache_ttl`],
+//! and every cached build is dropped by any erasure: a map must not keep a
+//! run the store no longer holds.
 
 pub mod http;
 mod stats;
@@ -248,7 +255,8 @@ pub struct FateConfig {
     pub tenant_maps: usize,
     /// The budget of a build the background warmer makes
     /// ([`Store::maintain_fate`], `--fate-build-seconds`): never less than
-    /// the query deadline. Such a build reads a tenant's whole default
+    /// the query deadline, and zero leaves the query deadline alone (no
+    /// bound when that is off too). Such a build reads a tenant's whole default
     /// window off every request path, so it may take longer than a request
     /// may; one that still runs out of time is retried over half the
     /// window, down to under two days, and the fuses say so meanwhile.
@@ -3538,14 +3546,18 @@ impl Store {
     /// it every few seconds; an embedder that sets `min_success_odds` on a
     /// policy calls it on its own cadence, or its fuses see no map.
     pub fn maintain_fate(&self) -> Result<usize> {
+        // Never less than the query deadline; a zero budget leaves the query
+        // deadline alone (and no bound at all when that is off too).
+        let own = self.config.fate.build_budget;
         let budget = match self.config.query_deadline {
-            Some(query) => query.max(self.config.fate.build_budget),
-            None => self.config.fate.build_budget,
+            Some(query) => Some(query.max(own)),
+            None if own.is_zero() => None,
+            None => Some(own),
         };
         let mut built = 0;
         let mut first_error = None;
         for key in self.fate.take_demand(WARM_PER_CALL) {
-            let deadline = Deadline::starting(Instant::now(), Some(budget));
+            let deadline = Deadline::starting(Instant::now(), budget);
             match self
                 .fate
                 .get_or_build(self, &key, crate::mcp::unix_nanos_now(), deadline)

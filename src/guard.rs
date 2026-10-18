@@ -105,7 +105,7 @@ use crate::{erasure, semconv, Deadline, Error, Result, Span, Store};
 /// Ceiling on span contributions held across every live run — each a 40-byte
 /// record under an 8-byte key, before hash-table overhead — plus the steps of
 /// the behaviour paths kept for runs under a predictive policy (48 bytes
-/// each, at most the earliest 192 per run; see [`crate::fate::LivePath`]).
+/// each, at most the earliest 192 per run; see [`crate::fate`]).
 /// Past it, whole runs are evicted least-recently-active first; they rebuild
 /// from the store when next asked about.
 pub const MAX_TRACKED_SPANS: usize = 1_000_000;

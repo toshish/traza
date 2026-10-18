@@ -227,6 +227,8 @@ that many steps, and the upper bound of their success rate's 95% interval is
 below the limit, the policy's action applies, with a reason like
 `foresight: runs that took this path succeeded 5 of 50 times (≤21.4%)`. On
 the pre-call check, a named next tool is judged as the next step of the path.
+The run is read as still going, so its last step is open: a run that has
+issued one refund is compared with every run that issued at least one there.
 
 It differs from every other limit in four ways, each on purpose: it is
 evaluated on the check and verdict queries **only, never on ingest**; it reads
@@ -235,6 +237,17 @@ latched** — a prediction is made again at every question, and lifts if the
 path moves on to better odds — and it **never warns at 80%**. The verdict
 document carries the run's `foresight` whenever the policy sets the limit.
 The whole model is in [the foresight guide](foresight.md#predictive-fuses).
+
+**Its memory.** For a run under a policy that sets `min_success_odds`, the
+guard keeps the run's behaviour path beside its usage: the earliest 192
+steps, 48 bytes each, maintained as usage is — each version of a span that
+lands replaces the last, a rebuild replays it, eviction and erasure drop it —
+and counted against the same 1,000,000-record budget as span contributions
+(so such runs are evicted somewhat sooner). The check reads that path from
+memory rather than reading the run back from the store. A run whose state
+started before any such policy existed keeps no path until the guard next
+rebuilds it, and is read from the store meanwhile. Runs under no predictive
+policy keep nothing extra.
 
 ## Stopping and resetting
 

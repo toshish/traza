@@ -203,6 +203,16 @@ Present unless the server runs with `--no-fuses`. See [run fuses](../guide/guard
 | `traza_fuse_warnings_total` | counter | Warn announcements: a run entering `warn`, and a `warn` policy's limit then being reached — each once per run until it returns to `continue` or is reset |
 | `traza_fuse_live_runs` | gauge | Live runs held in memory, bounded by `--fuse-max-runs`. Stopped runs parked out of the live set by eviction are not counted |
 
+### Fate Map
+
+See [foresight](../guide/foresight.md).
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `traza_fate_builds_total{result="ok"}` | counter | Fate Map builds that finished, on a request path or in the background warmer |
+| `traza_fate_builds_total{result="failed"}` | counter | Builds that failed — almost always a deadline. A rising count with predictive fuses in use means some tenant's maps outrun `--fate-build-seconds`: its window is being halved, and its fuses say so in their foresight |
+| `traza_fate_cached_builds` | gauge | Builds cached now: at most `--fate-tenant-maps` tenant maps plus 8 others |
+
 ## `GET /v1/stats`
 
 ```json
