@@ -724,6 +724,51 @@ fn the_node_bound_is_shared_shallowest_first_so_no_cohort_is_starved() {
 }
 
 #[test]
+fn an_open_step_whose_longer_repeats_were_cut_is_not_pooled_short() {
+    // Fourteen nodes: everything to depth 3 (thirteen), then the busiest
+    // depth-4 child — one refund, 60 runs. The 30 runs that refunded twice
+    // went down a branch the bound kept from being built.
+    let config = crate::Config {
+        fate: FateConfig {
+            max_nodes: 14,
+            ..FateConfig::default()
+        },
+        ..crate::Config::default()
+    };
+    let (fixture, now) = seeded("cut-pool", config, true);
+    let store = fixture.store();
+    let map = store
+        .fate_map("", &MapRequest::new("support-agent"), now)
+        .expect("builds")
+        .expect("exists");
+    let refunds = child(
+        child(child(&map.root, "llm:gpt-4o"), "tool:search_orders"),
+        "llm:gpt-4o",
+    );
+    assert_eq!(refunds.children.len(), 1);
+    assert_eq!(refunds.cut, 30);
+    // A run that has refunded once may refund again; pooling only the one
+    // branch that was built would claim 54 of 60. The map cannot say.
+    let healthy = store
+        .foresee("", "live-healthy-0", 30, now)
+        .expect("reads")
+        .expect("exists");
+    assert_eq!(
+        healthy.verdict,
+        ForesightVerdict::InsufficientHistory,
+        "{}",
+        healthy.explanation
+    );
+    assert!(healthy.explanation.contains("--fate-max-nodes"));
+    // A step the bound cut nothing of is still judged.
+    let doomed = store
+        .foresee("", "live-doomed-0", 30, now)
+        .expect("reads")
+        .expect("exists");
+    assert_eq!(doomed.verdict, ForesightVerdict::LikelyFailure);
+}
+
+#[test]
 fn the_run_bound_keeps_each_cohorts_newest_runs() {
     let config = crate::Config {
         fate: FateConfig {

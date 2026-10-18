@@ -327,7 +327,9 @@ So a server's first checks after start see no foresight for a few seconds. A
 background build that runs out of time is retried, after a minute (or a cache
 lifetime), over **half** its window — down to under two days — and widened
 again a step once a build finishes with three quarters of its budget to
-spare; meanwhile the fuse's foresight says why it has none:
+spare (until then the tenant's default-window map and run routes answer
+over the same narrower window, with `bounds.window_narrowed`); meanwhile the
+fuse's foresight says why it has none:
 `"foresight is unavailable: the last background build of this tenant's Fate
 Map ran out of time; it is retried over a shorter window, the last 15.0
 days"`. Every build is counted in `traza_fate_builds_total{result="ok"|"failed"}`.
@@ -357,7 +359,7 @@ Everything a build holds is bounded, and a build that meets a bound says so
 | Runs the fold tracks per build, across every agent of the build (each holding its run id, at most 1 KiB, and a fixed-size record) | 4 × `--fate-max-runs` | The window is **narrowed** to its most recent part that fits (`window_narrowed`, `window.since_ns`), so a map keeps the newest runs, not whichever the fold met first; past four narrowing attempts, further runs are skipped (`spans_skipped`). The bound is the build's, not an agent's: one busy agent narrows the window for every agent of its tenant |
 | Step records held per build (32 bytes each) | 2,097,152 (64 MiB) | As for runs |
 | Steps read per run | 192, the earliest | The path ends in `…` (`runs_partial`) |
-| Tree nodes per build, across its cohorts (`--fate-max-nodes`) | 50,000 | Nodes are created **level by level across every cohort** — each depth, most visited first, before any cohort's next depth — so the bound cuts the long tail of deep, rare paths and no busy agent can leave another agent of the tenant a bare root (`node_cap` for the build, `nodes_capped` for a cohort it cut, and `cut` on the nodes it cut below) |
+| Tree nodes per build, across its cohorts (`--fate-max-nodes`) | 50,000 | Nodes are created **level by level across every cohort** — each depth, most visited first, before any cohort's next depth — so the bound cuts the long tail of deep, rare paths and no busy agent can leave another agent of the tenant a bare root (`node_cap` for the build, `nodes_capped` for a cohort it cut, and `cut` on the nodes it cut below). A path into a cut branch — or a live run whose last step has a repeat bucket the bound cut there, so its pool would be short — gets `insufficient_history`, never a guess |
 | Distinct step signatures, and distinct path tokens, per build | 20,000 each | The path ends in `…` before the first one past it (`signature_cap`) |
 | Bytes of a name kept (tool, model, agent, service) | 160 | Cut, ending in `…` |
 | Cohorts per build | 256, the largest | Dropped (`cohorts_dropped`) |

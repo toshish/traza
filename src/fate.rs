@@ -1523,6 +1523,10 @@ struct Cohort {
     /// Whether the node bound kept some branch of this cohort's tree from
     /// being built.
     nodes_capped: bool,
+    /// Which steps the node bound kept from being built under which node
+    /// (see [`Grown`]): a live run whose last step is among them cannot be
+    /// pooled whole.
+    cut_steps: HashSet<(u32, u64)>,
     run_ids: Vec<Arc<str>>,
     members: HashMap<Arc<str>, Member>,
     calibration: Calibration,
@@ -1565,6 +1569,10 @@ struct Grown {
     /// Whether the node bound kept some branch of this cohort from being
     /// built.
     capped: bool,
+    /// `(parent node, stem key)` of every child the node bound kept from
+    /// being built: at most one entry per uncreated child, so no more than
+    /// the runs tracked.
+    cut_steps: HashSet<(u32, u64)>,
 }
 
 /// Grows every cohort's tree from its runs (each newest first) at once,
@@ -1575,6 +1583,7 @@ struct Grown {
 /// bare root.
 fn grow_all(
     cohorts: &[Vec<RunFinal>],
+    tokens: &Tokens,
     mut budget: usize,
     bounds: &mut Bounds,
     deadline: Option<Deadline>,
@@ -1596,6 +1605,7 @@ fn grow_all(
             nodes: vec![root],
             deepest: vec![0; runs.len()],
             capped: false,
+            cut_steps: HashSet::new(),
         });
         at.push(positions);
     }
@@ -1623,6 +1633,7 @@ fn grow_all(
             if budget == 0 {
                 bounds.node_cap = true;
                 tree.capped = true;
+                tree.cut_steps.insert((parent, tokens.parts(token).0));
                 continue;
             }
             budget -= 1;
@@ -2090,7 +2101,13 @@ fn build(
         knowns.push(known);
     }
     // The trees, grown together under the one node bound.
-    let grown = grow_all(&knowns, config.max_nodes.max(1), &mut bounds, deadline)?;
+    let grown = grow_all(
+        &knowns,
+        &tokens,
+        config.max_nodes.max(1),
+        &mut bounds,
+        deadline,
+    )?;
     let mut cohorts = Vec::with_capacity(pending.len());
     let mut index = HashMap::new();
     let mut by_key = HashMap::new();
@@ -2102,6 +2119,7 @@ fn build(
             nodes,
             deepest,
             capped,
+            cut_steps,
         } = grown;
         let calibration = calibrate(&nodes, &known, &deepest, &tokens);
         let root = nodes[0].counts();
@@ -2129,6 +2147,7 @@ fn build(
             tasks,
             nodes,
             nodes_capped: capped,
+            cut_steps,
             run_ids,
             members,
             calibration,
@@ -2338,10 +2357,12 @@ impl FateCache {
         if shrink > 0 && roomy {
             state.shrink.insert(key.clone(), shrink - 1);
         }
+        // A build that finished answers for the last one that failed, cached
+        // or not.
+        state.failed.remove(key);
         if state.epoch == epoch && !self.config.cache_ttl.is_zero() {
             state.tick += 1;
             let used = state.tick;
-            state.failed.remove(key);
             state.entries.insert(
                 key.clone(),
                 Entry {
@@ -3265,8 +3286,11 @@ fn judge(build: &Build, view: &View<'_>, probe: &Probe, min_support: u64) -> Jud
                     key == open.key && bucket != FOLD_BUCKET && bucket_range(bucket).1 >= open.count
                 })
                 .collect();
-            if compatible.is_empty() {
-                Some(((own, deepest_node.cut > 0), closed_here(), closed_options()))
+            // When the node bound kept a sibling token of this step from
+            // being built here, the pool would miss its runs: no verdict.
+            let cut = cohort.cut_steps.contains(&(deepest, open.key));
+            if compatible.is_empty() || cut {
+                Some(((own, cut), closed_here(), closed_options()))
             } else {
                 judged.matched_depth += 1;
                 let counts = compatible
