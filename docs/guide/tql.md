@@ -99,9 +99,10 @@ curl -sG localhost:8080/v1/trajectories/search \
       "tenant": ""
     }
   ],
-  "next_until_ns": null,
+  "next_cursor": null,
   "query": "test[error] ..> edit[file~\"(^|/)tests?/\"] ..> test[not error]",
   "runs_in_window": 3,
+  "runs_inexact": 0,
   "runs_scanned": 3,
   "runs_skipped": 0,
   "since_ns": 1772323199999999999,
@@ -445,7 +446,12 @@ than `(?:`, inline flags other than a leading `(?i)`, POSIX classes
 (`[:alpha:]`), and Unicode classes (`\p{…}`). A regex is at most 1024
 characters and 4096 compiled instructions, and **one query's regexes at most
 8,192 instructions in all** — the regex that crosses it is refused at its
-column. Matching costs up to *text length × instructions*; that work is
+column. Compiling is bounded too: parts that can only match nothing
+(`a{0}`, or a group of them repeated) are dropped before repetitions are
+expanded, and the compiler visits at most 16,384 pattern nodes, so neither a
+search nor `explain` can be made to spin on a pattern like
+`((((a{0}){256}){256}){256}){256}` — which compiles to "matches anywhere",
+as it should. Matching costs up to *text length × instructions*; that work is
 charged to the query deadline as it happens, so a heavy regex over a long
 text stops the scan at the deadline (`"stopped": "deadline"`) rather than
 running past it.
@@ -595,7 +601,7 @@ first read and the edit (the other two are gap steps).
 ## Searching
 
 ```text
-GET /v1/trajectories/search?q=&since=&until=&agent=&outcome=&limit=&run=&tenant=
+GET /v1/trajectories/search?q=&since=&until=&agent=&outcome=&limit=&run=&cursor=&tenant=
 ```
 
 | Parameter | Default | Means |
@@ -606,6 +612,7 @@ GET /v1/trajectories/search?q=&since=&until=&agent=&outcome=&limit=&run=&tenant=
 | `outcome` | `any` | `success`, `failure`, `abandoned`, `unknown` — how the run ended, by the [session outcome](http-api.md#get-v1recall) rule |
 | `limit` | 50 | matching runs returned, at most 500 |
 | `run` | — | search this one run and list every occurrence in it; the window and `agent` do not apply. In the operator view a run id two tenants share is read as their union, as a [tape](replay.md#runs-and-tapes) is — name the `tenant` |
+| `cursor` | — | continue an earlier answer: its `next_cursor`, as given. It carries that answer's window, so leave `since` and `until` out (or repeat them unchanged — a different one is a `400`); keep `q` and the filters. Not with `run` |
 | `tenant` | — | for an unbound credential: one tenant (empty is the default tenant); omitted is the operator view across tenants, each run read within its own tenant |
 
 The scan reads the window's **most recent runs first**: it enumerates the runs
@@ -618,23 +625,29 @@ until `limit` runs have matched. The response:
 | `query` | the query as read (canonical form) |
 | `matches[]` | matching runs, newest first: `run`, `tenant`, `agent`, `outcome`, the first occurrence's `spans` (`trace_id`, `span_id`, `step_index`, `kind`, `name`, at most 100), `captures` (each cut to 1 KiB) and `captures_truncated`, `first_step`, `last_step`, `count` (non-overlapping occurrences, at most 1,000), `steps`, `last_activity_ns`, `run_truncated`, `inexact`; with `run=`, also `occurrences[]` (at most 100) |
 | `runs_scanned` | candidate runs examined, newest first — including those the `agent` filter left out |
-| `runs_in_window` | candidate runs (at most 5,000) |
+| `runs_in_window` | candidate runs (at most 5,000); with a `cursor`, those after it |
+| `runs_inexact` | scanned runs **not listed** whose matching hit a [matcher cap](#limits-stated-plainly): each may hold an occurrence the caps dropped, so their absence is not proof. A listed run that hit a cap says so itself (`inexact`) |
 | `stopped` | `"limit"` or `"deadline"` when the scan stopped before the last candidate, else `null` |
 | `window_capped` | the window held more than 5,000 runs; only the most recent were considered |
-| `truncated` | there may be matches this answer does not list (any of the above) |
-| `next_until_ns` | when runs went unchecked: the latest activity of the newest run not checked — or, for a capped window the scan finished, of the oldest run it kept (every run left out was last active no later). Repeat the search with `until` set to it to continue (a run active on both sides of that instant can appear in both answers) |
+| `truncated` | there may be matches this answer does not list (any of the above, or `runs_inexact` above 0) |
+| `next_cursor` | when runs went unchecked (the scan stopped, or the window was capped): pass it back as `cursor` to continue with exactly those runs. It holds the window — an open end fixed at the latest span the first answer saw, so later activity cannot reorder the runs — and the place in the scan order of the last run decided. Runs active at the same instant are ordered by a digest of their tenant and id, so a page boundary falls between two of them rather than on their shared timestamp: following the cursors lists every run of the window once. It is digits, hex and dots — no run id or other producer text. A run that gains activity inside the window between two pages can be missed by the later one |
 | `spans_skipped` | spans in the window left out because their run id does not read back to them: a session id of the `trace:<id>` form naming another trace (it would be read as that trace's run), or naming none |
 | `runs_skipped` | candidate runs left out because their id was refused when read |
 
 **One compute budget** (`--query-deadline-ms`) covers the request.
 Enumerating the window's runs refuses with `400` when it runs out — narrow the
 window. Scanning stops where the budget ran out and answers what it found with
-`"stopped": "deadline"`, `"truncated": true` and a `next_until_ns` to resume
-from: the runs it did not reach are older than every run it did. The budget
+`"stopped": "deadline"`, `"truncated": true` and a `next_cursor` to resume
+from: the runs it did not reach come after every run it did. The budget
 holds inside a run too: the matcher charges its work — paths advanced,
 captures forked, regex instructions stepped over text — to a meter that
 checks the deadline every fraction of a millisecond of work, so neither a
-heavy predicate nor a capture-heavy pattern can run past it.
+heavy predicate nor a capture-heavy pattern can run past it. Reading a run is
+held to it as well — its step facts, agent ancestry and tool catalogs, a
+huge catalog included — and the deadline is consulted once more before a run
+counts as checked, so a run read past the budget is reported as not reached
+rather than as done. A long match's steps are copied out once, when it is
+final, not each time a greedy pattern meets a longer provisional match.
 
 ### Explain
 
@@ -688,7 +701,7 @@ directory, or named `test_*`, `*_test.*`, `*.test.*` or `*.spec.*`.
 ### Findings
 
 ```text
-GET /v1/detectors/findings?since=&until=&agent=&detector=&tenant=
+GET /v1/detectors/findings?since=&until=&agent=&detector=&cursor=&tenant=
 ```
 
 runs the library (or the detectors named — `detector=a,b` or repeated) over
@@ -700,7 +713,10 @@ baseline's total, and the denominator for a detector's `runs_matched`);
 `runs_scanned` counts every candidate examined, including runs the `agent`
 filter left out. A detector whose matched runs succeed far less often than
 the baseline is a behaviour costing you outcomes. Detectors with findings
-come first, by severity, then by runs matched.
+come first, by severity, then by runs matched. A detector's `runs_inexact`
+counts checked runs it did not match where its matcher hit a cap — its
+`runs_matched` is then a lower bound, and the report's `truncated` is set.
+`cursor` and `next_cursor` page through a window as for a search.
 
 ```sh
 curl -sG localhost:8080/v1/detectors/findings \
@@ -737,6 +753,7 @@ Abridged — each example run is cut to `run`, `outcome` and `captures`, and eac
         "success": 1,
         "unknown": 0
       },
+      "runs_inexact": 0,
       "runs_matched": 1,
       "severity": "high",
       "success_rate": 1.0,
@@ -761,13 +778,14 @@ Abridged — each example run is cut to `run`, `outcome` and `captures`, and eac
         "success": 0,
         "unknown": 0
       },
+      "runs_inexact": 0,
       "runs_matched": 1,
       "severity": "medium",
       "success_rate": 0.0,
       "title": "Edited one file over and over"
     }
   ],
-  "next_until_ns": null,
+  "next_cursor": null,
   "runs_checked": 3,
   "runs_in_window": 3,
   "runs_scanned": 3,
@@ -789,7 +807,7 @@ is `unknown` and is in neither side of the rate.
 
 The MCP tool [`find_behavior`](mcp.md#find_behavior) takes a `query` or a
 `detector` (or neither, to list the library), plus `since`, `until`, `agent`,
-`outcome` and `limit`, and returns each match's run, outcome and matched
+`outcome`, `limit` and `cursor`, and returns each match's run, outcome and matched
 steps — run ids, names and captured values inside the untrusted-telemetry
 block, a parse error with a caret under the column.
 
@@ -823,15 +841,19 @@ block, a parse error with a caret under the column.
   others; in a busy multi-agent store, narrow the window to reach older runs of
   one agent.
 - **Partial answers say so.** A scan stopped by the deadline or the limit sets
-  `truncated` and `stopped`. Enumerating the window is all-or-nothing.
+  `truncated` and `stopped`, and a scanned run the matcher caps cut without
+  a match is counted in `runs_inexact` (and sets `truncated`), so an empty
+  answer is never passed off as proof. Enumerating the window is
+  all-or-nothing.
 - **Path cap.** The matcher keeps at most 4,096 live paths per step, lets one
   step fork no more paths than that list still has room for, and remembers at
   most 65,536 states per step for deduplication. A capture-heavy pattern over a
   long run with thousands of distinct values (one path per file waiting for
   its pair), or several captures over one long list (`offered=@a,
   offered=@b, …`), can exceed them; the lowest-priority alternatives are
-  dropped and the run is marked `inexact`. Memory and work stay bounded either
-  way.
+  dropped and the run is marked `inexact` — or, when nothing matched, counted
+  in the answer's `runs_inexact` (a detector's, in findings). Memory and work
+  stay bounded either way.
 - **Run ids that do not read back are left out.** A run whose session id
   has the `trace:<id>` form is read as trace `<id>`; a span carrying such a
   session id in a different trace (or `trace:` alone) is not part of the run

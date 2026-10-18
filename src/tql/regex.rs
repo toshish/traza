@@ -45,6 +45,18 @@ pub(crate) const MAX_REPEAT: u32 = 256;
 /// Longest pattern accepted, in characters.
 pub(crate) const MAX_PATTERN_CHARS: usize = 1024;
 
+/// Syntax nodes the compiler may visit for one pattern, emitting or not.
+///
+/// [`MAX_PROGRAM`] bounds what is EMITTED, which alone does not bound the
+/// work: a repetition of a body that emits nothing (`(a{0}){256}`) visits
+/// that body without emitting, and nesting multiplies the visits. The
+/// pattern is [simplified](simplify) first so that every node left — but an
+/// alternation's empty branch, whose split and jump the alternation emits —
+/// emits at least one instruction; the visits are then at most twice the
+/// program plus one, and this cap stands behind that argument, so
+/// compilation is bounded work however the pattern is written.
+const MAX_COMPILE_VISITS: usize = 4 * MAX_PROGRAM;
+
 /// A compiled pattern. Cheap to clone: the program is shared.
 #[derive(Clone)]
 pub(crate) struct Regex {
@@ -102,6 +114,7 @@ impl Regex {
                 offset: parser.at,
             });
         }
+        let node = simplify(node);
         let literal = match (&node, case_insensitive) {
             (_, true) => None,
             (Node::Char(c), false) => Some(c.to_string()),
@@ -121,6 +134,7 @@ impl Regex {
         let mut compiler = Compiler {
             program: Vec::new(),
             case_insensitive,
+            visits: 0,
         };
         compiler
             .emit(&node)
@@ -535,6 +549,54 @@ enum Escaped {
     Assert(Assertion),
 }
 
+/// `node` with every subtree that emits no instruction removed, so that
+/// compiling costs in proportion to the program it produces
+/// ([`MAX_COMPILE_VISITS`]).
+///
+/// A repetition at most zero times, or of a body that emits nothing, is
+/// [`Node::Empty`] — it matches only the empty string, which is what an
+/// absent node matches too; a concatenation drops its empty items; a
+/// repetition exactly once is its body. An alternation keeps an empty
+/// branch: `(a|)` is an optional `a`, and the branch's split and jump are
+/// instructions.
+fn simplify(node: Node) -> Node {
+    match node {
+        Node::Concat(items) => {
+            let mut kept: Vec<Node> = Vec::with_capacity(items.len());
+            for item in items.into_iter().map(simplify) {
+                match item {
+                    Node::Empty => {}
+                    // A group repeated once leaves a sequence inside a
+                    // sequence: splice it, so a plain string stays one.
+                    Node::Concat(inner) => kept.extend(inner),
+                    other => kept.push(other),
+                }
+            }
+            match kept.len() {
+                0 => Node::Empty,
+                1 => kept.pop().unwrap_or(Node::Empty),
+                _ => Node::Concat(kept),
+            }
+        }
+        Node::Alternate(branches) => Node::Alternate(branches.into_iter().map(simplify).collect()),
+        Node::Repeat { node, min, max } => {
+            let body = simplify(*node);
+            if matches!(body, Node::Empty) || max == Some(0) {
+                Node::Empty
+            } else if min == 1 && max == Some(1) {
+                body
+            } else {
+                Node::Repeat {
+                    node: Box::new(body),
+                    min,
+                    max,
+                }
+            }
+        }
+        leaf => leaf,
+    }
+}
+
 const DIGIT: &[(char, char)] = &[('0', '9')];
 const WORD: &[(char, char)] = &[('0', '9'), ('A', 'Z'), ('_', '_'), ('a', 'z')];
 const SPACE: &[(char, char)] = &[('\t', '\r'), (' ', ' ')];
@@ -555,6 +617,8 @@ enum Inst {
 struct Compiler {
     program: Vec<Inst>,
     case_insensitive: bool,
+    /// Syntax nodes visited so far ([`MAX_COMPILE_VISITS`]).
+    visits: usize,
 }
 
 impl Compiler {
@@ -576,6 +640,16 @@ impl Compiler {
     }
 
     fn emit_inner(&mut self, node: &Node) -> Result<(), RegexError> {
+        self.visits += 1;
+        if self.visits > MAX_COMPILE_VISITS {
+            return Err(RegexError {
+                message: format!(
+                    "the regex takes more than {MAX_COMPILE_VISITS} steps to compile; \
+                     flatten its nested repetitions"
+                ),
+                offset: 0,
+            });
+        }
         match node {
             Node::Empty => {}
             Node::Char(c) => {
@@ -939,6 +1013,94 @@ mod tests {
         assert!(error.message.contains("expands past"), "{error:?}");
         let long = "a".repeat(MAX_PATTERN_CHARS + 1);
         assert!(Regex::new(&long).is_err());
+    }
+
+    /// Compiles `pattern` on another thread, failing the test if that takes
+    /// longer than a generous bound — the shape of the bug is billions of
+    /// steps, so the bound never decides a correct build.
+    fn compile_promptly(pattern: &'static str) -> Result<Regex, RegexError> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(Regex::new(pattern));
+        });
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap_or_else(|_| panic!("`{pattern}` did not compile in bounded work"))
+    }
+
+    #[test]
+    fn nested_repetitions_of_nothing_compile_in_bounded_work() {
+        // `a{0}` emits no instruction, so the instruction cap never fires;
+        // expanded naively, four levels of `{256}` visit it 256^4 times.
+        let regex = compile_promptly("((((a{0}){256}){256}){256}){256}").expect("compiles");
+        assert!(regex
+            .is_match("", &mut Meter::new(None))
+            .expect("no deadline"));
+        assert!(regex
+            .is_match("xyz", &mut Meter::new(None))
+            .expect("no deadline"));
+        assert_eq!(regex.size(), 1, "nothing to match but the end");
+        // Emptiness inside a pattern changes nothing around it.
+        let around = compile_promptly("^x((b{0}){256})+y$").expect("compiles");
+        assert!(around
+            .is_match("xy", &mut Meter::new(None))
+            .expect("no deadline"));
+        assert!(!around
+            .is_match("xby", &mut Meter::new(None))
+            .expect("no deadline"));
+        // A repetition once is its body: this is a plain substring search.
+        let once = compile_promptly("(ab){1}c").expect("compiles");
+        assert_eq!(once.inner.literal.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn compiling_is_capped_in_visits_not_only_in_instructions() {
+        // Behind the simplification stands a visit cap: an unsimplified tree
+        // of empty repetitions is refused after a bounded number of visits
+        // rather than expanded.
+        let mut node = Node::Repeat {
+            node: Box::new(Node::Char('a')),
+            min: 0,
+            max: Some(0),
+        };
+        for _ in 0..4 {
+            node = Node::Repeat {
+                node: Box::new(node),
+                min: MAX_REPEAT,
+                max: Some(MAX_REPEAT),
+            };
+        }
+        let mut compiler = Compiler {
+            program: Vec::new(),
+            case_insensitive: false,
+            visits: 0,
+        };
+        let refused = compiler.emit(&node).expect_err("refused");
+        assert!(refused.contains("steps to compile"), "{refused}");
+        assert_eq!(compiler.visits, MAX_COMPILE_VISITS + 1);
+        assert!(compiler.program.is_empty());
+        // Simplified, the same tree is nothing at all.
+        assert!(matches!(simplify(node), Node::Empty));
+    }
+
+    #[test]
+    fn simplified_programs_stay_within_the_visit_cap() {
+        // The visit cap is never what refuses a real pattern: the largest
+        // program the instruction cap allows compiles within it.
+        for pattern in [
+            r"(?:[^\x00]{255}){16}",
+            "((((a?){4}){4}){4}){4}",
+            "(a|b|){256}",
+            "((((((((((x{1}){1}){1}){1}){1}){1}){1}){1}){1}){1}){256}",
+        ] {
+            match Regex::new(pattern) {
+                Ok(regex) => assert!(regex.size() <= MAX_PROGRAM, "{pattern}"),
+                Err(error) => assert!(
+                    error.message.contains("expands past") || error.message.contains("capped"),
+                    "{pattern}: {error:?}"
+                ),
+            }
+        }
     }
 
     #[test]

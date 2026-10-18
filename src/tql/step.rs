@@ -23,7 +23,7 @@ use std::sync::OnceLock;
 use serde_json::{Map, Value};
 
 use super::ast::{Atom, AtomKind, Cond, Field, Literal, NameTest, Op, Pred, Test};
-use super::meter::{Meter, CONDITION_UNITS, FORK_UNITS};
+use super::meter::{Meter, BYTES_PER_UNIT, CONDITION_UNITS, FORK_UNITS, SPAN_UNITS, STATE_UNITS};
 use super::regex::Regex;
 use crate::semconv::{LlmFacts, StepFacts, StepKind};
 use crate::{Deadline, Result, Span};
@@ -143,17 +143,25 @@ pub(crate) struct Catalog {
     /// Whether every name fit under the cap. A truncated catalog can say
     /// what IS offered but not what is not.
     pub(crate) complete: bool,
+    /// The names in ASCII lower case, so a lookup costs the name looked up
+    /// rather than the whole catalog.
+    lowered: HashSet<String>,
 }
 
 impl Catalog {
+    fn new(names: Vec<String>, complete: bool) -> Self {
+        let lowered = names.iter().map(|name| name.to_ascii_lowercase()).collect();
+        Self {
+            names,
+            complete,
+            lowered,
+        }
+    }
+
     /// Whether `name` is offered, ignoring ASCII case as TQL names do;
     /// `None` when the catalog was truncated and does not list it.
     pub(crate) fn offers(&self, name: &str) -> Option<bool> {
-        if self
-            .names
-            .iter()
-            .any(|offered| offered.eq_ignore_ascii_case(name))
-        {
+        if self.lowered.contains(&name.to_ascii_lowercase()) {
             return Some(true);
         }
         self.complete.then_some(false)
@@ -348,13 +356,22 @@ impl<'a> Step<'a> {
                 _ => Val::Missing,
             },
             Field::UnknownCalls => match (self.facts.kind, &self.catalog) {
-                (StepKind::Llm, Some(catalog)) if catalog.complete => Val::List(Cow::Owned(
-                    self.calls()
-                        .iter()
-                        .filter(|call| catalog.offers(call) == Some(false))
-                        .cloned()
-                        .collect(),
-                )),
+                (StepKind::Llm, Some(catalog)) if catalog.complete => {
+                    let calls = self.calls();
+                    meter.charge(
+                        calls
+                            .iter()
+                            .map(|call| CONDITION_UNITS + call.len() as u64 / BYTES_PER_UNIT)
+                            .sum(),
+                    )?;
+                    Val::List(Cow::Owned(
+                        calls
+                            .iter()
+                            .filter(|call| catalog.offers(call) == Some(false))
+                            .cloned()
+                            .collect(),
+                    ))
+                }
                 _ => Val::Missing,
             },
             Field::Edit => Val::Bool(self.is_edit()),
@@ -499,25 +516,42 @@ pub(crate) fn value_text(value: &Value) -> String {
     out
 }
 
-/// Adds `item` (trimmed, cut to [`MAX_TEXT_BYTES`]) unless empty or already
-/// listed; `false` when the list was full and a new item was dropped.
-fn push_unique(list: &mut Vec<String>, item: &str) -> bool {
-    let item = capped(item.trim());
-    if item.is_empty() || list.iter().any(|known| known == item) {
-        return true;
+/// A list of distinct texts, in first-seen order, at most [`MAX_LIST`].
+/// Membership is a hash lookup, so filling it from a long input costs that
+/// input once — not once per entry already kept.
+#[derive(Default)]
+struct Unique {
+    list: Vec<String>,
+    seen: HashSet<String>,
+}
+
+impl Unique {
+    fn len(&self) -> usize {
+        self.list.len()
     }
-    if list.len() >= MAX_LIST {
-        return false;
+
+    /// Adds `item` (trimmed, cut to [`MAX_TEXT_BYTES`]) unless empty or
+    /// already listed; `false` when the list was full and a new item was
+    /// dropped.
+    fn push(&mut self, item: &str) -> bool {
+        let item = capped(item.trim());
+        if item.is_empty() || self.seen.contains(item) {
+            return true;
+        }
+        if self.list.len() >= MAX_LIST {
+            return false;
+        }
+        self.seen.insert(item.to_owned());
+        self.list.push(item.to_owned());
+        true
     }
-    list.push(item.to_owned());
-    true
 }
 
 /// Paths a tool step's arguments name: [`PATH_KEYS`] anywhere in the
 /// arguments, and the file headers of a patch (`*** Update File: …`,
 /// `*** Add File: …`, `*** Delete File: …`, `*** Move to: …`, `+++ b/…`).
 pub(crate) fn paths_in(request: &Value) -> Vec<String> {
-    fn walk(value: &Value, depth: usize, out: &mut Vec<String>) {
+    fn walk(value: &Value, depth: usize, out: &mut Unique) {
         if depth > MAX_JSON_DEPTH || out.len() >= MAX_LIST {
             return;
         }
@@ -525,7 +559,7 @@ pub(crate) fn paths_in(request: &Value) -> Vec<String> {
             Value::Object(map) => {
                 for key in PATH_KEYS {
                     if let Some(Value::String(path)) = map.get(key) {
-                        push_unique(out, path);
+                        out.push(path);
                     }
                 }
                 map.values().for_each(|item| walk(item, depth + 1, out));
@@ -535,9 +569,9 @@ pub(crate) fn paths_in(request: &Value) -> Vec<String> {
             _ => {}
         }
     }
-    let mut out = Vec::new();
+    let mut out = Unique::default();
     walk(request, 0, &mut out);
-    out
+    out.list
 }
 
 const PATCH_HEADERS: [&str; 5] = [
@@ -548,14 +582,14 @@ const PATCH_HEADERS: [&str; 5] = [
     "+++ b/",
 ];
 
-fn patch_paths(text: &str, out: &mut Vec<String>) {
+fn patch_paths(text: &str, out: &mut Unique) {
     if !text.contains("*** ") && !text.contains("+++ b/") {
         return;
     }
     for line in text.lines() {
         for header in PATCH_HEADERS {
             if let Some(path) = line.strip_prefix(header) {
-                push_unique(out, path);
+                out.push(path);
             }
         }
     }
@@ -593,7 +627,7 @@ pub(crate) fn calls_in(response: &Value) -> Vec<String> {
             .and_then(Value::as_str)
             .or_else(|| value.get("function")?.get("name")?.as_str())
     }
-    fn walk(value: &Value, depth: usize, out: &mut Vec<String>) {
+    fn walk(value: &Value, depth: usize, out: &mut Unique) {
         if depth > MAX_JSON_DEPTH || out.len() >= MAX_LIST {
             return;
         }
@@ -602,20 +636,20 @@ pub(crate) fn calls_in(response: &Value) -> Vec<String> {
                 if let Some(Value::Array(calls)) = map.get("tool_calls") {
                     for call in calls {
                         if let Some(name) = call_name(call) {
-                            push_unique(out, name);
+                            out.push(name);
                         }
                     }
                 }
                 if let Some(kind) = map.get("type").and_then(Value::as_str) {
                     if matches!(kind, "tool_call" | "tool_use" | "function_call") {
                         if let Some(name) = map.get("name").and_then(Value::as_str) {
-                            push_unique(out, name);
+                            out.push(name);
                         }
                     }
                 }
                 if let Some(call) = map.get("function_call").filter(|call| call.is_object()) {
                     if let Some(name) = call_name(call) {
-                        push_unique(out, name);
+                        out.push(name);
                     }
                 }
                 map.values().for_each(|item| walk(item, depth + 1, out));
@@ -624,9 +658,9 @@ pub(crate) fn calls_in(response: &Value) -> Vec<String> {
             _ => {}
         }
     }
-    let mut out = Vec::new();
+    let mut out = Unique::default();
     walk(response, 0, &mut out);
-    out
+    out.list
 }
 
 /// The tool catalog an llm span offered: `gen_ai.tool.definitions`
@@ -635,56 +669,109 @@ pub(crate) fn calls_in(response: &Value) -> Vec<String> {
 /// and OpenInference's `llm.tools.{i}.tool.json_schema`. `None` when the
 /// span records none of them; `complete: false` when more names than
 /// [`MAX_LIST`] were offered.
-pub(crate) fn catalog_of(attributes: &Map<String, Value>) -> Option<Catalog> {
+///
+/// The work — text parsed, entries and attributes visited, names kept — is
+/// charged to `meter` as it is done, so a span carrying a huge catalog
+/// cannot hold a request past its deadline. Reading stops at the first name
+/// the full list has to drop: nothing after it can change the answer.
+pub(crate) fn catalog_of(
+    attributes: &Map<String, Value>,
+    meter: &mut Meter,
+) -> Result<Option<Catalog>> {
     fn entry_name(value: &Value) -> Option<&str> {
         value
             .get("name")
             .and_then(Value::as_str)
             .or_else(|| value.get("function")?.get("name")?.as_str())
     }
-    let mut names = Vec::new();
+    /// `value`, or the JSON its text holds (charging the text), borrowed
+    /// when it is structured already.
+    fn structured<'v>(value: &'v Value, meter: &mut Meter) -> Result<Cow<'v, Value>> {
+        if let Value::String(text) = value {
+            meter.charge(text.len() as u64 / BYTES_PER_UNIT + 1)?;
+            let trimmed = text.trim_start();
+            if trimmed.starts_with('{') || trimmed.starts_with('[') {
+                if let Ok(parsed) = serde_json::from_str::<Value>(text) {
+                    return Ok(Cow::Owned(parsed));
+                }
+            }
+        }
+        Ok(Cow::Borrowed(value))
+    }
+    /// Adds `name`, charging it; `false` once the full list drops one.
+    fn keep(names: &mut Unique, name: &str, meter: &mut Meter) -> Result<bool> {
+        meter.charge(CONDITION_UNITS + name.len() as u64 / BYTES_PER_UNIT)?;
+        Ok(names.push(name))
+    }
+    let mut names = Unique::default();
     let mut complete = true;
     let mut found = false;
     if let Some(definitions) = attributes.get("gen_ai.tool.definitions") {
-        let parsed = crate::semconv::field_value(definitions);
-        if let Value::Array(entries) = parsed {
+        let parsed = structured(definitions, meter)?;
+        if let Value::Array(entries) = &*parsed {
             found = true;
-            for entry in &entries {
+            for entry in entries {
+                meter.charge(CONDITION_UNITS)?;
                 if let Some(name) = entry_name(entry) {
-                    complete &= push_unique(&mut names, name);
+                    if !keep(&mut names, name, meter)? {
+                        complete = false;
+                        break;
+                    }
                 }
             }
         }
     }
-    let mut indexed: Vec<(u64, String)> = Vec::new();
+    let mut schemas: Vec<(u64, Cow<'_, Value>)> = Vec::new();
+    let mut indexed: Vec<(u64, &str)> = Vec::new();
     for (key, value) in attributes {
+        meter.charge(CONDITION_UNITS + key.len() as u64 / BYTES_PER_UNIT)?;
         if let Some(rest) = key.strip_prefix("llm.request.functions.") {
             if let Some((index, "name")) = rest.split_once('.') {
                 if let (Ok(index), Some(name)) = (index.parse::<u64>(), value.as_str()) {
-                    indexed.push((index, name.to_owned()));
+                    indexed.push((index, name));
                 }
             }
         } else if let Some(rest) = key.strip_prefix("llm.tools.") {
             if let Some((index, "tool.json_schema")) = rest.split_once('.') {
-                let schema = crate::semconv::field_value(value);
-                if let (Ok(index), Some(name)) = (index.parse::<u64>(), entry_name(&schema)) {
-                    indexed.push((index, name.to_owned()));
+                if let Ok(index) = index.parse::<u64>() {
+                    let schema = structured(value, meter)?;
+                    if entry_name(&schema).is_some() {
+                        schemas.push((index, schema));
+                    }
                 }
             }
         }
     }
+    indexed.extend(
+        schemas
+            .iter()
+            .filter_map(|(index, schema)| Some((*index, entry_name(schema)?))),
+    );
     if !indexed.is_empty() {
         found = true;
-        indexed.sort();
-        for (_, name) in indexed {
-            complete &= push_unique(&mut names, &name);
+        meter.charge(indexed.len() as u64)?;
+        indexed.sort_unstable();
+        if complete {
+            for (_, name) in indexed {
+                if !keep(&mut names, name, meter)? {
+                    complete = false;
+                    break;
+                }
+            }
         }
     }
-    found.then_some(Catalog { names, complete })
+    Ok(found.then(|| Catalog::new(names.list, complete)))
 }
 
 /// Reads a run's spans (in step order) as steps. `facts` extracts a span's
 /// step and LLM facts — the store's priced extraction in production.
+///
+/// Every loop over the spans answers to `deadline`: the facts are read with
+/// a check every [`DEADLINE_CHECK_SPANS`] spans, and the rest — the span
+/// index, ancestry, catalogs — charges a meter that checks it in proportion
+/// to the work.
+/// The deadline is consulted once more before the steps are returned, so a
+/// run whose reading ran past it is not passed off as read.
 pub(crate) fn build_steps<'a>(
     spans: &'a [Span],
     mut facts: impl FnMut(&Span) -> (StepFacts, LlmFacts),
@@ -697,43 +784,50 @@ pub(crate) fn build_steps<'a>(
         }
         extracted.push(facts(span));
     }
+    let mut meter = Meter::new(deadline);
     let mut by_id: HashMap<(&str, &str), usize> = HashMap::with_capacity(spans.len());
-    for (position, span) in spans.iter().enumerate() {
+    let mut agents: Vec<Option<String>> = Vec::with_capacity(spans.len());
+    for (position, (span, (facts, _))) in spans.iter().zip(&extracted).enumerate() {
+        meter.charge(STATE_UNITS)?;
         by_id
             .entry((span.trace_id.as_str(), span.span_id.as_str()))
             .or_insert(position);
+        agents.push(facts.agent.clone());
     }
-    let agents: Vec<Option<String>> = extracted
-        .iter()
-        .map(|(facts, _)| facts.agent.clone())
-        .collect();
-    let enclosing_agent = |position: usize| -> Option<String> {
+    let enclosing_agent = |position: usize, meter: &mut Meter| -> Result<Option<String>> {
         let mut current = position;
         for _ in 0..MAX_ANCESTRY {
+            meter.charge(STATE_UNITS)?;
             let span = &spans[current];
-            let parent = span.parent_span_id.as_deref()?;
-            current = *by_id.get(&(span.trace_id.as_str(), parent))?;
+            let Some(parent) = span.parent_span_id.as_deref() else {
+                return Ok(None);
+            };
+            let Some(&found) = by_id.get(&(span.trace_id.as_str(), parent)) else {
+                return Ok(None);
+            };
+            current = found;
             if let Some(agent) = &agents[current] {
-                return Some(agent.clone());
+                return Ok(Some(agent.clone()));
             }
         }
-        None
+        Ok(None)
     };
     let mut steps: Vec<Step<'a>> = Vec::new();
     let mut llm_catalogs: HashMap<usize, Option<Rc<Catalog>>> = HashMap::new();
     // The latest model call's catalog under each agent (`None`: no agent).
     let mut latest_llm: HashMap<Option<String>, Option<Rc<Catalog>>> = HashMap::new();
     for (position, (span, (step_facts, llm))) in spans.iter().zip(extracted).enumerate() {
+        meter.charge(SPAN_UNITS)?;
         if !step_facts.kind.is_step() {
             continue;
         }
-        let agent = step_facts
-            .agent
-            .clone()
-            .or_else(|| enclosing_agent(position));
+        let agent = match &step_facts.agent {
+            Some(agent) => Some(agent.clone()),
+            None => enclosing_agent(position, &mut meter)?,
+        };
         let catalog = match step_facts.kind {
             StepKind::Llm => {
-                let catalog = catalog_of(&span.attributes).map(Rc::new);
+                let catalog = catalog_of(&span.attributes, &mut meter)?.map(Rc::new);
                 llm_catalogs.insert(position, catalog.clone());
                 latest_llm.insert(agent.clone(), catalog.clone());
                 catalog
@@ -771,6 +865,7 @@ pub(crate) fn build_steps<'a>(
             test: OnceCell::new(),
         });
     }
+    Deadline::check(deadline, 0)?;
     Ok(steps)
 }
 
@@ -903,7 +998,7 @@ fn offers(value: &Val<'_>, captured: &Captured) -> bool {
 /// Units reading `value` costs, beyond a condition's base.
 fn weight(value: &Val<'_>) -> u64 {
     match value {
-        Val::Text(text) => text.len() as u64 / 16,
+        Val::Text(text) => text.len() as u64 / BYTES_PER_UNIT,
         Val::List(items) => items.len() as u64 * 4,
         _ => 0,
     }
@@ -1775,7 +1870,12 @@ pub(crate) mod tests {
             "llm.tools.2.tool.json_schema": "{\"type\":\"function\",\"function\":{\"name\":\"c\"}}",
         });
         let names = |attributes: &Value| {
-            catalog_of(attributes.as_object().expect("object")).map(|catalog| catalog.names)
+            catalog_of(
+                attributes.as_object().expect("object"),
+                &mut Meter::new(None),
+            )
+            .expect("no deadline")
+            .map(|catalog| catalog.names)
         };
         assert_eq!(
             names(&attributes),
@@ -1784,6 +1884,98 @@ pub(crate) mod tests {
         let text = json!({"gen_ai.tool.definitions": "[{\"name\": \"x\"}]"});
         assert_eq!(names(&text), Some(vec!["x".into()]));
         assert_eq!(names(&json!({})), None);
+    }
+
+    #[test]
+    fn a_deadline_spent_after_the_facts_stops_the_catalogs_too() {
+        // The deadline expires while the last span's facts are read, so the
+        // facts loop's own checks have all passed; the catalogs built after
+        // it must still notice before the run is reported as read.
+        let catalog: Vec<Value> = (0..400).map(|i| json!({"name": format!("t{i}")})).collect();
+        let spans = vec![
+            step_span(
+                0,
+                "llm",
+                "m",
+                "ok",
+                json!({"gen_ai.tool.definitions": catalog}),
+            ),
+            step_span(1, "tool", "t3", "ok", json!({})),
+        ];
+        let deadline = crate::Deadline::starting(
+            std::time::Instant::now(),
+            Some(std::time::Duration::from_millis(200)),
+        );
+        let mut read = 0;
+        let outcome = build_steps(
+            &spans,
+            |span| {
+                read += 1;
+                if read == spans.len() {
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                }
+                unpriced(span)
+            },
+            deadline,
+        );
+        match outcome {
+            Err(crate::Error::DeadlineExceeded(_)) => {}
+            Ok(steps) => panic!("{} steps reported after the deadline", steps.len()),
+            Err(other) => panic!("expected a deadline refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reading_a_catalog_is_charged_and_stops_once_its_answer_is_known() {
+        // Many entries repeating few names: every entry is charged, and
+        // each costs a lookup rather than a pass over the names kept.
+        let repeated: Vec<Value> = (0..20_000)
+            .map(|i| json!({"name": format!("t{}", i % 500)}))
+            .collect();
+        let attributes = json!({"gen_ai.tool.definitions": repeated});
+        let mut meter = Meter::new(None);
+        let catalog = catalog_of(attributes.as_object().expect("object"), &mut meter)
+            .expect("no deadline")
+            .expect("a catalog");
+        assert!(catalog.complete);
+        assert_eq!(catalog.names.len(), 500);
+        assert!(
+            meter.spent() >= 20_000 * CONDITION_UNITS,
+            "{}",
+            meter.spent()
+        );
+        assert_eq!(catalog.offers("T7"), Some(true), "case is ignored");
+        assert_eq!(catalog.offers("t500"), Some(false));
+
+        // More distinct names than fit: reading stops at the first dropped.
+        let distinct: Vec<Value> = (0..20_000)
+            .map(|i| json!({"name": format!("t{i}")}))
+            .collect();
+        let attributes = json!({"gen_ai.tool.definitions": distinct});
+        let mut stopped = Meter::new(None);
+        let catalog = catalog_of(attributes.as_object().expect("object"), &mut stopped)
+            .expect("no deadline")
+            .expect("a catalog");
+        assert!(!catalog.complete);
+        assert_eq!(catalog.names.len(), MAX_LIST);
+        assert_eq!(catalog.offers("t9999"), None, "a cut catalog cannot say no");
+        assert!(stopped.spent() < meter.spent() / 10, "{}", stopped.spent());
+
+        // A spent deadline stops a long catalog partway.
+        let expired =
+            crate::Deadline::starting(std::time::Instant::now(), Some(std::time::Duration::ZERO));
+        let attributes = json!({"gen_ai.tool.definitions": repeated_names(200_000)});
+        match catalog_of(
+            attributes.as_object().expect("object"),
+            &mut Meter::new(expired),
+        ) {
+            Err(crate::Error::DeadlineExceeded(_)) => {}
+            other => panic!("expected a deadline refusal, got {other:?}"),
+        }
+    }
+
+    fn repeated_names(entries: usize) -> Vec<Value> {
+        (0..entries).map(|_| json!({"name": "Bash"})).collect()
     }
 
     #[test]

@@ -22,8 +22,11 @@
 //! the states a list remembers at [`MAX_SEEN`]; past any cap the
 //! lowest-priority alternatives are dropped and the result says `inexact`.
 //! All the work — paths advanced, states reached, environments forked,
-//! regex instructions stepped — is charged to one [`Meter`], which checks
-//! the query deadline in proportion to it.
+//! regex instructions stepped, the winning path copied out — is charged to
+//! one [`Meter`], which checks the query deadline in proportion to it. The
+//! winner of a search is held as a shared path until the search ends and
+//! copied once, so a greedy pattern that meets a provisional match after
+//! every step stays linear in the run.
 
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -261,16 +264,31 @@ impl Drop for PathNode {
     }
 }
 
-fn collect_path(path: &Option<Rc<PathNode>>) -> Vec<usize> {
+#[cfg(test)]
+thread_local! {
+    /// Path nodes copied out by [`collect_path`] on this thread, so a test
+    /// can tell linear reconstruction from quadratic.
+    static NODES_COLLECTED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The steps a path consumed, oldest first. Copying is charged to `meter`
+/// node by node: a path is as long as its match, up to the whole run.
+fn collect_path(path: &Option<Rc<PathNode>>, meter: &mut Meter) -> Result<Vec<usize>> {
     let mut out = Vec::new();
     let mut current = path.as_ref();
     while let Some(node) = current {
+        #[cfg(test)]
+        NODES_COLLECTED.with(|count| count.set(count.get() + 1));
+        meter.charge(PATH_NODE_UNITS)?;
         out.push(node.step);
         current = node.previous.as_ref();
     }
     out.reverse();
-    out
+    Ok(out)
 }
+
+/// Units charged for copying one step of a reported path.
+const PATH_NODE_UNITS: u64 = 1;
 
 #[derive(Clone)]
 struct Thread {
@@ -359,6 +377,42 @@ enum Inserted {
 struct List {
     threads: Vec<Thread>,
     seen: Seen,
+}
+
+impl List {
+    fn new(program: &Program) -> Self {
+        Self {
+            threads: Vec::new(),
+            seen: Seen::new(program),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.threads.clear();
+        self.seen.clear();
+    }
+}
+
+/// The working memory of one scan, allocated once and reused by every
+/// search for the next match: what one search sets up is then proportional
+/// to what it does, not to the program, however many matches a run holds.
+struct Scratch {
+    current: List,
+    next: List,
+    /// Per test: whether it held at this step, for tests that read no
+    /// capture.
+    memo: Vec<Option<bool>>,
+    envs: Vec<Env>,
+}
+
+/// The highest-priority match seen so far. Its path stays shared until the
+/// search ends: a greedy pattern meets a provisional match after every step
+/// while a longer one is still alive, and copying each would be quadratic.
+struct Best {
+    start: usize,
+    end: usize,
+    path: Option<Rc<PathNode>>,
+    env: Env,
 }
 
 /// One match.
@@ -536,20 +590,27 @@ impl Program {
         Ok(())
     }
 
-    /// The leftmost-first match starting at or after `from`.
-    fn find(&self, steps: &[Step<'_>], from: usize, meter: &mut Meter) -> Result<Option<Found>> {
+    /// The leftmost-first match starting at or after `from`, searched with
+    /// `scratch` (left in no particular state).
+    fn find(
+        &self,
+        steps: &[Step<'_>],
+        from: usize,
+        scratch: &mut Scratch,
+        meter: &mut Meter,
+    ) -> Result<Option<Found>> {
         let n = steps.len();
-        let mut current = List {
-            threads: Vec::new(),
-            seen: Seen::new(self),
-        };
-        let mut next = List {
-            threads: Vec::new(),
-            seen: Seen::new(self),
-        };
-        let mut memo = vec![None; self.tests.len()];
-        let mut envs = Vec::new();
-        let mut best: Option<Found> = None;
+        let Scratch {
+            current,
+            next,
+            memo,
+            envs,
+        } = scratch;
+        // Swapped every step, so held as rebindable references.
+        let (mut current, mut next) = (current, next);
+        current.clear();
+        next.clear();
+        let mut best: Option<Best> = None;
         let mut position = from;
         loop {
             if best.is_none() && position < n {
@@ -559,7 +620,7 @@ impl Program {
                     start: position,
                     path: None,
                 };
-                self.add(&mut current, seed, position, n, meter)?;
+                self.add(current, seed, position, n, meter)?;
             }
             memo.iter_mut().for_each(|slot| *slot = None);
             for thread in std::mem::take(&mut current.threads) {
@@ -568,10 +629,10 @@ impl Program {
                     Inst::Match => {
                         // Every lower-priority path is cut; higher-priority
                         // ones already advanced and may still win.
-                        best = Some(Found {
+                        best = Some(Best {
                             start: thread.start,
                             end: position - 1,
-                            path: collect_path(&thread.path),
+                            path: thread.path,
                             env: thread.env,
                         });
                         break;
@@ -588,8 +649,8 @@ impl Program {
                             test,
                             &steps[position],
                             &thread.env,
-                            &mut memo,
-                            &mut envs,
+                            memo,
+                            envs,
                             room,
                             meter,
                         )?;
@@ -608,7 +669,7 @@ impl Program {
                                 start: thread.start,
                                 path,
                             };
-                            self.add(&mut next, advanced, position + 1, n, meter)?;
+                            self.add(next, advanced, position + 1, n, meter)?;
                         }
                     }
                     _ => {}
@@ -618,18 +679,28 @@ impl Program {
                 break;
             }
             std::mem::swap(&mut current, &mut next);
-            next.threads.clear();
-            next.seen.clear();
+            next.clear();
             position += 1;
             if current.threads.is_empty() && best.is_some() {
                 break;
             }
         }
-        Ok(best)
+        // The winner's path is copied once, now that it is final.
+        best.map(|best| {
+            Ok(Found {
+                start: best.start,
+                end: best.end,
+                path: collect_path(&best.path, meter)?,
+                env: best.env,
+            })
+        })
+        .transpose()
     }
 
     /// Every non-overlapping match, keeping the first `keep` and counting up
-    /// to `max_count`. All the work is charged against `deadline`.
+    /// to `max_count`. All the work is charged against `deadline`, which is
+    /// consulted once more before the answer is given: a scan too short to
+    /// reach a periodic check must not report past an expired budget.
     pub(crate) fn scan(
         &self,
         steps: &[Step<'_>],
@@ -638,10 +709,29 @@ impl Program {
         deadline: Option<Deadline>,
     ) -> Result<Scan> {
         let mut meter = Meter::new(deadline);
+        let scan = self.scan_metered(steps, keep, max_count, &mut meter)?;
+        Deadline::check(deadline, 0)?;
+        Ok(scan)
+    }
+
+    /// [`Self::scan`] charging `meter`, so a test can read what was charged.
+    fn scan_metered(
+        &self,
+        steps: &[Step<'_>],
+        keep: usize,
+        max_count: usize,
+        meter: &mut Meter,
+    ) -> Result<Scan> {
+        let mut scratch = Scratch {
+            current: List::new(self),
+            next: List::new(self),
+            memo: vec![None; self.tests.len()],
+            envs: Vec::new(),
+        };
         let mut scan = Scan::default();
         let mut from = 0;
         while from < steps.len() {
-            let Some(found) = self.find(steps, from, &mut meter)? else {
+            let Some(found) = self.find(steps, from, &mut scratch, meter)? else {
                 break;
             };
             meter.charge(PATH_UNITS)?;
@@ -1098,6 +1188,71 @@ pub(crate) mod tests {
             panic!("captures key the states");
         };
         assert!(set.is_empty(), "nothing remembered for a dropped state");
+    }
+
+    #[test]
+    fn a_greedy_match_reconstructs_its_path_once() {
+        // `step+` reaches `Match` after every step while its greedy
+        // continuation stays alive: copying the provisional winner's path
+        // each time is quadratic in the run.
+        let query = query("step+");
+        let charged = |n: usize| {
+            let spec = vec!["L"; n].join(" ");
+            let spans = spans(&spec);
+            let steps = steps(&spans);
+            NODES_COLLECTED.with(|count| count.set(0));
+            let mut meter = Meter::new(None);
+            let scan = query
+                .program
+                .scan_metered(&steps, 1, 1, &mut meter)
+                .expect("scans");
+            assert_eq!(scan.found[0].path.len(), n);
+            let collected = NODES_COLLECTED.with(std::cell::Cell::get);
+            assert!(
+                collected <= 2 * n as u64,
+                "{collected} path nodes copied for one match of {n} steps"
+            );
+            meter.spent()
+        };
+        // The work charged — copying the reported path included — grows
+        // with the run, not with its square.
+        let (short, long) = (charged(2_000), charged(4_000));
+        assert!(
+            long <= short * 9 / 4,
+            "doubling the run took the work from {short} to {long} units"
+        );
+    }
+
+    #[test]
+    fn copying_the_reported_path_is_charged_and_honours_the_deadline() {
+        let mut path = None;
+        for step in 0..300 {
+            path = Some(Rc::new(PathNode {
+                step,
+                previous: path,
+            }));
+        }
+        let mut meter = Meter::new(None);
+        let copied = collect_path(&path, &mut meter).expect("no deadline");
+        assert_eq!(copied, (0..300).collect::<Vec<_>>());
+        assert_eq!(meter.spent(), 300 * PATH_NODE_UNITS);
+        // Past a spent deadline, a long copy stops at a check.
+        let expired =
+            Deadline::starting(std::time::Instant::now(), Some(std::time::Duration::ZERO));
+        let mut long = None;
+        for step in 0..200_000 {
+            long = Some(Rc::new(PathNode {
+                step,
+                previous: long,
+            }));
+        }
+        match collect_path(&long, &mut Meter::new(expired)) {
+            Err(crate::Error::DeadlineExceeded(_)) => {}
+            other => panic!(
+                "expected a deadline refusal, got {:?}",
+                other.map(|p| p.len())
+            ),
+        }
     }
 
     #[test]

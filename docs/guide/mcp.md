@@ -385,6 +385,7 @@ regex whose letters are steps — over the most recent runs, or one of the
 | `agent` | only runs of this agent |
 | `outcome` | `any` (default), `success`, `failure`, `abandoned`, `unknown` |
 | `limit` | runs to return, default 10, at most 50 |
+| `cursor` | an earlier call's `next_cursor`, to continue with the runs it did not check (keep the query; leave `since`/`until` out) |
 
 With neither `query` nor `detector` it lists the library — each detector's
 title, summary and pattern — so an agent can read a pattern and adapt it;
@@ -399,13 +400,19 @@ model can fix and retry from.
 One deliberate difference from the other tools' deadline rule: the scan reads
 runs newest first, so where the compute budget runs out it returns what it
 found, with a headline that says `STOPPED EARLY`, how many candidate runs
-were left unchecked — those runs are all older than every run it did check —
-and the `until` to call again with to continue (`next_until_ns` in structured
-content). The same `until` is offered when the window held more runs than
-are considered. Captured values are cut to 120 characters in the text and to
-1 KiB in `structuredContent` (`captures_truncated` says so); spans whose run
-id does not read back to them are left out and counted in the headline.
-Enumerating the window is still all-or-nothing.
+were left unchecked — those runs all come after every run it did check — and
+the `cursor` to call again with to continue (`next_cursor` in structured
+content); following it lists each run once, even among runs that tie on
+time. The same `cursor` is offered when the window held more runs than are
+considered. It is digits, hex and dots, so it stands outside the telemetry
+block. When a scanned run that is not listed had more partial matches than
+the matcher tracks, the headline says `UNCERTAIN` and how many such runs
+there were (`runs_inexact`), and the "No scanned run matches" note is
+withheld: an occurrence there may have been missed. Captured values are cut
+to 120 characters in the text and to 1 KiB in `structuredContent`
+(`captures_truncated` says so); spans whose run id does not read back to them
+are left out and counted in the headline. Enumerating the window is still
+all-or-nothing.
 
 ### Arguments
 

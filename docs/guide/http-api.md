@@ -1776,6 +1776,7 @@ Runs whose steps match `q`, the window's most recent runs first.
 | `outcome` | `any` / `success` / `failure` / `abandoned` / `unknown` | Only runs that ended this way. Default `any` |
 | `limit` | integer | Matching runs to return. Default 50, capped at 500 |
 | `run` | string | Search this one run and list every occurrence; the window and `agent` do not apply (in the operator view, a run id two tenants share is read as their union — name the `tenant`) |
+| `cursor` | string | Continue an earlier answer from its `next_cursor`. It carries that answer's window: leave `since`/`until` out or repeat them unchanged (a different one, or a cursor this server did not issue, is `400`). Not with `run` |
 | `tenant` | string | Tenant scope; omitted, an unbound caller reads every tenant, each run within its own |
 
 ```sh
@@ -1785,7 +1786,7 @@ curl -sG 'http://localhost:8080/v1/trajectories/search' \
 ```
 
 ```json
-{"matches":[{"agent":"coder","captures":{},"captures_truncated":false,"count":1,"count_capped":false,"first_step":1,"inexact":false,"last_activity_ns":1772323205000000000,"last_step":4,"outcome":"success","run":"tampered","run_truncated":false,"spans":[{"kind":"tool","name":"Bash","span_id":"tampered-1","step_index":1,"trace_id":"tr-tampered"},{"kind":"tool","name":"Edit","span_id":"tampered-3","step_index":3,"trace_id":"tr-tampered"},{"kind":"tool","name":"Bash","span_id":"tampered-4","step_index":4,"trace_id":"tr-tampered"}],"spans_truncated":false,"steps":6,"tenant":""}],"next_until_ns":null,"query":"test[error] ..> edit[file~\"(^|/)tests?/\"] ..> test[not error]","runs_in_window":3,"runs_scanned":3,"runs_skipped":0,"since_ns":1772323199999999999,"spans_skipped":0,"stopped":null,"truncated":false,"until_ns":null,"window_capped":false}
+{"matches":[{"agent":"coder","captures":{},"captures_truncated":false,"count":1,"count_capped":false,"first_step":1,"inexact":false,"last_activity_ns":1772323205000000000,"last_step":4,"outcome":"success","run":"tampered","run_truncated":false,"spans":[{"kind":"tool","name":"Bash","span_id":"tampered-1","step_index":1,"trace_id":"tr-tampered"},{"kind":"tool","name":"Edit","span_id":"tampered-3","step_index":3,"trace_id":"tr-tampered"},{"kind":"tool","name":"Bash","span_id":"tampered-4","step_index":4,"trace_id":"tr-tampered"}],"spans_truncated":false,"steps":6,"tenant":""}],"next_cursor":null,"query":"test[error] ..> edit[file~\"(^|/)tests?/\"] ..> test[not error]","runs_in_window":3,"runs_inexact":0,"runs_scanned":3,"runs_skipped":0,"since_ns":1772323199999999999,"spans_skipped":0,"stopped":null,"truncated":false,"until_ns":null,"window_capped":false}
 ```
 
 Each match carries the run, its `tenant`, `agent` and `outcome` (the
@@ -1808,11 +1809,14 @@ The scan keeps the window's 5,000 most recent runs (`runs_in_window`;
 not only those in the window — until `limit` runs matched. `runs_scanned`
 counts the candidates examined (those the `agent` filter left out included).
 `stopped` is `"limit"` or `"deadline"` when the scan ended before the last
-candidate. `next_until_ns`, set when runs went unchecked, is the instant to
-pass as `until` to continue: the latest activity of the newest run not
-checked, or, for a capped window the scan finished, of the oldest run it kept
-(a run active on both sides of that instant can appear twice). `truncated`
-says matches may be missing for any of these reasons. `spans_skipped` counts
+candidate. `runs_inexact` counts scanned runs not listed whose matching hit a
+matcher cap, so an occurrence there may have been missed. `next_cursor`, set
+when runs went unchecked, is the token to pass as `cursor` to continue with
+exactly those runs: it fixes the window (an open end at the latest span
+seen) and the scan position, ties on time included — runs active at the same
+instant are ordered by a digest of their tenant and id — so following it
+lists each run once. It is digits, hex and dots only. `truncated` says
+matches may be missing for any of these reasons. `spans_skipped` counts
 spans left out because their run id does not read back to them (a session id
 of the `trace:<id>` form naming another trace, or none); `runs_skipped`,
 candidates whose id was refused when read. The query deadline covers the
@@ -1853,10 +1857,13 @@ The library run over the window's 2,000 most recent runs.
 | `since`, `until` | integer ns | Window, as for search. Default: the last 30 days |
 | `agent` | string | Only runs of this agent |
 | `detector` | string | Only these detectors: a comma list, or repeated. An unknown name is `400` |
+| `cursor` | string | Continue from an earlier answer's `next_cursor`, as for search |
 | `tenant` | string | Tenant scope |
 
 Per detector: `name`, `title`, `severity`, `summary`, `query`,
-`runs_matched`, `occurrences`, `outcomes` (`{success, failure, abandoned,
+`runs_matched`, `runs_inexact` (checked runs it did not match where its
+matcher hit a cap — `runs_matched` is then a lower bound), `occurrences`,
+`outcomes` (`{success, failure, abandoned,
 unknown}` of the matched runs), `success_rate` (successes over runs whose
 outcome is known; `null` when none is), up to five `examples` (newest first,
 shaped like search matches) and `last_seen_ns`. Beside them: `baseline` and
@@ -1864,8 +1871,8 @@ shaped like search matches) and `last_seen_ns`. Beside them: `baseline` and
 detectors ran on — the baseline's total, and the denominator for
 `runs_matched`), `runs_scanned` (candidates examined, those the `agent`
 filter left out included), `runs_in_window`, `window_capped`, `stopped`,
-`next_until_ns`, `truncated`, `spans_skipped`, `runs_skipped`, `since_ns`,
-`until_ns`. Detectors with findings come first, by severity, then by runs
+`next_cursor`, `truncated` (also set when a detector's `runs_inexact` is
+above 0), `spans_skipped`, `runs_skipped`, `since_ns`, `until_ns`. Detectors with findings come first, by severity, then by runs
 matched. The [guide](tql.md#findings) has a worked response.
 ### `GET /v1/forks`
 
