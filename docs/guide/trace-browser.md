@@ -1,9 +1,9 @@
 # The trace browser
 
 Traza ships a dashboard: a React single-page app that talks to the same public
-`/v1` API any client uses. Twenty-two screens, grouped by the question you
-arrived with — what happened, may this run go on, how much did it cost, how
-good was it, is the server healthy.
+`/v1` API any client uses. Twenty-seven screens, grouped by the question you
+arrived with — what happened, may this run go on, what do the runs say
+together, how much did it cost, how good was it, is the server healthy.
 
 ## Getting it running
 
@@ -143,6 +143,7 @@ rail and the header's controls are real buttons, reachable by keyboard.
 |---|---|
 | **explore** | Overview `#/overview` · Traces `#/traces` · Sessions `#/sessions` · Live tail `#/tail` |
 | **runs** | Guard `#/guard` · Diff `#/diff` |
+| **insight** | Foresight `#/foresight` · X-Ray `#/xray` · Changes `#/changes` · Behaviors `#/behaviors` · Blame `#/blame` |
 | **measure** | Analytics `#/analytics` · Latency `#/latency` · Failures `#/failures` |
 | **evaluate** | Scores `#/scores` · Experiments `#/experiments` · Datasets `#/datasets` |
 | **operate** | Server `#/server`\* · Store `#/store`\* · Ledger `#/ledger` · Credentials `#/credentials`\* · Connect `#/connect` · MCP `#/mcp` |
@@ -151,7 +152,7 @@ rail and the header's controls are real buttons, reachable by keyboard.
 
 Detail screens hang off those: `#/trace/<id>`, `#/sessions/<id>`,
 `#/run/<run>`, `#/conversation/traces/<id>`, `#/compare?a=…&b=…`,
-`#/diff?a=…&b=…`.
+`#/diff?a=…&b=…`, `#/xray/<run>`.
 
 **A run's tenant travels in its route.** Links from Guard, a session or a
 trace to a run, from a run to its diff, and from a diff step to its tape carry
@@ -380,6 +381,16 @@ made — is dropped rather than shown beside the new one.
 **Compare with…** takes another run id, with recent sessions offered as
 suggestions, and opens the diff.
 
+**Foresight** reads [`GET /v1/fate/runs/{run}`](http-api.md#get-v1faterunsrun)
+in the run's tenant: the verdict, the server's sentence, the success rate
+with its interval against the agent's base rate, the support, the path (long
+paths folded around where the map stopped matching), and what earlier runs
+did next, the recommended option tagged; **On the Fate Map** opens
+[Foresight](#foresight) with the run lit. A run the map holds no span of says
+so, and a run with no history to compare against shows no odds. **X-Ray** in
+the header, and **X-Ray this call** on an opened model call, open
+[X-Ray](#x-ray) at the run or at that call.
+
 ## Diff
 
 `#/diff?a=<run>&b=<run>` — two runs aligned step by step, from
@@ -396,6 +407,166 @@ highlighted. Every step index opens that step on its run's tape, in the
 tenant the diff was read in. **Swap** reverses the comparison. A diff with no
 tenant named reads, for an operator, every tenant's runs of those ids, and the
 page says so above the totals, with a field to name the tenant.
+
+## Foresight
+
+`#/foresight` — an agent's [Fate Map](foresight.md): every path its
+completed runs took, how often each ended well, and where the failing paths
+part from the rest, from [`GET /v1/fate/cohorts`](http-api.md#get-v1fatecohorts)
+and [`GET /v1/fate/map`](http-api.md#get-v1fatemap).
+
+The cohorts sit in one row of cards — each agent, and each of its task
+sub-cohorts, with its completed runs, base rate, and runs still live (excluded
+from every rate, counted on the card). The largest opens first. Window chips
+(`24h` to `1y`) re-read both; `30d` sends no window at all, which is the
+server's default and the build it caches. **min support** and **depth** set
+the map's pruning. Tiles give completed runs, the base rate, runs live or
+unknown, nodes shown of the tree's total, fatal forks, hotspots, and the
+map's best calibration skill. Whatever bounded the build — a narrowed window,
+the node cap, runs read in part — is said under the tiles.
+
+The map is drawn left to right. A branch is as wide as the runs that went that
+way, and the ribbons leaving a node are stacked, so what a node passes on adds
+up to what came in less the runs that ended there. Colour is the success rate
+against the agent's base rate: ink at or above it, and below it the measured
+ramp in four steps (0–10, 10–20, 20–35 and 35+ points below); a branch whose
+95% interval still includes the base rate is drawn faint. Fatal forks and
+hotspots are named in words above their node (`FATAL FORK p <0.001`,
+`HOTSPOT 1.50 bits`), never by colour alone. Hovering or focusing a node reads
+it: runs, success, failure and abandoned, the Wilson interval drawn against
+the base rate, lift, mean cost and duration per run, runs that ended there,
+entropy, the comparison with its siblings, and what was pruned. Clicking opens
+it in the panel under the map (`?node=` in the route) with its example runs,
+**Diff success vs failure** (the newest success and failure through the node,
+in [Diff](#diff)) and **Find these runs**, which opens [Behaviors](#behaviors)
+with the TQL that matches the path — each token an atom, its repeat bucket a
+count, anchored at the run's first step. Double-clicking folds a branch. Below
+sit the fatal forks and hotspots (each opens its node) and **How good is this
+map**: Brier score, baseline and skill per depth, the skill read in words —
+under 5% the screen says not to act on the verdicts — and the reliability
+bins drawn as predicted against observed.
+
+**A run on its map.** `?run=<run>` (the Run screen links here) reads
+[`GET /v1/fate/runs/{run}`](http-api.md#get-v1faterunsrun) and opens its
+agent's map with the run lit in the accent: its matched path, the node it is
+judged at (`THIS RUN`), the siblings pooled with a live run's open last step
+(dashed), the option earlier runs did best with (`RECOMMENDED NEXT`), and, for
+a novel run, a dashed branch to the step it took that no earlier run took. A
+banner above the tiles gives the verdict, the server's sentence, the interval
+against the base rate, the support, the path (matched tokens solid), and what
+earlier runs did next with their rates. Foresight judges a run against its
+agent's last 30 days; with another window chosen, the banner says so, and
+when the map shown is another cohort's, the banner says that instead of
+lighting anything.
+
+## X-Ray
+
+`#/xray/<run>` — a run's model calls as the contexts they were, from
+[`GET /v1/cache/{run}`](http-api.md#get-v1cacherun) and
+[`GET /v1/xray/{trace_id}/{span_id}`](http-api.md#get-v1xraytrace_idspan_id).
+`#/xray` alone takes a run id and offers the recent sessions that made model
+calls. The [X-Ray guide](xray.md) explains every figure.
+
+**The Cache Autopsy** comes first: tiles for model calls, cache breaks,
+estimated tokens and USD lost (with the unpriced breaks counted), the calls
+where the provider disagrees, and the cache lifetime assumed (`5 min`, or
+`1 h` with the chip, sent as `ttl_seconds`). A timeline draws one column per
+call: its context split into the prefix the cache could serve, the tokens it
+re-processed although the previous call had them — the loss, in the accent —
+and new content, with a cause marker under it (stable, broken, TTL expired,
+new context). The server scales lost tokens by the provider's count; the bar
+takes them back to the estimate's scale so the three parts share a unit, and
+hovering a column gives the server's figures and sentence. Each break shape
+(culprit) is a card with its diff — the volatile token struck and its
+replacement on the accent tint — the tokens and money it cost, and the fixed
+advice the server chose for it. **Calls** lists the breaks (or every call)
+with the verdict, the first chunk that changed and the provider's cache read,
+marking a held prefix the provider served nothing from.
+
+**The X-Ray** of the selected call (`?step=`; the last call when none is
+named) follows: tiles for the estimated context, the provider's context and
+cache read, stale and repeated tokens, and chunks; then the **context
+window** as one bar, every chunk as wide as its estimated tokens in the order
+the model read it. Fill says the kind (instructions darkest, the model's own
+words lightest, tool definitions outlined), stale tool results are hatched,
+repeats carry a warning tick, and hovering a chunk lights every chunk the same
+step introduced in the accent. Under the bar, chips total the context by the
+step that introduced it — "step 7 Read 34%" — and narrow the chunk list to
+one step. The chunk list gives each chunk's kind, tokens, the step that
+introduced it (linked to that step on the tape), its age and its preview;
+filters show only stale chunks, repeats, tool results or instructions.
+Beside it: **Dropped since the previous call**, every lost instruction shown
+and flagged, the rest folded behind a count, unverified losses marked;
+**Edited since the previous call** with each diff; this call's cache verdict;
+repeated content; the context by source; and what the model answered. Every
+partial-read flag the server sets is said in words.
+
+Stored text — previews, prompts, diffs, explanations — is rendered as text
+everywhere on these screens, never as markup.
+
+## Changes
+
+`#/changes` — each agent's [change radar](radar.md) timeline, from
+[`GET /v1/changes`](http-api.md#get-v1changes), regressions first as the
+server ranks them. Window chips, an environment filter and agent chips (each
+with its regression count) narrow it.
+
+Each agent has its summary sentence, its current fingerprint, any volatile
+dimension, and a timeline: the stretches between its change points, each
+named by the value the change set up (the most readable of co-changed
+values, a version before a digest) with its error rate, tinted by that
+change's verdict, and a marker per change point. A change card gives the
+verdict, what decided it (quality or efficiency), the dimension and its
+co-changes, when, the effect size, from and to, the dimension's own evidence
+(the prompt edit as a diff, tools added and removed, parameters changed, or
+the paths whose share moved), the server's explanation, and the deltas —
+error and success rate, cost, steps and duration per run, before and after
+with their p-values and the runs counted. A row is marked by direction only
+when its own p is under 5%; the verdict is the server's, Holm-corrected. The
+tool mix, the path shift and the example runs follow, with **Diff the last
+run before against the first after**.
+
+**Place a run on its timeline** (`?run=`) asks the radar which changes that
+run ran downstream of: its fingerprint, its outcome, the changes listed, and
+its start marked on the timeline.
+
+## Behaviors
+
+`#/behaviors?q=<tql>` — [TQL](tql.md) searches and the detector library,
+from [`GET /v1/trajectories/search`](http-api.md#get-v1trajectoriessearch),
+[`/explain`](http-api.md#get-v1trajectoriesexplain),
+[`GET /v1/detectors`](http-api.md#get-v1detectors) and
+[`/findings`](http-api.md#get-v1detectorsfindings).
+
+The query box is parsed by the server a quarter second after typing stops:
+a valid query shows how it reads (grouping explicit), its atoms, captures,
+fields and the steps a match covers; a refused one shows the query with a
+caret under the column the server named and its message, and is not
+searched. `⌘↵` or **Search** runs it (the query is in the route). Each
+matching run shows its outcome, agent, the steps covered and how many times
+it matched, the steps the atoms matched — each opening that step on the
+tape — and its captures; inexact and cut runs are flagged, and a stopped or
+capped scan says so, with **Continue with older runs** when the server gave
+a point to resume from. Window chips, an outcome filter and an agent filter
+apply. The syntax panel condenses the guide's tables and lists worked
+examples to run with a click.
+
+**Detectors** runs the library over the window: the detectors that fired
+first, by severity, each with its runs matched of the runs checked, its
+occurrences, its success rate drawn against every checked run's, when it last
+fired, its example runs and captures, and **Search this pattern**; the quiet
+ones follow, one line each.
+
+## Blame
+
+`#/blame?path=&line=` — [Agent Blame](recorders.md#agent-blame) from
+[`GET /v1/blame`](http-api.md#get-v1blame): a file path (or suffix), the exact
+line, and optionally repository roots (`project`, repeatable). The answer
+shows the line as compared and, earliest first, each tool step that
+introduced it: when, the tool, the sub-agent, the prompt that turn was given,
+the model that asked for the edit, the run and its step (**Open the step on
+its tape**), the file as recorded and the project. A line no recorded edit
+introduced says what blame cannot see.
 
 ## Live tail
 

@@ -14,6 +14,7 @@ import { CodeBlock } from '../components/data/CodeBlock.jsx';
 import { MessageList } from '../components/trace/MessageList.jsx';
 import { UnscopedNote } from '../components/runs/UnscopedNote.jsx';
 import { VERDICT_TAG } from './GuardScreen.jsx';
+import { RunForesight } from '../components/insight/RunForesight.jsx';
 
 // A run read as a tape: its model calls, tool calls and agent invocations in
 // order, with what went into each and what came out — and from here, a replay
@@ -106,6 +107,7 @@ export function RunScreen({ runId, go, params, identity, pushToast }) {
           ? <Chip onClick={() => go(['sessions', runId], scope)}>Session</Chip>
           : <Chip onClick={() => go(['trace', runId.slice('trace:'.length)])}>Trace</Chip>}
         <Chip onClick={() => go(['guard'])}>Guard</Chip>
+        <Chip onClick={() => go(['xray', runId], scope)} title="Every model call's context window, and why the prompt cache broke">X-Ray</Chip>
         <Chip active={resolve} onClick={() => setParam('resolve', resolve ? '' : 'true')}
           title="Inline offloaded payloads, up to the server's --tape-max-bytes">
           {resolve ? 'Payloads inlined' : 'Inline payloads'}
@@ -143,8 +145,10 @@ export function RunScreen({ runId, go, params, identity, pushToast }) {
     </div> : null}
 
     <div className="tz-split" style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(320px, 420px)', gap: 14, alignItems: 'start' }}>
-      <Tape steps={data.steps} totals={totals} go={go} focusStep={focusStep} />
+      <Tape steps={data.steps} totals={totals} go={go} focusStep={focusStep}
+        onXray={(index) => go(['xray', runId], { ...(scope || {}), step: String(index) })} />
       <div style={{ display: 'grid', gap: 14, minWidth: 0 }}>
+        <RunForesight runId={runId} tenant={tenant} go={go} />
         <ReplayPanel key={replayScopeKey(shown.runId, shown.tenant)} runId={shown.runId} tenant={shown.tenant}
           tape={data} identity={identity} pushToast={pushToast} />
         <ComparePanel runId={runId} tenant={tenant} go={go} />
@@ -167,7 +171,7 @@ function stepName(step) {
   return step.model || step.tool || step.agent || step.name;
 }
 
-function Tape({ steps, totals, go, focusStep }) {
+function Tape({ steps, totals, go, focusStep, onXray }) {
   const [open, setOpen] = React.useState(() => new Set(focusStep != null ? [Number(focusStep)] : []));
   const focusRef = React.useRef(null);
   React.useEffect(() => {
@@ -243,7 +247,7 @@ function Tape({ steps, totals, go, focusStep }) {
                 <span style={{ fontSize: 11, color: step.status === 'error' ? 'var(--error)' : 'var(--ink-faint)' }}>{step.status}</span>
               </div>
             </div>
-            {expanded ? <StepDetail step={step} go={go} /> : null}
+            {expanded ? <StepDetail step={step} go={go} onXray={onXray} /> : null}
           </div>;
         })}
       </div>
@@ -259,7 +263,7 @@ function Num({ children, muted, accent }) {
   }}>{children}</div>;
 }
 
-function StepDetail({ step, go }) {
+function StepDetail({ step, go, onXray }) {
   const fp = splitFingerprint(step.fingerprint);
   return <div style={{ padding: '10px 14px 14px', borderBottom: '1px solid var(--hairline)', background: 'var(--bg)', display: 'grid', gap: 10 }}>
     <div style={{ display: 'flex', gap: 14, flexWrap: 'wrap', fontSize: 12, color: 'var(--ink-muted)' }}>
@@ -267,9 +271,11 @@ function StepDetail({ step, go }) {
       <span>started <Mono>{fmtTimeNs(step.start_ns)}</Mono></span>
       {step.tokens?.cache_read != null ? <span>cache read <Mono>{fmtNum(step.tokens.cache_read)}</Mono></span> : null}
       {step.tokens?.cache_write != null ? <span>cache write <Mono>{fmtNum(step.tokens.cache_write)}</Mono></span> : null}
+      {step.kind === 'llm' && onXray ? <a href="#" data-testid="xray-link" style={{ marginLeft: 'auto' }}
+        onClick={(e) => { e.preventDefault(); onXray(step.index); }}>X-Ray this call</a> : null}
       <a href={'#/trace/' + encodeURIComponent(step.trace_id) + '?span=' + encodeURIComponent(step.span_id)}
         onClick={(e) => { e.preventDefault(); go(['trace', step.trace_id], { span: step.span_id }); }}
-        style={{ marginLeft: 'auto' }}>open the span in its trace</a>
+        style={{ marginLeft: step.kind === 'llm' && onXray ? undefined : 'auto' }}>open the span in its trace</a>
     </div>
     <div className="tz-reflow-1" style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 12 }}>
       <Side title="request" digest={step.request_digest} value={step.request} kind={step.kind} direction="prompt" />

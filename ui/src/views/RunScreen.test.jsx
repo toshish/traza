@@ -17,6 +17,8 @@ vi.mock('../lib/api.js', () => ({
     createReplay: vi.fn(async () => replay),
     replay: vi.fn(async () => ({ served: 1, remaining: 1, diverged: null })),
     payload: vi.fn(async () => '{"k":1}'),
+    // The foresight panel's read; this file is about the tape.
+    fateRun: vi.fn(async () => { throw Object.assign(new Error('run not found'), { status: 404, what: 'run not found' }); }),
   },
 }));
 

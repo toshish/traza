@@ -421,6 +421,32 @@ export const api = {
   replay: (id, signal) => request('/v1/replays/' + encodeURIComponent(id), { signal }),
   diff: (params, signal) => read('/v1/diff' + query(params), signal),
 
+  // ------------------------------------------------------------- insight
+
+  /** The Fate Map's cohorts: agents (and their task sub-cohorts) with their
+      outcome counts and base rate. An unbound caller naming no tenant sees
+      every tenant's. */
+  fateCohorts: (params, signal) => read('/v1/fate/cohorts' + query(params), signal),
+  /** One agent's Fate Map: the tree of paths its completed runs took. */
+  fateMap: (params, signal) => read('/v1/fate/map' + query(params), signal),
+  /** Foresight for one run: its path walked down its agent's map. */
+  fateRun: (run, params, signal) => read('/v1/fate/runs/' + encodeURIComponent(run) + query(params), signal),
+  /** The context window one model call saw, as chunks with provenance. */
+  xray: (traceId, spanId, params, signal) => read('/v1/xray/' + encodeURIComponent(traceId) + '/'
+    + encodeURIComponent(spanId) + query(params), signal),
+  /** The Cache Autopsy: every model call of a run against its predecessor. */
+  cache: (run, params, signal) => read('/v1/cache/' + encodeURIComponent(run) + query(params), signal),
+  /** The change radar: each agent's ranked change points. */
+  changes: (params, signal) => read('/v1/changes' + query(params), signal),
+  /** Runs whose steps match a TQL query. */
+  trajectories: (params, signal) => read('/v1/trajectories/search' + query(params), signal),
+  /** Parses and compiles a TQL query without reading the store. */
+  explainQuery: (q, signal) => read('/v1/trajectories/explain' + query({ q }), signal),
+  detectors: (signal) => read('/v1/detectors', signal),
+  findings: (params, signal) => read('/v1/detectors/findings' + query(params), signal),
+  /** Agent Blame: the tool steps whose edit introduced a line. */
+  blame: (params, signal) => read('/v1/blame' + query(params), signal),
+
   // ---------------------------------------------------- ledger and evidence
 
   ledgerHead: (signal) => read('/v1/ledger/head', signal),

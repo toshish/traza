@@ -32,6 +32,11 @@ import { RunScreen } from './views/RunScreen.jsx';
 import { DiffScreen } from './views/DiffScreen.jsx';
 import { LedgerScreen } from './views/LedgerScreen.jsx';
 import { CredentialsScreen, TokenOnce } from './views/CredentialsScreen.jsx';
+import { ForesightScreen } from './views/ForesightScreen.jsx';
+import { XrayScreen } from './views/XrayScreen.jsx';
+import { ChangesScreen } from './views/ChangesScreen.jsx';
+import { BehaviorsScreen } from './views/BehaviorsScreen.jsx';
+import { BlameScreen } from './views/BlameScreen.jsx';
 
 /** How many samples the rail's ingest sparkline keeps. At a 5s poll this is
     about two minutes of history — long enough to show a shape, short enough
@@ -327,6 +332,11 @@ export function App() {
       case 'run': view = <RunScreen key={k('run:' + second)} runId={second} {...common} />; break;
       case 'guard': view = <GuardScreen key={k('guard')} {...common} />; break;
       case 'diff': view = <DiffScreen key={k('diff')} {...common} />; break;
+      case 'foresight': view = <ForesightScreen key={k('foresight')} {...common} />; break;
+      case 'xray': view = <XrayScreen key={k('xray:' + (second || ''))} runId={second} {...common} />; break;
+      case 'changes': view = <ChangesScreen key={k('changes')} {...common} />; break;
+      case 'behaviors': view = <BehaviorsScreen key={k('behaviors')} {...common} />; break;
+      case 'blame': view = <BlameScreen key={k('blame')} {...common} />; break;
       case 'analytics': view = <AnalyticsScreen key={k('analytics')} {...common} />; break;
       case 'latency': view = <LatencyScreen key={k('latency')} {...common} />; break;
       case 'failures': view = <FailuresScreen key={k('failures')} {...common} />; break;
@@ -353,7 +363,7 @@ export function App() {
         : screen === 'run' ? 'sessions' : screen;
 
   const subtitle = screen === 'trace' && second ? second
-    : screen === 'run' && second ? second
+    : (screen === 'run' || screen === 'xray') && second ? second
       : screen === 'diff' && route.params.get('a') && route.params.get('b')
         ? `${route.params.get('a')} against ${route.params.get('b')}` : undefined;
 
