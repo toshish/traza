@@ -146,8 +146,9 @@ export function FateMap({ map, highlight, selected, onSelect, collapsed, onToggl
   const hovered = hover ? layout.byKey.get(hover.key) : null;
   const lit = highlight || null;
   // A run opened on a deep map: bring its node into view, a third of the
-  // way in, so the canvas does not open on the part the run left behind.
-  const litKey = lit ? lit.atKey : null;
+  // way in, so the canvas does not open on the part the run left behind —
+  // or, on a map drawn short of that node, the deepest of its path drawn.
+  const litKey = lit ? (lit.atKey != null ? lit.atKey : lit.reachedKey) : null;
   React.useEffect(() => {
     const entry = litKey != null ? layout.byKey.get(litKey) : null;
     const node = scroller.current;

@@ -4,7 +4,8 @@ import { navigate, useRead } from '../lib/route.js';
 import { fmtNum, fmtTimeNs } from '../lib/format.js';
 import { routeTenant, tenantParams } from '../lib/runs.js';
 import {
-  SEVERITY, TQL_EXAMPLES, TQL_SYNTAX, WINDOWS, caretLine, fmtPct, matchRoute, ofTotal, windowFrom, windowSince,
+  SEVERITY, TQL_EXAMPLES, TQL_SYNTAX, WINDOWS, caretLine, detectorRate, fmtCi, fmtPct, matchRoute, ofTotal, windowFrom,
+  windowSince,
 } from '../lib/insight.js';
 import { Card, Chip, EmptyState, ErrorState, Kbd, LoadingBar, Mono, PanelHead, RangeBar, Skeleton } from '../components/primitives/Chrome.jsx';
 import { Tag } from '../components/primitives/Tag.jsx';
@@ -105,12 +106,16 @@ function useExplain(text) {
 function QueryBox({ draft, setDraft, explain, onSearch }) {
   const refusal = explain.error && explain.error.body;
   const column = refusal && typeof refusal.column === 'number' ? refusal.column : null;
+  // A query the server refused at a column is not searched, from the chip
+  // or the keyboard: the refusal is already on screen, and a search would
+  // only answer it again.
+  const submit = () => { if (column == null) onSearch(); };
   return <Card>
     <PanelHead title="TQL" note="a regular expression whose letters are steps" action={<span style={{ fontSize: 12, color: 'var(--ink-faint)' }}><Kbd>⌘↵</Kbd> search</span>} />
     <div className="tz-field" style={{ border: `1px solid ${column != null ? 'var(--error)' : 'var(--hairline)'}`, borderRadius: 'var(--radius-control)', background: 'var(--bg-raised)' }}>
       <textarea value={draft} onChange={(e) => setDraft(e.target.value)} spellCheck={false} aria-label="TQL query" rows={3}
         placeholder={'test[error] ..> edit[file~"(^|/)tests?/"] ..> test[not error]'}
-        onKeyDown={(e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); onSearch(); } }}
+        onKeyDown={(e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); submit(); } }}
         style={{
           display: 'block', width: '100%', resize: 'vertical', border: 'none', outline: 'none', background: 'transparent',
           color: 'var(--ink)', fontFamily: 'var(--font-mono)', fontSize: 13, lineHeight: '20px', padding: '8px 10px', minHeight: 64,
@@ -131,7 +136,7 @@ function QueryBox({ draft, setDraft, explain, onSearch }) {
             {explain.data.within ? <span>within <Mono>{explain.data.within.steps != null ? explain.data.within.steps + ' steps' : JSON.stringify(explain.data.within)}</Mono></span> : null}
           </div> : <div style={{ fontSize: 12, color: 'var(--ink-faint)' }}>{explain.pending ? 'Parsing…' : 'Parsed by the server as you type.'}</div>}
       </div>
-      <Chip tone="primary" onClick={column != null ? undefined : onSearch}>Search</Chip>
+      <Chip tone="primary" onClick={submit} title={column != null ? 'The server refused this query; fix it to search' : undefined}>Search</Chip>
     </div>
   </Card>;
 }
@@ -265,6 +270,9 @@ function Findings({ findings, library, go, onSearch, windowId }) {
 
 function DetectorRow({ d, baseline, checked, go, onSearch }) {
   const severity = SEVERITY[d.severity] || SEVERITY.low;
+  // The rate rests on the matched runs whose outcome is known; it is called
+  // worse than the baseline only when its whole interval is below it.
+  const rate = detectorRate(d, baseline);
   return <div data-testid="detector" style={{ display: 'grid', gap: 6, padding: '10px 14px', borderTop: '1px solid var(--hairline)' }}>
     <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
       <Tag status={severity.tone} mono>{d.severity}</Tag>
@@ -272,9 +280,10 @@ function DetectorRow({ d, baseline, checked, go, onSearch }) {
       <Mono size={11} color="var(--ink-faint)">{d.name}</Mono>
       <span style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap', fontSize: 12, color: 'var(--ink-muted)' }}>
         <span><Mono color="var(--accent)">{fmtNum(d.runs_matched)}</Mono> of <Mono>{fmtNum(checked)}</Mono> runs · <Mono>{fmtNum(d.occurrences)}</Mono> {d.occurrences === 1 ? 'time' : 'times'}</span>
-        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }} title="Successes over runs whose outcome is known, against every checked run (the ink hairline)">
-          <CiBar rate={d.success_rate} base={baseline} width={90} label={false} />
-          <Mono color={d.success_rate != null && baseline != null && d.success_rate < baseline ? 'var(--error)' : 'var(--accent)'}>{fmtPct(d.success_rate, 0)}</Mono> succeeded
+        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}
+          title={`Successes over the ${rate.n} matched run${rate.n === 1 ? '' : 's'} whose outcome is known (95% interval ${fmtCi(rate.ci)}), against every checked run (the ink hairline)`}>
+          <CiBar rate={rate.rate} ci={rate.ci || undefined} base={baseline} width={90} label={false} />
+          <span><span data-testid="detector-rate" style={{ fontFamily: 'var(--font-mono)', fontVariantNumeric: 'tabular-nums', color: rate.below ? 'var(--error)' : 'var(--accent)' }}>{fmtPct(rate.rate, 0)}</span> of <Mono>{fmtNum(rate.n)}</Mono> known succeeded</span>
         </span>
         {d.last_seen_ns ? <Mono size={11} color="var(--ink-faint)">last {fmtTimeNs(d.last_seen_ns)}</Mono> : null}
       </span>

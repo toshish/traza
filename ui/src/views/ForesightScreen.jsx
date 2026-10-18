@@ -2,16 +2,17 @@ import React from 'react';
 import { api } from '../lib/api.js';
 import { navigate, useRead } from '../lib/route.js';
 import { fmtNum, fmtTimeNs, fmtDurationNs } from '../lib/format.js';
-import { fmtMoney, routeTenant, tenantParams } from '../lib/runs.js';
+import { fmtMoney, routeTenant, singleTenantScope, tenantParams } from '../lib/runs.js';
 import {
-  FORESIGHT_VERDICT, WINDOWS, bestSkill, fmtCi, fmtP, fmtPct, nodeAt, nodeMeans, pathKey, pathToTql,
-  runOnMap, skillReading, windowFrom, windowSince,
+  DEFAULT_WINDOW, FORESIGHT_VERDICT, MIN_SCORED_RUNS, WINDOWS, bestSkill, drawRunChanges, fmtCi, fmtP, fmtPct, nodeAt,
+  nodeMeans, pathKey, pathToTql, runOnMap, skillReading, windowFrom, windowSince,
 } from '../lib/insight.js';
 import { Card, Chip, EmptyState, ErrorState, LoadingBar, Mono, PanelHead, RangeBar, Skeleton } from '../components/primitives/Chrome.jsx';
 import { Tag } from '../components/primitives/Tag.jsx';
-import { CiBar, Caveat, Kv, OutcomeTag, PathTokens, Tile, TileRow, Token } from '../components/insight/Bits.jsx';
+import { CiBar, Caveat, Kv, OutcomeTag, PathTokens, RunSkill, Tile, TileRow, Token } from '../components/insight/Bits.jsx';
 import { FateLegend, FateMap } from '../components/insight/FateMap.jsx';
 import { NextOptions } from '../components/insight/NextOptions.jsx';
+import { UnscopedNote } from '../components/runs/UnscopedNote.jsx';
 
 // Foresight: an agent's Fate Map. Every path its completed runs took, how
 // often each ended well, where the failing paths part from the rest — and,
@@ -22,6 +23,9 @@ import { NextOptions } from '../components/insight/NextOptions.jsx';
 
 const SUPPORT_CHOICES = [1, 3, 5, 10, 30];
 const DEPTH_CHOICES = [6, 12, 24];
+/** The deepest map the server renders. A depth off the chips (set to draw
+    a deep run's node) is kept and shown as its own chip. */
+const MAX_DEPTH = 65;
 
 /** The cohort a route names, as a key that tells task sub-cohorts and
     tenants apart. */
@@ -38,9 +42,14 @@ export function ForesightScreen({ go, params, identity }) {
   const tenant = routeTenant(params);
   const scope = tenantParams(tenant);
   const minSupport = SUPPORT_CHOICES.includes(Number(params.get('min'))) ? Number(params.get('min')) : 3;
-  const depth = DEPTH_CHOICES.includes(Number(params.get('depth'))) ? Number(params.get('depth')) : 12;
+  const askedDepth = Number(params.get('depth'));
+  const depth = Number.isInteger(askedDepth) && askedDepth >= 1 && askedDepth <= MAX_DEPTH ? askedDepth : 12;
   const selectedKey = params.has('node') ? params.get('node') : null;
   const operator = Boolean(identity && identity.operator);
+  // Foresight is one tenant's, and its route reads the default tenant when
+  // none is named — for an operator, not necessarily this run's. So a run
+  // is read only in a tenant the route names, or under a bound credential.
+  const oneTenant = singleTenantScope(tenant, identity);
 
   const set = (changes, { replace = true } = {}) => {
     const next = new URLSearchParams(params);
@@ -52,7 +61,7 @@ export function ForesightScreen({ go, params, identity }) {
   };
 
   const cohorts = useRead((signal) => api.fateCohorts({ since }, signal), [since]);
-  const foresight = useRead((signal) => api.fateRun(run, scope, signal), [run, tenant], { skip: !run });
+  const foresight = useRead((signal) => api.fateRun(run, scope, signal), [run, tenant, oneTenant], { skip: !run || !oneTenant });
   // The run names its agent; a map opened from a run follows it.
   const runAgent = foresight.data && foresight.data.agent;
   const shownAgent = agent || runAgent || (cohorts.data && cohorts.data.cohorts && cohorts.data.cohorts[0] && cohorts.data.cohorts[0].agent) || '';
@@ -65,7 +74,10 @@ export function ForesightScreen({ go, params, identity }) {
       : listed ? listed.tenant : undefined;
   // The map waits for what decides its cohort and tenant, so it is asked
   // for once rather than once per answer that refines them.
-  const ready = Boolean((cohorts.data || cohorts.error) && (!run || foresight.data || foresight.error));
+  // A run named with no tenant waits for the identity, which decides
+  // whether the run can be read at all.
+  const runSettled = !run || (oneTenant ? Boolean(foresight.data || foresight.error) : identity != null);
+  const ready = Boolean((cohorts.data || cohorts.error) && runSettled);
   const map = useRead((signal) => api.fateMap({
     agent: shownAgent, task: task || undefined, since, depth, min_support: minSupport,
     ...tenantParams(shownTenant),
@@ -93,8 +105,15 @@ export function ForesightScreen({ go, params, identity }) {
     () => (sameCohort ? runOnMap(data.root, foresight.data) : null),
     [sameCohort, data, foresight.data],
   );
-  const activeKey = selectedKey != null ? selectedKey : highlight ? highlight.atKey : '';
+  // Drawn short of the judged node, the panel opens on the deepest node of
+  // the run's path the map does draw; the banner says why it stops there.
+  const activeKey = selectedKey != null ? selectedKey
+    : highlight ? (highlight.atKey != null ? highlight.atKey : highlight.reachedKey) : '';
   const activeNode = data ? nodeAt(data.root, activeKey ? activeKey.split('\u0001') : []) : null;
+  const drawChanges = drawRunChanges(highlight, data, DEPTH_CHOICES);
+  // The map's own score at the depth the run was judged, read only off the
+  // build the run was judged against: its cohort, the default window.
+  const runSkill = sameCohort && windowId === DEFAULT_WINDOW ? { calibration: data.calibration } : null;
 
   const pickCohort = (c) => {
     const changes = { agent: c.agent, task: c.task || null, node: null, tenant: operator ? (c.tenant || '') : null };
@@ -116,7 +135,8 @@ export function ForesightScreen({ go, params, identity }) {
       </span>
       <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
         <span style={{ fontSize: 12, color: 'var(--ink-muted)' }}>depth</span>
-        {DEPTH_CHOICES.map((n) => <Chip key={n} mono active={depth === n} onClick={() => set({ depth: n === 12 ? null : n })}>{n}</Chip>)}
+        {(DEPTH_CHOICES.includes(depth) ? DEPTH_CHOICES : [...DEPTH_CHOICES, depth].sort((a, b) => a - b))
+          .map((n) => <Chip key={n} mono active={depth === n} onClick={() => set({ depth: n === 12 ? null : n })}>{n}</Chip>)}
       </span>
       {data ? <span style={{ marginLeft: 'auto', fontSize: 12, color: 'var(--ink-faint)' }}>
         built <Mono color="var(--ink-muted)" size={11}>{fmtTimeNs(data.built_at_ns)}</Mono> from <Mono color="var(--ink-muted)" size={11}>{fmtNum(data.bounds.spans_read)}</Mono> spans
@@ -125,7 +145,10 @@ export function ForesightScreen({ go, params, identity }) {
     <LoadingBar active={map.loading || cohorts.loading || foresight.loading} />
 
     {run ? <RunForesightBanner foresight={foresight} run={run} tenant={tenant} go={go}
-      mismatch={mismatch} windowId={windowId} /> : null}
+      mismatch={mismatch} windowId={windowId} oneTenant={oneTenant} identityKnown={identity != null}
+      onScope={(name) => set({ tenant: name, node: null })} highlight={highlight} map={data}
+      drawChanges={drawChanges} onDraw={() => set({ ...drawChanges, node: null })}
+      runSkill={runSkill} /> : null}
 
     <MapBody map={map} data={data} shownAgent={shownAgent} task={task} windowId={windowId} cohorts={list}
       highlight={highlight} activeKey={activeKey} activeNode={activeNode} collapsed={collapsed} onToggle={toggle}
@@ -187,6 +210,7 @@ function MapBody({ map, data, shownAgent, task, windowId, highlight, activeKey, 
   if (!data) return <Skeleton height={380} />;
   const skill = bestSkill(data.calibration);
   const caveats = boundsCaveats(data);
+  const searchScope = { agent: data.agent, ...tenantParams(data.tenant) };
   return <>
     <TileRow columns={7}>
       <Tile label="completed runs" value={fmtNum(data.runs)} testId="tile-runs" />
@@ -195,8 +219,9 @@ function MapBody({ map, data, shownAgent, task, windowId, highlight, activeKey, 
       <Tile label="nodes shown" value={`${fmtNum(data.nodes_shown)} / ${fmtNum(data.nodes_total)}`} tone="var(--ink)" />
       <Tile label="fatal forks" value={fmtNum(data.fatal_forks.length)} tone={data.fatal_forks.length ? 'var(--error)' : 'var(--ink)'} />
       <Tile label="hotspots" value={fmtNum(data.hotspots.length)} tone="var(--ink)" />
-      <Tile label="best skill" value={skill ? fmtPct(skill.skill, 0) : '—'} note={skill ? `depth ${skill.depth}` : ''}
-        title="How much of the base rate's prediction error the map removes, scored on runs it did not see" />
+      <Tile label="best skill" value={skill ? fmtPct(skill.skill, 0) : '—'} testId="tile-skill"
+        note={skill ? `depth ${skill.depth} · ${fmtNum(skill.covered)} runs` : `none on ${MIN_SCORED_RUNS}+ runs`}
+        title={`How much of the base rate's prediction error the map removes, scored on runs it did not see; only depths scored on ${MIN_SCORED_RUNS} or more runs are considered`} />
     </TileRow>
     {caveats.length ? <div style={{ display: 'grid', gap: 3 }}>{caveats.map((c) => <Caveat key={c}>{c}</Caveat>)}</div> : null}
 
@@ -214,7 +239,7 @@ function MapBody({ map, data, shownAgent, task, windowId, highlight, activeKey, 
 
     <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: 14, alignItems: 'start' }}>
       <NodePanel node={activeNode} nodeKey={activeKey} base={data.base_rate} go={go} tenant={tenant} windowId={windowId}
-        folded={collapsed.has(activeKey)} onToggle={onToggle} />
+        folded={collapsed.has(activeKey)} onToggle={onToggle} searchScope={searchScope} task={data.task} agent={data.agent} />
       <ForksCard forks={data.fatal_forks} base={data.base_rate} onSelect={onSelect} />
       <CalibrationCard calibration={data.calibration} />
       <HotspotsCard hotspots={data.hotspots} onSelect={onSelect} />
@@ -238,7 +263,7 @@ export function boundsCaveats(data) {
 
 /** The selected node: its figures, its example runs, and what to do next
     with them. */
-function NodePanel({ node, nodeKey, base, go, tenant, windowId, folded, onToggle }) {
+function NodePanel({ node, nodeKey, base, go, tenant, windowId, folded, onToggle, searchScope, task, agent }) {
   if (!node) return <Card><PanelHead title="Node" /><div style={{ fontSize: 12, color: 'var(--ink-muted)' }}>Click a node of the map.</div></Card>;
   const path = nodeKey ? nodeKey.split('\u0001') : [];
   const means = nodeMeans(node);
@@ -284,10 +309,13 @@ function NodePanel({ node, nodeKey, base, go, tenant, windowId, folded, onToggle
       <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
         {success && failure ? <Chip onClick={() => go(['diff'], { a: success.run, b: failure.run, ...(runParams || {}) })}
           title="Align a success and a failure from this point and name where they parted">Diff success vs {failure.outcome}</Chip> : null}
-        {tql ? <Chip onClick={() => go(['behaviors'], { q: tql, ...(windowId !== '30d' ? { window: windowId } : {}) })}
-          title={'Search for runs that took this path: ' + tql}>Find these runs</Chip> : null}
+        {tql ? <Chip onClick={() => go(['behaviors'], { q: tql, ...searchScope, ...(windowId !== '30d' ? { window: windowId } : {}) })}
+          title={'Search the cohort\'s runs for this path: ' + tql}>Find these runs</Chip> : null}
         {(node.children || []).length ? <Chip onClick={() => onToggle(nodeKey)}>{folded ? 'Unfold branches' : 'Fold branches'}</Chip> : null}
       </div>
+      {tql && task ? <div style={{ fontSize: 11, color: 'var(--ink-faint)', lineHeight: '16px' }}>
+        Find these runs searches every task of {agent}: a search cannot narrow to one task.
+      </div> : null}
     </div>
   </Card>;
 }
@@ -345,9 +373,14 @@ export function CalibrationCard({ calibration }) {
     <PanelHead title="How good is this map" note="two-fold cross-validation" />
     {!depths.length ? <div style={{ fontSize: 12, color: 'var(--ink-muted)' }}>Too few runs to score.</div> : <>
       <div style={{ fontSize: 12, color: 'var(--ink-muted)', lineHeight: '18px', marginBottom: 8 }}>
-        At its best the map is <strong style={{ color: 'var(--ink)', fontWeight: 500 }}>{skillReading(best && best.skill)}</strong>
-        {best ? <> (skill <Mono color="var(--accent)">{fmtPct(best.skill, 0)}</Mono> at depth {best.depth})</> : null}.
-        {best && best.skill < 0.05 ? ' Do not act on its verdicts: outcome barely depends on path here.' : ' Read skill before trusting a verdict.'}
+        {best ? <>
+          At its best the map is <strong style={{ color: 'var(--ink)', fontWeight: 500 }}>{skillReading(best.skill)}</strong>
+          {' '}(skill <Mono color="var(--accent)">{fmtPct(best.skill, 0)}</Mono> at depth {best.depth}, over <Mono>{fmtNum(best.covered)}</Mono> runs).
+          {best.skill < 0.05 ? ' Do not act on its verdicts: outcome barely depends on path here.' : ' Skill varies by depth: read it at the depth a verdict was given.'}
+        </> : <>
+          No depth was scored on {MIN_SCORED_RUNS} or more runs, so the map's skill cannot be told from the luck of
+          the split. Treat its verdicts as unscored.
+        </>}
       </div>
       <div role="table" aria-label="Calibration by depth" style={{ display: 'grid', gridTemplateColumns: '44px 56px 64px 64px minmax(60px, 1fr)', fontSize: 12 }}>
         {['depth', 'runs', 'Brier', 'base', 'skill'].map((h) => <div key={h} role="columnheader" style={{ color: 'var(--ink-muted)', padding: '2px 0', borderBottom: '1px solid var(--hairline)' }}>{h}</div>)}
@@ -392,7 +425,19 @@ function Reliability({ bins }) {
 
 /** A run read against its agent's map: the verdict, the interval it rests
     on, its path, and what earlier runs did next from there. */
-function RunForesightBanner({ foresight, run, tenant, go, mismatch, windowId }) {
+function RunForesightBanner({
+  foresight, run, tenant, go, mismatch, windowId, oneTenant, identityKnown, onScope, highlight, map, drawChanges, onDraw, runSkill,
+}) {
+  if (!oneTenant) {
+    if (!identityKnown) return <Skeleton height={60} />;
+    return <Card data-testid="run-foresight">
+      <UnscopedNote onScope={onScope}>
+        Foresight reads one tenant, and with no tenant named its route reads the default tenant's run{' '}
+        <Mono size={12}>{run}</Mono>, which may be another tenant's run of the same id. Name the run's tenant to
+        read it and light it on its map:
+      </UnscopedNote>
+    </Card>;
+  }
   if (foresight.error) {
     return <ErrorState what={foresight.error.status === 404 ? `No span carries run ${run}.` : foresight.error.what} next={foresight.error.next} />;
   }
@@ -417,8 +462,18 @@ function RunForesightBanner({ foresight, run, tenant, go, mismatch, windowId }) 
           support <Mono>{fmtNum(f.support)}</Mono> of <Mono>{fmtNum(f.cohort_runs)}</Mono> completed runs · needs <Mono>{fmtNum(f.min_support)}</Mono> · matched <Mono>{f.matched_depth}</Mono> of <Mono>{f.path.length}</Mono> tokens
         </div>
         <PathTokens path={f.path} matched={f.matched_depth} max={12} accentIndex={f.divergence ? f.divergence.depth : undefined} />
+        {runSkill ? <RunSkill calibration={runSkill.calibration} depth={f.matched_depth} /> : null}
         {mismatch ? <Caveat>{mismatch}</Caveat> : null}
         {windowId !== '30d' ? <Caveat>Foresight judges a run against the last 30 days; the map shown covers {windowId}.</Caveat> : null}
+        {highlight && !highlight.complete && map ? <div data-testid="run-past-map" style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+          <Caveat>
+            Foresight judged this run at depth {highlight.matchedDepth}; the map shown draws {highlight.walked} of its tokens
+            {highlight.matchedDepth > map.depth ? ` (it is cut at depth ${map.depth})` : ` (nodes under ${map.min_support} runs are pruned)`},
+            so the run's node, its next options and its siblings are not placed on it.
+          </Caveat>
+          {drawChanges && Object.keys(drawChanges).length ? <Chip onClick={onDraw}
+            title={[drawChanges.depth ? `depth ${drawChanges.depth}` : null, drawChanges.min ? `min support ${drawChanges.min}` : null].filter(Boolean).join(', ')}>Draw it</Chip> : null}
+        </div> : null}
       </div>
       <NextOptions foresight={f} />
     </div>

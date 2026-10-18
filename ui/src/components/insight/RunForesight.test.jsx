@@ -10,6 +10,7 @@ import { render, act, cleanup, fireEvent, screen } from '@testing-library/react'
 import novel from '../../test/fixtures/insight/fate_run_novel.json';
 import doomed from '../../test/fixtures/insight/fate_run_doomed.json';
 import cc from '../../test/fixtures/insight/fate_run_cc.json';
+import supportMap from '../../test/fixtures/insight/fate_map_support.json';
 import tape from '../../test/fixtures/tape_weather9.json';
 
 vi.mock('../../lib/api.js', () => ({
@@ -20,6 +21,9 @@ vi.mock('../../lib/api.js', () => ({
       if (run === 'weather-9' || run === 'gone') throw Object.assign(new Error('run not found'), { status: 404, what: 'run not found' });
       return cc;
     }),
+    // The calibration is the build's, whatever depth is drawn: the support
+    // agent's default-window map answers it.
+    fateMap: vi.fn(async () => supportMap),
     tape: vi.fn(async () => tape),
     fuseRun: vi.fn(async () => null),
     sessions: vi.fn(async () => ({ sessions: [] })),
@@ -30,12 +34,14 @@ const { RunForesight } = await import('./RunForesight.jsx');
 const { RunScreen } = await import('../../views/RunScreen.jsx');
 const { api } = await import('../../lib/api.js');
 
-async function panel(runId, tenant) {
+async function panel(runId, tenant, oneTenant = true) {
   const go = vi.fn();
-  render(<RunForesight runId={runId} tenant={tenant} go={go} />);
-  await act(async () => { for (let i = 0; i < 4; i += 1) await Promise.resolve(); });
+  render(<RunForesight runId={runId} tenant={tenant} oneTenant={oneTenant} go={go} />);
+  await act(async () => { for (let i = 0; i < 6; i += 1) await Promise.resolve(); });
   return go;
 }
+
+const OPERATOR = { auth: 'token', scope: 'admin', operator: true, tenant: null };
 
 beforeEach(() => Object.values(api).forEach((fn) => fn.mockClear()));
 afterEach(cleanup);
@@ -53,12 +59,28 @@ describe('the foresight panel', () => {
     expect(go).toHaveBeenCalledWith(['foresight'], { run: 'live-novel-0', agent: 'support-agent', tenant: '' });
   });
 
+  it("warns that the map's verdicts at the run's depth are worth no more than the base rate", async () => {
+    await panel('live-novel-0', '');
+    // The default-window build, drawn as small as the route allows: only its calibration is read.
+    expect(api.fateMap).toHaveBeenCalledWith({ agent: 'support-agent', depth: 1, max_nodes: 1, tenant: '' }, expect.anything());
+    const skill = screen.getByTestId('run-skill').textContent;
+    expect(skill).toContain('skill 0% at depth 1');
+    expect(skill).toContain('Do not act on this verdict');
+  });
+
   it('draws a likely failure against the base rate', async () => {
     await panel('live-doomed-0');
     const text = screen.getByTestId('run-foresight-panel').textContent;
     expect(text).toContain('likely failure');
     expect(text).toContain('10.0% 4.3–21.4%');
     expect(screen.getAllByRole('img', { name: /success 10\.0%, 95% interval 4\.3–21\.4%, base rate 54\.4%/ }).length).toBeGreaterThan(0);
+    expect(screen.getByTestId('run-skill').textContent).toContain('skill 21% at depth 2');
+  });
+
+  it('reads nothing for an operator who names no tenant: the route would read the default tenant', async () => {
+    await panel('live-doomed-0', undefined, false);
+    expect(api.fateRun).not.toHaveBeenCalled();
+    expect(screen.getByTestId('run-foresight-panel').textContent).toContain('Foresight reads one tenant');
   });
 
   it('shows a run with no history to compare against without inventing odds', async () => {
@@ -90,5 +112,15 @@ describe('the Run screen', () => {
     expect(screen.getAllByTestId('xray-link')).toHaveLength(1);
     fireEvent.click(screen.getByText('X-Ray'));
     expect(go).toHaveBeenCalledWith(['xray', 'weather-9'], { tenant: '' });
+  });
+
+  it('shows no foresight beside a tape read across every tenant, as it shows no guard verdict', async () => {
+    render(<RunScreen runId="acme-7" go={vi.fn()} params={new URLSearchParams('')} identity={OPERATOR} pushToast={vi.fn()} />);
+    await act(async () => { for (let i = 0; i < 4; i += 1) await Promise.resolve(); });
+    expect(api.tape).toHaveBeenCalled();
+    expect(api.fateRun).not.toHaveBeenCalled();
+    expect(api.fuseRun).not.toHaveBeenCalled();
+    expect(screen.getByTestId('run-foresight-panel').textContent).toContain('Foresight reads one tenant');
+    expect(screen.getByTestId('unscoped').textContent).toContain('no guard verdict or foresight is shown');
   });
 });

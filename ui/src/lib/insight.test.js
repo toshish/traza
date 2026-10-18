@@ -5,10 +5,14 @@
 import { describe, it, expect } from 'vitest';
 import {
   AT_OR_ABOVE, RAMP_STEPS, bestSkill, branchWidth, cacheSegments, caretLine, ciContains, classTotals, compactPath,
-  deltaDirection, DELTA_METRICS, fmtCi, fmtP, fmtPct, layoutFate, matchRoute, nodeAt, nodeMeans, pathKey, pathToTql,
-  provenanceGroups, rateColor, runOnMap, shortName, skillReading, splitToken, stableWithoutRead, windowFrom, windowSince,
+  deltaDirection, DELTA_METRICS, detectorRate, fmtCi, fmtP, fmtPct, layoutFate, matchRoute, nodeAt, nodeMeans, pathKey, pathToTql,
+  provenanceGroups, rateColor, runOnMap, shortName, skillAt, skillReading, splitToken, stableWithoutRead, wilson, windowFrom, windowSince,
 } from './insight.js';
 import supportMap from '../test/fixtures/insight/fate_map_support.json';
+import supportDepth2 from '../test/fixtures/insight/fate_map_support_depth2.json';
+import supportMin100 from '../test/fixtures/insight/fate_map_support_min100.json';
+import researcherMap from '../test/fixtures/insight/fate_map_researcher.json';
+import findings from '../test/fixtures/insight/findings.json';
 import doomed from '../test/fixtures/insight/fate_run_doomed.json';
 import healthy from '../test/fixtures/insight/fate_run_healthy.json';
 import novel from '../test/fixtures/insight/fate_run_novel.json';
@@ -123,6 +127,32 @@ describe('the Fate Map', () => {
     expect(runOnMap(supportMap.root, doomed).atKey).toBe(pathKey(['llm:gpt-4o', 'tool:search_orders×3-5']));
   });
 
+  it('places nothing on a map drawn shorter than where foresight judged the run, and says how far it got', () => {
+    // The same store, the map asked for at depth 2: foresight matched the
+    // healthy run at depth 4, past the last drawn column.
+    const cut = runOnMap(supportDepth2.root, healthy);
+    expect(cut.complete).toBe(false);
+    expect(cut.walked).toBe(2);
+    expect(cut.matchedDepth).toBe(4);
+    expect(cut.atKey).toBeNull();
+    expect(cut.reachedKey).toBe(pathKey(['llm:gpt-4o', 'tool:search_orders']));
+    expect([...cut.keys].sort()).toEqual([pathKey([]), pathKey(['llm:gpt-4o']), pathKey(['llm:gpt-4o', 'tool:search_orders'])].sort());
+    expect(cut.pooled.size).toBe(0);
+    expect(cut.recommendedKey).toBeNull();
+    // Pruned rather than cut: at min support 100 the doomed run's loop
+    // (50 runs) is not drawn, so no shallower node stands in for it.
+    const pruned = runOnMap(supportMin100.root, doomed);
+    expect(pruned.complete).toBe(false);
+    expect(pruned.walked).toBe(1);
+    expect(pruned.atKey).toBeNull();
+    // A novel run's divergence is drawn only from the node it diverged at.
+    const ghost = runOnMap(supportMin100.root, novel);
+    expect(ghost.complete).toBe(true);
+    expect(ghost.atKey).toBe(pathKey(['llm:gpt-4o']));
+    expect(ghost.divergence.took).toBe('tool:delete_database');
+    expect(runOnMap(supportMap.root, healthy).complete).toBe(true);
+  });
+
   it('turns a path into the TQL that finds the runs which took it', () => {
     expect(pathToTql(['llm:gpt-4o', 'tool:search_orders×3-5'])).toBe('^llm("gpt-4o") -> tool("search_orders"){3,5}');
     expect(pathToTql(['llm:gpt-4o', 'tool:issue_refund×2', 'agent:x×6+'])).toBe('^llm("gpt-4o") -> tool("issue_refund"){2} -> agent("x"){6,}');
@@ -156,6 +186,22 @@ describe('the Fate Map', () => {
     expect(skillReading(0.01)).toBe('no better than the base rate');
     expect(bestSkill({ depths: [] })).toBeNull();
   });
+
+  it('headlines no depth scored on too few runs, and reads the skill at the depth a run was judged', () => {
+    // The support map's rows, and one deep row scored on twelve runs that a
+    // lucky split would make the best.
+    const lucky = { depths: [...supportMap.calibration.depths, { depth: 8, runs: 180, covered: 12, brier: 0.1, baseline_brier: 0.25, skill: 0.6 }] };
+    expect(bestSkill(lucky).depth).toBe(3);
+    // The researcher's depth 3 reached no run at all.
+    expect(bestSkill(researcherMap.calibration).depth).toBe(1);
+    expect(bestSkill({ depths: [{ depth: 1, runs: 12, covered: 12, brier: 0.2, baseline_brier: 0.25, skill: 0.2 }] })).toBeNull();
+    expect(skillAt(supportMap.calibration, 1).skill).toBe(0);
+    expect(skillAt(supportMap.calibration, 2).skill).toBeCloseTo(0.2053);
+    expect(skillAt(supportMap.calibration, 4).depth).toBe(3);
+    expect(skillAt(supportMap.calibration, 40).depth).toBe(5);
+    expect(skillAt(lucky, 8).depth).toBe(5);
+    expect(skillAt(supportMap.calibration, 0)).toBeNull();
+  });
 });
 
 describe('the X-Ray', () => {
@@ -184,10 +230,44 @@ describe('the X-Ray', () => {
     expect(s2.served + s2.lost + s2.fresh).toBe(stable.est_tokens);
   });
 
+  it('keeps the shared prefix of a broken call servable: only past the TTL is it lost too', () => {
+    // Step 2 broke on a clock in the system prompt: 154 of its 254 tokens
+    // lead byte-identical to step 0, and ~34 (129 at the provider's scale)
+    // of what followed the divergence were re-processed.
+    const volatile = autopsy.steps.find((s) => s.step_index === 2);
+    expect(volatile.cause).toBe('volatile_content');
+    expect(cacheSegments(volatile)).toEqual({ total: 254, served: 154, lost: 34, fresh: 66 });
+    // A compaction (new_context with a predecessor) keeps its leading chunks too.
+    const rewritten = autopsy.steps.find((s) => s.step_index === 34);
+    expect(rewritten.cause).toBe('new_context');
+    expect(cacheSegments(rewritten)).toEqual({ total: 219, served: 154, lost: 6, fresh: 59 });
+    // The run's first call has nothing to serve from.
+    expect(cacheSegments(autopsy.steps[0]).served).toBe(0);
+    // Whether a strict prefix hits is unknown: nothing is drawn as servable.
+    expect(cacheSegments({ ...rewritten, cause: 'unknown' }).served).toBe(0);
+  });
+
   it('marks a held prefix the provider served nothing from', () => {
     const flagged = ccAutopsy.steps.filter(stableWithoutRead).map((s) => s.step_index);
     expect(flagged).toEqual([13]);
     expect(ccAutopsy.summary.disagreements).toBe(1);
+  });
+});
+
+describe('detectors', () => {
+  it("gives a detector's success rate its interval over the runs whose outcome is known", () => {
+    expect(wilson(5, 50)[0]).toBeCloseTo(0.0435, 4);
+    expect(wilson(5, 50)[1]).toBeCloseTo(0.2136, 4);
+    expect(wilson(0, 0)).toBeNull();
+    const hallucinated = findings.detectors.find((d) => d.name === 'hallucinated_tool');
+    const rate = detectorRate(hallucinated, findings.baseline_success_rate);
+    expect(rate.n).toBe(1);
+    expect(rate.rate).toBe(0);
+    expect(rate.ci[1]).toBeGreaterThan(findings.baseline_success_rate);
+    // One failure in one run cannot tell the detector from the baseline.
+    expect(rate.below).toBe(false);
+    const quiet = detectorRate(findings.detectors.find((d) => d.name === 'ping_pong'), findings.baseline_success_rate);
+    expect(quiet).toEqual({ rate: null, ci: null, n: 0, below: false });
   });
 });
 

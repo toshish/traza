@@ -46,17 +46,26 @@ describe('the timeline', () => {
     expect(screen.getAllByTestId('agent-changes')).toHaveLength(1);
     expect(screen.getAllByTestId('change-marker').map((m) => m.textContent)).toEqual(['system prompt', 'service version']);
     const stretches = screen.getAllByTestId('regime').map((r) => r.textContent);
-    // Named by the service version, not the prompt's digest.
-    expect(stretches).toEqual(['1.4.2err 5%', '1.5.0err 40%']);
+    // Named by the service version, not the prompt's digest; each rate with
+    // the runs it counts.
+    expect(stretches).toEqual(['1.4.2err 5% of 60', '1.5.0err 40% of 60']);
   });
 
   it('splits an agent into regimes at its change points', () => {
     const bot = changes.agents[0];
     const r = regimes(bot);
     expect(r).toHaveLength(2);
-    expect(r[0]).toMatchObject({ from: bot.first_run_ns, verdict: null, error: 0.05 });
-    expect(r[1]).toMatchObject({ to: bot.last_run_ns, verdict: 'regression', label: '1.5.0', error: 0.4 });
+    expect(r[0]).toMatchObject({ from: bot.first_run_ns, verdict: null, error: 0.05, n: 60 });
+    expect(r[1]).toMatchObject({ to: bot.last_run_ns, verdict: 'regression', label: '1.5.0', error: 0.4, n: 60 });
     expect(regimes(changes.agents[2])).toEqual([]);
+  });
+
+  it('labels no stretch with a rate when unlisted change points may have cut its sides', () => {
+    // Past 40 changes the lowest-ranked are not listed, yet each still
+    // bounds its neighbours' sides: a drawn stretch may hold several.
+    const r = regimes({ ...changes.agents[0], truncated: true });
+    expect(r.map((s) => s.label)).toEqual(['1.4.2', '1.5.0']);
+    expect(r.map((s) => s.error)).toEqual([null, null]);
   });
 });
 

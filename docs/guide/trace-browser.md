@@ -163,8 +163,8 @@ would read every tenant's `weather-7` interleaved. The Sessions list links each
 session with its tenant for the same reason. A run opened without one (from
 the command palette, or a typed link) is read the way the server reads it:
 a tenant-bound credential sees its own tenant, and an operator sees a note
-that the tape spans every tenant, no guard verdict, and a field to name the
-tenant (empty: the default).
+that the tape spans every tenant, no guard verdict or foresight, and a field
+to name the tenant (empty: the default).
 
 **A query lives in the URL.** The Traces screen serializes its predicates,
 window, sort and limit into the hash, so the search that found the bug is a
@@ -382,14 +382,20 @@ made — is dropped rather than shown beside the new one.
 suggestions, and opens the diff.
 
 **Foresight** reads [`GET /v1/fate/runs/{run}`](http-api.md#get-v1faterunsrun)
-in the run's tenant: the verdict, the server's sentence, the success rate
-with its interval against the agent's base rate, the support, the path (long
-paths folded around where the map stopped matching), and what earlier runs
-did next, the recommended option tagged; **On the Fate Map** opens
-[Foresight](#foresight) with the run lit. A run the map holds no span of says
-so, and a run with no history to compare against shows no odds. **X-Ray** in
-the header, and **X-Ray this call** on an opened model call, open
-[X-Ray](#x-ray) at the run or at that call.
+in the tenant the route names (a bound credential's own when it names none):
+the verdict, the server's sentence, the success rate with its interval
+against the agent's base rate, the support, the map's calibration skill at
+the depth the run was judged (the nearest depth scored on 30 or more runs,
+read from the agent's default-window map; under 5% the panel says not to act
+on the verdict), the path (long paths folded around where the map stopped
+matching), and what earlier runs did next, the recommended option tagged;
+**On the Fate Map** opens [Foresight](#foresight) with the run lit. That route
+reads the default tenant when none is named, so for an operator with no
+tenant in the route the panel reads nothing and asks for the tenant, as the
+guard verdict does. A run the map holds no span of says so, and a run with no
+history to compare against shows no odds. **X-Ray** in the header, and
+**X-Ray this call** on an opened model call, open [X-Ray](#x-ray) at the run
+or at that call.
 
 ## Diff
 
@@ -423,8 +429,11 @@ server's default and the build it caches. **min support** (1 to 30) and
 **depth** set the map's pruning; a map whose every branch falls under the
 support says so rather than drawing a bare start. Tiles give completed runs,
 the base rate, runs live or unknown, nodes shown of the tree's total, fatal
-forks, hotspots, and the map's best calibration skill. Whatever bounded the build — a narrowed window,
-the node cap, runs read in part — is said under the tiles.
+forks, hotspots, and the map's best calibration skill with the depth and the
+runs it was scored on — only depths scored on 30 or more runs are considered,
+since a depth few runs reached can win on the luck of the split. Whatever
+bounded the build — a narrowed window, the node cap, runs read in part — is
+said under the tiles.
 
 The map is drawn left to right. A branch is as wide as the runs that went that
 way, and the ribbons leaving a node are stacked, so what a node passes on adds
@@ -441,11 +450,14 @@ it in the panel under the map (`?node=` in the route) with its example runs,
 **Diff success vs failure** (the newest success and failure through the node,
 in [Diff](#diff)) and **Find these runs**, which opens [Behaviors](#behaviors)
 with the TQL that matches the path — each token an atom, its repeat bucket a
-count, anchored at the run's first step. Double-clicking folds a branch. Below
-sit the fatal forks and hotspots (each opens its node) and **How good is this
-map**: Brier score, baseline and skill per depth, the skill read in words —
-under 5% the screen says not to act on the verdicts — and the reliability
-bins drawn as predicted against observed.
+count, anchored at the run's first step — searching the cohort's agent in the
+map's tenant. A search cannot narrow to one task, so on a task sub-cohort's
+map the panel says the search covers every task of the agent.
+Double-clicking folds a branch. Below sit the fatal forks and hotspots (each
+opens its node) and **How good is this map**: Brier score, baseline and skill
+per depth, the best skill read in words — under 5% the screen says not to act
+on the verdicts — and the reliability bins drawn as predicted against
+observed.
 
 **A run on its map.** `?run=<run>` (the Run screen links here) reads
 [`GET /v1/fate/runs/{run}`](http-api.md#get-v1faterunsrun) and opens its
@@ -454,11 +466,18 @@ judged at (`THIS RUN`), the siblings pooled with a live run's open last step
 (dashed), the option earlier runs did best with (`RECOMMENDED NEXT`), and, for
 a novel run, a dashed branch to the step it took that no earlier run took. A
 banner above the tiles gives the verdict, the server's sentence, the interval
-against the base rate, the support, the path (matched tokens solid), and what
-earlier runs did next with their rates. Foresight judges a run against its
-agent's last 30 days; with another window chosen, the banner says so, and
-when the map shown is another cohort's, the banner says that instead of
-lighting anything.
+against the base rate, the support, the path (matched tokens solid), the
+map's skill at the depth the run was judged, and what earlier runs did next
+with their rates. Foresight judges a run against its agent's last 30 days;
+with another window chosen, the banner says so (and gives no skill), and when
+the map shown is another cohort's, the banner says that instead of lighting
+anything. Foresight walks the whole tree, so a run can be judged deeper than
+the map's **depth** or at a node **min support** pruned: the map then lights
+only the part of the run's path it draws, places nothing on an ancestor, and
+the banner says how far it got, with **Draw it** to set the depth or support
+that draws the run's node. The run is read in the tenant the route names; an
+operator who names none gets a field to name it instead, since the route
+would read the default tenant's run of that id.
 
 ## X-Ray
 
@@ -475,9 +494,13 @@ where the provider disagrees, and the cache lifetime assumed (`5 min`, or
 call: its context split into the prefix the cache could serve, the tokens it
 re-processed although the previous call had them — the loss, in the accent —
 and new content, with a cause marker under it (stable, broken, TTL expired,
-new context). The server scales lost tokens by the provider's count; the bar
-takes them back to the estimate's scale so the three parts share a unit, and
-hovering a column gives the server's figures and sentence. Each break shape
+new context). A broken call's leading chunks identical to the previous
+call's are still drawn as servable, since its loss is what followed the
+divergence; past the TTL the server counts that prefix lost too, and a call
+whose verdict is unknown draws none. The server scales lost tokens by the
+provider's count; the bar takes them back to the estimate's scale so the
+three parts share a unit, and hovering a column gives the server's figures
+and sentence. Each break shape
 (culprit) is a card with its diff — the volatile token struck and its
 replacement on the accent tint — the tokens and money it cost, and the fixed
 advice the server chose for it. **Calls** lists the breaks (or every call)
@@ -515,8 +538,12 @@ with its regression count) narrow it.
 Each agent has its summary sentence, its current fingerprint, any volatile
 dimension, and a timeline: the stretches between its change points, each
 named by the value the change set up (the most readable of co-changed
-values, a version before a digest) with its error rate, tinted by that
-change's verdict, and a marker per change point. A change card gives the
+values, a version before a digest) with its error rate and the finished runs
+it counts — the side of the change that opens the stretch, which stops at the
+next change point — tinted by that change's verdict, and a marker per change
+point. An agent with more than 40 changes lists only the highest-ranked, and
+the unlisted ones still bound their neighbours' sides, so its stretches carry
+no rate. A change card gives the
 verdict, what decided it (quality or efficiency), the dimension and its
 co-changes, when, the effect size, from and to, the dimension's own evidence
 (the prompt edit as a diff, tools added and removed, parameters changed, or
@@ -554,15 +581,18 @@ examples to run with a click.
 
 **Detectors** runs the library over the window: the detectors that fired
 first, by severity, each with its runs matched of the runs checked, its
-occurrences, its success rate drawn against every checked run's, when it last
-fired, its example runs and captures, and **Search this pattern**; the quiet
-ones follow, one line each.
+occurrences, its success rate with its 95% interval over the matched runs
+whose outcome is known (and how many those are), drawn against every checked
+run's and marked worse only when the whole interval lies below it, when it
+last fired, its example runs and captures, and **Search this pattern**; the
+quiet ones follow, one line each.
 
 ## Blame
 
 `#/blame?path=&line=` — [Agent Blame](recorders.md#agent-blame) from
 [`GET /v1/blame`](http-api.md#get-v1blame): a file path (or suffix), the exact
-line, and optionally repository roots (`project`, repeatable). The answer
+line, and optionally repository roots, one per line so a path may hold
+spaces (each sent as a repeated `project`). The answer
 shows the line as compared and, earliest first, each tool step that
 introduced it: when, the tool, the sub-agent, the prompt that turn was given,
 the model that asked for the edit, the run and its step (**Open the step on

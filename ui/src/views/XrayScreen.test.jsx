@@ -62,6 +62,20 @@ describe('the Cache Autopsy', () => {
     expect(calls).toHaveLength(19);
     expect(calls.map((c) => c.getAttribute('data-cause')).filter((c) => c !== 'stable'))
       .toEqual(['new_context', 'volatile_content', 'ttl_expired', 'new_context']);
+    // The clock break still had its first 154 tokens servable; what it lost
+    // came after the divergence.
+    const parts = (call) => Object.fromEntries([...call.querySelectorAll('[data-part]')].map((p) => [p.getAttribute('data-part'), Number(p.getAttribute('data-tokens'))]));
+    expect(parts(calls[1])).toEqual({ fresh: 66, lost: 34, served: 154 });
+    expect(parts(calls.find((c) => c.getAttribute('data-cause') === 'ttl_expired')).served).toBeUndefined();
+  });
+
+  it('keeps each column a button a screen reader announces, the one open pressed', async () => {
+    await show('fix-parser-7', 'step=30');
+    const calls = screen.getAllByTestId('cache-call');
+    expect(calls.every((c) => c.tagName === 'BUTTON' && !c.hasAttribute('role'))).toBe(true);
+    const timeline = screen.getByRole('group', { name: 'Model calls' });
+    expect(within(timeline).getAllByRole('button')).toHaveLength(19);
+    expect(within(timeline).getByRole('button', { pressed: true }).getAttribute('aria-label')).toMatch(/^step 30:/);
   });
 
   it('names each break shape with its diff and the fixed advice the server chose', async () => {
@@ -145,6 +159,18 @@ describe('the X-Ray of one call', () => {
     expect(dropped).toContain('instruction lost');
     expect(screen.getByText(/more dropped chunks/)).toBeTruthy();
     expect(document.body.textContent).toContain('2026-10-18T09:31:10Z');
+  });
+
+  it('unfolds a folded dropped chunk from the keyboard', async () => {
+    await show('fix-parser-7', 'step=34');
+    const panel = screen.getByTestId('dropped');
+    // The lost instruction opens unfolded; the rest fold to one line.
+    expect(within(panel).getAllByRole('button', { expanded: true })).toHaveLength(1);
+    const folded = within(panel).getAllByRole('button', { expanded: false });
+    expect(folded.length).toBeGreaterThan(0);
+    expect(folded[0].tagName).toBe('BUTTON');
+    fireEvent.click(folded[0]);
+    expect(folded[0].getAttribute('aria-expanded')).toBe('true');
   });
 
   it('shows a Claude Code call rebuilt from its deltas, each chunk traced to its step', async () => {

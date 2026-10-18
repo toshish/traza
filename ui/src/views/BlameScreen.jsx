@@ -22,7 +22,8 @@ export function BlameScreen({ go, params }) {
   const tenant = routeTenant(params);
   const [pathDraft, setPathDraft] = React.useState(path);
   const [lineDraft, setLineDraft] = React.useState(line);
-  const [projectDraft, setProjectDraft] = React.useState(project.join(' '));
+  // One root per line: a checkout path may hold spaces.
+  const [projectDraft, setProjectDraft] = React.useState(project.join('\n'));
 
   const ask = () => {
     const p = pathDraft.trim();
@@ -31,7 +32,7 @@ export function BlameScreen({ go, params }) {
     const next = new URLSearchParams();
     next.set('path', p);
     next.set('line', l);
-    for (const root of projectDraft.split(/\s+/).filter(Boolean)) next.append('project', root);
+    for (const root of projectRoots(projectDraft)) next.append('project', root);
     if (tenant !== undefined) next.set('tenant', tenant);
     // A URLSearchParams keeps repeated `project` keys through the route.
     navigate(['blame'], next);
@@ -52,9 +53,16 @@ export function BlameScreen({ go, params }) {
           <Input mono value={lineDraft} onChange={setLineDraft} placeholder="the line, exactly: self.items.iter().map(|item| item.price).sum()" ariaLabel="Line text"
             onKeyDown={(e) => { if (e.key === 'Enter') ask(); }} />
         </div>
-        <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-          <Input mono size="sm" value={projectDraft} onChange={setProjectDraft} placeholder="repository roots (optional): /srv/app /srv/app/.claude/worktrees/*"
-            ariaLabel="Repository roots" style={{ flex: 1, minWidth: 240 }} onKeyDown={(e) => { if (e.key === 'Enter') ask(); }} />
+        <div style={{ display: 'flex', gap: 8, alignItems: 'flex-end', flexWrap: 'wrap' }}>
+          <span className="tz-field" style={{ flex: 1, minWidth: 240, display: 'flex', border: '1px solid var(--hairline)', borderRadius: 'var(--radius-control)', background: 'var(--bg-raised)' }}>
+            <textarea value={projectDraft} onChange={(e) => setProjectDraft(e.target.value)} spellCheck={false} rows={2}
+              aria-label="Repository roots" placeholder={'repository roots (optional), one per line:\n/srv/app\n/srv/app/.claude/worktrees/*'}
+              onKeyDown={(e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); ask(); } }}
+              style={{
+                display: 'block', width: '100%', resize: 'vertical', border: 'none', outline: 'none', background: 'transparent',
+                color: 'var(--ink)', fontFamily: 'var(--font-mono)', fontSize: 12, lineHeight: '18px', padding: '4px 8px', minHeight: 30,
+              }} />
+          </span>
           <Chip tone="primary" onClick={ask}>Blame</Chip>
         </div>
         <div style={{ fontSize: 12, color: 'var(--ink-muted)', lineHeight: '18px' }}>
@@ -71,6 +79,12 @@ export function BlameScreen({ go, params }) {
     {!path ? <EmptyState message={<span>The same answer from a shell — <code>traza-server blame</code> scopes itself to the repository it runs in:</span>}
       command={'traza-server blame src/cart.rs:42\n' + curl} /> : null}
   </div>;
+}
+
+/** The repository roots a draft names: one per line, each trimmed, blank
+    lines dropped. Never split on spaces — `/Users/me/My Repo` is one root. */
+export function projectRoots(draft) {
+  return String(draft || '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
 }
 
 function BlameAnswer({ data, go }) {

@@ -121,13 +121,13 @@ export function CacheTimeline({ steps, selected, onPick }) {
   const hovered = hover ? steps.find((s) => s.step_index === hover.step) : null;
   return <div ref={wrap} style={{ position: 'relative' }} onMouseLeave={() => setHover(null)}>
     <div className="tz-scroll-x">
-      <div role="list" aria-label="Model calls" style={{ display: 'flex', alignItems: 'flex-end', gap: 3, minWidth: 'min-content', paddingBottom: 2 }}>
+      <div role="group" aria-label="Model calls" style={{ display: 'flex', alignItems: 'flex-end', gap: 3, minWidth: 'min-content', paddingBottom: 2 }}>
         {steps.map((step) => {
           const seg = cacheSegments(step);
           const cause = CACHE_CAUSE[step.cause] || CACHE_CAUSE.unknown;
           const active = step.step_index === selected;
           const scale = (v) => (v / max) * height;
-          return <button key={step.step_index} type="button" role="listitem" className="tz-plain-button" data-testid="cache-call"
+          return <button key={step.step_index} type="button" className="tz-plain-button" data-testid="cache-call"
             data-cause={step.cause} aria-pressed={active}
             aria-label={`step ${step.step_index}: ${cause.label}, ${step.est_tokens} estimated tokens, ${step.est_tokens_lost} lost`}
             onClick={() => onPick(step.step_index)}
@@ -142,9 +142,9 @@ export function CacheTimeline({ steps, selected, onPick }) {
               boxShadow: active ? 'inset 0 -2px 0 var(--accent)' : 'none',
             }}>
             <span style={{ height, display: 'flex', flexDirection: 'column', justifyContent: 'flex-end', gap: 1 }}>
-              {seg.fresh ? <span style={{ height: Math.max(1, scale(seg.fresh)), background: 'var(--series-4)', borderRadius: '1.5px 1.5px 0 0' }} /> : null}
-              {seg.lost ? <span style={{ height: Math.max(2, scale(seg.lost)), background: 'var(--accent)', borderRadius: 1 }} /> : null}
-              {seg.served ? <span style={{ height: Math.max(1, scale(seg.served)), background: 'var(--series-2)', borderRadius: 1 }} /> : null}
+              {seg.fresh ? <span data-part="fresh" data-tokens={seg.fresh} style={{ height: Math.max(1, scale(seg.fresh)), background: 'var(--series-4)', borderRadius: '1.5px 1.5px 0 0' }} /> : null}
+              {seg.lost ? <span data-part="lost" data-tokens={seg.lost} style={{ height: Math.max(2, scale(seg.lost)), background: 'var(--accent)', borderRadius: 1 }} /> : null}
+              {seg.served ? <span data-part="served" data-tokens={seg.served} style={{ height: Math.max(1, scale(seg.served)), background: 'var(--series-2)', borderRadius: 1 }} /> : null}
             </span>
             <span aria-hidden="true" style={{
               height: 6, borderRadius: 1.5,
@@ -466,12 +466,14 @@ function DroppedChunk({ d, toTape }) {
       {d.introduced_by && typeof d.introduced_by.step_index === 'number' ? <a href="#" style={{ marginLeft: 'auto', fontSize: 12 }}
         onClick={(e) => { e.preventDefault(); toTape(d.introduced_by.step_index); }}>from step {d.introduced_by.step_index}</a> : null}
     </div>
-    <div onClick={() => setOpen((v) => !v)} style={{
-      fontFamily: 'var(--font-mono)', fontSize: 12, whiteSpace: open ? 'pre-wrap' : 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
-      overflowWrap: 'anywhere', color: d.preview == null ? 'var(--ink-faint)' : 'var(--ink)', cursor: 'pointer',
-    }}>
-      {d.preview == null ? 'the text was not kept' : d.preview}
-    </div>
+    {d.preview == null ? <div style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--ink-faint)' }}>the text was not kept</div>
+      : <button type="button" className="tz-plain-button" aria-expanded={open} onClick={() => setOpen((v) => !v)}
+        title={open ? 'Fold to one line' : 'Show the whole preview'}
+        style={{
+          display: 'block', width: '100%', padding: 0, textAlign: 'left', fontFamily: 'var(--font-mono)', fontSize: 12,
+          whiteSpace: open ? 'pre-wrap' : 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', overflowWrap: 'anywhere',
+          color: 'var(--ink)', cursor: 'pointer',
+        }}>{d.preview}</button>}
   </div>;
 }
 

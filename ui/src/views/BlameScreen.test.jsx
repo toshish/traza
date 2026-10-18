@@ -66,11 +66,24 @@ describe('blame', () => {
     expect(api.blame).not.toHaveBeenCalled();
     fireEvent.change(screen.getByLabelText('File path'), { target: { value: 'src/item.rs' } });
     fireEvent.change(screen.getByLabelText('Line text'), { target: { value: '  pub price: u64,' } });
-    fireEvent.change(screen.getByLabelText('Repository roots'), { target: { value: '/tmp/demo-shop /srv/app/*' } });
+    fireEvent.change(screen.getByLabelText('Repository roots'), { target: { value: '/tmp/demo-shop\n/srv/app/*\n' } });
     fireEvent.click(screen.getByText('Blame'));
     const params = new URLSearchParams(window.location.hash.split('?')[1]);
     expect(params.get('path')).toBe('src/item.rs');
     expect(params.get('line')).toBe('  pub price: u64,');
     expect(params.getAll('project')).toEqual(['/tmp/demo-shop', '/srv/app/*']);
+  });
+
+  it('takes a repository root with a space in it whole: one root per line', async () => {
+    await show('path=src/item.rs&line=' + encodeURIComponent('pub price: u64,'));
+    fireEvent.change(screen.getByLabelText('Repository roots'), { target: { value: '  /Users/me/My Repo  \n\n/srv/app' } });
+    fireEvent.keyDown(screen.getByLabelText('Repository roots'), { key: 'Enter', metaKey: true });
+    const params = new URLSearchParams(window.location.hash.split('?')[1]);
+    expect(params.getAll('project')).toEqual(['/Users/me/My Repo', '/srv/app']);
+    // Roots from the route come back one per line.
+    cleanup();
+    await show('path=src/item.rs&line=x&project=' + encodeURIComponent('/Users/me/My Repo') + '&project=%2Fsrv%2Fapp');
+    expect(screen.getByLabelText('Repository roots').value).toBe('/Users/me/My Repo\n/srv/app');
+    expect(api.blame).toHaveBeenLastCalledWith(expect.objectContaining({ project: ['/Users/me/My Repo', '/srv/app'] }), expect.anything());
   });
 });

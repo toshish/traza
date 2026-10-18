@@ -1,5 +1,6 @@
 import React from 'react';
-import { compactPath, fmtCi, fmtPct, splitToken } from '../../lib/insight.js';
+import { fmtNum } from '../../lib/format.js';
+import { MIN_SCORED_RUNS, compactPath, fmtCi, fmtPct, skillAt, skillReading, splitToken } from '../../lib/insight.js';
 import { Tag } from '../primitives/Tag.jsx';
 
 // The small pieces every insight screen draws with: an interval against a
@@ -142,6 +143,26 @@ export function Swatch({ color, hatch, outline, size = 10, style }) {
     background: hatch ? `repeating-linear-gradient(135deg, ${color} 0 2px, var(--bg-raised) 2px 4px)` : color,
     border: outline ? '1px solid var(--hairline)' : 'none', ...style,
   }} />;
+}
+
+/** How far a run's verdict is worth trusting: the map's calibration skill
+    at the depth the run was judged (the nearest depth scored on enough
+    runs), in words, with a warning when it is no better than the base
+    rate. Nothing for a run the map matched nowhere. */
+export function RunSkill({ calibration, depth }) {
+  if (!(depth > 0) || !calibration) return null;
+  const row = skillAt(calibration, depth);
+  if (!row) {
+    return <div data-testid="run-skill"><Caveat>
+      The map scored no depth on {MIN_SCORED_RUNS} or more runs, so how far to trust this verdict is unknown.
+    </Caveat></div>;
+  }
+  const weak = row.skill < 0.05;
+  return <div data-testid="run-skill" style={{ fontSize: 12, lineHeight: '18px', color: weak ? 'var(--warn)' : 'var(--ink-muted)' }}>
+    The map's verdicts here: <span style={{ fontFamily: 'var(--font-mono)', fontVariantNumeric: 'tabular-nums', color: weak ? 'var(--warn)' : 'var(--accent)' }}>skill {fmtPct(row.skill, 0)}</span> at depth {row.depth}
+    {row.depth !== depth ? `, the scored depth nearest this run's ${depth}` : ''} — {skillReading(row.skill)}, over {fmtNum(row.covered)} runs.
+    {weak ? ' Do not act on this verdict: at this depth the outcome barely depends on the path.' : ''}
+  </div>;
 }
 
 /** A bounded-work caveat line, in the system's warning ink. */

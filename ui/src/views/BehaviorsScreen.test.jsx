@@ -74,9 +74,21 @@ describe('a search', () => {
     const shown = screen.getByTestId('tql-refusal').textContent;
     expect(shown).toContain('tool(bash)[stauts=error]\n' + ' '.repeat(11) + '^');
     expect(shown).toContain('unknown field `stauts`; did you mean `status`?');
-    // A refused query is not searched.
+    // A refused query is not searched — from the chip or the keyboard. A
+    // search would put it in the route.
+    const routed = () => new URLSearchParams(window.location.hash.split('?')[1]).get('q');
     fireEvent.click(screen.getAllByText('Search')[0]);
-    expect(api.trajectories).not.toHaveBeenCalled();
+    expect(routed()).toBeNull();
+    fireEvent.keyDown(screen.getByLabelText('TQL query'), { key: 'Enter', metaKey: true });
+    expect(routed()).toBeNull();
+    fireEvent.keyDown(screen.getByLabelText('TQL query'), { key: 'Enter', ctrlKey: true });
+    expect(routed()).toBeNull();
+    // Fixed, it is.
+    fireEvent.change(screen.getByLabelText('TQL query'), { target: { value: 'tool(bash)[status=error]' } });
+    await act(async () => { vi.advanceTimersByTime(300); });
+    await act(async () => { for (let i = 0; i < 4; i += 1) await Promise.resolve(); });
+    fireEvent.keyDown(screen.getByLabelText('TQL query'), { key: 'Enter', metaKey: true });
+    expect(routed()).toBe('tool(bash)[status=error]');
   });
 
   it('says what a valid query reads as', async () => {
@@ -112,6 +124,15 @@ describe('the detector library', () => {
     expect(panel).toContain('Agents handing work back and forth');
     fireEvent.click(screen.getAllByText('giveup-5')[0]);
     expect(go).toHaveBeenCalledWith(['run', 'giveup-5'], expect.objectContaining({ tenant: '' }));
+  });
+
+  it("draws a detector's success rate with its interval, and calls it worse only when the interval says so", async () => {
+    await show();
+    // One run matched, and failed: 0% of 1 cannot be told from the 61.9% baseline.
+    const row = screen.getAllByTestId('detector').find((d) => d.textContent.includes('hallucinated_tool'));
+    expect(row.textContent).toContain('0% of 1 known');
+    expect(within(row).getByRole('img', { name: /success 0\.0%, 95% interval 0\.0–79\.3%, base rate 61\.9%/ })).toBeTruthy();
+    expect(within(row).getByTestId('detector-rate').style.color).not.toBe('var(--error)');
   });
 
   it("loads a detector's query into the search", async () => {

@@ -15,6 +15,7 @@ import healthy from '../test/fixtures/insight/fate_run_healthy.json';
 import novel from '../test/fixtures/insight/fate_run_novel.json';
 import missing from '../test/fixtures/insight/fate_map_missing.json';
 import ccPruned from '../test/fixtures/insight/fate_map_cc_pruned.json';
+import supportDepth2 from '../test/fixtures/insight/fate_map_support_depth2.json';
 
 const RUNS = { 'live-doomed-0': doomed, 'live-healthy-0': healthy, 'live-novel-0': novel };
 
@@ -23,7 +24,7 @@ vi.mock('../lib/api.js', () => ({
     fateCohorts: vi.fn(async () => cohorts),
     fateMap: vi.fn(async (params) => {
       if (params.agent === 'researcher') return researcherMap;
-      if (params.agent === 'support-agent') return supportMap;
+      if (params.agent === 'support-agent') return params.depth === 2 ? supportDepth2 : supportMap;
       if (params.agent === 'claude-code') return ccPruned;
       throw Object.assign(new Error(missing.error), { status: 404, what: missing.error, body: missing });
     }),
@@ -36,9 +37,9 @@ const { api } = await import('../lib/api.js');
 
 const OPEN = { auth: 'open', scope: 'admin', operator: true, tenant: null };
 
-async function show(query = '') {
+async function show(query = '', identity = OPEN) {
   const go = vi.fn();
-  const view = render(<ForesightScreen go={go} params={new URLSearchParams(query)} identity={OPEN} pushToast={vi.fn()} />);
+  const view = render(<ForesightScreen go={go} params={new URLSearchParams(query)} identity={identity} pushToast={vi.fn()} />);
   await act(async () => { for (let i = 0; i < 6; i += 1) await Promise.resolve(); });
   return { view, go };
 }
@@ -96,10 +97,19 @@ describe('the cohorts and the map', () => {
     expect(panel.textContent).toContain('p(failure | here)80.0%');
     fireEvent.click(screen.getByText('Diff success vs failure'));
     expect(go).toHaveBeenCalledWith(['diff'], { a: 'search_loop-9', b: 'search_loop-0', tenant: '' });
+    // The search is the cohort's: its agent, in its tenant.
     fireEvent.click(screen.getByText('Find these runs'));
-    expect(go).toHaveBeenCalledWith(['behaviors'], { q: '^llm("gpt-4o") -> tool("search_orders"){3,5}' });
+    expect(go).toHaveBeenCalledWith(['behaviors'], { q: '^llm("gpt-4o") -> tool("search_orders"){3,5}', agent: 'support-agent', tenant: '' });
     fireEvent.click(screen.getByText('search_loop-0'));
     expect(go).toHaveBeenCalledWith(['run', 'search_loop-0'], { tenant: '' });
+  });
+
+  it("says a task map's search covers every task of the agent", async () => {
+    api.fateMap.mockResolvedValueOnce({ ...supportMap, task: 'dd8fe599d8750716' });
+    const { go } = await show('agent=support-agent&task=dd8fe599d8750716&node=' + encodeURIComponent('llm:gpt-4o'));
+    expect(screen.getByTestId('node-panel').textContent).toContain('searches every task of support-agent');
+    fireEvent.click(screen.getByText('Find these runs'));
+    expect(go).toHaveBeenCalledWith(['behaviors'], { q: '^llm("gpt-4o")', agent: 'support-agent', tenant: '' });
   });
 
   it("states the map's own score, and what it means", async () => {
@@ -108,6 +118,8 @@ describe('the cohorts and the map', () => {
     expect(card).toContain('much better than the base rate');
     expect(card).toContain('31%');
     expect(card).toContain('0.173'); // depth 3 Brier
+    // The headline says how many runs it was scored on.
+    expect(screen.getByTestId('tile-skill').textContent).toContain('depth 3 · 180 runs');
   });
 
   it('asks again for a wider window and a stricter support', async () => {
@@ -133,7 +145,7 @@ describe('the cohorts and the map', () => {
 
 describe('a run on its map', () => {
   it('lights a live run up to its open last step, pooled, with what earlier runs did next', async () => {
-    await show('run=live-healthy-0');
+    await show('run=live-healthy-0&tenant=');
     // The map follows the run's agent.
     expect(api.fateMap).toHaveBeenCalledWith(expect.objectContaining({ agent: 'support-agent' }), expect.anything());
     const banner = screen.getByTestId('run-foresight').textContent;
@@ -149,15 +161,56 @@ describe('a run on its map', () => {
   });
 
   it('names a likely failure', async () => {
-    await show('run=live-doomed-0');
+    await show('run=live-doomed-0&tenant=');
     const banner = screen.getByTestId('run-foresight').textContent;
     expect(banner).toContain('likely failure');
     expect(banner).toContain('5 of 50 times (10.0%, 95% CI 4.3–21.4%)');
     expect(node(['llm:gpt-4o', 'tool:search_orders×3-5']).textContent).toContain('THIS RUN');
+    // How far the map's verdicts at this depth have been worth trusting.
+    expect(screen.getByTestId('run-skill').textContent).toContain('skill 21% at depth 2');
+    expect(screen.getByTestId('run-skill').textContent).not.toContain('Do not act');
+  });
+
+  it('warns when the map has no skill at the depth the run was judged', async () => {
+    await show('run=live-novel-0&tenant=');
+    const skill = screen.getByTestId('run-skill').textContent;
+    expect(skill).toContain('skill 0% at depth 1');
+    expect(skill).toContain('no better than the base rate');
+    expect(skill).toContain('Do not act on this verdict');
+  });
+
+  it('places nothing on a map cut shorter than where the run was judged, and offers to draw it', async () => {
+    await show('run=live-healthy-0&tenant=&depth=2');
+    expect(api.fateMap).toHaveBeenCalledWith(expect.objectContaining({ agent: 'support-agent', depth: 2 }), expect.anything());
+    expect(document.body.textContent).not.toContain('THIS RUN');
+    expect(document.body.textContent).not.toContain('RECOMMENDED NEXT');
+    // The run's path is still lit as far as the map draws it, and that
+    // node is the one opened.
+    expect(screen.getByTestId('node-panel').textContent).toContain('runs through here90');
+    const caveat = screen.getByTestId('run-past-map').textContent;
+    expect(caveat).toContain('judged this run at depth 4');
+    expect(caveat).toContain('the map shown draws 2 of its tokens');
+    fireEvent.click(screen.getByText('Draw it'));
+    const params = new URLSearchParams(window.location.hash.split('?')[1]);
+    expect(params.get('depth')).toBe('6');
+    expect(params.get('min')).toBeNull();
+  });
+
+  it('reads no foresight for an operator who names no tenant, which would read the default tenant', async () => {
+    await show('run=live-healthy-0');
+    expect(api.fateRun).not.toHaveBeenCalled();
+    expect(screen.getByTestId('run-foresight').textContent).toContain('Foresight reads one tenant');
+    // The map still opens.
+    expect(api.fateMap).toHaveBeenCalled();
+    expect(document.body.textContent).not.toContain('THIS RUN');
+    // A credential bound to its tenant reads its own.
+    cleanup();
+    await show('run=live-healthy-0', { auth: 'token', scope: 'ro', operator: false, tenant: 'acme' });
+    expect(api.fateRun).toHaveBeenCalledWith('live-healthy-0', undefined, expect.anything());
   });
 
   it('draws where a novel run left the known paths, and what the runs that got there did instead', async () => {
-    await show('run=live-novel-0');
+    await show('run=live-novel-0&tenant=');
     expect(screen.getByTestId('run-foresight').textContent).toContain('novel');
     expect(document.body.textContent).toContain('NEVER TAKEN HERE BEFORE');
     expect(document.body.textContent).toContain('delete_database');
@@ -166,13 +219,13 @@ describe('a run on its map', () => {
 
   it('does not light a run on one task of its agent, which is not what it was judged against', async () => {
     api.fateMap.mockResolvedValueOnce({ ...supportMap, task: 'dd8fe599d8750716' });
-    await show('run=live-healthy-0&agent=support-agent&task=dd8fe599d8750716');
+    await show('run=live-healthy-0&tenant=&agent=support-agent&task=dd8fe599d8750716');
     expect(screen.getByTestId('run-foresight').textContent).toContain('The map shown is one task of support-agent');
     expect(document.body.textContent).not.toContain('THIS RUN');
   });
 
   it('says when the run belongs to another cohort than the map shown', async () => {
-    await show('run=live-healthy-0&agent=researcher');
+    await show('run=live-healthy-0&tenant=&agent=researcher');
     expect(screen.getByTestId('run-foresight').textContent).toContain('This run belongs to support-agent; the map shown is researcher.');
     expect(document.body.textContent).not.toContain('THIS RUN');
   });

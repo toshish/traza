@@ -127,8 +127,8 @@ export function RunScreen({ runId, go, params, identity, pushToast }) {
 
     {!oneTenant && operator ? <UnscopedNote onScope={scopeTo}>
       This tape is read across every tenant: no tenant is named, so if two tenants use this run id
-      their steps are interleaved here, and no guard verdict is shown, since a verdict is one
-      tenant's. Name the tenant to read it in:
+      their steps are interleaved here, and no guard verdict or foresight is shown, since each is
+      one tenant's. Name the tenant to read it in:
     </UnscopedNote> : null}
 
     {data.truncated ? <div style={{ fontSize: 12, color: 'var(--warn)' }}>
@@ -148,7 +148,7 @@ export function RunScreen({ runId, go, params, identity, pushToast }) {
       <Tape steps={data.steps} totals={totals} go={go} focusStep={focusStep}
         onXray={(index) => go(['xray', runId], { ...(scope || {}), step: String(index) })} />
       <div style={{ display: 'grid', gap: 14, minWidth: 0 }}>
-        <RunForesight runId={runId} tenant={tenant} go={go} />
+        <RunForesight runId={runId} tenant={tenant} oneTenant={oneTenant} identityKnown={identity != null} go={go} />
         <ReplayPanel key={replayScopeKey(shown.runId, shown.tenant)} runId={shown.runId} tenant={shown.tenant}
           tape={data} identity={identity} pushToast={pushToast} />
         <ComparePanel runId={runId} tenant={tenant} go={go} />

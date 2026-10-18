@@ -69,6 +69,19 @@ export function ciContains(ci, rate) {
   return Array.isArray(ci) && typeof rate === 'number' && ci[0] <= rate && rate <= ci[1];
 }
 
+/** The 95% Wilson score interval of `successes` in `n`, as the server
+    computes every `ci95`; null when there are no trials. */
+export function wilson(successes, n) {
+  if (!(n > 0)) return null;
+  const z = 1.959963984540054;
+  const p = successes / n;
+  const z2 = z * z;
+  const denom = 1 + z2 / n;
+  const center = (p + z2 / (2 * n)) / denom;
+  const half = (z * Math.sqrt((p * (1 - p)) / n + z2 / (4 * n * n))) / denom;
+  return [Math.max(0, center - half), Math.min(1, center + half)];
+}
+
 // ------------------------------------------------------------- the Fate Map
 
 /** How far below the agent's base rate a branch's success rate may fall
@@ -213,11 +226,19 @@ export function nodeAt(root, path) {
     whose last step is open, the pooled siblings counted with it), where it
     left the known paths, and the option earlier runs did best with.
 
-    The matched path is walked on the map itself, so a token the map does
-    not hold (pruned below `min_support`, or past `depth`) ends the walk:
-    `unmatched` holds what the run did beyond what is drawn. */
+    The matched path is walked on the map as drawn. Foresight walks the
+    whole tree, so a run can be judged deeper than the `depth` the map was
+    asked for, or at a node `min_support` pruned. The walk then stops short
+    (`complete` false): only the drawn prefix is lit, and nothing that
+    belongs to the judged node — THIS RUN, its pooled siblings, the
+    recommended option, a novel run's divergence — is placed on an ancestor
+    that merely shares a token with it. `reachedKey` is the deepest node
+    drawn; `unmatched` holds what the run did past it. */
 export function runOnMap(root, foresight) {
-  const empty = { keys: new Set(), pooled: new Set(), atKey: null, unmatched: [], recommendedKey: null, divergence: null };
+  const empty = {
+    keys: new Set(), pooled: new Set(), atKey: null, reachedKey: null, unmatched: [], recommendedKey: null,
+    divergence: null, complete: false, walked: 0, matchedDepth: 0,
+  };
   if (!root || !foresight || !Array.isArray(foresight.path)) return empty;
   const path = foresight.path;
   const depth = Math.min(foresight.matched_depth || 0, path.length);
@@ -231,6 +252,12 @@ export function runOnMap(root, foresight) {
     walked = i + 1;
     keys.add(pathKey(path.slice(0, walked)));
   }
+  const atPath = path.slice(0, walked);
+  const complete = walked === depth;
+  const out = {
+    ...empty, keys, reachedKey: pathKey(atPath), unmatched: path.slice(walked), complete, walked, matchedDepth: depth,
+  };
+  if (!complete) return out;
   const parentPath = path.slice(0, Math.max(0, walked - 1));
   const pooled = new Set();
   if (foresight.last_open && foresight.node && Array.isArray(foresight.node.pooled) && walked > 0) {
@@ -238,20 +265,28 @@ export function runOnMap(root, foresight) {
       if (nodeAt(root, [...parentPath, token])) pooled.add(pathKey([...parentPath, token]));
     }
   }
-  const atPath = path.slice(0, walked);
   let recommendedKey = null;
   if (foresight.recommended_next) {
     const candidate = [...atPath, foresight.recommended_next];
     if (nodeAt(root, candidate)) recommendedKey = pathKey(candidate);
   }
-  return {
-    keys,
-    pooled,
-    atKey: pathKey(atPath),
-    unmatched: path.slice(walked),
-    recommendedKey,
-    divergence: foresight.divergence || null,
-  };
+  return { ...out, pooled, atKey: pathKey(atPath), recommendedKey, divergence: foresight.divergence || null };
+}
+
+/** The route changes that would draw the node foresight judged a run at,
+    when `runOnMap` stopped short: a deeper `depth` if the map was cut
+    above it, and the lowest support if the walk stopped inside the drawn
+    depth (a pruned node). `choices` are the depth chips; a depth past them
+    is asked for exactly (the server takes up to 65). */
+export function drawRunChanges(lit, map, choices) {
+  if (!lit || lit.complete || !map) return null;
+  const changes = {};
+  if (lit.matchedDepth > (map.depth || 0)) {
+    const need = lit.matchedDepth + 1;
+    changes.depth = choices.find((d) => d >= need) || Math.min(65, need);
+  }
+  if (lit.walked < Math.min(map.depth || 0, lit.matchedDepth)) changes.min = 1;
+  return changes;
 }
 
 /** A node's means, from the sums the map carries: cost and duration per
@@ -294,16 +329,38 @@ export const FORESIGHT_VERDICT = {
   insufficient_history: { tone: 'neutral', label: 'insufficient history' },
 };
 
+/** Runs a calibration depth must have been scored on before its skill is
+    a headline or a run's verdict is read against it. Each run is
+    predicted from half the cohort, so a depth only a handful of runs
+    reached can win on the split alone. */
+export const MIN_SCORED_RUNS = 30;
+
+function scored(calibration, minCovered) {
+  return ((calibration && calibration.depths) || [])
+    .filter((row) => typeof row.skill === 'number' && (row.covered || 0) >= minCovered);
+}
+
 /** The depth whose prediction removed the most of the base rate's error,
-    or null when the map scored none. */
-export function bestSkill(calibration) {
-  const depths = (calibration && calibration.depths) || [];
+    among those scored on enough runs; null when none was. */
+export function bestSkill(calibration, minCovered = MIN_SCORED_RUNS) {
   let best = null;
-  for (const row of depths) {
-    if (typeof row.skill !== 'number') continue;
+  for (const row of scored(calibration, minCovered)) {
     if (!best || row.skill > best.skill) best = row;
   }
   return best;
+}
+
+/** The scored depth nearest to `depth` — the evidence for a verdict given
+    at that depth — the shallower on a tie; null for a run matched nowhere,
+    or a map that scored no depth on enough runs. */
+export function skillAt(calibration, depth, minCovered = MIN_SCORED_RUNS) {
+  if (!(depth > 0)) return null;
+  let near = null;
+  for (const row of scored(calibration, minCovered)) {
+    const gap = Math.abs(row.depth - depth);
+    if (!near || gap < Math.abs(near.depth - depth) || (gap === Math.abs(near.depth - depth) && row.depth < near.depth)) near = row;
+  }
+  return near;
 }
 
 /** How to read a map's skill: honest words for how much its verdicts are
@@ -407,13 +464,21 @@ export const CACHE_CAUSE = {
     the predecessor had them), and what is new. Estimates throughout, in
     one unit: the server scales `est_tokens_lost` by the provider's count
     (`calibration`) while `est_tokens` stays the raw estimate, so the loss
-    is taken back to the raw scale before it is set against the context. */
+    is taken back to the raw scale before it is set against the context.
+
+    The leading chunks byte-identical to the predecessor's
+    (`shared_est_tokens`) stay servable through a break — the loss is what
+    follows the divergence — except past the TTL, where the server counts
+    the prefix in the loss, and for `unknown`, where whether even a held
+    prefix hits cannot be told. The part of an edited chunk before the
+    change is neither shared nor lost, so it is drawn with the new. */
 export function cacheSegments(step) {
   const total = Math.max(0, step && step.est_tokens || 0);
   const reported = Math.max(0, step && step.est_tokens_lost || 0);
   const raw = step && typeof step.calibration === 'number' && step.calibration > 0 ? reported / step.calibration : reported;
   const lost = Math.min(total, Math.round(raw));
-  const served = step && step.cause === 'stable' ? Math.min(total, step.shared_est_tokens || 0) : 0;
+  const servable = step && step.cause !== 'ttl_expired' && step.cause !== 'unknown';
+  const served = servable ? Math.max(0, Math.min(total - lost, step.shared_est_tokens || 0)) : 0;
   const fresh = Math.max(0, total - lost - served);
   return { total, served, lost, fresh };
 }
@@ -543,6 +608,18 @@ export const SEVERITY = {
   medium: { tone: 'warn', rank: 1 },
   low: { tone: 'neutral', rank: 2 },
 };
+
+/** A detector's success rate as evidence: the server's rate, its Wilson
+    interval over the matched runs whose outcome is known (the rate's own
+    denominator, not `runs_matched`), that count, and whether the interval
+    lies wholly below the baseline — the only case the row calls worse. */
+export function detectorRate(detector, baseline) {
+  const o = (detector && detector.outcomes) || {};
+  const n = (o.success || 0) + (o.failure || 0) + (o.abandoned || 0);
+  const ci = wilson(o.success || 0, n);
+  const rate = detector && typeof detector.success_rate === 'number' ? detector.success_rate : null;
+  return { rate, ci, n, below: Boolean(ci && typeof baseline === 'number' && ci[1] < baseline) };
+}
 
 /** A match's run as a route to its tape at the first matched step. */
 export function matchRoute(match) {

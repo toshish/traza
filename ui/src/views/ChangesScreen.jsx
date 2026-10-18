@@ -172,10 +172,17 @@ function namer(items) {
 }
 
 /** The stretches between an agent's change points, each the regime the
-    change at its start set up: its value, its error rate, tinted by that
-    change's verdict. The first stretch is what the earliest change
-    replaced. Co-changes share a stretch, named by the most readable of
-    their values. */
+    change at its start set up: its value, its error rate and the runs that
+    rate counts, tinted by that change's verdict. The first stretch is what
+    the earliest change replaced. Co-changes share a stretch, named by the
+    most readable of their values.
+
+    A change's sides stop at the neighbouring change points of any
+    dimension, so a stretch is exactly the after side of the change that
+    opens it (the before side of the first) — while every change point is
+    listed. Past 40 the lowest-ranked are not, yet they still bound their
+    neighbours' sides, so a drawn stretch may hold several sides: it is then
+    given no rate. */
 export function regimes(agent) {
   const columns = new Map();
   agent.changes.forEach((change, i) => {
@@ -186,18 +193,21 @@ export function regimes(agent) {
   const instants = [...columns.keys()].map(Number).sort((a, b) => a - b);
   if (!instants.length) return [];
   const bounds = [agent.first_run_ns, ...instants, agent.last_run_ns];
+  const side = (change, which) => {
+    const delta = !agent.truncated && change.deltas && change.deltas.error_rate;
+    return delta ? { error: delta[which], n: delta[which === 'before' ? 'n_before' : 'n_after'] ?? null } : { error: null, n: null };
+  };
   const out = [];
   for (let k = 0; k < bounds.length - 1; k += 1) {
     const from = bounds[k];
     const to = bounds[k + 1];
     if (k === 0) {
       const items = columns.get(String(instants[0]));
-      const next = items[0].change;
-      out.push({ from, to, verdict: null, label: namer(items).from, error: next.deltas && next.deltas.error_rate ? next.deltas.error_rate.before : null });
+      out.push({ from, to, verdict: null, label: namer(items).from, ...side(items[0].change, 'before') });
     } else {
       const items = columns.get(String(from));
       const head = items[0].change;
-      out.push({ from, to, verdict: head.verdict, label: namer(items).to, error: head.deltas && head.deltas.error_rate ? head.deltas.error_rate.after : null });
+      out.push({ from, to, verdict: head.verdict, label: namer(items).to, ...side(head, 'after') });
     }
   }
   return out;
@@ -225,14 +235,16 @@ function Timeline({ agent, placed, anchor }) {
   return <div ref={wrap} style={{ position: 'relative' }} onMouseLeave={() => setHover(null)}>
     <div style={{ position: 'relative', height: 34 + markerRows * 19, margin: '0 2px' }} role="list" aria-label={`Timeline of ${agent.agent}`}>
       <div style={{ position: 'absolute', left: 0, right: 0, top: 0, height: 24, background: 'var(--bg-sunken)', borderRadius: 'var(--radius-control)' }} />
-      {stretches.map((r, k) => <div key={k} data-testid="regime" title={`${changeValue(r.label, 80)}${r.error != null ? ` · error rate ${fmtPct(r.error)}` : ''}`}
+      {stretches.map((r, k) => <div key={k} data-testid="regime" title={`${changeValue(r.label, 80)}${r.error != null ? ` · error rate ${fmtPct(r.error)}${r.n != null ? ` over ${fmtNum(r.n)} finished runs` : ''}` : ''}`}
         style={{
           position: 'absolute', top: 0, height: 24, left: pos(r.from) + '%', width: Math.max(0, pos(r.to) - pos(r.from)) + '%',
           background: VERDICT_TINT[r.verdict] || 'transparent', borderLeft: k ? `2px solid ${VERDICT_COLOR[r.verdict] || 'var(--ink-faint)'}` : 'none',
           display: 'flex', alignItems: 'center', gap: 6, padding: '0 6px', overflow: 'hidden', whiteSpace: 'nowrap', boxSizing: 'border-box',
         }}>
         <Mono size={11} color="var(--ink)" style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{changeValue(r.label, 40)}</Mono>
-        {r.error != null ? <Mono size={11} color={r.verdict === 'regression' ? 'var(--error)' : 'var(--ink-muted)'}>err {fmtPct(r.error, 0)}</Mono> : null}
+        {r.error != null ? <Mono size={11} color={r.verdict === 'regression' ? 'var(--error)' : 'var(--ink-muted)'}>
+          err {fmtPct(r.error, 0)}{r.n != null ? <span style={{ color: 'var(--ink-faint)' }}> of {fmtNum(r.n)}</span> : null}
+        </Mono> : null}
       </div>)}
       {!stretches.length ? <div style={{ position: 'absolute', left: 8, top: 4, fontSize: 12, color: 'var(--ink-faint)' }}>no change point: one regime throughout</div> : null}
       {placed ? <div title={`run ${placed.run}`} style={{
