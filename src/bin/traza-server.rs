@@ -188,6 +188,9 @@ impl RouteClass {
             ("GET", "/v1/annotations") => Self::Lookup,
             ("GET", path) if path.starts_with("/v1/tapes/") => Self::Lookup,
             ("GET", "/v1/diff" | "/v1/recall") => Self::Stats,
+            // Fork listings read and diff many runs; golden listings fold
+            // tagged spans and annotations.
+            ("GET", "/v1/forks" | "/v1/goldens") => Self::Stats,
             _ => Self::Other,
         }
     }

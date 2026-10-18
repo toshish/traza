@@ -41,7 +41,7 @@ use crate::analytics::{LlmAggregateRow, LlmGroupBy, SessionOrder};
 use crate::annotations::Annotation;
 use crate::{semconv, Error, Span, SpanCursor, SpanFilter, SpanSort, Store};
 
-// get_run_tape, compare_runs and recall_runs live beside this file.
+// get_run_tape, compare_runs, recall_runs and list_forks live beside this file.
 mod replay_tools;
 
 /// The MCP endpoint path served by `traza-server`.

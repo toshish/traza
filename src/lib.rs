@@ -18,6 +18,7 @@ pub mod diff;
 pub mod erasure;
 pub mod evals;
 pub mod expiration;
+pub mod fork;
 mod generation;
 pub mod guard;
 pub mod gzip;

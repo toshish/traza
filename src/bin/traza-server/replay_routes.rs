@@ -16,6 +16,10 @@
 //! - `GET /v1/diff?a=&b=&tenant=` — two runs aligned.
 //! - `GET /v1/recall?q=&outcome=&limit=&tenant=` — earlier runs on the same
 //!   words.
+//! - `GET /v1/forks?run=&limit=&tenant=` — a run's forks, each diffed against
+//!   it ([`traza::fork`]).
+//! - `GET /v1/goldens?limit=&tenant=` — the runs marked as regression
+//!   baselines.
 //!
 //! The provider-shaped routes answer errors in the provider's shape —
 //! `{"error": {"type", "message"}}`, plus `"type": "error"` at the top for
@@ -30,8 +34,9 @@ use std::io;
 use std::sync::OnceLock;
 
 use serde_json::{json, Map, Value};
+use traza::fork::{ForkSpec, DEFAULT_FORK_LIMIT, DEFAULT_GOLDEN_LIMIT};
 use traza::recall::OutcomeFilter;
-use traza::replay::{Mode, Registry, ReplayError, ServedStep};
+use traza::replay::{Mode, Provider, Registry, ReplayError, ServedStep};
 use traza::tape::{TapeOptions, DEFAULT_TAPE_MAX_BYTES, MAX_TAPE_SPANS};
 use traza::Store;
 
@@ -79,6 +84,8 @@ pub(super) fn handles(path: &str) -> bool {
         || path.starts_with(TAPES_PREFIX)
         || path == "/v1/diff"
         || path == "/v1/recall"
+        || path == "/v1/forks"
+        || path == "/v1/goldens"
 }
 
 /// Whether `path` is a replay route. Every one of them is a read, however it
@@ -130,6 +137,8 @@ pub(super) fn serve(
         }
         ("GET", "/v1/diff") => diff(responder, query, engine, metrics, principal),
         ("GET", "/v1/recall") => recall(responder, query, engine, metrics, principal),
+        ("GET", "/v1/forks") => forks(responder, query, engine, metrics, principal),
+        ("GET", "/v1/goldens") => goldens(responder, query, engine, metrics, principal),
         ("POST", REPLAYS) => create(responder, body, engine, metrics, principal),
         (_, _) if path.starts_with(REPLAY_PREFIX) => {
             let rest = &path[REPLAY_PREFIX.len()..];
@@ -372,6 +381,95 @@ fn recall(
     }
 }
 
+// -------------------------------------------------------- forks and goldens
+
+/// A `limit` query value: a positive integer, clamped by the engine.
+fn positive(value: &str) -> Option<usize> {
+    value.parse::<usize>().ok().filter(|limit| *limit > 0)
+}
+
+fn forks(
+    responder: &mut Responder<'_>,
+    query: &str,
+    engine: &Store,
+    metrics: &ServerMetrics,
+    principal: Option<&traza::auth::Principal>,
+) -> io::Result<()> {
+    let pairs = match query_pairs(query, &["run", "limit", "tenant"]) {
+        Ok(pairs) => pairs,
+        Err(error) => return responder.json(400, json!({"error": error})),
+    };
+    let (mut run, mut limit, mut selected) = (None, DEFAULT_FORK_LIMIT, None);
+    for (key, value) in pairs {
+        match key.as_str() {
+            "run" => run = Some(value),
+            "limit" => match positive(&value) {
+                Some(parsed) => limit = parsed,
+                None => {
+                    return responder
+                        .json(400, json!({"error": "limit must be a positive integer"}))
+                }
+            },
+            _ => selected = Some(value),
+        }
+    }
+    let Some(run) = run.filter(|run| !run.is_empty()) else {
+        return responder.json(
+            400,
+            json!({"error": "run is required: /v1/forks?run=<run>"}),
+        );
+    };
+    let effective = match effective_tenant(selected, principal) {
+        Ok(tenant) => tenant,
+        Err(()) => return foreign_tenant(responder),
+    };
+    match engine.forks(effective.as_deref(), &run, limit, now_ns()) {
+        Ok(Some(forks)) => responder.json(
+            200,
+            serde_json::to_value(forks).unwrap_or_else(|_| json!({})),
+        ),
+        Ok(None) => responder.json(404, json!({"error": "run not found"})),
+        Err(error) => engine_error(responder, metrics, error),
+    }
+}
+
+fn goldens(
+    responder: &mut Responder<'_>,
+    query: &str,
+    engine: &Store,
+    metrics: &ServerMetrics,
+    principal: Option<&traza::auth::Principal>,
+) -> io::Result<()> {
+    let pairs = match query_pairs(query, &["limit", "tenant"]) {
+        Ok(pairs) => pairs,
+        Err(error) => return responder.json(400, json!({"error": error})),
+    };
+    let (mut limit, mut selected) = (DEFAULT_GOLDEN_LIMIT, None);
+    for (key, value) in pairs {
+        match key.as_str() {
+            "limit" => match positive(&value) {
+                Some(parsed) => limit = parsed,
+                None => {
+                    return responder
+                        .json(400, json!({"error": "limit must be a positive integer"}))
+                }
+            },
+            _ => selected = Some(value),
+        }
+    }
+    let effective = match effective_tenant(selected, principal) {
+        Ok(tenant) => tenant,
+        Err(()) => return foreign_tenant(responder),
+    };
+    match engine.goldens(effective.as_deref(), limit) {
+        Ok(goldens) => responder.json(
+            200,
+            serde_json::to_value(goldens).unwrap_or_else(|_| json!({})),
+        ),
+        Err(error) => engine_error(responder, metrics, error),
+    }
+}
+
 // ------------------------------------------------------------------ replays
 
 fn create(
@@ -386,15 +484,17 @@ fn create(
         Ok(_) => {
             return responder.json(
                 400,
-                json!({"error": "body must be {\"run\": \"<run id>\", \"tenant\"?: \"..\", \"mode\"?: \"strict\"|\"loose\"}"}),
+                json!({"error": "body must be {\"run\": \"<run id>\", \"tenant\"?: \"..\", \"mode\"?: \"strict\"|\"loose\", \"edits\"?: [..], \"live_after\"?: n}"}),
             )
         }
         Err(error) => return responder.json(400, json!({"error": error.to_string()})),
     };
-    if let Some(unknown) = request
-        .keys()
-        .find(|key| !matches!(key.as_str(), "run" | "tenant" | "mode"))
-    {
+    if let Some(unknown) = request.keys().find(|key| {
+        !matches!(
+            key.as_str(),
+            "run" | "tenant" | "mode" | "edits" | "live_after"
+        )
+    }) {
         return responder.json(400, json!({"error": format!("unknown field: {unknown}")}));
     }
     let Some(run) = request
@@ -420,20 +520,27 @@ fn create(
         },
         Some(_) => return responder.json(400, json!({"error": "mode must be strict or loose"})),
     };
+    let fork = match ForkSpec::parse(request.get("edits"), request.get("live_after")) {
+        Ok(fork) => fork,
+        Err(error) => return responder.json(400, json!({"error": error})),
+    };
     let effective = match effective_tenant(selected, principal) {
         Ok(tenant) => tenant,
         Err(()) => return foreign_tenant(responder),
     };
-    match registry().create(
+    match registry().create_fork(
         engine,
         effective.as_deref(),
         run,
         mode,
+        &fork,
         tape_max_bytes(),
         now_ns(),
     ) {
         Ok(created) => send_json(responder, 201, &[], &created.to_json()),
         Err(ReplayError::RunNotFound) => responder.json(404, json!({"error": "run not found"})),
+        // An edit or live point the run cannot take: the caller's to fix.
+        Err(ReplayError::Invalid(reason)) => responder.json(400, json!({"error": reason})),
         // Permanent: the run cannot be replayed as asked, and a retry would
         // be refused the same way. `x-should-retry: false` for any SDK-style
         // client wrapping this call, which would otherwise retry a 409.
@@ -494,8 +601,22 @@ enum Shape {
 /// erasure, an unreadable tool step, an answer too large to render — carries
 /// `x-should-retry: false` (see the module docs).
 fn replay_error(responder: &mut Responder<'_>, shape: Shape, error: ReplayError) -> io::Result<()> {
+    replay_error_with(responder, shape, error, None)
+}
+
+/// [`replay_error`], carrying a divergence's first difference
+/// ([`Registry::explain_divergence`]) beside its digests when there is one.
+fn replay_error_with(
+    responder: &mut Responder<'_>,
+    shape: Shape,
+    error: ReplayError,
+    difference: Option<Value>,
+) -> io::Result<()> {
     let message = error.to_string();
     let mut extra = Map::new();
+    if let Some(difference) = difference {
+        extra.insert("difference".to_owned(), difference);
+    }
     let (status, kind, retry) = match error {
         ReplayError::NotFound => (404, "not_found_error", false),
         ReplayError::Diverged {
@@ -525,6 +646,18 @@ fn replay_error(responder: &mut Responder<'_>, shape: Shape, error: ReplayError)
         ReplayError::Erased { erasure } => {
             extra.insert("erasure".to_owned(), json!(erasure));
             (410, "replay_erased", true)
+        }
+        // A fork's live point: the harness switches to the real provider.
+        // Retrying the replay cannot serve what it never held.
+        ReplayError::Live {
+            live_after,
+            served,
+            fork_id,
+        } => {
+            extra.insert("live_after".to_owned(), json!(live_after));
+            extra.insert("served".to_owned(), json!(served));
+            extra.insert("fork_id".to_owned(), json!(fork_id));
+            (409, "replay_live", true)
         }
         ReplayError::Invalid(_) => (400, "invalid_request_error", false),
         // Creation-time refusals never reach a call route; the store's own
@@ -596,10 +729,11 @@ fn call(
                     return replay_error(responder, shape, ReplayError::Invalid(error.to_string()))
                 }
             };
-            let digest = match shape {
-                Shape::OpenAi => traza::replay::openai_request_digest(&request),
-                _ => traza::replay::anthropic_request_digest(&request),
+            let provider = match shape {
+                Shape::OpenAi => Provider::OpenAi,
+                _ => Provider::Anthropic,
             };
+            let digest = provider.request_digest(&request);
             let digest = match digest {
                 Ok(digest) => digest,
                 Err(reason) => return replay_error(responder, shape, ReplayError::Invalid(reason)),
@@ -612,6 +746,20 @@ fn call(
             };
             match registry().next_llm(engine, id, binding, digest, now, render) {
                 Ok(rendered) => send(responder, 200, rendered.content_type, &[], &rendered.body),
+                // Where the request differs from the recording, read once the
+                // refusal is decided and outside every replay lock.
+                Err(error @ ReplayError::Diverged { step, .. }) => {
+                    let difference = registry().explain_divergence(
+                        engine,
+                        id,
+                        binding,
+                        step,
+                        &request,
+                        provider,
+                        now_ns(),
+                    );
+                    replay_error_with(responder, shape, error, difference)
+                }
                 Err(error) => replay_error(responder, shape, error),
             }
         }
@@ -695,10 +843,19 @@ mod tests {
             "/v1/tapes/trace:abc",
             "/v1/diff",
             "/v1/recall",
+            "/v1/forks",
+            "/v1/goldens",
         ] {
             assert!(handles(path), "{path}");
         }
-        for path in ["/v1/replay", "/v1/tapes", "/v1/diffs", "/v1/spans"] {
+        for path in [
+            "/v1/replay",
+            "/v1/tapes",
+            "/v1/diffs",
+            "/v1/spans",
+            "/v1/forks/x",
+            "/v1/golden",
+        ] {
             assert!(!handles(path), "{path}");
         }
     }

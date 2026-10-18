@@ -266,8 +266,25 @@ impl Store {
         if right.spans.is_empty() {
             return Ok(Err(MissingRun(b.to_owned())));
         }
-        let side_a = self.side(a, &left, now_ns);
-        let side_b = self.side(b, &right, now_ns);
+        self.diff_tapes(a, &left, b, &right, now_ns, deadline)
+            .map(Ok)
+    }
+
+    /// Two runs already read — `left` as run `a`, `right` as run `b` —
+    /// aligned, classified and explained under the caller's `deadline`, so a
+    /// request comparing one run with many (a run's forks) reads the shared
+    /// side once and spends one budget across every comparison.
+    pub(crate) fn diff_tapes(
+        &self,
+        a: &str,
+        left: &RunTape,
+        b: &str,
+        right: &RunTape,
+        now_ns: u64,
+        deadline: Option<Deadline>,
+    ) -> Result<RunDiff> {
+        let side_a = self.side(a, left, now_ns);
+        let side_b = self.side(b, right, now_ns);
         let aligned = align(&left.steps, &right.steps, deadline)?;
         let first_divergence = first_divergence(&aligned, &left.steps, &right.steps, deadline)?;
         let delta = Delta {
@@ -281,17 +298,18 @@ impl Store {
         // checks: a diff that finished past it is refused like one stopped
         // there.
         Deadline::check(deadline, 0)?;
-        Ok(Ok(RunDiff {
+        Ok(RunDiff {
             a: side_a,
             b: side_b,
             aligned,
             first_divergence,
             delta,
             truncated: left.truncated || right.truncated,
-        }))
+        })
     }
 
-    fn side(&self, run: &str, tape: &RunTape, now_ns: u64) -> RunSide {
+    /// One run summarised as a side of a diff.
+    pub(crate) fn side(&self, run: &str, tape: &RunTape, now_ns: u64) -> RunSide {
         let (cost_usd, tokens) = run_cost(self, &tape.spans);
         let ended = attribution::session_outcome(&tape.spans, now_ns, crate::mcp::SESSION_IDLE_NS);
         RunSide {
