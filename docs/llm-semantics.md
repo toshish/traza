@@ -242,6 +242,16 @@ Membership is per span, as it is for sessions: a trace whose root carries
 not the session's. A session id that itself begins with `trace:` reads as the
 trace form.
 
+### Handoffs
+
+A run's **handoff sequence** is its steps that name an agent (the agent row
+of the names table above), in step order — start time, then identity — with
+consecutive steps of one agent merged into one **turn**. A step that names
+no agent does not move control. A **handoff cycle** is control returning to
+an agent straight from the agent it handed off to: turns `A, B, A`, counted
+per ordered pair. The run guard's `max_handoff_cycles` limit and the run
+topology both read this definition; see [steer](guide/steer.md#topology).
+
 ## Sessions and aggregation
 
 An agent session usually spans many traces. Any span carrying a recognized

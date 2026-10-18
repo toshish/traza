@@ -176,6 +176,7 @@ impl RouteClass {
             ("GET", "/v1/export" | "/v1/tail") => Self::Stream,
             // A long-poll is held open by the consumer's wait, not by work.
             ("GET", "/v1/fuses/events") => Self::Stream,
+            ("GET", traza::steer::http::LIVE_STREAM) => Self::Stream,
             ("GET", path) if path.starts_with("/v1/stats") => Self::Stats,
             ("GET", "/v1/sessions") => Self::Stats,
             ("GET", path)
@@ -653,9 +654,12 @@ a metered llm.cost_usd always wins)] \
 besides loopback)] \
 [--fuse-max-cost-usd F] [--fuse-max-tokens N] [--fuse-max-steps N] \
 [--fuse-max-duration-seconds N] [--fuse-max-repeats N (default 12)] [--fuse-max-error-streak N] \
+[--fuse-max-handoff-cycles N] \
 (the global default run-fuse policy; 0 removes a limit) \
 [--fuse-action stop|warn (default warn)] [--fuse-max-runs N (live runs kept; default 100000)] \
 [--no-fuses (do not observe runs; every /v1/fuses route answers 409)] \
+[--live-window-seconds N (how recent a run's activity must be for GET /v1/runs/live; \
+default 900)] \
 [--tape-max-bytes N (payload bytes one tape or replay inlines; default 8MiB)] \
 [--allow-unauthenticated-non-loopback] [--version] \
 [--restore BACKUP_DIR (install a backup into --data-dir, then serve it)]\n\
@@ -756,6 +760,7 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
     let mut max_batch_spans = traza::caps::DEFAULT_MAX_BATCH_SPANS as u64;
     let cap = |value: u64| (value > 0).then_some(value as usize);
     let mut fuses = traza::guard::FuseConfig::default();
+    let mut steer = traza::steer::SteerConfig::default();
     let mut tape_max_bytes = traza::tape::DEFAULT_TAPE_MAX_BYTES;
 
     let value = |i: usize, name: &str| -> Result<&String, String> {
@@ -997,6 +1002,19 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
                 let limit = number(i, "--fuse-max-error-streak")?;
                 fuses.limits.max_error_streak = (limit > 0).then_some(limit);
             }
+            "--fuse-max-handoff-cycles" => {
+                i += 1;
+                let limit = number(i, "--fuse-max-handoff-cycles")?;
+                fuses.limits.max_handoff_cycles = (limit > 0).then_some(limit);
+            }
+            "--live-window-seconds" => {
+                i += 1;
+                let seconds = number(i, "--live-window-seconds")?;
+                if seconds == 0 {
+                    return Err("--live-window-seconds must be at least 1".to_owned());
+                }
+                steer.live_window = Duration::from_secs(seconds);
+            }
             "--fuse-action" => {
                 i += 1;
                 fuses.action = match value(i, "--fuse-action")?.as_str() {
@@ -1093,6 +1111,7 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
             max_span_bytes: cap(max_span_bytes),
             max_batch_spans: cap(max_batch_spans),
             fuses,
+            steer,
         },
     }))
 }
@@ -3496,6 +3515,36 @@ fn serve_request(
                 Err(error) => responder.json(503, json!({"error": error.to_string()})),
             }
         }
+        // Steering: the live-run stream owns its socket, like the tail; the
+        // rest live beside the engine API they call (traza::steer::http).
+        ("GET", traza::steer::http::LIVE_STREAM) => {
+            let tenant = match traza::steer::http::stream_scope(query, scope) {
+                Ok(tenant) => tenant,
+                Err(reply) => return responder.json(reply.status, reply.body),
+            };
+            let slot = match engine.live_stream_slot() {
+                Ok(slot) => slot,
+                Err(error) => return engine_error(responder, metrics, error),
+            };
+            responder.must_close();
+            let streamed = stream_live(responder.stream, engine, tenant.as_deref());
+            drop(slot);
+            streamed
+        }
+        (_, path) if traza::steer::http::handles(path) => {
+            let reply = traza::steer::http::serve(
+                engine,
+                &request.method,
+                path,
+                query,
+                &request.body,
+                scope,
+            );
+            if reply.deadline_exceeded {
+                metrics.query_deadline_exceeded.increment();
+            }
+            responder.json(reply.status, reply.body)
+        }
         // Run fuses: policies, verdicts, the kill switch and the event feed.
         // The routes live beside the engine API they call (traza::guard::http);
         // the method rule above already authorized the request.
@@ -3778,6 +3827,70 @@ fn stream_tail(
         // signal, and it is what ends this thread.
         write_chunk(stream, frame.as_bytes())?;
         stream.flush()?;
+    }
+}
+
+/// Shortest gap between two change updates on a live-run stream: a burst of
+/// ingest touching the same runs coalesces into one update per run.
+const LIVE_COALESCE: Duration = Duration::from_millis(250);
+
+/// `GET /v1/runs/live/stream`: the live view as server-sent events.
+///
+/// Opens with `event: snapshot` — the live listing, as `GET /v1/runs/live`
+/// answers it — then sends `event: run` with one live run's row each time
+/// that run changes, at most one update per [`LIVE_COALESCE`], and a
+/// comment heartbeat after [`TAIL_HEARTBEAT`] of quiet. When more runs
+/// change at once than one update carries, or an erasure sweeps the view, a
+/// fresh `snapshot` replaces everything the client holds. A client that
+/// reconnects starts again from a snapshot; there is no resumable cursor.
+fn stream_live(stream: &mut TcpStream, engine: &Store, tenant: Option<&str>) -> io::Result<()> {
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nX-Accel-Buffering: no\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+    )?;
+    stream.flush()?;
+    let mut cursor = traza::steer::LiveCursor::default();
+    let mut last_write = std::time::Instant::now();
+    loop {
+        let update = match engine.live_wait(tenant, &mut cursor, TAIL_HEARTBEAT) {
+            Ok(update) => update,
+            // The response has begun; ending the stream is all that is left.
+            Err(error) => {
+                eprintln!("live-run stream ended: {error}");
+                return stream.flush();
+            }
+        };
+        let frame = match update {
+            traza::steer::LiveUpdate::Snapshot(page) => {
+                let payload = serde_json::to_value(&page).unwrap_or_else(|_| json!({}));
+                format!("event: snapshot\ndata: {payload}\n\n")
+            }
+            // Changes this stream may not see (another tenant's, or runs
+            // outside the window): nothing to send but a due heartbeat.
+            traza::steer::LiveUpdate::Changed(runs) if runs.is_empty() => {
+                if last_write.elapsed() < TAIL_HEARTBEAT {
+                    std::thread::sleep(LIVE_COALESCE);
+                    continue;
+                }
+                ": tick\n\n".to_owned()
+            }
+            traza::steer::LiveUpdate::Changed(runs) => {
+                let mut frame = String::new();
+                for run in runs {
+                    let payload = serde_json::to_value(&run).unwrap_or_else(|_| json!({}));
+                    frame.push_str(&format!("event: run\ndata: {payload}\n\n"));
+                }
+                frame
+            }
+            traza::steer::LiveUpdate::Idle => ": tick\n\n".to_owned(),
+        };
+        // A failed write is how a disconnect is detected.
+        write_chunk(stream, frame.as_bytes())?;
+        stream.flush()?;
+        last_write = std::time::Instant::now();
+        if frame.starts_with("event:") {
+            std::thread::sleep(LIVE_COALESCE);
+        }
     }
 }
 

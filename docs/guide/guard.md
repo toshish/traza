@@ -34,7 +34,7 @@ is shaped around both:
   and tool — it answers whether the step may run. A step that **would go
   past** a stop limit answers `stop`. This is the only surface that can
   refuse a step before it happens, and it is what an agent framework or a
-  hook (see [the Claude Code example](../../examples/guard/README.md#the-claude-code-hook))
+  hook (see [the Claude Code hook pack](../../examples/claude-code/README.md))
   should call.
 - **The post-ack verdict is a backstop.** Every ingest response names the
   runs in its batch whose verdict is not `continue`, so a client that does
@@ -105,7 +105,7 @@ pre-call check refuses the next step under `max_cost_usd`: what the run has
 spent, priced by the server from a `--pricing` file, plus the agent's estimate
 for the step would pass the limit. A grant then approves the run to finish.
 The last beat runs the
-[Claude Code hook](../../examples/guard/README.md#the-claude-code-hook)
+[Claude Code hook pack](../../examples/claude-code/README.md)
 against the same server. The verdicts, reasons, usage and run costs it prints
 are the server's answers. The per-step prices are the agent's own arithmetic
 on the same pricing file, and the demo asserts that the server's cost for the
@@ -137,6 +137,7 @@ What a run has used:
 | `error_streak` | Consecutive failed **steps** at the end of the run. A successful step ends it; a non-step span neither extends nor ends it. |
 | `duration_ns` | First span start to last span end, by the spans' own clocks. An idle gap counts once the next span arrives. |
 | `top_repeat` | The step fingerprint seen most often, its count and an example span. |
+| `top_handoff_cycle` | The pair of named agents control bounced between most — `A → B → A` returns, since the last reset — and how often; present only once there is one. See [handoff cycles](steer.md#handoff-cycles-as-a-fuse-limit). |
 
 A **fingerprint** is a step's kind and name plus a hash of its input —
 `tool:search_orders#465a6bab9a1c447d` — so two steps share one exactly when
@@ -176,6 +177,7 @@ A policy is a name, which runs it is for, a set of limits, and an action:
 | `max_duration_seconds` | `duration_ns >= limit × 10⁹` |
 | `max_repeats` | `top_repeat.count >= limit` |
 | `max_error_streak` | `error_streak >= limit` |
+| `max_handoff_cycles` | `top_handoff_cycle.count >= limit` |
 
 Every limit is optional and an absent one is unbounded. A present one must be
 positive, and `max_repeats` at least 2 — one occurrence is not a repeat.
@@ -301,7 +303,7 @@ must stop, never that it may go on. Two things leave the guard with part:
   `warn`.
 
 Either way a refusal is an error, not a `200`: a hook configured to fail
-closed (the Claude Code example's `TRAZA_FUSE_FAIL_CLOSED=1`) blocks the
+closed (the Claude Code hook pack's `TRAZA_FAIL_CLOSED=1`) blocks the
 step, and one that fails open lets it through — the operator's choice,
 rather than a `continue` that would have let the step through either way.
 
@@ -337,6 +339,10 @@ What a restart loses, and what it does not:
 
 ## Watching
 
+- **[Live runs](steer.md#live-runs)** — `GET /v1/runs/live` and its stream
+  — show the runs working now, with the step each is on and its verdict, from
+  this same live state; and a person can [nudge](steer.md#nudges) a run, or
+  veto its next step, through the pre-call check it already makes.
 - **The [event feed](http-api.md#get-v1fusesevents)** records every
   transition as it happens — a run entering `warn`, a policy `stop`, a
   `manual_stop`, a `reset` — in a ring of 4,096, read by cursor with an
@@ -392,8 +398,11 @@ Stated plainly, so none of them is discovered in production:
   — although a rebuild after a restart, reading the root first, judges them
   under the root's policy. Likewise a failed step arriving after steps that
   started later extends the error streak where it arrived, not where it
-  started. Where a run's services have different policies, keep the child
-  services' limits no stricter than the root's.
+  started, and a named step arriving after later-starting ones is judged
+  against `max_handoff_cycles` as it lands — counted where it started, but
+  possibly on a cycle a step still in flight would have broken. Where a
+  run's services have different policies, keep the child services' limits
+  no stricter than the root's.
 - **Concurrent re-sends that move usage between steps can stop a run on a
   total it never held.** Within one batch the guard withdraws every replaced
   version before landing the new ones, so a batch that moves cost from one

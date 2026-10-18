@@ -12,7 +12,8 @@ to the right document. Start with the row that matches what you are doing.
 | Look up an exact route, parameter, or response shape | [HTTP API reference](guide/http-api.md) |
 | Query LLM/agent telemetry — sessions, tokens, cost | [LLM semantics](llm-semantics.md) |
 | Let a coding agent read the store over MCP | [MCP server](guide/mcp.md) · [demo](../examples/mcp-demo/README.md) |
-| Stop a runaway agent run before its next step | [Run fuses](guide/guard.md) · [demo](../examples/guard/README.md) · [Claude Code hook](../examples/guard/README.md#the-claude-code-hook) |
+| Stop a runaway agent run before its next step | [Run fuses](guide/guard.md) · [demo](../examples/guard/README.md) · [Claude Code hook pack](../examples/claude-code/README.md) |
+| Watch live runs, nudge or veto a running agent, see how its agents hand off | [Steer](guide/steer.md) · [Claude Code hook pack](../examples/claude-code/README.md) |
 | Re-run a recorded agent run with zero model calls, or diff two runs | [Replay](guide/replay.md) · [demo](../examples/replay/README.md) |
 | Prove what the store committed, for an auditor or a notary | [Ledger and evidence packs](guide/ledger.md) · [demo](../examples/prove/README.md) |
 | Call the guard, replays, diff, recall or the ledger from Python or TypeScript | [Client libraries](guide/clients.md) |

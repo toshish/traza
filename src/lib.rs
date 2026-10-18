@@ -44,6 +44,7 @@ pub mod run;
 pub mod seed;
 pub mod segment;
 pub mod semconv;
+pub mod steer;
 pub mod tail;
 pub mod tape;
 pub mod ui;
@@ -932,6 +933,8 @@ pub struct Config {
     /// many runs it keeps live. On by default, warning on repeated steps
     /// only. See [`guard`].
     pub fuses: guard::FuseConfig,
+    /// Steering: the live view's activity window. See [`steer`].
+    pub steer: steer::SteerConfig,
 }
 
 /// The last commit whose reader accepts every segment format retired WITHOUT
@@ -1041,6 +1044,7 @@ impl Default for Config {
             max_span_bytes: Some(caps::DEFAULT_MAX_SPAN_BYTES),
             max_batch_spans: Some(caps::DEFAULT_MAX_BATCH_SPANS),
             fuses: guard::FuseConfig::default(),
+            steer: steer::SteerConfig::default(),
         }
     }
 }
@@ -2423,6 +2427,9 @@ pub struct Store {
     /// [`Config::fuses`] disables it. Its locks are leaf-level: never held
     /// while an engine lock is taken.
     guard: Option<guard::Guard>,
+    /// Nudges and live-stream slots, beside the guard; `None` when the
+    /// guard is. Its lock is leaf-level.
+    steer: Option<steer::Steer>,
     _directory_lock: DirectoryLock,
 }
 
@@ -2564,6 +2571,7 @@ impl Store {
 
             Ok(Self {
                 guard: guard::Guard::open(&directory, &config.fuses)?,
+                steer: steer::Steer::open(&directory, config.fuses.enabled)?,
                 annotations: annotations::AnnotationLog::open(&directory)?,
                 evals: evals::EvalLog::open(&directory)?,
                 erasures,
@@ -6614,6 +6622,7 @@ impl Store {
         // resolves no keys — its veil is the tenant predicate itself.
         self.veil_tail(subject, &purge.keys);
         self.forget_fuse_subject(subject, &purge.keys)?;
+        self.forget_steer_subject(subject)?;
 
         // ---- confirm: everything mutable, BEFORE the checkpoint ----------
         // The admission barrier suppresses covered spans (and the annotate

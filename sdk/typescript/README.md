@@ -167,9 +167,10 @@ signal ends a long-poll at once with the signal's `AbortError`.
 Claude Code
 -----------
 
-[`examples/guard/claude-code-hook.sh`](../../examples/guard/README.md) is the
-tested hook (POSIX `sh`, `curl`, `python3`). The same pre-call check as a Node
-`PreToolUse` hook command, saved as an `.mjs` file:
+[`examples/claude-code`](../../examples/claude-code/README.md) is the tested
+hook pack (`python3`, standard library only) — the gate, a person's nudges, a
+summary of earlier runs at session start, and an installer. The same pre-call
+check as a Node `PreToolUse` hook command, saved as an `.mjs` file:
 
 ```js
 #!/usr/bin/env node
@@ -190,8 +191,9 @@ try {
 }
 ```
 
-It checks only; the shell hook's `PostToolUse` half also records each call as
-a span, which gives the session's step and repeat limits something to count.
+It checks only; the pack's optional `PostToolUse` recorder also records each
+call as a span, which gives the session's step and repeat limits something to
+count.
 
 Replaying a run with zero model calls
 -------------------------------------

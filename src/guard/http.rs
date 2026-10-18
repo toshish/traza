@@ -37,7 +37,7 @@ pub struct Reply {
 }
 
 impl Reply {
-    fn ok(body: Value) -> Self {
+    pub(crate) fn ok(body: Value) -> Self {
         Self {
             status: 200,
             body,
@@ -45,7 +45,7 @@ impl Reply {
         }
     }
 
-    fn error(status: u16, message: impl Into<String>) -> Self {
+    pub(crate) fn error(status: u16, message: impl Into<String>) -> Self {
         Self {
             status,
             body: json!({"error": message.into()}),
@@ -55,7 +55,7 @@ impl Reply {
 
     /// The server's one cross-tenant refusal, byte for byte: `required`
     /// says what would have worked, so a dashboard can name it.
-    fn foreign_tenant() -> Self {
+    pub(crate) fn foreign_tenant() -> Self {
         Self {
             status: 403,
             body: json!({
@@ -71,7 +71,7 @@ impl Reply {
     /// is the remedy), anything else the store's 503. A run too long for a
     /// rebuild to read whole is 400 too, as a too-broad query is on the
     /// search route: retrying cannot help, and 503 would say it might.
-    fn engine(error: Error) -> Self {
+    pub(crate) fn engine(error: Error) -> Self {
         match error {
             Error::Invalid(reason) => Self::error(400, reason),
             Error::InvalidSpan(reason) => Self::error(400, reason),
@@ -86,7 +86,7 @@ impl Reply {
     }
 }
 
-type Routed<T> = Result<T, Reply>;
+pub(crate) type Routed<T> = Result<T, Reply>;
 
 /// Serves one `/v1/fuses/*` request. `bound` is the credential's tenant
 /// binding, `None` for an unbound credential or an open server. The caller
@@ -159,10 +159,16 @@ fn check(store: &Store, query: &str, body: &[u8], bound: Option<&str>) -> Routed
         None => store.fuse_verdict(&tenant, &request.run),
     }
     .map_err(Reply::engine)?;
+    // The run is active, and on the step it asked about (the live view).
+    store.guard_note_check(&tenant, &request.run, request.next.as_ref());
+    // Pending nudges ride this verdict, delivered once; a `block` vetoes
+    // this step (see `crate::steer::check_reply`).
+    let body =
+        crate::steer::check_reply(store, &tenant, &request.run, &doc).map_err(Reply::engine)?;
     // Always 200 when there is a verdict to give: the verdict is the answer,
     // and a pre-call hook should not have to tell "stop" from a failure by
     // status code.
-    Ok(Reply::ok(to_json(&doc)))
+    Ok(Reply::ok(body))
 }
 
 fn list_runs(store: &Store, query: &str, bound: Option<&str>) -> Routed<Reply> {
@@ -284,7 +290,7 @@ fn events(store: &Store, query: &str, bound: Option<&str>) -> Routed<Reply> {
 
 /// The tenant a single-run request addresses: the binding (refusing another
 /// named one), else the named tenant, else the default tenant.
-fn run_tenant(named: Option<&String>, bound: Option<&str>) -> Routed<String> {
+pub(crate) fn run_tenant(named: Option<&String>, bound: Option<&str>) -> Routed<String> {
     match (bound, named) {
         (Some(bound), Some(named)) if named != bound => Err(Reply::foreign_tenant()),
         (Some(bound), _) => Ok(bound.to_owned()),
@@ -303,7 +309,7 @@ fn run_tenant(named: Option<&String>, bound: Option<&str>) -> Routed<String> {
 
 /// The tenant scope a listing reads: the binding (refusing another named
 /// one), else the named tenant, else every tenant (`None`).
-fn scope_tenant(named: Option<&String>, bound: Option<&str>) -> Routed<Option<String>> {
+pub(crate) fn scope_tenant(named: Option<&String>, bound: Option<&str>) -> Routed<Option<String>> {
     match (bound, named) {
         (Some(_), _) => run_tenant(named, bound).map(Some),
         (None, None) => Ok(None),
@@ -312,7 +318,10 @@ fn scope_tenant(named: Option<&String>, bound: Option<&str>) -> Routed<Option<St
 }
 
 /// Query parameters, refusing any not in `allowed` and any repeated one.
-fn params(query: &str, allowed: &[&str]) -> Routed<std::collections::HashMap<String, String>> {
+pub(crate) fn params(
+    query: &str,
+    allowed: &[&str],
+) -> Routed<std::collections::HashMap<String, String>> {
     let mut found = std::collections::HashMap::new();
     for pair in query.split('&').filter(|pair| !pair.is_empty()) {
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
@@ -327,7 +336,7 @@ fn params(query: &str, allowed: &[&str]) -> Routed<std::collections::HashMap<Str
     Ok(found)
 }
 
-fn parse_body<T: for<'de> Deserialize<'de>>(body: &[u8], shape: &str) -> Routed<T> {
+pub(crate) fn parse_body<T: for<'de> Deserialize<'de>>(body: &[u8], shape: &str) -> Routed<T> {
     serde_json::from_slice(body)
         .map_err(|error| Reply::error(400, format!("body must be {shape}: {error}")))
 }
@@ -343,12 +352,12 @@ fn parse_optional_body<T: for<'de> Deserialize<'de> + Default>(
     parse_body(body, shape)
 }
 
-fn to_json<T: serde::Serialize>(value: &T) -> Value {
+pub(crate) fn to_json<T: serde::Serialize>(value: &T) -> Value {
     serde_json::to_value(value).unwrap_or_else(|_| json!({}))
 }
 
 /// `%XX` and `+` decoding, as the server decodes every other path and query.
-fn percent_decode(input: &str) -> String {
+pub(crate) fn percent_decode(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut output = Vec::with_capacity(bytes.len());
     let mut index = 0;

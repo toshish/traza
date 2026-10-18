@@ -111,6 +111,12 @@ pub struct Limits {
     /// Ceiling on consecutive failed steps.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_error_streak: Option<u64>,
+    /// Ceiling on handoff cycles: how often control may return to a named
+    /// agent straight from the agent it handed off to (`A → B → A`), for
+    /// the pair that does it most (see `crate::steer`). Trips at
+    /// `count >= max_handoff_cycles`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_handoff_cycles: Option<u64>,
 }
 
 impl Limits {
@@ -130,6 +136,7 @@ impl Limits {
             max_duration_seconds: grant.max_duration_seconds.or(self.max_duration_seconds),
             max_repeats: grant.max_repeats.or(self.max_repeats),
             max_error_streak: grant.max_error_streak.or(self.max_error_streak),
+            max_handoff_cycles: grant.max_handoff_cycles.or(self.max_handoff_cycles),
         }
     }
 
@@ -150,6 +157,7 @@ impl Limits {
             ("max_duration_seconds", self.max_duration_seconds),
             ("max_repeats", self.max_repeats),
             ("max_error_streak", self.max_error_streak),
+            ("max_handoff_cycles", self.max_handoff_cycles),
         ];
         for (name, value) in counts {
             if value == Some(0) {
