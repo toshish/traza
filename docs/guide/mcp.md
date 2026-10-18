@@ -114,7 +114,7 @@ over `curl`.
 
 ## The tools
 
-Twenty tools: eighteen reads and two gated writers. They are shaped like the
+Twenty-one tools: nineteen reads and two gated writers. They are shaped like the
 questions somebody asks at 2am, not like the route index — two routes may serve
 one tool, and one route may serve two. Most of them describe what is in the
 store; `diagnose_session` and `compare_runs` are the ones that answer a
@@ -140,6 +140,7 @@ question about it.
 | `list_live_runs` | Which agent runs are working right now, and what is each doing? |
 | `run_topology` | **How did this run's agents hand work around, and where did they ping-pong?** |
 | `blame_line` | **Which agent step wrote this line of code, and why?** |
+| `xray_step` | **What exactly did the model see at this step — and why did its cache break?** |
 | `record_annotation` | Attach a note or rating to a trace or span (**`rw` token + `--mcp-annotations`**) |
 | `promote_failures_to_dataset` | Turn this run's failures into a regression dataset (**`rw` token + `--mcp-promote`**) |
 
@@ -148,13 +149,13 @@ host asks for approval before each call:
 
 | Tool | `readOnlyHint` | `destructiveHint` | `idempotentHint` | `openWorldHint` |
 |---|---|---|---|---|
-| the eighteen readers | `true` | — | — | `false` |
+| the nineteen readers | `true` | — | — | `false` |
 | `record_annotation` | `false` | `false` | `false` | `false` |
 | `promote_failures_to_dataset` | `false` | `false` | `false` | `false` |
 
 **Absent annotations are not neutral.** Every hint defaults to the pessimistic
 answer — not read-only, potentially destructive, open world — so a server that
-omits them advertises eighteen read tools as though each might delete something and
+omits them advertises nineteen read tools as though each might delete something and
 call out to the internet. A host that gates on that asks for confirmation on
 every call, and one running non-interactively, with nobody to ask, declines
 them. `destructiveHint` and `idempotentHint` are meaningful only when
@@ -209,6 +210,23 @@ The reasoning behind these is worth knowing:
   deliberately no tool that creates a replay: a replay serves model answers to
   an agent harness, and letting the model under test create one would let
   stored telemetry choose which recording its next run is fed.
+- **`xray_step` reads one model call's context window.** It is the
+  [context X-Ray](xray.md): the context split into chunks with estimated
+  tokens and the step that introduced each, stale tool results, repeated
+  content, what the conversation's previous call had that this one lost (a
+  lost system or user chunk is called out as an instruction) or carries
+  edited, and the call's cache verdict naming the first divergent chunk and the
+  volatile token in it. It takes `trace_id` and `span_id` — `get_run_tape`
+  lists both for every step — or `run_id` and `step`, a tape index (the run is
+  read once, under one query deadline; with a credential that sees every
+  tenant, a run present in more than one is refused), and is text only. The
+  headline carries counts in Traza's own words, and counts as lost
+  instructions only losses checked against every possible edit — the rest are
+  counted as possibly edited. The model, the run, every preview and role, and
+  the cache explanation (which quotes recorded text) render inside the
+  telemetry block. Past the result ceiling rows are cut from the end, the
+  chunk list first, and the note says whether the summary rows survived; the
+  stale threshold is the server's `--xray-stale-steps`.
 
 **`foresee_run` reads a run against its agent's [Fate Map](foresight.md).** It
 takes `run_id`, an optional `tenant` (for an unbound credential; a bound one
@@ -264,7 +282,7 @@ the run's `foresight` too, and a foresight stop reads as any other reason;
 in `structuredContent` the reasons and the foresight's explanation and next
 tool are made JSON-safe, as `foresee_run` makes the same text. On a server
 started with `--no-fuses` it is not listed, nor is `list_live_runs` —
-sixteen reads, then — and a call naming either is refused.
+seventeen reads, then — and a call naming either is refused.
 
 **`list_live_runs` and `run_topology` are [steering](steer.md)'s reads.**
 `list_live_runs` is [`GET /v1/runs/live`](http-api.md#get-v1runslive): the

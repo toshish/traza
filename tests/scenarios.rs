@@ -53,6 +53,7 @@ fn store_with_corpus(label: &str, options: &SeedOptions) -> (Store, traza::seed:
             fuses: Default::default(),
             fate: Default::default(),
             steer: Default::default(),
+            xray_stale_steps: traza::xray::DEFAULT_STALE_STEPS,
         },
     )
     .expect("opens");

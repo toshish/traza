@@ -15,10 +15,23 @@
 //!
 //! A derived cost is arithmetic over the token counts the span reported, at
 //! the rates this deployment configured. It is not a bill. It does not know
-//! about cached-prompt discounts, batch tiers, reasoning tokens billed at a
-//! third rate, negotiated pricing, or the difference between what a vendor
-//! quotes and what it invoices. **A metered cost always wins** — if a span
-//! carries `llm.cost_usd`, that is the number, and the table is not consulted.
+//! about batch tiers, reasoning tokens billed at a third rate, negotiated
+//! pricing, or the difference between what a vendor quotes and what it
+//! invoices. **A metered cost always wins** — if a span carries
+//! `llm.cost_usd`, that is the number, and the table is not consulted.
+//!
+//! # Prompt caching
+//!
+//! A rate may name what cached prompt tokens cost (`cache_read_per_mtok`,
+//! `cache_write_per_mtok`). Without them a call that reported cache counters
+//! is priced exactly as it always was — prompt and completion at the two base
+//! rates — which under-counts an Anthropic-style call (its prompt count
+//! EXCLUDES the cached tokens, so they were never priced) and over-counts an
+//! OpenAI-style one (its prompt count INCLUDES them, so they were priced at
+//! the full input rate). With them, cached tokens are priced at their own
+//! rates under the provider's counting convention ([`CacheConvention`]); a
+//! provider whose convention is unknown keeps the old arithmetic, because
+//! which way to correct it cannot be told.
 //!
 //! Because the two are not the same kind of fact, they are summed separately:
 //! [`crate::analytics`] reports `cost_usd` alongside the derived share of it,
@@ -52,15 +65,61 @@ pub struct Rate {
     pub input_per_mtok: f64,
     /// USD per million output (completion) tokens.
     pub output_per_mtok: f64,
+    /// USD per million prompt tokens served from a provider's cache, when the
+    /// table names it (`cache_read_per_mtok`).
+    pub cache_read_per_mtok: Option<f64>,
+    /// USD per million prompt tokens written into a provider's cache, when
+    /// the table names it (`cache_write_per_mtok`).
+    pub cache_write_per_mtok: Option<f64>,
 }
 
+/// Tokens per million: the unit every rate is quoted in.
+const PER_MTOK: f64 = 1_000_000.0;
+
 impl Rate {
-    /// Cost of a call at this rate, in USD.
+    /// Cost of a call at this rate, in USD, prompt caching ignored.
     fn cost(&self, prompt_tokens: u64, completion_tokens: u64) -> f64 {
-        const PER_MTOK: f64 = 1_000_000.0;
         (prompt_tokens as f64 / PER_MTOK) * self.input_per_mtok
             + (completion_tokens as f64 / PER_MTOK) * self.output_per_mtok
     }
+
+    /// What one prompt token served from the cache saves against the same
+    /// token processed afresh, in USD per million tokens — the price of a
+    /// token the cache could have served and did not. `None` when the table
+    /// names no cache-read rate for this model.
+    pub fn cache_read_saving_per_mtok(&self) -> Option<f64> {
+        self.cache_read_per_mtok
+            .map(|read| (self.input_per_mtok - read).max(0.0))
+    }
+}
+
+/// How a provider's prompt-token count relates to its cache counters.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CacheConvention {
+    /// The prompt count is the UNCACHED remainder; cached tokens are reported
+    /// beside it and come on top (Anthropic, Bedrock, Claude on Vertex).
+    Exclusive,
+    /// The prompt count INCLUDES the cached tokens (OpenAI, Azure OpenAI,
+    /// Gemini on Vertex).
+    Inclusive,
+    /// Not known, so no correction is attempted.
+    #[default]
+    Unknown,
+}
+
+/// What one model call reported, for [`Pricing::cost_with_cache`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CallTokens {
+    /// Prompt/input tokens, as the provider counted them.
+    pub prompt: Option<u64>,
+    /// Completion/output tokens.
+    pub completion: Option<u64>,
+    /// Prompt tokens served from the provider's cache.
+    pub cache_read: Option<u64>,
+    /// Prompt tokens written into the provider's cache.
+    pub cache_write: Option<u64>,
+    /// How [`Self::prompt`] relates to the two cache counters.
+    pub convention: CacheConvention,
 }
 
 /// A model-name-to-rate table.
@@ -88,10 +147,15 @@ impl Pricing {
     ///
     /// ```json
     /// {"models": {
-    ///   "gpt-5.6-sol":  {"input_per_mtok": 1.25, "output_per_mtok": 10.0},
-    ///   "claude-opus-*": {"input_per_mtok": 15.0, "output_per_mtok": 75.0}
+    ///   "gpt-5.6-sol":  {"input_per_mtok": 1.25, "output_per_mtok": 10.0,
+    ///                    "cache_read_per_mtok": 0.125},
+    ///   "claude-opus-*": {"input_per_mtok": 15.0, "output_per_mtok": 75.0,
+    ///                     "cache_read_per_mtok": 1.5, "cache_write_per_mtok": 18.75}
     /// }}
     /// ```
+    ///
+    /// The two cache rates are optional; see [`Self::cost_with_cache`] for
+    /// what they change.
     ///
     /// Every rejection names the model it was reading. A pricing file is
     /// edited by hand, by somebody copying numbers off a price page, and
@@ -110,6 +174,10 @@ impl Pricing {
             let object = entry
                 .as_object()
                 .ok_or_else(|| format!("pricing: {name} must be an object"))?;
+            let optional = |field: &str| match object.get(field) {
+                None | Some(Value::Null) => Ok(None),
+                value => rate_field(value, name, field).map(Some),
+            };
             let rate = Rate {
                 input_per_mtok: rate_field(object.get("input_per_mtok"), name, "input_per_mtok")?,
                 output_per_mtok: rate_field(
@@ -117,6 +185,8 @@ impl Pricing {
                     name,
                     "output_per_mtok",
                 )?,
+                cache_read_per_mtok: optional("cache_read_per_mtok")?,
+                cache_write_per_mtok: optional("cache_write_per_mtok")?,
             };
             match name.strip_suffix('*') {
                 // A bare "*" prices everything the table did not name. Legal,
@@ -172,6 +242,52 @@ impl Pricing {
         cost.is_finite().then_some(cost)
     }
 
+    /// [`Self::cost`], with prompt caching priced where the table can.
+    ///
+    /// A call that reported no cache tokens, a provider whose convention is
+    /// [`CacheConvention::Unknown`], and a rate missing the cache rate a
+    /// reported counter needs all price exactly as [`Self::cost`] does — the
+    /// documented arithmetic from before cache rates existed, kept rather
+    /// than replaced by a guessed correction. Otherwise:
+    ///
+    /// - **Exclusive** (the prompt count is the uncached remainder): the
+    ///   prompt at the input rate, plus cache reads and writes at theirs.
+    /// - **Inclusive** (the prompt count includes them): the prompt count less
+    ///   the cached tokens at the input rate, plus the cached tokens at
+    ///   theirs. Cache counters larger than the prompt count they are part of
+    ///   contradict each other, and price as [`Self::cost`].
+    pub fn cost_with_cache(&self, model: &str, tokens: &CallTokens) -> Option<f64> {
+        let (prompt, completion) = (tokens.prompt?, tokens.completion?);
+        let rate = self.rate(model)?;
+        let plain = rate.cost(prompt, completion);
+        let read = tokens.cache_read.unwrap_or(0);
+        let write = tokens.cache_write.unwrap_or(0);
+        let cache_rate = |count: u64, rate: Option<f64>| match (count, rate) {
+            (0, _) => Some(0.0),
+            (_, rate) => rate,
+        };
+        let uncached = match tokens.convention {
+            _ if read == 0 && write == 0 => None,
+            CacheConvention::Exclusive => Some(prompt),
+            CacheConvention::Inclusive => prompt.checked_sub(read.saturating_add(write)),
+            CacheConvention::Unknown => None,
+        };
+        let cost = match (
+            uncached,
+            cache_rate(read, rate.cache_read_per_mtok),
+            cache_rate(write, rate.cache_write_per_mtok),
+        ) {
+            (Some(uncached), Some(read_rate), Some(write_rate)) => {
+                (uncached as f64 / PER_MTOK) * rate.input_per_mtok
+                    + (read as f64 / PER_MTOK) * read_rate
+                    + (write as f64 / PER_MTOK) * write_rate
+                    + (completion as f64 / PER_MTOK) * rate.output_per_mtok
+            }
+            _ => plain,
+        };
+        cost.is_finite().then_some(cost)
+    }
+
     /// A stable digest of the table, for the rollup validity gate.
     ///
     /// Zero for an empty table, and deliberately: a store that prices nothing
@@ -183,27 +299,40 @@ impl Pricing {
         if self.is_empty() {
             return 0;
         }
-        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-        let mut eat = |bytes: &[u8]| {
-            for byte in bytes {
-                hash ^= u64::from(*byte);
-                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        // The cache rates are fed only when present, each behind a tag byte
+        // UTF-8 text can never contain (0xFE, 0xFF): a table without them
+        // digests exactly as it did before they existed — upgrading
+        // invalidates nobody's rollups — while adding or changing one
+        // changes the digest, because it changes the arithmetic.
+        fn eat_rate(stream: &mut Vec<u8>, name: &str, rate: &Rate) {
+            stream.extend_from_slice(name.as_bytes());
+            stream.extend_from_slice(&rate.input_per_mtok.to_bits().to_le_bytes());
+            stream.extend_from_slice(&rate.output_per_mtok.to_bits().to_le_bytes());
+            if let Some(read) = rate.cache_read_per_mtok {
+                stream.push(0xFE);
+                stream.extend_from_slice(&read.to_bits().to_le_bytes());
             }
-        };
+            if let Some(write) = rate.cache_write_per_mtok {
+                stream.push(0xFF);
+                stream.extend_from_slice(&write.to_bits().to_le_bytes());
+            }
+        }
+        let mut stream = Vec::new();
         // Exact entries are a BTreeMap and prefixes are sorted by the parser,
         // so both iterate in a fixed order for a given table.
         for (name, rate) in &self.exact {
-            eat(name.as_bytes());
-            eat(&rate.input_per_mtok.to_bits().to_le_bytes());
-            eat(&rate.output_per_mtok.to_bits().to_le_bytes());
+            eat_rate(&mut stream, name, rate);
         }
         // A separator no model name can contain, so {"ab": r} and {"a": r}
         // with a "b" prefix cannot collide into the same byte stream.
-        eat(&[0]);
+        stream.push(0);
         for (prefix, rate) in &self.prefixes {
-            eat(prefix.as_bytes());
-            eat(&rate.input_per_mtok.to_bits().to_le_bytes());
-            eat(&rate.output_per_mtok.to_bits().to_le_bytes());
+            eat_rate(&mut stream, prefix, rate);
+        }
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in stream {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
         }
         hash
     }
@@ -376,5 +505,198 @@ mod tests {
 
         assert!(Pricing::parse("{}").is_err(), "missing models is an error");
         assert!(Pricing::parse("not json").is_err());
+    }
+
+    const CACHED: &str = r#"{"models": {
+        "claude-x": {"input_per_mtok": 3.0, "output_per_mtok": 15.0,
+                     "cache_read_per_mtok": 0.3, "cache_write_per_mtok": 3.75},
+        "gpt-x": {"input_per_mtok": 2.0, "output_per_mtok": 8.0,
+                  "cache_read_per_mtok": 0.5},
+        "bare": {"input_per_mtok": 3.0, "output_per_mtok": 15.0}
+    }}"#;
+
+    fn call(
+        prompt: u64,
+        read: u64,
+        write: u64,
+        completion: u64,
+        convention: CacheConvention,
+    ) -> CallTokens {
+        CallTokens {
+            prompt: Some(prompt),
+            completion: Some(completion),
+            cache_read: Some(read),
+            cache_write: Some(write),
+            convention,
+        }
+    }
+
+    fn close(left: Option<f64>, right: f64) -> bool {
+        left.is_some_and(|left| (left - right).abs() < 1e-12)
+    }
+
+    #[test]
+    fn exclusive_cache_tokens_are_priced_on_top_of_the_prompt() {
+        let pricing = Pricing::parse(CACHED).expect("parses");
+        // 1M uncached at $3, 2M read at $0.30, 0.5M written at $3.75, 0.1M
+        // out at $15: the old arithmetic priced the 1M prompt and nothing of
+        // the 2.5M cached tokens.
+        let cost = pricing.cost_with_cache(
+            "claude-x",
+            &call(
+                1_000_000,
+                2_000_000,
+                500_000,
+                100_000,
+                CacheConvention::Exclusive,
+            ),
+        );
+        assert!(close(cost, 3.0 + 0.6 + 1.875 + 1.5), "{cost:?}");
+        assert!(close(
+            pricing.cost("claude-x", Some(1_000_000), Some(100_000)),
+            4.5
+        ));
+    }
+
+    #[test]
+    fn inclusive_cache_reads_are_discounted_out_of_the_prompt() {
+        let pricing = Pricing::parse(CACHED).expect("parses");
+        // 1M prompt of which 0.8M were cache reads: 0.2M at $2 + 0.8M at
+        // $0.50, where the old arithmetic charged all 1M at $2.
+        let cost = pricing.cost_with_cache(
+            "gpt-x",
+            &call(1_000_000, 800_000, 0, 0, CacheConvention::Inclusive),
+        );
+        assert!(close(cost, 0.4 + 0.4), "{cost:?}");
+        // Cache counters exceeding the prompt they are part of contradict
+        // it: the plain arithmetic stands.
+        let contradictory =
+            pricing.cost_with_cache("gpt-x", &call(100, 800, 0, 0, CacheConvention::Inclusive));
+        assert!(close(contradictory, 100.0 * 2.0 / 1e6), "{contradictory:?}");
+    }
+
+    #[test]
+    fn without_the_needed_rate_or_convention_nothing_changes() {
+        let pricing = Pricing::parse(CACHED).expect("parses");
+        let plain = |model| pricing.cost(model, Some(1_000_000), Some(0));
+        // No cache rates at all.
+        assert_eq!(
+            pricing.cost_with_cache(
+                "bare",
+                &call(1_000_000, 500_000, 0, 0, CacheConvention::Exclusive)
+            ),
+            plain("bare")
+        );
+        // A write the table has no rate for.
+        assert_eq!(
+            pricing.cost_with_cache(
+                "gpt-x",
+                &call(1_000_000, 0, 10, 0, CacheConvention::Inclusive)
+            ),
+            plain("gpt-x")
+        );
+        // An unknown convention cannot be corrected either way.
+        assert_eq!(
+            pricing.cost_with_cache(
+                "claude-x",
+                &call(1_000_000, 500_000, 0, 0, CacheConvention::Unknown)
+            ),
+            plain("claude-x")
+        );
+        // No cache tokens is the old arithmetic under every convention.
+        for convention in [CacheConvention::Exclusive, CacheConvention::Inclusive] {
+            assert_eq!(
+                pricing.cost_with_cache("claude-x", &call(1_000_000, 0, 0, 0, convention)),
+                plain("claude-x")
+            );
+        }
+        // And both directions are still required.
+        let mut partial = call(1, 1, 0, 1, CacheConvention::Exclusive);
+        partial.completion = None;
+        assert_eq!(pricing.cost_with_cache("claude-x", &partial), None);
+    }
+
+    #[test]
+    fn a_table_without_cache_rates_digests_as_it_always_did() {
+        // The digest before cache rates existed, written out: FNV-1a over
+        // each exact name and its two rates' bits, a zero byte, then each
+        // prefix likewise.
+        fn legacy(entries: &[(&str, f64, f64)], prefixes: &[(&str, f64, f64)]) -> u64 {
+            let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+            let mut eat = |bytes: &[u8]| {
+                for byte in bytes {
+                    hash ^= u64::from(*byte);
+                    hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+                }
+            };
+            for (name, input, output) in entries {
+                eat(name.as_bytes());
+                eat(&input.to_bits().to_le_bytes());
+                eat(&output.to_bits().to_le_bytes());
+            }
+            eat(&[0]);
+            for (name, input, output) in prefixes {
+                eat(name.as_bytes());
+                eat(&input.to_bits().to_le_bytes());
+                eat(&output.to_bits().to_le_bytes());
+            }
+            hash
+        }
+        let pricing = Pricing::parse(TABLE).expect("parses");
+        assert_eq!(
+            pricing.fingerprint(),
+            legacy(
+                &[("gpt-5.6-sol", 1.25, 10.0)],
+                &[("gpt-4o-mini", 0.15, 0.6), ("gpt-4o", 2.5, 10.0)]
+            )
+        );
+
+        let with_read = Pricing::parse(
+            r#"{"models": {"m": {"input_per_mtok": 1.0, "output_per_mtok": 1.0,
+                                 "cache_read_per_mtok": 0.1}}}"#,
+        )
+        .expect("parses");
+        let with_write = Pricing::parse(
+            r#"{"models": {"m": {"input_per_mtok": 1.0, "output_per_mtok": 1.0,
+                                 "cache_write_per_mtok": 0.1}}}"#,
+        )
+        .expect("parses");
+        let without = legacy(&[("m", 1.0, 1.0)], &[]);
+        assert_ne!(with_read.fingerprint(), without);
+        assert_ne!(with_write.fingerprint(), without);
+        assert_ne!(
+            with_read.fingerprint(),
+            with_write.fingerprint(),
+            "a read rate and a write rate of the same value are different tables"
+        );
+    }
+
+    #[test]
+    fn a_cache_rate_is_validated_like_any_other() {
+        let error = Pricing::parse(
+            r#"{"models": {"m": {"input_per_mtok": 1.0, "output_per_mtok": 1.0,
+                                 "cache_read_per_mtok": -0.1}}}"#,
+        )
+        .expect_err("negative cache rate");
+        assert!(error.contains("m.cache_read_per_mtok"), "{error}");
+        let error = Pricing::parse(
+            r#"{"models": {"m": {"input_per_mtok": 1.0, "output_per_mtok": 1.0,
+                                 "cache_write_per_mtok": "cheap"}}}"#,
+        )
+        .expect_err("non-numeric cache rate");
+        assert!(error.contains("must be a number"), "{error}");
+        let null = Pricing::parse(
+            r#"{"models": {"m": {"input_per_mtok": 1.0, "output_per_mtok": 1.0,
+                                 "cache_read_per_mtok": null}}}"#,
+        )
+        .expect("null is absent");
+        assert_eq!(null.rate("m").and_then(|r| r.cache_read_per_mtok), None);
+        assert_eq!(
+            Pricing::parse(CACHED)
+                .expect("parses")
+                .rate("claude-x")
+                .and_then(|rate| rate.cache_read_saving_per_mtok()),
+            Some(3.0 - 0.3)
+        );
     }
 }

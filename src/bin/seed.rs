@@ -150,6 +150,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 },
                 fate: Default::default(),
                 steer: traza::steer::SteerConfig::default(),
+                // Read-side only; a seeder reads nothing.
+                xray_stale_steps: traza::xray::DEFAULT_STALE_STEPS,
             },
         )?),
         None => None,

@@ -147,6 +147,8 @@ coding (`br`, `deflate`, `zstd`, a doubled `gzip`), is `415`.
 | `GET` | [`/v1/fate/map`](#get-v1fatemap) | One agent's Fate Map: every path its runs took, with success rates, fatal forks and hotspots |
 | `GET` | [`/v1/fate/runs/{run}`](#get-v1faterunsrun) | Foresight for one run: how runs that took its path ended |
 | `GET` | [`/v1/blame`](#get-v1blame) | Agent Blame: the tool step that introduced a line of code |
+| `GET` | [`/v1/xray/{trace_id}/{span_id}`](#get-v1xraytrace_idspan_id) | A model call's context window: chunks, provenance, staleness, duplicates, compaction loss |
+| `GET` | [`/v1/cache/{run}`](#get-v1cacherun) | Cache Autopsy: why each call's prompt cache held or broke, and what it cost |
 | `POST` | [`/v1/annotations`](#post-v1annotations) | Attach a score or feedback record |
 | `GET` | [`/v1/annotations`](#get-v1annotations) | Query annotations |
 | `POST` | [`/v1/datasets`](#post-v1datasets) | Create a dataset |
@@ -1515,6 +1517,111 @@ curl 'http://127.0.0.1:8080/v1/fate/runs/live-healthy-0'
 
 **Errors.** `400` for an empty or over-long (1,024 bytes) run id,
 `min_support=0`, or an exhausted deadline; `404` for a run no span carries.
+
+---
+
+## Context X-Ray and Cache Autopsy
+
+One model call's context window read as chunks — with where each came from,
+what is stale, repeated, lost or edited since the conversation's previous call
+— and a run's prompt cache autopsied call by call. Deterministic arithmetic
+over stored spans; no model is called. The [X-Ray guide](xray.md) explains the
+chunking, the heuristics and the limits; this section is the reference.
+
+Both routes are reads, take the usual `tenant=` selector and binding (a bound
+credential reads its own tenant; naming another is `403` with `"required":
+"unbound"`), refuse unknown or repeated query parameters, and run inside one
+`--query-deadline-ms` budget — past it, `400`, never a partial answer.
+
+### `GET /v1/xray/{trace_id}/{span_id}`
+
+The X-Ray of one model call (an `llm` step). Percent-encode a `/` inside an id.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `tenant` | string | Tenant scope. In the operator view (unbound, no `tenant`), a span id present in more than one tenant is `400`; one present in exactly one is read entirely under that tenant |
+| `resolve` | `true` / `false` | Resolve offloaded `$payload` references — the call's request and the run's earlier ones — before chunking. Default `true`; at most 64 MiB of payload for the call and 64 MiB for its history, the 32 calls a predecessor can be read first |
+| `stale_steps` | integer, 1–100,000 | Steps after which an unreferenced tool result is `stale`. Default `--xray-stale-steps` (20) |
+| `ttl_seconds` | integer, 1–86,400 | The cache lifetime the embedded `cache` verdict assumes. Default 300 |
+
+```sh
+curl 'http://localhost:8080/v1/xray/4bf92f3577b34da6/m2'
+```
+
+```json
+{"cache":{"cache_read":0,"cache_write":null,"calibration":null,"cause":"volatile_content","chunks":4,"est_cost_lost_usd":0.000027,"est_tokens":39,"est_tokens_lost":10,"explanation":"chunk 0 (system) changed in place since step 0: \"2026-10-14T09:00:01Z\" → \"2026-10-14T09:00:02Z\" (a timestamp); ~10 tokens of content step 0 already had were re-processed","first_divergent_chunk":{"change":"edited","diff":{"after":"2026-10-14T09:00:02Z","before":"2026-10-14T09:00:01Z","offset":34},"index":0,"kind":"system","role":"system","volatile":"timestamp"},"gap_ns":1000000000,"model":"claude-sonnet-x","prefix_chunks_shared":0,"previous_step_index":0,"reported_hit":false,"shared_est_tokens":0,"span":{"span_id":"m2","trace_id":"4bf92f3577b34da6"},"step_index":2},"chunks":[{"age_steps":0,"chars":55,"digest":"d10d1295d605523b","est_tokens":14,"index":0,"introduced_by":{"kind":"llm","name":"claude-sonnet-x","span_id":"m2","step_index":2,"trace_id":"4bf92f3577b34da6","via":"content"},"kind":"system","preview":"You are a weather assistant. Now: 2026-10-14T09:00:02Z.","role":"system","stale":false},{"age_steps":2,"chars":36,"digest":"7046cb363208e1ee","est_tokens":9,"index":1,"introduced_by":{"kind":"llm","name":"claude-sonnet-x","span_id":"m0","step_index":0,"trace_id":"4bf92f3577b34da6","via":"content"},"kind":"user","preview":"Weather in Paris? Answer in Celsius.","role":"user","stale":false},{"age_steps":2,"chars":29,"digest":"d239da9c2fbb6d43","est_tokens":8,"index":2,"introduced_by":{"kind":"llm","name":"claude-sonnet-x","span_id":"m0","step_index":0,"trace_id":"4bf92f3577b34da6","via":"content"},"kind":"tool_call","name":"get_weather","preview":"get_weather({\"city\":\"Paris\"})","role":"assistant","stale":false,"tool_call_id":"tu_1"},{"age_steps":1,"chars":29,"digest":"d74e03b3bc7b0091","est_tokens":8,"index":3,"introduced_by":{"kind":"tool","name":"get_weather","span_id":"t1","step_index":1,"trace_id":"4bf92f3577b34da6","via":"content"},"kind":"tool_result","preview":"{\"temp_c\": 18, \"sky\": \"rain\"}","role":"user","stale":false,"tool_call_id":"tu_1"}],"chunks_truncated":false,"composition":{"by_kind":[{"chunks":1,"est_tokens":14,"key":"system","share":0.358974358974359},{"chunks":1,"est_tokens":9,"key":"user","share":0.23076923076923078},{"chunks":1,"est_tokens":8,"key":"tool_call","share":0.20512820512820512},{"chunks":1,"est_tokens":8,"key":"tool_result","share":0.20512820512820512}],"by_source":[{"chunks":1,"est_tokens":14,"key":"system","share":0.358974358974359},{"chunks":1,"est_tokens":9,"key":"user","share":0.23076923076923078},{"chunks":1,"est_tokens":8,"key":"tool calls","share":0.20512820512820512},{"chunks":1,"est_tokens":8,"key":"tool:get_weather","share":0.20512820512820512}]},"context_unavailable":null,"dropped_since_previous":[],"dropped_truncated":false,"duplicates":[],"duplicates_truncated":false,"edited_since_previous":[{"diff":{"after":"2026-10-14T09:00:02Z","before":"2026-10-14T09:00:01Z","offset":34},"index":0,"kind":"system","previous_index":0,"role":"system","volatile":"timestamp"}],"edited_truncated":false,"model":"claude-sonnet-x","previous":{"shared_chunks":2,"span_id":"m0","step_index":0,"trace_id":"4bf92f3577b34da6"},"provenance_partial":false,"provider":"anthropic","resolved_partial":false,"response":[{"age_steps":null,"chars":27,"digest":"93aafba39ecea63e","est_tokens":8,"index":0,"introduced_by":null,"kind":"assistant","preview":"18 °C and raining in Paris.","role":"assistant","stale":false}],"run":"weather-9","span":{"span_id":"m2","trace_id":"4bf92f3577b34da6"},"stale_after_steps":20,"start_ns":1791964801000000000,"step_index":2,"tenant":"","texts_partial":false,"totals":{"cache_read":0,"cache_write":null,"chunks":4,"duplicate_est_tokens":0,"est_tokens":39,"reported_context_tokens":96,"reported_input_tokens":96,"stale_chunks":0,"stale_est_tokens":0}}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `run`, `tenant`, `span`, `model`, `provider`, `start_ns` | | The call and its run |
+| `step_index` | integer or null | Its tape index; `null` when the run is longer than one read (20,000 spans) and the call lies past it — it is then X-rayed alone |
+| `chunks[]` | array | The context window in order: `index`, `role` (lowercased; `tools` for a tool definition; `null` for a bare prompt), `kind` (`system`, `user`, `assistant`, `tool_result`, `tool_call`, `other`), `chars`, `est_tokens`, `digest` (16 hex characters of the content's identity), `introduced_by`, `age_steps`, `stale`, `preview` (120 characters), and when present `name` (a call's or definition's tool), `tool_call_id`, `duplicate_of` (the first chunk with the same content) |
+| `chunks[].introduced_by` | object or null | The earliest step whose request or response held the same content: `trace_id`, `span_id`, `step_index`, `kind`, `name` (tool, model, agent or span name), `via` (`content`, or `tool_call_id` for a tool result the model was shown differently from what the tool step returned) |
+| `context_unavailable` | string or null | Why the context could not be read: `was not recorded`, `was offloaded and could not be resolved`, `was offloaded and resolve=false` |
+| `chunks_truncated` | boolean | The context had more than 2,000 chunks; the rest is not analysed |
+| `totals` | object | `chunks`, `est_tokens`, `reported_input_tokens`, `reported_context_tokens` (the context resolved across providers' cache conventions), `cache_read`, `cache_write`, `stale_chunks`, `stale_est_tokens`, `duplicate_est_tokens` |
+| `composition` | object | `by_kind` and `by_source` (`system`, `user`, `assistant`, `tool calls`, `tool definitions`, `tool:<name>`, `other`; past twelve sources the rest fold into `other sources`): `key`, `chunks`, `est_tokens`, `share` (0–1), largest first |
+| `previous` | object or null | The conversation's previous call (the [predecessor](xray.md#the-predecessor)): `trace_id`, `span_id`, `step_index`, `shared_chunks` |
+| `dropped_since_previous[]` | array | Its chunks this call lacks: `digest`, `role`, `kind` (`instruction` for a system or user chunk, else `other`), `chunk_kind`, `est_tokens`, `preview` (`null` when the text was not kept), `introduced_by`, `unverified` (`true` when a chunk of this call could be it edited but the two could not be compared — the old text was not kept, or the comparison bound was reached). At most 256; `dropped_truncated` says when more were cut |
+| `edited_since_previous[]` | array | Its chunks this call carries edited (same role and kind, at most a tenth of the text differing): `index`, `previous_index`, `role`, `kind`, `diff` (`offset`, `before`, `after`), `volatile`. At most 256; `edited_truncated` says when more were cut |
+| `duplicates[]` | array | Content present more than once: `digest`, `count`, `est_tokens_each`, `indices`, `preview`; most tokens wasted first, at most 64; `duplicates_truncated` says when more were cut |
+| `cache` | object | This call's cache verdict, as one entry of [`GET /v1/cache/{run}`](#get-v1cacherun) |
+| `response[]` | array | The model's output, chunked the same way (no provenance) |
+| `stale_after_steps` | integer | The stale threshold applied |
+| `resolved_partial` | boolean | An offloaded value stayed unresolved (budget, gone, or `resolve=false`) |
+| `provenance_partial` | boolean | A provenance or staleness bound was reached, or the history was not read; `introduced_by` and `stale` are then incomplete |
+| `texts_partial` | boolean | More than 32 MiB of distinct chunk text across the call and the 32 before it; some `preview` or `diff` is `null`, and a lost chunk may be `unverified` |
+
+`404 {"error":"span not found"}` for an unknown span; `400` for a span of
+another step kind (`the span is a tool step; the X-Ray reads model calls (llm
+steps)`), a malformed path, an invalid parameter, an ambiguous operator read
+(`that span exists in 2 tenants; name one with tenant=`), or an exhausted
+budget.
+
+### `GET /v1/cache/{run}`
+
+The Cache Autopsy of a run: every model call compared with its
+[predecessor](xray.md#the-predecessor) — the earlier call of the same tenant
+(and agent, when both name one) that this call continues: the longest matching
+lead past the tool definitions, else at least half its chunks shared — on
+exact chunk identity.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `tenant` | string | Tenant scope |
+| `ttl_seconds` | integer, 1–86,400 | The cache lifetime to assume. Default 300 |
+| `resolve` | `true` / `false` | Resolve offloaded requests before comparing. Default `true`; at most 64 MiB of payload per call and 512 MiB per autopsy |
+
+```sh
+curl 'http://localhost:8080/v1/cache/weather-9'
+```
+
+```json
+{"resolved_partial":false,"run":"weather-9","steps":[{"cache_read":0,"cache_write":null,"calibration":null,"cause":"new_context","chunks":2,"est_cost_lost_usd":0.0,"est_tokens":23,"est_tokens_lost":0,"explanation":"the first model call of the run: there was no earlier prompt to cache","gap_ns":null,"model":"claude-sonnet-x","prefix_chunks_shared":0,"previous_step_index":null,"reported_hit":false,"shared_est_tokens":0,"span":{"span_id":"m0","trace_id":"4bf92f3577b34da6"},"step_index":0},{"cache_read":0,"cache_write":null,"calibration":null,"cause":"volatile_content","chunks":4,"est_cost_lost_usd":0.000027,"est_tokens":39,"est_tokens_lost":10,"explanation":"chunk 0 (system) changed in place since step 0: \"2026-10-14T09:00:01Z\" → \"2026-10-14T09:00:02Z\" (a timestamp); ~10 tokens of content step 0 already had were re-processed","first_divergent_chunk":{"change":"edited","diff":{"after":"2026-10-14T09:00:02Z","before":"2026-10-14T09:00:01Z","offset":34},"index":0,"kind":"system","role":"system","volatile":"timestamp"},"gap_ns":1000000000,"model":"claude-sonnet-x","prefix_chunks_shared":0,"previous_step_index":0,"reported_hit":false,"shared_est_tokens":0,"span":{"span_id":"m2","trace_id":"4bf92f3577b34da6"},"step_index":2}],"summary":{"breaks":1,"by_cause":{"new_context":1,"reordered":0,"stable":0,"ttl_expired":0,"unknown":0,"volatile_content":1},"culprits":[{"advice":"A clock value sits inside the cached prefix. Move the time to the end of the prompt (after the last cache breakpoint), or round it to a coarser unit such as the day.","breaks":1,"cause":"volatile_content","change":"edited","est_cost_lost_usd":0.000027,"est_tokens_lost":10,"example":{"after":"2026-10-14T09:00:02Z","before":"2026-10-14T09:00:01Z","offset":34},"example_step_index":2,"role":"system","volatile":"timestamp"}],"culprits_truncated":false,"disagreement_advice":null,"disagreements":0,"est_cost_lost_usd":0.000027,"est_tokens_lost":10,"steps":2,"unpriced_breaks":0},"tenant":null,"texts_partial":false,"truncated":false,"ttl_seconds":300}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `steps[]` | array | One per model call, in step order |
+| `steps[].step_index`, `span`, `model` | | The call (`step_index` is `null` only in an X-Ray of a call past the read limit) |
+| `steps[].previous_step_index` | integer or null | Its predecessor; `null` for the first call of a conversation or when none can be paired |
+| `steps[].chunks`, `est_tokens` | integer | Its context's size |
+| `steps[].prefix_chunks_shared`, `shared_est_tokens` | integer | Leading chunks byte-identical to the predecessor's |
+| `steps[].first_divergent_chunk` | object | Present when the prefix diverged — including a `stable` new turn, where it marks where the predecessor's last chunk was replaced: `index`, `role`, `kind`, `change` (`edited`, `replaced`, `inserted`, `removed`, `moved`, `reserialized`, `rewritten`, `shrunk`), `diff` (`offset` — a byte offset into the chunk's text — `before`, `after`, each at most 80 characters, widened to the word; `null` when a text was not kept), `volatile` for an edit (`timestamp`, `uuid`, `hex_id`, `number`, `text`) |
+| `steps[].cause` | string | `stable`, `volatile_content`, `reordered`, `ttl_expired`, `new_context`, `unknown` — see [the guide](xray.md#causes) |
+| `steps[].explanation` | string | The verdict as a sentence; quotes recorded text |
+| `steps[].cache_read`, `cache_write`, `reported_hit` | | The provider's report |
+| `steps[].gap_ns` | integer or null | Time since the predecessor began |
+| `steps[].est_tokens_lost` | integer | Estimated tokens the cache could have served and did not — the content after the divergence the predecessor had, an edited chunk's own text after the change, and the shared prefix too past the TTL — scaled by `calibration` when there is one |
+| `steps[].calibration` | number or null | The provider's context count over the estimate (clamped 0.25–4); `null` when not applied: no predecessor, no provider count, or a context with media, unrecorded tool definitions or more than 2,000 chunks |
+| `steps[].est_cost_lost_usd` | number | Those tokens at the model's input rate less its cache-read rate; present only when `--pricing` names both |
+| `summary` | object | `steps`, `breaks` (calls with a predecessor whose verdict is not `stable`), `by_cause` (every cause), `est_tokens_lost`, `est_cost_lost_usd` (`null` when nothing could be priced), `unpriced_breaks`, `disagreements` (a stable prefix with no cache read reported, or a read reported where nothing was servable) and `disagreement_advice` (fixed guidance, `null` without disagreements), `culprits` (break shapes — `cause`, `change`, `role`, `volatile` — with `breaks`, `est_tokens_lost`, `est_cost_lost_usd` (`null` when any break of the shape is unpriced), `example_step_index`, `example`, and `advice`: fixed guidance chosen by the shape, not generated; by cost when every shape is priced, else by tokens; at most 10) and `culprits_truncated` |
+| `truncated` | boolean | The run had more than 20,000 spans or 2,000 model calls |
+| `resolved_partial` | boolean | An offloaded request stayed unresolved |
+| `texts_partial` | boolean | More than 32 MiB of distinct chunk text across the 32 most recent calls; some `diff` is `null` |
+
+`404 {"error":"run not found"}` for a run with no spans in scope.
 
 ---
 
@@ -3040,7 +3147,7 @@ Streamable HTTP transport, one message per request. **Served only when the
 server was started with `--mcp`**; otherwise every method answers `404` with
 the flag named.
 
-This route is documented in full in **[the MCP guide](mcp.md)** — its sixteen
+This route is documented in full in **[the MCP guide](mcp.md)** — its seventeen
 tools, five resources, three templates and four prompts, and what each returns.
 What belongs here is the transport contract:
 

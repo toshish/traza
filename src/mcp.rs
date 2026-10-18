@@ -48,6 +48,8 @@ mod fate_tools;
 mod steer_tools;
 // blame_line lives beside this file.
 mod blame_tools;
+// xray_step lives beside this file.
+mod xray_tools;
 
 /// The MCP endpoint path served by `traza-server`.
 pub const ENDPOINT: &str = "/v1/mcp";
@@ -636,6 +638,7 @@ impl<'a> Server<'a> {
         tools.extend(fate_tools::definitions());
         tools.extend(steer_tools::definitions(self.store.fuses_enabled()));
         tools.extend(blame_tools::definitions());
+        tools.extend(xray_tools::definitions());
         if self.annotation_tool_available(access) {
             tools.push(tool(
                 "record_annotation",
@@ -765,6 +768,7 @@ impl<'a> Server<'a> {
             name if blame_tools::handles(name) => {
                 blame_tools::call(self, name, arguments, &context)
             }
+            name if xray_tools::handles(name) => xray_tools::call(self, arguments, &context),
             "record_annotation" if self.annotation_tool_available(context.access) => {
                 self.record_annotation(arguments, context)
             }

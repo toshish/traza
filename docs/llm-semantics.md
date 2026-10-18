@@ -92,8 +92,13 @@ caching on, providers disagree about what the prompt count *counts*:
 
 | Provider | `input_tokens` / `prompt_tokens` | Context is |
 |---|---|---|
-| Anthropic, Bedrock, Vertex | the **uncached remainder** | prompt + cache read + cache creation |
-| OpenAI, Azure OpenAI | **inclusive** of its cached subset | the prompt count itself |
+| Anthropic, Bedrock, Claude on Vertex | the **uncached remainder** | prompt + cache read + cache creation |
+| OpenAI, Azure OpenAI, Gemini on Vertex | **inclusive** of its cached subset | the prompt count itself |
+
+Vertex (`gcp.vertex_ai`) serves both families under one provider name, so
+there the model decides: a name containing `claude` is read as Anthropic's, one
+containing `gemini` as inclusive, and any other Vertex model with cache
+counters falls in the "not known" case below.
 
 This matters wherever a growing conversation is being watched: read the
 uncached remainder alone and a context that is growing appears to *shrink* as
@@ -102,6 +107,12 @@ and where cache counters appear under a provider whose convention Traza does
 not know, it reports the trend as unreadable rather than guessing. The
 OpenInference host names (`aws`, `azure`, `google`) are not in the table
 above, so they fall in that last case.
+
+The same table decides how a derived cost counts cached tokens when the
+pricing file names `cache_read_per_mtok` / `cache_write_per_mtok` for the
+model: on top of the prompt for the exclusive providers, carved out of it for
+the inclusive ones, and not at all for a provider not in the table (see
+[Model pricing](configuration.md#model-pricing)).
 
 OpenInference's own cache counters
 (`llm.token_count.prompt_details.cache_read` / `.cache_write`) are **not**
