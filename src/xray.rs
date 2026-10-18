@@ -811,7 +811,7 @@ fn has_reference(value: &Value) -> bool {
 /// Why a context cannot be read, if it cannot.
 fn unavailable(request: Option<&Value>, resolve: bool) -> Option<&'static str> {
     match request {
-        None => Some("was not recorded"),
+        None => Some(NOT_RECORDED),
         Some(value) if has_reference(value) && resolve => {
             Some("was offloaded and could not be resolved")
         }
@@ -884,6 +884,14 @@ fn is_delta(span: &Span) -> bool {
         _ => false,
     }
 }
+
+/// Why a context cannot be read when its call recorded none.
+const NOT_RECORDED: &str = "was not recorded";
+
+/// Why a delta-recorded call's context could not be rebuilt from an earlier
+/// call of its conversation that could not be read.
+const EARLIER_UNREADABLE: &str =
+    "could not be rebuilt: an earlier call of its conversation could not be read";
 
 /// Why a delta-recorded call's context could not be rebuilt.
 const NOT_REBUILT: &str =
@@ -963,10 +971,12 @@ impl Threads {
                     }
                     read.context.list = list;
                     read.context.truncated = truncated;
-                    // A delta that added nothing is not an unrecorded one.
+                    // A delta that added nothing is not an unrecorded one;
+                    // an unreadable earlier call leaves this one partial.
+                    let earlier = thread.unavailable.map(|_| EARLIER_UNREADABLE);
                     read.unavailable = match read.unavailable {
-                        Some("was not recorded") => thread.unavailable,
-                        own => own.or(thread.unavailable),
+                        Some(NOT_RECORDED) => earlier,
+                        own => own.or(earlier),
                     };
                 }
                 None if self.lost_overflow || self.lost.contains(&key) => {

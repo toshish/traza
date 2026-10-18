@@ -276,7 +276,10 @@ like any other (`chunks_truncated`). The X-Ray reads the run's earlier calls
 twice when it rebuilds — once in order to rebuild the call and the comparison
 window, once as recorded for provenance — inside the same query deadline and
 payload budgets. A delta call past the read limit is X-rayed alone and says
-its context is partial.
+its context is partial. Measured on one real Claude Code session of 1,482
+model calls (26 MB of transcript, release build, a laptop): the X-Ray of its
+last call rebuilt 1,002 chunks in 0.5 s, and the autopsy of all 1,482 calls
+took 1.4 s, finding its two compactions as `rewritten`.
 
 What a transcript does not record, the rebuilt context cannot show: Claude
 Code and Codex transcripts carry neither the system prompt nor the tool

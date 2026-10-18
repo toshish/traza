@@ -1829,6 +1829,21 @@ fn threads_are_bounded_and_a_dropped_conversation_is_not_rebuilt_from_nothing() 
     plain.attributes.remove(CONVERSATION_ATTRIBUTE);
     let read = threads.fold(&plain, read_of("solo"));
     assert_eq!(read.context.list.len(), 1);
+    // An earlier call that could not be read leaves its successors partial,
+    // said as such rather than blamed on their own requests.
+    let mut unreadable = read_of("offloaded");
+    unreadable.unavailable = Some("was offloaded and could not be resolved");
+    threads.fold(&span_of("dark"), unreadable);
+    let read = threads.fold(&span_of("dark"), read_of("after"));
+    assert_eq!(read.unavailable, Some(EARLIER_UNREADABLE));
+    // An empty delta — a call that recorded no input — continues a readable
+    // conversation as a whole context, not an unrecorded one.
+    let mut empty = read_of("unused");
+    empty.context.list.clear();
+    empty.unavailable = Some(NOT_RECORDED);
+    let read = threads.fold(&span_of(&format!("c{MAX_THREADS}")), empty);
+    assert_eq!(read.unavailable, None);
+    assert_eq!(read.context.list.len(), 4, "hello, ok, again, ok");
     // The text bound holds too: one conversation larger than every bound
     // is never kept, so its next call is not rebuilt.
     let mut huge = Threads::default();
