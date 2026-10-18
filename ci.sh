@@ -58,8 +58,9 @@ python3 scripts/test-demos.py
 # break otherwise. guard, replay, prove, foresight and coding-agents run the
 # binary TRAZA_BIN names, so it is set here, never inherited: an older install
 # exported in the caller's shell must not stand in for the one just built.
-# foresight writes its corpus with the seed binary beside it, which the
-# release build above also built.
+# foresight writes its corpus with the seed TRAZA_SEED_BIN names, so that is
+# set too, to the seed the release build above also built: an exported older
+# seed would write a corpus the change under test never touched.
 if command -v python3 >/dev/null 2>&1; then
   demo_dir=$(mktemp -d "${TMPDIR:-/tmp}/traza-ci.XXXXXX")
   demos="$demo_dir/traza checkout"
@@ -84,7 +85,8 @@ if command -v python3 >/dev/null 2>&1; then
   echo "ci: replay demo ran"
   TRAZA_BIN="$built" "$demos/examples/prove/run.sh" >/dev/null
   echo "ci: prove demo ran"
-  TRAZA_BIN="$built" "$demos/examples/foresight/run.sh" >/dev/null
+  TRAZA_SEED_BIN="$demos/target/release/seed" TRAZA_BIN="$built" \
+    "$demos/examples/foresight/run.sh" >/dev/null
   echo "ci: foresight demo ran"
   TRAZA_BIN="$built" "$demos/examples/coding-agents/run.sh" >/dev/null
   echo "ci: coding-agents demo ran"

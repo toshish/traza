@@ -229,7 +229,10 @@ bold "▸ 4 · X-Ray: what the model saw, before and after the /compact"
 dim "  GET /v1/xray/{trace}/{span}: one call's context rebuilt from the"
 dim "  transcript's deltas, each chunk traced to the step that introduced it."
 echo
-set -- $(render compacted-step "$tmp/cache.json")
+# Captured first: `set -- $(…)` would swallow the render's failure.
+ids=$(render compacted-step "$tmp/cache.json") ||
+  fail "the autopsy found no rewritten (compacted) call to X-ray"
+set -- $ids
 compact_step=$1 trace=$3 after_span=$4 before_span=$5
 code=$(get "/v1/xray/$trace/$before_span" "$tmp/xray-before.json")
 need "$code" 200 "X-raying the call before the compaction"
@@ -240,8 +243,8 @@ render xray "$manifest" "$tmp/xray-before.json" "$tmp/xray-after.json"
 # ------------------------------------------------------------- 5 · TQL
 
 bold "▸ 5 · behaviour: the detectors, and one query of our own"
-dim "  The detector library is nine TQL patterns run over the window's"
-dim "  sessions; a pattern of your own is one GET."
+dim "  The detector library is a set of named TQL patterns, run over the"
+dim "  window's sessions; a pattern of your own is one GET."
 echo
 code=$(get /v1/detectors/findings "$tmp/findings.json")
 need "$code" 200 "running the detectors"

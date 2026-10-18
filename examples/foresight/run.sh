@@ -214,7 +214,10 @@ agent ready "$url" "$token" ticket-1042 || fail "the fuse never saw a cached Fat
 rc=0
 agent run "$url" "$token" ticket-1042 doomed "$tmp/doomed-state.json" "$tmp/doomed-" || rc=$?
 need "$rc" 3 "the doomed agent should be stopped at the pre-call check"
-render stopped "$tmp/doomed-check.json" "$tmp/doomed-steps.jsonl" "$tmp/map.json" ticket-1042
+# What the server holds for the run now that the agent has exited.
+code=$(get /v1/tapes/ticket-1042 "$tmp/doomed-tape.json")
+need "$code" 200 "reading ticket-1042's tape"
+render stopped "$tmp/doomed-check.json" "$tmp/map.json" "$tmp/doomed-tape.json" ticket-1042
 
 # -------------------------------------------- 5 · the healthy path runs
 

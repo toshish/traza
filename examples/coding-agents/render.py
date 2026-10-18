@@ -133,8 +133,10 @@ def rate_for(pricing, model):
 
 
 def transcript_costs(doc, pricing):
-    """Cost per agent from the transcripts alone: Anthropic usage counted once
-    per message id; Codex usage from each token_count's last response."""
+    """Cost per (session, agent) from the transcripts alone: Anthropic usage
+    counted once per message id, under the record's sessionId (a sub-agent's
+    records carry its parent session's); Codex usage from each token_count's
+    last response, under the rollout's thread id."""
     costs = {}
     claude_root = doc["claude_code"]["path"]
     for folder, _, names in os.walk(claude_root):
@@ -157,12 +159,15 @@ def transcript_costs(doc, pricing):
                         + use["output_tokens"] * rate["output_per_mtok"]
                         + use["cache_read_input_tokens"] * rate["cache_read_per_mtok"]
                         + use["cache_creation_input_tokens"] * rate["cache_write_per_mtok"]) / 1e6
-                costs[agent] = costs.get(agent, 0.0) + cost
+                key = (record["sessionId"], agent)
+                costs[key] = costs.get(key, 0.0) + cost
     for path in doc["codex"]["files"]:
-        model = None
+        model = thread = None
         for line in open(path):
             record = json.loads(line)
             payload = record["payload"]
+            if record["type"] == "session_meta":
+                thread = payload["id"]
             if record["type"] == "turn_context":
                 model = payload["model"]
             if record["type"] == "event_msg" and payload.get("type") == "token_count" and payload.get("info"):
@@ -171,7 +176,7 @@ def transcript_costs(doc, pricing):
                 cost = ((use["input_tokens"] - cached) * rate["input_per_mtok"]
                         + cached * rate.get("cache_read_per_mtok", rate["input_per_mtok"])
                         + use["output_tokens"] * rate["output_per_mtok"]) / 1e6
-                costs["codex"] = costs.get("codex", 0.0) + cost
+                costs[(thread, "codex")] = costs.get((thread, "codex"), 0.0) + cost
     return costs
 
 
@@ -180,6 +185,7 @@ def cost(manifest_path, pricing_path, *topologies):
     pricing = load(pricing_path)
     labels = {v: k for k, v in doc["sessions"].items()}
     agents = {}
+    served = {}
     per_session = []
     for path in topologies:
         topo = load(path)
@@ -191,15 +197,20 @@ def cost(manifest_path, pricing_path, *topologies):
             row["llm"] += node["llm_calls"]
             row["tool"] += node["tool_calls"]
             row["cost"] += node["cost_usd"]
+            key = (topo["run"], node["agent"])
+            served[key] = served.get(key, 0.0) + node["cost_usd"]
             total += node["cost_usd"]
         per_session.append((topo["run"], total, topo))
     grand = sum(r["cost"] for r in agents.values())
+    # Each session's agents, one by one: the per-agent and per-session totals
+    # printed below are sums of these.
     recomputed = transcript_costs(doc, pricing)
-    must(set(recomputed) == set(agents), "agents differ: %s vs %s" % (sorted(recomputed), sorted(agents)))
-    for agent, row in agents.items():
-        must(abs(row["cost"] - recomputed[agent]) < 1e-9,
-             "%s: the server says %.8f, the transcripts and pricing file say %.8f"
-             % (agent, row["cost"], recomputed[agent]))
+    must(set(recomputed) == set(served),
+         "sessions' agents differ: %s vs %s" % (sorted(recomputed), sorted(served)))
+    for (run, agent), value in sorted(served.items()):
+        must(abs(value - recomputed[(run, agent)]) < 1e-9,
+             "%s in %s %s: the server says %.8f, the transcripts and pricing file say %.8f"
+             % (agent, labels.get(run, "?"), short(run), value, recomputed[(run, agent)]))
     print("    %-16s %8s %5s %5s %9s  %s" % ("agent", "sessions", "llm", "tool", "cost", "share"))
     for agent, row in sorted(agents.items(), key=lambda item: -item[1]["cost"]):
         kind = "" if agent in ("claude-code", "codex") else "  (sub-agent)"
@@ -214,8 +225,9 @@ def cost(manifest_path, pricing_path, *topologies):
                            for n in sorted(topo["nodes"], key=lambda n: -n["cost_usd"]))
         print("      %-8s %-9s %s%s" % (labels.get(run, "?"), short(run), money(total),
                                        "  = " + parts if len(topo["nodes"]) > 1 else ""))
-    print("    every figure recomputed from the transcripts' own usage with the pricing file:"
-          " equal to the cent and beyond (asserted)")
+    print("    all %d per-session agent costs recomputed from the transcripts' own usage and the pricing"
+          % len(served))
+    print("    file, and every figure above is a sum of them: equal to the cent and beyond (asserted)")
 
 
 # ----------------------------------------------------------------- autopsy
@@ -294,9 +306,32 @@ def provenance(chunk):
     return "step %2d %s" % (found["step_index"], name)
 
 
+def is_text(chunk, text):
+    """Whether an X-Ray chunk is this text. The server describes a chunk by
+    its length and a 120-character preview, so the two are matched on both:
+    the same number of characters, and the preview a prefix of the text."""
+    preview = chunk["preview"] or ""
+    if preview.endswith("…") and chunk["chars"] > len(preview) - 1:
+        preview = preview[:-1]
+    return chunk["chars"] == len(text) and text.startswith(preview)
+
+
+def coupons_texts(doc):
+    """The coupons session's first prompt and its /compact summary, read whole
+    from the transcript the importer read, never from a preview."""
+    with open(doc["claude_code"]["files"][doc["sessions"]["coupons"]]) as handle:
+        records = [json.loads(line) for line in handle]
+    prompts = [r["message"]["content"] for r in records if r.get("type") == "user"
+               and isinstance(r["message"]["content"], str) and not r.get("isCompactSummary")]
+    summaries = [r["message"]["content"] for r in records if r.get("isCompactSummary")]
+    must(prompts and len(summaries) == 1, "the coupons transcript has a first prompt and one /compact summary")
+    return prompts[0], summaries[0]
+
+
 def xray(manifest_path, before_path, after_path):
     doc = manifest(manifest_path)
     before, after = load(before_path), load(after_path)
+    first_prompt, compact_summary = coupons_texts(doc)
     totals = before["totals"]
     print("    X-Ray of step %d (%s) — the last call before the /compact:"
           % (before["step_index"], tidy(before["model"])))
@@ -326,11 +361,20 @@ def xray(manifest_path, before_path, after_path):
     must(after["previous"]["step_index"] == before["step_index"], "the X-Ray pairs the call with its predecessor")
     dropped = after["dropped_since_previous"]
     lost = [d for d in dropped if d["kind"] == "instruction" and not d.get("unverified")]
-    rule = [d for d in lost if doc["rule"] in d["preview"]]
+    # The rule is in the first prompt, read whole. The dropped chunk is that
+    # prompt: its digest names a chunk of the call before, and that chunk is
+    # the prompt's text by length and preview, wherever the rule sits in it.
+    must(doc["rule"] in first_prompt, "the first prompt gives the migrations rule")
+    by_digest = {c["digest"]: c for c in before["chunks"]}
+    rule = [d for d in lost if d["digest"] in by_digest and is_text(by_digest[d["digest"]], first_prompt)]
     must(rule and rule[0]["introduced_by"]["step_index"] == 0,
-         "the compaction should have dropped the rule given at step 0: %s" % lost)
-    summary_chunk = after["chunks"][0]["preview"]
-    must("migrations" not in summary_chunk, "the summary should not mention migrations/")
+         "the compaction should have dropped the first prompt, and its rule, given at step 0: %s" % lost)
+    # And the summary that replaced the context, read whole: a chunk the
+    # server rebuilt is that text, and nowhere in it is migrations/.
+    replaced = [c for c in after["chunks"] if is_text(c, compact_summary)]
+    must(replaced, "a chunk of the call after the /compact should be the summary the transcript holds"
+         " (%d characters): %s" % (len(compact_summary), [(c["chars"], c["preview"]) for c in after["chunks"]]))
+    must("migrations" not in compact_summary, "the /compact summary should not mention migrations/")
     print()
     print("    step %d, the first call after the /compact: %d chunks, ~%d est. tokens"
           % (after["step_index"], after["totals"]["chunks"], after["totals"]["est_tokens"]))
@@ -344,7 +388,9 @@ def xray(manifest_path, before_path, after_path):
           % (before["step_index"], len(dropped), sum(d["est_tokens"] for d in dropped), len(lost)))
     for item in lost:
         print("      step %2d  %s" % (item["introduced_by"]["step_index"], tidy(item["preview"])))
-    print("    the summary that replaced them never mentions migrations/ (asserted)")
+    print("    the summary that replaced them never mentions migrations/: all %d characters, read from"
+          % len(compact_summary))
+    print("    the transcript and matched to chunk %d by length and preview (asserted)" % replaced[0]["index"])
 
 
 # --------------------------------------------------------------------- TQL
@@ -491,6 +537,22 @@ def live(url, token, run, tool):
         short(run), row["steps"], row["current"]["kind"], tidy(row["current"]["name"]), row["verdict"]))
 
 
+def compacted(cache_path):
+    """The rewritten (compacted) call the autopsy found, and the call before
+    it, as words for the shell: step, previous step, trace, span, previous
+    span."""
+    doc = load(cache_path)
+    steps = {s["step_index"]: s for s in doc["steps"]}
+    rewritten = [s for s in doc["steps"]
+                 if (s.get("first_divergent_chunk") or {}).get("change") == "rewritten"]
+    must(len(rewritten) == 1, "the autopsy should find one rewritten (compacted) call, found %d" % len(rewritten))
+    step = rewritten[0]
+    must(step["previous_step_index"] in steps,
+         "the rewritten call's predecessor should be in the autopsy: %s" % step["previous_step_index"])
+    print(step["step_index"], step["previous_step_index"], step["span"]["trace_id"], step["span"]["span_id"],
+          steps[step["previous_step_index"]]["span"]["span_id"])
+
+
 def rechecked(manifest_path, before_path, after_path):
     doc = manifest(manifest_path)
     before = next(d for d in load(before_path)["detectors"] if d["name"] == "unverified_finish")
@@ -512,6 +574,7 @@ MODES = {
     "search": search,
     "blame": blame,
     "rechecked": rechecked,
+    "compacted-step": compacted,
 }
 LIVE_MODES = {"arrived": arrived, "live": live}
 
@@ -523,12 +586,5 @@ if __name__ == "__main__":
         except (RedirectRefused, urllib.error.URLError, OSError) as error:
             print("render: %s" % error, file=sys.stderr)
             sys.exit(1)
-    elif mode == "compacted-step":
-        # The step the autopsy found rewritten, for the shell to address.
-        doc = load(sys.argv[2])
-        step = next(s for s in doc["steps"]
-                    if (s.get("first_divergent_chunk") or {}).get("change") == "rewritten")
-        print(step["step_index"], step["previous_step_index"], step["span"]["trace_id"], step["span"]["span_id"],
-              next(s["span"]["span_id"] for s in doc["steps"] if s["step_index"] == step["previous_step_index"]))
     else:
         MODES[mode](*sys.argv[2:])

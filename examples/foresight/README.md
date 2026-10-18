@@ -54,9 +54,9 @@ outside, and start it again where it left off.
 | 1 · the history | `GET /v1/fate/cohorts`: 180 completed `support-agent` runs, 98 successes, 9 abandoned, 6 still running — the corpus's ground truth (asserted). |
 | 2 · the Fate Map | `GET /v1/fate/map?agent=support-agent` drawn as a tree: every path with its runs, success rate and 95% Wilson interval as a bar against the base rate. Two fatal forks are flagged — `search_orders×3-5` (5 of 50) and `issue_refund×2` (15 of 30) — and the first step is a hotspot. The fork's Wilson interval and its Fisher exact p-value are recomputed with the standard library from the counts (asserted), and every interval printed is checked against the server's. |
 | 3 · the doomed path | `ticket-1042` takes three steps with no predictive policy in place. After each, `GET /v1/fate/runs/ticket-1042`: 98 of 180 (on track), 74 of 140 after one search, then — after the second empty search — 5 of 50, `likely_failure`. The run has no outcome yet; its last step is open, so it is pooled with every run that repeated the search at least as often (asserted). |
-| 4 · the fuse | A policy sets `min_success_odds: 0.5`. The agent resumes; its pre-call check for a third search answers `stop` with `foresight: runs that took this path and then called tool:search_orders succeeded 5 of 50 times (≤21.4%)`. Asserted: the reason, `raised: true`, the upper bound below the limit, the map being the one beat 2 cached, `tripped_by: null` (a prediction, not a latch), and no fourth step recorded. |
-| 5 · the healthy path | `ticket-1043` refunds once and finishes; every check answers `continue`, and the checks that name a tool are judged with it appended (69 of 90 before the refund). Read back after it ends: `success`, judged at its own node (54 of 60). |
-| 6 · calibration | The map's self-assessment: Brier score, baseline and skill per depth (skill recomputed and asserted — zero at depth 1, where every run looks the same, and above 20% by depth 3), and the reliability bins at depth 3: what the map said against what happened. |
+| 4 · the fuse | A policy sets `min_success_odds: 0.5`. The agent resumes; its pre-call check for a third search answers `stop` with `foresight: runs that took this path and then called tool:search_orders succeeded 5 of 50 times (≤21.4%)`. Asserted: the reason, `raised: true`, the upper bound below the limit, the map being the one beat 2 cached, `tripped_by: null` (a prediction, not a latch), and the server holding the run's three steps — in the usage the check judged and on its tape after the agent exited — so no fourth search ran. |
+| 5 · the healthy path | `ticket-1043` refunds once and finishes; every check answers `continue`; the checks that name a tool are judged with it appended (69 of 90 before the refund), and a model call's, which names none, on the path so far (asserted). Read back after it ends: `success`, judged at its own node (54 of 60). |
+| 6 · calibration | The map's self-assessment: Brier score, baseline and skill per depth (skill recomputed and asserted — zero at depth 1, where every run looks the same, and above 20% by depth 3), and the reliability bins at depth 3: what the map said against what happened, each observed rate drawn with its Wilson interval, recomputed from the bin's counts, and whether the prediction falls inside it. |
 
 ## Knobs
 
@@ -85,7 +85,8 @@ outside, and start it again where it left off.
   one before it resumes the agent.
 - The token counts and costs on the agent's spans are fixed by the script.
   Every verdict, count, rate and interval printed is the server's answer,
-  asserted or recomputed — none is a constant.
+  asserted or recomputed — none is a constant. The one default quoted,
+  `foresight_min_support`'s 30, is printed as the documented default it is.
 
 ## Runtime
 

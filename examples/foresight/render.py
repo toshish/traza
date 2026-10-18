@@ -24,6 +24,9 @@ SUPPORT_BRANCHES = {
     "double refund": (30, 15, 0),
 }
 LIVE_SUPPORT_RUNS = 6
+# docs/guide/foresight.md: the support a predictive limit needs when the
+# policy leaves foresight_min_support unset. Quoted as that, never measured.
+DEFAULT_MIN_SUPPORT = 30
 Z = 1.959963984540054
 # The tree's label column; a longer path prints on a line of its own.
 WIDTH = 38
@@ -114,6 +117,22 @@ def whisker(p, bounds, base, width=20):
 
 def axis(width=20):
     return " " + "0%".ljust(width // 2) + "50%".ljust(width - width // 2) + "100%"
+
+
+# The reliability bars' resolution: 50 cells, 2 points each.
+CELLS = 50
+
+
+def reliability(said, saw, bounds, width=CELLS):
+    """What happened ● inside its 95% interval ├─┤, and what was said ·."""
+    cells = [" "] * (width + 1)
+    lo, hi, at, mark = (round(v * width) for v in (bounds[0], bounds[1], saw, said))
+    for i in range(lo, hi + 1):
+        cells[i] = "─"
+    cells[lo], cells[hi] = "├", "┤"
+    cells[mark] = "·"
+    cells[at] = "●"
+    return "▕" + "".join(cells) + "▏"
 
 
 def odds(successes, n, p, served, base):
@@ -284,18 +303,26 @@ def doomed(steps_path, run):
     print("    the run has not failed — it has no outcome yet; foresight is about what comes next")
 
 
-def stopped(check_path, steps_path, map_path, run):
+def stopped(check_path, map_path, tape_path, run):
     check = load(check_path)
-    steps = lines(steps_path)
     built = load(map_path)["built_at_ns"]
-    must(len(steps) == 3, "a stopped agent must not have recorded a fourth step: %d" % len(steps))
     must(check["verdict"] == "stop", "the pre-call check should stop the run: %s" % check["verdict"])
     must(check["tripped_by"] is None, "a foresight stop is a prediction, never latched: %s" % check)
     reasons = check["reasons"]
     must(reasons and reasons[0].startswith("foresight: "), "expected a foresight reason: %s" % reasons)
     sight = check["foresight"]
-    must(sight["raised"] and sight["next_tool"] == "search_orders" and sight["support"] >= 30,
+    set_support = check["limits"].get("foresight_min_support")
+    must(sight["raised"] and sight["next_tool"] == "search_orders"
+         and sight["support"] >= (DEFAULT_MIN_SUPPORT if set_support is None else set_support),
          "the foresight should raise the action, judged with the next search: %s" % sight)
+    # The server's record of the run, not the agent's own log: the usage the
+    # check judged, and the tape read after the agent exited.
+    usage = check["usage"]
+    must((usage["steps"], usage["llm_calls"], usage["tool_calls"]) == (3, 1, 2),
+         "the check should have judged the run's three recorded steps: %s" % usage)
+    taken = [(s["kind"], s.get("tool")) for s in load(tape_path)["steps"]]
+    must(taken == [("llm", None), ("tool", "search_orders"), ("tool", "search_orders")],
+         "after the stop the server should hold the run's three steps, no fourth: %s" % taken)
     limit = check["limits"]["min_success_odds"]
     bounds = ci(sight["successes"], sight["support"], sight["ci95"])
     must(bounds[1] < limit, "the upper bound must be below min_success_odds")
@@ -306,24 +333,27 @@ def stopped(check_path, steps_path, map_path, run):
     print("    POST /v1/fuses/check {\"run\": \"%s\", \"next\": {\"tool\": \"search_orders\"}}" % run)
     print("      verdict   STOP    policy %s · min_success_odds %s" % (check["policy"], limit))
     print("      reason    %s" % safe(reasons[0]))
-    needed = check["limits"].get("foresight_min_support", 30)
-    print("      why       upper bound %s < %s, on %d earlier runs (%d needed%s)"
-          % (pct(bounds[1]), pct(limit), sight["support"], needed,
-             "" if "foresight_min_support" in check["limits"] else ", the default"))
+    print("      why       upper bound %s < %s, on %d earlier runs — at least the %s"
+          % (pct(bounds[1]), pct(limit), sight["support"],
+             "%d the policy's foresight_min_support needs" % set_support if set_support is not None else
+             "%d needed by default (foresight_min_support, unset here)" % DEFAULT_MIN_SUPPORT))
     print("      map       the one beat 2 built and cached: same map_built_at_ns (asserted)")
     print("      latched   no (tripped_by null): a prediction, made again at every check — it lifts")
     print("                by itself if the run's path moves on to better odds")
     print()
-    print("    the agent halted: 3 steps recorded before the check, 3 after — the fourth search"
-          " never ran (asserted)")
+    print("    the agent halted. The server holds %d steps for %s — %d model call, %d searches — in the"
+          % (usage["steps"], run, usage["llm_calls"], usage["tool_calls"]))
+    print("    usage the check judged and on its tape after the agent exited: no fourth search ran"
+          " (asserted)")
 
 
 def healthy(steps_path, fate_path, run):
     steps = lines(steps_path)
     must(len(steps) == 5, "the healthy agent should take all five steps: %d" % len(steps))
     print("    %-4s %-20s %-9s %-15s %s" % ("step", "about to take", "check", "foresight",
-                                           "runs on its path, the step included"))
+                                           "runs on its path (+ the tool, if the check names it)"))
     judged = []
+    ahead, so_far = [], []
     refund_step = None
     for step in steps:
         check = step["check"]
@@ -332,6 +362,13 @@ def healthy(steps_path, fate_path, run):
         label = "%s:%s" % (step["kind"], step["name"])
         if sight.get("support"):
             must(not sight["raised"], "foresight must not act on a healthy run: %s" % sight)
+            # A tool step's check names the tool and is judged with it
+            # appended; a model call's model is not part of the check.
+            want = step["name"] if step["kind"] == "tool" else None
+            must(sight.get("next_tool") == want,
+                 "step %d's check should be judged %s: %s" % (
+                     step["step"], "with %s appended" % want if want else "on the path so far", sight))
+            (ahead if want else so_far).append(str(step["step"]))
             judged.append(sight)
             if sight.get("next_tool") == "issue_refund":
                 refund_step = step["step"]
@@ -342,8 +379,11 @@ def healthy(steps_path, fate_path, run):
             print("    %-4d %-20s %-9s %-15s %s" % (step["step"], label, "continue", "—",
                                                    "no steps recorded yet: nothing to judge"))
     must(len(judged) >= 3, "foresight should have judged most of the healthy run's steps: %d" % len(judged))
-    ahead = [s for s in judged if s.get("next_tool")]
-    refund = [s for s in ahead if s["next_tool"] == "issue_refund"]
+    must(ahead and so_far, "the healthy run has tool steps and model calls to judge: %s, %s" % (ahead, so_far))
+    print("    steps %s name their tool, and are judged with it appended; steps %s are model calls,"
+          % (", ".join(ahead), ", ".join(so_far)))
+    print("    judged on the path so far — a model call's model is not part of the check (asserted)")
+    refund = [s for s in judged if s.get("next_tool") == "issue_refund"]
     must(refund and (refund[0]["successes"], refund[0]["support"]) == ground("clean refund", "double refund"),
          "the check before the refund pools one refund and two: %s" % refund)
     print()
@@ -379,12 +419,29 @@ def calibration(path):
           " (recomputed, asserted)")
     print()
     print("    reliability at depth 3 — when the map said p, how often those runs succeeded:")
+    rows, inside, sizes = [], 0, []
     for b in cal["reliability"]:
-        said, saw = round(20 * b["predicted"]), round(20 * b["observed"])
-        bar = "".join("●" if i == saw else ("·" if i == said else " ") for i in range(21))
-        print("      said %5s   saw %5s   %3d runs   ▕%s▏" % (pct(b["predicted"]), pct(b["observed"]),
-                                                            b["runs"], bar))
-    print("    (● what happened, · what was said, on 0–100%; one ● where they agree)")
+        runs = b["runs"]
+        hits = round(b["observed"] * runs)
+        must(abs(hits - b["observed"] * runs) < 0.01, "a bin's observed rate is a count over its runs: %s" % b)
+        bounds = wilson(hits, runs)
+        inside += bounds[0] <= b["predicted"] <= bounds[1]
+        sizes.append(runs)
+        rows.append(("      said %5s  saw %5s  %3d of %-3d %11s  " % (
+            pct(b["predicted"]), pct(b["observed"]), hits, runs, interval(bounds)),
+            reliability(b["predicted"], b["observed"], bounds)))
+    print(" " * len(rows[0][0]) + axis(CELLS))
+    for prefix, bar in rows:
+        print(prefix + bar)
+    print("    (● what happened, ├─┤ its 95%% Wilson interval, · what was said, in %d-point cells: · gives"
+          % (100 // CELLS))
+    print("    way only to ●, and only when the two are within %d points)" % (100 // CELLS))
+    if inside == len(rows):
+        print("    what was said lies inside that interval in all %d bins. At %d–%d runs a bin that is all"
+              % (inside, min(sizes), max(sizes)))
+        print("    the counts can show: a gap of a few points either way is within chance")
+    else:
+        print("    what was said lies inside that interval in %d of %d bins" % (inside, len(rows)))
     print("    each run was predicted from the half of the cohort it is not in (two-fold, split by run id)")
 
 
