@@ -16,6 +16,7 @@ import { UnscopedNote } from '../components/runs/UnscopedNote.jsx';
 import { TopologyCard } from '../components/runs/Topology.jsx';
 import { NudgesCard } from '../components/runs/Nudges.jsx';
 import { ForkModal, ForksCard } from '../components/runs/Fork.jsx';
+import { RunForesight } from '../components/insight/RunForesight.jsx';
 import { forkable } from '../lib/fork.js';
 import { VERDICT_TAG, canWrite } from './GuardScreen.jsx';
 
@@ -115,6 +116,7 @@ export function RunScreen({ runId, go, params, identity, pushToast }) {
           ? <Chip onClick={() => go(['sessions', runId], scope)}>Session</Chip>
           : <Chip onClick={() => go(['trace', runId.slice('trace:'.length)])}>Trace</Chip>}
         <Chip onClick={() => go(['guard'])}>Guard</Chip>
+        <Chip onClick={() => go(['xray', runId], scope)} title="Every model call's context window, and why the prompt cache broke">X-Ray</Chip>
         <Chip active={resolve} onClick={() => setParam('resolve', resolve ? '' : 'true')}
           title="Inline offloaded payloads, up to the server's --tape-max-bytes">
           {resolve ? 'Payloads inlined' : 'Inline payloads'}
@@ -134,8 +136,8 @@ export function RunScreen({ runId, go, params, identity, pushToast }) {
 
     {!oneTenant && operator ? <UnscopedNote onScope={scopeTo}>
       This tape is read across every tenant: no tenant is named, so if two tenants use this run id
-      their steps are interleaved here, and no guard verdict is shown, since a verdict is one
-      tenant's. Name the tenant to read it in:
+      their steps are interleaved here, and no guard verdict or foresight is shown, since each is
+      one tenant's. Name the tenant to read it in:
     </UnscopedNote> : null}
 
     {data.truncated ? <div style={{ fontSize: 12, color: 'var(--warn)' }}>
@@ -152,8 +154,10 @@ export function RunScreen({ runId, go, params, identity, pushToast }) {
     </div> : null}
 
     <div className="tz-split" style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(320px, 420px)', gap: 14, alignItems: 'start' }}>
-      <Tape steps={data.steps} totals={totals} go={go} focusStep={focusStep} onFork={setForking} />
+      <Tape steps={data.steps} totals={totals} go={go} focusStep={focusStep} onFork={setForking}
+        onXray={(index) => go(['xray', runId], { ...(scope || {}), step: String(index) })} />
       <div style={{ display: 'grid', gap: 14, minWidth: 0 }}>
+        <RunForesight runId={runId} tenant={tenant} oneTenant={oneTenant} identityKnown={identity != null} go={go} />
         {oneTenant ? <TopologyCard key={'topology:' + replayScopeKey(runId, tenant)} run={runId} tenant={tenant} go={go} /> : null}
         {oneTenant ? <NudgesCard key={'nudges:' + replayScopeKey(runId, tenant)} run={runId} tenant={tenant}
           writer={canWrite(identity)} /> : null}
@@ -183,7 +187,7 @@ function stepName(step) {
   return step.model || step.tool || step.agent || step.name;
 }
 
-function Tape({ steps, totals, go, focusStep, onFork }) {
+function Tape({ steps, totals, go, focusStep, onFork, onXray }) {
   const [open, setOpen] = React.useState(() => new Set(focusStep != null ? [Number(focusStep)] : []));
   const focusRef = React.useRef(null);
   React.useEffect(() => {
@@ -259,7 +263,7 @@ function Tape({ steps, totals, go, focusStep, onFork }) {
                 <span style={{ fontSize: 11, color: step.status === 'error' ? 'var(--error)' : 'var(--ink-faint)' }}>{step.status}</span>
               </div>
             </div>
-            {expanded ? <StepDetail step={step} go={go} onFork={onFork} /> : null}
+            {expanded ? <StepDetail step={step} go={go} onFork={onFork} onXray={onXray} /> : null}
           </div>;
         })}
       </div>
@@ -275,7 +279,7 @@ function Num({ children, muted, accent }) {
   }}>{children}</div>;
 }
 
-function StepDetail({ step, go, onFork }) {
+function StepDetail({ step, go, onFork, onXray }) {
   const fp = splitFingerprint(step.fingerprint);
   return <div style={{ padding: '10px 14px 14px', borderBottom: '1px solid var(--hairline)', background: 'var(--bg)', display: 'grid', gap: 10 }}>
     <div style={{ display: 'flex', gap: 14, flexWrap: 'wrap', fontSize: 12, color: 'var(--ink-muted)' }}>
@@ -284,6 +288,8 @@ function StepDetail({ step, go, onFork }) {
       {step.tokens?.cache_read != null ? <span>cache read <Mono>{fmtNum(step.tokens.cache_read)}</Mono></span> : null}
       {step.tokens?.cache_write != null ? <span>cache write <Mono>{fmtNum(step.tokens.cache_write)}</Mono></span> : null}
       <span style={{ marginLeft: 'auto', display: 'inline-flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+        {step.kind === 'llm' && onXray ? <a href="#" data-testid="xray-link"
+          onClick={(e) => { e.preventDefault(); onXray(step.index); }}>X-Ray this call</a> : null}
         <a href={'#/trace/' + encodeURIComponent(step.trace_id) + '?span=' + encodeURIComponent(step.span_id)}
           onClick={(e) => { e.preventDefault(); go(['trace', step.trace_id], { span: step.span_id }); }}>open the span in its trace</a>
         {onFork && forkable(step) ? <Chip onClick={() => onFork(step)}

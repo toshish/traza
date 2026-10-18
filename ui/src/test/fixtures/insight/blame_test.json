@@ -1,0 +1,1 @@
+{"line":"assert parse(' Mixed ') == 'mixed'","matches":[{"at_ns":1792305877932747000,"file":"tests/test_parser.py","model":null,"run":"fix-parser-7","service":"coder","span_id":"0000000000000020","step_index":31,"tenant":"","tool":"Edit","trace_id":"c0de0a4fa28021642ff6d23b47523fb9"}],"path":"tests/test_parser.py","searched_spans":14,"truncated":false}

@@ -20,7 +20,8 @@ vi.mock('../lib/api.js', () => ({
     topology: vi.fn(async () => ({ nodes: [], edges: [], handoffs: [], cycles: [], sequence: [], spans_read: 0 })),
     nudges: vi.fn(async () => ({ nudges: [], run: 'weather-9', tenant: '' })),
     forks: vi.fn(async () => ({ forks: [], merged_into_parent: 0, parent: null, run: 'weather-9', spans_examined: 0, truncated: false })),
-    fateRun: vi.fn(async () => null),
+    // The foresight panel's read; this file is about the tape.
+    fateRun: vi.fn(async () => { throw Object.assign(new Error('run not found'), { status: 404, what: 'run not found' }); }),
   },
 }));
 
