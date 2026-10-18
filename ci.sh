@@ -49,14 +49,15 @@ python3 scripts/test-demos.py
 # sample: they drive the real binary over the real endpoints and assert their
 # own claims, and a change that breaks a surface they show should not merge
 # green. Each runs at its documented smoke setting; guard, replay and prove
-# have no scale knob and run as they are, in seconds each.
+# have no scale knob and run as they are, in seconds each; mission-control
+# runs its checks at double pace and stops once they pass.
 #
 # They run through a symlink to this checkout whose path has a space in it:
 # a checkout can live under such a path, and a script that splits its own
 # path on spaces works from any path without one, so CI would never see it
-# break otherwise. guard, replay and prove run the binary TRAZA_BIN names, so
-# it is set here, never inherited: an older install exported in the caller's
-# shell must not stand in for the one just built.
+# break otherwise. guard, replay, prove and mission-control run the binary
+# TRAZA_BIN names, so it is set here, never inherited: an older install
+# exported in the caller's shell must not stand in for the one just built.
 if command -v python3 >/dev/null 2>&1; then
   demo_dir=$(mktemp -d "${TMPDIR:-/tmp}/traza-ci.XXXXXX")
   demos="$demo_dir/traza checkout"
@@ -81,6 +82,8 @@ if command -v python3 >/dev/null 2>&1; then
   echo "ci: replay demo ran"
   TRAZA_BIN="$built" "$demos/examples/prove/run.sh" >/dev/null
   echo "ci: prove demo ran"
+  TRAZA_BIN="$built" TRAZA_LIVE_SECONDS=1 TRAZA_LIVE_TEMPO=2 "$demos/examples/mission-control/run.sh" >/dev/null
+  echo "ci: mission-control demo ran"
 else
   echo "ci: skipping the demos (python3 not found)"
 fi
