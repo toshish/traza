@@ -28,10 +28,11 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import threading
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
+from typing import IO, Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .client import Client
 from .errors import TrazaError
@@ -50,8 +51,19 @@ __all__ = [
 ]
 
 #: Bytes of an agent command's stdout and stderr a golden result keeps: the
-#: tail, where a failure's last words are.
+#: tail, where a failure's last words are. It is also all the runner holds:
+#: both streams are drained as the agent writes, so an agent's output costs
+#: the runner this much memory per stream, however much it writes.
 OUTPUT_TAIL_BYTES = 64 * 1024
+
+#: How much of a stream the runner reads at once.
+_READ_BYTES = 64 * 1024
+
+#: Seconds the runner waits, once the agent has exited or been killed, for
+#: the rest of its output — what is still in the pipes. A process the agent
+#: started that keeps a pipe open past this is left writing into a bounded
+#: tail no one reads.
+_DRAIN_GRACE_S = 5.0
 
 #: The environment variable holding the key an agent under test is handed as
 #: its provider API key, in place of the runner's own ``TRAZA_TOKEN``.
@@ -316,12 +328,86 @@ class GoldenResult:
     stderr: str = ""
 
 
-def _tail(data: Optional[bytes]) -> str:
-    if not data:
-        return ""
-    clipped = data[-OUTPUT_TAIL_BYTES:]
-    text = clipped.decode("utf-8", "replace")
-    return ("…" + text) if len(data) > OUTPUT_TAIL_BYTES else text
+class _Tail:
+    """The last ``limit`` bytes of a stream, drained as it is written, and
+    how many bytes it carried in all: never more than ``limit`` held, plus
+    the one read in hand."""
+
+    def __init__(self, limit: int = OUTPUT_TAIL_BYTES) -> None:
+        self.limit = limit
+        self.total = 0
+        self._kept = bytearray()
+        self._lock = threading.Lock()
+
+    def add(self, chunk: bytes) -> None:
+        with self._lock:
+            self.total += len(chunk)
+            self._kept += chunk
+            excess = len(self._kept) - self.limit
+            if excess > 0:
+                del self._kept[:excess]
+
+    def drain(self, stream: IO[bytes]) -> None:
+        """Reads ``stream`` to its end into the tail. A reader thread's body."""
+        read = getattr(stream, "read1", None) or stream.read
+        try:
+            while True:
+                chunk = read(_READ_BYTES)
+                if not chunk:
+                    break
+                self.add(chunk)
+        except (OSError, ValueError):
+            pass
+        finally:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+    def text(self) -> str:
+        """The tail as text, marked ``…`` when the stream carried more."""
+        with self._lock:
+            kept, total = bytes(self._kept), self.total
+        text = kept.decode("utf-8", "replace")
+        return ("…" + text) if total > len(kept) else text
+
+
+def _run_agent(argv: Sequence[str], env: Mapping[str, str], timeout: float) -> Tuple[Optional[int], str, str, bool]:
+    """Runs an agent command to its end or its timeout, killing it then:
+    ``(exit code, stdout tail, stderr tail, timed out)``, the exit code
+    ``None`` on a timeout.
+
+    Each stream has a thread of its own reading it as the agent writes —
+    so neither pipe fills and blocks the agent, and neither is buffered
+    whole: what the runner holds is :data:`OUTPUT_TAIL_BYTES` per stream,
+    whatever the agent writes before it exits or is killed. Raises
+    ``OSError`` when the command cannot be started."""
+    process = subprocess.Popen(
+        list(argv), env=dict(env), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    out, err = _Tail(), _Tail()
+    readers = [
+        threading.Thread(target=tail.drain, args=(stream,), name=f"traza-test-{name}", daemon=True)
+        for tail, stream, name in ((out, process.stdout, "stdout"), (err, process.stderr, "stderr"))
+    ]
+    for reader in readers:
+        reader.start()
+    exit_code: Optional[int] = None
+    timed_out = False
+    try:
+        exit_code = process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        process.kill()
+        process.wait()
+    except BaseException:
+        process.kill()
+        process.wait()
+        raise
+    grace_ends = time.monotonic() + _DRAIN_GRACE_S
+    for reader in readers:
+        reader.join(max(0.0, grace_ends - time.monotonic()))
+    return exit_code, out.text(), err.text(), timed_out
 
 
 def _kind(status: ReplayStatus) -> str:
@@ -370,22 +456,13 @@ def run_golden(
         part.replace("{run}", run).replace("{input}", task).replace("{replay}", replay.id or "")
         for part in command
     ]
-    exit_code: Optional[int] = None
-    out: Optional[bytes] = None
-    err: Optional[bytes] = None
-    timed_out = False
     try:
-        finished = subprocess.run(argv, env=env, stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout)
-        exit_code, out, err = finished.returncode, finished.stdout, finished.stderr
-    except subprocess.TimeoutExpired as expired:
-        timed_out = True
-        out = expired.stdout if isinstance(expired.stdout, bytes) else None
-        err = expired.stderr if isinstance(expired.stderr, bytes) else None
+        exit_code, out, err, timed_out = _run_agent(argv, env, timeout)
     except OSError as error:
         return GoldenResult(run, tenant, False, "error", f"the agent command could not be started: {error}",
                             time.monotonic() - started, replay.id)
     seconds = time.monotonic() - started
-    result = GoldenResult(run, tenant, False, None, None, seconds, replay.id, exit_code, _tail(out), _tail(err))
+    result = GoldenResult(run, tenant, False, None, None, seconds, replay.id, exit_code, out, err)
     try:
         status = replay.status()
     except TrazaError as error:

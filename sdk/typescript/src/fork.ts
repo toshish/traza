@@ -17,7 +17,11 @@
  * the Traza replay until the replay answers `409 replay_live`, then sends
  * that call and every later one to the real provider, with the provider's
  * key — the base URL and key the environment named when the fork was made,
- * or `live` options. The SDK sees one provider throughout. Traza itself
+ * or `live` options. The SDK sees one provider throughout. Only a model
+ * call's answer moves the switch: the server keeps the tool and model
+ * cursors apart, so a tool the recording does not hold
+ * ({@link Fork.toolResult} answering `null`) runs for real while the
+ * recorded model calls are still served from the recording. Traza itself
  * never calls a model: the live half is the agent's own traffic, from the
  * agent's own process.
  *
@@ -142,7 +146,12 @@ export class Fork {
   readonly step: number;
   /** Whether calls go live after the cut. */
   readonly live: boolean;
-  /** When the first call went to the real provider. */
+  /**
+   * When model calls went to the real provider: when the replay first
+   * answered a model call `replay_live`. A tool step answered that way
+   * ({@link toolResult} returning `null`) does not set it — tool and model
+   * calls have their own cursors.
+   */
   liveAt: Date | null = null;
   /**
    * The switching `fetch`: pass it to the OpenAI or Anthropic SDK (both take
@@ -213,7 +222,12 @@ export class Fork {
     return { edits, liveAfter };
   }
 
-  /** Whether a call has gone past the cut to the real provider. */
+  /**
+   * Whether model calls now go to the real provider: the replay has answered
+   * one `replay_live`. Only the model endpoint's answer says so — a tool the
+   * recording lacks going live leaves the recorded model calls on the
+   * recording.
+   */
   get isLive(): boolean {
     return this.liveAt !== null;
   }
@@ -305,16 +319,19 @@ export class Fork {
   /**
    * The next recorded tool step (of `name`), with an edited result where the
    * fork has one — or `null` when the harness should run the real tool: past
-   * the cut, or with no recorded step left.
+   * the cut, or with no recorded step of that tool left.
+   *
+   * `null` says nothing about model calls. The server's tool cursor is
+   * independent of its model cursor, so a tool the recording does not hold
+   * answers this way while recorded model calls are still to come, and the
+   * switch keeps serving those from the recording until the model endpoint
+   * itself answers `replay_live`.
    */
   async toolResult(name?: string, options: CallOptions = {}): Promise<ToolStep | null> {
     try {
       return await this.replay.nextTool(name, options);
     } catch (error) {
-      if (error instanceof TrazaError && error.status === 409 && error.type === "replay_live") {
-        this.#wentLive();
-        return null;
-      }
+      if (error instanceof TrazaError && error.status === 409 && error.type === "replay_live") return null;
       throw error;
     }
   }
@@ -344,7 +361,8 @@ export class Fork {
     return this.#client.token || "traza-open";
   }
 
-  #wentLive(): void {
+  /** Notes the model endpoint's `replay_live`: from here every model call goes to the real provider. */
+  #modelsWentLive(): void {
     if (this.liveAt === null) this.liveAt = new Date();
   }
 
@@ -363,7 +381,7 @@ export class Fork {
       headers.set("authorization", `Bearer ${this.#token()}`);
       const answer = await this.#transport(request.url, { ...request.init, headers, body: request.body });
       if (!(this.live && answer.status === 409 && isLiveSignal(await answer.clone().text()))) return answer;
-      this.#wentLive();
+      this.#modelsWentLive();
     }
     const headers = new Headers(request.headers);
     headers.delete("authorization");

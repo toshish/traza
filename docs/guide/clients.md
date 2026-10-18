@@ -208,7 +208,9 @@ golden runs; in short:
   fork's OpenTelemetry context (`fork.run(context, fn)`) until `close()`.
   `tool_result(name)` /
   `toolResult(name)` returns the edited or recorded tool step, or
-  `None` / `null` once the real tool should run.
+  `None` / `null` once the real tool should run — which moves no model call
+  off the recording: only the model endpoint's own `replay_live` switches
+  model calls to the provider.
 - **Tape tests** replay a run strictly and fail — `TapeMismatch`, an
   `AssertionError` in Python, an `Error` in TypeScript — naming where the
   agent left the recorded path, when it stopped early, or when it overran.

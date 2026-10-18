@@ -775,6 +775,16 @@ pub(crate) mod tests {
 
     impl TempStore {
         pub(crate) fn open(label: &str, config: crate::Config) -> Self {
+            Self::open_prepared(label, config, |_| {})
+        }
+
+        /// A store opened over a data directory `prepare` has written into
+        /// first — a planted log the store replays as it opens.
+        pub(crate) fn open_prepared(
+            label: &str,
+            config: crate::Config,
+            prepare: impl FnOnce(&std::path::Path),
+        ) -> Self {
             let nonce = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -782,6 +792,7 @@ pub(crate) mod tests {
             let dir = std::env::temp_dir()
                 .join(format!("traza-tape-{label}-{}-{nonce}", std::process::id()));
             std::fs::create_dir_all(&dir).expect("dir");
+            prepare(&dir);
             let store = Store::open(&dir, config).expect("opens");
             Self {
                 dir,

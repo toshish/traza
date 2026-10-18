@@ -4237,16 +4237,38 @@ impl Store {
 
     /// Annotations matching `narrow`, newest first, across every trace unless
     /// one is named. See [`annotations::AnnotationQuery`].
+    ///
+    /// The walk spends the configured [`Config::query_deadline`]: past it the
+    /// answer is [`Error::DeadlineExceeded`] and nothing. With a `limit` it
+    /// holds no more than that many annotations at once, however many match.
     pub fn search_annotations(
         &self,
         narrow: &annotations::AnnotationQuery<'_>,
     ) -> Result<Vec<annotations::Annotation>> {
-        let mut found = self.annotations.search(narrow)?;
-        // Same rule as [`Self::annotations`], for the same reason.
-        if let Some(mask) = self.erasure_mask() {
-            found.retain(|annotation| !mask.covers_annotation(annotation));
-        }
-        Ok(found)
+        self.search_annotations_under(narrow, self.query_deadline(Instant::now()))
+            .map(|searched| searched.found)
+    }
+
+    /// [`Self::search_annotations`] under a caller-anchored budget, with how
+    /// many annotations matched — so a listing built on it spends its
+    /// request's one budget and can say what its limit left out.
+    pub(crate) fn search_annotations_under(
+        &self,
+        narrow: &annotations::AnnotationQuery<'_>,
+        deadline: Option<Deadline>,
+    ) -> Result<annotations::Searched> {
+        // Same rule as [`Self::annotations`], for the same reason — applied
+        // inside the walk, so a withheld annotation takes no place within
+        // the limit.
+        let mask = self.erasure_mask();
+        self.annotations.search(
+            narrow,
+            |annotation| {
+                mask.as_deref()
+                    .is_some_and(|mask| mask.covers_annotation(annotation))
+            },
+            deadline,
+        )
     }
 
     // ------------------------------------------------------------- evals
@@ -7388,9 +7410,12 @@ impl Store {
 
         // ---- annotation log -------------------------------------------------
         {
+            // Erasure work is exempt from the query budget, and reads every
+            // record, withheld or not: it reports what the log still holds.
             let all = self
                 .annotations
-                .search(&annotations::AnnotationQuery::default())?;
+                .search(&annotations::AnnotationQuery::default(), |_| false, None)?
+                .found;
             // Matched against the annotation's own typed subject, tenant
             // included: a session-subject annotation carries no span address
             // for the key set to catch, and a tenant subject dooms by
