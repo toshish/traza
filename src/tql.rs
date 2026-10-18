@@ -949,7 +949,14 @@ impl Store {
         spans: &'s crate::run::RunSpans,
         deadline: Option<Deadline>,
     ) -> Result<ReadRun<'s>> {
-        let steps = step::build_steps(&spans.spans, |span| self.step_facts(span), deadline)?;
+        // Undigested: a step's digest is computed when a pattern reads its
+        // `digest` or `fingerprint`, not for every step of every run — a
+        // SHA-256 of each call's whole conversation was most of a search.
+        let steps = step::build_steps(
+            &spans.spans,
+            |span| self.step_facts_undigested(span),
+            deadline,
+        )?;
         let agent = steps
             .first()
             .and_then(|step| step.facts.agent.clone())

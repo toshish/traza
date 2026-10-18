@@ -733,6 +733,39 @@ pub(crate) struct StepExtras {
 /// [`step_facts_with`] plus the [`StepExtras`] a tape step keeps, extracted
 /// together so neither repeats the other's work.
 pub(crate) fn step_facts_detailed(span: &Span, llm: &LlmFacts) -> (StepFacts, StepExtras) {
+    step_facts_parts(span, llm, true)
+}
+
+/// [`step_facts_with`] without its two SHA-256s: `request_digest` and
+/// `response_digest` are `None` and `fingerprint` is the signature alone.
+/// For a reader that needs a digest only for some steps, if any — a TQL
+/// search, whose patterns rarely name `digest` or `fingerprint`, reads
+/// whole runs whose requests carry whole conversations — and computes it
+/// with [`request_digest_and_fingerprint`] when it does.
+pub(crate) fn step_facts_undigested(span: &Span, llm: &LlmFacts) -> StepFacts {
+    step_facts_parts(span, llm, false).0
+}
+
+/// The `request_digest` and `fingerprint` [`step_facts_with`] reports, for
+/// facts extracted by [`step_facts_undigested`].
+pub(crate) fn request_digest_and_fingerprint(
+    span: &Span,
+    facts: &StepFacts,
+    llm: &LlmFacts,
+) -> (Option<String>, String) {
+    let digest = facts.request.as_ref().map(value_digest);
+    let fingerprint = step_fingerprint(
+        span,
+        facts.kind,
+        facts.tool.as_deref(),
+        facts.agent.as_deref(),
+        llm,
+        digest.as_deref(),
+    );
+    (digest, fingerprint)
+}
+
+fn step_facts_parts(span: &Span, llm: &LlmFacts, digest: bool) -> (StepFacts, StepExtras) {
     let attributes = &span.attributes;
     let traceloop_kind =
         attr_str(attributes, TRACELOOP_SPAN_KIND).map(|kind| kind.to_ascii_lowercase());
@@ -784,8 +817,8 @@ pub(crate) fn step_facts_detailed(span: &Span, llm: &LlmFacts) -> (StepFacts, St
         }
         _ => first_payload(attributes, &[TRACELOOP_ENTITY_OUTPUT, OI_OUTPUT_VALUE]),
     };
-    let request_digest = request.as_ref().map(value_digest);
-    let response_digest = response.as_ref().map(value_digest);
+    let request_digest = request.as_ref().filter(|_| digest).map(value_digest);
+    let response_digest = response.as_ref().filter(|_| digest).map(value_digest);
     let fingerprint = step_fingerprint(
         span,
         kind,

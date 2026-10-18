@@ -277,19 +277,25 @@ impl Store {
     ) -> Result<Option<RecalledRun>> {
         // Each run is read within its OWN tenant, even in the operator view:
         // two tenants reusing a session id are two runs, not one.
-        let tape = self.run_tape(
-            Some(&candidate.tenant),
-            &candidate.run,
-            max_spans,
-            usize::MAX,
-            deadline,
-        )?;
-        if tape.spans.is_empty() {
+        let read = self.run_spans(Some(&candidate.tenant), &candidate.run, max_spans, deadline)?;
+        if read.spans.is_empty() {
             return Ok(None);
         }
-        let truncated = tape.spans_truncated;
+        // The skeleton needs each step's signature only: no request or
+        // response is extracted or digested (a tape would SHA-256 every
+        // call's whole conversation, most of a recall's time).
+        let signatures: Vec<String> = read
+            .spans
+            .iter()
+            .filter_map(|span| {
+                let (kind, signature, _) =
+                    semconv::step_signature_with(span, &semconv::facts(&span.attributes));
+                kind.is_step().then_some(signature)
+            })
+            .collect();
+        let truncated = read.truncated;
         let mut ended =
-            attribution::session_outcome(&tape.spans, now_ns, crate::mcp::SESSION_IDLE_NS);
+            attribution::session_outcome(&read.spans, now_ns, crate::mcp::SESSION_IDLE_NS);
         if truncated {
             ended.outcome = Outcome::Unknown;
             ended.source = OutcomeSource::Unknown;
@@ -298,7 +304,7 @@ impl Store {
             return Ok(None);
         }
         let cause = if ended.outcome == Outcome::Failure {
-            attribution::diagnose(&tape.spans, now_ns, crate::mcp::SESSION_IDLE_NS, max_spans)
+            attribution::diagnose(&read.spans, now_ns, crate::mcp::SESSION_IDLE_NS, max_spans)
                 .cause
                 .map(|cause| RecallCause {
                     trace_id: cause.span.trace_id,
@@ -309,9 +315,8 @@ impl Store {
         } else {
             None
         };
-        let (skeleton, skeleton_truncated) =
-            skeleton(tape.steps.iter().map(|step| step.detail.signature.as_str()));
-        let (cost_usd, _) = crate::diff::run_cost(self, &tape.spans);
+        let (skeleton, skeleton_truncated) = skeleton(signatures.iter().map(String::as_str));
+        let (cost_usd, _) = crate::diff::run_cost(self, &read.spans);
         Ok(Some(RecalledRun {
             run: candidate.run,
             tenant: candidate.tenant,
@@ -319,13 +324,13 @@ impl Store {
             outcome_source: ended.source,
             goal: ended.goal,
             score: candidate.matches,
-            last_end_ns: tape
+            last_end_ns: read
                 .spans
                 .iter()
                 .map(|span| span.end_time_ns)
                 .max()
                 .unwrap_or(0),
-            steps: tape.steps.len(),
+            steps: signatures.len(),
             cost_usd,
             skeleton,
             skeleton_truncated,

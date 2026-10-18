@@ -511,6 +511,16 @@ before deploying over an existing setup.
   from its end (at most 8 MiB, past bookkeeping and an unfinished line); a
   file whose records cannot tell, and a Codex rollout (which timestamps
   every record it writes), are still judged by when they were modified.
+- **TQL searches, detector findings and recall stop hashing every step.**
+  Each read every candidate run's steps with their request and response
+  SHA-256s — over a coding agent's runs, a digest of every model call's
+  whole conversation — though only a pattern naming `digest` or
+  `fingerprint` reads one, and recall reads neither. On a real store of 57
+  coding-agent sessions (89,777 spans) that was most of the time: a search
+  took 4.8–12.5 s and the whole detector library 9.6 s. A step's digest is
+  now computed when a pattern first reads it, and recall summarises runs
+  from their step signatures alone: searches take 2.4–3.6 s, findings 4.1 s
+  and recall 1.2–3.4 s on the same store (release build, a laptop).
 
 ### Upgrade
 
