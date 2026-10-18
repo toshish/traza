@@ -69,6 +69,10 @@ use traza::{CompactionConfig, Config, Durability, Profile, Span, SpanCursor, Spa
 #[path = "traza-server/replay_routes.rs"]
 mod replay_routes;
 
+// Agent Blame: its route lives beside this file.
+#[path = "traza-server/blame_routes.rs"]
+mod blame_routes;
+
 const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 // Headers get a far tighter budget than bodies: without one, a 64 MiB
 // garbage "header" plus a 64 MiB declared body doubles the documented
@@ -168,6 +172,7 @@ impl RouteClass {
             (_, traza::mcp::ENDPOINT) => Self::Mcp,
             ("POST", "/v1/spans" | "/v1/traces") => Self::Ingest,
             ("GET", "/v1/spans") => Self::Search,
+            ("GET", blame_routes::BLAME) => Self::Search,
             // Long-lived responses, held open by the consumer rather than by
             // the server's own work. Export moved out of `search` with the
             // tail: its duration tracks dataset size, so it was already
@@ -684,7 +689,13 @@ default 900)] \
 exits 0 erased-and-conclusive, 3 erased-but-inconclusive, 2 not erased)\n\
        traza-server verify --ledger [--data-dir DIR] [--json] \
 (offline ledger verification: recomputes every head, checks the latest checkpoint names the \
-live manifest, re-digests its files; read-only; exits 0 intact, 2 broken)";
+live manifest, re-digests its files; read-only; exits 0 intact, 2 broken)\n\
+       traza-server import claude-code|codex [--path DIR] [--watch] [--url URL [--token T] | \
+--data-dir DIR | --dry-run] [--tenant T] [--since DURATION] [--project-filter SUBSTR] \
+[--state FILE | --no-state] [--interval-ms N] [--json] \
+(record coding-agent transcripts as runs; --watch follows them live)\n\
+       traza-server blame FILE:LINE [--url URL] [--token T] [--tenant T] [--limit N] [--json] \
+(which agent step introduced this line; exits 0 found, 1 not found)";
 
 /// Everything the command line decides, with the profile already resolved
 /// against the explicit flags.
@@ -1294,6 +1305,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // directory no live server owns.
     if args.first().map(String::as_str) == Some("verify") {
         return run_verify(&args[1..]);
+    }
+    // `traza-server import …` and `traza-server blame …` are clients: they
+    // read transcripts or a source file and talk to a server (or, for
+    // import, a data directory no server holds). See `traza::import`.
+    if let Some(command @ ("import" | "blame")) = args.first().map(String::as_str) {
+        let outcome = match command {
+            "import" => traza::import::import_main(&args[1..]),
+            _ => traza::import::blame_main(&args[1..]),
+        };
+        // Exit 1 is an answer for `blame` (no agent wrote the line), so a
+        // failure to answer at all exits 2.
+        match outcome {
+            Ok(0) => return Ok(()),
+            Ok(code) => std::process::exit(code),
+            Err(message) => {
+                eprintln!("traza-server: {message}");
+                std::process::exit(2);
+            }
+        }
     }
     let Some(options) = parse_args(&args)? else {
         return Ok(());
@@ -2373,6 +2403,9 @@ fn serve_request(
             return responder.json_with_headers(401, reply.body, &unauthorized_challenge());
         }
         return responder.json(reply.status, reply.body);
+    }
+    if path == blame_routes::BLAME && request.method == "GET" {
+        return blame_routes::serve(responder, query, engine, metrics, principal);
     }
     if replay_routes::handles(path) {
         return replay_routes::serve(

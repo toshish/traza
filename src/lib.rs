@@ -10,6 +10,7 @@ pub mod analytics;
 pub mod annotations;
 pub mod attribution;
 pub mod auth;
+pub mod blame;
 pub mod caps;
 pub mod content;
 mod crc;
@@ -23,6 +24,7 @@ mod generation;
 pub mod guard;
 pub mod gzip;
 pub mod hash;
+pub mod import;
 mod ingest_hooks;
 pub mod insights;
 pub mod ledger;
@@ -51,6 +53,7 @@ pub mod tape;
 pub mod ui;
 pub mod usage;
 mod wal;
+pub mod zstd;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -3932,6 +3935,36 @@ pub(crate) fn fold_view(
     cost: &mut QueryCost,
     visit: &mut impl FnMut(&Span),
 ) -> Result<()> {
+    fold_view_while(
+        writer,
+        segments,
+        metrics,
+        pricing,
+        filter,
+        mask,
+        deadline,
+        cost,
+        &mut |span| {
+            visit(span);
+            true
+        },
+    )
+}
+
+/// [`fold_view`] that stops — decoding nothing more — as soon as `visit`
+/// returns `false`, for a search that has seen enough (a candidate cap).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fold_view_while(
+    writer: &WriteBuffer,
+    segments: &[std::sync::Arc<Segment>],
+    metrics: &metrics::Metrics,
+    pricing: &crate::pricing::Pricing,
+    filter: &SpanFilter,
+    mask: Option<&erasure::Mask>,
+    deadline: Option<Deadline>,
+    cost: &mut QueryCost,
+    visit: &mut impl FnMut(&Span) -> bool,
+) -> Result<()> {
     // Same rule as the query path: a pending erasure's subject never reaches
     // an aggregation, even before its bytes are rewritten away.
     let visible = |span: &Span| mask.map_or(true, |mask| !mask.covers(span));
@@ -3986,8 +4019,9 @@ pub(crate) fn fold_view(
                 pricing,
                 deadline,
                 cost.segments_examined,
-            )? {
-                visit(&span);
+            )? && !visit(&span)
+            {
+                return Ok(());
             }
         }
     }
@@ -3999,8 +4033,8 @@ pub(crate) fn fold_view(
             decoded_since_check = 0;
             Deadline::check(deadline, cost.segments_examined)?;
         }
-        if visible(span) && span_matches(span, filter, content.as_ref()) {
-            visit(span);
+        if visible(span) && span_matches(span, filter, content.as_ref()) && !visit(span) {
+            return Ok(());
         }
     }
     // Final check before the fold reports completion: a fold past its
@@ -4054,6 +4088,44 @@ impl Store {
         } else {
             let view = self.snapshot()?; // takes both locks, then releases them
             view.fold(filter, deadline, &mut cost, &mut visit)?;
+        }
+        cost.elapsed_ns = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+        Ok(cost)
+    }
+
+    /// [`Self::fold_spans_under`] that stops as soon as `visit` returns
+    /// `false`: nothing past that span is decoded, so a search that caps how
+    /// many candidates it verifies costs the cap, not the corpus.
+    pub(crate) fn fold_spans_while(
+        &self,
+        filter: &SpanFilter,
+        deadline: Option<Deadline>,
+        mut visit: impl FnMut(&Span) -> bool,
+    ) -> Result<QueryCost> {
+        let started = std::time::Instant::now();
+        let mut cost = QueryCost::default();
+        if let Some(session_id) = &filter.session {
+            let content = filter.content.as_deref().map(content::Query::new);
+            for span in
+                self.resolve_session_spans(filter.tenant.as_deref(), session_id, deadline)?
+            {
+                if span_matches(&span, filter, content.as_ref()) && !visit(&span) {
+                    break;
+                }
+            }
+        } else {
+            let view = self.snapshot()?;
+            fold_view_while(
+                &view.buffer,
+                &view.segments,
+                view.metrics,
+                &view.pricing,
+                filter,
+                view.mask.as_deref(),
+                deadline,
+                &mut cost,
+                &mut visit,
+            )?;
         }
         cost.elapsed_ns = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
         Ok(cost)

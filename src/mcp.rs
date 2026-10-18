@@ -46,6 +46,8 @@ mod replay_tools;
 // foresee_run lives beside this file too.
 mod fate_tools;
 mod steer_tools;
+// blame_line lives beside this file.
+mod blame_tools;
 
 /// The MCP endpoint path served by `traza-server`.
 pub const ENDPOINT: &str = "/v1/mcp";
@@ -633,6 +635,7 @@ impl<'a> Server<'a> {
         tools.extend(replay_tools::definitions());
         tools.extend(fate_tools::definitions());
         tools.extend(steer_tools::definitions(self.store.fuses_enabled()));
+        tools.extend(blame_tools::definitions());
         if self.annotation_tool_available(access) {
             tools.push(tool(
                 "record_annotation",
@@ -758,6 +761,9 @@ impl<'a> Server<'a> {
             name if fate_tools::handles(name) => fate_tools::call(self, name, arguments, &context),
             name if steer_tools::handles(name) => {
                 steer_tools::call(self, name, arguments, &context)
+            }
+            name if blame_tools::handles(name) => {
+                blame_tools::call(self, name, arguments, &context)
             }
             "record_annotation" if self.annotation_tool_available(context.access) => {
                 self.record_annotation(arguments, context)
@@ -4179,7 +4185,7 @@ fn parse_time(text: &str, now_ns: u64) -> Result<u64, String> {
 }
 
 /// RFC 3339, and the plain `YYYY-MM-DD` a model reaches for.
-fn parse_iso(text: &str) -> Result<u64, String> {
+pub(crate) fn parse_iso(text: &str) -> Result<u64, String> {
     // Byte-oriented throughout, and every index is bounds-checked. Every
     // meaningful character in RFC 3339 is ASCII, so working on bytes is not a
     // shortcut — it is what makes `"2026-07-27T日本語"` an error message
