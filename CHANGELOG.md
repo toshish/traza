@@ -491,6 +491,14 @@ before deploying over an existing setup.
   its secret over the new session, and a secret on display no longer
   outlives the switch. Leaving the Live tail (or any streaming screen) no
   longer throws an unhandled "signal is aborted" error.
+- **Foresight on a long session keeps its outcome.** `GET /v1/fate/runs/{run}`
+  (and MCP `foresee_run`) read a run of more than 20,000 spans from its
+  earliest 20,000 only, so a finished coding-agent session that long came
+  back `"outcome": "unknown"` with a step count capped at what was read —
+  while the same answer said the run had been left out of its map as a
+  completed one. The run is now read whole: its path still comes from its
+  earliest 20,000 spans (`partial`), but its outcome and `steps` cover every
+  span, as the map's fold always did.
 
 ### Upgrade
 

@@ -1537,7 +1537,7 @@ share the path before a verdict, default 30).
 |---|---|---|
 | `run`, `tenant`, `agent` | string | The run and its cohort |
 | `path` | string[] | Its behaviour tokens so far |
-| `steps` | integer | Steps recorded |
+| `steps` | integer | Steps recorded, across the whole run |
 | `matched_depth` | integer | Path tokens found in the map |
 | `last_open` | boolean | Whether the last token was judged open (pooled) |
 | `node` | object \| null | Where the path matched, the run left out: `token`, `depth`, `visits`, `success`, `failure`, `abandoned`, `success_rate`, `ci95`, `p_fail_given_here`, `lift`, `cost_usd_avg`, and — for an open last token — `pooled`, the tokens whose runs are counted |
@@ -1551,7 +1551,7 @@ share the path before a verdict, default 30).
 | `outcome` | string | How the run has ended so far: `unknown` while live |
 | `cohort_runs` | integer | Completed runs in the cohort, the run left out |
 | `excluded_self` | boolean | Whether the run was in the map and taken out of it |
-| `partial` | boolean | Whether the run has more than 20,000 spans and was read from its earliest |
+| `partial` | boolean | Whether the run has more than 20,000 spans, so its path was read from its earliest 20,000. Its `outcome` and `steps` still cover every span |
 | `min_support` | integer | The support a verdict needed |
 | `map_built_at_ns` | integer | When the map was built |
 

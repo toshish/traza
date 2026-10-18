@@ -1363,7 +1363,7 @@ fn a_pre_call_check_reads_the_guards_live_path_never_the_store() {
         let _ = check(run, None);
         let live = store.fuse_behaviour("", run).expect("followed");
         let read = store.run_spans(Some(""), run, 1_000, None).expect("reads");
-        let (stored, _) = read_spans(&read.spans, read.truncated, now);
+        let (stored, _) = read_spans(&read.spans, 1_000, !read.truncated, now);
         let keys = |reading: &Reading| -> Vec<(u64, usize)> {
             reading
                 .groups
@@ -2259,4 +2259,60 @@ fn a_fatal_fork_is_judged_on_its_unrounded_gap() {
         31.0 / 85.0 - 7.0 / 61.0
     );
     assert!(map.fatal_forks.is_empty(), "{:?}", map.fatal_forks);
+}
+
+#[test]
+fn a_completed_run_past_the_read_limit_keeps_its_outcome_and_step_count() {
+    // One coding-agent session far longer than a foresight read: twenty
+    // thousand and fifty steps, the last of them two hours ago. The map
+    // folds every span and counts it a success; the run route used to keep
+    // only the earliest 20,000 spans, call the run's outcome `unknown`
+    // (it could not see the last span) and count 20,000 steps — while the
+    // same answer said the run had been taken out of the map as completed.
+    let fixture = TempStore::open("long-session", crate::Config::default());
+    let store = fixture.store();
+    let now = now();
+    let total = FORESIGHT_RUN_SPANS + 50;
+    let names: Vec<String> = (0..total)
+        .map(|index| {
+            if index % 2 == 0 {
+                "llm:claude-x".to_owned()
+            } else {
+                format!("tool:t{}", index % 7)
+            }
+        })
+        .collect();
+    let steps: Vec<&str> = names.iter().map(String::as_str).collect();
+    let mut spans = synthetic_run("long-session", "coder", &steps, 0, false);
+    // A millisecond apart, ending two hours ago: long idle, so completed.
+    let begin = now - 2 * 3_600_000_000_000 - total as u64 * 1_000_000;
+    for (index, span) in spans.iter_mut().enumerate() {
+        span.start_time_ns = begin + index as u64 * 1_000_000;
+        span.end_time_ns = span.start_time_ns + 10;
+    }
+    store.ingest_batch(spans).expect("ingests");
+    let cohorts = store.fate_cohorts(Some(""), None, now).expect("builds");
+    let coder = cohorts
+        .cohorts
+        .iter()
+        .find(|cohort| cohort.agent == "coder")
+        .expect("cohort");
+    assert_eq!((coder.success, coder.unknown), (1, 0), "{coder:?}");
+
+    let foresight = store
+        .foresee("", "long-session", DEFAULT_VERDICT_SUPPORT, now)
+        .expect("reads")
+        .expect("exists");
+    assert_eq!(foresight.outcome, Outcome::Success, "{foresight:?}");
+    assert!(foresight.excluded_self, "{foresight:?}");
+    assert!(
+        !foresight.last_open,
+        "a completed run is judged where it ended"
+    );
+    assert_eq!(foresight.steps, total as u64, "every step is counted");
+    assert!(
+        foresight.partial,
+        "its path was read from its earliest spans"
+    );
+    assert_eq!(foresight.path.last().map(String::as_str), Some(FOLD_TOKEN));
 }
