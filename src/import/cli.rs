@@ -337,7 +337,10 @@ fn render_blame(file: &str, number: usize, line: &str, answer: &Value) -> String
         return out;
     }
     for (position, found) in matches.iter().enumerate() {
-        let text = |key: &str| found.get(key).and_then(Value::as_str).unwrap_or("?");
+        // Every stored string is producer text: control characters are
+        // neutralised so a transcript cannot drive the terminal.
+        let text =
+            |key: &str| crate::mcp::sanitize(found.get(key).and_then(Value::as_str).unwrap_or("?"));
         let at = found.get("at_ns").and_then(Value::as_u64).unwrap_or(0);
         let lead = if position == 0 {
             "introduced"
@@ -351,11 +354,15 @@ fn render_blame(file: &str, number: usize, line: &str, answer: &Value) -> String
         let model = found
             .get("model")
             .and_then(Value::as_str)
-            .map_or(String::new(), |model| format!(", {model}"));
+            .map_or(String::new(), |model| {
+                format!(", {}", crate::mcp::sanitize(model))
+            });
         let agent = found
             .get("agent")
             .and_then(Value::as_str)
-            .map_or(String::new(), |agent| format!(" (sub-agent {agent})"));
+            .map_or(String::new(), |agent| {
+                format!(" (sub-agent {})", crate::mcp::sanitize(agent))
+            });
         let _ = writeln!(
             out,
             "  {lead} {} by {} in run {}{agent}  [{}{model}{step}]",
