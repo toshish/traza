@@ -2610,12 +2610,24 @@ mod tests {
         for attributes in shapes {
             let span = span_named("op", attributes);
             let llm = facts(&span.attributes);
+            let full = step_facts_with(&span, &llm);
             assert_eq!(
                 step_fingerprint_with(&span, &llm),
-                step_facts_with(&span, &llm).fingerprint,
+                full.fingerprint,
                 "{:?}",
                 span.attributes
             );
+            // The change radar's digest-free identity agrees as well.
+            let (kind, signature, agent) = step_identity_with(&span, &llm);
+            assert_eq!(
+                (kind, signature.as_str(), agent),
+                (full.kind, full.signature(), full.agent.clone()),
+                "{:?}",
+                span.attributes
+            );
+            if kind == StepKind::Llm {
+                assert_eq!(llm_request_of(&span), full.request);
+            }
         }
     }
 }

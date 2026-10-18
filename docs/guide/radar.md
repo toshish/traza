@@ -351,12 +351,14 @@ later, it is an agent run that is now missing spans. The analysed window
 then moves past its start. As a result, every agent run that starts after
 `covered_since_ns` is read in full, and no run before it is read at all.
 
-**Measured cost.** On an Apple M1 Max with a release build: 20,000 runs of
-six spans each (120,000 spans, every model call carrying a 2 KB system
-prompt) were analysed in 1.0–1.4 s over three requests. Most of that time is
-spent reading the spans and parsing each model call's messages. The analysis
-itself is linear in runs, apart from a permutation test per behaviour
-candidate. A window that cannot be read within the deadline is refused, not
+**Measured cost.** On an Apple M1 Max with a release build, on a laptop
+shared with other builds: 20,000 runs of six spans each (120,000 spans,
+every model call carrying a 2 KB system prompt) took 1.0–1.7 s over six
+requests in two server runs. For comparison, a whole-corpus
+`/v1/stats/duration` over the same spans took 0.23 s. The radar's extra cost
+is per-span extraction, mostly parsing, masking and digesting each model
+call's messages. The analysis itself is linear in runs, apart from one
+permutation test per behaviour candidate. A window that cannot be read within the deadline is refused, not
 cut short, so narrow `since` and `until`. Naming an `agent` does not make the
 read cheaper, because a run's agent is only known after it has been read.
 
