@@ -28,7 +28,9 @@
 //!   chunk is flagged an `instruction`: a constraint the agent was given
 //!   and may no longer see. A chunk that came back edited — the same role
 //!   and kind, differing in a stretch at most a tenth of its text — is
-//!   reported as edited, with the bytes that changed, not as lost.
+//!   reported as edited, with the bytes that changed, not as lost; when that
+//!   could not be checked (its text was not kept, or a bound was reached),
+//!   the loss is marked `unverified` rather than asserted.
 //! - **Why did the cache break?** The Cache Autopsy ([`autopsy`]) compares
 //!   each call with the previous call of its conversation and names the first
 //!   chunk that differs, the bytes that changed in it — usually one volatile
@@ -39,19 +41,24 @@
 //! counts per chunk are estimates (about four ASCII characters, or one and a
 //! half other characters, per token); the provider's own counts are reported
 //! beside them, and the autopsy scales its estimates by the ratio between the
-//! two before pricing anything.
+//! two before pricing anything — when the estimate covers what the provider
+//! counted (no media, no unrecorded tool definitions, nothing cut).
 //!
 //! **Bounds.** One request reads its run under the store's snapshot, erasure
 //! and tenant rules ([`crate::run`]), inside the query deadline, at most
 //! [`MAX_TAPE_SPANS`] spans; resolves at most [`MAX_READ_BYTES`] of offloaded
-//! payload content for the history and as much again for the call itself;
-//! splits one context into at most [`MAX_CONTEXT_CHUNKS`] chunks; keeps at
-//! most [`MAX_PROVENANCE_ENTRIES`] content digests for provenance,
-//! [`MAX_SAID_WORDS`] words for staleness and [`MAX_POOL_BYTES`] of chunk
-//! text for diffs; and an autopsy analyses at most [`MAX_AUTOPSY_STEPS`]
-//! model calls. Past any bound the answer says so (`chunks_truncated`,
-//! `provenance_partial`, `resolved_partial`, `texts_partial`, `truncated`)
-//! rather than looking complete.
+//! payload content for the call itself and as much again for its history
+//! (the comparison window first), or that much per call and
+//! [`MAX_AUTOPSY_READ_BYTES`] across an autopsy; splits one context into at
+//! most [`MAX_CONTEXT_CHUNKS`] chunks; keeps at most
+//! [`MAX_PROVENANCE_ENTRIES`] content digests for provenance,
+//! [`MAX_SAID_WORDS`] words for staleness and [`MAX_POOL_BYTES`] of the
+//! comparison window's chunk text for diffs; compares at most
+//! [`MAX_EDIT_COMPARE_BYTES`] of text pairing lost chunks with edited ones;
+//! and an autopsy analyses at most [`MAX_AUTOPSY_STEPS`] model calls. Past
+//! any bound the answer says so (`chunks_truncated`, `provenance_partial`,
+//! `resolved_partial`, `texts_partial`, `unverified`, `*_truncated`) rather
+//! than looking complete.
 
 mod autopsy;
 mod chunk;
@@ -67,7 +74,7 @@ pub use autopsy::{ByteDiff, Cause, Change, Divergence, Volatile};
 pub use chunk::ChunkKind;
 
 use crate::semconv::{self, LlmFacts, StepKind};
-use crate::tape::{payload_reference, ResolveBudget, Resolver, TapeStep, MAX_TAPE_SPANS};
+use crate::tape::{payload_reference, ResolveBudget, Resolver, RunTape, TapeStep, MAX_TAPE_SPANS};
 use crate::{Deadline, Result, Span, Store};
 use autopsy::{Comparison, Context, TextPool};
 use chunk::{Piece, TOOLS_ROLE};
@@ -85,13 +92,19 @@ pub const DEFAULT_CACHE_TTL_SECONDS: u64 = 300;
 /// analysed and `chunks_truncated` says so.
 pub const MAX_CONTEXT_CHUNKS: usize = 2_000;
 
-/// Offloaded payload bytes one request resolves for the run's history (and,
-/// separately, for the call under the X-Ray itself). Payload content is read
-/// to be chunked and digested, never returned whole, so this bounds reading
-/// work rather than response size; the query deadline bounds it too.
+/// Offloaded payload bytes resolved for one model call in an autopsy, for
+/// the call under an X-Ray, and — separately — for an X-Ray's history.
+/// Payload content is read to be chunked and digested, never returned, so
+/// this bounds reading work rather than response size (which is why it is
+/// not `--tape-max-bytes`, the cap on content a tape *returns*); the query
+/// deadline bounds it too.
 pub const MAX_READ_BYTES: usize = 64 * 1024 * 1024;
 
-/// Distinct chunk text kept for diffs and previews in one request.
+/// Offloaded payload bytes one autopsy resolves across all its calls.
+pub const MAX_AUTOPSY_READ_BYTES: usize = 512 * 1024 * 1024;
+
+/// Distinct chunk text held for diffs and previews at once: the comparison
+/// window's and the examined call's.
 pub const MAX_POOL_BYTES: usize = 32 * 1024 * 1024;
 
 /// Content digests kept for provenance in one request. Past it, only the
@@ -107,29 +120,63 @@ pub const MAX_SAID_WORDS: usize = 500_000;
 /// Model calls one autopsy analyses at most.
 pub const MAX_AUTOPSY_STEPS: usize = 2_000;
 
-/// Dropped chunks one X-Ray lists at most.
+/// Text bytes one X-Ray compares while pairing the previous call's lost
+/// chunks with edited ones. Texts of any size are compared; this bounds the
+/// total.
+pub const MAX_EDIT_COMPARE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Dropped chunks one X-Ray lists at most, and edited ones.
 const MAX_DROPPED: usize = 256;
 
 /// Duplicate groups one X-Ray lists at most.
 const MAX_DUPLICATES: usize = 64;
 
 /// Text comparisons one X-Ray spends pairing dropped chunks with edited
-/// ones, and the longest text it compares.
+/// ones, however small the texts.
 const MAX_EDIT_COMPARISONS: usize = 4_096;
-const MAX_EDIT_BYTES: usize = 64 * 1024;
+
+/// Culprits an autopsy's summary lists at most.
+const MAX_CULPRITS: usize = 10;
 
 /// Sources the composition names before folding the rest.
 const MAX_SOURCES: usize = 12;
 
-/// Earlier calls searched for a call's predecessor.
+/// Earlier calls searched for a call's predecessor: the comparison window.
 const RECENT_CONTEXTS: usize = 32;
 
 /// Characters of a chunk preview.
 const PREVIEW_CHARS: usize = 120;
 
+/// Ancestors walked looking for the agent step a model call runs under.
+const MAX_AGENT_DEPTH: usize = 64;
+
 /// How a calibration ratio is clamped: an estimate off by more than four
 /// times either way says the estimate is not about the same text.
 const CALIBRATION_RANGE: (f64, f64) = (0.25, 4.0);
+
+/// What one request may spend — the bounds of the module docs, gathered so a
+/// test can shrink them.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Limits {
+    /// [`MAX_READ_BYTES`].
+    pub(crate) read_bytes: usize,
+    /// [`MAX_AUTOPSY_READ_BYTES`].
+    pub(crate) autopsy_read_bytes: usize,
+    /// [`MAX_POOL_BYTES`].
+    pub(crate) pool_bytes: usize,
+    /// [`MAX_EDIT_COMPARE_BYTES`].
+    pub(crate) compare_bytes: usize,
+}
+
+impl Limits {
+    /// The documented bounds.
+    pub(crate) const DEFAULT: Self = Self {
+        read_bytes: MAX_READ_BYTES,
+        autopsy_read_bytes: MAX_AUTOPSY_READ_BYTES,
+        pool_bytes: MAX_POOL_BYTES,
+        compare_bytes: MAX_EDIT_COMPARE_BYTES,
+    };
+}
 
 /// What an X-Ray should do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -176,9 +223,18 @@ impl Default for AutopsyOptions {
 pub enum XrayMiss {
     /// No span with that trace and span id in scope.
     NoSpan,
+    /// No span carries that run id in scope.
+    NoRun,
+    /// The run has no step at that index.
+    NoStep {
+        /// Steps read.
+        steps: usize,
+        /// Whether the run is longer than one read, so more steps exist.
+        more: bool,
+    },
     /// The span is a step of another kind; the X-Ray reads model calls.
     NotAnLlmStep(StepKind),
-    /// The operator view found the ids in this many tenants.
+    /// The operator view found the ids (or the run) in this many tenants.
     AmbiguousTenant(usize),
 }
 
@@ -327,6 +383,11 @@ pub struct Dropped {
     pub preview: Option<String>,
     /// The earliest step that held it.
     pub introduced_by: Option<Introduced>,
+    /// This call has a chunk of the same role and kind that could be this
+    /// one edited, but the two were not compared — the old text was not
+    /// kept, or the comparison bound was reached — so the chunk may have
+    /// been changed rather than lost.
+    pub unverified: bool,
 }
 
 /// A chunk the previous call had, carried into this one with an edit.
@@ -364,8 +425,8 @@ pub struct Duplicate {
 /// One model call's cache verdict.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct CacheStep {
-    /// Its tape index.
-    pub step_index: usize,
+    /// Its tape index; `null` for a call past the run's read limit.
+    pub step_index: Option<usize>,
     /// Its span.
     pub span: SpanRef,
     /// The model it named.
@@ -396,9 +457,15 @@ pub struct CacheStep {
     pub cause: Cause,
     /// The verdict as a sentence. Quotes recorded text.
     pub explanation: String,
-    /// Estimated tokens the cache could have served and did not, scaled to
-    /// the provider's count when it reported one.
+    /// Estimated tokens the cache could have served and did not, scaled by
+    /// [`Self::calibration`] when there is one.
     pub est_tokens_lost: u64,
+    /// The provider's context count over the estimate (clamped 0.25–4), by
+    /// which [`Self::est_tokens_lost`] was scaled; `null` when it was left
+    /// unscaled — no predecessor, no provider count, or an estimate that does
+    /// not cover what the provider counted (media, unrecorded tool
+    /// definitions, a context cut short).
+    pub calibration: Option<f64>,
     /// What those tokens cost beyond a cache read, when the pricing table
     /// names the model's input and cache-read rates.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -444,12 +511,17 @@ fn advice(cause: Cause, change: Option<Change>, volatile: Option<Volatile>) -> &
              after the last cache breakpoint."
         }
         (Cause::VolatileContent, Some(Change::Edited), Some(Volatile::Number)) => {
-            "A changing number (a counter, a balance, a step count) sits inside the cached \
-             prefix. Move it to the end of the prompt."
+            "A changing number (a counter, a balance, a step count, a template variable) sits \
+             ahead of text that does not change. Move it to the end of the prompt."
         }
         (Cause::VolatileContent, Some(Change::Edited), _) => {
             "A chunk inside the cached prefix is rewritten between calls. Keep stable content \
              first and put what changes per call at the end."
+        }
+        (Cause::VolatileContent, Some(Change::Replaced), _) => {
+            "A chunk inside the cached prefix is swapped for different content between calls \
+             (a re-retrieved document, a regenerated status block) while what follows it stays. \
+             Put content that changes per call after the stable history."
         }
         (Cause::VolatileContent, Some(Change::Inserted), _) => {
             "New content is inserted ahead of earlier turns (retrieved documents or a status \
@@ -504,8 +576,11 @@ pub struct CacheSummary {
     pub disagreements: usize,
     /// Fixed guidance when there are disagreements; `null` otherwise.
     pub disagreement_advice: Option<&'static str>,
-    /// Recurring break shapes, costliest first.
+    /// Recurring break shapes, costliest first: by estimated cost when every
+    /// shape is priced, else by estimated tokens lost.
     pub culprits: Vec<Culprit>,
+    /// More shapes than the ten listed.
+    pub culprits_truncated: bool,
 }
 
 /// What usually explains a disagreement between the structure and the
@@ -577,8 +652,12 @@ pub struct XRay {
     /// role and kind, differing in a stretch at most a tenth of the text —
     /// a changed instruction, not a lost one.
     pub edited_since_previous: Vec<Edited>,
+    /// More was edited than listed.
+    pub edited_truncated: bool,
     /// Repeated content.
     pub duplicates: Vec<Duplicate>,
+    /// More content repeats than listed.
+    pub duplicates_truncated: bool,
     /// The call's cache verdict.
     pub cache: CacheStep,
     /// The stale threshold applied.
@@ -590,6 +669,9 @@ pub struct XRay {
     /// A provenance or staleness bound was reached, or the history was cut
     /// short, so `introduced_by` and `stale` are incomplete.
     pub provenance_partial: bool,
+    /// Some chunk text was not kept for lack of room: a preview or diff is
+    /// `null`, and a lost chunk may be `unverified`.
+    pub texts_partial: bool,
 }
 
 /// A step paired with its span.
@@ -615,6 +697,73 @@ fn pair<'t>(steps: &'t [TapeStep], spans: &'t [Span]) -> Vec<Paired<'t>> {
         }
     }
     paired
+}
+
+/// A span's key within a run read: tenant, trace, span.
+type SpanKey<'t> = (&'t str, &'t str, &'t str);
+
+/// Which agent each model call belongs to, as far as the trace says: the
+/// call's own `gen_ai.agent.name`, else the name of the nearest enclosing
+/// agent step (at most [`MAX_AGENT_DEPTH`] levels up). Calls of two
+/// differently named agents are never compared with each other.
+struct Agents<'t> {
+    parents: HashMap<SpanKey<'t>, &'t str>,
+    names: HashMap<SpanKey<'t>, &'t str>,
+}
+
+impl<'t> Agents<'t> {
+    fn new(steps: &'t [TapeStep], spans: &'t [Span]) -> Self {
+        let parents = spans
+            .iter()
+            .filter_map(|span| {
+                let parent = span.parent_span_id.as_deref()?;
+                Some((
+                    (
+                        span.tenant.as_str(),
+                        span.trace_id.as_str(),
+                        span.span_id.as_str(),
+                    ),
+                    parent,
+                ))
+            })
+            .collect();
+        let names = steps
+            .iter()
+            .filter(|step| step.kind == StepKind::Agent)
+            .filter_map(|step| {
+                let name = step.agent.as_deref()?;
+                Some((
+                    (
+                        step.detail.tenant.as_str(),
+                        step.trace_id.as_str(),
+                        step.span_id.as_str(),
+                    ),
+                    name,
+                ))
+            })
+            .collect();
+        Self { parents, names }
+    }
+
+    fn of(&self, span: &Span) -> Option<String> {
+        if let Some(name) = span
+            .attributes
+            .get("gen_ai.agent.name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+        {
+            return Some(name.to_owned());
+        }
+        let mut current = span.parent_span_id.as_deref()?;
+        for _ in 0..MAX_AGENT_DEPTH {
+            let key = (span.tenant.as_str(), span.trace_id.as_str(), current);
+            if let Some(name) = self.names.get(&key) {
+                return Some((*name).to_owned());
+            }
+            current = self.parents.get(&key).copied()?;
+        }
+        None
+    }
 }
 
 /// Whether a value holds a `$payload` reference anywhere.
@@ -661,6 +810,9 @@ fn read_call(
     if resolve {
         resolver.resolve_request(&mut step, budget)?;
         for definition in &mut definitions {
+            // As text first, so definitions recorded as text keep their
+            // bytes; then anything nested.
+            resolver.resolve_text(definition, budget)?;
             resolver.resolve(definition, budget)?;
         }
         if with_response {
@@ -702,13 +854,14 @@ fn introduced(step: &TapeStep, via: &'static str) -> Introduced {
     }
 }
 
-/// The ratio of the provider's context count to the estimate, clamped, or 1.
-fn calibration(llm: &LlmFacts, est_tokens: u64) -> f64 {
+/// The ratio of the provider's context count to the estimate, clamped —
+/// `None` when either is missing or zero.
+fn calibration(llm: &LlmFacts, est_tokens: u64) -> Option<f64> {
     match llm.context_tokens() {
-        Some(reported) if reported > 0 && est_tokens > 0 => {
-            (reported as f64 / est_tokens as f64).clamp(CALIBRATION_RANGE.0, CALIBRATION_RANGE.1)
-        }
-        _ => 1.0,
+        Some(reported) if reported > 0 && est_tokens > 0 => Some(
+            (reported as f64 / est_tokens as f64).clamp(CALIBRATION_RANGE.0, CALIBRATION_RANGE.1),
+        ),
+        _ => None,
     }
 }
 
@@ -718,56 +871,71 @@ fn round_usd(value: f64) -> f64 {
     (value * 1e10).round() / 1e10
 }
 
+/// What a cache verdict is about: the call, and what the search for its
+/// predecessor found.
+struct Verdict<'c> {
+    step: &'c TapeStep,
+    /// The call's tape index; `None` past the read limit.
+    step_index: Option<usize>,
+    llm: &'c LlmFacts,
+    context: &'c Context,
+    predecessor: std::result::Result<Option<(&'c Context, usize)>, (usize, &'static str)>,
+    /// Whether any earlier model call of the tenant was read at all.
+    seen_before: bool,
+}
+
 /// The cache verdict for one call.
-#[allow(clippy::too_many_arguments)]
-fn cache_step(
-    store: &Store,
-    step: &TapeStep,
-    llm: &LlmFacts,
-    context: &Context,
-    predecessor: std::result::Result<Option<(&Context, usize)>, (usize, &'static str)>,
-    ttl_ns: u64,
-    pool: &TextPool,
-) -> CacheStep {
+fn cache_step(store: &Store, verdict: Verdict<'_>, ttl_ns: u64, pool: &TextPool) -> CacheStep {
+    let Verdict {
+        step,
+        step_index,
+        llm,
+        context,
+        predecessor,
+        seen_before,
+    } = verdict;
     let est_tokens = context.est_tokens();
     let mut previous_step_index = None;
     let mut gap_ns = None;
+    let mut applied = None;
+    let unpaired = |explanation: String| Comparison {
+        cause: Cause::Unknown,
+        shared_chunks: 0,
+        shared_est_tokens: 0,
+        divergence: None,
+        est_tokens_lost: 0,
+        explanation,
+    };
     let comparison = match (context.unavailable, predecessor) {
-        (Some(reason), _) => Comparison {
-            cause: Cause::Unknown,
-            shared_chunks: 0,
-            shared_est_tokens: 0,
-            divergence: None,
-            est_tokens_lost: 0,
-            explanation: format!("this call's request {reason}, so its prefix cannot be compared"),
-        },
-        (None, Err((index, reason))) => Comparison {
-            cause: Cause::Unknown,
-            shared_chunks: 0,
-            shared_est_tokens: 0,
-            divergence: None,
-            est_tokens_lost: 0,
-            explanation: format!(
-                "the request of step {index}, the nearest earlier call, {reason}, so this call \
-                 cannot be paired with its predecessor"
-            ),
-        },
+        (Some(reason), _) => unpaired(format!(
+            "this call's request {reason}, so its prefix cannot be compared"
+        )),
+        (None, Err((index, reason))) => unpaired(format!(
+            "the request of step {index}, the nearest earlier call, {reason}, so this call \
+             cannot be paired with its predecessor"
+        )),
         (None, Ok(None)) => Comparison {
             cause: Cause::NewContext,
-            shared_chunks: 0,
-            shared_est_tokens: 0,
-            divergence: None,
-            est_tokens_lost: 0,
-            explanation: "the first call of this conversation in the run: there was no earlier \
-                          prompt to cache"
-                .to_owned(),
+            explanation: if seen_before {
+                format!(
+                    "no earlier call among the previous {RECENT_CONTEXTS} shares this call's \
+                     leading chunks or half of its chunks: a new conversation (a sub-agent, \
+                     say), or one whose previous call lies further back"
+                )
+            } else {
+                "the first model call of the run: there was no earlier prompt to cache".to_owned()
+            },
+            ..unpaired(String::new())
         },
         (None, Ok(Some((previous, _)))) => {
             previous_step_index = Some(previous.step_index);
             let gap = context.start_ns.saturating_sub(previous.start_ns);
             gap_ns = Some(gap);
-            let ratio = calibration(llm, est_tokens);
-            autopsy::compare(previous, context, gap, ttl_ns, pool, ratio)
+            applied = context
+                .calibratable
+                .then(|| calibration(llm, est_tokens))
+                .flatten();
+            autopsy::compare(previous, context, gap, ttl_ns, pool, applied.unwrap_or(1.0))
         }
     };
     let est_tokens_lost = comparison.est_tokens_lost;
@@ -777,7 +945,7 @@ fn cache_step(
         cost.is_finite().then_some(cost)
     });
     CacheStep {
-        step_index: step.index,
+        step_index,
         span: SpanRef {
             trace_id: step.trace_id.clone(),
             span_id: step.span_id.clone(),
@@ -796,16 +964,26 @@ fn cache_step(
         cause: comparison.cause,
         explanation: comparison.explanation,
         est_tokens_lost,
+        calibration: applied,
         est_cost_lost_usd,
     }
 }
 
-/// Whether a verdict and the provider's report contradict each other.
+/// Whether a verdict and the provider's report contradict each other: a
+/// prefix the cache could have served was not, or a read was reported where
+/// nothing could be served.
 fn disagrees(step: &CacheStep) -> bool {
-    let nothing_servable = step.previous_step_index.is_some()
-        && (step.cause == Cause::TtlExpired || step.prefix_chunks_shared == 0);
-    (step.cause == Cause::Stable && step.reported_hit == Some(false))
-        || (nothing_servable && step.reported_hit == Some(true))
+    if step.previous_step_index.is_none() {
+        return false;
+    }
+    let servable = step.prefix_chunks_shared > 0 && step.cause != Cause::TtlExpired;
+    match step.reported_hit {
+        Some(false) => step.cause == Cause::Stable && servable,
+        // A new turn on a one-chunk predecessor shares no whole chunk, yet a
+        // provider may serve part of it: no contradiction.
+        Some(true) => !servable && step.cause != Cause::Stable,
+        None => false,
+    }
 }
 
 /// The totals over an autopsy's steps.
@@ -856,10 +1034,12 @@ fn summarize(steps: &[CacheStep]) -> CacheSummary {
             Some((_, culprit)) => {
                 culprit.breaks += 1;
                 culprit.est_tokens_lost += step.est_tokens_lost;
-                if let Some(lost) = step.est_cost_lost_usd {
-                    culprit.est_cost_lost_usd =
-                        Some(round_usd(culprit.est_cost_lost_usd.unwrap_or(0.0) + lost));
-                }
+                culprit.est_cost_lost_usd =
+                    match (culprit.est_cost_lost_usd, step.est_cost_lost_usd) {
+                        (Some(sum), Some(lost)) => Some(round_usd(sum + lost)),
+                        // One unpriced break makes the shape's cost unknown.
+                        _ => None,
+                    };
             }
             None => shapes.push((
                 shape.clone(),
@@ -871,7 +1051,7 @@ fn summarize(steps: &[CacheStep]) -> CacheSummary {
                     breaks: 1,
                     est_tokens_lost: step.est_tokens_lost,
                     est_cost_lost_usd: step.est_cost_lost_usd,
-                    example_step_index: step.step_index,
+                    example_step_index: step.step_index.unwrap_or(0),
                     example: divergence.and_then(|d| d.diff.clone()),
                     advice: advice(shape.0, shape.1, shape.3),
                 },
@@ -879,13 +1059,24 @@ fn summarize(steps: &[CacheStep]) -> CacheSummary {
         }
     }
     let mut culprits: Vec<Culprit> = shapes.into_iter().map(|(_, culprit)| culprit).collect();
+    // A total order either way: by cost only when every shape has one.
+    let all_priced = culprits
+        .iter()
+        .all(|culprit| culprit.est_cost_lost_usd.is_some());
     culprits.sort_by(|a, b| {
-        b.est_tokens_lost
-            .cmp(&a.est_tokens_lost)
+        let by_cost = if all_priced {
+            let cost = |culprit: &Culprit| culprit.est_cost_lost_usd.unwrap_or(0.0);
+            cost(b).total_cmp(&cost(a))
+        } else {
+            std::cmp::Ordering::Equal
+        };
+        by_cost
+            .then_with(|| b.est_tokens_lost.cmp(&a.est_tokens_lost))
             .then_with(|| b.breaks.cmp(&a.breaks))
             .then_with(|| a.example_step_index.cmp(&b.example_step_index))
     });
-    culprits.truncate(10);
+    let culprits_truncated = culprits.len() > MAX_CULPRITS;
+    culprits.truncate(MAX_CULPRITS);
     CacheSummary {
         steps: steps.len(),
         breaks,
@@ -896,6 +1087,7 @@ fn summarize(steps: &[CacheStep]) -> CacheSummary {
         disagreements,
         disagreement_advice: (disagreements > 0).then_some(DISAGREEMENT_ADVICE),
         culprits,
+        culprits_truncated,
     }
 }
 
@@ -972,6 +1164,45 @@ fn shares(rows: HashMap<String, (usize, u64)>, total: u64, fold_past: Option<usi
     rows
 }
 
+/// Where a tool result in the examined context came from: the step that
+/// held the same content (`content_step`, the earliest one), or the tool
+/// step that answered its call id (`call_steps`, every tool step carrying
+/// that id, in order).
+///
+/// A tool step holding the content wins. Otherwise the content was first
+/// seen in a model call — the agent changed the text before the model saw
+/// it — and the tool step that answered the call is the latest one carrying
+/// its id before that call, since ids repeat when a call is retried or a
+/// framework numbers calls per turn.
+fn origin(
+    content_step: Option<usize>,
+    call_steps: Option<&[usize]>,
+    steps: &[&TapeStep],
+) -> Option<(usize, &'static str)> {
+    let content_is_tool = content_step
+        .and_then(|index| steps.get(index))
+        .is_some_and(|step| step.kind == StepKind::Tool);
+    if content_is_tool {
+        return content_step.map(|index| (index, "content"));
+    }
+    let before = content_step.unwrap_or(usize::MAX);
+    let answered =
+        call_steps.and_then(|indices| indices.iter().rev().find(|&&index| index < before).copied());
+    match (answered, content_step) {
+        (Some(index), _) => Some((index, "tool_call_id")),
+        (None, Some(index)) => Some((index, "content")),
+        (None, None) => None,
+    }
+}
+
+/// The call an X-Ray reads and its run, read once under the request's
+/// deadline.
+pub(crate) struct Target {
+    span: Span,
+    run: String,
+    tape: RunTape,
+}
+
 impl Store {
     /// The stale threshold this store's X-Rays default to
     /// ([`crate::Config::xray_stale_steps`]).
@@ -993,6 +1224,39 @@ impl Store {
         options: XrayOptions,
     ) -> Result<std::result::Result<XRay, XrayMiss>> {
         let deadline = self.query_deadline(Instant::now());
+        match self.xray_target(tenant, trace_id, span_id, deadline)? {
+            Ok(target) => self.xray_in(target, deadline, options, Limits::DEFAULT),
+            Err(miss) => Ok(Err(miss)),
+        }
+    }
+
+    /// The X-Ray of step `step` (a tape index) of `run_id` under `tenant` —
+    /// the run read once, under one deadline, for both the lookup and the
+    /// X-Ray. In the operator view (`None`) a run present in more than one
+    /// tenant is refused as ambiguous, since its step numbering would not be
+    /// the one the X-Ray reports.
+    pub fn xray_step(
+        &self,
+        tenant: Option<&str>,
+        run_id: &str,
+        step: usize,
+        options: XrayOptions,
+    ) -> Result<std::result::Result<XRay, XrayMiss>> {
+        let deadline = self.query_deadline(Instant::now());
+        match self.xray_step_target(tenant, run_id, step, deadline)? {
+            Ok(target) => self.xray_in(target, deadline, options, Limits::DEFAULT),
+            Err(miss) => Ok(Err(miss)),
+        }
+    }
+
+    /// The span `trace_id`/`span_id` and its run.
+    pub(crate) fn xray_target(
+        &self,
+        tenant: Option<&str>,
+        trace_id: &str,
+        span_id: &str,
+        deadline: Option<Deadline>,
+    ) -> Result<std::result::Result<Target, XrayMiss>> {
         let (spans, _) = self.trace_spans_at(tenant, trace_id, deadline)?;
         let matching: Vec<&Span> = spans
             .iter()
@@ -1004,7 +1268,7 @@ impl Store {
             many => return Ok(Err(XrayMiss::AmbiguousTenant(many.len()))),
         };
         drop(spans);
-        let (facts, _, llm) = self.step_facts_detailed(&span);
+        let (facts, _, _) = self.step_facts_detailed(&span);
         if facts.kind != StepKind::Llm {
             return Ok(Err(XrayMiss::NotAnLlmStep(facts.kind)));
         }
@@ -1016,7 +1280,63 @@ impl Store {
             MAX_TAPE_SPANS,
             deadline,
         )?;
+        Ok(Ok(Target { span, run, tape }))
+    }
+
+    /// Step `step` of `run_id` and its run.
+    fn xray_step_target(
+        &self,
+        tenant: Option<&str>,
+        run_id: &str,
+        step: usize,
+        deadline: Option<Deadline>,
+    ) -> Result<std::result::Result<Target, XrayMiss>> {
+        let tape = self.run_tape(tenant, run_id, MAX_TAPE_SPANS, MAX_TAPE_SPANS, deadline)?;
+        if tape.spans.is_empty() {
+            return Ok(Err(XrayMiss::NoRun));
+        }
+        if tenant.is_none() {
+            let tenants: HashSet<&str> =
+                tape.spans.iter().map(|span| span.tenant.as_str()).collect();
+            if tenants.len() > 1 {
+                return Ok(Err(XrayMiss::AmbiguousTenant(tenants.len())));
+            }
+        }
+        let Some(found) = tape.steps.get(step) else {
+            return Ok(Err(XrayMiss::NoStep {
+                steps: tape.steps.len(),
+                more: tape.truncated,
+            }));
+        };
+        if found.kind != StepKind::Llm {
+            return Ok(Err(XrayMiss::NotAnLlmStep(found.kind)));
+        }
+        let span = pair(&tape.steps, &tape.spans)
+            .into_iter()
+            .find(|entry| entry.step.index == step)
+            .map(|entry| entry.span.clone());
+        let Some(span) = span else {
+            return Ok(Err(XrayMiss::NoSpan));
+        };
+        Ok(Ok(Target {
+            span,
+            run: run_id.to_owned(),
+            tape,
+        }))
+    }
+
+    /// The X-Ray of `target`, spending `deadline` and at most `limits`.
+    pub(crate) fn xray_in(
+        &self,
+        target: Target,
+        deadline: Option<Deadline>,
+        options: XrayOptions,
+        limits: Limits,
+    ) -> Result<std::result::Result<XRay, XrayMiss>> {
+        let Target { span, run, tape } = target;
+        let (_, _, llm) = self.step_facts_detailed(&span);
         let paired = pair(&tape.steps, &tape.spans);
+        let agents = Agents::new(&tape.steps, &tape.spans);
         let target = paired.iter().position(|entry| {
             entry.step.trace_id == span.trace_id && entry.step.span_id == span.span_id
         });
@@ -1039,7 +1359,7 @@ impl Store {
         };
         let tenant_scope = span.tenant.clone();
         let mut resolver = Resolver::new(self, Some(&tenant_scope), deadline);
-        let mut target_budget = ResolveBudget::new(MAX_READ_BYTES);
+        let mut target_budget = ResolveBudget::new(limits.read_bytes);
         let read = read_call(
             target_entry,
             &mut resolver,
@@ -1049,23 +1369,51 @@ impl Store {
         )?;
         let pieces = read.context.list;
         let contents: HashSet<u128> = pieces.iter().map(|piece| piece.content).collect();
+        // The call's own texts are held first and never released: its
+        // previews and diffs matter most.
+        let mut pool = TextPool::new(limits.pool_bytes);
+        pool.hold(&pieces);
 
-        // The history, oldest first, up to and including the call.
-        let mut history_budget = ResolveBudget::new(MAX_READ_BYTES);
-        let mut provenance: HashMap<u128, usize> = HashMap::new();
-        let mut provenance_partial = target.is_none();
-        let mut call_steps: HashMap<String, usize> = HashMap::new();
-        let mut first_said: HashMap<u64, usize> = HashMap::new();
-        let mut said_overflow = false;
-        let mut output_steps: Vec<usize> = Vec::new();
-        let mut recent: VecDeque<Context> = VecDeque::new();
-        let mut pool = TextPool::new(MAX_POOL_BYTES);
-        let mut resolved_partial = !options.resolve;
         let target_index = target.unwrap_or(0);
         let history: &[Paired<'_>] = match target {
             Some(index) => &paired[..=index],
             None => &[],
         };
+        // The comparison window — the calls a predecessor can be — is read
+        // first, newest first, so a long run spends its read budget on the
+        // calls the verdict and the loss list are about; older history, read
+        // only for provenance and staleness, gets what remains.
+        let window: Vec<usize> = history[..history.len().saturating_sub(1)]
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.step.kind == StepKind::Llm)
+            .map(|(index, _)| index)
+            .rev()
+            .take(RECENT_CONTEXTS)
+            .collect();
+        let mut history_budget = ResolveBudget::new(limits.read_bytes);
+        let mut window_reads: HashMap<usize, Read> = HashMap::new();
+        for &index in &window {
+            Deadline::check(deadline, 0)?;
+            let call = read_call(
+                &history[index],
+                &mut resolver,
+                &mut history_budget,
+                options.resolve,
+                true,
+            )?;
+            window_reads.insert(index, call);
+        }
+
+        // The history, oldest first, up to and including the call.
+        let mut provenance: HashMap<u128, usize> = HashMap::new();
+        let mut provenance_partial = target.is_none();
+        let mut call_steps: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut first_said: HashMap<u64, usize> = HashMap::new();
+        let mut said_overflow = false;
+        let mut output_steps: Vec<usize> = Vec::new();
+        let mut recent: VecDeque<Context> = VecDeque::new();
+        let mut resolved_partial = !options.resolve;
         let mut note = |digest: u128, index: usize, provenance: &mut HashMap<u128, usize>| {
             if provenance.contains_key(&digest) {
                 return;
@@ -1107,13 +1455,17 @@ impl Store {
                     }
                 }
                 StepKind::Llm => {
-                    let call = read_call(
-                        entry,
-                        &mut resolver,
-                        &mut history_budget,
-                        options.resolve,
-                        true,
-                    )?;
+                    let in_window = window_reads.contains_key(&index);
+                    let call = match window_reads.remove(&index) {
+                        Some(call) => call,
+                        None => read_call(
+                            entry,
+                            &mut resolver,
+                            &mut history_budget,
+                            options.resolve,
+                            true,
+                        )?,
+                    };
                     let mut said = false;
                     for piece in call.context.list.iter().chain(call.response.iter()) {
                         note(piece.content, index, &mut provenance);
@@ -1127,18 +1479,18 @@ impl Store {
                     if said {
                         output_steps.push(index);
                     }
-                    for piece in &call.context.list {
-                        pool.keep(piece);
-                    }
-                    recent.push_back(Context::new(
-                        index,
-                        &entry.span.tenant,
-                        entry.span.start_time_ns,
-                        &call.context.list,
-                        call.unavailable,
-                    ));
-                    if recent.len() > RECENT_CONTEXTS {
-                        recent.pop_front();
+                    if in_window {
+                        let mut context = Context::new(
+                            index,
+                            &entry.span.tenant,
+                            entry.span.start_time_ns,
+                            &call.context.list,
+                            call.context.truncated,
+                            call.unavailable,
+                        )
+                        .with_agent(agents.of(entry.span));
+                        context.held = pool.hold(&call.context.list);
+                        recent.push_back(context);
                     }
                 }
                 StepKind::Tool => {
@@ -1152,7 +1504,7 @@ impl Store {
                         }
                     }
                     if let Some(id) = step.detail.tool_call_id.clone() {
-                        call_steps.entry(id).or_insert(index);
+                        call_steps.entry(id).or_default().push(index);
                     }
                     if let Some(piece) = step.response.as_ref().and_then(|response| {
                         chunk::value_piece(response, ChunkKind::ToolResult, None)
@@ -1215,14 +1567,9 @@ impl Store {
                 .tool_call_id
                 .as_deref()
                 .filter(|_| piece.kind == ChunkKind::ToolResult)
-                .and_then(|id| call_steps.get(id).copied());
-            let origin = match (by_content, by_call) {
-                (Some(content), Some(call)) if call < content => Some((call, "tool_call_id")),
-                (Some(content), _) => Some((content, "content")),
-                (None, Some(call)) => Some((call, "tool_call_id")),
-                (None, None) => None,
-            };
-            let introduced_by = origin
+                .and_then(|id| call_steps.get(id))
+                .map(Vec::as_slice);
+            let introduced_by = origin(by_content, by_call, &steps)
                 .filter(|(index, _)| *index < steps.len())
                 .map(|(index, via)| introduced(steps[index], via));
             let age_steps = introduced_by
@@ -1312,24 +1659,25 @@ impl Store {
                 .cmp(&wasted(a))
                 .then_with(|| a.indices[0].cmp(&b.indices[0]))
         });
+        let duplicates_truncated = duplicates.len() > MAX_DUPLICATES;
         duplicates.truncate(MAX_DUPLICATES);
 
         // The predecessor, what was lost since, and the cache verdict.
-        for piece in &pieces {
-            pool.keep(piece);
-        }
         let current = Context::new(
             target_index,
             &span.tenant,
             span.start_time_ns,
             &pieces,
+            read.context.truncated,
             read.unavailable,
-        );
+        )
+        .with_agent(agents.of(&span));
         let found = autopsy::predecessor(&current, recent.iter(), &pool);
         let mut previous = None;
         let mut dropped = Vec::new();
         let mut dropped_truncated = false;
         let mut edited = Vec::new();
+        let mut edited_truncated = false;
         if let Ok(Some((before, shared))) = &found {
             let step = steps[before.step_index];
             previous = Some(PreviousRef {
@@ -1348,27 +1696,41 @@ impl Store {
                 .map(|(position, _)| position)
                 .collect();
             let mut attempts = 0;
+            let mut compare_budget = limits.compare_bytes;
             for (previous_index, kept) in before.chunks.iter().enumerate() {
                 if contents.contains(&kept.content) || !seen.insert(kept.content) {
                     continue;
                 }
                 // Changed rather than lost: a near-identical chunk of the same
-                // role and kind took its place.
+                // role and kind took its place. Lengths too far apart cannot
+                // be an edit, which settles most candidates without a text.
                 let old_text = pool.get(kept.exact);
-                let partner = old_text.and_then(|old| {
-                    fresh.iter().position(|&position| {
-                        let piece = &pieces[position];
-                        if piece.kind != kept.kind
-                            || piece.role != kept.role
-                            || attempts >= MAX_EDIT_COMPARISONS
-                            || old.len().max(piece.text.len()) > MAX_EDIT_BYTES
-                        {
-                            return false;
-                        }
-                        attempts += 1;
-                        autopsy::similar(old, &piece.text)
-                    })
-                });
+                let mut partner = None;
+                let mut unverified = false;
+                for (slot, &position) in fresh.iter().enumerate() {
+                    let piece = &pieces[position];
+                    if piece.kind != kept.kind
+                        || piece.role != kept.role
+                        || !autopsy::could_be_edit(kept.bytes, piece.text.len())
+                    {
+                        continue;
+                    }
+                    let Some(old) = old_text else {
+                        unverified = true;
+                        break;
+                    };
+                    let cost = old.len().min(piece.text.len());
+                    if attempts >= MAX_EDIT_COMPARISONS || cost > compare_budget {
+                        unverified = true;
+                        break;
+                    }
+                    attempts += 1;
+                    compare_budget -= cost;
+                    if autopsy::similar(old, &piece.text) {
+                        partner = Some(slot);
+                        break;
+                    }
+                }
                 if let (Some(slot), Some(old)) = (partner, old_text) {
                     let index = fresh.remove(slot);
                     if edited.len() < MAX_DROPPED {
@@ -1381,12 +1743,14 @@ impl Store {
                             diff,
                             volatile,
                         });
+                    } else {
+                        edited_truncated = true;
                     }
                     continue;
                 }
                 if dropped.len() == MAX_DROPPED {
                     dropped_truncated = true;
-                    break;
+                    continue;
                 }
                 let instruction = matches!(kept.kind, ChunkKind::System | ChunkKind::User)
                     && kept.role.as_deref() != Some(TOOLS_ROLE);
@@ -1396,22 +1760,28 @@ impl Store {
                     kind: if instruction { "instruction" } else { "other" },
                     chunk_kind: kept.kind,
                     est_tokens: kept.est_tokens,
-                    preview: pool
-                        .get(kept.exact)
-                        .map(|text| chunk::clip(text, PREVIEW_CHARS)),
+                    preview: old_text.map(|text| chunk::clip(text, PREVIEW_CHARS)),
                     introduced_by: provenance
                         .get(&kept.content)
                         .filter(|index| **index < steps.len())
                         .map(|index| introduced(steps[*index], "content")),
+                    unverified,
                 });
             }
         }
+        let seen_before = history[..history.len().saturating_sub(1)]
+            .iter()
+            .any(|entry| entry.step.kind == StepKind::Llm);
         let mut cache = cache_step(
             self,
-            target_entry.step,
-            &llm,
-            &current,
-            found,
+            Verdict {
+                step: target_entry.step,
+                step_index: target,
+                llm: &llm,
+                context: &current,
+                predecessor: found,
+                seen_before,
+            },
             options.ttl_seconds.saturating_mul(1_000_000_000),
             &pool,
         );
@@ -1423,6 +1793,7 @@ impl Store {
                                  it were not read and its predecessor is unknown"
                 .to_owned();
             cache.est_tokens_lost = 0;
+            cache.calibration = None;
             cache.est_cost_lost_usd = None;
         }
         let response = read
@@ -1472,12 +1843,15 @@ impl Store {
             dropped_since_previous: dropped,
             dropped_truncated,
             edited_since_previous: edited,
+            edited_truncated,
             duplicates,
+            duplicates_truncated,
             cache,
             stale_after_steps: options.stale_steps,
             response,
             resolved_partial,
             provenance_partial,
+            texts_partial: pool.overflowed,
         }))
     }
 
@@ -1495,14 +1869,31 @@ impl Store {
     ) -> Result<Option<CacheAutopsy>> {
         let deadline = self.query_deadline(Instant::now());
         let tape = self.run_tape(tenant, run_id, MAX_TAPE_SPANS, MAX_TAPE_SPANS, deadline)?;
+        self.autopsy_in(tenant, run_id, &tape, deadline, options, Limits::DEFAULT)
+    }
+
+    /// The autopsy of a run already read, spending `deadline` and at most
+    /// `limits`.
+    pub(crate) fn autopsy_in(
+        &self,
+        tenant: Option<&str>,
+        run_id: &str,
+        tape: &RunTape,
+        deadline: Option<Deadline>,
+        options: AutopsyOptions,
+        limits: Limits,
+    ) -> Result<Option<CacheAutopsy>> {
         if tape.spans.is_empty() {
             return Ok(None);
         }
         let paired = pair(&tape.steps, &tape.spans);
+        let agents = Agents::new(&tape.steps, &tape.spans);
         let mut resolver = Resolver::new(self, tenant, deadline);
-        let mut budget = ResolveBudget::new(MAX_READ_BYTES);
-        let mut pool = TextPool::new(MAX_POOL_BYTES);
+        let mut read_left = limits.autopsy_read_bytes;
+        let mut unresolved = false;
+        let mut pool = TextPool::new(limits.pool_bytes);
         let mut recent: VecDeque<Context> = VecDeque::new();
+        let mut tenants_seen: HashSet<&str> = HashSet::new();
         let mut steps = Vec::new();
         let mut truncated = tape.truncated;
         let ttl_ns = options.ttl_seconds.saturating_mul(1_000_000_000);
@@ -1515,25 +1906,43 @@ impl Store {
                 truncated = true;
                 break;
             }
+            // Each call gets its own budget, out of what the request has
+            // left: one giant call cannot starve the calls after it.
+            let mut budget = ResolveBudget::new(limits.read_bytes.min(read_left));
             let read = read_call(entry, &mut resolver, &mut budget, options.resolve, false)?;
-            for piece in &read.context.list {
-                pool.keep(piece);
-            }
-            let context = Context::new(
+            read_left -= budget.spent();
+            unresolved |= budget.unresolved;
+            let mut context = Context::new(
                 entry.step.index,
                 &entry.span.tenant,
                 entry.span.start_time_ns,
                 &read.context.list,
+                read.context.truncated,
                 read.unavailable,
-            );
+            )
+            .with_agent(agents.of(entry.span));
+            context.held = pool.hold(&read.context.list);
             let llm = self.facts(entry.span);
+            let seen_before = !tenants_seen.insert(entry.span.tenant.as_str());
             let found = autopsy::predecessor(&context, recent.iter(), &pool);
             steps.push(cache_step(
-                self, entry.step, &llm, &context, found, ttl_ns, &pool,
+                self,
+                Verdict {
+                    step: entry.step,
+                    step_index: Some(entry.step.index),
+                    llm: &llm,
+                    context: &context,
+                    predecessor: found,
+                    seen_before,
+                },
+                ttl_ns,
+                &pool,
             ));
             recent.push_back(context);
             if recent.len() > RECENT_CONTEXTS {
-                recent.pop_front();
+                if let Some(gone) = recent.pop_front() {
+                    pool.release(&gone.held);
+                }
             }
         }
         let summary = summarize(&steps);
@@ -1545,7 +1954,7 @@ impl Store {
             steps,
             summary,
             truncated,
-            resolved_partial: budget.unresolved || !options.resolve,
+            resolved_partial: unresolved || !options.resolve,
             texts_partial: pool.overflowed,
         }))
     }

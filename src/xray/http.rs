@@ -187,7 +187,9 @@ fn xray(store: &Store, rest: &str, query: &str, bound: Option<&str>) -> Routed {
             200,
             serde_json::to_value(found).unwrap_or_else(|_| json!({})),
         )),
-        Err(XrayMiss::NoSpan) => Err(error(404, "span not found")),
+        Err(XrayMiss::NoSpan | XrayMiss::NoRun | XrayMiss::NoStep { .. }) => {
+            Err(error(404, "span not found"))
+        }
         Err(XrayMiss::NotAnLlmStep(kind)) => Err(error(
             400,
             format!("the span is a {kind} step; the X-Ray reads model calls (llm steps)"),

@@ -272,8 +272,8 @@ span names decides how they are applied (the table in
 
 | Provider (`gen_ai.provider.name`) | The prompt count is | Derived cost |
 |---|---|---|
-| `anthropic`, `aws.bedrock`, `gcp.vertex_ai` | the uncached remainder | prompt × input rate + cache reads × read rate + cache writes × write rate + output |
-| `openai`, `azure.ai.openai` | inclusive of the cached tokens | (prompt − cached) × input rate + cache reads × read rate + cache writes × write rate + output |
+| `anthropic`, `aws.bedrock`; `gcp.vertex_ai` for a model whose name contains `claude` | the uncached remainder | prompt × input rate + cache reads × read rate + cache writes × write rate + output |
+| `openai`, `azure.ai.openai`; `gcp.vertex_ai` for a model whose name contains `gemini` | inclusive of the cached tokens | (prompt − cached) × input rate + cache reads × read rate + cache writes × write rate + output |
 | anything else | unknown | prompt × input rate + output, as before |
 
 Without the cache rates — or for a reported cache counter whose rate is

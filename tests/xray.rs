@@ -552,6 +552,178 @@ fn the_mcp_tool_renders_a_framed_compact_xray() {
 }
 
 #[test]
+fn the_predecessor_and_the_verdict_follow_the_conversation_not_the_neighbour() {
+    let server = Server::spawn(&["--mcp"]);
+    let system = "You are a careful agent.";
+    let mut spans = vec![
+        // A compaction that keeps the system prompt: it shares a third of
+        // its chunks with the call it compacted and half with an older one.
+        claude(
+            "cmp",
+            "m0",
+            0,
+            system,
+            json!([user(RULE)]),
+            json!([said("ok")]),
+        ),
+        claude(
+            "cmp",
+            "m1",
+            100,
+            system,
+            json!([user(RULE), said("ok"), user("go on")]),
+            json!([said("done")]),
+        ),
+        claude(
+            "cmp",
+            "m2",
+            200,
+            system,
+            json!([user("Summary: the parser is fixed."), user("continue")]),
+            json!([said("next")]),
+        ),
+    ];
+    // A stateless pipeline: one system prompt, a new input each call.
+    for (index, input) in [
+        "Label: the sky is green",
+        "Label: water is wet",
+        "Label: grass is blue",
+    ]
+    .iter()
+    .enumerate()
+    {
+        spans.push(claude(
+            "cls",
+            &format!("m{index}"),
+            100 * index as u64,
+            system,
+            json!([user(input)]),
+            json!([said("false")]),
+        ));
+    }
+    // Two agents on the same system prompt.
+    for (index, (agent, task)) in [
+        ("planner", "plan the release"),
+        ("worker", "write the notes"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let mut call = claude(
+            "agt",
+            &format!("m{index}"),
+            100 * index as u64,
+            system,
+            json!([user(task)]),
+            json!([said("ok")]),
+        );
+        call["attributes"]["gen_ai.agent.name"] = json!(agent);
+        spans.push(call);
+    }
+    ingest(&server, spans, None);
+
+    let (status, compacted) = get(&server, "/v1/xray/tr-cmp/m2", None);
+    assert_eq!(status, 200, "{compacted}");
+    assert_eq!(compacted["previous"]["step_index"], json!(1), "{compacted}");
+    let dropped = compacted["dropped_since_previous"].as_array().unwrap();
+    let kinds: Vec<(&str, bool)> = dropped
+        .iter()
+        .map(|entry| {
+            (
+                entry["kind"].as_str().unwrap(),
+                entry["unverified"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            ("instruction", false),
+            ("other", false),
+            ("instruction", false)
+        ],
+        "{compacted}"
+    );
+    assert_eq!(dropped[2]["preview"], json!("go on"));
+    assert_eq!(compacted["cache"]["cause"], json!("new_context"));
+    assert_eq!(
+        compacted["cache"]["first_divergent_chunk"]["change"],
+        json!("rewritten")
+    );
+    for flag in ["texts_partial", "edited_truncated", "duplicates_truncated"] {
+        assert_eq!(compacted[flag], json!(false), "{flag}");
+    }
+
+    let (status, pipeline) = get(&server, "/v1/cache/cls", None);
+    assert_eq!(status, 200, "{pipeline}");
+    let causes: Vec<&str> = pipeline["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|step| step["cause"].as_str().unwrap())
+        .collect();
+    assert_eq!(causes, ["new_context", "stable", "stable"], "{pipeline}");
+    assert_eq!(
+        pipeline["steps"][1]["first_divergent_chunk"]["change"],
+        json!("replaced")
+    );
+    assert_eq!(pipeline["steps"][1]["est_tokens_lost"], json!(0));
+    assert!(
+        pipeline["steps"][1].get("calibration").is_some(),
+        "{pipeline}"
+    );
+    assert_eq!(pipeline["summary"]["breaks"], json!(0));
+    assert_eq!(pipeline["summary"]["culprits"], json!([]));
+    assert_eq!(pipeline["summary"]["culprits_truncated"], json!(false));
+    assert!(pipeline["steps"][0]["explanation"]
+        .as_str()
+        .unwrap()
+        .starts_with("the first model call of the run"));
+
+    let (status, worker) = get(&server, "/v1/xray/tr-agt/m1", None);
+    assert_eq!(status, 200, "{worker}");
+    assert_eq!(worker["previous"], json!(null), "{worker}");
+    assert_eq!(worker["dropped_since_previous"], json!([]));
+    assert!(
+        worker["cache"]["explanation"]
+            .as_str()
+            .unwrap()
+            .starts_with("no earlier call among the previous 32"),
+        "{worker}"
+    );
+
+    // The MCP tool, addressed by run and step, counts the verified loss.
+    let (status, body) = server.json(
+        "POST",
+        "/v1/mcp",
+        Some(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                     "params": {"name": "xray_step",
+                                "arguments": {"run_id": "cmp", "step": 2}}})),
+        &[("Accept", "application/json, text/event-stream")],
+    );
+    assert_eq!(status, 200, "{body}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("3 chunks dropped, 2 of them INSTRUCTIONS"),
+        "{text}"
+    );
+    assert!(!text.contains("possibly edited"), "{text}");
+    let (_, missing) = server.json(
+        "POST",
+        "/v1/mcp",
+        Some(&json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                     "params": {"name": "xray_step",
+                                "arguments": {"run_id": "cmp", "step": 9}}})),
+        &[("Accept", "application/json, text/event-stream")],
+    );
+    assert_eq!(missing["result"]["isError"], json!(true));
+    assert!(missing["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("The run has 3 steps — no step 9."));
+}
+
+#[test]
 fn a_zero_stale_threshold_is_refused_at_startup() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_traza-server"))
         .args(["--xray-stale-steps", "0", "--port", "0"])

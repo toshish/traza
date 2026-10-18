@@ -18,6 +18,11 @@
 //!   as recorded. The cache autopsy compares this, because a provider's
 //!   prefix cache matches bytes: the same content re-serialized with its keys
 //!   in another order is a cache miss even though it is not new content.
+//!   Tool-call arguments and tool definitions that travelled as text keep
+//!   their recorded bytes here (a definitions list recorded as one text is
+//!   split into its items' own substrings); only values recorded as
+//!   structured JSON, whose original byte order no longer exists, are
+//!   canonical.
 //!
 //! Digests are Traza's 128-bit [`hash128`](crate::hash::hash128) — fast enough
 //! to digest every prompt of a long run — and are reported as their first 16
@@ -219,14 +224,20 @@ impl Pieces {
             })
         };
         let name = field(&["name", "tool_name"]).and_then(scalar_text);
-        let arguments = field(&["arguments", "input", "args", "parameters"])
+        let recorded = field(&["arguments", "input", "args", "parameters"]);
+        let arguments = recorded
             .map(crate::semconv::field_value)
             .unwrap_or(Value::Null);
         let id = field(&["id", "call_id", "tool_call_id"]).and_then(scalar_text);
-        let arguments_text = match &arguments {
-            Value::Null => String::new(),
-            Value::String(text) => text.clone(),
-            other => crate::evals::canonical_json(other),
+        // Arguments that travelled as text (OpenAI's `arguments` string) are
+        // shown, and identified, exactly as recorded: re-serializing them is
+        // a cache miss the autopsy must be able to see. Structured arguments
+        // have no recorded byte order left to keep, so they are canonical.
+        let arguments_text = match (recorded, &arguments) {
+            (Some(Value::String(text)), _) => text.clone(),
+            (_, Value::Null) => String::new(),
+            (_, Value::String(text)) => text.clone(),
+            (_, other) => crate::evals::canonical_json(other),
         };
         let text = format!("{}({arguments_text})", name.as_deref().unwrap_or("?"));
         let mut identity = Map::new();
@@ -292,8 +303,11 @@ impl Pieces {
         });
     }
 
-    /// A tool definition, reported under [`TOOLS_ROLE`].
-    fn definition(&mut self, definition: &Value) {
+    /// A tool definition, reported under [`TOOLS_ROLE`]. `recorded` is its
+    /// text exactly as recorded, when it travelled as text: the chunk then
+    /// shows, and is identified by, those bytes; a structured definition is
+    /// canonical JSON.
+    fn definition(&mut self, definition: &Value, recorded: Option<&str>) {
         if self.full() {
             return;
         }
@@ -303,9 +317,10 @@ impl Pieces {
             .find_map(|key| definition.get(*key))
             .or_else(|| definition.get("function").and_then(|f| f.get("name")))
             .and_then(scalar_text);
-        let text = match &definition {
-            Value::String(text) => text.clone(),
-            other => crate::evals::canonical_json(other),
+        let text = match (recorded, &definition) {
+            (Some(raw), _) => raw.to_owned(),
+            (None, Value::String(text)) => text.clone(),
+            (None, other) => crate::evals::canonical_json(other),
         };
         let text_hash = hash(text.as_bytes());
         let content = canonical_digest(&text).unwrap_or(text_hash);
@@ -321,6 +336,64 @@ impl Pieces {
             media: false,
         });
     }
+}
+
+/// The items of a JSON array held as text, each as its exact recorded
+/// substring with surrounding whitespace trimmed — or `None` when the text is
+/// not one top-level array. Only called on text that already parsed as an
+/// array, so it tracks strings and nesting, not grammar. Slicing happens only
+/// at ASCII delimiters, which UTF-8 never uses inside a character.
+pub(crate) fn split_json_array(text: &str) -> Option<Vec<&str>> {
+    let bytes = text.as_bytes();
+    let mut at = 0;
+    while bytes.get(at).is_some_and(u8::is_ascii_whitespace) {
+        at += 1;
+    }
+    if bytes.get(at) != Some(&b'[') {
+        return None;
+    }
+    at += 1;
+    let mut items = Vec::new();
+    let (mut depth, mut in_string, mut escaped) = (0usize, false, false);
+    let mut start = at;
+    let mut closed = false;
+    while at < bytes.len() {
+        let byte = bytes[at];
+        at += 1;
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'[' | b'{' => depth += 1,
+            b']' | b'}' if depth > 0 => depth -= 1,
+            b',' if depth == 0 => {
+                items.push(text[start..at - 1].trim());
+                start = at;
+            }
+            b']' => {
+                let last = text[start..at - 1].trim();
+                if !last.is_empty() || !items.is_empty() {
+                    items.push(last);
+                }
+                closed = true;
+                break;
+            }
+            b'}' => return None,
+            _ => {}
+        }
+    }
+    if !closed || !text[at..].trim().is_empty() || items.iter().any(|item| item.is_empty()) {
+        return None;
+    }
+    Some(items)
 }
 
 /// The digest of a JSON-shaped text's canonical form, or `None` when the text
@@ -430,9 +503,21 @@ fn role_of(message: &Map<String, Value>) -> Option<String> {
 pub(crate) fn context_pieces(request: Option<&Value>, definitions: &[Value], cap: usize) -> Pieces {
     let mut pieces = Pieces::new(cap);
     for definition in definitions {
+        let raw = definition.as_str();
         match crate::semconv::field_value(definition) {
-            Value::Array(list) => list.iter().for_each(|item| pieces.definition(item)),
-            other => pieces.definition(&other),
+            Value::Array(list) => {
+                // A list recorded as one text: each definition keeps its own
+                // recorded bytes when the text splits into exactly the items
+                // it parsed into.
+                let items = raw
+                    .and_then(split_json_array)
+                    .filter(|items| items.len() == list.len());
+                for (position, item) in list.iter().enumerate() {
+                    let recorded = items.as_ref().map(|items| items[position]);
+                    pieces.definition(item, recorded);
+                }
+            }
+            other => pieces.definition(&other, raw),
         }
     }
     if let Some(request) = request {
@@ -443,7 +528,9 @@ pub(crate) fn context_pieces(request: Option<&Value>, definitions: &[Value], cap
             .and_then(Value::as_array)
         {
             if definitions.is_empty() {
-                body_tools.iter().for_each(|tool| pieces.definition(tool));
+                body_tools
+                    .iter()
+                    .for_each(|tool| pieces.definition(tool, tool.as_str()));
             }
         }
         messages(&mut pieces, request, None);
@@ -791,7 +878,8 @@ mod tests {
             ]
         );
         let call = &pieces.list[3];
-        assert_eq!(call.text, r#"get_weather({"city":"Paris"})"#);
+        // Arguments recorded as text are shown as recorded.
+        assert_eq!(call.text, r#"get_weather({"city": "Paris"})"#);
         assert_eq!(call.tool_call_id.as_deref(), Some("c1"));
         assert_eq!(call.name.as_deref(), Some("get_weather"));
         assert_eq!(pieces.list[4].tool_call_id.as_deref(), Some("c1"));
@@ -870,6 +958,59 @@ mod tests {
         );
         assert_eq!(user.list[0].content, system.list[0].content);
         assert_ne!(user.list[0].exact, system.list[0].exact);
+    }
+
+    #[test]
+    fn text_recorded_arguments_and_definitions_keep_their_bytes() {
+        // The same tool call, its arguments re-serialized: the same content,
+        // a different prompt — the cache miss the autopsy must see.
+        let call = |arguments: &str| {
+            let request = json!([{"role": "assistant", "tool_calls": [
+                {"id": "c1", "type": "function",
+                 "function": {"name": "grep", "arguments": arguments}}]}]);
+            context_pieces(Some(&request), &[], 10).list.remove(0)
+        };
+        let (tight, spaced) = (call(r#"{"q":"x","n":1}"#), call(r#"{"n": 1, "q": "x"}"#));
+        assert_eq!(tight.content, spaced.content);
+        assert_ne!(tight.exact, spaced.exact);
+        assert_eq!(spaced.text, r#"grep({"n": 1, "q": "x"})"#);
+
+        // A definitions list recorded as one text: each item is identified by
+        // its own bytes, so a key-order change in the second tool leaves the
+        // first identical.
+        let defs = |text: &str| {
+            let attributes = json!({"gen_ai.tool.definitions": text});
+            let found = tool_definitions(attributes.as_object().unwrap());
+            context_pieces(None, &found, 10).list
+        };
+        let before = defs(r#"[{"name":"a","x":1}, {"name":"b","y":2,"z":3}]"#);
+        let after = defs(r#"[{"name":"a","x":1}, {"z":3,"name":"b","y":2}]"#);
+        assert_eq!(before.len(), 2);
+        assert_eq!(before[0].exact, after[0].exact);
+        assert_ne!(before[1].exact, after[1].exact);
+        assert_eq!(before[1].content, after[1].content);
+        assert_eq!(after[1].text, r#"{"z":3,"name":"b","y":2}"#);
+        assert_eq!(after[1].name.as_deref(), Some("b"));
+        // Structured definitions have no recorded bytes: canonical.
+        let structured = defs_structured(json!([{"y": 2, "name": "b"}]));
+        assert_eq!(structured[0].text, r#"{"name":"b","y":2}"#);
+
+        assert_eq!(
+            split_json_array(r#" [ {"a":"],}"} , [1,[2]], "x\"]" ,3 ] "#),
+            Some(vec![r#"{"a":"],}"}"#, "[1,[2]]", r#""x\"]""#, "3"])
+        );
+        assert_eq!(split_json_array("[]"), Some(vec![]));
+        assert_eq!(split_json_array("[1,]"), None);
+        assert_eq!(split_json_array("[1] trailing"), None);
+        assert_eq!(split_json_array("{\"a\": 1}"), None);
+        assert_eq!(
+            split_json_array("[\"é\",\"ü\"]"),
+            Some(vec!["\"é\"", "\"ü\""])
+        );
+    }
+
+    fn defs_structured(list: Value) -> Vec<Piece> {
+        context_pieces(None, &[list], 10).list
     }
 
     #[test]

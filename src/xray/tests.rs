@@ -236,6 +236,7 @@ fn provenance_age_staleness_duplicates_and_composition() {
     assert_eq!(xray.response.len(), 1);
     assert_eq!(xray.response[0].preview, "Done.");
     assert!(!xray.provenance_partial && !xray.resolved_partial);
+    assert!(!xray.texts_partial && !xray.edited_truncated && !xray.duplicates_truncated);
 
     // The previous call is step 4, and nothing it had was lost.
     let previous = xray.previous.clone().expect("previous");
@@ -348,6 +349,690 @@ fn compaction_loss_names_the_lost_instruction() {
     let divergence = xray.cache.first_divergent_chunk.clone().expect("diverged");
     assert_eq!(divergence.change, Change::Rewritten);
     assert_eq!(divergence.index, 1);
+}
+
+#[test]
+fn a_compaction_pairs_with_the_call_it_compacted_whatever_its_shape() {
+    let fixture = TempStore::open("xray-compaction-shapes", crate::Config::default());
+    let rule = "Never touch prod. Clean the logs.";
+    let tools = json!([{"name": "shell", "description": "run a command"}]);
+    let with_tools = |mut span: Span| {
+        span.attributes
+            .insert("gen_ai.tool.definitions".into(), json!(tools.to_string()));
+        span
+    };
+    fixture
+        .store()
+        .ingest_batch(vec![
+            // [S, rule] → [S, rule, ok, go on] → [S, summary, continue]: the
+            // compacted call shares a third of its chunks with the call it
+            // compacted, and half with the older, shorter one.
+            llm(
+                "c1",
+                "l0",
+                100,
+                json!([msg("system", SYSTEM), msg("user", rule)]),
+                json!([msg("assistant", "ok")]),
+            ),
+            llm(
+                "c1",
+                "l1",
+                200,
+                json!([
+                    msg("system", SYSTEM),
+                    msg("user", rule),
+                    msg("assistant", "ok"),
+                    msg("user", "go on")
+                ]),
+                json!([msg("assistant", "done")]),
+            ),
+            llm(
+                "c1",
+                "l2",
+                300,
+                json!([
+                    msg("system", SYSTEM),
+                    msg("user", "Summary: logs cleaned."),
+                    msg("user", "continue")
+                ]),
+                json!([msg("assistant", "next")]),
+            ),
+            // [tools, S, rule, …] → [tools, S, summary, …]: under half shared
+            // either way; the lead past the tool definitions pairs them.
+            with_tools(llm(
+                "c2",
+                "l0",
+                100,
+                json!([
+                    msg("system", SYSTEM),
+                    msg("user", rule),
+                    msg("assistant", "a"),
+                    msg("user", "b"),
+                    msg("assistant", "c"),
+                    msg("user", "d")
+                ]),
+                json!([msg("assistant", "e")]),
+            )),
+            with_tools(llm(
+                "c2",
+                "l1",
+                200,
+                json!([
+                    msg("system", SYSTEM),
+                    msg("user", "Summary: logs cleaned."),
+                    msg("user", "continue"),
+                    msg("user", "and report")
+                ]),
+                json!([msg("assistant", "f")]),
+            )),
+        ])
+        .expect("ingests");
+    let xray = xray_of(fixture.store(), Some(""), "tr-c1", "l2", options(20));
+    assert_eq!(xray.previous.as_ref().map(|p| p.step_index), Some(1));
+    let lost: Vec<(&str, Option<&str>, bool)> = xray
+        .dropped_since_previous
+        .iter()
+        .map(|dropped| (dropped.kind, dropped.preview.as_deref(), dropped.unverified))
+        .collect();
+    assert_eq!(
+        lost,
+        [
+            ("instruction", Some(rule), false),
+            ("other", Some("ok"), false),
+            ("instruction", Some("go on"), false),
+        ]
+    );
+    let divergence = xray.cache.first_divergent_chunk.clone().expect("diverged");
+    assert_eq!(divergence.change, Change::Rewritten);
+    assert!(
+        !xray.cache.explanation.contains("changed in place"),
+        "the lost instruction is not a volatile token: {}",
+        xray.cache.explanation
+    );
+
+    let tooled = xray_of(fixture.store(), Some(""), "tr-c2", "l1", options(20));
+    assert_eq!(tooled.chunks[0].role.as_deref(), Some("tools"));
+    assert_eq!(tooled.previous.as_ref().map(|p| p.step_index), Some(0));
+    assert!(tooled
+        .dropped_since_previous
+        .iter()
+        .any(|dropped| dropped.kind == "instruction" && dropped.preview.as_deref() == Some(rule)));
+}
+
+#[test]
+fn agents_are_kept_apart_and_a_first_call_is_told_from_an_unpaired_one() {
+    let fixture = TempStore::open("xray-agents", crate::Config::default());
+    let named = |mut span: Span, agent: &str| {
+        span.attributes
+            .insert("gen_ai.agent.name".into(), json!(agent));
+        span
+    };
+    fixture
+        .store()
+        .ingest_batch(vec![
+            named(
+                llm(
+                    "a1",
+                    "l0",
+                    100,
+                    json!([msg("system", SYSTEM), msg("user", "plan the release")]),
+                    json!([msg("assistant", "delegating")]),
+                ),
+                "planner",
+            ),
+            // A worker on the same system prompt: unnamed, it would pair
+            // with the planner and report the planner's task as lost.
+            named(
+                llm(
+                    "a1",
+                    "l1",
+                    200,
+                    json!([msg("system", SYSTEM), msg("user", "write the notes")]),
+                    json!([msg("assistant", "written")]),
+                ),
+                "worker",
+            ),
+        ])
+        .expect("ingests");
+    let worker = xray_of(fixture.store(), Some(""), "tr-a1", "l1", options(20));
+    assert!(worker.previous.is_none(), "{:?}", worker.previous);
+    assert!(worker.dropped_since_previous.is_empty());
+    assert_eq!(worker.cache.cause, Cause::NewContext);
+    assert!(
+        worker
+            .cache
+            .explanation
+            .starts_with("no earlier call among the previous 32"),
+        "{}",
+        worker.cache.explanation
+    );
+    let planner = xray_of(fixture.store(), Some(""), "tr-a1", "l0", options(20));
+    assert!(
+        planner
+            .cache
+            .explanation
+            .starts_with("the first model call of the run"),
+        "{}",
+        planner.cache.explanation
+    );
+}
+
+#[test]
+fn a_restamped_long_system_prompt_is_an_edit_not_a_lost_instruction() {
+    let fixture = TempStore::open("xray-long-edit", crate::Config::default());
+    // Over 80 KB, with the clock near the top.
+    let system = |time: &str| {
+        format!(
+            "Now: 2026-10-17T{time}Z.\n{}",
+            "Follow the policy. ".repeat(4_500)
+        )
+    };
+    fixture
+        .store()
+        .ingest_batch(vec![
+            llm(
+                "e1",
+                "l0",
+                100,
+                json!([msg("system", &system("09:14:03")), msg("user", "hi")]),
+                json!([msg("assistant", "hello")]),
+            ),
+            llm(
+                "e1",
+                "l1",
+                200,
+                json!([
+                    msg("system", &system("09:19:44")),
+                    msg("user", "hi"),
+                    msg("assistant", "hello")
+                ]),
+                json!([]),
+            ),
+        ])
+        .expect("ingests");
+    let xray = xray_of(fixture.store(), Some(""), "tr-e1", "l1", options(20));
+    assert!(xray.chunks[0].chars > 80_000);
+    assert!(
+        xray.dropped_since_previous.is_empty(),
+        "{:?}",
+        xray.dropped_since_previous
+    );
+    assert_eq!(xray.edited_since_previous.len(), 1);
+    assert_eq!(xray.edited_since_previous[0].volatile, Volatile::Timestamp);
+    assert_eq!(
+        xray.edited_since_previous[0].diff.after,
+        "2026-10-17T09:19:44Z"
+    );
+    let divergence = xray.cache.first_divergent_chunk.clone().expect("diverged");
+    assert_eq!(divergence.change, Change::Edited);
+    // The policy text after the clock is what the cache lost.
+    assert!(xray.cache.est_tokens_lost > 20_000, "{:?}", xray.cache);
+}
+
+#[test]
+fn an_edit_that_could_not_be_checked_is_unverified_not_an_instruction_loss() {
+    let fixture = TempStore::open("xray-unverified", crate::Config::default());
+    let system = |time: &str| format!("You help. Now: 2026-10-17T{time}Z. Be brief and exact.");
+    fixture
+        .store()
+        .ingest_batch(vec![
+            llm(
+                "u1",
+                "l0",
+                100,
+                json!([
+                    msg("system", &system("09:14:03")),
+                    msg("user", "question one")
+                ]),
+                json!([msg("assistant", "a")]),
+            ),
+            llm(
+                "u1",
+                "l1",
+                200,
+                json!([
+                    msg("system", &system("09:19:44")),
+                    msg("user", "question one"),
+                    msg("assistant", "a")
+                ]),
+                json!([]),
+            ),
+        ])
+        .expect("ingests");
+    let store = fixture.store();
+    // Room for this call's own texts only: the previous system prompt's
+    // text is refused, so the edit cannot be checked.
+    let own: usize = system("09:19:44").len() + "question one".len() + "a".len();
+    let target = store
+        .xray_target(Some(""), "tr-u1", "l1", None)
+        .expect("reads")
+        .expect("found");
+    let limits = Limits {
+        pool_bytes: own,
+        ..Limits::DEFAULT
+    };
+    let xray = store
+        .xray_in(target, None, options(20), limits)
+        .expect("reads")
+        .expect("found");
+    assert!(xray.texts_partial);
+    assert_eq!(xray.dropped_since_previous.len(), 1);
+    let dropped = &xray.dropped_since_previous[0];
+    assert!(dropped.unverified, "{dropped:?}");
+    assert_eq!(dropped.preview, None);
+    // With room for both texts the same call shows the edit.
+    let full = xray_of(store, Some(""), "tr-u1", "l1", options(20));
+    assert!(full.dropped_since_previous.is_empty() && !full.texts_partial);
+    assert_eq!(full.edited_since_previous.len(), 1);
+}
+
+#[test]
+fn a_stateless_pipeline_is_not_a_cache_break() {
+    let fixture = TempStore::open("xray-stateless", priced_config());
+    let calls = [
+        "Classify: the sky is green",
+        "Classify: water is wet",
+        "Classify: grass is blue",
+    ];
+    fixture
+        .store()
+        .ingest_batch(
+            calls
+                .iter()
+                .enumerate()
+                .map(|(index, input)| {
+                    llm(
+                        "p1",
+                        &format!("l{index}"),
+                        100 * (index as u64 + 1),
+                        json!([msg("system", SYSTEM), msg("user", input)]),
+                        json!([msg("assistant", "false")]),
+                    )
+                })
+                .collect(),
+        )
+        .expect("ingests");
+    let autopsy = fixture
+        .store()
+        .cache_autopsy(Some(""), "p1", AutopsyOptions::default())
+        .expect("reads")
+        .expect("found");
+    let causes: Vec<Cause> = autopsy.steps.iter().map(|step| step.cause).collect();
+    assert_eq!(causes, [Cause::NewContext, Cause::Stable, Cause::Stable]);
+    let turn = &autopsy.steps[1];
+    assert_eq!(turn.previous_step_index, Some(0));
+    assert_eq!(turn.est_tokens_lost, 0);
+    assert_eq!(
+        turn.first_divergent_chunk.as_ref().map(|d| d.change),
+        Some(Change::Replaced)
+    );
+    assert_eq!(autopsy.summary.breaks, 0);
+    assert!(autopsy.summary.culprits.is_empty());
+    assert_eq!(autopsy.summary.est_tokens_lost, 0);
+}
+
+#[test]
+fn provenance_prefers_the_tool_that_returned_the_content_when_call_ids_repeat() {
+    let fixture = TempStore::open("xray-repeated-ids", crate::Config::default());
+    let ls = "alpha.rs beta.rs";
+    let cat = "beta_contents_here and more";
+    let base = vec![
+        msg("user", "list then read"),
+        call("c1", "ls", json!({})),
+        result("c1", ls),
+        // The framework numbers calls per turn: the next call reuses "c1".
+        call("c1", "cat", json!({"path": "beta.rs"})),
+    ];
+    let run = |name: &str, shown: &str| {
+        let mut last = base.clone();
+        last.push(result("c1", shown));
+        vec![
+            llm(
+                name,
+                "l0",
+                100,
+                json!([msg("user", "list then read")]),
+                json!([call("c1", "ls", json!({}))]),
+            ),
+            tool(name, "t1", 200, "ls", "c1", json!({}), ls),
+            llm(
+                name,
+                "l2",
+                300,
+                Value::Array(base[..3].to_vec()),
+                json!([call("c1", "cat", json!({"path": "beta.rs"}))]),
+            ),
+            tool(
+                name,
+                "t3",
+                400,
+                "cat",
+                "c1",
+                json!({"path": "beta.rs"}),
+                cat,
+            ),
+            llm(
+                name,
+                "l4",
+                500,
+                Value::Array(last),
+                json!([msg("assistant", "ok")]),
+            ),
+        ]
+    };
+    let mut spans = run("r1", cat);
+    // The same run, the cat output truncated before the model saw it.
+    spans.extend(run("r2", "beta_contents_here [truncated]"));
+    fixture.store().ingest_batch(spans).expect("ingests");
+    let exact = xray_of(fixture.store(), Some(""), "tr-r1", "l4", options(20));
+    let from = exact.chunks[4].introduced_by.clone().expect("attributed");
+    assert_eq!(
+        (from.step_index, from.name.as_str(), from.via),
+        (3, "cat", "content")
+    );
+    let rewritten = xray_of(fixture.store(), Some(""), "tr-r2", "l4", options(20));
+    let from = rewritten.chunks[4]
+        .introduced_by
+        .clone()
+        .expect("attributed");
+    assert_eq!(
+        (from.step_index, from.name.as_str(), from.via),
+        (3, "cat", "tool_call_id"),
+        "the latest tool step answering the id, not the first"
+    );
+    // The ls result keeps its own tool.
+    let from = exact.chunks[2].introduced_by.clone().expect("attributed");
+    assert_eq!((from.step_index, from.name.as_str()), (1, "ls"));
+}
+
+#[test]
+fn rewritten_tool_arguments_break_the_cache_where_they_sit() {
+    let fixture = TempStore::open("xray-reserialized", crate::Config::default());
+    let openai = |id: &str, start: u64, input: Value| {
+        let mut span = llm("o1", id, start, input, json!([]));
+        span.attributes
+            .insert("gen_ai.provider.name".into(), json!("openai"));
+        span
+    };
+    let grep = |arguments: &str| {
+        json!({"role": "assistant", "content": null, "tool_calls": [
+            {"id": "c1", "type": "function",
+             "function": {"name": "grep", "arguments": arguments}}]})
+    };
+    fixture
+        .store()
+        .ingest_batch(vec![
+            openai(
+                "l0",
+                100,
+                json!([
+                    msg("system", SYSTEM),
+                    msg("user", TASK),
+                    grep(r#"{"q":"parse","n":5}"#),
+                    result("c1", GREP)
+                ]),
+            ),
+            // The framework re-serialized the earlier call's arguments.
+            openai(
+                "l1",
+                200,
+                json!([
+                    msg("system", SYSTEM),
+                    msg("user", TASK),
+                    grep(r#"{"n": 5, "q": "parse"}"#),
+                    result("c1", GREP),
+                    msg("assistant", "found it")
+                ]),
+            ),
+        ])
+        .expect("ingests");
+    let autopsy = fixture
+        .store()
+        .cache_autopsy(Some(""), "o1", AutopsyOptions::default())
+        .expect("reads")
+        .expect("found");
+    let step = &autopsy.steps[1];
+    assert_eq!(step.cause, Cause::Reordered, "{}", step.explanation);
+    let divergence = step.first_divergent_chunk.clone().expect("diverged");
+    assert_eq!(divergence.index, 2);
+    assert_eq!(divergence.change, Change::Reserialized);
+    let diff = divergence.diff.expect("diff");
+    assert_ne!(diff.before, diff.after, "the bytes that changed are shown");
+}
+
+#[test]
+fn calibration_is_skipped_when_the_estimate_cannot_cover_the_providers_count() {
+    let fixture = TempStore::open("xray-calibration", priced_config());
+    let long = "context ".repeat(400);
+    let system = |time: &str| format!("You are helpful. The time is 2026-10-17T{time}Z. Be brief.");
+    let user_with_image = json!({"role": "user", "content": [
+        {"type": "text", "text": long},
+        {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                     "data": "AAAA".repeat(64)}}]});
+    let calls = [
+        (
+            "l0",
+            0,
+            json!([msg("system", &system("09:14:03")), user_with_image.clone()]),
+        ),
+        (
+            "l1",
+            SECOND,
+            json!([
+                msg("system", &system("09:19:44")),
+                user_with_image,
+                msg("assistant", "a1")
+            ]),
+        ),
+    ];
+    fixture
+        .store()
+        .ingest_batch(
+            calls
+                .into_iter()
+                .map(|(id, start, input)| {
+                    let mut span = llm("m1", id, 1_000 + start, input, json!([]));
+                    span.attributes
+                        .insert("gen_ai.usage.input_tokens".into(), json!(5_000));
+                    span.attributes
+                        .insert("gen_ai.usage.output_tokens".into(), json!(10));
+                    span
+                })
+                .collect(),
+        )
+        .expect("ingests");
+    let autopsy = fixture
+        .store()
+        .cache_autopsy(Some(""), "m1", AutopsyOptions::default())
+        .expect("reads")
+        .expect("found");
+    let step = &autopsy.steps[1];
+    assert_eq!(step.cause, Cause::VolatileContent);
+    // An image the estimate counts as zero: the provider's 5,000 would
+    // inflate a ratio, so the raw estimate stands — the long text (800) and
+    // the system prompt's tail after the clock (3).
+    assert_eq!(step.calibration, None);
+    assert_eq!(step.est_tokens_lost, 803);
+}
+
+#[test]
+fn the_comparison_window_is_read_before_older_history() {
+    let config = crate::Config {
+        payload_threshold: Some(64),
+        ..crate::Config::default()
+    };
+    let fixture = TempStore::open("xray-window-budget", config);
+    let rule = "a long standing instruction ".repeat(20);
+    let calls: Vec<Span> = (0..5)
+        .map(|index| {
+            let mut span = llm(
+                "w1",
+                &format!("l{index}"),
+                100 * (index + 1),
+                json!(null),
+                json!([]),
+            );
+            span.attributes.insert(
+                "gen_ai.input.messages".into(),
+                json!(json!([
+                    msg("system", &rule),
+                    msg("user", &format!("question {index}"))
+                ])
+                .to_string()),
+            );
+            span
+        })
+        .collect();
+    let payload = calls[4].attributes["gen_ai.input.messages"]
+        .as_str()
+        .expect("text")
+        .len();
+    fixture.store().ingest_batch(calls).expect("ingests");
+    let store = fixture.store();
+    // Room for the call itself and one more call of history.
+    let limits = Limits {
+        read_bytes: payload + payload / 2,
+        ..Limits::DEFAULT
+    };
+    let target = store
+        .xray_target(Some(""), "tr-w1", "l4", None)
+        .expect("reads")
+        .expect("found");
+    let xray = store
+        .xray_in(target, None, options(20), limits)
+        .expect("reads")
+        .expect("found");
+    assert!(xray.resolved_partial, "older history was left unresolved");
+    assert_eq!(
+        xray.previous.as_ref().map(|previous| previous.step_index),
+        Some(3),
+        "the nearest call was read first: {}",
+        xray.cache.explanation
+    );
+
+    // The autopsy gives each call its own budget out of the request's.
+    let tape = store
+        .run_tape(Some(""), "w1", MAX_TAPE_SPANS, MAX_TAPE_SPANS, None)
+        .expect("reads");
+    let per_call = Limits {
+        read_bytes: payload + payload / 2,
+        autopsy_read_bytes: 100 * payload,
+        ..Limits::DEFAULT
+    };
+    let autopsy = store
+        .autopsy_in(
+            Some(""),
+            "w1",
+            &tape,
+            None,
+            AutopsyOptions::default(),
+            per_call,
+        )
+        .expect("reads")
+        .expect("found");
+    assert!(!autopsy.resolved_partial);
+    assert!(autopsy
+        .steps
+        .iter()
+        .all(|step| step.cause != Cause::Unknown));
+    let starved = Limits {
+        autopsy_read_bytes: 2 * payload + payload / 2,
+        ..per_call
+    };
+    let autopsy = store
+        .autopsy_in(
+            Some(""),
+            "w1",
+            &tape,
+            None,
+            AutopsyOptions::default(),
+            starved,
+        )
+        .expect("reads")
+        .expect("found");
+    assert!(autopsy.resolved_partial);
+    assert_eq!(autopsy.steps[3].cause, Cause::Unknown);
+}
+
+#[test]
+fn culprits_are_ordered_by_cost_when_every_one_is_priced() {
+    let pricing = crate::pricing::Pricing::parse(
+        r#"{"models": {"claude-x": {"input_per_mtok": 3.0, "output_per_mtok": 15.0,
+                                    "cache_read_per_mtok": 0.3},
+                       "cheap-x": {"input_per_mtok": 0.1, "output_per_mtok": 0.4,
+                                   "cache_read_per_mtok": 0.01}}}"#,
+    )
+    .expect("pricing");
+    let fixture = TempStore::open(
+        "xray-culprits",
+        crate::Config {
+            pricing: std::sync::Arc::new(pricing),
+            ..crate::Config::default()
+        },
+    );
+    let call = |id: &str, start: u64, model: &str, input: Value| {
+        let mut span = llm("k1", id, start, input, json!([]));
+        span.attributes
+            .insert("gen_ai.request.model".into(), json!(model));
+        span
+    };
+    let clock = |time: &str| format!("Cheap agent. Now 2026-10-17T{time}Z. Go.");
+    let request = |id: &str| format!("Dear agent, request {id} follows. Go.");
+    let long = "bulk ".repeat(800);
+    let short = "note ".repeat(80);
+    fixture
+        .store()
+        .ingest_batch(vec![
+            // Many tokens lost, at a cheap rate: a timestamp.
+            call(
+                "a0",
+                100,
+                "cheap-x",
+                json!([msg("system", &clock("09:00:00")), msg("user", &long)]),
+            ),
+            // Fewer tokens, at a dear rate: a request id.
+            call(
+                "b0",
+                200,
+                "claude-x",
+                json!([
+                    msg("system", &request("550e8400-e29b-41d4-a716-446655440000")),
+                    msg("user", &short)
+                ]),
+            ),
+            call(
+                "a1",
+                300,
+                "cheap-x",
+                json!([
+                    msg("system", &clock("09:00:05")),
+                    msg("user", &long),
+                    msg("assistant", "x")
+                ]),
+            ),
+            call(
+                "b1",
+                400,
+                "claude-x",
+                json!([
+                    msg("system", &request("650e8400-e29b-41d4-a716-446655440000")),
+                    msg("user", &short),
+                    msg("assistant", "y")
+                ]),
+            ),
+        ])
+        .expect("ingests");
+    let autopsy = fixture
+        .store()
+        .cache_autopsy(Some(""), "k1", AutopsyOptions::default())
+        .expect("reads")
+        .expect("found");
+    let culprits = &autopsy.summary.culprits;
+    assert_eq!(culprits.len(), 2, "{culprits:?}");
+    assert!(culprits[1].est_tokens_lost > culprits[0].est_tokens_lost);
+    assert_eq!(culprits[0].volatile, Some(Volatile::Uuid), "{culprits:?}");
+    assert!(culprits[0].est_cost_lost_usd > culprits[1].est_cost_lost_usd);
+    assert!(!autopsy.summary.culprits_truncated);
 }
 
 fn priced_config() -> crate::Config {
@@ -476,13 +1161,14 @@ fn the_autopsy_names_causes_volatile_tokens_and_cost() {
         "{cost}"
     );
     // Calibrated to the provider's count: anthropic reports 900 uncached
-    // input tokens plus 0 read, so the raw estimate of the carried user
-    // chunk (3,200 ASCII characters, 800 tokens) is scaled to that context.
-    assert_eq!(
-        edit.est_tokens_lost,
-        (800.0 * 900.0 / edit.est_tokens as f64).round() as u64
-    );
-    assert_ne!(edit.est_tokens_lost, 800);
+    // input tokens plus 0 read, so the raw estimate — the carried user chunk
+    // (3,200 ASCII characters, 800 tokens) plus the system prompt's text
+    // after the changed clock ("Z. Be brief.", 3 tokens), which the cache
+    // could no longer serve either — is scaled to that context.
+    let ratio = 900.0 / edit.est_tokens as f64;
+    assert_eq!(edit.calibration, Some(ratio));
+    assert_eq!(edit.est_tokens_lost, (803.0 * ratio).round() as u64);
+    assert_ne!(edit.est_tokens_lost, 803);
 
     let stable = &autopsy.steps[2];
     assert_eq!(stable.prefix_chunks_shared, 3);
@@ -724,6 +1410,120 @@ fn refusals_bounds_and_the_deadline() {
             .cache_autopsy(Some(""), "s1", AutopsyOptions::default()),
         Err(crate::Error::DeadlineExceeded(_))
     ));
+}
+
+#[test]
+fn the_analysis_itself_honours_the_deadline_after_the_read() {
+    // The run is read with no budget; the analysis is then handed one that
+    // has already run out. A zero query deadline stops at the read, so this
+    // is what shows the X-Ray's and the autopsy's own work is budgeted.
+    let fixture = TempStore::open("xray-analysis-deadline", crate::Config::default());
+    fixture.store().ingest_batch(agent_run()).expect("ingests");
+    let store = fixture.store();
+    let spent = || Some(crate::Deadline::capped(None, std::time::Duration::ZERO));
+    let target = store
+        .xray_target(Some(""), "tr-s1", "l6", None)
+        .expect("reads")
+        .expect("found");
+    assert!(matches!(
+        store.xray_in(target, spent(), options(20), Limits::DEFAULT),
+        Err(crate::Error::DeadlineExceeded(_))
+    ));
+    let tape = store
+        .run_tape(Some(""), "s1", MAX_TAPE_SPANS, MAX_TAPE_SPANS, None)
+        .expect("reads");
+    assert!(matches!(
+        store.autopsy_in(
+            Some(""),
+            "s1",
+            &tape,
+            spent(),
+            AutopsyOptions::default(),
+            Limits::DEFAULT
+        ),
+        Err(crate::Error::DeadlineExceeded(_))
+    ));
+    // With time left, the same calls answer.
+    let target = store
+        .xray_target(Some(""), "tr-s1", "l6", None)
+        .expect("reads")
+        .expect("found");
+    assert!(store
+        .xray_in(target, None, options(20), Limits::DEFAULT)
+        .expect("reads")
+        .is_ok());
+}
+
+#[test]
+fn a_step_of_a_run_is_xrayed_from_one_read() {
+    let fixture = TempStore::open("xray-step", crate::Config::default());
+    fixture.store().ingest_batch(agent_run()).expect("ingests");
+    let store = fixture.store();
+    let by_step = store
+        .xray_step(Some(""), "s1", 6, options(2))
+        .expect("reads")
+        .expect("found");
+    let by_span = xray_of(store, Some(""), "tr-s1", "l6", options(2));
+    assert_eq!(by_step, by_span);
+    assert_eq!(
+        store
+            .xray_step(Some(""), "s1", 9, options(2))
+            .expect("reads"),
+        Err(XrayMiss::NoStep {
+            steps: 7,
+            more: false
+        })
+    );
+    assert_eq!(
+        store
+            .xray_step(Some(""), "s1", 1, options(2))
+            .expect("reads"),
+        Err(XrayMiss::NotAnLlmStep(StepKind::Tool))
+    );
+    assert_eq!(
+        store
+            .xray_step(Some(""), "nope", 0, options(2))
+            .expect("reads"),
+        Err(XrayMiss::NoRun)
+    );
+    // A run present in two tenants numbers its steps per tenant: the
+    // operator view must not guess which one is meant.
+    let mut other = agent_run();
+    for span in &mut other {
+        span.tenant = "beta".into();
+    }
+    store.ingest_batch(other).expect("ingests");
+    assert_eq!(
+        store.xray_step(None, "s1", 6, options(2)).expect("reads"),
+        Err(XrayMiss::AmbiguousTenant(2))
+    );
+    let beta = store
+        .xray_step(Some("beta"), "s1", 6, options(2))
+        .expect("reads")
+        .expect("found");
+    assert_eq!(beta.tenant, "beta");
+}
+
+#[test]
+fn a_call_past_the_read_limit_reports_no_step_index_anywhere() {
+    let fixture = TempStore::open("xray-fallback", crate::Config::default());
+    fixture.store().ingest_batch(agent_run()).expect("ingests");
+    let store = fixture.store();
+    let mut target = store
+        .xray_target(Some(""), "tr-s1", "l6", None)
+        .expect("reads")
+        .expect("found");
+    // As if the call lay past the read: its step is not in the tape.
+    target.tape.steps.retain(|step| step.span_id != "l6");
+    let xray = store
+        .xray_in(target, None, options(20), Limits::DEFAULT)
+        .expect("reads")
+        .expect("found");
+    assert_eq!(xray.step_index, None);
+    assert_eq!(xray.cache.step_index, None);
+    assert_eq!(xray.cache.cause, Cause::Unknown);
+    assert!(xray.provenance_partial);
+    assert_eq!(xray.chunks.len(), 10);
 }
 
 #[test]

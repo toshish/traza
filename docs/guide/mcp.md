@@ -213,12 +213,16 @@ The reasoning behind these is worth knowing:
   lost system or user chunk is called out as an instruction) or carries
   edited, and the call's cache verdict naming the first divergent chunk and the
   volatile token in it. It takes `trace_id` and `span_id` — `get_run_tape`
-  lists both for every step — or `run_id` and `step`, a tape index, and is text
-  only. The headline carries counts in Traza's own words; the model, the run,
-  every preview and role, and the cache explanation (which quotes recorded
-  text) render inside the telemetry block. Past the result ceiling the chunk
-  list is cut from its end and the summary rows above it survive; the stale
-  threshold is the server's `--xray-stale-steps`.
+  lists both for every step — or `run_id` and `step`, a tape index (the run is
+  read once, under one query deadline; with a credential that sees every
+  tenant, a run present in more than one is refused), and is text only. The
+  headline carries counts in Traza's own words, and counts as lost
+  instructions only losses checked against every possible edit — the rest are
+  counted as possibly edited. The model, the run, every preview and role, and
+  the cache explanation (which quotes recorded text) render inside the
+  telemetry block. Past the result ceiling rows are cut from the end, the
+  chunk list first, and the note says whether the summary rows survived; the
+  stale threshold is the server's `--xray-stale-steps`.
 
 **`check_run_guard` reads a run's [fuse](guard.md) verdict** — `continue`,
 `warn` or `stop` — with its reasons, policy, limits and usage: the same

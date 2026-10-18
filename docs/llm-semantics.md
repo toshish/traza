@@ -92,8 +92,13 @@ caching on, providers disagree about what the prompt count *counts*:
 
 | Provider | `input_tokens` / `prompt_tokens` | Context is |
 |---|---|---|
-| Anthropic, Bedrock, Vertex | the **uncached remainder** | prompt + cache read + cache creation |
-| OpenAI, Azure OpenAI | **inclusive** of its cached subset | the prompt count itself |
+| Anthropic, Bedrock, Claude on Vertex | the **uncached remainder** | prompt + cache read + cache creation |
+| OpenAI, Azure OpenAI, Gemini on Vertex | **inclusive** of its cached subset | the prompt count itself |
+
+Vertex (`gcp.vertex_ai`) serves both families under one provider name, so
+there the model decides: a name containing `claude` is read as Anthropic's, one
+containing `gemini` as inclusive, and any other Vertex model with cache
+counters falls in the "not known" case below.
 
 This matters wherever a growing conversation is being watched: read the
 uncached remainder alone and a context that is growing appears to *shrink* as

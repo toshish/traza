@@ -239,8 +239,19 @@ impl LlmFacts {
         use crate::pricing::CacheConvention;
         match self.provider.as_deref() {
             // The providers whose `input_tokens` excludes the cached part.
-            Some("anthropic") | Some("aws.bedrock") | Some("gcp.vertex_ai") => {
-                CacheConvention::Exclusive
+            Some("anthropic") | Some("aws.bedrock") => CacheConvention::Exclusive,
+            // Vertex serves both families under one provider name, and they
+            // count differently: Claude like Anthropic, Gemini's
+            // `promptTokenCount` inclusive of `cachedContentTokenCount`.
+            Some("gcp.vertex_ai") => {
+                let model = self.model.as_deref().unwrap_or("").to_ascii_lowercase();
+                if model.contains("claude") {
+                    CacheConvention::Exclusive
+                } else if model.contains("gemini") {
+                    CacheConvention::Inclusive
+                } else {
+                    CacheConvention::Unknown
+                }
             }
             // Inclusive, so the prompt count already IS the context.
             Some("openai") | Some("azure.ai.openai") => CacheConvention::Inclusive,
@@ -1589,6 +1600,50 @@ mod tests {
         );
         // An unknown provider keeps the plain arithmetic.
         assert!(close(call("somebody").cost_usd, 2.0));
+        // Vertex by model family: Claude is exclusive, Gemini inclusive (its
+        // cached tokens are not charged twice), anything else unknown.
+        let vertex = |model: &str| {
+            facts(&attrs(json!({
+                "gen_ai.provider.name": "gcp.vertex_ai",
+                "gen_ai.request.model": model,
+                "gen_ai.usage.input_tokens": 1_000_000,
+                "gen_ai.usage.output_tokens": 0,
+                "gen_ai.usage.cache_read.input_tokens": 600_000,
+                "gen_ai.usage.cache_creation_input_tokens": 100_000,
+            })))
+        };
+        let pricing_for = |model: &str| {
+            crate::pricing::Pricing::parse(&format!(
+                r#"{{"models": {{"{model}": {{"input_per_mtok": 2.0, "output_per_mtok": 10.0,
+                                              "cache_read_per_mtok": 0.2,
+                                              "cache_write_per_mtok": 2.5}}}}}}"#
+            ))
+            .expect("parses")
+        };
+        let claude = vertex("claude-sonnet-4@20250514");
+        assert_eq!(claude.context_tokens(), Some(1_700_000));
+        assert!(close(
+            claude
+                .priced(&pricing_for("claude-sonnet-4@20250514"))
+                .cost_usd,
+            2.0 + 0.12 + 0.25
+        ));
+        let gemini = vertex("gemini-2.5-pro");
+        assert_eq!(
+            gemini.cache_convention(),
+            crate::pricing::CacheConvention::Inclusive
+        );
+        assert_eq!(gemini.context_tokens(), Some(1_000_000));
+        assert!(close(
+            gemini.priced(&pricing_for("gemini-2.5-pro")).cost_usd,
+            0.3 * 2.0 + 0.12 + 0.25
+        ));
+        let other = vertex("llama-3-70b");
+        assert_eq!(
+            other.cache_convention(),
+            crate::pricing::CacheConvention::Unknown
+        );
+        assert_eq!(other.context_tokens(), None);
         assert_eq!(
             call("anthropic").cache_convention(),
             crate::pricing::CacheConvention::Exclusive

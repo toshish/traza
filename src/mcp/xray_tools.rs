@@ -11,14 +11,18 @@
 use serde_json::{json, Map, Value};
 
 use super::{
-    clamp_report_narrowing, count, known_keys, optional_string, optional_usize, sanitize,
+    clamp_report_narrowing, count, known_keys, optional_string, optional_usize, report, sanitize,
     text_result, thousands, tool, Context, Nature, Server, Tool, ToolError, ToolResult,
 };
 use crate::xray::{Cause, Chunk, XRay, XrayMiss, XrayOptions};
 
-/// What to do about a result the ceiling cut short.
+/// What to do about a result the ceiling cut inside the chunk list.
 const NARROW: &str = "The chunk list is cut from its end; the summary rows above it are \
                       complete. Fetch GET /v1/xray/{trace_id}/{span_id} for every chunk.";
+
+/// What to do about a result the ceiling cut inside the summary rows.
+const NARROW_SUMMARY: &str = "Rows are cut from the end, summary rows included. Fetch GET \
+                              /v1/xray/{trace_id}/{span_id} for the whole X-Ray.";
 
 /// Characters of a chunk preview in the rendering.
 const PREVIEW_CHARS: usize = 100;
@@ -80,35 +84,19 @@ pub(super) fn call(
     let span_id = optional_string(arguments, "span_id")?;
     let run_id = optional_string(arguments, "run_id")?;
     let step = optional_usize(arguments, "step")?;
-    let (trace_id, span_id) = match (trace_id, span_id, run_id, step) {
+    let options = XrayOptions {
+        stale_steps: server.store.xray_stale_steps(),
+        ..XrayOptions::default()
+    };
+    // Either way, one store call: one run read, one query deadline.
+    let found = match (trace_id, span_id, run_id, step) {
         (Some(trace), Some(span), None, None) if !trace.is_empty() && !span.is_empty() => {
-            (trace, span)
+            server.store.xray(context.scope(), &trace, &span, options)?
         }
         (None, None, Some(run), Some(step)) if !run.is_empty() => {
-            let tape = server
+            server
                 .store
-                .tape(
-                    context.scope(),
-                    &run,
-                    crate::tape::TapeOptions {
-                        max_steps: step.saturating_add(1),
-                        resolve: None,
-                    },
-                )?
-                .ok_or_else(|| {
-                    ToolError(
-                        "No run with that id. A run id is a session id (take one from \
-                         list_sessions) or 'trace:' followed by a trace id."
-                            .to_owned(),
-                    )
-                })?;
-            let found = tape.steps.get(step).ok_or_else(|| {
-                ToolError(format!(
-                    "The run has {} — no step {step}.",
-                    count(tape.steps.len() as u64, "step")
-                ))
-            })?;
-            (found.trace_id.clone(), found.span_id.clone())
+                .xray_step(context.scope(), &run, step, options)?
         }
         _ => {
             return Err(ToolError(
@@ -118,14 +106,7 @@ pub(super) fn call(
             ))
         }
     };
-    let options = XrayOptions {
-        stale_steps: server.store.xray_stale_steps(),
-        ..XrayOptions::default()
-    };
-    let xray = match server
-        .store
-        .xray(context.scope(), &trace_id, &span_id, options)?
-    {
+    let xray = match found {
         Ok(xray) => xray,
         Err(XrayMiss::NoSpan) => {
             return Err(ToolError(
@@ -133,6 +114,21 @@ pub(super) fn call(
                  get_trace."
                     .to_owned(),
             ))
+        }
+        Err(XrayMiss::NoRun) => {
+            return Err(ToolError(
+                "No run with that id. A run id is a session id (take one from \
+                 list_sessions) or 'trace:' followed by a trace id."
+                    .to_owned(),
+            ))
+        }
+        Err(XrayMiss::NoStep { steps, more }) => {
+            return Err(ToolError(format!(
+                "The run has {}{} — no step {}.",
+                if more { "more than " } else { "" },
+                count(steps as u64, "step"),
+                step.unwrap_or(0)
+            )))
         }
         Err(XrayMiss::NotAnLlmStep(kind)) => {
             return Err(ToolError(format!(
@@ -142,8 +138,8 @@ pub(super) fn call(
         }
         Err(XrayMiss::AmbiguousTenant(tenants)) => {
             return Err(ToolError(format!(
-                "That span id exists in {tenants} tenants; this credential sees all of them. \
-                 Use a tenant-bound credential to disambiguate."
+                "That span or run exists in {tenants} tenants; this credential sees all of \
+                 them. Use a tenant-bound credential to disambiguate."
             )))
         }
     };
@@ -169,11 +165,30 @@ fn render(xray: &XRay, max_bytes: usize) -> String {
         || "a step past the run's read limit".to_owned(),
         |i| format!("step {i}"),
     );
+    // Only a loss checked against every possible edit is called one.
     let instructions_lost = xray
         .dropped_since_previous
         .iter()
-        .filter(|dropped| dropped.kind == "instruction")
+        .filter(|dropped| dropped.kind == "instruction" && !dropped.unverified)
         .count();
+    let unverified = xray
+        .dropped_since_previous
+        .iter()
+        .filter(|dropped| dropped.unverified)
+        .count();
+    let mut lost = Vec::new();
+    if instructions_lost > 0 {
+        lost.push(format!(
+            "{} of them INSTRUCTIONS",
+            thousands(instructions_lost as u64)
+        ));
+    }
+    if unverified > 0 {
+        lost.push(format!(
+            "{} possibly edited rather than lost (not compared)",
+            thousands(unverified as u64)
+        ));
+    }
     let head = format!(
         "X-Ray of {at}: {}, ~{} estimated tokens ({reported}). Stale: {} (~{} tokens). \
          Repeated content: ~{} tokens. Since the previous call: {} dropped{}, {} edited. \
@@ -184,13 +199,10 @@ fn render(xray: &XRay, max_bytes: usize) -> String {
         thousands(totals.stale_est_tokens),
         thousands(totals.duplicate_est_tokens),
         count(xray.dropped_since_previous.len() as u64, "chunk"),
-        if instructions_lost > 0 {
-            format!(
-                ", {} of them INSTRUCTIONS",
-                thousands(instructions_lost as u64)
-            )
-        } else {
+        if lost.is_empty() {
             String::new()
+        } else {
+            format!(", {}", lost.join(", "))
         },
         thousands(xray.edited_since_previous.len() as u64),
         xray.cache.cause.as_str(),
@@ -238,8 +250,13 @@ fn render(xray: &XRay, max_bytes: usize) -> String {
     }
     for dropped in xray.dropped_since_previous.iter().take(LISTED) {
         rows.push(format!(
-            "dropped {} ({}) ~{} tok: {}",
+            "dropped {}{} ({}) ~{} tok: {}",
             dropped.kind,
+            if dropped.unverified {
+                " (unverified: may be edited)"
+            } else {
+                ""
+            },
             sanitize(
                 dropped
                     .role
@@ -268,6 +285,7 @@ fn render(xray: &XRay, max_bytes: usize) -> String {
             quoted(&duplicate.preview),
         ));
     }
+    let summary_rows = rows.len();
     for chunk in &xray.chunks {
         rows.push(chunk_line(chunk));
     }
@@ -278,27 +296,72 @@ fn render(xray: &XRay, max_bytes: usize) -> String {
          the stale threshold that no model output since has quoted — a heuristic, not proof."
             .to_owned(),
     ];
-    if xray.chunks_truncated || xray.provenance_partial || xray.resolved_partial {
-        notes.push(format!(
-            "Incomplete: {}{}{}.",
-            if xray.chunks_truncated {
-                "the context had more chunks than one X-Ray analyses; "
-            } else {
-                ""
-            },
-            if xray.provenance_partial {
-                "provenance or staleness hit a bound or lacks history; "
-            } else {
-                ""
-            },
-            if xray.resolved_partial {
-                "an offloaded value could not be resolved"
-            } else {
-                ""
-            },
-        ));
+    let gaps: Vec<&str> = [
+        (
+            xray.chunks_truncated,
+            "the context had more chunks than one X-Ray analyses",
+        ),
+        (
+            xray.provenance_partial,
+            "provenance or staleness hit a bound or lacks history",
+        ),
+        (
+            xray.resolved_partial,
+            "an offloaded value could not be resolved",
+        ),
+        (
+            xray.texts_partial,
+            "some chunk text was not kept, so a preview or diff is missing",
+        ),
+        (
+            xray.dropped_truncated || xray.edited_truncated || xray.duplicates_truncated,
+            "more chunks were dropped, edited or repeated than one X-Ray lists",
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(hit, gap)| hit.then_some(gap))
+    .collect();
+    if !gaps.is_empty() {
+        notes.push(format!("Incomplete: {}.", gaps.join("; ")));
     }
-    clamp_report_narrowing(&head, &rows, &notes, max_bytes, NARROW)
+    clamp_rows(&head, &rows, &notes, max_bytes, summary_rows)
+}
+
+/// [`clamp_report_narrowing`]'s halving, with the truncation note saying
+/// truthfully whether the summary rows (the first `summary_rows`) survived.
+fn clamp_rows(
+    head: &str,
+    rows: &[String],
+    notes: &[String],
+    max_bytes: usize,
+    summary_rows: usize,
+) -> String {
+    let full = report(head, rows, notes);
+    if full.len() <= max_bytes {
+        return full;
+    }
+    let mut kept = rows.len();
+    while kept > 0 {
+        let narrow = if kept >= summary_rows {
+            NARROW
+        } else {
+            NARROW_SUMMARY
+        };
+        let mut with_note = notes.to_vec();
+        with_note.push(format!(
+            "Truncated: {} of {} shown, because the rest would exceed this server's \
+             --mcp-max-result-bytes. {narrow}",
+            kept,
+            count(rows.len() as u64, "row")
+        ));
+        let candidate = report(head, &rows[..kept], &with_note);
+        if candidate.len() <= max_bytes {
+            return candidate;
+        }
+        kept /= 2;
+    }
+    // Even the headline and notes alone are over the cap.
+    clamp_report_narrowing(head, &[], notes, max_bytes, NARROW_SUMMARY)
 }
 
 fn chunk_line(chunk: &Chunk) -> String {
@@ -452,6 +515,8 @@ mod tests {
             (json!({"trace_id": "t1", "span_id": "nope"}), "No span"),
             (json!({"trace_id": "t1", "span_id": "tool-1"}), "tool step"),
             (json!({"run_id": "s1", "step": 9}), "no step 9"),
+            (json!({"run_id": "s1", "step": 1}), "tool step"),
+            (json!({"run_id": "nope", "step": 0}), "No run with that id"),
             (json!({"trace_id": "t1"}), "either trace_id and span_id"),
             (
                 json!({"run_id": "s1", "step": 0, "span_id": "x"}),
@@ -488,5 +553,95 @@ mod tests {
                 serialized.len()
             );
         }
+    }
+
+    #[test]
+    fn an_unverified_loss_is_not_counted_as_an_instruction() {
+        let fixture = TempStore::open("mcp-xray-unverified", crate::Config::default());
+        let system = |time: &str| format!("You help. Now: 2026-10-17T{time}Z. Be brief and exact.");
+        let call = |id: &str, start: u64, messages: Value| {
+            span(
+                "t2",
+                id,
+                start,
+                json!({"session.id": "s2", "gen_ai.operation.name": "chat",
+                       "gen_ai.request.model": "m", "gen_ai.input.messages": messages}),
+            )
+        };
+        fixture
+            .store()
+            .ingest_batch(vec![
+                call(
+                    "l0",
+                    100,
+                    json!([{"role": "system", "content": system("09:14:03")},
+                           {"role": "user", "content": "question one"}]),
+                ),
+                call(
+                    "l1",
+                    200,
+                    json!([{"role": "system", "content": system("09:19:44")},
+                           {"role": "user", "content": "question one"},
+                           {"role": "assistant", "content": "a"}]),
+                ),
+            ])
+            .expect("ingests");
+        let store = fixture.store();
+        let target = store
+            .xray_target(Some(""), "t2", "l1", None)
+            .expect("reads")
+            .expect("found");
+        // Room for the call's own texts only: the old system text is refused.
+        let own = system("09:19:44").len() + "question one".len() + "a".len();
+        let limits = crate::xray::Limits {
+            pool_bytes: own,
+            ..crate::xray::Limits::DEFAULT
+        };
+        let xray = store
+            .xray_in(target, None, XrayOptions::default(), limits)
+            .expect("reads")
+            .expect("found");
+        assert!(xray.dropped_since_previous[0].unverified);
+        let text = render(&xray, 32 * 1024);
+        assert!(
+            text.contains("1 chunk dropped, 1 possibly edited rather than lost (not compared)"),
+            "{text}"
+        );
+        assert!(!text.contains("INSTRUCTIONS"), "{text}");
+        assert!(
+            text.contains("dropped instruction (unverified: may be edited)"),
+            "{text}"
+        );
+        assert!(text.contains("some chunk text was not kept"), "{text}");
+    }
+
+    #[test]
+    fn the_truncation_note_says_whether_the_summary_rows_survived() {
+        let rows: Vec<String> = (0..12)
+            .map(|i| format!("row {i} {}", "x".repeat(80)))
+            .collect();
+        let notes = vec!["a note".to_owned()];
+        let (mut summary_cut, mut chunks_cut) = (false, false);
+        for ceiling in 100..4_000 {
+            let text = clamp_rows("head", &rows, &notes, ceiling, 2);
+            assert!(text.len() <= ceiling, "{} > {ceiling}", text.len());
+            let Some(at) = text.find("Truncated: ") else {
+                continue;
+            };
+            let kept: usize = text[at + "Truncated: ".len()..]
+                .split(' ')
+                .next()
+                .and_then(|n| n.parse().ok())
+                .expect("a count");
+            if kept >= 2 {
+                assert!(text.contains(NARROW), "{text}");
+                chunks_cut = true;
+            } else {
+                assert!(text.contains(NARROW_SUMMARY), "{text}");
+                assert!(!text.contains("are complete"), "{text}");
+                summary_cut = true;
+            }
+        }
+        assert!(summary_cut && chunks_cut);
     }
 }

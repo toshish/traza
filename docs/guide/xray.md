@@ -76,15 +76,17 @@ An excerpt of the real response, shares rounded (the full body is in the
     "cause": "volatile_content", "previous_step_index": 0, "prefix_chunks_shared": 0,
     "first_divergent_chunk": {"index": 0, "role": "system", "change": "edited", "volatile": "timestamp",
       "diff": {"offset": 34, "before": "2026-10-14T09:00:01Z", "after": "2026-10-14T09:00:02Z"}},
-    "est_tokens_lost": 22, "est_cost_lost_usd": 0.0000594,
-    "explanation": "chunk 0 (system) changed in place since step 0: \"2026-10-14T09:00:01Z\" → \"2026-10-14T09:00:02Z\" (a timestamp); ~22 tokens of content step 0 already had were re-processed"}
+    "est_tokens_lost": 10, "calibration": null, "est_cost_lost_usd": 0.000027,
+    "explanation": "chunk 0 (system) changed in place since step 0: \"2026-10-14T09:00:01Z\" → \"2026-10-14T09:00:02Z\" (a timestamp); ~10 tokens of content step 0 already had were re-processed"}
 }
 ```
 
 Read top to bottom: the user's question and the model's tool call came in with
 the first call; the tool result came from the tool step; the system prompt is
 new in this call — because one second of clock in it changed, which is also
-why the provider's cache served nothing.
+why the provider's cache served nothing. (`calibration` is `null` here: the
+agent uses a tool whose definition the span did not record, so the provider's
+96 tokens cover text the estimate cannot see, and the raw estimate stands.)
 
 ## The context window as chunks
 
@@ -116,7 +118,11 @@ or a request body's `tools`. They are part of what the model is billed for and
 part of the prompt a provider caches, which is why they lead: Anthropic orders
 its cache prefix tools, system, messages.
 
-A tool call's text is `name(arguments)`, the arguments canonical JSON. A tool
+A tool call's text is `name(arguments)`: the arguments exactly as recorded
+when they travelled as text (OpenAI's `arguments` string), canonical JSON when
+they were recorded as structured JSON. A tool definition's text is likewise
+its recorded text when it has one — a `gen_ai.tool.definitions` list recorded
+as one string is split into each tool's own bytes — else canonical JSON. A tool
 result's text is its content: a string, a list of text parts joined by
 newlines, or a content envelope's text. A media part is shown as a placeholder
 (`[image: image/png, 182044 bytes recorded]`) and estimates to zero tokens:
@@ -134,15 +140,20 @@ chunk's *content*: a JSON object or array held as text is canonicalized first,
 and role and position are not part of it — so the same tool output matches
 whether the tool span stored it parsed and the next prompt carried it as text,
 or the other way round. The Cache Autopsy compares a second, internal identity
-instead — role, kind, tool-call id and the text *exactly as recorded* —
+instead — role, kind, tool-call id and the chunk's text as shown above —
 because a provider's cache matches bytes: the same content re-serialized with
 its keys in another order is new to the cache even though it is not new
-content.
+content. Text-recorded values (messages, tool-call arguments, tool
+definitions) keep their recorded bytes here; a value the instrumentation
+recorded as structured JSON no longer has a byte order to keep, so for it the
+identity is its canonical form.
 
 **Offloaded prompts are resolved.** A request offloaded to the payload store
 (anything over `--payload-threshold-bytes`, 256 KiB by default — long agent
 contexts usually are) is read back before it is chunked, under the caller's
-tenant, and so are the run's earlier requests the analysis compares against.
+tenant, and so are the run's earlier requests the analysis compares against —
+the 32 calls a predecessor can be first, newest first, then older history
+(read only for provenance and staleness) with what the budget has left.
 `resolve=false` skips that: an offloaded request is then one opaque chunk,
 `context_unavailable` says why, and the cache verdict is `unknown`.
 
@@ -160,10 +171,13 @@ model or agent `name`, and its span. So:
 
 `via` is `content` for all of these. When an agent shows the model a tool
 result different from what the tool returned — truncated, summarized,
-annotated — no step holds the same content, and the chunk is attributed to the
-tool step whose `gen_ai.tool.call.id` matches the result's call id, with `via:
-"tool_call_id"`. That is worth noticing on its own: the model did not see what
-the tool said.
+annotated — no tool step holds the same content, and the chunk is attributed
+to the tool step whose `gen_ai.tool.call.id` matches the result's call id,
+with `via: "tool_call_id"`: the latest such step before the call that first
+carried the result, since a call id can repeat within a run (a retried call,
+a framework that numbers calls per turn). A tool step that holds the same
+content always wins over an id match. That is worth noticing on its own: the
+model did not see what the tool said.
 
 `age_steps` is the steps between the introducing step and this call.
 `composition.by_source` totals the context by where it came from —
@@ -212,7 +226,15 @@ the Cache Autopsy uses (below) — and compares the two contexts:
 - `edited_since_previous`: chunks that came back changed — the same role and
   kind, differing in a stretch at most a tenth of the text — with the first
   differing bytes and what kind of token they were. A re-stamped system prompt
-  is an edit, not a lost instruction.
+  is an edit, not a lost instruction, however long it is.
+
+Before a chunk is called lost, every chunk of this call that could be it
+edited (the same role and kind, and a length within a tenth of it) is
+compared with it. When that comparison could not be made — the old text was
+not kept for lack of room (`texts_partial`), or the comparison bound was
+reached — the dropped chunk is marked `"unverified": true`: it may have been
+changed rather than lost. `xray_step` counts only verified losses as lost
+instructions.
 
 ## Cache Autopsy
 
@@ -227,40 +249,58 @@ returns one verdict per model call of the run, in step order, and a summary
 {"summary": {"steps": 2, "breaks": 1,
              "by_cause": {"new_context": 1, "reordered": 0, "stable": 0,
                           "ttl_expired": 0, "unknown": 0, "volatile_content": 1},
-             "est_tokens_lost": 22, "est_cost_lost_usd": 0.0000594, "disagreements": 0,
+             "est_tokens_lost": 10, "est_cost_lost_usd": 0.000027, "disagreements": 0,
              "culprits": [{"cause": "volatile_content", "change": "edited", "role": "system",
-                           "volatile": "timestamp", "breaks": 1, "est_tokens_lost": 22,
-                           "example_step_index": 2,
+                           "volatile": "timestamp", "breaks": 1, "est_tokens_lost": 10,
+                           "est_cost_lost_usd": 0.000027, "example_step_index": 2,
                            "example": {"offset": 34, "before": "2026-10-14T09:00:01Z",
                                        "after": "2026-10-14T09:00:02Z"},
-                           "advice": "A clock value sits inside the cached prefix. Move the time to the end of the prompt (after the last cache breakpoint), or round it to a coarser unit such as the day."}]}}
+                           "advice": "A clock value sits inside the cached prefix. Move the time to the end of the prompt (after the last cache breakpoint), or round it to a coarser unit such as the day."}],
+             "culprits_truncated": false}}
 ```
 
-`culprits` groups the breaks by shape, costliest first — the kind of headline
-that reads *a timestamp in the system prompt broke the cache on 47 of 48
-calls* — and each carries `advice`: fixed guidance chosen by the shape (a
-lookup table in the code, not generated text), such as moving a clock value
-after the cached prefix, appending retrieved documents after the history
-rather than ahead of it, or serializing tool output with sorted keys.
+`culprits` groups the breaks by shape, costliest first — by estimated cost
+when every shape could be priced, else by estimated tokens lost, since
+neither a mix of priced and unpriced shapes nor tokens across differently
+priced models ranks by money — the kind of headline that reads *a timestamp in
+the system prompt broke the cache on 47 of 48 calls*. Each carries `advice`:
+fixed guidance chosen by the shape (a lookup table in the code, not generated
+text), such as moving a clock value after the cached prefix, appending
+retrieved documents after the history rather than ahead of it, or serializing
+tool output with sorted keys. At most ten are listed; `culprits_truncated`
+says when there were more.
 
 ### The predecessor
 
 A provider's prompt cache serves the longest previously-seen **prefix** of a
 prompt, byte for byte, while the entry lives. So each call is compared with the
-call before it **in the same conversation** — its predecessor: the nearest
-earlier model call of the same tenant whose context shares at least half of its
-chunks with this one, counted either way round (so a compaction that kept the
-system prompt and replaced the history still finds the call it compacted). The
-first chunks of the two contexts also count as shared when they are
-near-identical, so a system prompt with a clock in it does not hide the
-conversation it belongs to. Calls of *other* agents interleaved in the same run
-share little and are skipped, which keeps a multi-agent run's autopsy per
-conversation. The predecessor is searched among the previous 32 model calls.
+call before it **in the same conversation** — its predecessor — chosen among
+the previous 32 model calls of the same tenant:
 
-A call with no predecessor is `new_context`: the first call of a conversation,
-with nothing to cache yet. If the nearest earlier call of the tenant could not
-be read (not recorded, or offloaded and unresolvable), the verdict is
-`unknown` rather than a pairing across the gap.
+- A candidate **qualifies** when its leading chunks match this call's past the
+  tool definitions — the same system prompt, or the same first turn — or,
+  failing that, when the two share at least half of either context's chunks
+  (which is what still pairs a context whose tool definitions were
+  re-ordered). Leading chunks also match when they are near-identical, so a
+  system prompt with a clock in it does not hide the conversation it belongs
+  to. A compaction keeps the system prompt and replaces the history, so it
+  finds the call it compacted whatever share of the context it replaced;
+  sharing only the tool catalog is not enough.
+- Among qualifying candidates, the one whose matching lead is **longest** wins,
+  then the one sharing the most chunks, then the nearest. A sub-agent that
+  opens with its parent's system prompt therefore does not capture the
+  parent's next call, which continues a longer prefix.
+- When both calls name an agent — `gen_ai.agent.name` on the call, else the
+  name of the nearest enclosing agent step — calls of **different agents never
+  pair**.
+
+A call with no predecessor is `new_context`. The explanation says which case
+it is: *the first model call of the run*, or *no earlier call among the
+previous 32 shares this call's leading chunks or half of its chunks* — a new
+conversation, or one whose previous call lies further back. If a nearer
+earlier call of the tenant could not be read (not recorded, or offloaded and
+unresolvable) before any qualifying one was found, the verdict is `unknown`
+rather than a pairing across the gap.
 
 ### Causes
 
@@ -270,8 +310,10 @@ identity; `prefix_chunks_shared` is how far they agree.
 | `cause` | When | `first_divergent_chunk.change` |
 |---|---|---|
 | `stable` | The predecessor's whole context is an unchanged prefix of this one, within the TTL | — |
-| `ttl_expired` | The prefix is intact, but the TTL had passed since the predecessor began | — |
-| `volatile_content` | A chunk inside the prefix changed in place, the rest surviving | `edited` |
+| | A **new turn**: everything up to the predecessor's last chunk is unchanged, this call puts new content (or an edit at its very end) in that chunk's place, and nothing the predecessor had follows — a stateless pipeline's next input, a replaced last message. The cache served all it could | `replaced` or `edited` |
+| `ttl_expired` | The prefix is intact (or a new turn), but the TTL had passed since the predecessor began | — or `replaced` / `edited` |
+| `volatile_content` | A chunk inside the prefix changed in place — the same role and kind, at most a tenth of its text differing, verified on both texts — with content the predecessor had after the change | `edited` |
+| | A chunk inside the prefix was swapped for different content while what followed it survives (or its text was not kept, so an edit could not be confirmed) | `replaced` |
 | | A new chunk sits ahead of content the predecessor already had | `inserted` |
 | `reordered` | The same content in different bytes (key order, spacing), or under another role | `reserialized` |
 | | Both differing chunks exist in both contexts, in other places | `moved` |
@@ -301,11 +343,22 @@ ids, hashes), `number`, or `text`.
 
 `est_tokens_lost` is the estimated tokens of content the predecessor already
 had that this call carried **after** the break — what the cache could have
-served and the provider processed afresh — plus, when the TTL had expired, the
-shared prefix too. Estimates are scaled by the call's own calibration: the
-provider's resolved context count over the estimate for the whole context,
-clamped to 0.25–4×, so the figure tracks the provider's tokenizer rather than
-the four-characters rule. The explanation quotes the same scaled figure.
+served and the provider processed afresh: the chunks after the divergent one
+that the predecessor had, and, for an edited chunk, its own text after the
+change (a clock at the top of a long system prompt costs the whole prompt
+below it) — plus, when the TTL had expired, the shared prefix too. A new turn
+loses nothing, which is why it is not a break.
+
+`calibration` is the call's provider-reported context count over the
+estimate for the whole context, clamped to 0.25–4×, and `est_tokens_lost` is
+scaled by it so the figure leans toward the provider's tokenizer rather than
+the four-characters rule. It is applied only when the estimate covers what the
+provider counted: not when the context holds media (estimated at zero), uses
+tools without recording their definitions, or was cut at the chunk cap — the
+ratio would then mostly measure what was not recorded — and `calibration` is
+`null` and the raw estimate stands. Even when applied, the ratio absorbs
+anything the provider adds that no span records (injected system text,
+formatting tokens). The explanation quotes the figure reported.
 
 `est_cost_lost_usd` is those tokens at the model's input rate *less* its cache
 read rate, from [`--pricing`](../configuration.md#model-pricing) — present only
@@ -328,8 +381,10 @@ counts them, and `summary.disagreement_advice` lists what to check.
 The same pricing keys fix cached-token arithmetic everywhere Traza derives a
 cost. With `cache_read_per_mtok` and `cache_write_per_mtok` in a model's entry,
 a call's priced cost counts cache reads and writes at their own rates under its
-provider's convention — on top of the prompt for Anthropic, Bedrock and Vertex,
-carved out of it for OpenAI and Azure OpenAI. Without them, nothing changes.
+provider's convention — on top of the prompt for Anthropic, Bedrock and Claude
+on Vertex, carved out of it for OpenAI, Azure OpenAI and Gemini on Vertex
+(Vertex is decided by the model's family; any other Vertex model keeps the
+plain arithmetic). Without them, nothing changes.
 See [Model pricing](../configuration.md#model-pricing).
 
 ## From an agent: `xray_step`
@@ -339,10 +394,14 @@ headline of counts in Traza's own words, then — inside the untrusted-telemetry
 block — the model and run, the composition, the cache verdict with its diff,
 what was dropped or edited since the previous call, repeats, and one line per
 chunk. It takes `trace_id` and `span_id` (as `get_run_tape` lists them), or
-`run_id` and `step` (a tape index). Everything the telemetry wrote — previews,
-roles, model names, the explanation, which quotes recorded text — renders
-inside the block; the result is clamped to `--mcp-max-result-bytes` with the
-loss stated, the chunk list cut from its end first.
+`run_id` and `step` (a tape index) — either way the run is read once, under
+one query deadline; with a credential that sees every tenant, a run present in
+more than one is refused rather than guessed at. Everything the telemetry
+wrote — previews, roles, model names, the explanation, which quotes recorded
+text — renders inside the block; the headline counts only verified lost
+instructions and says how many losses are unverified. The result is clamped to
+`--mcp-max-result-bytes` with the loss stated, the chunk list cut from its end
+first, and the note says whether the summary rows survived.
 
 ## Tenancy and erasure
 
@@ -361,30 +420,44 @@ anything.
 - **Estimates and heuristics are labelled.** Per-chunk tokens are estimates;
   staleness is the heuristic above; "near-identical" is a 90%-shared-text rule;
   the predecessor search is a heuristic about which call a conversation
-  continues. A run with conversations that share most of their content may
-  pair calls across them.
+  continues. Conversations that open with the same system prompt or share
+  most of their content can pair across each other unless their calls name
+  different agents: the first call of a sub-agent that reuses its parent's
+  system prompt pairs with the parent's latest call, and lists the parent's
+  turns as dropped. A compaction that rewrites the system prompt too leaves
+  nothing to link it to the call it compacted.
 - **The provider's cache rules are not modelled** — minimum cacheable length,
   breakpoint placement, TTL refreshes on a hit, per-organization cache
   isolation. The verdicts describe the recorded prompt; `cache_read` and
   `disagreements` are where the provider's behaviour shows.
 - **Byte-exactness is the recording's.** Instrumentation records messages, not
   the HTTP body the SDK sent; a difference the instrumentation normalized away
-  is invisible, and one it introduced is reported. Structured values are
-  compared in canonical key order, so a key-order change is visible only when
-  it travelled as text.
+  is invisible, and one it introduced is reported. Values recorded as
+  structured JSON (Anthropic's `tool_use` input, indexed tool-definition
+  attributes, a provider body's `tools`) are compared in canonical key order,
+  so a key-order change in them is invisible; text-recorded arguments and
+  definitions keep their bytes, offloaded or not.
 - **Bounds.** One request reads its run's first 20,000 spans; a call past that
-  is X-rayed alone (`step_index: null`, `provenance_partial: true`, cache
-  `unknown`). A context is split into at most 2,000 chunks
-  (`chunks_truncated`). Up to 64 MiB of offloaded payload is resolved for an
-  X-Ray's history and as much again for the call itself, and 64 MiB across
-  all of an autopsy's calls (`resolved_partial`). At most
-  200,000 content digests are kept for provenance and 500,000 words for
-  staleness (`provenance_partial`; staleness is then not judged at all), 32 MiB
-  of distinct chunk text for previews and diffs (the autopsy's
-  `texts_partial`), 256 dropped and 256 edited chunks and 64 duplicate groups
-  listed, and an autopsy covers at most 2,000 model calls (`truncated`). The
-  whole request runs inside one `--query-deadline-ms` budget and is refused
-  with `400`, never answered partially, when it runs out.
+  is X-rayed alone (`step_index: null` here and in `cache`,
+  `provenance_partial: true`, cache `unknown`). A context is split into at most
+  2,000 chunks (`chunks_truncated`). Up to 64 MiB of offloaded payload is
+  resolved for the call under an X-Ray and as much again for its history — the
+  32 calls a predecessor can be first, newest first — and an autopsy resolves
+  up to 64 MiB per call and 512 MiB across all its calls (`resolved_partial`).
+  These are bounds on reading work, not on response size, which is why they
+  are not `--tape-max-bytes` (the cap on content a tape *returns*); the query
+  deadline bounds them as well. At most 200,000 content digests are kept for
+  provenance and 500,000 words for staleness (`provenance_partial`; staleness
+  is then not judged at all), and 32 MiB of distinct chunk text for previews
+  and diffs — the examined call's and the comparison window's, released as
+  calls leave the window (`texts_partial`). Pairing lost chunks with edited
+  ones compares at most 64 MiB of text and 4,096 pairs (`unverified` past it).
+  At most 256 dropped and 256 edited chunks, 64 duplicate groups and 10
+  culprits are listed (`dropped_truncated`, `edited_truncated`,
+  `duplicates_truncated`, `culprits_truncated`), and an autopsy covers at most
+  2,000 model calls (`truncated`). The whole request runs inside one
+  `--query-deadline-ms` budget and is refused with `400`, never answered
+  partially, when it runs out.
 - **Digests are identities, not commitments.** They are Traza's 128-bit hash,
   reported as 16 hex characters. A producer able to write its own telemetry can
   manufacture a collision; it would get a wrong answer about its own data in

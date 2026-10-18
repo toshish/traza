@@ -8,15 +8,19 @@
 //! differs is where the cache stopped serving; what kind of difference it is
 //! names the cause.
 //!
-//! **The predecessor** is the nearest earlier model call of the same tenant
-//! whose context shares at least half of its chunks with this one, measured
-//! either way round (so a compaction that kept the system prompt and replaced
-//! the history still finds the call it compacted). The first chunks of the
-//! two contexts also count as shared when they are near-identical — the same
-//! kind, differing in a short span — so a system prompt that embeds the time
-//! of day does not hide the conversation it belongs to. Calls of other agents
-//! interleaved in the same run share little with each other and are skipped,
-//! which is what keeps a multi-agent run's autopsy per conversation.
+//! **The predecessor** is chosen among the previous 32 model calls of the
+//! same tenant (and of the same agent, when both calls name one). A
+//! candidate qualifies when its leading chunks match this call's past the
+//! tool definitions — the same system prompt, or the same first
+//! turn, so a compaction that kept the system prompt and replaced the history
+//! still finds the call it compacted — or, failing that, when the two share
+//! at least half of either context's chunks (a re-ordered context). Leading
+//! chunks also match when they are near-identical — the same kind and role,
+//! differing in a short span — so a system prompt that embeds the time of day
+//! does not hide the conversation it belongs to. Among qualifying candidates
+//! the one with the longest matching lead wins, then the most shared chunks,
+//! then the nearest: a sub-agent that opens with its parent's system prompt
+//! does not capture the parent's next call, which continues a longer prefix.
 //!
 //! Everything here is computed from recorded text. What it cannot see, it
 //! says: the provider's own rules (minimum cacheable length, where cache
@@ -81,8 +85,13 @@ impl Cause {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Change {
-    /// The chunk was edited in place; the rest of the context survives.
+    /// The chunk was edited in place — the same kind and role, differing in
+    /// a stretch at most a tenth of its text; the rest of the context
+    /// survives.
     Edited,
+    /// A different chunk took its place: not a small edit of it, and not
+    /// content the predecessor had elsewhere.
+    Replaced,
     /// A new chunk sits where the predecessor's chunk was, and that chunk
     /// follows it.
     Inserted,
@@ -151,6 +160,9 @@ pub(crate) struct Kept {
     pub(crate) content: u128,
     pub(crate) exact: u128,
     pub(crate) est_tokens: u64,
+    /// Bytes of its text, so two chunks too different in length to be an
+    /// edit of each other are told apart without their texts.
+    pub(crate) bytes: usize,
     pub(crate) kind: ChunkKind,
     pub(crate) role: Option<String>,
 }
@@ -163,20 +175,35 @@ pub(crate) struct Context {
     pub(crate) step_index: usize,
     /// The span's tenant, so contexts of two tenants never pair.
     pub(crate) tenant: String,
+    /// The agent the call belongs to, when the trace names one: calls of
+    /// two differently named agents never pair.
+    pub(crate) agent: Option<String>,
     pub(crate) start_ns: u64,
     pub(crate) chunks: Vec<Kept>,
     /// Content digests present.
     pub(crate) contents: HashSet<u128>,
     /// Why the context could not be read, when it could not.
     pub(crate) unavailable: Option<&'static str>,
+    /// Leading tool-definition chunks.
+    pub(crate) leading_tools: usize,
+    /// Whether the estimate covers what the provider counted, so their ratio
+    /// may calibrate it: the whole context was read and split, holds no
+    /// media (estimated at zero), and either recorded its tool definitions
+    /// or used no tools.
+    pub(crate) calibratable: bool,
+    /// The texts this context holds in a [`TextPool`], released when it
+    /// leaves the comparison window.
+    pub(crate) held: Vec<u128>,
 }
 
 impl Context {
+    /// `truncated` says the context had more chunks than were split.
     pub(crate) fn new(
         step_index: usize,
         tenant: &str,
         start_ns: u64,
         pieces: &[Piece],
+        truncated: bool,
         unavailable: Option<&'static str>,
     ) -> Self {
         let chunks: Vec<Kept> = pieces
@@ -185,19 +212,43 @@ impl Context {
                 content: piece.content,
                 exact: piece.exact,
                 est_tokens: piece.est_tokens(),
+                bytes: piece.text.len(),
                 kind: piece.kind,
                 role: piece.role.clone(),
             })
             .collect();
         let contents = chunks.iter().map(|chunk| chunk.content).collect();
+        let is_definition = |piece: &Piece| piece.role.as_deref() == Some(super::chunk::TOOLS_ROLE);
+        let leading_tools = pieces
+            .iter()
+            .take_while(|piece| is_definition(piece))
+            .count();
+        let uses_tools = pieces
+            .iter()
+            .any(|piece| matches!(piece.kind, ChunkKind::ToolCall | ChunkKind::ToolResult));
+        let calibratable = !truncated
+            && unavailable.is_none()
+            && !pieces.is_empty()
+            && !pieces.iter().any(|piece| piece.media)
+            && (!uses_tools || pieces.iter().any(is_definition));
         Self {
             step_index,
             tenant: tenant.to_owned(),
+            agent: None,
             start_ns,
             chunks,
             contents,
             unavailable,
+            leading_tools,
+            calibratable,
+            held: Vec::new(),
         }
+    }
+
+    /// The same context, attributed to `agent`.
+    pub(crate) fn with_agent(mut self, agent: Option<String>) -> Self {
+        self.agent = agent;
+        self
     }
 
     pub(crate) fn est_tokens(&self) -> u64 {
@@ -207,9 +258,12 @@ impl Context {
 
 /// Chunk text kept for diffs and previews, by exact digest, up to a byte
 /// ceiling: a run's contexts repeat each other, so keying by identity stores
-/// each distinct text once.
+/// each distinct text once. Each text counts its holders — the contexts in
+/// the comparison window that carry it — and is dropped when the last one
+/// leaves, so the ceiling is spent on the calls a verdict can still be about,
+/// never on history nobody will compare again.
 pub(crate) struct TextPool {
-    texts: HashMap<u128, String>,
+    texts: HashMap<u128, (String, usize)>,
     bytes: usize,
     max_bytes: usize,
     /// Whether a text was refused for want of room.
@@ -226,20 +280,47 @@ impl TextPool {
         }
     }
 
-    pub(crate) fn keep(&mut self, piece: &Piece) {
-        if self.texts.contains_key(&piece.exact) {
-            return;
+    /// One more holder of the piece's text; `false` when it was refused for
+    /// want of room (and so holds nothing to release).
+    pub(crate) fn keep(&mut self, piece: &Piece) -> bool {
+        if let Some((_, holders)) = self.texts.get_mut(&piece.exact) {
+            *holders += 1;
+            return true;
         }
         if self.bytes.saturating_add(piece.text.len()) > self.max_bytes {
             self.overflowed = true;
-            return;
+            return false;
         }
         self.bytes += piece.text.len();
-        self.texts.insert(piece.exact, piece.text.clone());
+        self.texts.insert(piece.exact, (piece.text.clone(), 1));
+        true
+    }
+
+    /// Keeps every piece's text, returning the identities kept, for
+    /// [`Self::release`].
+    pub(crate) fn hold(&mut self, pieces: &[Piece]) -> Vec<u128> {
+        pieces
+            .iter()
+            .filter(|piece| self.keep(piece))
+            .map(|piece| piece.exact)
+            .collect()
+    }
+
+    /// Gives up one hold on each identity; a text nobody holds is dropped.
+    pub(crate) fn release(&mut self, held: &[u128]) {
+        for exact in held {
+            if let Some((text, holders)) = self.texts.get_mut(exact) {
+                *holders -= 1;
+                if *holders == 0 {
+                    self.bytes -= text.len();
+                    self.texts.remove(exact);
+                }
+            }
+        }
     }
 
     pub(crate) fn get(&self, exact: u128) -> Option<&str> {
-        self.texts.get(&exact).map(String::as_str)
+        self.texts.get(&exact).map(|(text, _)| text.as_str())
     }
 }
 
@@ -255,39 +336,82 @@ pub(crate) fn predecessor<'r>(
     if current.chunks.is_empty() {
         return Ok(None);
     }
+    // (candidate, lead, shared): the best qualifying candidate so far.
+    let mut best: Option<(&'r Context, usize, usize)> = None;
     for candidate in recent.rev() {
         if candidate.tenant != current.tenant || candidate.step_index >= current.step_index {
             continue;
         }
+        if let (Some(theirs), Some(ours)) = (&candidate.agent, &current.agent) {
+            if theirs != ours {
+                continue;
+            }
+        }
         if let Some(reason) = candidate.unavailable {
-            return Err((candidate.step_index, reason));
+            match best {
+                // A nearer call already pairs; this one is only a rival.
+                Some(_) => continue,
+                None => return Err((candidate.step_index, reason)),
+            }
         }
         if candidate.chunks.is_empty() {
             continue;
         }
-        let mut shared = candidate
-            .chunks
-            .iter()
-            .filter(|chunk| current.contents.contains(&chunk.content))
-            .count();
-        if !current.contents.contains(&candidate.chunks[0].content)
-            && near_identical(&candidate.chunks[0], &current.chunks[0], pool)
-        {
-            shared += 1;
-        }
+        let (lead, bridged) = leading_match(candidate, current, pool);
+        let shared = bridged
+            + candidate
+                .chunks
+                .iter()
+                .filter(|chunk| current.contents.contains(&chunk.content))
+                .count();
+        let anchored = lead > current.leading_tools;
         let of_current = shared as f64 / current.chunks.len() as f64;
         let of_candidate = shared as f64 / candidate.chunks.len() as f64;
-        if shared > 0 && (of_current >= 0.5 || of_candidate >= 0.5) {
-            return Ok(Some((candidate, shared)));
+        let overlapping = shared > 0 && (of_current >= 0.5 || of_candidate >= 0.5);
+        if !(anchored || overlapping) {
+            continue;
+        }
+        let better = match best {
+            None => true,
+            Some((_, best_lead, best_shared)) => (lead, shared) > (best_lead, best_shared),
+        };
+        if better {
+            best = Some((candidate, lead, shared));
+        }
+        // A candidate this call wholly continues cannot be bettered by an
+        // older one in any way that matters to a cache or a conversation.
+        if lead == candidate.chunks.len() {
+            break;
         }
     }
-    Ok(None)
+    Ok(best.map(|(candidate, _, shared)| (candidate, shared)))
 }
 
-/// Same kind, and the texts differ only in a stretch at most a tenth of the
-/// longer one: the shape of a volatile token inside a stable chunk.
+/// How many leading chunks of `candidate` and `current` match — the same
+/// content, or near-identical — and how many of those matched only as
+/// near-identical.
+fn leading_match(candidate: &Context, current: &Context, pool: &TextPool) -> (usize, usize) {
+    let mut bridged = 0;
+    let mut lead = 0;
+    for (theirs, ours) in candidate.chunks.iter().zip(current.chunks.iter()) {
+        if theirs.content == ours.content {
+            lead += 1;
+        } else if near_identical(theirs, ours, pool) {
+            lead += 1;
+            bridged += 1;
+        } else {
+            break;
+        }
+    }
+    (lead, bridged)
+}
+
+/// Same kind and role, and the texts differ only in a stretch at most a
+/// tenth of the longer one: the shape of a volatile token inside a stable
+/// chunk.
 fn near_identical(left: &Kept, right: &Kept, pool: &TextPool) -> bool {
-    if left.kind != right.kind || left.role != right.role {
+    if left.kind != right.kind || left.role != right.role || !could_be_edit(left.bytes, right.bytes)
+    {
         return false;
     }
     let (Some(a), Some(b)) = (pool.get(left.exact), pool.get(right.exact)) else {
@@ -296,12 +420,23 @@ fn near_identical(left: &Kept, right: &Kept, pool: &TextPool) -> bool {
     similar(a, b)
 }
 
+/// Whether texts of these byte lengths could pass [`similar`] at all: the
+/// common ends cannot exceed the shorter text, so a shorter side under nine
+/// tenths of the longer rules an edit out without reading either.
+pub(crate) fn could_be_edit(a: usize, b: usize) -> bool {
+    a.min(b) * 10 >= a.max(b) * 9
+}
+
 /// Whether two texts differ only in a stretch at most a tenth of the longer
-/// one — an edit, rather than different content.
+/// one — an edit, rather than different content. Linear in the texts'
+/// common ends, so it is cheap for different texts of any size.
 pub(crate) fn similar(a: &str, b: &str) -> bool {
     let longer = a.len().max(b.len());
     if longer == 0 {
         return true;
+    }
+    if !could_be_edit(a.len(), b.len()) {
+        return false;
     }
     let (prefix, suffix) = common_ends(a, b);
     (prefix + suffix) * 10 >= longer * 9
@@ -309,7 +444,7 @@ pub(crate) fn similar(a: &str, b: &str) -> bool {
 
 /// Lengths in bytes of the common prefix and the common suffix of two texts,
 /// on character boundaries, never overlapping.
-fn common_ends(a: &str, b: &str) -> (usize, usize) {
+pub(crate) fn common_ends(a: &str, b: &str) -> (usize, usize) {
     let mut prefix = a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count();
     while !(a.is_char_boundary(prefix) && b.is_char_boundary(prefix)) {
         prefix -= 1;
@@ -629,21 +764,58 @@ pub(crate) fn compare(
             / rest.len() as f64
     };
 
+    let texts = (pool.get(before.exact), pool.get(after.exact));
+    // An edit is a small change to the same kind of chunk, verified on the
+    // texts; anything else in that place is a replacement.
+    let edited_text = match texts {
+        (Some(old), Some(new))
+            if before.kind == after.kind && before.role == after.role && similar(old, new) =>
+        {
+            Some((old, new))
+        }
+        _ => None,
+    };
+    let edit = edited_text.is_some();
+    // Of an edited chunk, the text after the change is content the
+    // predecessor had that the cache can no longer serve.
+    let in_chunk = edited_text.map_or(0, |(old, new)| {
+        let (_, suffix) = common_ends(old, new);
+        super::chunk::est_tokens(&new[new.len() - suffix..])
+    });
+    let structural = carried_after(shared) + in_chunk;
+    // The predecessor's last chunk gave way to new content and nothing it
+    // had follows: a new turn, which leaves the cache nothing to lose.
+    let new_turn =
+        rest.is_empty() && !before_later_here && !after_anywhere_there && structural == 0;
+
     let (cause, change) = if before.content == after.content {
         (Cause::Reordered, Change::Reserialized)
     } else if before_later_here && after_later_there {
         (Cause::Reordered, Change::Moved)
+    } else if new_turn {
+        let change = if edit {
+            Change::Edited
+        } else {
+            Change::Replaced
+        };
+        let cause = if expired {
+            Cause::TtlExpired
+        } else {
+            Cause::Stable
+        };
+        (cause, change)
     } else if survived < SURVIVAL_FOR_EDIT {
         (Cause::NewContext, Change::Rewritten)
     } else if !after_anywhere_there && before_later_here {
         (Cause::VolatileContent, Change::Inserted)
     } else if after_anywhere_there && !before_anywhere_here {
         (Cause::NewContext, Change::Removed)
-    } else {
+    } else if edit {
         (Cause::VolatileContent, Change::Edited)
+    } else {
+        (Cause::VolatileContent, Change::Replaced)
     };
 
-    let texts = (pool.get(before.exact), pool.get(after.exact));
     let (diff, volatile) = match texts {
         (Some(old), Some(new)) => {
             let (diff, volatile) = byte_diff(old, new);
@@ -651,7 +823,7 @@ pub(crate) fn compare(
         }
         _ => (None, None),
     };
-    let mut lost = carried_after(shared);
+    let mut lost = structural;
     if expired {
         lost += shared_est_tokens;
     }
@@ -681,6 +853,24 @@ pub(crate) fn compare(
     };
     let relabelled = before.role != after.role || before.kind != after.kind;
     let explanation = match change {
+        _ if new_turn => {
+            let how = if edit {
+                format!("carries it edited at its end{swapped}")
+            } else {
+                format!("puts new content ({role}) in its place")
+            };
+            let held = format!(
+                "the prefix is unchanged since step {from} up to that call's last chunk ({shared} \
+                 chunks, ~{} tokens); this call {how}, and nothing step {from} had follows it — \
+                 a new turn, not a break",
+                thousands(shared_est_tokens)
+            );
+            if expired {
+                format!("{held}; but {gap} passed since that call began — past the {ttl} TTL")
+            } else {
+                format!("{held}; within the {ttl} TTL")
+            }
+        }
         Change::Reserialized if relabelled => format!(
             "chunk {shared} holds the same content as in step {from} under another role or kind \
              ({role} now); {reprocessed}{expired_note}"
@@ -709,6 +899,16 @@ pub(crate) fn compare(
                 .role
                 .clone()
                 .unwrap_or_else(|| before.kind.as_str().to_owned())
+        ),
+        Change::Replaced if diff.is_none() => format!(
+            "chunk {shared} ({role}) differs from step {from}'s, whose text was not kept, so \
+             whether it is an edit is not known; it sits ahead of content step {from} already \
+             had; {reprocessed}{expired_note}"
+        ),
+        Change::Replaced => format!(
+            "chunk {shared} ({role}) was replaced with different content since step \
+             {from}{swapped}, ahead of content step {from} already had; \
+             {reprocessed}{expired_note}"
         ),
         Change::Edited | Change::Shrunk => format!(
             "chunk {shared} ({role}) changed in place since step {from}{swapped}{token}; \
@@ -771,11 +971,19 @@ mod tests {
     const TTL: u64 = 300_000_000_000;
 
     fn context(step: usize, messages: Value, pool: &mut TextPool) -> Context {
-        let pieces = context_pieces(Some(&messages), &[], 100).list;
-        for piece in &pieces {
-            pool.keep(piece);
-        }
-        Context::new(step, "", step as u64 * 1_000_000_000, &pieces, None)
+        context_with_tools(step, &[], messages, pool)
+    }
+
+    fn context_with_tools(
+        step: usize,
+        definitions: &[Value],
+        messages: Value,
+        pool: &mut TextPool,
+    ) -> Context {
+        let pieces = context_pieces(Some(&messages), definitions, 100).list;
+        let mut context = Context::new(step, "", step as u64 * 1_000_000_000, &pieces, false, None);
+        context.held = pool.hold(&pieces);
+        context
     }
 
     fn msg(role: &str, text: &str) -> Value {
@@ -1003,6 +1211,265 @@ mod tests {
             predecessor(&parent_again, [parent, unreadable].iter(), &pool).unwrap_err(),
             (1, "offloaded and not resolved")
         );
+    }
+
+    #[test]
+    fn a_new_turn_is_not_a_break_and_a_templated_edit_is() {
+        let mut pool = TextPool::new(1 << 20);
+        let system = msg("system", "You label sentences. Answer with one word.");
+        // A stateless pipeline: the same system prompt, a different input.
+        let p = context(
+            0,
+            json!([system.clone(), msg("user", "Classify: the sky is green")]),
+            &mut pool,
+        );
+        let c = context(
+            1,
+            json!([system.clone(), msg("user", "Classify: water is wet")]),
+            &mut pool,
+        );
+        let turn = compare(&p, &c, 0, TTL, &pool, 1.0);
+        assert_eq!(turn.cause, Cause::Stable, "{}", turn.explanation);
+        assert_eq!(turn.est_tokens_lost, 0);
+        assert_eq!(turn.shared_chunks, 1);
+        let divergence = turn.divergence.expect("where the prefix ended");
+        assert_eq!(divergence.change, Change::Replaced);
+        assert_eq!(divergence.volatile, None);
+        assert!(
+            turn.explanation.contains("a new turn, not a break"),
+            "{}",
+            turn.explanation
+        );
+        // The same, past the TTL, is an expiry of the shared prefix.
+        let late = compare(&p, &c, TTL, TTL, &pool, 1.0);
+        assert_eq!(late.cause, Cause::TtlExpired);
+        assert_eq!(late.est_tokens_lost, turn.shared_est_tokens);
+
+        // A template whose variable sits ahead of fixed rules: the rules are
+        // re-processed every call — a break, priced by the rules' tokens.
+        let rules = " Rules: answer yes or no, cite the line, never guess.".repeat(4);
+        let p = context(
+            2,
+            json!([
+                system.clone(),
+                msg("user", &format!("Check item 123.{rules}"))
+            ]),
+            &mut pool,
+        );
+        let c = context(
+            3,
+            json!([
+                system.clone(),
+                msg("user", &format!("Check item 124.{rules}"))
+            ]),
+            &mut pool,
+        );
+        let templated = compare(&p, &c, 0, TTL, &pool, 1.0);
+        assert_eq!(templated.cause, Cause::VolatileContent);
+        let divergence = templated.divergence.expect("diverged");
+        assert_eq!(divergence.change, Change::Edited);
+        assert_eq!(divergence.volatile, Some(Volatile::Number));
+        assert_eq!(
+            templated.est_tokens_lost,
+            super::super::chunk::est_tokens(&format!(".{rules}"))
+        );
+
+        // A chunk replaced wholesale with what followed it surviving.
+        let p = context(
+            4,
+            json!([
+                system.clone(),
+                msg("user", "doc: alpha beta gamma"),
+                msg("user", "q?")
+            ]),
+            &mut pool,
+        );
+        let c = context(
+            5,
+            json!([
+                system,
+                msg("user", "entirely different retrieved text"),
+                msg("user", "q?"),
+                msg("assistant", "a")
+            ]),
+            &mut pool,
+        );
+        let replaced = compare(&p, &c, 0, TTL, &pool, 1.0);
+        assert_eq!(replaced.cause, Cause::VolatileContent);
+        assert_eq!(replaced.divergence.unwrap().change, Change::Replaced);
+        assert_eq!(replaced.est_tokens_lost, 1, "the carried \"q?\"");
+    }
+
+    #[test]
+    fn compactions_pair_with_the_call_they_compacted() {
+        let mut pool = TextPool::new(1 << 20);
+        let rule = msg("user", "Never touch prod. Clean the logs.");
+        let l0 = context(0, json!([msg("system", "S"), rule.clone()]), &mut pool);
+        let l1 = context(
+            1,
+            json!([
+                msg("system", "S"),
+                rule.clone(),
+                msg("assistant", "ok"),
+                msg("user", "go on")
+            ]),
+            &mut pool,
+        );
+        let l2 = context(
+            2,
+            json!([
+                msg("system", "S"),
+                msg("user", "Summary: logs cleaned."),
+                msg("user", "continue")
+            ]),
+            &mut pool,
+        );
+        let recent = [l0.clone(), l1.clone()];
+        let (found, shared) = predecessor(&l2, recent.iter(), &pool)
+            .expect("readable")
+            .expect("paired");
+        assert_eq!(found.step_index, 1, "the call compacted, not an older one");
+        assert_eq!(shared, 1);
+        let verdict = compare(found, &l2, 0, TTL, &pool, 1.0);
+        assert_eq!(verdict.cause, Cause::NewContext);
+        assert_eq!(verdict.divergence.unwrap().change, Change::Rewritten);
+
+        // A longer summary shares under half of either context.
+        let l2b = context(
+            2,
+            json!([
+                msg("system", "S"),
+                msg("user", "Summary: logs cleaned."),
+                msg("user", "continue"),
+                msg("user", "and report")
+            ]),
+            &mut pool,
+        );
+        let only_l1 = [l1.clone()];
+        let found = predecessor(&l2b, only_l1.iter(), &pool).expect("readable");
+        assert_eq!(found.map(|(c, _)| c.step_index), Some(1));
+
+        // Tool definitions lead both contexts; the lead must reach past them.
+        let tools = [json!([{"name": "grep"}])];
+        let t1 = context_with_tools(
+            3,
+            &tools,
+            json!([
+                msg("system", "S"),
+                rule,
+                msg("assistant", "a"),
+                msg("user", "b"),
+                msg("assistant", "c"),
+                msg("user", "d")
+            ]),
+            &mut pool,
+        );
+        let t2 = context_with_tools(
+            4,
+            &tools,
+            json!([
+                msg("system", "S"),
+                msg("user", "Summary."),
+                msg("user", "next"),
+                msg("user", "more")
+            ]),
+            &mut pool,
+        );
+        assert_eq!(t2.leading_tools, 1);
+        let only_t1 = [t1.clone()];
+        let found = predecessor(&t2, only_t1.iter(), &pool).expect("readable");
+        assert_eq!(found.map(|(c, _)| c.step_index), Some(3));
+        // Sharing only the tool catalog is not a conversation.
+        let other = context_with_tools(
+            5,
+            &tools,
+            json!([
+                msg("system", "another agent"),
+                msg("user", "x"),
+                msg("user", "y")
+            ]),
+            &mut pool,
+        );
+        assert!(predecessor(&other, [t1].iter(), &pool)
+            .expect("readable")
+            .is_none());
+    }
+
+    #[test]
+    fn a_sub_agent_on_the_same_system_prompt_does_not_capture_its_parent() {
+        let mut pool = TextPool::new(1 << 20);
+        let system = msg("system", "You are a careful agent.");
+        let p1 = context(
+            0,
+            json!([
+                system.clone(),
+                msg("user", "task"),
+                msg("assistant", "a"),
+                msg("user", "b")
+            ]),
+            &mut pool,
+        );
+        let s1 = context(
+            1,
+            json!([system.clone(), msg("user", "sub task")]),
+            &mut pool,
+        );
+        let p2 = context(
+            2,
+            json!([
+                system,
+                msg("user", "task"),
+                msg("assistant", "a"),
+                msg("user", "b"),
+                msg("user", "sub result")
+            ]),
+            &mut pool,
+        );
+        let recent = [p1.clone(), s1.clone()];
+        let (found, _) = predecessor(&p2, recent.iter(), &pool)
+            .expect("readable")
+            .expect("paired");
+        assert_eq!(found.step_index, 0, "the longer lead beats the nearer call");
+
+        // Calls that name different agents never pair; unnamed ones may.
+        assert!(predecessor(&s1, [p1.clone()].iter(), &pool)
+            .expect("readable")
+            .is_some());
+        let planner = p1.with_agent(Some("planner".into()));
+        let worker = s1.with_agent(Some("worker".into()));
+        assert!(predecessor(&worker, [planner].iter(), &pool)
+            .expect("readable")
+            .is_none());
+    }
+
+    #[test]
+    fn the_pool_holds_texts_while_a_context_needs_them() {
+        let pieces = context_pieces(
+            Some(&json!([msg("user", "abcd"), msg("user", "efgh")])),
+            &[],
+            10,
+        )
+        .list;
+        let mut pool = TextPool::new(8);
+        let first = pool.hold(&pieces);
+        let second = pool.hold(&pieces);
+        assert_eq!(first.len(), 2);
+        assert_eq!(pool.get(pieces[0].exact), Some("abcd"));
+        pool.release(&first);
+        assert_eq!(pool.get(pieces[0].exact), Some("abcd"), "still held");
+        pool.release(&second);
+        assert_eq!(
+            pool.get(pieces[0].exact),
+            None,
+            "evicted with its last holder"
+        );
+        assert!(!pool.overflowed);
+        // Room is given back, and a refusal holds nothing.
+        let big = context_pieces(Some(&json!([msg("user", "123456789")])), &[], 10).list;
+        assert!(pool.hold(&big).is_empty());
+        assert!(pool.overflowed);
+        assert_eq!(pool.hold(&pieces).len(), 2);
+        assert!(could_be_edit(90, 100) && !could_be_edit(89, 100));
     }
 
     #[test]

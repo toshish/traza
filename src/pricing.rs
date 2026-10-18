@@ -97,9 +97,10 @@ impl Rate {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CacheConvention {
     /// The prompt count is the UNCACHED remainder; cached tokens are reported
-    /// beside it and come on top (Anthropic, Bedrock, Vertex).
+    /// beside it and come on top (Anthropic, Bedrock, Claude on Vertex).
     Exclusive,
-    /// The prompt count INCLUDES the cached tokens (OpenAI, Azure OpenAI).
+    /// The prompt count INCLUDES the cached tokens (OpenAI, Azure OpenAI,
+    /// Gemini on Vertex).
     Inclusive,
     /// Not known, so no correction is attempted.
     #[default]
