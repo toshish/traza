@@ -273,10 +273,12 @@ describe('following the stream', () => {
     expect(opens).toBe(2);
   });
 
-  it('stops for good on a refused credential or a store without fuses', async () => {
+  it('stops for good on a refused credential, a store without fuses, or a server without the route', async () => {
     for (const [error, state] of [
       [failing(401, 'This request needs a bearer token.'), 'denied'],
       [failing(409, 'live runs and nudges need run fuses, which are disabled on this store (traza-server --no-fuses)'), 'disabled'],
+      // A server that predates the live view: retrying would never help.
+      [failing(404, 'not found'), 'missing'],
     ]) {
       const statuses = [];
       const open = vi.fn(async () => { throw error; });

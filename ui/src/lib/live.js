@@ -387,12 +387,14 @@ export function deliveryWaitMs(nudge) {
 const defaultSleep = (ms) => new Promise((done) => setTimeout(done, ms));
 
 /** What a failure means for the stream: `denied` (401/403 — nothing will
-    change until the credential does), `disabled` (409 from a store started
-    with --no-fuses), `refused` (409: every stream slot of the scope is
-    taken — poll instead), or `broken` (anything else: reconnect). */
+    change until the credential does), `missing` (404: a server that
+    predates the live view), `disabled` (409 from a store started with
+    --no-fuses), `refused` (409: every stream slot of the scope is taken —
+    poll instead), or `broken` (anything else: reconnect). */
 export function classifyFailure(error) {
   const status = error && error.status;
   if (status === 401 || status === 403) return 'denied';
+  if (status === 404) return 'missing';
   if (status === 409) return /fuses/.test((error && error.what) || '') && /disabled/.test(error.what || '') ? 'disabled' : 'refused';
   return 'broken';
 }
@@ -405,7 +407,8 @@ export function classifyFailure(error) {
 
     `onSnapshot(snapshot, {source})` replaces everything; `onRun(row)`
     upserts one row; `onStatus({state, …})` reports `live`, `reconnecting`
-    (with `inMs`), `polling` (with the refusal), `disabled` or `denied`.
+    (with `inMs`), `polling` (with the refusal), `disabled`, `missing` or
+    `denied`.
 
     Backoff resets on progress — a frame, the heartbeat included — never on
     a connection merely being accepted, for the reason lib/tail.js gives: a
@@ -435,7 +438,7 @@ export async function runLiveStream(options) {
       } catch (error) {
         if (aborted()) return;
         const kind = classifyFailure(error);
-        if (kind === 'denied' || kind === 'disabled') { onStatus({ state: kind, error }); return; }
+        if (kind === 'denied' || kind === 'disabled' || kind === 'missing') { onStatus({ state: kind, error }); return; }
       }
       await sleep(LIVE_POLL_MS);
       continue;
@@ -461,7 +464,7 @@ export async function runLiveStream(options) {
     } catch (error) {
       if (aborted()) return;
       const kind = classifyFailure(error);
-      if (kind === 'denied' || kind === 'disabled') { onStatus({ state: kind, error }); return; }
+      if (kind === 'denied' || kind === 'disabled' || kind === 'missing') { onStatus({ state: kind, error }); return; }
       if (kind === 'refused') {
         refusal = error;
         pollUntil = now() + STREAM_RETRY_MS;

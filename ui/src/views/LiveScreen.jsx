@@ -536,6 +536,10 @@ export function LiveScreen({ go, params, identity, pushToast }) {
       started with <code>--no-fuses</code>, so it follows no runs and every live-run and nudge route
       answers <code>409</code>. Restart without the flag to steer runs here.</span>} />;
   }
+  if (live.status.state === 'missing') {
+    return <EmptyState message={<span>This server has no live-run view: <code>GET /v1/runs/live/stream</code>
+      answered <code>404</code>, so it predates Traza 0.28. The Guard screen lists the runs it follows.</span>} />;
+  }
   if (live.status.state === 'denied') {
     return <ErrorState what={live.status.error?.what || 'The live view was refused.'} next={live.status.error?.next} />;
   }
