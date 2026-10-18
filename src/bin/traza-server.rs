@@ -1916,6 +1916,10 @@ fn handle_connection(
             }
         };
         let started = std::time::Instant::now();
+        // When the request arrived, on both clocks: a replay call is judged
+        // against its replay's expiry from here, so the time its body takes
+        // to arrive and be decoded, parsed and digested counts too.
+        let arrival = traza::replay::Arrival::at(traza::mcp::unix_nanos_now(), started);
         let keep_alive = head.wants_keep_alive();
 
         // Answers that need no credential, decided from the head alone and
@@ -2114,6 +2118,7 @@ fn handle_connection(
             mcp_protocol_version: head.mcp_protocol_version,
             content_encoding: head.content_encoding,
             body,
+            arrival,
         };
         let mut responder = connection.responder(keep_alive);
         let class = RouteClass::of(&request.method, {
@@ -2456,6 +2461,7 @@ fn serve_request(
             engine,
             metrics,
             principal,
+            request.arrival,
         );
     }
     if tql_routes::handles(path) {
@@ -4431,6 +4437,8 @@ struct Request {
     /// `Content-Encoding:`, lowercased; see [`decode_content`].
     content_encoding: Option<String>,
     body: Vec<u8>,
+    /// When the request's head was read.
+    arrival: traza::replay::Arrival,
 }
 
 /// A parsed request head: everything except the body, which is read only

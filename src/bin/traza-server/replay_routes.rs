@@ -36,7 +36,7 @@ use std::sync::OnceLock;
 use serde_json::{json, Map, Value};
 use traza::fork::{ForkSpec, DEFAULT_FORK_LIMIT, DEFAULT_GOLDEN_LIMIT};
 use traza::recall::OutcomeFilter;
-use traza::replay::{Mode, Provider, Registry, ReplayError, ServedStep};
+use traza::replay::{Arrival, Mode, Provider, Registry, ReplayError, ServedStep};
 use traza::tape::{TapeOptions, DEFAULT_TAPE_MAX_BYTES, MAX_TAPE_SPANS};
 use traza::Store;
 
@@ -117,7 +117,9 @@ pub(super) fn presented_credential(
     }
 }
 
-/// Serves one of this module's routes.
+/// Serves one of this module's routes. `arrival` is when the request's head
+/// was read: the registry judges a replay's expiry from it, so everything
+/// the request costs before it gets there counts.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn serve(
     responder: &mut Responder<'_>,
@@ -128,6 +130,7 @@ pub(super) fn serve(
     engine: &Store,
     metrics: &ServerMetrics,
     principal: Option<&traza::auth::Principal>,
+    arrival: Arrival,
 ) -> io::Result<()> {
     let binding = principal.and_then(|principal| principal.tenant.as_deref());
     match (method, path) {
@@ -139,11 +142,11 @@ pub(super) fn serve(
         ("GET", "/v1/recall") => recall(responder, query, engine, metrics, principal),
         ("GET", "/v1/forks") => forks(responder, query, engine, metrics, principal),
         ("GET", "/v1/goldens") => goldens(responder, query, engine, metrics, principal),
-        ("POST", REPLAYS) => create(responder, body, engine, metrics, principal),
+        ("POST", REPLAYS) => create(responder, body, engine, metrics, principal, arrival),
         (_, _) if path.starts_with(REPLAY_PREFIX) => {
             let rest = &path[REPLAY_PREFIX.len()..];
             let (id, route) = rest.find('/').map_or((rest, ""), |at| rest.split_at(at));
-            call(responder, method, id, route, body, engine, binding)
+            call(responder, method, id, route, body, engine, binding, arrival)
         }
         _ => responder.json(404, json!({"error": "not found"})),
     }
@@ -478,6 +481,7 @@ fn create(
     engine: &Store,
     metrics: &ServerMetrics,
     principal: Option<&traza::auth::Principal>,
+    arrival: Arrival,
 ) -> io::Result<()> {
     let request: Map<String, Value> = match serde_json::from_slice(body) {
         Ok(Value::Object(object)) => object,
@@ -535,7 +539,7 @@ fn create(
         mode,
         &fork,
         tape_max_bytes(),
-        now_ns(),
+        arrival,
     ) {
         Ok(created) => send_json(responder, 201, &[], &created.to_json()),
         Err(ReplayError::RunNotFound) => responder.json(404, json!({"error": "run not found"})),
@@ -695,6 +699,12 @@ fn replay_error_with(
 
 /// A route under `/v1/replays/{id}`. These routes take no query parameters:
 /// an SDK appends none, and the replay's tenant was fixed when it was made.
+///
+/// Every registry call is handed the request's `arrival`, not a time taken
+/// here: parsing and digesting a request body is work done after the request
+/// arrived, and a call judged from after it would be served past its
+/// replay's expiry by however long that took.
+#[allow(clippy::too_many_arguments)]
 fn call(
     responder: &mut Responder<'_>,
     method: &str,
@@ -703,10 +713,10 @@ fn call(
     body: &[u8],
     engine: &Store,
     binding: Option<&str>,
+    arrival: Arrival,
 ) -> io::Result<()> {
-    let now = now_ns();
     match (method, route) {
-        ("GET", "") => match registry().status(engine, id, binding, now) {
+        ("GET", "") => match registry().status(engine, id, binding, arrival) {
             Ok(status) => responder.json(200, status),
             Err(error) => replay_error(responder, Shape::Native, error),
         },
@@ -744,20 +754,13 @@ fn call(
                 Shape::OpenAi => served.openai(&request),
                 _ => served.anthropic(&request),
             };
-            match registry().next_llm(engine, id, binding, digest, now, render) {
+            match registry().next_llm(engine, id, binding, digest, arrival, render) {
                 Ok(rendered) => send(responder, 200, rendered.content_type, &[], &rendered.body),
                 // Where the request differs from the recording, read once the
                 // refusal is decided and outside every replay lock.
                 Err(error @ ReplayError::Diverged { step, .. }) => {
-                    let difference = registry().explain_divergence(
-                        engine,
-                        id,
-                        binding,
-                        step,
-                        &request,
-                        provider,
-                        now_ns(),
-                    );
+                    let difference = registry()
+                        .explain_divergence(engine, id, binding, step, &request, provider, arrival);
                     replay_error_with(responder, shape, error, difference)
                 }
                 Err(error) => replay_error(responder, shape, error),
@@ -791,7 +794,7 @@ fn call(
                     Err(error) => return responder.json(400, json!({"error": error.to_string()})),
                 }
             };
-            match registry().next_tool(engine, id, binding, tool.as_deref(), now) {
+            match registry().next_tool(engine, id, binding, tool.as_deref(), arrival) {
                 Ok(served) => responder.json(200, served.to_json()),
                 Err(error) => replay_error(responder, Shape::Native, error),
             }
