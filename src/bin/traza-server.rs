@@ -4021,12 +4021,16 @@ const LIVE_COALESCE: Duration = Duration::from_millis(250);
 /// `GET /v1/runs/live/stream`: the live view as server-sent events.
 ///
 /// Opens with `event: snapshot` — the live listing, as `GET /v1/runs/live`
-/// answers it — then sends `event: run` with one live run's row each time
-/// that run changes, at most one update per [`LIVE_COALESCE`], and a
-/// comment heartbeat after [`TAIL_HEARTBEAT`] of quiet. When more runs
-/// change at once than one update carries, or an erasure sweeps the view, a
-/// fresh `snapshot` replaces everything the client holds. A client that
-/// reconnects starts again from a snapshot; there is no resumable cursor.
+/// answers it — then sends `event: removed` (`{run, tenant, reason}`) when a
+/// run the client holds leaves the view — `evicted` from the guard's memory,
+/// or `expired` out of the window — and `event: run` with one live run's row
+/// each time that run changes, removals first, at most one update per
+/// [`LIVE_COALESCE`], and a comment heartbeat after [`TAIL_HEARTBEAT`] of
+/// quiet. When more runs change at once than one update carries, the client
+/// would hold more rows than the stream tracks, or an erasure sweeps the
+/// view, a fresh `snapshot` replaces everything the client holds. A client
+/// that reconnects starts again from a snapshot; there is no resumable
+/// cursor.
 fn stream_live(stream: &mut TcpStream, engine: &Store, tenant: Option<&str>) -> io::Result<()> {
     write!(
         stream,
@@ -4051,15 +4055,21 @@ fn stream_live(stream: &mut TcpStream, engine: &Store, tenant: Option<&str>) -> 
             }
             // Changes this stream may not see (another tenant's, or runs
             // outside the window): nothing to send but a due heartbeat.
-            traza::steer::LiveUpdate::Changed(runs) if runs.is_empty() => {
+            traza::steer::LiveUpdate::Changed { removed, runs }
+                if removed.is_empty() && runs.is_empty() =>
+            {
                 if last_write.elapsed() < TAIL_HEARTBEAT {
                     std::thread::sleep(LIVE_COALESCE);
                     continue;
                 }
                 ": tick\n\n".to_owned()
             }
-            traza::steer::LiveUpdate::Changed(runs) => {
+            traza::steer::LiveUpdate::Changed { removed, runs } => {
                 let mut frame = String::new();
+                for gone in removed {
+                    let payload = serde_json::to_value(&gone).unwrap_or_else(|_| json!({}));
+                    frame.push_str(&format!("event: removed\ndata: {payload}\n\n"));
+                }
                 for run in runs {
                     let payload = serde_json::to_value(&run).unwrap_or_else(|_| json!({}));
                     frame.push_str(&format!("event: run\ndata: {payload}\n\n"));

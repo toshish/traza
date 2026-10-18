@@ -842,8 +842,19 @@ pub struct LiveForesight {
 }
 
 /// Runs one live-view call rebuilds from the store at most, so they have a
-/// whole path to read foresight from ([`Store::fill_live_foresight`]).
+/// whole path to read foresight from ([`Store::fill_live_foresight`]) —
+/// all of them under the call's one query budget.
 pub const LIVE_FORESIGHT_REBUILDS: usize = 8;
+
+/// How long the live view leaves a run unread after its read for foresight
+/// failed — ran out of the listing's budget, say — so polling does not
+/// repeat a failing read on every call.
+pub const LIVE_READ_BACKOFF: Duration = Duration::from_secs(60);
+
+/// Most runs remembered as backing off ([`LIVE_READ_BACKOFF`]) at once —
+/// about a kilobyte each at the longest run id. Past it, a failure goes
+/// unremembered, and its run is read again, rather than the set growing.
+pub const MAX_LIVE_READ_BACKOFF: usize = 1024;
 
 /// What to render of a map.
 #[derive(Clone, Debug, PartialEq)]
@@ -2400,6 +2411,10 @@ pub(crate) struct FateCache {
     /// background alike), for `traza_fate_builds_total`.
     builds_ok: AtomicU64,
     builds_failed: AtomicU64,
+    /// Runs whose read for live foresight failed lately, by `(tenant,
+    /// run)`: until when the live view leaves each unread. At most
+    /// [`MAX_LIVE_READ_BACKOFF`]; memory only, and cleared by every erasure.
+    live_backoff: Mutex<HashMap<(String, String), Instant>>,
     /// Runs a fuse's foresight read back from the store, for the test that
     /// it reads the guard's live path instead.
     #[cfg(test)]
@@ -2476,9 +2491,42 @@ impl FateCache {
             settled: Condvar::new(),
             builds_ok: AtomicU64::new(0),
             builds_failed: AtomicU64::new(0),
+            live_backoff: Mutex::new(HashMap::new()),
             #[cfg(test)]
             run_reads: AtomicU64::new(0),
         }
+    }
+
+    /// Whether the live view should leave `run` unread at `now`: a read of
+    /// it for foresight failed less than [`LIVE_READ_BACKOFF`] ago.
+    fn live_read_backing_off(&self, tenant: &str, run: &str, now: Instant) -> bool {
+        self.live_backoff.lock().is_ok_and(|backoff| {
+            backoff
+                .get(&(tenant.to_owned(), run.to_owned()))
+                .is_some_and(|until| now < *until)
+        })
+    }
+
+    /// Records how a read of `run` for live foresight ended at `now`: a
+    /// failure backs it off for [`LIVE_READ_BACKOFF`] — unless
+    /// [`MAX_LIVE_READ_BACKOFF`] runs are backing off already — and a
+    /// success forgets any back-off.
+    fn live_read_ended(&self, tenant: &str, run: &str, failed: bool, now: Instant) {
+        let Ok(mut backoff) = self.live_backoff.lock() else {
+            return;
+        };
+        let key = (tenant.to_owned(), run.to_owned());
+        if !failed {
+            backoff.remove(&key);
+            return;
+        }
+        if backoff.len() >= MAX_LIVE_READ_BACKOFF && !backoff.contains_key(&key) {
+            backoff.retain(|_, until| now < *until);
+            if backoff.len() >= MAX_LIVE_READ_BACKOFF {
+                return;
+            }
+        }
+        backoff.insert(key, now + LIVE_READ_BACKOFF);
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, CacheState>> {
@@ -2655,6 +2703,10 @@ impl FateCache {
         if let Ok(mut state) = self.state.lock() {
             state.epoch += 1;
             state.entries.clear();
+        }
+        // The back-off names runs; an erasure may be of one of them.
+        if let Ok(mut backoff) = self.live_backoff.lock() {
+            backoff.clear();
         }
     }
 
@@ -3948,10 +4000,22 @@ impl Store {
     /// rebuilt from the store — the read any question about a run makes,
     /// once per run while it stays in memory — at most
     /// [`LIVE_FORESIGHT_REBUILDS`] per call, newest first, and only for a
-    /// tenant with a map cached; the rest list without foresight until a
-    /// later call reaches them.
-    pub(crate) fn fill_live_foresight(&self, rows: &mut [crate::steer::LiveRun]) {
-        let mut rebuilds = 0;
+    /// tenant with a map cached.
+    ///
+    /// Every read runs under `deadline`, the one budget of the request
+    /// (a listing, or one stream update): once it is spent no read starts,
+    /// and a read it cut short ends the reading. A run whose read failed is
+    /// left unread for [`LIVE_READ_BACKOFF`], so polling does not repeat
+    /// it. Each row that needed a read this call did not complete says so
+    /// (`foresight_deferred`) and lists without foresight until a later
+    /// call reaches it.
+    pub(crate) fn fill_live_foresight(
+        &self,
+        rows: &mut [crate::steer::LiveRun],
+        deadline: Option<Deadline>,
+    ) {
+        let mut reads = 0;
+        let mut spent = false;
         let mut cached: HashMap<String, bool> = HashMap::new();
         for row in rows {
             let has_map = *cached.entry(row.tenant.clone()).or_insert_with(|| {
@@ -3960,11 +4024,29 @@ impl Store {
                 self.fate.peek_or_why(&key).is_ok()
             });
             let mut foresight = self.foresee_live(&row.tenant, &row.run, DEFAULT_VERDICT_SUPPORT);
-            if foresight.is_none() && has_map && rebuilds < LIVE_FORESIGHT_REBUILDS {
-                rebuilds += 1;
-                if self.fuse_verdict(&row.tenant, &row.run).is_ok() {
-                    foresight = self.foresee_live(&row.tenant, &row.run, DEFAULT_VERDICT_SUPPORT);
+            if foresight.is_none() && has_map && self.fuse_followed_partly(&row.tenant, &row.run) {
+                spent = spent || Deadline::check(deadline, 0).is_err();
+                let mut read_whole = false;
+                if !spent
+                    && reads < LIVE_FORESIGHT_REBUILDS
+                    && !self
+                        .fate
+                        .live_read_backing_off(&row.tenant, &row.run, Instant::now())
+                {
+                    reads += 1;
+                    read_whole = self
+                        .fuse_rebuild_within(&row.tenant, &row.run, deadline)
+                        .is_ok();
+                    self.fate
+                        .live_read_ended(&row.tenant, &row.run, !read_whole, Instant::now());
+                    if read_whole {
+                        foresight =
+                            self.foresee_live(&row.tenant, &row.run, DEFAULT_VERDICT_SUPPORT);
+                    } else {
+                        spent = Deadline::check(deadline, 0).is_err();
+                    }
                 }
+                row.foresight_deferred = !read_whole;
             }
             row.foresight = foresight;
         }

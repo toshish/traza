@@ -33,16 +33,18 @@ mod topology;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-pub use crate::guard::{LiveCursor, LivePage, LiveRun, LiveStep, LiveUpdate};
+pub use crate::guard::{
+    LiveCursor, LivePage, LiveRemoval, LiveRemovalReason, LiveRun, LiveStep, LiveUpdate,
+};
 pub use handoff::MAX_AGENT_NAME_CHARS;
 pub use nudges::{
     Nudge, NudgeKind, NudgeSpec, NudgeStatus, BLOCK_HOLD_MS, DEFAULT_NUDGE_TTL_SECONDS,
-    MAX_HELD_NUDGE_BYTES, MAX_KEPT_PER_RUN, MAX_NUDGE_BYTES, MAX_NUDGE_TTL_SECONDS,
-    MAX_PENDING_PER_RUN, MAX_TENANT_NUDGE_BYTES, NUDGE_OVERHEAD_BYTES,
+    MAX_HELD_NUDGE_BYTES, MAX_HOLD_BLOCKS, MAX_KEPT_PER_RUN, MAX_NUDGE_BYTES,
+    MAX_NUDGE_TTL_SECONDS, MAX_PENDING_PER_RUN, MAX_TENANT_NUDGE_BYTES, NUDGE_OVERHEAD_BYTES,
 };
 pub use topology::{
     Topology, TopologyCycle, TopologyEdge, TopologyHandoff, TopologyNode, MAX_CYCLES, MAX_EDGES,
@@ -65,6 +67,13 @@ pub const MAX_LIVE_STREAMS_PER_SCOPE: usize = 8;
 /// Most runs one stream update carries as changes; more changing at once
 /// restarts the stream from a listing instead.
 pub const MAX_LIVE_CHANGES: usize = 256;
+
+/// Most rows one stream keeps track of on its client's behalf — every row
+/// it sent and has not told the client to drop, so it can say when one
+/// leaves the view — at about 64 bytes each (the run ids are the guard's
+/// own). Past it, the stream restarts from a listing, which holds at most
+/// [`MAX_LIVE_CHANGES`].
+pub const MAX_LIVE_HELD: usize = 4096;
 
 /// Steering's settings.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -206,18 +215,22 @@ impl Store {
     /// most `limit`. From guard live state alone; see [`crate::guard`]'s
     /// live view for what it does and does not show.
     pub fn live_runs(&self, tenant: Option<&str>, limit: usize) -> Result<LivePage> {
+        let deadline = self.query_deadline(Instant::now());
         let steer = self.steer()?;
         let mut page = self.guard_live_page(tenant, limit, self.config.steer.live_window)?;
         fill_pending(steer, &mut page.runs)?;
-        self.fill_live_foresight(&mut page.runs);
+        self.fill_live_foresight(&mut page.runs, deadline);
         Ok(page)
     }
 
     /// Waits up to `wait` for live runs to change after `cursor` and says
     /// what a stream should send next, advancing `cursor`: a listing to
-    /// start from (the first call, after an erasure, or when more than
-    /// [`MAX_LIVE_CHANGES`] runs changed at once), the runs that changed, or
-    /// nothing.
+    /// start from (the first call, after an erasure, when more than
+    /// [`MAX_LIVE_CHANGES`] runs changed at once, or when the client would
+    /// hold more than [`MAX_LIVE_HELD`] rows), the rows the client holds
+    /// that left the view — evicted, or out of the window — and the runs
+    /// that changed, or nothing. The update's foresight reads share one
+    /// query budget, anchored once the wait is over.
     pub fn live_wait(
         &self,
         tenant: Option<&str>,
@@ -229,17 +242,19 @@ impl Store {
             tenant,
             cursor,
             MAX_LIVE_CHANGES,
+            MAX_LIVE_HELD,
             self.config.steer.live_window,
             wait,
         )?;
+        let deadline = self.query_deadline(Instant::now());
         match &mut update {
             LiveUpdate::Snapshot(page) => {
                 fill_pending(steer, &mut page.runs)?;
-                self.fill_live_foresight(&mut page.runs);
+                self.fill_live_foresight(&mut page.runs, deadline);
             }
-            LiveUpdate::Changed(runs) => {
+            LiveUpdate::Changed { runs, .. } => {
                 fill_pending(steer, runs)?;
-                self.fill_live_foresight(runs);
+                self.fill_live_foresight(runs, deadline);
             }
             LiveUpdate::Idle => {}
         }

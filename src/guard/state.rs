@@ -156,8 +156,9 @@ pub(crate) struct Observation {
     tokens: u64,
     cost_usd: f64,
     fingerprint: Option<String>,
-    /// Steps only: the agent the step names, if any, clipped.
-    agent: Option<String>,
+    /// Steps only: the agent the step names, if any — told apart by its
+    /// whole name, rendered by its label.
+    agent: Option<handoff::AgentName>,
     /// Steps only: the step's label — tool, model, agent or span name —
     /// clipped.
     label: Option<String>,
@@ -193,7 +194,7 @@ impl Observation {
         let (agent, label) = if kind.is_step() {
             let (agent, label) = semconv::step_labels_with(span, &llm, kind);
             (
-                agent.map(handoff::clip_owned),
+                agent.map(handoff::AgentName::of_owned),
                 Some(handoff::clip_owned(label)),
             )
         } else {
@@ -388,7 +389,8 @@ pub(crate) struct RunState {
     /// The handoff sequence since the last reset, once a step names an
     /// agent; `None` for a run whose steps name none, which costs nothing.
     handoffs: Option<Box<HandoffTracker>>,
-    /// The earliest-starting step: its position and the agent it names.
+    /// The earliest-starting step: its position and the label of the agent
+    /// it names.
     first_step: Option<(handoff::Position, Option<String>)>,
     /// The latest-starting step: its position, kind and label.
     latest_step: Option<(handoff::Position, StepKind, String)>,
@@ -501,12 +503,8 @@ impl RunState {
         // too: a version that moves or renames a named step, or names none,
         // takes the old one out here, and `land` places the new one.
         if let Some(handoffs) = self.handoffs.as_deref_mut() {
-            let same = observation.agent.as_deref().is_some_and(|agent| {
-                handoffs.holds_as(
-                    observation.key,
-                    observation.position(),
-                    handoff::agent_key(agent),
-                )
+            let same = observation.agent.as_ref().is_some_and(|agent| {
+                handoffs.holds_as(observation.key, observation.position(), agent.key)
             });
             if !same && handoffs.holds(observation.key) {
                 handoffs.remove(observation.key);
@@ -590,7 +588,8 @@ impl RunState {
             .as_ref()
             .map_or(true, |(first, _)| position <= *first)
         {
-            self.first_step = Some((position, observation.agent.clone()));
+            let agent = observation.agent.as_ref().map(|agent| agent.label.clone());
+            self.first_step = Some((position, agent));
         }
         if self
             .latest_step
@@ -600,14 +599,14 @@ impl RunState {
             let label = observation.label.clone().unwrap_or_default();
             self.latest_step = Some((position, mark.kind, label));
         }
-        let Some(agent) = observation.agent.as_deref() else {
+        let Some(agent) = observation.agent.as_ref() else {
             return false;
         };
         if mark.before_reset {
             return false;
         }
         let handoffs = self.handoffs.get_or_insert_with(Box::default);
-        if handoffs.holds_as(observation.key, position, handoff::agent_key(agent)) {
+        if handoffs.holds_as(observation.key, position, agent.key) {
             return false;
         }
         handoffs.upsert(observation.key, position, agent);
@@ -2040,7 +2039,7 @@ mod tests {
     /// A step naming `agent`, starting at `start`.
     fn named(id: &str, agent: &str, start: u64, revision: u64) -> Observation {
         let mut observation = obs(id, StepKind::Agent, Some(&format!("agent:{agent}")), false);
-        observation.agent = Some(agent.to_owned());
+        observation.agent = Some(handoff::AgentName::of(agent));
         observation.start_ns = start;
         observation.end_ns = start + 5;
         observation.revision = revision;

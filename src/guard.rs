@@ -91,7 +91,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 pub use events::{EventKind, EventPage, FuseEvent, MAX_WAIT_MS};
-pub use live::{LiveCursor, LivePage, LiveRun, LiveUpdate};
+pub use live::{LiveCursor, LivePage, LiveRemoval, LiveRemovalReason, LiveRun, LiveUpdate};
 pub use policy::{
     Action, FuseConfig, FusePolicy, Limits, PolicyMatch, PolicySpec, DEFAULT_MAX_REPEATS,
     DEFAULT_MAX_RUNS, DEFAULT_POLICY_NAME, GLOBAL_POLICY_NAME, MAX_POLICIES_PER_TENANT,
@@ -512,6 +512,10 @@ pub(crate) struct Guard {
     /// a rebuild reads without ingesting a hundred thousand spans.
     #[cfg(test)]
     rebuild_max_spans: std::sync::atomic::AtomicUsize,
+    /// Rebuild reads begun, for the test that one request starts no more
+    /// than its budget allows.
+    #[cfg(test)]
+    rebuild_reads: AtomicU64,
 }
 
 /// See [`Guard::after_forget`] and [`Guard::rebuild_started`].
@@ -580,6 +584,8 @@ impl Guard {
             rebuild_started: Mutex::new(None),
             #[cfg(test)]
             rebuild_max_spans: std::sync::atomic::AtomicUsize::new(REBUILD_MAX_SPANS),
+            #[cfg(test)]
+            rebuild_reads: AtomicU64::new(0),
         }))
     }
 
@@ -1411,6 +1417,8 @@ impl State {
             let Some((shared, run)) = self.take_live(&key) else {
                 continue;
             };
+            // Streams tell their clients to drop it.
+            self.live_leave(Arc::clone(&shared), now);
             if run.class == Verdict::Stop {
                 let parked = Parked {
                     tick: run.tick,
@@ -1569,6 +1577,22 @@ impl Store {
         self.fuse_answer(tenant, run, None)
     }
 
+    /// Rebuild reads the guard has begun, for tests.
+    #[cfg(test)]
+    pub(crate) fn guard_rebuild_reads(&self) -> u64 {
+        self.guard
+            .as_ref()
+            .map_or(0, |guard| guard.rebuild_reads.load(Ordering::Relaxed))
+    }
+
+    /// Runs `hook` once, as the guard's next rebuild begins; for tests.
+    #[cfg(test)]
+    pub(crate) fn guard_on_next_rebuild(&self, hook: Box<dyn FnOnce(&Store) + Send>) {
+        if let Some(guard) = self.guard.as_ref() {
+            *guard.rebuild_started.lock().expect("hook") = Some(hook);
+        }
+    }
+
     /// [`Self::fuse_verdict`] for a step about to happen: `next` is added to
     /// the run's usage hypothetically, so a step that WOULD go past a stop
     /// limit answers `stop`. This is the pre-call gate. Nothing about the
@@ -1583,7 +1607,8 @@ impl Store {
     /// Fate Map with what is left of the request's one budget.
     fn fuse_answer(&self, tenant: &str, run: &str, next: Option<&NextStep>) -> Result<VerdictDoc> {
         let started = Instant::now();
-        let mut doc = self.fuse_answer_usage(tenant, run, next)?;
+        let deadline = self.query_deadline(started);
+        let mut doc = self.fuse_answer_usage(tenant, run, next, deadline)?;
         if doc.limits.min_success_odds.is_some() && doc.verdict != Verdict::Stop {
             let action = self.guard()?.policy_action(tenant, &doc.policy)?;
             crate::fate::apply_to_verdict(self, &mut doc, action, next, started);
@@ -1591,11 +1616,30 @@ impl Store {
         Ok(doc)
     }
 
+    /// Makes sure the guard holds `run` whole — rebuilding it from the store
+    /// if it is followed only since it came into memory, as the first
+    /// verdict query about it would — within `deadline`, the budget of the
+    /// request asking; a no-op for a run already whole. For a request that
+    /// rebuilds several runs under one budget (a live listing).
+    pub(crate) fn fuse_rebuild_within(
+        &self,
+        tenant: &str,
+        run: &str,
+        deadline: Option<Deadline>,
+    ) -> Result<()> {
+        self.fuse_answer_usage(tenant, run, None, deadline)
+            .map(|_| ())
+    }
+
+    /// The usage half of a verdict: from memory for a run held whole, else
+    /// rebuilt from the store under `deadline` — one budget across every
+    /// attempt, however many erasures make it read again.
     fn fuse_answer_usage(
         &self,
         tenant: &str,
         run: &str,
         next: Option<&NextStep>,
+        deadline: Option<Deadline>,
     ) -> Result<VerdictDoc> {
         let guard = self.guard()?;
         validate_tenant(tenant)?;
@@ -1612,7 +1656,7 @@ impl Store {
                     return guard.answer(&state, &key, judged, Source::Live);
                 }
             }
-            let read = self.fuse_rebuild_read(guard, &key)?;
+            let read = self.fuse_rebuild_read(guard, &key, deadline)?;
             if let Some(doc) = self.fuse_rebuild_install(guard, &key, read, next, now)? {
                 return Ok(doc);
             }
@@ -1629,8 +1673,16 @@ impl Store {
     /// [`Self::fuse_rebuild_install`], so nothing admitted during the read is
     /// lost or counted twice — and one of a version the read already
     /// reflects, which may be older than the version it found, is not
-    /// replayed over it (the floor).
-    fn fuse_rebuild_read(&self, guard: &Guard, key: &RunKey) -> Result<RebuildRead> {
+    /// replayed over it (the floor). The read and its extraction run under
+    /// `deadline`, the asking request's budget.
+    fn fuse_rebuild_read(
+        &self,
+        guard: &Guard,
+        key: &RunKey,
+        deadline: Option<Deadline>,
+    ) -> Result<RebuildRead> {
+        #[cfg(test)]
+        guard.rebuild_reads.fetch_add(1, Ordering::Relaxed);
         #[cfg(test)]
         if let Some(hook) = guard
             .rebuild_started
@@ -1650,7 +1702,6 @@ impl Store {
         };
         // The deadline covers extraction too: digesting 100,000 requests is
         // work the budget exists to bound, not a free tail after the read.
-        let deadline = self.query_deadline(Instant::now());
         let replayed = self
             .run_spans_at(
                 Some(&key.tenant),
@@ -1785,6 +1836,22 @@ impl Store {
         }
         let path = live.behaviour()?;
         Some(path.reading(live.service.as_deref(), live.truncated, live.steps()))
+    }
+
+    /// Whether the guard holds `run` live but only as followed since it
+    /// came into memory — not yet rebuilt whole from the store, which its
+    /// first verdict query, or [`Self::fuse_rebuild_within`], does.
+    pub(crate) fn fuse_followed_partly(&self, tenant: &str, run: &str) -> bool {
+        let Some(guard) = self.guard.as_ref() else {
+            return false;
+        };
+        let Ok(state) = guard.state.lock() else {
+            return false;
+        };
+        state
+            .runs
+            .get(&RunKey::new(tenant, run))
+            .is_some_and(|live| !live.complete)
     }
 
     /// Runs the guard holds — live ones, and stopped ones parked out of the
@@ -2093,6 +2160,10 @@ impl Store {
             for (_, pending) in state.rebuilding.values_mut() {
                 pending.clear();
             }
+            // The live feed's memory of evicted runs names runs; every
+            // stream starts over from a listing after an erasure anyway.
+            let latest = state.next_change;
+            state.live.forget_gone(latest);
             let doomed: Vec<RunKey> = state
                 .runs
                 .iter()
@@ -2652,6 +2723,111 @@ mod tests {
             .collect()
     }
 
+    /// A stream's client is told to drop a held row the guard evicts —
+    /// before that run's row when it is back in the same update — and one
+    /// whose activity left the window; a stream further behind the feed's
+    /// memory of evictions than it reaches, or whose client would hold more
+    /// rows than it tracks, starts over from a listing.
+    #[test]
+    fn the_live_feed_tells_a_stream_which_held_rows_left() {
+        let fixture = TempStore::open(
+            "live-gone",
+            FuseConfig {
+                max_runs: 1,
+                ..FuseConfig::default()
+            },
+        );
+        let store = fixture.store();
+        let wait = |cursor: &mut LiveCursor, held: usize, window: Duration| {
+            store
+                .guard_live_wait(None, cursor, 256, held, window, Duration::ZERO)
+                .expect("waits")
+        };
+        let window = Duration::from_secs(900);
+        let rows = |update: &LiveUpdate| -> (Vec<String>, Vec<(String, LiveRemovalReason)>) {
+            match update {
+                LiveUpdate::Snapshot(page) => (
+                    page.runs.iter().map(|row| row.run.clone()).collect(),
+                    vec![],
+                ),
+                LiveUpdate::Changed { removed, runs } => (
+                    runs.iter().map(|row| row.run.clone()).collect(),
+                    removed
+                        .iter()
+                        .map(|gone| (gone.run.clone(), gone.reason))
+                        .collect(),
+                ),
+                LiveUpdate::Idle => (vec![], vec![]),
+            }
+        };
+        store
+            .ingest_batch(vec![tool_span("a", "s1", "x", "{}", 1)])
+            .expect("ingests");
+        let mut cursor = LiveCursor::default();
+        let first = wait(&mut cursor, 16, window);
+        assert!(matches!(first, LiveUpdate::Snapshot(_)), "{first:?}");
+        assert_eq!(rows(&first).0, ["a"]);
+        // b evicts a, then a comes back and evicts b, before the stream
+        // looks: the client drops a and takes it again; b it never held.
+        for (run, id) in [("b", "s1"), ("a", "s2")] {
+            store
+                .ingest_batch(vec![tool_span(run, id, "x", "{}", 2)])
+                .expect("ingests");
+        }
+        let update = wait(&mut cursor, 16, window);
+        assert!(matches!(update, LiveUpdate::Changed { .. }), "{update:?}");
+        assert_eq!(
+            rows(&update),
+            (
+                vec!["a".to_owned()],
+                vec![("a".to_owned(), LiveRemovalReason::Evicted)]
+            )
+        );
+        assert!(matches!(wait(&mut cursor, 16, window), LiveUpdate::Idle));
+        // More evictions at once than the feed remembers: a listing.
+        let crowd: Vec<Span> = (0..1100)
+            .map(|index| tool_span(&format!("crowd-{index}"), "s", "x", "{}", 3))
+            .collect();
+        store.ingest_batch(crowd).expect("ingests");
+        let update = wait(&mut cursor, 16, window);
+        assert!(matches!(update, LiveUpdate::Snapshot(_)), "{update:?}");
+        // A held row whose activity left the window is dropped as expired,
+        // with no change to wake the stream.
+        let short = Duration::from_millis(300);
+        let mut cursor = LiveCursor::default();
+        let held = rows(&wait(&mut cursor, 16, short)).0;
+        assert_eq!(held.len(), 1, "{held:?}");
+        std::thread::sleep(short + Duration::from_millis(50));
+        let update = store
+            .guard_live_wait(None, &mut cursor, 256, 16, short, Duration::from_secs(5))
+            .expect("waits");
+        assert_eq!(
+            rows(&update),
+            (vec![], vec![(held[0].clone(), LiveRemovalReason::Expired)])
+        );
+        drop(fixture);
+
+        // A client that would hold more rows than the stream tracks starts
+        // over from a listing.
+        let fixture = TempStore::open("live-held", FuseConfig::default());
+        let store = fixture.store();
+        store
+            .ingest_batch(vec![tool_span("one", "s", "x", "{}", 1)])
+            .expect("ingests");
+        let mut cursor = LiveCursor::default();
+        let first = store
+            .guard_live_wait(None, &mut cursor, 256, 1, window, Duration::ZERO)
+            .expect("waits");
+        assert!(matches!(first, LiveUpdate::Snapshot(_)));
+        store
+            .ingest_batch(vec![tool_span("two", "s", "x", "{}", 1)])
+            .expect("ingests");
+        let update = store
+            .guard_live_wait(None, &mut cursor, 256, 1, window, Duration::ZERO)
+            .expect("waits");
+        assert!(matches!(update, LiveUpdate::Snapshot(_)), "{update:?}");
+    }
+
     #[test]
     fn eviction_keeps_the_bound_and_parks_a_kill_switch() {
         let fixture = TempStore::open(
@@ -2957,7 +3133,9 @@ mod tests {
         let key = RunKey::new("", "secret");
         // The store is read; then, before the result is installed, the run's
         // session is erased.
-        let read = store.fuse_rebuild_read(guard, &key).expect("reads");
+        let read = store
+            .fuse_rebuild_read(guard, &key, store.query_deadline(Instant::now()))
+            .expect("reads");
         assert!(matches!(&read.replayed, Ok(replayed) if replayed.observations.len() == 2));
         store
             .erase(erasure::Subject::Session {
@@ -3530,7 +3708,9 @@ mod tests {
         let store = fixture.store();
         let guard = store.guard().expect("guard");
         let key = RunKey::new("", "r");
-        let read = store.fuse_rebuild_read(guard, &key).expect("reads");
+        let read = store
+            .fuse_rebuild_read(guard, &key, store.query_deadline(Instant::now()))
+            .expect("reads");
         let admission = store
             .ingest_batch(vec![
                 step_at("r", "e3", "3", 300, 310, "error"),
@@ -3682,7 +3862,9 @@ mod tests {
             .expect("B stores, and observes");
         let guard = store.guard().expect("guard");
         let key = RunKey::new("", "late");
-        let read = store.fuse_rebuild_read(guard, &key).expect("reads");
+        let read = store
+            .fuse_rebuild_read(guard, &key, store.query_deadline(Instant::now()))
+            .expect("reads");
         store.observe_fuses(&[older], a);
         let doc = store
             .fuse_rebuild_install(guard, &key, read, None, unix_now_ns())
@@ -3718,7 +3900,9 @@ mod tests {
                 .expect("B stores, and observes");
         }));
         let key = RunKey::new("", "r");
-        let read = store.fuse_rebuild_read(guard, &key).expect("reads");
+        let read = store
+            .fuse_rebuild_read(guard, &key, store.query_deadline(Instant::now()))
+            .expect("reads");
         assert!(
             guard.rebuild_started.lock().expect("hook").is_none(),
             "it ran"
@@ -3760,8 +3944,12 @@ mod tests {
             .expect("ingests");
         let guard = store.guard().expect("guard");
         let key = RunKey::new("", "r");
-        let first = store.fuse_rebuild_read(guard, &key).expect("reads");
-        let second = store.fuse_rebuild_read(guard, &key).expect("reads");
+        let first = store
+            .fuse_rebuild_read(guard, &key, store.query_deadline(Instant::now()))
+            .expect("reads");
+        let second = store
+            .fuse_rebuild_read(guard, &key, store.query_deadline(Instant::now()))
+            .expect("reads");
         store
             .fuse_rebuild_install(guard, &key, first, None, unix_now_ns())
             .expect("installs")
@@ -3809,7 +3997,9 @@ mod tests {
             .expect("ingests");
         let guard = store.guard().expect("guard");
         let key = RunKey::new("", "r");
-        let read = store.fuse_rebuild_read(guard, &key).expect("registers");
+        let read = store
+            .fuse_rebuild_read(guard, &key, store.query_deadline(Instant::now()))
+            .expect("registers");
         assert!(read.replayed.is_err(), "no budget to read in");
         store
             .ingest_batch(vec![
