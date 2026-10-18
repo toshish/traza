@@ -10,12 +10,37 @@ import { Card, Chip, ErrorState, EmptyState, LoadingBar, Mono } from '../compone
 // column, and errors that click through. The list and Analytics used to
 // disagree about "now" because only one of them had a window at all.
 
+/** A session's turns, and what was counted to get them. The server counts
+    the turn spans Traza's recorders mark, one per user prompt
+    (`turns_from: "prompts"`), and otherwise traces (`"traces"`). An imported
+    coding-agent session is one trace however many prompts it held, so
+    counting traces read every such session as one turn. A server that sends
+    no `turn_count` counted nothing else, so its traces stand. */
+function sessionTurns(session) {
+  const count = typeof session?.turn_count === 'number' ? session.turn_count : session?.trace_count || 0;
+  const title = session?.turns_from === 'prompts' ? 'Turns: user prompts'
+    : session?.turns_from === 'traces' ? 'Turns: traces — this producer marks no prompts, so each trace counts as a turn'
+      : 'Turns: traces — this server reports no prompt count, so each trace counts as a turn';
+  return { count, title, fromPrompts: session?.turns_from === 'prompts' };
+}
+
+/** Cost per turn, or `—` when nothing was priced: `0.00000` would say the
+    session was free. */
+function costPerTurn(session) {
+  const cost = fmtCostProvenance(session);
+  const { count } = sessionTurns(session);
+  return count && cost.priced ? (cost.estimated ? '~' : '') + (session.cost_usd / count).toFixed(5) : '—';
+}
+
 const SORTS = [
   { id: 'recent', label: 'most recent', of: (s) => -s.last_end_ns },
   { id: 'cost', label: 'costliest', of: (s) => -s.cost_usd },
   { id: 'errors', label: 'most errors', of: (s) => -s.error_count },
-  { id: 'turns', label: 'longest', of: (s) => -s.trace_count },
-  { id: 'efficiency', label: 'worst cost/turn', of: (s) => -(s.trace_count ? s.cost_usd / s.trace_count : 0) },
+  { id: 'turns', label: 'longest', of: (s) => -sessionTurns(s).count },
+  { id: 'efficiency', label: 'worst cost/turn', of: (s) => {
+    const { count } = sessionTurns(s);
+    return -(count ? s.cost_usd / count : 0);
+  } },
 ];
 
 export function SessionsScreen({ go }) {
@@ -64,6 +89,7 @@ export function SessionsScreen({ go }) {
       </div>
       {rows.map((session) => {
         const cost = fmtCostProvenance(session);
+        const turns = sessionTurns(session);
         // A row omits `tenant` for the default tenant. The link names it
         // either way, so the session — and the run it opens — is read in
         // its own tenant rather than merged with another's of the same id.
@@ -85,14 +111,12 @@ export function SessionsScreen({ go }) {
             {fmtWindow(session.first_start_ns, session.last_end_ns)}
           </div>
         </div>
-        <Num>{fmtNum(session.trace_count)}</Num>
+        <Num title={turns.title}>{fmtNum(turns.count)}</Num>
         <Num muted>{fmtNum(session.span_count)}</Num>
         <Num muted>{fmtNum(session.llm_calls)}</Num>
         <Num>{fmtNum(session.total_tokens)}</Num>
         <Num accent={!cost.estimated} muted={cost.estimated} title={cost.title}>{cost.text}</Num>
-        <Num muted>{session.trace_count && cost.priced
-          ? (cost.estimated ? '~' : '') + (session.cost_usd / session.trace_count).toFixed(5)
-          : '—'}</Num>
+        <Num muted>{costPerTurn(session)}</Num>
         <Num tone={session.error_count ? 'var(--error)' : 'var(--ink-faint)'}>{session.error_count}</Num>
         <Num muted>{fmtAgo(session.last_end_ns)}</Num>
       </div>;
@@ -118,6 +142,7 @@ export function SessionScreen({ sessionId, go, params }) {
   if (!data) return <LoadingBar active />;
 
   const traces = data.traces || [];
+  const turns = sessionTurns(data);
   const maxCost = Math.max(...traces.map((t) => t.cost_usd || 0), 0);
   // The run's tenant: the one this session was read in, else the one its
   // spans agree on. Read without a tenant, an empty answer means the default
@@ -142,17 +167,15 @@ export function SessionScreen({ sessionId, go, params }) {
 
     <div className="tz-reflow" style={{ display: 'grid', gridTemplateColumns: 'repeat(7,1fr)', gap: 12 }}>
       {[
-        ['turns', fmtNum(data.trace_count)],
+        ['turns', fmtNum(turns.count), turns.title],
         ['spans', fmtNum(data.span_count)],
         ['LLM calls', fmtNum(data.llm_calls)],
         ['tokens', fmtNum(data.total_tokens)],
         ['cost USD', fmtCostProvenance(data).text],
         // Nothing priced is no figure, per turn as in total.
-        ['cost / turn', data.trace_count && fmtCostProvenance(data).priced
-          ? (fmtCostProvenance(data).estimated ? '~' : '') + (data.cost_usd / data.trace_count).toFixed(5)
-          : '—'],
+        ['cost / turn', costPerTurn(data)],
         ['errors', fmtNum(data.error_count)],
-      ].map(([label, value]) => <Card key={label} pad="12px 14px">
+      ].map(([label, value, title]) => <Card key={label} pad="12px 14px" title={title}>
         <div style={{ fontSize: 12, color: 'var(--ink-muted)', marginBottom: 5 }}>{label}</div>
         <div style={{
           fontFamily: 'var(--font-mono)', fontSize: 18, lineHeight: '26px', fontWeight: 500,
@@ -167,8 +190,10 @@ export function SessionScreen({ sessionId, go, params }) {
         display: 'grid', gridTemplateColumns: '1fr 132px 86px 76px 94px 92px 76px',
         background: 'var(--bg-sunken)', borderBottom: '1px solid var(--hairline)',
       }}>
-        {['turn', 'cost', 'window', 'spans', 'tokens', 'cost USD', 'errors'].map((label, i) => (
-          <div key={label} style={{
+        {/* Each row is a trace. Where the turns were prompts, a row is not a
+            turn, and its header does not say it is. */}
+        {[turns.fromPrompts ? 'trace' : 'turn', 'cost', 'window', 'spans', 'tokens', 'cost USD', 'errors'].map((label, i) => (
+          <div key={label} role="columnheader" style={{
             padding: '6px 10px', fontSize: 12, fontWeight: 500, color: 'var(--ink-muted)',
             textAlign: i === 0 || i === 1 ? 'left' : 'right', whiteSpace: 'nowrap',
           }}>{label}</div>
