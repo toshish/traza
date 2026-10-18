@@ -43,6 +43,8 @@ use crate::{semconv, Error, Span, SpanCursor, SpanFilter, SpanSort, Store};
 
 // get_run_tape, compare_runs and recall_runs live beside this file.
 mod replay_tools;
+// foresee_run lives beside this file too.
+mod fate_tools;
 
 /// The MCP endpoint path served by `traza-server`.
 pub const ENDPOINT: &str = "/v1/mcp";
@@ -628,6 +630,7 @@ impl<'a> Server<'a> {
             );
         }
         tools.extend(replay_tools::definitions());
+        tools.extend(fate_tools::definitions());
         if self.annotation_tool_available(access) {
             tools.push(tool(
                 "record_annotation",
@@ -750,6 +753,7 @@ impl<'a> Server<'a> {
             name if replay_tools::handles(name) => {
                 replay_tools::call(self, name, arguments, &context)
             }
+            name if fate_tools::handles(name) => fate_tools::call(self, name, arguments, &context),
             "record_annotation" if self.annotation_tool_available(context.access) => {
                 self.record_annotation(arguments, context)
             }
@@ -1953,6 +1957,25 @@ impl<'a> Server<'a> {
         }
         let text = clamp_report(&head, &rows, &notes, self.limits.max_result_bytes);
         let mut structured = serde_json::to_value(&doc).unwrap_or_else(|_| json!({}));
+        // Producer and caller text in the structured half is made JSON-safe,
+        // as foresee_run does for the same foresight: the reasons, and the
+        // foresight's explanation (which quotes tool names) and next tool.
+        if let Some(object) = structured.as_object_mut() {
+            if let Some(reasons) = object.get_mut("reasons").and_then(Value::as_array_mut) {
+                for reason in reasons.iter_mut() {
+                    if let Value::String(text) = reason {
+                        *text = json_safe(text);
+                    }
+                }
+            }
+            if let Some(foresight) = object.get_mut("foresight").and_then(Value::as_object_mut) {
+                for key in ["explanation", "next_tool"] {
+                    if let Some(Value::String(text)) = foresight.get_mut(key) {
+                        *text = json_safe(text);
+                    }
+                }
+            }
+        }
         let mut result = json!({
             "content": [{"type": "text", "text": text}],
             "structuredContent": structured.clone(),
@@ -1979,6 +2002,13 @@ impl<'a> Server<'a> {
                     if let Some(text) = top.get("fingerprint").and_then(Value::as_str) {
                         let short = truncate_bytes(text, 80);
                         top.insert("fingerprint".to_owned(), json!(short));
+                    }
+                }
+                if let Some(foresight) = object.get_mut("foresight").and_then(Value::as_object_mut)
+                {
+                    if let Some(text) = foresight.get("explanation").and_then(Value::as_str) {
+                        let short = truncate_bytes(text, 120);
+                        foresight.insert("explanation".to_owned(), json!(short));
                     }
                 }
             }
@@ -2936,6 +2966,12 @@ fn guard_output_schema() -> Value {
             "tripped_by": {"type": ["string", "null"], "enum": ["policy", "manual", null]},
             "evidence": {"type": "array", "items": span_ref},
             "source": {"type": "string", "enum": ["live", "rebuilt"]},
+            "foresight": {
+                "type": "object",
+                "description": "Present when the policy sets min_success_odds: what runs that \
+                                took this run's path did (verdict, p_success, ci95, support), \
+                                and whether that raised the policy's action.",
+            },
         },
         "required": ["run", "verdict", "reasons", "policy", "usage", "source"],
     })

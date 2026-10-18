@@ -176,6 +176,7 @@ A policy is a name, which runs it is for, a set of limits, and an action:
 | `max_duration_seconds` | `duration_ns >= limit × 10⁹` |
 | `max_repeats` | `top_repeat.count >= limit` |
 | `max_error_streak` | `error_streak >= limit` |
+| `min_success_odds` | Runs that took this run's path succeeded so rarely that the 95% interval's upper bound is below the limit — see [predictive limits](#predictive-limits) |
 
 Every limit is optional and an absent one is unbounded. A present one must be
 positive, and `max_repeats` at least 2 — one occurrence is not a repeat.
@@ -214,6 +215,39 @@ reappear underneath it. Set every limit you want on the policy you mean.
 the one limit that is safe without knowing the workload, and a warning,
 because a default that stopped someone's agent would be a decision nobody
 made.
+
+## Predictive limits
+
+The limits above are arithmetic over what a run has used. One limit looks
+the other way — at how runs like it have ended. `min_success_odds` (with
+`foresight_min_support`, default 30, and `foresight_after_steps`, default 3)
+walks the run's path so far down its agent's [Fate Map](foresight.md), and
+when at least that many earlier runs took the same path, the run has at least
+that many steps, and the upper bound of their success rate's 95% interval is
+below the limit, the policy's action applies, with a reason like
+`foresight: runs that took this path succeeded 5 of 50 times (≤21.4%)`. On
+the pre-call check, a named next tool is judged as the next step of the path.
+The run is read as still going, so its last step is open: a run that has
+issued one refund is compared with every run that issued at least one there.
+
+It differs from every other limit in four ways, each on purpose: it is
+evaluated on the check and verdict queries **only, never on ingest**; it reads
+**only a cached map**, so a cold cache gives no foresight stop; it is **not
+latched** — a prediction is made again at every question, and lifts if the
+path moves on to better odds — and it **never warns at 80%**. The verdict
+document carries the run's `foresight` whenever the policy sets the limit.
+The whole model is in [the foresight guide](foresight.md#predictive-fuses).
+
+**Its memory.** For a run under a policy that sets `min_success_odds`, the
+guard keeps the run's behaviour path beside its usage: the earliest 192
+steps, 48 bytes each, maintained as usage is — each version of a span that
+lands replaces the last, a rebuild replays it, eviction and erasure drop it —
+and counted against the same 1,000,000-record budget as span contributions
+(so such runs are evicted somewhat sooner). The check reads that path from
+memory rather than reading the run back from the store. A run whose state
+started before any such policy existed keeps no path until the guard next
+rebuilds it, and is read from the store meanwhile. Runs under no predictive
+policy keep nothing extra.
 
 ## Stopping and resetting
 

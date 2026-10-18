@@ -146,6 +146,9 @@ pub(crate) struct Observation {
     /// `Store::observe_admitted`), or 0 for one a rebuild read from the
     /// store, which is ordered by the rebuilt state's floor instead.
     revision: u64,
+    /// For a step: its place and signature for the run's behaviour path,
+    /// which a run under a predictive policy keeps ([`crate::fate`]).
+    behaviour: Option<crate::fate::StepToken>,
 }
 
 impl Observation {
@@ -161,6 +164,11 @@ impl Observation {
         let fingerprint = kind
             .is_step()
             .then(|| semconv::step_fingerprint_with(span, &llm));
+        let behaviour = if kind.is_step() {
+            crate::fate::StepToken::of(span, &llm)
+        } else {
+            None
+        };
         Self {
             key: span_key(&span.trace_id, &span.span_id),
             trace_id: span.trace_id.clone(),
@@ -174,6 +182,7 @@ impl Observation {
             start_ns: span.start_time_ns,
             end_ns: span.end_time_ns,
             revision,
+            behaviour,
         }
     }
 
@@ -318,6 +327,10 @@ pub(crate) struct RunState {
     pub(crate) class: Verdict,
     /// Server clock at the last observation or query, Unix nanoseconds.
     pub(crate) last_seen_ns: u64,
+    /// The run's behaviour path, for the predictive fuses: kept only from
+    /// a fresh state of a run under a policy that sets `min_success_odds`
+    /// ([`Self::follow_behaviour`]), and counted in [`Self::tracked`].
+    behaviour: Option<crate::fate::LivePath>,
 }
 
 impl RunState {
@@ -345,7 +358,27 @@ impl RunState {
             tick: 0,
             class: Verdict::Continue,
             last_seen_ns: 0,
+            behaviour: None,
         }
+    }
+
+    /// Starts keeping the run's behaviour path — only on a state that has
+    /// absorbed nothing yet, so the path it keeps is the run's whole one as
+    /// far as this state knows it, never a tail posing as the whole.
+    pub(crate) fn follow_behaviour(&mut self) {
+        if self.marks.is_empty() && self.behaviour.is_none() {
+            self.behaviour = Some(crate::fate::LivePath::default());
+        }
+    }
+
+    /// The behaviour path, when this state keeps one.
+    pub(crate) fn behaviour(&self) -> Option<&crate::fate::LivePath> {
+        self.behaviour.as_ref()
+    }
+
+    /// Steps recorded.
+    pub(crate) fn steps(&self) -> u64 {
+        self.steps
     }
 
     /// Whether any span keyed in `keys` (by [`span_key`]) contributed here.
@@ -353,10 +386,14 @@ impl RunState {
         self.marks.keys().any(|key| keys.contains(key))
     }
 
-    /// Spans this state holds a mark for — its share of the guard's memory
-    /// budget.
+    /// Spans this state holds a mark for, plus the steps its behaviour path
+    /// holds — its share of the guard's memory budget.
     pub(crate) fn tracked(&self) -> usize {
         self.marks.len()
+            + self
+                .behaviour
+                .as_ref()
+                .map_or(0, crate::fate::LivePath::len)
     }
 
     /// Folds one span in on its own — a fold of one, without the limit
@@ -404,6 +441,12 @@ impl RunState {
     /// their observers run in whichever order they finish, and the guard
     /// must end up holding what the store holds.
     fn land(&mut self, observation: &Observation, before_reset: bool, withdrawn: bool) -> bool {
+        // The behaviour path takes every version that lands, even one whose
+        // contribution is unchanged: a re-ingest that only moved a step's
+        // start moves its place in the path.
+        if let Some(path) = self.behaviour.as_mut() {
+            path.land(observation.key, observation.behaviour.as_ref());
+        }
         let previous = self.marks.get(&observation.key).copied();
         // The span's clocks count whether or not its contribution changed:
         // an upsert that only moved a span's end still moves the run's.
@@ -819,13 +862,18 @@ pub(crate) struct Assessment {
 /// the reset itself when a reset left cumulative usage over a limit, which
 /// live would re-trip at once. `resolve` names the run's policy from its
 /// first span's service — the first span replayed, reset or not, exactly as
-/// [`RunState::service`] has it.
-pub(crate) fn replay(
+/// [`RunState::service`] has it. `follow_behaviour` keeps the run's
+/// behaviour path ([`RunState::follow_behaviour`]).
+pub(crate) fn replay_following(
     observations: &[Observation],
     reset_at: Option<u64>,
     resolve: &dyn Fn(&str) -> (Limits, Action),
+    follow_behaviour: bool,
 ) -> RunState {
     let mut state = RunState::new(true);
+    if follow_behaviour {
+        state.follow_behaviour();
+    }
     let stop_limits = |service: &str| {
         let (limits, action) = resolve(service);
         (action == Action::Stop).then_some(limits)
@@ -849,6 +897,16 @@ pub(crate) fn replay(
         }
     }
     state
+}
+
+/// [`replay_following`] without a behaviour path.
+#[cfg(test)]
+pub(crate) fn replay(
+    observations: &[Observation],
+    reset_at: Option<u64>,
+    resolve: &dyn Fn(&str) -> (Limits, Action),
+) -> RunState {
+    replay_following(observations, reset_at, resolve, false)
 }
 
 /// Whether a run at `assessment` should warn, under `resolved`.
@@ -1102,7 +1160,21 @@ mod tests {
             start_ns: 1_000,
             end_ns: 2_000,
             revision: 0,
+            behaviour: None,
         }
+    }
+
+    /// `observation` with the behaviour token its kind, start, id and
+    /// fingerprint (standing in for its signature) give it.
+    fn with_token(mut observation: Observation) -> Observation {
+        observation.behaviour = observation.kind.is_step().then(|| {
+            crate::fate::StepToken::named(
+                observation.start_ns,
+                &observation.span_id,
+                observation.fingerprint.as_deref().unwrap_or("?"),
+            )
+        });
+        observation
     }
 
     fn step(id: &str, fingerprint: &str) -> Observation {
@@ -1646,7 +1718,9 @@ mod tests {
     /// exactly what a fresh replay of the store's versions counts, and
     /// latches a stop exactly when that replay does. A stop latched from a
     /// state the store never held — old versions of some spans beside new
-    /// versions of others — fails it.
+    /// versions of others — fails it. And the behaviour path the predictive
+    /// fuses read is exactly the replay's: every version that moved a step,
+    /// renamed it or made it no step at all is where the store has it.
     #[test]
     fn random_upsert_batches_latch_exactly_what_a_replay_of_the_store_does() {
         const KINDS: [StepKind; 4] = [
@@ -1670,7 +1744,7 @@ mod tests {
             );
             observation.tokens = rng.range(0, 60);
             observation.error = rng.chance(30);
-            observation
+            with_token(observation)
         }
         let mut rng = crate::seed::Rng::new(0x5eed_f01d);
         let mut latches = 0;
@@ -1706,7 +1780,7 @@ mod tests {
             for observation in &initial {
                 stored.insert(observation.span_id.clone(), observation.clone());
             }
-            let mut live = replay(&initial, None, &resolve);
+            let mut live = replay_following(&initial, None, &resolve, true);
             if live.trip.is_some() {
                 continue;
             }
@@ -1733,7 +1807,7 @@ mod tests {
                 }
                 let latched = live.fold(&batch, None, &|_| Some(limits), &|_| 1);
                 let held: Vec<Observation> = stored.values().cloned().collect();
-                let fresh = replay(&held, None, &resolve);
+                let fresh = replay_following(&held, None, &resolve, true);
                 let counted = |usage: Usage| {
                     (
                         usage.cost_usd,
@@ -1747,6 +1821,8 @@ mod tests {
                 };
                 let context = format!("scenario {scenario}, batch {round}, {limits:?}");
                 assert_eq!(counted(live.usage()), counted(fresh.usage()), "{context}");
+                assert_eq!(live.behaviour(), fresh.behaviour(), "{context}");
+                assert_eq!(live.tracked(), fresh.tracked(), "{context}");
                 // Whether, not where: a replay crosses among ALL the run's
                 // spans in step order, live among this batch's on top of
                 // what came before, so the reason's figure can differ.

@@ -114,7 +114,7 @@ over `curl`.
 
 ## The tools
 
-Sixteen tools: fourteen reads and two gated writers. They are shaped like the
+Seventeen tools: fifteen reads and two gated writers. They are shaped like the
 questions somebody asks at 2am, not like the route index — two routes may serve
 one tool, and one route may serve two. Most of them describe what is in the
 store; `diagnose_session` and `compare_runs` are the ones that answer a
@@ -136,6 +136,7 @@ question about it.
 | `get_run_tape` | What did this run do, step by step? |
 | `compare_runs` | **Where did this run part from that one, and why?** |
 | `recall_runs` | Has this been done before, and how did it go? |
+| `foresee_run` | **How have runs like this one ended — and what did the ones that succeeded do next?** |
 | `record_annotation` | Attach a note or rating to a trace or span (**`rw` token + `--mcp-annotations`**) |
 | `promote_failures_to_dataset` | Turn this run's failures into a regression dataset (**`rw` token + `--mcp-promote`**) |
 
@@ -144,13 +145,13 @@ host asks for approval before each call:
 
 | Tool | `readOnlyHint` | `destructiveHint` | `idempotentHint` | `openWorldHint` |
 |---|---|---|---|---|
-| the fourteen readers | `true` | — | — | `false` |
+| the fifteen readers | `true` | — | — | `false` |
 | `record_annotation` | `false` | `false` | `false` | `false` |
 | `promote_failures_to_dataset` | `false` | `false` | `false` | `false` |
 
 **Absent annotations are not neutral.** Every hint defaults to the pessimistic
 answer — not read-only, potentially destructive, open world — so a server that
-omits them advertises fourteen read tools as though each might delete something and
+omits them advertises fifteen read tools as though each might delete something and
 call out to the internet. A host that gates on that asks for confirmation on
 every call, and one running non-interactively, with nobody to ask, declines
 them. `destructiveHint` and `idempotentHint` are meaningful only when
@@ -206,6 +207,25 @@ The reasoning behind these is worth knowing:
   an agent harness, and letting the model under test create one would let
   stored telemetry choose which recording its next run is fed.
 
+**`foresee_run` reads a run against its agent's [Fate Map](foresight.md).** It
+takes `run_id`, an optional `tenant` (for an unbound credential; a bound one
+naming another tenant is refused) and an optional `min_support` (default 30),
+and answers what [`GET /v1/fate/runs/{run}`](http-api.md#get-v1faterunsrun)
+answers: the run's behaviour path so far, the share of the agent's completed
+runs that took the same path and succeeded — with its 95% interval and how
+many runs that is — a verdict (`on_track`, `at_risk`, `likely_failure`,
+`novel`, `insufficient_history`), where the run left the known paths, and what
+earlier runs did next from here and how that went for them. A run still
+going is compared with every run that repeated its last step at least as
+often (it may yet repeat it), and the text says so; an option that is the
+same step again reads "again". The headline is
+only numbers and verdict words the server computed; the run id, the agent and
+every token of the path — tool and model names from the telemetry — and the
+explanation that quotes them render inside the telemetry block, and are made
+JSON-safe in `structuredContent`. It is a read: it builds the agent's map if
+none is cached (under the query deadline), and changes nothing. Nothing in it
+comes from a model — it is counting over stored runs — and it says so.
+
 **`check_run_guard` reads a run's [fuse](guard.md) verdict** — `continue`,
 `warn` or `stop` — with its reasons, policy, limits and usage: the same
 document as [`GET /v1/fuses/runs/{run}`](http-api.md#get-v1fusesrunsrun), as
@@ -218,9 +238,13 @@ block. It is read-only: nothing on this surface can trip or reset a run, so a
 stopped agent cannot talk its way past its own fuse. It answers what is
 recorded, which is the pre-call check without an estimate; an agent wanting
 to price its next step uses
-[`POST /v1/fuses/check`](http-api.md#post-v1fusescheck). On a server started
-with `--no-fuses` it is not listed — thirteen reads, then — and a call naming it
-is refused as invalid params.
+[`POST /v1/fuses/check`](http-api.md#post-v1fusescheck). When the run's policy
+sets a [predictive limit](foresight.md#predictive-fuses), the verdict carries
+the run's `foresight` too, and a foresight stop reads as any other reason;
+in `structuredContent` the reasons and the foresight's explanation and next
+tool are made JSON-safe, as `foresee_run` makes the same text. On
+a server started with `--no-fuses` it is not listed — fourteen reads, then —
+and a call naming it is refused as invalid params.
 
 **The eval entities are not on this surface.** Datasets, versions, examples,
 experiments, runs and scores are served over HTTP only — no tool reads them,
@@ -291,7 +315,7 @@ so a tool composed of several folds — `describe_store` runs half a dozen —
 can spend several budgets end to end.
 
 `list_sessions`, `diagnose_session`, `analyze_cost`, `check_run_guard`,
-`compare_runs` and `recall_runs` additionally return `structuredContent` against a declared
+`compare_runs`, `recall_runs` and `foresee_run` additionally return `structuredContent` against a declared
 `outputSchema`, because their answers are small, genuinely tabular or
 record-shaped, and the thing a client is most likely to chart or act on.
 Everything else is text only — for span data the compact rendering is strictly

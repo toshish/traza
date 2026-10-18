@@ -14,6 +14,7 @@ to the right document. Start with the row that matches what you are doing.
 | Let a coding agent read the store over MCP | [MCP server](guide/mcp.md) · [demo](../examples/mcp-demo/README.md) |
 | Stop a runaway agent run before its next step | [Run fuses](guide/guard.md) · [demo](../examples/guard/README.md) · [Claude Code hook](../examples/guard/README.md#the-claude-code-hook) |
 | Re-run a recorded agent run with zero model calls, or diff two runs | [Replay](guide/replay.md) · [demo](../examples/replay/README.md) |
+| See which paths an agent's runs take and how each ends; foresee a live run's fate; stop a run whose path has always failed | [Foresight](guide/foresight.md) |
 | Prove what the store committed, for an auditor or a notary | [Ledger and evidence packs](guide/ledger.md) · [demo](../examples/prove/README.md) |
 | Call the guard, replays, diff, recall or the ledger from Python or TypeScript | [Client libraries](guide/clients.md) |
 | Watch the claims proven live before reading further | [The demo tour](../examples/README.md) |
@@ -39,13 +40,18 @@ Sending traces to Traza and getting answers back out.
   attributes Traza recognizes, sessions, token and cost analytics, prompt and
   completion payloads, span links, and query recipes.
 - **[MCP server](guide/mcp.md)** — the Model Context Protocol endpoint: its
-  sixteen tools, its resources and prompts, how results are bounded for a
+  seventeen tools, its resources and prompts, how results are bounded for a
   context window, and the untrusted-content boundary stored span text is held
   behind.
 - **[Run fuses](guide/guard.md)** — per-run limits on cost, tokens, steps,
   repeated calls and failure streaks; the pre-call check, the verdict on every
   ingest acknowledgement, the kill switch, and why a post-ack stop always
   lands one step late.
+- **[Foresight](guide/foresight.md)** — the Fate Map: every path an agent's
+  runs took, each branch's success rate with a Wilson interval, the fatal
+  forks and hotspots, the map's own calibration; foresight for one run with
+  its verdict and what earlier runs did next; and predictive fuses that stop a
+  run whose path has historically failed.
 - **[Replay](guide/replay.md)** — a run read as a tape, replaying it through
   the OpenAI or Anthropic SDK with zero model calls, diffing two runs, and
   recalling earlier runs that did the same thing.

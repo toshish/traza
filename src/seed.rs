@@ -1945,6 +1945,417 @@ impl Gen {
     }
 }
 
+// ------------------------------------------------------- behaviour corpus
+
+/// How [`behaviour_corpus`] lays its runs out.
+#[derive(Clone, Debug)]
+pub struct BehaviourOptions {
+    /// "Now", Unix nanoseconds. Every completed run ends more than an hour
+    /// before it — past the idle window, so its outcome is settled — and
+    /// every live run's last span ends within the last minute.
+    pub now_ns: u64,
+    /// The tenant every span is stamped with; empty is the default tenant.
+    pub tenant: String,
+    /// Multiplier on every branch's run counts (and outcome counts).
+    pub scale: usize,
+    /// Prepended to every run id, so several corpora can share a store.
+    pub prefix: String,
+    /// Whether to add the live demonstration runs (`live-doomed-*`,
+    /// `live-healthy-0`, `live-novel-0`, `live-early-0`), still running.
+    pub live: bool,
+    /// PRNG seed for step durations. Outcomes are exact, never random.
+    pub seed: u64,
+}
+
+impl Default for BehaviourOptions {
+    fn default() -> Self {
+        Self {
+            now_ns: SeedOptions::default().start_time_ns + 30 * 86_400 * SEC,
+            tenant: String::new(),
+            scale: 1,
+            prefix: String::new(),
+            live: false,
+            seed: 0x0fa7e,
+        }
+    }
+}
+
+/// One generated run and the truth about it, for tests to assert against.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BehaviourRun {
+    /// The run id (its `session.id`).
+    pub run: String,
+    /// The cohort it belongs to.
+    pub agent: &'static str,
+    /// The behaviour branch it follows.
+    pub branch: &'static str,
+    /// `success`, `failure`, `abandoned`, or `live`.
+    pub outcome: &'static str,
+}
+
+/// A behaviour corpus: spans, and the ground truth behind them.
+#[derive(Clone, Debug, Default)]
+pub struct BehaviourCorpus {
+    /// Every span, in generation order.
+    pub spans: Vec<Span>,
+    /// Every run, in generation order.
+    pub runs: Vec<BehaviourRun>,
+}
+
+/// One step of a branch: kind, name, consecutive repeats.
+type BranchStep = (&'static str, &'static str, usize);
+
+/// A behaviour branch: who runs it, what it does, and how it ends.
+struct Branch {
+    agent: &'static str,
+    name: &'static str,
+    steps: &'static [BranchStep],
+    runs: usize,
+    success: usize,
+    abandoned: usize,
+    goal: Option<&'static str>,
+}
+
+const GPT: BranchStep = ("llm", "gpt-4o", 1);
+const SONNET: BranchStep = ("llm", "claude-sonnet-4-5", 1);
+
+/// The branches, with their exact outcome counts. Support agents mostly
+/// refund cleanly, sometimes escalate, and fail hard when they get stuck
+/// re-running the same search; the researcher's fate depends on which
+/// source it reaches for first.
+const BRANCHES: &[Branch] = &[
+    Branch {
+        agent: "support-agent",
+        name: "refund_happy",
+        steps: &[
+            GPT,
+            ("tool", "search_orders", 1),
+            GPT,
+            ("tool", "issue_refund", 1),
+            GPT,
+        ],
+        runs: 60,
+        success: 54,
+        abandoned: 0,
+        goal: None,
+    },
+    Branch {
+        agent: "support-agent",
+        name: "search_loop",
+        steps: &[GPT, ("tool", "search_orders", 4), GPT],
+        runs: 50,
+        success: 5,
+        abandoned: 5,
+        goal: None,
+    },
+    Branch {
+        agent: "support-agent",
+        name: "escalate",
+        steps: &[
+            GPT,
+            ("tool", "lookup_customer", 1),
+            GPT,
+            ("tool", "escalate_ticket", 1),
+            GPT,
+        ],
+        runs: 40,
+        success: 24,
+        abandoned: 4,
+        goal: Some("escalate billing dispute"),
+    },
+    Branch {
+        agent: "support-agent",
+        name: "refund_retry",
+        steps: &[
+            GPT,
+            ("tool", "search_orders", 1),
+            GPT,
+            ("tool", "issue_refund", 2),
+            GPT,
+        ],
+        runs: 30,
+        success: 15,
+        abandoned: 0,
+        goal: None,
+    },
+    Branch {
+        agent: "researcher",
+        name: "web_search",
+        steps: &[SONNET, ("tool", "web_search", 1), SONNET],
+        runs: 10,
+        success: 9,
+        abandoned: 0,
+        goal: None,
+    },
+    Branch {
+        agent: "researcher",
+        name: "read_url",
+        steps: &[SONNET, ("tool", "read_url", 1), SONNET],
+        runs: 10,
+        success: 7,
+        abandoned: 0,
+        goal: None,
+    },
+    Branch {
+        agent: "researcher",
+        name: "query_db",
+        steps: &[SONNET, ("tool", "query_db", 1), SONNET],
+        runs: 10,
+        success: 3,
+        abandoned: 0,
+        goal: None,
+    },
+    Branch {
+        agent: "researcher",
+        name: "ask_human",
+        steps: &[SONNET, ("tool", "ask_human", 1), SONNET],
+        runs: 10,
+        success: 1,
+        abandoned: 0,
+        goal: None,
+    },
+];
+
+/// The live demonstration runs of `support-agent`: id and steps so far.
+const LIVE: &[(&str, &[BranchStep])] = &[
+    ("live-doomed-0", &[GPT, ("tool", "search_orders", 4)]),
+    ("live-doomed-1", &[GPT, ("tool", "search_orders", 3)]),
+    ("live-doomed-2", &[GPT, ("tool", "search_orders", 5)]),
+    (
+        "live-healthy-0",
+        &[
+            GPT,
+            ("tool", "search_orders", 1),
+            GPT,
+            ("tool", "issue_refund", 1),
+        ],
+    ),
+    ("live-novel-0", &[GPT, ("tool", "delete_database", 1)]),
+    ("live-early-0", &[GPT]),
+];
+
+/// Whether item `index` of `total` is among `chosen` spread evenly across
+/// them (Bresenham), so any newest-first prefix of a branch stays close to
+/// its proportions.
+fn spread(index: usize, total: usize, chosen: usize) -> bool {
+    total > 0 && (index + 1) * chosen / total > index * chosen / total
+}
+
+/// A corpus of agent runs whose behaviour branches have known, different
+/// success rates — the shape the Fate Map ([`crate::fate`]) learns from.
+///
+/// Two cohorts. `support-agent` runs (service `support-agent`, under a
+/// workflow root that is not a step) take one of four branches: a clean
+/// refund (54 of 60 succeed), a search re-run four times in a row (5 of 50
+/// succeed and 5 are abandoned — the fatal fork), an escalation (24 of 40,
+/// 4 abandoned, each declaring the goal `escalate billing dispute`), and a
+/// refund issued twice (15 of 30). `researcher` runs (an `invoke_agent`
+/// root naming `gen_ai.agent.name: researcher`, service `research-svc`)
+/// pick one of four sources, with 9, 7, 3 and 1 successes in 10 — a
+/// hotspot. Failed runs end on an error status; abandoned runs declare
+/// `session.outcome: abandoned`.
+///
+/// Deterministic: the same options give the same spans, byte for byte, and
+/// every outcome count is exact (times `scale`).
+pub fn behaviour_corpus(options: &BehaviourOptions) -> BehaviourCorpus {
+    let mut rng = Rng::new(options.seed);
+    let scale = options.scale.max(1);
+    let mut out = BehaviourCorpus::default();
+    let namespace = options
+        .prefix
+        .bytes()
+        .chain(options.tenant.bytes())
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+        });
+    let mut serial = 0_u64;
+    let completed_end = options.now_ns.saturating_sub(2 * 3_600 * SEC);
+    for branch in BRANCHES {
+        let runs = branch.runs * scale;
+        let successes = branch.success * scale;
+        let mut others = 0;
+        for index in 0..runs {
+            let outcome = if spread(index, runs, successes) {
+                "success"
+            } else {
+                others += 1;
+                if spread(others - 1, runs - successes, branch.abandoned * scale) {
+                    "abandoned"
+                } else {
+                    "failure"
+                }
+            };
+            let start = completed_end.saturating_sub(serial * 45 * SEC);
+            let run = format!("{}{}-{index}", options.prefix, branch.name);
+            let plan = RunPlan {
+                run: &run,
+                agent: branch.agent,
+                steps: branch.steps,
+                start,
+                outcome,
+                goal: branch.goal,
+            };
+            push_behaviour_run(&mut out, &mut rng, options, namespace, serial, &plan);
+            out.runs.push(BehaviourRun {
+                run,
+                agent: branch.agent,
+                branch: branch.name,
+                outcome,
+            });
+            serial += 1;
+        }
+    }
+    if options.live {
+        for (offset, (name, steps)) in LIVE.iter().enumerate() {
+            let run = format!("{}{name}", options.prefix);
+            let plan = RunPlan {
+                run: &run,
+                agent: "support-agent",
+                steps,
+                start: options
+                    .now_ns
+                    .saturating_sub(40 * SEC + offset as u64 * SEC),
+                outcome: "live",
+                goal: None,
+            };
+            push_behaviour_run(&mut out, &mut rng, options, namespace, serial, &plan);
+            out.runs.push(BehaviourRun {
+                run,
+                agent: "support-agent",
+                branch: "live",
+                outcome: "live",
+            });
+            serial += 1;
+        }
+    }
+    out
+}
+
+/// One run to generate.
+struct RunPlan<'a> {
+    run: &'a str,
+    agent: &'static str,
+    steps: &'a [BranchStep],
+    start: u64,
+    outcome: &'static str,
+    goal: Option<&'static str>,
+}
+
+/// Appends one run's spans: its steps in order, then its root — which a
+/// live run has not ended yet, and so has not exported.
+fn push_behaviour_run(
+    out: &mut BehaviourCorpus,
+    rng: &mut Rng,
+    options: &BehaviourOptions,
+    namespace: u64,
+    serial: u64,
+    plan: &RunPlan<'_>,
+) {
+    let trace = format!("{namespace:016x}{serial:016x}");
+    let root_id = format!("{:016x}", serial << 8);
+    let researcher = plan.agent == "researcher";
+    let service = if researcher {
+        "research-svc"
+    } else {
+        plan.agent
+    };
+    let live = plan.outcome == "live";
+    let looping = plan
+        .steps
+        .iter()
+        .any(|(_, name, repeats)| *name == "search_orders" && *repeats > 1);
+    let mut clock = plan.start + 5 * MS;
+    let flat: Vec<(&str, &str)> = plan
+        .steps
+        .iter()
+        .flat_map(|(kind, name, repeats)| std::iter::repeat((*kind, *name)).take(*repeats))
+        .collect();
+    let total = flat.len();
+    let mut steps = Vec::with_capacity(total);
+    for (position, (kind, name)) in flat.into_iter().enumerate() {
+        let duration = rng.range(300, 1_200) * MS;
+        let last = position + 1 == total;
+        let mut attributes = Map::new();
+        attributes.insert("session.id".into(), json!(plan.run));
+        let (span_name, status) = if kind == "llm" {
+            attributes.insert("gen_ai.operation.name".into(), json!("chat"));
+            attributes.insert("gen_ai.request.model".into(), json!(name));
+            attributes.insert(
+                "gen_ai.usage.input_tokens".into(),
+                json!(600 + 40 * position as u64),
+            );
+            attributes.insert("gen_ai.usage.output_tokens".into(), json!(90));
+            attributes.insert("llm.cost_usd".into(), json!(0.002));
+            let failed = last && plan.outcome == "failure";
+            (format!("chat {name}"), if failed { "error" } else { "ok" })
+        } else {
+            attributes.insert("gen_ai.operation.name".into(), json!("execute_tool"));
+            attributes.insert("gen_ai.tool.name".into(), json!(name));
+            attributes.insert(
+                "gen_ai.tool.call.arguments".into(),
+                json!(format!("{{\"attempt\": {position}}}")),
+            );
+            // A search re-run in a row is a search that came back empty.
+            let empty = looping && name == "search_orders" && !last;
+            (
+                format!("execute_tool {name}"),
+                if empty { "error" } else { "ok" },
+            )
+        };
+        let mut span = make_span(
+            &trace,
+            &format!("{:016x}", (serial << 8) + position as u64 + 1),
+            Some(&root_id),
+            &span_name,
+            service,
+            clock,
+            duration,
+            status,
+            attributes,
+        );
+        span.tenant = options.tenant.clone();
+        steps.push(span);
+        clock += duration + 50 * MS;
+    }
+    if !live {
+        let mut attributes = Map::new();
+        attributes.insert("session.id".into(), json!(plan.run));
+        let root_name = if researcher {
+            attributes.insert("gen_ai.operation.name".into(), json!("invoke_agent"));
+            attributes.insert("gen_ai.agent.name".into(), json!("researcher"));
+            "invoke_agent researcher"
+        } else {
+            attributes.insert("traceloop.span.kind".into(), json!("workflow"));
+            attributes.insert("traceloop.entity.name".into(), json!("handle_ticket"));
+            "support.handle_ticket"
+        };
+        if let Some(goal) = plan.goal {
+            attributes.insert("session.goal".into(), json!(goal));
+        }
+        if plan.outcome == "abandoned" {
+            attributes.insert("session.outcome".into(), json!("abandoned"));
+        }
+        let mut root = make_span(
+            &trace,
+            &root_id,
+            None,
+            root_name,
+            service,
+            plan.start,
+            clock + 10 * MS - plan.start,
+            if plan.outcome == "failure" {
+                "error"
+            } else {
+                "ok"
+            },
+            attributes,
+        );
+        root.tenant = options.tenant.clone();
+        out.spans.push(root);
+    }
+    out.spans.extend(steps);
+}
+
 /// Builds a span. A free function, not a method, so a caller can compute
 /// random durations from the generator's RNG in the argument list.
 #[allow(clippy::too_many_arguments)]
@@ -2046,6 +2457,83 @@ mod tests {
             large > small * 2,
             "scale 4 should dwarf scale 1: {small} vs {large}"
         );
+    }
+
+    #[test]
+    fn the_behaviour_corpus_is_exact_and_deterministic() {
+        let options = BehaviourOptions {
+            live: true,
+            ..BehaviourOptions::default()
+        };
+        let first = behaviour_corpus(&options);
+        let second = behaviour_corpus(&options);
+        assert_eq!(first.spans, second.spans);
+        assert_eq!(first.runs, second.runs);
+        let mut keys = HashSet::new();
+        for span in &first.spans {
+            assert!(
+                keys.insert((span.trace_id.clone(), span.span_id.clone())),
+                "duplicate span identity: {}/{}",
+                span.trace_id,
+                span.span_id
+            );
+        }
+        let count = |branch: &str, outcome: &str| {
+            first
+                .runs
+                .iter()
+                .filter(|run| run.branch == branch && run.outcome == outcome)
+                .count()
+        };
+        assert_eq!(
+            (
+                count("refund_happy", "success"),
+                count("refund_happy", "failure")
+            ),
+            (54, 6)
+        );
+        assert_eq!(
+            (
+                count("search_loop", "success"),
+                count("search_loop", "abandoned"),
+                count("search_loop", "failure")
+            ),
+            (5, 5, 40)
+        );
+        assert_eq!(
+            (
+                count("escalate", "success"),
+                count("escalate", "abandoned"),
+                count("escalate", "failure")
+            ),
+            (24, 4, 12)
+        );
+        assert_eq!(count("live", "live"), 6);
+        // Completed runs end two hours before "now"; live ones within it.
+        let latest_completed = first
+            .spans
+            .iter()
+            .filter(|span| {
+                !span.attributes["session.id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .starts_with("live-")
+            })
+            .map(|span| span.end_time_ns)
+            .max()
+            .unwrap_or_default();
+        assert!(latest_completed < options.now_ns - 3_600 * SEC);
+        let scaled = behaviour_corpus(&BehaviourOptions {
+            scale: 2,
+            ..BehaviourOptions::default()
+        });
+        assert_eq!(scaled.runs.len(), 2 * 220);
+        let tenanted = behaviour_corpus(&BehaviourOptions {
+            tenant: "acme".to_owned(),
+            ..BehaviourOptions::default()
+        });
+        assert!(tenanted.spans.iter().all(|span| span.tenant == "acme"));
+        assert_ne!(tenanted.spans[0].trace_id, first.spans[0].trace_id);
     }
 
     #[test]
