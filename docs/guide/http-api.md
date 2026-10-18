@@ -1715,7 +1715,7 @@ When none of the window's 363 spans belongs to that agent, the answer is:
 | `changes[].behavior_shift` | object, optional | `js_distance` and `p_value` between the two sides' path distributions. For a `behavior` change, measured on the half of the runs that did not choose the split, with the p-value Bonferroni-corrected |
 | `changes[].detail` | object, optional | For a system prompt, `diff` (`offset`, `context`, `before`, `after`). For a catalog, `added`, `removed` and `definitions_changed`. For params, `changed[]` (`key`, `before`, `after`, the values as typed JSON). For behaviour, `paths[]` |
 | `changes[].example_runs` | object | `before` and `after`: up to three run ids each, nearest the change |
-| `run` | object, with `run=` only | `run`, `tenant`, `agent`, `start_ns`, `outcome`, `errored`, `fingerprint` (each dimension's value for this run, plus `path`), and `downstream_of[]`. For each dimension, `downstream_of` holds the latest change point at or before the run whose new value the run carries, regressions first: `dimension`, `at_ns`, `to`, `verdict`, `explanation` |
+| `run` | object, with `run=` only | `run`, `tenant`, `agent`, `start_ns`, `outcome`, `errored`, `fingerprint` (each dimension's value for this run, plus `path`), and `downstream_of[]`. For each dimension, `downstream_of` holds the latest change point at or before the run whose new value the run carries (compared by the value's digest, not by its displayed text), regressions first: `dimension`, `at_ns`, `to`, `verdict`, `explanation` |
 
 Rate p-values come from the pooled two-proportion z-test, or from Fisher's
 exact test when an expected cell count of the rate's 2×2 table is below 5.

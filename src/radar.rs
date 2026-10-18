@@ -1615,10 +1615,10 @@ fn analyse_window(
         runs.sort_by(|a, b| a.start_ns.cmp(&b.start_ns).then_with(|| a.run.cmp(&b.run)));
         runs_scanned += runs.len();
         let context = context_for(runs[0].tenant_id);
-        let mut changes = analyse(&cohort_tenant, &agent, &runs, &context, deadline)?;
+        let (mut changes, targets) = analyse(&cohort_tenant, &agent, &runs, &context, deadline)?;
         if let Some(view) = named.filter(|view| view.tenant == cohort_tenant && view.agent == agent)
         {
-            run = Some(run_context(view, &changes, &context));
+            run = Some(run_context(view, &changes, &targets, &context));
         }
         changes.unnamed = context.unnamed.get() || runs.iter().any(|run| run.unnamed_path);
         truncated |= changes.unnamed;
@@ -1663,8 +1663,16 @@ fn analyse_window(
 
 /// One run placed on its agent's timeline: its fingerprint, and the latest
 /// change point of each dimension that introduced the value it carries and
-/// started at or before it. Regressions first.
-fn run_context(view: &RunView, agent: &AgentChanges, context: &Context<'_>) -> RunContext {
+/// started at or before it. Regressions first. `targets` holds, per change
+/// of `agent`, the identity of the value it introduced: carrying is decided
+/// by identity, because two values can share a display (a value past
+/// [`fingerprint::MAX_VALUE_CHARS`] is shown cut short).
+fn run_context(
+    view: &RunView,
+    agent: &AgentChanges,
+    targets: &[Option<u32>],
+    context: &Context<'_>,
+) -> RunContext {
     let mut fingerprint = BTreeMap::new();
     for dimension in Dimension::CONFIG {
         if let Some(combo) = view.values[dimension.index()] {
@@ -1676,13 +1684,14 @@ fn run_context(view: &RunView, agent: &AgentChanges, context: &Context<'_>) -> R
     }
     fingerprint.insert("path".to_owned(), context.paths.name(view.path).to_owned());
     let mut latest: BTreeMap<Dimension, &Change> = BTreeMap::new();
-    for change in &agent.changes {
+    for (change, target) in agent.changes.iter().zip(targets) {
         if change.at_ns > view.start_ns {
             continue;
         }
-        let carries = match change.dimension {
-            Dimension::Behavior => true,
-            dimension => fingerprint.get(dimension.as_str()) == Some(&change.to),
+        let carries = match (change.dimension, target) {
+            (Dimension::Behavior, _) => true,
+            (dimension, Some(combo)) => view.values[dimension.index()] == Some(*combo),
+            (_, None) => false,
         };
         if carries
             && latest
@@ -2275,7 +2284,7 @@ fn analyse(
     runs: &[&RunView],
     context: &Context<'_>,
     deadline: Option<Deadline>,
-) -> Result<AgentChanges> {
+) -> Result<(AgentChanges, Vec<Option<u32>>)> {
     let mut raw: Vec<RawChange> = Vec::new();
     let mut volatile = Vec::new();
     let mut current = BTreeMap::new();
@@ -2356,19 +2365,26 @@ fn analyse(
     raw.sort_by(|a, b| a.onset.cmp(&b.onset).then(a.dimension.cmp(&b.dimension)));
     let onsets: Vec<usize> = raw.iter().map(|change| change.onset).collect();
 
-    let mut built: Vec<(Change, Vec<u32>, Vec<u32>)> = Vec::with_capacity(raw.len());
+    let mut built: Vec<Built> = Vec::with_capacity(raw.len());
     for position in 0..raw.len() {
         Deadline::check(deadline, 0)?;
         built.push(build_change(position, &raw, &onsets, runs, context));
     }
-    built.sort_by(|a, b| rank(&a.0, &b.0));
+    built.sort_by(|a, b| rank(&a.change, &b.change));
     let truncated = built.len() > MAX_CHANGES_PER_AGENT;
     built.truncate(MAX_CHANGES_PER_AGENT);
     // The path shift across each reported configuration change: a fixed
     // split (the change's own), so its permutation test needs no correction
     // — and it is run only for the changes reported.
     let mut changes = Vec::with_capacity(built.len());
-    for (mut change, left, right) in built {
+    let mut targets = Vec::with_capacity(built.len());
+    for Built {
+        mut change,
+        left,
+        right,
+        target,
+    } in built
+    {
         if change.behavior_shift.is_none()
             && left.len() >= MIN_RUNS_PER_SIDE
             && right.len() >= MIN_RUNS_PER_SIDE
@@ -2388,9 +2404,10 @@ fn analyse(
             });
         }
         changes.push(change);
+        targets.push(target);
     }
     let summary = summarize(agent, runs.len(), &changes, &volatile);
-    Ok(AgentChanges {
+    let timeline = AgentChanges {
         agent: agent.to_owned(),
         tenant: tenant.to_owned(),
         runs: runs.len(),
@@ -2402,7 +2419,20 @@ fn analyse(
         changes,
         truncated,
         unnamed: false,
-    })
+    };
+    Ok((timeline, targets))
+}
+
+/// A change point as built, before ranking.
+struct Built {
+    change: Change,
+    /// The two sides' paths, nearest the change, for the shift test.
+    left: Vec<u32>,
+    right: Vec<u32>,
+    /// The identity of the value the change introduced (`None` for
+    /// behaviour): the change's `to` is only its display, which two values
+    /// can share, so a run is placed downstream by this.
+    target: Option<u32>,
 }
 
 /// One change point with its sides, deltas, verdict and detail — and the
@@ -2415,7 +2445,7 @@ fn build_change(
     onsets: &[usize],
     runs: &[&RunView],
     context: &Context<'_>,
-) -> (Change, Vec<u32>, Vec<u32>) {
+) -> Built {
     let change = &raw[position];
     let onset = change.onset;
     // Co-changes are neighbours in onset order.
@@ -2467,6 +2497,7 @@ fn build_change(
         .map(|run| run.path)
         .collect();
 
+    let target = (change.dimension != Dimension::Behavior).then_some(change.to);
     let (from, to, detail) = match change.dimension {
         Dimension::Behavior => {
             let (from, to, rows) = path_detail(&before, &after, context);
@@ -2481,7 +2512,7 @@ fn build_change(
             )
         }
     };
-    let change = Change {
+    let built = Change {
         at_ns: runs[onset].start_ns,
         dimension: change.dimension,
         from,
@@ -2510,7 +2541,12 @@ fn build_change(
                 .collect(),
         },
     };
-    (change, left, right)
+    Built {
+        change: built,
+        left,
+        right,
+        target,
+    }
 }
 
 /// One metric's test, for the verdict.
@@ -5473,5 +5509,58 @@ mod tests {
             "{:?}",
             run.fingerprint
         );
+    }
+
+    #[test]
+    fn a_straggler_is_placed_by_the_value_it_ran_on_not_by_how_it_reads() {
+        // Two model ids that differ only past the 160 characters a value is
+        // shown by: compared by digest, shown alike.
+        let prefix = "p".repeat(170);
+        let (old, new) = (format!("{prefix}-old"), format!("{prefix}-new"));
+        let fixture = TempStore::open("radar-straggler", crate::Config::default());
+        let store = fixture.store();
+        let mut spans = Vec::new();
+        for index in 0..120u64 {
+            // Run 90 is a straggler still on the old model.
+            let model = if index < 60 || index == 90 {
+                &old
+            } else {
+                &new
+            };
+            spans.extend(simple_run(
+                "long-bot",
+                &format!("long-{index:03}"),
+                BASE + index * MINUTE,
+                model,
+                "Prompt.",
+                0,
+                false,
+            ));
+        }
+        store.ingest_batch(spans).expect("ingests");
+        let report = store.changes(None, &query(), NOW).expect("analyses");
+        let change = find(&report, Dimension::ModelRequested).expect("the switch is found");
+        assert_eq!(change.at_ns, BASE + 60 * MINUTE);
+        assert_eq!(change.from, change.to, "the two values read alike");
+        let placed = |run: &str| {
+            let question = ChangeQuery {
+                run: Some(run.to_owned()),
+                ..query()
+            };
+            let run = store
+                .changes(None, &question, NOW)
+                .expect("analyses")
+                .run
+                .expect("placed");
+            run.downstream_of
+                .iter()
+                .map(|change| change.dimension)
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            !placed("long-090").contains(&Dimension::ModelRequested),
+            "the straggler ran on the old model"
+        );
+        assert!(placed("long-091").contains(&Dimension::ModelRequested));
     }
 }

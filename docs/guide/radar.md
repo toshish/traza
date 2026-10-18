@@ -118,9 +118,15 @@ curl 'http://127.0.0.1:8080/v1/changes?run=ticket-076'
 top-level `path`. `downstream_of` lists, for each dimension, the latest
 change point at or before the run's start whose new value the run carries,
 regressions first. A run that still carries an old value (a straggler on the
-previous version) is not downstream of that change. For a `behavior` change,
-any run that started after it counts as downstream. `downstream_of` is empty
-when the run used values older than every change in the window.
+previous version) is not downstream of that change. "Carries" compares the
+value's identity (its digest), not the text shown: two values longer than
+160 characters that differ only past them read alike in `fingerprint` and in
+a change's `from` and `to`, but a straggler on one is never placed
+downstream of a change to the other. A run whose set of values is
+incomplete (more than four values of a dimension) is downstream of no change
+of that dimension. For a `behavior` change, any run that started after it
+counts as downstream. `downstream_of` is empty when the run used values
+older than every change in the window.
 
 A run that is not among the window's agent runs gets `404`. A run that is,
 but that `agent=` or `environment=` excludes, gets `400` saying which filter
