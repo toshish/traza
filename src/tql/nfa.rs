@@ -17,13 +17,19 @@
 //! `steps × live paths` rather than exponential, and why the answer equals
 //! the backtracking one exactly (the property tests below check that
 //! against a literal backtracking reference on random patterns and runs).
-//! Paths are capped at [`MAX_THREADS`] per step; past the cap the
-//! lowest-priority paths are dropped and the result says `inexact`.
+//! Paths are capped at [`MAX_THREADS`] per step, the environments one
+//! evaluation may fork at what the next step's list still has room for, and
+//! the states a list remembers at [`MAX_SEEN`]; past any cap the
+//! lowest-priority alternatives are dropped and the result says `inexact`.
+//! All the work — paths advanced, states reached, environments forked,
+//! regex instructions stepped — is charged to one [`Meter`], which checks
+//! the query deadline in proportion to it.
 
 use std::collections::HashSet;
 use std::rc::Rc;
 
 use super::ast::{Atom, Gap, Node, Pred};
+use super::meter::{Meter, PATH_UNITS, STATE_UNITS};
 use super::step::{atom_uses_captures, eval_atom, pred_uses_captures, test_pred, Env, Step};
 use super::Within;
 use crate::{Deadline, Result};
@@ -35,11 +41,14 @@ pub(crate) const MAX_PROGRAM: usize = 20_000;
 /// Live paths kept per step of the run.
 pub(crate) const MAX_THREADS: usize = 4096;
 
-/// Path evaluations between two deadline checks. Counted per path rather
-/// than per position, because one position can hold thousands of live paths,
-/// each evaluating predicates (regexes over up to 64 KiB of text included):
-/// the budget must be consulted in proportion to the work, not the steps.
-const DEADLINE_CHECK_WORK: usize = 512;
+/// States (instruction, captures, start) one list remembers at most when
+/// captures or `within` key them. Each live path passes through a handful of
+/// states between two steps, so this leaves room for every path the list can
+/// hold while bounding what a flood of distinct captures can allocate.
+pub(crate) const MAX_SEEN: usize = 16 * MAX_THREADS;
+
+/// Bytes of an environment hashed per unit of work.
+const HASH_BYTES_PER_UNIT: u64 = 64;
 
 #[derive(Clone, Debug)]
 pub(crate) enum Inst {
@@ -306,18 +315,45 @@ impl Seen {
         }
     }
 
-    fn insert(&mut self, pc: usize, start: usize, env: &Env) -> bool {
+    fn contains(&self, pc: usize, start: usize, env: &Env) -> bool {
+        match self {
+            Seen::Dense { stamp, generation } => stamp[pc] == *generation,
+            Seen::Hashed(set) => set.contains(&(pc, start, env.clone())),
+        }
+    }
+
+    fn insert(&mut self, pc: usize, start: usize, env: &Env) -> Inserted {
         match self {
             Seen::Dense { stamp, generation } => {
                 if stamp[pc] == *generation {
-                    return false;
+                    return Inserted::Known;
                 }
                 stamp[pc] = *generation;
-                true
+                Inserted::New
             }
-            Seen::Hashed(set) => set.insert((pc, start, env.clone())),
+            Seen::Hashed(set) => {
+                let key = (pc, start, env.clone());
+                if set.contains(&key) {
+                    Inserted::Known
+                } else if set.len() >= MAX_SEEN {
+                    Inserted::Full
+                } else {
+                    set.insert(key);
+                    Inserted::New
+                }
+            }
         }
     }
+}
+
+/// What remembering a state did.
+#[derive(Debug, PartialEq, Eq)]
+enum Inserted {
+    New,
+    /// Already held: a higher-priority path got there first.
+    Known,
+    /// Not held, and no room to remember it ([`MAX_SEEN`]).
+    Full,
 }
 
 struct List {
@@ -364,21 +400,42 @@ impl Program {
     }
 
     /// Adds `thread` and every state reachable from it without consuming a
-    /// step, in priority order.
+    /// step, in priority order. A state the list has no room for — its paths
+    /// are full, or it cannot remember another state — is dropped, and the
+    /// meter says so; nothing is remembered for it, so a flood of distinct
+    /// captures allocates no more than the caps.
     fn add(
         &self,
         list: &mut List,
         thread: Thread,
         position: usize,
         steps: usize,
-        inexact: &mut bool,
-    ) {
+        meter: &mut Meter,
+    ) -> Result<()> {
         let keyed_start = self.within.is_some();
+        // Every state of one closure shares the thread's captures: what
+        // remembering one costs is fixed for the call.
+        let units = match list.seen {
+            Seen::Dense { .. } => STATE_UNITS,
+            Seen::Hashed(_) => STATE_UNITS + thread.env.weight() / HASH_BYTES_PER_UNIT,
+        };
         let mut stack = vec![thread];
         while let Some(thread) = stack.pop() {
+            meter.charge(units)?;
             let start = if keyed_start { thread.start } else { 0 };
-            if !list.seen.insert(thread.pc, start, &thread.env) {
+            if list.threads.len() >= MAX_THREADS {
+                if !list.seen.contains(thread.pc, start, &thread.env) {
+                    meter.dropped = true;
+                }
                 continue;
+            }
+            match list.seen.insert(thread.pc, start, &thread.env) {
+                Inserted::New => {}
+                Inserted::Known => continue,
+                Inserted::Full => {
+                    meter.dropped = true;
+                    continue;
+                }
             }
             match self.insts[thread.pc] {
                 Inst::Jmp(target) => stack.push(Thread {
@@ -411,18 +468,15 @@ impl Program {
                         });
                     }
                 }
-                Inst::Consume { .. } | Inst::Match => {
-                    if list.threads.len() >= MAX_THREADS {
-                        *inexact = true;
-                    } else {
-                        list.threads.push(thread);
-                    }
-                }
+                Inst::Consume { .. } | Inst::Match => list.threads.push(thread),
             }
         }
+        Ok(())
     }
 
-    /// Evaluates test `id` on `step` for a path holding `env`.
+    /// Evaluates test `id` on `step` for a path holding `env`, pushing at
+    /// most `limit` environments onto `out`.
+    #[allow(clippy::too_many_arguments)]
     fn evaluate(
         &self,
         id: usize,
@@ -430,45 +484,60 @@ impl Program {
         env: &Env,
         memo: &mut [Option<bool>],
         out: &mut Vec<Env>,
-    ) {
+        limit: usize,
+        meter: &mut Meter,
+    ) -> Result<()> {
         let test = &self.tests[id];
         if test.pure {
-            let holds = *memo[id].get_or_insert_with(|| match &test.kind {
-                TestKind::Atom(atom) => {
-                    let mut scratch = Vec::new();
-                    eval_atom(atom, step, env, &mut scratch);
-                    !scratch.is_empty()
+            let holds = match memo[id] {
+                Some(holds) => holds,
+                None => {
+                    let holds = match &test.kind {
+                        TestKind::Atom(atom) => {
+                            // A pure atom forks nothing: one environment at most.
+                            let mut scratch = Vec::new();
+                            eval_atom(atom, step, env, &mut scratch, 1, meter)?;
+                            !scratch.is_empty()
+                        }
+                        TestKind::Gap(pred) => match pred {
+                            Some(pred) => test_pred(pred, step, env, meter)?,
+                            None => true,
+                        },
+                    };
+                    memo[id] = Some(holds);
+                    holds
                 }
-                TestKind::Gap(pred) => pred
-                    .as_ref()
-                    .map_or(true, |pred| test_pred(pred, step, env)),
-            });
+            };
             if holds {
-                out.push(env.clone());
+                if out.len() < limit {
+                    out.push(env.clone());
+                } else {
+                    meter.dropped = true;
+                }
             }
-            return;
+            return Ok(());
         }
         match &test.kind {
-            TestKind::Atom(atom) => eval_atom(atom, step, env, out),
+            TestKind::Atom(atom) => eval_atom(atom, step, env, out, limit, meter)?,
             TestKind::Gap(pred) => {
-                if pred
-                    .as_ref()
-                    .map_or(true, |pred| test_pred(pred, step, env))
-                {
-                    out.push(env.clone());
+                let holds = match pred {
+                    Some(pred) => test_pred(pred, step, env, meter)?,
+                    None => true,
+                };
+                if holds {
+                    if out.len() < limit {
+                        out.push(env.clone());
+                    } else {
+                        meter.dropped = true;
+                    }
                 }
             }
         }
+        Ok(())
     }
 
     /// The leftmost-first match starting at or after `from`.
-    fn find(
-        &self,
-        steps: &[Step<'_>],
-        from: usize,
-        inexact: &mut bool,
-        deadline: Option<Deadline>,
-    ) -> Result<Option<Found>> {
+    fn find(&self, steps: &[Step<'_>], from: usize, meter: &mut Meter) -> Result<Option<Found>> {
         let n = steps.len();
         let mut current = List {
             threads: Vec::new(),
@@ -482,7 +551,6 @@ impl Program {
         let mut envs = Vec::new();
         let mut best: Option<Found> = None;
         let mut position = from;
-        let mut work = 0_usize;
         loop {
             if best.is_none() && position < n {
                 let seed = Thread {
@@ -491,14 +559,11 @@ impl Program {
                     start: position,
                     path: None,
                 };
-                self.add(&mut current, seed, position, n, inexact);
+                self.add(&mut current, seed, position, n, meter)?;
             }
             memo.iter_mut().for_each(|slot| *slot = None);
             for thread in std::mem::take(&mut current.threads) {
-                work += 1;
-                if work % DEADLINE_CHECK_WORK == 0 {
-                    Deadline::check(deadline, 0)?;
-                }
+                meter.charge(PATH_UNITS)?;
                 match self.insts[thread.pc] {
                     Inst::Match => {
                         // Every lower-priority path is cut; higher-priority
@@ -516,7 +581,18 @@ impl Program {
                             continue;
                         }
                         envs.clear();
-                        self.evaluate(test, &steps[position], &thread.env, &mut memo, &mut envs);
+                        // An evaluation may fork no more paths than the next
+                        // step's list still has room for.
+                        let room = MAX_THREADS.saturating_sub(next.threads.len());
+                        self.evaluate(
+                            test,
+                            &steps[position],
+                            &thread.env,
+                            &mut memo,
+                            &mut envs,
+                            room,
+                            meter,
+                        )?;
                         for env in envs.drain(..) {
                             let path = if record {
                                 Some(Rc::new(PathNode {
@@ -532,7 +608,7 @@ impl Program {
                                 start: thread.start,
                                 path,
                             };
-                            self.add(&mut next, advanced, position + 1, n, inexact);
+                            self.add(&mut next, advanced, position + 1, n, meter)?;
                         }
                     }
                     _ => {}
@@ -553,7 +629,7 @@ impl Program {
     }
 
     /// Every non-overlapping match, keeping the first `keep` and counting up
-    /// to `max_count`.
+    /// to `max_count`. All the work is charged against `deadline`.
     pub(crate) fn scan(
         &self,
         steps: &[Step<'_>],
@@ -561,12 +637,14 @@ impl Program {
         max_count: usize,
         deadline: Option<Deadline>,
     ) -> Result<Scan> {
+        let mut meter = Meter::new(deadline);
         let mut scan = Scan::default();
         let mut from = 0;
         while from < steps.len() {
-            let Some(found) = self.find(steps, from, &mut scan.inexact, deadline)? else {
+            let Some(found) = self.find(steps, from, &mut meter)? else {
                 break;
             };
+            meter.charge(PATH_UNITS)?;
             scan.count += 1;
             from = found.end + 1;
             if scan.found.len() < keep {
@@ -576,16 +654,11 @@ impl Program {
                 scan.count_capped = from < steps.len();
                 break;
             }
-            // Many short matches each do little work inside `find`; the
-            // budget is consulted across them too.
-            if scan.count % 64 == 0 {
-                Deadline::check(deadline, 0)?;
-            }
         }
+        scan.inexact = meter.dropped;
         Ok(scan)
     }
 }
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::super::ast::{Atom, Node};
@@ -655,7 +728,15 @@ pub(crate) mod tests {
                 return None;
             }
             let mut envs = Vec::new();
-            eval_atom(atom, &steps[at], env, &mut envs);
+            eval_atom(
+                atom,
+                &steps[at],
+                env,
+                &mut envs,
+                usize::MAX,
+                &mut Meter::new(None),
+            )
+            .expect("no deadline");
             for next in envs {
                 path.push(at);
                 if let Some(found) = k(at + 1, &next, path) {
@@ -684,10 +765,9 @@ pub(crate) mod tests {
             if gap.max.is_some_and(|max| count >= max) || at >= steps.len() {
                 return None;
             }
-            let passes = gap
-                .pred
-                .as_ref()
-                .map_or(true, |pred| test_pred(pred, &steps[at], env));
+            let passes = gap.pred.as_ref().map_or(true, |pred| {
+                test_pred(pred, &steps[at], env, &mut Meter::new(None)).expect("no deadline")
+            });
             if !passes {
                 return None;
             }
@@ -970,6 +1050,54 @@ pub(crate) mod tests {
         let scan = query.program.scan(&steps, 10, 10, None).expect("scans");
         assert!(scan.inexact, "dropping paths must be flagged");
         assert_eq!(scan.count, 0);
+    }
+
+    #[test]
+    fn a_full_list_remembers_nothing_new_and_says_so() {
+        let query = query("tool[file=@f] (..> tool(a) | ..> tool(b))");
+        let program = &query.program;
+        let thread = |n: usize| Thread {
+            pc: 1,
+            env: Env::new(1).with_slot_for_tests(0, &format!("f{n}")),
+            start: 0,
+            path: None,
+        };
+        // Remembered states are capped: past MAX_SEEN a new one is refused.
+        let mut seen = Seen::new(program);
+        for n in 0..MAX_SEEN {
+            assert_eq!(seen.insert(1, 0, &thread(n).env), Inserted::New);
+        }
+        assert_eq!(seen.insert(1, 0, &thread(0).env), Inserted::Known);
+        assert_eq!(seen.insert(1, 0, &thread(MAX_SEEN).env), Inserted::Full);
+
+        // A list that cannot remember a state drops it, and says so.
+        let mut list = List {
+            threads: Vec::new(),
+            seen,
+        };
+        let mut meter = Meter::new(None);
+        program
+            .add(&mut list, thread(MAX_SEEN + 1), 1, 2, &mut meter)
+            .expect("no deadline");
+        assert!(list.threads.is_empty());
+        assert!(meter.dropped);
+
+        // A list whose paths are full takes no more, remembers nothing for
+        // them, and says so.
+        let mut list = List {
+            threads: (0..MAX_THREADS).map(thread).collect(),
+            seen: Seen::new(program),
+        };
+        let mut meter = Meter::new(None);
+        program
+            .add(&mut list, thread(MAX_THREADS), 1, 2, &mut meter)
+            .expect("no deadline");
+        assert_eq!(list.threads.len(), MAX_THREADS);
+        assert!(meter.dropped);
+        let Seen::Hashed(set) = &list.seen else {
+            panic!("captures key the states");
+        };
+        assert!(set.is_empty(), "nothing remembered for a dropped state");
     }
 
     #[test]

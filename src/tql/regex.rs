@@ -33,6 +33,8 @@
 use std::fmt;
 use std::sync::Arc;
 
+use super::meter::Meter;
+
 /// Largest compiled program a pattern may produce. Repetition counts expand
 /// the program, so this bounds both memory and the per-character cost.
 pub(crate) const MAX_PROGRAM: usize = 4096;
@@ -139,15 +141,31 @@ impl Regex {
         &self.source
     }
 
-    /// Whether `text` contains a match.
-    pub(crate) fn is_match(&self, text: &str) -> bool {
+    /// Instructions in the compiled program: the per-character cost bound a
+    /// query's regex budget counts.
+    pub(crate) fn size(&self) -> usize {
+        self.inner.program.len()
+    }
+
+    /// Whether `text` contains a match. The work — `text length × live
+    /// instructions` — is charged to `meter`, so a heavy pattern over a long
+    /// text stops at the query deadline rather than past it.
+    pub(crate) fn is_match(&self, text: &str, meter: &mut Meter) -> crate::Result<bool> {
         let compiled = &*self.inner;
         if let Some(literal) = &compiled.literal {
-            return text.contains(literal.as_str());
+            meter.charge(text.len() as u64 / LITERAL_BYTES_PER_UNIT + 1)?;
+            return Ok(text.contains(literal.as_str()));
         }
-        simulate(compiled, text)
+        simulate(compiled, text, meter)
     }
 }
+
+/// Bytes a substring search covers per unit of work.
+const LITERAL_BYTES_PER_UNIT: u64 = 4;
+
+/// Units a simulation accumulates before charging them, so the meter is not
+/// consulted on every character.
+const CHARGE_BATCH: u64 = 1 << 14;
 
 // ------------------------------------------------------------------ syntax
 
@@ -746,7 +764,7 @@ fn closure(
     matched
 }
 
-fn simulate(compiled: &Compiled, text: &str) -> bool {
+fn simulate(compiled: &Compiled, text: &str, meter: &mut Meter) -> crate::Result<bool> {
     let program = &compiled.program;
     let mut current = PcSet::new(program.len());
     let mut next = PcSet::new(program.len());
@@ -754,6 +772,8 @@ fn simulate(compiled: &Compiled, text: &str) -> bool {
     let mut stack = Vec::new();
     let mut before: Option<char> = None;
     let mut chars = text.chars().peekable();
+    // Setting up the two sets is proportional to the program.
+    let mut unbilled = program.len() as u64;
     loop {
         let after = chars.peek().copied();
         current.clear();
@@ -761,14 +781,23 @@ fn simulate(compiled: &Compiled, text: &str) -> bool {
         // thread starting here: the search is unanchored.
         for pc in pending.drain(..) {
             if closure(program, &mut current, &mut stack, pc, before, after) {
-                return true;
+                meter.charge(unbilled)?;
+                return Ok(true);
             }
         }
         if closure(program, &mut current, &mut stack, 0, before, after) {
-            return true;
+            meter.charge(unbilled)?;
+            return Ok(true);
+        }
+        // This character's cost: every state the closures reached.
+        unbilled += current.dense.len() as u64 + 1;
+        if unbilled >= CHARGE_BATCH {
+            meter.charge(unbilled)?;
+            unbilled = 0;
         }
         let Some(c) = after else {
-            return false;
+            meter.charge(unbilled)?;
+            return Ok(false);
         };
         chars.next();
         let folded = if compiled.case_insensitive {
@@ -799,7 +828,8 @@ mod tests {
     fn matches(pattern: &str, text: &str) -> bool {
         Regex::new(pattern)
             .unwrap_or_else(|error| panic!("{pattern}: {error:?}"))
-            .is_match(text)
+            .is_match(text, &mut Meter::new(None))
+            .expect("no deadline")
     }
 
     #[test]
@@ -909,6 +939,35 @@ mod tests {
         assert!(error.message.contains("expands past"), "{error:?}");
         let long = "a".repeat(MAX_PATTERN_CHARS + 1);
         assert!(Regex::new(&long).is_err());
+    }
+
+    #[test]
+    fn the_work_is_charged_and_the_deadline_honoured() {
+        let text = "a".repeat(64 * 1024);
+        let heavy = Regex::new(r"(?:[^\x00]{255}){16}\x00").expect("compiles");
+        assert!(heavy.size() > 4000);
+        // Charged by characters × live instructions, not by calls.
+        let light = Regex::new("a+b").expect("compiles");
+        let mut meter = Meter::new(None);
+        assert!(!light.is_match(&text, &mut meter).expect("no deadline"));
+        assert!(meter.spent() >= text.len() as u64, "{}", meter.spent());
+        let literal = Regex::new("needle").expect("compiles");
+        let mut meter = Meter::new(None);
+        assert!(!literal.is_match(&text, &mut meter).expect("no deadline"));
+        assert!(meter.spent() >= text.len() as u64 / LITERAL_BYTES_PER_UNIT);
+        // A spent deadline stops a heavy match partway instead of after it.
+        let expired =
+            crate::Deadline::starting(std::time::Instant::now(), Some(std::time::Duration::ZERO));
+        let mut meter = Meter::new(expired);
+        match heavy.is_match(&text, &mut meter) {
+            Err(crate::Error::DeadlineExceeded(_)) => {}
+            other => panic!("expected a deadline refusal, got {other:?}"),
+        }
+        assert!(
+            meter.spent() < 1 << 20,
+            "stopped within a check of the deadline, not at the end ({})",
+            meter.spent()
+        );
     }
 
     #[test]
@@ -1024,7 +1083,13 @@ mod tests {
             let text_chars: Vec<char> = text.chars().collect();
             let expected = (0..=text_chars.len())
                 .any(|start| reference(&node, &text_chars, start, &mut |_| true));
-            assert_eq!(regex.is_match(&text), expected, "{source} on {text:?}");
+            assert_eq!(
+                regex
+                    .is_match(&text, &mut Meter::new(None))
+                    .expect("no deadline"),
+                expected,
+                "{source} on {text:?}"
+            );
         }
     }
 }

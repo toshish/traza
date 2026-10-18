@@ -72,11 +72,13 @@ pub const DETECTORS: &[Detector] = &[
     },
     Detector {
         name: "give_up_loop",
-        title: "Failed the same tool three times, then gave up",
+        title: "Failed the same tool call three times, then gave up",
         severity: Severity::Medium,
-        summary: "The same tool fails at least 3 times with no success of it in between, and \
-                  the run ends on a model answer without that tool ever succeeding.",
-        query: "tool(@t)[error] (..[not (name=@t and not error)]> tool(@t)[error]){2,} \
+        summary: "The same tool call — same tool, same input (its fingerprint) — fails at least \
+                  3 times, that tool never succeeds in between or afterwards, and the run ends \
+                  on a model answer.",
+        query: "tool(@t)[error, fingerprint=@c] \
+                (..[not (name=@t and not error)]> tool[error, fingerprint=@c]){2,} \
                 ..[not (name=@t and not error)]> llm$",
     },
     Detector {
@@ -271,6 +273,38 @@ mod tests {
             0,
             "a success breaks the loop"
         );
+        // Three different failing commands through one tool are not one
+        // call failing three times.
+        let different = vec![
+            bash(0, "ls missing", "error"),
+            bash(1, "cat nope", "error"),
+            bash(2, "make", "error"),
+            llm(3, json!({})),
+        ];
+        assert_eq!(fires("give_up_loop", &different), 0);
+        // The same call, with other failing calls of the tool between.
+        let interleaved = vec![
+            bash(0, "make", "error"),
+            bash(1, "ls", "error"),
+            bash(2, "make", "error"),
+            bash(3, "make", "error"),
+            llm(4, json!({})),
+        ];
+        assert_eq!(fires("give_up_loop", &interleaved), 1);
+    }
+
+    #[test]
+    fn test_tampering_ignores_a_runner_named_outside_a_command_position() {
+        // No test ever passed: installing a pytest plugin is not a test run.
+        let spans = vec![
+            bash(0, "pytest -q", "error"),
+            edit(1, "tests/test_a.py"),
+            bash(2, "pip install pytest-xdist", "ok"),
+        ];
+        assert_eq!(fires("test_tampering", &spans), 0);
+        let mut passed = spans.clone();
+        passed.push(bash(3, "python -m pytest -q", "ok"));
+        assert_eq!(fires("test_tampering", &passed), 1);
     }
 
     #[test]

@@ -410,6 +410,119 @@ fn the_detector_library_and_its_findings() {
     assert_eq!(one["detectors"].as_array().map(Vec::len), Some(1));
 }
 
+/// About 4,080 regex instructions, all live on every character of a text
+/// without a NUL: seconds of work over 64 KiB, even in a release build.
+const HEAVY: &str = r#"(?:[^\x00]{255}){16}\x00"#;
+
+#[test]
+fn hostile_queries_and_data_stay_bounded() {
+    let server = Server::spawn(&[]);
+    let mut spans = Vec::new();
+    // A model call offering 64 tools: five captures over its catalog are
+    // 64^5 combinations.
+    let mut wide = run("", "wide", 0);
+    let catalog: Vec<String> = (0..64).map(|i| format!("tool_{i}")).collect();
+    let catalog: Vec<&str> = catalog.iter().map(String::as_str).collect();
+    spans.push(wide.llm(&catalog));
+    // A command of 5 KiB, captured.
+    let mut long = run("", "long", 100);
+    let command = format!("pytest {}", "x".repeat(5_000));
+    spans.push(long.bash(&command, "ok"));
+    // A failed test, a test-file edit, then a plugin install: no test ever
+    // passed, so this is not test tampering.
+    let mut install = run("", "install", 200);
+    spans.push(install.bash("pytest -q", "error"));
+    spans.push(install.edit("tests/test_a.py"));
+    spans.push(install.bash("pip install pytest-xdist", "ok"));
+    spans.push(install.llm(&["Bash", "Edit"]));
+    // A span whose session id claims the `trace:` form with no trace.
+    let mut poisoned = run("", "trace:", 300);
+    spans.push(poisoned.bash("ls", "ok"));
+    let (status, body) = server.json("POST", "/v1/spans", Some(&json!(spans)), &[]);
+    assert_eq!(status, 200, "{body}");
+
+    // The fan-out is cut at the path cap and flagged, promptly.
+    let started = std::time::Instant::now();
+    let (status, body) = search(
+        &server,
+        "llm[offered=@a, offered=@b, offered=@c, offered=@d, offered=@e]",
+        "",
+        &[],
+    );
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
+    // `install` offers two tools (32 combinations, all kept); `wide` 64.
+    assert_eq!(runs(&body), ["install", "wide"]);
+    assert_eq!(body["matches"][0]["inexact"], json!(false), "{body}");
+    assert_eq!(body["matches"][1]["inexact"], json!(true), "{body}");
+
+    // The poisoned span is left out and counted; the search answers.
+    assert_eq!(body["spans_skipped"], json!(1), "{body}");
+    let (status, findings) = server.json(
+        "GET",
+        &format!("/v1/detectors/findings?since={}", T0 - 1),
+        None,
+        &[],
+    );
+    assert_eq!(status, 200, "{findings}");
+    assert_eq!(findings["spans_skipped"], json!(1));
+    assert_eq!(findings["runs_checked"], json!(3));
+    let tampering = findings["detectors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == json!("test_tampering"))
+        .expect("row");
+    assert_eq!(
+        tampering["runs_matched"],
+        json!(0),
+        "installing pytest is not a passing test run"
+    );
+
+    // Captured values come back cut to 1 KiB, and say so.
+    let (status, body) = search(&server, "tool[args=@a]", "&run=long", &[]);
+    assert_eq!(status, 200, "{body}");
+    let captured = body["matches"][0]["captures"]["a"].as_str().expect("text");
+    assert_eq!(captured.len(), 1024);
+    assert_eq!(body["matches"][0]["captures_truncated"], json!(true));
+
+    // A query holds at most 8192 regex instructions, refused at the column
+    // of the regex that crosses it.
+    let three = format!("tool[args~\"{HEAVY}\" or result~\"{HEAVY}\" or span~\"{HEAVY}\"]");
+    let (status, body) = search(&server, &three, "", &[]);
+    assert_eq!(status, 400, "{body}");
+    let column = three.rfind("~\"").unwrap() + 3;
+    assert_eq!(body["column"], json!(column), "{body}");
+}
+
+#[test]
+fn a_heavy_regex_stops_at_the_query_deadline() {
+    let server = Server::spawn(&["--query-deadline-ms", "1000"]);
+    let mut heavy = run("", "heavy", 0);
+    let spans = vec![heavy.bash(&"a".repeat(64 * 1024), "ok")];
+    let (status, body) = server.json("POST", "/v1/spans", Some(&json!(spans)), &[]);
+    assert_eq!(status, 200, "{body}");
+    let query = format!("tool[args~\"{HEAVY}\" or args~\"{HEAVY}y\"]");
+    let started = std::time::Instant::now();
+    let (status, body) = search(&server, &query, "", &[]);
+    let elapsed = started.elapsed();
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["stopped"], json!("deadline"), "{body}");
+    assert_eq!(body["truncated"], json!(true));
+    assert_eq!(body["runs_scanned"], json!(0));
+    assert_eq!(body["next_until_ns"], json!(T0));
+    // The two regexes alone take several seconds; the request ends within a
+    // sliver of its one-second budget.
+    assert!(
+        elapsed < std::time::Duration::from_millis(2_500),
+        "answered after {elapsed:?}"
+    );
+}
+
 #[test]
 fn a_bound_credential_sees_only_its_tenant() {
     let server = Server::spawn_with_env(

@@ -270,7 +270,10 @@ runs newest first, so where the compute budget runs out it returns what it
 found, with a headline that says `STOPPED EARLY`, how many candidate runs
 were left unchecked — those runs are all older than every run it did check —
 and the `until` to call again with to continue (`next_until_ns` in structured
-content).
+content). The same `until` is offered when the window held more runs than
+are considered. Captured values are cut to 120 characters in the text and to
+1 KiB in `structuredContent` (`captures_truncated` says so); spans whose run
+id does not read back to them are left out and counted in the headline.
 Enumerating the window is still all-or-nothing.
 
 ### Arguments

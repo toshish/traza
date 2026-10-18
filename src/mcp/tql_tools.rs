@@ -199,8 +199,21 @@ pub(super) fn call(
     }
     if result.window_capped {
         head.push_str(&format!(
-            "\nThe window held more runs than are considered; only the {} most recent were.",
-            result.runs_in_window
+            "\nThe window held more runs than are considered; only the {} most recent were.{}",
+            result.runs_in_window,
+            if result.stopped.is_none() {
+                resume.as_str()
+            } else {
+                ""
+            }
+        ));
+    }
+    if result.spans_skipped > 0 || result.runs_skipped > 0 {
+        head.push_str(&format!(
+            "\nLeft out: {} and {} whose run id does not read back to them (a session id of \
+             the form trace:<id> naming another trace).",
+            count(result.spans_skipped as u64, "span"),
+            count(result.runs_skipped as u64, "run"),
         ));
     }
     let rows: Vec<String> = result
@@ -305,6 +318,9 @@ fn match_line(index: usize, found: &RunMatch) -> String {
             })
             .collect();
         line.push_str(&format!(" · {}", captures.join(" ")));
+        if found.captures_truncated {
+            line.push_str(" (values cut to their first KiB)");
+        }
     }
     if found.run_truncated {
         line.push_str(" · TRUNCATED: only the run's beginning was read");
@@ -369,7 +385,8 @@ fn output_schema() -> Value {
             "matches": {
                 "type": "array",
                 "description": "Matching runs, most recent first: run, tenant, agent, outcome, \
-                                spans (trace_id, span_id, step_index, kind, name), captures, \
+                                spans (trace_id, span_id, step_index, kind, name), captures \
+                                (each value cut to 1 KiB; captures_truncated says so), \
                                 first_step, last_step, count, steps, run_truncated, inexact.",
             },
             "query": {"type": "string", "description": "The pattern as read."},
@@ -378,7 +395,9 @@ fn output_schema() -> Value {
             "stopped": {"type": ["string", "null"]},
             "next_until_ns": {
                 "type": ["integer", "null"],
-                "description": "When stopped early: pass as 'until' to continue with older runs.",
+                "description": "When runs went unchecked (stopped early, or more runs in the \
+                                window than are considered): pass as 'until' to continue with \
+                                older runs.",
             },
             "detectors": {
                 "type": "array",
@@ -511,6 +530,25 @@ mod tests {
         assert!(message.contains("column 6"), "{message}");
         assert!(message.contains("did you mean `status`"), "{message}");
         assert!(message.contains("\n     ^"), "{message}");
+    }
+
+    #[test]
+    fn an_unreadable_run_id_is_left_out_and_said_so() {
+        let fixture = seeded("mcp-tql-poisoned");
+        let mut poisoned = bash("", "trace:", "p", 20, "x", "error");
+        poisoned.trace_id = "tr-poisoned".into();
+        fixture
+            .store()
+            .ingest_batch(vec![poisoned])
+            .expect("ingests");
+        let result = call(fixture.store(), json!({"query": "tool[error]"}), Some(""));
+        assert_eq!(result["isError"], json!(false), "{result}");
+        let body = text(&result);
+        assert!(body.contains("Left out: 1 span"), "{body}");
+        assert_eq!(
+            result["structuredContent"]["matches"][0]["run"],
+            json!("streak")
+        );
     }
 
     #[test]

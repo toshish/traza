@@ -26,17 +26,23 @@
 //! On the store, [`Store::trajectory_search`] runs one query over the most
 //! recent runs of a window and [`Store::detector_findings`] runs the whole
 //! library. Both are bounded at every stage — candidate runs, spans per
-//! run, matches kept, paths per step — and spend ONE compute budget
-//! ([`crate::Config::query_deadline`]): enumerating the window's runs
-//! refuses when the budget is gone, while scanning them (most recent first)
-//! stops where the budget ran out and says so (`stopped: "deadline"`), so a
-//! partial answer is never mistaken for a complete one.
+//! run, text per field, regex instructions per query, environments per
+//! evaluation, paths and remembered states per step, matches kept — and
+//! spend ONE compute budget ([`crate::Config::query_deadline`]):
+//! enumerating the window's runs refuses when the budget is gone, while
+//! scanning them (most recent first) stops where the budget ran out and
+//! says so (`stopped: "deadline"`), so a partial answer is never mistaken
+//! for a complete one. Inside a run the matcher charges its work — paths
+//! advanced, environments forked, regex instructions stepped over text —
+//! to a meter that consults the deadline in proportion (`meter`), so no
+//! predicate or capture can run past the budget.
 //!
 //! Everything is deterministic computation over stored spans: no model is
 //! called, nothing leaves the process. The guide is `docs/guide/tql.md`.
 
 mod ast;
 pub mod detectors;
+mod meter;
 mod nfa;
 mod parse;
 mod regex;
@@ -85,6 +91,10 @@ pub const MAX_MATCH_SPANS: usize = 100;
 
 /// Example runs listed per detector.
 pub const MAX_DETECTOR_EXAMPLES: usize = 5;
+
+/// Bytes of one captured value a response carries. Matching uses the whole
+/// value (up to the 64 KiB text cap); only the report is cut.
+pub const MAX_CAPTURE_BYTES: usize = 1024;
 
 /// A query refused by the parser, and where.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -362,8 +372,11 @@ pub struct Occurrence {
     pub spans: Vec<MatchSpan>,
     /// Whether `spans` was cut to [`MAX_MATCH_SPANS`].
     pub spans_truncated: bool,
-    /// Captured values by name. Producer data.
+    /// Captured values by name, each text cut to [`MAX_CAPTURE_BYTES`].
+    /// Producer data.
     pub captures: Map<String, Value>,
+    /// Whether a captured value was cut.
+    pub captures_truncated: bool,
 }
 
 /// One run that matched.
@@ -383,8 +396,11 @@ pub struct RunMatch {
     pub spans: Vec<MatchSpan>,
     /// Whether the first occurrence's steps were cut.
     pub spans_truncated: bool,
-    /// The first occurrence's captures.
+    /// The first occurrence's captures, each text cut to
+    /// [`MAX_CAPTURE_BYTES`].
     pub captures: Map<String, Value>,
+    /// Whether one of those captured values was cut.
+    pub captures_truncated: bool,
     /// The first occurrence's first step.
     pub first_step: usize,
     /// The first occurrence's last step.
@@ -426,7 +442,8 @@ pub struct SearchResult {
     pub query: String,
     /// Matching runs, most recent first.
     pub matches: Vec<RunMatch>,
-    /// Runs read and matched.
+    /// Candidate runs examined, newest first: read and matched, or left out
+    /// by the `agent` filter, or gone or unreadable when reached.
     pub runs_scanned: usize,
     /// Candidate runs in the window (at most [`MAX_SEARCH_RUNS`]).
     pub runs_in_window: usize,
@@ -438,26 +455,63 @@ pub struct SearchResult {
     /// Whether the window held more runs than [`MAX_SEARCH_RUNS`] (only the
     /// most recent were considered).
     pub window_capped: bool,
-    /// When the scan stopped early: the latest activity of the newest run it
-    /// did not check. Repeating the search with this as `until` continues
-    /// where it stopped (a run active on both sides of the instant can
-    /// appear in both answers).
+    /// When runs went unchecked — the scan stopped early, or the window was
+    /// capped — the latest activity of the newest run not checked (for a
+    /// capped window, of the oldest run considered: every run left out was
+    /// active no later). Repeating the search with this as `until`
+    /// continues (a run active on both sides of the instant can appear in
+    /// both answers).
     pub next_until_ns: Option<u64>,
+    /// Spans in the window left out because their run id cannot be read
+    /// back to them: a session id of the `trace:` form naming another trace
+    /// (or none).
+    pub spans_skipped: usize,
+    /// Candidate runs left out because reading them by id was refused.
+    pub runs_skipped: usize,
     /// The window searched (absent when one run was searched).
     pub since_ns: Option<u64>,
     /// The window's end, when bounded.
     pub until_ns: Option<u64>,
 }
 
-/// The compute budget of a scan's two phases. In production both are the
-/// same request deadline; they are separate so a test can spend one and
-/// not the other.
+/// The bounds of a scan's two phases. In production both deadlines are the
+/// same request deadline and nothing else is set; they are separate, and the
+/// rest exists, so a test can spend one phase and not the other, stop a scan
+/// partway, or cap a small window, without racing a clock.
 #[derive(Clone, Copy)]
 struct Budget {
     /// Enumerating the window's runs: all or nothing.
     enumerate: Option<Deadline>,
     /// Reading and matching them, newest first: stops where it runs out.
     scan: Option<Deadline>,
+    /// Most recent runs of the window considered.
+    window_cap: usize,
+    /// Runs the scan may check before its budget counts as spent (`None`:
+    /// only the deadline stops it).
+    scan_runs: Option<usize>,
+}
+
+impl Budget {
+    /// One request's budget: `deadline` for both phases.
+    fn request(deadline: Option<Deadline>, window_cap: usize) -> Self {
+        Self {
+            enumerate: deadline,
+            scan: deadline,
+            window_cap,
+            scan_runs: None,
+        }
+    }
+
+    /// Errs as the deadline does once the scan has checked `scanned` runs
+    /// and may check no more.
+    fn check_run(&self, scanned: usize) -> Result<()> {
+        if self.scan_runs.is_some_and(|runs| scanned >= runs) {
+            return Err(Error::DeadlineExceeded(format!(
+                "the scan's budget allowed {scanned} runs"
+            )));
+        }
+        Deadline::check(self.scan, 0)
+    }
 }
 
 /// A window's candidate run.
@@ -467,11 +521,40 @@ struct Candidate {
     latest: u64,
 }
 
+/// A window's candidate runs.
+struct Window {
+    /// The most recent runs, newest first.
+    candidates: Vec<Candidate>,
+    /// Whether the window held more runs than the cap.
+    capped: bool,
+    /// Spans left out because their run id does not read back to them.
+    spans_skipped: usize,
+}
+
+/// What reading a candidate run found.
+enum Read {
+    Spans(crate::run::RunSpans),
+    /// No spans: erased between enumeration and read.
+    Gone,
+    /// The run id was refused when read back. Enumeration leaves out every
+    /// id it knows to be unreadable; this keeps one that slips through from
+    /// failing the whole request.
+    Unreadable,
+}
+
 /// One run read for matching.
 struct ReadRun<'s> {
     steps: Vec<step::Step<'s>>,
     agent: Option<String>,
     truncated: bool,
+}
+
+/// Whether a span's run id reads back to the span. A run id of the
+/// `trace:<id>` form is read as trace `<id>`, so a span whose SESSION id
+/// takes that form while naming another trace (or none) would be listed
+/// under a run that does not contain it — or one that cannot be read.
+fn reads_back(run: &str, trace_id: &str) -> bool {
+    semconv::run_trace_id(run).map_or(true, |trace| !trace.is_empty() && trace == trace_id)
 }
 
 impl Store {
@@ -480,7 +563,8 @@ impl Store {
     ///
     /// Exact under the cap: a run is kept or evicted by its latest start
     /// seen so far, and since that only grows, a run evicted (or never
-    /// admitted) cannot belong to the final top `cap`.
+    /// admitted) cannot belong to the final top `cap`. A span whose run id
+    /// does not [read back](reads_back) to it is left out and counted.
     fn window_runs(
         &self,
         tenant: Option<&str>,
@@ -488,7 +572,7 @@ impl Store {
         until_ns: Option<u64>,
         cap: usize,
         deadline: Option<Deadline>,
-    ) -> Result<(Vec<Candidate>, bool)> {
+    ) -> Result<Window> {
         let filter = SpanFilter {
             tenant: tenant.map(str::to_owned),
             since_ns: Some(since_ns),
@@ -500,8 +584,13 @@ impl Store {
         // cap, the map alone is the answer, and most windows stay below it.
         let mut order: Option<BTreeSet<(u64, String, String)>> = None;
         let mut capped = false;
+        let mut spans_skipped = 0;
         self.fold_spans_under(&filter, deadline, |span| {
             let run = semconv::run_id(&span.attributes, &span.trace_id);
+            if !reads_back(&run, &span.trace_id) {
+                spans_skipped += 1;
+                return;
+            }
             let key = (span.tenant.clone(), run);
             let start = span.start_time_ns;
             if let Some(known) = latest.get_mut(&key) {
@@ -549,7 +638,11 @@ impl Store {
                 .then_with(|| left.tenant.cmp(&right.tenant))
                 .then_with(|| left.run.cmp(&right.run))
         });
-        Ok((candidates, capped))
+        Ok(Window {
+            candidates,
+            capped,
+            spans_skipped,
+        })
     }
 
     /// Reads one run's spans and steps within its own tenant. `None` when
@@ -562,6 +655,17 @@ impl Store {
     ) -> Result<Option<crate::run::RunSpans>> {
         let spans = self.run_spans(tenant, run, MAX_RUN_SPANS, deadline)?;
         Ok((!spans.spans.is_empty()).then_some(spans))
+    }
+
+    /// Reads a window's candidate run; a refused id is [`Read::Unreadable`]
+    /// rather than an error, so one bad id cannot fail the request.
+    fn read_candidate(&self, candidate: &Candidate, deadline: Option<Deadline>) -> Result<Read> {
+        match self.read_run_spans(Some(&candidate.tenant), &candidate.run, deadline) {
+            Ok(Some(spans)) => Ok(Read::Spans(spans)),
+            Ok(None) => Ok(Read::Gone),
+            Err(Error::Invalid(_)) => Ok(Read::Unreadable),
+            Err(other) => Err(other),
+        }
     }
 
     fn read_steps<'s>(
@@ -603,15 +707,12 @@ impl Store {
             query,
             options,
             now_ns,
-            Budget {
-                enumerate: deadline,
-                scan: deadline,
-            },
+            Budget::request(deadline, MAX_SEARCH_RUNS),
         )
     }
 
-    /// [`Self::trajectory_search`] under an explicit budget per phase, so
-    /// tests can reach a scan the budget interrupts without racing a clock.
+    /// [`Self::trajectory_search`] under explicit bounds, so tests can reach
+    /// a scan the budget interrupts without racing a clock.
     fn trajectory_search_under(
         &self,
         tenant: Option<&str>,
@@ -631,6 +732,8 @@ impl Store {
             stopped: None,
             window_capped: false,
             next_until_ns: None,
+            spans_skipped: 0,
+            runs_skipped: 0,
             since_ns: None,
             until_ns: None,
         };
@@ -670,15 +773,17 @@ impl Store {
             .unwrap_or_else(|| now_ns.saturating_sub(DEFAULT_WINDOW_NS));
         result.since_ns = Some(since);
         result.until_ns = options.until_ns;
-        let (candidates, capped) = self.window_runs(
+        let window = self.window_runs(
             tenant,
             since,
             options.until_ns,
-            MAX_SEARCH_RUNS,
+            budget.window_cap,
             budget.enumerate,
         )?;
+        let candidates = &window.candidates;
         result.runs_in_window = candidates.len();
-        result.window_capped = capped;
+        result.window_capped = window.capped;
+        result.spans_skipped = window.spans_skipped;
         for (index, candidate) in candidates.iter().enumerate() {
             if result.matches.len() >= limit {
                 result.stopped = Some(Stopped::Limit);
@@ -686,12 +791,12 @@ impl Store {
                 result.next_until_ns = Some(candidate.latest);
                 break;
             }
-            let outcome = (|| -> Result<Option<RunMatch>> {
-                Deadline::check(deadline, 0)?;
-                let Some(spans) =
-                    self.read_run_spans(Some(&candidate.tenant), &candidate.run, deadline)?
-                else {
-                    return Ok(None);
+            let outcome = (|| -> Result<Option<Option<RunMatch>>> {
+                budget.check_run(index)?;
+                let spans = match self.read_candidate(candidate, deadline)? {
+                    Read::Spans(spans) => spans,
+                    Read::Gone => return Ok(Some(None)),
+                    Read::Unreadable => return Ok(None),
                 };
                 let read = self.read_steps(&spans, deadline)?;
                 if options
@@ -699,7 +804,7 @@ impl Store {
                     .as_deref()
                     .is_some_and(|agent| read.agent.as_deref() != Some(agent))
                 {
-                    return Ok(None);
+                    return Ok(Some(None));
                 }
                 self.match_run(
                     query,
@@ -712,12 +817,15 @@ impl Store {
                     OutcomeOf::At(now_ns),
                     deadline,
                 )
+                .map(Some)
             })();
             match outcome {
                 Ok(found) => {
                     result.runs_scanned = index + 1;
-                    if let Some(found) = found {
-                        result.matches.push(found);
+                    match found {
+                        Some(Some(found)) => result.matches.push(found),
+                        Some(None) => {}
+                        None => result.runs_skipped += 1,
                     }
                 }
                 Err(Error::DeadlineExceeded(_)) => {
@@ -729,7 +837,14 @@ impl Store {
                 Err(other) => return Err(other),
             }
         }
-        result.truncated |= capped;
+        if window.capped {
+            result.truncated = true;
+            // Every run the cap left out was last active no later than the
+            // oldest run kept.
+            if result.stopped.is_none() {
+                result.next_until_ns = candidates.last().map(|candidate| candidate.latest);
+            }
+        }
         Ok(result)
     }
 
@@ -778,6 +893,7 @@ impl Store {
             spans: first.spans,
             spans_truncated: first.spans_truncated,
             captures: first.captures,
+            captures_truncated: first.captures_truncated,
             first_step: first.first_step,
             last_step: first.last_step,
             count: scan.count,
@@ -830,9 +946,12 @@ fn occurrence(query: &Query, steps: &[step::Step<'_>], found: &nfa::Found) -> Oc
         })
         .collect();
     let mut captures = Map::new();
+    let mut captures_truncated = false;
     for (slot, value) in found.env.slots().iter().enumerate() {
         if let Some(value) = value {
-            captures.insert(query.captures[slot].clone(), value.to_json());
+            let (json, cut) = value.to_json_capped(MAX_CAPTURE_BYTES);
+            captures_truncated |= cut;
+            captures.insert(query.captures[slot].clone(), json);
         }
     }
     Occurrence {
@@ -841,6 +960,7 @@ fn occurrence(query: &Query, steps: &[step::Step<'_>], found: &nfa::Found) -> Oc
         spans_truncated: found.path.len() > MAX_MATCH_SPANS,
         spans,
         captures,
+        captures_truncated,
     }
 }
 
@@ -922,9 +1042,15 @@ pub struct Findings {
     /// Per detector: those with findings first, by severity, then by runs
     /// matched.
     pub detectors: Vec<DetectorFindings>,
-    /// Runs read and checked.
+    /// Candidate runs examined, newest first (see
+    /// [`SearchResult::runs_scanned`]): those the `agent` filter left out,
+    /// and those gone or unreadable when reached, included.
     pub runs_scanned: usize,
-    /// How every scanned run ended — the base rate to compare a detector's
+    /// Runs the detectors were run on: the scanned runs that were read and
+    /// passed the filters. The baseline's total, and the denominator to
+    /// compare a detector's `runs_matched` against.
+    pub runs_checked: usize,
+    /// How every checked run ended — the base rate to compare a detector's
     /// matched runs against.
     pub baseline: OutcomeCounts,
     /// The baseline's success rate.
@@ -937,9 +1063,14 @@ pub struct Findings {
     pub stopped: Option<Stopped>,
     /// Whether the window held more runs than [`MAX_FINDINGS_RUNS`].
     pub window_capped: bool,
-    /// When the scan stopped early: the latest activity of the newest run it
-    /// did not check (see [`SearchResult::next_until_ns`]).
+    /// When runs went unchecked: where to continue from (see
+    /// [`SearchResult::next_until_ns`]).
     pub next_until_ns: Option<u64>,
+    /// Spans left out because their run id cannot be read back to them
+    /// (see [`SearchResult::spans_skipped`]).
+    pub spans_skipped: usize,
+    /// Candidate runs left out because reading them by id was refused.
+    pub runs_skipped: usize,
     /// The window's start.
     pub since_ns: u64,
     /// The window's end, when bounded.
@@ -963,14 +1094,11 @@ impl Store {
             tenant,
             options,
             now_ns,
-            Budget {
-                enumerate: deadline,
-                scan: deadline,
-            },
+            Budget::request(deadline, MAX_FINDINGS_RUNS),
         )
     }
 
-    /// [`Self::detector_findings`] under an explicit budget per phase.
+    /// [`Self::detector_findings`] under explicit bounds.
     fn detector_findings_under(
         &self,
         tenant: Option<&str>,
@@ -1006,13 +1134,14 @@ impl Store {
         let since = options
             .since_ns
             .unwrap_or_else(|| now_ns.saturating_sub(DEFAULT_WINDOW_NS));
-        let (candidates, capped) = self.window_runs(
+        let window = self.window_runs(
             tenant,
             since,
             options.until_ns,
-            MAX_FINDINGS_RUNS,
+            budget.window_cap,
             budget.enumerate,
         )?;
+        let candidates = &window.candidates;
         let mut rows: Vec<DetectorFindings> = selected
             .iter()
             .map(|&index| {
@@ -1034,16 +1163,17 @@ impl Store {
             .collect();
         let mut baseline = OutcomeCounts::default();
         let mut scanned = 0;
+        let mut runs_skipped = 0;
         let mut stopped = None;
         let mut next_until_ns = None;
         let search_options = SearchOptions::default();
         for (index, candidate) in candidates.iter().enumerate() {
-            let checked = (|| -> Result<bool> {
-                Deadline::check(deadline, 0)?;
-                let Some(spans) =
-                    self.read_run_spans(Some(&candidate.tenant), &candidate.run, deadline)?
-                else {
-                    return Ok(false);
+            let checked = (|| -> Result<Option<bool>> {
+                budget.check_run(index)?;
+                let spans = match self.read_candidate(candidate, deadline)? {
+                    Read::Spans(spans) => spans,
+                    Read::Gone => return Ok(Some(false)),
+                    Read::Unreadable => return Ok(None),
                 };
                 let read = self.read_steps(&spans, deadline)?;
                 if options
@@ -1051,7 +1181,7 @@ impl Store {
                     .as_deref()
                     .is_some_and(|agent| read.agent.as_deref() != Some(agent))
                 {
-                    return Ok(false);
+                    return Ok(Some(false));
                 }
                 let outcome = run_outcome(&spans, now_ns);
                 // Every detector is evaluated before any is recorded, so a
@@ -1086,10 +1216,15 @@ impl Store {
                         entry.examples.push(found);
                     }
                 }
-                Ok(true)
+                Ok(Some(true))
             })();
             match checked {
-                Ok(_) => scanned = index + 1,
+                Ok(read) => {
+                    scanned = index + 1;
+                    if read.is_none() {
+                        runs_skipped += 1;
+                    }
+                }
                 Err(Error::DeadlineExceeded(_)) => {
                     stopped = Some(Stopped::Deadline);
                     next_until_ns = Some(candidate.latest);
@@ -1098,6 +1233,13 @@ impl Store {
                 Err(other) => return Err(other),
             }
         }
+        if window.capped && stopped.is_none() {
+            // As for a search: every run the cap left out was last active no
+            // later than the oldest run kept.
+            next_until_ns = candidates.last().map(|candidate| candidate.latest);
+        }
+        let runs_checked =
+            baseline.success + baseline.failure + baseline.abandoned + baseline.unknown;
         for row in &mut rows {
             row.success_rate = row.outcomes.success_rate();
         }
@@ -1112,13 +1254,16 @@ impl Store {
         Ok(Findings {
             detectors: rows,
             runs_scanned: scanned,
+            runs_checked,
             baseline_success_rate: baseline.success_rate(),
             baseline,
             runs_in_window: candidates.len(),
-            truncated: stopped.is_some() || capped,
+            truncated: stopped.is_some() || window.capped,
             stopped,
-            window_capped: capped,
+            window_capped: window.capped,
             next_until_ns,
+            spans_skipped: window.spans_skipped,
+            runs_skipped,
             since_ns: since,
             until_ns: options.until_ns,
         })
@@ -1203,6 +1348,23 @@ mod tests {
             );
             assert_eq!(error.column, column, "`{text}`: {error}");
         }
+    }
+
+    #[test]
+    fn a_query_holds_a_bounded_amount_of_regex() {
+        // Each regex compiles to about 4,080 instructions: two fit the
+        // query's budget, a third is refused at its own column.
+        let heavy = r#""(?:[^\x00]{255}){16}""#;
+        let two = format!("tool[args~{heavy} or result~{heavy}]");
+        Query::compile(&two).expect("two fit");
+        let three = format!("tool[args~{heavy} or result~{heavy} or span~{heavy}]");
+        let error = compile_error(&three);
+        assert!(error.message.contains("8192 instructions"), "{error}");
+        let third = three.rfind("~\"").expect("third regex") + 3;
+        assert_eq!(error.column, third, "{error}");
+        // Regexes in names count too.
+        let names = format!("tool(~{heavy}|~{heavy}|~{heavy})");
+        assert!(compile_error(&names).message.contains("in all"));
     }
 
     #[test]
@@ -1580,7 +1742,9 @@ mod tests {
             spans.push(bash("", &session, "b", offset + 50, "ls", "ok"));
         }
         store.ingest_batch(spans).expect("ingests");
-        let (candidates, capped) = store
+        let Window {
+            candidates, capped, ..
+        } = store
             .window_runs(Some(""), 0, None, 10, None)
             .expect("enumerates");
         assert!(capped);
@@ -1597,48 +1761,299 @@ mod tests {
         assert_eq!(got, wanted);
     }
 
+    fn unbounded(window_cap: usize) -> Budget {
+        Budget::request(None, window_cap)
+    }
+
     #[test]
     fn a_budget_spent_mid_scan_returns_what_it_found_and_says_so() {
         let fixture = seeded("scan-deadline");
         let store = fixture.store();
-        let expired = Deadline::starting(Instant::now(), Some(std::time::Duration::ZERO));
-        let budget = Budget {
-            enumerate: None,
-            scan: expired,
+        // The budget runs out after the newest run (`failed`) is checked.
+        let partway = Budget {
+            scan_runs: Some(1),
+            ..unbounded(MAX_SEARCH_RUNS)
         };
         let query = Query::compile("test").expect("compiles");
         let result = store
-            .trajectory_search_under(Some(""), &query, &SearchOptions::default(), NOW, budget)
+            .trajectory_search_under(Some(""), &query, &SearchOptions::default(), NOW, partway)
             .expect("answers with what it found");
         assert_eq!(result.stopped, Some(Stopped::Deadline));
         assert!(result.truncated);
         assert_eq!(result.runs_in_window, 3);
-        assert_eq!(result.runs_scanned, 0);
-        assert!(result.matches.is_empty());
+        assert_eq!(result.runs_scanned, 1);
+        let runs: Vec<_> = result.matches.iter().map(|m| m.run.as_str()).collect();
+        assert_eq!(runs, ["failed"], "what was found before the stop is kept");
         assert_eq!(
             result.next_until_ns,
-            Some(NOW - 3_600 * SECOND + 22 * SECOND)
+            Some(NOW - 3_600 * SECOND + 12 * SECOND),
+            "the first unchecked run: `honest`"
         );
 
         let findings = store
-            .detector_findings_under(Some(""), &FindingsOptions::default(), NOW, budget)
+            .detector_findings_under(Some(""), &FindingsOptions::default(), NOW, partway)
             .expect("answers with what it found");
         assert_eq!(findings.stopped, Some(Stopped::Deadline));
         assert!(findings.truncated);
-        assert_eq!(findings.runs_scanned, 0);
-        assert_eq!(findings.baseline, OutcomeCounts::default());
-        assert!(findings.detectors.iter().all(|row| row.runs_matched == 0));
+        assert_eq!(findings.runs_scanned, 1);
+        assert_eq!(findings.runs_checked, 1);
+        assert_eq!(
+            findings.baseline,
+            OutcomeCounts {
+                failure: 1,
+                ..OutcomeCounts::default()
+            }
+        );
+        assert!(
+            findings.detectors.iter().any(|row| row.runs_matched > 0),
+            "the checked run's findings are kept"
+        );
+        for row in &findings.detectors {
+            assert!(
+                row.examples.iter().all(|example| example.run == "failed"),
+                "{}: only the checked run can have matched",
+                row.name
+            );
+        }
+        assert_eq!(
+            findings.next_until_ns,
+            Some(NOW - 3_600 * SECOND + 12 * SECOND)
+        );
+
+        // A deadline already spent stops the scan before its first run.
+        let expired = Budget {
+            scan: Deadline::starting(Instant::now(), Some(std::time::Duration::ZERO)),
+            ..unbounded(MAX_SEARCH_RUNS)
+        };
+        let none = store
+            .trajectory_search_under(Some(""), &query, &SearchOptions::default(), NOW, expired)
+            .expect("answers");
+        assert_eq!((none.runs_scanned, none.matches.len()), (0, 0));
+        assert_eq!(none.stopped, Some(Stopped::Deadline));
 
         // With budget to spare the same scans complete.
-        let unbounded = Budget {
-            enumerate: None,
-            scan: None,
-        };
         let complete = store
-            .trajectory_search_under(Some(""), &query, &SearchOptions::default(), NOW, unbounded)
+            .trajectory_search_under(
+                Some(""),
+                &query,
+                &SearchOptions::default(),
+                NOW,
+                unbounded(MAX_SEARCH_RUNS),
+            )
             .expect("searches");
         assert_eq!(complete.stopped, None);
         assert_eq!(complete.runs_scanned, 3);
+        assert_eq!(complete.next_until_ns, None);
+    }
+
+    #[test]
+    fn a_capped_window_says_where_to_continue() {
+        let fixture = seeded("capped-window");
+        let store = fixture.store();
+        let query = Query::compile("test").expect("compiles");
+        // Two of the three runs are considered: `failed` and `honest`.
+        let capped = store
+            .trajectory_search_under(
+                Some(""),
+                &query,
+                &SearchOptions::default(),
+                NOW,
+                unbounded(2),
+            )
+            .expect("searches");
+        assert!(capped.window_capped && capped.truncated);
+        assert_eq!(capped.stopped, None);
+        let runs: Vec<_> = capped.matches.iter().map(|m| m.run.as_str()).collect();
+        assert_eq!(runs, ["failed", "honest"]);
+        let next = capped.next_until_ns.expect("a resume point");
+        assert_eq!(
+            next,
+            NOW - 3_600 * SECOND + 12 * SECOND,
+            "the oldest kept run"
+        );
+        // Continuing reaches the run the cap left out.
+        let rest = store
+            .trajectory_search_under(
+                Some(""),
+                &query,
+                &SearchOptions {
+                    until_ns: Some(next),
+                    ..SearchOptions::default()
+                },
+                NOW,
+                unbounded(2),
+            )
+            .expect("searches");
+        let runs: Vec<_> = rest.matches.iter().map(|m| m.run.as_str()).collect();
+        assert_eq!(runs, ["honest", "tampered"]);
+        assert!(!rest.window_capped);
+        assert_eq!(rest.next_until_ns, None);
+
+        let findings = store
+            .detector_findings_under(Some(""), &FindingsOptions::default(), NOW, unbounded(2))
+            .expect("finds");
+        assert!(findings.window_capped);
+        assert_eq!(findings.next_until_ns, Some(next));
+    }
+
+    fn session_span(session: &str, trace: &str, id: &str, offset: u64) -> crate::Span {
+        let mut span = bash("", session, id, offset, "pytest", "ok");
+        span.trace_id = trace.into();
+        span
+    }
+
+    #[test]
+    fn a_run_id_that_cannot_be_read_back_is_skipped_not_fatal() {
+        let fixture = TempStore::open("poisoned", crate::Config::default());
+        let store = fixture.store();
+        store
+            .ingest_batch(vec![
+                session_span("good", "t-good", "a", 0),
+                // `trace:` names no trace at all.
+                session_span("trace:", "t-poison", "b", 1),
+                // A session claiming another trace's run id.
+                session_span("trace:t-good", "t-other", "c", 2),
+                // A session naming its own trace reads back fine.
+                session_span("trace:t-self", "t-self", "d", 3),
+            ])
+            .expect("ingests");
+        let query = Query::compile("test").expect("compiles");
+        let result = store
+            .trajectory_search(Some(""), &query, &SearchOptions::default(), NOW)
+            .expect("one bad span does not fail the search");
+        let mut runs: Vec<_> = result.matches.iter().map(|m| m.run.as_str()).collect();
+        runs.sort_unstable();
+        assert_eq!(runs, ["good", "trace:t-self"]);
+        assert_eq!(result.spans_skipped, 2);
+        assert_eq!(result.runs_skipped, 0);
+        let findings = store
+            .detector_findings(Some(""), &FindingsOptions::default(), NOW)
+            .expect("nor the findings");
+        assert_eq!(findings.spans_skipped, 2);
+        assert_eq!(findings.runs_checked, 2);
+
+        // An id that is refused when read is skipped and counted.
+        let unreadable = Candidate {
+            tenant: String::new(),
+            run: "trace:".into(),
+            latest: 0,
+        };
+        assert!(matches!(
+            store.read_candidate(&unreadable, None),
+            Ok(Read::Unreadable)
+        ));
+        let gone = Candidate {
+            run: "no-such-run".into(),
+            ..unreadable
+        };
+        assert!(matches!(store.read_candidate(&gone, None), Ok(Read::Gone)));
+    }
+
+    #[test]
+    fn findings_name_the_runs_they_checked() {
+        let fixture = seeded("checked");
+        let store = fixture.store();
+        let mut spans = Vec::new();
+        let mut other = bash("", "other-agent", "a", 40, "pytest", "ok");
+        other.service = "reviewer".into();
+        spans.push(other);
+        store.ingest_batch(spans).expect("ingests");
+        let findings = store
+            .detector_findings(
+                Some(""),
+                &FindingsOptions {
+                    agent: Some("coder".into()),
+                    ..FindingsOptions::default()
+                },
+                NOW,
+            )
+            .expect("finds");
+        // Four runs read; the reviewer's left out by the agent filter.
+        assert_eq!(findings.runs_scanned, 4);
+        assert_eq!(findings.runs_checked, 3);
+        assert_eq!(
+            findings.runs_checked,
+            findings.baseline.success
+                + findings.baseline.failure
+                + findings.baseline.abandoned
+                + findings.baseline.unknown
+        );
+    }
+
+    #[test]
+    fn captured_values_are_cut_in_the_answer_not_in_the_match() {
+        let fixture = TempStore::open("captures", crate::Config::default());
+        let store = fixture.store();
+        let long = format!("pytest {}", "é".repeat(MAX_CAPTURE_BYTES));
+        store
+            .ingest_batch(vec![
+                bash("", "s", "a", 0, &long, "error"),
+                bash("", "s", "b", 1, &long, "ok"),
+                bash("", "s", "c", 2, "pytest -q", "ok"),
+            ])
+            .expect("ingests");
+        let query = Query::compile("tool[args=@a] -> tool[args=@a]").expect("compiles");
+        let result = store
+            .trajectory_search(Some(""), &query, &SearchOptions::default(), NOW)
+            .expect("searches");
+        // The whole value matched (a and b, not b and c) ...
+        let found = &result.matches[0];
+        assert_eq!((found.first_step, found.last_step), (0, 1));
+        // ... and the report carries its first KiB, flagged.
+        let captured = found.captures["a"].as_str().expect("text");
+        assert!(captured.len() <= MAX_CAPTURE_BYTES && long.starts_with(captured));
+        assert!(found.captures_truncated);
+
+        let short = Query::compile("tool[args=\"pytest -q\", args=@a]").expect("compiles");
+        let result = store
+            .trajectory_search(Some(""), &short, &SearchOptions::default(), NOW)
+            .expect("searches");
+        assert_eq!(result.matches[0].captures["a"], json!("pytest -q"));
+        assert!(!result.matches[0].captures_truncated);
+    }
+
+    #[test]
+    fn a_heavy_regex_stops_at_the_deadline_with_what_was_found() {
+        let fixture = TempStore::open("heavy-regex", crate::Config::default());
+        let store = fixture.store();
+        let big = "a".repeat(64 * 1024);
+        store
+            .ingest_batch(vec![
+                bash("", "light", "a", 10, "pytest", "ok"),
+                bash("", "heavy", "a", 0, &big, "ok"),
+            ])
+            .expect("ingests");
+        // Two regexes of about 4,000 live instructions on every one of
+        // 65,536 characters: seconds of work each, even in a release build.
+        let heavy = r#"(?:[^\x00]{255}){16}\x00"#;
+        let query = Query::compile(&format!(
+            "test | tool[args~\"{heavy}\" or args~\"{heavy}y\"]"
+        ))
+        .expect("compiles");
+        let budget = Budget {
+            scan: Deadline::starting(Instant::now(), Some(std::time::Duration::from_secs(1))),
+            ..unbounded(MAX_SEARCH_RUNS)
+        };
+        let started = Instant::now();
+        let result = store
+            .trajectory_search_under(Some(""), &query, &SearchOptions::default(), NOW, budget)
+            .expect("answers with what it found");
+        let elapsed = started.elapsed();
+        assert_eq!(result.stopped, Some(Stopped::Deadline));
+        let runs: Vec<_> = result.matches.iter().map(|m| m.run.as_str()).collect();
+        assert_eq!(runs, ["light"]);
+        assert_eq!(result.runs_scanned, 1);
+        assert_eq!(
+            result.next_until_ns,
+            Some(NOW - 3_600 * SECOND),
+            "the heavy run is where to continue"
+        );
+        // The regexes alone would take several seconds; the scan stops
+        // within a sliver of its one-second budget.
+        assert!(
+            elapsed < std::time::Duration::from_millis(2_500),
+            "stopped after {elapsed:?}"
+        );
     }
 
     #[test]

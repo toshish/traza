@@ -24,6 +24,12 @@ const MAX_DEPTH: usize = 64;
 /// Most atoms one query may write.
 pub(crate) const MAX_ATOMS: usize = 256;
 
+/// Compiled regex instructions one query may hold across all its regexes.
+/// A regex costs `text length × instructions` per evaluation; this keeps
+/// the per-step cost of a query to a few maximal regexes rather than a
+/// hundred `or`-ed ones.
+pub(crate) const MAX_QUERY_REGEX_INSTRUCTIONS: usize = 8192;
+
 #[derive(Clone, Debug, PartialEq)]
 enum Tok {
     Ident(String),
@@ -411,6 +417,8 @@ struct Parser {
     captures: Vec<String>,
     /// Every capture reference: (slot, column), in order.
     references: Vec<(usize, usize)>,
+    /// Regex instructions compiled so far.
+    regex_instructions: usize,
 }
 
 /// Parses `text` into a syntax tree with captures resolved and binding
@@ -424,6 +432,7 @@ pub(crate) fn parse(text: &str) -> Result<Parsed, TqlError> {
         atoms: 0,
         captures: Vec::new(),
         references: Vec::new(),
+        regex_instructions: 0,
     };
     if parser.peek() == &Tok::Eof {
         return error(
@@ -569,6 +578,23 @@ impl Parser {
             );
         }
         Ok(())
+    }
+
+    /// Compiles a regex written at `col`, counting it against the query's
+    /// [`MAX_QUERY_REGEX_INSTRUCTIONS`].
+    fn regex(&mut self, source: &str, insensitive: bool, col: usize) -> Result<Regex, TqlError> {
+        let regex = compile_regex(source, insensitive, col)?;
+        self.regex_instructions += regex.size();
+        if self.regex_instructions > MAX_QUERY_REGEX_INSTRUCTIONS {
+            return error(
+                col,
+                format!(
+                    "the query's regexes compile to more than {MAX_QUERY_REGEX_INSTRUCTIONS} \
+                     instructions in all; shorten them or lower their repetition counts"
+                ),
+            );
+        }
+        Ok(regex)
     }
 
     fn capture_slot(&mut self, name: &str, col: usize) -> Result<usize, TqlError> {
@@ -918,7 +944,7 @@ impl Parser {
                         self.advance();
                     }
                     Tok::Regex(source, insensitive) => {
-                        names.push(NameTest::Regex(compile_regex(
+                        names.push(NameTest::Regex(self.regex(
                             &source,
                             insensitive,
                             name_col + 1,
@@ -930,7 +956,7 @@ impl Parser {
                         let regex_col = self.col();
                         match self.peek().clone() {
                             Tok::Str(source) => {
-                                names.push(NameTest::Regex(compile_regex(
+                                names.push(NameTest::Regex(self.regex(
                                     &source,
                                     false,
                                     regex_col + 1,
@@ -1158,7 +1184,7 @@ impl Parser {
             Tok::Str(text) => {
                 self.advance();
                 if matches!(op, Op::Match | Op::NotMatch) {
-                    Literal::Regex(compile_regex(&text, false, col + 1)?)
+                    Literal::Regex(self.regex(&text, false, col + 1)?)
                 } else {
                     Literal::Str(text)
                 }
@@ -1171,7 +1197,7 @@ impl Parser {
                         format!("a /regex/ goes with `~` or `!~`, not `{}`", op.symbol()),
                     );
                 }
-                Literal::Regex(compile_regex(&source, insensitive, col + 1)?)
+                Literal::Regex(self.regex(&source, insensitive, col + 1)?)
             }
             Tok::Ident(word) => {
                 self.advance();
@@ -1180,7 +1206,7 @@ impl Parser {
                 } else if word.eq_ignore_ascii_case("false") {
                     Literal::Bool(false)
                 } else if matches!(op, Op::Match | Op::NotMatch) {
-                    Literal::Regex(compile_regex(&word, false, col)?)
+                    Literal::Regex(self.regex(&word, false, col)?)
                 } else {
                     Literal::Str(word)
                 }

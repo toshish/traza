@@ -1332,32 +1332,40 @@ curl -sG 'http://localhost:8080/v1/trajectories/search' \
 ```
 
 ```json
-{"matches":[{"agent":"coder","captures":{},"count":1,"count_capped":false,"first_step":1,"inexact":false,"last_activity_ns":1772323205000000000,"last_step":4,"outcome":"success","run":"tampered","run_truncated":false,"spans":[{"kind":"tool","name":"Bash","span_id":"tampered-1","step_index":1,"trace_id":"tr-tampered"},{"kind":"tool","name":"Edit","span_id":"tampered-3","step_index":3,"trace_id":"tr-tampered"},{"kind":"tool","name":"Bash","span_id":"tampered-4","step_index":4,"trace_id":"tr-tampered"}],"spans_truncated":false,"steps":6,"tenant":""}],"next_until_ns":null,"query":"test[error] ..> edit[file~\"(^|/)tests?/\"] ..> test[not error]","runs_in_window":3,"runs_scanned":3,"since_ns":1772323199999999999,"stopped":null,"truncated":false,"until_ns":null,"window_capped":false}
+{"matches":[{"agent":"coder","captures":{},"captures_truncated":false,"count":1,"count_capped":false,"first_step":1,"inexact":false,"last_activity_ns":1772323205000000000,"last_step":4,"outcome":"success","run":"tampered","run_truncated":false,"spans":[{"kind":"tool","name":"Bash","span_id":"tampered-1","step_index":1,"trace_id":"tr-tampered"},{"kind":"tool","name":"Edit","span_id":"tampered-3","step_index":3,"trace_id":"tr-tampered"},{"kind":"tool","name":"Bash","span_id":"tampered-4","step_index":4,"trace_id":"tr-tampered"}],"spans_truncated":false,"steps":6,"tenant":""}],"next_until_ns":null,"query":"test[error] ..> edit[file~\"(^|/)tests?/\"] ..> test[not error]","runs_in_window":3,"runs_scanned":3,"runs_skipped":0,"since_ns":1772323199999999999,"spans_skipped":0,"stopped":null,"truncated":false,"until_ns":null,"window_capped":false}
 ```
 
 Each match carries the run, its `tenant`, `agent` and `outcome` (the
 [session outcome](#get-v1recall) rule; `unknown` while active or past the
 span budget), the first occurrence's `spans` — the steps its atoms matched,
 `{trace_id, span_id, step_index, kind, name}`, at most 100, gap steps not
-listed — its `captures`, `first_step` and `last_step` (the covered range, gap
-steps included), `count` (non-overlapping occurrences, at most 1,000, with
-`count_capped`), `steps`, `last_activity_ns`, `run_truncated` (the run had
-more than 20,000 spans and was matched on its beginning) and `inexact` (the
-matcher's 4,096-path cap dropped paths in this run). With `run=`, a match also
-lists `occurrences` (at most 100), each `{first_step, last_step, spans,
-spans_truncated, captures}`; an unknown run, or one in another tenant, is an
-empty `matches`, not a `404`.
+listed — its `captures` (each value cut to its first 1 KiB, with
+`captures_truncated` set when one was), `first_step` and `last_step` (the
+covered range, gap steps included), `count` (non-overlapping occurrences, at
+most 1,000, with `count_capped`), `steps`, `last_activity_ns`, `run_truncated`
+(the run had more than 20,000 spans and was matched on its beginning) and
+`inexact` (a matcher cap — 4,096 live paths, the environments one step may
+fork, 65,536 remembered states — dropped alternatives in this run). With
+`run=`, a match also lists `occurrences` (at most 100), each `{first_step,
+last_step, spans, spans_truncated, captures, captures_truncated}`; an unknown
+run, or one in another tenant, is an empty `matches`, not a `404`.
 
 The scan keeps the window's 5,000 most recent runs (`runs_in_window`;
 `window_capped` when there were more), then reads each whole — every step,
 not only those in the window — until `limit` runs matched. `runs_scanned`
-counts the runs read. `stopped` is `"limit"` or `"deadline"` when the scan
-ended before the last candidate, with `next_until_ns` — the latest activity of
-the newest run it did not check — to pass as `until` to continue (a run active
-on both sides of that instant can appear twice); `truncated` says matches may
-be missing for any of these reasons. The query deadline covers the request: enumerating
-the window refuses with `400` when it runs out; the scan answers what it found
-with `"stopped": "deadline"`.
+counts the candidates examined (those the `agent` filter left out included).
+`stopped` is `"limit"` or `"deadline"` when the scan ended before the last
+candidate. `next_until_ns`, set when runs went unchecked, is the instant to
+pass as `until` to continue: the latest activity of the newest run not
+checked, or, for a capped window the scan finished, of the oldest run it kept
+(a run active on both sides of that instant can appear twice). `truncated`
+says matches may be missing for any of these reasons. `spans_skipped` counts
+spans left out because their run id does not read back to them (a session id
+of the `trace:<id>` form naming another trace, or none); `runs_skipped`,
+candidates whose id was refused when read. The query deadline covers the
+request, inside every predicate and regex too: enumerating the window refuses
+with `400` when it runs out; the scan answers what it found with
+`"stopped": "deadline"`.
 
 ### `GET /v1/trajectories/explain`
 
@@ -1399,9 +1407,12 @@ Per detector: `name`, `title`, `severity`, `summary`, `query`,
 unknown}` of the matched runs), `success_rate` (successes over runs whose
 outcome is known; `null` when none is), up to five `examples` (newest first,
 shaped like search matches) and `last_seen_ns`. Beside them: `baseline` and
-`baseline_success_rate` over every scanned run, `runs_scanned`,
-`runs_in_window`, `window_capped`, `stopped`, `next_until_ns`, `truncated`,
-`since_ns`, `until_ns`. Detectors with findings come first, by severity, then by runs
+`baseline_success_rate` over every checked run, `runs_checked` (the runs the
+detectors ran on — the baseline's total, and the denominator for
+`runs_matched`), `runs_scanned` (candidates examined, those the `agent`
+filter left out included), `runs_in_window`, `window_capped`, `stopped`,
+`next_until_ns`, `truncated`, `spans_skipped`, `runs_skipped`, `since_ns`,
+`until_ns`. Detectors with findings come first, by severity, then by runs
 matched. The [guide](tql.md#findings) has a worked response.
 
 ---

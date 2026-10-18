@@ -60,6 +60,7 @@ curl -sG localhost:8080/v1/trajectories/search \
     {
       "agent": "coder",
       "captures": {},
+      "captures_truncated": false,
       "count": 1,
       "count_capped": false,
       "first_step": 1,
@@ -101,7 +102,9 @@ curl -sG localhost:8080/v1/trajectories/search \
   "query": "test[error] ..> edit[file~\"(^|/)tests?/\"] ..> test[not error]",
   "runs_in_window": 3,
   "runs_scanned": 3,
+  "runs_skipped": 0,
   "since_ns": 1772323199999999999,
+  "spans_skipped": 0,
   "stopped": null,
   "truncated": false,
   "until_ns": null,
@@ -234,8 +237,8 @@ with `not`, or with `=true` / `=false`.
 | `signature` | text | `kind:name` |
 | `calls` | list | tool names an llm step's response asked for |
 | `offered` | list | the tool catalog an llm step offered; on a tool step, its requesting llm step's |
-| `in_catalog` | bool | a tool step's name is in its requesting llm step's catalog — **absent** when that catalog is unknown |
-| `unknown_calls` | list | calls an llm step made to tools outside its own catalog — absent when the catalog is unknown |
+| `in_catalog` | bool | a tool step's name is in its requesting llm step's catalog, ignoring ASCII case — **absent** when that catalog is unknown, or was cut at 512 names without listing it |
+| `unknown_calls` | list | calls an llm step made to tools outside its own catalog (ignoring ASCII case) — absent when the catalog is unknown or was cut at 512 names |
 | `edit` | bool | a tool step that edits a file |
 | `test` | bool | a tool step whose input runs a test suite |
 
@@ -245,6 +248,11 @@ document order (object keys sorted), one per line. `^` and `$` in a regex
 anchor at line boundaries, so `args~"^pytest"` matches a command leaf that
 starts with `pytest`. A dynamic field yields text, a number, a boolean, or —
 for an array of scalars — a list.
+
+**Every text is capped.** Whatever a predicate reads — `args`, `result`, a
+value at `args.<path>` or `result.<path>` (an object there reads as its JSON
+text), an `attr.<key>`, a name, each entry of a list — is cut to its first
+64 KiB. A list holds at most 512 entries.
 
 ### Derived fields
 
@@ -264,23 +272,43 @@ These are heuristics, documented so their edges are known:
   `contents`, `file_text`, `edits`, `patch`, `diff`, `code_edit` or
   `new_source`, or contains a patch — and whose `command` argument, if any, is
   not `view` or `read`.
-- **`test`** — a tool step whose `args` text matches a test-runner invocation:
-  `pytest`, `py.test`, `tox`, `nox`, `jest`, `vitest`, `mocha`, `rspec`,
-  `phpunit`, `ctest`, `go test`, `cargo test`, `cargo nextest`,
-  `npm|yarn|pnpm [run] test`, `bun test`, `deno test`,
-  `python -m pytest|unittest`, `mvn … test`, `gradle … test`,
-  `make … test|check`, `dotnet test`, `swift test`, `mix test`, `rake test`,
-  `bundle exec rspec|rake`. A test run "fails" when its span status is
-  `error` — which is what a shell tool's span records for a non-zero exit
-  only when its instrumentation maps the exit code to the status.
+- **`test`** — a tool step that is not an `edit` and whose **command** runs a
+  test runner at a **command position**. The command is the value of the
+  argument `command`, `cmd`, `commands`, `script` or `shell_command` (an array
+  of strings, as Codex records argv, is joined with spaces), or the arguments
+  themselves when they are one string; file contents, descriptions and other
+  arguments are never read. A command position is the start of a line or the
+  point after `&&`, `||`, `;`, `|`, `(`, a backtick or `$(`, optionally
+  followed by environment assignments (`CI=1`), wrappers (`sudo`, `env`,
+  `time`, `nice`, `exec`, `command`, `npx`, `bunx`, `uvx`, `yarn`, `pnpm`,
+  `uv run`, `poetry run`, `pipenv run`, `pdm run`, `hatch run`, `rye run`,
+  `npm exec`, `pnpm exec`, `yarn dlx`, `pnpm dlx`, `xvfb-run`,
+  `timeout N`, `sh|bash|zsh|dash -flags`, then an optional quote) and a
+  directory (`.venv/bin/`, `./`). The runners: `pytest`, `py.test`, `tox`,
+  `nox`, `jest`, `vitest`, `mocha`, `rspec`, `phpunit`, `ctest`, `go test`,
+  `cargo test`, `cargo nextest`, `npm|yarn|pnpm [run] test`, `bun test`,
+  `deno test`, `python -m pytest|unittest`, `mvn … test|verify`,
+  `gradle[w] … test|check` (also `:module:test`), `make … test|check`,
+  `dotnet test`, `swift test`, `mix test`, `rake test`,
+  `bundle exec rspec|rake`. So `cd repo && pytest`, `uv run pytest` and
+  `CI=1 npm test` are test runs; `pip install pytest`, `cat pytest.ini`,
+  `grep pytest` and an `Edit` whose new text says `import pytest` are not.
+  The command is matched as text, not parsed as shell: a runner after a `;`
+  inside a quoted string still counts. A test run "fails" when its span
+  status is `error` — which is what a shell tool's span records for a
+  non-zero exit only when its instrumentation maps the exit code to the
+  status.
 - **`calls`** — entries of a `tool_calls` list (`name` or `function.name`),
   content blocks typed `tool_call`, `tool_use` or `function_call`, and a
   legacy `function_call` object, anywhere in an llm step's response.
 - **`offered`** — `gen_ai.tool.definitions` (a list, or its JSON text, of
   `{name}` or `{function: {name}}`), OpenLLMetry's
   `llm.request.functions.{i}.name`, or OpenInference's
-  `llm.tools.{i}.tool.json_schema`. A tool step's *requesting* llm step is its
-  parent span when that is a model call, else the latest model call before it.
+  `llm.tools.{i}.tool.json_schema`, at most 512 names. A tool step's
+  *requesting* llm step is its parent span when that is a model call, else
+  the latest model call before it **under the same agent** (see `agent`
+  below); another agent's call, whose tools may differ, is never used, and
+  then the catalog is unknown.
 - **`agent`** — the step's own agent name ([precedence](../llm-semantics.md#tool-agent-and-call-id)),
   else the nearest ancestor span (up to 64 levels, within the run) that names
   one.
@@ -341,11 +369,17 @@ not yet bound is false (so its `!=` is true). A query that references a
 capture nothing can bind is refused, naming the column.
 
 A capture on a list field binds each value in turn: `edit[file=@f]` on a patch
-naming two files tries both. A scaled capture compares numbers:
+naming two files tries both. Several such bindings on one step multiply
+(`llm[offered=@a, offered=@b]` over 64 tools is 4,096 pairs); one step forks
+at most as many paths as the matcher can still hold (see [the path
+cap](#limits-stated-plainly)), keeping the first in priority order and marking
+the run `inexact`. A scaled capture compares numbers:
 `llm[context=@c] ..> llm[context>=2*@c]`.
 
 Captures are reported with each match (`"captures": {"f": "src/app.py"}`).
-They are producer data.
+They are producer data. A reported value is cut to its first 1 KiB, with
+`captures_truncated: true` on the match; the comparison itself used the whole
+value (up to the 64 KiB text cap).
 
 ## How a match is chosen
 
@@ -397,7 +431,12 @@ exponentially.
 Refused, with the column: backreferences, lookaround, `(?…)` groups other
 than `(?:`, inline flags other than a leading `(?i)`, POSIX classes
 (`[:alpha:]`), and Unicode classes (`\p{…}`). A regex is at most 1024
-characters and 4096 compiled instructions.
+characters and 4096 compiled instructions, and **one query's regexes at most
+8,192 instructions in all** — the regex that crosses it is refused at its
+column. Matching costs up to *text length × instructions*; that work is
+charged to the query deadline as it happens, so a heavy regex over a long
+text stops the scan at the deadline (`"stopped": "deadline"`) rather than
+running past it.
 
 ## Grammar
 
@@ -444,8 +483,8 @@ Tokens:
 Keywords (`and`, `or`, `not`, `within`, `true`, `false`) and step kinds are
 case-insensitive; fields are lower-case. Whitespace is free. Counts in
 quantifiers and gap bounds are at most 100; a query is at most 4096
-characters, 256 atoms, 16 captures, 64 levels of nesting, and 20,000
-compiled instructions.
+characters, 256 atoms, 16 captures, 64 levels of nesting, 20,000 compiled
+instructions, and 8,192 regex instructions.
 
 **Every refusal names its column** (1-based, in characters) and, for an
 unknown step kind or field, the likely intended one:
@@ -529,9 +568,11 @@ is unknown.
 **25. An exploration spree.** `tool(grep|glob|read){5,}` — five or more
 searches and reads in a row.
 
-**26. Gave up.** `tool(@t)[error] (..[not (name=@t and not error)]> tool(@t)[error]){2,} ..[not (name=@t and not error)]> llm$`
-— three failures of one tool, never a success of it, and the run ends on a
-model answer. (This is the library's `give_up_loop`.)
+**26. Gave up.** `tool(@t)[error, fingerprint=@c] (..[not (name=@t and not error)]> tool[error, fingerprint=@c]){2,} ..[not (name=@t and not error)]> llm$`
+— the same call (same tool, same input: its `fingerprint`) failing three
+times, never a success of that tool, and the run ends on a model answer.
+(This is the library's `give_up_loop`.) Bind `name` instead of `fingerprint`
+to count any three failures of one tool.
 
 **27. Finished without testing.** `edit ..[not test]> llm$`.
 
@@ -563,19 +604,25 @@ until `limit` runs have matched. The response:
 | Field | Means |
 |---|---|
 | `query` | the query as read (canonical form) |
-| `matches[]` | matching runs, newest first: `run`, `tenant`, `agent`, `outcome`, the first occurrence's `spans` (`trace_id`, `span_id`, `step_index`, `kind`, `name`, at most 100), `captures`, `first_step`, `last_step`, `count` (non-overlapping occurrences, at most 1,000), `steps`, `last_activity_ns`, `run_truncated`, `inexact`; with `run=`, also `occurrences[]` (at most 100) |
-| `runs_scanned` | runs read and matched |
+| `matches[]` | matching runs, newest first: `run`, `tenant`, `agent`, `outcome`, the first occurrence's `spans` (`trace_id`, `span_id`, `step_index`, `kind`, `name`, at most 100), `captures` (each cut to 1 KiB) and `captures_truncated`, `first_step`, `last_step`, `count` (non-overlapping occurrences, at most 1,000), `steps`, `last_activity_ns`, `run_truncated`, `inexact`; with `run=`, also `occurrences[]` (at most 100) |
+| `runs_scanned` | candidate runs examined, newest first — including those the `agent` filter left out |
 | `runs_in_window` | candidate runs (at most 5,000) |
 | `stopped` | `"limit"` or `"deadline"` when the scan stopped before the last candidate, else `null` |
 | `window_capped` | the window held more than 5,000 runs; only the most recent were considered |
 | `truncated` | there may be matches this answer does not list (any of the above) |
-| `next_until_ns` | when the scan stopped early: the latest activity of the newest run it did not check — repeat the search with `until` set to it to continue (a run active on both sides of that instant can appear in both answers) |
+| `next_until_ns` | when runs went unchecked: the latest activity of the newest run not checked — or, for a capped window the scan finished, of the oldest run it kept (every run left out was last active no later). Repeat the search with `until` set to it to continue (a run active on both sides of that instant can appear in both answers) |
+| `spans_skipped` | spans in the window left out because their run id does not read back to them: a session id of the `trace:<id>` form naming another trace (it would be read as that trace's run), or naming none |
+| `runs_skipped` | candidate runs left out because their id was refused when read |
 
 **One compute budget** (`--query-deadline-ms`) covers the request.
 Enumerating the window's runs refuses with `400` when it runs out — narrow the
 window. Scanning stops where the budget ran out and answers what it found with
 `"stopped": "deadline"`, `"truncated": true` and a `next_until_ns` to resume
-from: the runs it did not reach are older than every run it did.
+from: the runs it did not reach are older than every run it did. The budget
+holds inside a run too: the matcher charges its work — paths advanced,
+captures forked, regex instructions stepped over text — to a meter that
+checks the deadline every fraction of a millisecond of work, so neither a
+heavy predicate nor a capture-heavy pattern can run past it.
 
 ### Explain
 
@@ -615,7 +662,7 @@ a search to see the same matches, or adapt its threshold.
 |---|---|---|---|
 | `test_tampering` | high | A test run fails, a test file is edited before any test passes, and a later test run passes | `test[error] ..[not (test and not error)]> edit[file~"<test file>"] ..> test[not error]` |
 | `hallucinated_tool` | high | A tool step outside its requesting model call's catalog, or a model call asking for a tool outside its own — only where the catalog was recorded | `tool[in_catalog=false] \| llm[unknown_calls]` |
-| `give_up_loop` | medium | One tool fails ≥ 3 times with no success of it in between, and the run ends on a model answer | see example 26 |
+| `give_up_loop` | medium | The same tool call (same tool and input) fails ≥ 3 times, that tool never succeeds in between or after, and the run ends on a model answer | see example 26 |
 | `edit_thrash` | medium | One file edited ≥ 5 times within 10 steps | `edit[file=@f] (..> edit[file=@f]){4,} within 10` |
 | `ping_pong` | medium | A→B→A agent handoffs ≥ 3 times, no other agent in between | see example 19 |
 | `context_blowup` | medium | A model call's context (≥ 1000 tokens) at least doubled by a call ≤ 5 steps later | `llm[context>=1000, context=@c] ..> llm[context>=2*@c] within 6` |
@@ -636,9 +683,12 @@ runs the library (or the detectors named — `detector=a,b` or repeated) over
 the window's 2,000 most recent runs, and reports per detector the runs and
 occurrences it matched, how those runs ended, their `success_rate`, up to five
 example runs (newest first), and when it last fired — next to the `baseline`:
-how every scanned run ended. A detector whose matched runs succeed far less
-often than the baseline is a behaviour costing you outcomes. Detectors with
-findings come first, by severity, then by runs matched.
+how every **checked** run ended. `runs_checked` counts those runs (the
+baseline's total, and the denominator for a detector's `runs_matched`);
+`runs_scanned` counts every candidate examined, including runs the `agent`
+filter left out. A detector whose matched runs succeed far less often than
+the baseline is a behaviour costing you outcomes. Detectors with findings
+come first, by severity, then by runs matched.
 
 ```sh
 curl -sG localhost:8080/v1/detectors/findings \
@@ -706,9 +756,12 @@ Abridged — each example run is cut to `run`, `outcome` and `captures`, and eac
     }
   ],
   "next_until_ns": null,
+  "runs_checked": 3,
   "runs_in_window": 3,
   "runs_scanned": 3,
+  "runs_skipped": 0,
   "since_ns": 1772323199999999999,
+  "spans_skipped": 0,
   "stopped": null,
   "truncated": false,
   "until_ns": null,
@@ -741,11 +794,14 @@ block, a parse error with a caret under the column.
   never marks errors, makes `test[error]` match nothing.
 - **Catalogs are optional.** `in_catalog`, `unknown_calls` and
   `hallucinated_tool` say nothing when the model call did not record its tool
-  definitions — most instrumentation does not by default.
-- **Text is capped.** `args` and `result` are matched on their first 64 KiB.
-  A value ingest [offloaded](data-model.md#payload-references) to the payload store is its
-  reference and inline preview (256 characters), not its full text — the same
-  rule as content search.
+  definitions — most instrumentation does not by default — when its catalog
+  was cut at 512 names, or when the tool step's requesting call is neither its
+  parent nor an earlier call under the same agent.
+- **Text is capped.** Every text a predicate reads is matched on its first
+  64 KiB. A value ingest [offloaded](data-model.md#payload-references) to the
+  payload store is its reference and inline preview (256 characters), not its
+  full text — the same rule as content search. Reported captures are cut to
+  1 KiB.
 - **Runs are read whole, windows pick them.** The window selects runs by span
   start time; a selected run is then matched over all its steps, up to 20,000
   spans (past that, its beginning is matched and `run_truncated` is set; its
@@ -756,10 +812,19 @@ block, a parse error with a caret under the column.
   one agent.
 - **Partial answers say so.** A scan stopped by the deadline or the limit sets
   `truncated` and `stopped`. Enumerating the window is all-or-nothing.
-- **Path cap.** The matcher keeps at most 4,096 live paths per step. A
-  capture-heavy pattern over a long run with thousands of distinct values
-  (one path per file waiting for its pair) can exceed it; the lowest-priority
-  paths are dropped and the run is marked `inexact`.
+- **Path cap.** The matcher keeps at most 4,096 live paths per step, lets one
+  step fork no more paths than that list still has room for, and remembers at
+  most 65,536 states per step for deduplication. A capture-heavy pattern over a
+  long run with thousands of distinct values (one path per file waiting for
+  its pair), or several captures over one long list (`offered=@a,
+  offered=@b, …`), can exceed them; the lowest-priority alternatives are
+  dropped and the run is marked `inexact`. Memory and work stay bounded either
+  way.
+- **Run ids that do not read back are left out.** A run whose session id
+  has the `trace:<id>` form is read as trace `<id>`; a span carrying such a
+  session id in a different trace (or `trace:` alone) is not part of the run
+  its id names, so it is skipped and counted in `spans_skipped` rather than
+  attributed to another run or failing the request.
 - **No index.** A search reads every span in its window once, to find the
   window's runs, and then each candidate run in full — work proportional to
   the window's spans plus the scanned runs' spans, under the query deadline.
