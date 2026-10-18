@@ -15,7 +15,7 @@ examples/mission-control/run.sh
 ```
 
 It builds `traza-server` if it is missing (or runs `TRAZA_BIN`), starts it on
-port 8132, checks every claim below against the server, prints the links, and
+port 8134, checks every claim below against the server, prints the links, and
 keeps the agents running until Ctrl-C. Nothing persists. `python3` (standard
 library only) runs the agents.
 
@@ -81,7 +81,7 @@ step.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `TRAZA_DEMO_PORT` | `8132` | Server port |
+| `TRAZA_DEMO_PORT` | `8134` | Server port |
 | `TRAZA_LIVE_SECONDS` | `0` | How long the agents run after the checks; `0` runs until Ctrl-C |
 | `TRAZA_LIVE_TEMPO` | `1` | A multiplier on the agents' pace; CI runs `2` |
 | `TRAZA_BIN` | — | A prebuilt `traza-server` to run instead of building one |

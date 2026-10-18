@@ -40,7 +40,7 @@ cd "$root"
 # split "$here" wherever the checkout's path has a space.
 agents() { python3 "$here/agents.py" "$@"; }
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/traza-mission.XXXXXX")
-port=${TRAZA_DEMO_PORT:-8132}
+port=${TRAZA_DEMO_PORT:-8134}
 url=http://127.0.0.1:$port
 seconds=${TRAZA_LIVE_SECONDS:-0}
 tempo=${TRAZA_LIVE_TEMPO:-1}

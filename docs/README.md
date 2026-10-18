@@ -13,7 +13,7 @@ to the right document. Start with the row that matches what you are doing.
 | Query LLM/agent telemetry — sessions, tokens, cost | [LLM semantics](llm-semantics.md) |
 | Let a coding agent read the store over MCP | [MCP server](guide/mcp.md) · [demo](../examples/mcp-demo/README.md) |
 | Stop a runaway agent run before its next step | [Run fuses](guide/guard.md) · [demo](../examples/guard/README.md) · [Claude Code hook pack](../examples/claude-code/README.md) |
-| Watch live runs, nudge or veto a running agent, see how its agents hand off | [Steer](guide/steer.md) · [Claude Code hook pack](../examples/claude-code/README.md) |
+| Watch live runs, nudge or veto a running agent, see how its agents hand off | [Steer](guide/steer.md) · [demo](../examples/mission-control/README.md) · [Claude Code hook pack](../examples/claude-code/README.md) |
 | Re-run a recorded agent run with zero model calls, or diff two runs | [Replay](guide/replay.md) · [demo](../examples/replay/README.md) |
 | See which paths an agent's runs take and how each ends; foresee a live run's fate; stop a run whose path has always failed | [Foresight](guide/foresight.md) · [demo](../examples/foresight/README.md) |
 | Record every Claude Code and Codex session with zero setup, or ask which agent step wrote a line of code | [Recorders and Agent Blame](guide/recorders.md) · [demo](../examples/coding-agents/README.md) |

@@ -20,6 +20,16 @@ guard state plus one durable log; the topology is computation over a run's
 stored spans. For Claude Code, the [hook pack](../../examples/claude-code/README.md)
 wires all of it in with one command.
 
+## See it run
+
+[`examples/mission-control/run.sh`](../../examples/mission-control/README.md)
+runs simulated support agents against a real server, each asking the guard
+before every step. It checks the claims this guide makes — foresight on the
+live listing, the stream's snapshot and rows, a run held by its history, a
+nudge heard at the next check after an approval with lower odds, the kill
+switch, a ping-pong run stopped at three handoff cycles, and a fork — then
+keeps the agents running for the dashboard's **Live** screen until Ctrl-C.
+
 ## Live runs
 
 ```sh
