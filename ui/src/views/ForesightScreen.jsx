@@ -4,8 +4,8 @@ import { navigate, useRead } from '../lib/route.js';
 import { fmtNum, fmtTimeNs, fmtDurationNs } from '../lib/format.js';
 import { fmtMoney, routeTenant, singleTenantScope, tenantParams } from '../lib/runs.js';
 import {
-  DEFAULT_WINDOW, FORESIGHT_VERDICT, MIN_SCORED_RUNS, WINDOWS, bestSkill, drawRunChanges, fmtCi, fmtP, fmtPct, nodeAt,
-  nodeMeans, pathKey, pathToTql, runOnMap, skillReading, windowFrom, windowSince,
+  DEFAULT_WINDOW, FORESIGHT_VERDICT, MIN_SCORED_RUNS, WINDOWS, bestSkill, drawRunChanges, entryKey, fmtCi, fmtP, fmtPct,
+  keyTokens, nodeAtKey, nodeMeans, pathToTql, runOnMap, skillReading, windowFrom, windowSince,
 } from '../lib/insight.js';
 import { Card, Chip, EmptyState, ErrorState, LoadingBar, Mono, PanelHead, RangeBar, Skeleton } from '../components/primitives/Chrome.jsx';
 import { Tag } from '../components/primitives/Tag.jsx';
@@ -123,7 +123,7 @@ export function ForesightScreen({ go, params, identity }) {
   // the run's path the map does draw; the banner says why it stops there.
   const activeKey = selectedKey != null ? selectedKey
     : highlight ? (highlight.atKey != null ? highlight.atKey : highlight.reachedKey) : '';
-  const activeNode = data ? nodeAt(data.root, activeKey ? activeKey.split('\u0001') : []) : null;
+  const activeNode = data ? nodeAtKey(data.root, activeKey) : null;
   const drawChanges = drawRunChanges(highlight, data, DEPTH_CHOICES);
   // The map's own score at the depth the run was judged, read only off the
   // build the run was judged against: its cohort, the default window.
@@ -254,9 +254,9 @@ function MapBody({ map, data, shownAgent, task, windowId, highlight, activeKey, 
     <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: 14, alignItems: 'start' }}>
       <NodePanel node={activeNode} nodeKey={activeKey} root={data.root} base={data.base_rate} go={go} tenant={tenant} windowId={windowId}
         folded={collapsed.has(activeKey)} onToggle={onToggle} searchScope={searchScope} task={data.task} agent={data.agent} />
-      <ForksCard forks={data.fatal_forks} base={data.base_rate} onSelect={onSelect} />
+      <ForksCard forks={data.fatal_forks} root={data.root} base={data.base_rate} onSelect={onSelect} />
       <CalibrationCard calibration={data.calibration} />
-      <HotspotsCard hotspots={data.hotspots} onSelect={onSelect} />
+      <HotspotsCard hotspots={data.hotspots} root={data.root} onSelect={onSelect} />
     </div>
   </>;
 }
@@ -279,7 +279,8 @@ export function boundsCaveats(data) {
     with them. */
 function NodePanel({ node, nodeKey, root, base, go, tenant, windowId, folded, onToggle, searchScope, task, agent }) {
   if (!node) return <Card><PanelHead title="Node" /><div style={{ fontSize: 12, color: 'var(--ink-muted)' }}>Click a node of the map.</div></Card>;
-  const path = nodeKey ? nodeKey.split('\u0001') : [];
+  // The key tells branches that read the same apart; the path is their text.
+  const path = keyTokens(nodeKey);
   const means = nodeMeans(node);
   const examples = node.example_runs || [];
   const success = examples.find((e) => e.outcome === 'success');
@@ -335,15 +336,15 @@ function NodePanel({ node, nodeKey, root, base, go, tenant, windowId, folded, on
   </Card>;
 }
 
-function ForksCard({ forks, base, onSelect }) {
+function ForksCard({ forks, root, base, onSelect }) {
   return <Card>
     <PanelHead title="Fatal forks" note="≥ 25 points below the siblings, Fisher p < 0.05" />
     {!forks.length ? <div style={{ fontSize: 12, color: 'var(--ink-muted)', lineHeight: '18px' }}>
       No branch does significantly worse than its siblings. Three unlucky runs are never called a fork: the
       gap must also pass a Fisher exact test.
     </div> : <div style={{ display: 'grid', gap: 10 }}>
-      {forks.map((f) => <button key={pathKey(f.path)} type="button" className="tz-plain-button" data-testid="fatal-fork"
-        onClick={() => onSelect(pathKey(f.path))}
+      {forks.map((f) => { const key = entryKey(root, f); return <button key={key} type="button" className="tz-plain-button" data-testid="fatal-fork"
+        onClick={() => onSelect(key)}
         style={{ display: 'grid', gap: 5, cursor: 'pointer', paddingBottom: 9, borderBottom: '1px solid var(--hairline)' }}>
         <PathTokens path={f.path} accentIndex={f.path.length - 1} />
         <span style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap', fontSize: 12, color: 'var(--ink-muted)' }}>
@@ -352,7 +353,7 @@ function ForksCard({ forks, base, onSelect }) {
           <span>of <Mono>{fmtNum(f.visits)}</Mono> vs siblings <Mono>{fmtPct(f.fork.siblings_success_rate)}</Mono> of <Mono>{fmtNum(f.fork.siblings_visits)}</Mono></span>
           <span>p <Mono>{fmtP(f.fork.p_value)}</Mono></span>
         </span>
-      </button>)}
+      </button>; })}
     </div>}
     <div style={{ marginTop: 10, fontSize: 11, color: 'var(--ink-faint)', lineHeight: '16px' }}>
       Correlation, not cause: a fork says where runs that went that way ended worse. Diff a success against a
@@ -361,19 +362,20 @@ function ForksCard({ forks, base, onSelect }) {
   </Card>;
 }
 
-function HotspotsCard({ hotspots, onSelect }) {
+function HotspotsCard({ hotspots, root, onSelect }) {
   return <Card>
     <PanelHead title="Hotspots" note="where the agent cannot make up its mind" />
     {!hotspots.length ? <div style={{ fontSize: 12, color: 'var(--ink-muted)' }}>No node has a next step with a bit or more of entropy.</div>
       : <div style={{ display: 'grid', gap: 10 }}>
-        {hotspots.map((h) => <button key={pathKey(h.path)} type="button" className="tz-plain-button" onClick={() => onSelect(pathKey(h.path))}
+        {hotspots.map((h) => { const key = entryKey(root, h); return <button key={key} type="button" className="tz-plain-button" onClick={() => onSelect(key)}
           style={{ display: 'grid', gap: 5, cursor: 'pointer', paddingBottom: 9, borderBottom: '1px solid var(--hairline)' }}>
           <PathTokens path={h.path} accentIndex={h.path.length - 1} />
           <span style={{ fontSize: 12, color: 'var(--ink-muted)' }}>
             <Mono color="var(--accent)">{h.entropy.toFixed(2)}</Mono> bits over <Mono>{fmtNum(h.visits)}</Mono> runs; next:
           </span>
-          <span style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>{h.next.map((t) => <span key={t} style={{ border: '1px solid var(--hairline)', borderRadius: 'var(--radius-control)', padding: '0 4px' }}><Token token={t} /></span>)}</span>
-        </button>)}
+          {/* Two next steps can read the same (search×2 beside search twice). */}
+          <span style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>{h.next.map((t, i) => <span key={i + ':' + t} style={{ border: '1px solid var(--hairline)', borderRadius: 'var(--radius-control)', padding: '0 4px' }}><Token token={t} /></span>)}</span>
+        </button>; })}
       </div>}
   </Card>;
 }

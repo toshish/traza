@@ -111,6 +111,68 @@ export function pathKey(path) {
   return (path || []).join('\u0001');
 }
 
+/** Marks the second and later of sibling branches that read the same. A
+    token is a name and a repeat bucket, so a tool literally named `search×2`
+    called once and `search` called twice are two branches with one text;
+    keyed by text alone they shared a React key, and a click on either opened
+    the first. The first keeps its plain text, so a path from anywhere else —
+    a run's, a fork's, a link's — still names it. */
+const NTH = '\u0002';
+
+/** Each child's key segment: its token, and for the n-th (n ≥ 1) sibling of
+    the same token, `token NTH n`. */
+export function childSegments(children) {
+  const seen = new Map();
+  return (children || []).map((child) => {
+    const nth = seen.get(child.token) || 0;
+    seen.set(child.token, nth + 1);
+    return nth ? child.token + NTH + nth : child.token;
+  });
+}
+
+/** The child a key segment names, or null. */
+function childAt(node, segment) {
+  const mark = segment.lastIndexOf(NTH);
+  const token = mark < 0 ? segment : segment.slice(0, mark);
+  const nth = mark < 0 ? 0 : Number(segment.slice(mark + 1));
+  if (!Number.isInteger(nth) || nth < 0) return null;
+  const same = ((node && node.children) || []).filter((child) => child.token === token);
+  return same[nth] || null;
+}
+
+/** A node key as the tokens of its path: what the map's text says, for
+    display and for a search. */
+export function keyTokens(key) {
+  if (!key) return [];
+  return key.split('\u0001').map((segment) => {
+    const mark = segment.lastIndexOf(NTH);
+    return mark < 0 ? segment : segment.slice(0, mark);
+  });
+}
+
+/** The tree's node a key names, or null. */
+export function nodeAtKey(root, key) {
+  return nodeAt(root, key ? key.split('\u0001') : []);
+}
+
+/** The key of the node a fork or hotspot entry describes. Its path is text,
+    so where branches read the same, the one whose figures match the entry's
+    is meant; failing that, the first, as its text alone says. */
+export function entryKey(root, entry) {
+  const path = (entry && entry.path) || [];
+  const found = [];
+  (function walk(node, depth, segments) {
+    if (depth === path.length) { found.push({ node, key: segments.join('\u0001') }); return; }
+    const children = (node && node.children) || [];
+    const marks = childSegments(children);
+    children.forEach((child, i) => { if (child.token === path[depth]) walk(child, depth + 1, [...segments, marks[i]]); });
+  }(root, 0, []));
+  const matches = (node) => ['visits', 'success_rate', 'entropy']
+    .every((field) => entry[field] === undefined || node[field] === entry[field]);
+  const hit = found.find((candidate) => matches(candidate.node)) || found[0];
+  return hit ? hit.key : pathKey(path);
+}
+
 /** `kind:name` (with a repeat bucket) split for display. The kind is the
     text before the first colon; a model name may itself hold colons. */
 export function splitToken(token) {
@@ -167,7 +229,8 @@ export function branchWidth(visits, rootVisits, max = 18) {
     label lines — and a parent sits midway between its first and last child,
     so siblings read top to bottom in the server's order (most visited
     first). Depth is the column. Returns positioned nodes (each with its
-    path and key), the edges between them, and the canvas size.
+    path of tokens and its key, unique even where siblings read the same:
+    [`childSegments`]), the edges between them, and the canvas size.
 
     `collapsed` holds keys whose children are not drawn. */
 export function layoutFate(root, { colWidth = 184, padX = 28, padY = 26, collapsed = new Set(), maxStroke = 18 } = {}) {
@@ -179,8 +242,8 @@ export function layoutFate(root, { colWidth = 184, padX = 28, padY = 26, collaps
   let cursor = padY;
   let maxDepth = 0;
 
-  const place = (node, path, depth, parent) => {
-    const key = pathKey(path);
+  const place = (node, path, segments, depth, parent) => {
+    const key = pathKey(segments);
     const width = branchWidth(node.visits, rootVisits, maxStroke);
     const children = collapsed.has(key) ? [] : (node.children || []);
     const entry = {
@@ -196,14 +259,15 @@ export function layoutFate(root, { colWidth = 184, padX = 28, padY = 26, collaps
       entry.y = cursor + row / 2;
       cursor += row;
     } else {
-      const placed = children.map((child) => place(child, [...path, child.token], depth + 1, entry));
+      const marks = childSegments(children);
+      const placed = children.map((child, i) => place(child, [...path, child.token], [...segments, marks[i]], depth + 1, entry));
       entry.y = (placed[0].y + placed[placed.length - 1].y) / 2;
       for (const child of placed) edges.push({ from: entry, to: child, width: child.stroke });
     }
     return entry;
   };
 
-  place(root, [], 0, null);
+  place(root, [], [], 0, null);
   return {
     nodes, edges, byKey,
     width: padX * 2 + maxDepth * colWidth + 150,
@@ -211,11 +275,12 @@ export function layoutFate(root, { colWidth = 184, padX = 28, padY = 26, collaps
   };
 }
 
-/** The tree's node at a path, or null. */
+/** The tree's node at a path, or null. Each item is a token, which names
+    the first sibling of that text, or a key segment ([`childSegments`]). */
 export function nodeAt(root, path) {
   let node = root;
-  for (const token of path || []) {
-    node = (node && node.children || []).find((child) => child.token === token);
+  for (const segment of path || []) {
+    node = childAt(node, segment);
     if (!node) return null;
   }
   return node;

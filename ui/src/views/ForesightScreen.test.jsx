@@ -127,6 +127,31 @@ describe('the cohorts and the map', () => {
     expect(screen.queryByText('Find these runs')).toBeNull();
   });
 
+  it('opens the second of two branches that read the same, not the first', async () => {
+    // `lit` called a tool named search×2 once; `two` called search twice.
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+    api.fateMap.mockResolvedValueOnce(miniMap);
+    await show('agent=mini-agent');
+    const twins = [...document.querySelectorAll('[data-testid="fate-node"][data-token="tool:search×2"]')];
+    expect(twins).toHaveLength(2);
+    fireEvent.click(twins[1]);
+    const key = new URLSearchParams(window.location.hash.split('?')[1]).get('node');
+    expect(key).toBe(twins[1].getAttribute('data-key'));
+    expect(key).not.toBe(twins[0].getAttribute('data-key'));
+    cleanup();
+    api.fateMap.mockResolvedValueOnce(miniMap);
+    await show('agent=mini-agent&node=' + encodeURIComponent(key));
+    const panel = screen.getByTestId('node-panel').textContent;
+    expect(panel).toContain('two');
+    expect(panel).not.toContain('lit');
+    expect(panel).toContain('success / failure / abandoned0 / 1 / 0');
+    // Its path reads as the map's text, with no key marker in it.
+    expect(panel).not.toMatch(/[\u0001\u0002]/);
+    const duplicate = errors.mock.calls.filter((args) => args.some((arg) => typeof arg === 'string' && /same key/i.test(arg)));
+    expect(duplicate).toEqual([]);
+    errors.mockRestore();
+  });
+
   it("states the map's own score, and what it means", async () => {
     await show('agent=support-agent');
     const card = screen.getByTestId('calibration').textContent;

@@ -2,7 +2,7 @@ import React from 'react';
 import { fmtDurationNs, fmtNum } from '../../lib/format.js';
 import { fmtMoney } from '../../lib/runs.js';
 import {
-  AT_OR_ABOVE, RAMP_STEPS, ciContains, fmtCi, fmtP, fmtPct, layoutFate, nodeMeans, rateColor, shortName, splitToken,
+  AT_OR_ABOVE, RAMP_STEPS, childSegments, ciContains, fmtCi, fmtP, fmtPct, layoutFate, nodeMeans, rateColor, shortName, splitToken,
 } from '../../lib/insight.js';
 import { CiBar, Kv, Swatch, Token, Tooltip } from './Bits.jsx';
 
@@ -52,13 +52,17 @@ function slots(layout) {
   return out;
 }
 
-/** The deepest column a tree draws, folded branches left out. */
-function treeDepth(root, collapsed, path = '') {
-  if (!root || (collapsed && collapsed.has(path))) return 0;
+/** The deepest column a tree draws, folded branches left out. Keys as
+    `layoutFate` keys them, so a fold of one of two branches that read the
+    same is the fold of that one. */
+function treeDepth(root, collapsed, key = '') {
+  if (!root || (collapsed && collapsed.has(key))) return 0;
   let deepest = 0;
-  for (const child of root.children || []) {
-    deepest = Math.max(deepest, 1 + treeDepth(child, collapsed, path ? path + '\u0001' + child.token : child.token));
-  }
+  const children = root.children || [];
+  const marks = childSegments(children);
+  children.forEach((child, i) => {
+    deepest = Math.max(deepest, 1 + treeDepth(child, collapsed, key ? key + '\u0001' + marks[i] : marks[i]));
+  });
   return deepest;
 }
 

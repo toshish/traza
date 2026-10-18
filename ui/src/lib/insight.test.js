@@ -5,7 +5,8 @@
 import { describe, it, expect } from 'vitest';
 import {
   AT_OR_ABOVE, RAMP_STEPS, bestSkill, branchWidth, cacheSegments, caretLine, ciContains, classTotals, compactPath,
-  deltaDirection, DELTA_METRICS, detectorRate, fmtCi, fmtP, fmtPct, layoutFate, matchRoute, nodeAt, nodeMeans, pathKey, pathToTql,
+  deltaDirection, DELTA_METRICS, detectorRate, entryKey, fmtCi, fmtP, fmtPct, keyTokens, layoutFate, matchRoute, nodeAt, nodeAtKey,
+  nodeMeans, pathKey, pathToTql,
   provenanceGroups, rateColor, runOnMap, shortName, skillAt, skillReading, splitToken, stableWithoutRead, wilson, windowFrom, windowSince,
 } from './insight.js';
 import supportMap from '../test/fixtures/insight/fate_map_support.json';
@@ -105,6 +106,44 @@ describe('the Fate Map', () => {
     const layout = layoutFate(supportMap.root, { collapsed: new Set([key]) });
     expect(layout.nodes).toHaveLength(2);
     expect(layout.byKey.get(key).hiddenChildren).toBe(3);
+  });
+
+  it('keys two branches that read the same apart, and finds each by its key', () => {
+    // mini-agent: `search×2` called once beside `search` called twice — one
+    // text, two branches, and one React key and one selection between them.
+    const layout = layoutFate(miniMap.root);
+    const twins = layout.nodes.filter((entry) => entry.depth === 2);
+    expect(twins.map((entry) => entry.node.token)).toEqual(['tool:search×2', 'tool:search×2']);
+    expect(new Set(layout.nodes.map((entry) => entry.key)).size).toBe(layout.nodes.length);
+    expect(layout.edges.map((edge) => edge.to.key).sort()).toEqual(layout.nodes.slice(1).map((entry) => entry.key).sort());
+    // The first keeps its plain path, so a link, a fork or a run's path that
+    // names it by its text still opens it.
+    expect(twins[0].key).toBe(pathKey(['llm:gpt-4o-mini', 'tool:search×2']));
+    expect(nodeAtKey(miniMap.root, twins[0].key)).toBe(twins[0].node);
+    expect(nodeAtKey(miniMap.root, twins[1].key)).toBe(twins[1].node);
+    expect(nodeAtKey(miniMap.root, twins[1].key).example_runs.map((e) => e.run)).toEqual(['two']);
+    const deep = layout.nodes.filter((entry) => entry.depth === 3);
+    expect(nodeAtKey(miniMap.root, deep[1].key).example_runs.map((e) => e.run)).toEqual(['two']);
+    // Folding the second folds only the second.
+    const folded = layoutFate(miniMap.root, { collapsed: new Set([twins[1].key]) });
+    expect(folded.nodes).toHaveLength(layout.nodes.length - 1);
+    expect(folded.byKey.get(twins[0].key).hiddenChildren).toBe(0);
+    // A key reads back as the tokens of its path, for display and search.
+    expect(keyTokens(twins[1].key)).toEqual(['llm:gpt-4o-mini', 'tool:search×2']);
+    expect(keyTokens('')).toEqual([]);
+    expect(nodeAtKey(miniMap.root, '')).toBe(miniMap.root);
+    expect(nodeAtKey(miniMap.root, twins[1].key + '\u0001tool:nope')).toBeNull();
+  });
+
+  it('opens the branch a fork or hotspot entry describes, where two read the same', () => {
+    const [mini] = miniMap.root.children;
+    const [first, second] = mini.children;
+    const entry = { path: ['llm:gpt-4o-mini', 'tool:search×2'], visits: second.visits, success_rate: second.success_rate };
+    expect(nodeAtKey(miniMap.root, entryKey(miniMap.root, entry))).toBe(second);
+    expect(nodeAtKey(miniMap.root, entryKey(miniMap.root, { ...entry, success_rate: first.success_rate }))).toBe(first);
+    // A path the map does not draw keys as its text.
+    expect(entryKey(miniMap.root, { path: ['tool:nope'] })).toBe(pathKey(['tool:nope']));
+    expect(entryKey(supportMap.root, researcherMap.fatal_forks[0])).toBe(pathKey(researcherMap.fatal_forks[0].path));
   });
 
   it('finds a node by path, and its means from the sums the map carries', () => {
