@@ -208,6 +208,43 @@ describe("a fork", () => {
     }
   });
 
+  it("runs a tool the recording lacks for real without moving model calls off the recording", async () => {
+    // Tool and model calls have their own cursors on the server: a tool the
+    // recording does not hold answers replay_live while recorded model calls
+    // are still to come, and those are still the recording's to serve.
+    const provider = await startStub(providerAnswer);
+    try {
+      const fork = await client.fork("weather-7", {
+        atStep: 1,
+        toolResult: { forecast: "sun", celsius: 30 },
+        liveOpenAI: { baseURL: `${provider.url}/v1`, apiKey: "sk-real-provider-key" },
+      });
+      const openai = fork.openaiOptions();
+      // A setup tool before the first model call runs for real...
+      assert.equal(await fork.callTool("open_session", () => "opened"), "opened");
+      assert.equal(fork.isLive, false, "a tool going live is not the model calls going live");
+      // ...and step 0 still comes from the recording, strictly matched.
+      const first = await chat(openai, { model: "gpt-4o", messages: messages() });
+      assert.equal(first.status, 200);
+      assert.equal(first.body.choices[0].message.tool_calls?.[0]?.id, "call_w1");
+      assert.equal(provider.requests.length, 0, "no recorded model call reached the provider");
+      const tool = await fork.toolResult("get_weather");
+      assert.equal(tool.edited, true, "the edit is still served after a tool went live");
+      // Past the cut the model endpoint itself says so, and only then do
+      // model calls go to the provider.
+      const live = await chat(openai, { model: "gpt-4o", messages: messages({ toolResult: JSON.stringify(tool.result) }) });
+      assert.equal(live.body.choices[0].message.content, "Live: it is sunny in Paris.");
+      assert.equal(fork.isLive, true);
+      assert.equal(provider.requests.length, 1);
+      const status = await fork.status();
+      assert.equal(status.served, 1, "the recorded model call was served by the replay");
+      assert.equal(status.diverged ?? null, null);
+      fork.close();
+    } finally {
+      await provider.close();
+    }
+  });
+
   it("switches an Anthropic SDK too, with its own key header", async () => {
     const provider = await startStub(providerAnswer);
     try {

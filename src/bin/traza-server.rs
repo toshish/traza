@@ -3101,7 +3101,9 @@ fn serve_request(
                     json!({"annotations": serde_json::to_value(annotations)
                         .unwrap_or_else(|_| Value::Array(Vec::new()))}),
                 ),
-                Err(error) => responder.json(503, json!({"error": error.to_string()})),
+                // The walk spends the query budget: past it, the deadline
+                // 400 every query route answers.
+                Err(error) => engine_error(responder, metrics, error),
             }
         }
         ("GET", _) if path.starts_with("/v1/payloads/") => {
@@ -3618,7 +3620,7 @@ fn serve_request(
                     json!({"scores": serde_json::to_value(scores)
                         .unwrap_or_else(|_| Value::Array(Vec::new()))}),
                 ),
-                Err(error) => responder.json(503, json!({"error": error.to_string()})),
+                Err(error) => engine_error(responder, metrics, error),
             }
         }
         ("GET", path) if path.starts_with("/v1/experiments/") && path.ends_with("/summary") => {

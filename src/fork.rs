@@ -51,7 +51,7 @@ use crate::attribution::Outcome;
 use crate::diff::{Delta, FirstDivergence, RunSide, MAX_DIFF_SPANS, MAX_DIFF_STEPS};
 use crate::semconv::{self, StepKind};
 use crate::tape::{RunTape, TapeStep};
-use crate::{Deadline, Error, Result, Span, SpanFilter, Store};
+use crate::{Deadline, Error, Result, Span, SpanFilter, Store, DEADLINE_CHECK_INTERVAL};
 
 /// The span attribute naming the run a forked run branched from.
 pub const FORK_PARENT: &str = "traza.fork.parent";
@@ -88,7 +88,11 @@ pub const MAX_FORK_LIMIT: usize = 50;
 /// Spans carrying [`GOLDEN`] one golden listing examines.
 pub const MAX_GOLDEN_SPANS: usize = 20_000;
 
-/// Annotations named [`GOLDEN`] one golden listing examines, newest first.
+/// The newest annotations named [`GOLDEN`] one golden listing decides from.
+///
+/// Finding them walks every golden annotation in scope, under the request's
+/// query budget, holding no more than this many at once; past it the older
+/// markers decide nothing and the listing says it was truncated.
 pub const MAX_GOLDEN_ANNOTATIONS: usize = 10_000;
 
 /// Golden runs one listing returns when the caller names no limit.
@@ -534,7 +538,9 @@ pub struct Goldens {
     pub runs: Vec<GoldenRun>,
     /// Tagged spans examined.
     pub spans_examined: usize,
-    /// Annotations named [`GOLDEN`] examined.
+    /// Annotations named [`GOLDEN`] in scope the listing examined: every one
+    /// found, of which it decided from the newest
+    /// [`MAX_GOLDEN_ANNOTATIONS`].
     pub annotations_examined: usize,
     /// Whether the listing is incomplete: more than [`MAX_GOLDEN_SPANS`]
     /// tagged spans or [`MAX_GOLDEN_ANNOTATIONS`] annotations, or more runs
@@ -776,7 +782,10 @@ impl Store {
         tagged.truncate(MAX_GOLDEN_SPANS);
 
         let mut runs: BTreeMap<(String, String), GoldenRun> = BTreeMap::new();
-        for span in &tagged {
+        for (index, span) in tagged.iter().enumerate() {
+            if index % DEADLINE_CHECK_INTERVAL == 0 {
+                Deadline::check(deadline, 0)?;
+            }
             let run = semconv::run_id(&span.attributes, &span.trace_id);
             let entry = runs
                 .entry((span.tenant.clone(), run.clone()))
@@ -791,25 +800,26 @@ impl Store {
         let spans_examined = tagged.len();
         drop(tagged);
 
-        let mut annotations = self.search_annotations(&AnnotationQuery {
-            trace_id: None,
-            span_id: None,
-            tenant,
-            session_id: None,
-            experiment_id: None,
-            example_id: None,
-            name: Some(GOLDEN),
-            source_prefix: None,
-            since_ns: None,
-            until_ns: None,
-            limit: Some(MAX_GOLDEN_ANNOTATIONS + 1),
-        })?;
-        truncated |= annotations.len() > MAX_GOLDEN_ANNOTATIONS;
-        annotations.truncate(MAX_GOLDEN_ANNOTATIONS);
-        Deadline::check(deadline, 0)?;
+        // The walk holds at most the cap and spends this request's budget,
+        // however many markers the population holds; `matched` is all of
+        // them, so the listing can say what the cap left undecided.
+        let searched = self.search_annotations_under(
+            &AnnotationQuery {
+                tenant,
+                name: Some(GOLDEN),
+                limit: Some(MAX_GOLDEN_ANNOTATIONS),
+                ..AnnotationQuery::default()
+            },
+            deadline,
+        )?;
+        truncated |= searched.matched > MAX_GOLDEN_ANNOTATIONS;
+        let annotations = searched.found;
         // Newest first: the first decision seen for a run is its newest.
         let mut decided: std::collections::HashSet<(String, String)> = Default::default();
-        for annotation in &annotations {
+        for (index, annotation) in annotations.iter().enumerate() {
+            if index % DEADLINE_CHECK_INTERVAL == 0 {
+                Deadline::check(deadline, 0)?;
+            }
             let run = if !annotation.session_id.is_empty() {
                 annotation.session_id.clone()
             } else if !annotation.trace_id.is_empty()
@@ -846,10 +856,11 @@ impl Store {
             truncated = true;
             runs.truncate(limit);
         }
+        Deadline::check(deadline, 0)?;
         Ok(Goldens {
             runs,
             spans_examined,
-            annotations_examined: annotations.len(),
+            annotations_examined: searched.matched,
             truncated,
         })
     }
@@ -1197,6 +1208,162 @@ mod tests {
             listed,
             ["note-exact", "unmark-cased"],
             "only the boolean or the exact string marks or un-marks, on either path"
+        );
+    }
+
+    /// A session annotation, as the annotation log stores one.
+    fn session_note(
+        tenant: &str,
+        session: &str,
+        name: &str,
+        at: u64,
+    ) -> crate::annotations::Annotation {
+        crate::annotations::Annotation {
+            trace_id: String::new(),
+            span_id: String::new(),
+            tenant: tenant.to_owned(),
+            session_id: session.to_owned(),
+            experiment_id: None,
+            example_id: String::new(),
+            name: name.to_owned(),
+            value: json!(true),
+            source: "human:test".to_owned(),
+            comment: String::new(),
+            timestamp_ns: at,
+        }
+    }
+
+    /// Writes `notes` as the data directory's annotation log, which the
+    /// store replays as it opens: a population no test could afford to
+    /// append one fsync at a time.
+    fn plant_annotations(dir: &std::path::Path, notes: &[crate::annotations::Annotation]) {
+        let mut log = String::new();
+        for note in notes {
+            log.push_str(&serde_json::to_string(note).expect("encodes"));
+            log.push('\n');
+        }
+        std::fs::write(dir.join("annotations.jsonl"), log).expect("plants the log");
+    }
+
+    /// Golden markers in the default tenant, one nanosecond apart, oldest
+    /// first: one on each of `oldest`, then [`MAX_GOLDEN_ANNOTATIONS`]
+    /// cycling over ten sessions `s-0`…`s-9` — so the runs decided stay far
+    /// under any listing limit, and only the annotation cap can truncate.
+    fn golden_population(oldest: &[&str]) -> Vec<crate::annotations::Annotation> {
+        let sessions = oldest
+            .iter()
+            .map(|session| (*session).to_owned())
+            .chain((0..MAX_GOLDEN_ANNOTATIONS).map(|index| format!("s-{}", index % 10)));
+        sessions
+            .enumerate()
+            .map(|(index, session)| session_note("", &session, GOLDEN, 1_000 + index as u64))
+            .collect()
+    }
+
+    #[test]
+    fn a_golden_listing_counts_every_marker_it_found_and_decides_from_the_newest() {
+        let mut notes = golden_population(&["old-0", "old-1"]);
+        // Judgments that are not golden markers, and another tenant's
+        // markers: neither is the default tenant's to count.
+        notes.extend((0..2_000).map(|index| {
+            session_note("", &format!("q-{index}"), "quality", 50_000 + index as u64)
+        }));
+        notes.extend((0..3).map(|index| {
+            session_note("acme", &format!("a-{index}"), GOLDEN, 60_000 + index as u64)
+        }));
+        let fixture = TempStore::open_prepared("goldens-cap", crate::Config::default(), |dir| {
+            plant_annotations(dir, &notes)
+        });
+        let store = fixture.store();
+
+        let goldens = store.goldens(Some(""), MAX_GOLDEN_LIMIT).expect("lists");
+        assert_eq!(
+            goldens.annotations_examined,
+            MAX_GOLDEN_ANNOTATIONS + 2,
+            "the count is of the markers found, not of the ones kept"
+        );
+        assert!(
+            goldens.truncated,
+            "more markers than one listing decides from"
+        );
+        assert_eq!(
+            goldens
+                .runs
+                .iter()
+                .map(|run| run.run.as_str())
+                .collect::<Vec<_>>(),
+            ["s-0", "s-1", "s-2", "s-3", "s-4", "s-5", "s-6", "s-7", "s-8", "s-9"],
+            "the two oldest markers are past the cap and decide nothing"
+        );
+
+        let acme = store.goldens(Some("acme"), 100).expect("lists");
+        assert_eq!(
+            acme.annotations_examined, 3,
+            "a tenant's count says nothing of another tenant's markers"
+        );
+        assert!(!acme.truncated);
+        assert_eq!(
+            acme.runs
+                .iter()
+                .map(|run| run.run.as_str())
+                .collect::<Vec<_>>(),
+            ["a-0", "a-1", "a-2"]
+        );
+
+        let operator = store.goldens(None, MAX_GOLDEN_LIMIT).expect("lists");
+        assert_eq!(
+            operator.annotations_examined,
+            MAX_GOLDEN_ANNOTATIONS + 2 + 3
+        );
+        assert!(operator.truncated);
+    }
+
+    #[test]
+    fn a_marker_a_pending_erasure_withholds_neither_counts_nor_crowds_out_a_visible_one() {
+        let mut notes = golden_population(&["old-0"]);
+        let at = 1_000 + notes.len() as u64;
+        notes.push(session_note("", "withheld", GOLDEN, at));
+        let tombstone = json!({
+            "op": "erase", "schema": 1, "id": 1, "requested_unix_ns": 123,
+            "subject": {"kind": "session", "session_id": "withheld"},
+            "span_keys": [], "payload_refs": [],
+        });
+        let fixture = TempStore::open_prepared("goldens-masked", crate::Config::default(), |dir| {
+            plant_annotations(dir, &notes);
+            std::fs::write(dir.join("tombstones.jsonl"), format!("{tombstone}\n"))
+                .expect("plants the pending erasure");
+        });
+        let store = fixture.store();
+
+        // The newest marker is withheld; one more than the cap is visible.
+        let goldens = store.goldens(Some(""), MAX_GOLDEN_LIMIT).expect("lists");
+        assert_eq!(goldens.annotations_examined, MAX_GOLDEN_ANNOTATIONS + 1);
+        assert!(
+            goldens.truncated,
+            "a visible marker is past the cap, whatever the withheld one did"
+        );
+        assert!(goldens
+            .runs
+            .iter()
+            .all(|run| run.run != "withheld" && run.run != "old-0"));
+
+        // The same rule on the search the listing is built on: a limit
+        // counts what the caller may see.
+        let newest_visible = store
+            .search_annotations(&AnnotationQuery {
+                tenant: Some(""),
+                name: Some(GOLDEN),
+                limit: Some(1),
+                ..AnnotationQuery::default()
+            })
+            .expect("searches");
+        assert_eq!(
+            newest_visible
+                .iter()
+                .map(|note| note.timestamp_ns)
+                .collect::<Vec<_>>(),
+            [at - 1],
+            "the withheld newest marker does not use up the limit"
         );
     }
 }

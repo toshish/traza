@@ -1053,3 +1053,38 @@ fn a_fork_listing_never_outlives_its_query_budget() {
         other => panic!("unexpected {other}: {body}"),
     }
 }
+
+#[test]
+fn an_annotation_walk_never_outlives_its_query_budget() {
+    // Golden markers planted as the annotation log, which the server replays
+    // as it starts: a population no test could append one fsync at a time,
+    // and far more than a millisecond of walking.
+    let dir = common::temp_dir();
+    let mut log = String::new();
+    for index in 0..300_000_u64 {
+        log.push_str(
+            &json!({
+                "session_id": format!("s-{index}"), "name": "traza.golden", "value": true,
+                "source": "human:test", "timestamp_ns": 1_000 + index,
+            })
+            .to_string(),
+        );
+        log.push('\n');
+    }
+    std::fs::write(dir.join("annotations.jsonl"), log).expect("plants the log");
+    let server = Server::spawn_in(dir, &["--query-deadline-ms", "1"]);
+    for path in [
+        "/v1/annotations?name=traza.golden&limit=10",
+        "/v1/goldens?limit=10",
+    ] {
+        let (status, _, body) = call(&server, "GET", path, None, &[]);
+        assert_eq!(status, 400, "{path} is refused past its budget: {body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("query-deadline-ms"),
+            "{path}: {body}"
+        );
+    }
+}

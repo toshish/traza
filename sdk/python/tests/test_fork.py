@@ -26,6 +26,11 @@ import xml.etree.ElementTree as ET
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
+try:
+    import resource
+except ImportError:  # pragma: no cover - not POSIX
+    resource = None  # type: ignore[assignment]
+
 SRC = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SRC))
 
@@ -38,6 +43,7 @@ from traza.cli import build_parser, main as cli_main  # noqa: E402
 from traza.forking import Fork, ForkSpanProcessor, active_fork  # noqa: E402
 from traza.models import Divergence, ReplayStatus  # noqa: E402
 from traza.testing import (  # noqa: E402
+    OUTPUT_TAIL_BYTES,
     GoldenResult,
     TapeMismatch,
     TapeTest,
@@ -148,6 +154,48 @@ AGENT = textwrap.dedent(
     """
 )
 
+#: The weather agent behind 192 MiB of output — 128 MiB on stdout, 64 MiB on
+#: stderr, interleaved — and, with NOISY_AGENT_HANGS set, an agent that never
+#: exits once its calls are made.
+NOISY_AGENT = textwrap.dedent(
+    """
+    import os, runpy, sys, time
+    chunk = b"x" * (1 << 20)
+    for index in range(128):
+        sys.stdout.buffer.write(chunk)
+        if index % 2:
+            sys.stderr.buffer.write(chunk)
+    sys.stdout.buffer.write(b"\\nend of the noise on stdout\\n")
+    sys.stderr.buffer.write(b"\\nend of the noise on stderr\\n")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    runpy.run_path(os.environ["NOISY_AGENT_RUNS"], run_name="__main__")
+    sys.stdout.flush()
+    if os.environ.get("NOISY_AGENT_HANGS"):
+        print("hanging now", flush=True)
+        time.sleep(600)
+    """
+)
+
+#: run_golden in a process of its own, which reports its peak resident memory:
+#: the measure is the runner's alone, whatever this test process holds.
+MEASURED_GOLDEN = textwrap.dedent(
+    """
+    import json, resource, sys
+    sys.path.insert(0, sys.argv[1])
+    from traza import Client
+    from traza.testing import run_golden
+    url, run, timeout = sys.argv[2], sys.argv[3], float(sys.argv[4])
+    result = run_golden(Client(url), run, [sys.executable, *sys.argv[5:]], timeout=timeout)
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    print(json.dumps({
+        "peak_bytes": peak if sys.platform == "darwin" else peak * 1024,
+        "passed": result.passed, "kind": result.kind, "message": result.message,
+        "stdout": result.stdout, "stderr": result.stderr, "seconds": result.seconds,
+    }))
+    """
+)
+
 SERVER = None
 CLIENT = None
 SCRATCH = None
@@ -254,6 +302,37 @@ class ForkGoesLive(unittest.TestCase):
             self.assertEqual({key: os.environ.get(key) for key in before}, before, "environment restored")
             self.assertEqual(fork.final_status.fork.live_calls, 2, "one model call and one tool call went live")
             self.assertEqual(fork.final_status.served, 1)
+
+    def test_a_tool_the_recording_lacks_runs_live_without_moving_model_calls_off_it(self):
+        # Tool and model calls have their own cursors on the server: a tool the
+        # recording does not hold answers replay_live while recorded model
+        # calls are still to come, and those are still the recording's to serve.
+        with Stub(provider_answer) as provider:
+            fork = Fork(
+                CLIENT, "weather-7", 1, tool_result={"forecast": "sun", "celsius": 30}, set_env=False,
+                live_openai_base_url=provider.url + "/v1", live_openai_api_key="sk-real-provider-key",
+            )
+            with fork:
+                base, key = fork.openai_base_url, fork.api_key
+                # A setup tool before the first model call runs for real...
+                self.assertEqual(fork.call_tool("open_session", lambda: "opened"), "opened")
+                self.assertFalse(fork.is_live, "a tool going live is not the model calls going live")
+                # ...and step 0 still comes from the recording, strictly matched.
+                status, first = chat(base, key, {"model": "gpt-4o", "messages": messages()})
+                self.assertEqual(status, 200)
+                self.assertEqual(first["choices"][0]["message"]["tool_calls"][0]["id"], "call_w1")
+                self.assertEqual(len(provider.requests), 0, "no recorded model call reached the provider")
+                tool = fork.tool_result("get_weather")
+                self.assertTrue(tool.edited, "the edit is still served after a tool went live")
+                # Past the cut the model endpoint itself says so, and only then
+                # do model calls go to the provider.
+                status, live = chat(base, key, {"model": "gpt-4o",
+                                                "messages": messages(tool_result=json.dumps(tool.result))})
+                self.assertEqual(live["choices"][0]["message"]["content"], "Live: it is sunny in Paris.")
+                self.assertTrue(fork.is_live)
+                self.assertEqual(len(provider.requests), 1)
+            self.assertEqual(fork.final_status.served, 1, "the recorded model call was served by the replay")
+            self.assertEqual(fork.final_status.diverged, None)
 
     def test_without_live_the_edit_is_served_and_the_recording_plays_on(self):
         with Fork(CLIENT, "weather-7", 0, response="It is sunny in Paris.", live=False) as fork:
@@ -592,6 +671,43 @@ class GoldenRunsAndTheCommand(unittest.TestCase):
         code, _, err = run_cli("test", "--url", auth.url, "--", *self.agent, "{input}")
         self.assertEqual(code, 0, err)
         self.assertEqual(keys.read_text().split(), [reader, reader])
+
+    @unittest.skipIf(resource is None, "peak memory is read with the resource module (POSIX)")
+    def test_a_runaway_agents_output_is_held_as_a_tail_never_whole(self):
+        noisy = Path(SCRATCH, "noisy_agent.py")
+        noisy.write_text(NOISY_AGENT)
+        measure = Path(SCRATCH, "measured_golden.py")
+        measure.write_text(MEASURED_GOLDEN)
+        env = {key: value for key, value in os.environ.items() if key != "NOISY_AGENT_HANGS"}
+        env["NOISY_AGENT_RUNS"] = str(Path(SCRATCH, "agent.py"))
+
+        def measured(timeout, **extra):
+            done = subprocess.run(
+                [sys.executable, str(measure), str(SRC), self.server.url, "golden-by-tag", str(timeout),
+                 str(noisy), "{input}"],
+                env=dict(env, **extra), capture_output=True, timeout=300,
+            )
+            self.assertEqual(done.returncode, 0, done.stderr.decode("utf-8", "replace")[-2000:])
+            return json.loads(done.stdout)
+
+        # 192 MiB went through the agent's pipes; the runner held their tails.
+        finished = measured(120)
+        self.assertTrue(finished["passed"], finished["message"])
+        self.assertLess(finished["peak_bytes"], 96 << 20,
+                        "the runner's memory is bounded by the tail, not by what the agent wrote")
+        self.assertTrue(finished["stdout"].startswith("…"), "the tail says it is one")
+        self.assertIn("end of the noise on stdout", finished["stdout"])
+        self.assertTrue(finished["stdout"].rstrip().endswith("It's raining in Paris, 12°C."))
+        self.assertLessEqual(len(finished["stdout"].encode("utf-8")), OUTPUT_TAIL_BYTES + len("…".encode("utf-8")))
+        self.assertTrue(finished["stderr"].startswith("…"))
+        self.assertTrue(finished["stderr"].rstrip().endswith("end of the noise on stderr"))
+
+        # An agent that never exits is cut off at the timeout, its tail kept.
+        hung = measured(15, NOISY_AGENT_HANGS="1")
+        self.assertEqual(hung["kind"], "timeout", hung["message"])
+        self.assertLess(hung["peak_bytes"], 96 << 20)
+        self.assertTrue(hung["stdout"].rstrip().endswith("hanging now"))
+        self.assertLess(hung["seconds"], 60, "the runner returned at the timeout, not when the agent would have")
 
     def test_an_empty_suite_is_not_a_pass_unless_asked(self):
         empty = Server()

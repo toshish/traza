@@ -1914,9 +1914,12 @@ a value by one rule: the boolean, or exactly the string `"true"` /
 
 `source` is `attribute` or `annotation` — what marked the run; `tagged_at_ns`
 is the newest tagged span's start, or the deciding annotation's timestamp.
-`truncated` says more than 20,000 tagged spans or 10,000 annotations were
-found, or more runs than `limit`. `400` for a bad `limit`, an unknown
-parameter, or a tagged-span read past the query budget.
+`annotations_examined` counts every `traza.golden` annotation in scope; the
+listing decides from the newest 10,000 of them, holding no more than that
+whatever the store holds. `truncated` says more than 20,000 tagged spans or
+10,000 annotations were found, or more runs than `limit`. The tagged-span
+read and the annotation walk spend one query budget. `400` for a bad
+`limit`, an unknown parameter, or either read past the query budget.
 
 ---
 
@@ -2005,9 +2008,13 @@ query returns every annotation, newest first.
 
 `trace_id` used to be required, which made an eval run unreadable: its scores
 exist per trace, but a run is a population and nobody wants it one trace at a
-time. Annotations are indexed in memory at human/eval scale, so the
-cross-trace path is a scan of that index rather than anything touching a
-segment.
+time. Annotations are indexed in memory — by trace, by experiment and by
+name — so the cross-trace path walks the shortest index the narrowings name
+(the whole index only when they name none) rather than touching a segment.
+With a `limit` the walk holds no more than `limit` annotations at once,
+however many match; annotations a pending erasure withholds take no place
+within it. The walk spends the
+[`--query-deadline-ms`](../configuration.md#server-flags) budget.
 
 Results are newest first, tie-broken by
 `(tenant, trace_id, span_id, example_id, name)` so a bulk import sharing one
@@ -2024,8 +2031,8 @@ curl 'http://localhost:8080/v1/annotations?source=eval:&since=170000000000000000
 {"annotations":[{"comment":"","name":"groundedness","source":"eval:nightly","span_id":"span-a","timestamp_ns":1785005352756011000,"trace_id":"trace-2","value":0.9}]}
 ```
 
-**Errors.** `400` for an unknown parameter or an unparseable number. `503` on
-store failure.
+**Errors.** `400` for an unknown parameter or an unparseable number, or a
+walk past the query budget. `503` on store failure.
 
 ---
 

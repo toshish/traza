@@ -8,7 +8,8 @@
 //! index is the honest design. The TTL compactor rewrites the log dropping
 //! entries older than the retention window.
 
-use std::collections::{HashMap, HashSet};
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -17,7 +18,7 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{Error, Result};
+use crate::{Deadline, Error, Result, DEADLINE_CHECK_INTERVAL};
 
 /// One annotation, addressed to a TYPED SUBJECT: a trace, a span within it,
 /// a session, or an experiment example (a **score**).
@@ -156,7 +157,16 @@ pub struct AnnotationQuery<'a> {
 }
 
 impl AnnotationQuery<'_> {
+    /// Whether `annotation` satisfies every narrowing. Every field is checked
+    /// here, the indexed ones included: which index a search walks is a cost
+    /// decision, never a filter.
     fn matches(&self, annotation: &Annotation) -> bool {
+        if self
+            .trace_id
+            .is_some_and(|trace_id| annotation.trace_id != trace_id)
+        {
+            return false;
+        }
         if self
             .span_id
             .is_some_and(|span_id| annotation.span_id != span_id)
@@ -212,6 +222,96 @@ impl AnnotationQuery<'_> {
     }
 }
 
+/// What [`AnnotationLog::search`] found.
+#[derive(Debug)]
+pub(crate) struct Searched {
+    /// The newest matches, newest first, at most the query's limit.
+    pub(crate) found: Vec<Annotation>,
+    /// How many annotations matched every narrowing and were not withheld;
+    /// `found` is the newest `limit` of them.
+    pub(crate) matched: usize,
+}
+
+/// The search order, newest first: timestamp descending, then a stable
+/// tiebreak so equal timestamps — which a bulk eval import produces by the
+/// thousand — page deterministically.
+fn newest_first(left: &Annotation, right: &Annotation) -> Ordering {
+    right
+        .timestamp_ns
+        .cmp(&left.timestamp_ns)
+        .then_with(|| left.tenant.cmp(&right.tenant))
+        .then_with(|| left.trace_id.cmp(&right.trace_id))
+        .then_with(|| left.span_id.cmp(&right.span_id))
+        .then_with(|| left.example_id.cmp(&right.example_id))
+        .then_with(|| left.name.cmp(&right.name))
+}
+
+/// A match, by reference, ordered as the search returns it. The log
+/// position breaks the last tie, as the stable sort this replaced did, so
+/// the order is total and a heap of these is exactly that sort's prefix.
+#[derive(Debug)]
+struct Ranked<'a> {
+    annotation: &'a Annotation,
+    position: usize,
+}
+
+impl Ord for Ranked<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        newest_first(self.annotation, other.annotation)
+            .then_with(|| self.position.cmp(&other.position))
+    }
+}
+
+impl PartialOrd for Ranked<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for Ranked<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for Ranked<'_> {}
+
+/// The newest `limit` matches offered so far — never more than `limit` held
+/// at once. A max-heap in search order: its top is the oldest kept, so a
+/// newer match replaces it in `O(log limit)` and an older one is dropped on
+/// sight. Without a limit, every match is kept.
+#[derive(Debug)]
+struct Newest<'a> {
+    limit: Option<usize>,
+    kept: BinaryHeap<Ranked<'a>>,
+}
+
+impl<'a> Newest<'a> {
+    fn new(limit: Option<usize>) -> Self {
+        Self {
+            limit,
+            kept: BinaryHeap::new(),
+        }
+    }
+
+    fn offer(&mut self, candidate: Ranked<'a>) {
+        match self.limit {
+            Some(limit) if self.kept.len() >= limit => {
+                if let Some(mut oldest) = self.kept.peek_mut() {
+                    if candidate < *oldest {
+                        *oldest = candidate;
+                    }
+                }
+            }
+            _ => self.kept.push(candidate),
+        }
+    }
+
+    fn into_newest_first(self) -> Vec<Ranked<'a>> {
+        self.kept.into_sorted_vec()
+    }
+}
+
 const LOG_NAME: &str = "annotations.jsonl";
 
 /// The append-only annotation log plus its in-memory trace index.
@@ -232,6 +332,10 @@ struct Inner {
     by_trace: HashMap<String, Vec<usize>>,
     /// Positions of scores, by experiment — the eval read path's index.
     by_experiment: HashMap<u64, Vec<usize>>,
+    /// Positions by annotation name, so a search for one kind of judgment
+    /// (the golden listing's `traza.golden`) walks that kind, not every
+    /// score the store holds.
+    by_name: HashMap<String, Vec<usize>>,
 }
 
 impl Inner {
@@ -239,6 +343,7 @@ impl Inner {
         self.entries = entries;
         self.by_trace.clear();
         self.by_experiment.clear();
+        self.by_name.clear();
         for position in 0..self.entries.len() {
             self.index(position);
         }
@@ -255,6 +360,11 @@ impl Inner {
                 .entry(experiment)
                 .or_default()
                 .push(position);
+        }
+        if let Some(positions) = self.by_name.get_mut(&annotation.name) {
+            positions.push(position);
+        } else {
+            self.by_name.insert(annotation.name.clone(), vec![position]);
         }
     }
 
@@ -374,57 +484,85 @@ impl AnnotationLog {
             .unwrap_or_default())
     }
 
-    /// Annotations matching every supplied narrowing, newest first.
+    /// Annotations matching every supplied narrowing that `hidden` does not
+    /// withhold, newest first, at most the query's `limit` — and how many
+    /// matched in all.
     ///
     /// Unlike [`Self::query`] this does not require a trace: scores are
     /// produced per trace but read across them — an eval run is a population,
     /// not a lookup — and requiring `trace_id` meant the only way to see a
     /// run's results was to already know every trace in it. The index is fully
-    /// in memory and annotation volume is human/eval scale, so the cross-trace
-    /// path is a scan of that map rather than anything touching a segment.
-    pub(crate) fn search(&self, narrow: &AnnotationQuery<'_>) -> Result<Vec<Annotation>> {
+    /// in memory, so the cross-trace path is a walk of it rather than anything
+    /// touching a segment.
+    ///
+    /// The walk runs under the log's one mutex, which every append waits on,
+    /// so it is bounded in what it holds and in how long it runs, whatever
+    /// the population:
+    ///
+    /// - it walks the shortest index list the narrowings name — an
+    ///   experiment's scores, a trace's judgments, one annotation name — and
+    ///   the whole log only when they name none;
+    /// - with a `limit` it holds only the newest `limit` matches seen so far,
+    ///   as positions in a heap rather than copies ([`Newest`]), and copies
+    ///   out just those: memory in the limit, not in the matches;
+    /// - it checks `deadline` every [`DEADLINE_CHECK_INTERVAL`] annotations
+    ///   walked, and refuses rather than finishing a walk past its budget.
+    ///
+    /// `hidden` is applied inside the walk, so an annotation a pending
+    /// erasure withholds neither counts nor takes a place within the limit:
+    /// the limit counts what the caller may see.
+    pub(crate) fn search(
+        &self,
+        narrow: &AnnotationQuery<'_>,
+        hidden: impl Fn(&Annotation) -> bool,
+        deadline: Option<Deadline>,
+    ) -> Result<Searched> {
         let inner = self
             .inner
             .lock()
             .map_err(|_| Error::LockPoisoned("annotations"))?;
-        let mut found: Vec<Annotation> = Vec::new();
-        let mut consider = |annotation: &Annotation| {
-            if narrow.matches(annotation) {
-                found.push(annotation.clone());
+        // A narrowing that names an index key with no list matches nothing,
+        // which is the empty list — the shortest of all.
+        let walk: Option<&[usize]> = [
+            narrow
+                .experiment_id
+                .map(|experiment| inner.by_experiment.get(&experiment)),
+            narrow.trace_id.map(|trace_id| inner.by_trace.get(trace_id)),
+            narrow.name.map(|name| inner.by_name.get(name)),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|list| list.map_or(&[][..], Vec::as_slice))
+        .min_by_key(|list| list.len());
+        let walked = walk.map_or(inner.entries.len(), <[usize]>::len);
+        let mut newest = Newest::new(narrow.limit);
+        let mut matched = 0;
+        for step in 0..walked {
+            if step % DEADLINE_CHECK_INTERVAL == 0 {
+                Deadline::check(deadline, 0)?;
             }
-        };
-        // Most selective index first: an experiment narrows to one run's
-        // scores, a trace to one trace's judgments; only a fully open search
-        // walks the population.
-        if let Some(experiment) = narrow.experiment_id {
-            for position in inner.by_experiment.get(&experiment).into_iter().flatten() {
-                consider(&inner.entries[*position]);
+            let position = walk.map_or(step, |list| list[step]);
+            let annotation = &inner.entries[position];
+            if !narrow.matches(annotation) || hidden(annotation) {
+                continue;
             }
-        } else if let Some(trace_id) = narrow.trace_id {
-            for position in inner.by_trace.get(trace_id).into_iter().flatten() {
-                consider(&inner.entries[*position]);
-            }
-        } else {
-            for annotation in &inner.entries {
-                consider(annotation);
-            }
+            matched += 1;
+            newest.offer(Ranked {
+                annotation,
+                position,
+            });
         }
-        // Newest first, then a stable tiebreak so equal timestamps — which
-        // a bulk eval import produces by the thousand — page deterministically.
-        found.sort_by(|left, right| {
-            right
-                .timestamp_ns
-                .cmp(&left.timestamp_ns)
-                .then_with(|| left.tenant.cmp(&right.tenant))
-                .then_with(|| left.trace_id.cmp(&right.trace_id))
-                .then_with(|| left.span_id.cmp(&right.span_id))
-                .then_with(|| left.example_id.cmp(&right.example_id))
-                .then_with(|| left.name.cmp(&right.name))
-        });
-        if let Some(limit) = narrow.limit {
-            found.truncate(limit);
-        }
-        Ok(found)
+        // Ordering an unlimited search's matches is the one step not bounded
+        // by a limit; it too waits for nothing past the budget.
+        Deadline::check(deadline, 0)?;
+        Ok(Searched {
+            found: newest
+                .into_newest_first()
+                .into_iter()
+                .map(|ranked| ranked.annotation.clone())
+                .collect(),
+            matched,
+        })
     }
 
     /// Drops annotations addressed to an erased subject, rewriting the log
@@ -524,5 +662,222 @@ impl AnnotationLog {
         }
         inner.adopt(kept);
         Ok(removed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::time::{Duration, Instant};
+
+    /// A log over `entries`, in memory: the walk under test never touches
+    /// the file.
+    fn log_of(entries: Vec<Annotation>) -> AnnotationLog {
+        let mut inner = Inner::default();
+        inner.adopt(entries);
+        AnnotationLog {
+            path: PathBuf::new(),
+            inner: Mutex::new(inner),
+        }
+    }
+
+    fn note(tenant: &str, trace_id: &str, name: &str, at: u64) -> Annotation {
+        Annotation {
+            trace_id: trace_id.to_owned(),
+            span_id: String::new(),
+            tenant: tenant.to_owned(),
+            session_id: String::new(),
+            experiment_id: None,
+            example_id: String::new(),
+            name: name.to_owned(),
+            value: Value::Bool(true),
+            source: "eval:test".to_owned(),
+            comment: String::new(),
+            timestamp_ns: at,
+        }
+    }
+
+    /// What the search returned before it was bounded: every match copied,
+    /// stably sorted, cut to the limit.
+    fn full_sort(entries: &[Annotation], narrow: &AnnotationQuery<'_>) -> Vec<Annotation> {
+        let mut found: Vec<Annotation> = entries
+            .iter()
+            .filter(|annotation| narrow.matches(annotation))
+            .cloned()
+            .collect();
+        found.sort_by(newest_first);
+        if let Some(limit) = narrow.limit {
+            found.truncate(limit);
+        }
+        found
+    }
+
+    #[test]
+    fn a_walk_refuses_at_its_next_check_once_its_budget_is_spent() {
+        let walk = 3 * DEADLINE_CHECK_INTERVAL;
+        let log = log_of(
+            (0..walk)
+                .map(|index| note("", &format!("t{index}"), "traza.golden", index as u64))
+                .collect(),
+        );
+        let deadline = Deadline::starting(Instant::now(), Some(Duration::from_millis(50)));
+        // The first annotation's predicate stalls past the budget, standing
+        // in for a walk that has simply gone on too long.
+        let considered = Cell::new(0_usize);
+        let stall = |_: &Annotation| {
+            if considered.get() == 0 {
+                std::thread::sleep(Duration::from_millis(120));
+            }
+            considered.set(considered.get() + 1);
+            false
+        };
+        let narrow = AnnotationQuery {
+            name: Some("traza.golden"),
+            limit: Some(10),
+            ..AnnotationQuery::default()
+        };
+        let refused = log.search(&narrow, stall, deadline);
+        assert!(
+            matches!(refused, Err(Error::DeadlineExceeded(_))),
+            "an exhausted budget is a refusal: {refused:?}"
+        );
+        assert_eq!(
+            considered.get(),
+            DEADLINE_CHECK_INTERVAL,
+            "the walk stopped at the first check after the stall, not at its end"
+        );
+        // With budget, the same walk answers.
+        let answered = log
+            .search(&narrow, |_| false, None)
+            .expect("an unbudgeted walk answers");
+        assert_eq!(answered.matched, walk);
+        assert_eq!(answered.found.len(), 10);
+    }
+
+    #[test]
+    fn a_limited_walk_holds_its_limit_and_returns_what_a_full_sort_would() {
+        // Pseudo-random timestamps over a narrow range, so ties — broken by
+        // tenant, then trace, then log position — are everywhere.
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let entries: Vec<Annotation> = (0..5_000)
+            .map(|_| {
+                let roll = next();
+                let tenant = ["", "acme", "zeta"][(roll % 3) as usize];
+                let trace = format!("t{}", (roll >> 8) % 7);
+                let name = ["traza.golden", "quality"][((roll >> 16) % 2) as usize];
+                note(tenant, &trace, name, (roll >> 24) % 50)
+            })
+            .collect();
+        let log = log_of(entries.clone());
+        for limit in [Some(0), Some(1), Some(7), Some(100), Some(4_999), None] {
+            for (tenant, name) in [(None, None), (Some("acme"), Some("traza.golden"))] {
+                let narrow = AnnotationQuery {
+                    tenant,
+                    name,
+                    limit,
+                    ..AnnotationQuery::default()
+                };
+                let expected = full_sort(&entries, &narrow);
+                let searched = log.search(&narrow, |_| false, None).expect("searches");
+                assert_eq!(
+                    searched.found, expected,
+                    "limit {limit:?}, tenant {tenant:?}"
+                );
+                let all = full_sort(
+                    &entries,
+                    &AnnotationQuery {
+                        limit: None,
+                        ..narrow.clone()
+                    },
+                );
+                assert_eq!(searched.matched, all.len());
+            }
+        }
+
+        // The selection itself never holds more than its limit, whatever it
+        // is offered.
+        let mut newest = Newest::new(Some(16));
+        for (position, annotation) in entries.iter().enumerate() {
+            newest.offer(Ranked {
+                annotation,
+                position,
+            });
+            assert!(newest.kept.len() <= 16);
+        }
+        let held: Vec<Annotation> = newest
+            .into_newest_first()
+            .into_iter()
+            .map(|ranked| ranked.annotation.clone())
+            .collect();
+        assert_eq!(
+            held,
+            full_sort(
+                &entries,
+                &AnnotationQuery {
+                    limit: Some(16),
+                    ..AnnotationQuery::default()
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn every_narrowing_filters_whichever_index_the_walk_takes() {
+        let score = |trace_id: &str, at: u64| Annotation {
+            experiment_id: Some(7),
+            example_id: format!("ex-{trace_id}"),
+            ..note("", trace_id, "groundedness", at)
+        };
+        let log = log_of(vec![
+            score("ta", 1),
+            score("tb", 2),
+            note("", "ta", "quality", 3),
+            note("", "tb", "quality", 4),
+            note("", "tc", "quality", 5),
+        ]);
+        let traces = |narrow: AnnotationQuery<'_>| -> Vec<String> {
+            log.search(&narrow, |_| false, None)
+                .expect("searches")
+                .found
+                .into_iter()
+                .map(|annotation| annotation.trace_id)
+                .collect()
+        };
+        // The experiment's list is walked; the trace still narrows it.
+        assert_eq!(
+            traces(AnnotationQuery {
+                experiment_id: Some(7),
+                trace_id: Some("ta"),
+                ..AnnotationQuery::default()
+            }),
+            ["ta"]
+        );
+        // The trace's list is the shorter; the name still narrows it.
+        assert_eq!(
+            traces(AnnotationQuery {
+                trace_id: Some("tb"),
+                name: Some("quality"),
+                ..AnnotationQuery::default()
+            }),
+            ["tb"]
+        );
+        // A name nothing carries walks nothing and finds nothing.
+        assert!(traces(AnnotationQuery {
+            name: Some("traza.golden"),
+            ..AnnotationQuery::default()
+        })
+        .is_empty());
+        // An unnarrowed walk sees everything, newest first.
+        assert_eq!(
+            traces(AnnotationQuery::default()),
+            ["tc", "tb", "ta", "tb", "ta"]
+        );
     }
 }

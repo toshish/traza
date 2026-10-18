@@ -16,8 +16,12 @@ point at a *switch*: a small HTTP server on a loopback port, private to this
 process, that forwards each model call to the Traza replay until the replay
 answers ``409 replay_live``, and from then on to the real provider (the base
 URL and key the environment named when the fork was made). The agent sees
-one provider throughout. An SDK client constructed *before* the block keeps
-the URL it was built with: build it inside, or pass :meth:`Fork.openai_kwargs`.
+one provider throughout. Only a model call's answer moves the switch: the
+server keeps the tool and model cursors apart, so a tool the recording does
+not hold (:meth:`Fork.tool_result` answering ``None``) runs for real while
+the recorded model calls are still served from the recording. An SDK client
+constructed *before* the block keeps the URL it was built with: build it
+inside, or pass :meth:`Fork.openai_kwargs`.
 
 The environment is the whole process's, so only one fork at a time may own
 it: starting a second ``set_env`` fork while one is active is refused. Forks
@@ -316,7 +320,10 @@ class Fork:
         self.id: Optional[str] = None
         #: The step it was cut at, as the server computed it.
         self.step: Optional[int] = None
-        #: Unix seconds when the first call went to the real provider.
+        #: Unix seconds when model calls went to the real provider: when the
+        #: replay first answered a model call ``replay_live``. A tool step the
+        #: replay answers that way (``tool_result`` returning ``None``) does
+        #: not set it — tool and model calls have their own cursors.
         self.live_at: Optional[float] = None
         #: Whether spans are being tagged (OpenTelemetry SDK configured).
         self.tagging = False
@@ -445,7 +452,10 @@ class Fork:
 
     @property
     def is_live(self) -> bool:
-        """Whether a call has gone past the cut to the real provider."""
+        """Whether model calls now go to the real provider: the replay has
+        answered one ``replay_live``. Only the model endpoint's answer says
+        so — a tool the recording lacks going live leaves the recorded model
+        calls on the recording."""
         return self.live_at is not None
 
     @property
@@ -515,12 +525,17 @@ class Fork:
     def tool_result(self, name: Optional[str] = None) -> Optional[ToolStep]:
         """The next recorded tool step (of ``name``), with an edited result
         where the fork has one — or ``None`` when the harness should run the
-        real tool: past the cut, or with no recorded step left."""
+        real tool: past the cut, or with no recorded step of that tool left.
+
+        ``None`` says nothing about model calls. The server's tool cursor is
+        independent of its model cursor, so a tool the recording does not
+        hold answers this way while recorded model calls are still to come,
+        and the switch keeps serving those from the recording until the
+        model endpoint itself answers ``replay_live``."""
         try:
             step = self._require_replay().next_tool(name)
         except TrazaError as error:
             if error.status == 409 and error.type == "replay_live":
-                self._went_live()
                 return None
             raise
         return step
@@ -544,7 +559,9 @@ class Fork:
 
     # ---------------------------------------------------------- internals
 
-    def _went_live(self) -> None:
+    def _models_went_live(self) -> None:
+        """Notes the model endpoint's ``replay_live``: from here every model
+        call goes to the real provider. Called by the switch alone."""
         if self.live_at is None:
             self.live_at = time.time()
 
@@ -649,7 +666,7 @@ class _SwitchHandler(BaseHTTPRequestHandler):
             if not (status == 409 and _is_live_signal(content)):
                 self._write(status, reason, response_headers, content)
                 return
-            fork._went_live()
+            fork._models_went_live()
         live_headers = dict(forwarded)
         if provider == "openai" and fork.live_openai_api_key:
             live_headers["Authorization"] = "Bearer " + fork.live_openai_api_key

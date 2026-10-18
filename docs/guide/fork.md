@@ -252,7 +252,13 @@ or pass `fork.openai_kwargs()`.
 
 `fork.tool_result(name)` returns the next recorded tool step — the edit, at
 the edited step — or `None` once the harness should run the real tool;
-`fork.call_tool(name, fn, *args)` does that choice for you.
+`fork.call_tool(name, fn, *args)` does that choice for you. A `None` says
+nothing about model calls: the server keeps a tool cursor and a model cursor
+apart, and answers `replay_live` for a tool the recording does not hold —
+a setup tool the agent calls before its first model call, say — while
+recorded model calls are still to come. Only the model endpoint's own
+`replay_live` moves the switch (and `fork.is_live`), so those calls are
+still answered from the recording, strictly matched.
 
 **The environment is one fork's at a time.** Starting a second fork that
 would set it while one's block is active raises `RuntimeError` before
@@ -304,7 +310,9 @@ Anthropic SDKs take one — so no port is opened: it sends each call to the
 replay until it answers `replay_live`, then that call and every later one to
 the real provider (`liveOpenAI` / `liveAnthropic` options, else the
 environment's base URL and key). Each fork is its own `fetch`, so any number
-can run side by side in one process.
+can run side by side in one process. As in Python, `fork.toolResult(name)`
+answering `null` — a tool the recording lacks — moves no model call off the
+recording; only a model call answered `replay_live` does (`fork.isLive`).
 
 `fork.spanProcessor()` returns a duck-typed OpenTelemetry span processor
 that stamps the fork's attributes and session id on the spans started **in
@@ -468,6 +476,9 @@ exits 0 having made exactly the recorded model calls; it fails as
 cannot be created. Each `testcase` is named by run id, classed
 `traza.golden` (`traza.golden.<tenant>` for a named tenant), with the tail of
 the agent's output (64 KiB of each stream) as `system-out` / `system-err`.
+Both streams are read as the agent writes them, so that tail is all the
+runner holds — an agent that prints gigabytes before it finishes, or until
+its timeout, costs the runner 64 KiB a stream, not its output.
 
 The exit status is 0 when every run passed and 1 otherwise. **An empty suite
 is a failure** unless `--allow-empty` is given: a CI step that tests nothing
@@ -504,7 +515,10 @@ that creates a replay ([MCP guide](mcp.md#the-tools)).
 
 - **Traza does not go live; your harness does.** The server stops serving at
   the live point and answers `409 replay_live`. The clients switch to the
-  real provider; a harness of your own must do the same on that answer.
+  real provider; a harness of your own must do the same on that answer —
+  and must keep tools and model calls apart, as the clients do: a
+  `tools/next` `replay_live` means run that tool for real, not that model
+  calls may skip the recording.
 - **After an edit without a live point, the recording plays on loosely**,
   answering a conversation it was not recorded in. That exercises the agent's
   own code down the recorded path; it is not what a model would have said.
@@ -520,9 +534,11 @@ that creates a replay ([MCP guide](mcp.md#the-tools)).
 - **Bounds:** 64 edits per fork; a fork listing examines 10,000 tagged spans
   (the earliest-starting: past the cap the newest forks can be missing) and
   lists at most 50 forks, each diffed within the differ's own caps (5,000
-  steps, 50,000 spans a side); a golden listing examines 20,000 tagged spans
-  and 10,000 annotations and lists at most 1,000 runs (200 by default); a
-  divergence's kept difference quotes 120 characters a side and 32 of a role.
+  steps, 50,000 spans a side); a golden listing examines 20,000 tagged spans,
+  decides from the newest 10,000 golden annotations — walking every one in
+  scope under the query budget, never holding more than 10,000 — and lists
+  at most 1,000 runs (200 by default); a divergence's kept difference quotes
+  120 characters a side and 32 of a role.
 - **A run past 20,000 spans replays only as a rewind** whose live point falls
   within the steps read; a plain replay, or a later live point, is refused.
 - **The Python switch acts on the process environment**, so one fork at a
