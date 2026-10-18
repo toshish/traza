@@ -17,14 +17,16 @@ import socket
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import IO, Any, Callable, Dict, Iterator, List, Mapping, Optional, Tuple, TypeVar, Union
+from typing import IO, TYPE_CHECKING, Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple, TypeVar, Union
 
 from . import __version__
 from .errors import FuseTripped, TrazaError, error_from_response
 from .models import (
     Diff,
     EvidencePack,
+    Forks,
     FuseEvent,
+    Goldens,
     Identity,
     LedgerHead,
     Limits,
@@ -40,7 +42,16 @@ from .models import (
     decode,
 )
 
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from .forking import Fork
+
 __all__ = ["Client", "Guard", "EventStream", "FOLLOW_WAIT_MS"]
+
+#: The span attribute, and annotation name, that marks a run as golden.
+GOLDEN = "traza.golden"
+
+# Distinguishes "no tool result edit" from an edit whose result is None.
+_NOT_GIVEN: Any = object()
 
 F = TypeVar("F", bound=Callable[..., Any])
 
@@ -314,20 +325,98 @@ class Client:
             query["max_steps"] = max_steps
         return decode(Tape, self._object("GET", "/v1/tapes/" + _segment(run), query=query))
 
-    def replay(self, run: str, mode: str = "strict") -> Replay:
+    def replay(
+        self,
+        run: str,
+        mode: str = "strict",
+        edits: Optional[Sequence[Mapping[str, Any]]] = None,
+        live_after: Optional[int] = None,
+    ) -> Replay:
         """Snapshot ``run`` into a replay that serves its model answers back.
 
         ``strict`` refuses a request whose messages differ from the recorded
-        step (:class:`~traza.Conflict`, ``type == "replay_divergence"``);
-        ``loose`` serves the recorded steps in order whatever is asked. The
-        replay lives in server memory for an hour.
+        step (:class:`~traza.Conflict`, ``type == "replay_divergence"``, with
+        the first difference in the error body); ``loose`` serves the
+        recorded steps in order whatever is asked. The replay lives in server
+        memory for an hour.
+
+        ``edits`` and ``live_after`` make it a fork (see :meth:`fork`, which
+        also switches the agent to the real provider at the cut): each edit
+        is ``{"step": n, "response": ...}`` or ``{"step": n, "tool_result":
+        ...}``, served instead of the recording at that step; after step
+        ``live_after`` every call answers ``409 replay_live``.
         """
         body: Dict[str, Any] = {"run": run, "mode": mode}
+        if edits:
+            body["edits"] = [dict(edit) for edit in edits]
+        if live_after is not None:
+            body["live_after"] = live_after
         if self.tenant is not None:
             body["tenant"] = self.tenant
         replay = decode(Replay, self._object("POST", "/v1/replays", body=body))
         replay._client = self
         return replay
+
+    def fork(
+        self,
+        run: str,
+        at_step: int,
+        response: Any = None,
+        tool_result: Any = _NOT_GIVEN,
+        *,
+        live: bool = True,
+        mode: str = "strict",
+        **options: Any,
+    ) -> "Fork":
+        """Branch ``run`` at tape step ``at_step``: a context manager.
+
+        Steps before ``at_step`` are replayed from the recording, strictly.
+        At ``at_step`` the agent receives ``response`` (a model answer: text,
+        or an assistant message) or ``tool_result`` (from
+        :meth:`~traza.forking.Fork.tool_result`) instead of what was recorded —
+        or, with neither, the recording stops there. With ``live`` (the
+        default) every later call goes to the real provider: inside the
+        ``with`` block ``OPENAI_BASE_URL`` and ``ANTHROPIC_BASE_URL`` point at
+        a loopback switch that forwards to the replay until the cut and to
+        the provider after it, and spans started in the block carry the
+        fork's tags. See :class:`~traza.forking.Fork` for ``options``.
+        """
+        from .forking import Fork
+
+        if tool_result is not _NOT_GIVEN:
+            options["tool_result"] = tool_result
+        return Fork(self, run, at_step, response=response, live=live, mode=mode, **options)
+
+    def forks(self, run: str, limit: Optional[int] = None) -> Forks:
+        """The recorded forks of ``run``, newest first, each diffed against it."""
+        query = self._tenant_query()
+        query["run"] = run
+        if limit is not None:
+            query["limit"] = limit
+        return decode(Forks, self._object("GET", "/v1/forks", query=query))
+
+    def goldens(self, limit: Optional[int] = None) -> Goldens:
+        """The runs marked golden, by span attribute or by annotation."""
+        query = self._tenant_query()
+        if limit is not None:
+            query["limit"] = limit
+        return decode(Goldens, self._object("GET", "/v1/goldens", query=query))
+
+    def mark_golden(self, run: str, golden: bool = True, source: str = "human:traza-sdk") -> None:
+        """Mark ``run`` as a regression baseline, or with ``golden=False``
+        un-mark it: an annotation named ``traza.golden`` on the run's session
+        (or, for ``trace:<id>``, its trace). The newest one decides. Needs an
+        ``rw`` credential."""
+        if not isinstance(run, str) or not run:
+            raise ValueError("expected a non-empty run id")
+        body: Dict[str, Any] = {"name": GOLDEN, "value": bool(golden), "source": source}
+        if run.startswith("trace:"):
+            body["trace_id"] = run[len("trace:"):]
+        else:
+            body["session_id"] = run
+        if self.tenant is not None:
+            body["tenant"] = self.tenant
+        self._object("POST", "/v1/annotations", body=body)
 
     def diff(self, a: str, b: str) -> Diff:
         """Align two runs' steps and name the first place they diverge."""

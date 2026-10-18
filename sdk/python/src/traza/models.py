@@ -43,6 +43,9 @@ __all__ = [
     "Step",
     "Tape",
     "Replay",
+    "ForkEdit",
+    "ForkInfo",
+    "ForkState",
     "Divergence",
     "ReplayCall",
     "ReplayStatus",
@@ -55,6 +58,10 @@ __all__ = [
     "FailureCause",
     "RecalledRun",
     "Recall",
+    "ForkSummary",
+    "Forks",
+    "GoldenRun",
+    "Goldens",
     "LedgerHead",
     "EvidenceWindow",
     "DayActivity",
@@ -336,6 +343,51 @@ class Divergence:
     step: Optional[int] = None
     expected_digest: Optional[str] = None
     got_digest: Optional[str] = None
+    #: Where the request first differed from the recording: ``message``,
+    #: ``role``, ``field`` (``role``, ``content``, ``tool_call_id``,
+    #: ``tool_calls``, or ``missing`` / ``extra``), ``at_char``, quotes of
+    #: both sides as ``recorded`` and ``got``, and both message counts.
+    #: ``None`` when it could not be said.
+    difference: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class ForkEdit:
+    step: Optional[int] = None
+    #: ``response`` or ``tool_result``.
+    kind: Optional[str] = None
+    #: In a status document: whether the edit has been served.
+    served: Optional[bool] = None
+
+
+@dataclass
+class ForkInfo:
+    """A fork's ``fork`` object in a replay's creation response."""
+
+    id: Optional[str] = None
+    #: The run it branches from.
+    parent: Optional[str] = None
+    #: The first step whose answer is not the parent's.
+    step: Optional[int] = None
+    edits: List[ForkEdit] = field(default_factory=list)
+    #: After this step every call answers ``replay_live``.
+    live_after: Optional[int] = None
+    #: The span attributes the forked run's spans carry.
+    attributes: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ForkState:
+    """A fork's ``fork`` object in a replay's status document."""
+
+    id: Optional[str] = None
+    parent: Optional[str] = None
+    step: Optional[int] = None
+    edits: List[ForkEdit] = field(default_factory=list)
+    live_after: Optional[int] = None
+    #: When a call was first answered ``replay_live``.
+    live_at_ns: Optional[int] = None
+    live_calls: Optional[int] = None
 
 
 @dataclass
@@ -356,8 +408,13 @@ class ReplayStatus:
     remaining: Optional[int] = None
     diverged: Optional[Divergence] = None
     calls: List[ReplayCall] = field(default_factory=list)
+    #: Model calls refused because every recorded step had been served.
+    exhausted_calls: Optional[int] = None
     unreadable_tool_steps: List[int] = field(default_factory=list)
     expires_at_ns: Optional[int] = None
+    #: Present when the replay is a fork.
+    fork_id: Optional[str] = None
+    fork: Optional[ForkState] = None
     raw: Dict[str, Any] = _raw()
 
 
@@ -369,6 +426,8 @@ class ToolStep:
     tool: Optional[str] = None
     arguments: Any = None
     result: Any = None
+    #: ``True`` when ``result`` is a fork's edit rather than the recording's.
+    edited: Optional[bool] = None
     raw: Dict[str, Any] = _raw()
 
 
@@ -391,6 +450,9 @@ class Replay:
     unreadable_tool_steps: List[int] = field(default_factory=list)
     #: The server's base URLs, as paths: ``{"openai": ..., "anthropic": ...}``.
     base_urls: Dict[str, str] = field(default_factory=dict)
+    #: Present when the replay is a fork (created with edits or a live point).
+    fork_id: Optional[str] = None
+    fork: Optional[ForkInfo] = None
     raw: Dict[str, Any] = _raw()
     # Typed Any rather than Client: decode() resolves every annotation with
     # get_type_hints, and Client is imported for type checkers only.
@@ -564,6 +626,82 @@ class Recall:
     raw: Dict[str, Any] = _raw()
 
     def __iter__(self) -> typing.Iterator[RecalledRun]:
+        return iter(self.runs)
+
+    def __len__(self) -> int:
+        return len(self.runs)
+
+
+# ---------------------------------------------------------------- forks
+
+
+@dataclass
+class ForkSummary:
+    """One fork in ``GET /v1/forks``."""
+
+    run: Optional[str] = None
+    tenant: Optional[str] = None
+    fork_id: Optional[str] = None
+    fork_step: Optional[int] = None
+    first_start_ns: Optional[int] = None
+    last_end_ns: Optional[int] = None
+    tagged_spans: Optional[int] = None
+    #: Whether it was diffed against its parent; when not, ``skipped`` says
+    #: why (``deadline`` or ``parent_missing``).
+    diffed: Optional[bool] = None
+    skipped: Optional[str] = None
+    steps: Optional[int] = None
+    outcome: Optional[str] = None
+    cost_usd: Optional[float] = None
+    errors: Optional[int] = None
+    #: Where it parted from its parent (``a`` the parent, ``b`` the fork).
+    first_divergence: Optional[FirstDivergence] = None
+    delta: Optional[DiffDelta] = None
+    diverged_before_cut: Optional[bool] = None
+    truncated: Optional[bool] = None
+
+
+@dataclass
+class Forks:
+    """``GET /v1/forks``: a run's forks, each diffed against it."""
+
+    run: Optional[str] = None
+    parent: Optional[RunSummary] = None
+    forks: List[ForkSummary] = field(default_factory=list)
+    #: Tagged spans that joined the parent run itself (a fork without a
+    #: session of its own).
+    merged_into_parent: Optional[int] = None
+    spans_examined: Optional[int] = None
+    truncated: Optional[bool] = None
+    raw: Dict[str, Any] = _raw()
+
+    def __iter__(self) -> typing.Iterator[ForkSummary]:
+        return iter(self.forks)
+
+    def __len__(self) -> int:
+        return len(self.forks)
+
+
+@dataclass
+class GoldenRun:
+    run: Optional[str] = None
+    tenant: Optional[str] = None
+    #: ``attribute`` or ``annotation``.
+    source: Optional[str] = None
+    tagged_at_ns: Optional[int] = None
+
+
+@dataclass
+class Goldens:
+    """``GET /v1/goldens``: the runs marked as regression baselines."""
+
+    runs: List[GoldenRun] = field(default_factory=list)
+    spans_examined: Optional[int] = None
+    annotations_examined: Optional[int] = None
+    truncated: Optional[bool] = None
+    raw: Dict[str, Any] = _raw()
+
+    def __iter__(self) -> typing.Iterator[GoldenRun]:
         return iter(self.runs)
 
     def __len__(self) -> int:

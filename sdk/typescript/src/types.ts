@@ -202,12 +202,59 @@ export interface ReplayDocument {
   unreadable_tool_steps: number[];
   /** Paths on the server: `{openai: "/v1/replays/…/openai/v1", anthropic: …}`. */
   base_urls: { openai: string; anthropic: string };
+  /** Present when the replay is a fork (created with edits or a live point). */
+  fork_id?: string;
+  fork?: ForkInfo;
+}
+
+/** An edit a fork serves in place of the recording at one tape step. */
+export type ForkEdit = { step: number; response: unknown } | { step: number; tool_result: unknown };
+
+/** A fork's `fork` object in a replay's creation response. */
+export interface ForkInfo {
+  id: string;
+  /** The run it branches from. */
+  parent: string;
+  /** The first step whose answer is not the parent's. */
+  step: number;
+  edits: { step: number; kind: "response" | "tool_result" }[];
+  /** After this step every call answers `replay_live`. */
+  live_after: number | null;
+  /** The span attributes the forked run's spans carry. */
+  attributes: Record<string, string | number>;
+}
+
+/** A fork's `fork` object in a replay's status document. */
+export interface ForkState {
+  id: string;
+  parent: string;
+  step: number;
+  edits: { step: number; kind: "response" | "tool_result"; served: boolean }[];
+  live_after: number | null;
+  /** When a call was first answered `replay_live`. */
+  live_at_ns: Nanos | null;
+  live_calls: number;
+}
+
+/** Where a divergent request first differed from the recording. */
+export interface Difference {
+  message: number;
+  role: string | null;
+  /** `role`, `content`, `tool_call_id`, `tool_calls`, or `missing` / `extra`. */
+  field: string;
+  at_char: number;
+  recorded: string | null;
+  got: string | null;
+  recorded_messages: number;
+  got_messages: number;
 }
 
 export interface Divergence {
   step: number;
   expected_digest: string;
   got_digest: string;
+  /** Where the request first differed, when the recording could be re-read. */
+  difference?: Difference;
 }
 
 /** `GET /v1/replays/{id}`. */
@@ -219,8 +266,13 @@ export interface ReplayStatus {
   remaining: number;
   diverged: Divergence | null;
   calls: { step: number; matched: boolean; at_ns: Nanos }[];
+  /** Model calls refused because every recorded step had been served. */
+  exhausted_calls: number;
   unreadable_tool_steps: number[];
   expires_at_ns: Nanos;
+  /** Present when the replay is a fork. */
+  fork_id?: string;
+  fork?: ForkState;
 }
 
 /** A recorded tool step, from `POST /v1/replays/{id}/tools/next`. */
@@ -229,6 +281,8 @@ export interface ToolStep {
   tool: string;
   arguments: unknown;
   result: unknown;
+  /** `true` when `result` is a fork's edit rather than the recording's. */
+  edited?: boolean;
 }
 
 /** The environment that points both providers' SDKs at a replay. */
@@ -276,6 +330,50 @@ export interface Diff {
   } | null;
   /** `b` minus `a`. */
   delta: { cost_usd: number; tokens: number; duration_ns: Nanos; errors: number; steps: number };
+  truncated: boolean;
+}
+
+// ---------------------------------------------------------------- forks
+
+/** One fork in `GET /v1/forks`. */
+export interface ForkSummary {
+  run: string;
+  tenant: string;
+  fork_id: string | null;
+  fork_step: number | null;
+  first_start_ns: Nanos;
+  last_end_ns: Nanos;
+  tagged_spans: number;
+  /** Whether it was diffed; when not, `skipped` says why. */
+  diffed: boolean;
+  skipped?: "deadline" | "parent_missing";
+  steps: number | null;
+  outcome: RunSummary["outcome"] | null;
+  cost_usd: number | null;
+  errors: number | null;
+  /** Where it parted from its parent (`a` the parent, `b` the fork). */
+  first_divergence: Diff["first_divergence"];
+  delta: Diff["delta"] | null;
+  diverged_before_cut: boolean | null;
+  truncated: boolean;
+}
+
+/** `GET /v1/forks`. */
+export interface Forks {
+  run: string;
+  parent: RunSummary | null;
+  forks: ForkSummary[];
+  /** Tagged spans that joined the parent run itself (a fork without its own session). */
+  merged_into_parent: number;
+  spans_examined: number;
+  truncated: boolean;
+}
+
+/** `GET /v1/goldens`. */
+export interface Goldens {
+  runs: { run: string; tenant: string; source: "attribute" | "annotation"; tagged_at_ns: Nanos }[];
+  spans_examined: number;
+  annotations_examined: number;
   truncated: boolean;
 }
 
