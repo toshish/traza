@@ -1603,7 +1603,7 @@ curl 'http://localhost:8080/v1/xray/4bf92f3577b34da6/m2'
 | Field | Type | Description |
 |---|---|---|
 | `run`, `tenant`, `span`, `model`, `provider`, `start_ns` | | The call and its run |
-| `step_index` | integer or null | Its tape index; `null` when the run is longer than one read (20,000 spans) and the call lies past it — it is then X-rayed alone |
+| `step_index` | integer or null | Its tape index, counted over the whole run. A call past the run's first 20,000 spans is read with the 20,000 that end at it, with `provenance_partial: true`; `null` only for a call not among its run's spans, X-rayed alone |
 | `chunks[]` | array | The context window in order: `index`, `role` (lowercased; `tools` for a tool definition; `null` for a bare prompt), `kind` (`system`, `user`, `assistant`, `tool_result`, `tool_call`, `other`), `chars`, `est_tokens`, `digest` (16 hex characters of the content's identity), `introduced_by`, `age_steps`, `stale`, `preview` (120 characters), and when present `name` (a call's or definition's tool), `tool_call_id`, `duplicate_of` (the first chunk with the same content) |
 | `chunks[].introduced_by` | object or null | The earliest step whose request or response held the same content: `trace_id`, `span_id`, `step_index`, `kind`, `name` (tool, model, agent or span name), `via` (`content`, or `tool_call_id` for a tool result the model was shown differently from what the tool step returned) |
 | `context_unavailable` | string or null | Why the context could not be read whole: `was not recorded`, `was offloaded and could not be resolved`, `was offloaded and resolve=false`, tool definitions that were offloaded and could not be resolved (or `resolve=false`), or — for a call [recorded as a delta](xray.md#conversations-recorded-as-deltas) — an earlier call of its conversation, or its answer, that could not be read, a conversation dropped for room, or no readable `gen_ai.conversation.id`. The chunks are what could be read (a placeholder for each value that could not); the context is not compared or calibrated, and its losses are `unverified` |
@@ -1652,7 +1652,7 @@ curl 'http://localhost:8080/v1/cache/weather-9'
 | Field | Type | Description |
 |---|---|---|
 | `steps[]` | array | One per model call, in step order |
-| `steps[].step_index`, `span`, `model` | | The call (`step_index` is `null` only in an X-Ray of a call past the read limit) |
+| `steps[].step_index`, `span`, `model` | | The call (`step_index` is `null` only in an X-Ray of a call X-rayed alone) |
 | `steps[].previous_step_index` | integer or null | Its predecessor; `null` for the first call of a conversation or when none can be paired |
 | `steps[].chunks`, `est_tokens` | integer | Its context's size |
 | `steps[].chunks_truncated` | boolean | Its context, or its predecessor's, had more than 2,000 chunks. The comparison covers the chunks both analysed: a divergence among them is reported where it is, but a verdict what lies past the cut could change — the whole prefix held, a new turn, a rewrite, a removal — is `unknown` with nothing counted lost, and `est_tokens_lost` of any other verdict counts the chunks compared only |

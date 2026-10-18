@@ -317,8 +317,11 @@ as a context it was not. A rebuilt context is held to the 2,000-chunk bound
 like any other (`chunks_truncated`). The X-Ray reads the run's earlier calls
 twice when it rebuilds — once in order to rebuild the call and the comparison
 window, once as recorded for provenance — inside the same query deadline and
-payload budgets. A delta call past the read limit is X-rayed alone and says
-its context is partial. Measured on one real Claude Code session of 1,482
+payload budgets. A call past a run's first 20,000 spans is read with the
+20,000 spans that end at it (below): a conversation already under way before
+them is rebuilt from its first compaction inside them on, and a delta call of
+it before that compaction says it *could not be rebuilt*, its conversation
+having begun before the spans read. Measured on one real Claude Code session of 1,482
 model calls (26 MB of transcript, release build, a laptop): the X-Ray of its
 last call rebuilt 1,002 chunks in 0.5 s, and the autopsy of all 1,482 calls
 took 1.4 s, finding its two compactions as `rewritten`.
@@ -567,9 +570,13 @@ anything.
   attributes, a provider body's `tools`) are compared in canonical key order,
   so a key-order change in them is invisible; text-recorded arguments and
   definitions keep their bytes, offloaded or not.
-- **Bounds.** One request reads its run's first 20,000 spans; a call past that
-  is X-rayed alone (`step_index: null` here and in `cache`,
-  `provenance_partial: true`, cache `unknown`). A context is split into at most
+- **Bounds.** One request reads 20,000 of its run's spans: the first 20,000,
+  or — for a call past them, such as the latest call of a long session — the
+  20,000 that end at it. Its `step_index` (and every index it names) still
+  counts the whole run's steps, and `provenance_partial` is `true`: a chunk
+  first seen before those spans is not traced to its step. (A call that is
+  not among its run's spans at all is X-rayed alone: `step_index: null` here
+  and in `cache`, cache `unknown`.) A context is split into at most
   2,000 chunks (`chunks_truncated` on the X-Ray, on a verdict when either
   context compared was cut, and on the autopsy; past the cut nothing is taken
   to match or to be missing — see [Causes](#causes) and

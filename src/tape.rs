@@ -285,10 +285,22 @@ impl Store {
         deadline: Option<Deadline>,
     ) -> Result<RunTape> {
         let run = self.run_spans(tenant, run_id, max_spans, deadline)?;
+        self.tape_of(run.spans, run.truncated, max_steps, deadline)
+    }
+
+    /// The tape of `spans` — a run's spans in step order, or a stretch of
+    /// them (`spans_truncated` says they are not the whole run) — at most
+    /// `max_steps` steps, numbered from zero.
+    pub(crate) fn tape_of(
+        &self,
+        spans: Vec<Span>,
+        spans_truncated: bool,
+        max_steps: usize,
+        deadline: Option<Deadline>,
+    ) -> Result<RunTape> {
         let mut steps = Vec::new();
-        let spans_truncated = run.truncated;
         let mut truncated = spans_truncated;
-        for (examined, span) in run.spans.iter().enumerate() {
+        for (examined, span) in spans.iter().enumerate() {
             // Extraction reassembles and digests every value the read
             // returned — work proportional to the run's bytes, done after
             // the read's own checks — so it spends the same budget.
@@ -306,7 +318,7 @@ impl Store {
             steps.push(tape_step(steps.len(), span, facts, extras, llm));
         }
         Ok(RunTape {
-            spans: run.spans,
+            spans,
             steps,
             truncated,
             spans_truncated,

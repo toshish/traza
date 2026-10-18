@@ -534,6 +534,15 @@ before deploying over an existing setup.
   now `stable`, nothing lost, its explanation saying the cache outlived the
   assumed TTL; a smaller read (a long-lived system prompt alone) leaves the
   verdict standing, and no structural verdict yields to a reported count.
+- **The X-Ray reads a long session's latest calls.** A run read its first
+  20,000 spans, and a call past them was X-rayed alone — no step index, no
+  predecessor and, for Claude Code and Codex transcripts (recorded as
+  deltas), no context at all: exactly the latest calls of the sessions
+  worth X-raying. Such a call is now read with the 20,000 spans that end at
+  it: its indices count the whole run, and a conversation already under way
+  before those spans is rebuilt from its first compaction inside them (a
+  delta call before that says its conversation began before the read).
+  `xray_step` reaches any step of a run, not only those in its first read.
 
 ### Upgrade
 
