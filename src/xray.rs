@@ -604,6 +604,12 @@ fn advice(cause: Cause, change: Option<Change>, volatile: Option<Volatile>) -> &
             "Calls are further apart than the cache lifetime. Use a longer-lived cache if the \
              provider offers one, or pass ttl_seconds= if it is already in use."
         }
+        (Cause::PartialHit, _, _) => {
+            "Part of the prompt outlived the cache lifetime and part did not — a long-lived \
+             system prompt kept warm while the conversation after it expired. Use a longer-lived \
+             cache for the whole prompt, or place a cache breakpoint after the conversation, not \
+             only after the system prompt."
+        }
         (Cause::Unknown, _, _) | (Cause::Stable, _, _) | (Cause::VolatileContent, _, _) => {
             "The trace does not say enough to explain this break; open the step's X-Ray."
         }
@@ -1375,22 +1381,27 @@ fn cache_step(store: &Store, verdict: Verdict<'_>, ttl_ns: u64, pool: &TextPool)
     }
 }
 
-/// Of what the predecessor reported as its context, the share this call
-/// must report reading from the cache for an expired-TTL verdict to yield
-/// to the provider.
-const SERVED_SHARE: f64 = 0.5;
-
-/// An expired-TTL verdict the provider's own report refutes, made `stable`.
+/// An expired-TTL verdict set against what the provider reports serving.
 ///
 /// The TTL is an assumption (`ttl_seconds`, five minutes unless asked), not
 /// something a trace records — and real producers run longer caches: Claude
 /// Code's and Codex's outlive five minutes. When the predecessor's context
-/// was carried intact and this call reports reading at least
-/// [`SERVED_SHARE`] of what the predecessor reported as its context, both
-/// counts from the provider's own tokenizer, the cache plainly held: the
-/// prefix was served and nothing was lost. A smaller read — a long-lived
-/// system prompt alone, say — leaves the verdict standing. Only the TTL
-/// verdict yields: what the recording shows changed is never overruled.
+/// was carried intact, the provider's own counts decide, both from its own
+/// tokenizer:
+///
+/// - this call read at least the whole context the predecessor reported: the
+///   cache plainly held, the prefix was served, and nothing was lost —
+///   `stable`;
+/// - it read some of it: part of the prefix outlived the assumed TTL and
+///   part did not (a long-lived system prompt and an expired conversation
+///   after it, say) — `partial_hit`, losing what it did not serve of the
+///   predecessor's reported context. The remainder may also include text
+///   past the provider's last cache breakpoint, which the trace cannot tell
+///   apart; the explanation says so rather than asserting either;
+/// - it read nothing: the TTL verdict stands.
+///
+/// Only the TTL verdict yields: what the recording shows changed is never
+/// overruled.
 fn served_past_ttl(
     comparison: autopsy::Comparison,
     llm: &LlmFacts,
@@ -1399,22 +1410,38 @@ fn served_past_ttl(
     let (Some(read), Some(reported)) = (llm.cache_read_tokens, reported) else {
         return comparison;
     };
-    if comparison.cause != Cause::TtlExpired
-        || reported == 0
-        || (read as f64) < reported as f64 * SERVED_SHARE
-    {
+    if comparison.cause != Cause::TtlExpired || reported == 0 || read == 0 {
         return comparison;
     }
+    if read >= reported {
+        let explanation = format!(
+            "{} assumed — yet the provider read {} tokens from its cache, of the {} the previous \
+             call reported: the cache outlived the assumed TTL, and the prefix was served",
+            comparison.explanation,
+            autopsy::thousands(read),
+            autopsy::thousands(reported)
+        );
+        return autopsy::Comparison {
+            cause: Cause::Stable,
+            est_tokens_lost: 0,
+            explanation,
+            ..comparison
+        };
+    }
+    let lost = reported - read;
     let explanation = format!(
-        "{} assumed — yet the provider read {} tokens from its cache, of the {} the previous \
-         call reported: the cache outlived the assumed TTL, and the prefix was served",
+        "{} assumed — yet the provider read {} tokens from its cache, of the {} the previous call \
+         reported, so {} were not served: part of the prefix outlived the assumed TTL (a \
+         longer-lived system prompt, say) and the rest — expired, or past the provider's last \
+         cache breakpoint, which the trace cannot tell apart — was re-processed",
         comparison.explanation,
         autopsy::thousands(read),
-        autopsy::thousands(reported)
+        autopsy::thousands(reported),
+        autopsy::thousands(lost)
     );
     autopsy::Comparison {
-        cause: Cause::Stable,
-        est_tokens_lost: 0,
+        cause: Cause::PartialHit,
+        est_tokens_lost: lost,
         explanation,
         ..comparison
     }
@@ -1444,6 +1471,7 @@ fn summarize(steps: &[CacheStep]) -> CacheSummary {
         Cause::VolatileContent,
         Cause::Reordered,
         Cause::TtlExpired,
+        Cause::PartialHit,
         Cause::NewContext,
         Cause::Unknown,
     ]

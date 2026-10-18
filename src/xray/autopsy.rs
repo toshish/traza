@@ -62,6 +62,11 @@ pub enum Cause {
     Reordered,
     /// The prefix was intact, but the TTL had passed since the predecessor.
     TtlExpired,
+    /// The prefix was intact and the TTL had passed, yet the provider served
+    /// part of it from its cache: a long-lived system prompt, say, outlived
+    /// the conversation after it. What it did not serve of the
+    /// predecessor's reported context is the loss.
+    PartialHit,
     /// No predecessor (the first call of a conversation), or the context was
     /// rewritten: chunks removed from inside the prefix, or most of it gone.
     NewContext,
@@ -78,6 +83,7 @@ impl Cause {
             Self::VolatileContent => "volatile_content",
             Self::Reordered => "reordered",
             Self::TtlExpired => "ttl_expired",
+            Self::PartialHit => "partial_hit",
             Self::NewContext => "new_context",
             Self::Unknown => "unknown",
         }

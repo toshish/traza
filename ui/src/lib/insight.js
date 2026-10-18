@@ -547,6 +547,7 @@ export const CACHE_CAUSE = {
   volatile_content: { tone: 'error', label: 'volatile content' },
   reordered: { tone: 'error', label: 'reordered' },
   ttl_expired: { tone: 'warn', label: 'ttl expired' },
+  partial_hit: { tone: 'warn', label: 'partial hit' },
   new_context: { tone: 'neutral', label: 'new context' },
   unknown: { tone: 'neutral', label: 'unknown' },
 };

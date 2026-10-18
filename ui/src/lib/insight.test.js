@@ -4,7 +4,7 @@
 
 import { describe, it, expect } from 'vitest';
 import {
-  AT_OR_ABOVE, RAMP_STEPS, bestSkill, branchWidth, cacheSegments, caretLine, ciContains, classTotals, compactPath,
+  AT_OR_ABOVE, CACHE_CAUSE, RAMP_STEPS, bestSkill, branchWidth, cacheSegments, caretLine, ciContains, classTotals, compactPath,
   deltaDirection, DELTA_METRICS, detectorRate, entryKey, fmtCi, fmtP, fmtPct, keyTokens, layoutFate, matchRoute, nodeAt, nodeAtKey,
   nodeMeans, pathKey, pathToTql,
   provenanceGroups, rateColor, runOnMap, shortName, skillAt, skillReading, splitToken, stableWithoutRead, wilson, windowFrom, windowSince,
@@ -341,6 +341,17 @@ describe('the X-Ray', () => {
     expect(cacheSegments(autopsy.steps[0]).served).toBe(0);
     // Whether a strict prefix hits is unknown: nothing is drawn as servable.
     expect(cacheSegments({ ...rewritten, cause: 'unknown' }).served).toBe(0);
+  });
+
+  it('draws a partial hit as what the provider served and what it did not', () => {
+    // Past the TTL the provider read half the predecessor's context: the
+    // server counts the other half lost, at the provider's scale.
+    const partial = {
+      cause: 'partial_hit', est_tokens: 1000, shared_est_tokens: 900,
+      est_tokens_lost: 1000, calibration: 2,
+    };
+    expect(CACHE_CAUSE.partial_hit).toEqual({ tone: 'warn', label: 'partial hit' });
+    expect(cacheSegments(partial)).toEqual({ total: 1000, served: 500, lost: 500, fresh: 0 });
   });
 
   it('marks a held prefix the provider served nothing from', () => {

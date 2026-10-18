@@ -1248,8 +1248,17 @@ fn a_cache_the_provider_served_did_not_expire_whatever_ttl_was_assumed() {
     // provider. A real coding-agent store showed this on 15 of 25 such
     // verdicts of one session, millions of tokens counted lost that the
     // provider had served.
-    let served = |read: u64| {
+    let served = |previous: Option<(u64, u64)>, read: u64| {
         let mut spans = cache_run("claude-x");
+        if let Some((input, cached)) = previous {
+            let before = &mut spans[2];
+            before
+                .attributes
+                .insert("gen_ai.usage.input_tokens".into(), json!(input));
+            before
+                .attributes
+                .insert("gen_ai.usage.cache_read.input_tokens".into(), json!(cached));
+        }
         let last = spans.last_mut().expect("four calls");
         last.attributes
             .insert("gen_ai.usage.cache_read.input_tokens".into(), json!(read));
@@ -1261,8 +1270,8 @@ fn a_cache_the_provider_served_did_not_expire_whatever_ttl_was_assumed() {
             .expect("reads")
             .expect("found")
     };
-    // The predecessor reported a 900-token context; 850 of it read now.
-    let autopsy = served(850);
+    // The predecessor reported a 900-token context; all of it read now.
+    let autopsy = served(None, 900);
     let last = &autopsy.steps[3];
     assert_eq!(last.cause, Cause::Stable, "{}", last.explanation);
     assert_eq!(last.est_tokens_lost, 0);
@@ -1270,7 +1279,7 @@ fn a_cache_the_provider_served_did_not_expire_whatever_ttl_was_assumed() {
     assert_eq!(last.gap_ns, Some(600 * SECOND));
     assert!(
         last.explanation.contains("past the 5 min 0 s TTL assumed")
-            && last.explanation.contains("read 850"),
+            && last.explanation.contains("read 900"),
         "{}",
         last.explanation
     );
@@ -1280,11 +1289,75 @@ fn a_cache_the_provider_served_did_not_expire_whatever_ttl_was_assumed() {
         autopsy.summary.disagreements, 1,
         "only the stable call with no read: the served one agrees"
     );
-    // A read of a small part — what a longer-lived system prompt alone
-    // would be — leaves the conversation's prefix expired.
-    let autopsy = served(100);
+    // Nothing read: the assumed expiry stands.
+    let autopsy = served(None, 0);
     assert_eq!(autopsy.steps[3].cause, Cause::TtlExpired);
     assert!(autopsy.steps[3].est_tokens_lost > 0);
+}
+
+#[test]
+fn a_cache_served_only_in_part_past_the_ttl_counts_what_it_did_not_serve() {
+    // Mixed lifetimes: the predecessor carried a 100,000-token context — a
+    // long-lived 50,000-token system prefix and the conversation after it.
+    // Ten minutes later the provider reads 50,000 tokens from its cache: the
+    // prefix outlived the assumed TTL, the conversation did not. Half the
+    // context was served and half re-processed; neither `stable` with
+    // nothing lost nor `ttl_expired` with everything lost says that.
+    let mut spans = cache_run("claude-x");
+    let before = &mut spans[2];
+    before
+        .attributes
+        .insert("gen_ai.usage.input_tokens".into(), json!(2));
+    before
+        .attributes
+        .insert("gen_ai.usage.cache_read.input_tokens".into(), json!(99_998));
+    spans
+        .last_mut()
+        .expect("four calls")
+        .attributes
+        .insert("gen_ai.usage.cache_read.input_tokens".into(), json!(50_000));
+    let fixture = TempStore::open("xray-ttl-partial", priced_config());
+    fixture.store().ingest_batch(spans).expect("ingests");
+    let autopsy = fixture
+        .store()
+        .cache_autopsy(Some(""), "s3", AutopsyOptions::default())
+        .expect("reads")
+        .expect("found");
+    let last = &autopsy.steps[3];
+    assert_eq!(last.cause, Cause::PartialHit, "{}", last.explanation);
+    assert_eq!(
+        last.est_tokens_lost, 50_000,
+        "reported context less the read"
+    );
+    let cost = last.est_cost_lost_usd.expect("priced");
+    assert!((cost - 50_000.0 * 2.7 / 1e6).abs() < 1e-9, "{cost}");
+    assert!(
+        last.explanation.contains("read 50,000")
+            && last.explanation.contains("100,000")
+            && last.explanation.contains("50,000 were not"),
+        "{}",
+        last.explanation
+    );
+    assert_eq!(autopsy.summary.by_cause["partial_hit"], 1);
+    assert_eq!(
+        autopsy.summary.breaks, 2,
+        "the timestamp edit and the partial hit"
+    );
+    assert!(autopsy.summary.est_tokens_lost >= 50_000);
+    let partial = autopsy
+        .summary
+        .culprits
+        .iter()
+        .find(|culprit| culprit.cause == Cause::PartialHit)
+        .expect("the partial-hit culprit");
+    assert!(
+        partial.advice.contains("cache lifetime"),
+        "{}",
+        partial.advice
+    );
+    // The provider served what it read, so its report agrees — as the
+    // stable predecessor's, which read from the cache too, does.
+    assert_eq!(autopsy.summary.disagreements, 0);
 }
 
 #[test]

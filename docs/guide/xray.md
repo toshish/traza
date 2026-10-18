@@ -344,8 +344,9 @@ returns one verdict per model call of the run, in step order, and a summary
 
 ```json
 {"summary": {"steps": 2, "breaks": 1,
-             "by_cause": {"new_context": 1, "reordered": 0, "stable": 0,
-                          "ttl_expired": 0, "unknown": 0, "volatile_content": 1},
+             "by_cause": {"new_context": 1, "partial_hit": 0, "reordered": 0,
+                          "stable": 0, "ttl_expired": 0, "unknown": 0,
+                          "volatile_content": 1},
              "est_tokens_lost": 10, "est_cost_lost_usd": 0.000027, "disagreements": 0,
              "culprits": [{"cause": "volatile_content", "change": "edited", "role": "system",
                            "volatile": "timestamp", "breaks": 1, "est_tokens_lost": 10,
@@ -414,7 +415,8 @@ identity; `prefix_chunks_shared` is how far they agree.
 |---|---|---|
 | `stable` | The predecessor's whole context is an unchanged prefix of this one, within the TTL | — |
 | | A **new turn**: everything up to the predecessor's last chunk is unchanged, this call puts new content (or an edit at its very end) in that chunk's place, and nothing the predecessor had follows — a stateless pipeline's next input, a replaced last message. The cache served all it could | `replaced` or `edited` |
-| `ttl_expired` | The prefix is intact (or a new turn), but the TTL had passed since the predecessor began — unless the provider reports having served it (below), which makes the call `stable` | — or `replaced` / `edited` |
+| `ttl_expired` | The prefix is intact (or a new turn), but the TTL had passed since the predecessor began, and the provider reports no cache read — a read makes the call `stable` or `partial_hit` (below) | — or `replaced` / `edited` |
+| `partial_hit` | The prefix is intact and the TTL had passed, yet the provider read part of the predecessor's reported context from its cache: part of the prompt outlived the cache lifetime and part did not. Lost: what it did not serve (below) | — or `replaced` / `edited` |
 | `volatile_content` | A chunk inside the prefix changed in place — the same role and kind, at most a tenth of its text differing, verified on both texts — with content the predecessor had after the change | `edited` |
 | | A chunk inside the prefix was swapped for different content while what followed it survives (or its text was not kept, so an edit could not be confirmed) | `replaced` |
 | | A new chunk sits ahead of content the predecessor already had | `inserted` |
@@ -448,15 +450,27 @@ deployments on longer-lived caches. `gap_ns` is the time since the predecessor
 outranks an expired TTL as the cause; the explanation mentions both.
 
 The TTL is an assumption; the provider's report is evidence. When the prefix
-was carried intact past the TTL and the call reports reading at least half of
-what its predecessor reported as its whole context from the cache — both
-counts in the provider's own tokens — the cache plainly outlived the
-assumption: the verdict is `stable`, nothing is counted lost, and the
-explanation says the cache outlived the assumed TTL. Real producers run longer
-caches than five minutes: on one real Claude Code session, 15 of the 25 calls
-a five-minute TTL called expired had read their whole prefix from the cache.
-A smaller read (a long-lived system prompt alone, say) leaves `ttl_expired`
-standing, and no structural verdict ever yields to a reported count.
+was carried intact past the TTL, the call's cache read is set against what its
+predecessor reported as its whole context — both counts in the provider's own
+tokens:
+
+- **All of it read**: the cache plainly outlived the assumption. The verdict
+  is `stable`, nothing is counted lost, and the explanation says the cache
+  outlived the assumed TTL. Real producers run longer caches than five
+  minutes: on one real Claude Code session, 15 of the 25 calls a five-minute
+  TTL called expired had read their whole prefix from the cache.
+- **Part of it read**: part of the prompt outlived the cache lifetime and
+  part did not — a 100,000-token context whose 50,000-token system prefix
+  stayed warm while the conversation after it expired, say. The verdict is
+  `partial_hit`, and `est_tokens_lost` is the predecessor's reported context
+  less the read (here 50,000), priced like any other loss. Neither `stable`
+  (nothing lost) nor `ttl_expired` (everything lost) would be true. The
+  unserved part may also include text past the provider's last cache
+  breakpoint, which a trace cannot tell from expired text; the explanation
+  says so.
+- **Nothing read**: `ttl_expired` stands.
+
+No structural verdict ever yields to a reported count.
 
 ### The volatile token
 
