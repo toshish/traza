@@ -180,8 +180,11 @@ resource as ordinary span attributes, so they are stored, searchable and
 read by the [change radar](radar.md). A copied attribute sits beneath the
 scope's and the span's own attributes: a span that already carries one of
 these keys keeps its value. Only scalar values (string, number or boolean)
-are copied. Each adds a few bytes to every span. On a span already at
-`--max-span-attributes`, the copies count toward that cap.
+are copied, and a string only up to 256 bytes. Each adds a few bytes to
+every span. The admission caps do not count these five attributes, so a span
+admitted at `--max-span-attributes` or `--max-span-bytes` before the copy is
+still admitted after it. That holds for native ingest too: a span may carry
+these five, in that shape, beyond its caps.
 
 **The rest are discarded.** `service.instance.id`, `host.name`, `k8s.*`,
 `telemetry.sdk.language` and every other resource attribute are not stored

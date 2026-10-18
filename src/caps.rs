@@ -107,11 +107,12 @@ pub(crate) fn measure(config: &Config, spans: &[Span]) -> Result<Admitting> {
                 shown(&span.span_id)
             ))
         };
+        let (build_count, build_bytes) = build_attributes(span);
         if let Some(cap) = config.max_span_attributes {
-            if span.attributes.len() > cap {
+            let counted = span.attributes.len() - build_count;
+            if counted > cap {
                 return Err(refuse(format!(
-                    "{} attributes exceeds the max-span-attributes cap of {cap}",
-                    span.attributes.len()
+                    "{counted} attributes exceeds the max-span-attributes cap of {cap}"
                 )));
             }
         }
@@ -141,7 +142,8 @@ pub(crate) fn measure(config: &Config, spans: &[Span]) -> Result<Admitting> {
         }
         let bytes = json_len(span);
         if let Some(cap) = config.max_span_bytes {
-            let stored = stored_len(span, bytes, config.payload_threshold);
+            let stored =
+                stored_len(span, bytes, config.payload_threshold).saturating_sub(build_bytes);
             if stored > cap as u64 {
                 return Err(refuse(format!(
                     "{stored} bytes after payload offload exceeds the max-span-bytes cap of {cap}"
@@ -151,6 +153,27 @@ pub(crate) fn measure(config: &Config, spans: &[Span]) -> Result<Admitting> {
         measured.push(Measured { bytes });
     }
     Ok(Admitting { spans: measured })
+}
+
+/// The build attributes a span carries ([`crate::otlp::is_build_attribute`]:
+/// at most five, each a short scalar) — how many, and an upper bound on the
+/// bytes their entries add to the span's JSON. Neither cap counts them:
+/// OTLP ingest copies them from the resource onto every span, and a copy
+/// that turned an admissible span into a refused batch would make the copy
+/// a breaking change for an exporter that never retries a `400`.
+fn build_attributes(span: &Span) -> (usize, u64) {
+    let mut count = 0;
+    let mut bytes = 0u64;
+    for key in crate::otlp::KEPT_RESOURCE_ATTRIBUTES {
+        if let Some(value) = span.attributes.get(key) {
+            if crate::otlp::is_build_attribute(key, value) {
+                count += 1;
+                // `"key":value` and its separating comma.
+                bytes += json_len(key) + json_len(value) + 2;
+            }
+        }
+    }
+    (count, bytes)
 }
 
 /// The span's size once stored: `sent` minus every value the offload would
@@ -249,6 +272,38 @@ mod tests {
             serde_json::to_vec(&stamped).expect("encodes").len() as u64,
             "the tenant stamp is part of what is charged"
         );
+    }
+
+    /// A span admitted exactly at both caps stays admitted once the five
+    /// build attributes are added to it (what OTLP ingest copies from the
+    /// resource) — and only those: a sixth attribute of any other kind, or an
+    /// overlong "version", is counted as usual.
+    #[test]
+    fn build_attributes_are_not_counted_against_the_caps() {
+        let own = span(json!({"a": "1", "b": "2"}));
+        let config = Config {
+            max_span_attributes: Some(2),
+            max_span_bytes: Some(json_len(&own) as usize),
+            ..Config::default()
+        };
+        measure(&config, std::slice::from_ref(&own)).expect("at both caps");
+        let mut built = own.clone();
+        for key in crate::otlp::KEPT_RESOURCE_ATTRIBUTES {
+            built.attributes.insert(key.to_owned(), json!("1.27.0"));
+        }
+        built
+            .attributes
+            .insert("telemetry.sdk.version".to_owned(), json!(127));
+        measure(&config, std::slice::from_ref(&built)).expect("the copies are exempt");
+        let mut extra = built.clone();
+        extra.attributes.insert("c".to_owned(), json!("3"));
+        assert!(refusal(&config, &[extra]).contains("3 attributes exceeds"));
+        let mut long = own.clone();
+        long.attributes.insert(
+            "service.version".to_owned(),
+            json!("x".repeat(crate::otlp::MAX_BUILD_VALUE_BYTES + 1)),
+        );
+        assert!(refusal(&config, &[long]).contains("3 attributes exceeds"));
     }
 
     /// Two spans with one primary key, told apart only by an attribute:

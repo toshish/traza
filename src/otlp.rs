@@ -84,6 +84,27 @@ pub const KEPT_RESOURCE_ATTRIBUTES: [&str; 5] = [
     "telemetry.sdk.version",
 ];
 
+/// Bytes of a build attribute's string value copied at most: a version, an
+/// environment or an SDK name is short, and a longer one is not copied.
+pub const MAX_BUILD_VALUE_BYTES: usize = 256;
+
+/// Whether `key = value` is a build attribute in the shape the copy gives
+/// them: a [`KEPT_RESOURCE_ATTRIBUTES`] key with a scalar value — a string
+/// of at most [`MAX_BUILD_VALUE_BYTES`], a number or a boolean.
+///
+/// The admission caps ([`crate::caps`]) do not count these, so copying them
+/// from the resource can never push a span that was admissible before the
+/// copy over `--max-span-attributes` or `--max-span-bytes`: the copy is
+/// additive, as it must be for an exporter that does not retry a `400`.
+pub fn is_build_attribute(key: &str, value: &Value) -> bool {
+    KEPT_RESOURCE_ATTRIBUTES.contains(&key)
+        && match value {
+            Value::String(text) => text.len() <= MAX_BUILD_VALUE_BYTES,
+            Value::Number(_) | Value::Bool(_) => true,
+            _ => false,
+        }
+}
+
 /// What one OTLP `Resource` contributes to its spans. Both decoders fill it
 /// through [`ResourceIdentity::absorb`], so which attribute wins a duplicate
 /// key is decided once.
@@ -100,8 +121,8 @@ pub(crate) struct ResourceIdentity {
 impl ResourceIdentity {
     /// Takes in one resource attribute. A non-string `service.name` or
     /// `traza.tenant` does not stop the scan, and a kept key keeps its first
-    /// scalar (string, number or boolean) value; arrays, maps and nulls are
-    /// not versions and are ignored.
+    /// value that [`is_build_attribute`] accepts; arrays, maps, nulls and
+    /// overlong strings are not versions and are ignored.
     pub(crate) fn absorb(&mut self, key: String, value: Value) {
         match (key.as_str(), value) {
             ("service.name", Value::String(name)) if self.service.is_none() => {
@@ -110,9 +131,7 @@ impl ResourceIdentity {
             ("traza.tenant", Value::String(name)) if self.tenant.is_none() => {
                 self.tenant = Some(name);
             }
-            (name, value @ (Value::String(_) | Value::Number(_) | Value::Bool(_)))
-                if KEPT_RESOURCE_ATTRIBUTES.contains(&name) && !self.kept.contains_key(name) =>
-            {
+            (name, value) if is_build_attribute(name, &value) && !self.kept.contains_key(name) => {
                 self.kept.insert(key, value);
             }
             _ => {}
@@ -1190,6 +1209,53 @@ mod tests {
         let mut request = Vec::new();
         pb::bytes(1, &resource_spans, &mut request);
         request
+    }
+
+    #[test]
+    fn copied_build_attributes_never_push_a_span_over_the_admission_caps() {
+        // A span already at --max-span-attributes, from a resource that
+        // carries every build attribute: before the copy it was admitted,
+        // and the copy must not make it refused.
+        let body = serde_json::json!({"resourceSpans": [{
+            "resource": {"attributes": [
+                {"key": "service.name", "value": {"stringValue": "checkout"}},
+                {"key": "service.version", "value": {"stringValue": "1.5.0"}},
+                {"key": "deployment.environment.name", "value": {"stringValue": "prod"}},
+                {"key": "deployment.environment", "value": {"stringValue": "prod"}},
+                {"key": "telemetry.sdk.name", "value": {"stringValue": "opentelemetry"}},
+                {"key": "telemetry.sdk.version", "value": {"stringValue": "1.27.0"}}
+            ]},
+            "scopeSpans": [{"spans": [{
+                "traceId": "aa", "spanId": "bb",
+                "startTimeUnixNano": "1", "endTimeUnixNano": "2",
+                "attributes": [
+                    {"key": "a", "value": {"stringValue": "1"}},
+                    {"key": "b", "value": {"stringValue": "2"}},
+                    {"key": "c", "value": {"stringValue": "3"}}
+                ]
+            }]}]
+        }]});
+        let spans = spans_from_json(body.to_string().as_bytes()).expect("maps");
+        assert_eq!(spans[0].attributes["service.version"], "1.5.0", "copied");
+        let fixture = crate::tape::tests::TempStore::open(
+            "otlp-build-caps",
+            crate::Config {
+                max_span_attributes: Some(3),
+                ..crate::Config::default()
+            },
+        );
+        fixture
+            .store()
+            .ingest_batch(spans)
+            .expect("the copies do not count against the span's caps");
+        // The cap still holds for the span's own attributes.
+        let mut over = body.clone();
+        over["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"]
+            .as_array_mut()
+            .expect("attributes")
+            .push(serde_json::json!({"key": "d", "value": {"stringValue": "4"}}));
+        let spans = spans_from_json(over.to_string().as_bytes()).expect("maps");
+        assert!(fixture.store().ingest_batch(spans).is_err());
     }
 
     #[test]
