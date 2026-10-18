@@ -1717,10 +1717,14 @@ When none of the window's 363 spans belongs to that agent, the answer is:
 | `changes[].example_runs` | object | `before` and `after`: up to three run ids each, nearest the change |
 | `run` | object, with `run=` only | `run`, `tenant`, `agent`, `start_ns`, `outcome`, `errored`, `fingerprint` (each dimension's value for this run, plus `path`), and `downstream_of[]`. For each dimension, `downstream_of` holds the latest change point at or before the run whose new value the run carries, regressions first: `dimension`, `at_ns`, `to`, `verdict`, `explanation` |
 
-Rate p-values come from the pooled two-proportion z-test. Mean p-values come
-from Welch's t-test on a log scale: cost over priced runs, steps and duration
-as `ln(1+x)`. Holm's correction at 5% across the five tests of a change
-decides the verdict. A verdict needs at least 10 finished runs on each side.
+Rate p-values come from the pooled two-proportion z-test, or from Fisher's
+exact test when an expected cell count of the rate's 2×2 table is below 5.
+Mean p-values come from Welch's t-test on a log scale: cost over priced runs,
+steps and duration as `ln(1+x)`. Holm's correction at 5% across a change's
+tests (up to five) decides the verdict. A verdict needs at least 10 finished
+runs on each side, and a metric counts toward it only when its own test had
+10 observations on each side (runs that ended, for `success_rate`; priced
+runs, for `cost_per_run`); a metric short of that is still reported.
 
 A bound credential reads its own tenant, and naming another is `403`.
 Unknown or repeated parameters are `400`, and so are a non-integer

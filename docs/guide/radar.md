@@ -324,8 +324,8 @@ points.
 
 | Delta | Per run | Test |
 |---|---|---|
-| `error_rate` | at least one span with status `error` | pooled two-proportion z-test |
-| `success_rate` | ended `success`, of the runs that ended at all ([outcome](../llm-semantics.md#session-outcome-and-goal--traza-extensions): declared, else the last span to end) | pooled two-proportion z-test |
+| `error_rate` | at least one span with status `error` | pooled two-proportion z-test, or Fisher's exact test when the table is sparse |
+| `success_rate` | ended `success`, of the runs that ended at all ([outcome](../llm-semantics.md#session-outcome-and-goal--traza-extensions): declared, else the last span to end) | pooled two-proportion z-test, or Fisher's exact test when the table is sparse |
 | `cost_per_run` | cost in USD, metered or [priced](../configuration.md#model-pricing) | Welch's t-test on `ln(cost)` over priced runs |
 | `steps_per_run` | llm, tool and agent spans | Welch's t-test on `ln(1 + steps)` |
 | `duration_ns_per_run` | first start to last end | Welch's t-test on `ln(1 + milliseconds)` |
@@ -336,13 +336,28 @@ is `after / before`. Each delta also reports how many runs it counted on
 each side (`n_before`, `n_after`). The mean tests run on a log scale, so a
 single runaway run cannot decide a verdict. When no run on either side is
 priced, the cost delta is reported empty rather than as a confident zero.
-The p-values come from in-module implementations of the normal and
-Student-t distributions, checked in tests against SciPy reference values.
+
+A rate's z-test leans on the normal approximation, which overstates
+significance when the table is sparse: one success of one run before
+against none of ten after is p = 0.0009 by the z-test, and 1/11 exactly.
+So when any expected cell count of a rate's 2×2 table is below 5 (Cochran's
+rule), the rate is tested by Fisher's exact test instead. The p-values come
+from in-module implementations of the normal and Student-t distributions and
+of Fisher's test, checked in tests against SciPy reference values.
+
+A metric takes part in the verdict only when **its own test** had at least
+10 observations on each side. For error rate, steps and duration that is
+every finished run. For success rate it is only the runs that ended (a run
+that declared an outcome Traza does not recognize, such as `escalated`, did
+not end in success or failure), and for cost only the priced runs; sixty
+finished runs a side can still hold a single rated one. A metric short of
+the bar is still reported, with its counts (`n_before`, `n_after`) and
+p-value, for you to weigh.
 
 Holm's correction holds the family-wise error rate at 5% across a change's
 tests: up to five, since a test is left out when it cannot be computed (no
-priced runs, or no variation at all). The verdict follows these rules, in
-order:
+priced runs, or no variation at all) or is short of the bar above. The
+verdict follows these rules, in order:
 
 1. `insufficient_data`: fewer than 10 finished runs on either side. The
    deltas are still reported for you to weigh.
@@ -477,9 +492,10 @@ binding.
   several things changed at once, `co_changes` lists them all, because the
   radar cannot tell which one did it.
 - **The tests assume runs are independent.** A burst of retries of one task
-  is not independent, and inflates significance. The normal approximation of
-  the z-test is weak for very small or very lopsided samples, which is part
-  of why a verdict needs 10 runs on each side.
+  is not independent, and inflates significance. Sparse rate tables are
+  tested exactly (see above), and every metric needs 10 observations of its
+  own on each side to count, but Welch's test still assumes roughly normal
+  log-scale values, which a side of 10 runs cannot check.
 - **Many changes are many tests.** Holm's correction covers the tests of one
   change, not the whole timeline. Across dozens of change points, expect
   an occasional false verdict.

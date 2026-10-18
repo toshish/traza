@@ -84,16 +84,20 @@
 //! the session idle window of the earlier of now and `until`) are left out:
 //! their cost and steps may be partial. Rates (error rate: runs with at least
 //! one error span; success rate: runs that ended success, of those that
-//! ended at all) use the pooled two-proportion z-test; cost, steps and
-//! duration use Welch's t-test on the logarithm (cost over priced runs only;
-//! steps and duration as `ln(1+x)`), so one runaway run does not decide a
-//! verdict. Holm's correction holds the family-wise error rate across a
-//! change's five tests at 5%. The verdict is `regression` when a quality
-//! metric (error or success rate) got significantly worse — or, with quality
-//! unchanged, an efficiency metric did — `improvement` symmetrically,
-//! `neutral` when nothing is significant, and `insufficient_data` with fewer
-//! than [`MIN_RUNS_PER_SIDE`] runs on a side; `decided_by` says which kind of
-//! metric decided. Changes are ranked by verdict (regressions first), then
+//! ended at all) use the pooled two-proportion z-test, or Fisher's exact test
+//! when an expected cell count is below 5 (where the normal approximation
+//! overstates significance); cost, steps and duration use Welch's t-test on
+//! the logarithm (cost over priced runs only; steps and duration as
+//! `ln(1+x)`), so one runaway run does not decide a verdict. A metric takes
+//! part in the verdict only when its own test had [`MIN_RUNS_PER_SIDE`]
+//! observations on each side — runs that ended, for the success rate; priced
+//! runs, for cost — and is reported either way. Holm's correction holds the
+//! family-wise error rate across a change's tests at 5%. The verdict is
+//! `regression` when a quality metric (error or success rate) got
+//! significantly worse — or, with quality unchanged, an efficiency metric
+//! did — `improvement` symmetrically, `neutral` when nothing is significant,
+//! and `insufficient_data` with fewer than [`MIN_RUNS_PER_SIDE`] runs on a
+//! side; `decided_by` says which kind of metric decided. Changes are ranked by verdict (regressions first), then
 //! quality-decided before efficiency-decided, then by effect size (Cohen's h
 //! for rates, Cohen's d — capped at 4 — for log-scale means), then newest.
 //!
@@ -480,7 +484,10 @@ pub struct RateDelta {
     pub before: Option<f64>,
     /// The rate on the new side.
     pub after: Option<f64>,
-    /// Two-proportion z-test, two-sided; `null` when it cannot be computed.
+    /// Two-sided: the pooled two-proportion z-test, or Fisher's exact test
+    /// when an expected cell count is below 5; `null` when it cannot be
+    /// computed. Reported even when a side has too few runs rated for the
+    /// metric to take part in the verdict.
     pub p_value: Option<f64>,
     /// Runs rated on the old side.
     pub n_before: usize,
@@ -497,7 +504,8 @@ pub struct MeanDelta {
     pub after: Option<f64>,
     /// `after / before`, when `before` is positive.
     pub ratio: Option<f64>,
-    /// Welch's t-test on the log scale, two-sided.
+    /// Welch's t-test on the log scale, two-sided. For cost, over the priced
+    /// runs only.
     pub p_value: Option<f64>,
     /// Runs measured on the old side.
     pub n_before: usize,
@@ -2440,19 +2448,21 @@ fn deltas(
         n_after: after.len(),
         ..RateDelta::default()
     };
-    if let Some(test) = stats::two_proportion(e1, before.len(), e2, after.len()) {
+    if let Some(test) = stats::proportions(e1, before.len(), e2, after.len()) {
         error_rate.p_value = Some(test.p_value);
         let (b, a) = (
             error_rate.before.unwrap_or(0.0),
             error_rate.after.unwrap_or(0.0),
         );
-        tests.push(MetricTest {
-            p_value: test.p_value,
-            worse: a > b,
-            effect: stats::cohens_h(b, a),
-            quality: true,
-            phrase: format!("error rate {} → {}", percent(b), percent(a)),
-        });
+        if judged(before.len(), after.len()) {
+            tests.push(MetricTest {
+                p_value: test.p_value,
+                worse: a > b,
+                effect: stats::cohens_h(b, a),
+                quality: true,
+                phrase: format!("error rate {} → {}", percent(b), percent(a)),
+            });
+        }
     }
     // Success rate: of the runs that ended at all.
     let decided = |side: &[&RunView]| {
@@ -2474,19 +2484,23 @@ fn deltas(
         n_after: d2,
         ..RateDelta::default()
     };
-    if let Some(test) = stats::two_proportion(s1, d1, s2, d2) {
+    if let Some(test) = stats::proportions(s1, d1, s2, d2) {
         success_rate.p_value = Some(test.p_value);
         let (b, a) = (
             success_rate.before.unwrap_or(0.0),
             success_rate.after.unwrap_or(0.0),
         );
-        tests.push(MetricTest {
-            p_value: test.p_value,
-            worse: a < b,
-            effect: stats::cohens_h(b, a),
-            quality: true,
-            phrase: format!("success rate {} → {}", percent(b), percent(a)),
-        });
+        // Only the runs that ended are rated: sixty runs a side can hold one
+        // that ended, and one is no evidence about a rate.
+        if judged(d1, d2) {
+            tests.push(MetricTest {
+                p_value: test.p_value,
+                worse: a < b,
+                effect: stats::cohens_h(b, a),
+                quality: true,
+                phrase: format!("success rate {} → {}", percent(b), percent(a)),
+            });
+        }
     }
     // Cost: means over every run; the test over priced runs, on the log.
     let costs = |side: &[&RunView]| side.iter().map(|run| run.cost).collect::<Vec<f64>>();
@@ -2589,15 +2603,28 @@ fn mean_delta(
     };
     if let Some(test) = stats::welch(log_before, log_after) {
         delta.p_value = Some(test.p_value);
-        tests.push(MetricTest {
-            p_value: test.p_value,
-            worse: test.statistic > 0.0,
-            effect: stats::cohens_d(log_before, log_after),
-            quality: false,
-            phrase: phrase(b.unwrap_or(0.0), a.unwrap_or(0.0)),
-        });
+        // The test's own samples decide eligibility: cost is tested over
+        // priced runs only, which can be far fewer than the side.
+        if judged(log_before.len(), log_after.len()) {
+            tests.push(MetricTest {
+                p_value: test.p_value,
+                worse: test.statistic > 0.0,
+                effect: stats::cohens_d(log_before, log_after),
+                quality: false,
+                phrase: phrase(b.unwrap_or(0.0), a.unwrap_or(0.0)),
+            });
+        }
     }
     delta
+}
+
+/// Whether a metric measured on `before` and `after` observations takes part
+/// in the verdict: at least [`MIN_RUNS_PER_SIDE`] of them on each side — the
+/// same bar the verdict sets on the sides themselves, applied to the
+/// observations the metric's test actually used. A metric short of it is
+/// still reported, p-value and all, for a reader to weigh.
+fn judged(before: usize, after: usize) -> bool {
+    before >= MIN_RUNS_PER_SIDE && after >= MIN_RUNS_PER_SIDE
 }
 
 fn tool_mix(before: &[&RunView], after: &[&RunView], context: &Context<'_>) -> Vec<ToolShare> {
@@ -4899,5 +4926,104 @@ mod tests {
             windowed.body["since_ns"],
             json!(5_000_000_000_000_000_000u64 - DEFAULT_WINDOW_NS)
         );
+    }
+
+    /// One single-step run of `service` on `version`, declaring `outcome`
+    /// when given, its one span failing when `failed`.
+    fn versioned_run(
+        service: &str,
+        id: &str,
+        start: u64,
+        version: &str,
+        outcome: Option<&str>,
+        failed: bool,
+    ) -> Vec<Span> {
+        let mut spans = simple_run(service, id, start, "m", "Prompt.", 0, failed);
+        for span in &mut spans {
+            span.attributes
+                .insert("service.version".to_owned(), json!(version));
+            if let Some(outcome) = outcome {
+                span.attributes
+                    .insert(semconv::OUTCOME_KEYS[0].to_owned(), json!(outcome));
+            }
+        }
+        spans
+    }
+
+    /// The service-version change of `agent`.
+    fn version_change<'r>(report: &'r ChangeReport, agent: &str) -> &'r Change {
+        report
+            .agents
+            .iter()
+            .find(|cohort| cohort.agent == agent)
+            .and_then(|cohort| {
+                cohort
+                    .changes
+                    .iter()
+                    .find(|change| change.dimension == Dimension::ServiceVersion)
+            })
+            .unwrap_or_else(|| panic!("{agent}'s deploy is found: {report:#?}"))
+    }
+
+    #[test]
+    fn a_rate_is_judged_on_its_own_runs_and_exactly_when_its_cells_are_sparse() {
+        let fixture = TempStore::open("radar-sparse-rates", crate::Config::default());
+        let store = fixture.store();
+        let mut spans = Vec::new();
+        // 60 finished runs a side, but almost none declared an outcome the
+        // radar knows: one success before, ten failures after, every other
+        // run "escalated" (an outcome, but neither success nor failure).
+        for index in 0..120u64 {
+            let (version, outcome) = match index {
+                0 => ("1.0", "success"),
+                1..=59 => ("1.0", "escalated"),
+                60..=69 => ("2.0", "failure"),
+                _ => ("2.0", "escalated"),
+            };
+            spans.extend(versioned_run(
+                "declaring-bot",
+                &format!("declaring-{index:03}"),
+                BASE + index * MINUTE,
+                version,
+                Some(outcome),
+                false,
+            ));
+        }
+        // 20 runs a side, no error before and six after: every expected
+        // cell count of the table is at least 5 only on one diagonal.
+        for index in 0..40u64 {
+            spans.extend(versioned_run(
+                "erring-bot",
+                &format!("erring-{index:03}"),
+                BASE + index * MINUTE,
+                if index < 20 { "1.0" } else { "2.0" },
+                None,
+                (20..26).contains(&index),
+            ));
+        }
+        store.ingest_batch(spans).expect("ingests");
+        let report = store.changes(None, &query(), NOW).expect("analyses");
+
+        let declaring = version_change(&report, "declaring-bot");
+        assert_eq!((declaring.runs_before, declaring.runs_after), (60, 60));
+        let success = &declaring.deltas.success_rate;
+        assert_eq!((success.n_before, success.n_after), (1, 10));
+        // scipy.stats.fisher_exact([[1, 0], [0, 10]]).pvalue == 1/11; the
+        // z-test says 0.00091 of the same table.
+        let p = success.p_value.expect("reported");
+        assert!((p - 1.0 / 11.0).abs() < 1e-9, "{p}");
+        assert_eq!(
+            declaring.verdict,
+            Verdict::Neutral,
+            "one run before is no evidence about a success rate: {declaring:#?}"
+        );
+
+        let erring = version_change(&report, "erring-bot");
+        assert_eq!((erring.runs_before, erring.runs_after), (20, 20));
+        // scipy.stats.fisher_exact([[0, 20], [6, 14]]).pvalue; the z-test's
+        // 0.0079 would pass Holm's 0.05/4 and call this a regression.
+        let p = erring.deltas.error_rate.p_value.expect("reported");
+        assert!((p - 0.020_196_020_196_020_2).abs() < 1e-9, "{p}");
+        assert_eq!(erring.verdict, Verdict::Neutral, "{erring:#?}");
     }
 }

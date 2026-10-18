@@ -215,11 +215,12 @@ pub(super) fn call(
          runs (at least half of a sliding window); 'behavior' means the agent's top-level \
          paths shifted with no configuration change. Deltas compare finished runs just \
          before with just after; p-values are two-sided (two-proportion z-test for rates, \
-         Welch's t-test on the log scale for cost, steps and duration), Holm-corrected for \
-         the verdict. This is correlation in time, not proof of cause: changes listed \
-         together happened together, and the radar cannot tell which of them did it. Open \
-         an example run with get_run_tape, or compare a before run with an after run with \
-         compare_runs."
+         Fisher's exact test when a rate's table is sparse, Welch's t-test on the log scale \
+         for cost, steps and duration), Holm-corrected for the verdict, and a metric with \
+         fewer than 10 observations on a side is reported but does not count. This is \
+         correlation in time, not proof of cause: changes listed together happened \
+         together, and the radar cannot tell which of them did it. Open an example run \
+         with get_run_tape, or compare a before run with an after run with compare_runs."
             .to_owned(),
     ];
     if report.agents.iter().any(|agent| agent.unnamed) {

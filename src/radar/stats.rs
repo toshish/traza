@@ -13,9 +13,12 @@
 //! - Student's t two-sided tail, as the regularized incomplete beta function
 //!   `I_x(ν/2, 1/2)` with `x = ν/(ν+t²)`, evaluated by Lentz's continued
 //!   fraction, with `ln Γ` by the Lanczos approximation (g = 7, n = 9);
-//! - the two-proportion z-test (pooled), Welch's unequal-variance t-test with
-//!   Welch–Satterthwaite degrees of freedom, Holm's step-down correction, and
-//!   the Jensen–Shannon distance (base 2, so it lies in `[0, 1]`).
+//! - the two-proportion z-test (pooled), and Fisher's exact test for the
+//!   sparse tables where the z-test's normal approximation overstates
+//!   significance (an expected cell count below 5), Welch's unequal-variance
+//!   t-test with Welch–Satterthwaite degrees of freedom, Holm's step-down
+//!   correction, and the Jensen–Shannon distance (base 2, so it lies in
+//!   `[0, 1]`).
 //!
 //! Every function returns `None` rather than a number when its inputs cannot
 //! support one — an empty side, no variation at all — because a p-value
@@ -199,6 +202,76 @@ pub(crate) fn two_proportion(x1: usize, n1: usize, x2: usize, n2: usize) -> Opti
     Some(TestResult {
         statistic: z,
         p_value: normal_two_sided(z),
+    })
+}
+
+/// The smallest expected cell count at which [`proportions`] trusts the
+/// z-test's normal approximation: Cochran's rule for a 2×2 table.
+pub(crate) const MIN_EXPECTED_CELL: f64 = 5.0;
+
+/// Fisher's exact test of `x1/n1` (before) against `x2/n2` (after),
+/// two-sided: conditioned on the table's margins, the probability of a
+/// table no more likely than the one observed (relative tolerance `1e-7`,
+/// so a table that ties the observed one in exact arithmetic counts, as R's
+/// `fisher.test` and SciPy's `fisher_exact` count it). `None` when a side is
+/// empty.
+///
+/// The hypergeometric probabilities are built by their ratio recurrence
+/// outward from the mode, each relative to the mode's (so none overflows),
+/// and normalized by their own sum — no factorial is evaluated, and a table
+/// whose every outcome counts is exactly `1`. The support, and the one
+/// vector this holds, has at most `min(n1, n2) + 1` entries.
+pub(crate) fn fisher_exact(x1: usize, n1: usize, x2: usize, n2: usize) -> Option<f64> {
+    if n1 == 0 || n2 == 0 || x1 > n1 || x2 > n2 {
+        return None;
+    }
+    let total = n1 + n2;
+    let hits = x1 + x2;
+    let misses = total - hits;
+    // X = k: k of the `hits` fall in the first row, for k in [low, high].
+    let (low, high) = (n1.saturating_sub(misses), hits.min(n1));
+    // P(X = k + 1) / P(X = k); `misses + k + 1 > n1` because `k >= low`.
+    let up = |k: usize| {
+        ((hits - k) as f64 * (n1 - k) as f64) / ((k + 1) as f64 * (misses + k + 1 - n1) as f64)
+    };
+    let mode = ((n1 + 1) * (hits + 1) / (total + 2)).clamp(low, high);
+    let mut weights = vec![0.0f64; high - low + 1];
+    weights[mode - low] = 1.0;
+    for k in mode..high {
+        weights[k + 1 - low] = weights[k - low] * up(k);
+    }
+    for k in (low..mode).rev() {
+        weights[k - low] = weights[k + 1 - low] / up(k);
+    }
+    let threshold = weights[x1 - low] * (1.0 + 1e-7);
+    let (mut extreme, mut all) = (0.0f64, 0.0f64);
+    for &weight in &weights {
+        all += weight;
+        if weight <= threshold {
+            extreme += weight;
+        }
+    }
+    Some((extreme / all).clamp(0.0, 1.0))
+}
+
+/// The two-proportion comparison the radar's rates use: the pooled z-test
+/// when every expected cell count of the 2×2 table is at least
+/// [`MIN_EXPECTED_CELL`], and [`fisher_exact`] when one is not — where the
+/// normal approximation overstates significance (1 of 1 against 0 of 10 is
+/// z's p = 0.0009 and the exact p = 1/11). `None` exactly when
+/// [`two_proportion`] is: an empty side, or no variation at all. The
+/// statistic is z's either way; its sign is the direction of the move.
+pub(crate) fn proportions(x1: usize, n1: usize, x2: usize, n2: usize) -> Option<TestResult> {
+    let z = two_proportion(x1, n1, x2, n2)?;
+    let total = n1 + n2;
+    let hits = x1 + x2;
+    let smallest = n1.min(n2) as f64 * hits.min(total - hits) as f64 / total as f64;
+    if smallest >= MIN_EXPECTED_CELL {
+        return Some(z);
+    }
+    Some(TestResult {
+        statistic: z.statistic,
+        p_value: fisher_exact(x1, n1, x2, n2)?,
     })
 }
 
@@ -664,6 +737,50 @@ mod tests {
         assert_eq!(two_proportion(0, 10, 0, 10), None, "no variation");
         assert_eq!(two_proportion(10, 10, 10, 10), None, "no variation");
         assert_eq!(two_proportion(1, 0, 1, 10), None, "an empty side");
+    }
+
+    #[test]
+    fn fishers_exact_test_matches_scipy() {
+        // (x1, n1, x2, n2, scipy.stats.fisher_exact([[x1, n1-x1], [x2, n2-x2]]).pvalue)
+        for (x1, n1, x2, n2, p) in [
+            (1, 1, 0, 10, 0.090_909_090_909_090_91),
+            (0, 12, 5, 12, 0.037_267_080_745_341_61),
+            (12, 12, 7, 12, 0.037_267_080_745_341_62),
+            (0, 10, 4, 10, 0.086_687_306_501_547_99),
+            (10, 10, 0, 10, 1.082_508_822_446_903e-5),
+            (1, 40, 8, 40, 0.028_888_503_554_707_81),
+            (0, 20, 6, 20, 0.020_196_020_196_020_2),
+            (0, 100, 3, 10, 0.000_556_018_904_642_757_8),
+            (3, 60, 24, 60, 5.008_189_159_570_698e-6),
+            (30, 100, 45, 100, 0.040_534_006_514_982_64),
+            (4, 120, 16, 85, 0.000_468_764_607_206_940_75),
+        ] {
+            let actual = fisher_exact(x1, n1, x2, n2).expect("computes");
+            close(actual, p, 1e-9);
+        }
+        assert_eq!(fisher_exact(5, 2000, 0, 10), Some(1.0));
+        assert_eq!(fisher_exact(1, 0, 1, 10), None, "an empty side");
+    }
+
+    #[test]
+    fn sparse_tables_are_tested_exactly_and_ample_ones_by_z() {
+        // Every expected count at least 5: the z-test, as before.
+        let ample = proportions(3, 60, 24, 60).expect("computes");
+        assert_eq!(Some(ample), two_proportion(3, 60, 24, 60));
+        // An expected count below 5: the exact test, keeping z's direction.
+        for (x1, n1, x2, n2) in [(1, 1, 0, 10), (0, 20, 6, 20), (0, 100, 3, 10)] {
+            let sparse = proportions(x1, n1, x2, n2).expect("computes");
+            let z = two_proportion(x1, n1, x2, n2).expect("computes");
+            assert_eq!(sparse.p_value, fisher_exact(x1, n1, x2, n2).expect("exact"));
+            assert!(
+                sparse.p_value > z.p_value,
+                "z overstates: {sparse:?} vs {z:?}"
+            );
+            assert_eq!(sparse.statistic, z.statistic);
+        }
+        // No variation is no test, whichever test would have run.
+        assert_eq!(proportions(0, 1, 0, 10), None);
+        assert_eq!(proportions(10, 10, 10, 10), None);
     }
 
     #[test]
