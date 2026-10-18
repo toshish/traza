@@ -101,6 +101,67 @@ describe('the foresight panel', () => {
   });
 });
 
+describe('when the run or tenant changes while its answer is on its way', () => {
+  const settle = () => act(async () => { for (let i = 0; i < 6; i += 1) await Promise.resolve(); });
+  const held = () => {
+    let arrive;
+    api.fateRun.mockImplementationOnce(() => new Promise((resolve) => { arrive = resolve; }));
+    return (body) => act(async () => { arrive(body); for (let i = 0; i < 6; i += 1) await Promise.resolve(); });
+  };
+  const text = () => screen.getByTestId('run-foresight-panel').textContent;
+
+  it("shows no earlier run's verdict under the run now named until that run's own answer arrives", async () => {
+    const go = vi.fn();
+    const view = render(<RunForesight runId="live-doomed-0" tenant="" go={go} />);
+    await settle();
+    expect(text()).toContain('likely failure');
+    const arriveNovel = held();
+    view.rerender(<RunForesight runId="live-novel-0" tenant="" go={go} />);
+    await settle();
+    expect(api.fateRun).toHaveBeenLastCalledWith('live-novel-0', { tenant: '' }, expect.anything());
+    // live-doomed-0's verdict, odds and path are not live-novel-0's, and no
+    // link opens the map with them.
+    expect(text()).not.toContain('likely failure');
+    expect(text()).not.toContain('10.0%');
+    expect(screen.queryByText('On the Fate Map')).toBeNull();
+    await arriveNovel(novel);
+    expect(text()).toContain('novel');
+    fireEvent.click(screen.getByText('On the Fate Map'));
+    expect(go).toHaveBeenLastCalledWith(['foresight'], { run: 'live-novel-0', agent: 'support-agent', tenant: '' });
+  });
+
+  it("shows no tenant's answer under another tenant's run of the same id", async () => {
+    const view = render(<RunForesight runId="live-doomed-0" tenant="" go={vi.fn()} />);
+    await settle();
+    expect(text()).toContain('likely failure');
+    const arrive = held();
+    view.rerender(<RunForesight runId="live-doomed-0" tenant="acme" go={vi.fn()} />);
+    await settle();
+    expect(api.fateRun).toHaveBeenLastCalledWith('live-doomed-0', { tenant: 'acme' }, expect.anything());
+    expect(text()).not.toContain('likely failure');
+    await arrive(novel);
+    expect(text()).toContain('novel');
+  });
+
+  it('lets a late answer for the earlier run change nothing', async () => {
+    const arriveDoomed = held();
+    const view = render(<RunForesight runId="live-doomed-0" tenant="" go={vi.fn()} />);
+    await settle();
+    const arriveNovel = held();
+    view.rerender(<RunForesight runId="live-novel-0" tenant="" go={vi.fn()} />);
+    await settle();
+    // The earlier run's answer lands first, then the run's own, then — once
+    // more — the earlier one: only the run named is ever shown.
+    await arriveDoomed(doomed);
+    expect(text()).not.toContain('likely failure');
+    await arriveNovel(novel);
+    expect(text()).toContain('novel');
+    await arriveDoomed(doomed);
+    expect(text()).toContain('novel');
+    expect(text()).not.toContain('likely failure');
+  });
+});
+
 describe('the Run screen', () => {
   it('opens a model call in the X-Ray, in the run\'s tenant, and the whole run from the header', async () => {
     const go = vi.fn();

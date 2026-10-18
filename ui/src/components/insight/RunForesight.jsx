@@ -1,6 +1,7 @@
 import React from 'react';
 import { api } from '../../lib/api.js';
 import { useRead } from '../../lib/route.js';
+import { credentialGeneration, onCredentialChange } from '../../lib/session.js';
 import { fmtNum } from '../../lib/format.js';
 import { tenantParams } from '../../lib/runs.js';
 import { FORESIGHT_VERDICT } from '../../lib/insight.js';
@@ -22,14 +23,26 @@ import { NextOptions } from './NextOptions.jsx';
 // same id being judged beside this tape.
 
 export function RunForesight({ runId, tenant, oneTenant = true, identityKnown = true, go }) {
-  const answer = useRead((signal) => api.fateRun(runId, tenantParams(tenant), signal), [runId, tenant, oneTenant],
-    { skip: !oneTenant });
-  const f = answer.data;
+  // Each answer is kept with the scope it was asked for: the run, its
+  // tenant, and the credential it was asked under. A read keeps its last
+  // answer while the next one loads, and the Run screen stays mounted while
+  // the route moves to the same run in another tenant, so an answer is shown
+  // only beside the run it is about; until that run's own arrives, the panel
+  // is loading.
+  const generation = React.useSyncExternalStore(onCredentialChange, credentialGeneration);
+  const scope = JSON.stringify([runId, tenant === undefined ? null : tenant, generation]);
+  const answer = useRead((signal) => api.fateRun(runId, tenantParams(tenant), signal).then((body) => ({ body, scope })),
+    [scope, oneTenant], { skip: !oneTenant });
+  const f = answer.data && answer.data.scope === scope ? answer.data.body : null;
   // The calibration is the build's, whatever is drawn: the default-window
   // map (the build foresight judged against, cached per tenant), drawn as
-  // small as the route allows.
-  const scored = useRead((signal) => api.fateMap({ agent: f.agent, depth: 1, max_nodes: 1, ...tenantParams(f.tenant) }, signal),
-    [f && f.agent, f && f.tenant], { skip: !f || !f.cohort_runs || !(f.matched_depth > 0) });
+  // small as the route allows — and kept, like the answer, with the agent
+  // and tenant it was asked for.
+  const buildScope = f ? JSON.stringify([f.agent, f.tenant === undefined ? null : f.tenant, generation]) : null;
+  const scored = useRead((signal) => api.fateMap({ agent: f.agent, depth: 1, max_nodes: 1, ...tenantParams(f.tenant) }, signal)
+    .then((body) => ({ body, scope: buildScope })),
+  [buildScope], { skip: !f || !f.cohort_runs || !(f.matched_depth > 0) });
+  const calibration = scored.data && scored.data.scope === buildScope ? scored.data.body.calibration : null;
   const open = () => {
     const params = { run: runId };
     if (f) params.agent = f.agent;
@@ -39,7 +52,7 @@ export function RunForesight({ runId, tenant, oneTenant = true, identityKnown = 
   return <Card data-testid="run-foresight-panel">
     <PanelHead title="Foresight" note="this path, against the agent's last 30 days"
       action={f ? <Chip onClick={open}>On the Fate Map</Chip> : null} />
-    <LoadingBar active={answer.loading || (!oneTenant && !identityKnown)} />
+    <LoadingBar active={answer.loading || (oneTenant && Boolean(answer.data) && !f) || (!oneTenant && !identityKnown)} />
     {!oneTenant && identityKnown ? <div style={{ fontSize: 12, color: 'var(--ink-muted)', lineHeight: '18px' }}>
       Foresight reads one tenant, and no tenant is named: name the run's tenant above to judge it against its
       agent's map.
@@ -49,7 +62,7 @@ export function RunForesight({ runId, tenant, oneTenant = true, identityKnown = 
         : answer.error.status === 409 || answer.error.status === 400 ? answer.error.what
           : `Foresight could not be read: ${answer.error.what}`}
     </div> : null}
-    {f ? <Body f={f} calibration={scored.data ? scored.data.calibration : null} /> : null}
+    {f ? <Body f={f} calibration={calibration} /> : null}
   </Card>;
 }
 
