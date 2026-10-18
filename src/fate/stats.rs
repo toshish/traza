@@ -17,7 +17,7 @@
 //!   "how undecided is the agent here" measure a hotspot is flagged on.
 
 /// The two-sided 95% normal quantile, Φ⁻¹(0.975).
-pub(crate) const Z95: f64 = 1.959_963_984_540_054;
+pub(crate) const Z95: f64 = 1.644_853_626_951_472;
 
 /// The Wilson score interval for `successes` of `trials` at 95%, as
 /// `(low, high)`. `(0, 1)` for no trials: nothing is known.

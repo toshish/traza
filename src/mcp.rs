@@ -1985,6 +1985,13 @@ impl<'a> Server<'a> {
                         top.insert("fingerprint".to_owned(), json!(short));
                     }
                 }
+                if let Some(foresight) = object.get_mut("foresight").and_then(Value::as_object_mut)
+                {
+                    if let Some(text) = foresight.get("explanation").and_then(Value::as_str) {
+                        let short = truncate_bytes(text, 120);
+                        foresight.insert("explanation".to_owned(), json!(short));
+                    }
+                }
             }
             result["structuredContent"] = structured;
         }

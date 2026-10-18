@@ -1331,7 +1331,7 @@ first, each followed by its task sub-cohorts (at most 32, each with at least
 | `task` | string | Present on a task sub-cohort: 16 hex characters of the SHA-256 of the run's `traza.task` (else `session.goal`) |
 | `runs` | integer | Completed runs: `success + failure + abandoned` |
 | `success`, `failure`, `abandoned` | integer | By outcome |
-| `unknown` | integer | Runs excluded because their outcome cannot be told — still active (last span within 15 minutes) or an unrecognised declared outcome |
+| `unknown` | integer | Runs excluded because their outcome cannot be told — still active (no declared outcome, last span within 15 minutes) or an unrecognised declared outcome |
 | `base_rate` | number \| null | `success / runs` |
 
 ```sh

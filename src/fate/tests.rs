@@ -1042,6 +1042,34 @@ fn cached_foresight_never_builds_on_the_request_path() {
 }
 
 #[test]
+fn explicit_windows_never_evict_the_maps_the_fuses_read() {
+    let (fixture, now) = seeded("eviction", crate::Config::default(), false);
+    let store = fixture.store();
+    let default = BuildKey::of(Some(""), None, None);
+    store
+        .fate
+        .get_or_build(store, &default, now, None)
+        .expect("builds");
+    // A dashboard polling with a fresh `until` each time.
+    for poll in 0..(CACHE_ENTRIES as u64 + 4) {
+        let window = Some((now - DEFAULT_WINDOW_NS, now + poll));
+        store
+            .fate_map(
+                "",
+                &MapRequest {
+                    window,
+                    ..MapRequest::new("support-agent")
+                },
+                now,
+            )
+            .expect("builds");
+    }
+    let state = store.fate.lock().expect("lock");
+    assert_eq!(state.entries.len(), CACHE_ENTRIES);
+    assert!(state.entries.contains_key(&default));
+}
+
+#[test]
 #[ignore = "a timing probe, run by hand: cargo test --lib fate_build_timing -- --ignored --nocapture"]
 fn fate_build_timing() {
     let fixture = TempStore::open("timing", crate::Config::default());

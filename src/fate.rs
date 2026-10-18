@@ -1962,11 +1962,14 @@ impl FateCache {
                     used,
                 },
             );
+            // Explicit windows go first: a dashboard asking for a fresh
+            // `until` on every poll must not push out the default-window
+            // maps the predictive fuses read.
             while state.entries.len() > CACHE_ENTRIES {
                 let oldest = state
                     .entries
                     .iter()
-                    .min_by_key(|(_, entry)| entry.used)
+                    .min_by_key(|(key, entry)| (key.window == Window::Default, entry.used))
                     .map(|(key, _)| key.clone());
                 match oldest {
                     Some(oldest) => {

@@ -88,12 +88,12 @@ curl 'http://127.0.0.1:8080/v1/fate/cohorts'
 ```
 
 **Outcomes** come from the same rule every other run surface uses
-([attribution](../llm-semantics.md#steps-and-runs)): a declared
-`session.outcome` from the span that ended last, else the status of the span
-that ended last — `success`, `failure` or `abandoned`. A run whose last span
-ended in the last 15 minutes is still active, and a declared outcome Traza
-does not recognise cannot be told; both are **`unknown`, excluded from every
-rate, and counted** (the six live runs above). The base rate is
+([attribution](../llm-semantics.md#steps-and-runs)): the latest declared
+`session.outcome`, else the status of the span that ended last — `success`,
+`failure` or `abandoned`. A run with no declaration whose last span ended in
+the last 15 minutes is still active, and a declared outcome Traza does not
+recognise cannot be told; both are **`unknown`, excluded from every rate, and
+counted** (the six live runs above). The base rate is
 `success / runs` over completed runs.
 
 ## The Fate Map
@@ -304,7 +304,7 @@ build holds is bounded, and a build that meets a bound says so
 | Cohorts per build | 256, the largest | Dropped (`cohorts_dropped`) |
 | Tasks listed per cohort | 32, with at least 3 runs | Not listed |
 | Distinct agent and service names per build | 4,096 | The spans are skipped (`spans_skipped`) |
-| Cached builds | 8 | Least recently used evicted |
+| Cached builds | 8 | Least recently used evicted — explicit `since`/`until` windows before the default window the predictive fuses read |
 
 Builds are cached for `--fate-cache-seconds` (default 300) per tenant,
 window and task, and built once however many requests ask at the same
