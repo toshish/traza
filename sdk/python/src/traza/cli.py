@@ -1,4 +1,4 @@
-"""The ``traza`` command: tape tests, golden runs and forks from a shell.
+"""The ``traza`` command: tape tests, golden runs, forks and a TLS forwarder from a shell.
 
 ::
 
@@ -8,6 +8,7 @@
     traza golden list
     traza forks weather-7                               # its branches and where they parted
     traza fork weather-7 --at 2 --response "It is sunny." -- python agent.py
+    traza forward --upstream https://api.trazadb.com    # plain HTTP on 127.0.0.1:8089, TLS upstream
 
 The server is ``--url`` (default ``TRAZA_URL``, else ``http://127.0.0.1:8080``)
 and the tenant ``--tenant`` (default ``TRAZA_TENANT``). The credential is
@@ -15,6 +16,9 @@ and the tenant ``--tenant`` (default ``TRAZA_TENANT``). The credential is
 CI logs. The agent ``traza test`` runs is handed ``TRAZA_REPLAY_KEY`` as its
 provider API key when set — a ``ro`` credential of the runs' tenant — else
 ``TRAZA_TOKEN``, which is refused when it is an unbound (operator) credential.
+
+``traza forward`` takes no ``--url``: it forwards whatever local tools send
+it to ``--upstream`` (see :mod:`traza.forward`).
 
 Exit status: ``0`` when every test passed (or the command succeeded), ``1``
 when a test failed, ``2`` for a usage error or a server that could not be
@@ -30,7 +34,7 @@ import subprocess
 import sys
 from typing import Any, List, Optional, Sequence
 
-from . import __version__
+from . import __version__, forward as _forward
 from .client import Client
 from .errors import TrazaError
 from .testing import GoldenResult, junit_xml, replay_key, run_golden
@@ -199,7 +203,7 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--tenant", help="tenant scope (default: $TRAZA_TENANT)")
     common.add_argument("--http-timeout", type=float, default=30.0, help=argparse.SUPPRESS)
 
-    parser = argparse.ArgumentParser(prog="traza", description="Tape tests, golden runs and forks for Traza.")
+    parser = argparse.ArgumentParser(prog="traza", description="Tape tests, golden runs, forks and a TLS forwarder for Traza.")
     parser.add_argument("--version", action="version", version=f"traza {__version__}")
     commands = parser.add_subparsers(dest="name", metavar="COMMAND")
     commands.required = True
@@ -237,6 +241,11 @@ def build_parser() -> argparse.ArgumentParser:
     fork.add_argument("--response-json", help="an assistant message, as JSON, served at the step")
     fork.add_argument("--tool-result", help="a tool result, as JSON, served at the step")
     fork.add_argument("--no-live", action="store_true", help="after the edit, keep serving the recording")
+
+    _forward.add_arguments(commands.add_parser(
+        "forward", help="forward plain HTTP on loopback to an https:// Traza server",
+        description="Listen on a loopback address and forward each request to the https:// --upstream, "
+        "TLS verified: for tools that speak plain HTTP only, such as traza-server import --watch."))
     return parser
 
 
@@ -252,7 +261,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         arguments, command = arguments[:cut], arguments[cut + 1:]
     args = parser.parse_args(arguments)
     args.command = command
-    handlers: Any = {"test": _cmd_test, "golden": _cmd_golden, "forks": _cmd_forks, "fork": _cmd_fork}
+    handlers: Any = {"test": _cmd_test, "golden": _cmd_golden, "forks": _cmd_forks, "fork": _cmd_fork,
+                     "forward": lambda args, _parser: _forward.run(args)}
     try:
         return int(handlers[args.name](args, parser))
     except TrazaError as error:

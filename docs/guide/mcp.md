@@ -99,9 +99,11 @@ surface unless you deliberately enabled `record_annotation`. An `rw` token in
 an agent's configuration buys nothing and widens what a mistake can do.
 
 **The bridge speaks plain HTTP and refuses an `https://` URL.** Behind TLS
-termination, point it at the server's plaintext address on the host itself —
-or use the HTTP client form above, which handles `https://` directly and needs
-no bridge at all.
+termination, point it at the server's plaintext address on the host itself,
+or at the Python SDK's
+[`traza forward`](../../sdk/python/README.md#reaching-a-server-over-tls-traza-forward)
+on loopback — or use the HTTP client form above, which handles `https://`
+directly and needs no bridge at all.
 
 The dashboard's **MCP** screen generates both snippets against the origin you
 are actually on, and shows the live tool list, so it is correct behind any

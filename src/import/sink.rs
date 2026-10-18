@@ -49,16 +49,20 @@ pub struct HttpTarget {
 }
 
 impl HttpTarget {
-    /// Parses `http://host[:port][/prefix]`. `https` is refused: put TLS
-    /// termination in front and point at the plaintext side.
+    /// Parses `http://host[:port][/prefix]`. `https` is refused: run the
+    /// Python SDK's `traza forward` on loopback, or put TLS termination in
+    /// front, and point at the plaintext side.
     pub fn parse(url: &str, token: Option<String>) -> Result<Self, String> {
         let (scheme, rest) = url.split_once("://").unwrap_or(("http", url));
         if scheme.eq_ignore_ascii_case("https") {
-            return Err(
-                "the importer speaks plain HTTP; put TLS termination in front of the server \
-                 and point --url at the plaintext side"
-                    .to_owned(),
-            );
+            // Named without any user:password the URL carried.
+            let shown = rest.rsplit_once('@').map_or(rest, |(_, after)| after);
+            return Err(format!(
+                "the importer speaks plain HTTP; to reach https://{shown} over TLS, run `traza \
+                 forward --upstream https://{shown}` (the Python SDK) and point --url at \
+                 http://127.0.0.1:8089, or point --url at the plaintext side of the server's TLS \
+                 termination"
+            ));
         }
         if !scheme.eq_ignore_ascii_case("http") {
             return Err(format!(

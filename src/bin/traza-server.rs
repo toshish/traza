@@ -1847,16 +1847,23 @@ fn forward(
 /// scheme and the path to `/`.
 fn split_url(url: &str) -> Result<(String, u16, String), Box<dyn std::error::Error>> {
     let (scheme, rest) = url.split_once("://").unwrap_or(("http", url));
-    if scheme == "https" {
-        return Err(
-            "the bridge speaks plain HTTP; put TLS termination in front of it, and \
-                    point --url at the plaintext side"
-                .into(),
-        );
-    }
     let (authority, path) = rest
         .split_once('/')
         .map_or((rest, String::new()), |(a, p)| (a, format!("/{p}")));
+    if scheme == "https" {
+        // The forwarder takes the origin and the bridge keeps its path; any
+        // user:password the URL carried is not repeated.
+        let origin = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, after)| after);
+        return Err(format!(
+            "the bridge speaks plain HTTP; to reach https://{origin}{path} over TLS, run `traza \
+             forward --upstream https://{origin}` (the Python SDK) and point --url at \
+             http://127.0.0.1:8089{path}, or point --url at the plaintext side of the server's \
+             TLS termination"
+        )
+        .into());
+    }
     let (host, port) = match authority.rsplit_once(':') {
         Some((host, port)) => (host.to_owned(), port.parse::<u16>()?),
         None => (authority.to_owned(), 80),

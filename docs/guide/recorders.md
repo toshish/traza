@@ -199,7 +199,7 @@ re-sends spans the destination already holds, which is harmless.
   `POST /v1/spans` to a running server, which needs `rw`. A credential bound to
   a tenant stamps that tenant on every span; `--tenant` names one for an
   unbound credential. The client speaks plain HTTP and connects only to the URL
-  given.
+  given; for a server reached over TLS, see [below](#a-server-over-tls).
 - `--data-dir DIR`: straight into a data directory no server holds (the
   directory's lock refuses one a server is running on), with the server's
   default payload threshold.
@@ -238,6 +238,35 @@ or working directory contains it. `--json` prints the counts as JSON:
 ```
 
 All flags are in [configuration](../configuration.md#traza-server-import-and-traza-server-blame).
+
+### A server over TLS
+
+The importer speaks plain HTTP and refuses an `https://` URL. To import into
+a server across a network — Traza Cloud, or your own behind TLS — run the
+Python SDK's [`traza forward`](../../sdk/python/README.md#reaching-a-server-over-tls-traza-forward)
+beside it and point `--url` at that:
+
+```sh
+pip install ./sdk/python            # standard library only
+traza forward --upstream https://api.trazadb.com &
+traza-server import claude-code --watch --url http://127.0.0.1:8089 --token tzk_…
+```
+
+The forwarder listens on loopback only (a non-loopback `--listen` is
+refused), sends every request on over TLS verified against the system's
+authorities (it cannot be told not to), passes method, path, query and the
+end-to-end headers through with `Host` set to the upstream's, and streams
+bodies both ways. It follows no redirect and passes none on, so the token
+goes only to `--upstream`; it adds no credential of its own. A request body
+over 64 MiB (`--max-body-bytes`) is refused with `413` before anything is
+sent, and an upstream silent for 120 s (`--timeout`) is answered `504`. An
+unreachable upstream answers the importer `502`, which a watch treats like a
+server that is down: it keeps its offsets and tries again.
+
+The state file keys progress by the URL given, so an import through the
+forwarder keeps its own progress, apart from one sent to the same server any
+other way. [`traza-server blame`](#agent-blame) and the
+[MCP bridge](mcp.md) reach a TLS server the same way.
 
 ## Agent Blame
 

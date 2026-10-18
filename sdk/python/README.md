@@ -316,6 +316,61 @@ exporters on does not send those to Traza, which ingests traces only.
 `OTEL_RESOURCE_ATTRIBUTES` replaces any value you already export; merge it by
 hand if you set others.
 
+Reaching a server over TLS: `traza forward`
+-------------------------------------------
+
+Some of Traza's own tools speak plain HTTP only and refuse an `https://`
+URL: `traza-server import --watch`, `traza-server blame` and the MCP bridge.
+That is all a server on the same machine needs. For one across a network —
+Traza Cloud, or your own behind TLS — `traza forward` listens on loopback and
+sends each request on over TLS:
+
+```sh
+traza forward --upstream https://api.trazadb.com &
+traza-server import claude-code --watch --url http://127.0.0.1:8089 --token tzk_…
+```
+
+```text
+traza forward: http://127.0.0.1:8089 -> https://api.trazadb.com (TLS verified); Ctrl-C to stop
+```
+
+- **Loopback only.** `--listen` (default `127.0.0.1:8089`) must be
+  `127.0.0.1`, another `127.x` address, `::1` or `localhost`; anything else
+  is refused before a socket is opened. A request reaches the forwarder in
+  plain text, token and all, and only the loopback interface keeps that on
+  the machine.
+- **TLS verified, always.** The upstream must be `https://`, and its
+  certificate is checked against the system's authorities, hostname
+  included, with `ssl.create_default_context()`. There is no flag to turn
+  that off. A private authority goes where OpenSSL looks for one
+  (`SSL_CERT_FILE`).
+- **Passed through as sent.** Method, path, query and headers go on
+  unchanged, except the hop-by-hop ones (`Connection` and every header it
+  names, `Keep-Alive`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`,
+  `Proxy-Authorization`, `Proxy-Connection`). `Host` becomes the upstream's,
+  and a path under the upstream (`https://host/traza`) leads every path.
+  The forwarder adds no credential and keeps none: the token is whatever the
+  local tool sends.
+- **Streamed.** Request and response bodies pass in pieces of at most
+  64 KiB, never held whole, so a live stream (`/v1/tail`,
+  `/v1/runs/live/stream`) stays live. A request body is capped at
+  `--max-body-bytes` (64 MiB, the server's own cap): a larger declared body
+  is answered `413` and never sent, and a chunked one that passes the cap
+  abandons its upstream request and is answered `413`.
+- **No redirects.** An upstream `3xx` (other than `304`) is neither
+  followed nor passed on: it is answered `502`, naming where it pointed, so
+  a credential goes only where `--upstream` says.
+- **Bounded waits.** `--timeout` (120 s) bounds connecting and every read
+  or write in between, upstream and from the local tool; past it the
+  answer is `504`.
+
+Its own errors are JSON, `{"error": "…"}`, as the server's are: `400` for a
+request it will not forward (a full URL as the target — it is not a proxy —
+or a malformed body), `413` for a body over the cap, `502` for an upstream it
+could not reach, failed verification or a redirect, `504` for one that went
+quiet. `--quiet` turns off the per-request log on stderr, which never shows
+a header. `python -m traza.forward` is the same command.
+
 Errors
 ------
 

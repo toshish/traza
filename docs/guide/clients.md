@@ -223,6 +223,7 @@ golden runs; in short:
   traza golden add weather-7                        # mark a run golden
   traza forks weather-7                             # its branches and where they parted
   traza fork weather-7 --at 1 --response "Sunny." -- python agent.py
+  traza forward --upstream https://api.trazadb.com  # plain HTTP on 127.0.0.1:8089, TLS upstream
   ```
 
   The command reads the server from `--url` or `TRAZA_URL`, the tenant from
@@ -234,6 +235,12 @@ golden runs; in short:
   `--allow-empty`, or the golden listing was incomplete, unless
   `--allow-partial`), 2 for a usage error, a refused key, or a server that
   could not be asked.
+- **`traza forward`** (Python) lets the tools that speak plain HTTP only —
+  `traza-server import --watch`, `traza-server blame`, the MCP bridge —
+  reach a server over TLS: it listens on loopback only and forwards each
+  request to an `https://` upstream, certificate verified, bodies streamed,
+  redirects refused
+  ([details](../../sdk/python/README.md#reaching-a-server-over-tls-traza-forward)).
 
 ## The exporter environment
 
