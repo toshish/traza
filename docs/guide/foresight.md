@@ -160,7 +160,10 @@ unlucky runs from being called a fork: the researcher's `query_db` branch
 succeeded 3 of 10 times against 17 of 30 for its siblings — 27 points worse —
 and is *not* flagged (p = 0.27); its `ask_human` branch, 1 of 10 against 19
 of 30, is (p = 0.008). The `fork` object carries the comparison either way:
-`siblings_visits`, `siblings_success_rate`, `gap`, `p_value`.
+`siblings_visits`, `siblings_success_rate`, `gap`, `p_value`. Rates and the
+gap are rounded to four places there; the 25-point rule is applied to the
+exact gap, so a branch 24.995 points worse (7 of 61 against 31 of 85) shows
+`"gap": 0.25` and is not flagged.
 
 **Summaries.** `fatal_forks` lists the flagged forks within `depth`, most
 significant first, each with its path from the root; `hotspots` the
@@ -291,7 +294,9 @@ A [fuse policy](guard.md#policies) may set three more limits:
 When a run's foresight has at least that support, the run has at least that
 many steps, and the **upper bound** of the 95% interval is below
 `min_success_odds`, the policy's action applies — `stop` or `warn` — with the
-reason:
+reason. The bound compared is the exact one, from `successes` and `support`;
+`ci95` is rounded to four places for display, so 0 of 30 (upper bound
+0.11351…, shown as `0.1135`) does not stop a run under odds of `0.11351`:
 
 ```sh
 curl -X POST http://127.0.0.1:8080/v1/fuses/policies -d '{
@@ -372,7 +377,14 @@ run go on against its history, reset it with a grant of lower odds:
 A build reads every span in its window — the cost of any whole-window
 aggregation. A request's build runs under `--query-deadline-ms`; a window too
 large to read in time answers `400` and the advice to narrow it with
-`since=`/`until=`. A background build for the fuses runs under
+`since=`/`until=`. Rendering a map answers to the same budget, cached or not
+— its summaries look at every node of the cohort's tree, whatever
+`max_nodes` shows. That work, like a build's calibration, is linear in the
+runs and nodes: each node is compared with its siblings through its
+parent's totals, and each run's calibration pool is summed once per tree,
+never sibling by sibling — so an agent whose runs fan out ten thousand ways
+costs ten thousand comparisons, not a hundred million. A background build
+for the fuses runs under
 `--fate-build-seconds` and narrows itself when it runs out (above).
 Everything a build holds is bounded, and a build that meets a bound says so
 (`truncated: true`, and which in `bounds`):
@@ -380,7 +392,7 @@ Everything a build holds is bounded, and a build that meets a bound says so
 | Bound | Default | Past it |
 |---|---|---|
 | Completed runs per cohort map (`--fate-max-runs`) | 20,000 | The oldest are dropped (`runs_dropped`) |
-| Runs the fold tracks per build, across every agent of the build (each holding its run id, at most 1 KiB, and a fixed-size record) | 4 × `--fate-max-runs` | The window is **narrowed** to its most recent part that fits (`window_narrowed`, `window.since_ns`), so a map keeps the newest runs, not whichever the fold met first; past four narrowing attempts, further runs are skipped (`spans_skipped`). The bound is the build's, not an agent's: one busy agent narrows the window for every agent of its tenant |
+| Runs the fold tracks per build, across every agent and tenant of the build (each holding its run id, at most 1 KiB, and a fixed-size record; a tenant is held only for a run it tracks) | 4 × `--fate-max-runs` | The window is **narrowed** to its most recent part that fits (`window_narrowed`, `window.since_ns`), so a map keeps the newest runs, not whichever the fold met first; past four narrowing attempts, further runs are skipped (`spans_skipped`) and their spans keep nothing — no tenant entry, no interned name. The bound is the build's, not an agent's: one busy agent narrows the window for every agent of its tenant |
 | Step records held per build (32 bytes each) | 2,097,152 (64 MiB) | As for runs |
 | Steps read per run | 192, the earliest | The path ends in `…` (`runs_partial`) |
 | Tree nodes per build, across its cohorts (`--fate-max-nodes`) | 50,000 | Nodes are created **level by level across every cohort** — each depth, most visited first, before any cohort's next depth — so the bound cuts the long tail of deep, rare paths and no busy agent can leave another agent of the tenant a bare root (`node_cap` for the build, `nodes_capped` for a cohort it cut, and `cut` on the nodes it cut below). A path into a cut branch — or a live run whose last step has a repeat bucket the bound cut there, so its pool would be short — gets `insufficient_history`, never a guess |
@@ -439,9 +451,16 @@ Stated plainly:
   them.
 - **Step order on ties.** Steps are ordered by start time, then by the first
   eight bytes of their trace and span ids — the canonical order on everything
-  but a tie of start time and both prefixes. Likewise the span that ended
-  last (which decides an undeclared outcome) is chosen by end time and the
-  ids' first eight bytes, then by a hash of both ids.
+  but a tie of start time and both prefixes. Steps tied on all three are
+  ordered by a hash of their token's step, then of their agent: the same on
+  the map, the run route and the fuses' live paths, whatever order the spans
+  arrived in, though not necessarily the order of their full ids. (A run's
+  earliest span, whose service names the cohort when no step names an
+  agent, is likewise chosen by start, the prefixes, then a hash of its
+  service — by the map and the run route; the fuses take the run guard's
+  service, the one that picked the run's policy.) The span that ended last
+  (which decides an undeclared outcome) is chosen by end time and the ids'
+  first eight bytes, then by a hash of both ids.
 - **Buckets blur an open group.** A live run's last step is pooled with
   every bucket that can hold its count, but a bucket does not keep exact
   counts: a run on its fourth search is pooled with the `×3-5` runs that

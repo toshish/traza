@@ -283,7 +283,14 @@ every token of the path — tool and model names from the telemetry — and the
 explanation that quotes them render inside the telemetry block, and are made
 JSON-safe in `structuredContent`. It is a read: it builds the agent's map if
 none is cached (under the query deadline), and changes nothing. Nothing in it
-comes from a model — it is counting over stored runs — and it says so.
+comes from a model — it is counting over stored runs — and it says so. Under
+a tight `--mcp-max-result-bytes` the structured half is cut, detail first —
+`next`, `recommended_next`, the node and divergence, the explanation, then
+the path from its end — until it fits beside the headline, and the result
+says so (`truncated: true`, and the headline names what was left out); the
+run id, tenant, agent, verdict and numbers are never cut, so a run whose
+identifiers alone overflow the ceiling (a run id of a kilobyte under a
+one-kilobyte ceiling) is refused with a tool error that quotes none of them.
 
 **`blame_line` answers "why does this code look like this?"** before an
 agent changes it. It takes `path` (a file path or a suffix such as

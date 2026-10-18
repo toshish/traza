@@ -1418,7 +1418,10 @@ are `400`. `since`/`until` are integer Unix nanoseconds over span start times
 alone runs to now).
 
 A build reads every span of its window under `--query-deadline-ms`; one that
-runs out answers `400` naming `since=`/`until=` as the remedy. Builds are
+runs out answers `400` naming `since=`/`until=` as the remedy. Rendering a
+map, cached or not, spends the same budget (its summaries look at every node
+of the tree, in work linear in it), and answers the same way when it runs
+out. Builds are
 cached for `--fate-cache-seconds` (each tenant's default-window build in a
 pool of `--fate-tenant-maps` that no other request evicts from, everything
 else in eight slots) and dropped by any erasure. Each answer
@@ -1491,7 +1494,7 @@ runs, predicted, observed}`), and `root`, the tree. Each node:
 | `lift` | number \| null | `success_rate / base_rate` |
 | `entropy` | number | Bits of entropy of the next token, ending the run counted as one |
 | `hotspot` | boolean | `entropy ≥ 1` and `visits ≥ min_support` |
-| `fatal_fork` | boolean | At least 25 points below its siblings' pooled success rate, both with `min_support` runs, two-sided Fisher exact p < 0.05 |
+| `fatal_fork` | boolean | At least 25 points below its siblings' pooled success rate, both with `min_support` runs, two-sided Fisher exact p < 0.05 — judged on the exact gap, not the four-place `fork.gap` |
 | `fork` | object | `{siblings_visits, siblings_success_rate, gap, p_value}` whenever both sides have `min_support` runs |
 | `cost_usd_sum`, `duration_ns_sum` | number, integer | Summed run cost and duration of the runs through the node |
 | `example_runs` | object[] | `{run, outcome}`: the newest run of each outcome through the node |

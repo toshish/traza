@@ -230,7 +230,8 @@ the other way — at how runs like it have ended. `min_success_odds` (with
 `foresight_min_support`, default 30, and `foresight_after_steps`, default 3)
 walks the run's path so far down its agent's [Fate Map](foresight.md), and
 when at least that many earlier runs took the same path, the run has at least
-that many steps, and the upper bound of their success rate's 95% interval is
+that many steps, and the upper bound of their success rate's 95% interval —
+exact, from the counts, not the four-place `ci95` the verdict shows — is
 below the limit, the policy's action applies, with a reason like
 `foresight: runs that took this path succeeded 5 of 50 times (≤21.4%)`. On
 the pre-call check, a named next tool is judged as the next step of the path.

@@ -81,16 +81,33 @@
 //! Every structure here is built from tenant data, so every one is bounded:
 //! runs per cohort ([`FateConfig::max_runs`]), nodes per build
 //! ([`FateConfig::max_nodes`], spent level by level across cohorts), runs
-//! tracked by the fold (each a fixed-size record and its run id), step
-//! records held by it ([`MAX_STEP_RECORDS`]), steps read per run
-//! ([`RUN_STEP_WINDOW`]), distinct signatures, names cut to
+//! tracked by the fold (each a fixed-size record and its run id — and the
+//! fold keeps nothing, not even a tenant entry, for a run it does not
+//! track), step records held by it ([`MAX_STEP_RECORDS`]), steps read per
+//! run ([`RUN_STEP_WINDOW`]), distinct signatures, names cut to
 //! [`MAX_NAME_BYTES`], cohorts, cached builds ([`FateConfig::tenant_maps`]
 //! tenant maps and [`CACHE_ENTRIES`] others), builds running at once — and a
-//! build that meets a bound says so (`truncated`). Builds run under a
-//! deadline. Builds are tenant-scoped (the operator view, with no tenant,
-//! keeps tenants apart in its cohorts), cached for [`FateConfig::cache_ttl`],
-//! and every cached build is dropped by any erasure: a map must not keep a
-//! run the store no longer holds.
+//! build that meets a bound says so (`truncated`). Builds, and renderings of
+//! a cached build, run under the request's deadline, checked inside every
+//! loop over runs or nodes, and their work is linear in the runs and nodes:
+//! calibration pools and sibling comparisons are summed once per tree,
+//! never per sibling. Builds are tenant-scoped (the operator view, with no
+//! tenant, keeps tenants apart in its cohorts), cached for
+//! [`FateConfig::cache_ttl`], and every cached build is dropped by any
+//! erasure: a map must not keep a run the store no longer holds.
+//!
+//! # One step order everywhere
+//!
+//! A build, a read of the store and the run guard's live path order a run's
+//! steps the same way (`StepOrder`): by start, the ids' first eight bytes,
+//! then — for steps tied on those — by what the step is, never by interning
+//! or arrival order. So the same spans make the same path on every surface.
+//!
+//! # Thresholds are held to exact figures
+//!
+//! Rates, intervals and gaps are rounded to four places for the wire; every
+//! threshold — a predictive fuse's `min_success_odds`, a fatal fork's gap, a
+//! verdict's bounds — is compared with the exact figure.
 
 pub mod http;
 mod stats;
@@ -223,10 +240,53 @@ const NEXT_OPTIONS: usize = 5;
 const DEMAND_KEYS: usize = 64;
 const WARM_PER_CALL: usize = 2;
 
-/// Spans or runs between deadline checks in a build's own loops.
+/// Steps of work — spans, runs, tree nodes — between deadline checks in a
+/// build's and a rendering's own loops.
 const DEADLINE_STRIDE: usize = 1_024;
 
+/// A request's deadline, checked every [`DEADLINE_STRIDE`] steps of work.
+/// Every loop over tenant data in a build or a rendering steps one, so no
+/// such loop — however wide the tree or many the runs — runs past the
+/// budget by more than a stride.
+struct Paced {
+    deadline: Option<Deadline>,
+    steps: usize,
+}
+
+impl Paced {
+    fn new(deadline: Option<Deadline>) -> Self {
+        Self { deadline, steps: 0 }
+    }
+
+    /// Counts `steps` steps of work; errs once the deadline has passed.
+    fn step(&mut self, steps: usize) -> Result<()> {
+        let before = self.steps / DEADLINE_STRIDE;
+        self.steps = self.steps.saturating_add(steps);
+        if self.steps / DEADLINE_STRIDE == before {
+            return Ok(());
+        }
+        Deadline::check(self.deadline, 0)
+    }
+}
+
 const NONE: u32 = u32::MAX;
+
+#[cfg(test)]
+thread_local! {
+    /// Tree nodes calibration and a map's summaries looked at, on this
+    /// thread: for the test that holds them to work linear in the tree.
+    static EXAMINED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts `count` tree nodes looked at (tests only).
+#[cfg(test)]
+fn examined(count: usize) {
+    EXAMINED.with(|cell| cell.set(cell.get() + count as u64));
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn examined(_count: usize) {}
 
 // ------------------------------------------------------------ configuration
 
@@ -386,7 +446,8 @@ pub struct ForkStat {
     pub siblings_visits: u64,
     /// Their pooled success rate.
     pub siblings_success_rate: f64,
-    /// Siblings' rate minus this branch's.
+    /// Siblings' rate minus this branch's, to four places. A fatal fork is
+    /// judged on the exact gap.
     pub gap: f64,
     /// Two-sided Fisher exact p-value for the difference.
     pub p_value: f64,
@@ -738,7 +799,8 @@ pub struct GuardForesight {
     pub verdict: ForesightVerdict,
     /// Success rate of runs that took this path.
     pub p_success: Option<f64>,
-    /// Its 95% Wilson interval.
+    /// Its 95% Wilson interval, to four places. `min_success_odds` is held
+    /// to the exact upper bound, from `successes` and `support`.
     pub ci95: Option<[f64; 2]>,
     /// Runs behind it.
     pub support: u64,
@@ -971,9 +1033,9 @@ fn prefix8(text: &str) -> u64 {
     u64::from_be_bytes(bytes)
 }
 
-/// Step order as the fold keeps it: start, then trace and span id by their
-/// first eight bytes. The canonical order on everything but a tie of start
-/// time AND both eight-byte prefixes.
+/// Where a span falls in time: start, then trace and span id by their first
+/// eight bytes. The canonical order on everything but a tie of start time
+/// AND both eight-byte prefixes; [`StepOrder`] breaks that tie for steps.
 type OrderKey = (u64, u64, u64);
 
 fn order_key(span: &Span) -> OrderKey {
@@ -982,6 +1044,21 @@ fn order_key(span: &Span) -> OrderKey {
         prefix8(&span.trace_id),
         prefix8(&span.span_id),
     )
+}
+
+/// Step order, the one every reader of a run uses — a build, a read of the
+/// store, the run guard's live path: [`OrderKey`], then the step's
+/// [`stem_key`], then its agent's (0 for none). The last two break the ties
+/// the first leaves by what the step IS, never by what only one reader has
+/// — the order names were interned in, the order spans arrived, a hash of
+/// their ids — so the same spans make the same path, and name the same
+/// agent, everywhere. Steps tied on all of it are the same token by the
+/// same agent, so which of them comes first changes nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct StepOrder {
+    at: OrderKey,
+    stem: u64,
+    agent: u64,
 }
 
 /// The task a span declares: `traza.task`, else `session.goal` (and its
@@ -994,9 +1071,10 @@ fn task_key(attributes: &Map<String, serde_json::Value>) -> Option<String> {
 
 // ------------------------------------------------------------- interning
 
-/// A bounded string interner.
+/// A bounded interner of stems, each with its [`stem_key`].
 struct Interner {
     names: Vec<Arc<str>>,
+    keys: Vec<u64>,
     ids: HashMap<Arc<str>, u32>,
     cap: usize,
 }
@@ -1005,6 +1083,7 @@ impl Interner {
     fn new(cap: usize) -> Self {
         Self {
             names: Vec::new(),
+            keys: Vec::new(),
             ids: HashMap::new(),
             cap,
         }
@@ -1022,12 +1101,26 @@ impl Interner {
         let id = self.names.len() as u32;
         let shared: Arc<str> = Arc::from(name);
         self.names.push(Arc::clone(&shared));
+        self.keys.push(stem_key(name));
         self.ids.insert(shared, id);
         Some(id)
     }
 
+    /// The [`stem_key`] of `name`, and its id when there was room to intern
+    /// it: the key is known either way.
+    fn keyed(&mut self, name: &str) -> (u64, Option<u32>) {
+        match self.intern(name) {
+            Some(id) => (self.key(id), Some(id)),
+            None => (stem_key(name), None),
+        }
+    }
+
     fn name(&self, id: u32) -> &str {
         self.names.get(id as usize).map_or("", |name| name)
+    }
+
+    fn key(&self, id: u32) -> u64 {
+        self.keys.get(id as usize).copied().unwrap_or(0)
     }
 }
 
@@ -1083,11 +1176,14 @@ impl Tokens {
 
 // ------------------------------------------------------------------ fold
 
-/// A step as the fold holds it: 32 bytes.
+/// A step as the fold holds it, 32 bytes: where it falls, and its
+/// signature's [`stem_key`] — known even past the signature bound, so a step
+/// that cannot be named still keeps its place. Ordered as [`StepOrder`] is
+/// on its first two parts, which is all a path is made of.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct StepRecord {
     key: OrderKey,
-    signature: u32,
+    stem: u64,
 }
 
 /// Which of two spans [`attribution::session_outcome`] takes as the later
@@ -1138,8 +1234,12 @@ struct RunAcc {
     step_count: u64,
     /// Whether some step was not kept for want of room.
     steps_dropped: bool,
-    earliest: (OrderKey, u32),
-    first_step: Option<(OrderKey, Option<u32>)>,
+    /// The earliest span — by [`OrderKey`], then its service's key, so a
+    /// tie goes the same way whatever order the spans arrived in — and its
+    /// interned service.
+    earliest: ((OrderKey, u64), u32),
+    /// The first step in [`StepOrder`], and its interned agent.
+    first_step: Option<(StepOrder, Option<u32>)>,
     task: Option<(OrderKey, String)>,
     tail: Tail,
     declared: Option<Declared>,
@@ -1244,9 +1344,22 @@ impl Fold<'_> {
             return;
         }
         let key = order_key(span);
-        let service = match self.names.intern(&stem_cow(&span.service)) {
-            Some(id) => id,
-            None => {
+        // Admission before anything is kept: a span of a run the fold does
+        // not track costs a run-id lookup and nothing more — no tenant
+        // entry, no interned name — so every tenant the fold holds holds an
+        // admitted run, and the run bound bounds the tenants too.
+        let tracked = self
+            .runs
+            .get(span.tenant.as_str())
+            .is_some_and(|runs| runs.contains_key(run.as_str()));
+        if !tracked && (self.tracked >= self.max_tracked || self.held >= MAX_STEP_RECORDS) {
+            self.bounds.spans_skipped += 1;
+            self.overflowed = true;
+            return;
+        }
+        let (service_key, service) = match self.names.keyed(&stem_cow(&span.service)) {
+            (key, Some(id)) => (key, id),
+            (_, None) => {
                 self.bounds.spans_skipped += 1;
                 return;
             }
@@ -1255,12 +1368,7 @@ impl Fold<'_> {
             Some(runs) => runs,
             None => self.runs.entry(span.tenant.clone()).or_default(),
         };
-        if !tenant_runs.contains_key(run.as_str()) {
-            if self.tracked >= self.max_tracked || self.held >= MAX_STEP_RECORDS {
-                self.bounds.spans_skipped += 1;
-                self.overflowed = true;
-                return;
-            }
+        if !tracked {
             self.tracked += 1;
             tenant_runs.insert(
                 run.clone(),
@@ -1268,7 +1376,7 @@ impl Fold<'_> {
                     steps: BinaryHeap::new(),
                     step_count: 0,
                     steps_dropped: false,
-                    earliest: (key, service),
+                    earliest: ((key, service_key), service),
                     first_step: None,
                     task: None,
                     tail: Tail {
@@ -1293,8 +1401,8 @@ impl Fold<'_> {
         acc.cost_usd += llm.cost_usd.unwrap_or(0.0);
         acc.min_start = acc.min_start.min(span.start_time_ns);
         acc.max_end = acc.max_end.max(span.end_time_ns);
-        if key < acc.earliest.0 {
-            acc.earliest = (key, service);
+        if (key, service_key) < acc.earliest.0 {
+            acc.earliest = ((key, service_key), service);
         }
         // Only a span that might end later pays for its full end key.
         let ends = if span.end_time_ns >= acc.tail.end.0 {
@@ -1334,24 +1442,29 @@ impl Fold<'_> {
             return;
         }
         acc.step_count += 1;
-        let agent = agent.and_then(|agent| self.names.intern(&stem_cow(&agent)));
+        // Past the signature bound a step cannot be named. It keeps its
+        // place, by its key, and the run's path ends before it.
+        let (stem, named) = self.signatures.keyed(&stem_cow(&signature));
+        if named.is_none() {
+            self.bounds.signature_cap = true;
+        }
+        let (agent_key, agent) = match agent {
+            Some(agent) => self.names.keyed(&stem_cow(&agent)),
+            None => (0, None),
+        };
+        let order = StepOrder {
+            at: key,
+            stem,
+            agent: agent_key,
+        };
         if acc
             .first_step
             .as_ref()
-            .map_or(true, |(first, _)| key < *first)
+            .map_or(true, |(first, _)| order < *first)
         {
-            acc.first_step = Some((key, agent));
+            acc.first_step = Some((order, agent));
         }
-        // Past the signature bound a step cannot be named. It keeps its
-        // place, as an unnamed record, and the run's path ends before it.
-        let signature = self
-            .signatures
-            .intern(&stem_cow(&signature))
-            .unwrap_or_else(|| {
-                self.bounds.signature_cap = true;
-                NONE
-            });
-        let record = StepRecord { key, signature };
+        let record = StepRecord { key, stem };
         let room = acc.steps.len() < RUN_STEP_WINDOW && self.held < MAX_STEP_RECORDS;
         if room {
             acc.steps.push(record);
@@ -1543,6 +1656,10 @@ struct Cohort {
     unknown: u64,
     tasks: Vec<CohortSummary>,
     nodes: Vec<Node>,
+    /// Each node's place in the order of the paths to it (see
+    /// [`path_ranks`]), so a summary can order its rows by path without
+    /// spelling out the path of every node it considers.
+    path_rank: Vec<u32>,
     /// Whether the node bound kept some branch of this cohort's tree from
     /// being built.
     nodes_capped: bool,
@@ -1609,7 +1726,7 @@ fn grow_all(
     tokens: &Tokens,
     mut budget: usize,
     bounds: &mut Bounds,
-    deadline: Option<Deadline>,
+    paced: &mut Paced,
 ) -> Result<Vec<Grown>> {
     let mut grown: Vec<Grown> = Vec::with_capacity(cohorts.len());
     // Where each run is: the node it reached, or NONE once it ended.
@@ -1618,6 +1735,7 @@ fn grow_all(
         let mut root = Node::new(NONE, NONE, 0);
         let mut positions = vec![0_u32; runs.len()];
         for (index, run) in runs.iter().enumerate() {
+            paced.step(1)?;
             root.add(index as u32, run);
             if run.path.is_empty() {
                 root.ended += 1;
@@ -1633,10 +1751,10 @@ fn grow_all(
         at.push(positions);
     }
     for depth in 0..=MAX_DEPTH {
-        Deadline::check(deadline, 0)?;
         let mut wanted: HashMap<(u32, u32, u32), u32> = HashMap::new();
         for (cohort, runs) in cohorts.iter().enumerate() {
             for (index, run) in runs.iter().enumerate() {
+                paced.step(1)?;
                 let parent = at[cohort][index];
                 if parent != NONE {
                     *wanted
@@ -1652,6 +1770,7 @@ fn grow_all(
         order.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
         let mut created: HashMap<(u32, u32, u32), u32> = HashMap::with_capacity(order.len());
         for ((cohort, parent, token), _) in order {
+            paced.step(1)?;
             let tree = &mut grown[cohort as usize];
             if budget == 0 {
                 bounds.node_cap = true;
@@ -1669,6 +1788,7 @@ fn grow_all(
         for (cohort, runs) in cohorts.iter().enumerate() {
             let tree = &mut grown[cohort];
             for (index, run) in runs.iter().enumerate() {
+                paced.step(1)?;
                 let parent = at[cohort][index];
                 if parent == NONE {
                     continue;
@@ -1695,6 +1815,10 @@ fn grow_all(
     Ok(grown)
 }
 
+/// One step's calibration pools under one parent: `(runs, successes)` by
+/// repeat bucket (each pooling that bucket and every longer one) and half.
+type Pools = [[(u64, u64); 2]; 4];
+
 /// Scores cross-validated predictions against outcomes; see
 /// [`CalibrationPoint`].
 ///
@@ -1706,23 +1830,34 @@ fn grow_all(
 /// same bucket or a longer one ([`Tokens::parts`]) — exactly as a live
 /// run's open last group is judged. Predicting each run from its own
 /// bucket's node instead would use what it did next, and overstate skill.
-fn calibrate(nodes: &[Node], runs: &[RunFinal], deepest: &[u32], tokens: &Tokens) -> Calibration {
+///
+/// Those pools are summed once per tree, keyed by parent, step, bucket and
+/// half, so each prediction is a lookup: the work is linear in the runs and
+/// the nodes, however many siblings a node has, and `paced` keeps it to the
+/// request's deadline.
+fn calibrate(
+    nodes: &[Node],
+    runs: &[RunFinal],
+    deepest: &[u32],
+    tokens: &Tokens,
+    paced: &mut Paced,
+) -> Result<Calibration> {
     if runs.len() < 2 {
-        return Calibration::default();
+        return Ok(Calibration::default());
     }
-    let chains: Vec<Vec<u32>> = deepest
-        .iter()
-        .map(|&deep| {
-            let mut chain = Vec::new();
-            let mut at = deep;
-            while at != NONE {
-                chain.push(at);
-                at = nodes[at as usize].parent;
-            }
-            chain.reverse();
-            chain
-        })
-        .collect();
+    let mut chains: Vec<Vec<u32>> = Vec::with_capacity(deepest.len());
+    for &deep in deepest {
+        let mut chain = Vec::new();
+        let mut at = deep;
+        while at != NONE {
+            chain.push(at);
+            at = nodes[at as usize].parent;
+        }
+        chain.reverse();
+        examined(chain.len());
+        paced.step(chain.len().max(1))?;
+        chains.push(chain);
+    }
     // Two-fold cross-validation: each run is predicted from the half of the
     // cohort it is not in. Leave-one-out would be tighter, but on a branch
     // of identical runs it predicts a success lower and a failure higher —
@@ -1731,11 +1866,32 @@ fn calibrate(nodes: &[Node], runs: &[RunFinal], deepest: &[u32], tokens: &Tokens
     let folds: Vec<usize> = runs.iter().map(|run| fold_of(&run.run)).collect();
     let mut counts: Vec<[(u64, u64); 2]> = vec![[(0, 0); 2]; nodes.len()];
     for (index, run) in runs.iter().enumerate() {
+        paced.step(chains[index].len().max(1))?;
         let success = u64::from(run.outcome == Outcome::Success);
         for &id in &chains[index] {
             let slot = &mut counts[id as usize][folds[index]];
             slot.0 += 1;
             slot.1 += success;
+        }
+    }
+    // Each step's pools under each parent, per half: `[bucket][half]` holds
+    // the runs through that step's sibling tokens of that bucket or a
+    // longer one (the fold token has no stem, and pools nothing).
+    let mut pools: HashMap<(u32, u64), Pools> = HashMap::new();
+    for (id, node) in nodes.iter().enumerate().skip(1) {
+        examined(1);
+        paced.step(1)?;
+        let (key, bucket) = tokens.parts(node.token);
+        if bucket == FOLD_BUCKET {
+            continue;
+        }
+        let own = counts[id];
+        let pool = pools.entry((node.parent, key)).or_default();
+        for halves in pool.iter_mut().take(usize::from(bucket) + 1) {
+            for (half, slot) in halves.iter_mut().enumerate() {
+                slot.0 += own[half].0;
+                slot.1 += own[half].1;
+            }
         }
     }
     let rate = |(visits, success): (u64, u64)| success as f64 / visits as f64;
@@ -1744,6 +1900,7 @@ fn calibrate(nodes: &[Node], runs: &[RunFinal], deepest: &[u32], tokens: &Tokens
     for depth in CALIBRATION_DEPTHS {
         let (mut runs_at, mut covered, mut brier, mut baseline) = (0_u64, 0_u64, 0.0, 0.0);
         for (index, run) in runs.iter().enumerate() {
+            paced.step(1)?;
             let other = 1 - folds[index];
             if run.path.len() < depth || counts[0][other].0 == 0 {
                 continue;
@@ -1762,20 +1919,10 @@ fn calibrate(nodes: &[Node], runs: &[RunFinal], deepest: &[u32], tokens: &Tokens
                     .map(|&id| counts[id as usize][other])
             } else {
                 chains[index].get(depth - 1).map(|&parent| {
-                    nodes[parent as usize]
-                        .children
-                        .iter()
-                        .filter(|&&child| {
-                            let (child_key, child_bucket) =
-                                tokens.parts(nodes[child as usize].token);
-                            child_key == key
-                                && child_bucket != FOLD_BUCKET
-                                && child_bucket >= bucket
-                        })
-                        .fold((0, 0), |(visits, success), &child| {
-                            let slot = counts[child as usize][other];
-                            (visits + slot.0, success + slot.1)
-                        })
+                    examined(1);
+                    pools
+                        .get(&(parent, key))
+                        .map_or((0, 0), |pool| pool[usize::from(bucket)][other])
                 })
             };
             let node = pooled.filter(|(visits, _)| *visits >= CALIBRATION_SUPPORT);
@@ -1821,10 +1968,41 @@ fn calibrate(nodes: &[Node], runs: &[RunFinal], deepest: &[u32], tokens: &Tokens
             observed: stats::round4(bin.2 as f64 / bin.0 as f64),
         })
         .collect();
-    Calibration {
+    Ok(Calibration {
         depths,
         reliability,
+    })
+}
+
+/// Each node's rank in the order of the paths to it — the order a list of
+/// token paths sorts in: a node before its descendants, sibling subtrees by
+/// their tokens' text (then by node, for two tokens that read alike). A
+/// summary orders its rows by rank, so it spells out only the paths it
+/// shows.
+fn path_ranks(nodes: &[Node], tokens: &Tokens, paced: &mut Paced) -> Result<Vec<u32>> {
+    let name = |id: u32| {
+        let token = nodes[id as usize].token;
+        if token == NONE {
+            "^"
+        } else {
+            tokens.name(token)
+        }
+    };
+    let mut rank = vec![0_u32; nodes.len()];
+    let mut next = 0_u32;
+    let mut stack = vec![0_u32];
+    while let Some(id) = stack.pop() {
+        let children = &nodes[id as usize].children;
+        examined(children.len());
+        paced.step(children.len().max(1))?;
+        rank[id as usize] = next;
+        next += 1;
+        // Pushed largest first, so the smallest is visited next.
+        let mut ordered = children.clone();
+        ordered.sort_by(|left, right| name(*right).cmp(name(*left)).then_with(|| right.cmp(left)));
+        stack.extend(ordered);
     }
+    Ok(rank)
 }
 
 /// Which half of a cohort a run falls in for cross-validation: FNV-1a of its
@@ -1959,14 +2137,18 @@ fn build(
     } = fold;
     bounds.runs_tracked = tracked as u64;
     bounds.window_narrowed = narrowed;
+    let mut paced = Paced::new(deadline);
 
     // Runs, finalized: outcome, cohort, path.
     let mut tokens = Tokens::new();
     // The fold token first, so a full table can still end a path with it.
     tokens.intern(0, FOLD_BUCKET, || FOLD_TOKEN.to_owned());
-    let signature_keys: Vec<u64> = signatures.names.iter().map(|name| stem_key(name)).collect();
+    // Each named step's name, by key: the first signature interned with it.
+    let mut named: HashMap<u64, u32> = HashMap::with_capacity(signatures.keys.len());
+    for (id, key) in signatures.keys.iter().enumerate() {
+        named.entry(*key).or_insert(id as u32);
+    }
     let mut finals: Vec<RunFinal> = Vec::with_capacity(tracked);
-    let mut seen = 0_usize;
     let mut tenants: Vec<(String, HashMap<String, RunAcc>)> = accs.into_iter().collect();
     tenants.sort_by(|left, right| left.0.cmp(&right.0));
     for (tenant, runs) in tenants {
@@ -1974,10 +2156,7 @@ fn build(
         let mut runs: Vec<(String, RunAcc)> = runs.into_iter().collect();
         runs.sort_by(|left, right| left.0.cmp(&right.0));
         for (run, acc) in runs {
-            seen += 1;
-            if seen % DEADLINE_STRIDE == 0 {
-                Deadline::check(deadline, 0)?;
-            }
+            paced.step(1)?;
             let task = acc.task.map(|(_, task)| task);
             if key.task.is_some() && task != key.task {
                 continue;
@@ -1989,21 +2168,25 @@ fn build(
             let outcome = outcome_of(&acc.tail, acc.declared.as_ref(), now_ns);
             let mut complete = !acc.steps_dropped && acc.step_count == acc.steps.len() as u64;
             let mut ordered = acc.steps.into_sorted_vec();
-            if let Some(unnamed) = ordered.iter().position(|record| record.signature == NONE) {
+            paced.step(ordered.len())?;
+            if let Some(unnamed) = ordered
+                .iter()
+                .position(|record| !named.contains_key(&record.stem))
+            {
                 ordered.truncate(unnamed);
                 complete = false;
             }
             if !complete {
                 bounds.runs_partial += 1;
             }
-            let grouped = groups(ordered.iter().map(|record| record.signature));
+            let grouped = groups(ordered.iter().map(|record| record.stem));
             let (usable, folded) = shape(&grouped, complete, |(_, count)| *count);
             let mut path = Vec::with_capacity(usable.len() + 1);
             let mut capped = false;
-            for &(signature, count) in usable {
-                let key = signature_keys[signature as usize];
+            for &(key, count) in usable {
                 let interned = tokens.intern(key, bucket_of(count), || {
-                    format!("{}{}", signatures.name(signature), bucket(count))
+                    let name = named.get(&key).map_or("", |id| signatures.name(*id));
+                    format!("{name}{}", bucket(count))
                 });
                 match interned {
                     Some(id) => path.push(id),
@@ -2036,6 +2219,7 @@ fn build(
     // Cohorts: (tenant, agent), the largest first.
     let mut grouped: HashMap<CohortKey, Vec<RunFinal>> = HashMap::new();
     for run in finals {
+        paced.step(1)?;
         grouped
             .entry((Arc::clone(&run.tenant), run.agent))
             .or_default()
@@ -2065,6 +2249,7 @@ fn build(
         let mut task_counts: HashMap<String, [u64; 4]> = HashMap::new();
         let mut known: Vec<RunFinal> = Vec::with_capacity(runs.len());
         for run in runs {
+            paced.step(1)?;
             if key.task.is_none() {
                 if let Some(task) = &run.task {
                     let slot = match run.outcome {
@@ -2129,7 +2314,7 @@ fn build(
         &tokens,
         config.max_nodes.max(1),
         &mut bounds,
-        deadline,
+        &mut paced,
     )?;
     let mut cohorts = Vec::with_capacity(pending.len());
     let mut index = HashMap::new();
@@ -2144,22 +2329,22 @@ fn build(
             capped,
             cut_steps,
         } = grown;
-        let calibration = calibrate(&nodes, &known, &deepest, &tokens);
+        let calibration = calibrate(&nodes, &known, &deepest, &tokens, &mut paced)?;
+        let path_rank = path_ranks(&nodes, &tokens, &mut paced)?;
         let root = nodes[0].counts();
-        let members = known
-            .iter()
-            .zip(&deepest)
-            .map(|(run, &deep)| {
-                (
-                    Arc::clone(&run.run),
-                    Member {
-                        outcome: run.outcome,
-                        deepest: deep,
-                    },
-                )
-            })
-            .collect();
-        let run_ids = known.iter().map(|run| Arc::clone(&run.run)).collect();
+        let mut members = HashMap::with_capacity(known.len());
+        let mut run_ids = Vec::with_capacity(known.len());
+        for (run, &deep) in known.iter().zip(&deepest) {
+            paced.step(1)?;
+            members.insert(
+                Arc::clone(&run.run),
+                Member {
+                    outcome: run.outcome,
+                    deepest: deep,
+                },
+            );
+            run_ids.push(Arc::clone(&run.run));
+        }
         let cohort = Cohort {
             tenant: tenant.to_string(),
             agent: names.name(agent).to_owned(),
@@ -2169,6 +2354,7 @@ fn build(
             unknown,
             tasks,
             nodes,
+            path_rank,
             nodes_capped: capped,
             cut_steps,
             run_ids,
@@ -2562,9 +2748,22 @@ impl FateCache {
 struct Render<'b> {
     build: &'b Build,
     cohort: &'b Cohort,
+    /// The cohort's base rate, unrounded: it is computed with, never shown.
     base_rate: Option<f64>,
     min_support: u64,
     facts: stats::LnFactorials,
+    /// Each node's children's visits and successes, summed. A node's
+    /// siblings are its parent's total less itself, so comparing every
+    /// node with its siblings is linear in the tree, however wide.
+    child_totals: Vec<(u64, u64)>,
+}
+
+/// A node against its siblings: the comparison as the wire carries it,
+/// rounded, and what it is judged on — the exact gap and p-value.
+struct Compared {
+    stat: ForkStat,
+    gap: f64,
+    fatal: bool,
 }
 
 impl Render<'_> {
@@ -2582,6 +2781,7 @@ impl Render<'_> {
     }
 
     fn entropy(&self, node: &Node) -> f64 {
+        examined(node.children.len());
         let mut counts: Vec<u64> = node
             .children
             .iter()
@@ -2591,26 +2791,22 @@ impl Render<'_> {
         stats::entropy(&counts)
     }
 
-    fn fork(&self, id: u32) -> Option<ForkStat> {
+    fn fork(&self, id: u32) -> Option<Compared> {
         let node = &self.cohort.nodes[id as usize];
         if node.parent == NONE {
             return None;
         }
-        let parent = &self.cohort.nodes[node.parent as usize];
-        let (mut visits, mut success) = (0_u64, 0_u64);
-        for &sibling in &parent.children {
-            if sibling != id {
-                let sibling = &self.cohort.nodes[sibling as usize];
-                visits += u64::from(sibling.visits);
-                success += u64::from(sibling.success);
-            }
-        }
+        examined(1);
+        let (all_visits, all_success) = self.child_totals[node.parent as usize];
         let own = node.counts();
+        let visits = all_visits.saturating_sub(own.visits);
+        let success = all_success.saturating_sub(own.success);
         if own.visits < self.min_support || visits < self.min_support {
             return None;
         }
         let own_rate = own.rate().unwrap_or(0.0);
         let siblings_rate = success as f64 / visits as f64;
+        let gap = siblings_rate - own_rate;
         let p_value = stats::fisher_two_sided(
             own.success,
             own.visits - own.success,
@@ -2618,20 +2814,21 @@ impl Render<'_> {
             visits - success,
             &self.facts,
         );
-        Some(ForkStat {
-            siblings_visits: visits,
-            siblings_success_rate: stats::round4(siblings_rate),
-            gap: stats::round4(siblings_rate - own_rate),
-            p_value,
+        Some(Compared {
+            stat: ForkStat {
+                siblings_visits: visits,
+                siblings_success_rate: stats::round4(siblings_rate),
+                gap: stats::round4(gap),
+                p_value,
+            },
+            gap,
+            fatal: gap >= FORK_GAP && p_value < FORK_ALPHA,
         })
     }
 
-    fn is_fatal(fork: &ForkStat) -> bool {
-        fork.gap >= FORK_GAP && fork.p_value < FORK_ALPHA
-    }
-
-    fn node(&self, id: u32, shown: &HashSet<u32>) -> MapNode {
+    fn node(&self, id: u32, shown: &HashSet<u32>, paced: &mut Paced) -> Result<MapNode> {
         let node = &self.cohort.nodes[id as usize];
+        paced.step(node.children.len().max(1))?;
         let counts = node.counts();
         let (low, high) = stats::wilson(counts.success, counts.visits);
         let rate = counts.rate();
@@ -2651,7 +2848,7 @@ impl Render<'_> {
         let mut rendered = Vec::new();
         for child in children {
             if shown.contains(&child) {
-                rendered.push(self.node(child, shown));
+                rendered.push(self.node(child, shown, paced)?);
             } else {
                 omitted_children += 1;
                 omitted_visits += u64::from(self.cohort.nodes[child as usize].visits);
@@ -2668,7 +2865,7 @@ impl Render<'_> {
                 outcome,
             })
             .collect();
-        MapNode {
+        Ok(MapNode {
             token: self.build.token(node.token).to_owned(),
             depth: usize::from(node.depth),
             visits: counts.visits,
@@ -2686,8 +2883,8 @@ impl Render<'_> {
             },
             entropy: stats::round4(entropy),
             hotspot: entropy >= HOTSPOT_BITS && counts.visits >= self.min_support,
-            fatal_fork: fork.as_ref().is_some_and(Self::is_fatal),
-            fork,
+            fatal_fork: fork.as_ref().is_some_and(|fork| fork.fatal),
+            fork: fork.map(|fork| fork.stat),
             cost_usd_sum: round_usd(node.cost_usd_sum),
             duration_ns_sum: node.duration_ns_sum,
             example_runs,
@@ -2695,70 +2892,136 @@ impl Render<'_> {
             omitted_children,
             omitted_visits,
             cut: u64::from(node.cut),
-        }
+        })
     }
 }
 
-fn render_map(build: &Build, cohort: &Cohort, request: &MapRequest) -> FateMap {
+/// Renders `cohort`'s map as `request` asks, under `deadline`. Every loop
+/// here walks the cohort's tree, so a cached map answers to the request's
+/// budget as a build does; and the work is linear in the tree — each node
+/// is compared with its siblings through its parent's totals, and a
+/// summary spells out the paths of the rows it keeps, not of every node it
+/// considered.
+fn render_map(
+    build: &Build,
+    cohort: &Cohort,
+    request: &MapRequest,
+    deadline: Option<Deadline>,
+) -> Result<FateMap> {
+    Deadline::check(deadline, 0)?;
+    let mut paced = Paced::new(deadline);
+    let nodes = &cohort.nodes;
     let summary = cohort.summary(request.task.as_deref());
+    let mut child_totals = vec![(0_u64, 0_u64); nodes.len()];
+    for node in nodes.iter().skip(1) {
+        examined(1);
+        paced.step(1)?;
+        let slot = &mut child_totals[node.parent as usize];
+        slot.0 += u64::from(node.visits);
+        slot.1 += u64::from(node.success);
+    }
     let render = Render {
         build,
         cohort,
-        base_rate: summary.base_rate,
+        base_rate: (summary.runs > 0).then(|| cohort.success as f64 / summary.runs as f64),
         min_support: request.min_support,
         facts: stats::LnFactorials::up_to(summary.runs),
+        child_totals,
     };
     // The nodes shown: the root, then the most visited of those whose
     // parent is shown, within depth and support, up to max_nodes.
     let mut shown: HashSet<u32> = HashSet::from([0]);
     let mut frontier: BinaryHeap<(u32, std::cmp::Reverse<u32>)> = BinaryHeap::new();
-    let push_children = |frontier: &mut BinaryHeap<(u32, std::cmp::Reverse<u32>)>, id: u32| {
-        for &child in &cohort.nodes[id as usize].children {
-            let node = &cohort.nodes[child as usize];
+    let mut expand = 0_u32;
+    loop {
+        let children = &nodes[expand as usize].children;
+        paced.step(children.len().max(1))?;
+        for &child in children {
+            let node = &nodes[child as usize];
             if usize::from(node.depth) <= request.depth
                 && u64::from(node.visits) >= request.min_support
             {
                 frontier.push((node.visits, std::cmp::Reverse(child)));
             }
         }
-    };
-    push_children(&mut frontier, 0);
-    while shown.len() < request.max_nodes + 1 {
+        if shown.len() > request.max_nodes {
+            break;
+        }
         let Some((_, std::cmp::Reverse(id))) = frontier.pop() else {
             break;
         };
         shown.insert(id);
-        push_children(&mut frontier, id);
+        expand = id;
     }
-    // Summaries over every node within depth and support, shown or not.
-    let mut forks = Vec::new();
-    let mut hotspots = Vec::new();
-    for (id, node) in cohort.nodes.iter().enumerate().skip(1) {
+    // Summaries over every node within depth and support, shown or not:
+    // ranked first, on the exact figures, and only the rows kept spelled
+    // out with their paths.
+    let rank = |id: u32| {
+        cohort
+            .path_rank
+            .get(id as usize)
+            .copied()
+            .unwrap_or(u32::MAX)
+    };
+    let mut forks: Vec<(u32, Compared)> = Vec::new();
+    for (id, node) in nodes.iter().enumerate().skip(1) {
+        examined(1);
+        paced.step(1)?;
         if usize::from(node.depth) > request.depth || u64::from(node.visits) < request.min_support {
             continue;
         }
-        if let Some(fork) = render.fork(id as u32) {
-            if Render::is_fatal(&fork) {
-                forks.push(ForkSummary {
-                    path: render.path(id as u32),
-                    visits: u64::from(node.visits),
-                    success_rate: stats::round4(node.counts().rate().unwrap_or(0.0)),
-                    fork,
-                });
-            }
+        if let Some(fork) = render.fork(id as u32).filter(|fork| fork.fatal) {
+            forks.push((id as u32, fork));
         }
     }
-    for (id, node) in cohort.nodes.iter().enumerate() {
+    forks.sort_by(|(left_id, left), (right_id, right)| {
+        left.stat
+            .p_value
+            .total_cmp(&right.stat.p_value)
+            .then(right.gap.total_cmp(&left.gap))
+            .then_with(|| rank(*left_id).cmp(&rank(*right_id)))
+    });
+    forks.truncate(SUMMARY_ROWS);
+    let mut hot: Vec<(u32, f64)> = Vec::new();
+    for (id, node) in nodes.iter().enumerate() {
+        examined(1);
+        paced.step(node.children.len().max(1))?;
         if usize::from(node.depth) >= request.depth || u64::from(node.visits) < request.min_support
         {
             continue;
         }
         let entropy = render.entropy(node);
         if entropy >= HOTSPOT_BITS {
+            hot.push((id as u32, entropy));
+        }
+    }
+    let weight = |(id, entropy): &(u32, f64)| entropy * f64::from(nodes[*id as usize].visits);
+    hot.sort_by(|left, right| {
+        weight(right)
+            .total_cmp(&weight(left))
+            .then_with(|| rank(left.0).cmp(&rank(right.0)))
+    });
+    hot.truncate(SUMMARY_ROWS);
+    let fatal_forks = forks
+        .into_iter()
+        .map(|(id, fork)| {
+            let node = &nodes[id as usize];
+            ForkSummary {
+                path: render.path(id),
+                visits: u64::from(node.visits),
+                success_rate: stats::round4(node.counts().rate().unwrap_or(0.0)),
+                fork: fork.stat,
+            }
+        })
+        .collect();
+    let hotspots = hot
+        .into_iter()
+        .map(|(id, entropy)| {
+            let node = &nodes[id as usize];
             let mut next: Vec<&Node> = node
                 .children
                 .iter()
-                .map(|&child| &cohort.nodes[child as usize])
+                .map(|&child| &nodes[child as usize])
                 .collect();
             next.sort_by(|left, right| {
                 right
@@ -2766,8 +3029,8 @@ fn render_map(build: &Build, cohort: &Cohort, request: &MapRequest) -> FateMap {
                     .cmp(&left.visits)
                     .then_with(|| build.token(left.token).cmp(build.token(right.token)))
             });
-            hotspots.push(HotspotSummary {
-                path: render.path(id as u32),
+            HotspotSummary {
+                path: render.path(id),
                 visits: u64::from(node.visits),
                 entropy: stats::round4(entropy),
                 next: next
@@ -2775,25 +3038,11 @@ fn render_map(build: &Build, cohort: &Cohort, request: &MapRequest) -> FateMap {
                     .take(3)
                     .map(|child| build.token(child.token).to_owned())
                     .collect(),
-            });
-        }
-    }
-    forks.sort_by(|left, right| {
-        left.fork
-            .p_value
-            .total_cmp(&right.fork.p_value)
-            .then(right.fork.gap.total_cmp(&left.fork.gap))
-            .then_with(|| left.path.cmp(&right.path))
-    });
-    forks.truncate(SUMMARY_ROWS);
-    hotspots.sort_by(|left, right| {
-        (right.entropy * right.visits as f64)
-            .total_cmp(&(left.entropy * left.visits as f64))
-            .then_with(|| left.path.cmp(&right.path))
-    });
-    hotspots.truncate(SUMMARY_ROWS);
-    let root = render.node(0, &shown);
-    FateMap {
+            }
+        })
+        .collect();
+    let root = render.node(0, &shown, &mut paced)?;
+    Ok(FateMap {
         tenant: cohort.tenant.clone(),
         agent: cohort.agent.clone(),
         task: request.task.clone(),
@@ -2809,14 +3058,14 @@ fn render_map(build: &Build, cohort: &Cohort, request: &MapRequest) -> FateMap {
         built_at_ns: build.built_at_ns,
         depth: request.depth,
         min_support: request.min_support,
-        nodes_total: cohort.nodes.len() as u64,
+        nodes_total: nodes.len() as u64,
         nodes_capped: cohort.nodes_capped,
         nodes_shown: shown.len() as u64,
-        fatal_forks: forks,
+        fatal_forks,
         hotspots,
         calibration: cohort.calibration.clone(),
         root,
-    }
+    })
 }
 
 // ------------------------------------------------------------- foresight
@@ -2963,15 +3212,17 @@ impl StepToken {
     }
 }
 
-/// One step of a [`LivePath`]: 48 bytes.
+/// One step of a [`LivePath`]: 48 bytes, ordered as [`StepOrder`] — where it
+/// falls, then its stem's key, then its agent's — and only then by the
+/// guard's key for the span, which breaks no tie a path could see.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct LiveStep {
     order: OrderKey,
+    stem: u64,
+    agent: u64,
     /// The run guard's key for the span, so a re-ingested version replaces
     /// it.
     span: u64,
-    stem: u64,
-    agent: u64,
 }
 
 /// A run's behaviour as the run guard follows it live, for the predictive
@@ -3054,20 +3305,33 @@ impl LivePath {
 /// A run's stored spans read the way a build reads them, and how the run
 /// has ended so far (`unknown` while it may go on).
 fn read_spans(spans: &[Span], truncated: bool, now_ns: u64) -> (Reading, Outcome) {
-    let mut steps: Vec<(OrderKey, String, Option<String>)> = Vec::new();
-    let mut earliest: Option<(OrderKey, &str)> = None;
+    let mut steps: Vec<(StepOrder, String, Option<String>)> = Vec::new();
+    // The earliest span as a build picks it: by order, then by its
+    // service's key, whatever order the store returned the spans in.
+    let mut earliest: Option<((OrderKey, u64), &str)> = None;
     for span in spans {
         let key = order_key(span);
-        if earliest.map_or(true, |(first, _)| key < first) {
-            earliest = Some((key, span.service.as_str()));
+        if earliest.map_or(true, |((first, _), _)| key <= first) {
+            let candidate = (key, stem_key(&stem_cow(&span.service)));
+            if earliest.map_or(true, |(first, _)| candidate < first) {
+                earliest = Some((candidate, span.service.as_str()));
+            }
         }
         let (kind, signature, agent) =
             semconv::step_signature_with(span, &semconv::facts(&span.attributes));
         if kind.is_step() {
-            steps.push((key, stem(&signature), agent));
+            let signature = stem(&signature);
+            let order = StepOrder {
+                at: key,
+                stem: stem_key(&signature),
+                agent: agent
+                    .as_deref()
+                    .map_or(0, |agent| stem_key(&stem_cow(agent))),
+            };
+            steps.push((order, signature, agent));
         }
     }
-    steps.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    steps.sort_by_key(|step| step.0);
     let agent = stem(
         &steps
             .first()
@@ -3519,9 +3783,10 @@ impl Store {
         let deadline = self.query_deadline(Instant::now());
         let key = BuildKey::of(Some(tenant), request.task.as_deref(), request.window);
         let build = self.fate.get_or_build(self, &key, now_ns, deadline)?;
-        Ok(build
+        build
             .cohort(tenant, &stem(&request.agent))
-            .map(|cohort| render_map(&build, cohort, request)))
+            .map(|cohort| render_map(&build, cohort, request, deadline))
+            .transpose()
     }
 
     /// Foresight for one run of `tenant`, against its agent's map over the
@@ -3942,7 +4207,11 @@ pub(crate) fn apply_to_verdict(
         foresight.verdict,
         ForesightVerdict::OnTrack | ForesightVerdict::AtRisk | ForesightVerdict::LikelyFailure
     );
-    let upper = foresight.ci95.map_or(1.0, |ci| ci[1]);
+    // The bound the limit is held to is the exact one, from the counts —
+    // never `ci95`, which is rounded for the wire: a limit between the two
+    // would otherwise be judged on a figure the runs did not produce. (No
+    // support is no bound: (0, 1).)
+    let upper = stats::wilson(foresight.successes, foresight.support).1;
     if judged && foresight.support >= min_support && doc.usage.steps >= after_steps && upper < odds
     {
         foresight.raised = true;

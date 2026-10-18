@@ -1830,3 +1830,333 @@ fn the_live_view_shows_foresight_from_memory_and_completes_a_bounded_few_runs() 
     let rows = quiet.store().live_runs(Some(""), 6).expect("lists").runs;
     assert!(rows.iter().all(|row| row.foresight.is_none()), "{rows:?}");
 }
+
+// ------------------------------------------------- review: astra findings
+
+/// Runs of `service`, one per entry of `paths`, each finishing well before
+/// `now` (so completed), its last step failed when `failed(index)`.
+fn completed_runs(
+    prefix: &str,
+    service: &str,
+    paths: &[Vec<String>],
+    now: u64,
+    failed: impl Fn(usize) -> bool,
+) -> Vec<Span> {
+    let mut spans = Vec::new();
+    for (index, path) in paths.iter().enumerate() {
+        let steps: Vec<&str> = path.iter().map(String::as_str).collect();
+        spans.extend(synthetic_run(
+            &format!("{prefix}-{index}"),
+            service,
+            &steps,
+            now - 3 * 3_600_000_000_000 - index as u64 * 60_000_000_000,
+            failed(index),
+        ));
+    }
+    spans
+}
+
+#[test]
+fn calibration_and_summaries_do_work_linear_in_the_tree() {
+    // An agent whose every run starts with a different tool: the root has
+    // as many children as there are runs. Calibration pools each run's
+    // siblings, and a map's summaries compare each node with its siblings;
+    // neither may examine every sibling for every run or node.
+    let fixture = TempStore::open("linear-work", crate::Config::default());
+    let store = fixture.store();
+    let now = now();
+    let runs = 2_000;
+    let paths: Vec<Vec<String>> = (0..runs)
+        .map(|index| vec![format!("tool:t{index}"), "llm:gpt-4o".to_owned()])
+        .collect();
+    store
+        .ingest_batch(completed_runs("wide", "wide-agent", &paths, now, |i| {
+            i % 3 == 0
+        }))
+        .expect("ingests");
+    let request = MapRequest {
+        min_support: 1,
+        ..MapRequest::new("wide-agent")
+    };
+    EXAMINED.with(|cell| cell.set(0));
+    let map = store
+        .fate_map("", &request, now)
+        .expect("builds")
+        .expect("exists");
+    assert_eq!(map.runs, runs as u64);
+    let examined = EXAMINED.with(std::cell::Cell::get);
+    let linear = 32 * (map.nodes_total + map.runs);
+    assert!(
+        examined <= linear,
+        "{examined} nodes examined for a tree of {} nodes and {} runs",
+        map.nodes_total,
+        map.runs
+    );
+    // And a cached map renders in linear work too.
+    EXAMINED.with(|cell| cell.set(0));
+    store
+        .fate_map("", &request, now)
+        .expect("serves")
+        .expect("exists");
+    let examined = EXAMINED.with(std::cell::Cell::get);
+    assert!(
+        examined <= linear,
+        "{examined} nodes examined from the cache"
+    );
+}
+
+#[test]
+fn rendering_a_cached_map_honours_the_query_deadline() {
+    // A map already cached, read by a request whose budget is spent: the
+    // rendering walks the whole tree, so it answers to the deadline too.
+    let config = crate::Config {
+        query_deadline: Some(Duration::ZERO),
+        ..crate::Config::default()
+    };
+    let (fixture, now) = seeded("render-deadline", config, false);
+    let store = fixture.store();
+    store
+        .fate
+        .get_or_build(store, &BuildKey::of(Some(""), None, None), now, None)
+        .expect("builds without a deadline");
+    assert!(matches!(
+        store.fate_map("", &MapRequest::new("support-agent"), now),
+        Err(Error::DeadlineExceeded(_))
+    ));
+}
+
+#[test]
+fn a_run_the_fold_cannot_track_keeps_nothing_not_even_its_tenant() {
+    let fixture = TempStore::open("fold-admission", crate::Config::default());
+    let store = fixture.store();
+    // Room for four runs (four times one).
+    let mut fold = Fold::new(store, 1, 0, u64::MAX);
+    let step = |tenant: &str, run: &str, service: &str| {
+        let mut span = span(
+            &format!("{tenant}-{run}"),
+            "s",
+            1_000,
+            json!({"session.id": run, "gen_ai.operation.name": "execute_tool",
+                   "gen_ai.tool.name": "lookup"}),
+        );
+        span.tenant = tenant.to_owned();
+        span.service = service.to_owned();
+        span
+    };
+    for index in 0..4 {
+        fold.observe(&step("acme", &format!("run-{index}"), "svc"));
+    }
+    assert_eq!(fold.tracked, 4);
+    // Then a thousand tenants, each with a run of its own service, all at
+    // the same moment so no narrower window can tell them apart.
+    for tenant in 0..1_000 {
+        fold.observe(&step(
+            &format!("tenant-{tenant}"),
+            "run",
+            &format!("svc-{tenant}"),
+        ));
+    }
+    assert_eq!(fold.tracked, 4);
+    assert_eq!(fold.bounds.spans_skipped, 1_000);
+    assert!(fold.overflowed);
+    // Every tenant the fold holds holds a run it admitted, and an untracked
+    // run's span cost a lookup only: no tenant entry, no interned name.
+    assert_eq!(fold.runs.len(), 1, "{} tenants held", fold.runs.len());
+    assert!(fold.runs.values().all(|runs| !runs.is_empty()));
+    assert_eq!(
+        fold.names.names.len(),
+        1,
+        "{} names",
+        fold.names.names.len()
+    );
+}
+
+#[test]
+fn a_paced_loop_checks_its_deadline_once_a_stride() {
+    let spent = Deadline::starting(Instant::now(), Some(Duration::ZERO));
+    let mut paced = Paced::new(spent);
+    assert!(paced.step(DEADLINE_STRIDE - 1).is_ok(), "within the stride");
+    assert!(matches!(paced.step(1), Err(Error::DeadlineExceeded(_))));
+    // A loop that steps by the size of its work crosses strides too.
+    let mut paced = Paced::new(spent);
+    assert!(matches!(
+        paced.step(10 * DEADLINE_STRIDE),
+        Err(Error::DeadlineExceeded(_))
+    ));
+    // No deadline, no refusal.
+    assert!(Paced::new(None).step(usize::MAX).is_ok());
+}
+
+#[test]
+fn identical_spans_make_the_same_path_on_every_surface() {
+    // The fold's step record is documented at this size.
+    assert_eq!(std::mem::size_of::<StepRecord>(), 32);
+    // Two steps of each run start at the same nanosecond and their span ids
+    // share their first eight bytes, so nothing but a tie-breaker orders
+    // them. The build, a read of the store and the run guard's live path
+    // must break the tie the same way, whichever span calls which tool.
+    for (first, second) in [("zeta", "alpha"), ("alpha", "zeta")] {
+        let fixture = TempStore::open(&format!("tied-{first}"), crate::Config::default());
+        let store = fixture.store();
+        let now = now();
+        let tied = |run: &str, start: u64, failed: bool| -> Vec<Span> {
+            [("0000000000000001", first), ("0000000000000002", second)]
+                .into_iter()
+                .map(|(id, tool)| {
+                    let mut span = span(
+                        &format!("{run}-trace"),
+                        id,
+                        start,
+                        json!({"session.id": run, "gen_ai.operation.name": "execute_tool",
+                               "gen_ai.tool.name": tool}),
+                    );
+                    span.service = "tied-agent".to_owned();
+                    if failed {
+                        span.status = "error".to_owned();
+                    }
+                    span
+                })
+                .collect()
+        };
+        let mut spans = Vec::new();
+        for index in 0..40_u64 {
+            spans.extend(tied(
+                &format!("done-{index}"),
+                now - 3 * 3_600_000_000_000 - index * 60_000_000_000,
+                index % 4 == 0,
+            ));
+        }
+        spans.extend(tied("going", now - 5_000_000_000, false));
+        store.ingest_batch(spans).expect("ingests");
+        // The map's one path.
+        let map = store
+            .fate_map("", &MapRequest::new("tied-agent"), now)
+            .expect("builds")
+            .expect("exists");
+        assert_eq!(map.root.children.len(), 1, "{first}: {:?}", map.root);
+        let step1 = &map.root.children[0];
+        assert_eq!(step1.children.len(), 1, "{first}");
+        let mapped = vec![step1.token.clone(), step1.children[0].token.clone()];
+        // A read of the store.
+        let foresight = store
+            .foresee("", "going", 30, now)
+            .expect("reads")
+            .expect("exists");
+        assert_eq!(
+            foresight.path, mapped,
+            "{first}: the route reads another path"
+        );
+        assert_ne!(
+            foresight.verdict,
+            ForesightVerdict::Novel,
+            "{first}: {}",
+            foresight.explanation
+        );
+        // The run guard's live path.
+        let _ = store.fuse_verdict("", "going").expect("verdict");
+        let live = store.fuse_behaviour("", "going").expect("followed");
+        let keys: Vec<u64> = live.groups.iter().map(|group| group.key).collect();
+        let expected: Vec<u64> = mapped.iter().map(|token| stem_key(token)).collect();
+        assert_eq!(keys, expected, "{first}: the live path reads another path");
+    }
+}
+
+#[test]
+fn a_predictive_fuse_compares_the_unrounded_upper_bound() {
+    // Thirty runs took the path and none succeeded: the interval's upper
+    // bound is 0.113513…, which the wire rounds to 0.1135. Odds of 0.11351
+    // sit between the two — the runs' upper bound clears them.
+    let fixture = TempStore::open("unrounded-odds", crate::Config::default());
+    let store = fixture.store();
+    let now = now();
+    let doomed: Vec<Vec<String>> = (0..30).map(|_| vec!["tool:doom".to_owned()]).collect();
+    let fine: Vec<Vec<String>> = (0..30).map(|_| vec!["tool:fine".to_owned()]).collect();
+    let mut spans = completed_runs("doomed", "odds-agent", &doomed, now, |_| true);
+    spans.extend(completed_runs("fine", "odds-agent", &fine, now, |_| false));
+    spans.extend(synthetic_run(
+        "going",
+        "odds-agent",
+        &["tool:doom"],
+        now - 5_000_000_000,
+        false,
+    ));
+    store.ingest_batch(spans).expect("ingests");
+    let (_, upper) = stats::wilson(0, 30);
+    assert!(upper > 0.11351 && stats::round4(upper) < 0.11351, "{upper}");
+    let policy = |odds: f64| {
+        store
+            .put_fuse_policy(crate::guard::PolicySpec {
+                name: "odds".into(),
+                matches: crate::guard::PolicyMatch {
+                    service: Some("odds-agent".into()),
+                },
+                limits: crate::guard::Limits {
+                    min_success_odds: Some(odds),
+                    foresight_after_steps: Some(1),
+                    ..crate::guard::Limits::default()
+                },
+                action: Action::Stop,
+                ..crate::guard::PolicySpec::default()
+            })
+            .expect("policy")
+    };
+    policy(0.11351);
+    let _ = store.fuse_verdict("", "going").expect("verdict");
+    store.maintain_fate().expect("warms");
+    let verdict = store.fuse_verdict("", "going").expect("verdict");
+    let foresight = verdict.foresight.as_ref().expect("evaluated");
+    assert_eq!((foresight.support, foresight.successes), (30, 0));
+    assert_eq!(
+        foresight.ci95.map(|ci| ci[1]),
+        Some(0.1135),
+        "the wire rounds"
+    );
+    assert_eq!(
+        verdict.verdict,
+        Verdict::Continue,
+        "an upper bound of {upper} does not fall below odds of 0.11351: {:?}",
+        verdict.reasons
+    );
+    assert!(!foresight.raised);
+    // Just above the exact bound, it stops.
+    policy(0.1136);
+    let verdict = store.fuse_verdict("", "going").expect("verdict");
+    assert_eq!(verdict.verdict, Verdict::Stop, "{:?}", verdict.reasons);
+}
+
+#[test]
+fn a_fatal_fork_is_judged_on_its_unrounded_gap() {
+    // 7 of 61 runs down one branch succeeded, 31 of 85 down its sibling: a
+    // gap of 0.24995…, which rounds to 0.25 on the wire but is short of
+    // the 25 points a fatal fork needs, however significant.
+    let fixture = TempStore::open("unrounded-gap", crate::Config::default());
+    let store = fixture.store();
+    let now = now();
+    let mut paths: Vec<Vec<String>> = (0..61).map(|_| vec!["tool:worse".to_owned()]).collect();
+    paths.extend((0..85).map(|_| vec!["tool:better".to_owned()]));
+    let failed = |index: usize| {
+        if index < 61 {
+            index >= 7
+        } else {
+            index - 61 >= 31
+        }
+    };
+    store
+        .ingest_batch(completed_runs("fork", "fork-agent", &paths, now, failed))
+        .expect("ingests");
+    let map = store
+        .fate_map("", &MapRequest::new("fork-agent"), now)
+        .expect("builds")
+        .expect("exists");
+    let worse = child(&map.root, "tool:worse");
+    assert_eq!((worse.visits, worse.success), (61, 7));
+    let fork = worse.fork.as_ref().expect("compared");
+    assert_eq!(fork.gap, 0.25, "the wire rounds");
+    assert!(fork.p_value < FORK_ALPHA, "{fork:?}");
+    assert!(
+        !worse.fatal_fork,
+        "a gap of {} is under {FORK_GAP}",
+        31.0 / 85.0 - 7.0 / 61.0
+    );
+    assert!(map.fatal_forks.is_empty(), "{:?}", map.fatal_forks);
+}
