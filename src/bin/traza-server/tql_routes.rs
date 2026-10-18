@@ -4,13 +4,14 @@
 //! binary's responder, tenant binding and error mapping, and the logic lives
 //! in [`traza::tql`].
 //!
-//! - `GET /v1/trajectories/search?q=&since=&until=&agent=&outcome=&limit=&run=&tenant=`
-//!   — runs whose steps match a TQL pattern, most recent first.
+//! - `GET /v1/trajectories/search?q=&since=&until=&agent=&outcome=&limit=&run=&cursor=&tenant=`
+//!   — runs whose steps match a TQL pattern, most recent first; `cursor`
+//!   continues an earlier answer from its `next_cursor`.
 //! - `GET /v1/trajectories/explain?q=` — how a pattern was read (no store
 //!   access).
 //! - `GET /v1/detectors` — the detector library.
-//! - `GET /v1/detectors/findings?since=&until=&agent=&detector=&tenant=` —
-//!   the library run over a window.
+//! - `GET /v1/detectors/findings?since=&until=&agent=&detector=&cursor=&tenant=`
+//!   — the library run over a window.
 //!
 //! A query the parser refuses is `400 {"error": "column N: …", "column": N}`.
 
@@ -122,7 +123,7 @@ fn search(
         query,
         &[
             "q", "since", "since_ns", "until", "until_ns", "agent", "outcome", "limit", "run",
-            "tenant",
+            "cursor", "tenant",
         ],
     ) {
         Ok(pairs) => pairs,
@@ -157,6 +158,10 @@ fn search(
             },
             "run" => {
                 options.run = Some(value);
+                Ok(())
+            }
+            "cursor" => {
+                options.cursor = Some(value);
                 Ok(())
             }
             _ => {
@@ -201,7 +206,7 @@ fn findings(
     let pairs = match pairs(
         query,
         &[
-            "since", "since_ns", "until", "until_ns", "agent", "detector", "tenant",
+            "since", "since_ns", "until", "until_ns", "agent", "detector", "cursor", "tenant",
         ],
     ) {
         Ok(pairs) => pairs,
@@ -215,6 +220,10 @@ fn findings(
             "until" | "until_ns" => nanos(&value, "until").map(|n| options.until_ns = Some(n)),
             "agent" => {
                 options.agent = Some(value);
+                Ok(())
+            }
+            "cursor" => {
+                options.cursor = Some(value);
                 Ok(())
             }
             "detector" => {

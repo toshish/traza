@@ -33,6 +33,12 @@ pub(crate) const FORK_UNITS: u64 = 32;
 /// Units charged for evaluating one condition, before the text it reads.
 pub(crate) const CONDITION_UNITS: u64 = 8;
 
+/// Units charged for reading one span as a step, before its catalog.
+pub(crate) const SPAN_UNITS: u64 = 32;
+
+/// Bytes of text read, hashed or parsed per unit.
+pub(crate) const BYTES_PER_UNIT: u64 = 16;
+
 /// The work meter of one scan.
 pub(crate) struct Meter {
     deadline: Option<Deadline>,

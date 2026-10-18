@@ -32,10 +32,13 @@
 //! enumerating the window's runs refuses when the budget is gone, while
 //! scanning them (most recent first) stops where the budget ran out and
 //! says so (`stopped: "deadline"`), so a partial answer is never mistaken
-//! for a complete one. Inside a run the matcher charges its work — paths
-//! advanced, environments forked, regex instructions stepped over text —
-//! to a meter that consults the deadline in proportion (`meter`), so no
-//! predicate or capture can run past the budget.
+//! for a complete one; its cursor continues with exactly the runs not
+//! reached, ties on time included. Inside a run the matcher charges its
+//! work — paths advanced, environments forked, regex instructions stepped
+//! over text, catalogs read, paths copied out — to a meter that consults
+//! the deadline in proportion (`meter`), so no predicate or capture can run
+//! past the budget. A run where a cap dropped alternatives and nothing
+//! matched is counted (`runs_inexact`), never passed off as a clean miss.
 //!
 //! Everything is deterministic computation over stored spans: no model is
 //! called, nothing leaves the process. The guide is `docs/guide/tql.md`.
@@ -48,7 +51,7 @@ mod parse;
 mod regex;
 mod step;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::time::Instant;
 
@@ -330,6 +333,10 @@ pub struct SearchOptions {
     pub limit: usize,
     /// Search this one run only, listing every occurrence (no window).
     pub run: Option<String>,
+    /// Continue an earlier search from its [`SearchResult::next_cursor`].
+    /// The cursor carries that search's window, so `since_ns` and
+    /// `until_ns` are left out, or repeated as first given.
+    pub cursor: Option<String>,
 }
 
 impl Default for SearchOptions {
@@ -341,6 +348,7 @@ impl Default for SearchOptions {
             outcome: OutcomeFilter::Any,
             limit: DEFAULT_SEARCH_LIMIT,
             run: None,
+            cursor: None,
         }
     }
 }
@@ -445,10 +453,17 @@ pub struct SearchResult {
     /// Candidate runs examined, newest first: read and matched, or left out
     /// by the `agent` filter, or gone or unreadable when reached.
     pub runs_scanned: usize,
-    /// Candidate runs in the window (at most [`MAX_SEARCH_RUNS`]).
+    /// Candidate runs in the window (at most [`MAX_SEARCH_RUNS`]); with a
+    /// cursor, those after it.
     pub runs_in_window: usize,
+    /// Scanned runs NOT listed whose matching hit a matcher cap (paths,
+    /// environments, remembered states): each may hold an occurrence the
+    /// caps dropped, so its absence here is not proof. A listed run that hit
+    /// a cap says so itself (`inexact`).
+    pub runs_inexact: usize,
     /// Whether there may be matches this answer does not list: the scan
-    /// stopped early, or the window held more runs than are considered.
+    /// stopped early, the window held more runs than are considered, or a
+    /// scanned run was matched inexactly (`runs_inexact`).
     pub truncated: bool,
     /// Why the scan stopped early, if it did.
     pub stopped: Option<Stopped>,
@@ -456,12 +471,11 @@ pub struct SearchResult {
     /// most recent were considered).
     pub window_capped: bool,
     /// When runs went unchecked — the scan stopped early, or the window was
-    /// capped — the latest activity of the newest run not checked (for a
-    /// capped window, of the oldest run considered: every run left out was
-    /// active no later). Repeating the search with this as `until`
-    /// continues (a run active on both sides of the instant can appear in
-    /// both answers).
-    pub next_until_ns: Option<u64>,
+    /// capped — the cursor that continues with them: pass it back as
+    /// [`SearchOptions::cursor`]. It holds the window and the place in the
+    /// scan order of the last run decided, ties on time included, so the
+    /// next answer lists exactly the runs this one did not reach.
+    pub next_cursor: Option<String>,
     /// Spans in the window left out because their run id cannot be read
     /// back to them: a session id of the `trace:` form naming another trace
     /// (or none).
@@ -470,7 +484,8 @@ pub struct SearchResult {
     pub runs_skipped: usize,
     /// The window searched (absent when one run was searched).
     pub since_ns: Option<u64>,
-    /// The window's end, when bounded.
+    /// The window's end, when bounded (a continued search's is its first
+    /// page's, fixed then).
     pub until_ns: Option<u64>,
 }
 
@@ -514,21 +529,198 @@ impl Budget {
     }
 }
 
+/// A run's place in the scan order: the most recent activity first, and
+/// among runs active at the same instant, the lower digest of the run's
+/// identity first. Ordered so that sorting ascending is the scan order.
+///
+/// The digest makes the order total — a timestamp alone cannot say which of
+/// two runs that tie on it a scan has passed — without a cursor having to
+/// carry producer text: it is the first 128 bits of the SHA-256 of the
+/// run's tenant and id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Rank {
+    latest: u64,
+    digest: u128,
+}
+
+impl Ord for Rank {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .latest
+            .cmp(&self.latest)
+            .then(self.digest.cmp(&other.digest))
+    }
+}
+
+impl PartialOrd for Rank {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// The digest that orders runs active at the same instant ([`Rank`]).
+fn run_digest(tenant: &str, run: &str) -> u128 {
+    let mut identity = Vec::with_capacity(8 + tenant.len() + run.len());
+    identity.extend_from_slice(&(tenant.len() as u64).to_le_bytes());
+    identity.extend_from_slice(tenant.as_bytes());
+    identity.extend_from_slice(run.as_bytes());
+    let hex = crate::payload::sha256_hex(&identity);
+    u128::from_str_radix(&hex[..32], 16).unwrap_or(0)
+}
+
+/// Where a scan resumes: the window it enumerated — its end fixed when the
+/// first page left it open, so later activity cannot reorder the runs — and
+/// the rank of the last run already decided, if any.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Cursor {
+    since_ns: u64,
+    until_ns: u64,
+    after: Option<Rank>,
+}
+
+/// What prefixes a cursor, naming its format.
+const CURSOR_PREFIX: &str = "c1";
+
+impl Cursor {
+    /// The cursor as text: digits, lowercase hex and dots, nothing a
+    /// producer wrote.
+    fn encode(&self) -> String {
+        let mut text = format!("{CURSOR_PREFIX}.{}.{}", self.since_ns, self.until_ns);
+        if let Some(after) = self.after {
+            text.push_str(&format!(".{}.{:032x}", after.latest, after.digest));
+        }
+        text
+    }
+
+    fn parse(text: &str) -> Result<Self> {
+        let refused = || {
+            Error::Invalid(
+                "cursor is not one this server issued; pass next_cursor as given".to_owned(),
+            )
+        };
+        let parts: Vec<&str> = text.split('.').collect();
+        let number = |part: &str| -> Result<u64> {
+            if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(refused());
+            }
+            part.parse().map_err(|_| refused())
+        };
+        let (since_ns, until_ns, after) = match parts.as_slice() {
+            [prefix, since, until] if *prefix == CURSOR_PREFIX => {
+                (number(since)?, number(until)?, None)
+            }
+            [prefix, since, until, latest, digest] if *prefix == CURSOR_PREFIX => {
+                if digest.len() != 32
+                    || !digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                {
+                    return Err(refused());
+                }
+                let digest = u128::from_str_radix(digest, 16).map_err(|_| refused())?;
+                let after = Rank {
+                    latest: number(latest)?,
+                    digest,
+                };
+                (number(since)?, number(until)?, Some(after))
+            }
+            _ => return Err(refused()),
+        };
+        // A run decided inside the window was active inside it.
+        if since_ns > until_ns
+            || after.is_some_and(|after| after.latest < since_ns || after.latest > until_ns)
+        {
+            return Err(refused());
+        }
+        Ok(Self {
+            since_ns,
+            until_ns,
+            after,
+        })
+    }
+}
+
+/// The window a scan reads, and where in its order the scan starts.
+#[derive(Clone, Copy, Debug)]
+struct Plan {
+    since_ns: u64,
+    until_ns: Option<u64>,
+    after: Option<Rank>,
+}
+
+impl Plan {
+    /// The window of `since`/`until` (`since` defaulting to
+    /// [`DEFAULT_WINDOW_NS`] before `now_ns`), or the one `cursor`
+    /// continues — which a `since` or `until` that differs from it refuses.
+    fn resolve(
+        since: Option<u64>,
+        until: Option<u64>,
+        cursor: Option<&str>,
+        now_ns: u64,
+    ) -> Result<Self> {
+        let Some(text) = cursor else {
+            return Ok(Self {
+                since_ns: since.unwrap_or_else(|| now_ns.saturating_sub(DEFAULT_WINDOW_NS)),
+                until_ns: until,
+                after: None,
+            });
+        };
+        let cursor = Cursor::parse(text)?;
+        if since.is_some_and(|since| since != cursor.since_ns)
+            || until.is_some_and(|until| until != cursor.until_ns)
+        {
+            return Err(Error::Invalid(
+                "a cursor carries the window it continues; leave out since and until, or repeat \
+                 them as first given"
+                    .to_owned(),
+            ));
+        }
+        Ok(Self {
+            since_ns: cursor.since_ns,
+            until_ns: Some(cursor.until_ns),
+            after: cursor.after,
+        })
+    }
+
+    /// The cursor resuming this window after `after` (`None`: from its
+    /// start). An open window's end is fixed at `latest_seen`, the latest
+    /// span start enumeration saw in it.
+    fn cursor(&self, after: Option<Rank>, latest_seen: Option<u64>) -> String {
+        Cursor {
+            since_ns: self.since_ns,
+            until_ns: self
+                .until_ns
+                .or(latest_seen)
+                .unwrap_or(self.since_ns)
+                .max(self.since_ns),
+            after,
+        }
+        .encode()
+    }
+}
+
 /// A window's candidate run.
 struct Candidate {
     tenant: String,
     run: String,
-    latest: u64,
+    rank: Rank,
 }
 
 /// A window's candidate runs.
 struct Window {
-    /// The most recent runs, newest first.
+    /// The most recent runs after the plan's cursor, in scan order.
     candidates: Vec<Candidate>,
     /// Whether the window held more runs than the cap.
     capped: bool,
+    /// When capped: the rank of the last run the cap kept. Every run ranked
+    /// before it is a candidate (or was decided before the cursor), so a
+    /// scan that finishes continues from here.
+    boundary: Option<Rank>,
     /// Spans left out because their run id does not read back to them.
     spans_skipped: usize,
+    /// The latest span start seen in the window: an open window's end, for
+    /// a cursor.
+    latest_seen: Option<u64>,
 }
 
 /// What reading a candidate run found.
@@ -549,6 +741,26 @@ struct ReadRun<'s> {
     truncated: bool,
 }
 
+/// What matching one run found.
+struct RunScan {
+    /// The match, when the run matched and passes the outcome filter.
+    found: Option<RunMatch>,
+    /// No match is reported, but a matcher cap dropped alternatives while
+    /// looking, in a run the outcome filter admits: one may have been
+    /// missed.
+    missed: bool,
+}
+
+/// What checking one candidate run came to.
+enum Checked {
+    /// Read and matched.
+    Scanned(RunScan),
+    /// Gone when reached, or left out by the `agent` filter.
+    Passed,
+    /// Its id was refused when read.
+    Unreadable,
+}
+
 /// Whether a span's run id reads back to the span. A run id of the
 /// `trace:<id>` form is read as trace `<id>`, so a span whose SESSION id
 /// takes that form while naming another trace (or none) would be listed
@@ -557,91 +769,155 @@ fn reads_back(run: &str, trace_id: &str) -> bool {
     semconv::run_trace_id(run).map_or(true, |trace| !trace.is_empty() && trace == trace_id)
 }
 
+/// Whether a span starting at `start` in run `(tenant, run)` lies at or
+/// before `after` in the scan order: a run with such a span in the window
+/// ranks there too, so it was decided before the cursor.
+fn decided(start: u64, tenant: &str, run: &str, after: Rank) -> bool {
+    start > after.latest
+        || (start == after.latest
+            && Rank {
+                latest: start,
+                digest: run_digest(tenant, run),
+            } <= after)
+}
+
 impl Store {
-    /// The `cap` runs with the most recent activity among spans starting
-    /// in `[since, until]`, newest first, and whether the window held more.
+    /// The `cap` runs that come first in the scan order ([`Rank`]) among
+    /// runs with spans starting in `[since, until]` and none at or before
+    /// `after`, and whether there were more.
     ///
-    /// Exact under the cap: a run is kept or evicted by its latest start
-    /// seen so far, and since that only grows, a run evicted (or never
-    /// admitted) cannot belong to the final top `cap`. A span whose run id
-    /// does not [read back](reads_back) to it is left out and counted.
+    /// Exact under the cap: a run is kept or evicted by its rank so far, and
+    /// since that only improves as later spans are seen, a run evicted (or
+    /// never admitted) cannot belong to the final first `cap`.
+    ///
+    /// With `after`, two passes keep memory to the cap: the first ranks runs
+    /// by their spans after `after`; the second reads the spans at or before
+    /// it and drops every kept run that has one — such a run ranks before
+    /// the cursor, so an earlier page decided it. A span whose run id does
+    /// not [read back](reads_back) to it is left out and counted.
     fn window_runs(
         &self,
         tenant: Option<&str>,
-        since_ns: u64,
-        until_ns: Option<u64>,
+        plan: &Plan,
         cap: usize,
         deadline: Option<Deadline>,
     ) -> Result<Window> {
+        let after = plan.after;
+        let first_until = match (after, plan.until_ns) {
+            (Some(after), Some(until)) => Some(after.latest.min(until)),
+            (Some(after), None) => Some(after.latest),
+            (None, until) => until,
+        };
         let filter = SpanFilter {
             tenant: tenant.map(str::to_owned),
-            since_ns: Some(since_ns),
-            until_ns,
+            since_ns: Some(plan.since_ns),
+            until_ns: first_until,
             ..SpanFilter::default()
         };
-        let mut latest: HashMap<(String, String), u64> = HashMap::new();
+        let mut ranks: HashMap<(String, String), Rank> = HashMap::new();
         // The eviction order is needed only once the map is full: below the
         // cap, the map alone is the answer, and most windows stay below it.
-        let mut order: Option<BTreeSet<(u64, String, String)>> = None;
+        let mut order: Option<BTreeSet<(Rank, String, String)>> = None;
         let mut capped = false;
         let mut spans_skipped = 0;
+        let mut latest_seen: Option<u64> = None;
         self.fold_spans_under(&filter, deadline, |span| {
+            let start = span.start_time_ns;
+            latest_seen = Some(latest_seen.map_or(start, |seen| seen.max(start)));
             let run = semconv::run_id(&span.attributes, &span.trace_id);
+            if after.is_some_and(|after| decided(start, &span.tenant, &run, after)) {
+                // The second pass's.
+                return;
+            }
             if !reads_back(&run, &span.trace_id) {
                 spans_skipped += 1;
                 return;
             }
             let key = (span.tenant.clone(), run);
-            let start = span.start_time_ns;
-            if let Some(known) = latest.get_mut(&key) {
-                if start > *known {
+            if let Some(rank) = ranks.get_mut(&key) {
+                if start > rank.latest {
+                    let raised = Rank {
+                        latest: start,
+                        digest: rank.digest,
+                    };
                     if let Some(order) = order.as_mut() {
-                        order.remove(&(*known, key.0.clone(), key.1.clone()));
-                        order.insert((start, key.0.clone(), key.1.clone()));
+                        order.remove(&(*rank, key.0.clone(), key.1.clone()));
+                        order.insert((raised, key.0.clone(), key.1.clone()));
                     }
-                    *known = start;
+                    *rank = raised;
                 }
                 return;
             }
-            if latest.len() >= cap {
+            let rank = Rank {
+                latest: start,
+                digest: run_digest(&key.0, &key.1),
+            };
+            if ranks.len() >= cap {
                 capped = true;
                 let order = order.get_or_insert_with(|| {
-                    latest
+                    ranks
                         .iter()
-                        .map(|((tenant, run), start)| (*start, tenant.clone(), run.clone()))
+                        .map(|((tenant, run), rank)| (*rank, tenant.clone(), run.clone()))
                         .collect()
                 });
-                let Some(oldest) = order.first().cloned() else {
+                let Some(worst) = order.last().cloned() else {
                     return;
                 };
-                if start <= oldest.0 {
+                if rank >= worst.0 {
                     return;
                 }
-                order.remove(&oldest);
-                latest.remove(&(oldest.1, oldest.2));
-                order.insert((start, key.0.clone(), key.1.clone()));
+                order.remove(&worst);
+                ranks.remove(&(worst.1, worst.2));
+                order.insert((rank, key.0.clone(), key.1.clone()));
             }
-            latest.insert(key, start);
+            ranks.insert(key, rank);
         })?;
-        let mut candidates: Vec<Candidate> = latest
+        let boundary = if capped {
+            ranks.values().max().copied()
+        } else {
+            None
+        };
+        if let Some(after) = after {
+            let filter = SpanFilter {
+                tenant: tenant.map(str::to_owned),
+                since_ns: Some(after.latest.max(plan.since_ns)),
+                until_ns: plan.until_ns,
+                ..SpanFilter::default()
+            };
+            let mut before: HashSet<(String, String)> = HashSet::new();
+            self.fold_spans_under(&filter, deadline, |span| {
+                let run = semconv::run_id(&span.attributes, &span.trace_id);
+                if !decided(span.start_time_ns, &span.tenant, &run, after) {
+                    // The first pass's.
+                    return;
+                }
+                if !reads_back(&run, &span.trace_id) {
+                    spans_skipped += 1;
+                    return;
+                }
+                let key = (span.tenant.clone(), run);
+                if ranks.contains_key(&key) {
+                    before.insert(key);
+                }
+            })?;
+            ranks.retain(|key, _| !before.contains(key));
+        }
+        let mut candidates: Vec<Candidate> = ranks
             .into_iter()
-            .map(|((tenant, run), latest)| Candidate {
-                tenant,
-                run,
-                latest,
-            })
+            .map(|((tenant, run), rank)| Candidate { tenant, run, rank })
             .collect();
         candidates.sort_by(|left, right| {
-            right
-                .latest
-                .cmp(&left.latest)
+            left.rank
+                .cmp(&right.rank)
                 .then_with(|| left.tenant.cmp(&right.tenant))
                 .then_with(|| left.run.cmp(&right.run))
         });
         Ok(Window {
             candidates,
             capped,
+            boundary,
             spans_skipped,
+            latest_seen,
         })
     }
 
@@ -693,7 +969,9 @@ impl Store {
     /// One compute budget covers the request. Enumerating the window's
     /// runs refuses with [`Error::DeadlineExceeded`] when it runs out;
     /// scanning them, most recent first, stops where it ran out and says so
-    /// (`stopped: "deadline"`, `truncated: true`).
+    /// (`stopped: "deadline"`, `truncated: true`). A cursor that is not one
+    /// this server issued, or a window that disagrees with it, is
+    /// [`Error::Invalid`].
     pub fn trajectory_search(
         &self,
         tenant: Option<&str>,
@@ -728,10 +1006,11 @@ impl Store {
             matches: Vec::new(),
             runs_scanned: 0,
             runs_in_window: 0,
+            runs_inexact: 0,
             truncated: false,
             stopped: None,
             window_capped: false,
-            next_until_ns: None,
+            next_cursor: None,
             spans_skipped: 0,
             runs_skipped: 0,
             since_ns: None,
@@ -741,6 +1020,11 @@ impl Store {
         if let Some(run) = &options.run {
             if run.is_empty() {
                 return Err(Error::Invalid("run= names no run".to_owned()));
+            }
+            if options.cursor.is_some() {
+                return Err(Error::Invalid(
+                    "run= searches one run whole; it takes no cursor".to_owned(),
+                ));
             }
             let Some(spans) = self.read_run_spans(tenant, run, deadline)? else {
                 return Ok(result);
@@ -753,7 +1037,7 @@ impl Store {
                 .first()
                 .map(|span| span.tenant.clone())
                 .unwrap_or_default();
-            if let Some(found) = self.match_run(
+            let scanned = self.match_run(
                 query,
                 &spans,
                 &read,
@@ -763,40 +1047,49 @@ impl Store {
                 MAX_OCCURRENCES_LISTED,
                 OutcomeOf::At(now_ns),
                 deadline,
-            )? {
-                result.matches.push(found);
+            )?;
+            if scanned.missed {
+                result.runs_inexact = 1;
+                result.truncated = true;
             }
+            result.matches.extend(scanned.found);
             return Ok(result);
         }
-        let since = options
-            .since_ns
-            .unwrap_or_else(|| now_ns.saturating_sub(DEFAULT_WINDOW_NS));
-        result.since_ns = Some(since);
-        result.until_ns = options.until_ns;
-        let window = self.window_runs(
-            tenant,
-            since,
+        let plan = Plan::resolve(
+            options.since_ns,
             options.until_ns,
-            budget.window_cap,
-            budget.enumerate,
+            options.cursor.as_deref(),
+            now_ns,
         )?;
+        result.since_ns = Some(plan.since_ns);
+        result.until_ns = plan.until_ns;
+        let window = self.window_runs(tenant, &plan, budget.window_cap, budget.enumerate)?;
         let candidates = &window.candidates;
         result.runs_in_window = candidates.len();
         result.window_capped = window.capped;
         result.spans_skipped = window.spans_skipped;
+        // The cursor that resumes at candidate `index`: after the one before
+        // it, or where this page itself began.
+        let resume_at = |index: usize| {
+            let after = match index {
+                0 => plan.after,
+                _ => Some(candidates[index - 1].rank),
+            };
+            plan.cursor(after, window.latest_seen)
+        };
         for (index, candidate) in candidates.iter().enumerate() {
             if result.matches.len() >= limit {
                 result.stopped = Some(Stopped::Limit);
                 result.truncated = true;
-                result.next_until_ns = Some(candidate.latest);
+                result.next_cursor = Some(resume_at(index));
                 break;
             }
-            let outcome = (|| -> Result<Option<Option<RunMatch>>> {
+            let checked = (|| -> Result<Checked> {
                 budget.check_run(index)?;
                 let spans = match self.read_candidate(candidate, deadline)? {
                     Read::Spans(spans) => spans,
-                    Read::Gone => return Ok(Some(None)),
-                    Read::Unreadable => return Ok(None),
+                    Read::Gone => return Ok(Checked::Passed),
+                    Read::Unreadable => return Ok(Checked::Unreadable),
                 };
                 let read = self.read_steps(&spans, deadline)?;
                 if options
@@ -804,7 +1097,7 @@ impl Store {
                     .as_deref()
                     .is_some_and(|agent| read.agent.as_deref() != Some(agent))
                 {
-                    return Ok(Some(None));
+                    return Ok(Checked::Passed);
                 }
                 self.match_run(
                     query,
@@ -817,21 +1110,27 @@ impl Store {
                     OutcomeOf::At(now_ns),
                     deadline,
                 )
-                .map(Some)
+                .map(Checked::Scanned)
             })();
-            match outcome {
-                Ok(found) => {
+            match checked {
+                Ok(checked) => {
                     result.runs_scanned = index + 1;
-                    match found {
-                        Some(Some(found)) => result.matches.push(found),
-                        Some(None) => {}
-                        None => result.runs_skipped += 1,
+                    match checked {
+                        Checked::Scanned(scanned) => {
+                            if scanned.missed {
+                                result.runs_inexact += 1;
+                                result.truncated = true;
+                            }
+                            result.matches.extend(scanned.found);
+                        }
+                        Checked::Passed => {}
+                        Checked::Unreadable => result.runs_skipped += 1,
                     }
                 }
                 Err(Error::DeadlineExceeded(_)) => {
                     result.stopped = Some(Stopped::Deadline);
                     result.truncated = true;
-                    result.next_until_ns = Some(candidate.latest);
+                    result.next_cursor = Some(resume_at(index));
                     break;
                 }
                 Err(other) => return Err(other),
@@ -839,17 +1138,17 @@ impl Store {
         }
         if window.capped {
             result.truncated = true;
-            // Every run the cap left out was last active no later than the
-            // oldest run kept.
+            // Every run the cap left out ranks after the last run it kept.
             if result.stopped.is_none() {
-                result.next_until_ns = candidates.last().map(|candidate| candidate.latest);
+                result.next_cursor = Some(plan.cursor(window.boundary, window.latest_seen));
             }
         }
         Ok(result)
     }
 
-    /// Matches `query` against one read run; `None` when it does not match
-    /// or the run's outcome is filtered out.
+    /// Matches `query` against one read run: the match, when there is one
+    /// and the run's outcome passes the filter, and whether a match may have
+    /// been missed when none is reported.
     #[allow(clippy::too_many_arguments)]
     fn match_run(
         &self,
@@ -862,19 +1161,28 @@ impl Store {
         keep: usize,
         outcome: OutcomeOf,
         deadline: Option<Deadline>,
-    ) -> Result<Option<RunMatch>> {
+    ) -> Result<RunScan> {
         let scan = query
             .program
             .scan(&read.steps, keep, MAX_OCCURRENCES_COUNTED, deadline)?;
-        let Some(first) = scan.found.first() else {
-            return Ok(None);
-        };
-        let outcome = match outcome {
+        let outcome = || match outcome {
             OutcomeOf::Known(outcome) => outcome,
             OutcomeOf::At(now_ns) => run_outcome(spans, now_ns),
         };
+        let Some(first) = scan.found.first() else {
+            // Nothing found is proof of nothing when the caps dropped paths
+            // — unless the run could not have qualified anyway.
+            return Ok(RunScan {
+                found: None,
+                missed: scan.inexact && options.outcome.admits(outcome()),
+            });
+        };
+        let outcome = outcome();
         if !options.outcome.admits(outcome) {
-            return Ok(None);
+            return Ok(RunScan {
+                found: None,
+                missed: false,
+            });
         }
         let first = occurrence(query, &read.steps, first);
         let occurrences = if options.run.is_some() {
@@ -885,30 +1193,33 @@ impl Store {
         } else {
             Vec::new()
         };
-        Ok(Some(RunMatch {
-            run: run.to_owned(),
-            tenant: tenant.to_owned(),
-            agent: read.agent.clone(),
-            outcome,
-            spans: first.spans,
-            spans_truncated: first.spans_truncated,
-            captures: first.captures,
-            captures_truncated: first.captures_truncated,
-            first_step: first.first_step,
-            last_step: first.last_step,
-            count: scan.count,
-            count_capped: scan.count_capped,
-            steps: read.steps.len(),
-            last_activity_ns: spans
-                .spans
-                .iter()
-                .map(|span| span.start_time_ns)
-                .max()
-                .unwrap_or(0),
-            run_truncated: read.truncated,
-            inexact: scan.inexact,
-            occurrences,
-        }))
+        Ok(RunScan {
+            found: Some(RunMatch {
+                run: run.to_owned(),
+                tenant: tenant.to_owned(),
+                agent: read.agent.clone(),
+                outcome,
+                spans: first.spans,
+                spans_truncated: first.spans_truncated,
+                captures: first.captures,
+                captures_truncated: first.captures_truncated,
+                first_step: first.first_step,
+                last_step: first.last_step,
+                count: scan.count,
+                count_capped: scan.count_capped,
+                steps: read.steps.len(),
+                last_activity_ns: spans
+                    .spans
+                    .iter()
+                    .map(|span| span.start_time_ns)
+                    .max()
+                    .unwrap_or(0),
+                run_truncated: read.truncated,
+                inexact: scan.inexact,
+                occurrences,
+            }),
+            missed: false,
+        })
     }
 }
 
@@ -977,6 +1288,9 @@ pub struct FindingsOptions {
     pub agent: Option<String>,
     /// Only these detectors (empty: the whole library).
     pub detectors: Vec<String>,
+    /// Continue an earlier findings scan from its [`Findings::next_cursor`]
+    /// (see [`SearchOptions::cursor`]).
+    pub cursor: Option<String>,
 }
 
 /// Runs by how they ended.
@@ -1024,6 +1338,10 @@ pub struct DetectorFindings {
     pub query: &'static str,
     /// Runs it matched.
     pub runs_matched: usize,
+    /// Checked runs it did NOT match where its matcher hit a cap: each may
+    /// hold an occurrence the caps dropped, so `runs_matched` is then a
+    /// lower bound.
+    pub runs_inexact: usize,
     /// Occurrences across those runs.
     pub occurrences: usize,
     /// How the matched runs ended.
@@ -1055,17 +1373,20 @@ pub struct Findings {
     pub baseline: OutcomeCounts,
     /// The baseline's success rate.
     pub baseline_success_rate: Option<f64>,
-    /// Candidate runs in the window (at most [`MAX_FINDINGS_RUNS`]).
+    /// Candidate runs in the window (at most [`MAX_FINDINGS_RUNS`]); with a
+    /// cursor, those after it.
     pub runs_in_window: usize,
-    /// Whether runs in the window went unchecked.
+    /// Whether the findings may be incomplete: runs in the window went
+    /// unchecked, or a detector's matcher hit a cap in a run it did not
+    /// match (its `runs_inexact`).
     pub truncated: bool,
     /// Why the scan stopped early, if it did.
     pub stopped: Option<Stopped>,
     /// Whether the window held more runs than [`MAX_FINDINGS_RUNS`].
     pub window_capped: bool,
-    /// When runs went unchecked: where to continue from (see
-    /// [`SearchResult::next_until_ns`]).
-    pub next_until_ns: Option<u64>,
+    /// When runs went unchecked: the cursor that continues with them (see
+    /// [`SearchResult::next_cursor`]).
+    pub next_cursor: Option<String>,
     /// Spans left out because their run id cannot be read back to them
     /// (see [`SearchResult::spans_skipped`]).
     pub spans_skipped: usize,
@@ -1082,7 +1403,8 @@ impl Store {
     /// recent runs of a window, under the scoping and budget rules of
     /// [`Self::trajectory_search`].
     ///
-    /// An unknown detector name is [`Error::Invalid`].
+    /// An unknown detector name is [`Error::Invalid`], as is a cursor this
+    /// server did not issue.
     pub fn detector_findings(
         &self,
         tenant: Option<&str>,
@@ -1131,16 +1453,13 @@ impl Store {
         if selected.is_empty() {
             selected = (0..DETECTORS.len()).collect();
         }
-        let since = options
-            .since_ns
-            .unwrap_or_else(|| now_ns.saturating_sub(DEFAULT_WINDOW_NS));
-        let window = self.window_runs(
-            tenant,
-            since,
+        let plan = Plan::resolve(
+            options.since_ns,
             options.until_ns,
-            budget.window_cap,
-            budget.enumerate,
+            options.cursor.as_deref(),
+            now_ns,
         )?;
+        let window = self.window_runs(tenant, &plan, budget.window_cap, budget.enumerate)?;
         let candidates = &window.candidates;
         let mut rows: Vec<DetectorFindings> = selected
             .iter()
@@ -1153,6 +1472,7 @@ impl Store {
                     summary: detector.summary,
                     query: detector.query,
                     runs_matched: 0,
+                    runs_inexact: 0,
                     occurrences: 0,
                     outcomes: OutcomeCounts::default(),
                     success_rate: None,
@@ -1165,7 +1485,7 @@ impl Store {
         let mut scanned = 0;
         let mut runs_skipped = 0;
         let mut stopped = None;
-        let mut next_until_ns = None;
+        let mut next_cursor = None;
         let search_options = SearchOptions::default();
         for (index, candidate) in candidates.iter().enumerate() {
             let checked = (|| -> Result<Option<bool>> {
@@ -1187,8 +1507,9 @@ impl Store {
                 // Every detector is evaluated before any is recorded, so a
                 // run the budget interrupts counts toward none of them.
                 let mut hits = Vec::new();
+                let mut misses = Vec::new();
                 for (row, &detector) in selected.iter().enumerate() {
-                    if let Some(found) = self.match_run(
+                    let verdict = self.match_run(
                         &compiled[detector],
                         &spans,
                         &read,
@@ -1198,11 +1519,17 @@ impl Store {
                         1,
                         OutcomeOf::Known(outcome),
                         deadline,
-                    )? {
-                        hits.push((row, found));
+                    )?;
+                    match verdict.found {
+                        Some(found) => hits.push((row, found)),
+                        None if verdict.missed => misses.push(row),
+                        None => {}
                     }
                 }
                 baseline.add(outcome);
+                for row in misses {
+                    rows[row].runs_inexact += 1;
+                }
                 for (row, found) in hits {
                     let entry = &mut rows[row];
                     entry.runs_matched += 1;
@@ -1227,22 +1554,27 @@ impl Store {
                 }
                 Err(Error::DeadlineExceeded(_)) => {
                     stopped = Some(Stopped::Deadline);
-                    next_until_ns = Some(candidate.latest);
+                    let after = match index {
+                        0 => plan.after,
+                        _ => Some(candidates[index - 1].rank),
+                    };
+                    next_cursor = Some(plan.cursor(after, window.latest_seen));
                     break;
                 }
                 Err(other) => return Err(other),
             }
         }
         if window.capped && stopped.is_none() {
-            // As for a search: every run the cap left out was last active no
-            // later than the oldest run kept.
-            next_until_ns = candidates.last().map(|candidate| candidate.latest);
+            // As for a search: every run the cap left out ranks after the
+            // last run it kept.
+            next_cursor = Some(plan.cursor(window.boundary, window.latest_seen));
         }
         let runs_checked =
             baseline.success + baseline.failure + baseline.abandoned + baseline.unknown;
         for row in &mut rows {
             row.success_rate = row.outcomes.success_rate();
         }
+        let inexact = rows.iter().any(|row| row.runs_inexact > 0);
         let library_rank = |name: &str| DETECTORS.iter().position(|d| d.name == name);
         rows.sort_by(|left, right| {
             (left.runs_matched == 0)
@@ -1258,14 +1590,14 @@ impl Store {
             baseline_success_rate: baseline.success_rate(),
             baseline,
             runs_in_window: candidates.len(),
-            truncated: stopped.is_some() || window.capped,
+            truncated: stopped.is_some() || window.capped || inexact,
             stopped,
             window_capped: window.capped,
-            next_until_ns,
+            next_cursor,
             spans_skipped: window.spans_skipped,
             runs_skipped,
-            since_ns: since,
-            until_ns: options.until_ns,
+            since_ns: plan.since_ns,
+            until_ns: plan.until_ns,
         })
     }
 }
@@ -1594,19 +1926,14 @@ mod tests {
         assert_eq!(limited.matches[0].run, "failed", "most recent first");
         assert_eq!(limited.stopped, Some(Stopped::Limit));
         assert!(limited.truncated);
-        // Continuing from the resume point reaches the older runs.
-        let next = limited.next_until_ns.expect("a resume point");
-        assert_eq!(
-            next,
-            NOW - 3_600 * SECOND + 12 * SECOND,
-            "the newest unchecked run"
-        );
+        // Continuing from the cursor reaches the older runs, and only them.
+        let next = limited.next_cursor.clone().expect("a cursor");
         let rest = store
             .trajectory_search(
                 Some(""),
                 &any_test,
                 &SearchOptions {
-                    until_ns: Some(next),
+                    cursor: Some(next.clone()),
                     ..SearchOptions::default()
                 },
                 NOW,
@@ -1614,6 +1941,55 @@ mod tests {
             .expect("searches");
         let runs: Vec<_> = rest.matches.iter().map(|m| m.run.as_str()).collect();
         assert_eq!(runs, ["honest", "tampered"]);
+        assert_eq!(rest.runs_in_window, 2, "the runs after the cursor");
+        assert_eq!(rest.next_cursor, None);
+        assert_eq!(
+            rest.since_ns, limited.since_ns,
+            "the window travels with it"
+        );
+        // The cursor carries the window: one that disagrees is refused, a
+        // repeat of the first is not.
+        let with_since = |since_ns| SearchOptions {
+            cursor: Some(next.clone()),
+            since_ns,
+            ..SearchOptions::default()
+        };
+        match store.trajectory_search(Some(""), &any_test, &with_since(Some(5)), NOW) {
+            Err(Error::Invalid(message)) => assert!(message.contains("cursor"), "{message}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        store
+            .trajectory_search(Some(""), &any_test, &with_since(limited.since_ns), NOW)
+            .expect("the same window");
+        let digest = "0".repeat(32);
+        for forged in [
+            String::new(),
+            "c1".into(),
+            "c1.5".into(),
+            "c2.1.2".into(),
+            "c1.9.1".into(),
+            "c1.+1.9".into(),
+            "c1.1.9.5.zz".into(),
+            "c1.1.9.5.1".into(),
+            format!("c1.4.9.3.{digest}"),
+            format!("c1.4.9.10.{digest}"),
+            format!("c1.4.9.5.{}", "A".repeat(32)),
+        ] {
+            match store.trajectory_search(
+                Some(""),
+                &any_test,
+                &SearchOptions {
+                    cursor: Some(forged.clone()),
+                    ..SearchOptions::default()
+                },
+                NOW,
+            ) {
+                Err(Error::Invalid(message)) => {
+                    assert!(message.contains("not one this server issued"), "{message}")
+                }
+                other => panic!("`{forged}`: expected a refusal, got {other:?}"),
+            }
+        }
 
         let failures = store
             .trajectory_search(
@@ -1745,7 +2121,7 @@ mod tests {
         let Window {
             candidates, capped, ..
         } = store
-            .window_runs(Some(""), 0, None, 10, None)
+            .window_runs(Some(""), &whole_window(), 10, None)
             .expect("enumerates");
         assert!(capped);
         let mut expected: Vec<(u64, String)> = (0..40_u64)
@@ -1759,6 +2135,103 @@ mod tests {
             .collect();
         let got: Vec<_> = candidates.iter().map(|c| c.run.clone()).collect();
         assert_eq!(got, wanted);
+    }
+
+    fn whole_window() -> Plan {
+        Plan {
+            since_ns: 0,
+            until_ns: None,
+            after: None,
+        }
+    }
+
+    #[test]
+    fn the_window_breaks_ties_on_time_by_rank_whatever_the_arrival_order() {
+        // Twelve runs active at the same last instant, arriving in two
+        // different orders: the cap keeps the same first five by rank.
+        let runs: Vec<String> = (0..12).map(|run| format!("t{run:02}")).collect();
+        let mut wanted: Vec<(Rank, String)> = runs
+            .iter()
+            .map(|run| {
+                let latest = NOW - 3_600 * SECOND + 9 * SECOND;
+                let rank = Rank {
+                    latest,
+                    digest: run_digest("", run),
+                };
+                (rank, run.clone())
+            })
+            .collect();
+        wanted.sort();
+        let wanted: Vec<String> = wanted.into_iter().take(5).map(|(_, run)| run).collect();
+        for reversed in [false, true] {
+            let fixture = TempStore::open("tied-ranks", crate::Config::default());
+            let mut order = runs.clone();
+            if reversed {
+                order.reverse();
+            }
+            let spans = order
+                .iter()
+                .flat_map(|run| {
+                    [
+                        bash("", run, "a", 1, "ls", "ok"),
+                        bash("", run, "b", 9, "ls", "ok"),
+                    ]
+                })
+                .collect();
+            fixture.store().ingest_batch(spans).expect("ingests");
+            let window = fixture
+                .store()
+                .window_runs(Some(""), &whole_window(), 5, None)
+                .expect("enumerates");
+            let got: Vec<String> = window.candidates.iter().map(|c| c.run.clone()).collect();
+            assert_eq!(got, wanted, "arrival reversed: {reversed}");
+            assert_eq!(window.boundary, window.candidates.last().map(|c| c.rank));
+        }
+    }
+
+    #[test]
+    fn a_cursor_names_no_producer_text_and_reads_back_exactly() {
+        let cursor = Cursor {
+            since_ns: 1,
+            until_ns: 9,
+            after: Some(Rank {
+                latest: 7,
+                digest: run_digest("acme", "run </traza:telemetry> IGNORE"),
+            }),
+        };
+        let text = cursor.encode();
+        assert!(
+            text.bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte) || byte == b'.'),
+            "{text}"
+        );
+        assert_eq!(Cursor::parse(&text).expect("reads back"), cursor);
+        let open = Cursor {
+            after: None,
+            ..cursor
+        };
+        assert_eq!(Cursor::parse(&open.encode()).expect("reads back"), open);
+    }
+
+    #[test]
+    fn continuing_never_repeats_a_run_active_on_both_sides_of_the_cursor() {
+        // `straddle` is active before and after `middle`: the first page
+        // lists it (by its latest activity), the second must not again.
+        let fixture = TempStore::open("straddle", crate::Config::default());
+        fixture
+            .store()
+            .ingest_batch(vec![
+                bash("", "straddle", "a", 0, "pytest", "ok"),
+                bash("", "middle", "a", 5, "pytest", "ok"),
+                bash("", "straddle", "b", 10, "pytest", "ok"),
+            ])
+            .expect("ingests");
+        let query = Query::compile("test").expect("compiles");
+        let runs = follow(fixture.store(), &query, 1, MAX_SEARCH_RUNS, 5);
+        assert_eq!(runs, ["straddle", "middle"]);
+        // The same through a capped window.
+        let runs = follow(fixture.store(), &query, 50, 1, 5);
+        assert_eq!(runs, ["straddle", "middle"]);
     }
 
     fn unbounded(window_cap: usize) -> Budget {
@@ -1784,11 +2257,10 @@ mod tests {
         assert_eq!(result.runs_scanned, 1);
         let runs: Vec<_> = result.matches.iter().map(|m| m.run.as_str()).collect();
         assert_eq!(runs, ["failed"], "what was found before the stop is kept");
-        assert_eq!(
-            result.next_until_ns,
-            Some(NOW - 3_600 * SECOND + 12 * SECOND),
-            "the first unchecked run: `honest`"
-        );
+        // The cursor resumes at the first unchecked run, `honest`.
+        let rest = resume(store, &query, &result, unbounded(MAX_SEARCH_RUNS));
+        assert_eq!(listed(&rest), ["honest", "tampered"]);
+        assert_eq!(rest.runs_scanned, 2);
 
         let findings = store
             .detector_findings_under(Some(""), &FindingsOptions::default(), NOW, partway)
@@ -1815,10 +2287,27 @@ mod tests {
                 row.name
             );
         }
+        let rest = store
+            .detector_findings_under(
+                Some(""),
+                &FindingsOptions {
+                    cursor: findings.next_cursor.clone(),
+                    ..FindingsOptions::default()
+                },
+                NOW,
+                unbounded(MAX_SEARCH_RUNS),
+            )
+            .expect("continues");
         assert_eq!(
-            findings.next_until_ns,
-            Some(NOW - 3_600 * SECOND + 12 * SECOND)
+            (
+                rest.runs_scanned,
+                rest.runs_checked,
+                rest.next_cursor.clone()
+            ),
+            (2, 2, None),
+            "the two runs the first answer did not reach"
         );
+        assert_eq!(rest.baseline.success, 2);
 
         // A deadline already spent stops the scan before its first run.
         let expired = Budget {
@@ -1830,6 +2319,8 @@ mod tests {
             .expect("answers");
         assert_eq!((none.runs_scanned, none.matches.len()), (0, 0));
         assert_eq!(none.stopped, Some(Stopped::Deadline));
+        let all = resume(store, &query, &none, unbounded(MAX_SEARCH_RUNS));
+        assert_eq!(listed(&all), ["failed", "honest", "tampered"]);
 
         // With budget to spare the same scans complete.
         let complete = store
@@ -1843,7 +2334,27 @@ mod tests {
             .expect("searches");
         assert_eq!(complete.stopped, None);
         assert_eq!(complete.runs_scanned, 3);
-        assert_eq!(complete.next_until_ns, None);
+        assert_eq!(complete.next_cursor, None);
+    }
+
+    /// Continues `previous` with its cursor, under `budget`.
+    fn resume(
+        store: &Store,
+        query: &Query,
+        previous: &SearchResult,
+        budget: Budget,
+    ) -> SearchResult {
+        let options = SearchOptions {
+            cursor: Some(previous.next_cursor.clone().expect("a cursor")),
+            ..SearchOptions::default()
+        };
+        store
+            .trajectory_search_under(Some(""), query, &options, NOW, budget)
+            .expect("continues")
+    }
+
+    fn listed(result: &SearchResult) -> Vec<&str> {
+        result.matches.iter().map(|m| m.run.as_str()).collect()
     }
 
     #[test]
@@ -1863,37 +2374,18 @@ mod tests {
             .expect("searches");
         assert!(capped.window_capped && capped.truncated);
         assert_eq!(capped.stopped, None);
-        let runs: Vec<_> = capped.matches.iter().map(|m| m.run.as_str()).collect();
-        assert_eq!(runs, ["failed", "honest"]);
-        let next = capped.next_until_ns.expect("a resume point");
-        assert_eq!(
-            next,
-            NOW - 3_600 * SECOND + 12 * SECOND,
-            "the oldest kept run"
-        );
-        // Continuing reaches the run the cap left out.
-        let rest = store
-            .trajectory_search_under(
-                Some(""),
-                &query,
-                &SearchOptions {
-                    until_ns: Some(next),
-                    ..SearchOptions::default()
-                },
-                NOW,
-                unbounded(2),
-            )
-            .expect("searches");
-        let runs: Vec<_> = rest.matches.iter().map(|m| m.run.as_str()).collect();
-        assert_eq!(runs, ["honest", "tampered"]);
+        assert_eq!(listed(&capped), ["failed", "honest"]);
+        // Continuing reaches exactly the run the cap left out.
+        let rest = resume(store, &query, &capped, unbounded(2));
+        assert_eq!(listed(&rest), ["tampered"]);
         assert!(!rest.window_capped);
-        assert_eq!(rest.next_until_ns, None);
+        assert_eq!(rest.next_cursor, None);
 
         let findings = store
             .detector_findings_under(Some(""), &FindingsOptions::default(), NOW, unbounded(2))
             .expect("finds");
         assert!(findings.window_capped);
-        assert_eq!(findings.next_until_ns, Some(next));
+        assert_eq!(findings.next_cursor, capped.next_cursor);
     }
 
     fn session_span(session: &str, trace: &str, id: &str, offset: u64) -> crate::Span {
@@ -1936,7 +2428,10 @@ mod tests {
         let unreadable = Candidate {
             tenant: String::new(),
             run: "trace:".into(),
-            latest: 0,
+            rank: Rank {
+                latest: 0,
+                digest: 0,
+            },
         };
         assert!(matches!(
             store.read_candidate(&unreadable, None),
@@ -2043,10 +2538,15 @@ mod tests {
         let runs: Vec<_> = result.matches.iter().map(|m| m.run.as_str()).collect();
         assert_eq!(runs, ["light"]);
         assert_eq!(result.runs_scanned, 1);
+        let cursor = Cursor::parse(result.next_cursor.as_deref().expect("a cursor"))
+            .expect("one this server issued");
         assert_eq!(
-            result.next_until_ns,
-            Some(NOW - 3_600 * SECOND),
-            "the heavy run is where to continue"
+            cursor.after,
+            Some(Rank {
+                latest: NOW - 3_600 * SECOND + 10 * SECOND,
+                digest: run_digest("", "light"),
+            }),
+            "it resumes after `light`: the heavy run is where to continue"
         );
         // The regexes alone would take several seconds; the scan stops
         // within a sliver of its one-second budget.
@@ -2054,6 +2554,241 @@ mod tests {
             elapsed < std::time::Duration::from_millis(2_500),
             "stopped after {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn a_query_of_nested_empty_repetitions_compiles_promptly() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let compiled = Query::compile(r#"step[args~"((((a{0}){256}){256}){256}){256}"]"#)
+                .map(|query| query.explain().instructions);
+            let _ = sender.send(compiled);
+        });
+        let compiled = receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("compiling a query is bounded work");
+        compiled.expect("an empty-matching regex is a valid one");
+    }
+
+    fn tool_with_args(session: &str, id: &str, offset: u64, args: Value) -> crate::Span {
+        span(
+            "",
+            session,
+            id,
+            offset,
+            "ok",
+            json!({"gen_ai.operation.name": "execute_tool", "gen_ai.tool.name": "Probe",
+                   "gen_ai.tool.call.arguments": args}),
+        )
+    }
+
+    /// A run whose one match needs a combination the environment cap
+    /// drops: the first step offers 512 × 512 pairs, the second only the
+    /// last pair.
+    const PAIRS: &str = "tool[args.a=@a, args.b=@b] -> tool[args.a=@a, args.b=@b]";
+
+    fn pairs_store(label: &str) -> TempStore {
+        let fixture = TempStore::open(label, crate::Config::default());
+        let a: Vec<String> = (0..512).map(|i| format!("a{i}")).collect();
+        let b: Vec<String> = (0..512).map(|i| format!("b{i}")).collect();
+        fixture
+            .store()
+            .ingest_batch(vec![
+                tool_with_args("pairs", "p0", 0, json!({"a": a, "b": b})),
+                tool_with_args("pairs", "p1", 1, json!({"a": "a511", "b": "b511"})),
+            ])
+            .expect("ingests");
+        fixture
+    }
+
+    #[test]
+    fn a_match_the_caps_may_have_dropped_is_not_an_exact_no() {
+        let fixture = pairs_store("inexact-negative");
+        let store = fixture.store();
+        let query = Query::compile(PAIRS).expect("compiles");
+        let result = store
+            .trajectory_search(Some(""), &query, &SearchOptions::default(), NOW)
+            .expect("searches");
+        assert!(result.matches.is_empty(), "the pair was dropped");
+        assert!(
+            result.truncated,
+            "an empty answer from a run the caps cut is not proof: {result:?}"
+        );
+        let one = store
+            .trajectory_search(
+                Some(""),
+                &query,
+                &SearchOptions {
+                    run: Some("pairs".into()),
+                    ..SearchOptions::default()
+                },
+                NOW,
+            )
+            .expect("searches");
+        assert!(one.matches.is_empty());
+        assert!(one.truncated, "{one:?}");
+    }
+
+    /// One run that edits `src/x.py` five times in a row — `edit_thrash` by
+    /// definition — after four edits naming 512 files each, whose waiting
+    /// paths fill the matcher before the thrash starts.
+    fn crowded_thrash_store(label: &str) -> TempStore {
+        let fixture = TempStore::open(label, crate::Config::default());
+        let mut spans = Vec::new();
+        for step in 0..4_u64 {
+            let edits: Vec<Value> = (0..512)
+                .map(|file| json!({"file_path": format!("s{step}/f{file}.py")}))
+                .collect();
+            spans.push(span(
+                "",
+                "crowded",
+                &format!("wide{step}"),
+                step,
+                "ok",
+                json!({"gen_ai.operation.name": "execute_tool", "gen_ai.tool.name": "Edit",
+                       "gen_ai.tool.call.arguments": {"edits": edits}}),
+            ));
+        }
+        for step in 4..9_u64 {
+            spans.push(edit("", "crowded", &format!("x{step}"), step, "src/x.py"));
+        }
+        fixture.store().ingest_batch(spans).expect("ingests");
+        fixture
+    }
+
+    #[test]
+    fn findings_say_when_a_detector_may_have_missed_a_run() {
+        let fixture = crowded_thrash_store("inexact-findings");
+        let findings = fixture
+            .store()
+            .detector_findings(
+                Some(""),
+                &FindingsOptions {
+                    detectors: vec!["edit_thrash".into()],
+                    ..FindingsOptions::default()
+                },
+                NOW,
+            )
+            .expect("finds");
+        assert_eq!(findings.runs_checked, 1);
+        assert_eq!(findings.detectors[0].runs_matched, 0, "the caps cut it");
+        assert!(
+            findings.truncated,
+            "a detector that may have missed the run says so: {findings:?}"
+        );
+    }
+
+    /// `count` single-span runs that all start at the same instant.
+    fn tied_store(label: &str, count: usize) -> TempStore {
+        let fixture = TempStore::open(label, crate::Config::default());
+        let spans = (0..count)
+            .map(|run| bash("", &format!("tie{run:03}"), "a", 5, "pytest", "ok"))
+            .collect();
+        fixture.store().ingest_batch(spans).expect("ingests");
+        fixture
+    }
+
+    /// Follows a search's continuation until it has none, at most `pages`
+    /// times, returning every run listed, in order.
+    fn follow(
+        store: &Store,
+        query: &Query,
+        limit: usize,
+        window_cap: usize,
+        pages: usize,
+    ) -> Vec<String> {
+        let mut runs = Vec::new();
+        let mut options = SearchOptions {
+            limit,
+            ..SearchOptions::default()
+        };
+        for _ in 0..pages {
+            let result = store
+                .trajectory_search_under(Some(""), query, &options, NOW, unbounded(window_cap))
+                .expect("searches");
+            runs.extend(result.matches.iter().map(|m| m.run.clone()));
+            match result.next_cursor {
+                Some(cursor) => options.cursor = Some(cursor),
+                None => break,
+            }
+        }
+        runs
+    }
+
+    fn assert_each_once(runs: &[String], count: usize) {
+        let distinct: BTreeSet<&String> = runs.iter().collect();
+        assert_eq!(
+            (runs.len(), distinct.len()),
+            (count, count),
+            "every run exactly once: {runs:?}"
+        );
+    }
+
+    #[test]
+    fn pagination_advances_through_runs_that_tie_on_time() {
+        let fixture = tied_store("tied-limit", 51);
+        let query = Query::compile("test").expect("compiles");
+        let runs = follow(fixture.store(), &query, 50, MAX_SEARCH_RUNS, 5);
+        assert_each_once(&runs, 51);
+    }
+
+    #[test]
+    fn following_cursors_lists_the_window_once_in_scan_order() {
+        // Runs of one to three spans over six instants: ties everywhere,
+        // and runs active on both sides of many page boundaries.
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move |bound: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % bound
+        };
+        let fixture = TempStore::open("cursor-property", crate::Config::default());
+        let mut spans = Vec::new();
+        for run in 0..40 {
+            let session = format!("p{run:02}");
+            for id in 0..=next(3) {
+                spans.push(bash(
+                    "",
+                    &session,
+                    &format!("s{id}"),
+                    next(6),
+                    "pytest",
+                    "ok",
+                ));
+            }
+        }
+        fixture.store().ingest_batch(spans).expect("ingests");
+        let query = Query::compile("test").expect("compiles");
+        let whole = fixture
+            .store()
+            .trajectory_search_under(
+                Some(""),
+                &query,
+                &SearchOptions {
+                    limit: MAX_SEARCH_LIMIT,
+                    ..SearchOptions::default()
+                },
+                NOW,
+                unbounded(MAX_SEARCH_RUNS),
+            )
+            .expect("searches");
+        let order: Vec<String> = whole.matches.iter().map(|m| m.run.clone()).collect();
+        assert_eq!(order.len(), 40);
+        for limit in [1, 2, 3, 7, 50] {
+            for cap in [1, 2, 5, 13, MAX_SEARCH_RUNS] {
+                let paged = follow(fixture.store(), &query, limit, cap, 200);
+                assert_eq!(paged, order, "limit {limit}, window cap {cap}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_capped_window_continues_through_runs_that_tie_on_time() {
+        let fixture = tied_store("tied-window", 3);
+        let query = Query::compile("test").expect("compiles");
+        let runs = follow(fixture.store(), &query, 50, 2, 5);
+        assert_each_once(&runs, 3);
     }
 
     #[test]

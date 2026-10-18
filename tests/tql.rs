@@ -500,6 +500,105 @@ fn hostile_queries_and_data_stay_bounded() {
 }
 
 #[test]
+fn continuing_a_search_lists_every_run_once_even_when_runs_tie_on_time() {
+    let server = Server::spawn(&[]);
+    // 51 one-step runs that all start at the same instant.
+    let mut spans = Vec::new();
+    for index in 0..51 {
+        let session: &'static str = Box::leak(format!("tie{index:02}").into_boxed_str());
+        spans.push(run("", session, 7).bash("pytest -q", "ok"));
+    }
+    let (status, body) = server.json("POST", "/v1/spans", Some(&json!(spans)), &[]);
+    assert_eq!(status, 200, "{body}");
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut extra = "&limit=50".to_owned();
+    let mut pages = 0;
+    for _ in 0..5 {
+        let (status, body) = search(&server, "test", &extra, &[]);
+        assert_eq!(status, 200, "{body}");
+        pages += 1;
+        seen.extend(runs(&body));
+        match body["next_cursor"].as_str() {
+            Some(cursor) => extra = format!("&limit=50&cursor={}", encode(cursor)),
+            None => break,
+        }
+    }
+    let distinct: std::collections::BTreeSet<&String> = seen.iter().collect();
+    assert_eq!((seen.len(), distinct.len()), (51, 51), "{seen:?}");
+    assert_eq!(pages, 2);
+
+    // The findings continue the same way.
+    let findings = |extra: &str| {
+        let (status, body) = server.json(
+            "GET",
+            &format!("/v1/detectors/findings?since={}{extra}", T0 - 1),
+            None,
+            &[],
+        );
+        assert_eq!(status, 200, "{body}");
+        body
+    };
+    let first = findings("");
+    assert_eq!(first["runs_checked"], json!(51));
+    assert_eq!(first["next_cursor"], Value::Null);
+
+    // A cursor is checked: a forged one, or one with a different window, is
+    // refused.
+    let (status, body) = search(&server, "test", "&cursor=c1.1.2.3.zz", &[]);
+    assert_eq!(status, 400, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("cursor"), "{body}");
+    let (_, body) = search(&server, "test", "&limit=1", &[]);
+    let cursor = body["next_cursor"].as_str().expect("a cursor").to_owned();
+    let path = format!(
+        "/v1/trajectories/search?q=test&since=1&cursor={}",
+        encode(&cursor)
+    );
+    let (status, body) = server.json("GET", &path, None, &[]);
+    assert_eq!(status, 400, "{body}");
+    let (status, body) = server.json(
+        "GET",
+        &format!("/v1/detectors/findings?cursor={}", encode(&cursor)),
+        None,
+        &[],
+    );
+    assert_eq!(status, 200, "the findings take the search's cursor: {body}");
+    assert_eq!(body["runs_checked"], json!(50));
+}
+
+#[test]
+fn a_run_the_matcher_caps_cut_leaves_the_answer_marked_incomplete() {
+    let server = Server::spawn(&[]);
+    let mut pairs = run("", "pairs", 0);
+    let a: Vec<String> = (0..512).map(|i| format!("a{i}")).collect();
+    let b: Vec<String> = (0..512).map(|i| format!("b{i}")).collect();
+    let spans = vec![
+        pairs.span(
+            "ok",
+            json!({"gen_ai.operation.name": "execute_tool", "gen_ai.tool.name": "Probe",
+                   "gen_ai.tool.call.arguments": {"a": a, "b": b}}),
+        ),
+        pairs.span(
+            "ok",
+            json!({"gen_ai.operation.name": "execute_tool", "gen_ai.tool.name": "Probe",
+                   "gen_ai.tool.call.arguments": {"a": "a511", "b": "b511"}}),
+        ),
+    ];
+    let (status, body) = server.json("POST", "/v1/spans", Some(&json!(spans)), &[]);
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = search(
+        &server,
+        "tool[args.a=@a, args.b=@b] -> tool[args.a=@a, args.b=@b]",
+        "",
+        &[],
+    );
+    assert_eq!(status, 200, "{body}");
+    assert!(runs(&body).is_empty(), "{body}");
+    assert_eq!(body["truncated"], json!(true), "{body}");
+    assert_eq!(body["runs_inexact"], json!(1), "{body}");
+}
+
+#[test]
 fn a_heavy_regex_stops_at_the_query_deadline() {
     let server = Server::spawn(&["--query-deadline-ms", "1000"]);
     let mut heavy = run("", "heavy", 0);
@@ -514,7 +613,9 @@ fn a_heavy_regex_stops_at_the_query_deadline() {
     assert_eq!(body["stopped"], json!("deadline"), "{body}");
     assert_eq!(body["truncated"], json!(true));
     assert_eq!(body["runs_scanned"], json!(0));
-    assert_eq!(body["next_until_ns"], json!(T0));
+    // Where to continue: the same window, its open end fixed at the latest
+    // span it held, and no run passed yet.
+    assert_eq!(body["next_cursor"], json!(format!("c1.{}.{T0}", T0 - 1)));
     // The two regexes alone take several seconds; the request ends within a
     // sliver of its one-second budget.
     assert!(

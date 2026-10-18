@@ -78,6 +78,13 @@ pub(super) fn definitions() -> Vec<Tool> {
                         "Runs to return. Default {DEFAULT_LIMIT}, capped at {MAX_LIMIT}."
                     ),
                 },
+                "cursor": {
+                    "type": "string",
+                    "description": "Continue an earlier call: its next_cursor, as given. It \
+                                    carries that call's window, so leave out since and until \
+                                    (or repeat them unchanged); pass the same query or \
+                                    detector.",
+                },
             },
             "additionalProperties": false,
         }),
@@ -100,7 +107,7 @@ pub(super) fn call(
     known_keys(
         arguments,
         &[
-            "query", "detector", "since", "until", "agent", "outcome", "limit",
+            "query", "detector", "since", "until", "agent", "outcome", "limit", "cursor",
         ],
         "find_behavior",
     )?;
@@ -161,6 +168,7 @@ pub(super) fn call(
             .unwrap_or(DEFAULT_LIMIT)
             .clamp(1, MAX_LIMIT),
         run: None,
+        cursor: optional_string(arguments, "cursor")?,
     };
     let result =
         server
@@ -181,14 +189,20 @@ pub(super) fn call(
             .map_or_else(|| "the start".to_owned(), rfc3339),
     );
     head.push_str(&format!("\nPattern as read: {}", sanitize(&result.query)));
+    // A cursor is digits, lowercase hex and dots — nothing a producer wrote —
+    // so it may stand outside the telemetry block.
     let resume = result
-        .next_until_ns
-        .map(|until| format!(" To continue with the older runs, call again with until={until}."))
+        .next_cursor
+        .as_deref()
+        .map(|cursor| {
+            format!(" To continue with the runs not checked, call again with cursor={cursor}.")
+        })
         .unwrap_or_default();
     match result.stopped {
         Some(Stopped::Deadline) => head.push_str(&format!(
             "\nSTOPPED EARLY: the server's compute budget ran out after {} of {} candidate \
-             runs; older runs were NOT checked, so more may match.{resume}",
+             runs; the rest (older, or as recent) were NOT checked, so more may \
+             match.{resume}",
             result.runs_scanned, result.runs_in_window
         )),
         Some(Stopped::Limit) => head.push_str(&format!(
@@ -206,6 +220,14 @@ pub(super) fn call(
             } else {
                 ""
             }
+        ));
+    }
+    if result.runs_inexact > 0 {
+        head.push_str(&format!(
+            "\nUNCERTAIN: in {} not listed, the pattern had more partial matches than the \
+             matcher tracks, so an occurrence there may have been missed — their absence here \
+             is not proof. Narrow the pattern (fewer captures over long lists) to settle them.",
+            count(result.runs_inexact as u64, "scanned run"),
         ));
     }
     if result.spans_skipped > 0 || result.runs_skipped > 0 {
@@ -228,7 +250,9 @@ pub(super) fn call(
          'n occurrences' counts non-overlapping matches in the run."
             .to_owned(),
     ];
-    if result.matches.is_empty() && result.stopped.is_none() {
+    // Said only when every scanned run was matched exactly: a run the caps
+    // cut may hold the match.
+    if result.matches.is_empty() && result.stopped.is_none() && result.runs_inexact == 0 {
         notes.push(
             "No scanned run matches. Names compare ignoring case; check them with \
              describe_store, or widen 'since'."
@@ -244,7 +268,8 @@ pub(super) fn call(
         &[
             ("query", json!(json_safe(&result.query))),
             ("runs_scanned", json!(result.runs_scanned)),
-            ("next_until_ns", json!(result.next_until_ns)),
+            ("runs_inexact", json!(result.runs_inexact)),
+            ("next_cursor", json!(result.next_cursor)),
             ("truncated", json!(result.truncated)),
             (
                 "stopped",
@@ -391,13 +416,22 @@ fn output_schema() -> Value {
             },
             "query": {"type": "string", "description": "The pattern as read."},
             "runs_scanned": {"type": "integer"},
-            "truncated": {"type": "boolean"},
+            "runs_inexact": {
+                "type": "integer",
+                "description": "Scanned runs not listed where the matcher hit a cap: an \
+                                occurrence there may have been missed.",
+            },
+            "truncated": {
+                "type": "boolean",
+                "description": "Matches may be missing: the scan stopped early, the window \
+                                held more runs than are considered, or runs_inexact > 0.",
+            },
             "stopped": {"type": ["string", "null"]},
-            "next_until_ns": {
-                "type": ["integer", "null"],
+            "next_cursor": {
+                "type": ["string", "null"],
                 "description": "When runs went unchecked (stopped early, or more runs in the \
-                                window than are considered): pass as 'until' to continue with \
-                                older runs.",
+                                window than are considered): pass as 'cursor' to continue \
+                                with exactly those runs.",
             },
             "detectors": {
                 "type": "array",
@@ -549,6 +583,80 @@ mod tests {
             result["structuredContent"]["matches"][0]["run"],
             json!("streak")
         );
+    }
+
+    #[test]
+    fn a_run_the_caps_cut_is_not_reported_as_an_exact_no() {
+        let fixture = TempStore::open("mcp-tql-inexact", crate::Config::default());
+        let probe = |id: &str, offset: u64, args: Value| {
+            let mut span = bash("", "pairs", id, offset, "x", "ok");
+            span.attributes
+                .insert("gen_ai.tool.call.arguments".into(), args);
+            span
+        };
+        let a: Vec<String> = (0..512).map(|i| format!("a{i}")).collect();
+        let b: Vec<String> = (0..512).map(|i| format!("b{i}")).collect();
+        fixture
+            .store()
+            .ingest_batch(vec![
+                probe("p0", 0, json!({"a": a, "b": b})),
+                probe("p1", 1, json!({"a": "a511", "b": "b511"})),
+            ])
+            .expect("ingests");
+        let result = call(
+            fixture.store(),
+            json!({"query": "tool[args.a=@a, args.b=@b] -> tool[args.a=@a, args.b=@b]"}),
+            Some(""),
+        );
+        assert_eq!(result["isError"], json!(false), "{result}");
+        let body = text(&result);
+        assert!(!body.contains("No scanned run matches"), "{body}");
+        assert!(
+            body.contains("UNCERTAIN: in 1 scanned run not listed"),
+            "{body}"
+        );
+        assert_eq!(result["structuredContent"]["truncated"], json!(true));
+        assert_eq!(result["structuredContent"]["runs_inexact"], json!(1));
+    }
+
+    #[test]
+    fn a_cursor_continues_with_exactly_the_runs_not_checked() {
+        let fixture = TempStore::open("mcp-tql-cursor", crate::Config::default());
+        // Three one-step runs at the same instant.
+        let spans = ["r1", "r2", "r3"]
+            .iter()
+            .map(|session| bash("", session, "a", 0, "x", "error"))
+            .collect();
+        fixture.store().ingest_batch(spans).expect("ingests");
+        let mut seen = Vec::new();
+        let mut arguments = json!({"query": "tool[error]", "limit": 2});
+        for _ in 0..3 {
+            let result = call(fixture.store(), arguments.clone(), Some(""));
+            assert_eq!(result["isError"], json!(false), "{result}");
+            for found in result["structuredContent"]["matches"]
+                .as_array()
+                .expect("matches")
+            {
+                seen.push(found["run"].as_str().expect("run").to_owned());
+            }
+            let Some(cursor) = result["structuredContent"]["next_cursor"].as_str() else {
+                break;
+            };
+            // The text names it outside the telemetry block: it carries no
+            // producer text.
+            let body = text(&result);
+            let head = &body[..body.find(TELEMETRY_OPEN).expect("framed")];
+            assert!(head.contains(&format!("cursor={cursor}")), "{body}");
+            arguments["cursor"] = json!(cursor);
+        }
+        seen.sort();
+        assert_eq!(seen, ["r1", "r2", "r3"]);
+        let forged = call(
+            fixture.store(),
+            json!({"query": "tool", "cursor": "c1.x"}),
+            Some(""),
+        );
+        assert_eq!(forged["isError"], json!(true), "{forged}");
     }
 
     #[test]
