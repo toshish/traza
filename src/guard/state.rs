@@ -2528,7 +2528,8 @@ mod tests {
                         } else {
                             id
                         };
-                        let mut step = named(&id, *rng.pick(&agents), start, revision);
+                        let agent = *rng.pick(&agents);
+                        let mut step = named(&id, agent, start, revision);
                         // A re-sent version may stop naming its agent.
                         if rng.chance(20) {
                             step.agent = None;
