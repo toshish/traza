@@ -542,14 +542,22 @@ fn the_node_bound_keeps_the_shallowest_busiest_branches_and_says_so() {
         .fate_map("", &MapRequest::new("support-agent"), now)
         .expect("builds")
         .expect("exists");
-    assert!(map.truncated && map.bounds.node_cap);
-    // Four nodes beyond the root: the shared first step, then its three
-    // children by visits — nothing deeper.
-    assert_eq!(map.nodes_total, 5);
+    assert!(map.truncated && map.bounds.node_cap && map.nodes_capped);
+    // Four nodes across the build, level by level: both agents' first
+    // steps, then the two busiest second steps (support-agent's 90 and 50;
+    // its 40 escalations and the researcher's 40 are cut) — nothing deeper.
+    assert_eq!(map.nodes_total, 4);
     let llm = child(&map.root, "llm:gpt-4o");
-    assert_eq!(llm.children.len(), 3);
+    assert_eq!(llm.children.len(), 2);
+    assert_eq!(llm.cut, 40);
     assert!(llm.children.iter().all(|child| child.children.is_empty()));
     assert_eq!(child(llm, "tool:search_orders").cut, 90);
+    let research = store
+        .fate_map("", &MapRequest::new("researcher"), now)
+        .expect("builds")
+        .expect("exists");
+    assert_eq!(research.nodes_total, 2);
+    assert!(research.nodes_capped);
     // A path into the cut is not called novel: the map cannot say.
     let healthy = store
         .foresee("", "live-healthy-0", 30, now)
@@ -567,6 +575,63 @@ fn the_node_bound_keeps_the_shallowest_busiest_branches_and_says_so() {
         .expect("reads")
         .expect("exists");
     assert_eq!(doomed.verdict, ForesightVerdict::LikelyFailure);
+}
+
+#[test]
+fn the_node_bound_is_shared_shallowest_first_so_no_cohort_is_starved() {
+    // support-agent's whole tree is 13 nodes and the researcher's 10. With
+    // a budget of 13, spent cohort by cohort the larger would take it all
+    // and leave the researcher a bare root; spent level by level across
+    // cohorts, each keeps its first levels.
+    let config = crate::Config {
+        fate: FateConfig {
+            max_nodes: 13,
+            ..FateConfig::default()
+        },
+        ..crate::Config::default()
+    };
+    let (fixture, now) = seeded("node-share", config, false);
+    let store = fixture.store();
+    let research = store
+        .fate_map("", &MapRequest::new("researcher"), now)
+        .expect("builds")
+        .expect("exists");
+    assert!(research.nodes_total > 1, "{:?}", research.bounds);
+    let sonnet = child(
+        child(&research.root, "agent:researcher"),
+        "llm:claude-sonnet-4-5",
+    );
+    for tool in [
+        "tool:web_search",
+        "tool:read_url",
+        "tool:query_db",
+        "tool:ask_human",
+    ] {
+        assert_eq!(child(sonnet, tool).visits, 10);
+    }
+    let support = store
+        .fate_map("", &MapRequest::new("support-agent"), now)
+        .expect("builds")
+        .expect("exists");
+    // Three levels each: 1 + 3 + 3 for support-agent, 1 + 1 + 4 for the
+    // researcher — thirteen.
+    assert_eq!(support.nodes_total + research.nodes_total, 13 + 2);
+    assert!(support.bounds.node_cap);
+    // Each says the bound cut its own tree, and the researcher's still
+    // reads its runs: web_search's path is matched for three tokens and
+    // only the fourth is hidden by the bound, never called new.
+    assert!(support.nodes_capped && research.nodes_capped);
+    let web = store
+        .foresee("", "web_search-0", 3, now)
+        .expect("reads")
+        .expect("exists");
+    assert_eq!(web.matched_depth, 3);
+    assert_eq!(web.verdict, ForesightVerdict::InsufficientHistory);
+    assert!(
+        web.explanation.contains("--fate-max-nodes"),
+        "{}",
+        web.explanation
+    );
 }
 
 #[test]

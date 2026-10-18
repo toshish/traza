@@ -218,8 +218,10 @@ pub struct FateConfig {
     /// many runs across a build's cohorts.
     pub max_runs: usize,
     /// Tree nodes one build holds across its cohorts (`--fate-max-nodes`).
-    /// Nodes are created shallowest first and most-visited first, so the
-    /// bound cuts the long tail of deep, rare paths.
+    /// Nodes are created level by level across every cohort — each depth,
+    /// most visited first, before the next depth of any cohort — so the
+    /// bound cuts the long tail of deep, rare paths and no agent's busy
+    /// tree can leave another agent of the tenant with a bare root.
     pub max_nodes: usize,
     /// How long a build is served before it is rebuilt
     /// (`--fate-cache-seconds`). Zero disables the cache — and with it the
@@ -522,6 +524,11 @@ pub struct FateMap {
     pub min_support: u64,
     /// Nodes in the cohort's tree.
     pub nodes_total: u64,
+    /// Whether `--fate-max-nodes` kept some branch of THIS cohort's tree
+    /// from being built (`bounds.node_cap` says whether it did anywhere in
+    /// the build). Nodes are created level by level across every cohort of
+    /// the build, so a cohort loses its deepest, rarest branches first.
+    pub nodes_capped: bool,
     /// Nodes rendered under `root`.
     pub nodes_shown: u64,
     /// The strongest fatal forks within `depth`, most significant first.
@@ -1451,6 +1458,9 @@ struct Cohort {
     unknown: u64,
     tasks: Vec<CohortSummary>,
     nodes: Vec<Node>,
+    /// Whether the node bound kept some branch of this cohort's tree from
+    /// being built.
+    nodes_capped: bool,
     run_ids: Vec<Arc<str>>,
     members: HashMap<Arc<str>, Member>,
     calibration: Calibration,
@@ -1485,67 +1495,108 @@ impl Cohort {
     }
 }
 
-/// Grows a cohort's tree from `runs` (newest first) level by level, the
-/// most-visited children of each level first, while `budget` lasts.
-fn grow(runs: &[RunFinal], budget: &mut usize, bounds: &mut Bounds) -> (Vec<Node>, Vec<u32>) {
-    let mut nodes = vec![Node::new(NONE, NONE, 0)];
-    let mut at: Vec<u32> = vec![0; runs.len()];
-    let mut deepest: Vec<u32> = vec![0; runs.len()];
-    for (index, run) in runs.iter().enumerate() {
-        nodes[0].add(index as u32, run);
-        if run.path.is_empty() {
-            nodes[0].ended += 1;
-            at[index] = NONE;
+/// One cohort's tree as [`grow_all`] grows it.
+struct Grown {
+    nodes: Vec<Node>,
+    /// The deepest node each run reached, by run index.
+    deepest: Vec<u32>,
+    /// Whether the node bound kept some branch of this cohort from being
+    /// built.
+    capped: bool,
+}
+
+/// Grows every cohort's tree from its runs (each newest first) at once,
+/// level by level across cohorts: every cohort's depth-`d` children are
+/// created, the most visited first, before any cohort's depth `d + 1`,
+/// while `budget` nodes last. So one busy or varied agent cannot spend the
+/// bound on its deep, rare paths while another agent of the tenant keeps a
+/// bare root.
+fn grow_all(
+    cohorts: &[Vec<RunFinal>],
+    mut budget: usize,
+    bounds: &mut Bounds,
+    deadline: Option<Deadline>,
+) -> Result<Vec<Grown>> {
+    let mut grown: Vec<Grown> = Vec::with_capacity(cohorts.len());
+    // Where each run is: the node it reached, or NONE once it ended.
+    let mut at: Vec<Vec<u32>> = Vec::with_capacity(cohorts.len());
+    for runs in cohorts {
+        let mut root = Node::new(NONE, NONE, 0);
+        let mut positions = vec![0_u32; runs.len()];
+        for (index, run) in runs.iter().enumerate() {
+            root.add(index as u32, run);
+            if run.path.is_empty() {
+                root.ended += 1;
+                positions[index] = NONE;
+            }
         }
+        grown.push(Grown {
+            nodes: vec![root],
+            deepest: vec![0; runs.len()],
+            capped: false,
+        });
+        at.push(positions);
     }
     for depth in 0..=MAX_DEPTH {
-        let mut wanted: HashMap<(u32, u32), u32> = HashMap::new();
-        for (index, run) in runs.iter().enumerate() {
-            if at[index] != NONE {
-                *wanted.entry((at[index], run.path[depth])).or_default() += 1;
+        Deadline::check(deadline, 0)?;
+        let mut wanted: HashMap<(u32, u32, u32), u32> = HashMap::new();
+        for (cohort, runs) in cohorts.iter().enumerate() {
+            for (index, run) in runs.iter().enumerate() {
+                let parent = at[cohort][index];
+                if parent != NONE {
+                    *wanted
+                        .entry((cohort as u32, parent, run.path[depth]))
+                        .or_default() += 1;
+                }
             }
         }
         if wanted.is_empty() {
             break;
         }
-        let mut order: Vec<((u32, u32), u32)> = wanted.into_iter().collect();
+        let mut order: Vec<((u32, u32, u32), u32)> = wanted.into_iter().collect();
         order.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
-        let mut created: HashMap<(u32, u32), u32> = HashMap::with_capacity(order.len());
-        for ((parent, token), _) in order {
-            if *budget == 0 {
+        let mut created: HashMap<(u32, u32, u32), u32> = HashMap::with_capacity(order.len());
+        for ((cohort, parent, token), _) in order {
+            let tree = &mut grown[cohort as usize];
+            if budget == 0 {
                 bounds.node_cap = true;
-                break;
-            }
-            *budget -= 1;
-            let id = nodes.len() as u32;
-            nodes.push(Node::new(token, parent, (depth + 1) as u16));
-            nodes[parent as usize].children.push(id);
-            created.insert((parent, token), id);
-        }
-        for (index, run) in runs.iter().enumerate() {
-            let parent = at[index];
-            if parent == NONE {
+                tree.capped = true;
                 continue;
             }
-            match created.get(&(parent, run.path[depth])) {
-                Some(&child) => {
-                    nodes[child as usize].add(index as u32, run);
-                    deepest[index] = child;
-                    if run.path.len() == depth + 1 {
-                        nodes[child as usize].ended += 1;
-                        at[index] = NONE;
-                    } else {
-                        at[index] = child;
-                    }
+            budget -= 1;
+            let id = tree.nodes.len() as u32;
+            tree.nodes
+                .push(Node::new(token, parent, (depth + 1) as u16));
+            tree.nodes[parent as usize].children.push(id);
+            created.insert((cohort, parent, token), id);
+        }
+        for (cohort, runs) in cohorts.iter().enumerate() {
+            let tree = &mut grown[cohort];
+            for (index, run) in runs.iter().enumerate() {
+                let parent = at[cohort][index];
+                if parent == NONE {
+                    continue;
                 }
-                None => {
-                    nodes[parent as usize].cut += 1;
-                    at[index] = NONE;
+                match created.get(&(cohort as u32, parent, run.path[depth])) {
+                    Some(&child) => {
+                        tree.nodes[child as usize].add(index as u32, run);
+                        tree.deepest[index] = child;
+                        if run.path.len() == depth + 1 {
+                            tree.nodes[child as usize].ended += 1;
+                            at[cohort][index] = NONE;
+                        } else {
+                            at[cohort][index] = child;
+                        }
+                    }
+                    None => {
+                        tree.nodes[parent as usize].cut += 1;
+                        at[cohort][index] = NONE;
+                    }
                 }
             }
         }
     }
-    (nodes, deepest)
+    Ok(grown)
 }
 
 /// Scores cross-validated predictions against outcomes; see
@@ -1904,10 +1955,11 @@ fn build(
         bounds.cohorts_dropped = (cohorts_in.len() - MAX_COHORTS) as u64;
         cohorts_in.truncate(MAX_COHORTS);
     }
-    let mut budget = config.max_nodes.max(1);
-    let mut cohorts = Vec::with_capacity(cohorts_in.len());
-    let mut index = HashMap::new();
-    let mut by_key = HashMap::new();
+    // Each cohort's completed runs, newest first and capped, with what was
+    // excluded and its task sub-cohorts.
+    let mut pending: Vec<(CohortKey, u64, Vec<CohortSummary>)> =
+        Vec::with_capacity(cohorts_in.len());
+    let mut knowns: Vec<Vec<RunFinal>> = Vec::with_capacity(cohorts_in.len());
     for ((tenant, agent), runs) in cohorts_in {
         Deadline::check(deadline, 0)?;
         let mut unknown = 0_u64;
@@ -1949,8 +2001,6 @@ fn build(
             bounds.runs_dropped += (known.len() - max_runs) as u64;
             known.truncate(max_runs);
         }
-        let (nodes, deepest) = grow(&known, &mut budget, &mut bounds);
-        let calibration = calibrate(&nodes, &known, &deepest, &tokens);
         let mut tasks: Vec<CohortSummary> = task_counts
             .into_iter()
             .filter(|(_, counts)| counts[0] + counts[1] + counts[2] >= MIN_TASK_RUNS)
@@ -1971,6 +2021,24 @@ fn build(
             .collect();
         tasks.sort_by(|left, right| right.runs.cmp(&left.runs).then(left.task.cmp(&right.task)));
         tasks.truncate(LISTED_TASKS);
+        pending.push(((tenant, agent), unknown, tasks));
+        knowns.push(known);
+    }
+    // The trees, grown together under the one node bound.
+    let grown = grow_all(&knowns, config.max_nodes.max(1), &mut bounds, deadline)?;
+    let mut cohorts = Vec::with_capacity(pending.len());
+    let mut index = HashMap::new();
+    let mut by_key = HashMap::new();
+    for ((((tenant, agent), unknown, tasks), known), grown) in
+        pending.into_iter().zip(knowns).zip(grown)
+    {
+        Deadline::check(deadline, 0)?;
+        let Grown {
+            nodes,
+            deepest,
+            capped,
+        } = grown;
+        let calibration = calibrate(&nodes, &known, &deepest, &tokens);
         let root = nodes[0].counts();
         let members = known
             .iter()
@@ -1995,6 +2063,7 @@ fn build(
             unknown,
             tasks,
             nodes,
+            nodes_capped: capped,
             run_ids,
             members,
             calibration,
@@ -2488,6 +2557,7 @@ fn render_map(build: &Build, cohort: &Cohort, request: &MapRequest) -> FateMap {
         depth: request.depth,
         min_support: request.min_support,
         nodes_total: cohort.nodes.len() as u64,
+        nodes_capped: cohort.nodes_capped,
         nodes_shown: shown.len() as u64,
         fatal_forks: forks,
         hotspots,
