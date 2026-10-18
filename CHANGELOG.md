@@ -5,6 +5,434 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.28.0] - 2026-10-18
+
+The foresight release. 0.27.0 let the recording act on one run at a time;
+this release reads every run together. Traza now **learns from every run an
+agent made which paths end well, and sees failure coming**: the **Fate Map**
+counts each path an agent's completed runs took and how often it ended in
+success, with an interval and the number of runs behind it, and **foresight**
+walks a live run's path down that map, so a run that has started down a path
+that has mostly failed is called `likely_failure` before it has failed. A
+**predictive fuse** can stop it there, at the pre-call check, before the next
+step is paid for. Around that: **steering** (the runs live now, a person's
+nudge or veto delivered at the agent's next check, how a run's agents handed
+work around), **zero-setup recorders** for Claude Code and Codex with **Agent
+Blame** for the lines their edits introduced, a **context X-Ray** of what a model saw at
+one step and a **Cache Autopsy** of why its prompt cache broke, a **change
+radar** for what changed in an agent and whether it hurt, **TQL**, a
+regular-expression language over a run's steps with nine built-in detectors,
+and **fork and rewind** for any recorded run, with tape tests on top. Six new
+dashboard screens and three new demos (twelve in all) show it. Traza still
+never calls or embeds a model: every verdict here is counting and textbook
+statistics over stored spans, and every answer says how much history it
+stands on. There is no storage-format change. The Claude Code hook moved, the
+run guard's memory budget now also holds behaviour paths, OTLP ingest keeps
+five resource attributes it used to drop, and a rollback to 0.27.0 after
+using a new fuse limit needs a step first: read **Changed** and **Upgrade**
+before deploying over an existing setup.
+
+### Added
+
+- **Foresight: the Fate Map and predictive fuses.**
+  [docs/guide/foresight.md](docs/guide/foresight.md).
+  - A run's steps become **behaviour tokens** `kind:name` (the step
+    signature without its input hash), consecutive repeats folded into one
+    token by bucket (`x`, `x×2`, `x×3-5`, `x×6+`) so a loop is one shape. A
+    path holds at most 64 tokens. Runs are compared only with runs of the
+    same agent in the same tenant; `traza.task` (else `session.goal`) splits
+    an agent into task cohorts.
+  - `GET /v1/fate/cohorts` lists agents and tasks with outcome counts and
+    base rate. `GET /v1/fate/map?agent=` is the tree: every node with its
+    visits, outcomes, success rate and 95% **Wilson** interval, lift against
+    the base rate, entropy of what runs did next, summed cost and duration,
+    and the newest run of each outcome ready for `/v1/diff`. **Fatal forks**
+    are children at least 25 points below their siblings' pooled rate, both
+    sides with at least `min_support` runs, at Fisher exact p < 0.05;
+    **hotspots** are nodes with at least one bit of entropy. Pruning is
+    always reported. Every map scores itself: each completed run predicted at
+    several depths from the half of the cohort it is not in (two-fold
+    cross-validation), with Brier skill against the base rate and a
+    reliability table, in `calibration`.
+  - `GET /v1/fate/runs/{run}` is **foresight for one run**: its path walked
+    down its agent's map over the last 30 days, a verdict (`on_track`,
+    `at_risk`, `likely_failure`, `novel`, `insufficient_history`), the
+    sentence behind it, what earlier runs did next with their rates, and the
+    best of them as `recommended_next`. A live run's last step is still
+    open, so it is pooled with every run that repeated that step at least as
+    often; a completed run is left out of the statistics it is judged by.
+  - **Predictive fuses**: a fuse policy may set `min_success_odds`, with
+    `foresight_min_support` (default 30) and `foresight_after_steps`
+    (default 3). When the **upper** bound of the run's interval is below the
+    odds, the policy's action applies, with the reason
+    `foresight: runs that took this path succeeded 5 of 50 times (≤21.4%)`.
+    A check that names its next tool is judged with that step appended. It
+    is evaluated on the pre-call check and verdict queries only — never on
+    ingest, and not in the `GET /v1/fuses/runs` listing — reads only a
+    cached map and never builds one there, and is not latched: a prediction
+    made again at every question, lifted by a reset with a grant of lower
+    odds. `traza-server` builds requested maps on a background thread, two
+    at a time, each under `--fate-build-seconds` (default 120), halving a
+    window that runs out of time and saying so. New flags `--fate-max-runs`,
+    `--fate-max-nodes`, `--fate-cache-seconds`, `--fate-tenant-maps` and
+    `--fate-build-seconds`; metrics `traza_fate_builds_total` and
+    `traza_fate_cached_builds`. Any erasure drops every cached map.
+  - MCP tool `foresee_run`, and `seed --behaviours`, a corpus whose ground
+    truth is known exactly.
+  - What it cannot do: a fatal fork is correlation, not cause; paths ignore
+    inputs; undeclared outcomes are inferred from the last span; the fork
+    tests are not corrected for how many nodes were tested; maps are per
+    process. See [limitations](docs/guide/foresight.md#limitations).
+
+- **Steer: live runs, nudges and run topology.**
+  [docs/guide/steer.md](docs/guide/steer.md).
+  - `GET /v1/runs/live` lists the runs with activity in the last
+    `--live-window-seconds` (default 900) — current step, steps, tokens,
+    cost, errors, the guard's verdict, pending nudges and the run's
+    foresight — from the run guard's memory and the cached Fate Map.
+    `GET /v1/runs/live/stream` is the same view as server-sent events: a
+    snapshot, then a row each time a run changes (coalesced to one batch per
+    250 ms), a heartbeat after 15 quiet seconds, at most 64 streams per
+    server and 8 per scope.
+  - **Nudges**: `POST /v1/runs/{run}/nudges` (`rw`) queues `advice` (words
+    for the agent) or `block` (a veto of its next step) for the run's next
+    pre-call check, which delivers it **at most once** in a new `nudges`
+    field. A `block` answers `stop` for that check and every check of the
+    run in the two seconds after, without tripping the fuse. A check naming
+    no `next` step, the verdict route and the MCP tools never consume
+    nudges. Nudges are durable in `steer.jsonl`, 1 to 4,096 bytes, expire
+    after `ttl_seconds` (default an hour, at most seven days), 32 pending per
+    run, bounded per tenant and in all, and erased with their run's session,
+    trace or tenant. `GET /v1/runs/{run}/nudges` lists them with their
+    status. There is deliberately no MCP tool to read or queue one.
+  - `GET /v1/runs/{run}/topology`: a run's agents, the delegations between
+    them, the handoff sequence and its **cycles** — control returning to an
+    agent straight from the agent it handed off to. A new fuse limit,
+    `max_handoff_cycles` (global: `--fuse-max-handoff-cycles`), stops agents
+    bouncing a task between them, counted exactly as the topology counts it,
+    since the last reset.
+  - MCP tools `list_live_runs` and `run_topology`.
+  - **The Claude Code hook pack**, [`examples/claude-code/`](examples/claude-code/README.md):
+    one standard-library script and an installer that merges it into
+    `.claude/settings.json`. `PreToolUse` asks the pre-call check, denies on
+    a stop or a `block` nudge, and relays `advice` as `additionalContext`
+    without ever answering `allow`, so the user's own permission prompt is
+    untouched; `SessionStart` adds a summary of earlier runs from
+    `/v1/recall` inside the untrusted-telemetry block; an optional
+    `PostToolUse` recorder. It fails open unless `TRAZA_FAIL_CLOSED=1`. The
+    hook contract was checked against Claude Code 2.1.263's reference.
+  - What it cannot do: a lost check answer loses its nudge; an agent that
+    never checks never hears one; a veto covers two seconds, not a turn; a
+    nudge's author is a credential, not a person; the live view is per
+    process. See [limitations](docs/guide/steer.md#limitations).
+
+- **Recorders for Claude Code and Codex, and Agent Blame.**
+  [docs/guide/recorders.md](docs/guide/recorders.md).
+  - `traza-server import claude-code` and `traza-server import codex` turn
+    the transcripts those tools already write (`~/.claude/projects`,
+    `~/.codex/sessions`, including Codex's `.jsonl.zst`) into runs: every
+    session a run, every model response an llm step with its usage, every
+    tool call a tool step, every sub-agent an agent span. No SDK, exporter
+    or proxy. Ids derive from the transcript's own identity, so importing
+    twice leaves one copy. Unknown records are counted and skipped, never
+    fatal. Over `--url` (with `--tenant`, checked against `/v1/whoami`
+    before anything is read) or straight into a `--data-dir`; `--since`,
+    `--project-filter`, `--dry-run`, `--json`.
+  - `--watch` follows live sessions within about a second, resuming from a
+    per-destination state file (`~/.traza/import-state.json`) so a restart
+    sends nothing twice, and outlives an unreachable server.
+  - Compressed rollouts are read by Traza's own Zstandard decoder (RFC
+    8878, no new dependency), checksum verified, capped at 2 GiB.
+  - **Agent Blame**: `GET /v1/blame?path=&line=`, `traza-server blame
+    FILE:LINE` and the MCP tool `blame_line` name the earliest tool step
+    whose edit introduced a line — its run, the prompt that started the
+    turn, the model, the step on the tape — read from `Edit`, `MultiEdit`,
+    `Write`, `NotebookEdit`, Anthropic's text-editor tool and Codex patches,
+    whitespace-normalised. The CLI scopes itself to the repository and its
+    worktrees (`--anywhere` lifts that). Measured on one developer's real
+    history: 0.33 s to answer that no agent wrote a line, and a median of
+    0.44 s for a line it found, over 77,002 spans; 3.2 s and 2.9 s over
+    970,972 spans with a Codex history added.
+  - What it cannot do: the formats are undocumented and change with their
+    tools; a transcript records no system prompt or tool definitions; blame
+    cannot see lines a shell command wrote. See
+    [limits](docs/guide/recorders.md#limits-honestly).
+
+- **Context X-Ray and Cache Autopsy.**
+  [docs/guide/xray.md](docs/guide/xray.md).
+  - `GET /v1/xray/{trace_id}/{span_id}`: one model call's context window as
+    chunks (system, user, assistant, tool call, tool result, tool
+    definition) with estimated tokens, each traced to the step that
+    introduced it; stale tool results (unreferenced for
+    `--xray-stale-steps`, default 20 — a heuristic); duplicates; and what
+    the conversation's previous call had that this one lost
+    (`dropped_since_previous`, instructions first) — the compaction-loss
+    detector.
+  - `GET /v1/cache/{run}`: every model call against its predecessor in the
+    same conversation, with a cause (`stable`, `volatile_content`,
+    `reordered`, `ttl_expired`, `new_context`, `unknown`), the first chunk
+    that changed and the bytes that changed in it — usually one volatile
+    token, a timestamp or an id — the tokens the cache could have served and
+    did not, priced, and culprits with advice from a lookup table.
+    Disagreements with the provider's own cache counters are listed.
+  - Conversations recorded as deltas (`gen_ai.conversation.id` and
+    `traza.input.delta`, which the recorders set) are rebuilt call by call,
+    so an imported session's X-Ray shows the whole conversation.
+  - MCP tool `xray_step`.
+  - What it cannot do: per-chunk tokens are estimates; the provider's cache
+    rules (minimum length, breakpoints, TTL refresh) are not modelled; byte
+    exactness is the instrumentation's. See
+    [limits](docs/guide/xray.md#limits-stated-plainly).
+
+- **Cache rates in the pricing file.** A derived cost knew nothing about
+  cached-prompt discounts. A model's entry may now name
+  `cache_read_per_mtok` and `cache_write_per_mtok`, and every derived cost
+  then counts cache reads and writes at their own rates under the
+  provider's convention — on top of the prompt for Anthropic, Bedrock and
+  Claude on Vertex, carved out of it for OpenAI, Azure OpenAI and Gemini on
+  Vertex — instead of understating a cache-heavy Anthropic call and
+  overstating a cache-heavy OpenAI one. Without the keys nothing changes.
+  See [model pricing](docs/configuration.md#model-pricing).
+
+- **Change radar: what changed?** [docs/guide/radar.md](docs/guide/radar.md).
+  `GET /v1/changes?agent=` (and the MCP tool `what_changed`) returns a
+  ranked timeline of change points in an agent's system prompt, tool
+  catalog, requested and returned model, sampling parameters, service and
+  SDK versions, and in its behaviour with no configuration change (a shift
+  in its top-level paths, chosen on half the runs and tested on the other
+  half). A value is a change point when it takes over and runs it played no
+  part in proposing confirm it. Each change carries error rate, success
+  rate, cost, steps, duration and tool mix on both sides, with
+  two-proportion z-tests and Welch t-tests under Holm's correction, and a
+  verdict (`regression`, `improvement`, `neutral`, `insufficient_data` below
+  10 runs a side); regressions come first. `?run=` places one run on the
+  timeline, `?environment=` filters by `deployment.environment`, and
+  `--radar-max-runs` (default 20,000) bounds an analysis. What it cannot do:
+  correlation in time, not cause; it lists co-changes it cannot separate,
+  assumes independent runs, and is noisier below about 200 runs. See
+  [limitations](docs/guide/radar.md#limitations).
+
+- **TQL and the detector library.** [docs/guide/tql.md](docs/guide/tql.md).
+  A pattern language over a run's steps: atoms (`tool(bash)`, `llm(gpt-4o)`,
+  `agent(...)`, `step`, and derived `edit` and `test`), predicates in
+  brackets (`[status=error]`, `[cost>0.5]`, `[args~"pytest"]`,
+  `[file~"test_"]`, …), quantifiers, adjacency `->`, eventually `..>`,
+  alternation, grouping and captures that must match (`@f`), compiled to an
+  NFA run by a Pike VM, with a linear-time, std-only regex subset for `~`.
+  Parse errors name the column. `GET /v1/trajectories/search?q=` (newest
+  runs first, under the query deadline), `GET /v1/trajectories/explain`,
+  `GET /v1/detectors`, `GET /v1/detectors/findings`, and the MCP tool
+  `find_behavior`. Nine
+  detectors: `test_tampering`, `give_up_loop`, `hallucinated_tool`,
+  `edit_thrash`, `ping_pong`, `retry_without_change`, `context_blowup`,
+  `tool_error_streak` and `unverified_finish`; findings compare how the
+  matching runs ended against the rest. What it cannot do: `edit` and
+  `test` are heuristics over tool names and arguments, failure means span
+  status, there is no index, and "never" over a whole run cannot be
+  written. See [limits](docs/guide/tql.md#limits-stated-plainly).
+
+- **Fork and rewind, tape tests and golden runs.**
+  [docs/guide/fork.md](docs/guide/fork.md).
+  - `POST /v1/replays` takes `edits` (up to 64: a different model answer or
+    tool result at a step) and `live_after` (after that step every call
+    answers `409 replay_live`, so the harness switches to the real
+    provider). Strict matching holds up to the first edit and is off after
+    it. A fork answers `fork_id` and the `traza.fork.*` attributes its spans
+    carry; a live point alone is a **rewind**, and a run past 20,000 spans
+    can still be rewound within what was read. A repeated divergence is
+    answered from the difference already worked out.
+  - `GET /v1/forks?run=` lists a run's forks, each diffed against its
+    parent; `GET /v1/goldens` the runs marked as baselines. MCP tool
+    `list_forks`.
+  - What it cannot do: Traza never goes live itself — your harness does; an
+    edited answer has an invented id and zero usage; a fork is a replay, in
+    memory for an hour. See [limits](docs/guide/fork.md#limits-stated-plainly).
+
+- **Client libraries.** [docs/guide/clients.md](docs/guide/clients.md).
+  Python: `traza.fork(run, at_step, response=… | tool_result=…)`, a context
+  manager that points the provider SDKs at a loopback switch which forwards
+  to the replay until it answers `replay_live` and to the real provider
+  after, and tags the spans started in its context; `forks`, `goldens`,
+  `mark_golden`; `traza.testing` tape tests; the **pytest-traza** plugin
+  (`@pytest.mark.traza_tape("run")`, a `pytest11` entry point; the package
+  still depends on nothing); and a **`traza`** command — `traza test`
+  replays every golden run into JUnit XML, plus `traza golden add`,
+  `traza forks` and `traza fork`. TypeScript: `client.fork()` returning a
+  `Fork` with a switching `fetch` for the provider SDKs and a span
+  processor, `forks`, `goldens`, `markGolden`, and `replayTest()` for
+  vitest, jest or `node:test`. Both hand the nudges a check delivered to the
+  caller (`Verdict.nudges` and `on_nudges`, `verdict.nudges` and
+  `onNudges`).
+
+- **Dashboard: six screens, and steering from the Run view.**
+  [docs/guide/trace-browser.md](docs/guide/trace-browser.md).
+  - **Live** (`#/live`): the runs working now over the live stream, read
+    with `fetch` so the token never enters a URL — current step with its
+    elapsed time, spend counting up, the guard chip and foresight against
+    the base rate — ranked so runs that need a person come first, with
+    nudge, kill-switch and approve controls (a grant can lower
+    `min_success_odds`, the only way to lift a foresight stop). It
+    reconnects with backoff and rebuilds from a fresh snapshot, says so
+    when the server has no live view, and marks a run whose named step has
+    waited as **held** only after reading that run's verdict, which never
+    takes its nudges. An address naming no screen now opens Live when runs
+    are working, the Overview otherwise.
+  - **Foresight** (`#/foresight`): the Fate Map drawn as a tree with ribbons
+    sized by runs and coloured against the base rate, fatal forks and
+    hotspots labelled in words, intervals on hover, example runs and a
+    success-versus-failure diff, the map's calibration in words, and a run
+    lit on its map with its verdict — only where it was judged.
+  - **X-Ray** (`#/xray/<run>`): the Cache Autopsy timeline and culprits, and
+    one call's context as a stacked bar by kind and introducing step, with
+    what was dropped since the previous call.
+  - **Changes**, **Behaviors** (a TQL box checked by the server as you type,
+    and the detectors with their intervals) and **Blame**.
+  - The Run view gains a Foresight panel, an **Agents** card with the
+    topology drawn, a **Nudges** card with the composer, **Fork from here**
+    on any model or tool step — an editor on the recorded answer, then the
+    environment as shell-safe lines with the key as `TRAZA_REPLAY_KEY`, a
+    `traza.fork` snippet and a `traza fork` command — and a **Forks** card
+    with each fork's deltas and its diff.
+  - Stored text is rendered as text everywhere; every new screen reflows
+    at phone width without a horizontal page scroll.
+
+- **Three demos: `foresight`, `coding-agents` and `mission-control`**,
+  twelve in the [tour](examples/README.md) now. `foresight` draws the Fate
+  Map with every interval, recomputes the fatal fork's Wilson interval and
+  Fisher test from its counts, calls a live run `likely_failure` before it
+  has an outcome and stops it at the check while a healthy run goes through.
+  `coding-agents` imports four synthetic Claude Code and Codex sessions,
+  prices each sub-agent, finds a cache that expired and a `/compact` that
+  dropped an instruction, catches a test edited to pass, blames three lines
+  and follows a live transcript with `--watch`. `mission-control` runs
+  simulated agents that check before every step and obey nudges, checks
+  seven claims (a run held by its history, a nudge heard after an
+  approval, the kill switch, a ping-pong stopped at three cycles, a fork),
+  then keeps them running for the Live screen until Ctrl-C. Each asserts
+  its own claims, and `ci.sh` runs all twelve, pointing the three new ones
+  at the binary it just built (and `foresight` at the `seed` built beside
+  it).
+
+### Changed
+
+- **The Claude Code hook moved.** `examples/guard/claude-code-hook.sh` is
+  gone; the [hook pack](examples/claude-code/README.md) replaces it, with an
+  installer, nudges and a `SessionStart` recall. Its fail-closed switch is
+  `TRAZA_FAIL_CLOSED=1` (it was `TRAZA_FUSE_FAIL_CLOSED`), and it never
+  answers `allow`. The `guard` demo runs the pack in its seventh beat.
+- **OTLP ingest keeps five resource attributes.** `service.version`,
+  `deployment.environment.name`, `deployment.environment`,
+  `telemetry.sdk.name` and `telemetry.sdk.version` on a resource are copied
+  onto each of its spans as attributes, beneath any the span sets itself,
+  never pushing a span over its admission caps. They are stored, searchable
+  and what the change radar reads. Every other resource attribute is still
+  dropped. See [ingest](docs/guide/ingest.md#which-resource-attributes-reach-the-span).
+- **The run guard keeps every live run's behaviour path** — its earliest
+  192 steps, 48 bytes each — for live foresight and the predictive fuses,
+  counted against the same 1,000,000-record budget as span contributions.
+  Step-heavy runs are therefore evicted somewhat sooner than in 0.27.0 (they
+  rebuild from the store when next asked about). `--fate-cache-seconds 0`
+  stops keeping paths; an embedder sets `FuseConfig::live_paths = false`,
+  after which only runs a predictive policy could govern keep one.
+- **`POST /v1/fuses/check` answers carry `nudges`** (an empty list when
+  none), and `foresight` when the policy sets `min_success_odds`; the
+  verdict document of `GET /v1/fuses/runs/{run}` carries `foresight` too. A
+  check that names its `next` step now delivers pending nudges and counts as
+  activity for the live view: give that credential only to the agent, and
+  leave `next` out of monitoring checks.
+- **The MCP surface grows from sixteen tools to twenty-four**: eight reads
+  (`foresee_run`, `list_live_runs`, `run_topology`, `blame_line`,
+  `xray_step`, `what_changed`, `find_behavior`, `list_forks`), so an `ro`
+  token is offered twenty-two. See [the MCP guide](docs/guide/mcp.md#the-tools).
+- **Library surface.** `Config` gains `fate: fate::FateConfig`,
+  `steer: steer::SteerConfig` and `xray_stale_steps: usize`;
+  `guard::FuseConfig` gains `live_paths: bool`; `guard::Limits` gains
+  `min_success_odds`, `foresight_min_support`, `foresight_after_steps` and
+  `max_handoff_cycles`; `pricing::Rate` gains `cache_read_per_mtok` and
+  `cache_write_per_mtok`. A struct literal must add them;
+  `..Default::default()` need not. New public modules: `blame`, `fate`,
+  `fork`, `import`, `radar`, `steer`, `tql`, `xray`, `zstd`.
+- **`traza-server --help`** lists fifty-five flags, nine of them new:
+  `--fate-max-runs`, `--fate-max-nodes`, `--fate-cache-seconds`,
+  `--fate-tenant-maps`, `--fate-build-seconds`, `--fuse-max-handoff-cycles`,
+  `--live-window-seconds`, `--xray-stale-steps` and `--radar-max-runs`; and
+  two subcommands, `import` and `blame`. See
+  [configuration](docs/configuration.md).
+- **Docs**: the ingest guide said other resource attributes were "merged
+  beneath span attributes". They never were; it now says which reach the
+  span.
+- Version metadata: the crate, the UI and both client libraries move to
+  0.28.0. The MSRV stays 1.81, and a default build still has three direct
+  dependencies. No performance figure in this release is new; the published
+  ingest throughput predates both 0.27.0's admission pass and the behaviour
+  path above.
+
+### Fixed
+
+- **An evidence pack finishes on a busy store.** A manifest too long for
+  one request's budget never finished when the store checkpointed between
+  retries: each retry started over on the new generation, met the next
+  checkpoint and started over again — and a store with any damaged file
+  never got its pack, because confirming the damage let the pack move on to
+  the newest generation and begin again. A pack now pins the snapshot and
+  generation its manifest load began on and answers for that pair until it
+  is whole (its `ledger.head` says which), and a problem stands while the
+  path still holds the file the digest read, with the length and
+  modification time the pinned manifest records. Confirming file problems
+  takes at most 256 per hold of the maintenance lock, with the budget
+  checked between holds, and replaced file checks are freed 4,096 files at
+  a time between budget checks, never under the lock. See
+  [the ledger guide](docs/guide/ledger.md).
+- **A replay call is judged from when its request arrived.** Time spent
+  reading, parsing and digesting a request before the replay registry saw
+  it did not count toward the replay's expiry, so a request that arrived a
+  moment before expiry could be served after it. The expiry clock now
+  starts as soon as the request head is read.
+- **A diff explanation quotes a long configuration value in bounded
+  time.** Quoting eighty characters of a differing parameter scanned the
+  whole value first, so one long string held the explanation past the
+  deadline (600 ms for 32 MiB in a debug build). The quote is now written a
+  character at a time and stops at the cap.
+- **`@trazadb/sdk` writes JSON the way `JSON.stringify` does.** It re-read
+  an array's length on every element, so a `toJSON` hook that grew its own
+  array ran until the heap was exhausted, before any request timer existed;
+  and it read every member up front, so a hook's change to a later member
+  went out differently. Both now match `JSON.stringify`.
+- **Dashboard.** A credential minted while the tab switched to another
+  token (a handoff link followed before the mint answered) no longer shows
+  its secret over the new session, and a secret on display no longer
+  outlives the switch. Leaving the Live tail (or any streaming screen) no
+  longer throws an unhandled "signal is aborted" error.
+
+### Upgrade
+
+- **No migration.** Segments, the write-ahead log, generation manifests and
+  every file 0.27.0 wrote are read as they are. One new file appears beside
+  them when it is first needed: `steer.jsonl`, the nudge log, which like
+  `fuses.jsonl` lives outside generations, so a backup does not carry it.
+  `traza-server import` keeps its progress on the importing machine, in
+  `~/.traza/import-state.json`.
+- **Move a 0.27.0 Claude Code hook to the pack**: remove the old
+  `claude-code-hook.sh` entries from `.claude/settings.json` and run
+  `python3 examples/claude-code/install.py`, renaming
+  `TRAZA_FUSE_FAIL_CLOSED` to `TRAZA_FAIL_CLOSED` if you set it.
+- **Leave `next` out of checks that are not the agent's own.** A monitoring
+  script that sends `next` to `POST /v1/fuses/check` would take the run's
+  nudges; without it the check is a verdict read and takes nothing.
+- **Expect five more attributes on OTLP spans** whose resource sets them. A
+  consumer that compares a span's attribute set exactly will see them.
+- **Embedders** must add the new `Config`, `FuseConfig`, `Limits` and
+  `Rate` fields to struct literals.
+- **Rolling back to 0.27.0** reads the same data, ignores `steer.jsonl` and
+  the import state, and stops delivering nudges. But it **refuses to start**
+  on a `fuses.jsonl` that holds any policy, reset or grant naming
+  `min_success_odds`, `foresight_min_support`, `foresight_after_steps` or
+  `max_handoff_cycles` — deleting the policy is not enough, since the log
+  keeps the record until it is next rewritten. Either remove the lines
+  that name them from `fuses.jsonl` while no server holds the directory, or
+  start 0.27.0 with `--no-fuses`, under which it neither reads nor writes
+  the file and no policy, kill switch or grant applies.
+
 ## [0.27.0] - 2026-10-17
 
 The flight recorder release. Traza already kept what an agent did; this
