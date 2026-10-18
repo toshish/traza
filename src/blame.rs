@@ -12,8 +12,22 @@
 //! A tool step introduces a line into a file when its edit adds that line
 //! more times than it removes it, compared on whitespace-normalised text
 //! (runs of whitespace fold to one space, ends trimmed — so re-indenting a
-//! line is not authorship, as with `git blame -w`). Edits are read from the
-//! tool call's arguments, by shape:
+//! line is not authorship, as with `git blame -w`) — and the step did not
+//! fail. What the step's record says became of the edit is its
+//! [`EditOutcome`]:
+//!
+//! - status `error` — **failed**: the tool refused or could not apply the
+//!   edit (Claude Code's `old_string` not found, a Codex patch that did not
+//!   apply). These tools are all-or-nothing, so a failed step wrote nothing
+//!   and introduces nothing, however many times it was asked to add the line;
+//! - status `ok`, or a recorded result (`gen_ai.tool.call.result`,
+//!   `traceloop.entity.output`, `output.value`) — **applied**;
+//! - neither — **unconfirmed**: the record holds no outcome (a call still
+//!   running, or one whose result was never written). It is returned, marked
+//!   `unconfirmed`, after every applied introduction, so an attempt that may
+//!   not have happened never outranks one that did.
+//!
+//! Edits are read from the tool call's arguments, by shape:
 //!
 //! - `new_string` (with `old_string`) and a file path — Claude Code `Edit`;
 //! - `edits: [{old_string, new_string}]` — `MultiEdit`;
@@ -61,7 +75,8 @@
 //! Candidates are the tool steps of the editing tools in [`EDIT_TOOLS`],
 //! found through the exact attribute index on `gen_ai.tool.name` and
 //! `tool.name`, plus the steps carrying [`EDIT_MARKER`], so the search
-//! decodes edit calls and nothing else. The content index cannot serve here:
+//! decodes edit calls and nothing else; a failed step is passed over before
+//! its arguments are parsed. The content index cannot serve here:
 //! a store of agent transcripts is mostly model calls carrying whole
 //! conversations, whose word filters admit nearly every block for ordinary
 //! code words, and a content-driven search ends up tokenising the store
@@ -70,7 +85,8 @@
 //! name and key, then reading each match's run — spends one query deadline;
 //! at most [`MAX_BLAME_CANDIDATES`] candidates are verified, the fold stops
 //! decoding the moment the cap is passed (`truncated` says so), and the
-//! earliest [`MAX_BLAME_LIMIT`] matches are kept.
+//! first [`MAX_BLAME_LIMIT`] matches in answer order (applied before
+//! unconfirmed, each earliest first) are kept.
 //!
 //! **Limits, honestly:** a line written by a shell command (`sed -i`, a
 //! heredoc, a code generator) is not an edit Traza can read and is not found,
@@ -78,7 +94,11 @@
 //! offloaded to the payload store is read only as its inline preview; a line
 //! that was introduced, deleted and re-introduced
 //! returns every introduction, earliest first — the earliest is the answer
-//! the route is named for, not necessarily the one in the file today.
+//! the route is named for, not necessarily the one in the file today. The
+//! outcome is the step's own record: a producer that marks a failed edit
+//! `ok` (or records it with no status and a result) is believed, and an
+//! all-or-nothing tool is assumed — a step marked failed is taken to have
+//! written nothing.
 
 use std::time::Instant;
 
@@ -170,6 +190,50 @@ impl Edit {
     }
 }
 
+/// What a tool step's record says became of the edit it asked for. Ordered
+/// as blame ranks them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EditOutcome {
+    /// The step completed and was not marked failed: its status is `ok`, or
+    /// it recorded a result.
+    Applied,
+    /// The step records no outcome — status unset, no result: a call still
+    /// running, or one whose result was never written — so whether its edit
+    /// happened is unknown.
+    Unconfirmed,
+    /// The step's status is `error`: the tool refused or failed, and wrote
+    /// nothing. Never a match.
+    Failed,
+}
+
+impl EditOutcome {
+    /// What `span`'s status and recorded result say.
+    pub fn of(span: &Span) -> Self {
+        if span.status.eq_ignore_ascii_case("error") {
+            return Self::Failed;
+        }
+        let result = RESULT_KEYS.iter().any(|key| {
+            span.attributes
+                .get(*key)
+                .is_some_and(|value| !value.is_null())
+        });
+        if result || span.status.eq_ignore_ascii_case("ok") {
+            Self::Applied
+        } else {
+            Self::Unconfirmed
+        }
+    }
+}
+
+/// The attributes a tool step records its result under (see
+/// [`semconv::step_facts`]).
+const RESULT_KEYS: [&str; 3] = [
+    "gen_ai.tool.call.result",
+    "traceloop.entity.output",
+    "output.value",
+];
+
 /// One step that introduced the line.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct BlameMatch {
@@ -185,6 +249,10 @@ pub struct BlameMatch {
     pub tool: String,
     /// The file as the edit recorded it.
     pub file: String,
+    /// Whether the step's record shows the edit applied, or holds no outcome
+    /// ([`EditOutcome::Applied`] or [`EditOutcome::Unconfirmed`]; a failed
+    /// step is never a match).
+    pub outcome: EditOutcome,
     /// When the tool step started.
     pub at_ns: u64,
     /// The prompt that started the turn (or the task a sub-agent was given),
@@ -211,7 +279,8 @@ pub struct BlameMatch {
 /// A blame answer.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Blame {
-    /// The steps that introduced the line, earliest first.
+    /// The steps that introduced the line: applied ones earliest first, then
+    /// unconfirmed ones earliest first.
     pub matches: Vec<BlameMatch>,
     /// Candidate edit calls the search verified.
     pub searched_spans: usize,
@@ -347,13 +416,14 @@ struct Found {
     span: Span,
     tool: String,
     file: String,
+    outcome: EditOutcome,
 }
 
 impl Store {
-    /// The earliest tool steps (at most `limit`, itself at most
-    /// [`MAX_BLAME_LIMIT`]) whose edit introduced `line` into the file
-    /// `scope` names, under `tenant` (`None` is the operator view across
-    /// tenants).
+    /// The tool steps (at most `limit`, itself at most [`MAX_BLAME_LIMIT`])
+    /// whose edit introduced `line` into the file `scope` names, under
+    /// `tenant` (`None` is the operator view across tenants): applied ones
+    /// earliest first, then unconfirmed ones; a failed step is none.
     ///
     /// An empty line is [`Error::Invalid`]. Budgeted by the query deadline,
     /// anchored here, across the search and every match's enrichment.
@@ -524,6 +594,7 @@ impl Store {
             span_id: span.span_id.clone(),
             tool: found.tool,
             file: found.file,
+            outcome: found.outcome,
             at_ns: span.start_time_ns,
             prompt,
             model,
@@ -543,10 +614,11 @@ fn project_of(span: &Span) -> Option<&str> {
         .find_map(|key| span.attributes.get(*key).and_then(Value::as_str))
 }
 
-/// Keeps `span` among the earliest `limit` candidates when one of its edits
-/// introduced `normalized` into the file `scope` names. A span seen twice
-/// (indexed under both tool-name keys, or under a name and the edit marker)
-/// is kept once.
+/// Keeps `span` among the first `limit` candidates in answer order (applied
+/// before unconfirmed, then earliest first) when one of its edits introduced
+/// `normalized` into the file `scope` names and the step did not fail. A
+/// span seen twice (indexed under both tool-name keys, or under a name and
+/// the edit marker) is kept once.
 fn consider(
     span: &Span,
     normalized: &str,
@@ -554,6 +626,10 @@ fn consider(
     limit: usize,
     kept: &mut Vec<Found>,
 ) {
+    let outcome = EditOutcome::of(span);
+    if outcome == EditOutcome::Failed {
+        return;
+    }
     let project = project_of(span);
     let Some(edit) = edits(span)
         .into_iter()
@@ -563,6 +639,7 @@ fn consider(
     };
     let key = |found: &Found| {
         (
+            found.outcome,
             found.span.start_time_ns,
             found.span.tenant.clone(),
             found.span.trace_id.clone(),
@@ -573,6 +650,7 @@ fn consider(
         span: span.clone(),
         tool: edit.tool,
         file: edit.file,
+        outcome,
     };
     match kept.binary_search_by(|probe| key(probe).cmp(&key(&candidate))) {
         Ok(_) => {}

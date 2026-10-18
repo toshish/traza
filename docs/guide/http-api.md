@@ -1356,7 +1356,7 @@ recorded them, not only [imported](recorders.md) ones. The
 | `path` | string, required | The file's path, or a suffix of it (`src/cart.rs`); matched by path component, a leading `/` is not an anchor |
 | `line` | string, required | The exact line text; compared with whitespace normalised (runs fold to one space, ends trimmed) |
 | `project` | string, repeatable | An absolute repository root (a checkout, a worktree) to search in, or `<dir>/*` for every checkout directly under `<dir>` (where worktrees that no longer exist used to live); at most 64. With any, a relative `path` must name exactly `<root>/<path>` and an absolute one must lie under a root; a recorded path that stayed relative is placed with the span's `code.project`. Without, every project is searched and `path` is a suffix match — so a common line in a common path (`}` in `src/main.rs`) can be answered from an unrelated repository |
-| `limit` | integer | Introductions to return, earliest first. Default 5, capped at 50 |
+| `limit` | integer | Introductions to return: applied ones earliest first, then unconfirmed ones. Default 5, capped at 50 |
 | `tenant` | string | Tenant scope |
 
 ```sh
@@ -1364,12 +1364,17 @@ curl 'http://localhost:8080/v1/blame?path=src/item.rs&line=pub%20price%3A%20u64%
 ```
 
 ```json
-{"line":"pub price: u64,","matches":[{"agent":"general-purpose","at_ns":1767607225000000000,"file":"/tmp/demo-shop/src/item.rs","model":"claude-haiku-4-5-20251001","project":"/tmp/demo-shop","prompt":"Add a price field to Item in src/item.rs","run":"11111111-1111-4111-8111-111111111111","service":"claude-code","span_id":"fe06d3b7c5815378","step_index":10,"tenant":"","tool":"MultiEdit","trace_id":"257eaef69d566d3579947aac638045ca"}],"path":"src/item.rs","searched_spans":6,"truncated":false}
+{"line":"pub price: u64,","matches":[{"agent":"general-purpose","at_ns":1767607225000000000,"file":"/tmp/demo-shop/src/item.rs","model":"claude-haiku-4-5-20251001","outcome":"applied","project":"/tmp/demo-shop","prompt":"Add a price field to Item in src/item.rs","run":"11111111-1111-4111-8111-111111111111","service":"claude-code","span_id":"fe06d3b7c5815378","step_index":10,"tenant":"","tool":"MultiEdit","trace_id":"257eaef69d566d3579947aac638045ca"}],"path":"src/item.rs","searched_spans":6,"truncated":false}
 ```
 
 A step **introduces** a line when its edit adds it more times than it removes
 it, so a context line an edit kept, or a line it only re-indented, is not
-authorship. Each match names its `run`, `tenant`, `trace_id` and `span_id`, the
+authorship — and when the step did not fail: a step whose status is `error`
+(Claude Code's `old_string` not found, a Codex patch that did not apply) wrote
+nothing and is never a match. `outcome` is `applied` for a step with status
+`ok` or a recorded result, and `unconfirmed` for one with neither (a call still
+running, or one whose result was never written — it may not have happened);
+unconfirmed matches come after every applied one. Each match names its `run`, `tenant`, `trace_id` and `span_id`, the
 `tool`, the `file` as the edit recorded it (relative patch paths joined with
 the recorded working directory), `at_ns` (the tool step's start), `model` (of
 the response that requested the edit), `step_index` (its position on the run's

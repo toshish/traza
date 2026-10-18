@@ -35,8 +35,10 @@ fixtures in `tests/fixtures/import/` are synthetic transcripts in those shapes.
 
 Compressed Codex rollouts are decompressed by Traza's own Zstandard decoder
 (RFC 8878, no dependency, like its gzip inflate): the content checksum is
-verified when the frame carries one, a decompressed file is capped at 2 GiB,
-and dictionaries — which Codex does not use — are refused.
+verified when the frame carries one, the compressed file is read within
+2 GiB and its content capped at 2 GiB (a longer one is refused and counted
+in `files_failed`), and dictionaries — which Codex does not use — are
+refused.
 
 ## What becomes what
 
@@ -48,7 +50,7 @@ derived from data both sides of it hold.
 | a session | the run: every span carries `session.id` (Claude Code's `sessionId`; for Codex, the root thread id) | `traza.source`, `code.project` (the session's working directory), `service.version` (the tool's version), `vcs.ref.head.name`; `service` is `claude-code` or `codex` |
 | a user prompt | a `turn` span (not a step) | event `gen_ai.user.message` with the prompt as `content`; the session's first prompt, cut to 200 characters, is also `session.goal`; status is that of the turn's last model call |
 | a model response | an llm step, child of its turn | `gen_ai.operation.name=chat`, `gen_ai.provider.name` (`anthropic`, `openai`), `gen_ai.request.model`, `gen_ai.usage.input_tokens` / `output_tokens` / `cache_read.input_tokens` / `cache_creation.input_tokens`, `gen_ai.input.messages` (the conversation since the previous response), `gen_ai.output.messages` (text, reasoning, tool calls), `gen_ai.conversation.id` (the session; `<session>/<agent id>` for a Claude Code sub-agent; the thread for Codex) and `traza.input.delta` (`true`: the input is what was added since the conversation's previous call; `false` on the first call after a compaction, whose input — the summary and what followed, or Codex's replacement history — is all it saw) |
-| a tool call and its result | a tool step, child of the response that asked for it | `gen_ai.tool.name`, `gen_ai.tool.call.id`, `gen_ai.tool.call.arguments` (kept as JSON), `gen_ai.tool.call.result`; status `error` when Claude Code marks the result an error or a Codex command exits non-zero (`process.exit.code`); `traza.edit=true` on a Codex call that applies a patch through a general tool (an older build's `shell ["apply_patch", …]`), so blame can find it without reading every command |
+| a tool call and its result | a tool step, child of the response that asked for it | `gen_ai.tool.name`, `gen_ai.tool.call.id`, `gen_ai.tool.call.arguments` (kept as JSON), `gen_ai.tool.call.result`; status `error` when Claude Code marks the result an error or a Codex command exits non-zero (`process.exit.code`), `ok` once a result says otherwise, and none while no result was recorded (a call that never returned claims no outcome); `traza.edit=true` on a Codex call that applies a patch through a general tool (an older build's `shell ["apply_patch", …]`), so blame can find it without reading every command |
 | a sub-agent | an agent step, `gen_ai.operation.name=invoke_agent` | `gen_ai.agent.name` (Claude Code's `agentType`, Codex's `agent_role`); a Claude Code sub-agent is a child of the `Agent`/`Task` tool call that spawned it and its own calls are its children |
 | an API error Claude Code synthesized | a failed llm step | `error.type`; the model is the one the session was using |
 | a Codex token count no recorded response claims | an llm step with its usage and `codex.content_unrecorded=true` | the call happened and was paid for; the rollout kept no content for it |
@@ -139,7 +141,16 @@ directory), so importing into a scratch directory does not make the next import
 into your server skip anything. A file is re-read from its start when it grows
 (the current turn lives in earlier lines), and only spans touched by a line past
 the recorded offset are sent; a span built entirely from earlier lines was
-already sent in exactly its final form, so a restart sends nothing twice.
+already sent in exactly its final form, so a restart sends nothing twice. A
+file counts as unchanged while its size **and** its stamp — modification time,
+and on Unix its device and inode — are what was recorded, so an idle tree costs
+a stat per file; one that shrank, whose first bytes changed, or that was
+written to without growing (rewritten in place, or replaced, at its old size)
+is read again from its start and sent whole. A Claude Code sub-agent's
+`.meta.json` is recorded the same way (its size and stamp, or that it is
+missing): when it changes, the sub-agent's transcript is converted again and
+its spans sent again — after a restart too, and for a transcript whose
+converter was let go, though the transcript itself did not change.
 `--watch` keeps the converters of live files in memory instead, so following
 a live file reads only its new lines: only a file written to in the last ten
 minutes keeps one, and never more than 64 at any moment — the first pass over a
@@ -248,6 +259,18 @@ directory the Codex importer records. It therefore works on Claude Code and
 Codex sessions recorded any way, not only imported ones, as long as the
 arguments were recorded.
 
+**A failed edit introduces nothing.** What became of an edit is the step's own
+record — its `outcome`. A step whose status is `error` **failed**: Claude Code's
+`old_string` was not found, a Codex patch did not apply, the tool was refused.
+These tools are all-or-nothing, so a failed step wrote nothing and is never an
+answer, however many times it asked to add the line — a failed attempt followed
+by a successful one is blamed on the successful one. A step with status `ok`, or
+with a recorded result, is **applied**. A step with neither — no status, no
+result: a call still running, or one whose result was never written (the
+importers leave a call's status unset until its result arrives) — is
+**unconfirmed**: it may not have happened, so it is answered after every applied
+introduction, marked as such.
+
 **Which file, in which repository.** On its own, the query path matches when
 it is a suffix of the recorded path at a component boundary (`src/lib.rs`
 matches `/repo/src/lib.rs`, not `/repo/src/glib.rs`; a leading `/` is not an
@@ -267,12 +290,14 @@ one written into some other repository's `src/main.rs` is not.
 another machine) and each answer then names its `project`. The
 [`blame_line`](mcp.md#the-tools) tool takes the same `project`.
 
-**Which answer.** The earliest introduction first, then later ones (a line
-introduced, deleted and re-introduced has several), up to `limit` (default 5,
-at most 50). Each names its run, tenant, trace and span, the tool, the file as
-recorded, when, the prompt that started that turn (or the task a sub-agent was
-given, with the sub-agent named), the model whose response asked for the edit,
-and the step's position on the run's tape. `traza-server blame` exits 0 when it
+**Which answer.** The earliest applied introduction first, then later ones (a
+line introduced, deleted and re-introduced has several), then any unconfirmed
+ones, earliest first, up to `limit` (default 5, at most 50). Each names its
+`outcome` (`applied` or `unconfirmed`), run, tenant, trace and span, the tool,
+the file as recorded, when, the prompt that started that turn (or the task a
+sub-agent was given, with the sub-agent named), the model whose response asked
+for the edit, and the step's position on the run's tape; the CLI prints an
+unconfirmed one as `attempted`, saying no result was recorded. `traza-server blame` exits 0 when it
 found one, 1 when no recorded edit introduced the line, and 2 when it could not
 ask.
 
@@ -283,7 +308,7 @@ ask.
 index on `gen_ai.tool.name` and `tool.name`, plus the tool steps the Codex
 importer marked `traza.edit=true` (a shell call that applies a patch), so the
 search decodes edit calls and nothing else, and every candidate is verified by
-parsing its edit. General-purpose shells are not candidates by name: in an
+parsing its edit (a failed step is passed over before its edit is parsed). General-purpose shells are not candidates by name: in an
 older Codex history nearly every call is a `shell` call. (The content index
 cannot serve here either: a store of transcripts is mostly model calls carrying
 whole conversations, whose word filters admit nearly every block for ordinary
@@ -307,7 +332,11 @@ introduction" means blame found an edit in this repository that added the
 line; whether that edit is what put today's copy of the line there was not
 checked, and for a line written, deleted and written again the earliest is
 reported. The Codex history holds 447,767 tool steps; with general-purpose
-shells no longer candidates by name, 44,796 of them are.
+shells no longer candidates by name, 44,796 of them are. These figures were
+taken before failed edits stopped counting as introductions: a line whose only
+recorded "introductions" were failed attempts is now answered with none, and
+one whose earliest attempt failed is now answered with the edit that applied,
+so the counts in the last column are an upper bound until measured again.
 
 ## Limits, honestly
 
@@ -325,21 +354,36 @@ shells no longer candidates by name, 44,796 of them are.
   parent turns out to have a parent of its own does the run id change, and then
   the sub-agent's spans are sent again under the new ids and the earlier copy
   remains until erased. Claude Code workflow agents (which name no tool call)
-  are agent spans at the top of the session's trace.
+  are agent spans at the top of the session's trace. A rollout found while its
+  first (meta) line is still being written is not read until that line is
+  whole — every id derives from the thread it names — and is asked again on
+  the next poll; it has no complete line to convert in the meantime.
 - **Late sub-agent metadata.** Claude Code may write a sub-agent's
-  `.meta.json` after its transcript's first lines. While a watch follows the
-  transcript, the meta file is looked for again on every poll, and when it
-  appears the agent span is re-parented under the `Agent` call and its spans
-  renamed after the agent type. A batch import of a transcript whose meta file
-  never appeared leaves the agent span at the top of the trace.
+  `.meta.json` after its transcript's first lines. The meta file's stamp (or
+  its absence) is recorded with the transcript's progress, so whenever it
+  appears or changes — during a watch, after a restart, or for a transcript no
+  converter is kept for — the transcript is converted again: the agent span is
+  re-parented under the `Agent` call, its spans renamed after the agent type,
+  and the sub-agent's spans sent again (a stat of the meta file per sub-agent
+  transcript per poll). A transcript whose meta file never appeared keeps its
+  agent span at the top of the trace. A meta file over 64 KiB (real ones are a
+  few hundred bytes) is not read: it is named in `errors` and counted in
+  `files_failed`, and the transcript is imported unplaced.
 - **Codex content.** A model call whose token count survives but whose items
   do not is kept for its usage, marked `codex.content_unrecorded`. A
   plain-text rollout whose last turn never ended keeps that turn's held items
   unconverted until it ends (a compressed rollout is final, so its last turn is
   settled when it is read).
-- **Rewrites.** Transcripts only ever grow, so a file is re-examined only when
-  its size moves (a stat per file per poll); one rewritten in place to exactly
-  its old size is not noticed.
+- **Rewrites.** Transcripts only ever grow, so a file whose size and stamp
+  (modification time, and on Unix device and inode) are unchanged is not read
+  (a stat per file per poll). One written to without growing — rewritten in
+  place, or replaced, at exactly its old size — has a new stamp and is read
+  again whole and sent again; so is one merely touched, which costs a harmless
+  resend. A rewrite at the same size, on the same inode, within the
+  filesystem's timestamp resolution (a second on some filesystems) is not
+  noticed. A state file written before stamps were recorded gets each file's
+  stamp on its first poll, vouched for by the file's head; it re-sends every
+  Claude Code sub-agent transcript once, as the meta file's stamp is new too.
 - **Prices.** The cache counters are priced only when the
   [pricing table](../configuration.md#model-pricing) names a model's
   `cache_read_per_mtok` and `cache_write_per_mtok`: then a Claude Code call's
@@ -367,8 +411,20 @@ shells no longer candidates by name, 44,796 of them are.
   on old runs; a live one is the point.
 - **Size.** One trace per session means a very long session is a very large
   trace. Each file is capped at 200,000 spans (`capped` counts what was left
-  out), a decompressed rollout at 2 GiB, and a line at 64 MiB: a longer line is
+  out), a compressed rollout at 2 GiB read and 2 GiB decompressed, a
+  sub-agent's meta file at 64 KiB, and a line at 64 MiB: a longer line is
   skipped and counted as malformed, and the lines after it are read as usual.
+  Every one of these reads stops at its cap rather than trusting a length
+  looked at first, so a file growing meanwhile cannot outrun it. What a
+  converter remembers beside its spans is bounded by entries and by bytes:
+  the digests (16 bytes each) of the most recent 16,384 Claude Code content
+  blocks — enough to recognise a block an older build wrote twice — and of
+  the most recent 4,096 settled Codex turns — enough to recognise an item that
+  arrives after its turn ended — record timestamps for up to 1,000,000 records
+  by digest, and a Codex turn's held items at 10,000 and at 256 MiB of the
+  lines they came from. What a bound forgets or drops is counted in the
+  `records` counts (`dedup/forgotten`, `closed_turns/forgotten`,
+  `item_completed/overflow`, `token_count/unattributed`).
 - **Blame** cannot see lines written by shell commands (`sed -i`, heredocs,
   generators), edits by a tool whose name is not in the list above (a patch
   applied through some other tool is found only when the importer marked it),
@@ -376,4 +432,8 @@ shells no longer candidates by name, 44,796 of them are.
   offloaded to the payload store beyond its inline preview. Scoped to a
   repository, it misses sessions recorded under a different path for the same
   repository (another machine, a moved checkout) — `--anywhere` finds those,
-  and with them same-named files of other repositories.
+  and with them same-named files of other repositories. An edit's outcome is
+  the step's own record: a step marked `error` is taken to have written
+  nothing (true of the all-or-nothing edit tools above), and a producer that
+  marks a failed edit `ok`, or records a result for it with no status, is
+  believed.

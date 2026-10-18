@@ -465,7 +465,11 @@ fn render_blame(file: &str, number: usize, line: &str, answer: &Value) -> String
         let text =
             |key: &str| crate::mcp::sanitize(found.get(key).and_then(Value::as_str).unwrap_or("?"));
         let at = found.get("at_ns").and_then(Value::as_u64).unwrap_or(0);
-        let lead = if position == 0 {
+        // Unconfirmed matches follow every applied one.
+        let unconfirmed = found.get("outcome").and_then(Value::as_str) == Some("unconfirmed");
+        let lead = if unconfirmed {
+            "attempted"
+        } else if position == 0 {
             "introduced"
         } else {
             "also introduced"
@@ -494,6 +498,12 @@ fn render_blame(file: &str, number: usize, line: &str, answer: &Value) -> String
             text("run"),
             text("service"),
         );
+        if unconfirmed {
+            let _ = writeln!(
+                out,
+                "    no result was recorded for this call: the edit may not have applied"
+            );
+        }
         if let Some(prompt) = found.get("prompt").and_then(Value::as_str) {
             let _ = writeln!(out, "    prompt: {}", crate::mcp::sanitize(prompt));
         }
@@ -719,6 +729,30 @@ fn home_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unconfirmed_match_is_printed_as_an_attempt() {
+        let found = |outcome: &str, span: &str| {
+            serde_json::json!({"outcome": outcome, "at_ns": 0, "tool": "Edit", "run": "r",
+                               "service": "claude-code", "file": "/r/a.rs",
+                               "trace_id": "t", "span_id": span})
+        };
+        let answer = serde_json::json!({"matches": [found("applied", "s1"),
+                                                    found("unconfirmed", "s2")],
+                                        "searched_spans": 2});
+        let text = render_blame("a.rs", 1, "x", &answer);
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[1].starts_with("  introduced "), "{text}");
+        let attempt = lines
+            .iter()
+            .position(|line| line.starts_with("  attempted "))
+            .expect("the unconfirmed match");
+        assert!(
+            lines[attempt + 1].contains("no result was recorded"),
+            "{text}"
+        );
+        assert!(!text.contains("also introduced"), "{text}");
+    }
 
     #[test]
     fn durations_parse_and_garbage_is_refused() {

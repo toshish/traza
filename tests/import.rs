@@ -521,6 +521,11 @@ fn blame_finds_the_step_that_introduced_a_line_over_http_cli_and_mcp() {
     assert_eq!(first["model"], json!("claude-sonnet-4-5-20250929"));
     assert_eq!(first["step_index"], json!(3));
     assert_eq!(first["service"], json!("claude-code"));
+    assert_eq!(
+        first["outcome"],
+        json!("applied"),
+        "its result was recorded and was not an error"
+    );
     assert_eq!(found["matches"].as_array().map(Vec::len), Some(1));
 
     // A sub-agent's edit names the sub-agent and the task it was given.

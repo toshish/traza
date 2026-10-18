@@ -8,9 +8,10 @@ use serde_json::{json, Map, Value};
 
 use super::{
     blank_span, bounded, bounded_value, extend_end, preview, span_id, str_field, timestamp_ns,
-    trace_id, Base, Converter, FileStats, Found, Source, Spans, MAX_FIELD_BYTES, MAX_PART_BYTES,
-    TURN_SPAN_NAME,
+    trace_id, Base, Converter, FileStats, Found, RecentDigests, Source, Spans, MAX_FIELD_BYTES,
+    MAX_PART_BYTES, TURN_SPAN_NAME,
 };
+use crate::hash::hash128;
 use crate::Event;
 
 const SOURCE: Source = Source::Codex;
@@ -35,15 +36,24 @@ pub(crate) struct Ancestry {
 }
 
 impl Ancestry {
-    /// Reads the meta line of every file not seen before.
+    /// Reads the meta line of every file not settled before. A file whose
+    /// first line is still being written (or could not be read) is asked
+    /// again on the next call; one whose whole first line names no thread is
+    /// settled without one.
     pub(crate) fn learn(&mut self, found: &[Found]) {
         for file in found {
-            if self.seen.insert(file.path.clone()) {
-                if let Some((thread, parent)) = meta_of(&file.path) {
-                    self.threads.insert(file.path.clone(), thread.clone());
-                    self.parents.insert(thread, parent);
-                }
+            if self.seen.contains(&file.path) {
+                continue;
             }
+            match meta_of(&file.path) {
+                MetaRead::Found(meta) => {
+                    self.threads.insert(file.path.clone(), meta.thread.clone());
+                    self.parents.insert(meta.thread, meta.parent);
+                }
+                MetaRead::Absent => {}
+                MetaRead::Pending | MetaRead::Unreadable(_) => continue,
+            }
+            self.seen.insert(file.path.clone());
         }
     }
 
@@ -69,18 +79,62 @@ impl Ancestry {
     }
 }
 
-/// A rollout's thread id and parent thread id, from its meta line.
-fn meta_of(path: &Path) -> Option<(String, Option<String>)> {
-    let line = super::head_lines(path, 1).into_iter().next()?;
-    let record: Value = serde_json::from_str(line.trim_end()).ok()?;
+/// A rollout's identity, from its meta line: its thread, and the thread that
+/// spawned it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Meta {
+    thread: String,
+    parent: Option<String>,
+}
+
+/// What a rollout's first line says of its identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum MetaRead {
+    /// Its thread and parent.
+    Found(Meta),
+    /// The first line is whole (or longer than a head read) and names no
+    /// thread: the thread is the file name's, and there is no parent.
+    Absent,
+    /// The first line is still being written: nothing can be converted yet,
+    /// and the identity everything would be derived from is not known.
+    Pending,
+    /// The file could not be read.
+    Unreadable(String),
+}
+
+/// A rollout's identity, from its meta line.
+pub(crate) fn meta_of(path: &Path) -> MetaRead {
+    let line = match super::first_line(path) {
+        Ok(super::FirstLine::Whole(line)) => line,
+        Ok(super::FirstLine::Partial) => return MetaRead::Pending,
+        Ok(super::FirstLine::TooLong) => return MetaRead::Absent,
+        Err(error) => return MetaRead::Unreadable(error.to_string()),
+    };
+    let Ok(record) = serde_json::from_slice::<Value>(&line) else {
+        return MetaRead::Absent;
+    };
     let meta = match str_field(&record, "type") {
-        Some("session_meta") => record.get("payload")?.clone(),
+        Some("session_meta") => record.get("payload").cloned().unwrap_or(Value::Null),
         // The oldest builds wrote a bare `{id, timestamp, instructions}`.
         None if record.get("id").is_some() => record,
-        _ => return None,
+        _ => return MetaRead::Absent,
     };
-    let thread = str_field(&meta, "id")?.to_owned();
-    Some((thread, parent_of(&meta)))
+    match str_field(&meta, "id") {
+        Some(thread) => MetaRead::Found(Meta {
+            thread: thread.to_owned(),
+            parent: parent_of(&meta),
+        }),
+        None => MetaRead::Absent,
+    }
+}
+
+/// Why a rollout has no converter yet.
+#[derive(Debug)]
+pub(crate) enum NotYet {
+    /// Its meta line is still being written: ask again next poll.
+    Pending,
+    /// It could not be read.
+    Unreadable(String),
 }
 
 /// The parent thread a `session_meta` payload names, if any.
@@ -144,16 +198,24 @@ pub(crate) struct Codex {
     /// Output response items seen in the current turn.
     turn_outputs: usize,
     /// The current turn's `item_completed` items and orphaned token counts,
-    /// held until the turn ends (see [`Codex::settle`]).
+    /// held until the turn ends (see [`Codex::settle`]). Bounded:
+    /// [`MAX_PENDING`] entries, [`Codex::pending_budget`] bytes.
     pending: Vec<Pending>,
+    /// Line bytes charged to `pending`.
+    pending_bytes: usize,
+    /// The most line bytes `pending` may be charged ([`MAX_PENDING_BYTES`]).
+    pending_budget: usize,
     /// The line an item being converted came from: [`Codex::line`] normally,
     /// the held item's own line when a turn settles.
     item_line: u64,
     /// Between `task_started` and `task_complete`.
     in_turn: bool,
-    /// Turns already settled: an `item_completed` naming one arrived late
-    /// and duplicates what was converted.
-    closed_turns: HashSet<String>,
+    /// Turns already settled (digests of their ids): an `item_completed`
+    /// naming one arrived late and duplicates what was converted. Bounded:
+    /// [`MAX_CLOSED_TURNS`].
+    closed_turns: RecentDigests,
+    /// Bytes of the line being fed.
+    line_bytes: usize,
     awaiting_usage: Vec<String>,
     last_total: Option<String>,
     delta: Vec<Value>,
@@ -185,6 +247,19 @@ enum Pending {
 /// Items held for one turn, at most; past it they are counted and dropped.
 const MAX_PENDING: usize = 10_000;
 
+/// Bytes of transcript lines the items held for one turn may have come
+/// from, in all (each item is charged its whole line, an upper bound on what
+/// it holds); past it they are counted and dropped like items past
+/// [`MAX_PENDING`].
+const MAX_PENDING_BYTES: usize = 256 * 1024 * 1024;
+
+/// Settled turns remembered, by the digest of their id, to recognise an item
+/// that arrives late: the most recent 4,096 (under 256 KiB). A late item
+/// follows its turn's completion closely; an item naming a turn settled
+/// longer ago than that is held as the current turn's (`closed_turns/
+/// forgotten` counts the turns forgotten).
+pub(crate) const MAX_CLOSED_TURNS: usize = 4096;
+
 #[derive(Clone, Debug)]
 struct Turn {
     span: String,
@@ -192,20 +267,38 @@ struct Turn {
 }
 
 impl Codex {
-    /// A converter for the rollout at `path`, stamping `tenant`; `ancestry`
-    /// resolves a sub-agent thread's run.
-    pub(crate) fn new(path: &Path, tenant: &str, ancestry: &Ancestry) -> Self {
-        let fallback = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(|name| name.trim_end_matches(".zst").trim_end_matches(".jsonl"))
-            .map(|stem| stem.rsplit('-').take(5).collect::<Vec<_>>())
-            .map(|mut parts| {
-                parts.reverse();
-                parts.join("-")
-            })
-            .unwrap_or_else(|| "thread".to_owned());
-        let (thread, parent) = meta_of(path).unwrap_or((fallback, None));
+    /// A converter for the rollout at `path`, stamping `tenant`, with the
+    /// identity its meta line gives; `ancestry` resolves a sub-agent
+    /// thread's run. Every id the converter derives depends on that
+    /// identity, so there is no converter until it is known: a rollout whose
+    /// meta line is still being written is [`NotYet::Pending`].
+    pub(crate) fn open(path: &Path, tenant: &str, ancestry: &Ancestry) -> Result<Self, NotYet> {
+        match meta_of(path) {
+            MetaRead::Found(meta) => Ok(Self::new(path, tenant, ancestry, Some(meta))),
+            MetaRead::Absent => Ok(Self::new(path, tenant, ancestry, None)),
+            MetaRead::Pending => Err(NotYet::Pending),
+            MetaRead::Unreadable(error) => Err(NotYet::Unreadable(error)),
+        }
+    }
+
+    /// A converter for the rollout at `path` whose identity is `meta` (`None`:
+    /// a rollout that has none, whose thread is guessed from its file name).
+    pub(crate) fn new(path: &Path, tenant: &str, ancestry: &Ancestry, meta: Option<Meta>) -> Self {
+        let fallback = || {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.trim_end_matches(".zst").trim_end_matches(".jsonl"))
+                .map(|stem| stem.rsplit('-').take(5).collect::<Vec<_>>())
+                .map(|mut parts| {
+                    parts.reverse();
+                    parts.join("-")
+                })
+                .unwrap_or_else(|| "thread".to_owned())
+        };
+        let (thread, parent) = match meta {
+            Some(meta) => (meta.thread, meta.parent),
+            None => (fallback(), None),
+        };
         let root = ancestry.root(&thread, parent.as_deref());
         let child = parent.map(|parent| ChildInfo { parent });
         Self {
@@ -230,9 +323,12 @@ impl Codex {
             last_response: None,
             turn_outputs: 0,
             pending: Vec::new(),
+            pending_bytes: 0,
+            pending_budget: MAX_PENDING_BYTES,
             item_line: 0,
             in_turn: false,
-            closed_turns: HashSet::new(),
+            closed_turns: RecentDigests::new(MAX_CLOSED_TURNS),
+            line_bytes: 0,
             awaiting_usage: Vec::new(),
             last_total: None,
             delta: Vec::new(),
@@ -246,6 +342,31 @@ impl Codex {
 
     fn run_id(&self) -> &str {
         &self.base.session
+    }
+
+    /// Settled turns remembered.
+    #[cfg(test)]
+    pub(crate) fn closed_turns_len(&self) -> usize {
+        self.closed_turns.len()
+    }
+
+    /// Serialized bytes of what the current turn holds.
+    #[cfg(test)]
+    pub(crate) fn pending_bytes(&self) -> usize {
+        self.pending
+            .iter()
+            .map(|held| match held {
+                Pending::Item { item, .. } => item.to_string().len(),
+                Pending::Usage { usage, .. } => usage.to_string().len(),
+            })
+            .sum()
+    }
+
+    /// This converter with `bytes` as its held-items budget.
+    #[cfg(test)]
+    pub(crate) fn with_pending_budget(mut self, bytes: usize) -> Self {
+        self.pending_budget = bytes;
+        self
     }
 
     fn key(&self, item: &str) -> String {
@@ -513,6 +634,10 @@ impl Codex {
                 format!("execute_tool {tool_name}"),
                 at,
             );
+            // No outcome until the output (or the item's own status) says
+            // one: a call whose output was never written did not succeed as
+            // far as anyone knows (blame reads it as unconfirmed).
+            span.status = String::new();
             base.apply(SOURCE, &mut span.attributes);
             let a = &mut span.attributes;
             a.insert("gen_ai.operation.name".into(), json!("execute_tool"));
@@ -807,7 +932,11 @@ impl Codex {
                 self.settle(at, end, stats);
                 self.in_turn = false;
                 if let Some(turn_id) = str_field(payload, "turn_id") {
-                    self.closed_turns.insert(turn_id.to_owned());
+                    self.closed_turns.insert(
+                        hash128(turn_id.as_bytes()),
+                        stats,
+                        "closed_turns/forgotten",
+                    );
                 }
                 self.close_response();
                 let id = self.current_container();
@@ -839,19 +968,16 @@ impl Codex {
             "token_count" => self.token_count(payload, at, end, stats),
             "item_completed" => {
                 let late = str_field(payload, "turn_id")
-                    .is_some_and(|turn| self.closed_turns.contains(turn));
+                    .is_some_and(|turn| self.closed_turns.contains(&hash128(turn.as_bytes())));
                 if late {
                     stats.record("item_completed/late");
                 } else if let Some(item) = payload.get("item") {
-                    if self.pending.len() < MAX_PENDING {
-                        self.pending.push(Pending::Item {
-                            item: item.clone(),
-                            at,
-                            line: self.line,
-                        });
-                    } else {
-                        stats.record("item_completed/overflow");
-                    }
+                    let held = Pending::Item {
+                        item: item.clone(),
+                        at,
+                        line: self.line,
+                    };
+                    self.hold(held, stats, "item_completed/overflow");
                 }
             }
             "user_message"
@@ -888,18 +1014,28 @@ impl Codex {
         // is waiting for is a call whose items were recorded some other way
         // (or not at all): held until the turn ends.
         let Some(id) = self.awaiting_usage.pop() else {
-            if self.pending.len() < MAX_PENDING {
-                self.pending.push(Pending::Usage {
-                    usage: usage.clone(),
-                    at,
-                    line: self.line,
-                });
-            } else {
-                stats.record("token_count/unattributed");
-            }
+            let held = Pending::Usage {
+                usage: usage.clone(),
+                at,
+                line: self.line,
+            };
+            self.hold(held, stats, "token_count/unattributed");
             return;
         };
         self.set_usage(&id, usage, end);
+    }
+
+    /// Holds `entry` for the current turn, charged the line it came from,
+    /// unless that would pass [`MAX_PENDING`] entries or the byte budget:
+    /// then it is counted under `overflow` and dropped.
+    fn hold(&mut self, entry: Pending, stats: &mut FileStats, overflow: &str) {
+        let bytes = self.pending_bytes.saturating_add(self.line_bytes);
+        if self.pending.len() < MAX_PENDING && bytes <= self.pending_budget {
+            self.pending.push(entry);
+            self.pending_bytes = bytes;
+        } else {
+            stats.record(overflow);
+        }
     }
 
     fn set_usage(&mut self, id: &str, usage: &Value, end: u64) {
@@ -944,6 +1080,7 @@ impl Codex {
     /// in order, as that turn's responses and tool calls.
     fn settle(&mut self, at: u64, end: u64, stats: &mut FileStats) {
         let pending = std::mem::take(&mut self.pending);
+        self.pending_bytes = 0;
         let replay = self.turn_outputs == 0;
         self.turn_outputs = 0;
         if pending.is_empty() {
@@ -1221,6 +1358,7 @@ impl Converter for Codex {
     fn feed(&mut self, line: &[u8], end: u64, stats: &mut FileStats) {
         self.line += 1;
         self.item_line = self.line;
+        self.line_bytes = line.len();
         let Ok(record) = serde_json::from_slice::<Value>(line) else {
             stats.malformed_lines += 1;
             return;

@@ -296,7 +296,9 @@ from an unrelated repository) and an optional `limit` (default 5, at most 50),
 and returns the earliest recorded tool steps whose edit added that line —
 Claude Code `Edit`/`MultiEdit`/`Write`, Codex patches and file changes,
 Anthropic's text-editor tool — each with its run, step, model, tool, file, the
-project it was made in and the prompt the agent was following. It is the
+project it was made in and the prompt the agent was following. A failed edit
+(status `error`) is never an answer; an edit whose result was never recorded
+is listed after every applied one, as having tried to write the line. It is the
 same search as [`GET /v1/blame`](http-api.md#get-v1blame); see the
 [recorders guide](recorders.md#agent-blame) for what counts as introducing a
 line. Paths, tool and model names, run ids and prompts render inside the

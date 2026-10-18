@@ -639,3 +639,83 @@ fn hitting_the_candidate_cap_stops_the_search_and_says_truncated() {
         "stopped inside the first segment"
     );
 }
+
+/// A Claude Code `Edit` that failed (`old_string` not found) before a later
+/// one succeeded, and one in between whose result was never written.
+fn outcome_store(label: &str, line: &str) -> TempStore {
+    let fixture = TempStore::open(label, crate::Config::default());
+    let edit = |id: &str, start: u64, status: &str, result: Option<&str>| {
+        let mut span = tool_span(
+            "t1",
+            id,
+            start,
+            "Edit",
+            json!({"file_path": "/repo/src/a.rs", "old_string": "fn stale() {}",
+                   "new_string": line}),
+        );
+        span.status = status.to_owned();
+        if let Some(result) = result {
+            span.attributes
+                .insert("gen_ai.tool.call.result".into(), json!(result));
+        }
+        span
+    };
+    fixture
+        .store()
+        .ingest_batch(vec![
+            edit(
+                "failed",
+                100,
+                "error",
+                Some("<tool_use_error>String to replace not found in file.</tool_use_error>"),
+            ),
+            edit("unrecorded", 150, "", None),
+            edit("applied", 200, "ok", Some("The file has been updated.")),
+        ])
+        .expect("ingests");
+    fixture
+}
+
+#[test]
+fn a_failed_edit_is_not_an_introduction_and_an_unconfirmed_one_ranks_after_applied_ones() {
+    let line = "let total = items.len();";
+    let fixture = outcome_store("blame-outcome", line);
+    let blame = fixture
+        .store()
+        .blame(Some(""), &anywhere("src/a.rs"), line, 5)
+        .expect("blames");
+    let ids: Vec<&str> = blame.matches.iter().map(|m| m.span_id.as_str()).collect();
+    assert_eq!(
+        ids,
+        ["applied", "unrecorded"],
+        "the failed attempt wrote nothing; the call with no recorded outcome comes after \
+         every applied edit"
+    );
+    let outcomes: Vec<EditOutcome> = blame.matches.iter().map(|m| m.outcome).collect();
+    assert_eq!(outcomes, [EditOutcome::Applied, EditOutcome::Unconfirmed]);
+    let wire = serde_json::to_value(&blame).expect("serializes");
+    assert_eq!(wire["matches"][1]["outcome"], json!("unconfirmed"));
+    // A result alone is evidence the call completed (OTel's unset status is
+    // the usual one for success); `ok` alone is too.
+    let mut quiet = tool_span("t", "q", 1, "Edit", json!({}));
+    quiet.status = String::new();
+    assert_eq!(EditOutcome::of(&quiet), EditOutcome::Unconfirmed);
+    quiet
+        .attributes
+        .insert("output.value".into(), json!("done"));
+    assert_eq!(EditOutcome::of(&quiet), EditOutcome::Applied);
+    quiet.status = "ERROR".into();
+    assert_eq!(
+        EditOutcome::of(&quiet),
+        EditOutcome::Failed,
+        "a result does not undo a failure"
+    );
+    let one = fixture
+        .store()
+        .blame(Some(""), &anywhere("src/a.rs"), line, 1)
+        .expect("blames");
+    assert_eq!(
+        one.matches[0].span_id, "applied",
+        "the answer the route names"
+    );
+}
