@@ -431,8 +431,14 @@ below shares it, and none gets a fresh budget of its own.
   published, so the open file is a fixed snapshot of that generation's
   manifest even if a checkpoint deletes it meanwhile. Reading it, digesting
   it and decoding one entry per file stop at the budget and resume where they
-  stopped. If the live generation moves on before a manifest is taken in,
-  packs start on the new one.
+  stopped. Until a pack is answered, packs stay with the snapshot of the chain
+  and the generation that manifest belongs to, however many checkpoints land
+  meanwhile, so a store that checkpoints between every retry still gets its
+  pack. That pack's `ledger.head` is the head as it stood then, and every
+  entry and finding in it is as of that head. The next pack takes the store
+  as it is by then. Packs stop waiting on that snapshot once its manifest is
+  in and it is more than 60 seconds old, or as soon as the generation is
+  found to be no longer live while a file problem is being confirmed.
 - **The file check** digests files without that lock too, a budget at a time.
   Each file is digested from one open handle, so a file the budget stopped
   part-way through is continued, not started again. A new generation
@@ -458,7 +464,14 @@ below shares it, and none gets a fresh budget of its own.
   the pack checks that generation instead: it takes in the new manifest and
   digests what changed. A pack that keeps finding the store moved this way,
   eight times running, answers `409`; what it checked is kept, so a retry
-  continues.
+  continues. Problems are checked again 256 at a time, each batch under its
+  own hold of the lock, with the budget checked between batches, so a store
+  with thousands of damaged files does not hold off checkpoints while a pack
+  looks at all of them. Problems not yet checked again wait for the next
+  request.
+- **A file check the next generation replaces** is freed a budget's share at
+  a time, at the start of later packs and in the time they spend on redoing
+  old checks, and never while holding the lock.
 - **The window's entries and erasures** are found by binary search in indexes
   by time, so a pack reads only those lines.
 - **Activity** comes from the same fold the analytics use. A window too large
@@ -468,11 +481,12 @@ below shares it, and none gets a fresh budget of its own.
   either limit, `conclusive` and `result` are `null`, and
   `GET /v1/erasures/{id}/verify` answers for that erasure.
 
-If the budget runs out in any of the first four steps, that step stops,
+If the budget runs out in any of the first five steps, that step stops,
 keeps its progress, and the pack is refused with `400` saying how far it got
 (for example `the ledger chain was verified through line N …`, `N entries of
-generation G's manifest … were taken in …`, or `N of M files of generation G
-were digested …`). A pack never carries a partial
+generation G's manifest … were taken in …`, `N of M files of generation G
+were digested …`, or `N file problem(s) found off the maintenance lock were
+still to be confirmed …`). A pack never carries a partial
 verification. The next request resumes where the step stopped, however long
 ago that was, so retrying completes the check even when it needs many
 budgets. The first pack after a server starts does the most of this work,
