@@ -143,6 +143,9 @@ coding (`br`, `deflate`, `zstd`, a doubled `gzip`), is `415`.
 | `POST` | [`/v1/replays/{id}/tools/next`](#post-v1replaysidtoolsnext) | The next recorded tool result |
 | `GET` | [`/v1/diff`](#get-v1diff) | Two runs aligned, and where they first diverge |
 | `GET` | [`/v1/recall`](#get-v1recall) | Earlier runs containing the same words, successes first |
+| `GET` | [`/v1/fate/cohorts`](#get-v1fatecohorts) | Agents' run cohorts, with outcome counts and base rates |
+| `GET` | [`/v1/fate/map`](#get-v1fatemap) | One agent's Fate Map: every path its runs took, with success rates, fatal forks and hotspots |
+| `GET` | [`/v1/fate/runs/{run}`](#get-v1faterunsrun) | Foresight for one run: how runs that took its path ended |
 | `POST` | [`/v1/annotations`](#post-v1annotations) | Attach a score or feedback record |
 | `GET` | [`/v1/annotations`](#get-v1annotations) | Query annotations |
 | `POST` | [`/v1/datasets`](#post-v1datasets) | Create a dataset |
@@ -1292,6 +1295,153 @@ many to rank by recency; add a word.
 
 ---
 
+## Foresight
+
+The Fate Map — a tree of every path an agent's completed runs took, each
+branch with its success rate and 95% Wilson interval — and foresight for one
+run against it. The [guide](foresight.md) explains the model and the
+statistics; this is the wire. Every route is a `GET` (any valid credential).
+On the map and run routes `?tenant=` selects the tenant for an unbound
+credential (absent: the default tenant); on the cohort listing an unbound
+credential naming none sees every tenant. A bound credential is forced to its
+own tenant, and naming another is `403`. Unknown or repeated query parameters
+are `400`. `since`/`until` are integer Unix nanoseconds over span start times
+(default: the last 30 days; `until` alone is the 30 days before it, `since`
+alone runs to now).
+
+A build reads every span of its window under `--query-deadline-ms`; one that
+runs out answers `400` naming `since=`/`until=` as the remedy. Builds are
+cached for `--fate-cache-seconds` and dropped by any erasure. Each answer
+carries `bounds`, what the build met — `spans_read`, `runs_tracked`,
+`spans_skipped`, `runs_partial`, `runs_dropped`, `cohorts_dropped`,
+`node_cap`, `signature_cap`, `window_narrowed` — and `truncated`, whether any
+of them cut it short ([bounds](foresight.md#bounds-cache-and-erasure)).
+
+### `GET /v1/fate/cohorts`
+
+`?since=&until=&tenant=` → `{"cohorts": [...], "window": {"since_ns",
+"until_ns"}, "built_at_ns", "truncated", "bounds"}`. Agent cohorts largest
+first, each followed by its task sub-cohorts (at most 32, each with at least
+3 completed runs):
+
+| Field | Type | Description |
+|---|---|---|
+| `tenant` | string | The cohort's tenant |
+| `agent` | string | The first step's agent name, else the earliest span's service |
+| `task` | string | Present on a task sub-cohort: 16 hex characters of the SHA-256 of the run's `traza.task` (else `session.goal`) |
+| `runs` | integer | Completed runs: `success + failure + abandoned` |
+| `success`, `failure`, `abandoned` | integer | By outcome |
+| `unknown` | integer | Runs excluded because their outcome cannot be told — still active (last span within 15 minutes) or an unrecognised declared outcome |
+| `base_rate` | number \| null | `success / runs` |
+
+```sh
+curl 'http://127.0.0.1:8080/v1/fate/cohorts'
+```
+
+```json
+{"bounds":{"cohorts_dropped":0,"node_cap":false,"runs_dropped":0,"runs_partial":0,"runs_tracked":226,"signature_cap":false,"spans_read":1342,"spans_skipped":0,"window_narrowed":false},"built_at_ns":1792298013667246000,"cohorts":[{"abandoned":9,"agent":"support-agent","base_rate":0.5444,"failure":73,"runs":180,"success":98,"tenant":"","unknown":6},{"abandoned":4,"agent":"support-agent","base_rate":0.6,"failure":12,"runs":40,"success":24,"task":"dd8fe599d8750716","tenant":"","unknown":0},{"abandoned":0,"agent":"researcher","base_rate":0.5,"failure":20,"runs":40,"success":20,"tenant":"","unknown":0}],"truncated":false,"window":{"since_ns":1789706013667246000,"until_ns":1792298013667246000}}
+```
+
+### `GET /v1/fate/map`
+
+One agent's Fate Map.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `agent` | string, required | The cohort, as `/v1/fate/cohorts` names it |
+| `task` | string | Only runs of this task key |
+| `since`, `until` | integer | The window |
+| `depth` | integer | Tokens to render, 1–65. Default 12 |
+| `min_support` | integer | Nodes with fewer visits are pruned (and counted in their parent's `omitted_*`). Default 3 |
+| `max_nodes` | integer | Nodes rendered under the root, 1–5,000: the most visited whose parents are shown. Default 500 |
+| `tenant` | string | Tenant scope |
+
+**Response:** `tenant`, `agent`, `task`?, `runs`, `success`, `failure`,
+`abandoned`, `unknown`, `base_rate`, `truncated`, `bounds`, `window`,
+`built_at_ns`, `depth`, `min_support`, `nodes_total` (in the cohort's tree),
+`nodes_shown`, `fatal_forks` (at most 10 within `depth`, most significant
+first: `{path, visits, success_rate, fork}`), `hotspots` (at most 10:
+`{path, visits, entropy, next}`), `calibration` (`depths`: per depth `{depth,
+runs, covered, brier, baseline_brier, skill}`; `reliability`: depth-3
+predictions binned in tenths `{low, high, runs, predicted, observed}`), and
+`root`, the tree. Each node:
+
+| Field | Type | Description |
+|---|---|---|
+| `token` | string | `kind:name`, with a repeat bucket (`×2`, `×3-5`, `×6+`), or `…`; the root is `^` |
+| `depth` | integer | Tokens from the root |
+| `visits`, `success`, `failure`, `abandoned` | integer | Completed runs through the node, by outcome |
+| `ended` | integer | Runs whose path ends here |
+| `success_rate` | number \| null | `success / visits` |
+| `ci95` | [number, number] | 95% Wilson interval of the success rate |
+| `p_fail_given_here` | number \| null | `failure / visits` |
+| `lift` | number \| null | `success_rate / base_rate` |
+| `entropy` | number | Bits of entropy of the next token, ending the run counted as one |
+| `hotspot` | boolean | `entropy ≥ 1` and `visits ≥ min_support` |
+| `fatal_fork` | boolean | At least 25 points below its siblings' pooled success rate, both with `min_support` runs, two-sided Fisher exact p < 0.05 |
+| `fork` | object | `{siblings_visits, siblings_success_rate, gap, p_value}` whenever both sides have `min_support` runs |
+| `cost_usd_sum`, `duration_ns_sum` | number, integer | Summed run cost and duration of the runs through the node |
+| `example_runs` | object[] | `{run, outcome}`: the newest run of each outcome through the node |
+| `children` | object[] | Shown children, most visited first |
+| `omitted_children`, `omitted_visits` | integer | Children pruned by `min_support`, `depth` or `max_nodes`, and their visits; absent when zero |
+| `cut` | integer | Runs that went on past here along a branch `--fate-max-nodes` kept from being built; absent when zero |
+
+Rates are rounded to four decimal places, costs to the micro-dollar.
+
+```sh
+curl 'http://127.0.0.1:8080/v1/fate/map?agent=support-agent'
+```
+
+One node of the answer, the search loop:
+
+```json
+{"abandoned":5,"children":[…],"ci95":[0.0435,0.2136],"cost_usd_sum":0.2,"depth":2,"duration_ns_sum":249849000000,"ended":0,"entropy":0.0,"example_runs":[{"outcome":"success","run":"search_loop-9"},{"outcome":"failure","run":"search_loop-0"},{"outcome":"abandoned","run":"search_loop-8"}],"failure":40,"fatal_fork":true,"fork":{"gap":0.6154,"p_value":2.2114329254814858e-14,"siblings_success_rate":0.7154,"siblings_visits":130},"hotspot":false,"lift":0.1837,"p_fail_given_here":0.8,"success":5,"success_rate":0.1,"token":"tool:search_orders×3-5","visits":50}
+```
+
+**Errors.** `400` for a missing `agent`, a `depth`, `min_support` or
+`max_nodes` out of range, `since` after `until`, or an exhausted deadline;
+`404` when the agent has no runs in the window.
+
+### `GET /v1/fate/runs/{run}`
+
+Foresight for one run: its path so far, walked down its agent's map over the
+last 30 days, the run itself left out when it is in the map. `?tenant=`,
+`?min_support=` (runs that must share the path before a verdict, default 30).
+
+| Field | Type | Description |
+|---|---|---|
+| `run`, `tenant`, `agent` | string | The run and its cohort |
+| `path` | string[] | Its behaviour tokens so far |
+| `steps` | integer | Steps recorded |
+| `matched_depth` | integer | Path tokens found in the map |
+| `node` | object \| null | The deepest matched node, the run left out: `token`, `depth`, `visits`, `success`, `failure`, `abandoned`, `success_rate`, `ci95`, `p_fail_given_here`, `lift`, `cost_usd_avg` |
+| `p_success`, `ci95`, `support` | | That node's success rate, interval and visits |
+| `base_rate` | number \| null | The cohort's success rate, the run left out |
+| `verdict` | string | `on_track`, `at_risk` (interval's upper bound below the base rate), `likely_failure` (upper bound below 50%), `novel` (a step no earlier run took at that point), `insufficient_history` |
+| `explanation` | string | The verdict in one sentence |
+| `divergence` | object | For `novel`: `{depth, took, common_next}` |
+| `next` | object[] | What runs did next from the node: `{token, visits, success_rate, ci95}`, children with at least 3 runs, most common first, at most 5 |
+| `recommended_next` | string | The child with the highest Wilson lower bound among those with `min_support` runs, when that bound beats the node's rate |
+| `outcome` | string | How the run has ended so far: `unknown` while live |
+| `cohort_runs` | integer | Completed runs in the cohort, the run left out |
+| `excluded_self` | boolean | Whether the run was in the map and taken out of it |
+| `partial` | boolean | Whether the run has more than 20,000 spans and was read from its earliest |
+| `min_support` | integer | The support a verdict needed |
+| `map_built_at_ns` | integer | When the map was built |
+
+```sh
+curl 'http://127.0.0.1:8080/v1/fate/runs/live-doomed-0'
+```
+
+```json
+{"agent":"support-agent","base_rate":0.5444,"ci95":[0.0435,0.2136],"cohort_runs":180,"excluded_self":false,"explanation":"runs that took this path succeeded 5 of 50 times (10.0%, 95% CI 4.3–21.4%); the agent's overall success rate is 54%","map_built_at_ns":1792298124721544000,"matched_depth":2,"min_support":30,"next":[{"ci95":[0.0435,0.2136],"success_rate":0.1,"token":"llm:gpt-4o","visits":50}],"node":{"abandoned":5,"ci95":[0.0435,0.2136],"cost_usd_avg":0.004,"depth":2,"failure":40,"lift":0.1837,"p_fail_given_here":0.8,"success":5,"success_rate":0.1,"token":"tool:search_orders×3-5","visits":50},"outcome":"unknown","p_success":0.1,"partial":false,"path":["llm:gpt-4o","tool:search_orders×3-5"],"run":"live-doomed-0","steps":5,"support":50,"tenant":"","verdict":"likely_failure"}
+```
+
+**Errors.** `400` for an empty or over-long (1,024 bytes) run id,
+`min_support=0`, or an exhausted deadline; `404` for a run no span carries.
+
+---
+
 ## Annotations
 
 ### `POST /v1/annotations`
@@ -1959,6 +2109,7 @@ fields are `400`.
 | `tripped_by` | string \| null | `policy` or `manual`, for a recorded stop |
 | `evidence` | object[] | `{trace_id, span_id}` of the span that tripped a stop, and of the repeated step when repeats are a reason |
 | `source` | string | `live` from memory, `rebuilt` when answering read the run's stored spans |
+| `foresight` | object | Present when the policy sets `min_success_odds` and the run is not already stopped: `verdict`, `p_success`, `ci95`, `support`, `successes`, `base_rate`, `matched_depth`, `next_tool` (when the check's next tool was judged), `raised` (whether it raised the policy's action), `explanation`, `map_built_at_ns` (absent when no map was cached). See [predictive fuses](foresight.md#predictive-fuses) |
 
 ### `POST /v1/fuses/check`
 
@@ -2087,7 +2238,7 @@ its `id` and `created_at_ns`). Live runs of the tenant are re-judged at once.
 | `name` | string | 1–64 bytes, unique within the tenant. `default` is the tenant's fallback; `global` is reserved |
 | `tenant` | string | Optional; a bound credential is forced to its own |
 | `match` | object | `{"service": string}` (1–256 bytes) — runs whose first span, by start time, came from that service. Required unless the name is `default`, which must not have one |
-| `limits` | object | Any of `max_cost_usd`, `max_tokens`, `max_steps`, `max_llm_calls`, `max_tool_calls`, `max_duration_seconds`, `max_repeats`, `max_error_streak`. Each positive; `max_repeats` at least 2. Absent is unbounded, and nothing is inherited from `default` or `global` |
+| `limits` | object | Any of `max_cost_usd`, `max_tokens`, `max_steps`, `max_llm_calls`, `max_tool_calls`, `max_duration_seconds`, `max_repeats`, `max_error_streak`. Each positive; `max_repeats` at least 2. Absent is unbounded, and nothing is inherited from `default` or `global`. Also the predictive limits `min_success_odds` (in `(0, 1]`), `foresight_min_support` (default 30) and `foresight_after_steps` (default 3), evaluated on the check and verdict queries only — the last two require the first ([predictive fuses](foresight.md#predictive-fuses)) |
 | `action` | string | `stop` or `warn` (default `warn`) |
 
 ```sh

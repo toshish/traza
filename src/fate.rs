@@ -44,9 +44,9 @@
 //! below its siblings' pooled rate, both have support, and a two-sided
 //! Fisher exact test puts the difference at p < 0.05 — so three unlucky runs
 //! are not a fatal fork. Each map also reports its own **calibration**:
-//! leave-one-out predictions at several depths scored against what happened
-//! (Brier score and skill over the base rate), so a reader can see how much
-//! the map's foresight is worth before trusting it.
+//! cross-validated predictions at several depths scored against what
+//! happened (Brier score and skill over the base rate), so a reader can see
+//! how much the map's foresight is worth before trusting it.
 //!
 //! # Foresight for one run
 //!
@@ -440,10 +440,12 @@ pub struct CalibrationPoint {
     pub depth: usize,
     /// Completed runs at least this deep.
     pub runs: u64,
-    /// Of those, runs predicted by their own node (at least
-    /// 10 other runs there); the rest are predicted by the base rate.
+    /// Of those, runs predicted by their node (at least 10 runs of the
+    /// other half there); the rest are predicted by the base rate.
     pub covered: u64,
-    /// Mean squared error of the leave-one-out predictions.
+    /// Mean squared error of the predictions, each run predicted from the
+    /// half of the cohort it is not in (two-fold cross-validation, split by
+    /// a hash of the run id).
     pub brier: f64,
     /// The same for the base rate alone.
     pub baseline_brier: f64,
@@ -1023,8 +1025,6 @@ impl Fold<'_> {
             self.bounds.spans_skipped += 1;
             return;
         }
-        let llm = self.store.facts(span);
-        let (kind, signature, agent) = semconv::step_signature_with(span, &llm);
         let key = order_key(span);
         let service = match self.names.intern(&span.service) {
             Some(id) => id,
@@ -1069,6 +1069,10 @@ impl Fold<'_> {
         let Some(acc) = tenant_runs.get_mut(run.as_str()) else {
             return;
         };
+        // Facts only for spans of runs the fold tracks: an untracked run's
+        // spans cost a run-id lookup and nothing more.
+        let llm = self.store.facts(span);
+        let (kind, signature, agent) = semconv::step_signature_with(span, &llm);
         self.tracked_spans += 1;
         acc.cost_usd += llm.cost_usd.unwrap_or(0.0);
         acc.min_start = acc.min_start.min(span.start_time_ns);
@@ -1127,13 +1131,15 @@ impl Fold<'_> {
         {
             acc.first_step = Some((key, agent));
         }
-        let Some(signature) = self.signatures.intern(&stem(&signature)) else {
-            // Past the signature bound the step cannot be named; the run's
-            // path ends before it.
-            self.bounds.signature_cap = true;
-            acc.steps_dropped = true;
-            return;
-        };
+        // Past the signature bound a step cannot be named. It keeps its
+        // place, as an unnamed record, and the run's path ends before it.
+        let signature = self
+            .signatures
+            .intern(&stem(&signature))
+            .unwrap_or_else(|| {
+                self.bounds.signature_cap = true;
+                NONE
+            });
         let record = StepRecord { key, signature };
         let room = acc.steps.len() < RUN_STEP_WINDOW && self.held < MAX_STEP_RECORDS;
         if room {
@@ -1417,11 +1423,10 @@ fn grow(runs: &[RunFinal], budget: &mut usize, bounds: &mut Bounds) -> (Vec<Node
     (nodes, deepest)
 }
 
-/// Scores leave-one-out predictions against outcomes; see
+/// Scores cross-validated predictions against outcomes; see
 /// [`CalibrationPoint`].
 fn calibrate(nodes: &[Node], runs: &[RunFinal], deepest: &[u32]) -> Calibration {
-    let root = nodes[0].counts();
-    if root.visits < 2 {
+    if runs.len() < 2 {
         return Calibration::default();
     }
     let chains: Vec<Vec<u32>> = deepest
@@ -1437,12 +1442,29 @@ fn calibrate(nodes: &[Node], runs: &[RunFinal], deepest: &[u32]) -> Calibration 
             chain
         })
         .collect();
+    // Two-fold cross-validation: each run is predicted from the half of the
+    // cohort it is not in. Leave-one-out would be tighter, but on a branch
+    // of identical runs it predicts a success lower and a failure higher —
+    // its own outcome shifts the rate it is scored against — which splits a
+    // reliability table along exactly the line it is trying to draw.
+    let folds: Vec<usize> = runs.iter().map(|run| fold_of(&run.run)).collect();
+    let mut counts: Vec<[(u64, u64); 2]> = vec![[(0, 0); 2]; nodes.len()];
+    for (index, run) in runs.iter().enumerate() {
+        let success = u64::from(run.outcome == Outcome::Success);
+        for &id in &chains[index] {
+            let slot = &mut counts[id as usize][folds[index]];
+            slot.0 += 1;
+            slot.1 += success;
+        }
+    }
+    let rate = |(visits, success): (u64, u64)| success as f64 / visits as f64;
     let mut depths = Vec::new();
     let mut bins: [(u64, f64, u64); 10] = [(0, 0.0, 0); 10];
     for depth in CALIBRATION_DEPTHS {
         let (mut runs_at, mut covered, mut brier, mut baseline) = (0_u64, 0_u64, 0.0, 0.0);
         for (index, run) in runs.iter().enumerate() {
-            if run.path.len() < depth {
+            let other = 1 - folds[index];
+            if run.path.len() < depth || counts[0][other].0 == 0 {
                 continue;
             }
             runs_at += 1;
@@ -1451,15 +1473,15 @@ fn calibrate(nodes: &[Node], runs: &[RunFinal], deepest: &[u32]) -> Calibration 
             } else {
                 0.0
             };
-            let base = root.without(run.outcome).rate().unwrap_or(0.5);
+            let base = rate(counts[0][other]);
             let node = chains[index]
                 .get(depth)
-                .map(|&id| nodes[id as usize].counts().without(run.outcome))
-                .filter(|counts| counts.visits >= CALIBRATION_SUPPORT);
-            let predicted = match node.and_then(|counts| counts.rate()) {
-                Some(rate) => {
+                .map(|&id| counts[id as usize][other])
+                .filter(|(visits, _)| *visits >= CALIBRATION_SUPPORT);
+            let predicted = match node {
+                Some(node) => {
                     covered += 1;
-                    rate
+                    rate(node)
                 }
                 None => base,
             };
@@ -1502,6 +1524,15 @@ fn calibrate(nodes: &[Node], runs: &[RunFinal], deepest: &[u32]) -> Calibration 
         depths,
         reliability,
     }
+}
+
+/// Which half of a cohort a run falls in for cross-validation: FNV-1a of its
+/// id, so the split is deterministic and blind to how the run ended.
+fn fold_of(run: &str) -> usize {
+    let hash = run.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+    });
+    (hash & 1) as usize
 }
 
 // ----------------------------------------------------------------- build
@@ -1640,11 +1671,15 @@ fn build(
                 .and_then(|(_, agent)| agent)
                 .unwrap_or(acc.earliest.1);
             let outcome = outcome_of(&acc.tail, acc.declared.as_ref(), now_ns);
-            let complete = !acc.steps_dropped && acc.step_count == acc.steps.len() as u64;
+            let mut complete = !acc.steps_dropped && acc.step_count == acc.steps.len() as u64;
+            let mut ordered = acc.steps.into_sorted_vec();
+            if let Some(unnamed) = ordered.iter().position(|record| record.signature == NONE) {
+                ordered.truncate(unnamed);
+                complete = false;
+            }
             if !complete {
                 bounds.runs_partial += 1;
             }
-            let ordered = acc.steps.into_sorted_vec();
             let grouped: Vec<(String, usize)> =
                 groups(ordered.iter().map(|record| record.signature))
                     .into_iter()
@@ -2151,7 +2186,7 @@ impl Render<'_> {
             hotspot: entropy >= HOTSPOT_BITS && counts.visits >= self.min_support,
             fatal_fork: fork.as_ref().is_some_and(Self::is_fatal),
             fork,
-            cost_usd_sum: node.cost_usd_sum,
+            cost_usd_sum: round_usd(node.cost_usd_sum),
             duration_ns_sum: node.duration_ns_sum,
             example_runs,
             children: rendered,
@@ -2388,6 +2423,12 @@ struct Judged {
     next: Vec<NextOption>,
     recommended: Option<String>,
     matched_depth: usize,
+}
+
+/// A dollar amount to the micro-dollar: summing thousands of metered costs
+/// leaves float noise in the last digits that is not money.
+fn round_usd(value: f64) -> f64 {
+    (value * 1_000_000.0).round() / 1_000_000.0
 }
 
 fn percent(value: f64) -> String {
@@ -2764,6 +2805,8 @@ impl Store {
                     | ForesightVerdict::LikelyFailure
             ) {
                 judged = hypothetical;
+                judged.explanation =
+                    format!("if it calls tool:{tool} next: {}", judged.explanation);
                 out.next_tool = Some(tool.to_owned());
             }
         }
@@ -2817,7 +2860,8 @@ fn fill(foresight: &mut Foresight, build: &Build, cohort: &Cohort, judged: &Judg
                 (Some(rate), Some(base)) if base > 0.0 => Some(stats::round4(rate / base)),
                 _ => None,
             },
-            cost_usd_avg: (node.visits > 0).then(|| node.cost_usd_sum / f64::from(node.visits)),
+            cost_usd_avg: (node.visits > 0)
+                .then(|| round_usd(node.cost_usd_sum / f64::from(node.visits))),
         });
     }
 }

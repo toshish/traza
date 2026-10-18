@@ -184,7 +184,7 @@ fn render(foresight: &Foresight, max_bytes: usize) -> Value {
     let mut notes = vec![
         "Foresight is counting, not a model: the share of this agent's completed runs (last 30 \
          days) whose behaviour started the same way and succeeded. Repeats of a step fold into \
-         buckets (×2, ×3-5, ×6+). The run itself is left out of the counts."
+         buckets (×2, ×3-5, ×6+). A completed run is left out of the counts it is judged by."
             .to_owned(),
     ];
     if foresight.partial {

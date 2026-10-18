@@ -200,6 +200,9 @@ better p95/p99 with peak capacity. Do not pick it hoping for a lower median;
 | `--fuse-action stop\|warn` | `warn` | What the global policy does at a limit. `warn` reports; `stop` makes the run's verdict `stop` until it is reset. Every policy warns at 80% of a limit either way. The default warns, because a default that stopped someone's agent would be a decision nobody made. |
 | `--fuse-max-runs N` | `100000` | Live runs the fuse observer keeps in memory, least recently active evicted first, shared by every tenant; independently, at most 1,000,000 span contributions are held across them. An evicted run is rebuilt from the store when next asked about, but until then ingest verdicts for it see only the spans that arrive after the eviction. A run evicted while **stopped** is parked instead — its stop kept, its per-span state dropped — and up to this many runs are parked; past that the oldest parked runs are dropped, and a policy stop dropped that way is recomputed by the next rebuild under the policy then in force (a kill switch is durable and is never lost, only its place in the stopped listing). See [run fuses § What is durable](guide/guard.md#what-is-durable-and-what-is-rebuilt). |
 | `--no-fuses` | off (fuses on) | Turns the run-fuse observer off entirely: ingest does no fuse work, `fuses.jsonl` is neither read nor written (so a damaged one cannot keep the server from starting), responses carry no `fuses` field or `Traza-Fuse` header, and every `/v1/fuses/*` route answers `409`. |
+| `--fate-max-runs N` | `20000` | Completed runs one [Fate Map](guide/foresight.md) cohort is built from, the newest first; older ones are dropped and counted (`bounds.runs_dropped`). A build's fold tracks at most four times this many runs across its cohorts — a window holding more is narrowed to its most recent part that fits (`bounds.window_narrowed`) — and holds at most 2,097,152 step records (32 bytes each, 64 MiB) whatever this says. Values below 1 are raised to 1. |
+| `--fate-max-nodes N` | `50000` | Tree nodes one Fate Map build holds across its cohorts. Nodes are created shallowest first and most visited first, so the bound cuts the long tail of deep, rare paths; a cut is reported (`bounds.node_cap`, and `cut` on the nodes below which it cut). At most 8 builds are cached. Values below 1 are raised to 1. |
+| `--fate-cache-seconds N` | `300` | How long a Fate Map build is served before the next request rebuilds it. The predictive fuses (`min_success_odds`) read only cached maps — up to twice this old while a background thread rebuilds — and never build on the check path. `0` disables the cache: every map request builds, and the predictive fuses never act. Any erasure drops every cached build. |
 | `--allow-unauthenticated-non-loopback` | off | Explicitly permit an unauthenticated non-loopback bind. **Every client that reaches the port is then an unbound admin**, and the first to call `POST /v1/admin/credentials` mints the store's first admin credential — closing the store to everyone else, persistently (a later restart with `TRAZA_TOKENS` keeps it alongside). See [the non-loopback refusal](operations/administration.md#the-non-loopback-refusal). |
 | `--version`, `-V` | — | Print `traza-server <version>` and exit. |
 | `--restore DIR` | — | Install a backup from `DIR` into `--data-dir`, then serve it. The backup is verified before anything is swapped and the swap commits at one `CURRENT` rename, so a failed restore leaves the prior store. See [backup and restore](operations/backup.md). |
@@ -342,6 +345,7 @@ same values a `--profile` would give the server.
 | `max_span_bytes` | `Option<usize>` | `Some(4 MiB)` | As `--max-span-bytes`: measured as stored, after offload under `payload_threshold`. |
 | `max_batch_spans` | `Option<usize>` | `Some(100_000)` | As `--max-batch-spans`: one `ingest_batch` call may carry at most this many spans. |
 | `fuses` | `guard::FuseConfig` | on, warn at 12 repeats | The [run fuses](guide/guard.md): see `FuseConfig` below. On by default for embedders too — every acknowledged batch feeds the observer, which follows runs from their first step. |
+| `fate` | `fate::FateConfig` | see below | The [Fate Map](guide/foresight.md)'s bounds and cache: see `FateConfig` below. |
 
 `CompactionConfig`:
 
@@ -359,6 +363,14 @@ same values a `--profile` would give the server.
 | `limits` | `guard::Limits` | `max_repeats: Some(12)` | The global policy's limits, as the `--fuse-max-*` flags. `None` is unbounded. |
 | `action` | `guard::Action` | `Warn` | As `--fuse-action`. |
 | `max_runs` | `usize` | `100_000` | As `--fuse-max-runs`. |
+
+`fate::FateConfig`:
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `max_runs` | `usize` | `20_000` | As `--fate-max-runs`. |
+| `max_nodes` | `usize` | `50_000` | As `--fate-max-nodes`. |
+| `cache_ttl` | `Duration` | 300 s | As `--fate-cache-seconds`. The predictive fuses read only cached maps, which `traza-server` builds on a background thread; an embedder that sets `min_success_odds` on a policy calls `Store::maintain_fate` on its own cadence, or its fuses never see a map. |
 
 `Profile` exposes `parse`, `as_str`, `flush_spans`, `wal_commit_window`, and
 `config`. There is deliberately no `Profile` → `Durability` mapping.

@@ -8,6 +8,12 @@
 //! - `--url http://host:port` POSTs batches to a server that is already
 //!   running, over the same public `/v1/spans` and `/v1/annotations` API any
 //!   client uses.
+//!
+//! `--behaviours` loads the behaviour corpus instead
+//! ([`traza::seed::behaviour_corpus`]): agent runs whose branches succeed at
+//! known, different rates, laid out over the last few hours before now, plus
+//! a handful of runs still in flight — what the Fate Map and foresight
+//! (`/v1/fate/*`) learn from.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -36,6 +42,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut options = SeedOptions::default();
     let mut batch = 500_usize;
     let mut payload_threshold = 256 * 1024_usize;
+    let mut behaviours = false;
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -81,9 +88,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .ok_or("--payload-threshold-bytes needs a value")?
                     .parse()?;
             }
+            "--behaviours" => behaviours = true,
             "--help" | "-h" => {
                 println!(
-                    "Usage: seed (--data-dir DIR | --url http://host:port) [--scale N] [--seed N] [--batch N] [--payload-threshold-bytes N]"
+                    "Usage: seed (--data-dir DIR | --url http://host:port) [--scale N] [--seed N] [--batch N] [--payload-threshold-bytes N] [--behaviours (the Fate Map's behaviour corpus instead)]"
                 );
                 return Ok(());
             }
@@ -151,6 +159,38 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         (None, Some(endpoint)) => Some(split_url(endpoint)?),
         (Some(_), None) => None,
     };
+
+    if behaviours {
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        let generated = traza::seed::behaviour_corpus(&traza::seed::BehaviourOptions {
+            now_ns,
+            scale: total_scale,
+            live: true,
+            seed: options.seed,
+            ..traza::seed::BehaviourOptions::default()
+        });
+        let count = generated.spans.len();
+        match (&store, &endpoint) {
+            (Some(store), _) => {
+                store.ingest_batch(generated.spans)?;
+                store.flush()?;
+            }
+            (None, Some((host, port, _))) => {
+                for slice in generated.spans.chunks(batch) {
+                    post(host, *port, "/v1/spans", &serde_json::to_vec(slice)?)?;
+                }
+            }
+            (None, None) => unreachable!("a destination was validated above"),
+        }
+        eprintln!(
+            "seed: wrote {count} spans of {} behaviour runs",
+            generated.runs.len()
+        );
+        return Ok(());
+    }
 
     let mut done = 0_usize;
     let mut chunk_index = 0_u32;

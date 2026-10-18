@@ -953,3 +953,42 @@ fn predictive_limits_act_on_checks_from_a_cached_map_only() {
     let plain = store.fuse_verdict("", "trace:nothing").expect("verdict");
     assert!(plain.foresight.is_none());
 }
+
+#[test]
+#[ignore = "a timing probe, run by hand: cargo test --lib fate_build_timing -- --ignored --nocapture"]
+fn fate_build_timing() {
+    let fixture = TempStore::open("timing", crate::Config::default());
+    let store = fixture.store();
+    let now = now();
+    let scale = std::env::var("TRAZA_FATE_SCALE")
+        .ok()
+        .and_then(|scale| scale.parse().ok())
+        .unwrap_or(50);
+    let spans = behaviour_corpus(&BehaviourOptions {
+        now_ns: now,
+        scale,
+        ..BehaviourOptions::default()
+    })
+    .spans;
+    let count = spans.len();
+    for chunk in spans.chunks(20_000) {
+        store.ingest_batch(chunk.to_vec()).expect("ingests");
+    }
+    store.flush().expect("flushes");
+    let started = Instant::now();
+    let map = store
+        .fate_map("", &MapRequest::new("support-agent"), now)
+        .expect("builds")
+        .expect("exists");
+    println!(
+        "{count} spans, {} runs in the map ({} tracked), built in {:?}",
+        map.runs,
+        map.bounds.runs_tracked,
+        started.elapsed()
+    );
+    let started = Instant::now();
+    let _ = store
+        .foresee("", "search_loop-3", 30, now)
+        .expect("foresees");
+    println!("foresight from the cached map in {:?}", started.elapsed());
+}
