@@ -135,6 +135,16 @@ every read. A run that carries several values of one dimension (a planner
 model and an executor model, say) has the set of them as its value, shown
 joined with ` + `.
 
+A run holds at most four distinct values of a dimension. A run that carried
+more has an **incomplete** set: which values it ran on is not fully known,
+so it is left out of that dimension's change detection and of the sides of
+its changes, as a run that carries none of the dimension is. Which four it
+holds depends only on the set, never on the order its spans were read, and
+it is shown as those four and ` + …`. Holding the first four read instead
+would make two runs on the same five models look like different
+configurations whenever their spans arrived in a different order, and would
+miss an edit to the fifth.
+
 | Dimension | Read from (first present wins) | Shown as |
 |---|---|---|
 | `system_prompt` | The request's `system` and `developer` messages, with `gen_ai.system_instructions` folded in (the [step request](../llm-semantics.md#input-and-output) precedence: `gen_ai.input.messages`, indexed `gen_ai.prompt.{i}.*`, OpenInference `llm.input_messages.*`, …). When the request is a provider body (OpenInference `input.value`), its top-level `system` and its `messages` | 16 hex characters of SHA-256 over the text, volatile tokens masked |
@@ -179,9 +189,10 @@ Some edge cases:
 - A dimension where more than half of at least 20 runs carry a value that no
   other run shares is **volatile**: it is listed in the agent's `volatile`
   array and not searched. This usually means a prompt embeds something per
-  request that the masking above does not catch. A dimension with more than
-  100 change points in the window is listed as volatile too: a value that
-  changes that often is not a history of deploys.
+  request that the masking above does not catch. A dimension where more than
+  half of the runs carrying it have an incomplete set (above) is listed as
+  volatile too, and so is a dimension with more than 100 change points in
+  the window: a value that changes that often is not a history of deploys.
 
 ### Agents
 
@@ -425,7 +436,7 @@ most recent runs) and `summary`, a one-sentence headline.
 | Runs analysed | `--radar-max-runs` (default 20,000): the newest agent runs, by the start of their first step. Past it, `truncated: true` and `covered_since_ns` say where the analysed window starts. Every agent run whose first step starts at or after that point is read in full |
 | Memory per run held | Typically about a kilobyte; at most about 6 KB. Ids are clipped to 128 bytes, names to 256, declared outcomes to 32, and lists are capped as below |
 | Earliest steps kept per run | 32 (enough for the top-level path) |
-| Values per dimension per run | 4 (then `+ …`) |
+| Values per dimension per run | 4. A run that carried more is shown with `+ …` and left out of that dimension's change detection |
 | Tool counts per run | 64 tools |
 | Display names | 2,048 values per dimension, at most 256 of them from one tenant's service; 8,192 step and tool names, at most 1,024 per service. A value past these is still compared exactly, and shown as `#` and its digest (`unnamed: true`) |
 | Diff samples | 1 MiB per dimension (prompt texts up to 4 KB each, catalog tool names, parameters) |

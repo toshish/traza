@@ -19,7 +19,10 @@
 //! every key). Values are compared by a 64-bit digest; their text is kept
 //! only to be shown, in bounded tables.
 //! A run carrying several values of one dimension — a planner model and an
-//! executor model — has the SET of them as its value.
+//! executor model — has the SET of them as its value. A run holds at most
+//! [`MAX_RUN_VALUES`] of them; one that carried more has an INCOMPLETE set,
+//! which says nothing certain about what it ran on, so it is left out of
+//! that dimension's change detection and of its changes' sides.
 //!
 //! Runs are grouped into **cohorts** by `(tenant, agent)`, where the agent is
 //! the first step's agent name ([`semconv::step_facts`]) or else the run's
@@ -54,7 +57,8 @@
 //!
 //! A dimension where more than half the runs carry a value no other run
 //! shares — typically a prompt embedding something per-request that masking
-//! did not catch — or that has more than [`MAX_CHANGES_PER_DIMENSION`]
+//! did not catch — or where more than half the runs carrying it have an
+//! incomplete set, or that has more than [`MAX_CHANGES_PER_DIMENSION`]
 //! change points is **volatile**, and is reported as such instead of being
 //! searched.
 //!
@@ -207,8 +211,9 @@ pub const VERDICT_ALPHA: f64 = 0.05;
 /// Earliest steps kept per run — enough for the top-level path.
 pub const MAX_RUN_STEPS: usize = 32;
 
-/// Distinct values of one dimension kept per run; a run carrying more is
-/// shown with a trailing ` + …`.
+/// Distinct values of one dimension a run holds. A run carrying more has an
+/// incomplete set: it is shown as the values it holds and a trailing ` + …`,
+/// and left out of that dimension's change detection.
 pub const MAX_RUN_VALUES: usize = 4;
 
 /// Distinct values per dimension one analysis keeps a display name (and a
@@ -838,7 +843,17 @@ impl Tables {
     }
 }
 
-/// A run's distinct values of one dimension.
+/// A run's distinct values of one dimension, as a function of the set alone
+/// — never of the order its spans were read in, which batching can change.
+///
+/// It holds the [`MAX_RUN_VALUES`] smallest digests seen, sorted, and
+/// `overflow` says the run carried more. Both are exact: a value not held
+/// was refused or evicted only once more than [`MAX_RUN_VALUES`] distinct
+/// values had arrived, and the held ones only ever get smaller, so a repeat
+/// of it is never mistaken for a newcomer. A set that overflowed is
+/// INCOMPLETE: which values the run carried is not known, so the analysis
+/// leaves the run out of that dimension (see [`analyse`]); what it holds is
+/// kept only to be shown.
 #[derive(Clone, Debug, Default)]
 struct ValueSet {
     ids: Vec<u64>,
@@ -847,14 +862,18 @@ struct ValueSet {
 
 impl ValueSet {
     fn add(&mut self, id: u64) {
-        if self.ids.contains(&id) {
+        let Err(at) = self.ids.binary_search(&id) else {
+            return;
+        };
+        if self.ids.len() < MAX_RUN_VALUES {
+            self.ids.insert(at, id);
             return;
         }
-        if self.ids.len() >= MAX_RUN_VALUES {
-            self.overflow = true;
-            return;
+        self.overflow = true;
+        if at < self.ids.len() {
+            self.ids.pop();
+            self.ids.insert(at, id);
         }
-        self.ids.push(id);
     }
 }
 
@@ -1212,10 +1231,17 @@ struct ComboTable {
 }
 
 impl ComboTable {
+    /// Whether `combo` is a run's whole set, not an overflowed one's first
+    /// values.
+    fn complete(&self, combo: u32) -> bool {
+        self.members
+            .get(combo as usize)
+            .is_some_and(|(_, overflow)| !overflow)
+    }
+
     fn intern(&mut self, set: &ValueSet) -> u32 {
-        let mut ids = set.ids.clone();
-        ids.sort_unstable();
-        let key = (ids, set.overflow);
+        // Held sorted already (see `ValueSet`).
+        let key = (set.ids.clone(), set.overflow);
         if let Some(&id) = self.ids.get(&key) {
             return id;
         }
@@ -2259,11 +2285,30 @@ fn analyse(
         // The sequence, the volatility count and the current value: three
         // reads of the cohort's runs.
         pace.add(3 * runs.len())?;
+        // A run whose set overflowed is no evidence of what it ran on: two
+        // runs on the same five models would hold different first fours, and
+        // an edit to a fifth would go unseen. It is left out of the
+        // dimension, as a run carrying none of it is.
+        let mut incomplete = 0usize;
         let sequence: Vec<(usize, u32)> = runs
             .iter()
             .enumerate()
-            .filter_map(|(position, run)| run.values[index].map(|combo| (position, combo)))
+            .filter_map(|(position, run)| {
+                let combo = run.values[index]?;
+                if context.combos[index].complete(combo) {
+                    Some((position, combo))
+                } else {
+                    incomplete += 1;
+                    None
+                }
+            })
             .collect();
+        if incomplete > sequence.len() {
+            // Most of its runs carry more values than a run holds: too
+            // varied per run to search.
+            volatile.push(dimension);
+            continue;
+        }
         if sequence.is_empty() {
             continue;
         }
@@ -5283,6 +5328,150 @@ mod tests {
                 {"key": "stop", "before": "END, temperature=0.7", "after": "END"},
                 {"key": "temperature", "before": null, "after": 0.7},
             ])
+        );
+    }
+
+    #[test]
+    fn a_run_value_set_does_not_depend_on_the_order_its_values_arrived() {
+        let ids: Vec<u64> = ["a", "b", "c", "d", "e"]
+            .iter()
+            .map(|v| digest(v))
+            .collect();
+        let set = |order: &mut dyn Iterator<Item = &u64>| {
+            let mut set = ValueSet::default();
+            for &id in order {
+                set.add(id);
+                set.add(id);
+            }
+            set
+        };
+        let forward = set(&mut ids.iter());
+        let backward = set(&mut ids.iter().rev());
+        assert_eq!(
+            (&forward.ids, forward.overflow),
+            (&backward.ids, backward.overflow)
+        );
+        assert!(forward.overflow, "five values do not fit four");
+        assert_eq!(forward.ids.len(), MAX_RUN_VALUES);
+        // A set that fits is held whole, whatever its order.
+        let fits = set(&mut ids[..MAX_RUN_VALUES].iter());
+        let reversed = set(&mut ids[..MAX_RUN_VALUES].iter().rev());
+        assert_eq!((&fits.ids, fits.overflow), (&reversed.ids, false));
+    }
+
+    /// One run of `service` making one model call per entry of `models`, in
+    /// that order, ten ns apart.
+    fn fanout_run(service: &str, id: &str, start: u64, models: &[&str]) -> Vec<Span> {
+        models
+            .iter()
+            .enumerate()
+            .map(|(index, model)| Span {
+                trace_id: format!("trace-{id}"),
+                span_id: format!("llm-{index}"),
+                tenant: String::new(),
+                parent_span_id: None,
+                name: "chat".to_owned(),
+                start_time_ns: start + index as u64 * 10,
+                end_time_ns: start + index as u64 * 10 + 5,
+                status: "ok".to_owned(),
+                service: service.to_owned(),
+                attributes: json!({
+                    "session.id": id,
+                    "gen_ai.operation.name": "chat",
+                    "gen_ai.request.model": model,
+                })
+                .as_object()
+                .cloned()
+                .unwrap_or_default(),
+                events: Vec::new(),
+                links: Vec::new(),
+                extra: Map::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_run_with_more_values_than_it_holds_is_not_evidence_of_a_change() {
+        let fixture = TempStore::open("radar-overflow", crate::Config::default());
+        let store = fixture.store();
+        let models = ["model-a", "model-b", "model-c", "model-d", "model-e"];
+        let reversed: Vec<&str> = models.iter().rev().copied().collect();
+        let mut spans = Vec::new();
+        for index in 0..120u64 {
+            // The same five models in every run; only the order they are
+            // called (and read) in changes, at run 60.
+            let order: &[&str] = if index < 60 { &models } else { &reversed };
+            spans.extend(fanout_run(
+                "fanout-bot",
+                &format!("fanout-{index:03}"),
+                BASE + index * MINUTE,
+                order,
+            ));
+            // Another agent moves from one model to another at run 60; every
+            // tenth of its runs fans out to all five as well.
+            let single = [if index < 60 { "model-a" } else { "model-b" }];
+            let calls: &[&str] = if index % 10 == 5 { order } else { &single };
+            spans.extend(fanout_run(
+                "mixed-bot",
+                &format!("mixed-{index:03}"),
+                BASE + index * MINUTE + 1,
+                calls,
+            ));
+        }
+        store.ingest_batch(spans).expect("ingests");
+        let report = store.changes(None, &query(), NOW).expect("analyses");
+        let mixed = report
+            .agents
+            .iter()
+            .find(|agent| agent.agent == "mixed-bot")
+            .expect("mixed-bot");
+        let moved = mixed
+            .changes
+            .iter()
+            .find(|change| change.dimension == Dimension::ModelRequested)
+            .expect("the complete runs still show the move");
+        assert_eq!(
+            (moved.from.as_str(), moved.to.as_str()),
+            ("model-a", "model-b")
+        );
+        assert_eq!(
+            (moved.runs_before, moved.runs_after),
+            (54, 54),
+            "the fanned-out runs are on neither side"
+        );
+        assert!(mixed.volatile.is_empty(), "{:?}", mixed.volatile);
+        let agent = report
+            .agents
+            .iter()
+            .find(|agent| agent.agent == "fanout-bot")
+            .expect("fanout-bot");
+        assert!(
+            !agent
+                .changes
+                .iter()
+                .any(|change| change.dimension == Dimension::ModelRequested),
+            "the configuration did not change: {:#?}",
+            agent.changes
+        );
+        assert!(
+            agent.volatile.contains(&Dimension::ModelRequested),
+            "every run's set is incomplete, so the dimension is not searched: {:?}",
+            agent.volatile
+        );
+        // A placed run still shows what it holds, and that it holds more.
+        let placed = ChangeQuery {
+            run: Some("fanout-070".to_owned()),
+            ..query()
+        };
+        let run = store
+            .changes(None, &placed, NOW)
+            .expect("analyses")
+            .run
+            .expect("placed");
+        assert!(
+            run.fingerprint["model_requested"].ends_with(" + …"),
+            "{:?}",
+            run.fingerprint
         );
     }
 }
