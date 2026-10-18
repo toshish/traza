@@ -173,9 +173,12 @@ fn an_imported_claude_code_history_answers_every_new_read() {
     assert_eq!(xray["cache"]["cause"], "stable");
 
     // The Cache Autopsy pairs each call with its conversation's previous
-    // one — the sub-agent's calls with each other — and, with a one-minute
-    // cache, prices the two calls that came back too late at the input rate
-    // less the cache-read rate: 158 and 197 tokens × $2.70 per Mtok.
+    // one — the sub-agent's calls with each other. With a one-minute cache
+    // assumed, two calls came back too late; the first of them reports
+    // reading its whole prefix from the cache anyway (1,500 tokens of the
+    // 1,408 its predecessor reported), so the cache outlived the assumption
+    // and it is stable. The other read nothing: its 197 tokens are priced at
+    // the input rate less the cache-read rate, $2.70 per Mtok.
     let autopsy = ok(&server, &format!("/v1/cache/{S1}?ttl_seconds=60"));
     let verdicts: Vec<(Value, Value, Value)> = autopsy["steps"]
         .as_array()
@@ -198,16 +201,16 @@ fn an_imported_claude_code_history_answers_every_new_read() {
             (json!(6), json!(4), json!("stable")),
             (json!(9), Value::Null, json!("new_context")),
             (json!(11), json!(9), json!("stable")),
-            (json!(12), json!(6), json!("ttl_expired")),
+            (json!(12), json!(6), json!("stable")),
             (json!(13), json!(12), json!("ttl_expired")),
             (json!(14), json!(13), json!("stable")),
         ],
         "{autopsy}"
     );
     let summary = &autopsy["summary"];
-    assert_eq!(summary["est_tokens_lost"], json!(355));
+    assert_eq!(summary["est_tokens_lost"], json!(197));
     assert!(
-        close(&summary["est_cost_lost_usd"], 0.000_958_5),
+        close(&summary["est_cost_lost_usd"], 0.000_531_9),
         "{summary}"
     );
 
