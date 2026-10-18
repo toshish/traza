@@ -190,6 +190,7 @@ better p95/p99 with peak capacity. Do not pick it hoping for a lower median;
 | `--mcp-max-result-bytes N` | `32768` | Ceiling on one MCP tool result or resource read, counting the **whole serialized result** — text block, `structuredContent`, and the JSON envelope around them — in UTF-8 bytes, which is what goes on the wire. **Refused below 1,024**: beneath that there is no result that both fits and conforms to the `outputSchema` its tool advertises, and failing at startup beats answering every request with something a validating client rejects. Past it, rows are dropped and the truncation is stated with the argument that would have narrowed it. Raise for a client with a large context window; lower to make an agent narrow its own queries. |
 | `--mcp-max-payload-bytes N` | `262144` | Ceiling on one `get_payload` fetch, whatever the call asks for. This is what stops a single offloaded prompt filling a context window. The **effective** cap is the smaller of this and `--mcp-max-result-bytes`, so that the byte count the tool reports is the one it returns. |
 | `--tape-max-bytes N` | `8388608` (8 MiB) | Offloaded payload content one tape inlines when asked to resolve `$payload` references ([`GET /v1/tapes/{run}?resolve=true`](guide/http-api.md#get-v1tapesrun)), and one replay holds when it snapshots a run ([`POST /v1/replays`](guide/http-api.md#post-v1replays)). For a tape the cut is a prefix — the first reference that does not fit, and every one after it, stays a reference and the tape says `resolved_partial: true` — and every occurrence is charged. For a replay only what it keeps is charged: model answers, and tool arguments and results. Recorded requests are resolved one at a time to be digested for strict matching, then dropped, and cost none of it. A replay whose model answers cannot all be held is refused with `409`, naming the step and saying this limit is why; a tool step past it is listed in `unreadable_tool_steps` and refused by `tools/next`. This bounds bytes, not time: resolution runs inside the request's one [`--query-deadline-ms`](#server-flags) budget, checked before every payload read, and a payload referenced from many steps is probed for tenant reachability once per request. `0` resolves nothing. See the [replay guide](guide/replay.md). |
+| `--xray-stale-steps N` | `20` | Steps after which a tool result in a [context X-Ray](guide/xray.md) is reported `stale` when no model output since has drawn on it (a heuristic; see the guide). A per-request `stale_steps=` overrides it. Read-side only: nothing on the ingest path consults it. At least 1 — `0` refuses startup. |
 | `--pricing FILE` | none | Per-model rates used to derive a cost for LLM spans that did not meter one. Nothing is derived without it, which is the behaviour every store had before it existed. A malformed file refuses startup rather than being ignored — silently reporting `$0.00` is the symptom the file was supplied to fix. Changing the rates invalidates rollups folded under the old ones, which costs a rebuild of the affected sidecars. See [Model pricing](#model-pricing). |
 | `--fuse-max-cost-usd F` | off | The **global** [run fuse](guide/guard.md) policy's cost limit, in USD: the policy every run gets whose tenant has no service-matching or `default` policy. Priced cost — metered, else derived from `--pricing`. `0` removes the limit. |
 | `--fuse-max-tokens N` | off | The global policy's token limit. `0` removes it. |
@@ -241,7 +242,10 @@ surface, which reads as *this was free* rather than *nobody told me the rates*.
   "models": {
     "gpt-5.6-sol":   {"input_per_mtok": 1.25, "output_per_mtok": 10.00},
     "gpt-4o-mini*":  {"input_per_mtok": 0.15, "output_per_mtok": 0.60},
-    "gpt-4o*":       {"input_per_mtok": 2.50, "output_per_mtok": 10.00}
+    "gpt-4o*":       {"input_per_mtok": 2.50, "output_per_mtok": 10.00,
+                      "cache_read_per_mtok": 1.25},
+    "claude-sonnet-*": {"input_per_mtok": 3.00, "output_per_mtok": 15.00,
+                        "cache_read_per_mtok": 0.30, "cache_write_per_mtok": 3.75}
   }
 }
 ```
@@ -257,9 +261,31 @@ vendor's schedule rather than Traza's, and self-hosted models have no public
 rate at all.
 
 **What derived cost is.** Arithmetic over the tokens the span reported, at the
-rates you configured. It is not a bill — it knows nothing about cached-prompt
-discounts, batch tiers, reasoning tokens billed at a third rate, or negotiated
-pricing.
+rates you configured. It is not a bill — it knows nothing about batch tiers,
+reasoning tokens billed at a third rate, or negotiated pricing.
+
+**Cached prompt tokens** are priced only when the model's entry names their
+rates: `cache_read_per_mtok` and `cache_write_per_mtok`, both optional, both
+USD per million tokens. Providers count them differently, and the provider a
+span names decides how they are applied (the table in
+[Prompt caching](llm-semantics.md#prompt-caching-and-what-prompt-tokens-means)):
+
+| Provider (`gen_ai.provider.name`) | The prompt count is | Derived cost |
+|---|---|---|
+| `anthropic`, `aws.bedrock`, `gcp.vertex_ai` | the uncached remainder | prompt × input rate + cache reads × read rate + cache writes × write rate + output |
+| `openai`, `azure.ai.openai` | inclusive of the cached tokens | (prompt − cached) × input rate + cache reads × read rate + cache writes × write rate + output |
+| anything else | unknown | prompt × input rate + output, as before |
+
+Without the cache rates — or for a reported cache counter whose rate is
+missing, a provider whose convention is not known, or cache counters larger
+than the inclusive prompt count they are part of — the old arithmetic stands:
+prompt and output at the two base rates. That **under-counts** an
+Anthropic-style call (its cached tokens are never priced) and **over-counts** an
+OpenAI-style one (its cached tokens are priced at the full input rate), which
+is why the cache rates exist. A table without them digests exactly as before,
+so upgrading invalidates no rollups; adding one invalidates those folded under
+the old arithmetic, as any rate change does. The same rates price the
+[cache autopsy](guide/xray.md#cache-autopsy)'s lost-cache estimate.
 
 Three rules keep it from being mistaken for one:
 
@@ -342,6 +368,7 @@ same values a `--profile` would give the server.
 | `max_span_bytes` | `Option<usize>` | `Some(4 MiB)` | As `--max-span-bytes`: measured as stored, after offload under `payload_threshold`. |
 | `max_batch_spans` | `Option<usize>` | `Some(100_000)` | As `--max-batch-spans`: one `ingest_batch` call may carry at most this many spans. |
 | `fuses` | `guard::FuseConfig` | on, warn at 12 repeats | The [run fuses](guide/guard.md): see `FuseConfig` below. On by default for embedders too — every acknowledged batch feeds the observer, which follows runs from their first step. |
+| `xray_stale_steps` | `usize` | `20` | As `--xray-stale-steps`: the default stale threshold of `Store::xray` callers that take it from `Store::xray_stale_steps` (the HTTP route and the MCP tool do). A value of `0` reads as `1`. |
 
 `CompactionConfig`:
 

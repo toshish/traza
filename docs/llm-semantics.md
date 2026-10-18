@@ -103,6 +103,12 @@ not know, it reports the trend as unreadable rather than guessing. The
 OpenInference host names (`aws`, `azure`, `google`) are not in the table
 above, so they fall in that last case.
 
+The same table decides how a derived cost counts cached tokens when the
+pricing file names `cache_read_per_mtok` / `cache_write_per_mtok` for the
+model: on top of the prompt for the exclusive providers, carved out of it for
+the inclusive ones, and not at all for a provider not in the table (see
+[Model pricing](configuration.md#model-pricing)).
+
 OpenInference's own cache counters
 (`llm.token_count.prompt_details.cache_read` / `.cache_write`) are **not**
 read: OpenInference reports its prompt count inclusive of them, and folding

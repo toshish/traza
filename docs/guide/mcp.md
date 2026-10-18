@@ -114,7 +114,7 @@ over `curl`.
 
 ## The tools
 
-Sixteen tools: fourteen reads and two gated writers. They are shaped like the
+Seventeen tools: fifteen reads and two gated writers. They are shaped like the
 questions somebody asks at 2am, not like the route index — two routes may serve
 one tool, and one route may serve two. Most of them describe what is in the
 store; `diagnose_session` and `compare_runs` are the ones that answer a
@@ -136,6 +136,7 @@ question about it.
 | `get_run_tape` | What did this run do, step by step? |
 | `compare_runs` | **Where did this run part from that one, and why?** |
 | `recall_runs` | Has this been done before, and how did it go? |
+| `xray_step` | **What exactly did the model see at this step — and why did its cache break?** |
 | `record_annotation` | Attach a note or rating to a trace or span (**`rw` token + `--mcp-annotations`**) |
 | `promote_failures_to_dataset` | Turn this run's failures into a regression dataset (**`rw` token + `--mcp-promote`**) |
 
@@ -144,13 +145,13 @@ host asks for approval before each call:
 
 | Tool | `readOnlyHint` | `destructiveHint` | `idempotentHint` | `openWorldHint` |
 |---|---|---|---|---|
-| the fourteen readers | `true` | — | — | `false` |
+| the fifteen readers | `true` | — | — | `false` |
 | `record_annotation` | `false` | `false` | `false` | `false` |
 | `promote_failures_to_dataset` | `false` | `false` | `false` | `false` |
 
 **Absent annotations are not neutral.** Every hint defaults to the pessimistic
 answer — not read-only, potentially destructive, open world — so a server that
-omits them advertises fourteen read tools as though each might delete something and
+omits them advertises fifteen read tools as though each might delete something and
 call out to the internet. A host that gates on that asks for confirmation on
 every call, and one running non-interactively, with nobody to ask, declines
 them. `destructiveHint` and `idempotentHint` are meaningful only when
@@ -205,6 +206,19 @@ The reasoning behind these is worth knowing:
   deliberately no tool that creates a replay: a replay serves model answers to
   an agent harness, and letting the model under test create one would let
   stored telemetry choose which recording its next run is fed.
+- **`xray_step` reads one model call's context window.** It is the
+  [context X-Ray](xray.md): the context split into chunks with estimated
+  tokens and the step that introduced each, stale tool results, repeated
+  content, what the conversation's previous call had that this one lost (a
+  lost system or user chunk is called out as an instruction) or carries
+  edited, and the call's cache verdict naming the first divergent chunk and the
+  volatile token in it. It takes `trace_id` and `span_id` — `get_run_tape`
+  lists both for every step — or `run_id` and `step`, a tape index, and is text
+  only. The headline carries counts in Traza's own words; the model, the run,
+  every preview and role, and the cache explanation (which quotes recorded
+  text) render inside the telemetry block. Past the result ceiling the chunk
+  list is cut from its end and the summary rows above it survive; the stale
+  threshold is the server's `--xray-stale-steps`.
 
 **`check_run_guard` reads a run's [fuse](guard.md) verdict** — `continue`,
 `warn` or `stop` — with its reasons, policy, limits and usage: the same
@@ -219,7 +233,7 @@ stopped agent cannot talk its way past its own fuse. It answers what is
 recorded, which is the pre-call check without an estimate; an agent wanting
 to price its next step uses
 [`POST /v1/fuses/check`](http-api.md#post-v1fusescheck). On a server started
-with `--no-fuses` it is not listed — thirteen reads, then — and a call naming it
+with `--no-fuses` it is not listed — fourteen reads, then — and a call naming it
 is refused as invalid params.
 
 **The eval entities are not on this surface.** Datasets, versions, examples,

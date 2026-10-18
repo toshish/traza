@@ -671,7 +671,7 @@ pub(crate) fn contains_reference(value: &Value) -> bool {
 }
 
 /// One span as a tape step.
-fn tape_step(
+pub(crate) fn tape_step(
     index: usize,
     span: &Span,
     facts: StepFacts,

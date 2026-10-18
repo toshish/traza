@@ -40,6 +40,7 @@ impl Drop for TestDir {
 fn config() -> Config {
     Config {
         fuses: Default::default(),
+        xray_stale_steps: traza::xray::DEFAULT_STALE_STEPS,
         pricing: Default::default(),
         max_span_attributes: Some(traza::caps::DEFAULT_MAX_SPAN_ATTRIBUTES),
         max_attribute_key_bytes: Some(traza::caps::DEFAULT_MAX_ATTRIBUTE_KEY_BYTES),

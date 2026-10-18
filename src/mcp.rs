@@ -43,6 +43,8 @@ use crate::{semconv, Error, Span, SpanCursor, SpanFilter, SpanSort, Store};
 
 // get_run_tape, compare_runs and recall_runs live beside this file.
 mod replay_tools;
+// xray_step lives beside this file.
+mod xray_tools;
 
 /// The MCP endpoint path served by `traza-server`.
 pub const ENDPOINT: &str = "/v1/mcp";
@@ -628,6 +630,7 @@ impl<'a> Server<'a> {
             );
         }
         tools.extend(replay_tools::definitions());
+        tools.extend(xray_tools::definitions());
         if self.annotation_tool_available(access) {
             tools.push(tool(
                 "record_annotation",
@@ -750,6 +753,7 @@ impl<'a> Server<'a> {
             name if replay_tools::handles(name) => {
                 replay_tools::call(self, name, arguments, &context)
             }
+            name if xray_tools::handles(name) => xray_tools::call(self, arguments, &context),
             "record_annotation" if self.annotation_tool_available(context.access) => {
                 self.record_annotation(arguments, context)
             }

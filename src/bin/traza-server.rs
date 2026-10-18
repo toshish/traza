@@ -187,6 +187,7 @@ impl RouteClass {
             }
             ("GET", "/v1/annotations") => Self::Lookup,
             ("GET", path) if path.starts_with("/v1/tapes/") => Self::Lookup,
+            ("GET", path) if traza::xray::http::handles(path) => Self::Lookup,
             ("GET", "/v1/diff" | "/v1/recall") => Self::Stats,
             _ => Self::Other,
         }
@@ -657,6 +658,8 @@ besides loopback)] \
 [--fuse-action stop|warn (default warn)] [--fuse-max-runs N (live runs kept; default 100000)] \
 [--no-fuses (do not observe runs; every /v1/fuses route answers 409)] \
 [--tape-max-bytes N (payload bytes one tape or replay inlines; default 8MiB)] \
+[--xray-stale-steps N (steps after which an unreferenced tool result is stale in the \
+context X-Ray; default 20)] \
 [--allow-unauthenticated-non-loopback] [--version] \
 [--restore BACKUP_DIR (install a backup into --data-dir, then serve it)]\n\
        traza-server mcp --url URL [--token TOKEN] \
@@ -757,6 +760,7 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
     let cap = |value: u64| (value > 0).then_some(value as usize);
     let mut fuses = traza::guard::FuseConfig::default();
     let mut tape_max_bytes = traza::tape::DEFAULT_TAPE_MAX_BYTES;
+    let mut xray_stale_steps = traza::xray::DEFAULT_STALE_STEPS;
 
     let value = |i: usize, name: &str| -> Result<&String, String> {
         args.get(i)
@@ -1017,6 +1021,14 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
                 i += 1;
                 tape_max_bytes = number(i, "--tape-max-bytes")? as usize;
             }
+            "--xray-stale-steps" => {
+                i += 1;
+                let steps = number(i, "--xray-stale-steps")?;
+                if steps == 0 {
+                    return Err("--xray-stale-steps must be at least 1".to_owned());
+                }
+                xray_stale_steps = steps as usize;
+            }
             "--help" | "-h" => {
                 println!("{USAGE}");
                 return Ok(None);
@@ -1093,6 +1105,7 @@ fn parse_args(args: &[String]) -> Result<Option<Options>, String> {
             max_span_bytes: cap(max_span_bytes),
             max_batch_spans: cap(max_batch_spans),
             fuses,
+            xray_stale_steps,
         },
     }))
 }
@@ -3508,6 +3521,15 @@ fn serve_request(
                 &request.body,
                 scope,
             );
+            if reply.deadline_exceeded {
+                metrics.query_deadline_exceeded.increment();
+            }
+            responder.json(reply.status, reply.body)
+        }
+        // Context X-Ray and Cache Autopsy (traza::xray::http): reads, under
+        // the caller's tenant binding.
+        (_, path) if traza::xray::http::handles(path) => {
+            let reply = traza::xray::http::serve(engine, &request.method, path, query, scope);
             if reply.deadline_exceeded {
                 metrics.query_deadline_exceeded.increment();
             }

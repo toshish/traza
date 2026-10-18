@@ -140,6 +140,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     enabled: false,
                     ..traza::guard::FuseConfig::default()
                 },
+                // Read-side only; a seeder reads nothing.
+                xray_stale_steps: traza::xray::DEFAULT_STALE_STEPS,
             },
         )?),
         None => None,

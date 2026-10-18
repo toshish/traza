@@ -49,6 +49,7 @@ pub mod tape;
 pub mod ui;
 pub mod usage;
 mod wal;
+pub mod xray;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -932,6 +933,10 @@ pub struct Config {
     /// many runs it keeps live. On by default, warning on repeated steps
     /// only. See [`guard`].
     pub fuses: guard::FuseConfig,
+    /// Steps after which a tool result no model output has drawn on is
+    /// reported stale by the context X-Ray (`--xray-stale-steps`; see
+    /// [`xray`]). Read-side only: nothing on the ingest path consults it.
+    pub xray_stale_steps: usize,
 }
 
 /// The last commit whose reader accepts every segment format retired WITHOUT
@@ -1041,6 +1046,7 @@ impl Default for Config {
             max_span_bytes: Some(caps::DEFAULT_MAX_SPAN_BYTES),
             max_batch_spans: Some(caps::DEFAULT_MAX_BATCH_SPANS),
             fuses: guard::FuseConfig::default(),
+            xray_stale_steps: xray::DEFAULT_STALE_STEPS,
         }
     }
 }
