@@ -832,6 +832,39 @@ fn step_agent(attributes: &Map<String, Value>, traceloop_kind: Option<&str>) -> 
         .or_else(|| attr_str(attributes, OI_AGENT_NAME))
 }
 
+/// The agent `span` names — [`StepFacts::agent`], for a span of any kind —
+/// without extracting or digesting its request: what the run guard and the
+/// run topology read to tell which agent a span belongs to.
+pub(crate) fn span_agent(span: &Span) -> Option<String> {
+    let traceloop_kind =
+        attr_str(&span.attributes, TRACELOOP_SPAN_KIND).map(|kind| kind.to_ascii_lowercase());
+    step_agent(&span.attributes, traceloop_kind.as_deref())
+}
+
+/// A step's agent ([`StepFacts::agent`]) and its label — the name its
+/// fingerprint carries: the tool for a tool step, the model for an llm step,
+/// the agent for an agent step, the span name otherwise or when that fact is
+/// absent — without digesting its request. `kind` is the span's
+/// [`step_kind_with`].
+pub(crate) fn step_labels_with(
+    span: &Span,
+    llm: &LlmFacts,
+    kind: StepKind,
+) -> (Option<String>, String) {
+    let attributes = &span.attributes;
+    let traceloop_kind =
+        attr_str(attributes, TRACELOOP_SPAN_KIND).map(|kind| kind.to_ascii_lowercase());
+    let agent = step_agent(attributes, traceloop_kind.as_deref());
+    let label = match kind {
+        StepKind::Tool => step_tool(attributes, traceloop_kind.as_deref()),
+        StepKind::Llm => llm.model.clone(),
+        StepKind::Agent => agent.clone(),
+        _ => None,
+    }
+    .unwrap_or_else(|| span.name.clone());
+    (agent, label)
+}
+
 /// The step's request, per the request table on [`step_facts`].
 fn step_request(span: &Span, kind: StepKind) -> Option<Value> {
     match kind {

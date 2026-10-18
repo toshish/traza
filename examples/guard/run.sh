@@ -6,8 +6,8 @@
 # the evidence, and the pre-call check refuses the next step before it is
 # taken. Then the kill switch stops a second, healthy run; a reset is shown
 # not to refill a budget; a grant approves the first run to finish; and the
-# Claude Code hook in this directory refuses a looping session's next tool
-# call.
+# Claude Code hook pack (examples/claude-code) relays a person's note to a
+# session and refuses its next tool call once it loops.
 #
 #   examples/guard/run.sh
 #
@@ -42,7 +42,7 @@ cd "$root"
 # A function, not a command kept in a string: expanding the string would
 # split "$here" wherever the checkout's path has a space.
 agent() { python3 "$here/agent.py" "$@"; }
-hook=$here/claude-code-hook.sh
+hook=$root/examples/claude-code/traza_hook.py
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/traza-guard.XXXXXX")
 port=${TRAZA_DEMO_PORT:-8129}
 url=http://127.0.0.1:$port
@@ -260,39 +260,44 @@ agent finished "$tmp/final.json" "$tmp/loop.json" 0.035 0.10
 # -------------------------------------------------- 7 · the Claude Code hook
 
 bold "▸ 7 · the same fuse in front of Claude Code"
-dim "  claude-code-hook.sh, fed the JSON Claude Code would pipe to it. Policy:"
+dim "  examples/claude-code/traza_hook.py, fed the JSON Claude Code would pipe"
+dim "  to it, recording tool calls itself (TRAZA_RECORD_TOOLS=1). Policy:"
 dim "  sessions of service claude-code stop at 3 identical tool calls."
 echo
 code=$(post /v1/fuses/policies '{"name": "claude-code", "match": {"service": "claude-code"},
   "limits": {"max_repeats": 3}, "action": "stop"}' "$tmp/cc-policy.json")
 need "$code" 200 "creating the claude-code policy"
 session="cc-$(python3 -c 'import secrets; print(secrets.token_hex(4))')"
+code=$(post "/v1/runs/$session/nudges" '{"message": "The suite is slow; run one test file at a time.",
+  "kind": "advice"}' "$tmp/cc-nudge.json")
+need "$code" 201 "queueing a nudge for the session"
 hook_call() { # hook_call EVENT TOOL_USE_ID — exit code is the hook's
   printf '{"session_id": "%s", "hook_event_name": "%s", "tool_name": "Bash", "tool_use_id": "%s", "tool_input": {"command": "npm test"}}' \
     "$session" "$1" "$2" |
-    TRAZA_URL=$url TRAZA_TOKEN=$token sh "$hook" 2>"$tmp/hook.err"
+    TRAZA_URL=$url TRAZA_TOKEN=$token TRAZA_RECORD_TOOLS=1 python3 "$hook" \
+      >"$tmp/hook.out" 2>"$tmp/hook.err"
 }
 rc=0
 hook_call PreToolUse toolu_0 || rc=$?
-printf '    %-12s %-14s %-22s → ' PreToolUse 'Bash npm test' '(a fresh session)'
-agent hook "$rc" "$tmp/hook.err" 0
+printf '    %-12s %-14s %-24s → ' PreToolUse 'Bash npm test' '(a nudge is queued)'
+agent hook "$rc" "$tmp/hook.out" context "run one test file at a time"
 for n in 1 2 3; do
   rc=0
   hook_call PostToolUse "toolu_$n" || rc=$?
-  printf '    %-12s %-14s %-22s → ' PostToolUse 'Bash npm test' "(records call $n of 3)"
+  printf '    %-12s %-14s %-24s → ' PostToolUse 'Bash npm test' "(records call $n of 3)"
   if [ "$n" -lt 3 ]; then
-    agent hook "$rc" "$tmp/hook.err" 0
+    agent hook "$rc" "$tmp/hook.out" none
   else
-    agent hook "$rc" "$tmp/hook.err" 2 "max_repeats 3 reached" "already ran"
+    agent hook "$rc" "$tmp/hook.out" block "max_repeats 3 reached" "already ran"
   fi
 done
 rc=0
 hook_call PreToolUse toolu_4 || rc=$?
-printf '    %-12s %-14s %-22s → ' PreToolUse 'Bash npm test' '(the next call)'
-agent hook "$rc" "$tmp/hook.err" 2 "Traza stopped run $session" "max_repeats 3 reached"
+printf '    %-12s %-14s %-24s → ' PreToolUse 'Bash npm test' '(the next call)'
+agent hook "$rc" "$tmp/hook.out" deny "Traza stopped run $session" "max_repeats 3 reached"
 echo
-dim "  Exit 2 is Claude Code's 'block this call': the stderr above is what the"
-dim "  model is shown, in place of the fourth test run."
+dim "  permissionDecision \"deny\" is Claude Code's 'refuse this call': the reason"
+dim "  above is what the model is shown, in place of the fourth test run."
 
 # ------------------------------------------------------- 8 · the record
 

@@ -52,6 +52,7 @@ fn store_with_corpus(label: &str, options: &SeedOptions) -> (Store, traza::seed:
             flush_wal_bytes: None,
             fuses: Default::default(),
             fate: Default::default(),
+            steer: Default::default(),
         },
     )
     .expect("opens");

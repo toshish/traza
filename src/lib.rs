@@ -45,6 +45,7 @@ pub mod run;
 pub mod seed;
 pub mod segment;
 pub mod semconv;
+pub mod steer;
 pub mod tail;
 pub mod tape;
 pub mod ui;
@@ -935,6 +936,8 @@ pub struct Config {
     pub fuses: guard::FuseConfig,
     /// The Fate Map's bounds and cache lifetime. See [`fate`].
     pub fate: fate::FateConfig,
+    /// Steering: the live view's activity window. See [`steer`].
+    pub steer: steer::SteerConfig,
 }
 
 /// The last commit whose reader accepts every segment format retired WITHOUT
@@ -1045,6 +1048,7 @@ impl Default for Config {
             max_batch_spans: Some(caps::DEFAULT_MAX_BATCH_SPANS),
             fuses: guard::FuseConfig::default(),
             fate: fate::FateConfig::default(),
+            steer: steer::SteerConfig::default(),
         }
     }
 }
@@ -2430,6 +2434,9 @@ pub struct Store {
     /// Cached Fate Map builds. Its lock is leaf-level and never held while
     /// the store is read; every erasure empties it.
     fate: fate::FateCache,
+    /// Nudges and live-stream slots, beside the guard; `None` when the
+    /// guard is. Its lock is leaf-level.
+    steer: Option<steer::Steer>,
     _directory_lock: DirectoryLock,
 }
 
@@ -2572,6 +2579,7 @@ impl Store {
             Ok(Self {
                 guard: guard::Guard::open(&directory, &config.fuses)?,
                 fate: fate::FateCache::new(&config.fate),
+                steer: steer::Steer::open(&directory, config.fuses.enabled)?,
                 annotations: annotations::AnnotationLog::open(&directory)?,
                 evals: evals::EvalLog::open(&directory)?,
                 erasures,
@@ -6626,6 +6634,7 @@ impl Store {
         self.veil_tail(subject, &purge.keys);
         self.forget_fuse_subject(subject, &purge.keys)?;
         self.forget_fate();
+        self.forget_steer_subject(subject)?;
 
         // ---- confirm: everything mutable, BEFORE the checkpoint ----------
         // The admission barrier suppresses covered spans (and the annotate

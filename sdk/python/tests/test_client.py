@@ -282,6 +282,42 @@ class Fuses(unittest.TestCase):
         with self.assertRaises(FuseTripped):
             asyncio.run(with_block())
 
+    def test_a_check_delivers_nudges_once_and_the_guard_hands_them_over(self):
+        client = Client(OPEN.url, tenant="steered")
+
+        def queue(run, kind, message):
+            client.request(
+                "POST",
+                "/v1/runs/" + run + "/nudges",
+                query={"tenant": "steered"},
+                body={"message": message, "kind": kind},
+            )
+
+        queue("nudged-1", "advice", "Use the cached catalog.")
+        verdict = client.check("nudged-1")
+        self.assertEqual(verdict.verdict, "continue")
+        self.assertEqual([(n.kind, n.message) for n in verdict.nudges], [("advice", "Use the cached catalog.")])
+        self.assertEqual(verdict.advice, ["Use the cached catalog."])
+        self.assertTrue(verdict.nudges[0].id.startswith("nd_"))
+        self.assertEqual(client.check("nudged-1").nudges, [], "delivered once")
+
+        heard = []
+        queue("nudged-2", "advice", "Summarize before the next tool.")
+        with client.guard("nudged-2", on_nudges=heard.extend) as guard:
+            pass
+        self.assertEqual([n.message for n in heard], ["Summarize before the next tool."])
+        self.assertEqual(guard.verdict.advice, ["Summarize before the next tool."])
+
+        # A block vetoes the step: the guard hands it over, then raises.
+        heard.clear()
+        queue("nudged-3", "block", "Hold refunds for a human.")
+        with self.assertRaises(FuseTripped) as caught:
+            with client.guard("nudged-3", tool="refund", on_nudges=heard.extend):
+                self.fail("the vetoed step ran")
+        self.assertEqual([n.kind for n in heard], ["block"])
+        self.assertEqual(caught.exception.verdict.reasons, ["Hold refunds for a human."])
+        self.assertIsNone(caught.exception.verdict.tripped_by, "a veto trips nothing")
+
     def test_guard_fails_closed_unless_told_to_fail_open(self):
         unreachable = Client("http://127.0.0.1:1", timeout=2)
         with self.assertRaises(TrazaError) as caught:

@@ -22,6 +22,7 @@ from typing import IO, Any, Callable, Dict, Iterator, List, Mapping, Optional, T
 from . import __version__
 from .errors import FuseTripped, TrazaError, error_from_response
 from .models import (
+    DeliveredNudge,
     Diff,
     EvidencePack,
     FuseEvent,
@@ -160,10 +161,17 @@ class Client:
         The next step — an LLM call, or a call of ``tool`` when named — is
         added to the run's recorded usage hypothetically, with the estimates,
         and a step that would go past a ``stop`` limit answers ``stop``.
-        Nothing about the run changes. A ``stop`` is a normal answer here,
-        not an exception; :meth:`guard` is the form that raises. An answer
-        that names no verdict (``continue``, ``warn`` or ``stop``) raises
-        :class:`~traza.TrazaError` rather than passing for ``continue``.
+        Nothing about the run's usage changes. A ``stop`` is a normal answer
+        here, not an exception; :meth:`guard` is the form that raises. An
+        answer that names no verdict (``continue``, ``warn`` or ``stop``)
+        raises :class:`~traza.TrazaError` rather than passing for
+        ``continue``.
+
+        This is a pre-call check, so it also delivers the run's pending
+        nudges, in ``.nudges`` — once: they are marked delivered on the
+        server whether or not the caller reads them. ``advice`` is for the
+        agent to hear (``.advice``); a ``block`` makes the answer ``stop``
+        with its message as the reason.
         """
         nxt: Dict[str, Any] = {}
         if est_cost_usd is not None:
@@ -184,6 +192,7 @@ class Client:
         est_tokens: Optional[int] = None,
         tool: Optional[str] = None,
         fail_open: bool = False,
+        on_nudges: Optional[Callable[[List[DeliveredNudge]], None]] = None,
     ) -> "Guard":
         """A context manager and decorator that checks before its body runs.
 
@@ -191,6 +200,12 @@ class Client:
         :meth:`check` and raises :class:`~traza.FuseTripped` on ``stop``, so
         the step never starts. ``warn`` and ``continue`` let it through; the
         verdict is on the guard as ``.verdict``.
+
+        Each check delivers the run's pending nudges once (see
+        :meth:`check`). ``on_nudges``, when given, is called with them
+        before the step runs — or before :class:`~traza.FuseTripped` is
+        raised for a ``block`` — so a decorated agent step can hand the
+        advice to its model; otherwise they are on ``.verdict.nudges``.
 
         As a decorator ``run`` may be a callable, called with the decorated
         function's arguments to name the run — for a graph node whose run id
@@ -201,7 +216,7 @@ class Client:
         because silently running unguarded is a decision the caller should
         make.
         """
-        return Guard(self, run, est_cost_usd, est_tokens, tool, fail_open)
+        return Guard(self, run, est_cost_usd, est_tokens, tool, fail_open, on_nudges)
 
     def run_verdict(self, run: str) -> Verdict:
         """The run's current verdict, usage and limits.
@@ -534,6 +549,7 @@ class Guard:
         est_tokens: Optional[int],
         tool: Optional[str],
         fail_open: bool,
+        on_nudges: Optional[Callable[[List[DeliveredNudge]], None]] = None,
     ) -> None:
         self.client = client
         self.run = run
@@ -541,6 +557,7 @@ class Guard:
         self.est_tokens = est_tokens
         self.tool = tool
         self.fail_open = fail_open
+        self.on_nudges = on_nudges
         #: The last verdict this guard received; ``None`` before the first
         #: check, or when a fail-open check could not be answered.
         self.verdict: Optional[Verdict] = None
@@ -562,6 +579,8 @@ class Guard:
             self.verdict, self.error = None, error
             return None
         self.verdict = verdict
+        if verdict.nudges and self.on_nudges is not None:
+            self.on_nudges(verdict.nudges)
         if verdict.stopped:
             raise FuseTripped(verdict)
         return verdict

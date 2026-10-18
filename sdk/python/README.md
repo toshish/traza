@@ -165,9 +165,10 @@ the feed is a ring of 4,096 events, and a restart empties it.
 Claude Code: a hook in Python
 -----------------------------
 
-[`examples/guard/claude-code-hook.sh`](../../examples/guard/README.md) is the
-tested, dependency-light hook. The same pre-call check in Python, as a
-`PreToolUse` hook command:
+[`examples/claude-code`](../../examples/claude-code/README.md) is the tested,
+dependency-free hook pack — the gate, a person's nudges, a summary of earlier
+runs at session start, and an installer. The same pre-call check in Python, as
+a `PreToolUse` hook command:
 
 ```python
 #!/usr/bin/env python3
@@ -179,15 +180,25 @@ try:
     verdict = Client.from_env().check(hook["session_id"], tool=hook.get("tool_name"))
 except TrazaError as error:
     print(f"traza: guard unavailable, allowing the call: {error}", file=sys.stderr)
-    sys.exit(0)                          # fail open, as the shell hook does by default
+    sys.exit(0)                          # fail open, as the pack does by default
 if verdict.stopped:
     print("Traza run fuse: " + "; ".join(verdict.reasons), file=sys.stderr)
     sys.exit(2)                          # Claude Code blocks the call and shows stderr to the model
 ```
 
-It checks only. The shell hook's `PostToolUse` half also records each call as
-a span, which is what gives the session's step and repeat limits something to
-count.
+It checks only. The pack's optional `PostToolUse` recorder also records each
+call as a span, which is what gives the session's step and repeat limits
+something to count.
+
+**A check delivers the run's nudges.** `Client.check` — and every guard,
+which calls it — is a pre-call check, so it also carries the run's pending
+[nudges](../../docs/guide/steer.md#nudges), once: they are marked delivered
+on the server whether or not the caller reads them. Read them on the answer
+(`verdict.nudges`, `verdict.advice` for the advice messages), or pass
+`on_nudges` to `guard` to have them handed over before the step runs — a
+`block` nudge raises `FuseTripped` after the callback. Anything that checks
+a run with this client consumes its nudges, so give the agent's run id to
+the agent alone.
 
 Replaying a run with zero model calls
 -------------------------------------

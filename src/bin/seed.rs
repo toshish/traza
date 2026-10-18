@@ -149,6 +149,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     ..traza::guard::FuseConfig::default()
                 },
                 fate: Default::default(),
+                steer: traza::steer::SteerConfig::default(),
             },
         )?),
         None => None,

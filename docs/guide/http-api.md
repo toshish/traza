@@ -100,7 +100,7 @@ coding (`br`, `deflate`, `zstd`, a doubled `gzip`), is `415`.
 | `401` | Missing, malformed, unknown, expired, or revoked bearer token — including a request admitted in open mode whose body arrived after the store's first credential. Carries `WWW-Authenticate: Bearer` |
 | `403` | Valid token without the grant this request needs — the body's `"required"` names it (`rw`, `admin`, `unbound`) — or a tenant-bound credential naming a foreign tenant; in open mode, also a browser request from a non-loopback page to an admin operation |
 | `404` | No such route, or the requested trace/session/payload/dataset/experiment/credential/replay does not exist. Cross-tenant reads answer `404`, never `403` — existence is a fact about another tenant |
-| `409` | A conflict a retry may resolve: a mutation for a tenant whose erasure is pending, a tombstoned parent version, a payload reference not in the store, a pin label already taken, a credential token already registered, an environment credential named for revocation, a first credential that is not an unbound admin, a `/v1/fuses/*` route on a server started with `--no-fuses`, an anchor whose `target_head` is not the recorded head. Also a run that cannot be replayed, a strict replay's divergence, and a replayed answer too large to render — see [replays](#post-v1replays) for which of those a retry cannot fix |
+| `409` | A conflict a retry may resolve: a mutation for a tenant whose erasure is pending, a tombstoned parent version, a payload reference not in the store, a pin label already taken, a credential token already registered, an environment credential named for revocation, a first credential that is not an unbound admin, a `/v1/fuses/*` route — or a live-run or nudge route — on a server started with `--no-fuses`, a run's 33rd pending nudge, a 65th live-run stream, an anchor whose `target_head` is not the recorded head. Also a run that cannot be replayed, a strict replay's divergence, and a replayed answer too large to render — see [replays](#post-v1replays) for which of those a retry cannot fix |
 | `410` | A tombstoned dataset version: the content is withheld, the fact of the deletion is not. Also a replay that is exhausted or that an erasure withdrew |
 | `413` | A gzip body that decompresses past the 64 MiB body cap |
 | `415` | A `Content-Encoding` other than `gzip` on an ingest route, or any coding elsewhere; a `/v1/admin/` body not declared `application/json` |
@@ -179,6 +179,11 @@ coding (`br`, `deflate`, `zstd`, a doubled `gzip`), is `415`.
 | `GET` | [`/v1/fuses/policies`](#get-v1fusespolicies) | Fuse policies and the global default |
 | `POST` | [`/v1/fuses/policies/{id}/delete`](#post-v1fusespoliciesiddelete) | Delete a fuse policy |
 | `GET` | [`/v1/fuses/events`](#get-v1fusesevents) | Fuse transitions by cursor, with long-poll |
+| `GET` | [`/v1/runs/live`](#get-v1runslive) | Runs active now: what each is doing, its usage and verdict |
+| `GET` | [`/v1/runs/live/stream`](#get-v1runslivestream) | The live runs as server-sent events |
+| `POST` | [`/v1/runs/{run}/nudges`](#post-v1runsrunnudges) | Queue a nudge for a run's next pre-call check |
+| `GET` | [`/v1/runs/{run}/nudges`](#get-v1runsrunnudges) | A run's nudges and where each stands |
+| `GET` | [`/v1/runs/{run}/topology`](#get-v1runsruntopology) | A run's agents, delegations, handoffs and ping-pong |
 | `GET` | [`/v1/payloads/{reference}`](#get-v1payloadsreference) | Raw bytes of an offloaded payload |
 | `GET` | [`/v1/export`](#get-v1export) | Streaming NDJSON export |
 | `GET` | [`/v1/tail`](#get-v1tail) | Live span stream, in admission order |
@@ -2112,7 +2117,7 @@ fields are `400`.
 | `verdict` | string | `continue`, `warn` or `stop` |
 | `reasons` | string[] | For a stop, the reasons it tripped with; otherwise the limits reached or approached now. Empty for `continue` |
 | `policy` | string | The policy the run is held to; `global` for the server default |
-| `usage` | object | `steps`, `llm_calls`, `tool_calls`, `tokens`, `cost_usd`, `errors`, `error_streak`, `duration_ns`, and `top_repeat` (`{fingerprint, count, example: {trace_id, span_id}}` or `null`) |
+| `usage` | object | `steps`, `llm_calls`, `tool_calls`, `tokens`, `cost_usd`, `errors`, `error_streak`, `duration_ns`, `top_repeat` (`{fingerprint, count, example: {trace_id, span_id}}` or `null`), and — only once control has returned to a named agent since the last reset — `top_handoff_cycle` (`{agents: [returned_to, returned_from], count}`; see [steer](steer.md#handoff-cycles-as-a-fuse-limit)) |
 | `limits` | object | The limits in force: the policy's, with the run's grant over them. Absent limits are unbounded |
 | `grant` | object \| null | Limits raised for this run by resets |
 | `tripped_at_ns` | integer \| null | When the stop tripped |
@@ -2134,13 +2139,26 @@ about the run changes — `usage` is what it has recorded, and a hypothetical
 stop has no `tripped_by` — and a stop is still a `200`: the verdict is the
 answer. A run with no spans is a fresh run with zero usage.
 
+A check that names its `next` step — a pre-call check — also delivers the
+run's pending [nudges](#post-v1runsrunnudges), once: `nudges` lists them,
+`[{"id", "kind", "message"}]` in the order they were queued (empty when
+there are none), and they are marked delivered, durably, before the answer
+is sent. A `block` nudge makes this answer `stop` with the blocking messages
+as its first reasons, without tripping the fuse — no `tripped_by`, no event
+— and every pre-call check of the run in the two seconds after answers the
+same, carrying the same block nudge again, so the parallel calls of one
+batch are all vetoed. If the delivery cannot be recorded the check is `503`
+and the nudges stay pending. A check naming no `next` step is a verdict
+read: it answers `"nudges": []`, delivers nothing and is not activity for
+the [live view](#get-v1runslive); neither is the verdict route below.
+
 ```sh
 curl -X POST http://127.0.0.1:8080/v1/fuses/check \
   -d '{"run": "sess-9c21", "next": {"est_cost_usd": 0.40}}'
 ```
 
 ```json
-{"evidence":[{"span_id":"b1","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736"}],"grant":null,"limits":{"max_cost_usd":2.0,"max_error_streak":3,"max_repeats":4,"max_steps":40},"policy":"support","reasons":["max_cost_usd 2 would be exceeded by the next step: $1.7 spent + $0.4 estimated"],"run":"sess-9c21","source":"live","tenant":"","tripped_at_ns":null,"tripped_by":null,"usage":{"cost_usd":1.7,"duration_ns":900000000,"error_streak":0,"errors":0,"llm_calls":1,"steps":1,"tokens":1920,"tool_calls":0,"top_repeat":null},"verdict":"stop"}
+{"evidence":[{"span_id":"b1","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736"}],"grant":null,"limits":{"max_cost_usd":2.0,"max_error_streak":3,"max_repeats":4,"max_steps":40},"nudges":[],"policy":"support","reasons":["max_cost_usd 2 would be exceeded by the next step: $1.7 spent + $0.4 estimated"],"run":"sess-9c21","source":"live","tenant":"","tripped_at_ns":null,"tripped_by":null,"usage":{"cost_usd":1.7,"duration_ns":900000000,"error_streak":0,"errors":0,"llm_calls":1,"steps":1,"tokens":1920,"tool_calls":0,"top_repeat":null},"verdict":"stop"}
 ```
 
 **Errors.** `400` for a body that does not parse, an empty, bare `trace:` or
@@ -2248,7 +2266,7 @@ its `id` and `created_at_ns`). Live runs of the tenant are re-judged at once.
 | `name` | string | 1–64 bytes, unique within the tenant. `default` is the tenant's fallback; `global` is reserved |
 | `tenant` | string | Optional; a bound credential is forced to its own |
 | `match` | object | `{"service": string}` (1–256 bytes) — runs whose first span, by start time, came from that service. Required unless the name is `default`, which must not have one |
-| `limits` | object | Any of `max_cost_usd`, `max_tokens`, `max_steps`, `max_llm_calls`, `max_tool_calls`, `max_duration_seconds`, `max_repeats`, `max_error_streak`. Each positive; `max_repeats` at least 2. Absent is unbounded, and nothing is inherited from `default` or `global`. Also the predictive limits `min_success_odds` (in `(0, 1]`), `foresight_min_support` (default 30) and `foresight_after_steps` (default 3), evaluated on the check and verdict queries only — the last two require the first ([predictive fuses](foresight.md#predictive-fuses)) |
+| `limits` | object | Any of `max_cost_usd`, `max_tokens`, `max_steps`, `max_llm_calls`, `max_tool_calls`, `max_duration_seconds`, `max_repeats`, `max_error_streak`, `max_handoff_cycles` ([handoff cycles](steer.md#handoff-cycles-as-a-fuse-limit)). Each positive; `max_repeats` at least 2. Absent is unbounded, and nothing is inherited from `default` or `global`. Also the predictive limits `min_success_odds` (in `(0, 1]`), `foresight_min_support` (default 30) and `foresight_after_steps` (default 3), evaluated on the check and verdict queries only — the last two require the first ([predictive fuses](foresight.md#predictive-fuses)) |
 | `action` | string | `stop` or `warn` (default `warn`) |
 
 ```sh
@@ -2315,6 +2333,124 @@ events may have been missed in between.
 **Errors.** `400` for a malformed cursor or a `wait_ms` above 30,000.
 
 ---
+
+## Steer: live runs, nudges and topology
+
+Watch the runs working now, speak to one before its next step, and see how
+its agents hand control around. The [guide](steer.md) explains the model;
+this is the wire.
+
+The live-run and nudge routes answer `409` when the server runs with
+`--no-fuses`; the topology reads the store and answers either way. A run id
+in a path is percent-decoded (`%2F` for `/`) and at most 1,024 bytes. On the
+single-run routes `?tenant=` selects the run's tenant for an unbound
+credential (absent: the default tenant); a bound credential is forced to its
+own, and naming another is `403`. Unknown query parameters and body fields
+are `400`.
+
+### `GET /v1/runs/live`
+
+Runs with activity — a span arriving, or a pre-call check (one naming
+`next`) — within `--live-window-seconds` (default 900), most recently
+changed first, from the guard's live state alone. **Query:** `tenant` (unbound credentials: one
+tenant; absent: every tenant), `limit` (default 100, at most 1,000).
+
+```sh
+curl http://127.0.0.1:8080/v1/runs/live
+```
+
+```json
+{"runs":[{"agent":"triage","cost_usd":0.0,"current":{"kind":"llm","name":"gpt-4o-mini","pending":false,"started_ns":1792000004000001000},"errors":0,"last_activity_ns":1792298718444962000,"pending_nudges":0,"policy":"support","reasons":[],"run":"sess-42","service":"support-app","started_ns":1792000000000000000,"steps":8,"tenant":"","tokens":1840,"verdict":"continue"}],"truncated":false,"window_ns":900000000000}
+```
+
+| Field | Description |
+|---|---|
+| `agent` | The run's first step's agent name, else its first span's service |
+| `service` | The service of the run's first span |
+| `last_activity_ns` | Server clock at its last span arrival or pre-call check |
+| `started_ns` | Its first span's start, by the span's clock |
+| `current` | `{kind, name, started_ns, pending}`: the step a pre-call check last named, while no span has arrived since (`pending: true`, server clock), else the latest-starting recorded step |
+| `steps`, `cost_usd`, `tokens`, `errors` | Usage as the guard counts it |
+| `verdict`, `reasons`, `policy` | The guard's verdict now |
+| `pending_nudges` | Nudges queued and not yet delivered or expired |
+
+`truncated` is `true` when more runs were live than `limit`. A run is listed
+with what this process has seen of it; a run with no span yet, and a stopped
+run evicted from memory, are not listed.
+
+### `GET /v1/runs/live/stream`
+
+The live runs as server-sent events, held open until the client leaves.
+**Query:** `tenant`, as above. First `event: snapshot`, whose data is the
+`GET /v1/runs/live` document with a limit of 256; then `event: run` with one run's row each time
+that run changes, coalesced to at most one batch per 250 ms; and a `: tick`
+comment after 15 seconds of quiet. When more than 256 runs change at once, or
+an erasure sweeps the view, a new `snapshot` replaces everything before it.
+A reconnecting client starts again from a snapshot. At most 64 streams at
+once, and at most 8 per scope — one tenant, or the every-tenant view of an
+unbound credential: one more is `409`.
+
+### `POST /v1/runs/{run}/nudges`
+
+Queues a nudge for the run's next [pre-call check](#post-v1fusescheck).
+Needs `rw`. **Body:** `{"message": string, "kind": "advice"|"block",
+"ttl_seconds"?: integer}` — a message of 1 to 4,096 bytes; `ttl_seconds` 1 to
+604,800, default 3,600. A run need not have started.
+
+```sh
+curl -X POST http://127.0.0.1:8080/v1/runs/sess-42/nudges \
+  -d '{"message": "Billing owns refunds; do not hand them back to triage.", "kind": "advice"}'
+```
+
+**Response `201`:**
+
+```json
+{"created_at_ns":1792298718457171000,"delivered_at_ns":null,"expires_at_ns":1792302318457171000,"id":"nd_394a4ad29672c47e","kind":"advice","message":"Billing owns refunds; do not hand them back to triage.","run":"sess-42","status":"pending","tenant":""}
+```
+
+**Errors.** `400` for an empty or over-long message, an out-of-range
+`ttl_seconds`, a missing or unknown `kind`, an unknown field, or an invalid
+run id; `403` for a bound credential naming another tenant (or a `ro` one,
+with `"required": "rw"`); `409` when the run already has 32 pending nudges,
+when the tenant's nudges already cost 4 MiB (or every tenant's 32 MiB) and
+only pending ones are left to drop — delivered and expired ones are dropped,
+oldest first, to make room — while an erasure covering the run is pending,
+or under `--no-fuses`. Any `rw` credential can queue a nudge; its text
+reaches the agent as written.
+
+### `GET /v1/runs/{run}/nudges`
+
+The run's nudges, in the order they were queued — at most 64 kept per run —
+each with `status`: `pending`, `delivered` or `expired`.
+
+```json
+{"nudges":[{"created_at_ns":1792298718457171000,"delivered_at_ns":1792298718470236000,"expires_at_ns":1792302318457171000,"id":"nd_394a4ad29672c47e","kind":"advice","message":"Billing owns refunds; do not hand them back to triage.","run":"sess-42","status":"delivered","tenant":""},{"created_at_ns":1792298718463831000,"delivered_at_ns":1792298718470236000,"expires_at_ns":1792299318463831000,"id":"nd_e03d16ad2736feaa","kind":"block","message":"Hold refunds over $500 for a human.","run":"sess-42","status":"delivered","tenant":""}],"run":"sess-42","tenant":""}
+```
+
+### `GET /v1/runs/{run}/topology`
+
+The run's agent graph, from its stored spans, under `--query-deadline-ms`:
+`nodes` (agents — named, or a service standing in for one — with their
+spans, steps, LLM and tool calls, errors, cost, tokens, first start and last
+end), `edges` (parent → child relations crossing agents: `from`, `to`,
+`count`, `errors`, first and last child start), `handoffs` (turn-to-turn
+transitions between named agents), `sequence` (one entry per turn), `cycles`
+(`{agents: [returned_to, returned_from], count, first_ns, last_ns, example}`:
+control returning to an agent straight from the one it handed off to),
+`spans_read`, and `truncated` when the run has more than 50,000 spans (the
+earliest are read). Lists are cut at 256 nodes, 1,024 edges, 1,024 handoff
+pairs, 256 cycle pairs and 500 turns, largest first, each with its own flag:
+`nodes_truncated`, `edges_truncated`, `handoffs_truncated`,
+`cycles_truncated`, `sequence_truncated`. Every pass over the spans checks
+the deadline, not just the read. An unknown run is an empty graph. The
+definitions are in the [guide](steer.md#topology).
+
+```json
+{"cycles":[{"agents":["billing","triage"],"count":1,"example":{"span_id":"a3","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736"},"first_ns":1792000004000000000,"last_ns":1792000004000000000},{"agents":["triage","billing"],"count":1,"example":{"span_id":"a2","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736"},"first_ns":1792000003000000000,"last_ns":1792000003000000000}],"cycles_truncated":false,"edges":[{"count":2,"errors":0,"first_ns":1792000002000000000,"from":"support-app","last_ns":1792000004000000000,"to":"billing"},{"count":2,"errors":0,"first_ns":1792000001000000000,"from":"support-app","last_ns":1792000003000000000,"to":"triage"}],"edges_truncated":false,"handoffs":[{"count":2,"from":"triage","to":"billing"},{"count":1,"from":"billing","to":"triage"}],"handoffs_truncated":false,"nodes":[{"agent":"billing","cost_usd":0.0,"errors":0,"first_ns":1792000002000000000,"last_ns":1792000004500000000,"llm_calls":2,"named":true,"spans":4,"steps":4,"tokens":920,"tool_calls":0},{"agent":"triage","cost_usd":0.0,"errors":0,"first_ns":1792000001000000000,"last_ns":1792000003500000000,"llm_calls":2,"named":true,"spans":4,"steps":4,"tokens":920,"tool_calls":0},{"agent":"support-app","cost_usd":0.0,"errors":0,"first_ns":1792000000000000000,"last_ns":1792000060000000000,"llm_calls":0,"named":false,"spans":1,"steps":0,"tokens":0,"tool_calls":0}],"nodes_truncated":false,"run":"sess-42","sequence":["triage","billing","triage","billing"],"sequence_truncated":false,"spans_read":9,"tenant":"","truncated":false}
+```
+
+**Errors.** `400` for an invalid run id or tenant, or when the read or the
+graph's assembly exhausted `--query-deadline-ms`.
 
 ## Erasure
 

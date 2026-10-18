@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use super::policy::{Action, Limits, Resolved};
 use super::Verdict;
 use crate::semconv::{self, StepKind};
+use crate::steer::handoff::{self, HandoffTracker};
 use crate::{Error, Result, Span, Store};
 
 /// Longest fingerprint rendered into a reason, in characters. Fingerprints
@@ -55,6 +56,17 @@ pub struct TopRepeat {
     pub example: SpanRef,
 }
 
+/// The run's most frequent handoff cycle: control returning to one named
+/// agent straight from another (see [`crate::steer`]).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct HandoffCycle {
+    /// The agent control returned to, then the agent it returned from.
+    pub agents: [String; 2],
+    /// How often, since the run's last reset: turns `agents[0]`,
+    /// `agents[1]`, `agents[0]`.
+    pub count: u64,
+}
+
 /// What a run has used.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct Usage {
@@ -77,6 +89,10 @@ pub struct Usage {
     pub duration_ns: u64,
     /// The most-repeated step fingerprint, when any step occurred twice.
     pub top_repeat: Option<TopRepeat>,
+    /// The most frequent handoff cycle, when control has returned to a
+    /// named agent at least once since the last reset; absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_handoff_cycle: Option<HandoffCycle>,
 }
 
 /// A step a pre-call check asks about: what it is expected to cost.
@@ -140,6 +156,11 @@ pub(crate) struct Observation {
     tokens: u64,
     cost_usd: f64,
     fingerprint: Option<String>,
+    /// Steps only: the agent the step names, if any, clipped.
+    agent: Option<String>,
+    /// Steps only: the step's label — tool, model, agent or span name —
+    /// clipped.
+    label: Option<String>,
     start_ns: u64,
     pub(crate) end_ns: u64,
     /// The store's write revision of this version of the span (see
@@ -169,6 +190,15 @@ impl Observation {
         } else {
             None
         };
+        let (agent, label) = if kind.is_step() {
+            let (agent, label) = semconv::step_labels_with(span, &llm, kind);
+            (
+                agent.map(handoff::clip_owned),
+                Some(handoff::clip_owned(label)),
+            )
+        } else {
+            (None, None)
+        };
         Self {
             key: span_key(&span.trace_id, &span.span_id),
             trace_id: span.trace_id.clone(),
@@ -179,6 +209,8 @@ impl Observation {
             tokens: llm.total(),
             cost_usd: llm.cost_usd.filter(|cost| cost.is_finite()).unwrap_or(0.0),
             fingerprint,
+            agent,
+            label,
             start_ns: span.start_time_ns,
             end_ns: span.end_time_ns,
             revision,
@@ -197,6 +229,28 @@ impl Observation {
             span_id: self.span_id.clone(),
         }
     }
+
+    /// Where the span falls in step order, as the handoff tracker keys it.
+    fn position(&self) -> handoff::Position {
+        (self.start_ns, self.key)
+    }
+}
+
+/// A step a run is known to be taking: the latest one recorded, or the one
+/// a pre-call check asked about.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct LiveStep {
+    /// `llm`, `tool` or `agent`.
+    pub kind: StepKind,
+    /// The tool, model or agent it names, else its span name; `None` for a
+    /// checked step that named no tool.
+    pub name: Option<String>,
+    /// When it started: the span's own clock for a recorded step, the
+    /// server's for a checked one.
+    pub started_ns: u64,
+    /// Whether it is the step a pre-call check asked about, with no span
+    /// arrived since — about to happen or happening, but not recorded.
+    pub pending: bool,
 }
 
 /// A 64-bit key for a span within its run (the tenant is fixed by the run).
@@ -331,6 +385,23 @@ pub(crate) struct RunState {
     /// a fresh state of a run under a policy that sets `min_success_odds`
     /// ([`Self::follow_behaviour`]), and counted in [`Self::tracked`].
     behaviour: Option<crate::fate::LivePath>,
+    /// The handoff sequence since the last reset, once a step names an
+    /// agent; `None` for a run whose steps name none, which costs nothing.
+    handoffs: Option<Box<HandoffTracker>>,
+    /// The earliest-starting step: its position and the agent it names.
+    first_step: Option<(handoff::Position, Option<String>)>,
+    /// The latest-starting step: its position, kind and label.
+    latest_step: Option<(handoff::Position, StepKind, String)>,
+    /// The step the last pre-call check asked about, server clock.
+    pub(crate) pending: Option<LiveStep>,
+    /// Server clock at the last span arrival or pre-call check.
+    pub(crate) last_activity_ns: u64,
+    /// Server clock at the last span arrival.
+    pub(crate) last_arrival_ns: u64,
+    /// The run's position in the guard's live-change order.
+    pub(crate) changed: u64,
+    /// Server clock at that change.
+    pub(crate) changed_ns: u64,
 }
 
 impl RunState {
@@ -359,6 +430,14 @@ impl RunState {
             class: Verdict::Continue,
             last_seen_ns: 0,
             behaviour: None,
+            handoffs: None,
+            first_step: None,
+            latest_step: None,
+            pending: None,
+            last_activity_ns: 0,
+            last_arrival_ns: 0,
+            changed: 0,
+            changed_ns: 0,
         }
     }
 
@@ -418,6 +497,21 @@ impl RunState {
     /// the totals no longer count the mark, but its side of the reset is the
     /// new version's too, and whether it had failed decides the streak.
     fn withdraw(&mut self, observation: &Observation) -> bool {
+        // The handoff sequence is not a total, but it is withdrawn first
+        // too: a version that moves or renames a named step, or names none,
+        // takes the old one out here, and `land` places the new one.
+        if let Some(handoffs) = self.handoffs.as_deref_mut() {
+            let same = observation.agent.as_deref().is_some_and(|agent| {
+                handoffs.holds_as(
+                    observation.key,
+                    observation.position(),
+                    handoff::agent_key(agent),
+                )
+            });
+            if !same && handoffs.holds(observation.key) {
+                handoffs.remove(observation.key);
+            }
+        }
         match self.marks.get(&observation.key).copied() {
             Some(previous) if !previous.same_as(&Mark::of(observation, previous.before_reset)) => {
                 self.subtract(&previous);
@@ -461,10 +555,11 @@ impl RunState {
             // revision still advances, so a version written between the two
             // cannot pass for the newer one when it lands late.
             self.marks.insert(observation.key, mark);
+            let placed = self.place_step(observation, &mark);
             if clocked {
                 self.last_span = Some(observation.span_ref());
             }
-            return clocked;
+            return clocked || placed;
         }
         self.add(&mark, observation);
         if mark.kind.is_step() && !mark.before_reset {
@@ -477,6 +572,45 @@ impl RunState {
             }
         }
         self.marks.insert(observation.key, mark);
+        self.place_step(observation, &mark);
+        true
+    }
+
+    /// Places a step's version where the live view and the handoff
+    /// sequence read it: the earliest and latest steps, and — when it names
+    /// an agent and landed after the last reset — its turn. Returns whether
+    /// its turn moved.
+    fn place_step(&mut self, observation: &Observation, mark: &Mark) -> bool {
+        if !mark.kind.is_step() {
+            return false;
+        }
+        let position = observation.position();
+        if self
+            .first_step
+            .as_ref()
+            .map_or(true, |(first, _)| position <= *first)
+        {
+            self.first_step = Some((position, observation.agent.clone()));
+        }
+        if self
+            .latest_step
+            .as_ref()
+            .map_or(true, |(latest, _, _)| position >= *latest)
+        {
+            let label = observation.label.clone().unwrap_or_default();
+            self.latest_step = Some((position, mark.kind, label));
+        }
+        let Some(agent) = observation.agent.as_deref() else {
+            return false;
+        };
+        if mark.before_reset {
+            return false;
+        }
+        let handoffs = self.handoffs.get_or_insert_with(Box::default);
+        if handoffs.holds_as(observation.key, position, handoff::agent_key(agent)) {
+            return false;
+        }
+        handoffs.upsert(observation.key, position, agent);
         true
     }
 
@@ -752,9 +886,42 @@ impl RunState {
         self.error_streak = 0;
         self.repeats.clear();
         self.top = None;
+        self.handoffs = None;
         for mark in self.marks.values_mut() {
             mark.before_reset = true;
         }
+    }
+
+    /// The most frequent handoff cycle since the last reset.
+    fn top_handoff(&self) -> Option<HandoffCycle> {
+        let handoffs = self.handoffs.as_deref()?;
+        let (count, to, from) = handoffs.top()?;
+        Some(HandoffCycle {
+            agents: [handoffs.name(to), handoffs.name(from)],
+            count,
+        })
+    }
+
+    /// What the live view labels the run with: its agent (its first step's
+    /// agent, else its first span's service), when it started by the
+    /// spans' clocks, and its latest recorded step.
+    pub(crate) fn live_labels(&self) -> (Option<String>, Option<u64>, Option<LiveStep>) {
+        let agent = self
+            .first_step
+            .as_ref()
+            .and_then(|(_, agent)| agent.clone())
+            .or_else(|| self.service.clone());
+        let started = (self.first_start_ns != u64::MAX).then_some(self.first_start_ns);
+        let latest = self
+            .latest_step
+            .as_ref()
+            .map(|((start, _), kind, label)| LiveStep {
+                kind: *kind,
+                name: Some(label.clone()),
+                started_ns: *start,
+                pending: false,
+            });
+        (agent, started, latest)
     }
 
     fn top_repeat(&self) -> Option<(&Repeats, &str, &SpanRef)> {
@@ -773,6 +940,11 @@ impl RunState {
             duration_ns: self.duration_ns(),
             repeats: self.top_repeat().map_or(0, |(entry, _, _)| entry.count),
             error_streak: self.error_streak,
+            handoff_cycles: self
+                .handoffs
+                .as_deref()
+                .and_then(HandoffTracker::top)
+                .map_or(0, |(count, _, _)| count),
         }
     }
 
@@ -798,6 +970,7 @@ impl RunState {
                     count: entry.count,
                     example: example.clone(),
                 }),
+            top_handoff_cycle: self.top_handoff(),
         }
     }
 
@@ -807,11 +980,17 @@ impl RunState {
         let top = self
             .top_repeat()
             .map(|(_, fingerprint, example)| (fingerprint, example));
+        let cycle = self.top_handoff().map(|cycle| {
+            format!(
+                "{} → {} → {}",
+                cycle.agents[0], cycle.agents[1], cycle.agents[0]
+            )
+        });
         let mut reached = Vec::new();
         let mut approaching = Vec::new();
         let mut evidence = Vec::new();
         for finding in &findings {
-            let reason = finding.render(top.map(|(fingerprint, _)| fingerprint));
+            let reason = finding.render(top.map(|(fingerprint, _)| fingerprint), cycle.as_deref());
             if finding.dimension == Dimension::Repeats {
                 if let Some((_, example)) = top {
                     evidence.push(example.clone());
@@ -929,6 +1108,7 @@ struct Measures {
     duration_ns: u64,
     repeats: u64,
     error_streak: u64,
+    handoff_cycles: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -941,6 +1121,7 @@ enum Dimension {
     Duration,
     Repeats,
     ErrorStreak,
+    HandoffCycles,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1008,7 +1189,7 @@ fn dimensions(
     measures: &Measures,
     limits: &Limits,
     next: Option<&NextStep>,
-) -> [(Dimension, Option<f64>, f64, f64); 8] {
+) -> [(Dimension, Option<f64>, f64, f64); 9] {
     let step = next.map_or(0.0, |_| 1.0);
     let (llm, tool) = match next {
         Some(next) if next.tool.is_some() => (0.0, 1.0),
@@ -1064,12 +1245,18 @@ fn dimensions(
             measures.error_streak as f64,
             0.0,
         ),
+        (
+            Dimension::HandoffCycles,
+            limits.max_handoff_cycles.map(|limit| limit as f64),
+            measures.handoff_cycles as f64,
+            0.0,
+        ),
     ]
 }
 
 impl Finding {
     /// The reason line: the limit's name and value, then what the run did.
-    fn render(&self, top_fingerprint: Option<&str>) -> String {
+    fn render(&self, top_fingerprint: Option<&str>, top_cycle: Option<&str>) -> String {
         let (name, limit) = match self.dimension {
             Dimension::Cost => ("max_cost_usd", usd(self.limit)),
             Dimension::Tokens => ("max_tokens", whole(self.limit)),
@@ -1079,6 +1266,7 @@ impl Finding {
             Dimension::Duration => ("max_duration_seconds", whole(self.limit / 1e9)),
             Dimension::Repeats => ("max_repeats", whole(self.limit)),
             Dimension::ErrorStreak => ("max_error_streak", whole(self.limit)),
+            Dimension::HandoffCycles => ("max_handoff_cycles", whole(self.limit)),
         };
         let used = match self.dimension {
             Dimension::Cost => format!("${} spent", usd(self.value)),
@@ -1098,6 +1286,12 @@ impl Finding {
             Dimension::ErrorStreak => {
                 format!("{} consecutive failed steps", whole(self.value))
             }
+            Dimension::HandoffCycles => format!(
+                "control went {} {} {}",
+                top_cycle.unwrap_or("from one agent to another and back"),
+                whole(self.value),
+                if self.value < 2.0 { "time" } else { "times" }
+            ),
         };
         let with_next = match (self.dimension, self.delta > 0.0) {
             (_, false) => String::new(),
@@ -1157,6 +1351,8 @@ mod tests {
             tokens: 10,
             cost_usd: 0.5,
             fingerprint: fingerprint.map(str::to_owned),
+            agent: None,
+            label: kind.is_step().then(|| id.to_owned()),
             start_ns: 1_000,
             end_ns: 2_000,
             revision: 0,
@@ -1839,6 +2035,173 @@ mod tests {
         }
         // The property must have been exercised, not passed vacuously.
         assert!(latches > 300, "only {latches} scenarios latched");
+    }
+
+    /// A step naming `agent`, starting at `start`.
+    fn named(id: &str, agent: &str, start: u64, revision: u64) -> Observation {
+        let mut observation = obs(id, StepKind::Agent, Some(&format!("agent:{agent}")), false);
+        observation.agent = Some(agent.to_owned());
+        observation.start_ns = start;
+        observation.end_ns = start + 5;
+        observation.revision = revision;
+        observation
+    }
+
+    fn cycles_limit(limit: u64) -> Limits {
+        Limits {
+            max_handoff_cycles: Some(limit),
+            ..Limits::default()
+        }
+    }
+
+    #[test]
+    fn handoff_cycles_latch_at_the_returning_step_live_and_in_replay() {
+        let limits = cycles_limit(2);
+        let steps: Vec<Observation> = ["triage", "billing", "triage", "billing", "triage"]
+            .iter()
+            .enumerate()
+            .map(|(index, agent)| named(&format!("s{index}"), agent, 10 * (index as u64 + 1), 0))
+            .collect();
+        let replayed = replay(&steps, None, &|_| (limits, Action::Stop));
+        let trip = replayed
+            .trip
+            .as_ref()
+            .expect("the second return stops the run");
+        assert_eq!(trip.at_ns, 55, "timed by the fifth step's end");
+        assert_eq!(
+            trip.reasons,
+            ["max_handoff_cycles 2 reached: control went triage → billing → triage 2 times"]
+        );
+        assert_eq!(
+            replayed.usage().top_handoff_cycle,
+            Some(HandoffCycle {
+                agents: ["triage".into(), "billing".into()],
+                count: 2,
+            })
+        );
+        // One step per batch, live, latches at the same step.
+        let mut live = RunState::new(true);
+        for (index, step) in steps.iter().enumerate() {
+            let latched = live.fold(std::slice::from_ref(step), None, &|_| Some(limits), &|_| 1);
+            assert_eq!(latched, index == 4, "step {index}");
+        }
+        // Steps that name no agent move nothing: an unnamed LLM call
+        // between the turns changes no count.
+        let mut quiet = replay(&steps[..3], None, &|_| (limits, Action::Stop));
+        let mut llm = obs("llm", StepKind::Llm, Some("llm:m"), false);
+        llm.start_ns = 25;
+        quiet.fold(&[llm], None, &|_| Some(limits), &|_| 1);
+        assert_eq!(
+            quiet.usage().top_handoff_cycle.map(|cycle| cycle.count),
+            Some(1)
+        );
+        // And a run whose steps name no agent holds no handoff state at all.
+        let plain = replay(
+            &[step("a", "tool:x#1"), step("b", "tool:y#1")],
+            None,
+            &|_| (limits, Action::Stop),
+        );
+        assert!(plain.handoffs.is_none() && plain.usage().top_handoff_cycle.is_none());
+    }
+
+    #[test]
+    fn a_reset_clears_handoff_cycles_as_it_clears_repeats() {
+        let limits = cycles_limit(1);
+        let steps = [
+            named("a", "planner", 10, 0),
+            named("b", "coder", 20, 0),
+            named("c", "planner", 30, 0),
+        ];
+        let mut run = replay(&steps, None, &|_| (limits, Action::Stop));
+        assert!(run.trip.is_some());
+        run.reset();
+        assert!(run.usage().top_handoff_cycle.is_none());
+        assert!(run.assess(&limits, None).reached.is_empty());
+        // Replayed with the reset after those steps ended, the same.
+        let rebuilt = replay(&steps, Some(100), &|_| (limits, Action::Stop));
+        assert!(rebuilt.trip.is_none() && rebuilt.usage().top_handoff_cycle.is_none());
+        // A step after the reset counts from a clean sequence.
+        run.fold(
+            &[named("d", "coder", 200, 0)],
+            None,
+            &|_| Some(limits),
+            &|_| 1,
+        );
+        assert!(run.usage().top_handoff_cycle.is_none());
+    }
+
+    #[test]
+    fn random_named_batches_count_what_a_replay_of_the_store_counts() {
+        let agents = ["planner", "coder", "critic"];
+        let mut rng = crate::seed::Rng::new(0x5eed_4a0d);
+        let mut latches = 0;
+        for scenario in 0..1_500 {
+            let limit = rng.range(1, 3);
+            let limits = cycles_limit(limit);
+            let resolve = |_: &str| (limits, Action::Stop);
+            let mut stored: HashMap<String, Observation> = HashMap::new();
+            let mut live = RunState::new(true);
+            let mut revision = 0;
+            // In order: every batch starts after everything before it, so
+            // each batch end is a prefix of the run, and a latch must agree
+            // with a replay's. Out of order, only the counts must.
+            let in_order = rng.chance(50);
+            let mut clock = 0;
+            for round in 0..8 {
+                let batch: Vec<Observation> = (0..rng.range(1, 4))
+                    .map(|_| {
+                        revision += 1;
+                        let id = format!("s{}", rng.range(0, 7));
+                        let start = if in_order {
+                            clock += 10;
+                            clock
+                        } else {
+                            rng.range(0, 8) * 10
+                        };
+                        let id = if in_order {
+                            format!("{id}-{clock}")
+                        } else {
+                            id
+                        };
+                        let mut step = named(&id, rng.pick(&agents), start, revision);
+                        // A re-sent version may stop naming its agent.
+                        if rng.chance(20) {
+                            step.agent = None;
+                        }
+                        step
+                    })
+                    .collect();
+                for observation in &batch {
+                    let mut kept = observation.clone();
+                    kept.revision = 0;
+                    stored.insert(kept.span_id.clone(), kept);
+                }
+                let latched = live.fold(&batch, None, &|_| Some(limits), &|_| 1);
+                let held: Vec<Observation> = stored.values().cloned().collect();
+                let fresh = replay(&held, None, &resolve);
+                let context = format!("scenario {scenario}, batch {round}, limit {limit}");
+                let counted = |run: &RunState| {
+                    run.handoffs
+                        .as_deref()
+                        .and_then(HandoffTracker::top)
+                        .map(|(count, _, _)| count)
+                };
+                assert_eq!(counted(&live), counted(&fresh), "{context}");
+                assert_eq!(
+                    live.usage().top_handoff_cycle,
+                    fresh.usage().top_handoff_cycle,
+                    "{context}"
+                );
+                if in_order {
+                    assert_eq!(latched, fresh.trip.is_some(), "{context}");
+                }
+                if latched || live.trip.is_some() {
+                    latches += 1;
+                    break;
+                }
+            }
+        }
+        assert!(latches > 200, "only {latches} scenarios latched");
     }
 
     #[test]

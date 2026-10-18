@@ -396,21 +396,41 @@ def finished(path, state_path, cap, grant):
           % (doc["verdict"], cost, cap, grant))
 
 
-def hook_result(code, stderr_path, want_code, *want_text):
-    code, want_code = int(code), int(want_code)
-    with open(stderr_path) as handle:
-        err = handle.read()
-    must(code == want_code, "the hook exited %d, wanted %d (stderr: %s)" % (code, want_code, err))
+def hook_result(code, stdout_path, want, *want_text):
+    """What the hook told Claude Code: `none` (no output), `context`
+    (additionalContext only, no decision), `deny` (a PreToolUse
+    permissionDecision) or `block` (a PostToolUse decision) — always with
+    exit 0, the JSON deciding, as Claude Code's hooks reference asks."""
+    code = int(code)
+    with open(stdout_path) as handle:
+        out = handle.read()
+    must(code == 0, "the hook exited %d, wanted 0 (stdout: %s)" % (code, out))
+    if want == "none":
+        must(out.strip() == "", "the hook should say nothing: %s" % out)
+        return "", ""
+    doc = json.loads(out)
+    specific = doc.get("hookSpecificOutput") or {}
+    if want == "context":
+        must("permissionDecision" not in specific,
+             "advice must not decide the call (an allow would skip the user's prompt): %s" % out)
+        text = specific.get("additionalContext", "")
+    elif want == "deny":
+        must(specific.get("permissionDecision") == "deny", "the hook should deny: %s" % out)
+        text = specific.get("permissionDecisionReason", "")
+    else:
+        must(doc.get("decision") == "block", "the hook should block: %s" % out)
+        text = doc.get("reason", "")
     for wanted in want_text:
-        must(wanted in err, "the hook's stderr should contain %r: %s" % (wanted, err))
-    return err
+        must(wanted in text, "the hook's answer should contain %r: %s" % (wanted, text))
+    return want, text
 
 
-def hook(code, stderr_path, want_code, *want_text):
-    err = hook_result(code, stderr_path, want_code, *want_text)
-    print("exit %s" % code)
-    for line in err.splitlines():
-        print("        stderr: " + line)
+def hook(code, stdout_path, want, *want_text):
+    kind, text = hook_result(code, stdout_path, want, *want_text)
+    print({"none": "nothing (the call proceeds)", "context": "additionalContext",
+           "deny": "permissionDecision: deny", "block": "decision: block"}[want])
+    for line in text.splitlines():
+        print("        " + line)
 
 
 def events(path, hook_run):

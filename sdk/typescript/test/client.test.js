@@ -273,6 +273,36 @@ describe("@trazadb/sdk against traza-server", () => {
       });
     });
 
+    it("a check delivers nudges once and the guard hands them over", async () => {
+      const client = new Client(open.url, { tenant: "steered" });
+      const queue = (run, kind, message) =>
+        client.request("POST", `/v1/runs/${run}/nudges`, {
+          query: { tenant: "steered" },
+          body: { message, kind },
+        });
+      await queue("nudged-1", "advice", "Use the cached catalog.");
+      const verdict = await client.check("nudged-1");
+      assert.equal(verdict.verdict, "continue");
+      assert.deepEqual(
+        verdict.nudges.map((nudge) => [nudge.kind, nudge.message]),
+        [["advice", "Use the cached catalog."]],
+      );
+      assert.deepEqual((await client.check("nudged-1")).nudges, [], "delivered once");
+
+      const heard = [];
+      await queue("nudged-2", "block", "Hold refunds for a human.");
+      const error = await client.guard("nudged-2", { tool: "refund", onNudges: (nudges) => heard.push(...nudges) }).then(
+        () => assert.fail("the vetoed step was let through"),
+        (caught) => caught,
+      );
+      assert.ok(error instanceof FuseTripped);
+      assert.deepEqual(error.verdict.reasons, ["Hold refunds for a human."]);
+      assert.deepEqual(
+        heard.map((nudge) => nudge.kind),
+        ["block"],
+      );
+    });
+
     it("guard fails closed unless told to fail open", async () => {
       const unreachable = new Client("http://127.0.0.1:1", { timeoutMs: 2000 });
       await assert.rejects(unreachable.guard("any"), (error) => error instanceof TrazaError && error.status === null);

@@ -768,6 +768,20 @@ impl Mask {
         &self.payloads
     }
 
+    /// Whether a pending erasure covers the run `run` of `tenant` as a whole
+    /// — its tenant, its session (a session run), or its trace (a
+    /// `trace:<id>` run) — so that state keyed by the run, such as a nudge,
+    /// must not be created for it until the erasure settles.
+    pub(crate) fn covers_run(&self, tenant: &str, run: &str) -> bool {
+        if self.tenants.contains(tenant) {
+            return true;
+        }
+        match semconv::run_trace_id(run) {
+            Some(trace) => self.traces.contains(&(tenant.to_owned(), trace.to_owned())),
+            None => self.sessions.contains(&(tenant.to_owned(), run.to_owned())),
+        }
+    }
+
     /// Whether a pending erasure covers this annotation, judged against the
     /// annotation's own typed subject: trace-level annotations (empty
     /// `span_id`) are covered by trace subjects, span addresses by any

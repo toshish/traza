@@ -81,6 +81,12 @@ export interface RunUsage {
   duration_ns: Nanos;
   /** The step fingerprint seen most often, or `null`. */
   top_repeat: { fingerprint: string; count: number; example: SpanRef } | null;
+  /**
+   * The most frequent handoff cycle since the last reset — control
+   * returning to `agents[0]` straight from `agents[1]` — absent when there
+   * is none.
+   */
+  top_handoff_cycle?: { agents: [string, string]; count: number };
 }
 
 /** A fuse policy's limits, or a reset's grant. An absent limit is unbounded. */
@@ -93,6 +99,17 @@ export interface Limits {
   max_duration_seconds?: number;
   max_repeats?: number;
   max_error_streak?: number;
+  max_handoff_cycles?: number;
+}
+
+/**
+ * A nudge a pre-call check delivered: `advice` for the agent to hear, or a
+ * `block` that vetoed the step it asked about.
+ */
+export interface DeliveredNudge {
+  id: string;
+  kind: "advice" | "block";
+  message: string;
 }
 
 /** The verdict document every run-fuse route answers. */
@@ -111,6 +128,13 @@ export interface Verdict {
   tripped_by: "policy" | "manual" | null;
   evidence: SpanRef[];
   source: "live" | "rebuilt";
+  /**
+   * The nudges this answer delivered: present on {@link Client.check}
+   * answers only. Each nudge is delivered once — the check that carries it
+   * consumes it, read or not — so read them here, or pass `onNudges` to
+   * `guard`.
+   */
+  nudges?: DeliveredNudge[];
 }
 
 export interface Policy {

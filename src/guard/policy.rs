@@ -127,6 +127,12 @@ pub struct Limits {
     /// (default 3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub foresight_after_steps: Option<u64>,
+    /// Ceiling on handoff cycles: how often control may return to a named
+    /// agent straight from the agent it handed off to (`A → B → A`), for
+    /// the pair that does it most (see `crate::steer`). Trips at
+    /// `count >= max_handoff_cycles`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_handoff_cycles: Option<u64>,
 }
 
 impl Limits {
@@ -149,6 +155,7 @@ impl Limits {
             min_success_odds: grant.min_success_odds.or(self.min_success_odds),
             foresight_min_support: grant.foresight_min_support.or(self.foresight_min_support),
             foresight_after_steps: grant.foresight_after_steps.or(self.foresight_after_steps),
+            max_handoff_cycles: grant.max_handoff_cycles.or(self.max_handoff_cycles),
         }
     }
 
@@ -178,6 +185,7 @@ impl Limits {
             ("max_duration_seconds", self.max_duration_seconds),
             ("max_repeats", self.max_repeats),
             ("max_error_streak", self.max_error_streak),
+            ("max_handoff_cycles", self.max_handoff_cycles),
         ];
         for (name, value) in counts {
             if value == Some(0) {

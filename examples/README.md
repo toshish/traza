@@ -40,6 +40,8 @@ Integrations
 
 Not demos — pieces to wire into your own setup:
 
-- [`guard/claude-code-hook.sh`](guard/README.md#the-claude-code-hook): a
-  Claude Code hook that puts a [run fuse](../docs/guide/guard.md) in front of
-  every tool call. The `guard/` demo runs it in its last beat.
+- [`claude-code/`](claude-code/README.md): the Claude Code hook pack — a
+  [run fuse](../docs/guide/guard.md) in front of every tool call, a person's
+  [nudges](../docs/guide/steer.md#nudges) relayed before the next step, a
+  summary of earlier runs at session start, and an installer that merges it
+  into `.claude/settings.json`. The `guard/` demo runs it in its last beat.

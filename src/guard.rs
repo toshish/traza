@@ -77,7 +77,8 @@
 
 mod events;
 pub mod http;
-mod log;
+mod live;
+pub(crate) mod log;
 mod policy;
 mod state;
 
@@ -90,14 +91,16 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 pub use events::{EventKind, EventPage, FuseEvent, MAX_WAIT_MS};
+pub use live::{LiveCursor, LivePage, LiveRun, LiveUpdate};
 pub use policy::{
     Action, FuseConfig, FusePolicy, Limits, PolicyMatch, PolicySpec, DEFAULT_MAX_REPEATS,
     DEFAULT_MAX_RUNS, DEFAULT_POLICY_NAME, GLOBAL_POLICY_NAME, MAX_POLICIES_PER_TENANT,
     MAX_SERVICE_BYTES,
 };
-pub use state::{NextStep, SpanRef, TopRepeat, TrippedBy, Usage};
+pub use state::{HandoffCycle, LiveStep, NextStep, SpanRef, TopRepeat, TrippedBy, Usage};
 
 use log::{FuseLog, Record};
+pub(crate) use state::span_key;
 use state::{Observation, RunState, Trip};
 
 use crate::{erasure, semconv, Deadline, Error, Result, Span, Store};
@@ -470,6 +473,15 @@ struct State {
     /// Bumped by every erasure pass, so a rebuild can tell that what it read
     /// may include what an erasure has since removed.
     erasure_epoch: u64,
+    /// Live runs by change position, for the live view (see `live`).
+    live: live::LiveIndex,
+    /// The last change position handed out.
+    next_change: u64,
+    /// The time of the last change, server clock; change times never go
+    /// backwards.
+    last_change_ns: u64,
+    /// The change feed waiting streams read without this lock.
+    live_feed: Arc<live::Feed>,
 }
 
 /// The run guard a store owns when fuses are enabled.
@@ -482,6 +494,8 @@ pub(crate) struct Guard {
     log: Mutex<FuseLog>,
     state: Mutex<State>,
     events: events::EventFeed,
+    /// The live view's change feed, shared with the state that advances it.
+    live_feed: Arc<live::Feed>,
     trips: AtomicU64,
     warnings: AtomicU64,
     /// Runs once, at the end of the next erasure sweep: lets a test land an
@@ -551,11 +565,13 @@ impl Guard {
         if log.compaction_due() {
             log.compact(&state.records())?;
         }
+        let live_feed = Arc::clone(&state.live_feed);
         Ok(Some(Self {
             config: config.clone(),
             log: Mutex::new(log),
             state: Mutex::new(state),
             events: events::EventFeed::new(),
+            live_feed,
             trips: AtomicU64::new(0),
             warnings: AtomicU64::new(0),
             #[cfg(test)]
@@ -646,6 +662,9 @@ impl Guard {
                 continue;
             }
             state.entry(&key, now);
+            if let Some(run) = state.runs.get_mut(&key) {
+                run.last_arrival_ns = run.last_arrival_ns.max(now);
+            }
             let (added, latched) = {
                 // The fields apart, so the policy can be read while the run
                 // is folded — a fold checks for a stop after every span.
@@ -675,6 +694,7 @@ impl Guard {
             // the budget moves by the difference either way.
             state.tracked = (state.tracked + added.1).saturating_sub(added.0);
             let judged = self.settle(&mut state, &key, now);
+            state.live_touch(&key, now, true);
             if latched {
                 self.tripped(&key, &judged, now);
             }
@@ -1151,6 +1171,8 @@ impl State {
         if let Some(run) = self.runs.get_mut(key) {
             run.class = class;
         }
+        // A verdict a viewer sees moved: the live view re-stamps it.
+        self.live_touch(key, unix_now_ns(), false);
     }
 
     /// Adds a live run at `tick`, filed under its class.
@@ -1158,6 +1180,7 @@ impl State {
         run.tick = tick;
         run.last_seen_ns = now;
         run.class = self.class_of(&key, &run);
+        self.live_admit(&key, &mut run, now);
         self.tracked += run.tracked();
         self.listing.insert(&key, tick, run.class);
         self.order.insert(tick, Arc::clone(&key));
@@ -1169,6 +1192,7 @@ impl State {
         let (shared, run) = self.runs.remove_entry(key)?;
         self.order.remove(&run.tick);
         self.listing.remove(key, run.tick, run.class);
+        self.live.remove(key, run.changed);
         self.tracked = self.tracked.saturating_sub(run.tracked());
         Some((shared, run))
     }
@@ -1239,6 +1263,11 @@ impl State {
         let mut carried = None;
         if let Some((_, previous)) = self.take_live(key) {
             run.warn_level = run.warn_level.max(previous.warn_level);
+            // What the live view knows of the run's activity is not in the
+            // store; a rebuild keeps it.
+            run.last_activity_ns = previous.last_activity_ns;
+            run.last_arrival_ns = previous.last_arrival_ns;
+            run.pending = previous.pending;
             carried = previous.trip;
         }
         if let Some(parked) = self.unpark(key) {
@@ -1436,7 +1465,7 @@ impl State {
 }
 
 /// Refuses a run id no span could carry, or one too long to hold.
-fn validate_run(run: &str) -> Result<()> {
+pub(crate) fn validate_run(run: &str) -> Result<()> {
     if run.is_empty() {
         return Err(Error::Invalid("run id is empty".to_owned()));
     }
@@ -1455,7 +1484,7 @@ fn validate_run(run: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_tenant(tenant: &str) -> Result<()> {
+pub(crate) fn validate_tenant(tenant: &str) -> Result<()> {
     if tenant.is_empty() || crate::valid_tenant(tenant) {
         Ok(())
     } else {
@@ -2111,6 +2140,9 @@ impl Store {
             log.rewrite(&records)?;
         }
         drop(log);
+        // Live streams start over from a fresh listing, which no longer
+        // holds what was swept.
+        guard.live_feed.epoch.fetch_add(1, Ordering::AcqRel);
         #[cfg(test)]
         if let Some(hook) = guard
             .after_forget

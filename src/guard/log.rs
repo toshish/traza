@@ -19,8 +19,10 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use super::policy::{FusePolicy, Limits};
@@ -78,8 +80,13 @@ pub(crate) enum Record {
 }
 
 /// The open log: its path, for appends, and how many lines it holds.
+///
+/// Generic over its record type so another append-only operator log —
+/// `steer.jsonl`, the nudges ([`crate::steer`]) — gets the same torn-tail
+/// healing, fsync-per-append, cut-back-on-failure and atomic rewrite rather
+/// than a second copy of them.
 #[derive(Debug)]
-pub(crate) struct FuseLog {
+pub(crate) struct FuseLog<R = Record> {
     path: PathBuf,
     /// Records in the file.
     lines: usize,
@@ -95,18 +102,26 @@ pub(crate) struct FuseLog {
     /// Makes the next failed append's truncation fail too.
     #[cfg(test)]
     uncuttable: bool,
+    records: PhantomData<fn() -> R>,
 }
 
-impl FuseLog {
-    /// Opens the log in `directory`, returning it with every record it holds
-    /// in append order.
+impl FuseLog<Record> {
+    /// Opens `fuses.jsonl` in `directory`; see [`Self::open_named`].
+    pub(crate) fn open(directory: &Path) -> Result<(Self, Vec<Record>)> {
+        Self::open_named(directory, LOG_NAME)
+    }
+}
+
+impl<R: Serialize + DeserializeOwned> FuseLog<R> {
+    /// Opens the log `name` in `directory`, returning it with every record
+    /// it holds in append order.
     ///
     /// A torn final line — a crash mid-append — is truncated away before
     /// anything else is written, exactly as the annotation log heals one; a
     /// malformed line anywhere else is corruption and refuses the open,
     /// because skipping it would silently drop a later kill switch.
-    pub(crate) fn open(directory: &Path) -> Result<(Self, Vec<Record>)> {
-        let path = directory.join(LOG_NAME);
+    pub(crate) fn open_named(directory: &Path, name: &str) -> Result<(Self, Vec<R>)> {
+        let path = directory.join(name);
         // A rewrite a crash interrupted before its rename: the log itself is
         // intact, and the erasure that started the rewrite resumes and
         // redoes it.
@@ -126,7 +141,7 @@ impl FuseLog {
                     valid_len = valid_len.saturating_add(line.len() as u64);
                     continue;
                 }
-                match serde_json::from_slice::<Record>(line) {
+                match serde_json::from_slice::<R>(line) {
                     Ok(record) => {
                         valid_len = valid_len.saturating_add(line.len() as u64);
                         records.push(record);
@@ -168,6 +183,7 @@ impl FuseLog {
                 short_write: None,
                 #[cfg(test)]
                 uncuttable: false,
+                records: PhantomData,
             },
             records,
         ))
@@ -183,7 +199,7 @@ impl FuseLog {
     /// — when at least half its lines are superseded, and re-arms the check
     /// either way. Halving is what keeps compaction amortized O(1) per
     /// append. Returns whether it rewrote.
-    pub(crate) fn compact(&mut self, records: &[Record]) -> Result<bool> {
+    pub(crate) fn compact(&mut self, records: &[R]) -> Result<bool> {
         let rewrote = self.lines >= records.len().saturating_mul(2);
         if rewrote {
             self.rewrite(records)?;
@@ -201,7 +217,7 @@ impl FuseLog {
     /// crash leaves the old log or the new one, never a blend — which is what
     /// an erasure needs, since a half-rewritten log could keep what it was
     /// asked to forget.
-    pub(crate) fn rewrite(&mut self, records: &[Record]) -> Result<()> {
+    pub(crate) fn rewrite(&mut self, records: &[R]) -> Result<()> {
         let staged = self.path.with_extension("jsonl.tmp");
         let mut bytes = Vec::new();
         for record in records {
@@ -236,7 +252,7 @@ impl FuseLog {
     /// marked damaged and refuses appends, so nothing acknowledged is ever
     /// written after the fragment; a rewrite, which replaces the file whole,
     /// clears that, and so does a restart, which heals a torn final line.
-    pub(crate) fn append(&mut self, record: &Record) -> Result<()> {
+    pub(crate) fn append(&mut self, record: &R) -> Result<()> {
         if self.damaged {
             return Err(Error::Io(std::io::Error::other(format!(
                 "{} ends in the remains of an append that failed and could not be cut \

@@ -114,7 +114,7 @@ over `curl`.
 
 ## The tools
 
-Seventeen tools: fifteen reads and two gated writers. They are shaped like the
+Nineteen tools: seventeen reads and two gated writers. They are shaped like the
 questions somebody asks at 2am, not like the route index — two routes may serve
 one tool, and one route may serve two. Most of them describe what is in the
 store; `diagnose_session` and `compare_runs` are the ones that answer a
@@ -137,6 +137,8 @@ question about it.
 | `compare_runs` | **Where did this run part from that one, and why?** |
 | `recall_runs` | Has this been done before, and how did it go? |
 | `foresee_run` | **How have runs like this one ended — and what did the ones that succeeded do next?** |
+| `list_live_runs` | Which agent runs are working right now, and what is each doing? |
+| `run_topology` | **How did this run's agents hand work around, and where did they ping-pong?** |
 | `record_annotation` | Attach a note or rating to a trace or span (**`rw` token + `--mcp-annotations`**) |
 | `promote_failures_to_dataset` | Turn this run's failures into a regression dataset (**`rw` token + `--mcp-promote`**) |
 
@@ -145,13 +147,13 @@ host asks for approval before each call:
 
 | Tool | `readOnlyHint` | `destructiveHint` | `idempotentHint` | `openWorldHint` |
 |---|---|---|---|---|
-| the fifteen readers | `true` | — | — | `false` |
+| the seventeen readers | `true` | — | — | `false` |
 | `record_annotation` | `false` | `false` | `false` | `false` |
 | `promote_failures_to_dataset` | `false` | `false` | `false` | `false` |
 
 **Absent annotations are not neutral.** Every hint defaults to the pessimistic
 answer — not read-only, potentially destructive, open world — so a server that
-omits them advertises fifteen read tools as though each might delete something and
+omits them advertises seventeen read tools as though each might delete something and
 call out to the internet. A host that gates on that asks for confirmation on
 every call, and one running non-interactively, with nobody to ask, declines
 them. `destructiveHint` and `idempotentHint` are meaningful only when
@@ -242,9 +244,29 @@ to price its next step uses
 sets a [predictive limit](foresight.md#predictive-fuses), the verdict carries
 the run's `foresight` too, and a foresight stop reads as any other reason;
 in `structuredContent` the reasons and the foresight's explanation and next
-tool are made JSON-safe, as `foresee_run` makes the same text. On
-a server started with `--no-fuses` it is not listed — fourteen reads, then —
-and a call naming it is refused as invalid params.
+tool are made JSON-safe, as `foresee_run` makes the same text. On a server
+started with `--no-fuses` it is not listed, nor is `list_live_runs` —
+fifteen reads, then — and a call naming either is refused.
+
+**`list_live_runs` and `run_topology` are [steering](steer.md)'s reads.**
+`list_live_runs` is [`GET /v1/runs/live`](http-api.md#get-v1runslive): the
+runs active now, most recently changed first, each with its agent, the step
+it is on (a step a pre-call check named and no span has recorded yet is
+marked pending), its usage, verdict and waiting nudges, as text and as
+`structuredContent`. It takes `limit` (default 20, at most 200) and, for an
+unbound credential, `tenant`. `run_topology` is
+[`GET /v1/runs/{run}/topology`](http-api.md#get-v1runsruntopology) rendered:
+the run's agents, which delegated to which, the ping-pong pairs (control
+returning to an agent straight from the one it handed off to, counted per
+direction) and the turns in order; when a list was cut, the headline says
+so (`more than 256 agents`, and which lists show only their largest
+entries) rather than reporting the cut count as the run's. Agent names, run
+ids, tool names and reasons are telemetry and render inside the telemetry
+block. **There is no nudge tool**, in either direction: an agent hears
+nudges through its pre-call check — a nudge read here would be consumed, or
+not, depending on which surface asked first — and queueing one is an
+operator's act, not one stored telemetry should be able to talk a model
+into.
 
 **The eval entities are not on this surface.** Datasets, versions, examples,
 experiments, runs and scores are served over HTTP only — no tool reads them,

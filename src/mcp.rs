@@ -45,6 +45,7 @@ use crate::{semconv, Error, Span, SpanCursor, SpanFilter, SpanSort, Store};
 mod replay_tools;
 // foresee_run lives beside this file too.
 mod fate_tools;
+mod steer_tools;
 
 /// The MCP endpoint path served by `traza-server`.
 pub const ENDPOINT: &str = "/v1/mcp";
@@ -631,6 +632,7 @@ impl<'a> Server<'a> {
         }
         tools.extend(replay_tools::definitions());
         tools.extend(fate_tools::definitions());
+        tools.extend(steer_tools::definitions(self.store.fuses_enabled()));
         if self.annotation_tool_available(access) {
             tools.push(tool(
                 "record_annotation",
@@ -754,6 +756,9 @@ impl<'a> Server<'a> {
                 replay_tools::call(self, name, arguments, &context)
             }
             name if fate_tools::handles(name) => fate_tools::call(self, name, arguments, &context),
+            name if steer_tools::handles(name) => {
+                steer_tools::call(self, name, arguments, &context)
+            }
             "record_annotation" if self.annotation_tool_available(context.access) => {
                 self.record_annotation(arguments, context)
             }
