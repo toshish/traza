@@ -686,37 +686,110 @@ fn quote(text: &str) -> String {
     clip(text, QUOTED_CHARS)
 }
 
-/// `value` as compact JSON, quoted as [`quote`] quotes text — but serialized
-/// only as far as the quote shows. A configuration value is producer-sized;
-/// writing a megabyte of it out to keep eighty characters is work the
+/// `value` as compact JSON, quoted as [`quote`] quotes text — but written
+/// only as far as the quote shows. A configuration value is producer-sized,
+/// and writing a megabyte of it out to keep eighty characters is work the
 /// budget would not see.
+///
+/// Written here rather than by `serde_json`, which scans a whole string for
+/// characters to escape before it writes any of it: a writer refusing
+/// everything past the quote bounded the memory that took, not the time.
 fn quote_json(value: &Value) -> String {
-    /// Bytes enough for one character past the quote, at four bytes per
-    /// character, so a value that does not fit is always seen not to.
-    const PREFIX_BYTES: usize = (QUOTED_CHARS + 1) * 4;
-    struct Prefix(Vec<u8>);
-    impl std::io::Write for Prefix {
-        fn write(&mut self, piece: &[u8]) -> std::io::Result<usize> {
-            let room = PREFIX_BYTES - self.0.len();
-            if room == 0 {
-                // Stops the serializer: everything the quote shows is in.
-                return Err(std::io::Error::other("the quote is full"));
-            }
-            let taken = piece.len().min(room);
-            self.0.extend_from_slice(&piece[..taken]);
-            Ok(taken)
-        }
+    let mut prefix = JsonPrefix::default();
+    // Its only error is the one that says the quote is full.
+    let _ = prefix.value(value);
+    quote(&prefix.text)
+}
 
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
+/// Compact JSON exactly as `serde_json` writes it, cut off as soon as it
+/// holds more than [`QUOTED_CHARS`] characters — one past what a quote
+/// shows, so a value that does not fit is always seen not to.
+///
+/// Every value writes a character before anything inside it is visited, and
+/// a string is written a character at a time, so the walk ends within a
+/// quote's length of characters and values whatever the value's size: a
+/// sixty-megabyte string costs what an eighty-character one does, with no
+/// deadline needed to stop it.
+#[derive(Default)]
+struct JsonPrefix {
+    text: String,
+    chars: usize,
+}
+
+/// A [`JsonPrefix`] holds everything its quote shows.
+struct QuoteFull;
+
+impl JsonPrefix {
+    fn push(&mut self, piece: &str) -> std::result::Result<(), QuoteFull> {
+        self.text.push_str(piece);
+        self.chars += piece.chars().count();
+        if self.chars > QUOTED_CHARS {
+            return Err(QuoteFull);
+        }
+        Ok(())
+    }
+
+    fn value(&mut self, value: &Value) -> std::result::Result<(), QuoteFull> {
+        match value {
+            Value::Null => self.push("null"),
+            Value::Bool(true) => self.push("true"),
+            Value::Bool(false) => self.push("false"),
+            // Without `arbitrary_precision` a number is an integer or a
+            // finite double, a few dozen characters at most, and its
+            // `Display` is the text serde_json writes for it.
+            Value::Number(number) => self.push(&number.to_string()),
+            Value::String(text) => self.string(text),
+            Value::Array(items) => {
+                self.push("[")?;
+                for (index, item) in items.iter().enumerate() {
+                    if index > 0 {
+                        self.push(",")?;
+                    }
+                    self.value(item)?;
+                }
+                self.push("]")
+            }
+            Value::Object(members) => {
+                self.push("{")?;
+                for (index, (key, item)) in members.iter().enumerate() {
+                    if index > 0 {
+                        self.push(",")?;
+                    }
+                    self.string(key)?;
+                    self.push(":")?;
+                    self.value(item)?;
+                }
+                self.push("}")
+            }
         }
     }
-    let mut prefix = Prefix(Vec::new());
-    // Its only error is the one `Prefix` raises once it holds enough.
-    let _ = serde_json::to_writer(&mut prefix, value);
-    // A cut through a character lands past what the quote shows, so the
-    // replacement character the lossy reading leaves there is clipped away.
-    quote(&String::from_utf8_lossy(&prefix.0))
+
+    /// `text` as a JSON string, escaped as serde_json escapes it: the quote
+    /// and the backslash, the five controls with short escapes, every other
+    /// control as `\u00xx` in lowercase hex, and everything else as itself.
+    fn string(&mut self, text: &str) -> std::result::Result<(), QuoteFull> {
+        self.push("\"")?;
+        let mut buffer = [0u8; 4];
+        for c in text.chars() {
+            let escaped;
+            let piece = match c {
+                '"' => "\\\"",
+                '\\' => "\\\\",
+                '\u{8}' => "\\b",
+                '\u{c}' => "\\f",
+                '\n' => "\\n",
+                '\r' => "\\r",
+                '\t' => "\\t",
+                c if c < ' ' => {
+                    escaped = format!("\\u{:04x}", u32::from(c));
+                    &escaped
+                }
+                c => c.encode_utf8(&mut buffer),
+            };
+            self.push(piece)?;
+        }
+        self.push("\"")
+    }
 }
 
 /// The sentence for one divergent entry. Only a parameter change compares
@@ -1665,6 +1738,104 @@ mod tests {
         // A value that fits is quoted whole, exactly as serialized.
         assert_eq!(quote_json(&json!(0.5)), "0.5");
         assert_eq!(quote_json(&json!({"a": [1, 2]})), "{\"a\":[1,2]}");
+    }
+
+    #[test]
+    fn a_quoted_value_reads_as_serde_json_writes_it() {
+        // The quote is written by hand so it can stop early; what it shows
+        // must still be serde_json's compact form, character for character,
+        // whatever the value — escapes, controls, wide characters, numbers
+        // of every kind, and lengths either side of the quote's edge.
+        let mut values = vec![
+            json!(null),
+            json!(true),
+            json!(false),
+            json!(0),
+            json!(-17),
+            json!(u64::MAX),
+            json!(i64::MIN),
+            json!(0.5),
+            json!(-1.25e-7),
+            json!(1e300),
+            json!(""),
+            json!([]),
+            json!({}),
+            json!([[], {}, [[]]]),
+            json!("quote \" backslash \\ slash / bell \u{7} nul \u{0} del \u{7f}"),
+            json!("\u{8}\u{c}\n\r\t\u{1f} é 中 😀"),
+            json!({"k\"ey\n": ["v\\", {"": null}], "z": 1.5}),
+            json!((0..100).collect::<Vec<_>>()),
+            json!({"stop": ["\n".repeat(200)]}),
+        ];
+        for length in [
+            QUOTED_CHARS - 3,
+            QUOTED_CHARS - 2,
+            QUOTED_CHARS - 1,
+            QUOTED_CHARS,
+        ] {
+            values.push(json!("x".repeat(length)));
+            values.push(json!("é".repeat(length)));
+            values.push(json!("\t".repeat(length / 2)));
+            values.push(json!(["é".repeat(length - 4)]));
+        }
+        for value in &values {
+            let whole = serde_json::to_string(value).expect("serializes");
+            assert_eq!(quote_json(value), quote(&whole), "{whole}");
+        }
+    }
+
+    #[test]
+    fn explaining_a_config_change_costs_the_same_however_long_its_strings() {
+        // A parameter whose value is one long string with nothing in it to
+        // escape. serde_json scans a whole string for escapes before writing
+        // any of it, so a writer that refused bytes past the quote's length
+        // bounded the memory and not the time: the explanation — which
+        // checks the clock between comparisons, not inside a write — ran on
+        // past the deadline for as long as the string was long.
+        const LENGTH: usize = 16 << 20;
+        let fixture = TempStore::open("diff-explain-long-string", crate::Config::default());
+        let (mut a, mut b) = one_step_each(fixture.store());
+        let long = json!("x".repeat(LENGTH));
+        let key = "gen_ai.request.stop".to_owned();
+        a[0].detail.config.insert(key.clone(), long.clone());
+        // A different length, so telling the values apart is instant and
+        // describing them is all the work there is.
+        b[0].detail.config.insert(key, json!("y"));
+        let aligned = assemble(&a, &b, &[(0, 0)], None).expect("no deadline to miss");
+        assert_eq!(aligned[0].why, Some(DivergenceKind::Config));
+        let found = first_divergence(&aligned, &a, &b, None)
+            .expect("no deadline to miss")
+            .expect("the runs part");
+        let shown = format!("gen_ai.request.stop \"{}…", "x".repeat(QUOTED_CHARS - 1));
+        assert!(found.explanation.contains(&shown), "{}", found.explanation);
+        assert!(
+            found.explanation.ends_with(" in a, \"y\" in b"),
+            "{}",
+            found.explanation
+        );
+
+        // What writing the value out whole costs on THIS machine, in THIS
+        // build profile — the scan an unbounded quote waits for.
+        let scan = unbudgeted_cost(|| serde_json::to_writer(std::io::sink(), &long));
+        let budget = scan / 8;
+        let fastest = (0..3)
+            .map(|_| {
+                let started = Instant::now();
+                let outcome =
+                    first_divergence(&aligned, &a, &b, Deadline::starting(started, Some(budget)));
+                let elapsed = started.elapsed();
+                match outcome {
+                    Ok(Some(_)) | Err(crate::Error::DeadlineExceeded(_)) => elapsed,
+                    other => panic!("expected an explanation or a refusal, got {other:?}"),
+                }
+            })
+            .min()
+            .expect("three runs");
+        assert!(
+            fastest < scan / 2,
+            "explaining took {fastest:?} against a {budget:?} budget; \
+             writing the value whole takes {scan:?}"
+        );
     }
 
     #[test]
