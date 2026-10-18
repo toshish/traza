@@ -141,13 +141,18 @@ joined with ` + `.
 | `tool_catalog` | `gen_ai.tool.definitions`, else indexed `llm.request.functions.{i}.*` (OpenLLMetry), else indexed `llm.tools.{i}.tool.json_schema` (OpenInference), else a provider request body's `tools` | 16 hex characters of SHA-256 over the definitions' canonical JSON, sorted, so their order does not matter |
 | `model_requested` | `gen_ai.request.model`, else `llm.model`, else `llm.model_name` | the value |
 | `model_returned` | `gen_ai.response.model` | the value |
-| `params` | Every `gen_ai.request.*` key except the model, plus `llm.invocation_parameters` without its `model` key. These are the keys a [run diff](http-api.md#get-v1diff) calls `config` | `key=value` pairs in key order |
+| `params` | Every `gen_ai.request.*` key except the model, plus `llm.invocation_parameters` without its `model` key. These are the keys a [run diff](http-api.md#get-v1diff) calls `config` | `key=value` pairs in key order, each value as JSON (strings quoted), for example `max_tokens=1024, stop="END"` |
 | `service_version` | `service.version`, on any span of the run | the value |
 | `sdk_version` | `telemetry.sdk.name` and `telemetry.sdk.version`, on any span | `name/version` |
 | `behavior` | The run's top-level path (see below), when no configuration change explains a shift | the most common path on each side |
 
 The first five are read from model-call steps. A value longer than 160
-characters is identified by its digest and shown cut short.
+characters is identified by its digest and shown cut short. Sampling
+parameters are identified by the canonical JSON of the typed parameters
+(keys sorted, strings quoted and escaped), never by the text shown: a `stop`
+string that spells out `END, temperature=0.7` is a different configuration
+from a `stop` of `END` beside a `temperature` of 0.7, and `1` differs from
+`"1"`.
 
 Runs are compared by a 64-bit digest of each value, never by its text, so
 the number of distinct values cannot hide a change. The text is kept only to
@@ -395,7 +400,8 @@ Each change also carries:
     and exactly one of them changed, the diff is of that one;
   - for a **tool catalog**, the tools added and removed, or
     `definitions_changed` when the names are the same;
-  - for **sampling parameters**, the keys that differ;
+  - for **sampling parameters**, the keys that differ, with their values
+    as typed JSON (a long value cut short);
   - for **behaviour**, the five paths whose share moved most.
 - `example_runs`, the three runs nearest the change on each side.
 

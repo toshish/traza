@@ -744,7 +744,7 @@ fn sample_bytes(sample: &Sample) -> usize {
         Sample::Names(names) => names.iter().map(String::len).sum(),
         Sample::Params(params) => params
             .iter()
-            .map(|(key, value)| key.len() + value.len())
+            .map(|(key, value)| key.len() + fingerprint::sample_value_bytes(value))
             .sum(),
     }
 }
@@ -5238,5 +5238,51 @@ mod tests {
                 "window {window}"
             );
         }
+    }
+
+    #[test]
+    fn a_rollout_between_parameter_sets_that_read_alike_is_a_change() {
+        // `stop` once spelled out a temperature; then the temperature became
+        // a parameter of its own. Joined as text, both read
+        // `stop=END, temperature=0.7`.
+        let fixture = TempStore::open("radar-params-typed", crate::Config::default());
+        let store = fixture.store();
+        let mut spans = Vec::new();
+        for index in 0..120u64 {
+            let mut run = simple_run(
+                "tuned-bot",
+                &format!("tuned-{index:03}"),
+                BASE + index * MINUTE,
+                "m",
+                "Prompt.",
+                0,
+                index >= 60 && index % 5 < 2,
+            );
+            let attributes = &mut run[0].attributes;
+            if index < 60 {
+                attributes.insert(
+                    "gen_ai.request.stop".to_owned(),
+                    json!("END, temperature=0.7"),
+                );
+            } else {
+                attributes.insert("gen_ai.request.stop".to_owned(), json!("END"));
+                attributes.insert("gen_ai.request.temperature".to_owned(), json!(0.7));
+            }
+            spans.extend(run);
+        }
+        store.ingest_batch(spans).expect("ingests");
+        let report = store.changes(None, &query(), NOW).expect("analyses");
+        let params = find(&report, Dimension::Params).expect("the rollout is on the timeline");
+        assert_eq!(params.at_ns, BASE + 60 * MINUTE);
+        assert_ne!(params.from, params.to, "and reads as two values");
+        assert_eq!(params.verdict, Verdict::Regression);
+        let changed = &params.detail.as_ref().expect("a detail")["changed"];
+        assert_eq!(
+            changed,
+            &json!([
+                {"key": "stop", "before": "END, temperature=0.7", "after": "END"},
+                {"key": "temperature", "before": null, "after": 0.7},
+            ])
+        );
     }
 }

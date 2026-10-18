@@ -467,9 +467,11 @@ fn detail_line(detail: &Value) -> Option<String> {
         let parts: Vec<String> = changed
             .iter()
             .map(|entry| {
+                // Parameter values are typed: each is shown as its JSON, so
+                // `"1"` and `1` read differently, as they are compared.
                 let side = |value: &Value| match value {
                     Value::Null => "unset".to_owned(),
-                    other => text(other),
+                    other => sanitize(crate::evals::canonical_json(other)),
                 };
                 format!(
                     "{} {} → {}",
@@ -854,5 +856,19 @@ mod tests {
             None,
         );
         assert_eq!(backwards["isError"], json!(true), "{backwards}");
+    }
+
+    #[test]
+    fn changed_parameters_read_as_their_typed_values() {
+        let detail = json!({"changed": [
+            {"key": "stop", "before": "END, temperature=0.7", "after": "END"},
+            {"key": "temperature", "before": null, "after": 0.7},
+            {"key": "n", "before": "1", "after": 1},
+        ]});
+        assert_eq!(
+            detail_line(&detail).expect("a line"),
+            "parameters: stop \"END, temperature=0.7\" → \"END\"; temperature unset → 0.7; \
+             n \"1\" → 1"
+        );
     }
 }
