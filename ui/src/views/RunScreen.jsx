@@ -13,13 +13,18 @@ import { Input } from '../components/primitives/Input.jsx';
 import { CodeBlock } from '../components/data/CodeBlock.jsx';
 import { MessageList } from '../components/trace/MessageList.jsx';
 import { UnscopedNote } from '../components/runs/UnscopedNote.jsx';
-import { VERDICT_TAG } from './GuardScreen.jsx';
+import { TopologyCard } from '../components/runs/Topology.jsx';
+import { NudgesCard } from '../components/runs/Nudges.jsx';
+import { ForkModal, ForksCard } from '../components/runs/Fork.jsx';
+import { forkable } from '../lib/fork.js';
+import { VERDICT_TAG, canWrite } from './GuardScreen.jsx';
 
 // A run read as a tape: its model calls, tool calls and agent invocations in
 // order, with what went into each and what came out — and from here, a replay
-// of it and a diff against another run. A run is a session id, or
-// `trace:<id>` for a trace with none; sessions and traces link here with
-// exactly that rule.
+// of it, a fork from any step, a diff against another run, its agents and
+// how they handed control around, and the nudges a person sent it. A run is
+// a session id, or `trace:<id>` for a trace with none; sessions and traces
+// link here with exactly that rule.
 
 /** Steps the screen asks for at a time. The server holds up to 20,000;
     drawing that many rows would stall the page, and the tape says when it
@@ -64,6 +69,10 @@ export function RunScreen({ runId, go, params, identity, pushToast }) {
   // --no-fuses answers 409 here, and the tape stands on its own.
   const verdict = useRead((signal) => api.fuseRun(runId, scope, signal).catch(() => null), [runId, tenant],
     { skip: !oneTenant });
+  // The step a fork is being made from, and a count of forks made here, so
+  // the listing reads again after one.
+  const [forking, setForking] = React.useState(null);
+  const [forked, setForked] = React.useState(0);
 
   const setParam = (key, value) => {
     const next = new URLSearchParams(params);
@@ -143,13 +152,20 @@ export function RunScreen({ runId, go, params, identity, pushToast }) {
     </div> : null}
 
     <div className="tz-split" style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(320px, 420px)', gap: 14, alignItems: 'start' }}>
-      <Tape steps={data.steps} totals={totals} go={go} focusStep={focusStep} />
+      <Tape steps={data.steps} totals={totals} go={go} focusStep={focusStep} onFork={setForking} />
       <div style={{ display: 'grid', gap: 14, minWidth: 0 }}>
+        {oneTenant ? <TopologyCard key={'topology:' + replayScopeKey(runId, tenant)} run={runId} tenant={tenant} go={go} /> : null}
+        {oneTenant ? <NudgesCard key={'nudges:' + replayScopeKey(runId, tenant)} run={runId} tenant={tenant}
+          writer={canWrite(identity)} /> : null}
         <ReplayPanel key={replayScopeKey(shown.runId, shown.tenant)} runId={shown.runId} tenant={shown.tenant}
           tape={data} identity={identity} pushToast={pushToast} />
+        <ForksCard key={'forks:' + replayScopeKey(runId, tenant)} run={runId} tenant={tenant} go={go} nonce={forked} />
         <ComparePanel runId={runId} tenant={tenant} go={go} />
       </div>
     </div>
+
+    <ForkModal run={shown.runId} tenant={shown.tenant} step={forking} identity={identity}
+      onClose={() => setForking(null)} onCreated={() => setForked((n) => n + 1)} />
   </div>;
 }
 
@@ -167,7 +183,7 @@ function stepName(step) {
   return step.model || step.tool || step.agent || step.name;
 }
 
-function Tape({ steps, totals, go, focusStep }) {
+function Tape({ steps, totals, go, focusStep, onFork }) {
   const [open, setOpen] = React.useState(() => new Set(focusStep != null ? [Number(focusStep)] : []));
   const focusRef = React.useRef(null);
   React.useEffect(() => {
@@ -243,7 +259,7 @@ function Tape({ steps, totals, go, focusStep }) {
                 <span style={{ fontSize: 11, color: step.status === 'error' ? 'var(--error)' : 'var(--ink-faint)' }}>{step.status}</span>
               </div>
             </div>
-            {expanded ? <StepDetail step={step} go={go} /> : null}
+            {expanded ? <StepDetail step={step} go={go} onFork={onFork} /> : null}
           </div>;
         })}
       </div>
@@ -259,7 +275,7 @@ function Num({ children, muted, accent }) {
   }}>{children}</div>;
 }
 
-function StepDetail({ step, go }) {
+function StepDetail({ step, go, onFork }) {
   const fp = splitFingerprint(step.fingerprint);
   return <div style={{ padding: '10px 14px 14px', borderBottom: '1px solid var(--hairline)', background: 'var(--bg)', display: 'grid', gap: 10 }}>
     <div style={{ display: 'flex', gap: 14, flexWrap: 'wrap', fontSize: 12, color: 'var(--ink-muted)' }}>
@@ -267,9 +283,12 @@ function StepDetail({ step, go }) {
       <span>started <Mono>{fmtTimeNs(step.start_ns)}</Mono></span>
       {step.tokens?.cache_read != null ? <span>cache read <Mono>{fmtNum(step.tokens.cache_read)}</Mono></span> : null}
       {step.tokens?.cache_write != null ? <span>cache write <Mono>{fmtNum(step.tokens.cache_write)}</Mono></span> : null}
-      <a href={'#/trace/' + encodeURIComponent(step.trace_id) + '?span=' + encodeURIComponent(step.span_id)}
-        onClick={(e) => { e.preventDefault(); go(['trace', step.trace_id], { span: step.span_id }); }}
-        style={{ marginLeft: 'auto' }}>open the span in its trace</a>
+      <span style={{ marginLeft: 'auto', display: 'inline-flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+        <a href={'#/trace/' + encodeURIComponent(step.trace_id) + '?span=' + encodeURIComponent(step.span_id)}
+          onClick={(e) => { e.preventDefault(); go(['trace', step.trace_id], { span: step.span_id }); }}>open the span in its trace</a>
+        {onFork && forkable(step) ? <Chip onClick={() => onFork(step)}
+          title={`Serve a different ${step.kind === 'llm' ? 'answer' : 'result'} here, or replay up to here and go live`}>Fork from here</Chip> : null}
+      </span>
     </div>
     <div className="tz-reflow-1" style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 12 }}>
       <Side title="request" digest={step.request_digest} value={step.request} kind={step.kind} direction="prompt" />
