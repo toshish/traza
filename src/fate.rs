@@ -2138,6 +2138,10 @@ pub(crate) struct FateCache {
     /// background alike), for `traza_fate_builds_total`.
     builds_ok: AtomicU64,
     builds_failed: AtomicU64,
+    /// Runs a fuse's foresight read back from the store, for the test that
+    /// it reads the guard's live path instead.
+    #[cfg(test)]
+    run_reads: AtomicU64,
 }
 
 #[derive(Default)]
@@ -2210,6 +2214,8 @@ impl FateCache {
             settled: Condvar::new(),
             builds_ok: AtomicU64::new(0),
             builds_failed: AtomicU64::new(0),
+            #[cfg(test)]
+            run_reads: AtomicU64::new(0),
         }
     }
 
@@ -2845,6 +2851,128 @@ impl Reading {
     }
 }
 
+/// A step as the run guard follows it for foresight: where it falls in step
+/// order, and the keys of its signature stem and agent. Extracted with the
+/// guard's other per-span facts, with no lock held; no text is kept.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StepToken {
+    order: OrderKey,
+    stem: u64,
+    /// [`stem_key`] of the step's agent name; 0 for none.
+    agent: u64,
+}
+
+impl StepToken {
+    /// The token of `span`, whose LLM facts are `llm`; `None` for a span
+    /// that is not a step.
+    pub(crate) fn of(span: &Span, llm: &semconv::LlmFacts) -> Option<Self> {
+        let (kind, signature, agent) = semconv::step_signature_with(span, llm);
+        kind.is_step().then(|| Self {
+            order: order_key(span),
+            stem: stem_key(&stem(&signature)),
+            agent: agent.map_or(0, |agent| stem_key(&stem(&agent))),
+        })
+    }
+
+    /// A token for a test: a step starting at `start`, named `signature`.
+    #[cfg(test)]
+    pub(crate) fn named(start: u64, span: &str, signature: &str) -> Self {
+        Self {
+            order: (start, 0, prefix8(span)),
+            stem: stem_key(signature),
+            agent: 0,
+        }
+    }
+}
+
+/// One step of a [`LivePath`]: 48 bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct LiveStep {
+    order: OrderKey,
+    /// The run guard's key for the span, so a re-ingested version replaces
+    /// it.
+    span: u64,
+    stem: u64,
+    agent: u64,
+}
+
+/// A run's behaviour as the run guard follows it live, for the predictive
+/// fuses: its earliest [`RUN_STEP_WINDOW`] steps in step order, by key — so
+/// a pre-call check reads the run's path from memory in time proportional
+/// to that window, never by reading the run back from the store. The guard
+/// keeps one only for a run under a policy that sets `min_success_odds`,
+/// counted against its span budget, and maintains it exactly as it does
+/// usage: every version of a span that lands replaces the last, a rebuild
+/// replays the store into a fresh one, and an evicted or erased run takes
+/// its path with it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LivePath {
+    steps: Vec<LiveStep>,
+    /// Whether some step fell past the window, so the path beyond it is
+    /// not known.
+    overflowed: bool,
+}
+
+impl LivePath {
+    /// Steps held: the path's share of the guard's span budget.
+    pub(crate) fn len(&self) -> usize {
+        self.steps.len()
+    }
+
+    /// Puts the version of span `span` that just landed in: its step, or —
+    /// when it is not (or no longer) a step — nothing, replacing whatever an
+    /// earlier version put in.
+    pub(crate) fn land(&mut self, span: u64, step: Option<&StepToken>) {
+        if let Some(at) = self.steps.iter().position(|held| held.span == span) {
+            self.steps.remove(at);
+        }
+        let Some(step) = step else {
+            return;
+        };
+        let entry = LiveStep {
+            order: step.order,
+            span,
+            stem: step.stem,
+            agent: step.agent,
+        };
+        let at = self.steps.partition_point(|held| *held < entry);
+        if self.steps.len() >= RUN_STEP_WINDOW {
+            // Full: keep the earliest, dropping whichever is latest.
+            self.overflowed = true;
+            if at >= self.steps.len() {
+                return;
+            }
+            self.steps.pop();
+        }
+        self.steps.insert(at, entry);
+    }
+
+    /// The path as foresight reads it: the run's agent is its first step's,
+    /// else `service`'s (the run's earliest span); `truncated` is whether
+    /// the guard rebuilt the run from its earliest spans only. Read as live.
+    pub(crate) fn reading(&self, service: Option<&str>, truncated: bool, steps: u64) -> Reading {
+        let agent_key = match self.steps.first() {
+            Some(first) if first.agent != 0 => first.agent,
+            _ => stem_key(&stem(service.unwrap_or(""))),
+        };
+        Reading {
+            agent_key,
+            agent: None,
+            groups: groups(self.steps.iter().map(|step| step.stem))
+                .into_iter()
+                .map(|(key, count)| ReadGroup {
+                    key,
+                    count,
+                    name: None,
+                })
+                .collect(),
+            complete: !self.overflowed && !truncated,
+            live: true,
+            steps,
+        }
+    }
+}
+
 /// A run's stored spans read the way a build reads them, and how the run
 /// has ended so far (`unknown` while it may go on).
 fn read_spans(spans: &[Span], truncated: bool, now_ns: u64) -> (Reading, Outcome) {
@@ -3470,21 +3598,34 @@ impl Store {
             }
         };
         out.map_built_at_ns = Some(build.built_at_ns);
-        let deadline = self.query_deadline(started);
-        let read = match self.run_spans(Some(tenant), run, FORESIGHT_RUN_SPANS, deadline) {
-            Ok(read) => read,
-            Err(error) => {
-                out.explanation = format!("the run could not be read for foresight: {error}");
-                return out;
+        // The run guard's live path when it keeps one — read from memory in
+        // time proportional to the path, never from the store; else (a run
+        // it does not follow whole, or one that started before a predictive
+        // policy existed) the run's stored spans.
+        let reading = match self.fuse_behaviour(tenant, run) {
+            Some(reading) => reading,
+            None => {
+                #[cfg(test)]
+                self.fate.run_reads.fetch_add(1, Ordering::Relaxed);
+                let deadline = self.query_deadline(started);
+                let read = match self.run_spans(Some(tenant), run, FORESIGHT_RUN_SPANS, deadline) {
+                    Ok(read) => read,
+                    Err(error) => {
+                        out.explanation =
+                            format!("the run could not be read for foresight: {error}");
+                        return out;
+                    }
+                };
+                if read.spans.is_empty() {
+                    out.explanation = "the run has no recorded steps yet".to_owned();
+                    return out;
+                }
+                let (mut reading, _) =
+                    read_spans(&read.spans, read.truncated, crate::mcp::unix_nanos_now());
+                reading.live = true;
+                reading
             }
         };
-        if read.spans.is_empty() {
-            out.explanation = "the run has no recorded steps yet".to_owned();
-            return out;
-        }
-        let (mut reading, _) =
-            read_spans(&read.spans, read.truncated, crate::mcp::unix_nanos_now());
-        reading.live = true;
         let Some(cohort) = build.cohort_by_key(tenant, reading.agent_key) else {
             out.explanation = match &reading.agent {
                 Some(agent) => {

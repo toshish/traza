@@ -144,6 +144,42 @@ fn a_path_read_in_part_is_judged_on_what_was_read_never_called_novel() {
 }
 
 #[test]
+fn a_live_path_keeps_the_earliest_steps_in_order_within_its_window() {
+    // The guard's budget is documented in records of this size.
+    assert_eq!(std::mem::size_of::<LiveStep>(), 48);
+    let mut path = LivePath::default();
+    let token = |start: u64, signature: &str| StepToken::named(start, "s", signature);
+    path.land(1, Some(&token(30, "tool:c")));
+    path.land(2, Some(&token(10, "tool:a")));
+    path.land(3, Some(&token(20, "tool:a")));
+    let reading = path.reading(Some("svc"), false, 3);
+    let groups: Vec<(u64, usize)> = reading
+        .groups
+        .iter()
+        .map(|group| (group.key, group.count))
+        .collect();
+    assert_eq!(groups, [(stem_key("tool:a"), 2), (stem_key("tool:c"), 1)]);
+    assert_eq!(reading.agent_key, stem_key("svc"));
+    // A new version moves its step; one that is no step takes it out.
+    path.land(1, Some(&token(5, "tool:c")));
+    path.land(3, None);
+    assert_eq!(path.len(), 2);
+    // Full: later steps are dropped, earlier ones displace the latest,
+    // and the path says it is no longer whole.
+    for index in 0..RUN_STEP_WINDOW as u64 {
+        path.land(100 + index, Some(&token(1_000 + index, "tool:x")));
+    }
+    assert_eq!(path.len(), RUN_STEP_WINDOW);
+    assert!(!path.reading(None, false, 0).complete);
+    path.land(9, Some(&token(1, "tool:first")));
+    assert_eq!(path.len(), RUN_STEP_WINDOW);
+    assert_eq!(
+        path.reading(None, false, 0).groups[0].key,
+        stem_key("tool:first")
+    );
+}
+
+#[test]
 fn long_names_are_cut_at_a_character_boundary() {
     let long = format!("tool:{}", "é".repeat(200));
     let cut = stem(&long);
@@ -1163,6 +1199,105 @@ fn cached_foresight_never_builds_on_the_request_path() {
         !warm.raised,
         "raising is the fuse's decision, not foresight's"
     );
+}
+
+fn predictive_policy(store: &Store, odds: f64) {
+    store
+        .put_fuse_policy(crate::guard::PolicySpec {
+            name: "support".into(),
+            matches: crate::guard::PolicyMatch {
+                service: Some("support-agent".into()),
+            },
+            limits: crate::guard::Limits {
+                min_success_odds: Some(odds),
+                ..crate::guard::Limits::default()
+            },
+            action: Action::Stop,
+            ..crate::guard::PolicySpec::default()
+        })
+        .expect("policy");
+}
+
+#[test]
+fn a_pre_call_check_reads_the_guards_live_path_never_the_store() {
+    let (fixture, now) = seeded("live-path", crate::Config::default(), true);
+    let store = fixture.store();
+    predictive_policy(store, 0.7);
+    let check = |run: &str, tool: Option<&str>| {
+        store
+            .fuse_check(
+                "",
+                run,
+                &NextStep {
+                    tool: tool.map(str::to_owned),
+                    ..NextStep::default()
+                },
+            )
+            .expect("verdict")
+    };
+    // The first check rebuilds the run in the guard from the store, as the
+    // guard always does — and with a predictive policy in force the rebuilt
+    // state keeps the run's behaviour path. The warmer builds the map.
+    let _ = check("live-doomed-0", None);
+    store.maintain_fate().expect("warms");
+    let reads = || store.fate.run_reads.load(Ordering::Relaxed);
+    let before = reads();
+    for _ in 0..5 {
+        let doomed = check("live-doomed-0", None);
+        assert_eq!(doomed.verdict, Verdict::Stop);
+        assert_eq!(
+            doomed.reasons.last().map(String::as_str),
+            Some("foresight: runs that took this path succeeded 5 of 50 times (≤21.4%)")
+        );
+    }
+    assert_eq!(
+        reads(),
+        before,
+        "every check read the run back from the store"
+    );
+    // The path the guard keeps is the one a read of the store gives.
+    for run in [
+        "live-doomed-0",
+        "live-healthy-0",
+        "live-novel-0",
+        "live-early-0",
+    ] {
+        let _ = check(run, None);
+        let live = store.fuse_behaviour("", run).expect("followed");
+        let read = store.run_spans(Some(""), run, 1_000, None).expect("reads");
+        let (stored, _) = read_spans(&read.spans, read.truncated, now);
+        let keys = |reading: &Reading| -> Vec<(u64, usize)> {
+            reading
+                .groups
+                .iter()
+                .map(|group| (group.key, group.count))
+                .collect()
+        };
+        assert_eq!(keys(&live), keys(&stored), "{run}");
+        assert_eq!(
+            (live.agent_key, live.complete, live.steps),
+            (stored.agent_key, stored.complete, stored.steps),
+            "{run}"
+        );
+    }
+    // A step that lands moves the path at once: a second refund, from
+    // memory, is now the 15-of-30 branch.
+    let before = reads();
+    assert_eq!(check("live-healthy-0", None).verdict, Verdict::Continue);
+    let mut refund = synthetic_run(
+        "live-healthy-0",
+        "support-agent",
+        &["tool:issue_refund"],
+        now - 1_000_000_000,
+        false,
+    );
+    refund[0].span_id = "second-refund".into();
+    store.ingest_batch(refund).expect("ingests");
+    let second = check("live-healthy-0", None);
+    assert_eq!(second.verdict, Verdict::Stop, "{:?}", second.foresight);
+    let foresight = second.foresight.as_ref().expect("foresight");
+    assert_eq!((foresight.support, foresight.successes), (30, 15));
+    assert_eq!(reads(), before);
 }
 
 #[test]

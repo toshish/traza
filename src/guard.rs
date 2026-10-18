@@ -103,9 +103,11 @@ use state::{Observation, RunState, Trip};
 use crate::{erasure, semconv, Deadline, Error, Result, Span, Store};
 
 /// Ceiling on span contributions held across every live run — each a 40-byte
-/// record under an 8-byte key, before hash-table overhead. Past it, whole
-/// runs are evicted least-recently-active first; they rebuild from the store
-/// when next asked about.
+/// record under an 8-byte key, before hash-table overhead — plus the steps of
+/// the behaviour paths kept for runs under a predictive policy (48 bytes
+/// each, at most the earliest 192 per run; see [`crate::fate::LivePath`]).
+/// Past it, whole runs are evicted least-recently-active first; they rebuild
+/// from the store when next asked about.
 pub const MAX_TRACKED_SPANS: usize = 1_000_000;
 
 /// Most spans a rebuild reads for one run. A larger run is rebuilt from its
@@ -661,11 +663,17 @@ impl Guard {
                 let limits = |service: &str| {
                     stop_limits(policies, &self.config, &key.tenant, service, controls)
                 };
+                let grant = controls.and_then(|controls| controls.grant.as_ref());
+                if follows_behaviour(policies, &self.config, grant) {
+                    run.follow_behaviour();
+                }
                 let before = run.tracked();
                 let latched = run.fold(&observations, None, &limits, &|_| now);
-                (run.tracked() - before, latched)
+                ((before, run.tracked()), latched)
             };
-            state.tracked += added;
+            // A behaviour path can shrink (a step re-ingested as no step), so
+            // the budget moves by the difference either way.
+            state.tracked = (state.tracked + added.1).saturating_sub(added.0);
             let judged = self.settle(&mut state, &key, now);
             if latched {
                 self.tripped(&key, &judged, now);
@@ -845,6 +853,19 @@ fn stop_limits(
     (resolved.action == Action::Stop).then_some(resolved.limits)
 }
 
+/// Whether a run of a tenant with `policies` keeps its behaviour path for
+/// the predictive fuses ([`crate::fate::LivePath`]): when a policy that
+/// could govern it — the global one, any of the tenant's, or the run's
+/// grant — sets `min_success_odds`. Decided when the run's state starts; a
+/// run that started before such a policy existed is read from the store.
+fn follows_behaviour(policies: &[FusePolicy], config: &FuseConfig, grant: Option<&Limits>) -> bool {
+    config.limits.min_success_odds.is_some()
+        || grant.is_some_and(|grant| grant.min_success_odds.is_some())
+        || policies
+            .iter()
+            .any(|policy| policy.limits.min_success_odds.is_some())
+}
+
 /// Everything durable a rebuild's replay depends on besides the spans.
 #[derive(Clone, Debug, PartialEq)]
 struct ReplayInputs {
@@ -867,7 +888,8 @@ impl ReplayInputs {
             let resolved = in_force(&self.policies, config, tenant, service, self.grant.as_ref());
             (resolved.limits, resolved.action)
         };
-        let mut rebuilt = state::replay(observations, self.reset_at, &resolve);
+        let follow = follows_behaviour(&self.policies, config, self.grant.as_ref());
+        let mut rebuilt = state::replay_following(observations, self.reset_at, &resolve, follow);
         if truncated {
             rebuilt.cut_short();
         }
@@ -1716,6 +1738,21 @@ impl Store {
         let answer = guard.answer(&state, key, judged, Source::Rebuilt);
         state.evict(now, guard.config.max_runs, MAX_TRACKED_SPANS, Some(key));
         answer.map(Some)
+    }
+
+    /// The behaviour path the guard keeps for `run`, read for foresight
+    /// from memory: `None` when it keeps none whole — fuses disabled, the
+    /// run not live or not yet rebuilt from the store, or not under a
+    /// predictive policy when its state started.
+    pub(crate) fn fuse_behaviour(&self, tenant: &str, run: &str) -> Option<crate::fate::Reading> {
+        let guard = self.guard.as_ref()?;
+        let state = guard.state.lock().ok()?;
+        let live = state.runs.get(&RunKey::new(tenant, run))?;
+        if !live.complete {
+            return None;
+        }
+        let path = live.behaviour()?;
+        Some(path.reading(live.service.as_deref(), live.truncated, live.steps()))
     }
 
     /// Runs the guard holds — live ones, and stopped ones parked out of the
@@ -3854,5 +3891,63 @@ mod tests {
             ),
             (Verdict::Continue, 2, 1)
         );
+    }
+
+    #[test]
+    fn a_predictive_policy_keeps_a_behaviour_path_inside_the_span_budget() {
+        let budget = |state: &State| -> (usize, usize) {
+            (
+                state.tracked,
+                state.runs.values().map(RunState::tracked).sum::<usize>(),
+            )
+        };
+        // No predictive limit: no path is kept, and nothing is spent on one.
+        let plain = TempStore::open("behaviour-off", FuseConfig::default());
+        plain
+            .store()
+            .ingest_batch(vec![tool_span("r", "a", "search", "1", 10)])
+            .expect("ingests");
+        plain.store().fuse_verdict("", "r").expect("verdict");
+        assert!(plain.store().fuse_behaviour("", "r").is_none());
+        // A predictive limit: two steps, two marks and two path steps.
+        let fixture = TempStore::open(
+            "behaviour-on",
+            FuseConfig {
+                limits: Limits {
+                    min_success_odds: Some(0.5),
+                    ..Limits::default()
+                },
+                ..FuseConfig::default()
+            },
+        );
+        let store = fixture.store();
+        store
+            .ingest_batch(vec![
+                tool_span("r", "a", "search", "1", 10),
+                tool_span("r", "b", "read", "2", 20),
+            ])
+            .expect("ingests");
+        let guard = store.guard().expect("on");
+        assert_eq!(budget(&guard.lock_state().expect("state")), (4, 4));
+        // Followed live only, the run's history is not known whole yet.
+        assert!(store.fuse_behaviour("", "r").is_none());
+        // `b` re-ingested as no step at all: the path gives its step back.
+        let mut plain_b = tool_span("r", "b", "read", "2", 20);
+        plain_b
+            .attributes
+            .retain(|key, _| key.as_str() == "session.id");
+        store.ingest_batch(vec![plain_b]).expect("ingests");
+        assert_eq!(budget(&guard.lock_state().expect("state")), (3, 3));
+        // Rebuilt whole by a question, the run reads as the store has it.
+        store.fuse_verdict("", "r").expect("verdict");
+        let reading = store.fuse_behaviour("", "r").expect("followed whole");
+        let groups: Vec<(u64, usize)> = reading
+            .groups
+            .iter()
+            .map(|group| (group.key, group.count))
+            .collect();
+        assert_eq!(groups, [(crate::fate::stem_key("tool:search"), 1)]);
+        assert!(reading.complete && reading.live);
+        assert_eq!(budget(&guard.lock_state().expect("state")), (3, 3));
     }
 }
